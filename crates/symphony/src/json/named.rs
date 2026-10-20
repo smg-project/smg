@@ -245,7 +245,12 @@ mod tests {
     const ARGUMENTS_CALL: &str = "get_weather[ARGS]{\"city\": \"Paris\", \"days\": [1, 2]}";
     const ARGUMENTS: &str = "{\"city\": \"Paris\", \"days\": [1, 2]}";
 
-    fn run(after: After, marker: &'static str, pieces: &[&str], cut: bool) -> (Vec<Event>, usize) {
+    fn run(
+        after: After,
+        marker: &'static str,
+        pieces: &[&str],
+        cut: bool,
+    ) -> (Vec<Event<'static>>, usize) {
         let mut assembler = Assembler::new(0, "call_0", marker, after);
         let mut out = Events::new();
         let mut taken = 0;
@@ -261,12 +266,12 @@ mod tests {
     }
 
     /// A call whose object follows the marker (the Inkling spelling).
-    fn run_object(pieces: &[&str], cut: bool) -> (Vec<Event>, usize) {
+    fn run_object(pieces: &[&str], cut: bool) -> (Vec<Event<'static>>, usize) {
         run(After::Object, OBJECT_MARKER, pieces, cut)
     }
 
     /// A call whose arguments alone follow the marker (the Mistral spelling).
-    fn run_arguments(pieces: &[&str], cut: bool) -> (Vec<Event>, usize) {
+    fn run_arguments(pieces: &[&str], cut: bool) -> (Vec<Event<'static>>, usize) {
         run(After::Arguments, ARGUMENTS_MARKER, pieces, cut)
     }
 

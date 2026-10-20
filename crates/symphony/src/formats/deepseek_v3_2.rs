@@ -108,7 +108,7 @@ mod tests {
         prompt: &str,
         pieces: &[&str],
         finish: EngineFinish,
-    ) -> Vec<Event> {
+    ) -> Vec<Event<'static>> {
         let mut parser = Engine::new(format, Declared::default());
         drive_to(&mut parser, prompt, pieces, finish)
     }
@@ -125,7 +125,7 @@ mod tests {
             .collect()
     }
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         run_table(deepseek_v3_2(), prompt, pieces, EngineFinish::Stop)
     }
 
@@ -141,9 +141,9 @@ mod tests {
             .expect("a finish")
     }
 
-    fn dropped(text: &str) -> Event {
+    fn dropped(text: &str) -> Event<'static> {
         Event::Dropped {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
         }
     }

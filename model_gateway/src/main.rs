@@ -492,10 +492,12 @@ struct RoutingArgs {
     /// lines still parse). A worker whose load report is at or above
     /// --worker-overload-waiting-requests or --worker-overload-token-usage is
     /// left out of routing while another worker is under them; when every
-    /// worker is over them the request goes to the least-loaded one, unless
-    /// --worker-overload-shed asks for a 503 instead. Evaluated once per load
-    /// report, never per request. Per-worker `overload` blocks on a WorkerSpec
-    /// override the gateway values per signal
+    /// worker is over them the request goes to the least-loaded one (in gRPC
+    /// and HTTP prefill/decode pair placement such a pool is placed by its
+    /// own policy, as if none were over them), unless --worker-overload-shed
+    /// asks for a 503 instead. Evaluated once per load report, never per
+    /// request. Per-worker `overload` blocks on a WorkerSpec override the
+    /// gateway values per signal
     #[arg(long, default_value_t = true, help_heading = "Routing Policy")]
     worker_overload_protection: bool,
 

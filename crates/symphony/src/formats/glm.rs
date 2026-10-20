@@ -130,11 +130,11 @@ mod tests {
         "</tool_call>"
     );
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         run_with(declared(), prompt, pieces)
     }
 
-    fn run_with(declared: Declared, prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run_with(declared: Declared, prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         drive(&mut Engine::new(glm(), declared), prompt, pieces)
     }
 
@@ -152,9 +152,9 @@ mod tests {
             .collect()
     }
 
-    fn dropped(text: &str) -> Event {
+    fn dropped(text: &str) -> Event<'static> {
         Event::Dropped {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
         }
     }
@@ -553,18 +553,18 @@ mod tests {
                 Event::Dropped {
                     text,
                     why: DropReason::MalformedCall,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()
     }
 
     /// The malformed events, as (reason, text).
-    fn malformed(events: &[Event]) -> Vec<(MalformedReason, &str)> {
+    fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<(MalformedReason, &'a str)> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, why } => Some((*why, text.text.as_str())),
+                Event::Malformed { text, why } => Some((*why, &*text.text)),
                 _ => None,
             })
             .collect()

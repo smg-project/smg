@@ -102,11 +102,11 @@ mod tests {
         ])
     }
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         run_until(prompt, pieces, EngineFinish::Stop)
     }
 
-    fn run_until(prompt: &str, pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
+    fn run_until(prompt: &str, pieces: &[&str], finish: EngineFinish) -> Vec<Event<'static>> {
         let mut parser = Engine::new(llama4(), tools());
         let mut out = Events::new();
         parser
@@ -131,7 +131,7 @@ mod tests {
                 .expect("delta");
         }
         parser.feed(Input::End { finish }, &mut out).expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     /// Every byte the events carry, in order: the output, when the engine accounts for all of it.
@@ -139,11 +139,11 @@ mod tests {
         events
             .iter()
             .map(|event| match event {
-                Event::Content(text) | Event::Reasoning(text) => text.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+                Event::Content(text) | Event::Reasoning(text) => &*text.text,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+                | Event::ToolCallEnd { source, .. } => &*source.text,
                 Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
             })
             .collect()
@@ -167,7 +167,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -178,20 +178,20 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect()
     }
 
-    fn dropped(events: &[Event]) -> Vec<&str> {
+    fn dropped<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
                 Event::Dropped {
                     text,
                     why: DropReason::Wrapper,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()

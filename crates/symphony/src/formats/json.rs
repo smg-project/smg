@@ -6,9 +6,9 @@
 //! at the output's start and dropped, so an output with it and one without read the same. The
 //! format the gateway's older `json` parser reads for a model that names it, and its older
 //! `llama` parser's (Llama 3.2 writes the same). The recorded groups that write it (Nemotron
-//! Ultra CPT, UltraLong, Safety Guard, the 70B Reward Principle) record the template's bare
-//! object; the marker and the `;` form stand on the unit tests, which hold a model's output
-//! verbatim.
+//! Ultra CPT, UltraLong, Safety Guard, the 70B Reward Principle, Llama 3.2 1B/3B Instruct and
+//! 11B/90B Vision Instruct) record the template's bare object; the marker and the `;` form stand
+//! on the unit tests, which hold a model's output verbatim.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 use crate::format::{CallSyntax, Emits, Format};
@@ -36,11 +36,11 @@ mod tests {
         Declared,
     };
 
-    fn run(pieces: &[&str]) -> Vec<Event> {
+    fn run(pieces: &[&str]) -> Vec<Event<'static>> {
         run_with(json(), pieces)
     }
 
-    fn run_with(format: Format, pieces: &[&str]) -> Vec<Event> {
+    fn run_with(format: Format, pieces: &[&str]) -> Vec<Event<'static>> {
         let mut parser = Engine::new(format, Declared::default());
         let mut out = Events::new();
         parser
@@ -72,7 +72,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     #[test]
@@ -122,7 +122,7 @@ mod tests {
 
     /// Whole, and one byte at a time: the same calls, the same bytes accounted for, the same
     /// dropped and malformed text by reason, and the same finish.
-    fn whole_and_per_byte(output: &str) -> Vec<Event> {
+    fn whole_and_per_byte(output: &str) -> Vec<Event<'static>> {
         let whole = run(&[output]);
         assert_eq!(bytes(&whole), output);
         let pieces: Vec<&str> = output
@@ -146,7 +146,7 @@ mod tests {
             if let Event::Dropped { text, why } = event {
                 match joined.iter_mut().find(|(reason, _)| reason == why) {
                     Some((_, so_far)) => so_far.push_str(&text.text),
-                    None => joined.push((*why, text.text.clone())),
+                    None => joined.push((*why, text.text.to_string())),
                 }
             }
         }
@@ -160,7 +160,7 @@ mod tests {
             if let Event::Malformed { text, why } = event {
                 match joined.iter_mut().find(|(reason, _)| reason == why) {
                     Some((_, so_far)) => so_far.push_str(&text.text),
-                    None => joined.push((*why, text.text.clone())),
+                    None => joined.push((*why, text.text.to_string())),
                 }
             }
         }

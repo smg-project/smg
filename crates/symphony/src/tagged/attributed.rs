@@ -418,7 +418,7 @@ impl Assembler {
         self.object.close(source, out);
         out.push(Event::ToolCallEnd {
             index: self.object.index,
-            source: Text::uncounted(terminal),
+            source: Text::uncounted(terminal.to_owned()),
         });
         self.done = true;
     }
@@ -610,7 +610,7 @@ impl Assembler {
             } else {
                 self.object.drop_carried(out);
                 out.push(Event::Malformed {
-                    text: Text::uncounted(run),
+                    text: Text::uncounted(run.to_owned()),
                     why: MalformedReason::TextBetweenTags,
                 });
             }
@@ -906,11 +906,11 @@ mod tests {
     }
 
     /// The events of one invoke fed in `pieces`, closed by its tag or cut.
-    fn run(pieces: &[&str], cut: bool) -> Vec<Event> {
+    fn run(pieces: &[&str], cut: bool) -> Vec<Event<'static>> {
         run_with(Tags::MINIMAX_M2, pieces, cut)
     }
 
-    fn run_with(tags: Tags, pieces: &[&str], cut: bool) -> Vec<Event> {
+    fn run_with(tags: Tags, pieces: &[&str], cut: bool) -> Vec<Event<'static>> {
         let mut assembler = Assembler::new(0, "call_0", tags);
         let mut out = Events::new();
         let declared = declared();
@@ -939,7 +939,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, why } => Some((text.text.clone(), *why)),
+                Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
                 _ => None,
             })
             .collect()

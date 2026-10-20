@@ -11,7 +11,6 @@ use futures_util::StreamExt;
 use openai_protocol::{chat::ChatCompletionRequest, common::to_value_exact, model_type::Endpoint};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tracing::warn;
 
 use super::{
     context::{ComponentRefs, PayloadState, RequestContext, SharedComponents, WorkerSelection},
@@ -26,7 +25,7 @@ use crate::{
     retry::{is_retryable_response, RetryExecutor},
     sse::SSE_CHANNEL_BUFFER,
     tenant::TenantRequestMeta,
-    upstream_body::{read_response_body_limited, ReadBodyResult, MAX_ERROR_RESPONSE_SIZE},
+    upstream_body,
     worker::{SelectWorkerRequest, WorkerSource},
     RetryConfig,
 };
@@ -61,7 +60,8 @@ async fn send_attempt(
 /// The upstream's success stream relayed to the client frame by frame; an
 /// error on it aborts the client's stream (the error's text is not
 /// delivered). The content type is the upstream's, else `text/event-stream`.
-/// A refusal never comes here: [`error_body`] answers it whole.
+/// A refusal never comes here: [`upstream_body::answer_error`] answers it
+/// whole.
 fn relayed_body(resp: reqwest::Response, status: StatusCode) -> Response {
     let content_type = resp.headers().get(CONTENT_TYPE).cloned();
     let stream = resp.bytes_stream();
@@ -96,8 +96,8 @@ fn relayed_body(resp: reqwest::Response, status: StatusCode) -> Response {
 }
 
 /// The upstream's success body read whole under its status and content type;
-/// a read failure is a 500. A refusal never comes here: [`error_body`]
-/// answers it.
+/// a read failure is a 500. A refusal never comes here:
+/// [`upstream_body::answer_error`] answers it.
 async fn buffered_body(resp: reqwest::Response, status: StatusCode) -> Response {
     let content_type = resp.headers().get(CONTENT_TYPE).cloned();
     match resp.bytes().await {
@@ -110,59 +110,6 @@ async fn buffered_body(resp: reqwest::Response, status: StatusCode) -> Response 
             response
         }
         Err(e) => error::internal_error("upstream_error", format!("Failed to read response: {e}")),
-    }
-}
-
-/// The upstream's error body, read whole within [`MAX_ERROR_RESPONSE_SIZE`],
-/// under its status and content type with the provider's account identifiers
-/// removed ([`error::sanitize_error_body`]); the provider's own words go to
-/// the log at warn. A body past the bound, or one that cannot be read, is
-/// answered under the upstream's status with the gateway's own envelope and
-/// none of it: the status is the provider's verdict and the retry layer reads
-/// it, a 500 would be retried.
-async fn error_body(resp: reqwest::Response, status: StatusCode, model: &str) -> Response {
-    let content_type = resp.headers().get(CONTENT_TYPE).cloned();
-    match read_response_body_limited(resp, MAX_ERROR_RESPONSE_SIZE).await {
-        ReadBodyResult::Ok(body) => {
-            warn!(
-                model = %model,
-                status = %status,
-                body_preview = %body.chars().take(200).collect::<String>(),
-                "Upstream error"
-            );
-            let mut response = Response::new(Body::from(error::sanitize_error_body(&body)));
-            *response.status_mut() = status;
-            if let Some(ct) = content_type {
-                response.headers_mut().insert(CONTENT_TYPE, ct);
-            }
-            response
-        }
-        ReadBodyResult::TooLarge => {
-            warn!(
-                model = %model,
-                status = %status,
-                max_size = MAX_ERROR_RESPONSE_SIZE,
-                "Upstream error body too large"
-            );
-            error::create_error(
-                status,
-                "upstream_error",
-                "Upstream error response too large",
-            )
-        }
-        ReadBodyResult::Error(e) => {
-            warn!(
-                model = %model,
-                status = %status,
-                error = %e,
-                "Failed to read upstream error body"
-            );
-            error::create_error(
-                status,
-                "upstream_error",
-                "Failed to read upstream error response",
-            )
-        }
     }
 }
 
@@ -323,7 +270,7 @@ pub(super) async fn route_chat(
                     // not the request streams: the provider's account
                     // identifiers in its message are the operator's, not
                     // the caller's (as the Responses paths answer theirs).
-                    error_body(resp, status, &model_name).await
+                    upstream_body::answer_error(resp, &model_name).await
                 } else if is_streaming {
                     relayed_body(resp, status)
                 } else {
@@ -429,75 +376,5 @@ mod tests {
             Some("text/event-stream")
         );
         assert_eq!(bytes_of(response).await, b"data: x\n\n");
-    }
-
-    const UPSTREAM_REFUSAL: &str = r#"{"error":{"message":"Rate limit reached for model in organization org-abc123 project proj_xyz789","type":"rate_limit","code":"rate_limit_exceeded"}}"#;
-
-    /// A provider's refusal reaches the chat caller under its status and
-    /// content type with the operator's organization and project gone, as
-    /// it reaches a Responses caller.
-    #[tokio::test]
-    async fn an_upstream_errors_body_loses_the_operators_identifiers() {
-        let response = error_body(
-            upstream(429, Some("application/json"), UPSTREAM_REFUSAL),
-            StatusCode::TOO_MANY_REQUESTS,
-            "m",
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            content_type_of(&response).as_deref(),
-            Some("application/json")
-        );
-        let text = String::from_utf8(bytes_of(response).await).expect("utf-8");
-        assert!(!text.contains("org-abc123"), "{text}");
-        assert!(!text.contains("proj_xyz789"), "{text}");
-        assert!(text.contains("Rate limit reached for model"), "{text}");
-        assert!(text.contains(r#""code":"rate_limit_exceeded""#), "{text}");
-    }
-
-    /// An error body past the bound is not buffered or relayed: the caller
-    /// gets the upstream's status with the gateway's envelope and none of it.
-    #[tokio::test]
-    async fn an_upstream_error_body_past_the_bound_is_answered_without_it() {
-        let body = format!(
-            r#"{{"error":{{"message":"{}"}}}}"#,
-            "x".repeat(MAX_ERROR_RESPONSE_SIZE)
-        );
-        let response = error_body(
-            upstream(429, Some("application/json"), body),
-            StatusCode::TOO_MANY_REQUESTS,
-            "m",
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        let text = String::from_utf8(bytes_of(response).await).expect("utf-8");
-        assert!(!text.contains("xxxx"), "{text}");
-        assert!(text.contains("too large"), "{text}");
-    }
-
-    /// A refusal whose body cannot be read keeps the upstream's status: the
-    /// caller gets it with the gateway's envelope and without the transport
-    /// error's text, not a 500 the retry layer would act on.
-    #[tokio::test]
-    async fn an_upstream_error_body_that_cannot_be_read_keeps_the_upstreams_status() {
-        let chunks = vec![
-            Ok::<Vec<u8>, std::io::Error>(b"{\"error\":".to_vec()),
-            Err(std::io::Error::other("connection reset")),
-        ];
-        let body = reqwest::Body::wrap_stream(futures_util::stream::iter(chunks));
-        let response = error_body(
-            upstream(403, Some("application/json"), body),
-            StatusCode::FORBIDDEN,
-            "m",
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
-        let text = String::from_utf8(bytes_of(response).await).expect("utf-8");
-        assert!(
-            text.contains("Failed to read upstream error response"),
-            "{text}"
-        );
-        assert!(!text.contains("connection reset"), "{text}");
     }
 }

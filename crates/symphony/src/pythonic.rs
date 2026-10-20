@@ -315,38 +315,38 @@ impl Assembler {
         }
     }
 
-    /// The region's end: a call still open is closed for the client, a name that never got its
-    /// `(` comes back as `Malformed`, and wrapping before any call is dropped. The marker that
-    /// closed the region is not passed: it belongs to the region, not to the last call, and the
-    /// engine drops it.
+    /// The region's end: its closing marker, or the next opener. A call still open is one the
+    /// model never finished, since every template writes the call's `)` before the marker: it
+    /// ends as it does at the stream's end, with the fragments it sent, nothing made up for the
+    /// object the model never closed, and one `Malformed` event that carries what was held, a
+    /// key, a value or a separator cut short, or no bytes ([`end_cut_call`]; the engine names the
+    /// reason for a region a marker closed). A name that never got its `(` comes back as
+    /// `Malformed`, and the wrapping before any call is dropped. The marker that closed the
+    /// region is not passed: it belongs to the region, not to the last call, and the engine
+    /// drops it.
     pub fn close(mut self, out: &mut Events) {
         match std::mem::replace(&mut self.stage, Stage::Between) {
             Stage::Prose | Stage::Opening { .. } | Stage::Holding(_) => self.release_content(out),
             Stage::After => self.release_after(out),
             Stage::Between => self.drop_carried(out),
             Stage::Name { .. } => self.report(MalformedReason::NameWithoutACall, out),
-            Stage::Arguments => {
-                let source = Text::uncounted(std::mem::take(&mut self.carried));
-                self.end_call(source, "", out);
-            }
-            Stage::Key { .. } => {
-                self.report(MalformedReason::KeyWithoutAValue, out);
-                self.end_call(Text::uncounted(String::new()), "", out);
-            }
-            Stage::Value { .. } => {
-                self.report(MalformedReason::ArgumentCutShort, out);
-                self.end_call(Text::uncounted(String::new()), "", out);
+            Stage::Arguments | Stage::Key { .. } | Stage::Value { .. } => {
+                end_cut_call(self.index, std::mem::take(&mut self.carried), "", out);
             }
         }
     }
 
     /// The stream was cut: nothing is closed, so arguments cut short never look complete to a
-    /// client; what was held comes back as `Malformed { UnterminatedRegion }`, and a call that
-    /// started still ends, with no bytes of its own, as every assembler ends one. Under the bare
-    /// list, content, a `[` no call followed yet and a list held after content come back as the
-    /// content they are, and the text after the list as what it was.
-    /// A call that started ends after the one `Malformed { UnterminatedRegion }` event that
-    /// says its arguments are no whole value ([`end_cut_call`]), with what was held.
+    /// client. A call that started still ends, with no bytes of its own, as every assembler ends
+    /// one and as [`Self::close`] ends a call the marker cut, after the one `Malformed {
+    /// UnterminatedRegion }` event that says its arguments are no whole value
+    /// ([`end_cut_call`]): it carries what was held, a key, a value or a separator cut short, or
+    /// no bytes when the cut came right after the `(`, so that a call the end cut before its `)`
+    /// is never handed over as finished without a word. Outside a call, what was held, a name
+    /// that never got its `(` or the list's wrapping, comes back as `Malformed {
+    /// UnterminatedRegion }` too. Under the bare list, content, a `[` no call followed yet and a
+    /// list held after content come back as the content they are, and the text after the list as
+    /// what it was.
     pub fn finish(mut self, out: &mut Events) {
         match self.stage {
             Stage::Prose | Stage::Opening { .. } | Stage::Holding(_) => {
@@ -512,7 +512,7 @@ impl Assembler {
                 c if c.is_whitespace() => self.carried.push(c),
                 ')' => {
                     let source = Text::uncounted(std::mem::take(&mut self.carried));
-                    self.end_call(source, ")", out);
+                    self.end_call(source, out);
                     self.stage = Stage::Between;
                 }
                 c if starts_a_name(c) => {
@@ -560,7 +560,7 @@ impl Assembler {
                     let (key, start) = (key.clone(), *start);
                     self.write_value(&key, start, declared, out);
                     if c == ')' {
-                        self.end_call(Text::uncounted(String::new()), ")", out);
+                        self.end_call(Text::uncounted(String::new()), out);
                         self.stage = Stage::Between;
                     } else {
                         self.carried.push(',');
@@ -624,9 +624,16 @@ impl Assembler {
     }
 
     /// The value's extent is complete: `"key": <json>` with the key, the `=`, the value and the
-    /// whitespace before them as its source.
+    /// whitespace before them as its source. An extent with no value in it (`key=` right before
+    /// the comma or the close) is a member Python refuses and the templates never write: its
+    /// bytes are reported whole under `KeyWithoutAValue` and nothing is written for it, so the
+    /// object closes whole without it and no empty string is made up for a value the model did
+    /// not write.
     fn write_value(&mut self, key: &str, start: usize, declared: &Declared, out: &mut Events) {
         let text = self.carried[start..].trim().to_string();
+        if text.is_empty() {
+            return self.skip_member_without_a_value(out);
+        }
         let value = match self.values {
             Values::Quoted => quoted_value(&text, declared.kind(&self.name, key)),
             Values::Python | Values::Json => python_literal(&text)
@@ -646,8 +653,10 @@ impl Assembler {
         });
     }
 
-    /// `}` (or `{}`) with `source`, then `ToolCallEnd` with the closing parenthesis.
-    fn end_call(&mut self, source: Text, close: &str, out: &mut Events) {
+    /// The call's own `)`: `}` (or `{}`) with `source`, then `ToolCallEnd` with the parenthesis.
+    /// It is the one end that closes a call's object; a region's marker or the stream's end
+    /// never does.
+    fn end_call<'d>(&mut self, source: Text<'d>, out: &mut Events<'d>) {
         out.push(Event::ToolCallArguments {
             index: self.index,
             json: if self.written == 0 { "{}" } else { "}" }.to_string(),
@@ -655,8 +664,17 @@ impl Assembler {
         });
         out.push(Event::ToolCallEnd {
             index: self.index,
-            source: Text::uncounted(close),
+            source: Text::uncounted(")"),
         });
+    }
+
+    /// `key=` with nothing before the comma or the close: the member's bytes come back as
+    /// `Malformed { KeyWithoutAValue }` and nothing is written for it. Out of line: the templates
+    /// never write the shape, and the value path stays as it is for the values they do write.
+    #[cold]
+    #[inline(never)]
+    fn skip_member_without_a_value(&mut self, out: &mut Events) {
+        self.report(MalformedReason::KeyWithoutAValue, out);
     }
 
     fn report(&mut self, why: MalformedReason, out: &mut Events) {
@@ -764,11 +782,11 @@ mod tests {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
     }
 
-    fn run(pieces: &[&str]) -> Vec<Event> {
+    fn run(pieces: &[&str]) -> Vec<Event<'static>> {
         run_with(Dialect::OLMO3, &Declared::default(), pieces)
     }
 
-    fn run_with(dialect: Dialect, declared: &Declared, pieces: &[&str]) -> Vec<Event> {
+    fn run_with(dialect: Dialect, declared: &Declared, pieces: &[&str]) -> Vec<Event<'static>> {
         let mut assembler = Assembler::new(0, ids(), dialect);
         let mut out = Events::new();
         for piece in pieces {
@@ -776,6 +794,39 @@ mod tests {
         }
         assembler.close(&mut out);
         out.drain()
+    }
+
+    /// How a region ends: its closing marker (`close`) or the stream's end (`finish`).
+    #[derive(Clone, Copy, Debug)]
+    enum Ending {
+        Close,
+        Stream,
+    }
+
+    impl Ending {
+        /// The Olmo 3 dialect's region after `pieces`, nothing declared, ended this way.
+        fn run(self, pieces: &[&str]) -> Vec<Event<'static>> {
+            let mut assembler = Assembler::new(0, ids(), Dialect::OLMO3);
+            let mut out = Events::new();
+            for piece in pieces {
+                assembler.feed(piece, &Declared::default(), &mut out);
+            }
+            match self {
+                Ending::Close => assembler.close(&mut out),
+                Ending::Stream => assembler.finish(&mut out),
+            }
+            out.drain()
+        }
+    }
+
+    fn dropped<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped { text, .. } => Some(&*text.text),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Content with a `[name(` of its own: a name no tool declares is given back as content at its
@@ -827,7 +878,7 @@ mod tests {
         assert_eq!(malformed(&events), "");
     }
 
-    fn run_bare(declared: &Declared, pieces: &[&str]) -> Vec<Event> {
+    fn run_bare(declared: &Declared, pieces: &[&str]) -> Vec<Event<'static>> {
         let mut assembler = Assembler::bare(0, ids(), Dialect::LLAMA4);
         let mut out = Events::new();
         for piece in pieces {
@@ -859,7 +910,19 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The text of every `Malformed` event, one entry per event, whatever its reason: an event of
+    /// no bytes counts here, where the joined text of [`malformed`] does not show it.
+    fn words<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -867,13 +930,7 @@ mod tests {
 
     /// The malformed text, whole: the events that carry it depend on the cuts, the text does not.
     fn malformed(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
+        words(events).concat()
     }
 
     fn tool(name: &str, parameters: serde_json::Value) -> Tool {
@@ -966,14 +1023,7 @@ mod tests {
                 (1, "get_stock_price".to_string(), "{}".to_string()),
             ]
         );
-        let dropped: Vec<&str> = events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Dropped { text, .. } => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(dropped, ["[", ", ", "]"]);
+        assert_eq!(dropped(&events), ["[", ", ", "]"]);
     }
 
     #[test]
@@ -992,38 +1042,25 @@ mod tests {
     }
 
     #[test]
-    fn a_call_cut_by_the_regions_end_is_closed_and_a_cut_stream_closes_nothing() {
-        let events = run(&["get_weather(city=\"Par"]);
-        assert!(events.iter().any(|event| matches!(
-            event,
-            Event::Malformed {
-                why: MalformedReason::ArgumentCutShort,
-                ..
-            }
-        )));
-        assert!(events
-            .iter()
-            .any(|event| matches!(event, Event::ToolCallEnd { .. })));
-        assert_eq!(bytes(&events), "get_weather(city=\"Par");
-
-        let mut assembler = Assembler::new(3, ids(), Dialect::OLMO3);
-        let mut out = Events::new();
-        assembler.feed("get_weather(city=\"Par", &Declared::default(), &mut out);
-        assembler.finish(&mut out);
-        let events = out.drain();
-        // The call ends with no bytes of its own; its arguments stay cut.
-        assert!(events.iter().any(|event| matches!(
-            event,
-            Event::ToolCallEnd { index: 3, source } if source.text.is_empty()
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            Event::Malformed {
-                why: MalformedReason::UnterminatedRegion,
-                ..
-            }
-        )));
-        assert!(matches!(&events[0], Event::ToolCallStart { index: 3, .. }));
+    fn a_call_either_ending_cuts_inside_a_value_closes_nothing_and_says_so() {
+        for ending in [Ending::Close, Ending::Stream] {
+            let events = ending.run(&["get_weather(city=\"Par"]);
+            assert_eq!(bytes(&events), "get_weather(city=\"Par", "{ending:?}");
+            // The call ends with no bytes of its own and no fragment: its one word carries the
+            // value cut short.
+            assert!(
+                matches!(
+                    &events[..],
+                    [
+                        Event::ToolCallStart { index: 0, .. },
+                        Event::Malformed { why: MalformedReason::UnterminatedRegion, .. },
+                        Event::ToolCallEnd { index: 0, source },
+                    ] if source.text.is_empty()
+                ),
+                "{ending:?}: {events:?}"
+            );
+            assert_eq!(said(&events), ["city=\"Par"], "{ending:?}");
+        }
     }
 
     #[test]
@@ -1050,6 +1087,87 @@ mod tests {
                 r#"{"city": "Paris", "days": 3}"#.to_string()
             )]
         );
+    }
+
+    /// A parameter whose value is missing before the comma or the close is a member Python
+    /// refuses and the templates never write: its bytes, the separator before it, the key and
+    /// the `=` with the whitespace around them, come back under the one reason, nothing is
+    /// written for it, and the object
+    /// closes whole without it, whole and by the character alike; no empty string stands for the
+    /// value the model did not write.
+    #[test]
+    fn a_parameter_without_a_value_is_reported_and_skipped_and_the_object_closes_whole() {
+        let cases: &[(&str, &str, &[&str])] = &[
+            ("[get_weather(city=, days=3)]", r#"{"days": 3}"#, &["city="]),
+            ("[get_weather(city=)]", "{}", &["city="]),
+            (
+                "[get_weather(city= , days=3)]",
+                r#"{"days": 3}"#,
+                &["city= "],
+            ),
+            (
+                "[get_weather(city='Paris', days=)]",
+                r#"{"city": "Paris"}"#,
+                &[", days="],
+            ),
+            (
+                "[get_weather(city='Paris', days= )]",
+                r#"{"city": "Paris"}"#,
+                &[", days= "],
+            ),
+            ("[get_weather(a=, b=)]", "{}", &["a=", ", b="]),
+            ("get_weather(city=, days=3)\nget_stock_price(q=)", "", &[]),
+        ];
+        for (text, arguments, reported) in cases {
+            let pieces: Vec<String> = text.chars().map(String::from).collect();
+            let whole = run(&[text]);
+            let by_char = run(&pieces.iter().map(String::as_str).collect::<Vec<_>>());
+            for events in [whole, by_char] {
+                assert_eq!(bytes(&events), *text);
+                let words: Vec<&str> = events
+                    .iter()
+                    .filter_map(|event| match event {
+                        Event::Malformed {
+                            text,
+                            why: MalformedReason::KeyWithoutAValue,
+                        } => Some(&*text.text),
+                        _ => None,
+                    })
+                    .collect();
+                if arguments.is_empty() {
+                    // Olmo's bare calls, one per line: each call keeps its own members.
+                    assert_eq!(
+                        calls(&events),
+                        [
+                            (0, "get_weather".to_string(), r#"{"days": 3}"#.to_string()),
+                            (1, "get_stock_price".to_string(), "{}".to_string()),
+                        ],
+                        "{text}"
+                    );
+                    assert_eq!(words, ["city=", "q="], "{text}");
+                } else {
+                    assert_eq!(
+                        calls(&events),
+                        [(0, "get_weather".to_string(), arguments.to_string())],
+                        "{text}"
+                    );
+                    assert_eq!(words, *reported, "{text}");
+                }
+                for (_, _, arguments) in calls(&events) {
+                    assert!(
+                        serde_json::from_str::<serde_json::Value>(&arguments).is_ok(),
+                        "{text}: {arguments} is whole"
+                    );
+                }
+                assert!(
+                    !events.iter().any(|event| matches!(
+                        event,
+                        Event::ToolCallArguments { json, .. } if json.contains("\"\"")
+                    )),
+                    "{text}: no empty string is written"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1191,6 +1309,25 @@ mod tests {
             assert!(calls(&events).is_empty(), "{prose:?}");
             assert_eq!(malformed(&events), "", "{prose:?}");
         }
+        // A member without a value, at both positions: at the turn's start the list streams as it
+        // arrives, so the call comes with the member reported and left out; after content a held
+        // list is read as calls only when it is well-formed Python, and `city=` is not, so the
+        // whole is content, as any held list with a malformed byte is.
+        let text = "[get_weather(city=, days=3)]";
+        let events = run_bare(&tools(), &[text]);
+        assert_eq!(bytes(&events), text);
+        assert_eq!(content(&events), "");
+        assert_eq!(
+            calls(&events),
+            [(0, "get_weather".to_string(), r#"{"days": 3}"#.to_string())]
+        );
+        assert_eq!(malformed(&events), "city=");
+        let text = "Let me check.[get_weather(city=, days=3)]";
+        let events = run_bare(&tools(), &[text]);
+        assert_eq!(bytes(&events), text);
+        assert_eq!(content(&events), text);
+        assert!(calls(&events).is_empty());
+        assert_eq!(malformed(&events), "");
         // Whitespace between the bracket and the name, and after the name, is Python's.
         let events = run_bare(&tools(), &["[ get_weather (city=\"Paris\") ]"]);
         assert_eq!(calls(&events).len(), 1);
@@ -1241,6 +1378,8 @@ mod tests {
             "f'(a) = lim(h→0)[f(a+h) - f(a)]/h",
             "[Note] see [1, 2] and [a link](https://example.com).",
             "[get_weather(city=\"Paris\")]\n\nDone.",
+            "[get_weather(city=, days=3)]",
+            "Let me check.[get_weather(city=, days=3)]",
         ] {
             let whole = run_bare(&tools(), &[text]);
             for cut in 1..text.len() {
@@ -1264,37 +1403,26 @@ mod tests {
         }
     }
 
-    /// The stream's end after `pieces`: nothing is closed, as the engine ends a cut stream.
-    fn cut(pieces: &[&str]) -> Vec<Event> {
-        let mut assembler = Assembler::new(0, ids(), Dialect::OLMO3);
-        let mut out = Events::new();
-        for piece in pieces {
-            assembler.feed(piece, &Declared::default(), &mut out);
-        }
-        assembler.finish(&mut out);
-        out.drain()
-    }
-
     fn by_the_character(text: &str) -> Vec<String> {
         text.chars().map(String::from).collect()
     }
 
     /// The words the end said: the text of every `Malformed { UnterminatedRegion }` event.
-    fn said(events: &[Event]) -> Vec<&str> {
+    fn said<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
                 Event::Malformed {
                     text,
                     why: MalformedReason::UnterminatedRegion,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()
     }
 
     #[test]
-    fn a_call_the_streams_end_cuts_right_after_its_parenthesis_says_so_before_its_end() {
+    fn a_call_either_ending_cuts_right_after_its_parenthesis_says_so_before_its_end() {
         let start = |index: u32, name: &str| Event::ToolCallStart {
             index,
             id: ids().id(index),
@@ -1309,142 +1437,193 @@ mod tests {
             index,
             source: Text::uncounted(""),
         };
-        assert_eq!(
-            cut(&["[get_weather("]),
-            [
-                Event::Dropped {
-                    text: Text::uncounted("["),
-                    why: DropReason::Wrapper,
-                },
-                start(0, "get_weather"),
-                word.clone(),
-                end(0),
-            ]
-        );
-        // The same by the character, for a second call the end cuts there: the first stands whole.
-        let text = "[get_weather(city='Paris'), get_stock_price(";
-        let pieces = by_the_character(text);
-        let events = cut(&pieces.iter().map(String::as_str).collect::<Vec<_>>());
-        assert_eq!(bytes(&events), text);
-        assert_eq!(
-            calls(&events),
-            [
-                (
-                    0,
-                    "get_weather".to_string(),
-                    r#"{"city": "Paris"}"#.to_string()
-                ),
-                (1, "get_stock_price".to_string(), String::new()),
-            ]
-        );
-        assert_eq!(
-            events[events.len() - 3..],
-            [start(1, "get_stock_price"), word, end(1)]
-        );
+        for ending in [Ending::Close, Ending::Stream] {
+            assert_eq!(
+                ending.run(&["[get_weather("]),
+                [
+                    Event::Dropped {
+                        text: Text::uncounted("["),
+                        why: DropReason::Wrapper,
+                    },
+                    start(0, "get_weather"),
+                    word.clone(),
+                    end(0),
+                ],
+                "{ending:?}"
+            );
+            // The same by the character, for a second call cut there: the first stands whole.
+            let text = "[get_weather(city='Paris'), get_stock_price(";
+            let pieces = by_the_character(text);
+            let events = ending.run(&pieces.iter().map(String::as_str).collect::<Vec<_>>());
+            assert_eq!(bytes(&events), text, "{ending:?}");
+            assert_eq!(
+                calls(&events),
+                [
+                    (
+                        0,
+                        "get_weather".to_string(),
+                        r#"{"city": "Paris"}"#.to_string()
+                    ),
+                    (1, "get_stock_price".to_string(), String::new()),
+                ],
+                "{ending:?}"
+            );
+            assert_eq!(
+                events[events.len() - 3..],
+                [start(1, "get_stock_price"), word.clone(), end(1)],
+                "{ending:?}"
+            );
+        }
+    }
+
+    /// What an ending finds at the cut: a call open (the one word carries what was held), whole
+    /// calls alone, the list's wrapping after a whole call, or a name that never got its `(`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Found {
+        Open,
+        Whole,
+        Wrapping,
+        Name,
     }
 
     #[test]
-    fn the_streams_end_says_so_wherever_it_cuts_a_call_and_carries_what_was_held() {
-        // Where the end cuts, what the one word carries, and whether a call was open at the cut.
-        let cuts: &[(&str, &str, bool)] = &[
-            ("[get_weather", "get_weather", false),
-            ("[get_weather(", "", true),
-            ("[get_weather( ", " ", true),
-            ("[get_weather(ci", "ci", true),
-            ("[get_weather(city ", "city ", true),
-            ("[get_weather(city=", "city=", true),
-            ("[get_weather(city='Par", "city='Par", true),
-            ("[get_weather(city='Paris'", "city='Paris'", true),
-            ("[get_weather(city='Paris',", ",", true),
-            ("[get_weather(city='Paris', ", ", ", true),
-            ("[get_weather(city='Paris', da", ", da", true),
-            ("[get_weather(prefs={'a': [1, ", "prefs={'a': [1, ", true),
-            ("[get_weather(city='Paris')", "", false),
-            ("[get_weather(city='Paris'), ", ", ", false),
-            ("[get_weather(city='Paris'), get_stock_price(", "", true),
+    fn either_ending_says_so_wherever_it_cuts_a_call_and_carries_what_was_held() {
+        // Where the ending cuts, what was held there, and what it finds.
+        let cuts: &[(&str, &str, Found)] = &[
+            ("[get_weather", "get_weather", Found::Name),
+            ("[get_weather(", "", Found::Open),
+            ("[get_weather( ", " ", Found::Open),
+            ("[get_weather(ci", "ci", Found::Open),
+            ("[get_weather(city ", "city ", Found::Open),
+            ("[get_weather(city=", "city=", Found::Open),
+            ("[get_weather(city='Par", "city='Par", Found::Open),
+            ("[get_weather(city='Paris'", "city='Paris'", Found::Open),
+            ("[get_weather(city='Paris',", ",", Found::Open),
+            ("[get_weather(city='Paris', ", ", ", Found::Open),
+            ("[get_weather(city='Paris', da", ", da", Found::Open),
+            (
+                "[get_weather(prefs={'a': [1, ",
+                "prefs={'a': [1, ",
+                Found::Open,
+            ),
+            ("[get_weather(city='Paris')", "", Found::Whole),
+            ("[get_weather(city='Paris'), ", ", ", Found::Wrapping),
+            (
+                "[get_weather(city='Paris'), get_stock_price(",
+                "",
+                Found::Open,
+            ),
         ];
-        for (text, held, open) in cuts {
-            let pieces = by_the_character(text);
-            let whole = cut(&[text]);
-            let by_the_character = cut(&pieces.iter().map(String::as_str).collect::<Vec<_>>());
-            for events in [whole, by_the_character] {
-                assert_eq!(bytes(&events), *text);
-                let starts = events
-                    .iter()
-                    .filter(|event| matches!(event, Event::ToolCallStart { .. }))
-                    .count();
-                let ends = events
-                    .iter()
-                    .filter(|event| matches!(event, Event::ToolCallEnd { .. }))
-                    .count();
-                assert_eq!(starts, ends, "{text:?}: every call that started ends");
-                if *open {
-                    assert_eq!(
-                        said(&events),
-                        [*held],
-                        "{text:?}: one word, with what was held"
-                    );
-                    assert!(
-                        matches!(
-                            &events[events.len() - 2..],
-                            [Event::Malformed { .. }, Event::ToolCallEnd { .. }]
-                        ),
-                        "{text:?}: the word comes right before the end"
-                    );
-                    // Nothing is made up: a cut call's fragments never close its object, so
-                    // they are no whole JSON value (a member's own `}` may end them).
-                    assert!(
-                        calls(&events).last().is_some_and(|(_, _, arguments)| {
-                            serde_json::from_str::<serde_json::Value>(arguments).is_err()
-                        }),
-                        "{text:?}: the cut call's arguments stay open"
-                    );
-                } else if held.is_empty() {
-                    assert!(said(&events).is_empty(), "{text:?}: whole calls, no word");
-                } else {
-                    assert_eq!(
-                        said(&events),
-                        [*held],
-                        "{text:?}: what was held, no call open"
-                    );
+        for ending in [Ending::Close, Ending::Stream] {
+            for (text, held, found) in cuts {
+                let pieces = by_the_character(text);
+                let whole = ending.run(&[text]);
+                let by_the_character =
+                    ending.run(&pieces.iter().map(String::as_str).collect::<Vec<_>>());
+                for events in [whole, by_the_character] {
+                    let place = format!("{ending:?} after {text:?}");
+                    assert_eq!(bytes(&events), *text, "{place}");
+                    let starts = events
+                        .iter()
+                        .filter(|event| matches!(event, Event::ToolCallStart { .. }))
+                        .count();
+                    let ends = events
+                        .iter()
+                        .filter(|event| matches!(event, Event::ToolCallEnd { .. }))
+                        .count();
+                    assert_eq!(starts, ends, "{place}: every call that started ends");
+                    match (found, ending) {
+                        (Found::Open, _) => {
+                            assert_eq!(said(&events), [*held], "{place}: one word, what was held");
+                            assert!(
+                                matches!(
+                                    &events[events.len() - 2..],
+                                    [Event::Malformed { .. }, Event::ToolCallEnd { source, .. }]
+                                        if source.text.is_empty()
+                                ),
+                                "{place}: the word comes right before an end of no bytes"
+                            );
+                            // Nothing is made up: a cut call's fragments never close its object,
+                            // so they are no whole JSON value (a member's own `}` may end them).
+                            assert!(
+                                calls(&events).last().is_some_and(|(_, _, arguments)| {
+                                    serde_json::from_str::<serde_json::Value>(arguments).is_err()
+                                }),
+                                "{place}: the cut call's arguments stay open"
+                            );
+                        }
+                        (Found::Whole, _) => {
+                            assert!(words(&events).is_empty(), "{place}: no word");
+                        }
+                        // The wrapping after a whole call is the template's at the close and a
+                        // cut region's bytes at the stream's end.
+                        (Found::Wrapping, Ending::Close) => {
+                            assert!(words(&events).is_empty(), "{place}: no word");
+                            assert!(dropped(&events).contains(held), "{place}: wrapping dropped");
+                        }
+                        (Found::Wrapping, Ending::Stream) => {
+                            assert_eq!(said(&events), [*held], "{place}: the held wrapping");
+                        }
+                        // A name that never got its `(` is no call either way, and the close
+                        // names its reason.
+                        (Found::Name, Ending::Close) => {
+                            assert_eq!(words(&events), [*held], "{place}: the name");
+                            assert!(said(&events).is_empty(), "{place}: the close's own reason");
+                        }
+                        (Found::Name, Ending::Stream) => {
+                            assert_eq!(said(&events), [*held], "{place}: the name");
+                        }
+                    }
+                    if *found != Found::Open {
+                        assert!(
+                            calls(&events)
+                                .iter()
+                                .all(|(_, _, arguments)| arguments.ends_with('}')),
+                            "{place}: every call is whole"
+                        );
+                    }
                 }
             }
         }
     }
 
     #[test]
-    fn a_call_the_streams_end_cuts_anywhere_keeps_the_fragments_it_sent_and_nothing_more() {
+    fn a_call_either_ending_cuts_anywhere_keeps_the_fragments_it_sent_and_nothing_more() {
         let whole = calls(&run(&[LFM]));
-        for at in 1..LFM.len() {
+        for (ending, at) in [Ending::Close, Ending::Stream]
+            .into_iter()
+            .flat_map(|ending| (1..LFM.len()).map(move |at| (ending, at)))
+        {
             if !LFM.is_char_boundary(at) {
                 continue;
             }
             let text = &LFM[..at];
-            let events = cut(&[text]);
-            assert_eq!(bytes(&events), text, "cut at {at}");
+            let events = ending.run(&[text]);
+            let place = format!("{ending:?} at {at}");
+            assert_eq!(bytes(&events), text, "{place}");
             for (index, name, arguments) in calls(&events) {
                 let (_, whole_name, whole_arguments) = &whole[index as usize];
-                assert_eq!(&name, whole_name, "cut at {at}");
+                assert_eq!(&name, whole_name, "{place}");
                 // A call's fragments are a prefix of what the whole call gives, and the one word
                 // stands between a cut call's start and its end, never inside a whole one.
                 assert!(
                     whole_arguments.starts_with(&arguments),
-                    "cut at {at}: {arguments:?} is no prefix of {whole_arguments:?}"
+                    "{place}: {arguments:?} is no prefix of {whole_arguments:?}"
                 );
                 let start = events
                     .iter()
                     .position(|event| matches!(event, Event::ToolCallStart { index: i, .. } if *i == index))
-                    .unwrap_or_else(|| panic!("cut at {at}: call {index} has no start"));
+                    .unwrap_or_else(|| panic!("{place}: call {index} has no start"));
                 let end = events
                     .iter()
                     .position(
                         |event| matches!(event, Event::ToolCallEnd { index: i, .. } if *i == index),
                     )
-                    .unwrap_or_else(|| panic!("cut at {at}: call {index} has no end"));
+                    .unwrap_or_else(|| panic!("{place}: call {index} has no end"));
                 assert_eq!(
                     said(&events[start..end]).len(),
                     usize::from(&arguments != whole_arguments),
-                    "cut at {at}: a cut call says so once, a whole one not at all"
+                    "{place}: a cut call says so once, a whole one not at all"
                 );
             }
         }

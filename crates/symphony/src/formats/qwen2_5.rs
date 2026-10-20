@@ -38,7 +38,7 @@ mod tests {
         "\n</tool_call>"
     );
 
-    fn run(output: &str) -> Vec<Event> {
+    fn run(output: &str) -> Vec<Event<'static>> {
         let mut parser = Engine::new(qwen2_5(), Declared::default());
         let mut out = Events::new();
         parser
@@ -59,7 +59,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     #[test]

@@ -51,16 +51,23 @@ pub fn deepseek_v3() -> Format {
         .transition("call", "call_open", "call")
         .transition("call", "calls_close", "content")
         .transition("calls", "calls_close", "content")
-        .calls(CallSyntax::NamedArguments(FENCE_OPEN))
+        .calls(CallSyntax::NamedArguments {
+            marker: FENCE_OPEN,
+            between_calls: "\n",
+        })
         .opens_turn("<｜Assistant｜>")
 }
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::common::{Function, Tool};
+    use serde_json::json as value;
+
     use super::*;
     use crate::{
         engine::Engine,
         event::{DropReason, Event, Events, FinishReason},
+        grammar::{GrammarStart, Options},
         input::{EngineFinish, Input},
         parser::Parser,
         Declared,
@@ -72,7 +79,7 @@ mod tests {
     /// and its distills). R1-0528 ends its prompt at the opener and writes `<think>` itself.
     const THINKING: &str = "<｜Assistant｜><think>\n";
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         let mut parser = Engine::new(deepseek_v3(), Declared::default());
         let mut out = Events::new();
         parser
@@ -104,7 +111,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     /// Every byte the events carry, in order: the output, when the engine accounts for all of it.
@@ -112,11 +119,11 @@ mod tests {
         events
             .iter()
             .map(|event| match event {
-                Event::Content(text) | Event::Reasoning(text) => text.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+                Event::Content(text) | Event::Reasoning(text) => &*text.text,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+                | Event::ToolCallEnd { source, .. } => &*source.text,
                 Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
             })
             .collect()
@@ -140,7 +147,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -150,17 +157,17 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
+                Event::Reasoning(text) => Some(&*text.text),
                 _ => None,
             })
             .collect()
     }
 
-    fn malformed(events: &[Event]) -> Vec<&str> {
+    fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -469,5 +476,137 @@ mod tests {
         format.validate().expect("a valid table");
         assert_eq!(format.name(), "deepseek_v3");
         assert_eq!(format.turn_opener(), Some("<｜Assistant｜>"));
+    }
+
+    #[test]
+    fn a_forced_call_is_the_block_holding_the_fenced_call_and_the_tools_schema() {
+        // The tag is written from the same rows as V3.1's: the block's ways in (from the turn's
+        // own state, or `</think>` first) around the one call, `<｜tool▁call▁begin｜>function
+        // <｜tool▁sep｜>`, the tool's name and the fence the template opens, the arguments the
+        // tool's schema accepts, and the fence's close with `<｜tool▁call▁end｜>`; then the block's
+        // close, and nothing after it for a named function.
+        let tool = Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: "get_weather".to_string(),
+                description: None,
+                parameters: value!({"type": "object", "properties": {"city": {"type": "string"}}}),
+                strict: None,
+                extra: Default::default(),
+            },
+        };
+        let got = deepseek_v3()
+            .grammar_for(
+                std::slice::from_ref(&tool),
+                Options {
+                    at_least_one: true,
+                    reasoning_open: false,
+                    thought_closed: false,
+                    one_call: true,
+                    start: GrammarStart::AfterReasoning,
+                },
+            )
+            .expect("a tag")
+            .payload();
+        let one_call = value!({"type": "or", "elements": [{"type": "sequence", "elements": [
+            {"type": "const_string", "value": "<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n"},
+            {"type": "json_schema", "json_schema": tool.function.parameters},
+            {"type": "const_string", "value": "```<｜tool▁call▁end｜>"},
+        ]}]});
+        let tag = |begin: &str| {
+            value!({
+                "type": "tag",
+                "begin": begin,
+                "content": one_call,
+                "end": "<｜tool▁calls▁end｜>",
+            })
+        };
+        assert_eq!(
+            got,
+            value!({"format": {
+                "type": "triggered_tags",
+                "triggers": ["<｜tool▁calls▁begin｜>", "</think>"],
+                "tags": [
+                    tag("<｜tool▁calls▁begin｜>"),
+                    tag("</think><｜tool▁calls▁begin｜>"),
+                ],
+                "at_least_one": true,
+                "stop_after_first": true,
+            }})
+        );
+        // `required` with parallel calls allowed: the template's newline before every call after
+        // the first, and nothing before the first.
+        let more = deepseek_v3()
+            .grammar_for(
+                std::slice::from_ref(&tool),
+                Options {
+                    at_least_one: true,
+                    reasoning_open: false,
+                    thought_closed: false,
+                    one_call: false,
+                    start: GrammarStart::AfterReasoning,
+                },
+            )
+            .expect("a tag")
+            .payload();
+        assert_eq!(
+            more["format"]["tags"][0]["content"],
+            value!({"type": "sequence", "elements": [
+                one_call,
+                {"type": "star", "content": {"type": "sequence", "elements": [
+                    {"type": "const_string", "value": "\n"},
+                    one_call,
+                ]}},
+            ]})
+        );
+        // With the prompt's thought open and the grammar run from the first token, the thought's
+        // text may not write the table's terminals, and may still hold a fenced draft of the
+        // arguments: the fence is ordinary text, and a call opens only at the call's opener.
+        let open = deepseek_v3()
+            .grammar_for(
+                std::slice::from_ref(&tool),
+                Options {
+                    at_least_one: true,
+                    reasoning_open: true,
+                    thought_closed: false,
+                    one_call: true,
+                    start: GrammarStart::FirstToken,
+                },
+            )
+            .expect("a tag")
+            .payload();
+        assert_eq!(
+            open["format"]["elements"][0]["content"]["excludes"],
+            value!([
+                "<think>",
+                "</think>",
+                "<｜tool▁calls▁begin｜>",
+                "<｜tool▁calls▁end｜>",
+                "<｜tool▁call▁begin｜>function<｜tool▁sep｜>",
+                "```<｜tool▁call▁end｜>",
+            ])
+        );
+        // The call as the tag writes it, the fence's close right after the object (the template
+        // puts a newline between them, which the table drops as wrapping either way), reads as
+        // the call whole and at every cut.
+        let output = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}```<｜tool▁call▁end｜><｜tool▁calls▁end｜>";
+        let expected = vec![(
+            "get_weather".to_string(),
+            "{\"city\": \"Paris\"}".to_string(),
+        )];
+        let whole = run(PROMPT, &[output]);
+        assert_eq!(bytes(&whole), output);
+        assert_eq!(calls(&whole), expected);
+        assert_eq!(content(&whole), "");
+        assert_eq!(malformed(&whole), Vec::<&str>::new());
+        assert_eq!(finish(&whole), (FinishReason::Stop, 1));
+        for (at, _) in output.char_indices().skip(1) {
+            let (head, rest) = output.split_at(at);
+            let events = run(PROMPT, &[head, rest]);
+            assert_eq!(calls(&events), expected, "cut at {at}");
+            assert_eq!(content(&events), "", "cut at {at}");
+            assert_eq!(malformed(&events), Vec::<&str>::new(), "cut at {at}");
+            assert_eq!(finish(&events), (FinishReason::Stop, 1), "cut at {at}");
+        }
     }
 }

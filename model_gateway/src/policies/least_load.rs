@@ -636,7 +636,7 @@ impl LeastLoadPolicy {
 
 impl LoadBalancingPolicy for LeastLoadPolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
-        let healthy = get_healthy_worker_indices(workers);
+        let healthy = get_healthy_worker_indices(workers, info);
         if healthy.is_empty() {
             return None;
         }

@@ -117,12 +117,39 @@ pub(crate) fn finished(events: &[Event]) -> Option<Finished> {
     })
 }
 
+/// The delta the reader feeds the engine for one engine chunk: the text the stop decoder released,
+/// the span of every token in it and the tokens read. The step's events borrow its text, so it
+/// lives with the caller, next to the events, and a stream fills the same one every step.
+#[derive(Debug, Default)]
+pub(crate) struct Delta {
+    text: String,
+    spans: Vec<TokenSpan>,
+    tokens: Vec<u32>,
+}
+
+impl Delta {
+    fn clear(&mut self) {
+        self.text.clear();
+        self.spans.clear();
+        self.tokens.clear();
+    }
+
+    fn input(&self) -> Input<'_> {
+        Input::Delta {
+            token_ids: &self.tokens,
+            text: &self.text,
+            spans: &self.spans,
+        }
+    }
+}
+
 /// One choice's reader: the engine over the choice's output, fed what the stop decoder releases
-/// with the span of every token in it. What it reads is counted as it goes ([`telemetry`]) and
-/// recorded when the output ends.
+/// with the span of every token in it. The events of a step go into the caller's [`Events`] and
+/// borrow the step's [`Delta`] text; the caller reads them in place and recycles the buffer
+/// (`docs/engine.md`, the shape of a step's events). What it reads is counted as it goes
+/// ([`telemetry`]) and recorded when the output ends.
 pub(crate) struct Reader {
     engine: Engine,
-    events: Events,
     /// The `table` label of the format, for the counters and the line.
     table: &'static str,
     /// What the output said so far that was not content, reasoning or a call.
@@ -137,35 +164,41 @@ pub(crate) struct Reader {
     ended: bool,
     /// Drop the events of every call after the first.
     first_call_only: bool,
-    /// The delta being read: the text the decoder released, each token's span in it, and the
-    /// tokens read; kept between deltas, so a stream fills them once.
-    text: String,
-    spans: Vec<TokenSpan>,
-    tokens: Vec<u32>,
 }
 
 impl Reader {
-    /// A reader for one choice, seeded with the assignment's prompt. `tools` are the request's
-    /// as its response spec holds them: every choice's reader shares them, none copies a schema.
-    pub(crate) fn new(assignment: &Assignment, tools: Arc<[Tool]>) -> Result<Self, SymphonyError> {
+    /// A reader for one choice, seeded with the assignment's prompt; the events the prompt's
+    /// replay gives (a thought the prompt opens) go into `out`, before the first delta's. `tools`
+    /// are the request's as its response spec holds them: every choice's reader shares them,
+    /// none copies a schema.
+    pub(crate) fn new(
+        assignment: &Assignment,
+        tools: Arc<[Tool]>,
+        out: &mut Events<'_>,
+    ) -> Result<Self, SymphonyError> {
         let mut reader = Self {
             table: telemetry::table_label(assignment.format.name()),
             engine: Engine::shared(Arc::clone(&assignment.format), Declared::shared(tools)),
-            events: Events::new(),
             tally: Tally::default(),
             last_token: None,
             ends: Vec::new(),
             read: 0,
             ended: false,
             first_call_only: false,
-            text: String::new(),
-            spans: Vec::new(),
-            tokens: Vec::new(),
         };
-        reader.feed(Input::Prompt {
-            token_ids: &[],
-            text: &assignment.prompt,
-        })?;
+        // The prompt's events carry no text of the prompt (a thought it opens or closes), so they
+        // move from the replay's own buffer into the caller's, whatever delta that one borrows.
+        let mut replayed = Events::new();
+        reader.feed(
+            Input::Prompt {
+                token_ids: &[],
+                text: &assignment.prompt,
+            },
+            &mut replayed,
+        )?;
+        for event in replayed.into_owned() {
+            out.push(event);
+        }
         Ok(reader)
     }
 
@@ -177,28 +210,18 @@ impl Reader {
         self
     }
 
-    fn drained(&mut self) -> Vec<Event> {
-        let mut events = self.events.drain();
-        for event in &events {
-            self.tally.see(event, self.first_call_only);
-        }
-        if self.first_call_only {
-            symphony::event::first_call_only(&mut events);
-        }
-        events
-    }
-
     /// Reads `token_ids` through `decoder` as one delta: the text the decoder releases, with each
-    /// token's span in it, zero-width for a token whose bytes it holds back. Gives the events,
-    /// and whether the decoder matched a stop, after which the rest of the tokens are not read.
-    pub(crate) fn read(
+    /// token's span in it, zero-width for a token whose bytes it holds back, into `delta`, and
+    /// the events into `out`, where they borrow the text. Says whether the decoder matched a
+    /// stop, after which the rest of the tokens are not read.
+    pub(crate) fn read<'d>(
         &mut self,
         decoder: &mut StopSequenceDecoder,
         token_ids: &[u32],
-    ) -> Result<(Vec<Event>, bool), SymphonyError> {
-        self.text.clear();
-        self.spans.clear();
-        self.tokens.clear();
+        delta: &'d mut Delta,
+        out: &mut Events<'d>,
+    ) -> Result<bool, SymphonyError> {
+        delta.clear();
         let mut stopped = false;
         for &token_id in token_ids {
             let output = decoder.process_token(token_id).map_err(|e| {
@@ -206,41 +229,32 @@ impl Reader {
                     "Stop decoder failed to process token {token_id}: {e}"
                 ))
             })?;
-            let start = self.text.len();
+            let start = delta.text.len();
             match output {
-                SequenceDecoderOutput::Text(released) => self.text.push_str(&released),
+                SequenceDecoderOutput::Text(released) => delta.text.push_str(&released),
                 SequenceDecoderOutput::StoppedWithText(released) => {
-                    self.text.push_str(&released);
+                    delta.text.push_str(&released);
                     stopped = true;
                 }
                 SequenceDecoderOutput::Stopped => stopped = true,
                 SequenceDecoderOutput::Held => {}
             }
-            self.spans.push(TokenSpan {
+            delta.spans.push(TokenSpan {
                 token_id,
                 start,
-                end: self.text.len(),
+                end: delta.text.len(),
                 continued: false,
             });
-            self.ends.push(self.read + self.text.len());
-            self.tokens.push(token_id);
+            self.ends.push(self.read + delta.text.len());
+            delta.tokens.push(token_id);
             self.last_token = Some(token_id);
             if stopped {
                 break;
             }
         }
-        self.read += self.text.len();
-        feed_engine(
-            &mut self.engine,
-            &mut self.events,
-            self.table,
-            Input::Delta {
-                token_ids: &self.tokens,
-                text: &self.text,
-                spans: &self.spans,
-            },
-        )?;
-        Ok((self.drained(), stopped))
+        self.read += delta.text.len();
+        self.feed(delta.input(), out)?;
+        Ok(stopped)
     }
 
     /// Where each token's text ends in the output read so far, for the logprobs filter the older
@@ -250,49 +264,49 @@ impl Reader {
     }
 
     /// Reads `text` the decoder released after its last token, which held it back as a possible
-    /// stop: bytes of that token.
-    pub(crate) fn tail(&mut self, text: &str) -> Result<Vec<Event>, SymphonyError> {
+    /// stop: bytes of that token. The text moves into `delta`, whose text the events borrow.
+    pub(crate) fn tail<'d>(
+        &mut self,
+        text: String,
+        delta: &'d mut Delta,
+        out: &mut Events<'d>,
+    ) -> Result<(), SymphonyError> {
         if text.is_empty() {
-            return Ok(Vec::new());
+            return Ok(());
         }
-        let spans: Vec<TokenSpan> = self
-            .last_token
-            .map(|token_id| TokenSpan {
+        delta.clear();
+        delta
+            .spans
+            .extend(self.last_token.map(|token_id| TokenSpan {
                 token_id,
                 start: 0,
                 end: text.len(),
                 continued: true,
-            })
-            .into_iter()
-            .collect();
-        self.read += text.len();
+            }));
+        delta.text = text;
+        self.read += delta.text.len();
         if let Some(last) = self.ends.last_mut() {
             *last = self.read;
         }
-        self.feed(Input::Delta {
-            token_ids: &[],
-            text,
-            spans: &spans,
-        })?;
-        Ok(self.drained())
+        self.feed(delta.input(), out)
     }
 
     /// Ends the output with the engine's finish, once: the events, the last of them the
-    /// `Finish`, or nothing when the output already ended. The output is recorded here, under
-    /// `who`: its counters, and the line when it was not clean ([`Tally::report`]).
+    /// `Finish`, go into `out`; nothing when the output already ended. The output is recorded
+    /// here, under `who`: its counters, and the line when it was not clean ([`Tally::report`]).
     pub(crate) fn end(
         &mut self,
         finish: EngineFinish,
         who: Who<'_>,
-    ) -> Result<Vec<Event>, SymphonyError> {
+        out: &mut Events<'_>,
+    ) -> Result<(), SymphonyError> {
         if self.ended {
-            return Ok(Vec::new());
+            return Ok(());
         }
         self.ended = true;
-        self.feed(Input::End { finish })?;
-        let events = self.drained();
+        self.feed(Input::End { finish }, out)?;
         self.tally.report(self.table, who);
-        Ok(events)
+        Ok(())
     }
 
     /// Whether the output ended.
@@ -300,26 +314,34 @@ impl Reader {
         self.ended
     }
 
-    fn feed(&mut self, input: Input<'_>) -> Result<(), SymphonyError> {
-        feed_engine(&mut self.engine, &mut self.events, self.table, input)
+    /// Feeds `input` to the engine, its events into `out` after the ones already there: the
+    /// reader's one way in. The events this step added are tallied, and limited to the first
+    /// call where the request asks. An output the engine refuses is recorded as failed for the
+    /// table, which the error names.
+    fn feed<'d>(&mut self, input: Input<'d>, out: &mut Events<'d>) -> Result<(), SymphonyError> {
+        let before = out.len();
+        let last = out.as_slice().last().map_or(0, telemetry::bytes_of);
+        self.engine.feed(input, out).map_err(|e| {
+            telemetry::record_failed(self.table);
+            SymphonyError::Read(format!(
+                "Symphony failed to read the output with the {} table: {e}",
+                self.table
+            ))
+        })?;
+        // Text of one kind pushed right after text of that kind joins it (`Events::push`): bytes
+        // that grew an event already tallied are counted without an event of their own.
+        if let Some(grown) = before.checked_sub(1).map(|at| &out.as_slice()[at]) {
+            self.tally.grew(telemetry::bytes_of(grown) - last);
+        }
+        let fresh = &mut out.as_mut_slice()[before..];
+        for event in fresh.iter() {
+            self.tally.see(event, self.first_call_only);
+        }
+        if self.first_call_only {
+            symphony::event::first_call_only(fresh);
+        }
+        Ok(())
     }
-}
-
-/// Feeds `input` to `engine`, its events into `events`: the reader's one way in, over the fields
-/// rather than the reader, so a delta read from the reader's own buffers can be fed too. An
-/// output the engine refuses is recorded as failed for `table`, which the error names.
-fn feed_engine(
-    engine: &mut Engine,
-    events: &mut Events,
-    table: &'static str,
-    input: Input<'_>,
-) -> Result<(), SymphonyError> {
-    engine.feed(input, events).map_err(|e| {
-        telemetry::record_failed(table);
-        SymphonyError::Read(format!(
-            "Symphony failed to read the output with the {table} table: {e}"
-        ))
-    })
 }
 
 #[cfg(test)]
@@ -686,15 +708,19 @@ mod tests {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
         };
-        let mut reader = Reader::new(&assignment, Arc::default()).expect("a reader");
+        let mut events = Events::new();
+        let mut reader = Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
         assert!(!reader.ended());
-        let events = reader.end(EngineFinish::Stop, who()).expect("ended");
-        assert!(finished(&events).is_some());
+        reader
+            .end(EngineFinish::Stop, who(), &mut events)
+            .expect("ended");
+        assert!(finished(events.as_slice()).is_some());
         assert!(reader.ended());
-        assert!(reader
-            .end(EngineFinish::Stop, who())
-            .expect("ended")
-            .is_empty());
+        let mut again = Events::new();
+        reader
+            .end(EngineFinish::Stop, who(), &mut again)
+            .expect("ended");
+        assert!(again.is_empty());
     }
 
     #[tokio::test]
@@ -779,11 +805,11 @@ mod tests {
             prompt: "<|im_start|>assistant\n".to_string(),
         };
         let calls = |first_only: bool| {
-            let mut reader = Reader::new(&assignment, tools().into())
+            let mut events = Events::new();
+            let mut reader = Reader::new(&assignment, tools().into(), &mut events)
                 .expect("a reader")
                 .first_call_only(first_only);
-            let mut events = reader.tail(TWO_CALLS).expect("read");
-            events.extend(reader.end(EngineFinish::Stop, who()).expect("ended"));
+            let events = read_tail(&mut reader, TWO_CALLS);
             let starts = events
                 .iter()
                 .filter(|event| matches!(event, Event::ToolCallStart { .. }))
@@ -797,20 +823,70 @@ mod tests {
         assert_eq!(calls(true), (1, 1));
     }
 
+    /// The unary reads feed the output and then the decoder's last text into one buffer, where
+    /// content at the output's end and the flushed text join one event: the tally counts the
+    /// joined bytes, so a malformed run the end reports after them stands at the byte it stands
+    /// at when the output comes in one step.
+    #[test]
+    fn the_tally_counts_the_bytes_a_later_step_merged_into_an_earlier_event() {
+        let assignment = Assignment {
+            format: Arc::new(qwen3(CallSyntax::Json)),
+            prompt: String::new(),
+        };
+        let first_run_at = |steps: &[&str]| -> (Option<usize>, usize) {
+            let mut events = Events::new();
+            let mut reader =
+                Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
+            let mut deltas: Vec<Delta> = steps.iter().map(|_| Delta::default()).collect();
+            for (text, delta) in steps.iter().zip(deltas.iter_mut()) {
+                reader
+                    .tail((*text).to_string(), delta, &mut events)
+                    .expect("read");
+            }
+            reader
+                .end(EngineFinish::Stop, who(), &mut events)
+                .expect("ended");
+            // Where the first malformed event stands, by the events' own bytes.
+            let before = events
+                .as_slice()
+                .iter()
+                .take_while(|event| !matches!(event, Event::Malformed { .. }))
+                .map(telemetry::bytes_of)
+                .sum();
+            (reader.tally.first_run().map(|first| first.at), before)
+        };
+        let (content, rest) = (
+            "Hello",
+            " there<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": ",
+        );
+        let whole = format!("{content}{rest}");
+        let (in_one_step, by_the_events) = first_run_at(&[&whole]);
+        assert_eq!(in_one_step, Some(by_the_events), "the one-step reading");
+        assert!(
+            by_the_events > content.len(),
+            "the cut call stands after the content"
+        );
+        assert_eq!(
+            first_run_at(&[content, rest]),
+            (in_one_step, by_the_events),
+            "the two-step reading, its second step's content joined to the first's"
+        );
+    }
+
     #[test]
     fn a_bare_answer_the_json_table_reads_as_a_call_comes_back_as_its_text() {
         let assignment = Assignment {
             format: Arc::new(symphony::formats::json().without_calls()),
             prompt: String::new(),
         };
-        let mut reader = Reader::new(&assignment, Arc::default()).expect("a reader");
+        let mut events = Events::new();
+        let mut reader = Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
         let answer = "{\"answer\": 42}";
-        let mut events = reader.tail(answer).expect("read");
-        events.extend(reader.end(EngineFinish::Stop, who()).expect("ended"));
+        let events = read_tail(&mut reader, answer);
         let text: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) | Event::Malformed { text, .. } => Some(text.text.as_str()),
+                Event::Content(text) | Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect();

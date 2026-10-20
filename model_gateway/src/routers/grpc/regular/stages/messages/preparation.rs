@@ -6,7 +6,7 @@ use openai_protocol::{
     common::{ToolChoice, ToolChoiceValue},
     messages::CreateMessageRequest,
 };
-use tracing::{debug, error};
+use tracing::error;
 
 use crate::{
     routers::{
@@ -14,8 +14,10 @@ use crate::{
         grpc::{
             common::stages::PipelineStage,
             context::{PreparationOutput, RequestContext},
-            multimodal,
-            regular::symphony,
+            regular::{
+                stages::rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
+                symphony,
+            },
             spec::MessagesResponseSpec,
             utils::{self, message_utils},
         },
@@ -115,132 +117,23 @@ impl MessagePreparationStage {
             }
         };
 
-        // Step 3: Tokenize the prompt the way its renderer said to
-        let encoding = match utils::encode_prompt_blocking(
-            tokenizer.clone(),
+        // Steps 3 and 4: the prompt tokenized the way its renderer said to,
+        // the media anchors checked, the media processed or kept as
+        // references (shared with the chat stage).
+        let RenderedPrompt {
+            token_ids,
+            multimodal_intermediate,
+            multimodal_refs,
+        } = prepare_rendered_prompt(
+            ctx,
+            &tokenizer,
             &processed_messages.text,
             prompt_encoding,
+            media.media,
+            self.wire_pools,
+            "MessagePreparationStage::execute",
         )
-        .await
-        {
-            Ok(encoding) => encoding,
-            Err(e) => {
-                error!(function = "MessagePreparationStage::execute", error = %e, "Tokenization failed");
-                return Err(error::internal_error(
-                    "tokenization_failed",
-                    format!("Tokenization failed: {e}"),
-                ));
-            }
-        };
-
-        let mut token_ids = encoding.token_ids().to_vec();
-
-        if let Some(media) = media.media.as_ref() {
-            multimodal::validate_rendered_media_anchors(
-                &media.plan,
-                &media.placeholders,
-                &*tokenizer,
-                &token_ids,
-            )
-            .map_err(|error| {
-                error!(
-                    function = "MessagePreparationStage::execute",
-                    %error,
-                    "Rendered multimodal anchors do not match request media"
-                );
-                error::bad_request("multimodal_prompt_contract_mismatch", error.to_string())
-            })?;
-        }
-
-        // Step 4: Full multimodal processing (fetch + preprocess + expand tokens + hash),
-        // or keep the media references for a worker that processes them itself.
-        let mut multimodal_intermediate = None;
-        let mut multimodal_refs = None;
-        if let Some(message_utils::MediaContext {
-            plan: media_plan,
-            placeholders,
-            components: mm_components,
-            tokenizer_id,
-            tokenizer_source,
-        }) = media.media
-        {
-            let processing = multimodal::resolve_mm_processing(
-                &mm_components,
-                &ctx.components.worker_registry,
-                model_id,
-                &media_plan,
-                &placeholders,
-            )
-            .map_err(|e| error::bad_request(e.code(), e.to_string()))?;
-            if processing == multimodal::MmProcessing::Worker {
-                debug!(
-                    function = "MessagePreparationStage::execute",
-                    media_items = media_plan.parts().len(),
-                    "Forwarding media references for worker-side processing"
-                );
-                // Which of the workers that process references may take the
-                // plan (see `resolve_mm_processing` and `PipelinePin`).
-                ctx.state.media_refs_pipeline =
-                    multimodal::media_refs_pipeline_pin(&media_plan, &placeholders);
-                multimodal_refs = Some(media_plan);
-            } else {
-                // The dtype every worker the selection can pick reads image
-                // pixels in, when they agree (and the one-pass write is not
-                // switched off, `SMG_MM_ONE_PASS_WIRE=0`): the preprocessor
-                // then writes it directly; otherwise `None`, and the write
-                // happens at assembly. Resolved over the pools of this
-                // pipeline's mode, the pools the pixels can reach, as the
-                // selection draws them.
-                let image_wire_dtype = multimodal::mm_shared_image_wire_dtype_over(
-                    &ctx.components.worker_registry,
-                    model_id,
-                    self.wire_pools,
-                );
-                // The frames decode under the destination engine's own
-                // transparency rule, resolved over the same pools as the dtype.
-                let transparency = multimodal::engine_transparency_policy(
-                    &ctx.components.worker_registry,
-                    model_id,
-                    self.wire_pools,
-                );
-                // The engine's per-item bound, the smallest its workers
-                // advertise: an item above it would never be scheduled.
-                let encoder_budget =
-                    multimodal::engine_encoder_budget(&ctx.components.worker_registry, model_id);
-                match multimodal::process_multimodal_plan(
-                    media_plan,
-                    model_id,
-                    &*tokenizer,
-                    token_ids,
-                    &mm_components,
-                    &tokenizer_id,
-                    &tokenizer_source,
-                    image_wire_dtype,
-                    transparency,
-                    encoder_budget,
-                )
-                .await
-                {
-                    Ok(output) => {
-                        debug!(
-                            function = "MessagePreparationStage::execute",
-                            expanded_tokens = output.expanded_token_ids.len(),
-                            "Multimodal processing complete"
-                        );
-                        token_ids = output.expanded_token_ids;
-                        multimodal_intermediate = Some(output.intermediate);
-                    }
-                    Err(e) => {
-                        error!(
-                            function = "MessagePreparationStage::execute",
-                            error = %multimodal::processing_failed_message(&e),
-                            "Multimodal processing failed"
-                        );
-                        return Err(multimodal::processing_failed_response(&e));
-                    }
-                }
-            }
-        }
+        .await?;
 
         // Step 4: Build tool constraints if tools present. When Symphony reads
         // the message, its table gives a forced call its tag (see
@@ -255,18 +148,26 @@ impl MessagePreparationStage {
         // prompt where a table reads the message: a turn the prompt leaves
         // unopened starts inside the thought whatever the switch says, and the
         // tag must read it as the engine will (`regular::symphony::reasoning_open`).
-        let reasoning = utils::messages_reasoning_starts_in_prefill(
+        let switch = utils::messages_reasoning_starts_in_prefill(
             request,
             processed_messages.continued_final_message,
             tokenizer.as_ref(),
-        ) || symphony::reasoning_open(
-            parser,
-            &names,
-            &request.model,
-            &ctx.components.templates,
-            &processed_messages.text,
-        )
-        .is_some_and(|thought| thought.open);
+        );
+        let replay = (!switch)
+            .then(|| {
+                symphony::reasoning_open(
+                    parser,
+                    &names,
+                    &request.model,
+                    &ctx.components.templates,
+                    &processed_messages.text,
+                )
+            })
+            .flatten();
+        let reasoning = switch || replay.is_some_and(|thought| thought.open);
+        // The prompt closed the thought itself and wrote the template's text
+        // after it (thinking switched off): the calls' tag owes none of it.
+        let thought_closed = replay.is_some_and(|thought| thought.closed);
         let workers = ctx
             .components
             .worker_registry
@@ -280,6 +181,7 @@ impl MessagePreparationStage {
             },
             &filtered_tools,
             reasoning,
+            thought_closed,
             symphony::grammar_start_of(&workers),
             &ctx.components.templates,
         );

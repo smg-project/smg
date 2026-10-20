@@ -20,12 +20,8 @@ impl RandomPolicy {
 }
 
 impl LoadBalancingPolicy for RandomPolicy {
-    fn select_worker(
-        &self,
-        workers: &[Arc<dyn Worker>],
-        _info: &SelectWorkerInfo,
-    ) -> Option<usize> {
-        let healthy_indices = get_healthy_worker_indices(workers);
+    fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
+        let healthy_indices = get_healthy_worker_indices(workers, info);
 
         if healthy_indices.is_empty() {
             return None;

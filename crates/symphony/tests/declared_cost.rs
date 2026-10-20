@@ -1,8 +1,9 @@
 //! What a request declares about its calls costs nothing to hold: [`Declared::shared`] over the
 //! request's tools allocates nothing, however many tools the request declares and however large
-//! their schemas, and a parameter's schema is read in place. And the engine's hold-back of a
-//! possible marker costs nothing in a steady stream: a delta after a held byte allocates as much
-//! as one that reads as text whole. A separate executable, so it can declare the counting
+//! their schemas, and a parameter's schema is read in place. And a steady stream costs nothing per
+//! delta: a delta read as text whole allocates nothing, its event borrows it and the buffer is the
+//! stream's, and the engine's hold-back of a possible marker costs the delta after a held byte one
+//! copy, the held bytes joined to it. A separate executable, so it can declare the counting
 //! allocator the pins need.
 
 #![expect(unsafe_code, reason = "a global allocator that counts allocations")]
@@ -132,10 +133,11 @@ fn holding_what_a_request_declares_allocates_nothing() {
     );
 }
 
-/// Feeds `text` as one delta and drains the events, as a stream's reader does; the allocations
-/// it took.
-fn allocations_for_delta(engine: &mut Engine, out: &mut Events, text: &str) -> usize {
+/// Feeds `text` as one delta into the stream's buffer, reads the events in place and recycles
+/// the buffer, as a stream's reader does; the allocations it took.
+fn allocations_for_delta(engine: &mut Engine, spare: &mut Events<'static>, text: &str) -> usize {
     let mut fed = Ok(());
+    let mut out = std::mem::take(spare);
     let allocations = allocations_during(|| {
         fed = engine.feed(
             Input::Delta {
@@ -143,16 +145,17 @@ fn allocations_for_delta(engine: &mut Engine, out: &mut Events, text: &str) -> u
                 text,
                 spans: &[],
             },
-            out,
+            &mut out,
         );
-        black_box(out.drain());
+        black_box(out.as_slice());
     });
+    *spare = out.recycle();
     assert!(fed.is_ok(), "the delta is taken: {fed:?}");
     allocations
 }
 
 #[test]
-fn a_delta_after_a_held_byte_allocates_as_one_that_reads_as_text_whole() {
+fn a_delta_read_as_text_allocates_nothing_and_one_after_a_held_byte_one_copy() {
     let mut engine = Engine::new(Table::Qwen3.format(), Declared::of(&[]));
     let mut out = Events::new();
     engine
@@ -175,10 +178,16 @@ fn a_delta_after_a_held_byte_allocates_as_one_that_reads_as_text_whole() {
     let holding = allocations_for_delta(&mut engine, &mut out, "e<");
     let after_a_hold = allocations_for_delta(&mut engine, &mut out, "f. ");
     assert_eq!(
+        whole, 0,
+        "a delta read as text whole allocated {whole} times: its event borrows it and the buffer \
+         is the stream's"
+    );
+    assert_eq!(
         (holding, after_a_hold),
-        (whole, whole),
+        (whole, whole + 1),
         "a delta that ends in a held byte took {holding} allocations and the one after it \
-         {after_a_hold}, where a delta read as text whole takes {whole}"
+         {after_a_hold}, where a delta read as text whole takes {whole}; the one after a hold \
+         pays one copy, the held bytes joined to it, which no event can borrow"
     );
     engine
         .feed(

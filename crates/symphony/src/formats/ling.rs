@@ -69,7 +69,7 @@ mod tests {
         "</tool_call>\n<tool_call>get_weather\n</tool_call>"
     );
 
-    fn run(prompt: &str, output: &str) -> Vec<Event> {
+    fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
         drive(&mut Engine::new(ling(), declared()), prompt, &[output])
     }
 
@@ -103,14 +103,14 @@ mod tests {
         let reasoning: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
+                Event::Reasoning(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();
         let content: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -139,7 +139,7 @@ mod tests {
         let reasoning: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
+                Event::Reasoning(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();

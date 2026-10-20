@@ -41,8 +41,18 @@
 //! reads free text before triggered tags so that the prefix could end inside the call's terminal
 //! and the triggered tags' free text write the rest, a call no tag constrains.
 //!
-//! Arguments written as JSON, or as an object that names the call, have no tag yet: a layout has
-//! no places for them.
+//! Arguments that are one JSON value (Kimi K2's) are written as the tool's schema where the value
+//! stands, right after the header the layout spells and before the trailer and the close; the
+//! layout writes no parameter and nothing around the value. Where the header numbers the call
+//! ([`Segment::Index`], the `N` of `functions.NAME:N`), the tag writes any run of digits there,
+//! since the model counts its calls and no request knows the count ahead: the header's text up to
+//! the index begins the tag, and the digits with the rest of the header open its content. Where
+//! the calls sit in a block of the table's (a wrapper state with a row into the arguments state),
+//! the calls are written between the block's ways in and its close, one after another, as the
+//! tagged syntaxes write theirs ([`in_block`](super::calls::in_block)): the layout's text between
+//! and after the calls is not written there, the block's being the table's own, and the lead, the
+//! text before a call's terminal, stands before each call inside the block. Arguments as an
+//! object that names the call have no tag yet: a layout has no places for them.
 //!
 //! [`CallSyntax::Shaped`]: crate::CallSyntax::Shaped
 
@@ -50,13 +60,17 @@ use openai_protocol::common::Tool;
 use serde_json::Value;
 
 use super::{
+    calls,
     schema::{self, shape as typed, Definitions},
-    Count, Grammar, Tag,
+    CallMarkers, Count, Grammar, Tag, WayIn,
 };
 use crate::{
-    format::{Emits, Format},
+    format::{Emits, Format, Whitespace},
     shape::{Arguments, Atom, CallShape, End, Layout, Nested, Segment, Slot, Spellings, Words},
 };
+
+/// The call's index as a tag writes it where the header has its place: any run of digits.
+const INDEX: &str = "[0-9]+";
 
 /// One call as a tag writes it: the layout's lead for the tool, what the tag begins with (the
 /// terminal, the header and the text before the parameters), and the parameters.
@@ -68,33 +82,29 @@ struct Call {
 }
 
 /// The structural tag of a shaped call to one of `tools`, as `count` asks, written as `layout`
-/// says the template writes one (see the module documentation). `None` when the layout does not
-/// fit the table, the arguments are not tagged parameters, a value's end holds no text, no tool
-/// can be called through the header, or the stream's stop closes the last call while no call is
-/// owed and more than one may come.
+/// says the template writes one (see the module documentation); in the table's block of calls,
+/// where it has one (`markers`), between the block's `ways_in` and its close. `None` when the
+/// layout does not fit the table, the arguments are neither tagged parameters nor one JSON value,
+/// a value's end holds no text, no tool can be called through the header, or the stream's stop
+/// closes the last call while no call is owed and more than one may come.
 pub(super) fn calls(
     format: &Format,
     shape: &CallShape,
     layout: &Layout,
+    markers: Option<&CallMarkers<'_>>,
+    ways_in: &[WayIn<'_>],
     tools: &[&Tool],
     count: Count<'_>,
 ) -> Option<Grammar> {
     layout.check(format).ok()?;
-    let Arguments::Params { ends, .. } = &shape.arguments else {
-        return None;
-    };
     let state = (0..format.states()).find(|&state| format.emits(state) == Emits::Arguments)?;
     let terminals = rows(format, |from, to| from != state && to == state);
     let exits = rows(format, |from, to| from == state && to != state);
-    let values = Values {
-        excludes: excludes(ends, &exits)?,
-        spellings: layout.values,
-    };
+    let writing = Writing::of(shape, layout, &exits)?;
     let call = &layout.call;
-    let parameters = Parameters::of(layout);
     let tail = format!(
         "{}{}{}",
-        parameters.closing,
+        writing.closing(),
         call.trailer,
         call.close.as_deref().unwrap_or("")
     );
@@ -116,22 +126,61 @@ pub(super) fn calls(
     let mut written: Vec<Call> = Vec::new();
     for tool in tools {
         let name = &tool.function.name;
-        let Some(arguments) = parameters.of_tool(shape, layout, &values, tool, limited) else {
+        let Some(arguments) = writing.of_tool(shape, layout, tool, limited) else {
             continue;
         };
         let (lead, _) = call.lead.around_the_value(name, "");
         for terminal in &terminals {
-            if let Some(header) = layout.header_for(shape, terminal, name) {
-                written.push(Call {
-                    lead: lead.clone(),
-                    begin: format!("{terminal}{header}{}", call.before),
-                    arguments: arguments.clone(),
-                });
+            if layout.header_for(shape, terminal, name).is_none() {
+                continue;
             }
+            // The header up to the call's index begins the tag; the digits, the rest of the header
+            // and the text before the arguments open its content.
+            let (begin, numbered) = call.header.around_the_index(name);
+            let (begin, arguments) = match numbered {
+                None => (
+                    format!("{terminal}{begin}{}", call.before),
+                    arguments.clone(),
+                ),
+                Some(rest) => (
+                    format!("{terminal}{begin}"),
+                    sequence(vec![
+                        Grammar::Regex(INDEX.to_string()),
+                        text(&format!("{rest}{}", call.before)),
+                        arguments.clone(),
+                    ]),
+                ),
+            };
+            written.push(Call {
+                lead: lead.clone(),
+                begin,
+                arguments,
+            });
         }
     }
     if written.is_empty() {
         return None;
+    }
+    // In a block, the calls stand between the block's ways in and its close, as the tagged
+    // syntaxes' do, each after its lead, the text the template writes before a call's terminal;
+    // a block's calls are closed by a terminal, never by the stop.
+    if let Some(markers) = markers.filter(|markers| markers.block.is_some()) {
+        call.close.as_ref()?;
+        let count = Count { one, ..count };
+        let calls = written
+            .iter()
+            .map(|call| {
+                let begin = format!("{}{}", call.lead, call.begin);
+                (begin, call.arguments.clone(), tail.clone())
+            })
+            .collect();
+        return Some(calls::in_block(
+            markers,
+            ways_in,
+            calls,
+            count,
+            |one_call| count.calls(one_call),
+        ));
     }
     if in_a_row {
         let tags = written
@@ -194,6 +243,66 @@ fn lead(calls: &[Call]) -> Option<Grammar> {
         [] => None,
         [only] => Some(text(only)),
         many => Some(Grammar::Or(many.iter().map(|lead| text(lead)).collect())),
+    }
+}
+
+/// How a call's arguments are written: the layout's parameters with the values' spellings, or
+/// the tool's schema as one JSON value.
+enum Writing<'l> {
+    Parameters {
+        parameters: Parameters<'l>,
+        values: Values,
+    },
+    Json,
+}
+
+impl<'l> Writing<'l> {
+    /// How `shape`'s arguments are written as `layout` says, with the terminals that take the
+    /// call out of its region (`exits`), which no text value may hold. `None` for arguments the
+    /// layout has no places for, or a value's end that holds no text.
+    fn of(shape: &CallShape, layout: &'l Layout, exits: &[&str]) -> Option<Self> {
+        match &shape.arguments {
+            Arguments::Params { ends, .. } => Some(Self::Parameters {
+                parameters: Parameters::of(layout),
+                values: Values {
+                    excludes: excludes(ends, exits)?,
+                    spellings: layout.values,
+                },
+            }),
+            Arguments::Json(_) => Some(Self::Json),
+            Arguments::Envelope { .. } => None,
+        }
+    }
+
+    /// What the layout writes after the last parameter, before the trailer; nothing for a JSON
+    /// value, which the trailer follows at once.
+    fn closing(&self) -> &str {
+        match self {
+            Self::Parameters { parameters, .. } => parameters.closing,
+            Self::Json => "",
+        }
+    }
+
+    /// The arguments of a call to `tool`: its parameters as the layout writes them
+    /// ([`Parameters::of_tool`]), or its schema as one JSON value.
+    fn of_tool(
+        &self,
+        shape: &CallShape,
+        layout: &Layout,
+        tool: &Tool,
+        limited: bool,
+    ) -> Option<Grammar> {
+        match self {
+            Self::Parameters { parameters, values } => {
+                parameters.of_tool(shape, layout, values, tool, limited)
+            }
+            Self::Json => Some(Grammar::JsonSchema {
+                schema: tool.function.parameters.clone(),
+                style: None,
+                excludes: Vec::new(),
+                whitespace: Whitespace::Free,
+            }),
+        }
     }
 }
 
@@ -310,14 +419,14 @@ fn any_parameter(layout: &Layout, values: &Values) -> Option<Grammar> {
             Segment::Slot(Slot::Key) => {
                 let next = segments.get(at + 1).and_then(|next| match next {
                     Segment::Lit(lit) => lit.chars().next(),
-                    Segment::Slot(_) => None,
+                    Segment::Slot(_) | Segment::Index => None,
                 })?;
                 let mut excludes = vec![next.to_string()];
                 excludes.extend(values.excludes.iter().cloned());
                 Grammar::AnyText { excludes }
             }
             Segment::Slot(Slot::Value) => values.text(),
-            Segment::Slot(Slot::Name) => return None,
+            Segment::Slot(Slot::Name) | Segment::Index => return None,
         });
     }
     Some(sequence(parts))
@@ -580,6 +689,7 @@ mod tests {
         Options {
             at_least_one,
             reasoning_open: false,
+            thought_closed: false,
             one_call,
             start: GrammarStart::Unknown,
         }
@@ -717,6 +827,152 @@ mod tests {
         assert!(
             !other.contains("json_schema"),
             "an object written as text: {other}"
+        );
+    }
+
+    /// A table whose shaped calls sit in a block, their header numbered (`f.NAME:N>`) and their
+    /// arguments one JSON value: the block `<b` to `</b>` around calls `<c` to `</c>`, entered
+    /// from the content or from the thought, whose close leads to the content.
+    fn numbered_in_a_block() -> Format {
+        let shape = intern(CallShape {
+            header: Pattern(
+                [
+                    lit("f."),
+                    run(none_of(":"), 1, true, Some(Slot::Name)),
+                    lit(":"),
+                    run(Class::new([('0', '9')], false), 1, true, None),
+                    lit(">"),
+                ]
+                .into(),
+            ),
+            name: NameSource::Header,
+            arguments: Arguments::Json(Default::default()),
+            trailer: Pattern::default(),
+            word: word(),
+            hold_cap: 8192,
+        });
+        Format::new("numbered")
+            .terminal("think_open", "<t>")
+            .terminal("think_close", "</t>")
+            .terminal("block_open", "<b")
+            .terminal("block_close", "</b>")
+            .terminal("open", "<c")
+            .terminal("close", "</c>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("block", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "content")
+            .transition("content", "block_open", "block")
+            .transition("reasoning", "block_open", "block")
+            .transition("block", "open", "call")
+            .transition("call", "close", "block")
+            .transition("block", "block_close", "content")
+            .calls(CallSyntax::Shaped(shape))
+            .with_layout(Layout {
+                call: CallLayout {
+                    lead: Written::default(),
+                    header: written([
+                        piece("f."),
+                        Segment::Slot(Slot::Name),
+                        piece(":"),
+                        Segment::Index,
+                        piece(">"),
+                    ]),
+                    before: "".into(),
+                    parameter: Written::default(),
+                    between: "".into(),
+                    after: "".into(),
+                    trailer: "".into(),
+                    close: Some("</c>".into()),
+                },
+                between_calls: Some("".into()),
+                after_calls: "".into(),
+                values: Spellings::default(),
+                thought: Some(Message {
+                    close: Some("</t>".into()),
+                    ..Message::default()
+                }),
+                answer: None,
+            })
+    }
+
+    #[test]
+    fn json_arguments_in_a_block_are_the_schema_after_the_numbered_header_between_the_ways_in() {
+        let format = numbered_in_a_block();
+        let call = |tool: &Tool| {
+            value!({"type": "sequence", "elements": [
+                {"type": "const_string", "value": format!("<cf.{}:", tool.function.name)},
+                {"type": "sequence", "elements": [
+                    {"type": "regex", "pattern": "[0-9]+"},
+                    {"type": "const_string", "value": ">"},
+                    {"type": "json_schema", "json_schema": tool.function.parameters},
+                ]},
+                {"type": "const_string", "value": "</c>"},
+            ]})
+        };
+        let ping = tool("ping", value!({"type": "object", "properties": {}}));
+        // One call owed at most: the block's two ways in around the one call, nothing after.
+        let got = payload(&format, &[lookup(), ping.clone()], options(true, true)).expect("a tag");
+        let one = value!({"type": "or", "elements": [call(&lookup()), call(&ping)]});
+        assert_eq!(
+            got,
+            value!({"format": {
+                "type": "triggered_tags",
+                "triggers": ["<b", "</t>"],
+                "tags": [
+                    {"type": "tag", "begin": "<b", "content": one, "end": "</b>"},
+                    {"type": "tag", "begin": "</t><b", "content": one, "end": "</b>"},
+                ],
+                "at_least_one": true,
+                "stop_after_first": true,
+            }})
+        );
+        // Any number of calls: one or more in the block.
+        let many = payload(&format, &[lookup()], options(true, false)).expect("a tag");
+        assert_eq!(
+            many["format"]["tags"][0]["content"],
+            value!({"type": "plus", "content": {"type": "or", "elements": [call(&lookup())]}})
+        );
+        assert_eq!(many["format"]["stop_after_first"], Value::Null);
+        // A template that writes one call in a turn holds one in every tag.
+        let mut single = format.layout().cloned().expect("a layout");
+        single.between_calls = None;
+        let single = numbered_in_a_block().with_layout(single);
+        let got = payload(&single, &[lookup()], options(true, false)).expect("a tag");
+        assert_eq!(got["format"]["stop_after_first"], true);
+        assert_eq!(got["format"]["tags"][0]["content"]["type"], "or");
+        // A lead stands before each call inside the block, named for its tool; nothing stands
+        // before the block's tags.
+        let mut led = format.layout().cloned().expect("a layout");
+        led.call.lead = written([piece("@"), Segment::Slot(Slot::Name), piece("\n")]);
+        let got = payload(
+            &numbered_in_a_block().with_layout(led),
+            &[lookup(), ping.clone()],
+            options(true, false),
+        )
+        .expect("a tag");
+        assert_eq!(got["format"]["type"], "triggered_tags");
+        let calls = &got["format"]["tags"][0]["content"]["content"]["elements"];
+        assert_eq!(calls[0]["elements"][0]["value"], "@lookup\n<cf.lookup:");
+        assert_eq!(calls[1]["elements"][0]["value"], "@ping\n<cf.ping:");
+        // A layout with a parameter does not fit JSON arguments, and gives no tag.
+        let mut tagged = format.layout().cloned().expect("a layout");
+        tagged.call.parameter = written([
+            piece("<p "),
+            Segment::Slot(Slot::Key),
+            piece(">"),
+            Segment::Slot(Slot::Value),
+            piece("</p>"),
+        ]);
+        assert_eq!(
+            payload(
+                &numbered_in_a_block().with_layout(tagged),
+                &[lookup()],
+                options(true, true)
+            ),
+            None
         );
     }
 
@@ -972,7 +1228,7 @@ mod tests {
         for input in inputs {
             engine.feed(input, &mut out).expect("a parse");
         }
-        let message = adapt::chat::message(0, &out.drain()).message;
+        let message = adapt::chat::message(0, &out.into_owned().drain()).message;
         let calls: Vec<Value> = message
             .tool_calls
             .unwrap_or_default()

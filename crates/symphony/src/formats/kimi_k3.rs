@@ -86,7 +86,7 @@ mod tests {
         "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
     );
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         drive(
             &mut Engine::with_call_ids(Arc::new(kimi_k3()), Declared::default(), ids()),
             prompt,
@@ -94,19 +94,19 @@ mod tests {
         )
     }
 
-    fn ends(events: &[Event]) -> Vec<&str> {
+    fn ends<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallEnd { source, .. } => Some(source.text.as_str()),
+                Event::ToolCallEnd { source, .. } => Some(&*source.text),
                 _ => None,
             })
             .collect()
     }
 
-    fn dropped(text: &str) -> Event {
+    fn dropped(text: &str) -> Event<'static> {
         Event::Dropped {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
         }
     }

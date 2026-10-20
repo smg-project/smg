@@ -319,13 +319,13 @@ impl Assembler {
             .map_or(text.len(), |(at, _)| at);
         if tag_at > 0 {
             out.push(Event::Dropped {
-                text: Text::uncounted(&text[..tag_at]),
+                text: Text::uncounted(text[..tag_at].to_owned()),
                 why: DropReason::Wrapper,
             });
         }
         if tag_at < text.len() {
             out.push(Event::Malformed {
-                text: Text::uncounted(&text[tag_at..]),
+                text: Text::uncounted(text[tag_at..].to_owned()),
                 why,
             });
         }
@@ -458,7 +458,7 @@ impl Assembler {
             } else {
                 self.drop_carried(out);
                 out.push(Event::Malformed {
-                    text: Text::uncounted(run),
+                    text: Text::uncounted(run.to_owned()),
                     why,
                 });
             }
@@ -665,12 +665,12 @@ impl Assembler {
     }
 
     /// `}` after the members, or `{}` when there were none.
-    fn close_object(&mut self, source: Text, out: &mut Events) {
+    fn close_object<'d>(&mut self, source: Text<'d>, out: &mut Events<'d>) {
         let closing = if self.written == 0 { "{}" } else { "}" };
         self.push_fragment(closing.to_string(), source, out);
     }
 
-    fn push_fragment(&self, json: String, source: Text, out: &mut Events) {
+    fn push_fragment<'d>(&self, json: String, source: Text<'d>, out: &mut Events<'d>) {
         out.push(Event::ToolCallArguments {
             index: self.index,
             json,
@@ -772,7 +772,7 @@ mod tests {
         pieces: &[&str],
         placement: Placement,
         ending: fn(Assembler, &mut Events),
-    ) -> (Vec<Event>, Vec<usize>) {
+    ) -> (Vec<Event<'static>>, Vec<usize>) {
         let declared = declared();
         let mut assembler = Assembler::new(0, ids(), placement);
         let mut out = Events::new();
@@ -785,16 +785,16 @@ mod tests {
     }
 
     /// The values on a line of their own, Qwen 3.5's way, and the stream cut at the end.
-    fn finished(pieces: &[&str]) -> Vec<Event> {
+    fn finished(pieces: &[&str]) -> Vec<Event<'static>> {
         run(pieces, Placement::OwnLine, Assembler::finish).0
     }
 
     /// The values between the tags directly, Seed-OSS's and MiMo's way, and the stream cut.
-    fn finished_direct(pieces: &[&str]) -> Vec<Event> {
+    fn finished_direct(pieces: &[&str]) -> Vec<Event<'static>> {
         run(pieces, Placement::Direct, Assembler::finish).0
     }
 
-    fn closed(pieces: &[&str]) -> Vec<Event> {
+    fn closed(pieces: &[&str]) -> Vec<Event<'static>> {
         run(pieces, Placement::OwnLine, Assembler::close).0
     }
 
@@ -809,7 +809,7 @@ mod tests {
             .collect()
     }
 
-    fn name_of(events: &[Event]) -> Option<&str> {
+    fn name_of<'a>(events: &'a [Event<'_>]) -> Option<&'a str> {
         events.iter().find_map(|event| match event {
             Event::ToolCallStart { name, .. } => Some(name.as_str()),
             _ => None,
@@ -820,7 +820,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, why } => Some((text.text.clone(), *why)),
+                Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
                 _ => None,
             })
             .collect()
@@ -830,7 +830,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Dropped { text, .. } => Some(text.text.clone()),
+                Event::Dropped { text, .. } => Some(text.text.to_string()),
                 _ => None,
             })
             .collect()
@@ -843,18 +843,18 @@ mod tests {
             .count()
     }
 
-    fn fragment(json: &str, source: &str) -> Event {
+    fn fragment(json: &str, source: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index: 0,
             json: json.to_string(),
-            source: Text::uncounted(source),
+            source: Text::uncounted(source.to_owned()),
         }
     }
 
-    fn end(source: &str) -> Event {
+    fn end(source: &str) -> Event<'static> {
         Event::ToolCallEnd {
             index: 0,
-            source: Text::uncounted(source),
+            source: Text::uncounted(source.to_owned()),
         }
     }
 
@@ -1122,12 +1122,12 @@ mod tests {
             index,
             id: ids().id(index),
             name: "f".to_string(),
-            source: Text::uncounted(source),
+            source: Text::uncounted(source.to_owned()),
         };
         let fragment_of = |index: u32, json: &str, source: &str| Event::ToolCallArguments {
             index,
             json: json.to_string(),
-            source: Text::uncounted(source),
+            source: Text::uncounted(source.to_owned()),
         };
         let end_of = |index: u32| Event::ToolCallEnd {
             index,

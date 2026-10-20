@@ -262,10 +262,12 @@ pub struct RouterConfig {
     /// Absolute worker overload protection, on by default. A worker whose load
     /// report is at or above either threshold below is left out of routing
     /// while another worker is under them; when every worker is over them the
-    /// request goes to the least-loaded one (see `worker_overload_shed` for
-    /// refusing instead). Evaluated once per ingested load report, never per
-    /// request. `false` switches both gateway thresholds off; per-worker
-    /// `overload` blocks on a WorkerSpec still apply.
+    /// request goes to the least-loaded one (in gRPC and HTTP prefill/decode
+    /// pair placement such a pool is placed by its own policy, as if none
+    /// were over them; see `worker_overload_shed` for refusing instead).
+    /// Evaluated once per ingested load report, never per request. `false`
+    /// switches both gateway thresholds off; per-worker `overload` blocks on
+    /// a WorkerSpec still apply.
     #[serde(default = "default_worker_overload_protection")]
     pub worker_overload_protection: bool,
     /// Queued (waiting) requests, summed across DP ranks, at or above which a

@@ -42,7 +42,7 @@ mod tests {
     use super::*;
     use crate::{engine::Engine, event::Event, testing::drive, Declared};
 
-    fn run(prompt: &str, output: &str) -> Vec<Event> {
+    fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
         drive(
             &mut Engine::new(lfm2_5(), Declared::default()),
             prompt,
@@ -54,8 +54,8 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(text) if reasoning => Some(text.text.as_str()),
-                Event::Content(text) if !reasoning => Some(text.text.as_str()),
+                Event::Reasoning(text) if reasoning => Some(&*text.text),
+                Event::Content(text) if !reasoning => Some(&*text.text),
                 _ => None,
             })
             .collect()

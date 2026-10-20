@@ -48,7 +48,7 @@ fn overlap_affinity_group(
 }
 use crate::{
     observability::metrics::CACHE_AWARE_MATCH_RATIO_BUCKETS,
-    worker::{BasicWorkerBuilder, WorkerBlocks, WorkerType},
+    worker::{runtime::StallReason, BasicWorkerBuilder, WorkerBlocks, WorkerType},
 };
 
 fn no_health_check() -> HealthCheckConfig {
@@ -163,6 +163,51 @@ fn overloaded_worker_is_vetoed_by_the_fused_gather() {
         worker.set_overloaded(false);
     }
     assert!(policy.select_worker(&workers, &info).is_some());
+}
+
+/// A caller that judged the overload veto unable to steer lifts it (every
+/// worker of a disaggregated pool over the thresholds): the policy then
+/// places as if none were over them, prefix affinity included. The liveness
+/// veto is not lifted.
+#[test]
+fn a_lifted_overload_veto_keeps_the_prefix_owner() {
+    let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+        eviction_interval_secs: 0,
+        ..Default::default()
+    });
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+
+    let info = SelectWorkerInfo {
+        request_text: Some("a stable prefix that pins one worker"),
+        ..Default::default()
+    };
+    let owner = policy.select_worker(&workers, &info).unwrap();
+    for worker in &workers {
+        worker.set_overloaded(true);
+    }
+    assert_eq!(
+        policy.select_worker(&workers, &info),
+        None,
+        "the veto applies"
+    );
+    let lifted = SelectWorkerInfo {
+        overload_lifted: true,
+        ..info.clone()
+    };
+    for _ in 0..4 {
+        assert_eq!(
+            policy.select_worker(&workers, &lifted),
+            Some(owner),
+            "with the veto lifted the owner keeps its prefix"
+        );
+    }
+    workers[owner].set_stall(Some(StallReason::Wedged));
+    assert_ne!(
+        policy.select_worker(&workers, &lifted),
+        Some(owner),
+        "a stalled owner is not lifted back"
+    );
 }
 
 #[test]

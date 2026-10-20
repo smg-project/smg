@@ -42,7 +42,7 @@ mod tests {
     /// The generation prompt's tail: the model's turn opened, and nothing more.
     const PROMPT: &str = "<start_of_turn>model\n";
 
-    fn run(prompt: &str, output: &str) -> Vec<Event> {
+    fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
         drive(
             &mut Engine::new(function_gemma(), Declared::default()),
             prompt,
@@ -50,14 +50,14 @@ mod tests {
         )
     }
 
-    fn dropped(events: &[Event]) -> Vec<&str> {
+    fn dropped<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
                 Event::Dropped {
                     text,
                     why: DropReason::Wrapper,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()

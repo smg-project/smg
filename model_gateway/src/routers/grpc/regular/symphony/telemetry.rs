@@ -106,7 +106,7 @@ pub(crate) fn reason_label(why: MalformedReason) -> &'static str {
 }
 
 /// The bytes an event accounts for in the output.
-fn bytes_of(event: &Event) -> usize {
+pub(super) fn bytes_of(event: &Event) -> usize {
     match event {
         Event::Content(text) | Event::Reasoning(text) => text.text.len(),
         Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.len(),
@@ -195,6 +195,19 @@ impl Tally {
             _ => {}
         }
         self.at += bytes_of(event);
+    }
+
+    /// `bytes` more of the output went out in an event seen already: text pushed right after
+    /// text of its kind joins the last event rather than making one, and the next event starts
+    /// after it.
+    pub(crate) fn grew(&mut self, bytes: usize) {
+        self.at += bytes;
+    }
+
+    /// The first malformed run, for the reader's tests.
+    #[cfg(test)]
+    pub(super) fn first_run(&self) -> Option<&FirstRun> {
+        self.first.as_ref()
     }
 
     /// Malformed runs seen.
@@ -417,23 +430,23 @@ mod tests {
 
     use super::*;
 
-    fn malformed(text: &str, why: MalformedReason) -> Event {
+    fn malformed(text: &str, why: MalformedReason) -> Event<'static> {
         Event::Malformed {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why,
         }
     }
 
-    fn call_start(index: u32, source: &str) -> Event {
+    fn call_start(index: u32, source: &str) -> Event<'static> {
         Event::ToolCallStart {
             index,
             id: format!("call_{index}"),
             name: "lookup".into(),
-            source: Text::uncounted(source),
+            source: Text::uncounted(source.to_owned()),
         }
     }
 
-    fn finish(tool_calls: u32) -> Event {
+    fn finish(tool_calls: u32) -> Event<'static> {
         Event::Finish {
             reason: FinishReason::Stop,
             tool_calls,
@@ -495,7 +508,7 @@ mod tests {
         // The refuse order: the event of no bytes, then the bytes it refuses; a second refused
         // run's bytes count, but are not the first run's.
         let refused = |text: &str| Event::Dropped {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why: DropReason::MalformedCall,
         };
         let mut tally = Tally::default();

@@ -11,7 +11,7 @@ pub(super) use openai_protocol::{
     chat::ChatCompletionRequest, common::Tool, messages::CreateMessageRequest,
 };
 pub(super) use serde_json::{json, Value};
-pub(super) use symphony::{formats::qwen3, CallSyntax, EngineFinish, Event, Format};
+pub(super) use symphony::{formats::qwen3, CallSyntax, EngineFinish, Event, Events, Format};
 pub(super) use tool_parser::ToolConstraint;
 
 pub(super) use super::{
@@ -111,6 +111,7 @@ pub(super) fn constraint(
         Asks::Chat(request),
         tools,
         reasoning_open,
+        false,
         symphony::GrammarStart::Unknown,
         &templates(),
     )
@@ -246,22 +247,34 @@ pub(super) fn tag_of(constraint: Result<Option<ToolConstraint>, SymphonyError>) 
 pub(super) const QWEN3_OUTPUT: &str = "<think>plan</think>\n\nHello <tool_call>\n\
                             {\"name\": \"lookup\", \"arguments\": {\"q\": 1}}\n</tool_call>";
 
-pub(super) fn read_with(format: Format) -> Vec<Event> {
+pub(super) fn read_with(format: Format) -> Vec<Event<'static>> {
     let assignment = Assignment {
         format: Arc::new(format),
         prompt: "<|im_start|>assistant\n".to_string(),
     };
-    let mut reader = Reader::new(&assignment, tools().into()).expect("a reader");
-    let mut events = reader.tail(QWEN3_OUTPUT).expect("read");
-    events.extend(reader.end(EngineFinish::Stop, who()).expect("ended"));
-    events
+    let mut events = Events::new();
+    let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
+    read_tail(&mut reader, QWEN3_OUTPUT)
+}
+
+/// The events of `output` read whole as the decoder's last text, then ended by a stop, owned.
+pub(super) fn read_tail(reader: &mut Reader, output: &str) -> Vec<Event<'static>> {
+    let mut delta = Delta::default();
+    let mut events = Events::new();
+    reader
+        .tail(output.to_string(), &mut delta, &mut events)
+        .expect("read");
+    reader
+        .end(EngineFinish::Stop, who(), &mut events)
+        .expect("ended");
+    events.into_owned().drain()
 }
 
 pub(super) fn content_of(events: &[Event]) -> String {
     events
         .iter()
         .filter_map(|event| match event {
-            Event::Content(text) => Some(text.text.as_str()),
+            Event::Content(text) => Some(&*text.text),
             _ => None,
         })
         .collect()

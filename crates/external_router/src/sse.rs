@@ -80,6 +80,37 @@ impl SseEncoder {
     pub fn done() -> Bytes {
         Bytes::from_static(b"data: [DONE]\n\n")
     }
+
+    /// The `error` event that ends a failed Responses stream: the API's own
+    /// event (`type`, `code`, `message`, `param`, `sequence_number`) on a
+    /// `data:` line alone, nothing after it. The one frame every router
+    /// writes for a failure of its own, so a client reads the same event
+    /// whichever router served the stream. The frame names no event, as the
+    /// gateway's error frames never have: the SDKs parse the typed event the
+    /// same way with or without the name, and the older ones only without it.
+    ///
+    /// `code` is the failure's class (`stream_error`, `max_tool_calls_exceeded`,
+    /// the upstream's own code, ...), `sequence_number` the event's place in
+    /// the stream, from the stream's own counter.
+    pub fn encode_responses_error(
+        &mut self,
+        code: &str,
+        message: &str,
+        sequence_number: u64,
+    ) -> Bytes {
+        let event = ResponsesErrorEvent {
+            r#type: "error",
+            code,
+            message,
+            param: None,
+            sequence_number,
+        };
+        // Unreachable in practice: two strings and an integer always
+        // serialize; the fallback keeps the frame well-formed should that
+        // ever change.
+        self.encode_data(&event)
+            .unwrap_or_else(|_| Bytes::from_static(RESPONSES_ERROR_FALLBACK))
+    }
 }
 
 impl Default for SseEncoder {
@@ -87,6 +118,20 @@ impl Default for SseEncoder {
         Self::new()
     }
 }
+
+/// The `error` event of a Responses stream, the fields in the order the API
+/// writes them.
+#[derive(Serialize)]
+struct ResponsesErrorEvent<'a> {
+    r#type: &'static str,
+    code: &'a str,
+    message: &'a str,
+    param: Option<&'a str>,
+    sequence_number: u64,
+}
+
+/// The error frame written when the event itself cannot be serialized.
+const RESPONSES_ERROR_FALLBACK: &[u8] = b"data: {\"type\":\"error\",\"code\":\"internal_error\",\"message\":\"serialization failed\",\"param\":null}\n\n";
 
 /// Errors that can occur during SSE encoding.
 #[derive(Debug, thiserror::Error)]
@@ -556,6 +601,22 @@ mod tests {
         let json_str = serde_json::to_string(&val).unwrap();
         let expected = format!("event: content_block_start\ndata: {json_str}\n\n");
         assert_eq!(text, expected);
+    }
+
+    /// The error event of a failed Responses stream: the API's fields in its
+    /// order, the message escaped as JSON, on a data line alone, no event
+    /// name and no sentinel.
+    #[test]
+    fn a_responses_error_frame_is_the_typed_event_on_a_data_line() {
+        let mut enc = SseEncoder::new();
+        let frame =
+            enc.encode_responses_error("stream_error", "Stream error: he said \"bye\"\n", 7);
+        assert_eq!(
+            frame,
+            "data: {\"type\":\"error\",\"code\":\"stream_error\",\"message\":\"Stream error: he \
+             said \\\"bye\\\"\\n\",\"param\":null,\"sequence_number\":7}\n\n"
+                .as_bytes()
+        );
     }
 
     // --- SseDecoder tests ---
