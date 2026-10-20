@@ -83,21 +83,31 @@ struct RequestRegistry<O> {
     idle_since: Option<Instant>,
     /// The in-flight time of the busy periods that ended since the engine's
     /// last output; with the current one, the engine's unanswered work (see
-    /// [`Self::unanswered_for`]).
+    /// [`Self::unexplained_for`]).
     unanswered_before: Duration,
     /// The silence watchdog's window ([`ENGINE_SILENCE_DEATH_TIMEOUT`] unless
-    /// [`Client::set_silence_death_timeout`] changed it): the dispatcher's
-    /// deadline with nothing pending prefill (see [`Self::silence_bound`]),
-    /// and the idle spell after which the count starts over.
+    /// [`Client::set_silence_death_timeout`] changed it): how long the engine
+    /// may be silent past its prefill work in hand ([`Self::work_end`])
+    /// before it is dead, and the idle spell after which the count starts
+    /// over.
     silence_window: Duration,
     /// The prefill rate the watchdog allows the engine for the prompt tokens
-    /// pending prefill ([`ENGINE_PREFILL_TOKENS_PER_SEC`] unless
+    /// it is handed ([`ENGINE_PREFILL_TOKENS_PER_SEC`] unless
     /// [`Client::set_prefill_tokens_per_sec`] changed it); zero allows
     /// nothing.
     prefill_tokens_per_sec: u64,
+    /// When the engine's prefill work in hand is due to be done at the
+    /// allowed rate: each prompt registered queues its allowance behind the
+    /// work before it, an output restarts the figure from the prompt still
+    /// pending then, and a prompt withdrawn before its first output leaves
+    /// its allowance in place until it passes (the engine may be mid-way
+    /// through it, and nothing on a token-batch wire says otherwise).
+    /// Silence before this instant is explained; only the in-flight time
+    /// past it counts toward the window (see [`Self::unexplained_for`]).
+    work_end: Instant,
     /// Signalled when `requests` goes from empty to non-empty: the dispatcher
-    /// re-arms the silence watchdog for the remainder of the bound the
-    /// engine's unanswered work has left, not a whole one.
+    /// re-arms the silence watchdog for the remainder of the window the
+    /// engine's unexplained silence has left, not a whole one.
     busy_started: Arc<Notify>,
     /// Prompt tokens of the registered requests that have produced no output
     /// yet: the engine's prefill work in hand, as the servicer reports it and
@@ -110,13 +120,11 @@ struct RequestRegistry<O> {
 }
 
 /// One registered request: its output stream, whether the engine reports it
-/// on every step ([`EngineProtocol::reported_every_step`]), when it was
-/// registered and, until its first output, the prompt the engine still has
-/// to prefill for it.
+/// on every step ([`EngineProtocol::reported_every_step`]) and, until its
+/// first output, the prompt the engine still has to prefill for it.
 struct InFlight<O> {
     sender: OutputSender<O>,
     prompt_tokens: u64,
-    registered: Instant,
     started: bool,
     every_step: bool,
 }
@@ -135,6 +143,7 @@ impl<O> Default for RequestRegistry<O> {
             unanswered_before: Duration::ZERO,
             silence_window: ENGINE_SILENCE_DEATH_TIMEOUT,
             prefill_tokens_per_sec: ENGINE_PREFILL_TOKENS_PER_SEC,
+            work_end: Instant::now(),
             busy_started: Arc::new(Notify::new()),
             prefill_pending: 0,
             every_step: 0,
@@ -180,12 +189,14 @@ impl<O: EngineOutput> RequestRegistry<O> {
             InFlight {
                 sender,
                 prompt_tokens,
-                registered: now,
                 started: false,
                 every_step,
             },
         );
         self.prefill_pending = self.prefill_pending.saturating_add(prompt_tokens);
+        // The prompt's prefill queues behind the work in hand.
+        let allowance = self.prefill_allowance(prompt_tokens);
+        self.work_end = deadline(self.work_end.max(now), allowance);
         if every_step {
             self.every_step += 1;
         }
@@ -203,57 +214,32 @@ impl<O: EngineOutput> RequestRegistry<O> {
 
     /// Drop a request's entry, settling its pending prefill and its place in
     /// the silence count. A request gone before its first output (aborted,
-    /// its stream dropped) was pending prefill for its whole stay: the
-    /// silence its prompt explained, its stay up to its prefill allowance,
-    /// is taken off the engine's unanswered work, so a client that gives up
-    /// on a long prompt mid-prefill does not turn the allowance it had into
-    /// a verdict (see [`Self::silence_bound`]). The last one ends the busy
-    /// period, whose in-flight time counts as unanswered until the engine's
-    /// next output.
+    /// its stream dropped) leaves its prefill allowance in the work in hand
+    /// until it passes: the engine may be mid-way through it, and a client
+    /// that gives up on a long prompt mid-prefill must not turn the
+    /// allowance it had into a verdict. The last one ends the busy period,
+    /// whose in-flight time past the work in hand counts as unexplained
+    /// until the engine's next output.
     fn retire(&mut self, request_id: &str) -> Option<InFlight<O>> {
         let mut entry = self.requests.remove(request_id)?;
         let now = Instant::now();
-        if !entry.started {
-            let allowance = self.prefill_allowance(entry.prompt_tokens);
-            self.explain_silence(entry.registered, allowance, now);
-        }
         self.prefilled(&mut entry);
         if entry.every_step {
             self.every_step = self.every_step.saturating_sub(1);
         }
         if self.requests.is_empty() {
             if let Some(since) = self.in_flight_since.take() {
-                self.unanswered_before += now.saturating_duration_since(since);
+                self.unanswered_before += now.saturating_duration_since(since.max(self.work_end));
             }
             self.idle_since = Some(now);
         }
         Some(entry)
     }
 
-    /// Take the stretch a prompt registered at `registered` explains, its
-    /// stay up to `allowance`, off the engine's unanswered work: the busy
-    /// period it is in starts later by that much, and never before the
-    /// prompt's registration or past `now`. A prompt's stay lies within its
-    /// busy period (the period cannot end while it is in flight), so the
-    /// periods before it (`unanswered_before`) are evidence it never
-    /// overlapped and stay as they are; and what an output or an earlier
-    /// withdrawal already moved the period's start past is not taken
-    /// twice, so two long prompts withdrawn together explain their one
-    /// shared stretch once.
-    fn explain_silence(&mut self, registered: Instant, allowance: Duration, now: Instant) {
-        let Some(since) = self.in_flight_since else {
-            return;
-        };
-        let end = registered
-            .checked_add(allowance)
-            .map_or(now, |until| until.min(now));
-        let taken = end.saturating_duration_since(since.max(registered));
-        self.in_flight_since = Some(since + taken);
-    }
-
     /// The engine answered (an output of any kind): nothing in flight is
     /// unanswered any more, and the busy period, if one is on, counts from
-    /// `now`.
+    /// `now`. The work in hand is read again once the batch is routed
+    /// ([`Self::work_resumes`]).
     fn output_seen(&mut self, now: Instant) {
         self.unanswered_before = Duration::ZERO;
         if self.in_flight_since.is_some() {
@@ -261,18 +247,29 @@ impl<O: EngineOutput> RequestRegistry<O> {
         }
     }
 
-    /// How long the engine has had requests in flight since its last output:
-    /// the busy period it is in and the ones that ended since, unless a whole
-    /// window idle separated them from it. The silence watchdog's measure of
-    /// the engine's silence: a request registered just before the watchdog's
-    /// tick has a whole window to answer, while a core that reads every
-    /// request and answers none is given up on even when every request is
-    /// abandoned before the window.
-    fn unanswered_for(&self, now: Instant) -> Duration {
+    /// The engine's prefill work in hand after an output, from `now`: the
+    /// allowance for the prompt still pending prefill once the batch that
+    /// came is routed (a prompt whose first token it carried is done; one
+    /// that got nothing yet may be next). Read after the routing, so the
+    /// figure is the pending set the batch left.
+    fn work_resumes(&mut self, now: Instant) {
+        self.work_end = deadline(now, self.prefill_allowance(self.prefill_pending));
+    }
+
+    /// How long the engine has had requests in flight, past its prefill work
+    /// in hand, since its last output: the busy period it is in from the
+    /// later of its start and the work's end, and the ones that ended since
+    /// (their time past the work in hand then), unless a whole window idle
+    /// separated them from it. The silence watchdog's measure of the
+    /// engine's silence: a request registered just before the watchdog's
+    /// tick has a whole window to answer past its prefill, while a core that
+    /// reads every request and answers none is given up on even when every
+    /// request is abandoned before the window.
+    fn unexplained_for(&self, now: Instant) -> Duration {
         self.unanswered_before
-            + self
-                .in_flight_since
-                .map_or(Duration::ZERO, |since| now.saturating_duration_since(since))
+            + self.in_flight_since.map_or(Duration::ZERO, |since| {
+                now.saturating_duration_since(since.max(self.work_end))
+            })
     }
 
     /// Deliver one output to its request stream; drop the entry when terminal.
@@ -335,27 +332,18 @@ impl<O: EngineOutput> RequestRegistry<O> {
         Duration::from_millis(u64::try_from(millis).unwrap_or(u64::MAX))
     }
 
-    /// The silence watchdog's bound now: the window, plus the time the
-    /// prompt tokens pending prefill may take at the allowed rate. A wire
-    /// that carries token batches only says nothing through a prefill, so a
-    /// batch of long prompts is silent for as long as their prefill takes,
-    /// and that is no fixed window. The allowance grows with the prompt in
-    /// hand and goes with it: an engine with nothing pending is given up on
-    /// at the window.
-    fn silence_bound(&self) -> Duration {
-        self.silence_window
-            .saturating_add(self.prefill_allowance(self.prefill_pending))
-    }
-
-    /// When the silence watchdog checks next: at the bound, counted over the
-    /// engine's unanswered work, and within a window at most, so a bound
-    /// that shrinks meanwhile (a long prompt withdrawn, its stay past its
-    /// allowance) is re-read within a window of the change.
+    /// When the silence watchdog checks next: when the unexplained silence
+    /// reaches the window, counted from the latest of now, the busy period's
+    /// start and the end of the prefill work in hand, and within a window at
+    /// most, so the figures are re-read at least once a window.
     fn next_tick(&self, now: Instant) -> Instant {
         let left = self
-            .silence_bound()
-            .saturating_sub(self.unanswered_for(now));
-        now + left.min(self.silence_window)
+            .silence_window
+            .saturating_sub(self.unexplained_for(now));
+        let from = self
+            .in_flight_since
+            .map_or(now, |since| now.max(since).max(self.work_end));
+        deadline(from, left).min(deadline(now, self.silence_window))
     }
 
     /// In-flight requests the engine reports on every step it decodes.
@@ -1183,21 +1171,21 @@ impl<P: EngineProtocol> Client<P> {
     }
 
     /// Bound how long the engine may have requests in flight, in total since
-    /// its last output, before it is treated as dead
-    /// ([`ENGINE_SILENCE_DEATH_TIMEOUT`] by default), with nothing pending
-    /// prefill: the prompt tokens pending prefill extend the bound at the
-    /// rate [`Self::set_prefill_tokens_per_sec`] allows.
+    /// its last output and past the prefill allowance for the prompt it was
+    /// handed (the rate [`Self::set_prefill_tokens_per_sec`] allows), before
+    /// it is treated as dead ([`ENGINE_SILENCE_DEATH_TIMEOUT`] by default).
     pub fn set_silence_death_timeout(&self, timeout: Duration) {
         self.inner.registry.lock().silence_window = timeout;
     }
 
     /// The prefill rate the silence watchdog allows the engine
-    /// ([`ENGINE_PREFILL_TOKENS_PER_SEC`] by default): the prompt tokens of
-    /// the in-flight requests without a first output yet
-    /// ([`Self::prefill_pending_tokens`]) extend the silence bound by the
-    /// time they take at this rate, so a batch of long prompts on a wire that
-    /// says nothing through a prefill is not read as a dead engine. Zero
-    /// allows nothing: the bound is the silence window alone.
+    /// ([`ENGINE_PREFILL_TOKENS_PER_SEC`] by default): the prompt tokens the
+    /// engine is handed queue up as prefill work in hand at this rate, and
+    /// only its silence past that work counts toward the window, so a batch
+    /// of long prompts on a wire that says nothing through a prefill is not
+    /// read as a dead engine. A prompt withdrawn before its first output
+    /// leaves its allowance in hand until it passes. Zero allows nothing:
+    /// the bound is the silence window alone.
     pub fn set_prefill_tokens_per_sec(&self, tokens_per_sec: u64) {
         self.inner.registry.lock().prefill_tokens_per_sec = tokens_per_sec;
     }
@@ -1471,16 +1459,29 @@ const ENGINE_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 /// Generous so a slow first token never trips it, while still bounding an
 /// otherwise infinite hang.
 ///
-/// The window is not the whole bound: the prompt tokens pending prefill
-/// extend it at [`ENGINE_PREFILL_TOKENS_PER_SEC`]
-/// ([`Client::set_prefill_tokens_per_sec`]). A wire that reports every
-/// scheduler step is never silent through a prefill; one that carries token
-/// batches only says nothing until a prompt's first token, and a batch of
-/// million-token prompts is silent for as long as their prefill takes, which
-/// no fixed window covers. Both figures are per client
-/// ([`Client::set_silence_death_timeout`]); neither removes the watchdog:
-/// without it a killed engine hangs its requests forever.
+/// The window is counted past the engine's prefill work in hand: the prompt
+/// tokens it is handed queue up as work at [`ENGINE_PREFILL_TOKENS_PER_SEC`]
+/// ([`Client::set_prefill_tokens_per_sec`]), and only the silence past that
+/// work counts. A wire that reports every scheduler step is never silent
+/// through a prefill; one that carries token batches only says nothing until
+/// a prompt's first token, and a batch of million-token prompts is silent for
+/// as long as their prefill takes, which no fixed window covers. Both figures
+/// are per client ([`Client::set_silence_death_timeout`]); neither removes
+/// the watchdog: without it a killed engine hangs its requests forever.
 pub const ENGINE_SILENCE_DEATH_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// `at + after`, or an instant that never comes when the sum does not fit
+/// (a window or an allowance of thousands of years means "no bound", not a
+/// panic in the dispatcher).
+fn deadline(at: Instant, after: Duration) -> Instant {
+    at.checked_add(after).unwrap_or_else(far_future)
+}
+
+/// Thirty years out: past any deployment, within what every platform's
+/// `Instant` holds.
+fn far_future() -> Instant {
+    Instant::now() + Duration::from_secs(30 * 365 * 24 * 60 * 60)
+}
 
 /// The prefill rate the silence watchdog allows the engine for the prompt
 /// tokens pending prefill, by default: a bound on how slowly a healthy engine
@@ -1547,11 +1548,11 @@ async fn run_dispatcher<P: EngineProtocol>(
     loop {
         tokio::select! {
             () = busy_started.notified() => {
-                // A busy period began. The engine has what is left of a bound
-                // of unanswered work to answer in, not a whole one: a tick that
-                // landed in the gap before this period waited a whole window,
-                // and the sum of the periods before it must not be waited out
-                // again.
+                // A busy period began. The engine has what is left of a window
+                // of unexplained silence to answer in, past its prefill work in
+                // hand, not a whole one: a tick that landed in the gap before
+                // this period waited a whole window, and the sum of the periods
+                // before it must not be waited out again.
                 let now = Instant::now();
                 let next = inner.registry.lock().next_tick(now);
                 watchdog.as_mut().reset(next);
@@ -1594,7 +1595,13 @@ async fn run_dispatcher<P: EngineProtocol>(
                             registry.route(output);
                         }
                         registry.remove_all(&finished);
+                        // The work in hand is what the batch left pending;
+                        // the watchdog counts from its end.
+                        let now = Instant::now();
+                        registry.work_resumes(now);
+                        let next = registry.next_tick(now);
                         drop(registry);
+                        watchdog.as_mut().reset(next);
                         inner.release(batch.engine_index, &finished);
                     }
                     Some(Err(error)) => {
@@ -1649,17 +1656,16 @@ async fn run_dispatcher<P: EngineProtocol>(
                     watchdog.as_mut().reset(now + window);
                     continue;
                 }
-                // The engine's unanswered work: its in-flight time since its
-                // last output, over the busy periods since. Short of the bound
-                // (the window, plus the allowance for the prompt pending
-                // prefill now) it is a request still in its first step (one
-                // registered just before this tick, say) or a prefill in
-                // progress; a whole bound of it is a dead engine, however many
-                // requests it was spread over and whether or not one is in
-                // flight at this tick.
-                let unanswered = registry.unanswered_for(now);
-                let bound = registry.silence_bound();
-                if unanswered < bound {
+                // The engine's unexplained silence: its in-flight time since
+                // its last output, past the prefill work it was handed, over
+                // the busy periods since. Short of a window it is a request
+                // still in its first step (one registered just before this
+                // tick, say) or a prefill still within its allowance; a whole
+                // window of it is a dead engine, however many requests it was
+                // spread over and whether or not one is in flight at this
+                // tick.
+                let unexplained = registry.unexplained_for(now);
+                if unexplained < window {
                     let next = registry.next_tick(now);
                     drop(registry);
                     watchdog.as_mut().reset(next);
@@ -1668,9 +1674,9 @@ async fn run_dispatcher<P: EngineProtocol>(
                 inner.routing.lock().inflight.clear();
                 warn!(
                     prefill_pending_tokens = registry.prefill_pending_tokens(),
-                    "no engine output through {unanswered:?} of in-flight requests \
-                     (the bound: {window:?}, plus the prefill allowance for the prompt \
-                     pending; {bound:?} now); treating engine as dead"
+                    "no engine output through {unexplained:?} of in-flight requests past \
+                     the prefill allowance for the prompt it was handed (the window: \
+                     {window:?}); treating engine as dead"
                 );
                 registry.fail_all(Arc::new(Error::EngineCoreDead));
                 return;
@@ -4753,9 +4759,9 @@ mod tests {
     }
 
     /// A long prompt withdrawn mid-prefill (its client gave up on it) leaves
-    /// no silence to answer for: its stay, up to its allowance, is what the
-    /// engine's silence was spent on, so the next request is owed a whole
-    /// window, not given up on at its dispatch.
+    /// its allowance in hand until it passes: the engine may be mid-way
+    /// through it, so the next request is not given up on at its dispatch
+    /// for the silence the prompt explains.
     #[tokio::test]
     async fn a_long_prompt_withdrawn_mid_prefill_leaves_no_silence_to_answer_for() {
         let (client, mut engine, _ns) = connect().await;
@@ -4793,36 +4799,39 @@ mod tests {
             .finished());
     }
 
-    /// Two long prompts withdrawn together explain their one shared stretch
-    /// of silence once, and only their own: the unanswered work before them
-    /// (short requests a hung engine read and never answered) stands, so the
-    /// next request is given up on for what is left of the window, not
-    /// handed a whole one.
+    /// Prompts withdrawn before their allowance passes keep explaining the
+    /// silence until it does (the engine may be mid-way through them), and
+    /// explain nothing before them: the unanswered work of a short request
+    /// the engine read and never answered stands, so once the prompts'
+    /// allowance has passed the next request is given up on for what that
+    /// evidence left of the window, not a whole window later.
     #[tokio::test]
-    async fn prompts_withdrawn_together_explain_their_shared_stretch_once_and_nothing_before_it() {
+    async fn prompts_withdrawn_before_their_allowance_passes_explain_the_silence_until_it_does() {
         let (client, mut engine, _ns) = connect().await;
         let window = Duration::from_secs(1);
         client.set_silence_death_timeout(window);
         client.set_prefill_tokens_per_sec(10_000);
         // Evidence first: a short request the engine reads and never answers,
-        // abandoned after 600 ms.
+        // abandoned after 700 ms.
         let stream = client.submit(request_for("req-short", 0)).await.unwrap();
         engine.recv().await.unwrap();
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        tokio::time::sleep(Duration::from_millis(700)).await;
         drop(stream);
         match engine.recv().await.unwrap() {
             EngineInbound::Abort(ids) => assert_eq!(ids, ["req-short"]),
             other => panic!("expected the abort, got {other:?}"),
         }
-        // Two 20k-token prompts (two seconds of allowance each), withdrawn
-        // together after 300 ms.
+        // Two 10k-token prompts, a second of allowance each and two seconds
+        // in hand together, withdrawn together after 300 ms.
+        let handed = std::time::Instant::now();
+        let allowance = Duration::from_secs(2);
         let first = client
-            .submit(long_request("req-long-1", 20_000))
+            .submit(long_request("req-long-1", 10_000))
             .await
             .unwrap();
         engine.recv().await.unwrap();
         let second = client
-            .submit(long_request("req-long-2", 20_000))
+            .submit(long_request("req-long-2", 10_000))
             .await
             .unwrap();
         engine.recv().await.unwrap();
@@ -4835,27 +4844,32 @@ mod tests {
                 other => panic!("expected an abort, got {other:?}"),
             }
         }
-        // The 600 ms of evidence stand: the next request has 400 ms, not a
-        // whole window.
-        let started = std::time::Instant::now();
+        // The next request is not given up on at the window: the prompts'
+        // allowance still explains the silence. Once it has passed, the
+        // 700 ms of evidence stand, and the verdict comes 300 ms later, not
+        // a whole window later.
         let mut stream = client.submit(request_for("req-next", 0)).await.unwrap();
         engine.recv().await.unwrap();
         let error = stream
             .next()
             .await
             .expect("an item")
-            .expect_err("the unanswered work before the prompts stands");
+            .expect_err("a silent engine once the allowance in hand has passed");
         assert!(is_engine_dead(&error), "{error:?}");
-        let elapsed = started.elapsed();
+        let elapsed = handed.elapsed();
         assert!(
-            elapsed < window,
-            "given up on for what was left of the window after the evidence, not a whole one: {elapsed:?}"
+            elapsed >= allowance,
+            "not before the withdrawn prompts' allowance passed: {elapsed:?}"
+        );
+        assert!(
+            elapsed < allowance + window,
+            "the unanswered work before the prompts stood: {elapsed:?}"
         );
         assert!(!client.is_alive());
     }
 
-    /// The default allowance: 500 s per million prompt tokens pending, none
-    /// at a rate of zero; the bound with nothing pending is the window.
+    /// The default allowance: 500 s per million prompt tokens, none at a
+    /// rate of zero; prompts queue their allowance behind the work in hand.
     #[test]
     fn the_default_prefill_allowance_is_500_s_per_million_tokens() {
         let mut registry = RequestRegistry::<<VllmProtocol as EngineProtocol>::Output>::default();
@@ -4864,7 +4878,14 @@ mod tests {
             Duration::from_secs(500)
         );
         assert_eq!(registry.prefill_allowance(0), Duration::ZERO);
-        assert_eq!(registry.silence_bound(), ENGINE_SILENCE_DEATH_TIMEOUT);
+        let before = Instant::now();
+        let _first = registry.register("req-1".to_string(), 1_000_000, true);
+        let _second = registry.register("req-2".to_string(), 1_000_000, true);
+        let in_hand = registry.work_end.saturating_duration_since(before);
+        assert!(
+            in_hand >= Duration::from_secs(1_000) && in_hand < Duration::from_secs(1_001),
+            "two million tokens of prefill in hand: {in_hand:?}"
+        );
         registry.prefill_tokens_per_sec = 0;
         assert_eq!(registry.prefill_allowance(1_000_000), Duration::ZERO);
     }
