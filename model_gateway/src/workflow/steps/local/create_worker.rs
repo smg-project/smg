@@ -284,6 +284,9 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     .resilience(resolved_resilience.clone())
                     .health_config(health_config.clone())
                     .health_endpoint(health_endpoint)
+                    .zmq_startup_timeout(Duration::from_secs(
+                        app_context.router_config.zmq_startup_timeout_secs,
+                    ))
                     .overload_defaults(overload_defaults)
                     .labels(labels_for_rank(&labels, dp, &config.labels));
 

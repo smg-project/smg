@@ -277,6 +277,11 @@ impl RouterConfigBuilder {
         self
     }
 
+    pub fn zmq_startup_timeout_secs(mut self, timeout: u64) -> Self {
+        self.config.zmq_startup_timeout_secs = timeout;
+        self
+    }
+
     pub fn worker_startup_delay_secs(mut self, delay: u64) -> Self {
         self.config.worker_startup_delay_secs = delay;
         self

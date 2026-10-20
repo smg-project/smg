@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use openai_protocol::{
@@ -21,8 +21,8 @@ use super::{
     },
 };
 use crate::{
-    observability::metrics::Metrics, routers::grpc::backend_client::BackendClient,
-    worker::pd_pairing::PdPairing,
+    config::types::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS, observability::metrics::Metrics,
+    routers::grpc::backend_client::BackendClient, worker::pd_pairing::PdPairing,
 };
 
 /// Builder for creating BasicWorker instances with fluent API.
@@ -35,6 +35,9 @@ pub struct BasicWorkerBuilder {
     /// If not set, falls back to `HealthCheckConfig::default()`.
     health_config: Option<HealthCheckConfig>,
     health_endpoint: String,
+    /// The per-stage silence bound of a ZMQ engine's startup handshake; the
+    /// router config's default when not set.
+    zmq_startup_timeout: Option<Duration>,
     circuit_breaker_config: CircuitBreakerConfig,
     backend_client: Option<BackendClient>,
     /// Pre-built worker-directed HTTP client (if not set, a default is created).
@@ -70,6 +73,7 @@ impl BasicWorkerBuilder {
             spec,
             health_config: None,
             health_endpoint: "/health".to_string(),
+            zmq_startup_timeout: None,
             circuit_breaker_config: CircuitBreakerConfig::default(),
             backend_client: None,
             http_client: None,
@@ -155,6 +159,14 @@ impl BasicWorkerBuilder {
     /// Set health check endpoint path (internal-only, from router config).
     pub fn health_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.health_endpoint = endpoint.into();
+        self
+    }
+
+    /// Set the longest any one stage of a ZMQ engine's startup handshake may
+    /// stay silent (internal-only, from router config): it alone covers the
+    /// engine's init between its HELLO and its READY.
+    pub fn zmq_startup_timeout(mut self, timeout: Duration) -> Self {
+        self.zmq_startup_timeout = Some(timeout);
         self
     }
 
@@ -308,6 +320,9 @@ impl BasicWorkerBuilder {
             spec: Arc::new(self.spec),
             health_config,
             health_endpoint: self.health_endpoint,
+            zmq_startup_timeout: self
+                .zmq_startup_timeout
+                .unwrap_or(Duration::from_secs(DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS)),
             http2: self.http2,
         };
 

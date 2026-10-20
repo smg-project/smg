@@ -1347,6 +1347,14 @@ impl ConfigValidator {
             ));
         }
 
+        if config.zmq_startup_timeout_secs == 0 {
+            return Err(ConfigError::invalid_value(
+                "zmq_startup_timeout_secs",
+                config.zmq_startup_timeout_secs,
+                "Must be > 0",
+            ));
+        }
+
         if config.load_monitor_interval_secs == 0 {
             return Err(ConfigError::invalid_value(
                 "load_monitor_interval_secs",

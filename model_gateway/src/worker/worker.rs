@@ -113,6 +113,7 @@ async fn connect_zmq_backend(
     runtime: RuntimeType,
     handshake_override: Option<String>,
     engine_count: usize,
+    startup: Duration,
 ) -> WorkerResult<Arc<BackendClient>> {
     zmq_client::connect_for_worker(
         &base_url,
@@ -120,6 +121,7 @@ async fn connect_zmq_backend(
         runtime,
         handshake_override.as_deref(),
         engine_count,
+        startup,
     )
     .await
     .map(|client| Arc::new(BackendClient::Zmq(client)))
@@ -191,8 +193,8 @@ fn require_backend_client(
 
 /// EngineCore exposes no admin RPCs over ZMQ, so these ops can never succeed for
 /// a ZMQ worker. Reject them up front rather than dispatching to client
-/// acquisition, which would otherwise drive the (up to 10-minute) lazy handshake
-/// only to return `unimplemented`.
+/// acquisition, which would otherwise drive the lazy handshake (as long as a
+/// model load) only to return `unimplemented`.
 fn zmq_admin_unsupported(url: &str, operation: &str) -> WorkerError {
     WorkerError::OperationFailed {
         url: url.to_string(),
@@ -1213,6 +1215,10 @@ pub struct WorkerMetadata {
     pub health_config: HealthCheckConfig,
     /// Health check endpoint path (internal-only, from router config).
     pub health_endpoint: String,
+    /// The longest any one stage of a ZMQ engine's startup handshake may stay
+    /// silent (from router config); it alone covers the engine's init between
+    /// its HELLO and its READY, which the gateway sees nothing of otherwise.
+    pub zmq_startup_timeout: Duration,
     /// Effective absolute overload thresholds (per signal: `spec.overload`
     /// override, else gateway default). Resolved once at registration; the
     /// load monitor's ingestion predicate scores every report against these,
@@ -1518,6 +1524,7 @@ impl BasicWorker {
         let runtime = self.metadata.spec.runtime_type;
         let handshake_override = self.metadata.spec.zmq_handshake_address.clone();
         let engine_count = self.metadata.zmq_engine_count();
+        let startup = self.metadata.zmq_startup_timeout;
         // Capture the readiness signal and the revision at hand-off. The
         // manager only promotes if this revision still matches, so a
         // same-URL replacement racing the handshake is discarded.
@@ -1538,6 +1545,7 @@ impl BasicWorker {
                         runtime,
                         handshake_override,
                         engine_count,
+                        startup,
                     )
                 })
                 .await
@@ -3441,6 +3449,7 @@ mod tests {
             spec: Arc::new(WorkerSpec::new("http://test:8080")),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
+            zmq_startup_timeout: Duration::from_secs(600),
             overload: OverloadThresholds::default(),
             http2: false,
         };
@@ -3467,6 +3476,7 @@ mod tests {
             spec: Arc::new(spec),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
+            zmq_startup_timeout: Duration::from_secs(600),
             overload: OverloadThresholds::default(),
             http2: false,
         };
