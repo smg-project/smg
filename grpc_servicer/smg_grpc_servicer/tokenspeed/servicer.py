@@ -57,7 +57,12 @@ from smg_grpc_servicer.tokenspeed.loads import (
 )
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
 
-from ..constrained_decoding import grammar_start_labels, tokenspeed_constrained_decoding_start
+from ..constrained_decoding import (
+    grammar_backend_entry,
+    grammar_start_labels,
+    tokenspeed_constrained_decoding_start,
+    tokenspeed_grammar_backend,
+)
 from ..pd_pairing import pairing_protocol_from_env
 
 if TYPE_CHECKING:
@@ -676,6 +681,9 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
         server_args_dict.update(
             grammar_start_labels(self.server_args, tokenspeed_constrained_decoding_start())
         )
+        # The grammar backend the scheduler runs, resolved, under the same key
+        # the Rust servicer reads.
+        grammar_backend_entry(server_args_dict, tokenspeed_grammar_backend(self.server_args))
 
         # Control endpoint and capabilities for a fronting gateway (SMG reads
         # the `rl.*` keys straight into worker labels). Older engines have no

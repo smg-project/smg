@@ -73,6 +73,7 @@ pub(super) async fn connect_engine(
     {
         Ok(client) => {
             client.adopt_tokenizer_eos(state.tokenizer());
+            client.set_structured_outputs_support(super::structured_outputs_support(&state.model));
             info!(
                 handshake = %handshake_address,
                 engines = engine_count,

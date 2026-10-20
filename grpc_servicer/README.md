@@ -399,6 +399,16 @@ grammar compile instead of falling back. Pin `guidance` (or `xgrammar`)
 explicitly when that matters; the engine keeps the backend of its first
 structured request either way, as it does behind vLLM's own frontend.
 
+A constraint the engine's backend cannot enforce is refused before the engine
+with INVALID_ARGUMENT (a 400 at a router), the same way on every Rust servicer:
+a JSON-schema feature xgrammar drops (`multipleOf`, `uniqueItems`, a string
+`format` it lacks, ...) wherever xgrammar is the backend, whether the schema is
+a `response_format`'s or inside a forced tool call's structural tag; every kind
+of constraint on an engine with no grammar backend; a kind the backend does not
+compile. The vLLM servicer reads the backend off `--structured-outputs-config`,
+the SGLang and TokenSpeed servicers off their engine's `--grammar-backend` (see
+their sections); a backend the servicer does not know is left to the engine.
+
 Both vLLM servicers also advertise the engine's reasoning parser
 (`engine_reasoning_parser`; `reasoning_parser` is the per-model parser override
 a router reads off a worker's labels) and where its grammar starts on a prompt
@@ -572,6 +582,16 @@ structural tag that lets the thought precede the JSON). A router shapes a
 forced tool call's grammar by it as the engine's own server would: the thought
 and then the calls, so the call is not forced into the thought.
 
+They also carry the grammar backend the engine runs as the `grammar_backend`
+key, resolved: `--grammar-backend` as given (`xgrammar` or `none`), else the
+checkpoint's default once the engine has read it (`none` for most checkpoints;
+the key is absent until it has). The Rust servicer refuses a constraint that
+backend cannot enforce before the scheduler, as the vLLM servicer does: every
+kind under `none` (the scheduler itself would admit the request and abort it
+with a 400 that its slim wire reports as a bare `abort`, an empty answer to the
+caller), and a JSON-schema feature xgrammar drops under `xgrammar`; with no key
+it judges nothing ahead of the engine.
+
 Both TokenSpeed servicers also report the engine's constrained-decoding policy,
 when it declares one, as `GetServerInfo.constrained_decoding` (a field of its
 own, not a `server_args` key): `always` for a model that takes a grammar on
@@ -651,6 +671,18 @@ reasoning, which a router does on a thinking prompt), `first_token` without
 one. A router shapes a forced tool call's grammar by it as the engine's own
 server would: the bare calls behind the parser's gate, so the call is forced
 right there; the thought and then the calls from the first token.
+
+They also carry the grammar backend the scheduler runs as the `grammar_backend`
+key, resolved: `--grammar-backend` as given (`xgrammar`, `outlines`,
+`llguidance` or `none`), `xgrammar` when it was not given, and `none` under
+`--skip-tokenizer-init`, since the scheduler builds no grammar backend without
+its tokenizer. The Rust servicer refuses a constraint that backend cannot
+enforce before the scheduler, as the vLLM servicer does: every kind under
+`none` (the scheduler itself would admit the request and abort it with a 400),
+an EBNF grammar or a structural tag under `outlines`, which compiles JSON
+schemas and regular expressions only, and a JSON-schema feature xgrammar drops
+under `xgrammar`; a backend it does not know (a plugin of the scheduler's) is
+left to the engine.
 
 #### KV-event recovery
 

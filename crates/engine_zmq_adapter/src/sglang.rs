@@ -23,6 +23,7 @@ use tracing::warn;
 use crate::{
     fanout::fan_out_n,
     stream::{poll_mapped, MappedGenerateStream, StreamState},
+    structured_outputs::ConstraintRef,
 };
 
 /// Streaming generate output for one SGLang sub-request, mapping each
@@ -674,6 +675,19 @@ pub(crate) fn translate_sampling_sglang(sp: sglang_proto::SamplingParams) -> Sgl
         None => {}
     }
     params
+}
+
+/// The request's constraint as the shared refusal reads it
+/// ([`crate::structured_outputs::refuse_unenforceable_constraint`]): the
+/// proto `constraint` one-of by kind, with its text.
+pub(crate) fn constraint_ref(sp: &sglang_proto::SamplingParams) -> Option<ConstraintRef<'_>> {
+    use sglang_proto::sampling_params::Constraint;
+    Some(match sp.constraint.as_ref()? {
+        Constraint::JsonSchema(schema) => ConstraintRef::JsonSchema(schema),
+        Constraint::Regex(regex) => ConstraintRef::Regex(regex),
+        Constraint::EbnfGrammar(grammar) => ConstraintRef::Ebnf(grammar),
+        Constraint::StructuralTag(tag) => ConstraintRef::StructuralTag(tag),
+    })
 }
 
 /// The gRPC status for a request the scheduler aborted with an HTTP-style

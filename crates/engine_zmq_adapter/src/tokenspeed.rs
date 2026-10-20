@@ -22,6 +22,7 @@ use tracing::warn;
 use crate::{
     fanout::fan_out_n,
     stream::{poll_mapped, MappedGenerateStream, StreamState},
+    structured_outputs::ConstraintRef,
 };
 
 /// Streaming generate output for one TokenSpeed sub-request, mapping each
@@ -592,6 +593,19 @@ pub(crate) fn apply_tokenspeed_constraint(
         Some(Constraint::StructuralTag(tag)) => params.structural_tag = Some(tag),
         None => {}
     }
+}
+
+/// The request's constraint as the shared refusal reads it
+/// ([`crate::structured_outputs::refuse_unenforceable_constraint`]): the
+/// proto `constraint` one-of by kind, with its text.
+pub(crate) fn constraint_ref(sp: &tokenspeed_proto::SamplingParams) -> Option<ConstraintRef<'_>> {
+    use tokenspeed_proto::sampling_params::Constraint;
+    Some(match sp.constraint.as_ref()? {
+        Constraint::JsonSchema(schema) => ConstraintRef::JsonSchema(schema),
+        Constraint::Regex(regex) => ConstraintRef::Regex(regex),
+        Constraint::EbnfGrammar(grammar) => ConstraintRef::Ebnf(grammar),
+        Constraint::StructuralTag(tag) => ConstraintRef::StructuralTag(tag),
+    })
 }
 
 /// Normalize a TokenSpeed wire finish-reason string into the canonical set the

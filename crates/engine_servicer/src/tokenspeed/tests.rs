@@ -1438,3 +1438,158 @@ async fn every_rank_of_a_data_parallel_publisher_reaches_the_gateway() {
     drop(stream);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
+
+/// What the scheduler enforces of a structured request, as the launcher's
+/// `server_args` say: the grammar backend it resolved; nothing is judged
+/// when the launcher could not tell.
+#[test]
+fn structured_outputs_support_follows_the_launcher_args() {
+    use engine_zmq_adapter::{
+        StructuredOutputBackend,
+        StructuredOutputsBackendConfig::{Other, Pinned},
+        StructuredOutputsSupport,
+    };
+    let support = |server_args_json: &str| {
+        structured_outputs_support(&TokenSpeedModelInfo {
+            server_args_json: server_args_json.to_string(),
+            ..model_info()
+        })
+    };
+    assert_eq!(
+        support(r#"{"grammar_backend":"xgrammar"}"#),
+        Pinned(StructuredOutputBackend::Xgrammar).into()
+    );
+    assert_eq!(
+        support(r#"{"grammar_backend":"none"}"#),
+        StructuredOutputsSupport::DISABLED
+    );
+    // A launcher that wrote no backend could not tell (a checkpoint default
+    // not resolved yet, or an older launcher): nothing is judged here.
+    assert_eq!(support(r#"{"model":"org/model"}"#), Other.into());
+    assert_eq!(support(""), Other.into());
+    assert_eq!(support(r#"{"grammar_backend":"other"}"#), Other.into());
+}
+
+/// A constraint the scheduler's grammar backend cannot enforce is refused
+/// before the scheduler, as the caller's error, on this wire as on the
+/// others: every kind under `--grammar-backend none` (the scheduler would
+/// admit the request and abort it, which this wire reports as a bare
+/// `abort`, an empty answer), and a schema with a feature xgrammar drops;
+/// what the backend compiles reaches the scheduler with its constraint, an
+/// unconstrained request is served as before, and nothing is judged when
+/// the launcher wrote no backend.
+#[tokio::test]
+async fn a_constraint_the_grammar_backend_cannot_enforce_is_refused_before_the_scheduler() {
+    use ts::sampling_params::Constraint;
+
+    let with_backend = |server_args_json: &str| TokenSpeedModelInfo {
+        server_args_json: server_args_json.to_string(),
+        ..model_info()
+    };
+    let constrained = |id: &str, constraint: Constraint| {
+        let mut request = generate_request(id, false, Vec::new());
+        request.sampling_params.as_mut().unwrap().constraint = Some(constraint);
+        request
+    };
+    const SCHEMA: &str = r#"{"type":"object","properties":{"city":{"type":"string"}}}"#;
+    const MULTIPLE_OF: &str = r#"{"type":"integer","multipleOf":3}"#;
+    let schema = || Constraint::JsonSchema(SCHEMA.to_string());
+    let regex = || Constraint::Regex("[0-9]+".to_string());
+
+    // No backend: every kind is refused up front; nothing reaches the
+    // scheduler but the unconstrained request.
+    {
+        let mut h = harness(with_backend(r#"{"grammar_backend":"none"}"#), None).await;
+        for (id, constraint) in [
+            ("n1", schema()),
+            ("n2", regex()),
+            ("n3", Constraint::EbnfGrammar("root ::= \"a\"".to_string())),
+            (
+                "n4",
+                Constraint::StructuralTag(r#"{"format":{}}"#.to_string()),
+            ),
+        ] {
+            let status = h
+                .client
+                .generate(constrained(id, constraint))
+                .await
+                .expect_err("refused");
+            assert_eq!(status.code(), Code::InvalidArgument, "{id}");
+            assert!(
+                status
+                    .message()
+                    .contains("grammar backend disabled (`none`)"),
+                "{id}: {}",
+                status.message()
+            );
+        }
+        assert_scheduler_idle(&mut h.engine_in).await;
+        let _stream = h
+            .client
+            .generate(generate_request("n5", false, Vec::new()))
+            .await
+            .expect("generate")
+            .into_inner();
+        assert_eq!(recv_add(&mut h.engine_in).await.rid, "n5");
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+
+    // xgrammar: a schema and a regex reach the scheduler with their
+    // constraint; a schema with a feature xgrammar drops is refused.
+    {
+        let mut h = harness(with_backend(r#"{"grammar_backend":"xgrammar"}"#), None).await;
+        let _schema_stream = h
+            .client
+            .generate(constrained("x1", schema()))
+            .await
+            .expect("generate")
+            .into_inner();
+        let sent = recv_add(&mut h.engine_in).await;
+        assert_eq!(sent.sampling_params.json_schema.as_deref(), Some(SCHEMA));
+        let _regex_stream = h
+            .client
+            .generate(constrained("x2", regex()))
+            .await
+            .expect("generate")
+            .into_inner();
+        let sent = recv_add(&mut h.engine_in).await;
+        assert_eq!(sent.sampling_params.regex.as_deref(), Some("[0-9]+"));
+        let status = h
+            .client
+            .generate(constrained(
+                "x3",
+                Constraint::JsonSchema(MULTIPLE_OF.to_string()),
+            ))
+            .await
+            .expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status.message().contains("`multipleOf` at its root")
+                && status.message().contains("not supported by xgrammar"),
+            "{}",
+            status.message()
+        );
+        assert_scheduler_idle(&mut h.engine_in).await;
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+
+    // No backend written: nothing is judged ahead of the engine.
+    {
+        let mut h = harness(with_backend(r#"{"model":"org/model"}"#), None).await;
+        let _stream = h
+            .client
+            .generate(constrained(
+                "u1",
+                Constraint::JsonSchema(MULTIPLE_OF.to_string()),
+            ))
+            .await
+            .expect("generate")
+            .into_inner();
+        let sent = recv_add(&mut h.engine_in).await;
+        assert_eq!(
+            sent.sampling_params.json_schema.as_deref(),
+            Some(MULTIPLE_OF)
+        );
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+}

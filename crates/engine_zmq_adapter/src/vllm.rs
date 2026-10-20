@@ -16,11 +16,7 @@ use engine_zmq_client::{
         output::{EngineCoreFinishReason, EngineCoreOutput, SpecDecodeMetrics, StopReason},
         request::{EngineCoreRequest, MmFeaturesPayload},
         sampling::EngineCoreSamplingParams,
-        structured_outputs::{
-            xgrammar_unsupported_feature_in_schema_text,
-            xgrammar_unsupported_feature_in_structural_tag, StructuredOutputBackend,
-            StructuredOutputsParams,
-        },
+        structured_outputs::{StructuredOutputBackend, StructuredOutputsParams},
     },
 };
 use futures::Stream;
@@ -31,6 +27,10 @@ use crate::{
     fanout::fan_out_n,
     multimodal,
     stream::{poll_mapped, MappedGenerateStream, StreamState},
+    structured_outputs::{
+        refuse_unenforceable_constraint, ConstraintRef, StructuredOutputsBackendConfig,
+        StructuredOutputsSupport,
+    },
 };
 
 /// Ranked candidates to emit per position for a requested logprob count:
@@ -467,37 +467,6 @@ pub(crate) fn translate_request(
     )
 }
 
-/// The engine's `--structured-outputs-config.backend`, as it bears on the
-/// `_backend` this translation stamps on structured requests. The engine
-/// keeps the backend of its first structured request for its life, so the
-/// stamp is a per-engine pin, not a per-request choice: under `auto` (vLLM's
-/// default, and the state of a connection nothing configured) every
-/// constraint carries xgrammar, the one backend that compiles a structural
-/// tag in the triggered-tags format; vLLM's own frontend would send a JSON
-/// schema with features xgrammar lacks to guidance instead, which on a
-/// single-backend engine pins guidance when it comes first and fails every
-/// structural tag after it; such a schema is refused here before it reaches
-/// the engine ([`refuse_schema_xgrammar_cannot_enforce`]), as vLLM's frontend
-/// refuses it under `backend=xgrammar`, because xgrammar would compile it with
-/// the unsupported keywords dropped and answer off the schema. An explicit
-/// backend is pinned on every request as configured.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum StructuredOutputsBackendConfig {
-    #[default]
-    Auto,
-    Pinned(StructuredOutputBackend),
-}
-
-impl StructuredOutputsBackendConfig {
-    /// The backend every structured request carries under this config.
-    pub fn backend(self) -> StructuredOutputBackend {
-        match self {
-            Self::Auto => StructuredOutputBackend::Xgrammar,
-            Self::Pinned(backend) => backend,
-        }
-    }
-}
-
 /// [`StructuredOutputsBackendConfig`] from the configured backend name.
 /// vLLM accepts `xgrammar:...`/`guidance:...` option spellings and reads the
 /// backend off the prefix; an unknown name is `auto`.
@@ -680,7 +649,7 @@ pub(crate) fn translate_request_with_backend(
     structured_backend: StructuredOutputsBackendConfig,
 ) -> Result<EngineCoreRequest, String> {
     let media = translate_media(&mut req, model_dtype)?;
-    translate_request_with_media(req, media, max_model_len, eos, structured_backend)
+    translate_request_with_media(req, media, max_model_len, eos, structured_backend.into())
 }
 
 /// Translate a request whose media was already translated
@@ -690,7 +659,7 @@ pub(crate) fn translate_request_with_media(
     media: TranslatedMedia,
     max_model_len: u64,
     eos: &EosTokenIds,
-    structured_backend: StructuredOutputsBackendConfig,
+    support: StructuredOutputsSupport,
 ) -> Result<EngineCoreRequest, String> {
     // Connector params ride `SamplingParams.extra_args`, where vLLM's own
     // frontend puts them, so a request carrying them always gets params.
@@ -716,7 +685,7 @@ pub(crate) fn translate_request_with_media(
         u32::try_from(max_model_len.saturating_sub(prompt_len)).unwrap_or(u32::MAX);
     if let Some(sp) = req.sampling_params.as_ref() {
         validate_sampling(sp, sp.max_tokens.unwrap_or(default_max_tokens))?;
-        refuse_schema_xgrammar_cannot_enforce(sp, structured_backend)?;
+        refuse_unenforceable_constraint(constraint_ref(sp), support)?;
     }
     let sampling_params = match (req.sampling_params, kv_transfer_params.is_some()) {
         (None, false) => None,
@@ -725,7 +694,7 @@ pub(crate) fn translate_request_with_media(
             default_max_tokens,
             eos,
             kv_transfer_params,
-            structured_backend,
+            support.backend,
         )),
     };
     Ok(EngineCoreRequest {
@@ -918,85 +887,20 @@ pub(crate) fn validate_sampling(sp: &vllm::SamplingParams, max_tokens: u32) -> R
     Ok(())
 }
 
-/// vLLM's frontend refuses a JSON schema with features xgrammar does not
-/// compile when the backend is xgrammar (`validate_xgrammar_grammar`, a 400):
-/// xgrammar's converter drops those keywords and the engine answers off the
-/// schema with a 200. The same refusal here for every config that resolves to
-/// xgrammar, `auto` included, for a JSON-schema constraint and for the
-/// schemas a structural tag carries alike (its `json_schema` elements go
-/// through the same converter); a backend that enforces such a schema itself
-/// takes the constraint as is. A `JsonSchema` constraint is one schema
-/// whatever built it: a `response_format` schema, or the tool parameters of a
-/// forced tool call on a parser without structural tags. A `StructuralTag`
-/// carries the tool parameters of a constrained call (`tool_choice` required
-/// or a named function; on an always-constrained worker every turn's tag,
-/// `auto` included, so a tool list with one such schema is refused on every
-/// turn there), or a JSON answer's schema; vLLM's own frontend checks a
-/// structural tag only for compiling, so this refusal reaches the schemas
-/// inside tags, which that check does not. The message names the source, the
-/// keyword, where it stands and, in a tag, the tags around it by their
-/// `begin` (a call's opens with the tool's name).
-pub(crate) fn refuse_schema_xgrammar_cannot_enforce(
-    sp: &vllm::SamplingParams,
-    structured_backend: StructuredOutputsBackendConfig,
-) -> Result<(), String> {
+/// The request's constraint as the shared refusal reads it
+/// ([`refuse_unenforceable_constraint`]): the proto `constraint` one-of by
+/// kind, with its text. `json_object = false` is an opt-out, no constraint.
+pub(crate) fn constraint_ref(sp: &vllm::SamplingParams) -> Option<ConstraintRef<'_>> {
     use vllm::sampling_params::Constraint;
-    if structured_backend.backend() != StructuredOutputBackend::Xgrammar {
-        return Ok(());
+    match sp.constraint.as_ref()? {
+        Constraint::JsonSchema(schema) => Some(ConstraintRef::JsonSchema(schema)),
+        Constraint::Regex(regex) => Some(ConstraintRef::Regex(regex)),
+        Constraint::Grammar(grammar) => Some(ConstraintRef::Ebnf(grammar)),
+        Constraint::StructuralTag(tag) => Some(ConstraintRef::StructuralTag(tag)),
+        Constraint::JsonObject(true) => Some(ConstraintRef::JsonObject),
+        Constraint::JsonObject(false) => None,
+        Constraint::Choice(_) => Some(ConstraintRef::Choice),
     }
-    let (source, feature) = match sp.constraint.as_ref() {
-        Some(Constraint::JsonSchema(schema)) => (
-            "The JSON schema constraint (a response_format schema, or the tool parameters of a \
-             forced tool call)",
-            xgrammar_unsupported_feature_in_schema_text(schema),
-        ),
-        Some(Constraint::StructuralTag(tag)) => (
-            "The structural tag constraint (the tool parameters of a constrained tool call: \
-             `tool_choice` required, a named function, or every turn on an always-constrained \
-             worker; or a JSON answer's schema)",
-            xgrammar_unsupported_feature_in_structural_tag(tag),
-        ),
-        _ => return Ok(()),
-    };
-    let Some(feature) = feature else {
-        return Ok(());
-    };
-    let place = if feature.pointer.is_empty() {
-        "its root".to_string()
-    } else {
-        format!("`{}`", feature.pointer)
-    };
-    let around = match feature.openers.as_slice() {
-        [] => String::new(),
-        [one] => format!(" (inside the tag that begins `{}`)", printable(one)),
-        many => {
-            let begins: Vec<String> = many
-                .iter()
-                .map(|begin| format!("`{}`", printable(begin)))
-                .collect();
-            format!(" (inside the tags that begin {})", begins.join(" then "))
-        }
-    };
-    Err(format!(
-        "{source} uses `{}` at {place}{around}, a JSON-schema feature not supported by xgrammar, \
-         the structured-output backend this engine runs: xgrammar would drop it and answer off \
-         the schema",
-        feature.keyword
-    ))
-}
-
-/// `text` for an error message: its control characters (a tag's `begin`
-/// often ends in a newline) written as escapes, the rest as it is.
-fn printable(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for ch in text.chars() {
-        if ch.is_control() {
-            out.extend(ch.escape_default());
-        } else {
-            out.push(ch);
-        }
-    }
-    out
 }
 
 /// Map the proto `constraint` oneof onto typed structured-output params (the
