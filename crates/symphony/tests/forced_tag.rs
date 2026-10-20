@@ -1,7 +1,8 @@
 //! Every table that reads tool calls writes a structural tag for a forced or required call in
 //! every configuration a request and an engine present: `tool_choice` naming a function or
 //! `required`, parallel calls on or off, the prompt's thought closed or left open, the engine's
-//! grammar started where it does not say, after its reasoning parser or at the first token. A
+//! grammar started where it does not say, after its reasoning parser, at the first token, or on
+//! an engine of either kind (the engines a request may run on name different starts). A
 //! table that writes none leaves the request to the gateway's older path, a JSON-schema
 //! constraint whose output the table never reads, so the forced call comes back as raw text. The
 //! gaps known today are listed with their cause and checked both ways: a listed gap that closes
@@ -76,6 +77,7 @@ fn configurations() -> Vec<(String, Options, std::ops::Range<usize>)> {
                 GrammarStart::Unknown,
                 GrammarStart::AfterReasoning,
                 GrammarStart::FirstToken,
+                GrammarStart::Either,
             ] {
                 all.push((
                     format!("{ask}, {thought}, start {start:?}"),
