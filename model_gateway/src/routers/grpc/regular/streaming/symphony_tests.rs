@@ -428,16 +428,23 @@ async fn symphony_folds_a_whole_output_into_the_message() {
 #[tokio::test]
 async fn a_refused_block_released_as_the_answer_keeps_its_tokens_logprobs() {
     // The whole answer after the thought is a call written as Python inside the call tag: the
-    // reader releases the refused bytes as the content, and their tokens keep their logprobs,
-    // placed where the output wrote them, not where the released event stands.
+    // reader releases the block, from its opener, as the content, and its tokens keep their
+    // logprobs, placed where the output wrote them, not where the released event stands. Two
+    // closed blocks with the template's newline between them the same, over the one slice.
     let output = "plan</think><tool_call>get_stock_info(company=\"Apple\")</tool_call>";
     let (choice, reasoning_tokens) = fold_with(output, glm(), "<|assistant|><think>").await;
-    let released = "get_stock_info(company=\"Apple\")</tool_call>";
+    let released = "<tool_call>get_stock_info(company=\"Apple\")</tool_call>";
     assert_eq!(choice.message.content.as_deref(), Some(released));
     assert_eq!(choice.message.reasoning_content.as_deref(), Some("plan"));
     assert!(choice.message.tool_calls.is_none());
     assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
     assert_eq!(reasoning_tokens, 4);
+    assert_eq!(kept_logprob_tokens(&choice), released);
+    let output = "plan</think><tool_call>a(x=1)</tool_call>\n<tool_call>b(y=2)</tool_call>";
+    let (choice, _) = fold_with(output, glm(), "<|assistant|><think>").await;
+    let released = "<tool_call>a(x=1)</tool_call>\n<tool_call>b(y=2)</tool_call>";
+    assert_eq!(choice.message.content.as_deref(), Some(released));
+    assert!(choice.message.tool_calls.is_none());
     assert_eq!(kept_logprob_tokens(&choice), released);
 }
 
@@ -1120,16 +1127,16 @@ async fn a_stream_of_no_tokens_is_recorded_empty_too() {
 
 /// An output whose only answer is a call written as Python inside the block's markers, after
 /// a thought: the table refuses the block, so the stream would end with the reasoning deltas and
-/// a finish chunk alone. The reader releases the refused bytes as one content delta before the
-/// finish chunk, which stays last; no call delta is made of them; the output is counted as
-/// malformed under the reason, and its line says how many bytes went out.
+/// a finish chunk alone. The reader releases the block, from its opener, as one content delta
+/// before the finish chunk, which stays last; no call delta is made of it; the output is counted
+/// as malformed under the reason, and its line says how many bytes went out.
 #[tracing_test::traced_test]
 #[tokio::test]
 async fn a_stream_whose_only_answer_is_a_python_call_in_the_tag_carries_it_as_content_before_the_finish(
 ) {
     let spec = assigned(chat_spec(true), glm(), "<|assistant|><think>");
     let output = "plan</think><tool_call>get_stock_info(company=\"Apple\")</tool_call>";
-    let released = "get_stock_info(company=\"Apple\")</tool_call>";
+    let released = "<tool_call>get_stock_info(company=\"Apple\")</tool_call>";
     let ((result, events), scrape) = scraped(stream_events(
         vec![
             chunk(0, &output[..12]),
@@ -1177,5 +1184,64 @@ async fn a_stream_whose_only_answer_is_a_python_call_in_the_tag_carries_it_as_co
     assert!(logs_contain(
         "Symphony did not read the whole output as content, reasoning and calls"
     ));
+    assert!(logs_contain(&format!("released_bytes={}", released.len())));
+}
+
+/// Two closed blocks after the thought, with the template's newline between them, cut by the
+/// stream at the newline and inside the second opener: the one content delta before the finish
+/// chunk is the output's own slice from the first opener to the last refused byte, the newline
+/// and the second opener in their places; the finish chunk stays last, and the line counts the
+/// whole slice.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_stream_of_two_refused_blocks_carries_the_bytes_between_them_before_the_finish() {
+    let spec = assigned(chat_spec(true), glm(), "<|assistant|><think>");
+    let output = "plan</think><tool_call>a(x=1)</tool_call>\n<tool_call>b(y=2)</tool_call>";
+    let released = "<tool_call>a(x=1)</tool_call>\n<tool_call>b(y=2)</tool_call>";
+    let ((result, events), scrape) = scraped(stream_events(
+        vec![
+            chunk(0, &output[..12]),
+            chunk(0, &output[12..41]),
+            chunk(0, &output[41..42]),
+            chunk(0, &output[42..47]),
+            chunk(0, &output[47..]),
+            complete(0, "stop"),
+        ],
+        true,
+        spec,
+    ))
+    .await;
+    result.expect("the stream ends well");
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
+    assert_eq!(chat_text(&events, 0, "content"), released);
+    assert!(tool_call_deltas(&events).is_empty(), "{events:#?}");
+    let chunks: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["choices"][0].is_object())
+        .collect();
+    let content_at: Vec<usize> = chunks
+        .iter()
+        .enumerate()
+        .filter(|(_, chunk)| {
+            chunk["choices"][0]["delta"]["content"]
+                .as_str()
+                .is_some_and(|text| !text.is_empty())
+        })
+        .map(|(at, _)| at)
+        .collect();
+    let finish_at = chunks
+        .iter()
+        .position(|chunk| chunk["choices"][0]["finish_reason"].is_string())
+        .expect("a finish chunk");
+    assert_eq!(content_at, vec![finish_at - 1], "{events:#?}");
+    assert_eq!(finish_at, chunks.len() - 1, "{events:#?}");
+    assert_eq!(chunks[finish_at]["choices"][0]["finish_reason"], "stop");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"glm\"", "outcome=\"malformed\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
     assert!(logs_contain(&format!("released_bytes={}", released.len())));
 }
