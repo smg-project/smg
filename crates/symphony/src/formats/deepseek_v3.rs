@@ -38,7 +38,9 @@ pub const FENCE_OPEN: &str = "\n```json\n";
 /// the prompt's replay walks the call turn, and the R1 distills' template ends a turn with one
 /// call with neither `<｜tool▁calls▁end｜>` nor `<｜end▁of▁sentence｜>`; the walk goes on past the
 /// tool outputs in content, where the model's own `<think>`, or one the client prefilled, opens
-/// the thought.
+/// the thought. The tool outputs' close is a terminal too, a row from content to itself, so the
+/// outputs' text is not text the content stay has written: the answer after a tool result starts
+/// with nothing begun, and whitespace alone ahead of its thought or call is held, not shown.
 pub fn deepseek_v3() -> Format {
     Format::new("deepseek_v3")
         .terminal("think_open", "<think>")
@@ -48,6 +50,7 @@ pub fn deepseek_v3() -> Format {
         .terminal("call_open", "<｜tool▁call▁begin｜>function<｜tool▁sep｜>")
         .terminal("call_close", "```<｜tool▁call▁end｜>")
         .terminal("outputs_open", "<｜tool▁outputs▁begin｜>")
+        .terminal("outputs_close", "<｜tool▁outputs▁end｜>")
         .state("content", Emits::Content)
         .state("reasoning", Emits::Reasoning)
         .state("calls", Emits::Wrapper)
@@ -62,6 +65,7 @@ pub fn deepseek_v3() -> Format {
         .transition("call", "calls_close", "content")
         .transition("calls", "calls_close", "content")
         .transition("calls", "outputs_open", "content")
+        .transition("content", "outputs_close", "content")
         .calls(CallSyntax::NamedArguments {
             marker: FENCE_OPEN,
             between_calls: "\n",
@@ -494,6 +498,23 @@ mod tests {
         assert_eq!(reasoning(&events), "Warm.");
         assert_eq!(content(&events), "It is 18 degrees.");
         assert!(calls(&events).is_empty());
+        // The tool outputs' text is not text the content stay has written (their close is a row
+        // from content to itself): the answer starts with nothing begun, and whitespace alone
+        // ahead of its thought is held, not shown as content.
+        let events = run(one_call, &["\n<think>Warm.</think>It is 18 degrees."]);
+        assert_eq!(reasoning(&events), "Warm.");
+        assert_eq!(
+            content(&events),
+            "It is 18 degrees.",
+            "no whitespace-only content"
+        );
+        let events = run(prompt, &["\n\n<think>Warm.</think>It is 18 degrees."]);
+        assert_eq!(reasoning(&events), "Warm.");
+        assert_eq!(
+            content(&events),
+            "It is 18 degrees.",
+            "the lead is held after an ended block too"
+        );
         // A thought the client prefilled after the tool result (`continue_final_message`) is
         // read: the walk went past the tool outputs, and `<think>` opened the thought.
         let prefilled = format!("{one_call}<think>\nThe tool says");
@@ -630,6 +651,7 @@ mod tests {
                 "<｜tool▁call▁begin｜>function<｜tool▁sep｜>",
                 "```<｜tool▁call▁end｜>",
                 "<｜tool▁outputs▁begin｜>",
+                "<｜tool▁outputs▁end｜>",
             ])
         );
         // The call as the tag writes it, the fence's close right after the object (the template
