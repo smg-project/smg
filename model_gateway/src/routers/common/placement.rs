@@ -1058,6 +1058,10 @@ fn relaxed_pair(
     } else {
         Metrics::record_worker_liveness_fallback(STAGE_SELECTION);
     }
+    // Every confined side counts as a split selection, as under the policies.
+    for group in [prefill_group, decode_group].into_iter().flatten() {
+        Metrics::record_traffic_split_selection(model_id, group);
+    }
     debug!(
         branch,
         prefill = %prefill.url(),
@@ -1383,7 +1387,12 @@ pub(crate) fn select_pair(
             info.role = WorkerRole::Decode;
             let key = policies.effective_sticky_key(&info).map(|(key, _)| key);
             match side_arm(key, &decode, &|_: &dyn Worker| true, prefill_group) {
-                Ok(side) => side.confined,
+                Ok(side) => {
+                    if let Some(group) = side.confined {
+                        Metrics::record_traffic_split_selection(model_id, group);
+                    }
+                    side.confined
+                }
                 Err(Drained) => {
                     return Err(declined(WorkerRole::Decode, decode_policy.name()));
                 }
@@ -3369,6 +3378,38 @@ mod tests {
                 .all(|pair| pair.decode.url() == "grpc://ds:1"),
             "the drained decode canary took a fallback pair"
         );
+        // Partners whose groups all weigh 0: declined, not served from the
+        // drained build.
+        let registry = labelled_pd_registry(&[
+            ("grpc://p:1", WorkerType::Prefill, None),
+            ("grpc://dc:1", WorkerType::Decode, Some(("canary", "0"))),
+        ]);
+        lift_decodes(&registry);
+        let pairs = pairs_of(&registry, &policies);
+        match select_pair(
+            &registry,
+            &policies,
+            MODEL,
+            &pairs,
+            None,
+            true,
+            None,
+            PlacementInputs::default(),
+        ) {
+            Ok(pair) => panic!(
+                "a drained decode pool served {} / {}",
+                pair.prefill.url(),
+                pair.decode.url()
+            ),
+            Err(failure) => {
+                assert_eq!(failure.role, WorkerRole::Decode);
+                assert!(
+                    matches!(failure.verdict, PlacementFailure::PolicyDeclined(_)),
+                    "{:?}",
+                    failure.verdict
+                );
+            }
+        }
     }
 
     /// One prefill worker over the thresholds beside one under them, as the
