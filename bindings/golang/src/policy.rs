@@ -14,12 +14,14 @@ use std::{
         atomic::{AtomicU8, AtomicUsize, Ordering},
         Arc,
     },
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use llm_tokenizer::{create_tokenizer_from_file, traits::Tokenizer};
 use openai_protocol::worker::{HealthCheckConfig, WorkerSpec, WorkerStatus};
 use smg::{
+    config::types::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     policies::{
         BucketPolicy, CacheAwarePolicy, LoadBalancingPolicy, PowerOfTwoPolicy, RandomPolicy,
         RoundRobinPolicy, SelectWorkerInfo,
@@ -71,6 +73,9 @@ impl GrpcWorker {
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
             overload: OverloadThresholds::default(),
+            // The binding's workers speak gRPC and never run the ZMQ startup handshake:
+            // the bound is the router's default, and nothing reads it here.
+            zmq_startup_timeout: Duration::from_secs(DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS),
             http2: false,
         };
         Self {
