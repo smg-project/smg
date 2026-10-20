@@ -1522,6 +1522,7 @@ pub enum DiscoveryConfig {
     Kubernetes(KubernetesDiscoveryConfig),
     File(FileDiscoveryConfig),
     Slurm(SlurmDiscoveryConfig),
+    Consul(ConsulDiscoveryConfig),
 }
 
 impl From<KubernetesDiscoveryConfig> for DiscoveryConfig {
@@ -1539,6 +1540,12 @@ impl From<FileDiscoveryConfig> for DiscoveryConfig {
 impl From<SlurmDiscoveryConfig> for DiscoveryConfig {
     fn from(config: SlurmDiscoveryConfig) -> Self {
         Self::Slurm(config)
+    }
+}
+
+impl From<ConsulDiscoveryConfig> for DiscoveryConfig {
+    fn from(config: ConsulDiscoveryConfig) -> Self {
+        Self::Consul(config)
     }
 }
 
@@ -1658,9 +1665,9 @@ impl Default for KubernetesDiscoveryConfig {
 }
 
 /// The interval of a discovery provider's periodic pass when none is given,
-/// the same for every provider. Kubernetes and file discovery apply a change
-/// as it happens and use the pass to retry what earlier ones left undone;
-/// Slurm discovery polls on it. ([`KubernetesDiscoveryConfig`] keeps its own
+/// the same for every provider. Kubernetes, file and Consul discovery apply a
+/// change as it happens and use the pass to retry what earlier ones left
+/// undone; Slurm discovery polls on it. ([`KubernetesDiscoveryConfig`] keeps its own
 /// default, 120, for programmatic and serialized configuration.)
 pub const DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS: u64 = 30;
 
@@ -1714,6 +1721,26 @@ pub struct SlurmDiscoveryConfig {
     pub account: Option<String>,
     #[serde(default)]
     pub partition: Option<String>,
+    #[serde(default = "default_discovery_check_interval_secs")]
+    pub check_interval_secs: u64,
+}
+
+/// Consul worker discovery: the instances of one Consul service whose health
+/// checks all pass, each configured by its `smg_*` service metadata.
+///
+/// Consul is read with blocking queries, so a change applies as soon as
+/// Consul reports it; every `check_interval_secs` the last good list is
+/// reconciled again. `address` is Consul's HTTP API, by default
+/// `CONSUL_HTTP_ADDR` or `http://127.0.0.1:8500`; `datacenter` is by default
+/// the agent's own. The ACL token and the TLS settings come from Consul's own
+/// environment variables, never from this configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConsulDiscoveryConfig {
+    pub service: String,
+    #[serde(default)]
+    pub address: Option<String>,
+    #[serde(default)]
+    pub datacenter: Option<String>,
     #[serde(default = "default_discovery_check_interval_secs")]
     pub check_interval_secs: u64,
 }
@@ -3214,6 +3241,27 @@ discovery:
         );
         let written = serde_json::to_value(discovery.unwrap()).unwrap();
         assert_eq!(written["provider"], "slurm");
+    }
+
+    /// The Consul provider needs only its tag and a service; the address and
+    /// datacenter default at runtime, the interval here.
+    #[test]
+    fn tagged_consul_discovery_reads_with_defaults() {
+        let discovery = read_discovery(serde_json::json!({
+            "provider": "consul",
+            "service": "smg-worker",
+        }));
+        assert_eq!(
+            discovery,
+            Some(DiscoveryConfig::Consul(ConsulDiscoveryConfig {
+                service: "smg-worker".to_string(),
+                address: None,
+                datacenter: None,
+                check_interval_secs: DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
+            }))
+        );
+        let written = serde_json::to_value(discovery.unwrap()).unwrap();
+        assert_eq!(written["provider"], "consul");
     }
 
     #[test]

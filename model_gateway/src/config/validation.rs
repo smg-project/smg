@@ -1544,6 +1544,7 @@ impl ConfigValidator {
             }
             DiscoveryConfig::File(file) => Self::validate_file_discovery(file, mode),
             DiscoveryConfig::Slurm(slurm) => Self::validate_slurm_discovery(slurm, mode),
+            DiscoveryConfig::Consul(consul) => Self::validate_consul_discovery(consul, mode),
         }
     }
 
@@ -1699,11 +1700,45 @@ impl ConfigValidator {
                 "File discovery needs a manifest path",
             ));
         }
+        Self::validate_record_discovery(discovery.check_interval_secs, mode)
+    }
 
-        if discovery.check_interval_secs == 0 {
+    /// Consul's address, ACL token and TLS settings are resolved, with the
+    /// environment, when discovery starts; each instance's metadata is checked
+    /// against the routing mode whenever Consul answers.
+    fn validate_consul_discovery(
+        discovery: &ConsulDiscoveryConfig,
+        mode: &RoutingMode,
+    ) -> ConfigResult<()> {
+        if discovery.service.is_empty() {
+            return Err(ConfigError::invalid_value(
+                "discovery.service",
+                String::new(),
+                "Consul discovery needs a service name",
+            ));
+        }
+        for (field, value) in [
+            ("discovery.address", &discovery.address),
+            ("discovery.datacenter", &discovery.datacenter),
+        ] {
+            if value.as_deref() == Some("") {
+                return Err(ConfigError::invalid_value(
+                    field,
+                    String::new(),
+                    "Must not be empty when given",
+                ));
+            }
+        }
+        Self::validate_record_discovery(discovery.check_interval_secs, mode)
+    }
+
+    /// What the file and Consul providers share: their records name their own
+    /// worker types, so any mode with worker pools can use them.
+    fn validate_record_discovery(check_interval_secs: u64, mode: &RoutingMode) -> ConfigResult<()> {
+        if check_interval_secs == 0 {
             return Err(ConfigError::invalid_value(
                 "discovery.check_interval_secs",
-                discovery.check_interval_secs,
+                check_interval_secs,
                 "Must be > 0",
             ));
         }
@@ -3448,6 +3483,62 @@ mod tests {
             ..Default::default()
         };
         openai.discovery = file("/run/smg/workers.json", 30);
+        assert!(matches!(
+            ConfigValidator::validate(&openai),
+            Err(ConfigError::ValidationFailed { ref reason })
+                if reason.contains("does not support service discovery")
+        ));
+    }
+
+    #[test]
+    fn test_validate_consul_discovery() {
+        let consul = |service: &str, address: Option<&str>, datacenter: Option<&str>, check| {
+            Some(DiscoveryConfig::Consul(ConsulDiscoveryConfig {
+                service: service.to_string(),
+                address: address.map(str::to_string),
+                datacenter: datacenter.map(str::to_string),
+                check_interval_secs: check,
+            }))
+        };
+
+        let mut config = regular_mode_config();
+        for discovery in [
+            consul("smg-worker", None, None, 30),
+            consul("smg-worker", Some("https://consul:8501"), Some("dc2"), 30),
+        ] {
+            config.discovery = discovery;
+            assert!(ConfigValidator::validate(&config).is_ok());
+        }
+
+        for (discovery, field) in [
+            (consul("", None, None, 30), "discovery.service"),
+            (
+                consul("smg-worker", Some(""), None, 30),
+                "discovery.address",
+            ),
+            (
+                consul("smg-worker", None, Some(""), 30),
+                "discovery.datacenter",
+            ),
+            (
+                consul("smg-worker", None, None, 0),
+                "discovery.check_interval_secs",
+            ),
+        ] {
+            config.discovery = discovery;
+            assert!(matches!(
+                ConfigValidator::validate(&config),
+                Err(ConfigError::InvalidValue { field: ref actual, .. }) if actual == field
+            ));
+        }
+
+        let mut openai = RouterConfig {
+            mode: RoutingMode::OpenAI {
+                worker_urls: vec![],
+            },
+            ..Default::default()
+        };
+        openai.discovery = consul("smg-worker", None, None, 30);
         assert!(matches!(
             ConfigValidator::validate(&openai),
             Err(ConfigError::ValidationFailed { ref reason })

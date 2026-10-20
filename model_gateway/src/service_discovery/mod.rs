@@ -9,8 +9,11 @@
 //!   fixed interval.
 //! - `slurm` polls Slurm for the running jobs whose names map to worker
 //!   types, and places a worker on each of their nodes.
-//! - `snapshot` keeps the last good snapshot the file and Slurm providers
-//!   read, which every pass reconciles.
+//! - `consul` watches a Consul service with blocking queries, and makes a
+//!   worker of each instance whose health checks pass.
+//! - `snapshot` keeps the last good snapshot the file, Slurm and Consul
+//!   providers read, which every pass reconciles, and logs what a read left
+//!   out.
 //! - `provider` defines the contract every provider produces: a
 //!   `provider::DiscoveredWorker` per worker, plus the provider's kind.
 //! - `reconciler` owns ownership, the registry diff and the `JobQueue`
@@ -23,6 +26,7 @@
 //! SMG mesh-router peer discovery is a different concern — it discovers router
 //! peers, not inference workers — and lives in [`crate::mesh_discovery`].
 
+mod consul;
 mod file;
 mod kubernetes;
 mod provider;
@@ -33,6 +37,7 @@ mod snapshot;
 #[cfg(test)]
 pub(crate) mod testing;
 
+pub use consul::ConsulProviderConfig;
 pub use file::FileProviderConfig;
 #[cfg(feature = "test-util")]
 pub use kubernetes::start_service_discovery_with_client;

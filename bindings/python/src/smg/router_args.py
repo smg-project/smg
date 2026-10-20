@@ -45,7 +45,7 @@ COMMON_POLICY_CHOICES = [
 PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
 ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 # Worker discovery providers --discovery-provider accepts.
-DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file", "slurm"]
+DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file", "slurm", "consul"]
 
 
 def _parse_kv_index(value: str) -> str:
@@ -333,6 +333,14 @@ class RouterArgs:
     # mTLS for worker communication: the client certificate and key (with ca_cert_paths)
     client_cert_path: str | None = None
     client_key_path: str | None = None
+    # Consul discovery (discovery_provider="consul"): Consul's HTTP API address
+    # (None = CONSUL_HTTP_ADDR, else http://127.0.0.1:8500), the datacenter
+    # (None = the agent's own), and the service whose passing instances are the
+    # workers. The ACL token and TLS settings come from Consul's environment
+    # variables only.
+    consul_address: str | None = None
+    consul_datacenter: str | None = None
+    consul_service: str | None = None
     # API keys for control plane auth (list of tuples: id, name, key, role)
     control_plane_api_keys: list[tuple] = dataclasses.field(default_factory=list)
     control_plane_audit_enabled: bool = False
@@ -347,9 +355,9 @@ class RouterArgs:
     disable_retries: bool = False
     # Disable automatic tokenizer loading at startup and worker registration
     disable_tokenizer_autoload: bool = False
-    # The selected provider's periodic pass (None = 30s): Kubernetes and file
-    # discovery apply a change as it happens and retry on it, Slurm discovery
-    # polls on it; and the file provider's manifest path.
+    # The selected provider's periodic pass (None = 30s): Kubernetes, file and
+    # Consul discovery apply a change as it happens and retry on it, Slurm
+    # discovery polls on it; and the file provider's manifest path.
     discovery_check_interval_secs: int | None = None
     discovery_file: str | None = None
     # The worker discovery provider. service_discovery=True is the legacy
@@ -712,6 +720,10 @@ class RouterArgs:
         )
         slurm_discovery_group = parser.add_argument_group(
             "Service Discovery (Slurm)", "Workers on the nodes of running Slurm jobs"
+        )
+        consul_discovery_group = parser.add_argument_group(
+            "Service Discovery (Consul)",
+            "Workers that are the passing instances of a Consul service",
         )
         logging_group = parser.add_argument_group("Logging", "Log output configuration")
         prometheus_group = parser.add_argument_group(
@@ -1826,10 +1838,10 @@ class RouterArgs:
             type=int,
             default=None,
             help=(
-                "Seconds between periodic discovery passes. Kubernetes and file"
-                " discovery apply a change as it happens and use the pass to retry"
-                " and to catch what went unreported; Slurm discovery polls at this"
-                " interval (default: 30)"
+                "Seconds between periodic discovery passes. Kubernetes, file and"
+                " Consul discovery apply a change as it happens and use the pass to"
+                " retry and to catch what went unreported; Slurm discovery polls at"
+                " this interval (default: 30)"
             ),
         )
         for role, workers in [
@@ -1883,6 +1895,34 @@ class RouterArgs:
             type=str,
             default=None,
             help="Discover only jobs in this Slurm partition",
+        )
+        consul_discovery_group.add_argument(
+            f"--{prefix}consul-service",
+            type=str,
+            default=None,
+            help=(
+                "Consul service whose instances with passing health checks are the"
+                " workers (required with --discovery-provider consul). Each"
+                " instance's smg_* service metadata configures its worker"
+            ),
+        )
+        consul_discovery_group.add_argument(
+            f"--{prefix}consul-address",
+            type=str,
+            default=None,
+            help=(
+                "Consul's HTTP API address (default: CONSUL_HTTP_ADDR, else"
+                " http://127.0.0.1:8500). The ACL token and TLS settings come from"
+                " Consul's environment variables: CONSUL_HTTP_TOKEN or"
+                " CONSUL_HTTP_TOKEN_FILE, CONSUL_CACERT, CONSUL_CLIENT_CERT and"
+                " CONSUL_CLIENT_KEY"
+            ),
+        )
+        consul_discovery_group.add_argument(
+            f"--{prefix}consul-datacenter",
+            type=str,
+            default=None,
+            help="Consul datacenter to read (default: the Consul agent's own)",
         )
         k8s_group.add_argument(
             f"--{prefix}selector",

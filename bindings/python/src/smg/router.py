@@ -64,6 +64,15 @@ _MAPPED_PROVIDERS = {
             },
             required=("slurm_port",),
         ),
+        _MappedProvider(
+            "consul",
+            {
+                "consul_service": "service",
+                "consul_address": "address",
+                "consul_datacenter": "datacenter",
+            },
+            required=("consul_service",),
+        ),
     ]
 }
 

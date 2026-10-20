@@ -31,12 +31,12 @@ use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
         bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, AccessLogField,
-        CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, DiscoveryConfig,
-        FileDiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig,
-        ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, ParserChoice,
-        PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig,
-        RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
-        SlurmDiscoveryConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, ConsulDiscoveryConfig,
+        DiscoveryConfig, FileDiscoveryConfig, HealthCheckConfig, HistoryBackend,
+        KubernetesDiscoveryConfig, ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig,
+        ParserChoice, PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric,
+        RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+        SchemaConfig, SlurmDiscoveryConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
         TurboJpegPolicy, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
@@ -178,6 +178,8 @@ pub enum DiscoveryProvider {
     File,
     #[value(name = "slurm")]
     Slurm,
+    #[value(name = "consul")]
+    Consul,
 }
 
 impl DiscoveryProvider {
@@ -187,6 +189,7 @@ impl DiscoveryProvider {
             Self::Kubernetes => "kubernetes",
             Self::File => "file",
             Self::Slurm => "slurm",
+            Self::Consul => "consul",
         }
     }
 }
@@ -1130,7 +1133,7 @@ struct DiscoveryArgs {
     #[arg(long, help_heading = "Service Discovery (File)")]
     discovery_file: Option<PathBuf>,
 
-    /// Seconds between periodic discovery passes. Kubernetes and file
+    /// Seconds between periodic discovery passes. Kubernetes, file and Consul
     /// discovery apply a change as it happens and use the pass to retry and
     /// to catch what went unreported; Slurm discovery polls at this interval
     /// (default: 30)
@@ -1179,6 +1182,25 @@ struct DiscoveryArgs {
     /// Discover only jobs in this Slurm partition
     #[arg(long, help_heading = "Service Discovery (Slurm)")]
     slurm_partition: Option<String>,
+
+    // ==================== Service Discovery (Consul) ====================
+    /// Consul service whose instances with passing health checks are the
+    /// workers (required with `--discovery-provider consul`). Each instance's
+    /// `smg_*` service metadata configures its worker
+    #[arg(long, help_heading = "Service Discovery (Consul)")]
+    consul_service: Option<String>,
+
+    /// Consul's HTTP API address (default: `CONSUL_HTTP_ADDR`, else
+    /// http://127.0.0.1:8500). The ACL token and TLS settings come from
+    /// Consul's environment variables: `CONSUL_HTTP_TOKEN` or
+    /// `CONSUL_HTTP_TOKEN_FILE`, `CONSUL_CACERT`, `CONSUL_CLIENT_CERT` and
+    /// `CONSUL_CLIENT_KEY`
+    #[arg(long, help_heading = "Service Discovery (Consul)")]
+    consul_address: Option<String>,
+
+    /// Consul datacenter to read (default: the Consul agent's own)
+    #[arg(long, help_heading = "Service Discovery (Consul)")]
+    consul_datacenter: Option<String>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -3049,9 +3071,9 @@ impl CliArgs {
 
     /// The discovery configuration of the selected provider, or none. The
     /// Kubernetes flags are ignored under another provider, as they always
-    /// were without discovery; the file and Slurm flags have no other use, so
-    /// giving them without their provider is an error, as is either provider
-    /// without what it cannot run without. The interval applies to whichever
+    /// were without discovery; the file, Slurm and Consul flags have no other
+    /// use, so giving them without their provider is an error, as is any of
+    /// those providers without what it cannot run without. The interval applies to whichever
     /// provider is selected.
     fn discovery_config(&self) -> ConfigResult<Option<DiscoveryConfig>> {
         let provider = self.selected_discovery_provider();
@@ -3068,6 +3090,9 @@ impl CliArgs {
         }
         if provider != Some(DiscoveryProvider::Slurm) && self.has_slurm_flags() {
             return incompatible("The --slurm-* flags apply only to --discovery-provider slurm");
+        }
+        if provider != Some(DiscoveryProvider::Consul) && self.has_consul_flags() {
+            return incompatible("The --consul-* flags apply only to --discovery-provider consul");
         }
         let interval = self
             .discovery
@@ -3118,7 +3143,26 @@ impl CliArgs {
                 partition: self.discovery.slurm_partition.clone(),
                 check_interval_secs: interval,
             })),
+            Some(DiscoveryProvider::Consul) => {
+                Some(DiscoveryConfig::Consul(ConsulDiscoveryConfig {
+                    service: self.discovery.consul_service.clone().ok_or_else(|| {
+                        ConfigError::MissingRequired {
+                            field: "--consul-service".to_string(),
+                        }
+                    })?,
+                    address: self.discovery.consul_address.clone(),
+                    datacenter: self.discovery.consul_datacenter.clone(),
+                    check_interval_secs: interval,
+                }))
+            }
         })
+    }
+
+    /// Whether any `--consul-*` flag was given.
+    fn has_consul_flags(&self) -> bool {
+        self.discovery.consul_service.is_some()
+            || self.discovery.consul_address.is_some()
+            || self.discovery.consul_datacenter.is_some()
     }
 
     /// Whether any `--slurm-*` flag was given.
@@ -5108,6 +5152,79 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    /// `--discovery-provider consul` builds a Consul configuration from the
+    /// `--consul-*` flags, the shared interval included. Worker discovery runs
+    /// from it; router discovery does not.
+    #[test]
+    fn discovery_provider_consul_builds_a_consul_config() {
+        let cli = cli_args_from(&[
+            "--discovery-provider",
+            "consul",
+            "--pd-disaggregation",
+            "--consul-service",
+            "smg-worker",
+            "--consul-address",
+            "http://consul.internal:8500",
+            "--consul-datacenter",
+            "dc2",
+            "--discovery-check-interval-secs",
+            "10",
+        ]);
+        let router = cli.to_router_config(vec![], vec![]).unwrap();
+        assert_eq!(
+            router.discovery,
+            Some(DiscoveryConfig::Consul(ConsulDiscoveryConfig {
+                service: "smg-worker".to_string(),
+                address: Some("http://consul.internal:8500".to_string()),
+                datacenter: Some("dc2".to_string()),
+                check_interval_secs: 10,
+            }))
+        );
+        assert!(router.health_check.remove_unhealthy_workers);
+
+        let server = cli.to_server_config(router).unwrap();
+        assert!(matches!(
+            server.service_discovery_config,
+            Some(RuntimeDiscoveryConfig::Consul(_))
+        ));
+        assert!(server.mesh_discovery_config.is_none());
+
+        let err = cli_args_from(&["--discovery-provider", "consul"])
+            .to_router_config(vec![], vec![])
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::MissingRequired { ref field } if field == "--consul-service"),
+            "{err}"
+        );
+    }
+
+    /// The Consul flags configure nothing else, so they need their provider.
+    #[test]
+    fn consul_flags_need_the_consul_provider() {
+        for args in [
+            &["--consul-service", "smg-worker"][..],
+            &["--consul-address", "http://consul:8500"][..],
+            &[
+                "--discovery-provider",
+                "slurm",
+                "--slurm-job-name",
+                "w",
+                "--slurm-port",
+                "8000",
+                "--consul-datacenter",
+                "dc2",
+            ][..],
+        ] {
+            let err = cli_args_from(args)
+                .to_router_config(vec![], vec![])
+                .unwrap_err();
+            assert!(
+                matches!(err, ConfigError::IncompatibleConfig { .. }),
+                "{args:?}: {err}"
+            );
+        }
     }
 
     #[test]

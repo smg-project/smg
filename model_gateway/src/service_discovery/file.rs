@@ -46,7 +46,7 @@ use tokio::{sync::mpsc, task, time};
 use tracing::{info, warn};
 
 use super::{
-    provider::{DiscoveredWorker, DiscoveryKind},
+    provider::{DiscoveredWorker, DiscoveryKind, Roles},
     reconciler::DesiredState,
     snapshot::{LastGood, SnapshotError},
 };
@@ -84,56 +84,6 @@ impl FileProviderConfig {
             check_interval,
             roles,
         })
-    }
-}
-
-/// The worker types a routing mode accepts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Roles {
-    Regular,
-    PrefillDecode,
-    EncodePrefillDecode,
-}
-
-impl Roles {
-    fn of(mode: &RoutingMode) -> Option<Self> {
-        match mode {
-            RoutingMode::Regular { .. } => Some(Self::Regular),
-            RoutingMode::PrefillDecode { .. } => Some(Self::PrefillDecode),
-            RoutingMode::EncodePrefillDecode { .. } => Some(Self::EncodePrefillDecode),
-            RoutingMode::OpenAI { .. }
-            | RoutingMode::Anthropic { .. }
-            | RoutingMode::Gemini { .. } => None,
-        }
-    }
-
-    fn allows(self, worker_type: WorkerType) -> bool {
-        matches!(
-            (self, worker_type),
-            (Self::Regular, WorkerType::Regular)
-                | (
-                    Self::PrefillDecode,
-                    WorkerType::Prefill | WorkerType::Decode
-                )
-                | (
-                    Self::EncodePrefillDecode,
-                    WorkerType::Encode | WorkerType::Prefill | WorkerType::Decode
-                )
-        )
-    }
-
-    /// The type of a record that names none. Regular routing has only one; a
-    /// disaggregated record must say which pool it joins.
-    fn default_type(self) -> Option<WorkerType> {
-        (self == Self::Regular).then_some(WorkerType::Regular)
-    }
-
-    fn name(self) -> &'static str {
-        match self {
-            Self::Regular => "regular",
-            Self::PrefillDecode => "prefill-decode",
-            Self::EncodePrefillDecode => "encode-prefill-decode",
-        }
     }
 }
 

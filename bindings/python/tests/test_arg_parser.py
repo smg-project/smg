@@ -46,6 +46,9 @@ class TestRouterArgs:
         assert args.slurm_job_name == []
         assert args.slurm_port is None
         assert args.slurm_user is None
+        assert args.consul_service is None
+        assert args.consul_address is None
+        assert args.consul_datacenter is None
         assert args.selector == {}
         assert args.service_discovery_port == 80
         assert args.service_discovery_namespace is None
@@ -1143,6 +1146,29 @@ class TestParseRouterArgs:
         assert router_args.slurm_user == "svc"
         assert router_args.slurm_account == "acct"
         assert router_args.slurm_partition == "gpu"
+        assert router_args.discovery_check_interval_secs == 10
+
+    def test_parse_discovery_provider_consul(self):
+        """The Consul provider's flags parse into RouterArgs."""
+        router_args = parse_router_args(
+            [
+                "--discovery-provider",
+                "consul",
+                "--consul-service",
+                "smg-worker",
+                "--consul-address",
+                "https://consul.internal:8501",
+                "--consul-datacenter",
+                "dc2",
+                "--discovery-check-interval-secs",
+                "10",
+            ]
+        )
+
+        assert router_args.selected_discovery_provider() == "consul"
+        assert router_args.consul_service == "smg-worker"
+        assert router_args.consul_address == "https://consul.internal:8501"
+        assert router_args.consul_datacenter == "dc2"
         assert router_args.discovery_check_interval_secs == 10
 
     def test_service_discovery_and_discovery_provider_are_exclusive(self):
