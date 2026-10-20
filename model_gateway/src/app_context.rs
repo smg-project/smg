@@ -683,7 +683,7 @@ impl AppContextBuilder {
         }
 
         let make_builder = || {
-            let mut client_builder = crate::http_client::client_builder()
+            let mut client_builder = crate::clients::http_client_builder()
                 .pool_idle_timeout(pool_idle_timeout)
                 .pool_max_idle_per_host(500)
                 .timeout(Duration::from_secs(timeout_secs))

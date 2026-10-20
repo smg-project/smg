@@ -803,9 +803,12 @@ mod tests {
     #[tokio::test]
     #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_sglang_http_metadata() {
-        let labels =
-            fetch_sglang_http_metadata(&crate::http_client::client(), "http://0.0.0.0:30000", None)
-                .await;
+        let labels = fetch_sglang_http_metadata(
+            &crate::clients::http_client(),
+            "http://0.0.0.0:30000",
+            None,
+        )
+        .await;
         dump_labels("SGLang HTTP combined", &labels);
         assert!(labels.contains_key("model_path"));
         assert!(labels.contains_key("tokenizer_path"));
@@ -815,7 +818,7 @@ mod tests {
     #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_vllm_http_metadata() {
         let labels =
-            fetch_vllm_http_metadata(&crate::http_client::client(), "http://0.0.0.0:20000", None)
+            fetch_vllm_http_metadata(&crate::clients::http_client(), "http://0.0.0.0:20000", None)
                 .await;
         dump_labels("vLLM HTTP", &labels);
         assert!(labels.contains_key("model_path"));
@@ -953,7 +956,7 @@ mod tests {
         });
 
         let labels = fetch_sglang_http_metadata(
-            &crate::http_client::client(),
+            &crate::clients::http_client(),
             &format!("http://{addr}"),
             None,
         )

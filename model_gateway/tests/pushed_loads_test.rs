@@ -104,7 +104,7 @@ async fn eight_workers_loads_reach_the_gateway_through_the_event_streams() {
 
     // Idle engines publish no KV events; their streams still send the load
     // record as heartbeats within a second or so of the subscription.
-    let client = smg::http_client::client_builder()
+    let client = smg::clients::http_client_builder()
         .no_proxy()
         .build()
         .expect("test client");

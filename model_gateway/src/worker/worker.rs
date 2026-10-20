@@ -91,7 +91,7 @@ impl LazyHttpClient {
 
     fn init(&self) -> &Arc<reqwest::Client> {
         self.cell
-            .get_or_init(|| Arc::new(crate::http_client::client()))
+            .get_or_init(|| Arc::new(crate::clients::http_client()))
     }
 }
 

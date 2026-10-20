@@ -153,7 +153,7 @@ mod tests {
         let router_config = RouterConfig::default();
         Arc::new(
             AppContext::builder()
-                .client(crate::http_client::client())
+                .client(crate::clients::http_client())
                 .rate_limiter(None)
                 .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
                 .reasoning_parser_factory(None)

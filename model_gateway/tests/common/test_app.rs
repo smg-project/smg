@@ -249,7 +249,7 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
     let router_config = RouterConfig::default();
     // A test's upstreams are its own loopback servers; the environment's
     // proxy would otherwise sit in the path of every request.
-    let client = smg::http_client::client_builder()
+    let client = smg::clients::http_client_builder()
         .no_proxy()
         .build()
         .expect("test client");

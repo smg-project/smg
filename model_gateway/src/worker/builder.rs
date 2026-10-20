@@ -523,7 +523,7 @@ mod tests {
     #[test]
     fn provided_http_client_is_used_as_is() {
         let worker = BasicWorkerBuilder::new("http://localhost:8080")
-            .http_client(Arc::new(crate::http_client::client()))
+            .http_client(Arc::new(crate::clients::http_client()))
             .build();
         assert!(!worker.http_client.cell_is_empty());
     }

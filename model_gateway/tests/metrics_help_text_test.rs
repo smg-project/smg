@@ -57,7 +57,7 @@ async fn every_smg_family_has_help_text() {
     Metrics::record_worker_cb_transition(worker, "closed", "open");
     Metrics::record_kv_event_lag(worker, 0.004);
 
-    let body = smg::http_client::client()
+    let body = smg::clients::http_client()
         .get(format!("http://{addr}/metrics"))
         .send()
         .await

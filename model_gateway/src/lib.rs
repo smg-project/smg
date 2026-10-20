@@ -1,8 +1,8 @@
 pub mod app_context;
+pub mod clients;
 pub mod config;
 pub mod endpoints;
 pub mod health;
-pub mod http_client;
 pub mod mesh;
 pub mod mesh_discovery;
 pub mod middleware;

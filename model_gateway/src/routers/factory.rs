@@ -352,7 +352,7 @@ mod grpc_router_type_tests {
         Arc::new(
             AppContext::builder()
                 .router_config(config)
-                .client(crate::http_client::client())
+                .client(crate::clients::http_client())
                 .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
                 .reasoning_parser_factory(Some(ReasoningParserFactory::new()))
                 .tool_parser_factory(Some(ToolParserFactory::new()))

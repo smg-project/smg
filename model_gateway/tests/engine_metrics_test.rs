@@ -45,7 +45,7 @@ async fn engine_pd_gauge_appears_on_metrics_endpoint() {
     };
     Metrics::record_engine_load("grpc://prefill-0:30000", "test-model", &response);
 
-    let body = smg::http_client::client()
+    let body = smg::clients::http_client()
         .get(format!("http://{addr}/metrics"))
         .send()
         .await

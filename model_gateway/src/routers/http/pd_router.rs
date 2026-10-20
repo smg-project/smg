@@ -3463,7 +3463,7 @@ mod tests {
                 ..Default::default()
             };
             let client = Arc::new(
-                crate::http_client::client_builder()
+                crate::clients::http_client_builder()
                     .timeout(std::time::Duration::from_secs(1))
                     .build()
                     .unwrap(),
@@ -3567,7 +3567,7 @@ mod tests {
             ..Default::default()
         };
         let client = Arc::new(
-            crate::http_client::client_builder()
+            crate::clients::http_client_builder()
                 .timeout(std::time::Duration::from_secs(1))
                 .build()
                 .unwrap(),

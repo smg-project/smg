@@ -90,7 +90,7 @@ impl GrpcWorker {
             circuit_breaker: CircuitBreaker::new(),
             metadata,
             api_key: None,
-            http_client: Arc::new(smg::http_client::client()),
+            http_client: Arc::new(smg::clients::http_client()),
             resilience: ResolvedResilience::default(),
             weight_version: fingerprint_of(None),
         }

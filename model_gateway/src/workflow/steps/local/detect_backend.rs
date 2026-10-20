@@ -445,7 +445,7 @@ mod tests {
         })))
         .await;
 
-        let runtime = detect_http_backend(&url, 5, &crate::http_client::client(), None)
+        let runtime = detect_http_backend(&url, 5, &crate::clients::http_client(), None)
             .await
             .unwrap();
         server.abort();
@@ -461,7 +461,7 @@ mod tests {
         })))
         .await;
 
-        let runtime = detect_http_backend(&url, 5, &crate::http_client::client(), None)
+        let runtime = detect_http_backend(&url, 5, &crate::clients::http_client(), None)
             .await
             .unwrap();
         server.abort();
@@ -482,7 +482,7 @@ mod tests {
         );
         let (url, server) = serve_router(router).await;
 
-        let runtime = detect_http_backend(&url, 5, &crate::http_client::client(), None)
+        let runtime = detect_http_backend(&url, 5, &crate::clients::http_client(), None)
             .await
             .unwrap();
         server.abort();
@@ -501,7 +501,7 @@ mod tests {
         let err = detect_http_backend(
             &format!("http://{addr}"),
             1,
-            &crate::http_client::client(),
+            &crate::clients::http_client(),
             None,
         )
         .await
@@ -516,7 +516,7 @@ mod tests {
         // retries instead of registering a backend with nothing to serve.
         let (url, server) = serve_router(models_route(json!({"object": "list", "data": []}))).await;
 
-        let result = detect_http_backend(&url, 5, &crate::http_client::client(), None).await;
+        let result = detect_http_backend(&url, 5, &crate::clients::http_client(), None).await;
         server.abort();
 
         result.unwrap_err();
@@ -530,7 +530,7 @@ mod tests {
         })))
         .await;
 
-        let runtime = detect_http_backend(&url, 5, &crate::http_client::client(), None)
+        let runtime = detect_http_backend(&url, 5, &crate::clients::http_client(), None)
             .await
             .unwrap();
         server.abort();
