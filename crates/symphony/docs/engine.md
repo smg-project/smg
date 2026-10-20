@@ -15,9 +15,9 @@ What the engine decides for every format, and what it leaves open:
   two after `</think>`, and so on are reasoning or content, not dropped. Whether they should be
   is bellwether #17; `Dropped { Whitespace }` exists for the other answer. A table whose family's
   reference parser reads a marker together with the separator before it spells the marker that
-  way (DeepSeek V4.1's block opener after its blank line, `docs/tables.md`): the separator then
-  leaves with the marker as `Dropped { Wrapper }`, and the scanner's hold-back keeps a stream's
-  reading the whole's. One exception, so
+  way (the DeepSeek DSML tables' block opener after its blank line, `docs/tables.md`): the
+  separator then leaves with the marker as `Dropped { Wrapper }`, and the scanner's hold-back
+  keeps a stream's reading the whole's. One exception, so
   that a stream shows the content the whole answer has: whitespace a content stay begins with
   is held while nothing else has arrived in the stay, and leaves as content before the stay's
   first other text, as `Dropped { Whitespace }` when the stay ends without any (a call's opener
