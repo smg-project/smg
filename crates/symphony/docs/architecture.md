@@ -71,8 +71,9 @@ start inside one, an ignored terminal would break its header, or a row from one 
 another's where the header may not match). The error text names the table and the row, so a table
 that fails is a programming error caught by the crate's tests, never a request's failure.
 
-**The engine.** A terminal with no row from the current state is text, as the model wrote it; a
-terminal with a row is `Dropped { Wrapper }` (or content, where a table's variant shows the markers
+**The engine.** A terminal with no row from the current state is text, as the model wrote it,
+and where that text is the table's own content a `Malformed { MarkerOutOfPlace }` event of no
+bytes says so; a terminal with a row is `Dropped { Wrapper }` (or content, where a table's variant shows the markers
 of a channel the request does not separate) and moves the engine. A call region the model closes
 early is closed for the client (an open string gets its quote, the object closes); a region the
 stream cuts is left open, so cut arguments never look complete. The whitespace a content stay begins
@@ -116,8 +117,9 @@ A family of a known call syntax costs a table and evidence, and no engine change
 2. Register it: the `Table` variant, its row in `Table::ALL`, its name and its builder
    (`formats/registry.rs`), its module and re-export (`formats/mod.rs`), and the checkpoint groups
    it reads, one line each in `formats/groups.json` (the table by its name, with each group's own
-   turn opener where the template writes one the table does not; the build script compiles the
-   file into `GROUPS`). A group that names no table fails the build; the registry's tests hold the
+   turn opener where the template writes one the table does not, and its own text after the
+   thought's close where the template writes other than the table's; the build script compiles
+   the file into `GROUPS`). A group that names no table fails the build; the registry's tests hold the
    names unique, every table buildable and the file in the registry's form.
 3. Give it a subject in `tests/contract.rs` (the test `every_registry_table_has_a_subject` refuses a
    table without one): a handful of outputs in the family's syntax, which the contract then checks
@@ -140,8 +142,10 @@ Three tiers, two of them at run time:
 - **Dropped**: bytes the format consumed on purpose, each with a `DropReason`: a marker that moved
   the engine or a special token (`ControlToken`, `Wrapper`), the template's wrapping between regions
   (`Wrapper`), whitespace the format treats as structural (`Whitespace`), a call after the first
-  where the request takes one call only (`LaterCall`). Dropped bytes are
-  expected on every well-formed output.
+  where the request takes one call only (`LaterCall`), and the bytes of a call block a syntax
+  whose block is never prose could not read (`MalformedCall`, behind a `Malformed` event of no
+  bytes that counts the failure). Dropped bytes are expected on every well-formed output, the
+  last kind excepted.
 - **Malformed**: bytes of a region the parser gave up on, returned whole, each with a
   `MalformedReason` from a closed set: the stream ended inside a region (`UnterminatedRegion`),
   arguments that did not parse (`InvalidArguments`), a call to a function the request did not
@@ -155,8 +159,11 @@ Three tiers, two of them at run time:
   carries per-syntax known differences and opt-in allowances for the classes the recorded
   references get wrong. Each run counts them on its diagnostic line.
 
-The adapters show malformed text as content and drop nothing, so a client never loses the bytes;
-the reason is for the operator. The set is closed and `Copy` so that a reader can count malformed
+The adapters show malformed text as content and drop nothing, so a client never loses the bytes a
+parser hands back with the event; the keyed syntax, whose block is never prose, hands them back as
+`Dropped { MalformedCall }` behind an event of no bytes instead, so that the failure is counted and
+the format's own tags never reach the answer (`docs/assemblers.md`). The reason is for the
+operator. The set is closed and `Copy` so that a reader can count malformed
 regions by table and reason as a bounded label, log a sample with the table, the reason and the
 bytes' length, and mark the request's span; how a gateway surfaces that (metric, log, span event,
 and whether a request may ask for the reasons on the wire) is the gateway's policy, documented with

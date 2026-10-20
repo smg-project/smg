@@ -15,16 +15,16 @@
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/engine.md`.
 
-use std::{collections::VecDeque, sync::Arc};
+use std::{borrow::Cow, collections::VecDeque, ops::Range, sync::Arc};
 
 use crate::{
-    event::{runs, DropReason, Event, Events, FinishReason, MalformedReason, Text},
+    event::{runs_at, DropReason, Event, Events, FinishReason, MalformedReason, Text},
     format::{CallId, CallSyntax, Emits, Format, Replay},
     gemma,
     ids::CallIds,
     input::{EngineFinish, Input},
     json,
-    markers::{Piece, Scanner},
+    markers::{Piece, Scanned, Scanner},
     parser::{ParseError, Parser},
     pythonic,
     shape::{self, Values},
@@ -124,7 +124,7 @@ enum Held {
 }
 
 /// A text event of `like`'s kind carrying `text`, uncounted: the piece of a split text event.
-fn text_event_like(like: &Event, text: &str) -> Event {
+fn text_event_like<'d>(like: &Event<'_>, text: Cow<'d, str>) -> Event<'d> {
     let text = Text::uncounted(text);
     match like {
         Event::Reasoning(_) => Event::Reasoning(text),
@@ -135,7 +135,7 @@ fn text_event_like(like: &Event, text: &str) -> Event {
 }
 
 /// The text an event carries, for the events that carry output bytes.
-fn event_text(event: &mut Event) -> Option<&mut Text> {
+fn event_text<'e, 'd>(event: &'e mut Event<'d>) -> Option<&'e mut Text<'d>> {
     match event {
         Event::Content(text) | Event::Reasoning(text) => Some(text),
         Event::Dropped { text, .. } | Event::Malformed { text, .. } => Some(text),
@@ -143,6 +143,16 @@ fn event_text(event: &mut Event) -> Option<&mut Text> {
         | Event::ToolCallArguments { source, .. }
         | Event::ToolCallEnd { source, .. } => Some(source),
         Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => None,
+    }
+}
+
+/// `text[range]` as `text` is: a slice of a borrowed run stays borrowed from the delta, a slice
+/// of an owned run is copied. The pieces of a run the engine cuts (a lead, a body, a tail, the
+/// runs of a wrapper) keep the run's claim on the delta.
+fn part<'d>(text: &Cow<'d, str>, range: Range<usize>) -> Cow<'d, str> {
+    match text {
+        Cow::Borrowed(text) => Cow::Borrowed(&text[range]),
+        Cow::Owned(text) => Cow::Owned(text[range].to_owned()),
     }
 }
 
@@ -258,14 +268,33 @@ fn assembler(
             Box::new(tagged::Assembler::new(index, ids, placement))
         }
         Some(CallSyntax::Keyed(tags)) => Box::new(tagged::keyed::Assembler::new(index, id(), tags)),
-        Some(CallSyntax::Pythonic(_)) => Box::new(pythonic::Assembler::new(index, ids)),
-        // The list between markers (Llama Nemotron) takes text in place of it as malformed; the
-        // bare list the output starts in (xLAM) takes it for prose.
-        Some(CallSyntax::JsonList) if framed => Box::new(json::list::Assembler::framed(index, ids)),
-        Some(CallSyntax::JsonList) => Box::new(json::list::Assembler::new(index, ids)),
-        Some(CallSyntax::JsonAlone(opener)) => {
-            Box::new(json::list::Assembler::object_or_list(index, ids, opener))
+        // The list between markers (Olmo 3, LFM2.5) reads what the markers frame; the bare list
+        // the output starts in (Llama 4) reads the turn's content before it and the wrapping
+        // after it.
+        Some(CallSyntax::Pythonic(dialect)) if framed => {
+            Box::new(pythonic::Assembler::new(index, ids, dialect))
         }
+        Some(CallSyntax::Pythonic(dialect)) => {
+            Box::new(pythonic::Assembler::bare(index, ids, dialect))
+        }
+        // The list reader takes what frames the calls as one value: the list between markers
+        // (Llama Nemotron) takes text in place of it as malformed; the bare list the output starts
+        // in (xLAM) takes it for prose; the `json` table's output is one object, several with `;`
+        // between them, or a list, behind the family's call marker or not.
+        Some(CallSyntax::JsonList) => Box::new(json::list::Assembler::new(
+            index,
+            ids,
+            if framed {
+                json::list::Framing::Framed
+            } else {
+                json::list::Framing::Bare
+            },
+        )),
+        Some(CallSyntax::JsonAlone(opener)) => Box::new(json::list::Assembler::new(
+            index,
+            ids,
+            json::list::Framing::ObjectOrList { opener },
+        )),
         Some(CallSyntax::Xml) => Box::new(tagged::xml::Assembler::new(index, id())),
         Some(CallSyntax::Attributed(tags)) => {
             Box::new(tagged::attributed::Assembler::new(index, id(), tags))
@@ -277,7 +306,7 @@ fn assembler(
             marker,
             json::named::After::Object,
         )),
-        Some(CallSyntax::NamedArguments(marker)) => Box::new(json::named::Assembler::new(
+        Some(CallSyntax::NamedArguments { marker, .. }) => Box::new(json::named::Assembler::new(
             index,
             id(),
             marker,
@@ -384,18 +413,22 @@ impl Engine {
     /// scan stands where the old one cut the text with nothing held, from which on the two cut it
     /// alike; at the end of the stream everything is scanned to the end, and a header still
     /// undecided is decided once nothing more comes.
-    fn run(&mut self, pieces: Vec<Piece>, at_end: bool, out: &mut Events) {
-        let mut queue = VecDeque::from(pieces);
+    fn run(&mut self, scanned: &Scanned<'_>, at_end: bool, out: &mut Events) {
+        // The pieces are taken as scanned until a header decides; from then on, what the scan
+        // that reads again gives and the pieces not reached yet stand in a queue, which nothing
+        // is allocated for before.
+        let mut pieces = scanned.pieces();
+        let mut queue = VecDeque::new();
+        while let Some(piece) = pieces.next() {
+            if let Some(again) = self.step(piece, at_end, out) {
+                queue.extend(pieces.by_ref());
+                self.scan_again(again, &mut queue, at_end);
+                break;
+            }
+        }
         loop {
             while let Some(piece) = queue.pop_front() {
-                let again = match piece {
-                    Piece::Text(text) if at_end && self.cut_tag(&text) => {
-                        self.drop_cut_tag(&text, out);
-                        None
-                    }
-                    piece => self.take(piece, out),
-                };
-                if let Some(again) = again {
+                if let Some(again) = self.step(piece, at_end, out) {
                     self.scan_again(again, &mut queue, at_end);
                 }
             }
@@ -409,37 +442,42 @@ impl Engine {
         }
     }
 
-    /// The bytes a piece stands for.
-    fn piece_text<'p>(&'p self, piece: &'p Piece) -> &'p str {
+    /// Takes one piece: a tag the end cut short is dropped, anything else is taken as the table
+    /// says ([`Self::take`]). What a header that decided hands back to read again.
+    fn step(&mut self, piece: Piece<'_>, at_end: bool, out: &mut Events) -> Option<String> {
         match piece {
-            Piece::Text(text) => text,
-            Piece::Marker(index) => self.format.terminal_text(*index),
+            Piece::Text(text) if at_end && self.cut_tag(&text) => {
+                self.drop_cut_tag(text.into_owned(), out);
+                None
+            }
+            piece => self.take(piece, out),
         }
     }
 
     /// Scans `text` afresh, before the pieces in `queue`, and puts what it gives at the queue's
-    /// front. The queued pieces follow it, scanned again too while the new scan holds a possible
-    /// terminal at their edge: once it holds nothing where the old scan began a piece, both cut
-    /// what follows alike, since a scan from a piece's start reads nothing before it. When the
-    /// queue runs out first, what the old scanner held comes after them, and the new scanner takes
-    /// its place; at the end of the stream it is finished.
-    fn scan_again(&mut self, text: String, queue: &mut VecDeque<Piece>, at_end: bool) {
-        let mut scanner = Scanner::new(self.format.terminal_texts());
-        let mut pieces = scanner.feed(&text);
-        while !scanner.held().is_empty() {
+    /// front: the scanner reads it with what it held set aside, as a new scanner would. The
+    /// queued pieces follow it, scanned again too while the new scan holds a possible terminal at
+    /// their edge: once it holds nothing where the old scan began a piece, both cut what follows
+    /// alike, since a scan from a piece's start reads nothing before it, and the scanner takes
+    /// what it held back. When the queue runs out first, what was held comes after them, and the
+    /// new scan stands; at the end of the stream it is finished.
+    fn scan_again(&mut self, text: String, queue: &mut VecDeque<Piece<'_>>, at_end: bool) {
+        let held = self.scanner.set_aside();
+        let mut pieces = owned(&self.scanner.feed(&text));
+        while !self.scanner.held().is_empty() {
             let Some(piece) = queue.pop_front() else {
                 break;
             };
-            pieces.extend(scanner.feed(self.piece_text(&piece)));
+            let text = piece_text(&self.format, &piece);
+            pieces.extend(owned(&self.scanner.feed(text)));
         }
         if queue.is_empty() {
-            pieces.extend(scanner.feed(self.scanner.held()));
+            pieces.extend(owned(&self.scanner.feed(&held)));
             if at_end {
-                pieces.extend(scanner.finish());
-                self.scanner = Scanner::new(self.format.terminal_texts());
-            } else {
-                self.scanner = scanner;
+                pieces.extend(owned(&self.scanner.finish()));
             }
+        } else {
+            self.scanner.resume(held);
         }
         for piece in pieces.into_iter().rev() {
             queue.push_front(piece);
@@ -447,9 +485,9 @@ impl Engine {
     }
 
     /// Takes one piece, and says what to read again when a shaped call's header decided.
-    fn take(&mut self, piece: Piece, out: &mut Events) -> Option<String> {
+    fn take(&mut self, piece: Piece<'_>, out: &mut Events) -> Option<String> {
         if self.pending.is_some() {
-            let text = self.piece_text(&piece).to_string();
+            let text = piece_text(&self.format, &piece).to_string();
             return self.read_header(&text, out);
         }
         if let Piece::Marker(index) = piece {
@@ -459,7 +497,7 @@ impl Engine {
                 if !self.call_closes(&terminal) {
                     // The trailer does not end at the terminal: it closes nothing and is the
                     // call's text, as the template's closing pattern reads past it.
-                    self.text(&terminal, out);
+                    self.text(Cow::Owned(terminal), out);
                     return None;
                 }
             }
@@ -474,24 +512,26 @@ impl Engine {
 
     /// Takes one piece where the turn and the table put it: the turn's first piece decides where
     /// the turn starts, then text is the state's and a terminal moves the engine or is text.
-    fn place(&mut self, piece: Piece, out: &mut Events) {
+    fn place(&mut self, piece: Piece<'_>, out: &mut Events) {
         self.open_turn(&piece, out);
         match piece {
-            Piece::Text(text) => self.text(&text, out),
+            Piece::Text(text) => self.text(Cow::Owned(text.into_owned()), out),
             Piece::Marker(index) => self.terminal(index, out),
         }
     }
 
     /// Takes a delta that is text whole ([`Scanner::reads_as_text`]) where [`Self::place`] would
     /// take it as one text piece, without the piece: the common delta of a content or reasoning
-    /// stay, and of a call's arguments, is one.
-    fn place_text(&mut self, text: &str, out: &mut Events) {
-        self.open_turn(&Piece::Text(String::new()), out);
+    /// stay, and of a call's arguments, is one. A content or reasoning delta's events borrow the
+    /// delta, which comes borrowed; an arguments delta's go to the assembler, whose events own
+    /// their text; a scan's one piece comes as the scan gives it.
+    fn place_text<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
+        self.open_turn(&Piece::Text("".into()), out);
         self.text(text, out);
     }
 
     /// The turn's first piece decides where the turn starts, for a table with a start row.
-    fn open_turn(&mut self, piece: &Piece, out: &mut Events) {
+    fn open_turn(&mut self, piece: &Piece<'_>, out: &mut Events) {
         if self.at_turn_start {
             if let Some(state) = self.format.opening(self.state, piece) {
                 self.at_turn_start = false;
@@ -607,11 +647,13 @@ impl Engine {
         first.push_str(&call.into_header_bytes());
         let at = first.chars().next().map_or(0, char::len_utf8);
         let again = first.split_off(at);
-        self.place(Piece::Text(first), out);
+        self.place(Piece::Text(first.into()), out);
         again
     }
 
-    fn text(&mut self, text: &str, out: &mut Events) {
+    /// Text of the state the engine is in: borrowed from the delta when it came whole, owned when
+    /// the scan cut it or the engine held it.
+    fn text<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
         if self.format.is_framing(self.state) {
             out.push(Event::Dropped {
                 text: self.tokens.text(text),
@@ -634,17 +676,20 @@ impl Engine {
                     return;
                 };
                 let mut assembled = Events::new();
-                let taken = call.feed(text, &self.declared, &mut assembled);
+                let taken = call.feed(&text, &self.declared, &mut assembled);
                 self.region.fed += taken;
                 self.push_call_events(assembled.drain(), out);
-                self.wrapping(&text[taken..], MalformedReason::TextAfterTheArguments, out);
+                if taken < text.len() {
+                    let rest = part(&text, taken..text.len());
+                    self.wrapping(rest, MalformedReason::TextAfterTheArguments, out);
+                }
             }
             Emits::Wrapper => self.wrapping(text, MalformedReason::TextBetweenCalls, out),
         }
     }
 
     /// Text of the content or reasoning state the engine is in, as the client sees it.
-    fn show(&mut self, text: &str, out: &mut Events) {
+    fn show<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
         let counted = self.tokens.text(text);
         if self.emits() == Emits::Reasoning {
             self.reasoning_tokens += counted.tokens.unwrap_or(0);
@@ -657,14 +702,14 @@ impl Engine {
     /// Text in a trimmed stay: whitespace before the stay's first other character is dropped as it
     /// arrives; a run of it after the last one is held, and released as the state's text before
     /// more text that is not whitespace.
-    fn trimmed(&mut self, text: &str, out: &mut Events) {
-        let mut rest = text;
+    fn trimmed<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
+        let mut from = 0;
         if !self.stay.begun {
-            let body = rest.trim_start_matches(is_strip_space);
-            let lead = &rest[..rest.len() - body.len()];
-            if !lead.is_empty() {
+            let body = text.trim_start_matches(is_strip_space);
+            let lead = text.len() - body.len();
+            if lead > 0 {
                 out.push(Event::Dropped {
-                    text: self.tokens.text(lead),
+                    text: self.tokens.text(part(&text, 0..lead)),
                     why: DropReason::Whitespace,
                 });
             }
@@ -672,14 +717,15 @@ impl Engine {
                 return;
             }
             self.stay.begun = true;
-            rest = body;
+            from = lead;
         }
-        let body = rest.trim_end_matches(is_strip_space);
-        if !body.is_empty() {
+        let rest = &text[from..];
+        let body = rest.trim_end_matches(is_strip_space).len();
+        if body > 0 {
             self.release_stay(out);
-            self.show(body, out);
+            self.show(part(&text, from..from + body), out);
         }
-        self.hold(&rest[body.len()..]);
+        self.hold(&text[from + body..]);
     }
 
     /// Text at the start of a content stay, before the stay's first character that is not
@@ -689,15 +735,16 @@ impl Engine {
     /// after a thought nothing follows), dropped. The whole answer's message shows no content
     /// for whitespace alone, and a stream that showed it as it arrived carried what the whole
     /// answer does not.
-    fn lead(&mut self, text: &str, out: &mut Events) {
+    fn lead<'d>(&mut self, text: Cow<'d, str>, out: &mut Events<'d>) {
         let body = text.trim_start_matches(is_strip_space);
-        self.hold(&text[..text.len() - body.len()]);
+        let lead = text.len() - body.len();
+        self.hold(&text[..lead]);
         if body.is_empty() {
             return;
         }
         self.stay.begun = true;
         self.release_stay(out);
-        self.show(body, out);
+        self.show(part(&text, lead..text.len()), out);
     }
 
     /// Holds `space`, a run of whitespace, after what the stay holds.
@@ -716,9 +763,9 @@ impl Engine {
     fn release_stay(&mut self, out: &mut Events) {
         for held in std::mem::take(&mut self.stay.held) {
             match held {
-                Held::Space(space) => self.show(&space, out),
+                Held::Space(space) => self.show(Cow::Owned(space), out),
                 Held::Ignored(terminal) => out.push(Event::Dropped {
-                    text: self.tokens.text(&terminal),
+                    text: self.tokens.text(terminal),
                     why: DropReason::Wrapper,
                 }),
             }
@@ -734,7 +781,7 @@ impl Engine {
                 Held::Ignored(terminal) => (terminal, DropReason::Wrapper),
             };
             out.push(Event::Dropped {
-                text: self.tokens.text(&text),
+                text: self.tokens.text(text),
                 why,
             });
         }
@@ -744,9 +791,9 @@ impl Engine {
     /// between a block's calls. Each run of whitespace is the template's and is dropped, each run
     /// of anything else is malformed with `why`. Classifying run by run keeps the result the same
     /// wherever the chunks were cut.
-    fn wrapping(&mut self, surplus: &str, why: MalformedReason, out: &mut Events) {
-        for (run, space) in runs(surplus) {
-            let run = self.tokens.text(run);
+    fn wrapping<'d>(&mut self, surplus: Cow<'d, str>, why: MalformedReason, out: &mut Events<'d>) {
+        for (range, space) in runs_at(&surplus) {
+            let run = self.tokens.text(part(&surplus, range));
             out.push(if space {
                 Event::Dropped {
                     text: run,
@@ -776,7 +823,7 @@ impl Engine {
                         return;
                     }
                     out.push(Event::Dropped {
-                        text: self.tokens.text(&text),
+                        text: self.tokens.text(text),
                         why: DropReason::Wrapper,
                     });
                     return;
@@ -788,14 +835,34 @@ impl Engine {
                 return;
             }
             out.push(Event::Dropped {
-                text: self.tokens.text(&text),
+                text: self.tokens.text(text),
                 why: DropReason::Wrapper,
             });
             return;
         }
         let Some(next) = self.format.next(self.state, index) else {
+            // No row leads out on it: the marker is the state's text, as the model wrote it.
+            // Where that text is the table's own content, a `Malformed` event of no bytes stands
+            // before it, so a reader counts a frame the table did not read and no byte moves; in
+            // a thought the marker is the thought's text alone, as a table may read a thought's
+            // opener there (a turn anchor's table), and so it stays in a state a request's
+            // variant made content, where the table counted none (a thought's marker is the
+            // thought's text, a call's header the call's); where the template discards the
+            // state's text it is dropped as the text is. The run the stay holds (a lead, a
+            // trimmed tail) is the text's, as the marker's text would release it: released
+            // first, so the event stands right before the marker.
             let text = self.format.terminal_text(index).to_string();
-            self.text(&text, out);
+            if self.emits() == Emits::Content
+                && !self.format.is_framing(self.state)
+                && !self.format.is_remade(self.state)
+            {
+                self.release_stay(out);
+                out.push(Event::Malformed {
+                    text: self.tokens.text(""),
+                    why: MalformedReason::MarkerOutOfPlace,
+                });
+            }
+            self.text(Cow::Owned(text), out);
             return;
         };
         self.take_row(index, next, None, out);
@@ -825,7 +892,7 @@ impl Engine {
             self.emits() == Emits::Arguments && self.close_call(Closed::ByMarker, &terminal, out);
         let shown = !taken && self.format.shown(index);
         if !taken {
-            let text = self.tokens.text(&terminal);
+            let text = self.tokens.text(terminal);
             if shown {
                 // A marker of a channel the request does not separate: the client sees it.
                 out.push_content(text);
@@ -934,7 +1001,7 @@ impl Engine {
         // An ignored terminal no event carried out leaves here, before the region's close.
         for (_, marker) in std::mem::take(&mut self.region.carried) {
             out.push(Event::Dropped {
-                text: self.tokens.text(&marker),
+                text: self.tokens.text(marker),
                 why: DropReason::Wrapper,
             });
         }
@@ -946,7 +1013,7 @@ impl Engine {
     /// index the next call takes, and `Finish::tool_calls`. A syntax that writes several calls in
     /// one region starts each of them here. An event's bytes are counted as carried out of the
     /// region, with the ignored terminals that arrived among them placed where they arrived.
-    fn push_call_events(&mut self, events: Vec<Event>, out: &mut Events) {
+    fn push_call_events<'d>(&mut self, events: Vec<Event<'d>>, out: &mut Events<'d>) {
         for event in events {
             if let Event::ToolCallStart { id, .. } = &event {
                 self.calls += 1;
@@ -963,7 +1030,7 @@ impl Engine {
     /// none joins text a client reads (a syntax that hands held bytes back as content, as the bare
     /// list does). Nearly every event has nothing among its bytes and goes out as it is, without
     /// a list of its own.
-    fn push_carried_out(&mut self, mut event: Event, out: &mut Events) {
+    fn push_carried_out<'d>(&mut self, mut event: Event<'d>, out: &mut Events<'d>) {
         let Some(text) = event_text(&mut event) else {
             out.push(self.tokens.relabel(event));
             return;
@@ -1014,7 +1081,7 @@ impl Engine {
             }
             spliced.push_str(&bytes[done..]);
             if let Some(text) = event_text(&mut event) {
-                text.text = spliced;
+                text.text = Cow::Owned(spliced);
             }
             out.push(self.tokens.relabel(event));
             return;
@@ -1022,17 +1089,17 @@ impl Engine {
         let mut done = 0;
         for (cut, marker) in cuts {
             if cut > done {
-                let piece = text_event_like(&event, &bytes[done..cut]);
+                let piece = text_event_like(&event, part(&bytes, done..cut));
                 out.push(self.tokens.relabel(piece));
             }
             out.push(Event::Dropped {
-                text: self.tokens.text(&marker),
+                text: self.tokens.text(marker),
                 why: DropReason::Wrapper,
             });
             done = cut;
         }
         if done < bytes.len() {
-            let piece = text_event_like(&event, &bytes[done..]);
+            let piece = text_event_like(&event, part(&bytes, done..bytes.len()));
             out.push(self.tokens.relabel(piece));
         }
     }
@@ -1066,7 +1133,7 @@ impl Engine {
     /// A tag the end cut short is dropped as the whole tag would have been. Inside a call the
     /// assembler still holds the call's bytes, which came before the tail: the call ends first, so
     /// every byte leaves in order.
-    fn drop_cut_tag(&mut self, text: &str, out: &mut Events) {
+    fn drop_cut_tag(&mut self, text: String, out: &mut Events) {
         self.end_stay(out);
         if self.emits() == Emits::Arguments {
             self.close_call(Closed::ByEnd, "", out);
@@ -1078,13 +1145,11 @@ impl Engine {
     }
 
     fn end(&mut self, finish: EngineFinish, out: &mut Events) {
-        let scanner = std::mem::replace(
-            &mut self.scanner,
-            Scanner::new(self.format.terminal_texts()),
-        );
         // What the scanner held back as a possible terminal is text now that no more bytes come,
         // except a tag the end cut short.
-        self.run(scanner.finish(), true, out);
+        let scanned = self.scanner.finish();
+        self.run(&scanned, true, out);
+        self.scanner.reclaim(scanned);
         self.end_stay(out);
         match self.emits() {
             Emits::Reasoning => out.push(Event::ReasoningEnd),
@@ -1124,8 +1189,22 @@ impl Engine {
     }
 }
 
+/// The bytes a piece stands for.
+fn piece_text<'p>(format: &'p Format, piece: &'p Piece<'_>) -> &'p str {
+    match piece {
+        Piece::Text(text) => text,
+        Piece::Marker(index) => format.terminal_text(*index),
+    }
+}
+
+/// The pieces of a scan, owned: what a scan that reads again gives stands in the queue past the
+/// bytes it was read from.
+fn owned(scanned: &Scanned<'_>) -> Vec<Piece<'static>> {
+    scanned.pieces().map(Piece::into_owned).collect()
+}
+
 impl Parser for Engine {
-    fn feed(&mut self, input: Input<'_>, out: &mut Events) -> Result<(), ParseError> {
+    fn feed<'d>(&mut self, input: Input<'d>, out: &mut Events<'d>) -> Result<(), ParseError> {
         match input {
             Input::Prompt { text, .. } => {
                 if self.stage != Stage::Fresh {
@@ -1147,12 +1226,18 @@ impl Parser for Engine {
                 // the scan would make of it, without the scan and the piece.
                 if self.pending.is_none() && self.scanner.reads_as_text(text) {
                     if !text.is_empty() {
-                        self.place_text(text, out);
+                        self.place_text(Cow::Borrowed(text), out);
                     }
                     return Ok(());
                 }
-                let pieces = self.scanner.feed(text);
-                self.run(pieces, false, out);
+                let scanned = self.scanner.feed(text);
+                // One piece of text (after a held byte, or before one held now) is taken as
+                // [`Self::place`] would take it, without the piece, like a delta read as text.
+                match scanned.whole_text() {
+                    Some(whole) if self.pending.is_none() => self.place_text(whole, out),
+                    _ => self.run(&scanned, false, out),
+                }
+                self.scanner.reclaim(scanned);
                 Ok(())
             }
             Input::End { finish } => {
@@ -1207,7 +1292,7 @@ mod tests {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
     }
 
-    fn run(format: Format, output: &str, finish: EngineFinish) -> Vec<Event> {
+    fn run(format: Format, output: &str, finish: EngineFinish) -> Vec<Event<'static>> {
         let mut engine = Engine::with_call_ids(Arc::new(format), declared(), ids());
         let mut out = Events::new();
         for input in [
@@ -1220,11 +1305,11 @@ mod tests {
         ] {
             engine.feed(input, &mut out).expect("in order");
         }
-        out.drain()
+        out.into_owned().drain()
     }
 
     /// The events of `output` after `prompt`, ended by a stop.
-    fn run_after(format: Format, prompt: &str, output: &str) -> Vec<Event> {
+    fn run_after(format: Format, prompt: &str, output: &str) -> Vec<Event<'static>> {
         let mut engine = Engine::with_call_ids(Arc::new(format), declared(), ids());
         let mut out = Events::new();
         for input in [
@@ -1243,7 +1328,7 @@ mod tests {
         ] {
             engine.feed(input, &mut out).expect("in order");
         }
-        out.drain()
+        out.into_owned().drain()
     }
 
     /// Each call's arguments as the client joins them, and the bytes of each call's end.
@@ -1259,7 +1344,7 @@ mod tests {
                 }
                 Event::ToolCallEnd { source, .. } => {
                     if let Some((_, end)) = calls.last_mut() {
-                        *end = Some(source.text.clone());
+                        *end = Some(source.text.to_string());
                     }
                 }
                 _ => {}
@@ -1338,7 +1423,7 @@ mod tests {
         ] {
             let stopped = run(glm().closes_at_stop("call"), output, EngineFinish::Stop);
             let marked = run(glm(), &format!("{output}</tool_call>"), EngineFinish::Stop);
-            let without_end_bytes = |events: &[Event]| -> Vec<Event> {
+            let without_end_bytes = |events: &[Event<'static>]| -> Vec<Event<'static>> {
                 events
                     .iter()
                     .filter(|event| !matches!(event, Event::Dropped { .. }))
@@ -1680,6 +1765,92 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_with_no_row_is_the_states_text_and_content_says_so() {
+        // In the answer, a marker the table has no row for stays as the model wrote it, and a
+        // `Malformed` event of no bytes before it says a frame was not read; in the thought it is
+        // the thought's text alone, as the opener read there is; where the template discards the
+        // text it is dropped as the text is.
+        let events = run_after(
+            ernie(),
+            "Assistant:",
+            "<think>Plan <think>more</think>\n<response>\nHi<response>\nthere</response></response>",
+        );
+        let [content, reasoning, dropped, malformed] = kinds(&events);
+        assert_eq!(content, "Hi<response>\nthere");
+        assert_eq!(reasoning, "<think>Plan <think>more");
+        assert_eq!(dropped, "</think>\n<response>\n</response></response>");
+        assert_eq!(malformed, "");
+        let said: Vec<usize> = events
+            .iter()
+            .enumerate()
+            .filter_map(|(at, event)| match event {
+                Event::Malformed { text, why } => {
+                    assert_eq!(*why, MalformedReason::MarkerOutOfPlace, "{event:?}");
+                    assert!(text.text.is_empty(), "{event:?}");
+                    Some(at)
+                }
+                _ => None,
+            })
+            .collect();
+        let [at] = said[..] else {
+            panic!("one event of no bytes, not {said:?}: {events:?}");
+        };
+        assert!(
+            matches!(&events[at + 1], Event::Content(text) if text.text.starts_with("<response>\n")),
+            "{events:?}"
+        );
+        // A request that does not separate reasoning reads the thought as content, and counts
+        // the same: the marker written again inside the answer, not the ones in the thought.
+        let variant = run_after(
+            ernie().without_reasoning(),
+            "Assistant:",
+            "<think>Plan <think>more</think>\n<response>\nHi<response>\nthere</response></response>",
+        );
+        assert_eq!(
+            variant
+                .iter()
+                .filter(|event| matches!(event, Event::Malformed { .. }))
+                .count(),
+            1,
+            "{variant:?}"
+        );
+        let variant = run_after(
+            ernie().without_reasoning(),
+            "Assistant:",
+            "<think>\nPlan.\n</think>\n<response>\nHi\n</response>",
+        );
+        assert!(
+            !variant
+                .iter()
+                .any(|event| matches!(event, Event::Malformed { .. })),
+            "{variant:?}"
+        );
+    }
+
+    #[test]
+    fn the_run_a_trimmed_stay_holds_comes_out_before_the_event_for_a_marker_with_no_row() {
+        // The thought's close with no thought open, in a trimmed content stay: the tail the stay
+        // held is the text's, as the marker's text would make it, released before the event of
+        // no bytes, so the event stands right before the marker.
+        let events = run_after(gemma_trimmed(), "<|turn>model\n", "Hi \n<channel|>there");
+        let [content, reasoning, dropped, malformed] = kinds(&events);
+        assert_eq!(content, "Hi \n<channel|>there");
+        assert_eq!([reasoning, dropped, malformed], ["", "", ""]);
+        let at = events
+            .iter()
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the event of no bytes");
+        assert!(
+            matches!(&events[at - 1], Event::Content(text) if text.text.ends_with(" \n")),
+            "{events:?}"
+        );
+        assert!(
+            matches!(&events[at + 1], Event::Content(text) if text.text.starts_with("<channel|>")),
+            "{events:?}"
+        );
+    }
+
+    #[test]
     fn the_prompt_decides_the_start_when_it_writes_the_turns_first_byte() {
         // The generation prompt ends with a space after the anchor: the thought starts there, so
         // the answer's marker in the output is the thought's text.
@@ -1750,7 +1921,7 @@ mod tests {
                 Event::Dropped {
                     text,
                     why: DropReason::Whitespace,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -1794,7 +1965,7 @@ mod tests {
                     &mut out,
                 )
                 .expect("end");
-            let events = out.drain();
+            let events = out.into_owned().drain();
             assert_eq!(bytes(&events), output, "{cuts:?}");
             (kinds(&events), trimmed_space(&events), bytes(&events))
         };
@@ -2149,7 +2320,7 @@ mod tests {
             .iter()
             .take(3)
             .filter_map(|event| match event {
-                Event::Dropped { text, .. } => Some((text.text.clone(), text.tokens)),
+                Event::Dropped { text, .. } => Some((text.text.to_string(), text.tokens)),
                 _ => None,
             })
             .collect();
@@ -2272,17 +2443,17 @@ mod tests {
                 })
                 .collect()
         };
-        let read = |pieces: &[&str]| -> Vec<Event> {
+        let read = |pieces: &[&str]| -> Vec<Event<'static>> {
+            let spans: Vec<Vec<TokenSpan>> = pieces.iter().map(|piece| char_spans(piece)).collect();
             let mut engine = Engine::new(format(), declared());
             let mut out = Events::new();
-            for piece in pieces {
-                let spans = char_spans(piece);
+            for (piece, spans) in pieces.iter().zip(&spans) {
                 engine
                     .feed(
                         Input::Delta {
                             token_ids: &[],
                             text: piece,
-                            spans: &spans,
+                            spans,
                         },
                         &mut out,
                     )
@@ -2296,7 +2467,7 @@ mod tests {
                     &mut out,
                 )
                 .expect("end");
-            out.drain()
+            out.into_owned().drain()
         };
         let after_the_call = |events: &[Event]| -> (Vec<(String, Option<u32>)>, String) {
             let end = events
@@ -2307,7 +2478,9 @@ mod tests {
             let mut content = String::new();
             for event in &events[end + 1..] {
                 match event {
-                    Event::Dropped { text, .. } => dropped.push((text.text.clone(), text.tokens)),
+                    Event::Dropped { text, .. } => {
+                        dropped.push((text.text.to_string(), text.tokens));
+                    }
                     Event::Content(text) => content.push_str(&text.text),
                     Event::Finish { .. } => {}
                     other => panic!("after the call: {other:?}"),

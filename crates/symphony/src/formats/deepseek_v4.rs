@@ -100,7 +100,7 @@ mod tests {
         "</｜DSML｜tool_calls>"
     );
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         drive(
             &mut Engine::with_call_ids(Arc::new(deepseek_v4()), Declared::default(), ids()),
             prompt,
@@ -118,9 +118,9 @@ mod tests {
             .collect()
     }
 
-    fn dropped(text: &str) -> Event {
+    fn dropped(text: &str) -> Event<'static> {
         Event::Dropped {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
         }
     }
@@ -166,7 +166,7 @@ mod tests {
         let ends: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallEnd { source, .. } => Some(source.text.as_str()),
+                Event::ToolCallEnd { source, .. } => Some(&*source.text),
                 _ => None,
             })
             .collect();
@@ -335,14 +335,14 @@ mod tests {
     }
 
     /// The whitespace the engine dropped as the template's spacing, event by event.
-    fn spacing(events: &[Event]) -> Vec<&str> {
+    fn spacing<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
                 Event::Dropped {
                     text,
                     why: DropReason::Whitespace,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -454,7 +454,7 @@ mod tests {
         let ends: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallEnd { source, .. } => Some(source.text.as_str()),
+                Event::ToolCallEnd { source, .. } => Some(&*source.text),
                 _ => None,
             })
             .collect();

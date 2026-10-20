@@ -50,16 +50,23 @@ pub fn deepseek_v3_1() -> Format {
         .transition("call", "call_open", "call")
         .transition("call", "calls_close", "content")
         .transition("calls", "calls_close", "content")
-        .calls(CallSyntax::NamedArguments(SEP))
+        .calls(CallSyntax::NamedArguments {
+            marker: SEP,
+            between_calls: "",
+        })
         .opens_turn("<｜Assistant｜>")
 }
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::common::{Function, Tool};
+    use serde_json::{json as value, Value};
+
     use super::*;
     use crate::{
         engine::Engine,
         event::{DropReason, Event, Events, FinishReason},
+        grammar::{GrammarStart, Options},
         input::{EngineFinish, Input},
         parser::Parser,
         Declared,
@@ -70,7 +77,7 @@ mod tests {
     /// The generation prompt's tail in thinking mode: the turn's opener and the thought opened.
     const THINKING: &str = "<｜Assistant｜><think>";
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         let mut parser = Engine::new(deepseek_v3_1(), Declared::default());
         let mut out = Events::new();
         parser
@@ -102,7 +109,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     /// Every byte the events carry, in order: the output, when the engine accounts for all of it.
@@ -110,11 +117,11 @@ mod tests {
         events
             .iter()
             .map(|event| match event {
-                Event::Content(text) | Event::Reasoning(text) => text.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+                Event::Content(text) | Event::Reasoning(text) => &*text.text,
+                Event::Dropped { text, .. } | Event::Malformed { text, .. } => &*text.text,
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+                | Event::ToolCallEnd { source, .. } => &*source.text,
                 Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
             })
             .collect()
@@ -138,7 +145,7 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -148,17 +155,17 @@ mod tests {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
+                Event::Reasoning(text) => Some(&*text.text),
                 _ => None,
             })
             .collect()
     }
 
-    fn malformed(events: &[Event]) -> Vec<&str> {
+    fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -475,5 +482,331 @@ mod tests {
         format.validate().expect("a valid table");
         assert_eq!(format.name(), "deepseek_v3.1");
         assert_eq!(format.turn_opener(), Some("<｜Assistant｜>"));
+    }
+
+    /// The arguments of the named case and of the required case of a forced set a live cell ran
+    /// against the engine, as the model wrote them under the gateway's older constraint (the
+    /// thoughts are this test's: that cell ran in chat mode).
+    const FORCED_NAMED_ARGUMENTS: &str = "{\"location\": \"London\", \"days\": 3, \"details\": [\"high_low_temperature\", \"humidity\", \"precipitation\"]}";
+    const FORCED_NAMED_THOUGHT: &str = "The user wants a three-day forecast for London with the high and low temperature, the humidity and the precipitation. I call the function with those details.";
+    const FORCED_REQUIRED_ARGUMENTS: &str = "{\"number\": 5, \"sort_by\": \"popularity\"}";
+    /// The required case's answer under the older path: the list of calls the older constraint
+    /// asks for.
+    const FORCED_REQUIRED_LIST: &str = "[{\"name\": \"metropolitan_museum_get_top_artworks\", \"parameters\": {\"number\": 5, \"sort_by\": \"popularity\"}}]";
+
+    fn tool(name: &str, parameters: Value) -> Tool {
+        Tool {
+            tool_type: "function".to_string(),
+            function: Function {
+                name: name.to_string(),
+                description: None,
+                parameters,
+                strict: None,
+                extra: Default::default(),
+            },
+        }
+    }
+
+    /// The tools of the two forced cases, with the schemas their calls were recorded under.
+    fn forecast() -> Tool {
+        tool(
+            "detailed_weather_forecast",
+            value!({
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"},
+                    "days": {"type": "integer"},
+                    "details": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["location", "days"],
+            }),
+        )
+    }
+
+    fn artworks() -> Tool {
+        tool(
+            "metropolitan_museum_get_top_artworks",
+            value!({
+                "type": "object",
+                "properties": {"number": {"type": "integer"}, "sort_by": {"type": "string"}},
+                "required": ["number"],
+            }),
+        )
+    }
+
+    fn forced(reasoning_open: bool, one_call: bool, start: GrammarStart) -> Options {
+        Options {
+            at_least_one: true,
+            reasoning_open,
+            thought_closed: false,
+            one_call,
+            start,
+        }
+    }
+
+    fn payload(tools: &[Tool], options: Options) -> Option<Value> {
+        deepseek_v3_1()
+            .grammar_for(tools, options)
+            .map(|grammar| grammar.payload())
+    }
+
+    /// One call as the tag writes it: the call's opener, the tool's name and the separator, the
+    /// arguments the tool's schema accepts, and the call's close.
+    fn written_call(tool: &Tool) -> Value {
+        value!({"type": "sequence", "elements": [
+            {"type": "const_string", "value": format!("<｜tool▁call▁begin｜>{}<｜tool▁sep｜>", tool.function.name)},
+            {"type": "json_schema", "json_schema": tool.function.parameters},
+            {"type": "const_string", "value": "<｜tool▁call▁end｜>"},
+        ]})
+    }
+
+    /// One call with `arguments` as the tag writes the block around it.
+    fn written(name: &str, arguments: &str) -> String {
+        format!(
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>{name}<｜tool▁sep｜>{arguments}<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+        )
+    }
+
+    /// What the table says of an output: the calls, the finish, the content and the reasoning.
+    #[derive(Debug, PartialEq)]
+    struct Said {
+        calls: Vec<(String, String)>,
+        finish: (FinishReason, u32),
+        content: String,
+        reasoning: String,
+    }
+
+    fn said(events: &[Event]) -> Said {
+        Said {
+            calls: calls(events),
+            finish: finish(events),
+            content: content(events),
+            reasoning: reasoning(events),
+        }
+    }
+
+    /// What the table says of `output` after the prompt's `tail`: the same whole, at every
+    /// two-way cut and character by character, every byte accounted for and none malformed.
+    fn the_same_at_every_cut(tail: &str, output: &str) -> Said {
+        let events = run(tail, &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(malformed(&events), Vec::<&str>::new(), "{output:?}");
+        let whole = said(&events);
+        for (at, _) in output.char_indices().skip(1) {
+            let (head, rest) = output.split_at(at);
+            assert_eq!(
+                said(&run(tail, &[head, rest])),
+                whole,
+                "cut at {at}: {output:?}"
+            );
+        }
+        let pieces: Vec<&str> = output
+            .char_indices()
+            .map(|(at, c)| &output[at..at + c.len_utf8()])
+            .collect();
+        assert_eq!(
+            said(&run(tail, &pieces)),
+            whole,
+            "character by character: {output:?}"
+        );
+        whole
+    }
+
+    #[test]
+    fn a_forced_call_is_the_block_holding_the_name_the_separator_and_the_tools_schema() {
+        // A named function on a prompt with the thought closed (chat mode), for an engine that
+        // starts the grammar after its reasoning parser has seen the thought's close: the block
+        // at once, entered from the turn's own state or right after `</think>`, holding the one
+        // call as the template writes it (the call's opener, the tool's name, `<｜tool▁sep｜>`,
+        // the arguments the tool's schema accepts, the call's close), closed by the block's close,
+        // and nothing after it.
+        let got = payload(
+            &[forecast()],
+            forced(false, true, GrammarStart::AfterReasoning),
+        )
+        .expect("a tag");
+        let one_call = value!({"type": "or", "elements": [written_call(&forecast())]});
+        let tag = |begin: &str| {
+            value!({
+                "type": "tag",
+                "begin": begin,
+                "content": one_call,
+                "end": "<｜tool▁calls▁end｜>",
+            })
+        };
+        assert_eq!(
+            got,
+            value!({"format": {
+                "type": "triggered_tags",
+                "triggers": ["<｜tool▁calls▁begin｜>", "</think>"],
+                "tags": [
+                    tag("<｜tool▁calls▁begin｜>"),
+                    tag("</think><｜tool▁calls▁begin｜>"),
+                ],
+                "at_least_one": true,
+                "stop_after_first": true,
+            }})
+        );
+        // `required` with parallel calls allowed: one or more calls to any of the tools, nothing
+        // between them, the block closed after the last, and more may follow.
+        let got = payload(
+            &[forecast(), artworks()],
+            forced(false, false, GrammarStart::AfterReasoning),
+        )
+        .expect("a tag");
+        let format = &got["format"];
+        assert_eq!(format["at_least_one"], true);
+        assert_eq!(format["stop_after_first"], Value::Null);
+        assert_eq!(
+            format["tags"][0]["content"],
+            value!({"type": "plus", "content": {"type": "or", "elements": [
+                written_call(&forecast()),
+                written_call(&artworks()),
+            ]}})
+        );
+        // With the thought closed by the prompt, the engine's start changes nothing: the template
+        // renders no thought the model would write first, and the block follows at once.
+        let closed = payload(
+            &[forecast()],
+            forced(false, true, GrammarStart::AfterReasoning),
+        );
+        assert_eq!(
+            payload(&[forecast()], forced(false, true, GrammarStart::FirstToken)),
+            closed
+        );
+        assert_eq!(
+            payload(&[forecast()], forced(false, true, GrammarStart::Unknown)),
+            closed
+        );
+        // No call owed (`auto`): the same tags, free text before them.
+        let auto = payload(
+            &[forecast()],
+            Options {
+                at_least_one: false,
+                reasoning_open: false,
+                thought_closed: false,
+                one_call: false,
+                start: GrammarStart::Unknown,
+            },
+        )
+        .expect("a tag");
+        assert_eq!(auto["format"]["at_least_one"], false);
+        assert_eq!(auto["format"]["triggers"], got["format"]["triggers"]);
+        assert_eq!(
+            auto["format"]["tags"][0]["content"],
+            value!({"type": "plus", "content": {"type": "or", "elements": [written_call(&forecast())]}})
+        );
+    }
+
+    #[test]
+    fn the_prompts_open_thought_leads_the_tag_by_where_the_engine_starts() {
+        // Thinking mode: the prompt ends in `<think>`. After the gate of the engine's reasoning
+        // parser, which has read the thought and its close, the block comes at once, the same tag
+        // as with the thought closed; from the first token, the thought's text, which writes none
+        // of the table's terminals nor the separator, ends at `</think>` and the block follows;
+        // where the engine does not say, free text that may close the thought comes first.
+        let closed = payload(
+            &[forecast()],
+            forced(false, true, GrammarStart::AfterReasoning),
+        )
+        .expect("a tag");
+        assert_eq!(
+            payload(
+                &[forecast()],
+                forced(true, true, GrammarStart::AfterReasoning)
+            ),
+            Some(closed.clone())
+        );
+        let first =
+            payload(&[forecast()], forced(true, true, GrammarStart::FirstToken)).expect("a tag");
+        assert_eq!(first["format"]["type"], "sequence");
+        // The thought's text may not write the table's terminals; the separator alone opens no
+        // call (the call's opener before it is a terminal), so it stays writable.
+        assert_eq!(
+            first["format"]["elements"][0],
+            value!({"type": "tag", "begin": "", "content": {"type": "any_text", "excludes": [
+                "<think>", "</think>", "<｜tool▁calls▁begin｜>", "<｜tool▁calls▁end｜>",
+                "<｜tool▁call▁begin｜>", "<｜tool▁call▁end｜>",
+            ]}, "end": "</think>"})
+        );
+        assert_eq!(first["format"]["elements"][1], closed["format"]);
+        let unknown =
+            payload(&[forecast()], forced(true, true, GrammarStart::Unknown)).expect("a tag");
+        assert_eq!(
+            unknown["format"]["elements"][0],
+            value!({"type": "any_text", "excludes": [
+                "<｜tool▁calls▁begin｜>", "<｜tool▁calls▁end｜>", "<｜tool▁call▁begin｜>",
+                "<｜tool▁call▁end｜>",
+            ]})
+        );
+        assert_eq!(unknown["format"]["elements"][1], closed["format"]);
+    }
+
+    #[test]
+    fn the_recorded_forced_answers_in_the_tags_shape_read_as_the_thought_and_the_call() {
+        // The named case and the required case of the live cell, each as the tag writes it: in
+        // thinking mode the thought, its close and the block; in chat mode the block alone. One
+        // call with the recorded arguments, the thought as reasoning, no content, `stop` with one
+        // call counted; the same in a stream of any shape.
+        let named = format!(
+            "{FORCED_NAMED_THOUGHT}</think>{}",
+            written("detailed_weather_forecast", FORCED_NAMED_ARGUMENTS)
+        );
+        assert_eq!(
+            the_same_at_every_cut(THINKING, &named),
+            Said {
+                calls: vec![(
+                    "detailed_weather_forecast".to_string(),
+                    FORCED_NAMED_ARGUMENTS.to_string()
+                )],
+                finish: (FinishReason::Stop, 1),
+                content: String::new(),
+                reasoning: FORCED_NAMED_THOUGHT.to_string(),
+            }
+        );
+        let required = written(
+            "metropolitan_museum_get_top_artworks",
+            FORCED_REQUIRED_ARGUMENTS,
+        );
+        assert_eq!(
+            the_same_at_every_cut(CHAT, &required),
+            Said {
+                calls: vec![(
+                    "metropolitan_museum_get_top_artworks".to_string(),
+                    FORCED_REQUIRED_ARGUMENTS.to_string()
+                )],
+                finish: (FinishReason::Stop, 1),
+                content: String::new(),
+                reasoning: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn the_older_paths_forced_answers_read_as_the_thought_and_json_content() {
+        // What the gateway's older path had the model write when the table had no tag: the bare
+        // arguments object for a named function, or the list of calls for `required`, after the
+        // thought in thinking mode. The table reads them as what they are in its syntax, a
+        // thought and content, with no call: the tag is what makes a forced call a call here.
+        // Pinned whole and at every cut.
+        let named = format!("{FORCED_NAMED_THOUGHT}</think>{FORCED_NAMED_ARGUMENTS}");
+        assert_eq!(
+            the_same_at_every_cut(THINKING, &named),
+            Said {
+                calls: Vec::new(),
+                finish: (FinishReason::Stop, 0),
+                content: FORCED_NAMED_ARGUMENTS.to_string(),
+                reasoning: FORCED_NAMED_THOUGHT.to_string(),
+            }
+        );
+        assert_eq!(
+            the_same_at_every_cut(CHAT, FORCED_REQUIRED_LIST),
+            Said {
+                calls: Vec::new(),
+                finish: (FinishReason::Stop, 0),
+                content: FORCED_REQUIRED_LIST.to_string(),
+                reasoning: String::new(),
+            }
+        );
     }
 }

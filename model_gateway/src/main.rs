@@ -36,7 +36,7 @@ use smg::{
         ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, ParserChoice,
         PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig,
         RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
-        TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig, TurboJpegPolicy,
         DEFAULT_FILE_DISCOVERY_CHECK_INTERVAL_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
@@ -278,6 +278,12 @@ fn parse_mm_processing(value: &str) -> Result<MmProcessingMode, String> {
         .ok_or_else(|| format!("invalid value '{value}'; expected auto, router, or worker"))
 }
 
+/// Parse the `--mm-turbojpeg` value into a `TurboJpegPolicy`.
+fn parse_mm_turbojpeg(value: &str) -> Result<TurboJpegPolicy, String> {
+    TurboJpegPolicy::parse(value)
+        .ok_or_else(|| format!("invalid value '{value}'; expected prefer or require"))
+}
+
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
     match value.parse::<usize>() {
         Ok(n) if n >= 1 => Ok(n),
@@ -486,10 +492,12 @@ struct RoutingArgs {
     /// lines still parse). A worker whose load report is at or above
     /// --worker-overload-waiting-requests or --worker-overload-token-usage is
     /// left out of routing while another worker is under them; when every
-    /// worker is over them the request goes to the least-loaded one, unless
-    /// --worker-overload-shed asks for a 503 instead. Evaluated once per load
-    /// report, never per request. Per-worker `overload` blocks on a WorkerSpec
-    /// override the gateway values per signal
+    /// worker is over them the request goes to the least-loaded one (in gRPC
+    /// and HTTP prefill/decode pair placement such a pool is placed by its
+    /// own policy, as if none were over them), unless --worker-overload-shed
+    /// asks for a 503 instead. Evaluated once per load report, never per
+    /// request. Per-worker `overload` blocks on a WorkerSpec override the
+    /// gateway values per signal
     #[arg(long, default_value_t = true, help_heading = "Routing Policy")]
     worker_overload_protection: bool,
 
@@ -944,6 +952,16 @@ struct WorkerArgs {
     /// connected. Falls back to `SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS`.
     #[arg(long, action = ArgAction::SetTrue, help_heading = "Multimodal")]
     mm_allow_private_media_hosts: bool,
+
+    /// What the gateway's own media pipeline does when libjpeg-turbo
+    /// (`libturbojpeg.so.0`) cannot be loaded: `prefer` (default) decodes
+    /// JPEGs with the pure-Rust decoder, whose pixels differ from the
+    /// reference decoder's by a few levels, says so once at start-up and
+    /// sets the gauge `smg_mm_turbojpeg_available` to 0; `require` stops
+    /// start-up with an error instead, for a deployment whose pixels must
+    /// match the engine's. Falls back to `SMG_MM_TURBOJPEG`.
+    #[arg(long, value_parser = parse_mm_turbojpeg, help_heading = "Multimodal")]
+    mm_turbojpeg: Option<TurboJpegPolicy>,
 
     /// Listener IP for the RDMA pixel lane's metadata exchange, a plain IPv4
     /// or IPv6 address (no hostname, port or brackets: the workers connect to
@@ -3162,6 +3180,7 @@ impl CliArgs {
             .mm_pixel_rdma(self.workers.mm_pixel_rdma)
             .mm_allowed_media_domains(self.workers.mm_allowed_media_domains.clone())
             .mm_allow_private_media_hosts(self.workers.mm_allow_private_media_hosts)
+            .mm_turbojpeg(self.workers.mm_turbojpeg)
             .rdma_listen_ip(self.workers.rdma_listen_ip.clone())
             .rdma_slot_ttl_s(self.workers.rdma_slot_ttl_s)
             .log_mm_timing(self.workers.log_mm_timing)
@@ -5238,6 +5257,8 @@ mod tests {
             "--mm-allowed-media-domains",
             "media.example,cdn.example",
             "--mm-allow-private-media-hosts",
+            "--mm-turbojpeg",
+            "require",
         ]);
         let domains = Some(vec!["media.example".to_string(), "cdn.example".to_string()]);
 
@@ -5250,6 +5271,7 @@ mod tests {
         assert!(router_config.log_mm_timing);
         assert_eq!(router_config.mm_allowed_media_domains, domains);
         assert!(router_config.mm_allow_private_media_hosts);
+        assert_eq!(router_config.mm_turbojpeg, Some(TurboJpegPolicy::Require));
 
         let server_config = cli.to_server_config(router_config).unwrap();
         let nested = &server_config.router_config;
@@ -5261,6 +5283,7 @@ mod tests {
         assert!(nested.log_mm_timing);
         assert_eq!(nested.mm_allowed_media_domains, domains);
         assert!(nested.mm_allow_private_media_hosts);
+        assert_eq!(nested.mm_turbojpeg, Some(TurboJpegPolicy::Require));
     }
 
     #[test]
@@ -5275,9 +5298,11 @@ mod tests {
         assert!(!router_config.log_mm_timing);
         assert_eq!(router_config.mm_allowed_media_domains, None);
         assert!(!router_config.mm_allow_private_media_hosts);
+        assert_eq!(router_config.mm_turbojpeg, None);
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(server_config.router_config.mm_processing, None);
+        assert_eq!(server_config.router_config.mm_turbojpeg, None);
         assert!(!server_config.router_config.log_mm_timing);
         assert!(!server_config.router_config.mm_allow_private_media_hosts);
     }
@@ -5323,6 +5348,9 @@ mod tests {
         assert!(Cli::try_parse_from(["smg", "--mm-pixel-cache-mb", "-1"]).is_err());
         let cli = cli_args_from(&["--mm-processing", "Router"]);
         assert_eq!(cli.workers.mm_processing, Some(MmProcessingMode::Router));
+        assert!(Cli::try_parse_from(["smg", "--mm-turbojpeg", "required"]).is_err());
+        let cli = cli_args_from(&["--mm-turbojpeg", "Require"]);
+        assert_eq!(cli.workers.mm_turbojpeg, Some(TurboJpegPolicy::Require));
     }
 
     /// The multimodal transport flags must reach both `RouterConfig` and the

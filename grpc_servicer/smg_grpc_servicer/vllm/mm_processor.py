@@ -62,6 +62,8 @@ PROCESSOR_FLAG = "--mm-processor"
 ENV_MAX_INFLIGHT = "SMG_VLLM_MM_MAX_INFLIGHT"
 ENV_MAX_ITEM_BYTES = "SMG_VLLM_MM_MAX_ITEM_BYTES"
 ENV_MAX_ITEMS = "SMG_VLLM_MM_MAX_ITEMS"
+ENV_TURBOJPEG = "SMG_VLLM_MM_TURBOJPEG"
+TURBOJPEG_FLAG = "--mm-turbojpeg"
 
 MODE_OFF = "off"
 MODE_INPROCESS = "inprocess"
@@ -69,6 +71,11 @@ MODE_REDIS = "redis"
 # smg's own media pipeline, inside the Rust servicer only.
 MODE_SMG = "smg"
 VALID_MODES = (MODE_OFF, MODE_INPROCESS, MODE_REDIS, MODE_SMG)
+# What smg's own pipeline does when libjpeg-turbo cannot be loaded: decode
+# JPEGs with the pure-Rust fallback (prefer, the default) or refuse to start.
+TURBOJPEG_PREFER = "prefer"
+TURBOJPEG_REQUIRE = "require"
+VALID_TURBOJPEG = (TURBOJPEG_PREFER, TURBOJPEG_REQUIRE)
 
 DEFAULT_MAX_INFLIGHT = 64
 DEFAULT_MAX_ITEM_BYTES = 32 * 1024 * 1024
@@ -88,6 +95,15 @@ def resolve_mm_processor_mode(env: Mapping[str, str] = os.environ) -> str:
     if raw not in VALID_MODES:
         raise ValueError(
             f"{PROCESSOR_FLAG} / {ENV_PROCESSOR}={raw!r} is not one of {'|'.join(VALID_MODES)}"
+        )
+    return raw
+
+
+def resolve_mm_turbojpeg(env: Mapping[str, str] = os.environ) -> str:
+    raw = (env.get(ENV_TURBOJPEG) or TURBOJPEG_PREFER).strip().lower()
+    if raw not in VALID_TURBOJPEG:
+        raise ValueError(
+            f"{TURBOJPEG_FLAG} / {ENV_TURBOJPEG}={raw!r} is not one of {'|'.join(VALID_TURBOJPEG)}"
         )
     return raw
 
@@ -729,10 +745,15 @@ _MM_SETTING_SPECS: dict[str, tuple[str, str, Any]] = {
     "sidecar_timeout_ms": ("--mm-sidecar-timeout-ms", ENV_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
     "sidecar_max_queue": ("--mm-sidecar-max-queue", ENV_MAX_QUEUE, DEFAULT_MAX_QUEUE),
     "sidecar_namespace": ("--mm-sidecar-namespace", ENV_NAMESPACE, None),
+    "turbojpeg": (TURBOJPEG_FLAG, ENV_TURBOJPEG, TURBOJPEG_PREFER),
 }
 _MM_INT_SETTINGS = frozenset(
     {"max_inflight", "max_item_bytes", "max_items", "sidecar_timeout_ms", "sidecar_max_queue"}
 )
+# The variables that are not legacy spellings of their flag: documented beside
+# it as a supported way to set the value (as the router's SMG_MM_TURBOJPEG
+# is), so no deprecation line when the launcher defines the flag.
+_ENV_NOT_LEGACY = frozenset({"turbojpeg"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -751,6 +772,7 @@ class MmSettings:
     sidecar_timeout_ms: int | None = None
     sidecar_max_queue: int | None = None
     sidecar_namespace: str | None = None
+    turbojpeg: str | None = None
     sources: Mapping[str, str] = dataclasses.field(default_factory=dict, compare=False)
     # The settings whose flag the launcher defines (`from_args`), set or not.
     # For the rest the environment variable is the documented way to set them,
@@ -811,7 +833,9 @@ class MmSettings:
                 continue
             from_env = _read_env(name, env, env_name)
             if from_env is not None:
-                if name in self.flags_defined or name in (flags or {}):
+                if (
+                    name in self.flags_defined or name in (flags or {})
+                ) and name not in _ENV_NOT_LEGACY:
                     logger.warning(
                         "%s is deprecated in favour of %s; env support ends in the next minor release",
                         env_name,
@@ -837,7 +861,20 @@ _MM_FLAG_HELP: dict[str, str] = {
     "sidecar_timeout_ms": "How long to wait for the sidecar's result, in milliseconds.",
     "sidecar_max_queue": "Jobs the sidecar queue holds before this worker refuses more.",
     "sidecar_namespace": "The Redis key namespace shared with the sidecar.",
+    "turbojpeg": (
+        "What smg's own pipeline (--mm-processor smg) does when libjpeg-turbo cannot be loaded: "
+        "prefer decodes JPEGs with the pure-Rust fallback, whose pixels differ by a few levels; "
+        "require refuses to start."
+    ),
 }
+
+
+def _choice(value: str) -> str:
+    """A choice flag's value as `_validate_flag` reads it, before argparse
+    checks it against `choices` (which it does after `type`): any case, with
+    the blanks around it dropped, so `--mm-turbojpeg REQUIRE` is the policy
+    the help promises and not a rejected spelling."""
+    return value.strip().lower()
 
 
 def add_mm_arguments(parser: argparse.ArgumentParser) -> list[str]:
@@ -855,7 +892,11 @@ def add_mm_arguments(parser: argparse.ArgumentParser) -> list[str]:
             "help": f"{_MM_FLAG_HELP[name]} Unset falls back to ${env_name}.",
         }
         if name == "processor":
+            kwargs["type"] = _choice
             kwargs["choices"] = list(VALID_MODES)
+        elif name == "turbojpeg":
+            kwargs["type"] = _choice
+            kwargs["choices"] = list(VALID_TURBOJPEG)
         elif name in _MM_INT_SETTINGS:
             kwargs["type"] = int
         parser.add_argument(flag, **kwargs)
@@ -932,6 +973,11 @@ def _validate_flag(name: str, flag: str, value: Any) -> Any:
         if mode not in VALID_MODES:
             raise ValueError(f"{flag}={value!r} is not one of {'|'.join(VALID_MODES)}")
         return mode
+    if name == "turbojpeg":
+        policy = str(value).strip().lower()
+        if policy not in VALID_TURBOJPEG:
+            raise ValueError(f"{flag}={value!r} is not one of {'|'.join(VALID_TURBOJPEG)}")
+        return policy
     if name in _MM_INT_SETTINGS:
         if int(value) <= 0:
             raise ValueError(f"{flag}={value} must be positive")
@@ -944,6 +990,9 @@ def _read_env(name: str, env: Mapping[str, str], env_name: str) -> Any:
     if name == "processor":
         raw = env.get(env_name)
         return resolve_mm_processor_mode(env) if raw is not None and raw.strip() else None
+    if name == "turbojpeg":
+        raw = env.get(env_name)
+        return resolve_mm_turbojpeg(env) if raw is not None and raw.strip() else None
     if name in _MM_INT_SETTINGS:
         return env_int_opt(env, env_name)
     raw = env.get(env_name)

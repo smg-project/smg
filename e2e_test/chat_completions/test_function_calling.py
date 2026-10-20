@@ -1597,6 +1597,30 @@ class _TestToolChoiceBase:
         assert "invalid tool configuration" in error_msg
         assert "conflicting" in error_msg
 
+    def _assert_conflicting_defs_served(self, model, api_client):
+        """Under a table whose forced call carries each tool's own `$defs`, the pair is served
+        and the call's arguments follow the called tool's definition (a string for tool1, a
+        number for tool2). The subclasses whose parser name Symphony answers to call this under
+        --parser symphony; the base test keeps the legacy path's refusal."""
+        response = api_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content": "Test the conflicting tools"}],
+            max_tokens=100,
+            temperature=0.1,
+            tools=CONFLICTING_DEFS_TOOLS,
+            tool_choice="required",
+            stream=False,
+        )
+        calls = response.choices[0].message.tool_calls
+        assert calls, "tool_choice=required forces a call"
+        call = calls[0]
+        value = json.loads(call.function.arguments)["data"]["value"]
+        expected = {"tool1": str, "tool2": (int, float)}[call.function.name]
+        # A bool is an int to Python: a `true` must not pass as tool2's number.
+        assert isinstance(value, expected) and not isinstance(value, bool), (
+            f"{call.function.name} got value {value!r}: not its own DataType definition"
+        )
+
 
 # =============================================================================
 # Tool Choice Tests - Llama Model (llama parser)
@@ -1623,6 +1647,15 @@ class TestToolChoiceLlama(_TestToolChoiceBase):
         "test_tool_choice_auto_streaming",
     }
 
+    def test_conflicting_defs_required_tool_choice(self, model, api_client):
+        """Under --parser symphony the pair is served: the `llama` name reads the json table,
+        whose forced call carries each tool's own `$defs`. On the legacy path the merged schema
+        refuses the pair, as the base test expects."""
+        if get_parser() != "symphony":
+            super().test_conflicting_defs_required_tool_choice(model, api_client)
+            return
+        self._assert_conflicting_defs_served(model, api_client)
+
 
 # =============================================================================
 # Tool Choice Tests - Qwen Model (qwen parser)
@@ -1645,29 +1678,12 @@ class TestToolChoiceQwen(_TestToolChoiceBase):
 
     def test_conflicting_defs_required_tool_choice(self, model, api_client):
         """Under --parser symphony the pair is served: the Qwen3 table gives the forced call a
-        structural tag that carries each tool's own `$defs`, so the call's arguments follow the
-        called tool's definition (a string for tool1, a number for tool2). On the legacy path the
-        merged schema refuses the pair, as the base test expects."""
+        structural tag that carries each tool's own `$defs`. On the legacy path the merged schema
+        refuses the pair, as the base test expects."""
         if get_parser() != "symphony":
             super().test_conflicting_defs_required_tool_choice(model, api_client)
             return
-        response = api_client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": "Test the conflicting tools"}],
-            max_tokens=100,
-            temperature=0.1,
-            tools=CONFLICTING_DEFS_TOOLS,
-            tool_choice="required",
-            stream=False,
-        )
-        calls = response.choices[0].message.tool_calls
-        assert calls, "tool_choice=required forces a call"
-        call = calls[0]
-        value = json.loads(call.function.arguments)["data"]["value"]
-        expected = {"tool1": str, "tool2": (int, float)}[call.function.name]
-        assert isinstance(value, expected), (
-            f"{call.function.name} got value {value!r}: not its own DataType definition"
-        )
+        self._assert_conflicting_defs_served(model, api_client)
 
 
 # =============================================================================

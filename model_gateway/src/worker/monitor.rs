@@ -166,12 +166,15 @@ impl WorkerLoadManager {
         }
     }
 
+    /// Replace cached rank loads for the supplied workers, preserving other workers.
     pub fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
         debug!("WorkerLoadManager update_dp_loads map:{:?}", loads);
         let mut cached = self.dp_cached_loads.write();
         cached.extend(loads.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
 
+    /// Select and increment the least-loaded eligible rank. A virtual worker
+    /// can only select its pinned rank; missing telemetry returns `None`.
     pub fn select_and_increment_lowest_dp_load(
         &self,
         worker: &dyn Worker,
@@ -179,7 +182,14 @@ impl WorkerLoadManager {
     ) -> Option<isize> {
         let mut cached = self.dp_cached_loads.write();
         let loads = cached.get_mut(worker.url())?;
-        let (&dp_rank, _) = loads.iter().min_by_key(|&(rank, load)| (*load, *rank))?;
+        let (&dp_rank, _) = loads
+            .iter()
+            .filter(|(rank, _)| {
+                worker
+                    .dp_rank()
+                    .is_none_or(|pinned| **rank == pinned as isize)
+            })
+            .min_by_key(|&(rank, load)| (*load, *rank))?;
         if let Some(v) = loads.get_mut(&dp_rank) {
             *v += increment;
         }
@@ -532,6 +542,8 @@ impl WorkerMonitor {
     /// shared snapshot, which routing reads, in the next coalesced publish.
     /// The report's `sampled_at` is the receipt less the record's age and
     /// the one-way margin, what a policy releases its dispatch credit against.
+    /// Negative ranks and records for another virtual worker's rank are
+    /// ignored before updating freshness, liveness, metrics or routing state.
     pub fn apply_pushed_load(
         self: &Arc<Self>,
         worker: &Arc<dyn Worker>,
@@ -539,6 +551,13 @@ impl WorkerMonitor {
         record: &EngineLoad,
         received_at: Instant,
     ) {
+        if dp_rank < 0
+            || worker
+                .dp_rank()
+                .is_some_and(|rank| usize::try_from(dp_rank) != Ok(rank))
+        {
+            return;
+        }
         let age = Duration::from_millis(u64::from(record.age_ms)) + PUSHED_ONE_WAY_MARGIN;
         let sampled_at = received_at.checked_sub(age).unwrap_or(received_at);
         let url = worker.url().to_string();
@@ -1739,6 +1758,7 @@ mod worker_monitor_tests {
         Arc::new(worker)
     }
 
+    /// Build an isolated monitor and registry with round-robin routing for tests.
     fn build_monitor() -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>) {
         let registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
@@ -1750,6 +1770,89 @@ mod worker_monitor_tests {
             false,
         ));
         (registry, monitor)
+    }
+
+    /// Backend-wide pushes only refresh the matching virtual rank; quiet ranks keep polling.
+    #[tokio::test]
+    async fn dp8_pushes_cannot_redirect_virtual_workers_to_active_ranks() {
+        let (registry, monitor) = build_monitor();
+        let now = Instant::now();
+        let interval = Duration::from_secs(10);
+        let active = EngineLoad {
+            num_used_tokens: Some(2048),
+            max_total_num_tokens: Some(8192),
+            max_running_requests: 64,
+            ..pushed(7)
+        };
+        for rank in 0..8 {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("grpc://decode:9000")
+                    .worker_type(WorkerType::Decode)
+                    .dp_config(rank, 8)
+                    .build(),
+            );
+            worker.set_status(WorkerStatus::Ready);
+            registry.register(Arc::clone(&worker)).unwrap();
+            // Every subscription receives the same backend-wide stream.
+            for pushing_rank in [0, 2] {
+                monitor.apply_pushed_load(&worker, pushing_rank, &active, now);
+            }
+            let is_active = rank == 0 || rank == 2;
+            assert_eq!(worker.pushes_load_records(), is_active);
+            assert_eq!(
+                monitor.poll_mode(worker.url(), now, interval),
+                if is_active {
+                    PollMode::Suppressed
+                } else {
+                    PollMode::Poll
+                }
+            );
+            monitor.flush_pushed();
+            let snapshot = monitor.load_state.snapshot();
+            if is_active {
+                let report = snapshot.get(worker.url()).unwrap();
+                assert_eq!(report.loads.len(), 1);
+                assert_eq!(report.loads[0].dp_rank, rank as i32);
+            } else {
+                assert!(snapshot.get(worker.url()).is_none());
+            }
+
+            // A poll supplies each quiet rank's real idle sample. A later
+            // foreign push must neither overwrite it nor redirect selection.
+            let loads = HashMap::from([(
+                worker.url().to_string(),
+                HashMap::from([(rank as isize, 0)]),
+            )]);
+            monitor.worker_load_manager.update_dp_loads(&loads);
+            for pushing_rank in [0, 2] {
+                monitor.apply_pushed_load(&worker, pushing_rank, &active, now);
+            }
+            let manager = &monitor.worker_load_manager;
+            assert_eq!(
+                manager.select_and_increment_lowest_dp_load(worker.as_ref(), 1),
+                Some(rank as isize)
+            );
+        }
+    }
+
+    /// Foreign cached ranks cannot redirect a pinned worker or invent missing telemetry.
+    #[test]
+    fn virtual_rank_selection_rejects_foreign_cached_ranks() {
+        let worker = BasicWorkerBuilder::new("grpc://decode:9000")
+            .dp_config(7, 8)
+            .build();
+        let manager = Arc::new(WorkerLoadManager::new());
+        let mut loads = HashMap::from([(0, 0), (2, 0)]);
+        manager.update_dp_loads(&HashMap::from([(worker.url().to_string(), loads.clone())]));
+        assert!(manager
+            .select_and_increment_lowest_dp_load(&worker, 1)
+            .is_none());
+        loads.insert(7, 100);
+        manager.update_dp_loads(&HashMap::from([(worker.url().to_string(), loads)]));
+        assert_eq!(
+            manager.select_and_increment_lowest_dp_load(&worker, 1),
+            Some(7)
+        );
     }
 
     /// A pushed record is a poll of its worker: the rank's entry is replaced
@@ -2119,6 +2222,48 @@ mod worker_monitor_tests {
         record.engine_silence_ms = None;
         monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
         assert!(worker.stall_reason().is_none(), "the engine produces again");
+    }
+
+    /// A pushed record from a step-reporting wire whose silence is past the
+    /// threshold while the servicer reports a long prefill in hand (the step
+    /// that starts a long multimodal prompt, or a kernel built for it) is no
+    /// veto until twice that prefill's time has passed; the same silence
+    /// with nothing pending, a frozen engine, is the veto it was.
+    #[tokio::test]
+    async fn a_pushed_record_with_a_long_pending_prefill_behind_the_engines_silence_is_no_veto() {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("grpc://w1:9000", "llama-3");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let mut record = pushed(1);
+        record.engine_reports_steps = Some(true);
+        record.prefill_pending_tokens = Some(156_752);
+        for silence in [3_000, 10_000, 31_000] {
+            record.engine_silence_ms = Some(silence);
+            monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+            assert!(
+                worker.stall_reason().is_none(),
+                "{silence} ms of silence inside the prefill's allowance"
+            );
+        }
+        record.engine_silence_ms = Some(32_000);
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert_eq!(
+            worker.stall_reason(),
+            Some(super::super::worker::StallReason::Wedged),
+            "silent past twice the prefill at the cold prior"
+        );
+        record.engine_silence_ms = None;
+        record.prefill_pending_tokens = Some(0);
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert!(worker.stall_reason().is_none(), "the engine produces again");
+        // Nothing pending: the threshold, as before.
+        record.engine_silence_ms = Some(3_000);
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert_eq!(
+            worker.stall_reason(),
+            Some(super::super::worker::StallReason::Wedged),
+            "a frozen engine with nothing to prefill"
+        );
     }
 
     /// The overload veto's edges are INFO lines with the report's figures:

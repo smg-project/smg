@@ -1,9 +1,11 @@
 //! A Responses request that continues a stored turn carries that turn's tool
 //! calls and their outputs to the engine, in order: through `conversation`
 //! and through `previous_response_id`, over the real app with an in-process
-//! scripted engine and the in-memory history backend. The engine receives
-//! the rendered prompt as ids; the test's tokenizer renders the message list
-//! as JSON and encodes its bytes, so the prompt the engine saw is read back.
+//! scripted engine and the in-memory history backend; a conversation longer
+//! than the history window reaches the engine with its newest items. The
+//! engine receives the rendered prompt as ids; the test's tokenizer renders
+//! the message list as JSON and encodes its bytes, so the prompt the engine
+//! saw is read back.
 
 #[path = "common/mod.rs"]
 mod common;
@@ -196,14 +198,14 @@ async fn call(app: &Router, method: Method, path: &str, body: Value) -> (StatusC
     (status, json)
 }
 
-/// The turns of the prompt the engine received last: the role of each
-/// message, with the call id of a tool call or a tool result.
+/// The messages of the prompt the engine received last, as the rendered
+/// message list.
 #[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     reason = "test helper: failures should panic"
 )]
-fn last_prompt_turns(requests: &Mutex<Vec<ts::GenerateRequest>>) -> Vec<String> {
+fn last_prompt_messages(requests: &Mutex<Vec<ts::GenerateRequest>>) -> Vec<Value> {
     let requests = requests.lock().unwrap();
     let last = requests.last().expect("the engine received a request");
     let ids = &last
@@ -212,9 +214,27 @@ fn last_prompt_turns(requests: &Mutex<Vec<ts::GenerateRequest>>) -> Vec<String> 
         .expect("a tokenized prompt")
         .input_ids;
     let prompt: Value = serde_json::from_str(&prompt_text(ids)).expect("the rendered message list");
-    prompt["messages"]
-        .as_array()
-        .expect("messages")
+    prompt["messages"].as_array().expect("messages").clone()
+}
+
+/// The text of each message of the prompt the engine received last.
+fn last_prompt_texts(requests: &Mutex<Vec<ts::GenerateRequest>>) -> Vec<String> {
+    last_prompt_messages(requests)
+        .iter()
+        .filter_map(|message| match &message["content"] {
+            Value::String(text) => Some(text.clone()),
+            Value::Array(parts) => parts
+                .iter()
+                .find_map(|part| part["text"].as_str().map(str::to_string)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The turns of the prompt the engine received last: the role of each
+/// message, with the call id of a tool call or a tool result.
+fn last_prompt_turns(requests: &Mutex<Vec<ts::GenerateRequest>>) -> Vec<String> {
+    last_prompt_messages(requests)
         .iter()
         .map(|message| {
             let role = message["role"].as_str().unwrap_or("?");
@@ -321,5 +341,125 @@ async fn a_previous_response_reaches_the_engine_with_its_call_and_output_in_orde
     let stored = ["user", "assistant+calls:call_A", "tool:call_A"];
     assert_eq!(&turns[..3], &stored, "{turns:?}");
     assert_eq!(turns.last().map(String::as_str), Some("user"), "{turns:?}");
+    engine.abort();
+}
+
+/// Adds `items` to the conversation through the conversations API, which
+/// takes 20 items a call.
+async fn add_items(app: &Router, conversation_id: &str, items: &[Value]) {
+    for batch in items.chunks(20) {
+        let (status, added) = call(
+            app,
+            Method::POST,
+            &format!("/v1/conversations/{conversation_id}/items"),
+            json!({"items": batch}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{added}");
+    }
+}
+
+/// Message `n` of a conversation: a user's for an odd `n`, the assistant's
+/// for an even one, its text `item n`.
+fn message_item(n: usize) -> Value {
+    json!({
+        "type": "message",
+        "role": if n % 2 == 1 { "user" } else { "assistant" },
+        "content": format!("item {n}"),
+    })
+}
+
+/// A conversation of 120 items: the engine receives its newest 100, oldest
+/// first, then the request's input; items 1 to 20 are not in the prompt.
+#[tokio::test]
+async fn a_conversation_longer_than_the_history_window_reaches_the_engine_with_its_newest_items() {
+    let (app, requests, engine) = app().await;
+
+    let (status, conversation) = call(&app, Method::POST, "/v1/conversations", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{conversation}");
+    let conversation_id = conversation["id"].as_str().expect("a conversation id");
+    let items: Vec<Value> = (1..=120).map(message_item).collect();
+    add_items(&app, conversation_id, &items).await;
+
+    let (status, response) = call(
+        &app,
+        Method::POST,
+        "/v1/responses",
+        json!({
+            "model": MODEL,
+            "conversation": conversation_id,
+            "input": "item 121",
+            "max_output_tokens": 16,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["status"], "completed", "{response}");
+
+    let texts = last_prompt_texts(&requests);
+    let expected: Vec<String> = (21..=121).map(|n| format!("item {n}")).collect();
+    assert_eq!(
+        texts.first().map(String::as_str),
+        Some("item 21"),
+        "the prompt begins at the oldest of the newest 100 items: {texts:?}"
+    );
+    assert_eq!(texts, expected);
+    engine.abort();
+}
+
+/// A conversation one item longer than the window, whose first two items are
+/// a call and its output: the window begins at the output, which answers a
+/// call the engine would not see, so it is left out; the next call and its
+/// output reach the engine in order, in front of the messages.
+#[tokio::test]
+async fn a_history_window_that_begins_at_a_tool_output_leaves_it_out() {
+    let (app, requests, engine) = app().await;
+
+    let (status, conversation) = call(&app, Method::POST, "/v1/conversations", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{conversation}");
+    let conversation_id = conversation["id"].as_str().expect("a conversation id");
+    let call_item = |call_id: &str| {
+        json!({"type": "function_call", "call_id": call_id, "name": "calc",
+               "arguments": "{\"expr\":\"6*7\"}", "status": "completed"})
+    };
+    let output_item =
+        |call_id: &str| json!({"type": "function_call_output", "call_id": call_id, "output": "42"});
+    let mut items = vec![
+        call_item("call_A"),
+        output_item("call_A"),
+        call_item("call_B"),
+        output_item("call_B"),
+    ];
+    items.extend((5..=101).map(message_item));
+    add_items(&app, conversation_id, &items).await;
+
+    let (status, response) = call(
+        &app,
+        Method::POST,
+        "/v1/responses",
+        json!({
+            "model": MODEL,
+            "conversation": conversation_id,
+            "input": "item 102",
+            "max_output_tokens": 16,
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(response["status"], "completed", "{response}");
+
+    let turns = last_prompt_turns(&requests);
+    assert_eq!(
+        &turns[..3],
+        ["assistant+calls:call_B", "tool:call_B", "user"],
+        "{turns:?}"
+    );
+    assert!(!turns.contains(&"tool:call_A".to_string()), "{turns:?}");
+    // call_A is before the window, its output left out, the rest replays
+    assert_eq!(turns.len(), 101 - 2 + 1, "{turns:?}");
+    assert_eq!(
+        last_prompt_texts(&requests).last().map(String::as_str),
+        Some("item 102")
+    );
     engine.abort();
 }

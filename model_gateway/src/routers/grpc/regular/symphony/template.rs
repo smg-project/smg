@@ -1,5 +1,5 @@
 //! The table a model's response template compiles into, which the parser name `hf` selects
-//! ([`super::TEMPLATE`]).
+//! ([`TEMPLATE_PARSER`](crate::config::TEMPLATE_PARSER)).
 //!
 //! A tokenizer's `tokenizer_config.json` may carry a `response_template`, transformers' description
 //! of how the model's output splits into a thought, content and tool calls. `smg-response-template`
@@ -8,7 +8,7 @@
 //! tags need a layout, how the model's chat template writes a turn: it is learned by rendering the
 //! compiler's probe conversation through the tokenizer's chat template ([`layout::learn`]); a
 //! template whose renderings give no layout still parses, and a forced call or a JSON answer then
-//! has no tag ([`super::constraint`]). The vocabulary's added tokens, as the tokenizer lists them,
+//! has no tag ([`super::constraint`](fn@super::constraint)). The vocabulary's added tokens, as the tokenizer lists them,
 //! are the markers the tags write as tokens ([`Format::marker_tokens`]).
 //!
 //! A table is compiled once per model and tokenizer: a tokenizer registered anew under the model

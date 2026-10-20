@@ -1543,6 +1543,7 @@ fn modes(format: &Format, reasoning_open: bool) -> [Grammar; 4] {
     let options = |at_least_one, one_call| Options {
         at_least_one,
         reasoning_open,
+        thought_closed: false,
         one_call,
         start: GrammarStart::Unknown,
     };

@@ -30,8 +30,10 @@ pub fn answering_to(name: &str) -> Option<Table> {
 /// in [`UNANSWERED`] with the reason (what it selects then is said there), `passthrough`
 /// among them, which leaves its channel as written, which no table reads for. A row may also be
 /// the name a downstream launcher passes for a model family whose table has no older parser
-/// (`muse` for `muse_spark`), so that the launcher's flags read with the table.
-pub const ALIASES: [(&str, Table); 18] = [
+/// (`muse` for `muse_spark`), so that the launcher's flags read with the table, or an engine's
+/// exact name for a table (`llama4_pythonic` for `llama4`, whose generic legacy name `pythonic`
+/// is in [`UNANSWERED`] while another family carries it).
+pub const ALIASES: [(&str, Table); 19] = [
     ("qwen", Table::Qwen3),
     ("qwen_xml", Table::Qwen3Tagged),
     ("qwen_coder", Table::Qwen3Tagged),
@@ -44,6 +46,7 @@ pub const ALIASES: [(&str, Table); 18] = [
     ("deepseek", Table::DeepSeekV3),
     ("deepseek32", Table::DeepSeekV3_2),
     ("deepseek_v41", Table::DeepSeekV4_1),
+    ("llama4_pythonic", Table::Llama4),
     ("minimax", Table::MinimaxM2),
     ("muse", Table::MuseSpark),
     ("kimik2", Table::KimiK2),
@@ -66,7 +69,7 @@ pub const ALIASES: [(&str, Table); 18] = [
 /// the next source decides: after a worker's labels the registry's table for a model it
 /// knows, else the gateway's flags, else the legacy parsers (`passthrough` excepted, which
 /// keeps the legacy parsers either way).
-pub const UNANSWERED: [(&str, &str); 13] = [
+pub const UNANSWERED: [(&str, &str); 12] = [
     (
         "passthrough",
         "leaves its channel as written, which no table reads for: the way back to the \
@@ -101,19 +104,15 @@ pub const UNANSWERED: [(&str, &str); 13] = [
     ),
     (
         "pythonic",
-        "Llama 4's Python list of calls, which no table reads yet; the table that does takes \
-         the name",
+        "Llama 4's Python list of calls, which the llama4 table reads, and the name the \
+         DeepSeek R1 line carries while its own table is pending: the alias arrives once \
+         every family that names pythonic has a table; llama4_pythonic names the Llama 4 \
+         table exactly",
     ),
     (
         "kimi",
         "a thought between `◁think▷` and `◁/think▷`, which no table reads: the Kimi K2 \
          line's table reads `<think>`",
-    ),
-    (
-        "mistral",
-        "the list of calls after `[TOOL_CALLS]` of Mistral 7B v0.3 and Small 3, another \
-         spelling than mistral_v13's, which no table reads yet; the table that does takes \
-         the name",
     ),
     ("step3", "Step 3's calls and thought: no table"),
     ("sarashina", "Sarashina's calls: no table"),

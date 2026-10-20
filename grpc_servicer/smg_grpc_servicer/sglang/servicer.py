@@ -6,7 +6,6 @@ for orchestration without tokenization.
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -47,6 +46,7 @@ from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 
+from smg_grpc_servicer.health_probe import await_probe
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
@@ -66,7 +66,7 @@ from smg_grpc_servicer.sglang.utils import (
     to_token_id_array,
 )
 from smg_grpc_servicer.tensor_wire import tensor_from_parts
-from smg_grpc_servicer.tokenizer_bundle import build_tokenizer_zip, tokenizer_chunks
+from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 
 from ..constrained_decoding import grammar_start_labels, sglang_constrained_decoding_start
 from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
@@ -326,6 +326,12 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         """
         Check the health of the inference server by sending a special request to generate one token.
         Similar to HTTP server's /health endpoint.
+
+        The wait is :func:`await_probe`'s: any scheduler push after the probe
+        started, or the probe's own output, is healthy (a scheduler that aborts
+        the probe answers with a push, which counts); a probe whose submission
+        fails, the send to the scheduler raising, is unhealthy at once; neither
+        within ``HEALTH_CHECK_TIMEOUT`` is unhealthy at the deadline.
         """
         rid = f"HEALTH_CHECK_{time.time()}"
         logger.info(f"Receive health check request: {rid}")
@@ -394,23 +400,30 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 return False
             return False
 
+        started = time.time()
         task = asyncio.create_task(run_health_check())
 
         try:
-            # Wait for response with timeout
-            tic = time.time()
-            while time.time() < tic + HEALTH_CHECK_TIMEOUT:
-                await asyncio.sleep(1)
-                # Check if we got a response from scheduler
-                if self.request_manager.last_receive_tstamp > tic:
-                    return sglang_scheduler_pb2.HealthCheckResponse(
-                        healthy=True, message="Health check passed"
-                    )
-
-            # Timeout - server not responding
-            logger.warning(f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s")
+            verdict = await await_probe(
+                task,
+                started=started,
+                last_receive=lambda: self.request_manager.last_receive_tstamp,
+                timeout=HEALTH_CHECK_TIMEOUT,
+            )
+            if verdict:
+                return sglang_scheduler_pb2.HealthCheckResponse(
+                    healthy=True, message="Health check passed"
+                )
+            if verdict is None:
+                # Neither a push nor the probe's verdict within the deadline.
+                logger.warning(f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s")
+                return sglang_scheduler_pb2.HealthCheckResponse(
+                    healthy=False, message=f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s"
+                )
+            # The probe failed (logged where it did): the answer is now, not
+            # at the deadline.
             return sglang_scheduler_pb2.HealthCheckResponse(
-                healthy=False, message=f"Health check timeout after {HEALTH_CHECK_TIMEOUT}s"
+                healthy=False, message="Health check probe failed"
             )
         finally:
             # The RPC may be cancelled before a scheduler response or the timeout.
@@ -814,15 +827,15 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
             )
         tokenizer_dir = Path(tokenizer_path)
 
-        # Build ZIP archive in memory
+        # Reading and compressing the tokenizer directory is file I/O and CPU
+        # measured in hundreds of milliseconds: the shared bundle builds it in
+        # a worker thread, once, and the scheduler keeps answering everything
+        # else (streams, health checks, aborts) meanwhile.
         try:
-            zip_buffer = build_tokenizer_zip(tokenizer_dir)
+            zip_data, sha256 = await tokenizer_bundle(tokenizer_dir)
         except Exception as e:
             logger.error(f"Failed to build tokenizer ZIP: {e}\n{get_exception_traceback()}")
             await context.abort(grpc.StatusCode.INTERNAL, str(e))
-
-        zip_data = zip_buffer.getbuffer()
-        sha256 = hashlib.sha256(zip_data).hexdigest()
 
         logger.info(
             "Streaming tokenizer bundle: %d bytes, sha256=%s",

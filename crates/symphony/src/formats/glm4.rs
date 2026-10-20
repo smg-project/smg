@@ -8,6 +8,13 @@
 //! open the thought in the prompt ([`glm()`](super::glm())); Ling writes the newline before the
 //! close instead of after each pair, under its own turn opener ([`ling()`](super::ling())).
 //!
+//! The table carries the one part of its chat template's layout the tags write: after the
+//! thought's close the template writes a newline before the content or the first call
+//! (`</think>\n<tool_call>`), so a forced call written where the close left the engine begins on
+//! its own line, as the template writes it, and the call's marker is not the grammar's first text
+//! ([`Format::grammar_for`]). The thought the model opens and closes itself: a `<tool_call>`
+//! inside it is thought text, as the template reads it.
+//!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 use crate::{
     format::{CallSyntax, Emits, Format},
@@ -31,6 +38,7 @@ pub fn glm4() -> Format {
         .transition("call", "call_open", "call")
         .calls(CallSyntax::Keyed(keyed::Tags::GLM4))
         .opens_turn("<|assistant|>")
+        .with_layout(super::thought_layout("</think>", "\n"))
 }
 
 #[cfg(test)]
@@ -41,25 +49,40 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Text},
-        testing::{arguments_of, bytes, content, drive, reasoning},
+        event::{DropReason, Event, FinishReason, Text},
+        testing::{
+            a_forced_tag_begins_with_the_templates_text, arguments_of, bytes, content, drive,
+            reasoning, the_same_at_every_cut, Said,
+        },
         Declared,
     };
 
-    fn declared() -> Declared {
-        Declared::of(&[Tool {
+    /// The recorded tool and one without parameters, as a request lists them.
+    fn tools() -> Vec<Tool> {
+        let tool = |name: &str, parameters: serde_json::Value| Tool {
             tool_type: "function".to_string(),
             function: Function {
-                name: "ChaDri_change_drink".to_string(),
+                name: name.to_string(),
                 description: None,
-                parameters: value!({"type": "object", "properties": {
-                    "drink_id": {"type": "string"},
-                    "new_preferences": {"type": "object"},
-                }}),
+                parameters,
                 strict: None,
                 extra: Default::default(),
             },
-        }])
+        };
+        vec![
+            tool(
+                "ChaDri_change_drink",
+                value!({"type": "object", "properties": {
+                    "drink_id": {"type": "string"},
+                    "new_preferences": {"type": "object"},
+                }}),
+            ),
+            tool("ping", value!({"type": "object", "properties": {}})),
+        ]
+    }
+
+    fn declared() -> Declared {
+        Declared::of(&tools()[..1])
     }
 
     /// The generation prompt's tail when the request leaves thinking on: the turn opened, and
@@ -79,13 +102,13 @@ mod tests {
         "<arg_value>{\"size\": \"large\", \"temperature\": \"hot\"}</arg_value>\n</tool_call>"
     );
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         drive(&mut Engine::new(glm4(), declared()), prompt, pieces)
     }
 
-    fn dropped(text: &str) -> Event {
+    fn dropped(text: &str) -> Event<'static> {
         Event::Dropped {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
         }
     }
@@ -196,5 +219,98 @@ mod tests {
     #[test]
     fn the_table_validates() {
         glm4().validate().expect("a sound table");
+    }
+
+    /// One call as the tag writes it after the thought's close, and as the template renders one.
+    const FORCED_CALL: &str = "<tool_call>ChaDri_change_drink\n<arg_key>drink_id</arg_key>\n\
+                               <arg_value>latte</arg_value>\n</tool_call>";
+
+    #[test]
+    fn a_prompt_with_thinking_off_ends_with_the_bare_close_and_the_newline_stays_the_tags() {
+        // The thinking-off prompt closes an empty thought without the newline the template writes
+        // after the close before the content or a call, so the prompt has not written it: a
+        // forced call written after the gate of the engine's reasoning parser still begins with
+        // it, as with the thought left to the model.
+        use crate::grammar::{GrammarStart, Options};
+        let format = glm4();
+        assert!(!format.thought_closed(PROMPT_THINKING_OFF));
+        assert!(!format.thought_closed(PROMPT));
+        assert!(!format.reasoning_open(PROMPT_THINKING_OFF));
+        let tag = format
+            .grammar_for(
+                &tools(),
+                Options {
+                    at_least_one: true,
+                    reasoning_open: format.reasoning_open(PROMPT_THINKING_OFF),
+                    thought_closed: format.thought_closed(PROMPT_THINKING_OFF),
+                    one_call: false,
+                    start: GrammarStart::AfterReasoning,
+                },
+            )
+            .expect("a tag")
+            .payload();
+        assert_eq!(tag["format"]["type"], "sequence");
+        assert_eq!(tag["format"]["elements"][0]["type"], "const_string");
+        assert_eq!(tag["format"]["elements"][0]["value"], "\n");
+    }
+
+    #[test]
+    fn a_forced_call_after_the_thoughts_close_begins_with_the_templates_newline() {
+        // The GLM 4.5 and 4.6 templates write a newline after the thought's close before the
+        // content or the first call, and the table carries that part of its layout: where the
+        // grammar starts after the close, the calls' tag begins with it, so the call's marker is
+        // not the grammar's first text; with the thought closed, at the first token or where the
+        // engine does not say, the calls at once, as before.
+        a_forced_tag_begins_with_the_templates_text(
+            &glm4(),
+            &tools(),
+            "</think>",
+            "\n",
+            "<tool_call>",
+        );
+    }
+
+    #[test]
+    fn a_forced_call_written_after_the_thoughts_close_reads_as_the_call_with_the_rehearsal_as_thought(
+    ) {
+        // The tag's shape on an engine whose grammar starts after the thought's close: the thought
+        // with the call's format rehearsed inside it, its close, the template's newline and the
+        // call. The rehearsal is thought text, the newline the template's spacing, the call the
+        // call; whole, one character at a time and at every cut.
+        let rehearsed = format!("The user wants a latte. The format is {FORCED_CALL}. So:");
+        let output = format!("<think>{rehearsed}</think>\n{FORCED_CALL}");
+        assert_eq!(
+            the_same_at_every_cut(|pieces| run(PROMPT, pieces), &output),
+            Said {
+                calls: vec![(
+                    "ChaDri_change_drink".to_string(),
+                    r#"{"drink_id": "latte"}"#.to_string()
+                )],
+                finish: Some((FinishReason::Stop, 1)),
+                content: String::new(),
+                reasoning: rehearsed,
+            }
+        );
+    }
+
+    #[test]
+    fn a_call_marker_inside_the_thought_stays_thought_text() {
+        // An engine whose reasoning gate took the rehearsed marker for the thought's end and
+        // started a forced call there wrote the call inside the thought, the output ending there;
+        // the table reads it as the template does: thought text, no call, `stop`. The tag no
+        // longer lets such an engine start there (its first text after the close is the
+        // template's newline, not the marker); the reading is pinned here, whole, one character
+        // at a time and at every cut.
+        let thought = format!("The user wants a latte. The format is {FORCED_CALL}");
+        let output = format!("<think>{thought}");
+        assert_eq!(
+            the_same_at_every_cut(|pieces| run(PROMPT, pieces), &output),
+            Said {
+                calls: Vec::new(),
+                finish: Some((FinishReason::Stop, 0)),
+                content: String::new(),
+                reasoning: thought,
+            }
+        );
     }
 }

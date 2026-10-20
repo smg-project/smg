@@ -1,6 +1,6 @@
 // Integration test for Responses API
 
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode};
 use openai_protocol::{
     common::{GenerationRequest, UsageInfo},
     responses::{
@@ -2875,4 +2875,283 @@ async fn test_conversation_items_multi_conversation_sharing() {
     )
     .await;
     assert_eq!(get_resp.status(), StatusCode::OK);
+}
+
+// ============================================================================
+// A failed Responses stream on the external router ends with the one error
+// event every router writes: the API's typed event on a data line alone.
+// ============================================================================
+
+/// The frames of an SSE body, each with its trailing blank line removed.
+fn sse_frames(body: &str) -> Vec<&str> {
+    body.split("\n\n").filter(|f| !f.is_empty()).collect()
+}
+
+/// The `sequence_number` of a frame's data event.
+fn frame_sequence_number(frame: &str) -> Option<u64> {
+    let data = frame.lines().find_map(|l| l.strip_prefix("data: "))?;
+    serde_json::from_str::<serde_json::Value>(data).ok()?["sequence_number"].as_u64()
+}
+
+/// A streaming request that routes through the tool loop: one MCP tool at
+/// `mcp_url`, the mock server's `brave_web_search` behind it.
+fn streaming_mcp_request(mcp_url: &str, max_tool_calls: Option<u32>) -> ResponsesRequest {
+    ResponsesRequest {
+        input: ResponseInput::Text("search for something".to_string()),
+        model: "mock-model".to_string(),
+        max_tool_calls,
+        store: Some(false),
+        stream: Some(true),
+        tools: Some(vec![ResponseTool::Mcp(McpTool {
+            server_url: Some(mcp_url.to_string()),
+            authorization: None,
+            headers: None,
+            server_label: "mock".to_string(),
+            server_description: None,
+            require_approval: Some(RequireApproval::Mode(RequireApprovalMode::Never)),
+            allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
+        })]),
+        ..Default::default()
+    }
+}
+
+/// An upstream that answers `/v1/responses` with `responses`, and the model
+/// list and health probes a worker needs; returns its base URL.
+#[expect(
+    clippy::disallowed_methods,
+    clippy::expect_used,
+    reason = "test infrastructure"
+)]
+async fn stub_upstream(
+    responses: axum::routing::MethodRouter,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{routing::get, Json, Router};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let models = || async {
+        Json(
+            serde_json::json!({"object": "list", "data": [{"id": "mock-model", "object": "model"}]}),
+        )
+    };
+    let app = Router::new()
+        .route("/v1/responses", responses)
+        .route("/v1/models", get(models))
+        .route(
+            "/health",
+            get(|| async { Json(serde_json::json!({"status": "ok"})) }),
+        );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    (format!("http://{addr}"), server)
+}
+
+/// The SSE body of one function-call turn: the model asks for
+/// `brave_web_search`, as an upstream of the Responses API streams it. An
+/// upstream that answers every turn with it asks again after the call's
+/// output comes back, so with `max_tool_calls` 1 the second turn's call is
+/// one over the limit.
+fn function_call_turn() -> String {
+    let response = serde_json::json!({
+        "id": "resp_stub", "object": "response", "created_at": 1_700_000_000,
+        "model": "mock-model", "status": "in_progress", "output": []
+    });
+    let call = serde_json::json!({
+        "id": "fc_stub", "type": "function_call", "call_id": "call_stub",
+        "name": "brave_web_search", "arguments": "{\"query\":\"smg\"}", "status": "completed"
+    });
+    let events = [
+        (
+            "response.created",
+            serde_json::json!({"type": "response.created", "sequence_number": 0, "response": response}),
+        ),
+        (
+            "response.in_progress",
+            serde_json::json!({"type": "response.in_progress", "sequence_number": 1, "response": response}),
+        ),
+        (
+            "response.output_item.added",
+            serde_json::json!({"type": "response.output_item.added", "sequence_number": 2, "output_index": 0, "item": call}),
+        ),
+        (
+            "response.function_call_arguments.delta",
+            serde_json::json!({"type": "response.function_call_arguments.delta", "sequence_number": 3, "output_index": 0, "item_id": "fc_stub", "delta": "{\"query\":\"smg\"}"}),
+        ),
+        (
+            "response.function_call_arguments.done",
+            serde_json::json!({"type": "response.function_call_arguments.done", "sequence_number": 4, "output_index": 0, "item_id": "fc_stub", "arguments": "{\"query\":\"smg\"}"}),
+        ),
+        (
+            "response.output_item.done",
+            serde_json::json!({"type": "response.output_item.done", "sequence_number": 5, "output_index": 0, "item": call}),
+        ),
+        (
+            "response.completed",
+            serde_json::json!({"type": "response.completed", "sequence_number": 6, "response": {
+                "id": "resp_stub", "object": "response", "created_at": 1_700_000_000,
+                "model": "mock-model", "status": "completed", "output": [call]
+            }}),
+        ),
+    ];
+    events
+        .iter()
+        .map(|(name, data)| format!("event: {name}\ndata: {data}\n\n"))
+        .collect()
+}
+
+/// The router of an OpenAI-mode gateway over `upstream`, with the mock MCP
+/// server in its MCP configuration.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+async fn external_router_with_mcp(
+    upstream: &str,
+    mcp: &MockMCPServer,
+    startup_timeout_secs: u64,
+) -> (Box<dyn smg::routers::RouterTrait>, tempfile::TempDir) {
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+    let router_cfg = router_builder(vec![upstream.to_string()])
+        .worker_startup_timeout_secs(startup_timeout_secs)
+        .max_concurrent_requests(8)
+        .build_unchecked();
+    let cfg_path = cfg_path.to_str().expect("a utf-8 path");
+    let ctx = crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path).await;
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+    (router, dir)
+}
+
+/// The body of a streaming request through `router`, as the client reads it.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+async fn stream_body(router: &dyn smg::routers::RouterTrait, req: ResponsesRequest) -> String {
+    let response = router
+        .route_responses(None, &test_tenant_meta(), req.clone(), &req.model)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    String::from_utf8(bytes.to_vec()).expect("utf-8")
+}
+
+/// An upstream status answered before the first byte of the first turn: the
+/// stream is the one typed error event, the upstream's own code and message,
+/// at sequence number 0; no event name, no sentinel.
+#[tokio::test]
+async fn a_failed_upstream_status_ends_the_stream_with_the_typed_error_event() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(axum::routing::post(|| async {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": {
+                "code": "overloaded", "type": "server_error", "message": "busy, try again"
+            }})),
+        )
+    }))
+    .await;
+    let (router, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+
+    let body = stream_body(router.as_ref(), streaming_mcp_request(&mcp.url(), None)).await;
+
+    assert_eq!(
+        body,
+        "data: {\"type\":\"error\",\"code\":\"overloaded\",\"message\":\"busy, try again\",\
+         \"param\":null,\"sequence_number\":0}\n\n"
+    );
+    server.abort();
+    mcp.stop().await;
+}
+
+/// The tool-call limit reached mid-stream (an upstream that asks for the
+/// tool on every turn, a limit of one): the events of the calls the model
+/// asked for, then the one typed error event at the stream's next sequence
+/// number, and nothing after it (no sentinel).
+#[tokio::test]
+async fn the_tool_call_limit_ends_the_stream_with_the_typed_error_event_and_nothing_after() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(axum::routing::post(|| async {
+        ([(CONTENT_TYPE, "text/event-stream")], function_call_turn())
+    }))
+    .await;
+    let (router, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+
+    let body = stream_body(router.as_ref(), streaming_mcp_request(&mcp.url(), Some(1))).await;
+
+    let frames = sse_frames(&body);
+    let last = frames.last().expect("a frame");
+    let before: Vec<&str> = frames[..frames.len() - 1].to_vec();
+    assert!(
+        before
+            .iter()
+            .any(|f| f.starts_with("event: response.output_item.added\n")),
+        "the call's events precede the error: {body}"
+    );
+    let next = before
+        .iter()
+        .filter_map(|f| frame_sequence_number(f))
+        .max()
+        .map_or(0, |n| n + 1);
+    assert_eq!(
+        *last,
+        format!(
+            "data: {{\"type\":\"error\",\"code\":\"max_tool_calls_exceeded\",\"message\":\
+             \"Reached the max_tool_calls limit (1) before executing the remaining tool \
+             calls.\",\"param\":null,\"sequence_number\":{next}}}"
+        ),
+        "{body}"
+    );
+    assert!(!body.contains("event: error\n"), "{body}");
+    assert!(!body.contains("data: [DONE]"), "{body}");
+    server.abort();
+    mcp.stop().await;
+}
+
+/// An upstream nothing listens on: the stream is the one typed error event
+/// with the request's failure, at sequence number 0.
+#[tokio::test]
+async fn an_unreachable_upstream_ends_the_stream_with_the_typed_error_event() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        format!("http://{}", listener.local_addr().expect("addr"))
+    };
+    let (router, _dir) = external_router_with_mcp(&closed, &mcp, 1).await;
+
+    let body = stream_body(router.as_ref(), streaming_mcp_request(&mcp.url(), None)).await;
+
+    let frames = sse_frames(&body);
+    assert_eq!(frames.len(), 1, "{body}");
+    let event: serde_json::Value =
+        serde_json::from_str(frames[0].strip_prefix("data: ").expect("a data line")).expect("json");
+    assert_eq!(event["type"], "error", "{body}");
+    assert_eq!(event["code"], "upstream_request_failed", "{body}");
+    assert_eq!(event["sequence_number"], 0, "{body}");
+    assert!(
+        event["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("Upstream request failed: ")),
+        "{body}"
+    );
+    assert!(event["param"].is_null(), "{body}");
+    mcp.stop().await;
 }

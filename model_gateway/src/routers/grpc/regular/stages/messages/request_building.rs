@@ -6,25 +6,22 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use crate::{
-    config::ParserChoice,
-    routers::{
-        error,
-        grpc::{
-            client::GenerateRequestBuildOptions,
-            common::stages::{
-                helpers::{self, TagForStart},
-                BuildStage,
-            },
-            context::{
-                stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
-                ExecutionPlanKind, PreparationOutput, RequestContext,
-            },
-            proto_wrapper::MultimodalData,
-            regular::symphony,
-            spec::ResponseSpec,
-            utils,
+use crate::routers::{
+    error,
+    grpc::{
+        client::GenerateRequestBuildOptions,
+        common::stages::{
+            helpers::{self, TagForStart},
+            BuildStage,
         },
+        context::{
+            stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
+            ExecutionPlanKind, PreparationOutput, RequestContext,
+        },
+        proto_wrapper::MultimodalData,
+        regular::{stages::reading, symphony},
+        spec::ResponseSpec,
+        utils,
     },
 };
 
@@ -44,143 +41,6 @@ impl MessageRequestBuildingStage {
             plan_kind,
         }
     }
-}
-
-/// Whether the rendered prompt leaves the model inside its thought, as the
-/// request's grammar, the plan's reasoning state and the response spec all
-/// read it: where a Symphony table reads the message, its replay of the
-/// prompt (a turn the prompt leaves unopened starts inside the thought
-/// whatever the switch says: `regular::symphony::reasoning_open`) with the
-/// tokenizer-driven switch, or alone where the family's rule sets the switch
-/// aside (Gemma 4 prefills an open channel only after a tool response), and
-/// no legacy parser is built to be asked; otherwise native Gemma4 channels
-/// follow the rendered prompt when that parser decides, and other parsers
-/// keep their tokenizer-driven preference for the engine's reasoning gate.
-fn reasoning_decision(
-    ctx: &RequestContext,
-    messages_request: &openai_protocol::messages::CreateMessageRequest,
-    processed_text: &str,
-    continued_final_message: bool,
-) -> bool {
-    let switch = || {
-        ctx.tokenizer_arc().is_some_and(|tokenizer| {
-            utils::messages_reasoning_starts_in_prefill(
-                messages_request,
-                continued_final_message,
-                tokenizer.as_ref(),
-            )
-        })
-    };
-    match symphony::reasoning_open(
-        ctx.state.parser.unwrap_or_default(),
-        &ctx.components
-            .parser_resolver
-            .names(&messages_request.model),
-        &messages_request.model,
-        &ctx.components.templates,
-        processed_text,
-    ) {
-        Some(thought) => thought.or_switch(switch),
-        None => utils::rendered_prompt_reasoning_in_prefill(
-            &ctx.components.reasoning_parser_factory,
-            ctx.components
-                .parser_resolver
-                .reasoning_parser(&messages_request.model)
-                .as_deref(),
-            &messages_request.model,
-            processed_text,
-        )
-        .unwrap_or_else(switch),
-    }
-}
-
-/// What [`constraint_for_worker`] decided: what derives the `auto` tag for a
-/// worker's start, the constraint as the request carries it, and the worker
-/// decoding the policy chose it on, when it did (the stage records that, so a
-/// retry re-selects workers that decide alike).
-struct ConstraintForWorker {
-    auto_tag: Option<Arc<dyn TagForStart>>,
-    tool_constraints: Option<(String, String)>,
-    decided_on: Option<utils::WorkerDecoding>,
-}
-
-/// What constrains the output, decided on the worker selected for the
-/// request (`regular::symphony::worker_constraint`): the whole turn's grammar
-/// on a worker whose engine takes one on every turn from its first token;
-/// else what preparation found, and on a worker that takes a grammar on
-/// every turn the table's tag for the calls the request allows under `auto`.
-/// When the worker's policy chose the constraint, a retry re-selects only
-/// workers that decide alike (`utils::WorkerDecoding::decides_alike`); what
-/// the request asked for suits any worker. The attempt stamp carries what
-/// derives the `auto` tag for a worker's start, so the retry's worker gets it
-/// shaped for where its own engine starts the grammar.
-#[expect(clippy::too_many_arguments)]
-fn constraint_for_worker(
-    ctx: &RequestContext,
-    messages_request: &Arc<openai_protocol::messages::CreateMessageRequest>,
-    chat_tools: &Arc<[openai_protocol::common::Tool]>,
-    processed_text: &str,
-    continued_final_message: bool,
-    require_reasoning: bool,
-    tool_constraints: symphony::PreparedConstraint,
-    names: &utils::ModelNames<'_>,
-    parser: ParserChoice,
-) -> Result<ConstraintForWorker, Response> {
-    let decoding = utils::WorkerDecoding::of(ctx.state.workers.as_ref());
-    let decided = symphony::worker_constraint(
-        decoding,
-        tool_constraints,
-        || {
-            symphony::turn_constraint(
-                parser,
-                names,
-                symphony::Asks::Messages {
-                    request: messages_request,
-                    continues: messages_request.continues_final_assistant(),
-                },
-                chat_tools,
-                processed_text,
-                &ctx.components.templates,
-            )
-        },
-        || {
-            // The tag shares the spec's tools where `tool_choice` narrows
-            // nothing (the common case): no copy of the schemas on the
-            // first attempt; a narrowed list is the one the narrowing owns.
-            let tools: Arc<[_]> = ctx
-                .tokenizer_arc()
-                .map(|tokenizer| {
-                    match utils::template_tools(
-                        chat_tools,
-                        messages_request.tool_choice.as_ref(),
-                        tokenizer.renderer_capabilities(),
-                    ) {
-                        Cow::Owned(narrowed) => Arc::from(narrowed),
-                        Cow::Borrowed([]) => Arc::default(),
-                        Cow::Borrowed(_) => Arc::clone(chat_tools),
-                    }
-                })
-                .unwrap_or_default();
-            symphony::AutoTag {
-                parser,
-                labels: names.labels.clone(),
-                flags: names.flags.clone(),
-                request: symphony::AutoRequest::Messages {
-                    request: Arc::clone(messages_request),
-                    tools,
-                    continues: continued_final_message,
-                },
-                reasoning_open: require_reasoning,
-                templates: Arc::clone(&ctx.components.templates),
-            }
-        },
-    )
-    .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
-    Ok(ConstraintForWorker {
-        auto_tag: decided.auto.map(|auto| -> Arc<dyn TagForStart> { auto }),
-        tool_constraints: decided.constraint.map(|constraint| constraint.to_tuple()),
-        decided_on: decided.by_policy.then_some(decoding),
-    })
 }
 
 /// Build the backend `GenerateRequest` from the Messages request: the
@@ -319,59 +179,69 @@ impl BuildStage for MessageRequestBuildingStage {
         };
 
         let continued_final_message = processed_messages.continued_final_message;
-        let require_reasoning = reasoning_decision(
+        let (require_reasoning, thought_closed) = reading::reasoning_decision(
             ctx,
-            &messages_request,
+            &messages_request.model,
             &processed_messages.text,
-            continued_final_message,
+            |tokenizer| {
+                utils::messages_reasoning_starts_in_prefill(
+                    &messages_request,
+                    continued_final_message,
+                    tokenizer,
+                )
+            },
         );
 
-        let names = ctx
-            .components
-            .parser_resolver
-            .names(&messages_request.model);
-        let parser = ctx.state.parser.unwrap_or_default();
-        let ConstraintForWorker {
+        // What constrains the output on the selected worker, and Symphony's
+        // assignment, decided as for a chat request (`reading::decide`), in
+        // the order the chat builder has: the assignment takes the constraint
+        // as the request carries it, before the worker's shaping in the plan
+        // builder below. The `auto` tag derives for the request over the
+        // tools the template sees. The state records which parser reads the
+        // message, for the response's header.
+        let reading::Decided {
             auto_tag,
             tool_constraints,
-            decided_on,
-        } = constraint_for_worker(
+            assignment,
+            ..
+        } = reading::decide(
             ctx,
-            &messages_request,
-            &spec.chat_tools,
-            &processed_messages.text,
-            continued_final_message,
-            require_reasoning,
-            tool_constraints,
-            &names,
-            parser,
-        )?;
-        if let Some(decoding) = decided_on {
-            ctx.state.constraint_decided_on = Some(decoding);
-        }
-
-        // Symphony's assignment, taken while the rendered prompt is still here (see
-        // `regular::symphony`): the response spec carries it to the drivers, and the state
-        // records which parser reads the message for the response's header. It takes the
-        // constraint as the request carries it, before the worker's shaping in the plan
-        // builder below: the assignment reads the constraint's kind alone, which the shaping
-        // leaves as it is, in the order the chat builder has.
-        let assignment = symphony::assign(
-            parser,
-            &names,
             symphony::Asks::Messages {
-                request: messages_request.as_ref(),
+                request: &messages_request,
                 continues: messages_request.continues_final_assistant(),
             },
-            tool_constraints.as_ref(),
+            &spec.chat_tools,
             &processed_messages.text,
-            &ctx.components.templates,
-        )
-        .map_err(|why| error::bad_request("invalid_parser_configuration", why))?;
-        ctx.state.parser = Some(match assignment {
-            Some(_) => ParserChoice::Symphony,
-            None => ParserChoice::Legacy,
-        });
+            tool_constraints,
+            |ctx| {
+                // The tag shares the spec's tools where `tool_choice` narrows
+                // nothing (the common case): no copy of the schemas on the
+                // first attempt; a narrowed list is the one the narrowing owns.
+                let tools: Arc<[_]> = ctx
+                    .tokenizer_arc()
+                    .map(|tokenizer| {
+                        match utils::template_tools(
+                            &spec.chat_tools,
+                            messages_request.tool_choice.as_ref(),
+                            tokenizer.renderer_capabilities(),
+                        ) {
+                            Cow::Owned(narrowed) => Arc::from(narrowed),
+                            Cow::Borrowed([]) => Arc::default(),
+                            Cow::Borrowed(_) => Arc::clone(&spec.chat_tools),
+                        }
+                    })
+                    .unwrap_or_default();
+                reading::Auto {
+                    request: symphony::AutoRequest::Messages {
+                        request: Arc::clone(&messages_request),
+                        tools,
+                        continues: continued_final_message,
+                    },
+                    reasoning_open: require_reasoning,
+                    thought_closed,
+                }
+            },
+        )?;
 
         let (plan, stamp) = build_messages_backed_plan(
             ctx,

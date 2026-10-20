@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use openai_protocol::{
     model_card::ModelCard,
     model_type::ModelType,
-    worker::{ConstrainedDecoding, HealthCheckConfig, WorkerSpec, WorkerType},
+    worker::{ConstrainedDecoding, HealthCheckConfig, MmProcessingMode, WorkerSpec, WorkerType},
 };
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepId, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
@@ -15,7 +15,10 @@ use super::discover_dp::DpInfo;
 use crate::{
     config::ParserChoice,
     routers::grpc::{
-        multimodal::SUPPORTS_VISION_LABEL,
+        multimodal::{
+            mm_settings, pool_processes_media_refs, registration_lacks_media_processing,
+            SUPPORTS_VISION_LABEL,
+        },
         regular::symphony::{check_names, labels_select_nothing, set_aside_by_the_registry},
         utils::Names,
         zmq_client::zmq_handshake_address,
@@ -129,7 +132,7 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
 
         // Under Symphony the registry's table reads a model it knows for a
         // worker whose labels select no reader, whatever the gateway's flags
-        // name (`regular::symphony::reads`): the model's first such worker
+        // name (`regular::symphony::names::reads`): the model's first such worker
         // says so.
         if let Some(message) = registry_reads_over_the_flags(
             &model_card,
@@ -315,6 +318,47 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
             })
             .collect();
 
+        // A registration that worker-side media placement cannot use is said
+        // once, here, with the worker's address: an engine with a vision
+        // encoder that does not process media references never receives an
+        // image under `--mm-processing worker`. The line says what follows
+        // for the model, read from its pool (the registered workers and the
+        // ones registering with it): with a capable worker beside this one
+        // the media is served (selection picks that worker); without one the
+        // model's multimodal requests are refused (`no_media_ref_capable_worker`)
+        // and `/readiness` names the model until such a worker registers.
+        // The registration itself is not refused. A model on the
+        // encode-prefill-decode pipeline (an encode worker among its
+        // registered workers or these) is not warned about: references never
+        // travel on it, and selection answers with the fix that applies there.
+        if mm_settings().processing.value == MmProcessingMode::Worker {
+            for worker in &workers {
+                let registered = app_context.worker_registry.get_by_model(worker.model_id());
+                let pool = || {
+                    workers
+                        .iter()
+                        .chain(registered.iter())
+                        .filter(|other| other.model_id() == worker.model_id())
+                };
+                if !registration_lacks_media_processing(worker.as_ref(), pool()) {
+                    continue;
+                }
+                let consequence = if pool_processes_media_refs(pool()) {
+                    "other workers of the model process media references and serve them"
+                } else {
+                    "the model's multimodal requests are refused until a worker of it \
+                     processes media references"
+                };
+                warn!(
+                    url = %worker.url(),
+                    model = %worker.model_id(),
+                    "worker reports a vision encoder but no worker-side media processor (no \
+                     mm_processor label): under --mm-processing worker it receives no \
+                     multimodal request; {consequence}"
+                );
+            }
+        }
+
         debug!(
             "Created {} worker(s) for {} ({:?}, {} labels)",
             workers.len(),
@@ -477,7 +521,7 @@ pub(super) fn validate_parser_overrides(
 
 /// Under `--parser symphony`, the registry's table reads a model it knows for every worker whose
 /// labels select no reader (none, or a reasoning name alone that no table answers to), whatever the
-/// gateway's `--tool-call-parser` and `--reasoning-parser` name (`regular::symphony::reads`). When
+/// gateway's `--tool-call-parser` and `--reasoning-parser` name (`regular::symphony::names::reads`). When
 /// they name another reader, the registration of the model's first worker says so: `Some(message)`
 /// while no worker of the model is registered, naming the model, both readers and the one used;
 /// `None` for the model's later workers, a worker whose labels select a reader, a model the

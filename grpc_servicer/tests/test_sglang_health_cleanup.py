@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import smg_grpc_servicer.health_probe as probe_wait
 from test_sglang_server_info import servicer_mod as _servicer_fixture
 
 servicer_mod = _servicer_fixture
@@ -21,6 +22,7 @@ def health_probe(monkeypatch, servicer_mod):
     manager.rid_to_state = {}
     manager.record_request_for_crash_dump = Mock()
     probes = []
+    steps = []
     clock = SimpleNamespace(now=100.0)
     started, polling, resume = asyncio.Event(), asyncio.Event(), asyncio.Event()
 
@@ -34,7 +36,8 @@ def health_probe(monkeypatch, servicer_mod):
         probes.append(asyncio.current_task())
         started.set()
 
-    async def poll(_delay):
+    async def poll(delay):
+        steps.append(delay)
         polling.set()
         await resume.wait()
         clock.now += 1
@@ -58,12 +61,15 @@ def health_probe(monkeypatch, servicer_mod):
         servicer_mod, "DisaggregationMode", SimpleNamespace(NULL=SimpleNamespace(value="null"))
     )
     monkeypatch.setattr(servicer_mod, "HEALTH_CHECK_TIMEOUT", 1)
+    # One clock for the RPC's start and the wait's deadline, and only the
+    # wait's polling under control: the request manager uses real asyncio queues.
     monkeypatch.setattr(servicer_mod, "time", SimpleNamespace(time=lambda: clock.now))
-    # Control only the RPC's polling; the request manager uses real asyncio queues.
+    monkeypatch.setattr(probe_wait, "time", SimpleNamespace(time=lambda: clock.now))
+    monkeypatch.setattr(probe_wait, "asyncio", SimpleNamespace(sleep=poll))
     monkeypatch.setattr(
         servicer_mod,
         "asyncio",
-        SimpleNamespace(create_task=asyncio.create_task, sleep=poll, gather=asyncio.gather),
+        SimpleNamespace(create_task=asyncio.create_task, gather=asyncio.gather),
     )
 
     async def start():
@@ -87,6 +93,7 @@ def health_probe(monkeypatch, servicer_mod):
         manager=manager,
         service=service,
         probes=probes,
+        steps=steps,
         clock=clock,
         resume=resume,
         start=start,

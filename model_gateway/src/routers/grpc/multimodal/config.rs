@@ -333,6 +333,12 @@ impl MultimodalComponents {
         .map_err(anyhow::Error::msg)?;
 
         super::report_jpeg_decoder();
+        super::enforce_jpeg_decoder_policy(settings.turbojpeg.value)?;
+        tracing::info!(
+            policy = %settings.turbojpeg.value,
+            source = settings.turbojpeg.source.as_str(),
+            "TurboJPEG policy"
+        );
         let processing = settings.processing.value;
         tracing::info!(
             mode = %processing,
@@ -631,6 +637,37 @@ mod tests {
             components.pixel_cache.is_none(),
             "0 MiB keeps the cache off"
         );
+    }
+
+    /// Under `require` the components come up exactly when the library did:
+    /// a host without it is refused with the library and the gauge named, a
+    /// host with it starts as before.
+    #[test]
+    fn a_required_turbojpeg_is_refused_exactly_when_the_library_is_missing() {
+        use llm_multimodal::jpeg_turbo::{turbojpeg_available, TurboJpegPolicy};
+
+        use super::super::settings::{Setting, SettingSource};
+
+        let settings = MultimodalSettings {
+            turbojpeg: Setting {
+                value: TurboJpegPolicy::Require,
+                source: SettingSource::Flag,
+            },
+            ..MultimodalSettings::default()
+        };
+        let result = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &settings,
+        );
+        if turbojpeg_available() {
+            assert!(result.is_ok(), "{:#}", result.err().unwrap());
+        } else {
+            let error = format!("{:#}", result.err().expect("refused without the library"));
+            assert!(error.contains("libturbojpeg.so.0"), "{error}");
+            assert!(error.contains("smg_mm_turbojpeg_available"), "{error}");
+        }
     }
 
     fn components(max_inflight_bytes: Option<usize>) -> Result<MultimodalComponents> {

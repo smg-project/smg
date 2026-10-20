@@ -1,6 +1,7 @@
 //! Python calls written from the table's markers: Olmo 3's, one call per line between
 //! `<function_calls>` and `</function_calls>`, and LFM2.5's, a Python list between
-//! `<|tool_call_start|>` and `<|tool_call_end|>`.
+//! `<|tool_call_start|>` and `<|tool_call_end|>`; and Llama 4's list alone in the turn, with no
+//! marker around it, written as the bare JSON list is.
 //!
 //! A call is the tool's name, `(`, its arguments and `)`. The arguments are `key=value` pairs in
 //! the schema's order, joined by `, `, each present when the schema requires it and otherwise
@@ -9,9 +10,10 @@
 //! the template's: LFM2.5 writes Python, a string in either quote (`"Paris"`, `'Paris'`), a
 //! string `enum` as one of its values quoted the same way, a boolean as `True` or `False`, `null`
 //! as `None`; Olmo 3 writes every value through `tojson`, so JSON, a string in double quotes, an
-//! `enum` value the same, `true`, `false` and `null`. A number, an object or an array is the JSON
-//! the property's schema accepts under both, which the templates write with `tojson` and the
-//! assembler reads as it reads a Python literal. An `enum` behind a `$ref` is the target's, as
+//! `enum` value the same, `true`, `false` and `null`; Llama 4's template quotes every value, and
+//! its tags write Python's, the spelling its model card gives the model. A number, an object or
+//! an array is the JSON the property's schema accepts under every dialect, which the templates
+//! write with `tojson` and the assembler reads as it reads a Python literal. An `enum` behind a `$ref` is the target's, as
 //! every keyword is. A property that pins no type, or a schema without properties, takes any text
 //! up to the call's `)`.
 
@@ -37,6 +39,52 @@ pub(super) fn calls(
     tools: &[&Tool],
     count: Count<'_>,
 ) -> Grammar {
+    let (open, between, close) = framing(dialect.framing);
+    count.triggered(
+        vec![markers.call_open.to_string()],
+        vec![Tag::new(
+            format!("{}{open}", markers.call_open),
+            calls_joined(dialect, tools, count, between),
+            format!("{close}{}", markers.call_close),
+        )],
+    )
+}
+
+/// The calls for `tools` as a list alone in the turn, no marker before or after it (Llama 4):
+/// the list, closed with the end of the turn, or, when no call is required, prose that does not
+/// start with a bracket, as xLAM's bare list has it.
+pub(super) fn list_alone(dialect: Dialect, tools: &[&Tool], count: Count<'_>) -> Grammar {
+    let (open, between, close) = framing(dialect.framing);
+    let list = Grammar::Sequence(vec![
+        Grammar::ConstString(open.to_string()),
+        calls_joined(dialect, tools, count, between),
+        Grammar::ConstString(count.end(close)),
+    ]);
+    if count.at_least_one {
+        list
+    } else {
+        Grammar::Or(vec![
+            Grammar::Sequence(vec![
+                Grammar::Regex(r"\s*[^\s\[]".to_string()),
+                Grammar::AnyText {
+                    excludes: Vec::new(),
+                },
+            ]),
+            list,
+        ])
+    }
+}
+
+/// What the framing writes around the calls and between them.
+fn framing(framing: Framing) -> (&'static str, &'static str, &'static str) {
+    match framing {
+        Framing::OnePerLine => ("", "\n", ""),
+        Framing::List => ("[", ", ", "]"),
+    }
+}
+
+/// One call of `tools`, or more joined by `between`, as many as `count` lets the model write.
+fn calls_joined(dialect: Dialect, tools: &[&Tool], count: Count<'_>, between: &str) -> Grammar {
     let one_call = Grammar::Or(
         tools
             .iter()
@@ -49,29 +97,7 @@ pub(super) fn calls(
             })
             .collect(),
     );
-    let (open, between, close) = match dialect.framing {
-        Framing::OnePerLine => ("", "\n", ""),
-        Framing::List => ("[", ", ", "]"),
-    };
-    let content = if count.one {
-        one_call
-    } else {
-        Grammar::Sequence(vec![
-            one_call.clone(),
-            Grammar::Star(Box::new(Grammar::Sequence(vec![
-                Grammar::ConstString(between.to_string()),
-                one_call,
-            ]))),
-        ])
-    };
-    count.triggered(
-        vec![markers.call_open.to_string()],
-        vec![Tag::new(
-            format!("{}{open}", markers.call_open),
-            content,
-            format!("{close}{}", markers.call_close),
-        )],
-    )
+    count.calls_between(one_call, between)
 }
 
 /// One call: the name and `(`, the arguments, `)`.
@@ -141,16 +167,17 @@ fn value(schema: &Value, definitions: Definitions<'_>, values: Values) -> Gramma
     }
     let string = move || match values {
         Values::Python => python_string(),
+        Values::Quoted => quoted_string(),
         Values::Json => json_string(),
     };
     match shape(schema, definitions, string) {
         Some(("boolean", _)) => match values {
-            Values::Python => words(&["True", "False"]),
+            Values::Python | Values::Quoted => words(&["True", "False"]),
             Values::Json => words(&["true", "false"]),
         },
         Some(("null", _)) => Grammar::ConstString(
             match values {
-                Values::Python => "None",
+                Values::Python | Values::Quoted => "None",
                 Values::Json => "null",
             }
             .to_string(),
@@ -161,13 +188,24 @@ fn value(schema: &Value, definitions: Definitions<'_>, values: Values) -> Gramma
 }
 
 /// An `enum` value as the dialect quotes it: in either quote under Python, each with its own
-/// escaping; as the one JSON string under JSON.
+/// escaping; under the quoted dialect the double-quoted form is the option as written, since
+/// the reader keeps the text between double quotes as it stands and decodes no escape there, and
+/// it is offered only when the option holds no double quote, the single-quoted form (a Python
+/// literal, escapes decoded) standing for every option; as the one JSON string under JSON.
 fn quoted(option: &str, values: Values) -> Vec<Grammar> {
     match values {
         Values::Python => vec![
             Grammar::ConstString(format!("\"{}\"", escape(option, '"'))),
             Grammar::ConstString(format!("'{}'", escape(option, '\''))),
         ],
+        Values::Quoted => {
+            let mut forms = Vec::with_capacity(2);
+            if !option.contains('"') && !ends_in_an_odd_run_of_backslashes(option) {
+                forms.push(Grammar::ConstString(format!("\"{option}\"")));
+            }
+            forms.push(Grammar::ConstString(format!("'{}'", escape(option, '\''))));
+            forms
+        }
         Values::Json => vec![Grammar::ConstString(
             Value::String(option.to_string()).to_string(),
         )],
@@ -178,6 +216,21 @@ fn quoted(option: &str, values: Values) -> Vec<Grammar> {
 /// the same quote.
 fn python_string() -> Grammar {
     Grammar::Regex(r#""([^"\\]|\\.)*"|'([^'\\]|\\.)*'"#.to_string())
+}
+
+/// A string under the quoted dialect: between double quotes any text but a double quote, as the
+/// reader takes it (no escape is decoded there, so none is written), and no backslash right
+/// before the closing quote, since the scanner that finds the string's end pairs a backslash with
+/// the character after it in either quote; or a single-quoted Python string, which the reader
+/// decodes.
+fn quoted_string() -> Grammar {
+    Grammar::Regex(r#""([^"\\]|\\[^"])*"|'([^'\\]|\\.)*'"#.to_string())
+}
+
+/// Whether `text` ends in an odd run of backslashes: written raw between double quotes, the last
+/// one would pair with the closing quote in the scanner's eyes and the string would never end.
+fn ends_in_an_odd_run_of_backslashes(text: &str) -> bool {
+    text.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
 }
 
 /// A JSON string, as `tojson` writes one.
@@ -512,5 +565,60 @@ mod tests {
                 value!({"type": "any_text", "excludes": [")"]})
             );
         }
+    }
+
+    /// The quoted dialect writes what its reader reads: between double quotes the text as it
+    /// stands (the reader decodes no escape there), so an option with a quote or a backslash is
+    /// written raw or only in the single-quoted form, and a free string allows no escape between
+    /// double quotes.
+    #[test]
+    fn the_quoted_dialect_writes_strings_as_its_reader_reads_them() {
+        let root = value!({});
+        let definitions = Definitions::of(&root);
+        assert_eq!(
+            value(&value!({"enum": ["C:\\tmp"]}), definitions, Values::Quoted).to_json(),
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "\"C:\\tmp\""},
+                {"type": "const_string", "value": "'C:\\\\tmp'"},
+            ]})
+        );
+        assert_eq!(
+            value(
+                &value!({"enum": ["say \"hi\""]}),
+                definitions,
+                Values::Quoted
+            )
+            .to_json(),
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "'say \"hi\"'"},
+            ]})
+        );
+        assert_eq!(
+            value(&value!({"enum": ["it's"]}), definitions, Values::Quoted).to_json(),
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "\"it's\""},
+                {"type": "const_string", "value": "'it\\'s'"},
+            ]})
+        );
+        assert_eq!(
+            value(&value!({"type": "string"}), definitions, Values::Quoted).to_json(),
+            value!({"type": "regex", "pattern": r#""([^"\\]|\\[^"])*"|'([^'\\]|\\.)*'"#})
+        );
+        // An option ending in an odd run of backslashes: raw between double quotes its last
+        // backslash would pair with the closing quote, so the single-quoted form alone; an even
+        // run stays raw.
+        assert_eq!(
+            value(&value!({"enum": ["C:\\"]}), definitions, Values::Quoted).to_json(),
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "'C:\\\\'"},
+            ]})
+        );
+        assert_eq!(
+            value(&value!({"enum": ["C:\\\\"]}), definitions, Values::Quoted).to_json(),
+            value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "\"C:\\\\\""},
+                {"type": "const_string", "value": "'C:\\\\\\\\'"},
+            ]})
+        );
     }
 }

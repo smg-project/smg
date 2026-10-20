@@ -51,7 +51,10 @@ pub struct Output {
 }
 
 /// The output of the response `response_id`, folded from a whole event sequence.
-pub fn output<'a>(response_id: &str, events: impl IntoIterator<Item = &'a Event>) -> Output {
+pub fn output<'a, 'd: 'a>(
+    response_id: &str,
+    events: impl IntoIterator<Item = &'a Event<'d>>,
+) -> Output {
     let folded = fold(events);
     let (status, incomplete_details) =
         response_status(folded.finish.as_ref().map(|finish| &finish.reason));
@@ -268,7 +271,7 @@ impl Stream {
 
     /// Appends the stream events `event` produces to `out`, in order. Returns the response's
     /// [`Output`] when `event` is `Finish`, after completing every open item.
-    pub fn feed(&mut self, event: &Event, out: &mut Vec<StreamEvent>) -> Option<Output> {
+    pub fn feed(&mut self, event: &Event<'_>, out: &mut Vec<StreamEvent>) -> Option<Output> {
         match event {
             Event::Content(text) | Event::Malformed { text, .. } => self.content(&text.text, out),
             Event::Reasoning(text) => self.reasoning(&text.text, out),
@@ -680,7 +683,7 @@ mod tests {
     use super::*;
     use crate::event::{DropReason, MalformedReason, Text};
 
-    fn call(index: u32, name: &str) -> Event {
+    fn call(index: u32, name: &str) -> Event<'static> {
         Event::ToolCallStart {
             index,
             id: format!("call_{index}"),
@@ -689,7 +692,7 @@ mod tests {
         }
     }
 
-    fn arguments(index: u32, json: &str) -> Event {
+    fn arguments(index: u32, json: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index,
             json: json.into(),
@@ -697,14 +700,14 @@ mod tests {
         }
     }
 
-    fn end(index: u32) -> Event {
+    fn end(index: u32) -> Event<'static> {
         Event::ToolCallEnd {
             index,
             source: Text::default(),
         }
     }
 
-    fn finish(reason: FinishReason, tool_calls: u32) -> Event {
+    fn finish(reason: FinishReason, tool_calls: u32) -> Event<'static> {
         Event::Finish {
             reason,
             tool_calls,

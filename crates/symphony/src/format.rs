@@ -175,12 +175,18 @@ pub enum CallSyntax {
     /// terminals that leave the state are the message's own; the object's close is the call's end,
     /// and the message's closing terminal is the region's.
     NamedJson(&'static str),
-    /// The tool's name as text, then this marker, then the arguments object alone: Mistral's
-    /// `[TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}`. The terminal that enters the state is the
-    /// call's opener, which also opens the next call; the object's close is the call's end, and
-    /// the region ends at the next call's opener or the end of the turn, since the template writes
-    /// no closing marker.
-    NamedArguments(&'static str),
+    /// The tool's name as text, then `marker`, then the arguments object alone: Mistral's
+    /// `[TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}`, where the terminal that enters the state
+    /// is the call's opener, which also opens the next call, the object's close is the call's end,
+    /// and the region ends at the next call's opener or the end of the turn, since the template
+    /// writes no closing marker; or DeepSeek V3.1's and V3's calls in a block, each with a close
+    /// of its own. `between_calls` is what the template writes between two calls of a block (V3's
+    /// newline; nothing for V3.1 and Mistral), wrapping the table drops and the structural tag
+    /// writes.
+    NamedArguments {
+        marker: &'static str,
+        between_calls: &'static str,
+    },
     /// The arguments object alone, named by the function the request forces
     /// (`Declared::forced`): what the engine writes under the JSON-schema constraint the gateway
     /// builds when `tool_choice` names a function, the one shape known from the request rather
@@ -208,8 +214,11 @@ pub enum CallSyntax {
 
 impl CallSyntax {
     /// The tags the syntax writes inside a call besides the table's terminals: the markers a
-    /// grammar writes inside a call's region, which free text before a call may not write, and
-    /// which a client that shows a call as text has to strip. JSON, Python and xLAM's list have
+    /// grammar writes inside a call's region, which free text before a call may not write (the
+    /// named-arguments marker excepted: it stands only after the call's opener, a terminal the
+    /// text cannot write, and in one table it is ordinary text a thought may hold, so the
+    /// grammar's `excluded_but` leaves it writable), and which a client that shows a call as
+    /// text has to strip. JSON, Python and xLAM's list have
     /// none, their calls being their own text, and neither has MiniMax M3's XML tree, whose
     /// element tags are the arguments' keys. A call given as data has its parameters' (see
     /// [`CallShape::tag_texts`]).
@@ -227,7 +236,7 @@ impl CallSyntax {
                 TagEnd::Marker(marker) => vec![tags.parameter_open, tags.parameter_close, marker],
                 TagEnd::Angle => vec![tags.parameter_open, tags.parameter_close],
             },
-            Self::NamedJson(marker) | Self::NamedArguments(marker) => vec![*marker],
+            Self::NamedJson(marker) | Self::NamedArguments { marker, .. } => vec![*marker],
             Self::Gemma(spelling) => vec![spelling.string],
             Self::Shaped(shape) => shape.tag_texts(),
             Self::Json
@@ -339,6 +348,11 @@ struct State {
     kept: bool,
     /// The stream's stop closes the call open in the state (the stop row).
     closes_at_stop: bool,
+    /// A request's variant made the state content ([`Format::without_reasoning`],
+    /// [`Format::without_calls`]): a marker with no row out of it is its text and adds no
+    /// malformed run of its own, as the table the variant was made of added none there (a
+    /// thought's marker is the thought's text; a call's header is the call's to judge).
+    remade: bool,
 }
 
 /// What the replay of a prompt leaves ([`Format::replayed`]): the state the output starts in,
@@ -464,6 +478,7 @@ impl Format {
             trimmed: false,
             kept: false,
             closes_at_stop: false,
+            remade: false,
         });
         self
     }
@@ -692,7 +707,7 @@ impl Format {
         let mut markers: Vec<&str> = self
             .terminals
             .iter()
-            .map(|terminal| terminal.text.as_str())
+            .map(|terminal| &*terminal.text)
             .chain(self.structural_tokens.iter().map(String::as_str))
             .collect();
         let tags = self
@@ -732,6 +747,22 @@ impl Format {
         self
     }
 
+    /// The layout's text after the thought's close replaced by `after`, the close kept: a
+    /// checkpoint group whose template writes other text there than its table's (the registry's
+    /// `after`: the NVIDIA Nemotron 3 groups and Step 3.5 Flash write one newline before a call
+    /// where the Qwen 3.5 template writes two). A table without a thought layout is left as it is.
+    #[must_use]
+    pub fn with_thought_after(mut self, after: &str) -> Self {
+        if let Some(thought) = self
+            .layout
+            .as_mut()
+            .and_then(|layout| layout.thought.as_mut())
+        {
+            thought.after = after.into();
+        }
+        self
+    }
+
     /// The table's layout, if it has one.
     pub fn layout(&self) -> Option<&Layout> {
         self.layout.as_deref()
@@ -749,7 +780,9 @@ impl Format {
     /// stay with it: a trimmed stay is still trimmed, a framing state's text still dropped; and a
     /// tag the end cut short is still dropped, as the legacy parsers drop it on both their paths.
     /// A table without a thought changes only in what it shows; the thought-first mark and the
-    /// layout, which serve the tags alone, go.
+    /// layout, which serve the tags alone, go. A marker with no row out of the thought's state is
+    /// its text and counts no malformed run, as in the table ([`Self::is_remade`]), so an output
+    /// counts the same whether the request separates reasoning or not.
     #[must_use]
     pub fn without_reasoning(mut self) -> Self {
         let calls = self.terminals_of_calls();
@@ -761,6 +794,7 @@ impl Format {
         for state in &mut self.states {
             if state.emits == Emits::Reasoning {
                 state.emits = Emits::Content;
+                state.remade = true;
             }
         }
         self.thinks_first = false;
@@ -784,7 +818,9 @@ impl Format {
     /// (Inkling's ended message), whose whitespace is the template's with or without tools. A
     /// table whose output starts in its calls (`json`, `xlam`, `forced`) becomes content from
     /// its first byte. A state's own text rows stay with it, as in [`Self::without_reasoning`].
-    /// A stop that closed a call closes nothing; the layout goes.
+    /// A stop that closed a call closes nothing; the layout goes. A marker with no row out of a
+    /// state made content here is its text and adds no malformed run of its own
+    /// ([`Self::is_remade`]): in the table the call's syntax reads it and says what it is.
     #[must_use]
     pub fn without_calls(mut self) -> Self {
         let frame = self.message_frame();
@@ -818,6 +854,7 @@ impl Format {
             if demoted[index] {
                 state.emits = Emits::Content;
                 state.closes_at_stop = false;
+                state.remade = true;
             }
         }
         self.calls = None;
@@ -912,11 +949,7 @@ impl Format {
     pub(crate) fn turn_texts(&self) -> Vec<&str> {
         match self.turn_opener() {
             Some(opener) => vec![opener],
-            None => self
-                .anchors
-                .iter()
-                .map(|anchor| anchor.text.as_str())
-                .collect(),
+            None => self.anchors.iter().map(|anchor| &*anchor.text).collect(),
         }
     }
 
@@ -950,7 +983,7 @@ impl Format {
     }
 
     /// The bytes a piece of the replay stands for.
-    fn piece_len(&self, piece: &Piece) -> usize {
+    fn piece_len(&self, piece: &Piece<'_>) -> usize {
         match piece {
             Piece::Text(text) => text.len(),
             Piece::Marker(index) => self.terminal_text(*index).len(),
@@ -980,9 +1013,7 @@ impl Format {
             if anchor.text.is_empty() {
                 return None;
             }
-            prompt[from..]
-                .find(anchor.text.as_str())
-                .map(|at| from + at)
+            prompt[from..].find(&*anchor.text).map(|at| from + at)
         };
         let mut next: Vec<Option<usize>> =
             self.anchors.iter().map(|anchor| find(anchor, 0)).collect();
@@ -1012,7 +1043,7 @@ impl Format {
     /// the start row's state, unless the piece is a terminal whose row from `state` leads into
     /// another one, which wins as the longer match; then `state`. A terminal the table ignores
     /// decides nothing, and gives `None`. A table without a start row starts where it stands.
-    pub(crate) fn opening(&self, state: usize, piece: &Piece) -> Option<usize> {
+    pub(crate) fn opening(&self, state: usize, piece: &Piece<'_>) -> Option<usize> {
         let Some(start) = self.start else {
             return Some(state);
         };
@@ -1056,8 +1087,9 @@ impl Format {
         let mut at = 0;
         // An anchor that names its own state leaves no start to choose.
         let mut at_turn_start = self.start.is_some() && start == 0;
-        let pieces = scanner.feed(turn).into_iter().chain(scanner.finish());
-        for piece in pieces {
+        let fed = scanner.feed(turn);
+        let end = scanner.finish();
+        for piece in fed.pieces().chain(end.pieces()) {
             if at_turn_start {
                 if let Some(opened) = self.opening(state, &piece) {
                     at_turn_start = false;
@@ -1124,6 +1156,26 @@ impl Format {
         self.emits(self.prompt_state(prompt)) == Emits::Reasoning
     }
 
+    /// Whether `prompt` closed the thought itself and wrote what the template writes after the
+    /// close (a request with thinking switched off: Qwen3's `<think>\n\n</think>\n\n`), so the
+    /// structural tags owe none of it before their first text
+    /// ([`Options::thought_closed`](crate::grammar::Options::thought_closed)). `false` for a table
+    /// whose layout has no thought, a prompt that leaves the thought open or to the model, and
+    /// one that ends with the bare close (GLM 4.6's `<think></think>`, whose newline the tag still
+    /// writes).
+    pub fn thought_closed(&self, prompt: &str) -> bool {
+        let Some(thought) = self.layout().and_then(|layout| layout.thought.as_ref()) else {
+            return false;
+        };
+        let Some(close) = thought.close.as_deref() else {
+            return false;
+        };
+        !thought.after.is_empty()
+            && prompt
+                .strip_suffix(&*thought.after)
+                .is_some_and(|before| before.ends_with(close))
+    }
+
     /// The format's name.
     pub fn name(&self) -> &str {
         &self.name
@@ -1164,7 +1216,7 @@ impl Format {
     /// table's rows move on, and those it ignores. Whoever learns the table's [`Layout`] from a
     /// rendering reads them to tell a marker from the text the layout writes around it.
     pub fn terminal_texts(&self) -> impl Iterator<Item = &str> {
-        self.terminals.iter().map(|terminal| terminal.text.as_str())
+        self.terminals.iter().map(|terminal| &*terminal.text)
     }
 
     /// Whether `tail`, at the end of the output in `state`, is a tag the end cut short: it begins
@@ -1252,6 +1304,14 @@ impl Format {
     /// Whether the text of state `index` stands as written, whitespace alone included.
     pub(crate) fn is_kept(&self, index: usize) -> bool {
         self.states[index].kept
+    }
+
+    /// Whether a request's variant made state `index` content: the thought of a request that
+    /// does not separate reasoning ([`Self::without_reasoning`]), the calls of one without tools
+    /// ([`Self::without_calls`]). The engine counts no marker out of place there, as the table
+    /// counted none: a thought's marker is the thought's text, a call's header the call's.
+    pub(crate) fn is_remade(&self, index: usize) -> bool {
+        self.states[index].remade
     }
 
     /// What every table must hold before an engine runs it: a state to start in, which does not
@@ -1587,7 +1647,7 @@ mod tests {
             .opens_turn("<|im_start|>assistant")
     }
 
-    fn events(format: Format, prompt: &str, output: &str) -> Vec<crate::event::Event> {
+    fn events(format: Format, prompt: &str, output: &str) -> Vec<crate::event::Event<'static>> {
         use crate::{
             engine::Engine,
             event::Events,
@@ -1624,7 +1684,7 @@ mod tests {
                 &mut out,
             )
             .expect("end");
-        out.drain()
+        out.into_owned().drain()
     }
 
     fn said(events: &[crate::event::Event]) -> (String, String, usize) {

@@ -580,8 +580,9 @@ impl Format {
     fn walk(&self, text: &str, from: usize) -> Vec<usize> {
         let mut scanner = Scanner::new(self.terminal_texts());
         let mut states = vec![from];
-        let pieces = scanner.feed(text).into_iter().chain(scanner.finish());
-        for piece in pieces {
+        let fed = scanner.feed(text);
+        let end = scanner.finish();
+        for piece in fed.pieces().chain(end.pieces()) {
             if let Piece::Marker(index) = piece {
                 let state = *states.last().unwrap_or(&from);
                 if let Some(to) = self.next(state, index) {

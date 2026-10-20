@@ -17,10 +17,10 @@ use tracing::{debug, error, trace};
 
 use super::{
     common::{
-        apply_mcp_tool_call_limit, build_next_request, convert_mcp_tools_to_chat_tools,
-        dispatch_arguments, extract_all_tool_calls_from_chat, has_unfinished_mcp_call,
-        prepare_tool_choice, record_mcp_call, ExtractedToolCall, McpToolCallLimit,
-        ResponsesCallContext, ToolLoopState,
+        build_next_request, convert_mcp_tools_to_chat_tools, dispatch_arguments,
+        extract_all_tool_calls_from_chat, has_unfinished_mcp_call, partition_tool_calls,
+        prepare_tool_choice, record_mcp_call, McpToolCallLimit, ResponsesCallContext,
+        ToolLoopState,
     },
     conversions,
 };
@@ -292,28 +292,8 @@ pub(super) async fn execute_tool_loop(
             // Record tool loop iteration metric
             Metrics::record_mcp_tool_iteration(&current_request.model);
 
-            trace!(
-                "Tool loop iteration {}: found {} tool call(s)",
-                state.iteration,
-                tool_calls.len()
-            );
-
-            // Separate MCP and function tool calls using session-exposed names.
-            let (mut mcp_tool_calls, function_tool_calls): (Vec<ExtractedToolCall>, Vec<_>) =
-                tool_calls
-                    .into_iter()
-                    .partition(|tc| session.has_exposed_tool(tc.name.as_str()));
-
-            trace!(
-                "Separated tool calls: {} MCP, {} function",
-                mcp_tool_calls.len(),
-                function_tool_calls.len()
-            );
-
-            // Only execute calls that fit; preserve their results before ending
-            // the response when this batch exceeds the remaining allowance.
-            let tool_call_limit =
-                apply_mcp_tool_call_limit(&mut mcp_tool_calls, state.total_calls, max_tool_calls);
+            let (mcp_tool_calls, function_tool_calls, tool_call_limit) =
+                partition_tool_calls(tool_calls, &session, &state, max_tool_calls, false);
 
             // Resolve `response_format` once per call here and zip it through
             // to the output processing pass — looking it up twice (once for

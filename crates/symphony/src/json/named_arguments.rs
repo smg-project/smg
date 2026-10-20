@@ -125,7 +125,7 @@ mod tests {
 
     /// The object fed in `pieces` and finished, as the region's end or the stream's finishes it:
     /// its events and how many bytes it took.
-    fn run(pieces: &[&str]) -> (Vec<Event>, usize) {
+    fn run(pieces: &[&str]) -> (Vec<Event<'static>>, usize) {
         let mut object = Object::new(0);
         let mut out = Events::new();
         let mut taken = 0;
@@ -148,9 +148,9 @@ mod tests {
             .iter()
             .map(|e| match e {
                 Event::ToolCallArguments { source, .. } | Event::ToolCallEnd { source, .. } => {
-                    source.text.as_str()
+                    &*source.text
                 }
-                Event::Malformed { text, .. } => text.text.as_str(),
+                Event::Malformed { text, .. } => &*text.text,
                 other => panic!("an event the object never pushes: {other:?}"),
             })
             .collect()
@@ -171,7 +171,7 @@ mod tests {
         events
             .iter()
             .filter_map(|e| match e {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect()

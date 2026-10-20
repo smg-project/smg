@@ -52,7 +52,7 @@ fn fewest_in_flight(workers: &[Arc<dyn Worker>], candidates: &[usize]) -> Vec<us
 
 impl LoadBalancingPolicy for PowerOfTwoPolicy {
     fn select_worker(&self, workers: &[Arc<dyn Worker>], info: &SelectWorkerInfo) -> Option<usize> {
-        let healthy = get_healthy_worker_indices(workers);
+        let healthy = get_healthy_worker_indices(workers, info);
 
         if healthy.is_empty() {
             return None;

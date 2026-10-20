@@ -291,7 +291,7 @@ impl Assembler {
         if let Arguments::Envelope { .. } = &shape.arguments {
             if !header.is_empty() {
                 out.push(Event::Dropped {
-                    text: Text::uncounted(header),
+                    text: Text::uncounted(header.to_owned()),
                     why: DropReason::Wrapper,
                 });
             }
@@ -330,7 +330,7 @@ impl Assembler {
             index: self.index,
             id,
             name: name.clone(),
-            source: Text::uncounted(header),
+            source: Text::uncounted(header.to_owned()),
         });
         let body = match &shape.arguments {
             Arguments::Params { tag, ends, values } => Body::Params(Box::new(Params::new(
@@ -571,7 +571,7 @@ impl Value {
         if enveloped {
             if !trailer.is_empty() {
                 out.push(Event::Dropped {
-                    text: Text::uncounted(trailer),
+                    text: Text::uncounted(trailer.to_owned()),
                     why: DropReason::Wrapper,
                 });
             }
@@ -604,7 +604,7 @@ impl Value {
 /// result the same wherever the chunks were cut.
 fn wrapping(text: &str, why: MalformedReason, out: &mut Events) {
     for (run, space) in runs(text) {
-        let run = Text::uncounted(run);
+        let run = Text::uncounted(run.to_owned());
         out.push(if space {
             Event::Dropped {
                 text: run,
@@ -712,8 +712,8 @@ mod tests {
     }
 
     /// Events with adjacent text of one kind joined, so that chunkings compare by what they say.
-    fn joined(events: Vec<Event>) -> Vec<Event> {
-        let mut out: Vec<Event> = Vec::new();
+    fn joined(events: Vec<Event<'static>>) -> Vec<Event<'static>> {
+        let mut out: Vec<Event<'static>> = Vec::new();
         for event in events {
             match (out.last_mut(), event) {
                 (
@@ -722,14 +722,14 @@ mod tests {
                         text: more,
                         why: again,
                     },
-                ) if *why == again => text.text.push_str(&more.text),
+                ) if *why == again => text.text.to_mut().push_str(&more.text),
                 (
                     Some(Event::Malformed { text, why }),
                     Event::Malformed {
                         text: more,
                         why: again,
                     },
-                ) if *why == again => text.text.push_str(&more.text),
+                ) if *why == again => text.text.to_mut().push_str(&more.text),
                 (
                     Some(Event::ToolCallArguments {
                         index,
@@ -743,11 +743,11 @@ mod tests {
                     },
                 ) if *index == other => {
                     json.push_str(&more);
-                    source.text.push_str(&bytes.text);
+                    source.text.to_mut().push_str(&bytes.text);
                 }
                 (Some(Event::Content(text)), Event::Content(more))
                 | (Some(Event::Reasoning(text)), Event::Reasoning(more)) => {
-                    text.text.push_str(&more.text);
+                    text.text.to_mut().push_str(&more.text);
                 }
                 (_, event) => out.push(event),
             }
@@ -757,7 +757,12 @@ mod tests {
 
     /// The events of `output` after `prompt`, the same whole, cut once at every place and a
     /// character at a time, every byte accounted for.
-    fn run_after(format: &Format, prompt: &str, output: &str, finish: EngineFinish) -> Vec<Event> {
+    fn run_after(
+        format: &Format,
+        prompt: &str,
+        output: &str,
+        finish: EngineFinish,
+    ) -> Vec<Event<'static>> {
         run_declared(format, &Declared::default(), prompt, output, finish)
     }
 
@@ -768,7 +773,7 @@ mod tests {
         prompt: &str,
         output: &str,
         finish: EngineFinish,
-    ) -> Vec<Event> {
+    ) -> Vec<Event<'static>> {
         let starts: Vec<usize> = output.char_indices().map(|(at, _)| at).skip(1).collect();
         let mut plans: Vec<Vec<usize>> = vec![vec![], starts.clone()];
         plans.extend(starts.iter().map(|&cut| vec![cut]));
@@ -808,7 +813,7 @@ mod tests {
                 )
                 .expect("the end");
             assert_eq!(out.text(), output, "every byte, cut at {cuts:?}");
-            joined(out.drain())
+            joined(out.into_owned().drain())
         });
         let whole = runs.next().expect("the whole output is one plan");
         for (events, cuts) in runs.zip(plans.iter().skip(1)) {
@@ -817,17 +822,17 @@ mod tests {
         whole
     }
 
-    fn run(format: &Format, output: &str) -> Vec<Event> {
+    fn run(format: &Format, output: &str) -> Vec<Event<'static>> {
         run_after(format, "", output, EngineFinish::Stop)
     }
 
-    fn content(text: &str) -> Event {
-        Event::Content(Text::uncounted(text))
+    fn content(text: &str) -> Event<'static> {
+        Event::Content(Text::uncounted(text.to_owned()))
     }
 
-    fn wrapper(text: &str) -> Event {
+    fn wrapper(text: &str) -> Event<'static> {
         Event::Dropped {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
         }
     }
@@ -836,31 +841,31 @@ mod tests {
         CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
     }
 
-    fn start(name: &str, source: &str) -> Event {
+    fn start(name: &str, source: &str) -> Event<'static> {
         Event::ToolCallStart {
             index: 0,
             id: ids().id(0),
             name: name.to_string(),
-            source: Text::uncounted(source),
+            source: Text::uncounted(source.to_owned()),
         }
     }
 
-    fn arguments(json: &str) -> Event {
+    fn arguments(json: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index: 0,
             json: json.to_string(),
-            source: Text::uncounted(json),
+            source: Text::uncounted(json.to_owned()),
         }
     }
 
-    fn end(source: &str) -> Event {
+    fn end(source: &str) -> Event<'static> {
         Event::ToolCallEnd {
             index: 0,
-            source: Text::uncounted(source),
+            source: Text::uncounted(source.to_owned()),
         }
     }
 
-    fn finish(calls: u32) -> Event {
+    fn finish(calls: u32) -> Event<'static> {
         Event::Finish {
             reason: crate::event::FinishReason::Stop,
             tool_calls: calls,
@@ -1284,7 +1289,7 @@ mod tests {
         let shown: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -1516,15 +1521,15 @@ mod tests {
         vec![ends_at([lit("</k>")], [])]
     }
 
-    fn member(json: &str, source: &str) -> Event {
+    fn member(json: &str, source: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index: 0,
             json: json.to_string(),
-            source: Text::uncounted(source),
+            source: Text::uncounted(source.to_owned()),
         }
     }
 
-    fn closed() -> Event {
+    fn closed() -> Event<'static> {
         Event::ToolCallArguments {
             index: 0,
             json: "}".to_string(),
@@ -2118,11 +2123,13 @@ mod tests {
             .into_iter()
             .filter_map(|event| match event {
                 Event::Content(text) | Event::Dropped { text, .. } => {
-                    Some((text.text, text.tokens))
+                    Some((text.text.into_owned(), text.tokens))
                 }
                 Event::ToolCallStart { source, .. }
                 | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => Some((source.text, source.tokens)),
+                | Event::ToolCallEnd { source, .. } => {
+                    Some((source.text.into_owned(), source.tokens))
+                }
                 _ => None,
             })
             .collect();

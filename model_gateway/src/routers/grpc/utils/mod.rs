@@ -28,6 +28,7 @@ pub(crate) use logprobs::{
     convert_proto_to_openai_logprobs,
 };
 pub use message_utils::{process_messages_with_encoding, template_tools};
+pub(crate) use message_utils::{resolve_media, MediaContext};
 pub(crate) use metrics::{error_type_for_response, error_type_from_status, route_to_endpoint};
 // `pub` (not `pub(crate)`) so the Go bindings can reuse the gateway's arming
 // predicate instead of duplicating it.

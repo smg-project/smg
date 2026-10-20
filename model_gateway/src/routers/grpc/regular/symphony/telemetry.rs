@@ -6,8 +6,11 @@
 //!
 //! - `failed`: output the table could not read at all: the engine refused (`ParseError`); the
 //!   request answers with an error;
-//! - `malformed`: a call region the table read but gave up on (`Event::Malformed`), by its
-//!   reason; the bytes reach the client as content, so nothing is lost and nothing says so;
+//! - `malformed`: a call region the table read but gave up on, or a marker of the table where no
+//!   row leads, kept as content text (`Event::Malformed`), by its reason; the bytes reach the
+//!   client as content, or, where the syntax's block is never prose, are dropped behind an event of
+//!   no bytes (`Dropped { MalformedCall }`) and sized here as that event's; nothing is lost in the
+//!   events, and nothing says so to the client;
 //! - `dropped`: bytes the table treats as the template's wrapping (`Event::Dropped`): correct,
 //!   expected on every output, not counted here;
 //! - `forgiven`: a repair that keeps the answer's shape. Of those, the calls after the first
@@ -32,7 +35,7 @@ use std::{
 
 use metrics::{Key, Label, Level, Metadata};
 use parking_lot::Mutex;
-use symphony::{formats::Table, Event, MalformedReason};
+use symphony::{formats::Table, DropReason, Event, MalformedReason};
 use tracing::warn;
 
 /// Outputs read to their end, by `table` and `outcome` (`clean`, `malformed`, `failed`).
@@ -55,13 +58,15 @@ const TEMPLATE: &str = "response_template";
 const OTHER_TABLE: &str = "other";
 
 /// The `reason` labels, in the order of [`Tally::reasons`]: the three reasons that say what the
-/// model got wrong, and `other` for the crate's syntax-level reasons (text where the call's syntax
-/// has none, a tag out of place, a key without a value, ...), each spelled by the crate's sentence
-/// on the sampled line.
-const REASONS: [&str; 4] = [
+/// model got wrong, the table's own marker where no row leads (an answer's opener written again
+/// inside the answer: a frame the table did not read, kept as content), and `other` for the
+/// crate's syntax-level reasons (text where the call's syntax has none, a tag out of place, a key
+/// without a value, ...), each spelled by the crate's sentence on the sampled line.
+const REASONS: [&str; 5] = [
     "unterminated_region",
     "invalid_arguments",
     "unknown_tool",
+    "marker_out_of_place",
     "other",
 ];
 /// The `outcome` labels, in the order of [`Series::outputs`].
@@ -90,7 +95,8 @@ fn reason_index(why: MalformedReason) -> usize {
         MalformedReason::UnterminatedRegion => 0,
         MalformedReason::InvalidArguments => 1,
         MalformedReason::UnknownTool => 2,
-        _ => 3,
+        MalformedReason::MarkerOutOfPlace => 3,
+        _ => 4,
     }
 }
 
@@ -100,7 +106,7 @@ pub(crate) fn reason_label(why: MalformedReason) -> &'static str {
 }
 
 /// The bytes an event accounts for in the output.
-fn bytes_of(event: &Event) -> usize {
+pub(super) fn bytes_of(event: &Event) -> usize {
     match event {
         Event::Content(text) | Event::Reasoning(text) => text.text.len(),
         Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.len(),
@@ -128,7 +134,7 @@ pub(crate) struct FirstRun {
     pub why: &'static str,
     /// Where it starts in the output, in bytes.
     pub at: usize,
-    /// Its length in bytes.
+    /// Its length in bytes: the event's own, and the bytes a syntax refused right after it.
     pub bytes: usize,
 }
 
@@ -138,9 +144,11 @@ pub(crate) struct Tally {
     /// The bytes of the events seen so far: where the next event's bytes start.
     at: usize,
     /// Malformed runs by reason, in the order of [`REASONS`].
-    reasons: [u32; 4],
+    reasons: [u32; 5],
     malformed_bytes: u64,
     first: Option<FirstRun>,
+    /// The event before the next is the first run's: refused bytes that follow it are its size.
+    announced: bool,
     suppressed_calls: u32,
     tool_calls: u32,
 }
@@ -149,6 +157,7 @@ impl Tally {
     /// Accounts for `event`, the next of the output; `first_call_only` says whether the reader
     /// drops the calls after the first, which are then counted as suppressed.
     pub(crate) fn see(&mut self, event: &Event, first_call_only: bool) {
+        let announced = std::mem::take(&mut self.announced);
         match event {
             Event::Malformed { text, why } => {
                 self.reasons[reason_index(*why)] += 1;
@@ -160,6 +169,23 @@ impl Tally {
                         at: self.at,
                         bytes: text.text.len(),
                     });
+                    self.announced = true;
+                }
+            }
+            // The bytes of a call block a syntax refused (the keyed one): they are the malformed
+            // run's, announced by the event of no bytes right before them, so the histogram and
+            // the line still say how much of the answer was debris. At a cut call's end the bytes
+            // held come before the event (`tagged::end_cut_call`): they count, and the run keeps
+            // the size its event carried.
+            Event::Dropped {
+                text,
+                why: DropReason::MalformedCall,
+            } => {
+                self.malformed_bytes += text.text.len() as u64;
+                if announced {
+                    if let Some(first) = &mut self.first {
+                        first.bytes += text.text.len();
+                    }
                 }
             }
             Event::ToolCallStart { index, .. } if first_call_only && *index > 0 => {
@@ -169,6 +195,19 @@ impl Tally {
             _ => {}
         }
         self.at += bytes_of(event);
+    }
+
+    /// `bytes` more of the output went out in an event seen already: text pushed right after
+    /// text of its kind joins the last event rather than making one, and the next event starts
+    /// after it.
+    pub(crate) fn grew(&mut self, bytes: usize) {
+        self.at += bytes;
+    }
+
+    /// The first malformed run, for the reader's tests.
+    #[cfg(test)]
+    pub(super) fn first_run(&self) -> Option<&FirstRun> {
+        self.first.as_ref()
     }
 
     /// Malformed runs seen.
@@ -275,7 +314,7 @@ struct Series {
     /// [`OUTPUTS`] by outcome, in the order of [`OUTCOMES`].
     outputs: [Key; 3],
     /// [`MALFORMED`] by reason, in the order of [`REASONS`].
-    malformed: [Key; 4],
+    malformed: [Key; 5],
     malformed_bytes: Key,
     calls_suppressed: Key,
     sampler: Sampler,
@@ -391,23 +430,23 @@ mod tests {
 
     use super::*;
 
-    fn malformed(text: &str, why: MalformedReason) -> Event {
+    fn malformed(text: &str, why: MalformedReason) -> Event<'static> {
         Event::Malformed {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why,
         }
     }
 
-    fn call_start(index: u32, source: &str) -> Event {
+    fn call_start(index: u32, source: &str) -> Event<'static> {
         Event::ToolCallStart {
             index,
             id: format!("call_{index}"),
             name: "lookup".into(),
-            source: Text::uncounted(source),
+            source: Text::uncounted(source.to_owned()),
         }
     }
 
-    fn finish(tool_calls: u32) -> Event {
+    fn finish(tool_calls: u32) -> Event<'static> {
         Event::Finish {
             reason: FinishReason::Stop,
             tool_calls,
@@ -465,6 +504,134 @@ mod tests {
     }
 
     #[test]
+    fn refused_bytes_size_the_run_that_announced_them() {
+        // The refuse order: the event of no bytes, then the bytes it refuses; a second refused
+        // run's bytes count, but are not the first run's.
+        let refused = |text: &str| Event::Dropped {
+            text: Text::uncounted(text.to_owned()),
+            why: DropReason::MalformedCall,
+        };
+        let mut tally = Tally::default();
+        for event in [
+            Event::Content(Text::uncounted("Hi")),
+            malformed("", MalformedReason::TagCutShort),
+            refused("<arg_key>format=2D"),
+            malformed("", MalformedReason::TagOutOfPlace),
+            refused("</arg_value>"),
+            finish(1),
+        ] {
+            tally.see(&event, false);
+        }
+        assert_eq!(tally.malformed(), 2);
+        assert_eq!(tally.malformed_bytes, 18 + 12);
+        assert_eq!(
+            tally.first,
+            Some(FirstRun {
+                reason: "other",
+                why: "a tag that another tag or the call's end cut short",
+                at: 2,
+                bytes: 18,
+            })
+        );
+        // The cut order: the bytes held at the cut, then the word before the call's end: the
+        // bytes count, and the run keeps the size its event carried.
+        let mut tally = Tally::default();
+        for event in [
+            refused("<"),
+            malformed("", MalformedReason::UnterminatedRegion),
+            Event::ToolCallEnd {
+                index: 0,
+                source: Text::uncounted("</tool_call>"),
+            },
+            finish(1),
+        ] {
+            tally.see(&event, false);
+        }
+        assert_eq!(tally.malformed_bytes, 1);
+        assert_eq!(
+            tally.first,
+            Some(FirstRun {
+                reason: "unterminated_region",
+                why: "the stream ended inside a region that never closed",
+                at: 1,
+                bytes: 0,
+            })
+        );
+        // The template's wrapping after a run is not the run's.
+        let mut tally = Tally::default();
+        for event in [
+            malformed("x", MalformedReason::CallWithoutName),
+            Event::Dropped {
+                text: Text::uncounted("\n"),
+                why: DropReason::Wrapper,
+            },
+            finish(0),
+        ] {
+            tally.see(&event, false);
+        }
+        assert_eq!(tally.malformed_bytes, 1);
+        assert_eq!(tally.first.as_ref().map(|first| first.bytes), Some(1));
+    }
+
+    #[test]
+    fn a_botched_keyed_block_is_sized_by_its_refused_bytes() {
+        // Through the keyed table itself: a call whose key tag never opened. The assembler refuses
+        // the tags and the value behind events of no bytes; the tally counts the runs and sizes
+        // them by the refused bytes, the first by the bytes right after it.
+        use symphony::{Declared, Engine, EngineFinish, Events, Input, Parser};
+        let output =
+            "</think>At once:<tool_call>f</arg_key><arg_value>1975</arg_value></tool_call>";
+        let mut engine = Engine::new(Table::Glm.format(), Declared::default());
+        let mut out = Events::new();
+        engine
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: "<|assistant|><think>",
+                },
+                &mut out,
+            )
+            .expect("the prompt");
+        engine
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: output,
+                    spans: &[],
+                },
+                &mut out,
+            )
+            .expect("the delta");
+        engine
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("the end");
+        let mut tally = Tally::default();
+        for event in out.as_slice() {
+            tally.see(event, false);
+        }
+        assert_eq!(tally.malformed(), 4, "{:?}", out.as_slice());
+        assert_eq!(
+            tally.malformed_bytes,
+            "</arg_key><arg_value>1975</arg_value>".len() as u64
+        );
+        assert_eq!(
+            tally.first,
+            Some(FirstRun {
+                reason: "other",
+                why: "a tag where the call's syntax has none",
+                at: "</think>At once:<tool_call>f".len(),
+                bytes: "</arg_key>".len(),
+            })
+        );
+        assert_eq!(tally.tool_calls, 1);
+    }
+
+    #[test]
     fn the_first_run_of_another_reason_carries_its_sentence() {
         let mut tally = Tally::default();
         tally.see(
@@ -475,6 +642,32 @@ mod tests {
         assert_eq!(first.reason, "other");
         assert_eq!(first.why, "a name without a call");
         assert_eq!(first.at, 0);
+    }
+
+    #[test]
+    fn a_marker_out_of_place_has_a_label_of_its_own_and_counts_the_output_as_malformed() {
+        // The crate says so with an event of no bytes before the marker's text: the run counts,
+        // the first run stands where the marker does, and its bytes are none.
+        let mut tally = Tally::default();
+        tally.see(&Event::Content(Text::uncounted("<|text|>")), false);
+        tally.see(&malformed("", MalformedReason::MarkerOutOfPlace), false);
+        tally.see(&Event::Content(Text::uncounted("<|text|>{}")), false);
+        assert_eq!(tally.malformed(), 1);
+        assert_eq!(tally.malformed_bytes, 0);
+        assert_eq!(tally.reasons_seen(), "marker_out_of_place");
+        assert_eq!(
+            tally.first,
+            Some(FirstRun {
+                reason: "marker_out_of_place",
+                why: "a marker of the table where no row leads, kept as text",
+                at: "<|text|>".len(),
+                bytes: 0,
+            })
+        );
+        assert_eq!(
+            reason_label(MalformedReason::MarkerOutOfPlace),
+            "marker_out_of_place"
+        );
     }
 
     #[test]

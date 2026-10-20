@@ -262,7 +262,7 @@ mod tests {
         "</atem:invoke>\n</atem:function_calls>"
     );
 
-    fn run_with(prompt: &str, pieces: &[&str], finish: EngineFinish) -> Vec<Event> {
+    fn run_with(prompt: &str, pieces: &[&str], finish: EngineFinish) -> Vec<Event<'static>> {
         drive_to(
             &mut Engine::new(muse_spark(), declared()),
             prompt,
@@ -271,7 +271,7 @@ mod tests {
         )
     }
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         run_with(prompt, pieces, EngineFinish::Stop)
     }
 
@@ -307,17 +307,17 @@ mod tests {
                 Event::Dropped {
                     text,
                     why: DropReason::Wrapper,
-                } => Some(text.text.as_str()),
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect()
     }
 
-    fn malformed(events: &[Event]) -> Vec<&str> {
+    fn malformed<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(text.text.as_str()),
+                Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -616,6 +616,7 @@ mod tests {
                 Options {
                     at_least_one: true,
                     reasoning_open,
+                    thought_closed: false,
                     one_call: false,
                     start: GrammarStart::Unknown,
                 },
@@ -656,6 +657,7 @@ mod tests {
                 Options {
                     at_least_one: true,
                     reasoning_open: false,
+                    thought_closed: false,
                     one_call: true,
                     start: GrammarStart::Unknown,
                 },

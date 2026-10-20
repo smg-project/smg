@@ -36,6 +36,14 @@ pip install smg-grpc-servicer[sglang]
 vllm serve meta-llama/Llama-2-7b-hf --grpc
 ```
 
+Without `--kv-events-config`, the servicer turns vLLM's ZMQ KV-event publisher
+on by itself, under either implementation, before the engine is built, at a
+port found free on the host rather than vLLM's fixed default (one per
+data-parallel rank), so `SubscribeKvEvents` relays the events a cache-aware
+router routes by and workers that share a host do not collide; an explicit
+configuration is kept as given, its endpoint and off included, and
+`SMG_VLLM_SERVICER_KV_EVENTS=0` leaves the publisher off.
+
 #### Worker-side multimodal processing (media refs)
 
 By default the smg router fetches and preprocesses images itself and sends
@@ -95,7 +103,7 @@ by default) overrides the model's per-modality reference limits;
 `--mm-max-item-bytes` (`SMG_VLLM_MM_MAX_ITEM_BYTES`, default 32 MiB) caps inline
 `data:` payloads; `SMG_VLLM_MM_MAX_VIDEO_FRAMES` (env only for now; default 0,
 meaning vLLM's own `--media-io-kwargs` decide) caps the frames a video is
-sampled to, so long clips stay bounded. All eight flag-backed settings are
+sampled to, so long clips stay bounded. All nine flag-backed settings are
 validated when the servicer starts, whatever the processor mode, so a stale
 unreadable value fails loudly. Two layers bound an inline item: the router
 refuses a `data:` item above its own per-kind input bound
@@ -112,11 +120,17 @@ On the router side, `--mm-processing` selects `auto` (default: forward when
 every registered worker of the model advertises `mm_processor` and the model's
 spec opts in, or every one of those workers runs the router's own pipeline,
 `mm_processor=smg`, which expands any spec's image or video anchor itself), `router` (always
-preprocess) or `worker` (strict: 400 when a request cannot be forwarded; a
-family without the opt-in forwards when every media-processing worker of the
-model runs `smg`, and its requests are placed on `smg` workers only, so a
-worker on the engine's own processor never receives an anchor it cannot
-expand); the outcome is counted in
+preprocess) or `worker` (strict: 400 when a request cannot be forwarded, and
+`503 no_media_ref_capable_worker` for a model none of whose registered workers
+advertises `mm_processor`, answered before any worker is chosen; a family
+without the opt-in forwards when every media-processing worker of the model
+runs `smg`, and its requests are placed on `smg` workers only, so a worker on
+the engine's own processor never receives an anchor it cannot expand; while a
+model whose workers report a vision encoder has no worker advertising
+`mm_processor`, the ready body of `/readiness` names the model under
+`models_without_media_processing`, the pod staying ready for its text requests
+and its other models, and each vision worker without a media processor is
+warned about once at registration); the outcome is counted in
 `smg_mm_processing_total{model,mode,reason}` (`pipeline_workers` and
 `auto_pipeline` name the forwarded-by-the-pipeline case), and the startup line
 `multimodal processing mode` names the value and its source (`flag`, `env` or
@@ -130,6 +144,25 @@ the worker will schedule the full placeholder run. The `E2E_MM_PROCESSING=worker
 e2e lanes run the multimodal suites in this mode, and
 `crates/multimodal/scripts/check_worker_anchor_parity.py` checks that a spec's
 anchor is the token vLLM expands.
+
+Both pipelines (the router's own and `--mm-processor smg` on the worker)
+decode JPEGs through libjpeg-turbo's TurboJPEG library when `libturbojpeg.so.0`
+loads, so their pixels are the ones an engine that decodes with Pillow sees.
+Without the library they fall back to a pure-Rust decoder whose pixels differ
+by a few levels on up to a fifth of a JPEG's bytes (no JPEG of the parity
+corpus decodes identically), and the only marks of that state are the start-up
+line `libturbojpeg not found: JPEGs decode with the pure-Rust decoder ...` and
+the gauge `smg_mm_turbojpeg_available` at 0. The TurboJPEG policy makes the
+state fatal instead: `--mm-turbojpeg require` on the router (`SMG_MM_TURBOJPEG`
+for a process without the flag, `mm_turbojpeg` in a config file) stops the
+router at start-up, and `--mm-turbojpeg require` on the worker
+(`SMG_VLLM_MM_TURBOJPEG`, a supported spelling beside the flag, not a
+deprecated one) refuses to build smg's pipeline at launch, each with an error
+naming the library and the gauge. The router checks the policy once at
+start-up, in every routing mode, before anything binds; a worker whose
+launcher was not given the setting reads `SMG_MM_TURBOJPEG` as the router
+does. The default, `prefer`, keeps the fallback; an unreadable value stops
+start-up as an unreadable `SMG_MM_PROCESSING` does.
 
 To move fetching and processing out of the vLLM process, run the GPU-free
 sidecar next to a private Redis and point the worker at it
@@ -269,12 +302,13 @@ contract the Python servicer serves: text generation, PD disaggregation
 (inline and `/dev/shm` tensors), worker-side media processing (`media_refs`,
 below), `Embed`, `FlushCache`, `GetTokenizer` (which answers
 FAILED_PRECONDITION when the launcher could not resolve a local tokenizer
-directory) and `SubscribeKvEvents` (vLLM's ZMQ publisher, which Rust mode
-turns on by itself when the launcher is given no `--kv-events-config`, at a
-port found free on the host rather than vLLM's fixed default, so two engines
-on one host do not collide; an explicit one is kept as given, its endpoint
-included, and `SMG_VLLM_SERVICER_KV_EVENTS=0` leaves the publisher off).
-Tuning: `SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
+directory) and `SubscribeKvEvents` (vLLM's ZMQ publisher, which the servicer
+turns on by itself, on this path as on the Python one, when the launcher is
+given no `--kv-events-config`, at a port found free on the host rather than
+vLLM's fixed default, so two engines on one host do not collide; an explicit
+one is kept as given, its endpoint included, and
+`SMG_VLLM_SERVICER_KV_EVENTS=0` leaves the publisher off). Tuning:
+`SMG_VLLM_SERVICER_HANDSHAKE_PORT` (default: a free port),
 `SMG_VLLM_SERVICER_DRAIN_SECS` (default 5),
 `SMG_VLLM_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800: how long the servicer
 waits for a sign of life from the engine during its handshake; the launcher
@@ -480,6 +514,15 @@ python -m smg_grpc_servicer.tokenspeed --model meta-llama/Llama-2-7b-hf --host 0
 SMG_TOKENSPEED_SERVICER_IMPL=rust python -m smg_grpc_servicer.tokenspeed --model meta-llama/Llama-2-7b-hf --port 50051
 ```
 
+Without `--kv-events-config`, the servicer turns TokenSpeed's ZMQ KV-event
+publisher on by itself, under either implementation, before the engine is
+built, at a port found free on the host rather than TokenSpeed's fixed default,
+so `SubscribeKvEvents` relays the events a cache-aware router routes by and
+workers that share a host do not collide; an explicit configuration is kept as
+given, its endpoint and off included, and `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0`
+leaves the publisher off. An encode worker (`--disaggregation-mode encode`) has
+no KV cache and is left as given.
+
 This is the process `ts serve` spawns for its gRPC worker; `--servicer-impl`
 is this package's flag (listed first by `--help`, ahead of TokenSpeed's own
 flags), and `SMG_TOKENSPEED_SERVICER_IMPL` is the fallback the flag overrides
@@ -495,11 +538,12 @@ prompt logprobs are refused, and PD/EPD disaggregation stays with the Python
 implementation, as do the RL control-plane extras (the `rl.*` advertisement,
 the live `weight_version` on generate responses, `is_paused`); the Rust server
 redacts credentials from `server_args` the same way. `SubscribeKvEvents` relays
-TokenSpeed's ZMQ KV-event publisher, which Rust mode turns on by itself when
-the launcher is given no `--kv-events-config`, at a port found free on the
-host rather than TokenSpeed's fixed default (an explicit one is kept as given,
-its endpoint included; `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` leaves the
-publisher off). Tuning:
+TokenSpeed's ZMQ KV-event publisher, which the servicer turns on by itself, on
+this path as on the Python one, when the launcher is given no
+`--kv-events-config`, at a port found free on the host rather than
+TokenSpeed's fixed default (an explicit one is kept as given, its endpoint
+included; `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` leaves the publisher off).
+Tuning:
 `SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT` (default: a
 free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
 `SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
@@ -576,6 +620,14 @@ livenessProbe:
 ```bash
 sglang serve --model-path meta-llama/Llama-2-7b-hf --grpc-mode
 ```
+
+Without `--kv-events-config`, the servicer turns SGLang's ZMQ KV-event
+publisher on by itself, under either implementation, before the schedulers are
+started, at a port found free on the host rather than SGLang's fixed default,
+so `SubscribeKvEvents` relays the events a cache-aware router routes by and
+workers that share a host do not collide; an explicit configuration is kept as
+given, its endpoint and off included, and `SMG_SGLANG_SERVICER_KV_EVENTS=0`
+leaves the publisher off.
 
 Both SGLang servicers advertise the engine's `--limit-mm-data-per-request` as
 the flat `mm_item_limits` label (`image=1,video=1`) in `GetServerInfo`'s
@@ -665,12 +717,13 @@ What the wire does not carry is reported, not emulated: multimodal inputs and
 hidden states are refused, PD/EPD disaggregation stays with the Python
 implementation (the worker refuses to start on the Rust path in those modes),
 and LoRA loading answers UNIMPLEMENTED, as it does on the Python servicer.
-`SubscribeKvEvents` relays SGLang's ZMQ KV-event publisher, which Rust mode
-turns on by itself when the launcher is given no `--kv-events-config`, at a
-port found free on the host rather than SGLang's fixed default (an explicit
-one is kept as given, its endpoint included; `SMG_SGLANG_SERVICER_KV_EVENTS=0`
-leaves the publisher off). SGLang's HTTP sidecar (metrics and profiling endpoints) is not
-started on this path. Tuning: `SMG_SGLANG_SERVICER_HANDSHAKE_PORT` (default: a
+`SubscribeKvEvents` relays SGLang's ZMQ KV-event publisher, which the servicer
+turns on by itself, on this path as on the Python one, when the launcher is
+given no `--kv-events-config`, at a port found free on the host rather than
+SGLang's fixed default (an explicit one is kept as given, its endpoint
+included; `SMG_SGLANG_SERVICER_KV_EVENTS=0` leaves the publisher off). SGLang's
+HTTP sidecar (metrics and profiling endpoints) is not started on this path.
+Tuning: `SMG_SGLANG_SERVICER_HANDSHAKE_PORT` (default: a
 free port), `SMG_SGLANG_SERVICER_DRAIN_SECS` (default 5),
 `SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
 `SMG_SGLANG_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup

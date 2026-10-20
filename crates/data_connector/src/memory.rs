@@ -1216,6 +1216,55 @@ mod tests {
         assert_eq!(asc_after[0].id, i3.id);
     }
 
+    /// A conversation longer than a listing's limit: under `Desc` the listing
+    /// is the newest items, newest first (the window a request replays, put
+    /// back in stored order by its loader); under `Asc` the oldest, oldest
+    /// first (the public listing's default page). The same limit, the two
+    /// ends of the conversation.
+    #[tokio::test]
+    async fn a_conversation_longer_than_the_listing_lists_its_newest_items_under_desc_and_its_oldest_under_asc(
+    ) {
+        let store = MemoryConversationItemStorage::new();
+        let conv: ConversationId = "conv_long".into();
+        let mut stamps = AddedAtSequence::new();
+        let mut ids = Vec::new();
+        for _ in 0..150 {
+            let item = store
+                .create_item(make_item("message", Some("user"), json!([])))
+                .await
+                .unwrap();
+            store
+                .link_item(&conv, &item.id, stamps.next_added_at())
+                .await
+                .unwrap();
+            ids.push(item.id);
+        }
+        let list = |order: SortOrder| {
+            let store = store.clone();
+            let conv = conv.clone();
+            async move {
+                store
+                    .list_items(
+                        &conv,
+                        ListParams {
+                            limit: 101,
+                            order,
+                            after: None,
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|item| item.id)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let newest_first: Vec<ConversationItemId> = ids[49..].iter().rev().cloned().collect();
+        assert_eq!(list(SortOrder::Desc).await, newest_first);
+        assert_eq!(list(SortOrder::Asc).await, ids[..101].to_vec());
+    }
+
     // ========================================================================
     // Response Tests
     // ========================================================================

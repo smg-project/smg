@@ -500,6 +500,10 @@ pub struct Options {
     pub at_least_one: bool,
     /// The prompt left the model inside its thought.
     pub reasoning_open: bool,
+    /// The prompt closed the thought itself and wrote what the template writes after the close (a
+    /// request with thinking switched off): the tag owes nothing before its first text, and a
+    /// thought the model writes anyway carries its own ([`Format::thought_closed`]).
+    pub thought_closed: bool,
     /// At most one call: a named function, or `parallel_tool_calls: false`. The tag stops after
     /// the first call, and the call's end carries what the template writes after the last call to
     /// end the turn, so nothing else can follow.
@@ -514,7 +518,11 @@ pub struct Options {
 /// close, so the grammar starts where the answer or the calls do and nothing may precede them.
 /// An engine that does not say gets a prefix of free text with nothing owed at its end, which
 /// fits either kind where a trigger opens what follows (a block of calls) and is left as it is
-/// where none does (an answer's schema, which such an engine then holds to loosely).
+/// where none does (an answer's schema, which such an engine then holds to loosely). Where the
+/// prompt opens no thought, the start is read by the answer tag of a table whose thought is a
+/// message of its own alone, and only where it names the first token
+/// ([`Format::answer_grammar`]): an engine that starts after its parser may gate on it whatever
+/// the prompt or only when the request asks for reasoning, which the start does not say.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GrammarStart {
     /// The engine does not say where it starts.
@@ -556,6 +564,16 @@ impl Count<'_> {
         }
     }
 
+    /// The calls a block holds, `between` before every call after the first: [`Count::calls`]
+    /// when the tag holds one call or nothing stands between them, else [`repeated`].
+    fn calls_between(&self, call: Grammar, between: &str) -> Grammar {
+        if self.one || between.is_empty() {
+            self.calls(call)
+        } else {
+            repeated(call, between)
+        }
+    }
+
     /// Tags `triggers` open in free text, as many as the count lets the model write; with one
     /// call, each tag's end carries the end of the turn.
     fn triggered(&self, triggers: Vec<String>, tags: Vec<Tag>) -> Grammar {
@@ -586,12 +604,52 @@ impl Count<'_> {
     }
 }
 
+/// `item` once or more, `separator` before every repeat: the one shape of a separated list, for
+/// the calls of a block and the members of a value alike.
+fn repeated(item: Grammar, separator: &str) -> Grammar {
+    Grammar::Sequence(vec![
+        item.clone(),
+        Grammar::Star(Box::new(Grammar::Sequence(vec![
+            Grammar::ConstString(separator.to_string()),
+            item,
+        ]))),
+    ])
+}
+
 /// A region's two markers, the terminal of the row into its state and of the row back out, and
 /// the state the row back out returns to.
 struct Region<'a> {
     open: &'a str,
     close: &'a str,
     home: usize,
+}
+
+/// `body` after `after`, what the template writes after the thought's close ([`Format::led`]):
+/// `body` as it is when there is none.
+fn after_the_close(after: &str, body: Grammar) -> Grammar {
+    if after.is_empty() {
+        body
+    } else {
+        Grammar::Sequence(after_the_close_then(after, body))
+    }
+}
+
+/// The elements of [`after_the_close`], for a sequence that has more before them.
+fn after_the_close_then(after: &str, body: Grammar) -> Vec<Grammar> {
+    if after.is_empty() {
+        vec![body]
+    } else {
+        vec![Grammar::ConstString(after.to_string()), body]
+    }
+}
+
+/// `first` and then `after`, where there is one.
+fn after_then(first: Grammar, after: &str) -> Vec<Grammar> {
+    if after.is_empty() {
+        vec![first]
+    } else {
+        vec![first, Grammar::ConstString(after.to_string())]
+    }
 }
 
 impl Format {
@@ -621,6 +679,7 @@ impl Format {
             Options {
                 at_least_one,
                 reasoning_open,
+                thought_closed: false,
                 one_call: false,
                 start: GrammarStart::Unknown,
             },
@@ -659,9 +718,13 @@ impl Format {
             // xLAM's list stands alone in the turn, no marker before or after it, and its table
             // has no thought: the list is the same either way; a call alone (`json`) is forced as
             // the list, as the gateway's older `json` parser forces it. Between markers (Llama
-            // Nemotron) the list is one tag's content, and the thought takes the prefix.
+            // Nemotron) the list is one tag's content, and the thought takes the prefix; behind
+            // one marker the turn ends (the Mistral list) it is one tag that ends with nothing.
             CallSyntax::JsonList | CallSyntax::JsonAlone(_) => match markers {
-                None => (json::list_calls(&named, count), false),
+                None => match self.opened_list_markers() {
+                    Some(opened) => (json::list_tag(&opened, &named, count), true),
+                    None => (json::list_calls(&named, count), false),
+                },
                 Some(markers) => (json::list_tag(markers, &named, count), true),
             },
             CallSyntax::Json => (json::calls(markers?, &named, count), true),
@@ -690,13 +753,34 @@ impl Format {
                     true,
                 )
             }
-            CallSyntax::Pythonic(dialect) => {
-                (pythonic::calls(markers?, *dialect, &named, count), true)
+            // Llama 4's list stands alone in the turn, as xLAM's does, and its table has no
+            // thought; Olmo 3's and LFM2.5's are one tag between their markers.
+            CallSyntax::Pythonic(dialect) => match markers {
+                None => (pythonic::list_alone(*dialect, &named, count), false),
+                Some(markers) => (pythonic::calls(markers, *dialect, &named, count), true),
+            },
+            // The named-arguments calls sit in a block (DeepSeek V3.1's, V3's) or stand each from
+            // its own opener (Mistral's): in a block, between the block's ways in and its close.
+            CallSyntax::NamedArguments {
+                marker,
+                between_calls,
+            } => {
+                let ways_in = markers.map(|markers| self.ways_into_block(markers));
+                (
+                    json::named_arguments_calls(
+                        self,
+                        json::NamedArguments {
+                            marker,
+                            between_calls,
+                        },
+                        markers,
+                        ways_in.as_deref().unwrap_or_default(),
+                        &named,
+                        count,
+                    )?,
+                    true,
+                )
             }
-            CallSyntax::NamedArguments(marker) => (
-                json::named_arguments_calls(self, marker, &named, count)?,
-                true,
-            ),
             CallSyntax::Xml => (xml::calls(markers?, self.separator(), &named, count)?, true),
             CallSyntax::Gemma(spelling) => (gemma::calls(markers?, *spelling, &named, count), true),
             CallSyntax::NamedJson(marker) => {
@@ -705,19 +789,43 @@ impl Format {
             // A template's patterns do not say which text a run of whitespace or a skipped
             // attribute stands for, and a tag writes only what the template renders: a shaped
             // call's tag is written from the layout its chat template renders, and a table
-            // without one has none. With no call owed, the tag takes no prefix: its own free text
-            // writes the thought, where a prefix before it would let an engine end the prefix
-            // inside the call's terminal and write the rest as free text, a call no tag constrains.
-            CallSyntax::Shaped(shape) => (
-                shaped::calls(self, shape, self.layout()?, &named, count)?,
-                options.at_least_one,
-            ),
+            // without one has none; where the calls sit in a block (Kimi K2's), between the
+            // block's ways in and its close. With no call owed, the tag takes no prefix: its own
+            // free text writes the thought, where a prefix before it would let an engine end the
+            // prefix inside the call's terminal and write the rest as free text, a call no tag
+            // constrains.
+            CallSyntax::Shaped(shape) => {
+                let ways_in = markers.map(|markers| self.ways_into_block(markers));
+                (
+                    shaped::calls(
+                        self,
+                        shape,
+                        self.layout()?,
+                        markers,
+                        ways_in.as_deref().unwrap_or_default(),
+                        &named,
+                        count,
+                    )?,
+                    options.at_least_one,
+                )
+            }
             // The forced call's constraint is the request's own schema, which the gateway writes
             // for the function `tool_choice` names; the format derives nothing of its own.
             CallSyntax::ForcedArguments => return None,
         };
-        self.led(calls, options.reasoning_open, prefixed, options.start)
-            .map(|grammar| self.bounded(grammar))
+        // The calls' tag takes what the template writes after the thought's close where it starts
+        // there; an answer's keeps the schema alone, the engine's own constraint
+        // ([`Self::answer_grammar_for`]).
+        let after = self.around(|layout| layout.thought.as_ref()).1;
+        self.led(
+            calls,
+            options.reasoning_open,
+            options.thought_closed,
+            prefixed,
+            options.start,
+            after,
+        )
+        .map(|grammar| self.bounded(grammar))
     }
 
     /// The structural tag for an answer that is JSON `schema` accepts (`response_format`
@@ -736,6 +844,10 @@ impl Format {
     /// such state (xLAM, whose answer is anything but a list), with no way into it from where the
     /// model starts, or, with the thought open, a thought that closes only into the block, as for
     /// [`Self::grammar`]; a thought the model may write first leads the answer as it leads a call.
+    /// Where the thought is a message of its own before an answer that is another (Inkling's) and
+    /// the prompt opens no thought, the tag admits the thought first, closed and the next message
+    /// opened, and leaves the way into the answer optional unless the engine starts the grammar at
+    /// the first token ([`Self::thought_message`]).
     pub fn answer_grammar(&self, schema: &Value, reasoning_open: bool) -> Option<Grammar> {
         self.answer_grammar_for(schema, reasoning_open, GrammarStart::Unknown)
     }
@@ -772,7 +884,7 @@ impl Format {
                 _ => Grammar::Sequence(parts),
             };
             return self
-                .led(answer, reasoning_open, true, start)
+                .led(answer, reasoning_open, false, true, start, "")
                 .map(|grammar| self.bounded(grammar));
         }
         // The model starts in its thought when the prompt opened it, and otherwise in the turn's
@@ -820,11 +932,46 @@ impl Format {
         };
         end.push_str(after);
         end.push_str(self.turn_end());
+        // A thought that is a message of its own before an answer that is another, the prompt
+        // opening no thought: an engine that starts the grammar after its reasoning parser hands
+        // over at the answer's opener, since the thought's close ends every message alike, and so
+        // has consumed the way in when the grammar starts; one that starts at the first token
+        // writes it. On a prompt that opens no thought the start says which only when it names
+        // the first token: an engine that says it starts after its parser may gate on that parser
+        // whatever the prompt or only when the request asks for reasoning, and the tag fits
+        // both, the way in optional. The thought comes first either way, so an engine that starts
+        // before it does not force the answer into the model's first message.
+        if !reasoning_open {
+            if let Some(thought) = self.thought_message() {
+                let thought = if self.writes_thought_first() {
+                    thought
+                } else {
+                    Grammar::Optional(Box::new(thought))
+                };
+                let mut parts = vec![thought];
+                if !begin.is_empty() {
+                    let opener = Grammar::ConstString(begin);
+                    parts.push(match start {
+                        GrammarStart::FirstToken => opener,
+                        GrammarStart::AfterReasoning | GrammarStart::Unknown => {
+                            Grammar::Optional(Box::new(opener))
+                        }
+                    });
+                }
+                parts.push(answer);
+                if !end.is_empty() {
+                    parts.push(Grammar::ConstString(end));
+                }
+                return Some(self.bounded(Grammar::Sequence(parts)));
+            }
+        }
         self.led(
             Grammar::Tag(Tag::new(begin, answer, end)),
             reasoning_open,
             false,
+            false,
             start,
+            "",
         )
         .map(|grammar| self.bounded(grammar))
     }
@@ -841,30 +988,50 @@ impl Format {
     /// own state, where the output starts, and close back there. A table that leaves the thought
     /// to the model, the turn's own state opening it and closing an empty one, admits it first
     /// ([`Self::thought_the_model_may_write_first`]); one that does neither has nothing before
-    /// `body`.
+    /// `body` but, where the grammar starts after the thought's close, `after`.
+    ///
+    /// `after` is what the template writes after the thought's close, before what comes next
+    /// ([`Message::after`]), where the tag writes the close or starts right after it: after the
+    /// gate of an engine's reasoning parser, after the prompt's closed thought, and after the
+    /// thought a free-text prefix or a tag of the thought wrote. The tag then begins as the
+    /// template does there (Seed-OSS's newline before a call), and its first text is not the
+    /// call's marker: an engine that holds the grammar back until the thought ends, and takes a
+    /// call marker the model writes inside its thought as that end, cannot start the forced call
+    /// there when the tag cannot start with the marker. Empty where the table has no layout, or
+    /// the caller writes `after` itself (an answer's tag). Where the prompt closed the thought
+    /// itself and wrote `after` (`thought_closed`: a request with thinking switched off), the tag
+    /// owes it on no start ([`Self::thought_the_model_may_write_first`]).
     fn led(
         &self,
         body: Grammar,
         reasoning_open: bool,
+        thought_closed: bool,
         prefixed: bool,
         start: GrammarStart,
+        after: &str,
     ) -> Option<Grammar> {
         if reasoning_open {
             return match start {
                 // The engine starts the grammar where the thought's close left it: nothing of
-                // the thought precedes `body`, as nothing precedes it at the engine's own server.
-                GrammarStart::AfterReasoning => Some(body),
+                // the thought precedes `body` but what the template writes after the close, as
+                // at the engine's own server.
+                GrammarStart::AfterReasoning => Some(after_the_close(after, body)),
                 // The engine runs the grammar from the first token, the model inside its thought:
                 // the thought, closed by its own marker, comes first whether or not the tag takes
                 // a prefix, else the engine would force the tag's first text (a way in restating
                 // the close, or the body itself) before the model has thought.
-                GrammarStart::FirstToken => self.after_the_closed_thought(body),
-                GrammarStart::Unknown if prefixed => self.after_the_thought(body),
+                GrammarStart::FirstToken => self.after_the_closed_thought(body, after),
+                GrammarStart::Unknown if prefixed => self.after_the_thought(body, after),
                 GrammarStart::Unknown => Some(body),
             };
         }
         if !self.writes_thought_first() {
-            return Some(self.thought_the_model_may_write_first(body));
+            return Some(self.thought_the_model_may_write_first(
+                body,
+                start,
+                after,
+                thought_closed,
+            ));
         }
         let reasoning = self.state_emitting(Emits::Reasoning)?;
         let thought = self.region(reasoning, |state| self.is_call_state(state))?;
@@ -895,11 +1062,11 @@ impl Format {
 
     /// `body` after the prefix a prompt's open thought takes: free text that can write none of the
     /// table's terminals but the thought's own, nor the call syntax's inner tags, with nothing
-    /// owed at its end. A table without a thought has no prefix, and gives `body` as it is; a
-    /// thought that closes only into the block has no prefix, its close being its own way in, and
-    /// gives `None`; one that closes into the text after it takes the prefix with that close as
-    /// its own ([`Self::thought_markers`]).
-    fn after_the_thought(&self, body: Grammar) -> Option<Grammar> {
+    /// owed at its end, then `after` ([`Self::led`]). A table without a thought has no prefix,
+    /// and gives `body` as it is; a thought that closes only into the block has no prefix, its
+    /// close being its own way in, and gives `None`; one that closes into the text after it takes
+    /// the prefix with that close as its own ([`Self::thought_markers`]).
+    fn after_the_thought(&self, body: Grammar, after: &str) -> Option<Grammar> {
         let Some(reasoning) = self.state_emitting(Emits::Reasoning) else {
             return Some(body);
         };
@@ -911,16 +1078,19 @@ impl Format {
         let (open, closes) = self.thought_markers(reasoning)?;
         let own: Vec<&str> = std::iter::once(open).chain(closes).collect();
         let excludes = self.excluded_but(&own);
-        Some(Grammar::Sequence(vec![Grammar::AnyText { excludes }, body]))
+        let mut elements = vec![Grammar::AnyText { excludes }];
+        elements.extend(after_the_close_then(after, body));
+        Some(Grammar::Sequence(elements))
     }
 
     /// `body` after the prompt's open thought, for an engine that starts the grammar at the
     /// first token: the thought's text, which writes none of the table's terminals, ends at one
-    /// of the thought's closes, and `body` follows at once, so the engine neither forces `body`
-    /// into the thought nor lets free text run on after the close. A table without a thought has
-    /// no prefix, and gives `body` as it is; a thought that closes only into the block has no
-    /// prefix, its close being its own way in, and gives `None` ([`Self::thought_markers`]).
-    fn after_the_closed_thought(&self, body: Grammar) -> Option<Grammar> {
+    /// of the thought's closes, and `after` and `body` follow at once ([`Self::led`]), so the
+    /// engine neither forces `body` into the thought nor lets free text run on after the close.
+    /// A table without a thought has no prefix, and gives `body` as it is; a thought that closes
+    /// only into the block has no prefix, its close being its own way in, and gives `None`
+    /// ([`Self::thought_markers`]).
+    fn after_the_closed_thought(&self, body: Grammar, after: &str) -> Option<Grammar> {
         let Some(reasoning) = self.state_emitting(Emits::Reasoning) else {
             return Some(body);
         };
@@ -933,7 +1103,9 @@ impl Format {
             excludes: self.excluded_but(&[]),
         };
         let thought = Grammar::Tag(Tag::bounded("", text, end));
-        Some(Grammar::Sequence(vec![thought, body]))
+        let mut elements = vec![thought];
+        elements.extend(after_the_close_then(after, body));
+        Some(Grammar::Sequence(elements))
     }
 
     /// The thought's opener and the closes the model writes for it. Where the thought closes
@@ -985,13 +1157,37 @@ impl Format {
     /// thought's opener and one on its close, the model writing the thought or closing an empty
     /// one (MiniMax M3). The tag then admits the thought (its opener, its text free of the table's
     /// terminals and the call syntax's inner tags, and its close), or the bare close, or nothing
-    /// at all, before `body`: a forced call is written at once, and without this the tag would
-    /// take the thought away. A table whose prompt opens the thought has only the opener's row
-    /// there, if that, and adds nothing. A prompt with the thought closed is both the template's
-    /// adaptive default and a request with thinking switched off (its generation prompt ends with
-    /// the thought's close): the tag admits the thought, or a second close, in both, and an answer
-    /// that writes one with thinking off reads back as content, as the legacy parser's tag has it.
-    fn thought_the_model_may_write_first(&self, body: Grammar) -> Grammar {
+    /// at all, before `body`, `after` following the thought or the close ([`Self::led`]), and
+    /// once before `body` after the gate of the engine's reasoning parser, which has read one of
+    /// the two: a forced call is written at once, and without this the tag would take the thought
+    /// away. A table
+    /// whose prompt opens the thought has only the opener's row there, if that, and adds nothing.
+    /// A prompt with the thought closed is both the template's adaptive default and a request
+    /// with thinking switched off (its generation prompt ends with the thought's close): the tag
+    /// admits the thought, or a second close, in both, and an answer that writes one with thinking
+    /// off reads back as content, as the legacy parser's tag has it.
+    ///
+    /// A table with the opener's row alone (Seed-OSS, whose template writes no empty thought)
+    /// leaves the thought to the model too, and where its grammar starts is the engine's: after
+    /// the gate of the engine's reasoning parser, which has read the thought the model wrote, or
+    /// after the thought the prompt closed, `after` and then `body`, as the template writes them
+    /// after the close; at the first token, and where the engine does not say (the grammar may
+    /// then start at the turn's own start, where nothing stands after a close), `body` at once,
+    /// as before.
+    ///
+    /// Where the prompt closed the thought itself and wrote `after` (`thought_closed`: a request
+    /// with thinking switched off, whose generation prompt ends with the close and the template's
+    /// text after it), nothing is owed before `body` on any start, or the tag would write that
+    /// text a second time; a thought or a close the model writes anyway carries its own `after`,
+    /// as where the engine does not say. A prompt that ends with the bare close (GLM 4.6's
+    /// `<think></think>`) has not written it, and the tag still does.
+    fn thought_the_model_may_write_first(
+        &self,
+        body: Grammar,
+        start: GrammarStart,
+        after: &str,
+        thought_closed: bool,
+    ) -> Grammar {
         let Some(reasoning) = self.state_emitting(Emits::Reasoning) else {
             return body;
         };
@@ -1011,31 +1207,93 @@ impl Format {
             .transitions()
             .any(|(source, on, _)| source == 0 && self.terminal_text(on) == close);
         if !closes_from_start {
-            return body;
+            return if start == GrammarStart::AfterReasoning && !thought_closed {
+                after_the_close(after, body)
+            } else {
+                body
+            };
         }
         let text = Grammar::AnyText {
             excludes: self.excluded_but(&[]),
         };
-        let first = Grammar::Or(vec![
-            Grammar::Tag(Tag::new(open, text, close)),
-            Grammar::ConstString(close.to_string()),
-        ]);
-        Grammar::Sequence(vec![Grammar::Optional(Box::new(first)), body])
+        let thought = Grammar::Tag(Tag::new(open, text, close));
+        let bare = Grammar::ConstString(close.to_string());
+        // After the gate of the engine's reasoning parser, which has read the thought or the bare
+        // close, `after` is owed once before `body`, whichever of the two the engine read; the
+        // thought or the close the tag still admits there would be a second one. Elsewhere, and
+        // where the prompt wrote `after` after the thought it closed, each of the two carries
+        // `after`, and nothing is owed where the model writes neither.
+        let gated = start == GrammarStart::AfterReasoning && !thought_closed;
+        let first = if after.is_empty() || gated {
+            Grammar::Or(vec![thought, bare])
+        } else {
+            Grammar::Or(vec![
+                Grammar::Sequence(after_then(thought, after)),
+                Grammar::Sequence(after_then(bare, after)),
+            ])
+        };
+        let mut elements = vec![Grammar::Optional(Box::new(first))];
+        if gated {
+            elements.extend(after_the_close_then(after, body));
+        } else {
+            elements.push(body);
+        }
+        Grammar::Sequence(elements)
+    }
+
+    /// The thought where it is a message of its own, as Inkling's: it opens from the turn's own
+    /// state, and its close leaves the engine between the template's messages instead of back
+    /// where it opened ([`Self::close_of`]'s second case), from where rows lead back to the turn's
+    /// own state, where the next message says what it is. The grammar of that thought written
+    /// first and closed, the next message opened: the thought's opener, text that writes none of
+    /// the table's terminals nor the call syntax's tags, its close with what the layout writes
+    /// after a thought, and the rows back. `None` for every other table: a thought that closes
+    /// back where it opened (ChatML's), into the text after it (MiniMax M3's), or no thought.
+    fn thought_message(&self) -> Option<Grammar> {
+        let reasoning = self.state_emitting(Emits::Reasoning)?;
+        if self
+            .region(reasoning, |state| self.is_call_state(state))
+            .is_some()
+        {
+            return None;
+        }
+        let (_, open, _) = self
+            .transitions()
+            .find(|&(source, _, target)| source == 0 && target == reasoning)?;
+        let (close, landing) = self.close_of(reasoning)?;
+        let back = self.path(landing, 0)?;
+        if back.is_empty() {
+            return None;
+        }
+        let (before, after) = self.around(|layout| layout.thought.as_ref());
+        let text = Grammar::AnyText {
+            excludes: self.excluded_but(&[]),
+        };
+        let mut end = format!("{close}{after}");
+        end.extend(back.iter().copied());
+        Some(Grammar::Tag(Tag::new(
+            format!("{before}{}", self.terminal_text(open)),
+            text,
+            end,
+        )))
     }
 
     /// What free text before a tag may not write: the table's terminals, but `kept` and those
     /// written inside one of them (a kept close `<e></t>` holds the terminal `<e>`, and free text
-    /// that excluded `<e>` could never write the close), and the call syntax's inner tags.
+    /// that excluded `<e>` could never write the close), and the call syntax's inner tags. The
+    /// named-arguments marker is not among them: it stands only after the call's opener, a
+    /// terminal the text cannot write, and in one table it is ordinary text (DeepSeek V3's fence),
+    /// which a thought may well hold.
     fn excluded_but(&self, kept: &[&str]) -> Vec<String> {
         let mut excludes: Vec<String> = self
             .terminal_texts()
             .filter(|text| !kept.iter().any(|kept| kept.contains(text)))
             .map(str::to_string)
             .collect();
-        let inner = self
-            .call_syntax()
-            .map(CallSyntax::tag_texts)
-            .unwrap_or_default();
+        let inner = match self.call_syntax() {
+            Some(CallSyntax::NamedArguments { .. }) | None => Vec::new(),
+            Some(syntax) => syntax.tag_texts(),
+        };
         excludes.extend(inner.iter().map(|tag| tag.to_string()));
         excludes
     }
@@ -1079,22 +1337,47 @@ impl Format {
             }
             None => None,
         };
-        let mut call_exits: Vec<&str> = Vec::new();
+        Some(CallMarkers {
+            block,
+            call_open: call.open,
+            call_close: call.close,
+            call_exits: self.call_exits(arguments),
+        })
+    }
+
+    /// The markers of a list a marker opens and the turn ends, the Mistral list behind
+    /// `[TOOL_CALLS]`: no row closes the arguments state, so [`Self::region`] names no region, and
+    /// the tag ends with nothing, as the v13 table's do. `None` for a list that stands alone in the
+    /// turn (xLAM's, `json`'s), which no row enters: a tag for it would write a marker the table
+    /// never reads.
+    fn opened_list_markers(&self) -> Option<CallMarkers<'_>> {
+        let arguments = self.state_emitting(Emits::Arguments)?;
+        let (_, open, _) = self
+            .transitions()
+            .find(|&(source, _, target)| target == arguments && source != arguments)?;
+        Some(CallMarkers {
+            block: None,
+            call_open: self.terminal_text(open),
+            call_close: "",
+            call_exits: self.call_exits(arguments),
+        })
+    }
+
+    /// The terminals the table has a row for out of the arguments state `arguments`, in the order
+    /// of the rows, each once: what the engine takes wherever it stands inside a call, a value
+    /// included.
+    fn call_exits(&self, arguments: usize) -> Vec<&str> {
+        let mut exits: Vec<&str> = Vec::new();
         for (_, on, _) in self
             .transitions()
             .filter(|&(source, _, _)| source == arguments)
         {
             let text = self.terminal_text(on);
-            if !call_exits.contains(&text) {
-                call_exits.push(text);
+            if !exits.contains(&text) {
+                exits.push(text);
             }
         }
-        Some(CallMarkers {
-            block,
-            call_open: call.open,
-            call_close: call.close,
-            call_exits,
-        })
+        exits
     }
 
     /// The ways into the block the calls sit in, or none when they sit in no block.
@@ -1515,7 +1798,13 @@ mod tests {
                 "{}",
                 format.name()
             );
-            assert_eq!(wrapped["elements"][1], bare, "{}", format.name());
+            // The calls come last: a table whose layout writes text after the thought's close
+            // (Qwen3's two newlines) puts it between the prefix and them.
+            let last = wrapped["elements"]
+                .as_array()
+                .and_then(|elements| elements.last())
+                .expect("elements");
+            assert_eq!(*last, bare, "{}", format.name());
         }
     }
 
@@ -2204,6 +2493,36 @@ mod tests {
     }
 
     #[test]
+    fn mistral_list_derives_one_tag_behind_the_marker_with_no_end() {
+        // The Mistral list: `[TOOL_CALLS]` opens the region and the turn ends it, so the tag is
+        // the marker, xLAM's list of the tools' calls, and an empty end, as the v13 table's tags
+        // end with nothing. A bare list would be content to this table, which starts in content.
+        let tools = weather_tools();
+        let payload = formats::mistral()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .payload();
+        let list = formats::xlam()
+            .grammar(&tools, true, false)
+            .expect("a grammar")
+            .to_json();
+        assert_eq!(
+            payload,
+            value!({"format": {
+                "type": "triggered_tags",
+                "triggers": ["[TOOL_CALLS]"],
+                "tags": [{
+                    "type": "tag",
+                    "begin": "[TOOL_CALLS]",
+                    "content": list,
+                    "end": "",
+                }],
+                "at_least_one": true,
+            }})
+        );
+    }
+
+    #[test]
     fn mistral_derives_a_tag_per_tool_from_the_opener_to_the_arguments_object() {
         // No hand-written tag to pin to: the gateway's older `mistral` parser reads Mistral 7B
         // v0.3's `[TOOL_CALLS][{…}]` list, another syntax. Per named tool, `[TOOL_CALLS]`, the
@@ -2238,6 +2557,8 @@ mod tests {
                 "at_least_one": true,
             }})
         );
+        // The free text keeps the thought's own markers, and the arguments marker too: `[ARGS]`
+        // opens no call without `[TOOL_CALLS]` before it, which the text cannot write.
         let open = formats::mistral_v13()
             .grammar(&tools, true, true)
             .expect("a grammar");
@@ -2247,7 +2568,7 @@ mod tests {
                 if parts.len() == 2
                     && matches!(&parts[0], Grammar::AnyText { excludes }
                         if excludes.contains(&"[TOOL_CALLS]".to_string())
-                            && excludes.contains(&"[ARGS]".to_string())
+                            && !excludes.contains(&"[ARGS]".to_string())
                             && !excludes.contains(&"[THINK]".to_string()))
         ));
     }
@@ -2333,6 +2654,7 @@ mod tests {
                 Options {
                     at_least_one,
                     reasoning_open,
+                    thought_closed: false,
                     one_call: true,
                     start: GrammarStart::Unknown,
                 },
@@ -2546,6 +2868,7 @@ mod tests {
                         Options {
                             at_least_one,
                             reasoning_open,
+                            thought_closed: false,
                             one_call: false,
                             start: GrammarStart::Unknown,
                         },
@@ -2597,7 +2920,7 @@ mod tests {
                 &mut out,
             )
             .expect("the end");
-        let events = out.drain();
+        let events = out.into_owned().drain();
         let message = adapt::chat::message(0, &events).message;
         let calls: Vec<Value> = message
             .tool_calls
@@ -2749,19 +3072,73 @@ mod tests {
     #[test]
     fn inklings_answer_is_a_text_message() {
         // The output starts after the message's opener, where the text marker makes the message
-        // the answer, and the message's close ends it. The generation prompt opens no thought; a
-        // thought a prompt left open reaches a text message only through the next message's
-        // header, which reads calls and is no framing, so it has no answer tag.
+        // the answer, and the message's close ends it. The thought is a message of its own, so
+        // the tag admits it first, closed and the next message opened, and leaves the text marker
+        // to the engine: one that starts the grammar after its reasoning parser has consumed the
+        // model's own marker (the parser hands over there, not at the thought's close, which ends
+        // every message), one that starts before the thought writes it. The generation prompt
+        // opens no thought; a thought a prompt left open reaches a text message only through the
+        // next message's header, which reads calls and is no framing, so it has no answer tag.
+        let thought = value!({
+            "type": "tag",
+            "begin": "<|content_thinking|>",
+            "content": {"type": "any_text", "excludes": [
+                "<|content_thinking|>", "<|content_text|>", "<|end_message|>",
+                "<|message_model|>", "<|content_model_end_sampling|>",
+                "<|content_invoke_tool_json|>",
+            ]},
+            "end": "<|end_message|><|message_model|>",
+        });
         assert_eq!(
             answer(&formats::inkling(), false),
-            Some(value!({"format": {
-                "type": "tag",
-                "begin": "<|content_text|>",
-                "content": {"type": "json_schema", "json_schema": answer_schema()},
-                "end": "<|end_message|>",
-            }}))
+            Some(value!({"format": {"type": "sequence", "elements": [
+                {"type": "optional", "content": thought},
+                {"type": "optional", "content": {"type": "const_string", "value": "<|content_text|>"}},
+                {"type": "json_schema", "json_schema": answer_schema()},
+                {"type": "const_string", "value": "<|end_message|>"},
+            ]}}))
         );
         assert_eq!(answer(&formats::inkling(), true), None);
+    }
+
+    #[test]
+    fn inklings_answer_writes_the_text_marker_outright_only_from_the_first_token() {
+        // Where the engine says it starts the grammar at the first token, the model writes the
+        // marker under the grammar, so the tag owes it; after a reasoning parser's gate, or where
+        // the engine does not say, the model's own marker may have been consumed before the
+        // grammar started, and the tag fits both.
+        let answer_for = |start| {
+            formats::inkling()
+                .answer_grammar_for(&answer_schema(), false, start)
+                .expect("an answer")
+                .payload()
+        };
+        let unknown = answer_for(GrammarStart::Unknown);
+        assert_eq!(answer_for(GrammarStart::AfterReasoning), unknown);
+        let first = answer_for(GrammarStart::FirstToken);
+        let elements = |payload: &Value| payload["format"]["elements"].as_array().cloned();
+        let (first, unknown) = (
+            elements(&first).expect("a sequence"),
+            elements(&unknown).expect("a sequence"),
+        );
+        assert_eq!(first.len(), 4);
+        assert_eq!(
+            first[0], unknown[0],
+            "the thought the model may write first"
+        );
+        assert_eq!(
+            first[1],
+            value!({"type": "const_string", "value": "<|content_text|>"})
+        );
+        assert_eq!(
+            unknown[1],
+            value!({"type": "optional", "content": first[1]})
+        );
+        assert_eq!(
+            first[2..],
+            unknown[2..],
+            "the schema and the message's close"
+        );
     }
 
     #[test]
@@ -2873,6 +3250,7 @@ mod tests {
                         Options {
                             at_least_one: true,
                             reasoning_open,
+                            thought_closed: false,
                             one_call,
                             start: GrammarStart::Unknown,
                         },
@@ -2921,6 +3299,7 @@ mod tests {
                     Options {
                         at_least_one: true,
                         reasoning_open,
+                        thought_closed: false,
                         one_call: false,
                         start,
                     },
@@ -3019,6 +3398,7 @@ mod tests {
                 Options {
                     at_least_one: true,
                     reasoning_open: true,
+                    thought_closed: false,
                     one_call: false,
                     start,
                 },
@@ -3091,7 +3471,13 @@ mod tests {
     /// A table whose template writes a thought before every call and answer: `<think>` blocks
     /// and `<tool_call>` blocks of JSON calls, everything else content, the turn's thought first.
     fn thinking_first() -> Format {
-        Format::new("thinking_first")
+        qwen3_rows().thinks_first()
+    }
+
+    /// Qwen3's rows alone: neither the property nor the registry table's layout (whose newlines
+    /// after the thought's close would stand before the calls), as a control.
+    fn qwen3_rows() -> Format {
+        Format::new("qwen3_rows")
             .terminal("think_open", "<think>")
             .terminal("think_close", "</think>")
             .terminal("call_open", "<tool_call>")
@@ -3104,7 +3490,6 @@ mod tests {
             .transition("content", "call_open", "call")
             .transition("call", "call_close", "content")
             .calls(CallSyntax::Json)
-            .thinks_first()
     }
 
     /// The thought a table that thinks first writes before a tag, as a payload node.
@@ -3127,11 +3512,12 @@ mod tests {
         let tools = weather_tools();
         let format = thinking_first();
         let excludes = value!(["<think>", "</think>", "<tool_call>", "</tool_call>"]);
-        let plain = formats::qwen3(CallSyntax::Json);
+        let plain = qwen3_rows();
         for one_call in [false, true] {
             let options = Options {
                 at_least_one: true,
                 reasoning_open: false,
+                thought_closed: false,
                 one_call,
                 start: GrammarStart::Unknown,
             };
@@ -3154,7 +3540,7 @@ mod tests {
             format.grammar(&tools, true, true),
             plain.grammar(&tools, true, true)
         );
-        // The same rows without the property, Qwen3's, give the tag alone.
+        // The same rows without the property give the tag alone.
         assert_eq!(
             plain
                 .grammar(&tools, true, false)
@@ -3259,6 +3645,195 @@ mod tests {
             headed.clone().thinks_first().grammar(&tools, true, true),
             headed.grammar(&tools, true, true)
         );
+    }
+
+    #[test]
+    fn a_forced_call_after_the_thoughts_close_begins_with_what_the_template_writes_there() {
+        // Seed-OSS's template writes a newline after the thought's close before every call, and
+        // its table carries that part of its layout. Where the grammar starts after the close
+        // (after the gate of the engine's reasoning parser, with the prompt's thought closed or
+        // open; after the thought a free-text prefix or a tag of the thought wrote), the calls'
+        // tag begins with it, so the call's marker is not the grammar's first text: an engine
+        // that takes a marker the model rehearses inside its thought for the thought's end cannot
+        // start the forced call there once the marker cannot start the grammar (smg-lab #845).
+        // With the thought closed, at the first token or where the engine does not say (the
+        // grammar may then start at the turn's own start), the calls at once, as before; an
+        // answer's tag keeps the schema alone; a table without a layout is as it was.
+        let tools = weather_tools();
+        let format = formats::seed_oss();
+        let calls_for = |reasoning_open, start| {
+            format
+                .grammar_for(
+                    &tools,
+                    Options {
+                        at_least_one: true,
+                        reasoning_open,
+                        thought_closed: false,
+                        one_call: true,
+                        start,
+                    },
+                )
+                .expect("a tag")
+                .payload()
+        };
+        let newline = value!({"type": "const_string", "value": "\n"});
+        let gated = calls_for(false, GrammarStart::AfterReasoning);
+        assert_eq!(gated["format"]["type"], "sequence", "{gated}");
+        assert_eq!(gated["format"]["elements"][0], newline);
+        let calls = &gated["format"]["elements"][1];
+        assert_eq!(calls["type"], "triggered_tags");
+        assert_eq!(calls["at_least_one"], true);
+        assert_eq!(calls["stop_after_first"], true);
+        assert_eq!(
+            calls["tags"][0]["begin"],
+            "<seed:tool_call>\n<function=get_weather>\n"
+        );
+        for start in [GrammarStart::FirstToken, GrammarStart::Unknown] {
+            assert_eq!(
+                calls_for(false, start)["format"],
+                *calls,
+                "{start:?}: the calls at once, as before"
+            );
+        }
+        assert_eq!(calls_for(true, GrammarStart::AfterReasoning), gated);
+        let closed = calls_for(true, GrammarStart::FirstToken);
+        assert_eq!(closed["format"]["elements"][0]["type"], "tag");
+        assert_eq!(closed["format"]["elements"][0]["end"], "</seed:think>");
+        assert_eq!(closed["format"]["elements"][1], newline);
+        assert_eq!(closed["format"]["elements"][2], *calls);
+        let unknown = calls_for(true, GrammarStart::Unknown);
+        assert_eq!(unknown["format"]["elements"][0]["type"], "any_text");
+        assert_eq!(unknown["format"]["elements"][1], newline);
+        assert_eq!(unknown["format"]["elements"][2], *calls);
+        // The tag for any number of calls the same way, and the `auto` tag (no call owed).
+        for (at_least_one, one_call) in [(true, false), (false, false), (false, true)] {
+            let tag = format
+                .grammar_for(
+                    &tools,
+                    Options {
+                        at_least_one,
+                        reasoning_open: false,
+                        thought_closed: false,
+                        one_call,
+                        start: GrammarStart::AfterReasoning,
+                    },
+                )
+                .expect("a tag")
+                .payload();
+            assert_eq!(tag["format"]["elements"][0], newline, "{tag}");
+            assert_eq!(tag["format"]["elements"][1]["type"], "triggered_tags");
+        }
+        // The answer: the schema alone after the gate, the engine's own constraint.
+        for start in [
+            GrammarStart::Unknown,
+            GrammarStart::AfterReasoning,
+            GrammarStart::FirstToken,
+        ] {
+            let answer = format
+                .answer_grammar_for(&answer_schema(), false, start)
+                .expect("an answer")
+                .payload();
+            assert_eq!(
+                answer["format"]["type"], "json_schema",
+                "{start:?}: {answer}"
+            );
+        }
+        // A table that leaves the thought to the model with a bare-close row (MiniMax M3's rows)
+        // and a layout: the thought or the bare close carry the after-text where the model writes
+        // them, and after the gate, which has read one of the two, the after-text stands once
+        // before the calls.
+        let left = formats::minimax_m3().with_layout(Layout {
+            thought: Some(Message {
+                before: "".into(),
+                after: "\n".into(),
+                stops: false,
+                close: Some("</mm:think>".into()),
+            }),
+            ..Layout::default()
+        });
+        let left_for = |start| {
+            left.grammar_for(
+                &tools,
+                Options {
+                    at_least_one: true,
+                    reasoning_open: false,
+                    thought_closed: false,
+                    one_call: true,
+                    start,
+                },
+            )
+            .expect("a tag")
+            .payload()
+        };
+        let unknown = left_for(GrammarStart::Unknown);
+        let choices = &unknown["format"]["elements"][0]["content"]["elements"];
+        assert_eq!(choices[0]["type"], "sequence", "{unknown}");
+        assert_eq!(choices[0]["elements"][0]["begin"], "<mm:think>");
+        assert_eq!(choices[0]["elements"][1], newline);
+        assert_eq!(
+            choices[1]["elements"],
+            value!([{"type": "const_string", "value": "</mm:think>"}, newline])
+        );
+        assert_eq!(
+            unknown["format"]["elements"].as_array().map(Vec::len),
+            Some(2)
+        );
+        assert_eq!(left_for(GrammarStart::FirstToken), unknown);
+        let gated = left_for(GrammarStart::AfterReasoning);
+        let choices = &gated["format"]["elements"][0]["content"]["elements"];
+        assert_eq!(choices[0]["begin"], "<mm:think>", "{gated}");
+        assert_eq!(
+            choices[1],
+            value!({"type": "const_string", "value": "</mm:think>"})
+        );
+        assert_eq!(gated["format"]["elements"][1], newline);
+        assert_eq!(
+            gated["format"]["elements"][2],
+            unknown["format"]["elements"][1]
+        );
+        // Without a layout the shape is the one it was, whatever the start.
+        for start in [
+            GrammarStart::Unknown,
+            GrammarStart::AfterReasoning,
+            GrammarStart::FirstToken,
+        ] {
+            assert_eq!(
+                formats::minimax_m3().grammar_for(
+                    &tools,
+                    Options {
+                        at_least_one: true,
+                        reasoning_open: false,
+                        thought_closed: false,
+                        one_call: false,
+                        start,
+                    },
+                ),
+                formats::minimax_m3().grammar(&tools, true, false),
+                "{start:?}"
+            );
+        }
+        // A table without a layout: the calls at once at every start, as before.
+        let plain = qwen3_rows();
+        for start in [
+            GrammarStart::Unknown,
+            GrammarStart::AfterReasoning,
+            GrammarStart::FirstToken,
+        ] {
+            let tag = plain
+                .grammar_for(
+                    &tools,
+                    Options {
+                        at_least_one: true,
+                        reasoning_open: false,
+                        thought_closed: false,
+                        one_call: true,
+                        start,
+                    },
+                )
+                .expect("a tag")
+                .payload();
+            assert_eq!(tag["format"]["type"], "triggered_tags", "{start:?}");
+        }
     }
 
     #[test]
@@ -3487,7 +4062,10 @@ mod tests {
     fn a_layouts_text_before_an_answer_stands_before_the_terminal_that_opens_it() {
         // The way in from the open thought is its close and two rows, `<n>` and the answer's
         // opener `<a>`: the layout's text after a thought follows the close, and its text before
-        // an answer comes right before `<a>`, not before the first row.
+        // an answer comes right before `<a>`, not before the first row. With the thought not
+        // open, the thought is a message of its own (it closes into the framing between the
+        // messages, and `<n>` leads back): the tag admits it first, closed and followed by `<n>`,
+        // and the way into the answer, the layout's text and `<a>`, is left optional.
         let format = Format::new("two markers")
             .terminal("think_open", "<t>")
             .terminal("think_close", "</t>")
@@ -3520,9 +4098,15 @@ mod tests {
             answer(&format, true).map(|payload| payload["format"]["begin"].clone()),
             Some(value!("</t>\n<n> <a>"))
         );
+        let closed = answer(&format, false).expect("an answer tag");
+        assert_eq!(closed["format"]["type"], "sequence");
         assert_eq!(
-            answer(&format, false).map(|payload| payload["format"]["begin"].clone()),
-            Some(value!(" <a>"))
+            closed["format"]["elements"][0]["content"]["end"],
+            value!("</t>\n<n>")
+        );
+        assert_eq!(
+            closed["format"]["elements"][1],
+            value!({"type": "optional", "content": {"type": "const_string", "value": " <a>"}})
         );
     }
 
@@ -3712,6 +4296,7 @@ mod tests {
             let options = Options {
                 at_least_one,
                 reasoning_open,
+                thought_closed: false,
                 one_call,
                 start: GrammarStart::Unknown,
             };
@@ -3986,6 +4571,7 @@ mod tests {
                     Options {
                         at_least_one: true,
                         reasoning_open,
+                        thought_closed: false,
                         one_call: false,
                         start: GrammarStart::Unknown,
                     },

@@ -11,8 +11,9 @@
 //! `ministral-3-14b-instruct-2512-bf16`, whose templates have no thought.
 //!
 //! The table is named after the tokenizer version that brought `[ARGS]`, and apart from the
-//! gateway's older `mistral` parser, which reads 7B v0.3's list: an operator naming `mistral` keeps
-//! that parser under `--parser symphony`, and the registry picks this table for the groups above.
+//! [`mistral`](super::mistral()) table, which reads 7B v0.3's list, the gateway's older `mistral`
+//! parser's format: an operator naming `mistral` reads with that table under `--parser symphony`,
+//! and the registry picks this one for the groups above.
 //!
 //! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
@@ -34,7 +35,10 @@ pub fn mistral_v13() -> Format {
         .transition("reasoning", "think_close", "content")
         .transition("content", "call_open", "call")
         .transition("call", "call_open", "call")
-        .calls(CallSyntax::NamedArguments(ARGS))
+        .calls(CallSyntax::NamedArguments {
+            marker: ARGS,
+            between_calls: "",
+        })
         .opens_turn("[/INST]")
 }
 
@@ -51,7 +55,7 @@ mod tests {
     /// The generation prompt's tail: the user turn's close, and nothing more.
     const PROMPT: &str = "[/INST]";
 
-    fn run(prompt: &str, output: &str) -> Vec<Event> {
+    fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
         drive(
             &mut Engine::new(mistral_v13(), Declared::default()),
             prompt,

@@ -23,6 +23,7 @@ const USER_KEY: &str = "matrix-user-key";
 
 /// Read-only control-plane routes: the `user` role reaches them.
 const READ_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/inflight"),
     ("GET", "/workers"),
     ("GET", "/get_loads"),
     ("GET", "/v1/tokenizers"),

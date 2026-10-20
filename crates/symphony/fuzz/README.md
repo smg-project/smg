@@ -68,10 +68,13 @@ or one scalar token, but which JSON refuses: a value left out, a trailing comma,
 lacks, a short `\u`, whitespace outside JSON's, a number or a word cut short) and `whole-json` (the
 committed prefix of a value that never closed). `json-prefix` holds until a call's
 `Malformed { InvalidArguments }` event of no bytes says where its arguments stopped being JSON;
-from there `verbatim-after-break` asks that every fragment be the model's bytes as written. A name
-is a shape, from any reader on every target, not a reader's own. The nightly workflow allows the shapes of the classes reported and
-not yet fixed, named in `symphony-fuzz.yml`; a name leaves the list with its fix, and a new
-reader's breach of an allowed shape surfaces then.
+from there `verbatim-after-break` asks that every fragment be the model's bytes as written.
+`pythonic-cut-call-closed` is a pythonic call that ended without its own `)` and had its object
+closed for it (one that said nothing and left it open is a breach of the whole-JSON names, so no
+event carries two names). A name is a shape, from any reader on every target, not a reader's own.
+The nightly workflow allows the shapes of the classes reported and not yet fixed, named in
+`symphony-fuzz.yml`; a name leaves the list with its fix, and a new reader's breach of an allowed
+shape surfaces then.
 
 One target by hand, with libFuzzer's own options after `--`:
 

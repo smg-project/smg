@@ -1,10 +1,12 @@
 //! What a request declares about its calls.
 //!
-//! A tagged format writes each argument as text that does not say its type; the request's tools
-//! do, and one [`Declared`] per request holds what they say: the kind each parameter declares
-//! (`Declared::kind`, and `Declared::kind_at` for a value inside another), the parameter's
-//! schema itself, and the function the request's `tool_choice` forces ([`Declared::forced`]). It
-//! is shared by every reader of the request's choices and copies no schema.
+//! A tagged format writes each argument as text that does not say its type, and so does the
+//! pythonic dialect that quotes every value; the request's tools do, and one [`Declared`] per
+//! request holds what they say: the kind each parameter declares (`Declared::kind`, and
+//! `Declared::kind_at` for a value inside another), the parameter's schema itself, whether a tool
+//! declares a function ([`Declared::declares`]), and the function the request's `tool_choice`
+//! forces ([`Declared::forced`]). It is shared by every reader of the request's choices and copies
+//! no schema.
 
 use std::sync::Arc;
 
@@ -34,6 +36,11 @@ impl Declared {
     /// Over a copy of `tools`. When two tools share a name, the first one's parameters count.
     pub fn of(tools: &[Tool]) -> Self {
         Self::shared(Arc::from(tools))
+    }
+
+    /// Whether a tool of the request declares `function`.
+    pub fn declares(&self, function: &str) -> bool {
+        self.tools.iter().any(|tool| tool.function.name == function)
     }
 
     /// [`Declared::of`] over tools the caller keeps: they are read in place, and nothing of them

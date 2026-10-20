@@ -43,7 +43,26 @@ KIND_INVALID = "invalid"
 KIND_UNAVAILABLE = "unavailable"
 KIND_INTERNAL = "internal"
 
-_RETRYABLE_CODES = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.RESOURCE_EXHAUSTED)
+_RETRYABLE_CODES = (
+    grpc.StatusCode.UNAVAILABLE,
+    grpc.StatusCode.RESOURCE_EXHAUSTED,
+    grpc.StatusCode.DEADLINE_EXCEEDED,
+)
+_CALLER_CODES = (grpc.StatusCode.INVALID_ARGUMENT, grpc.StatusCode.NOT_FOUND)
+
+
+def kind_for_code(code: grpc.StatusCode) -> str:
+    """The outcome kind the Rust servicer maps back to a status: a retryable
+    code (unavailable, resource exhausted, deadline exceeded) is unavailable,
+    the caller's codes (invalid argument, not found) are invalid, and any other
+    code, INTERNAL and the ones this sort does not know alike, is internal, so
+    a code added to the status table later cannot land on the caller by
+    falling through."""
+    if code in _RETRYABLE_CODES:
+        return KIND_UNAVAILABLE
+    if code in _CALLER_CODES:
+        return KIND_INVALID
+    return KIND_INTERNAL
 
 
 def lend_buffer(buffer: Any) -> Any:
@@ -289,8 +308,8 @@ class RustMediaBridge:
     @staticmethod
     def _finish(request_id: str, future: Future, done: Callable[[str, Any], None]) -> None:
         """Classify the outcome the way the Python servicer maps it to a
-        status: retryable failures UNAVAILABLE, the caller's INVALID_ARGUMENT,
-        anything else INTERNAL."""
+        status (`kind_for_code`): retryable failures UNAVAILABLE, the caller's
+        INVALID_ARGUMENT and NOT_FOUND, anything else INTERNAL."""
         try:
             result = future.result()
         except MmProcessorUnavailable as e:
@@ -298,14 +317,13 @@ class RustMediaBridge:
             done(KIND_UNAVAILABLE, str(e))
         except Exception as e:  # noqa: BLE001 - every failure must reach the caller
             code = _grpc_code_for(e)
-            if code is grpc.StatusCode.INTERNAL:
+            kind = kind_for_code(code)
+            if kind == KIND_INTERNAL:
                 logger.exception("Media processing failed for request %s", request_id)
-                done(KIND_INTERNAL, str(e))
-            elif code in _RETRYABLE_CODES:
+            elif kind == KIND_UNAVAILABLE:
                 logger.warning("Media processing unavailable for request %s: %s", request_id, e)
-                done(KIND_UNAVAILABLE, str(e))
             else:
                 logger.warning("Media of request %s rejected (%s): %s", request_id, code.name, e)
-                done(KIND_INVALID, str(e))
+            done(kind, str(e))
         else:
             done(KIND_OK, result)

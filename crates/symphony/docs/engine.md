@@ -54,11 +54,13 @@ What the engine decides for every format, and what it leaves open:
   the assembler writes closes only at the call's own end, and so does one whose close cut a streamed
   string, in every tag-based syntax (`tagged::end_cut_call`): no closing quote and no closing brace
   are made up for a value the model never finished, and the one event carries the bytes still held,
-  when there are any. Gemma's reader does the same in its own way (`gemma::Assembler::end`): its one
+  when there are any (the keyed syntax refuses them first, as `Dropped { MalformedCall }`, and its
+  event carries none: `tagged::refuse`). Gemma's reader does the same in its own way (`gemma::Assembler::end`): its one
   event names the value's reason, which the engine does not rename, and the bytes held at the marker
-  are the string's text, not the event's. A pythonic call the end cut ends as a tagged one does
-  (`tagged::end_cut_call`), the cut right after its `(` included, since its object closes only at
-  the call's own `)`.
+  are the string's text, not the event's. A pythonic call ends as a tagged one does
+  (`tagged::end_cut_call`) whether the stream's end or the region's marker cut it, the cut right
+  after its `(` included, since its object closes only at the call's own `)`, which every template
+  writes before the marker.
 - With the tagged syntax, a value's type comes from the request's tools (`Declared`): a
   declared string streams, every other value is written at its close. A call to a function the
   request did not declare has every value inferred.
@@ -106,6 +108,16 @@ is a later step).
   Face's null sink, the space around a response template's fields. Every byte of text there, a
   terminal with no row from the state and what the scanner held at the end included, is
   `Dropped { Wrapper }` at every finish; the state's rows still move the engine.
+- A terminal with no row from the state is the state's text, as the model wrote it (dropped where
+  the template discards the state's text). Where that text is the table's own content, a
+  `Malformed { MarkerOutOfPlace }` event of no bytes stands before it, so a reader counts a frame
+  the table did not read (an answer's opener written again inside the answer, a close with nothing
+  open) without a byte moving; in a thought the marker is the thought's text alone, as a table may
+  read a thought's opener as its text (a turn anchor's table), and so it stays in a state a
+  request's variant made content (`Format::is_remade`: the thought of a request that does not
+  separate reasoning, the calls of one without tools), where the table counted none: a thought
+  reads the same whether the request separates reasoning or not, and a call's header is the
+  call syntax's to judge; text in a wrapper state is malformed as text between calls, as before.
 - A table can trim a state's text stay by stay (`Format::trims`), as Hugging Face's `text` parser
   strips a field's value: whitespace before a stay's first other character is
   `Dropped { Whitespace }` as it arrives, and a run of it after the last one is held, with any
@@ -132,3 +144,38 @@ the state that anchor names, and not at all when the prompt holds none. A table 
 state moves the engine as any terminal does, and anything else starts the turn in the start state,
 where it is read; the first piece is the replay's first, or the output's when the prompt left
 nothing to replay.
+
+## The shape of a step's events
+
+The engine fills a buffer the caller keeps; it never hands out a vector of its own. One
+`Events` per stream, one `feed` per step, the step's events read in place, then the buffer
+recycled for the next step:
+
+```rust
+let mut spare = Events::new();                      // one buffer for the stream
+loop {
+    let mut events = spare;                         // this step's view of it
+    engine.feed(Input::Delta { token_ids, text: &delta, spans }, &mut events)?;
+    for event in &events { /* render it */ }
+    spare = events.recycle();                       // empty, allocation kept
+}
+```
+
+- `Event<'d>` and `Text<'d>` carry the delta's lifetime. A text event borrows the delta's bytes
+  where the engine held nothing back: the whole-text path (a delta with nothing held and no byte
+  that starts a marker, the common content or reasoning delta) costs no copy. A run the engine
+  held (a content stay's lead, a trimmed stay's tail, a shaped call's header), a run merged with
+  an earlier one in the same buffer, and the events an assembler builds carry their text owned
+  (`Cow::Owned`): an arguments delta takes the whole-text path too, which saves it the scan and
+  the piece, but its bytes go to the assembler, whose events own their text and their JSON.
+- The buffer's lifetime is the step's: `Events<'d>` cannot outlive the delta it borrows, so a
+  delta's text lives with the caller, next to the buffer, and a caller that keeps events past the
+  step takes them with `Event::into_owned` (or the whole buffer with `Events::into_owned`). A
+  caller that reads an output whole feeds every input into one buffer and takes the events with
+  `drain`, as the tests do.
+- `recycle` empties the buffer and keeps its allocation for the next step's lifetime: an empty
+  vector collected into a vector of the same layout is collected in place by the standard
+  library, and `Events::capacity` shows it; a unit test holds the property.
+- What was read is final: merging adjacent text of one kind only ever touches events pushed
+  into the same buffer since it was last recycled or drained, so a stream sees one `Content`
+  event per step for a run of content, and a whole read sees one for the whole run.

@@ -2300,10 +2300,23 @@ mod request_release_tests {
         worker_type: WorkerType,
         labels: &[(&str, &str)],
     ) -> Arc<dyn Worker> {
+        register_worker_of_runtime(registry, port, worker_type, RuntimeType::TokenSpeed, labels)
+    }
+
+    /// [`register_worker_with_labels`] for a worker typed as another engine:
+    /// the capability matrix reads the runtime, and a request refused before
+    /// dispatch never speaks to the stub.
+    fn register_worker_of_runtime(
+        registry: &WorkerRegistry,
+        port: u16,
+        worker_type: WorkerType,
+        runtime: RuntimeType,
+        labels: &[(&str, &str)],
+    ) -> Arc<dyn Worker> {
         let mut builder = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
             .worker_type(worker_type)
             .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(RuntimeType::TokenSpeed)
+            .runtime_type(runtime)
             .model(ModelCard::new(MODEL))
             .health_config(HealthCheckConfig {
                 disable_health_check: true,
@@ -2665,6 +2678,237 @@ mod request_release_tests {
                 .is_empty(),
             "nothing must reach the worker"
         );
+    }
+
+    /// The chat pipeline over one stub worker typed as `runtime`, and the
+    /// ids the stub saw.
+    async fn chat_pipeline_of_runtime(
+        runtime: RuntimeType,
+    ) -> (
+        RequestPipeline,
+        Arc<SharedComponents>,
+        Arc<Mutex<Vec<Vec<u32>>>>,
+    ) {
+        let seen_ids = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            seen_input_ids: Arc::clone(&seen_ids),
+            ..Default::default()
+        })
+        .await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker_of_runtime(&worker_registry, port, WorkerType::Regular, runtime, &[]);
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+            Duration::from_secs(60),
+        );
+        let pipeline =
+            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
+        let components = components_with_multimodal(worker_registry, true).await;
+        (pipeline, components, seen_ids)
+    }
+
+    /// The error body of a chat request the pipeline answered within its
+    /// budget.
+    async fn chat_error_body(
+        pipeline: &RequestPipeline,
+        components: Arc<SharedComponents>,
+        request: serde_json::Value,
+    ) -> (http::StatusCode, serde_json::Value) {
+        let request: Arc<ChatCompletionRequest> =
+            Arc::new(serde_json::from_value(request).expect("chat request"));
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.execute_chat(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the refusal must not wait on anything");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        (
+            status,
+            serde_json::from_slice(&body).expect("json error body"),
+        )
+    }
+
+    /// A video to a model whose only worker runs an engine without video in
+    /// the capability matrix is refused in preparation, before the model's
+    /// media config is read and before any byte of the clip is fetched or
+    /// decoded, with the code and the sentence the selection-time check gave
+    /// after the decode; with and without a sampling hint on the part (the
+    /// hint decides between router-side and worker-side processing, both
+    /// after this refusal). The clip is deliberately undecodable: a request
+    /// that reached the decoder would be answered differently.
+    #[tokio::test]
+    async fn video_to_a_pool_whose_engine_takes_no_video_is_refused_before_any_media_is_touched() {
+        for video_url in [
+            serde_json::json!({"url": "data:video/mp4;base64,invalid", "fps": 0.5}),
+            serde_json::json!({"url": "data:video/mp4;base64,invalid"}),
+        ] {
+            let (pipeline, components, seen_ids) =
+                chat_pipeline_of_runtime(RuntimeType::Sglang).await;
+            let started = Instant::now();
+            let (status, body) = chat_error_body(
+                &pipeline,
+                components,
+                serde_json::json!({
+                    "model": MODEL,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this video briefly."},
+                            {"type": "video_url", "video_url": video_url}
+                        ]
+                    }],
+                    "max_completion_tokens": 32,
+                }),
+            )
+            .await;
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{:?}",
+                started.elapsed()
+            );
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
+            assert_eq!(
+                body["error"]["message"], "backend sglang does not support video inputs",
+                "{body}"
+            );
+            assert!(
+                seen_ids
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty(),
+                "nothing must reach the worker"
+            );
+        }
+    }
+
+    /// An image to the same worker is not the matrix's refusal: it goes on
+    /// into multimodal processing (here, to the config lookup the mock
+    /// tokenizer cannot satisfy, as for the worker without a vision verdict).
+    #[tokio::test]
+    async fn image_to_a_pool_whose_engine_takes_images_goes_on_into_media_processing() {
+        let (pipeline, components, _) = chat_pipeline_of_runtime(RuntimeType::Sglang).await;
+        let (status, body) = chat_error_body(
+            &pipeline,
+            components,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What colour is this pixel?"},
+                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
+                    ]
+                }],
+                "max_completion_tokens": 32,
+            }),
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
+        assert_eq!(
+            body["error"]["code"], "invalid_multimodal_request",
+            "{body}"
+        );
+    }
+
+    /// The Messages route shares the refusal: an image block to a model
+    /// whose only worker runs an engine without image input in the matrix
+    /// is refused before any media is touched, with the same sentence; the
+    /// same block to an engine that takes images goes on.
+    #[tokio::test]
+    async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_any_media_is_touched(
+    ) {
+        let (_, png) = ONE_PIXEL_PNG_DATA_URL
+            .split_once("base64,")
+            .expect("data url");
+        let request = serde_json::json!({
+            "model": MODEL,
+            "max_tokens": 32,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What colour is this pixel?"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": png
+                    }}
+                ]
+            }],
+        });
+        for (runtime, refused) in [(RuntimeType::Mlx, true), (RuntimeType::Sglang, false)] {
+            let seen_ids = Arc::new(Mutex::new(Vec::new()));
+            let port = spawn_stub(GatedScheduler {
+                seen_input_ids: Arc::clone(&seen_ids),
+                ..Default::default()
+            })
+            .await;
+            let worker_registry = Arc::new(WorkerRegistry::new());
+            register_worker_of_runtime(&worker_registry, port, WorkerType::Regular, runtime, &[]);
+            let deps = PipelineDeps::pair(
+                worker_registry.clone(),
+                Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+                None,
+                None,
+                Duration::from_secs(60),
+            );
+            let pipeline = RequestPipeline::build(Endpoint::Messages, Mode::Regular, &deps)
+                .expect("messages pipeline");
+            let components = components_with_multimodal(worker_registry, true).await;
+            let request: Arc<CreateMessageRequest> =
+                Arc::new(serde_json::from_value(request.clone()).expect("messages request"));
+            let response = tokio::time::timeout(
+                Duration::from_secs(10),
+                pipeline.execute_messages(
+                    request,
+                    None,
+                    MODEL.to_string(),
+                    components,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("the refusal must not wait on anything");
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("drain body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+            if refused {
+                assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
+                assert_eq!(
+                    body["error"]["message"], "backend mlx does not support image inputs",
+                    "{body}"
+                );
+            } else {
+                assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
+            }
+            assert!(
+                seen_ids
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty(),
+                "nothing must reach the worker"
+            );
+        }
     }
 
     fn completion_request(stream: bool) -> Arc<CompletionRequest> {

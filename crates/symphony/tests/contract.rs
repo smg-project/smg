@@ -285,6 +285,10 @@ fn lfm2_5() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Lfm2_5.format(), Declared::default()))
 }
 
+fn llama4() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Llama4.format(), recorded_tools()))
+}
+
 fn xlam() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::Xlam.format(), Declared::default()))
 }
@@ -320,6 +324,10 @@ fn muse_spark() -> Box<dyn Parser> {
 
 fn kimi_k2() -> Box<dyn Parser> {
     Box::new(Engine::new(Table::KimiK2.format(), Declared::default()))
+}
+
+fn mistral() -> Box<dyn Parser> {
+    Box::new(Engine::new(Table::Mistral.format(), Declared::default()))
 }
 
 fn mistral_v13() -> Box<dyn Parser> {
@@ -891,6 +899,12 @@ const FORMATS: &[Subject] = &[
         table: Some(Table::Lfm2_5),
     },
     Subject {
+        name: "llama4",
+        new: llama4,
+        outputs: LLAMA4_OUTPUTS,
+        table: Some(Table::Llama4),
+    },
+    Subject {
         name: "xlam",
         new: xlam,
         outputs: XLAM_OUTPUTS,
@@ -1009,6 +1023,12 @@ const FORMATS: &[Subject] = &[
         new: inkling_without_calls,
         outputs: INKLING_NO_TOOLS_OUTPUTS,
         table: None,
+    },
+    Subject {
+        name: "mistral",
+        new: mistral,
+        outputs: MISTRAL_LIST_OUTPUTS,
+        table: Some(Table::Mistral),
     },
     Subject {
         name: "mistral v13",
@@ -1256,6 +1276,11 @@ const MUSE_SPARK_OUTPUTS: &[&str] = &[
 /// do.
 const KIMI_K2_OUTPUTS: &[&str] = &[
     "<think>Need the weather.</think><|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_calls_section_end|>",
+    // The forced answers of a live cell (a named function; `required`) in the shape the table's
+    // tag writes after the thought's close: the thought, then the block holding the one call with
+    // the recorded arguments.
+    "<think>I need to use the detailed_weather_forecast function with:\n- location: \"London, United Kingdom\"\n- days: 3\n\nLet me make this function call.</think><|tool_calls_section_begin|><|tool_call_begin|>functions.detailed_weather_forecast:0<|tool_call_argument_begin|>{\"location\": \"London, United Kingdom\", \"days\": 3, \"details\": [\"high_low_temperature\", \"humidity\", \"precipitation\"]}<|tool_call_end|><|tool_calls_section_end|>",
+    "<think>The user wants the top 5 popular artworks, sorted by popularity. Let me make this function call.</think><|tool_calls_section_begin|><|tool_call_begin|>functions.metropolitan_museum_get_top_artworks:0<|tool_call_argument_begin|>{\"number\": 5, \"sort_by\": \"popularity\"}<|tool_call_end|><|tool_calls_section_end|>",
     "<|tool_calls_section_begin|><|tool_call_begin|>functions.get_weather:0<|tool_call_argument_begin|>{\"city\": \"Paris\"}<|tool_call_end|><|tool_call_begin|>functions.get_weather:1<|tool_call_argument_begin|>{\"city\": \"Rome\", \"days\": 3}<|tool_call_end|><|tool_calls_section_end|>",
     "Let me check.<|tool_calls_section_begin|><|tool_call_begin|>functions.get_stock_price:0<|tool_call_argument_begin|>{}<|tool_call_end|><|tool_calls_section_end|>",
     "<think>Plan.</think>It is sunny.",
@@ -1404,6 +1429,10 @@ const OLMO3_OUTPUTS: &[&str] = &[
     "<function_calls>get_weather(city=\"Paris\"",
     "<function_calls>get_weather(",
     "<function_calls>get_weather(city=\"Paris\")\nget_stock_price(",
+    "<function_calls>get_weather(</function_calls>",
+    "<function_calls>get_weather(city=\"Paris\",</function_calls>",
+    "<function_calls>get_weather(city=\"Par</function_calls>\nDone.",
+    "<function_calls>get_weather(city=, days=3)\nget_stock_price(q= )</function_calls>",
     "<function_calls>I will call:\nget_weather(city=\"a)b\", n=-1.5e3)</function_calls>\nDone.",
     "<function_calls></function_calls>",
     "Hello!",
@@ -1418,9 +1447,51 @@ const LFM_OUTPUTS: &[&str] = &[
     "<|tool_call_start|>[get_weather(ci",
     "<|tool_call_start|>[get_weather(city='Paris', ",
     "<|tool_call_start|>[get_weather(city='Paris'), get_stock_price(",
+    "<|tool_call_start|>[get_weather(<|tool_call_end|>",
+    "<|tool_call_start|>[get_weather(city='Paris'), get_stock_price(<|tool_call_end|>",
+    "<|tool_call_start|>[get_weather(ci<|tool_call_end|>",
+    "<|tool_call_start|>[get_weather(city='Paris', <|tool_call_end|>",
+    "<|tool_call_start|>[get_weather(city='Par<|tool_call_end|>Then text.",
+    "<|tool_call_start|>[get_weather(city=), get_stock_price(city='Paris', days= )]\
+     <|tool_call_end|>",
     "<think>The user asks.</think><|tool_call_start|>[get_weather(city='計画 🌍 \"q\"')]\
      <|tool_call_end|>",
     "<|tool_call_start|>[]<|tool_call_end|>Nothing to call.",
+];
+
+/// Python calls as Llama 4 writes them: a list bare in the turn, every value in double quotes,
+/// after the content when the turn has both; the markers the model may put around them; prose
+/// with brackets in it; text after the list; and one cut short.
+const LLAMA4_OUTPUTS: &[&str] = &[
+    "[get_weather(city=\"Paris\", days=\"3\"), get_stock_price()]",
+    "Let me check.[get_weather(city=\"Paris\", unit=\"celsius\")]",
+    "[save_note(title=\"計画 🌍\", tags=\"['a', 'b']\", meta=\"{'deep': [1, 2.5, True, None]}\")]",
+    "<|python_start|>[get_weather(city='Paris', days=3)]<|python_end|>",
+    "<|python_start|>print(1)<|python_end|>",
+    "See [1] and [a link](https://example.com); the list [a, b] is prose.",
+    "[get_weather(city=\"Paris\")]\n\nDone.",
+    "[get_weather(\"Paris\", days=3) junk, get_stock_price()] after",
+    "Hello!",
+    "[get_wea",
+    "[get_weather(city=\"Par",
+];
+
+/// The Mistral list: `[TOOL_CALLS]`, a space or none, the JSON list of calls with their ids, the
+/// content before it; two markers; one cut short; prose with the marker's look; a list that is
+/// not one.
+const MISTRAL_LIST_OUTPUTS: &[&str] = &[
+    // Arguments that are not JSON, with the `id` member after them: the call carries them as
+    // written, says once that they are no JSON, and the `id` stays the object's.
+    "[TOOL_CALLS] [{\"name\": \"plot_sine_wave\", \"arguments\": {\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}, \"id\": \"call00000\"}]",
+    "[TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}, \"id\": \"call00000\"}]",
+    "[TOOL_CALLS][{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": [1, 2.5, true, null]}}, {\"name\": \"get_stock_price\", \"arguments\": {}}]",
+    "Let me check.[TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}, \"id\": \"call00000\"}]",
+    "[TOOL_CALLS] [{\"name\": \"save_note\", \"arguments\": {\"title\": \"計画 🌍\", \"body\": \"a ] b [TOOL_CALLS] c\"}, \"id\": \"call00000\"}]",
+    "[TOOL_CALLS] [{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}, \"id\": \"call00000\"}][TOOL_CALLS] [{\"name\": \"get_stock_price\", \"arguments\": {}, \"id\": \"call00001\"}]",
+    "[TOOL_CALLS] [{\"name\": \"get_weather\", \"argu",
+    "[TOOL_CALLS] not a list",
+    "The marker is [TOOL_CALLS]; the list follows it.",
+    "Hello!",
 ];
 
 /// Mistral's calls: the tool's name, `[ARGS]`, the arguments object alone, one call per opener,
@@ -1531,6 +1602,15 @@ const SEED_OUTPUTS: &[&str] = &[
     "<seed:tool_call>\n<function=get_weather>\n<parameter=city>Paris</parameter>\n</function>\n\
      then\n<function=other>\n</function>\n<function=get_weather>\n<parameter=city>Par\
      </seed:tool_call>",
+    // A forced call as its tag writes it after the thought's close (the template's newline, then
+    // the call), the format rehearsed inside the thought; and the same call an engine's reasoning
+    // gate started inside the thought, marker written twice, the output ending there.
+    "<seed:think>the format with <seed:tool_call>\n<function=get_weather>\n<parameter=city>Paris\
+     </parameter>\n</function>\n</seed:tool_call>. Then call it.</seed:think>\n<seed:tool_call>\n\
+     <function=get_weather>\n<parameter=city>Paris</parameter>\n<parameter=days>3</parameter>\n\
+     </function>\n</seed:tool_call>",
+    "<seed:think>the format with <seed:tool_call><seed:tool_call>\n<function=get_weather>\n\
+     <parameter=city>Paris</parameter>\n</function>\n</seed:tool_call>",
     "",
 ];
 
@@ -1740,6 +1820,15 @@ const QWEN3_TAGGED_OUTPUTS: &[&str] = &[
     // Two function blocks in one `<tool_call>` block, as a parallel answer may write them.
     "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n\
      <function=other>\n<parameter=days>\n3\n</parameter>\n</function>\n</tool_call>",
+    // A forced call as its tag writes it after the thought's close (the template's two newlines,
+    // then the call), the format rehearsed inside the thought; and the same call an engine's
+    // reasoning gate started inside the thought, the output ending there.
+    "<think>\nThe format is <tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n\
+     </parameter>\n</function>\n</tool_call>. Then call it.\n</think>\n\n<tool_call>\n\
+     <function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n\
+     </parameter>\n</function>\n</tool_call>",
+    "<think>\nThe format is <tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n\
+     </parameter>\n</function>\n</tool_call>",
 ];
 
 const QWEN3_OUTPUTS: &[&str] = &[
@@ -1792,6 +1881,11 @@ const QWEN3_OUTPUTS: &[&str] = &[
     "<tool_call>{\"name\": \"f\", \"arguments\": {\"flag\": nu}}</tool_call>",
     "<tool_call>{\"name\": \"f\", \"arguments\": 1.}</tool_call>",
     "<tool_call>{\"name\": \"f\", \"arguments\": nu}</tool_call>",
+    // A forced call as its tag writes it after the thought's close (the template's two newlines,
+    // then the call), the format rehearsed inside the thought; and the same call an engine's
+    // reasoning gate started inside the thought, the output ending there.
+    "<think>\nThe format is <tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>. Then call it.\n</think>\n\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": 3}}\n</tool_call>",
+    "<think>\nThe format is <tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>",
 ];
 
 /// The outputs bellwether's common set records for MiMo-V2.5 (Qwen 3.5's tags, the value between
@@ -1841,6 +1935,11 @@ const DEEPSEEK_V3_2_OUTPUTS: &[&str] = &[
 /// alone, and one cut short.
 const DEEPSEEK_V3_1_OUTPUTS: &[&str] = &[
     "<think>The user asks about Paris.</think><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Paris\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    // The forced answers of a live cell (a named function; `required`) in the shape the table's
+    // tag writes: the block holding the one call with the recorded arguments, after a thought in
+    // thinking mode and alone in chat mode.
+    "<think>The user wants a three-day forecast for London. I call the function.</think><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>detailed_weather_forecast<｜tool▁sep｜>{\"location\": \"London\", \"days\": 3, \"details\": [\"high_low_temperature\", \"humidity\", \"precipitation\"]}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>metropolitan_museum_get_top_artworks<｜tool▁sep｜>{\"number\": 5, \"sort_by\": \"popularity\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
     "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Paris\"}<｜tool▁call▁end｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Rome\"}<｜tool▁call▁end｜><｜tool▁call▁begin｜>get_stock_price<｜tool▁sep｜>{\"ticker\": \"MSFT\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
     "Let me check.<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Paris\", \"unit\": \"celsius\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
     "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_stock_price<｜tool▁sep｜>{}<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
@@ -1855,6 +1954,8 @@ const DEEPSEEK_V3_1_OUTPUTS: &[&str] = &[
 /// content alone, and one cut short inside the fence.
 const DEEPSEEK_V3_OUTPUTS: &[&str] = &[
     "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+    // A forced call as the table's tag writes it: the fence's close right after the object.
+    "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
     "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\"}\n```<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Rome\"}\n```<｜tool▁call▁end｜>\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_stock_price\n```json\n{\"ticker\": \"MSFT\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
     "Let me check.<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{\"city\": \"Paris\", \"unit\": \"celsius\"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
     "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_stock_price\n```json\n{}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
@@ -1910,6 +2011,10 @@ const MINICPM5_OUTPUTS: &[&str] = &[
     "<think>\n97 is not divisible by 2, 3, 5 or 7.\n</think>\n\nYes, 97 is prime.",
     "<function name=\"save_note\"><param name=\"body\"><![CDATA[Line one\nLine two",
     "<function name=\"get_weather\"><param name=\"city\">Par</function>",
+    // A forced call an engine's reasoning gate started inside the thought, the output ending
+    // there (the table's row out of the thought on the opener reads it); the call as its tag
+    // writes it after the close, with the template's two newlines, is the first row.
+    "<think>\nThe user asks about Paris: <function name=\"get_weather\"><param name=\"city\">Paris</param></function>",
 ];
 
 /// The outputs bellwether's common set records for dots3, and one cut short.
@@ -1922,6 +2027,12 @@ const DOTS3_OUTPUTS: &[&str] = &[
     "<think>\n97 is not divisible by 2, 3, 5 or 7.\n</think>\n\nYes, 97 is prime.",
     "<dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nPar",
     "<dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nPar\n</dots_function_call>",
+    // A forced call as its tag writes it after the thought's close (the template's two newlines,
+    // then the block, without the newline the template writes before every block, which the first
+    // row has); and the same call an engine's reasoning gate started inside the thought, the
+    // output ending there (the table's row out of the thought on the opener reads it).
+    "<think>\nThe user asks about Paris.\n</think>\n\n<dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nParis\n</parameter>\n</invoke>\n</dots_function_call>",
+    "<think>\nThe user asks about Paris: <dots_function_call>\n<invoke name=\"get_weather\">\n<parameter name=\"city\">\nParis\n</parameter>\n</invoke>\n</dots_function_call>",
 ];
 
 /// The outputs bellwether's common set records for GLM 4.6, and one cut short.
@@ -1934,6 +2045,11 @@ const GLM4_OUTPUTS: &[&str] = &[
     "\nHello!",
     "\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Par",
     "\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Par</tool_call>",
+    // A forced call as its tag writes it after the thought's close (the template's newline, then
+    // the call), the format rehearsed inside the thought; and the same call an engine's reasoning
+    // gate started inside the thought, the output ending there.
+    "\n<think>The format is <tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>. Then call it.</think>\n<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>",
+    "\n<think>The format is <tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Paris</arg_value>\n</tool_call>",
 ];
 
 /// The outputs bellwether's common set records for K2-Horizon (the thought the prompt opens
@@ -2096,7 +2212,7 @@ fn replay(
     text: &str,
     cuts: &[usize],
     empty_between: bool,
-) -> Result<Vec<Event>, ParseError> {
+) -> Result<Vec<Event<'static>>, ParseError> {
     common::replay(
         &mut *(subject.new)(),
         text,
@@ -2149,7 +2265,13 @@ fn closes_an_open_string(so_far: &str, fragment: &str) -> bool {
 }
 
 /// What a client relies on in the shape of the stream, checked event by event.
-fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
+fn check_well_formed(subject: &Subject, text: &str, cuts: &[usize], events: &[Event]) {
+    let name = subject.name;
+    // A pythonic call's end is its own `)`, which every template writes before the region's
+    // marker; the other syntaxes' ends may carry no bytes (the region's marker closes them).
+    let pythonic = subject
+        .table
+        .is_some_and(|table| matches!(table.format().call_syntax(), Some(CallSyntax::Pythonic(_))));
     let mut started: Vec<u32> = Vec::new();
     let mut ended: Vec<u32> = Vec::new();
     let mut arguments: Vec<(u32, String)> = Vec::new();
@@ -2215,7 +2337,7 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
                     }
                 }
             }
-            Event::ToolCallEnd { index, .. } => {
+            Event::ToolCallEnd { index, source } => {
                 assert!(
                     started.contains(index),
                     "{}: before the call's start",
@@ -2223,6 +2345,20 @@ fn check_well_formed(name: &str, text: &str, cuts: &[usize], events: &[Event]) {
                 );
                 assert!(!ended.contains(index), "{}: a second end", place());
                 ended.push(*index);
+                // A pythonic call that ended without its `)` was cut by the region's marker or
+                // the stream's end: it says so, and nothing closes its object for it.
+                if pythonic && source.text.is_empty() {
+                    let so_far = arguments
+                        .iter()
+                        .find(|(i, _)| i == index)
+                        .map_or("", |(_, so_far)| so_far.as_str());
+                    assert!(
+                        malformed_inside.contains(index)
+                            && serde_json::from_str::<serde_json::Value>(so_far).is_err(),
+                        "{}: a pythonic call ended without its `)` with arguments {so_far:?}: a cut call says so and its object stays open",
+                        place()
+                    );
+                }
                 // A call that ended is whole, or the parser said it is not, whether its own
                 // terminal, the region's or the end of the stream ended it: a client that reads
                 // the arguments as JSON relies on one or the other.
@@ -2357,7 +2493,7 @@ fn the_event_stream_is_well_formed_under_every_chunking() {
         for (_, cuts) in chunkings(text, usize::MAX) {
             let events = replay(subject, text, &cuts, false)
                 .unwrap_or_else(|e| panic!("{}: {text:?}: {e}", subject.name));
-            check_well_formed(subject.name, text, &cuts, &events);
+            check_well_formed(subject, text, &cuts, &events);
         }
     }
 }
@@ -2595,13 +2731,17 @@ fn token_boundaries(text: &str) -> Vec<usize> {
 /// Replay `text` through a new parser of `subject` cut at `cuts`, after the prompt, each delta
 /// carrying the spans of the synthetic tokens it holds, a token cut by a delta boundary continuing
 /// into the next delta, and a byte-less token at the very end, as an end-of-turn token would be.
-fn replay_counted(subject: &Subject, text: &str, cuts: &[usize]) -> Result<Vec<Event>, ParseError> {
+fn replay_counted(
+    subject: &Subject,
+    text: &str,
+    cuts: &[usize],
+) -> Result<Vec<Event<'static>>, ParseError> {
     let boundaries = token_boundaries(text);
     let mut tokens: Vec<(usize, usize)> = boundaries.windows(2).map(|w| (w[0], w[1])).collect();
     tokens.push((text.len(), text.len()));
-    let mut parser = (subject.new)();
-    let mut out = Events::new();
-    parser.feed(prompt(), &mut out)?;
+    // Each delta's spans are built first: a delta's events borrow it for as long as the buffer
+    // they are read into lives, here the whole output.
+    let mut deltas: Vec<(usize, usize, Vec<TokenSpan>)> = Vec::new();
     let mut from = 0;
     for &cut in cuts.iter().chain(std::iter::once(&text.len())) {
         if cut > from {
@@ -2618,16 +2758,22 @@ fn replay_counted(subject: &Subject, text: &str, cuts: &[usize]) -> Result<Vec<E
                     continued: start < from,
                 })
                 .collect();
-            parser.feed(
-                Input::Delta {
-                    token_ids: &[],
-                    text: &text[from..cut],
-                    spans: &spans,
-                },
-                &mut out,
-            )?;
+            deltas.push((from, cut, spans));
             from = cut;
         }
+    }
+    let mut parser = (subject.new)();
+    let mut out = Events::new();
+    parser.feed(prompt(), &mut out)?;
+    for (from, cut, spans) in &deltas {
+        parser.feed(
+            Input::Delta {
+                token_ids: &[],
+                text: &text[*from..*cut],
+                spans,
+            },
+            &mut out,
+        )?;
     }
     if text.is_empty() {
         // No delta carried text, so the byte-less token arrives in an empty one.
@@ -2651,7 +2797,7 @@ fn replay_counted(subject: &Subject, text: &str, cuts: &[usize]) -> Result<Vec<E
         },
         &mut out,
     )?;
-    Ok(out.drain())
+    Ok(out.into_owned().drain())
 }
 
 fn tokens_of(event: &Event) -> Option<u32> {
@@ -2733,7 +2879,7 @@ fn every_token_is_counted_in_the_event_that_carries_its_first_byte_whatever_the_
 }
 
 /// Feed `input`, which is out of order, and check that it is a `Lifecycle` error and emits nothing.
-fn rejected(parser: &mut dyn Parser, input: Input<'_>, out: &mut Events, what: &str) {
+fn rejected<'d>(parser: &mut dyn Parser, input: Input<'d>, out: &mut Events<'d>, what: &str) {
     let before = out.len();
     assert!(
         matches!(parser.feed(input, out), Err(ParseError::Lifecycle(_))),

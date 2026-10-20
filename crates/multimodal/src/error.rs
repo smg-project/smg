@@ -192,7 +192,7 @@ pub enum MediaErrorCode {
     /// ([`MediaConnectorError::PayloadTooLarge`]), the bytes it would decode
     /// to ([`MediaConnectorError::DecodedTooLarge`]: a video's frames, an
     /// audio clip's samples), or the image decoder's own limits. A bound on
-    /// decode work rather than on size (`SMG_VIDEO_MAX_DECODE_FRAMES`) is
+    /// decode work rather than on size (`SMG_VIDEO_MAX_DECODE_PIXELS`) is
     /// not one: a clip over it is a fetch failure.
     TooLarge,
 }

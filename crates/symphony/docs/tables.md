@@ -22,6 +22,17 @@ The definition is the table below; the `Engine` runs it, and decides everything 
   thought alike: every earlier turn opens with `<think>`, closed at once when it has no thought,
   and the generation prompt leaves the model to write `<think>` (`<think></think>` with thinking
   off): the same rows read both, as the recorded sets of the four groups show.
+- The table carries its template's two newlines after the thought's close (`</think>\n\n` before
+  the content or the first call) as its thought layout, so a forced call written where the close
+  left the engine begins with them and not with `<tool_call>` (`grammar`); a prompt with thinking
+  switched off has written them itself (`</think>\n\n` at its end), and the tag owes none. MiMo's
+  template writes what follows right after the close, and `qwen3_tagged_direct` carries none. The
+  NVIDIA Nemotron 3 groups (Nemotron 3, 3.5 Lightning, Labs 3, Cascade 2, Cosmos3 Edge) and Step
+  3.5 Flash read with `qwen3_tagged` but write one newline there (`</think>\n<tool_call>`): their
+  entries in `groups.json` carry the one newline as the group's `after`, which replaces the
+  table's, the close kept (`registry`). The Nemotron 3 groups' thinking-off prompt ends with the
+  bare `<think></think>`, so the newline stays the tag's; Step 3.5 Flash's prompt always opens the
+  thought.
 
 The tests here are the engine's as much as this format's: they were written against the hand-written
 parser this table replaced, and hold the table to the same events.
@@ -162,13 +173,27 @@ What the table says beyond the DSML ones:
   calls stand on the turns the template renders with string arguments, held in the module's tests
   at every cut, as the V4 table stands on its encoder's turns.
 
-What the table leaves open: a forced call's tag (`Format::grammar` writes none for the named
-arguments syntax beyond what the Mistral table gets), and the live reading on an engine, owed with
-the family's weights.
+- **A forced call's tag is the block around the calls the table reads.** `Format::grammar` writes
+  the block's ways in (`<｜tool▁calls▁begin｜>` from the turn's own state, or `</think>` first from
+  the thought) around one or more calls, each `<｜tool▁call▁begin｜>`, the tool's name,
+  `<｜tool▁sep｜>`, the arguments the tool's schema accepts and `<｜tool▁call▁end｜>`, with nothing
+  between the calls, and the block's close: the same rows the table reads a call by, written from
+  the named-arguments syntax as the tagged syntaxes' calls are (`docs/grammar.md`). On an engine
+  whose grammar starts after its reasoning parser has seen `</think>`, a thinking answer keeps its
+  thought and the forced call follows it in the model's own syntax; a prompt with the thought
+  closed takes the block at once. Before the builder saw through the block, the gateway handed a
+  forced or required request to its older path, whose JSON-schema constraint made the model write
+  the bare arguments (or the list of calls) and whose parsers read the answer; the module tests
+  pin how the table reads those bytes (a thought and JSON content, no call) beside the tag's
+  shape.
+
+What the table leaves open: the recorded set's calls (the recorder refused them, above) and the
+live reading of a conversation on an engine beyond the forced call, owed with the family's weights.
 
 ## DeepSeek V3 (`deepseek_v3`)
 
-The spelling before V3.1's, the gateway's older `deepseek` parser's: no thought, the call's opener
+The spelling before V3.1's, the gateway's older `deepseek` parser's: no thought in the template
+(the table reads one all the same, below), the call's opener
 is `<｜tool▁call▁begin｜>function<｜tool▁sep｜>` (the call's type before the separator, which the
 template writes from the message and every message writes as `function`), the name runs to the
 `json` fence the template opens on the next line, and the fence's close with `<｜tool▁call▁end｜>`
@@ -188,12 +213,27 @@ is the terminal that leaves the call. Beyond that:
   table reads as a thought; the recorded sets hold none.
 - **The recorded set holds no call**, for the reason given under V3.1; the calls stand on the turns
   the template renders, held in the module's tests at every cut.
+- **A forced call's tag writes the block**, from the same rows as V3.1's: each call is
+  `<｜tool▁call▁begin｜>function<｜tool▁sep｜>`, the tool's name and the fence the template opens,
+  the arguments the tool's schema accepts, then the fence's close with `<｜tool▁call▁end｜>` right
+  after the object (the template puts a newline between them, which the table drops as wrapping
+  either way), between the block's ways in and its close, with the template's newline before
+  every call after the first (`CallSyntax::NamedArguments::between_calls`). The fence is ordinary
+  text, so the free text before the calls (a thought the prompt opened) may still hold a fenced
+  draft of the arguments: only the table's terminals are kept out of it. Not yet read live on an
+  engine.
 
 ## GLM 4.5 and 4.6 (`glm4`)
 
 The template writes a newline before the thought, before the content and before every call, and
 strips the content's edges, so those newlines are the model's to write and reach the content stream;
 whose they are is bellwether #17's question, as for Qwen3.
+
+The table carries its template's newline after the thought's close (`</think>\n` before the content
+or the first call) as its thought layout, so a forced call written where the close left the engine
+begins with it and not with `<tool_call>` (`grammar`); a prompt with thinking switched off ends with
+the bare `<think></think>`, so the newline stays the tag's to write. A `<tool_call>` inside the
+thought stays thought text, as for Qwen3.
 
 ## MiniMax M2 (`minimax_m2`)
 
@@ -283,6 +323,17 @@ What the table says beyond the others:
 - **The turn's end token is ignored.** The template writes `<|content_model_end_sampling|>`
   after the turn; an engine that passes it through has it dropped wherever it stands, inside
   a message's header or its call included, where its bytes keep their place.
+- **A JSON answer's tag leaves the way in to the engine.** The thought is a message of its own
+  and the answer another, so an engine that starts a grammar after its reasoning parser hands
+  over at `<|content_text|>`, not at the thought's `<|end_message|>`, which ends every message
+  alike. `Format::answer_grammar` writes the thought the model may write first (its message,
+  closed, and `<|message_model|>`), then `<|content_text|>` as optional, unless the engine says
+  it starts at the first token, then the schema and `<|end_message|>`: an engine that consumed the
+  model's own marker writes the JSON at once, one that starts before the thought writes the
+  marker itself. Before this, the tag's `begin` wrote the marker again after the model's own on
+  such an engine, and the answer came back as `<|content_text|>{...}`; the table reads that second
+  marker as the answer's text, where no row leads, and says so with a `Malformed` event of no
+  bytes (`MarkerOutOfPlace`), so a reader counts it.
 - **A forced call's tag is the gateway's.** `Format::grammar` writes the tag the gateway's old
   Inkling parser hand-writes: the call marker triggers it inside whatever message the model is
   writing, the first one included, then `{"name":"NAME","args":`, the schema, `}` and
@@ -332,13 +383,59 @@ What the table says beyond the others:
 - **A forced call's tag has no end.** `Format::grammar` writes a tag per tool from `[TOOL_CALLS]`,
   the name and `[ARGS]` to the schema, and nothing after it, as the template writes nothing: the
   object the schema accepts ends the tag. The gateway's older `mistral` parser and its tag read
-  Mistral 7B v0.3's `[TOOL_CALLS][{…}]` list, another syntax, so nothing is pinned to it; the
-  table's name keeps that parser's apart, so `--tool-call-parser mistral` stays with it under
-  `--parser symphony`, and the registry picks this table for the v13 groups.
+  Mistral 7B v0.3's `[TOOL_CALLS][{…}]` list, another syntax, which the `mistral` table reads;
+  the names keep the two apart, `--tool-call-parser mistral` reads with that table under
+  `--parser symphony`, and the registry picks this one for the v13 groups.
 
 What the table leaves open: whether every engine takes a tag whose `end` is empty (xgrammar's
-structural tag allows it; the Symphony e2e lane says so for the engines it runs); and the older
-list syntax, which no recorded group writes.
+structural tag allows it; the Symphony e2e lane says so for the engines it runs).
+
+## Mistral, the list (`mistral`)
+
+The spelling of the Mistral tokenizers before v11, the gateway's older `mistral` parser's: the
+calls as one JSON list after `[TOOL_CALLS]`, `[TOOL_CALLS] [{"name": "get_weather", "arguments":
+{"city": "Paris"}, "id": "call00000"}]`, the content before it; no thought. Mistral 7B v0.3's
+template writes it (a space after the marker, an `id` member of nine characters after each call's
+arguments); Mistral Small 3 (2501) and the checkpoints that keep its tokenizer (Small 3.1,
+Devstral Small 2505) write the same list through their own tokenizer, since their chat templates
+render no tool call at all. What the table says beyond the others:
+
+- **One marker, the list behind it.** `[TOOL_CALLS]` enters the arguments state, and the list
+  assembler reads the region framed (`json::list::Assembler::framed`), as Llama Nemotron's does:
+  whitespace before the `[` is the template's, each object a call, the brackets and commas
+  wrapping, text in place of the list malformed. A second `[TOOL_CALLS]` opens another region
+  (`calls + calls_open = calls`), as the v13 table has it. The region ends with the turn: the
+  template writes no closing marker, and `</s>` is the stop the decoder hides.
+- **The `id` member is the call object's, not an argument.** The template writes it after the
+  arguments; the JSON assembler reads a member it does not name as part of the object, so the
+  call's arguments are the `arguments` value alone and the `id` is the object's bytes.
+- **The prompt ends at `[/INST]`, or after a tool result.** As the v13 table: no assistant
+  opener, no thought; after `[/TOOL_RESULTS]` the last `[/INST]` stands before the previous turn's
+  calls, the replay walks into the call state, which the prompt never enters, and the output
+  starts in content.
+- **The recorded set holds no call.** Mistral Small 3's template renders no tool call, so the
+  recorder kept its content sets alone (184,972 cases), which replay; 7B v0.3's parse sets are
+  not recorded. The calls stand on the turns 7B v0.3's template renders, held in the module's tests
+  at every cut; bellwether's hand-written sets record them for the family once its recorder has a
+  rule for call ids (the template requires one of nine letters or digits, and a corpus case's
+  calls carry none).
+- **7B v0.3's template writes a space before the assistant's text** (`[/INST] Hello!</s>`), and
+  none before `[TOOL_CALLS]`; the table reads the space as the model's bytes, as the v13 table
+  reads what its template writes around the content, and the module tests expect it. Whether
+  the family's own tokenizer shows that space to a client is for the live reading to say.
+- **A forced call is the list behind the marker, with no end.** `Format::grammar` writes one tag:
+  `[TOOL_CALLS]`, the list of the tools' calls as Llama Nemotron's tag holds it, and nothing after
+  it, as the template writes nothing and the turn ends the region (the v13 table's tags end the
+  same way). A list with no marker is content to this table, so the tag never writes one; the
+  `id` the template writes after each call's arguments is left to the model.
+
+What the table leaves open: the live reading on an engine (owed with the family's weights);
+Magistral Small 2506, whose recommended system prompt has the model write its thought as plain
+`<think>…</think>` text, which this table has no rows for, and which stays out of the group until
+a table reads it (the gateway's older parsers serve it meanwhile); and the v11 tokenizer's
+checkpoints (Mistral Small 3.2, Devstral Small 2507, Magistral Small 2509), whose templates write
+`[TOOL_CALLS]name[ARGS]{…}`, the v13 table's spelling without `[CALL_ID]`, and are not in the
+registry until a set records them.
 
 ## JSON (`json`)
 
@@ -346,7 +443,7 @@ What the table says beyond the others:
 
 - **One state, an object, several, or a list.** As `xlam`, the output starts in the arguments
   state and the assembler decides at the first byte that is not whitespace; unlike `xlam`, a `{`
-  there is one call alone (`json::list::Assembler::object_or_list`), whose object reads as a
+  there is one call alone (`json::list`, `Framing::ObjectOrList`), whose object reads as a
   list's object does, `arguments`, `parameters` or `args` naming the arguments. After the object
   a `;` and another object is another call, the `;` and the whitespace around it the template's
   wrapping: Llama 3.1 writes its parallel calls so, `{…}; {…}`, and the engines' own readers of
@@ -373,12 +470,68 @@ What the table says beyond the others:
   forced calls were written; the call token is not in the grammar, since the template never
   renders it.
 
-What the table leaves open: six recorded groups write the format (Nemotron Ultra 253B CPT, the
-UltraLong 1M, 2M and 4M, Safety Guard 8B v3, the 70B Reward Principle), as the template renders
-it: one call alone, `parameters` naming the arguments, and never a list, content beside a call or a
-thought, since the template refuses them; the call token and the `;` between calls are what a
-served Llama 3.1 Instruct checkpoint writes, held verbatim in the table's unit tests, and the list
-and the wrapping after an object rest on the unit tests until a group writes them.
+What the table leaves open: eight recorded groups write the format (Nemotron Ultra 253B CPT, the
+UltraLong 1M, 2M and 4M, Safety Guard 8B v3, the 70B Reward Principle, Llama 3.2 1B/3B Instruct
+and 11B/90B Vision Instruct), as the templates render it: one call alone, `parameters` naming the
+arguments, and never a list, content beside a call or a thought, since the templates refuse them;
+the call token and the `;` between calls are what a served Llama 3.1 Instruct checkpoint writes,
+held verbatim in the table's unit tests, and the list and the wrapping after an object rest on the
+unit tests until a group writes them.
+
+## Llama 4 (`llama4`)
+
+The template writes the turn as the content, if the message has one, then the calls as a Python
+list, `[get_weather(city="Paris"), get_stock_price()]`, with nothing between the content and the
+list and nothing after it; no thought. What the table says beyond the others:
+
+- **One state, no markers, the list bare in the turn.** As `xlam` and `json`, the output starts in
+  the arguments state; the pythonic assembler reads the turn bare (`pythonic::Assembler::bare`).
+  A turn that starts, after whitespace alone, with a `[` that a name and its `(` follow is the
+  list, read as it arrives, the whitespace its wrapping; after the list's `]` whitespace is
+  dropped and anything else malformed. A turn that starts with anything else is content, and a
+  `[name(` after that content, the shape the template renders for a message that holds both
+  (`Let me check.[get_weather(city="Paris")]`), is held until the `]` that closes it and read as
+  its calls only when the whole is a well-formed list of calls with keyword arguments to tools
+  the request declares: code holds `[name(` of its own (`lim(h→0)[f(a+h) - f(a)]/h`,
+  `movies[Math.floor(…)]`, `[set(range(10)) for _ in range(3)]`, `[Authorize(Roles = "Manager")]`,
+  `ingredients[exotic_ingredient.lower()]`: twenty-two of the 5,841 content cases a 1-in-100
+  sample of the recorded sets holds), and a list opened there as it arrives took those brackets
+  for calls; held, checked whole and held to the request's tools, every one of them is content,
+  and the recorded messages with content and calls read as the reference has them. A `[` that no
+  call follows (`[1]`, `[Note]`, a markdown link, a list of
+  names) is content, and so is a list the stream's end cut before its `]`, since no call began.
+  The engine's own reader for the family opens the list at the output's start alone; where the
+  model writes content before its list, that reader gives content only and this table the calls.
+- **Every value is a quoted string in the template, so the quotes carry no type.** The template
+  writes each argument as `"%s"` of its value: `days="3"`, `detailed="True"`, a list or an object
+  as Python's repr inside the quotes (`tags="['a', 'b']"`). The assembler reads a quoted value by
+  the kind the request's tool declares for the parameter, as the tagged tables read a value's
+  text (`Dialect::LLAMA4`, `Values::Quoted`): a declared string stays the string, digits or not;
+  an integer, an array, an object come back as what the text spells; a parameter no tool
+  declares reads by its text, a number or a word as what it is and anything else as the string.
+  The text between the quotes is the value's characters as they are: the template decodes no
+  escape, so a backslash and an `r` in a value stay those two characters (the recorded patches
+  are full of them), and the table reads them so. A value the model writes bare (`days=3`,
+  `detailed=False`, `city='Paris'`), the spelling its model card and the family's parsers take,
+  reads as Python's, a single-quoted string with its escapes. The structural tags write Python's
+  values, the spelling the model is told to write.
+- **A quote inside a quoted value is the template's loss.** The template does not escape a `"`
+  inside a string it quotes, so the bytes it writes for such a value cannot be read back by any
+  reader, this one included; the recorded sets hold a few such cases (five in a hundred thousand
+  of Scout's), and the corpus replay counts them apart, by the reference that holds the quote,
+  rather than against the table. A string that holds a newline or a backslash reads as written.
+- **`<|python_start|>` and `<|python_end|>` are wrapping wherever they stand.** The family's
+  earlier template wrote a tool turn's content between them, and the model may write them around
+  its code or its list; the table ignores both terminals, so the text between them reads as what
+  it is, content or the list.
+- **The prompt ends at the turn's opener.** `<|header_start|>assistant<|header_end|>` and two
+  newlines; after a tool result the previous turn's list stands in the prompt, and the replay
+  starts at the last opener, in content, where the template puts the answer.
+
+What the table leaves open: a live reading on an engine (owed with the family's weights); the
+base checkpoints' template (`llama-4-scout-17b-16e`), which writes JSON objects back to back behind
+the python markers, another format no table reads yet; and the structural tag of a forced call,
+which writes the bare list as the `xlam` table's does and is not yet proven on an engine.
 
 ## The forced call (`forced`)
 
@@ -451,7 +604,11 @@ newlines around the thought and before the calls reach the reasoning and content
 #17's question). A turn opens with `<|im_start|>assistant`, so the prompt's replay starts there.
 
 A forced call's structural tag is each call as a tag its opener triggers, the parameter tags with
-nothing between them (`grammar`).
+nothing between them (`grammar`). The table carries its template's two newlines after the thought's
+close (`</think>\n\n` before the content or the first call) as its thought layout, so a forced call
+written where the close left the engine begins with them and not with `<function name="`; a prompt
+with thinking switched off has written them itself, and the tag owes none. The table's row out of
+the thought on a call's opener reads a call wherever it stands, inside the thought too.
 
 ## dots3 (`dots3`)
 
@@ -465,6 +622,14 @@ thought and before a block are the model's to write and reach the reasoning and 
 prompt is `<|assistant|>` alone, or with the thought closed empty (`<think>\n\n</think>\n\n`) when
 the request turns thinking off, as Qwen3's does; a turn opens with `<|assistant|>`, so the prompt's
 replay starts there.
+
+The table carries its template's two newlines after the thought's close (`</think>\n\n` before the
+content or the calls) as its thought layout, so a forced call written where the close left the
+engine begins with them and not with `<dots_function_call>` (`grammar`); a prompt with thinking
+switched off has written them itself, and the tag owes none. The newline the template
+writes before every block is the call's own lead, which the tag does not write: a block written
+after the two newlines reads as one written after three. The table's row out of the thought on the
+block's opener reads a block wherever it stands, inside the thought too.
 
 ## Gemma 4 (`gemma4`)
 
@@ -604,7 +769,21 @@ wrapper state for the block, an arguments state per call):
   Thinking, K2.5 and K2.6 (without `preserve_thinking`) keep the thought of a message that calls
   and render an answer's as `<think></think>`, so the thought-and-answer turn is rendered where
   the template keeps it (K2.7-Code, K2.6 with `preserve_thinking`); and the two Instruct
-  templates differ in a block's indentation alone and render the same turns. What the table
-  leaves open: the structural tag for a forced or required call (`Format::grammar` writes none
-  for a shaped call without a layout; the forced table covers `tool_choice` as for the other
-  tables without one), the recorded sets, and the live reading against the engine's own server.
+  templates differ in a block's indentation alone and render the same turns.
+- **The forced tag is written from the table's layout.** A shaped call's tag needs the one
+  spelling the chat template renders, and the table carries it (`Format::with_layout`): the id as
+  `functions.{name}:{index}<|tool_call_argument_begin|>` with the call's number as a place of its
+  own (`Segment::Index`, written as a run of digits, since the model counts its calls and no
+  request knows the count ahead), the arguments one JSON value (the tool's schema, no parameter
+  and nothing around it), `<|tool_call_end|>` as the call's close, nothing between two calls, and
+  the thought closed by `</think>` with nothing after it. The calls sit in the table's block, so
+  the tag is the block's ways in (from the turn's own state, or `</think>` first) around one or
+  more calls and the block's close, as the tagged syntaxes' tags are. On an engine whose grammar
+  starts after its reasoning parser has seen `</think>`, a K2 Thinking answer keeps its thought
+  and the forced call follows it in the model's own syntax; a prompt that opens the thought (K2.5,
+  K2.6, K2.7-Code) takes the thought closed first from an engine that starts at the first token.
+  Before the table had its layout, the gateway handed a forced or required request to its older
+  path, whose JSON-schema constraint made the model write the bare arguments after the thought,
+  and the older parsers read that back as raw text (the module tests pin how the table reads
+  those bytes: a thought and JSON content, no call). What the table leaves open: the recorded
+  sets, and the live reading against the engine's own server.

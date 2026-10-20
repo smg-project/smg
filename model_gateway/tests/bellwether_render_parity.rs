@@ -427,19 +427,37 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template does not render as the reference does (smg-project/smg#2783)",
     ),
     (
+        "deepseek-v3.1/render/bfcl-*",
+        "the checkpoint's template never reads the request's tools and the reference is \
+         its own render; the gateway writes the family's tools block into the system prompt \
+         as the engines' tool chat templates do (smg-project/smg#3946)",
+    ),
+    (
         "deepseek-v3.1/render/hermes-func-calling-*",
         "the gateway parses tool-call arguments into objects before rendering and this \
-         template concatenates them as text, so the render fails (smg-project/smg#2783)",
+         template concatenates them as text, so the render fails (smg-project/smg#2783); and \
+         the checkpoint's template never reads the request's tools and the reference is \
+         its own render; the gateway writes the family's tools block into the system prompt \
+         as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
         "deepseek-v3.1/render/hermes-glaive-func-calling-*",
         "the gateway parses tool-call arguments into objects before rendering and this \
-         template concatenates them as text, so the render fails (smg-project/smg#2783)",
+         template concatenates them as text, so the render fails (smg-project/smg#2783); and \
+         the checkpoint's template never reads the request's tools and the reference is \
+         its own render; the gateway writes the family's tools block into the system prompt \
+         as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
         "deepseek-v3.1/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
          appended (smg-project/smg#2780)",
+    ),
+    (
+        "deepseek-v3.1/render/swebench-*",
+        "the checkpoint's template never reads the request's tools and the reference is \
+         its own render; the gateway writes the family's tools block into the system prompt \
+         as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
         "deepseek-v3.1/render/text-developer-role",
@@ -448,24 +466,48 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template run keeps or drops the role",
     ),
     (
+        "deepseek-v3.1/render/tools-declared-user-asks",
+        "the checkpoint's template never reads the request's tools and the reference is \
+         its own render; the gateway writes the family's tools block into the system prompt \
+         as the engines' tool chat templates do (smg-project/smg#3946)",
+    ),
+    (
         "deepseek-v3.1/render/tools-history-content-and-call",
         "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
+         template does not render as the reference does (smg-project/smg#2783); and \
+         the checkpoint's template never reads the request's tools and the reference is \
+         its own render; the gateway writes the family's tools block into the system prompt \
+         as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
         "deepseek-v3.1/render/tools-history-parallel-calls",
         "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
+         template does not render as the reference does (smg-project/smg#2783); and \
+         the checkpoint's template never reads the request's tools and the reference is \
+         its own render; the gateway writes the family's tools block into the system prompt \
+         as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
         "deepseek-v3.1/render/tools-history-results-reordered",
         "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
+         template does not render as the reference does (smg-project/smg#2783); and \
+         the checkpoint's template never reads the request's tools and the reference is \
+         its own render; the gateway writes the family's tools block into the system prompt \
+         as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
         "deepseek-v3.1/render/tools-history-single-call",
         "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
+         template does not render as the reference does (smg-project/smg#2783); and \
+         the checkpoint's template never reads the request's tools and the reference is \
+         its own render; the gateway writes the family's tools block into the system prompt \
+         as the engines' tool chat templates do (smg-project/smg#3946)",
+    ),
+    (
+        "deepseek-v3.1/render/tools-schema-with-defs",
+        "the checkpoint's template never reads the request's tools and the reference is \
+         its own render; the gateway writes the family's tools block into the system prompt \
+         as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
         "deepseek-v4.1-flash/render/*",

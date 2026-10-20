@@ -18,7 +18,7 @@ use openai_protocol::{
     messages::{self, Message},
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
-use symphony::adapt;
+use symphony::{adapt, Events};
 use tool_parser::ParserFactory as ToolParserFactory;
 use tracing::{error, warn};
 
@@ -29,7 +29,7 @@ use crate::routers::{
         context::{DispatchMetadata, ExecutionResult},
         proto_wrapper::ProtoGenerateComplete,
         regular::symphony::{
-            content_spans, engine_finish, finished, telemetry::Who, Assignment, Reader,
+            content_spans, engine_finish, finished, telemetry::Who, Assignment, Delta, Reader,
             SymphonyError,
         },
         spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
@@ -118,99 +118,38 @@ impl ResponseProcessor {
         // logprobs; the content starts after the reasoning span.
         let output_logprobs = complete.output_logprobs();
         let decoded_text = output_logprobs.as_ref().map(|_| final_text.clone());
-        let mut content_from = 0;
 
-        // Step 1: Handle reasoning content parsing
-        let mut reasoning_text: Option<String> = None;
-        let mut reasoning_tokens = 0;
-        let mut processed_text = final_text;
-
-        if original_request.separate_reasoning && reasoning_parser_available {
-            // Fresh parser per request: non-streaming extraction keeps no state
-            // across requests, so avoid serializing on the shared pooled mutex.
-            if let Some(mut parser) = utils::create_reasoning_parser(
-                &self.reasoning_parser_factory,
-                reasoning_parser_name,
+        // Steps 1 and 2: the reasoning split out, then the tool calls parsed
+        // from the content (shared with the Messages reader).
+        let ReasoningSplit {
+            content: processed_text,
+            reasoning: reasoning_text,
+            reasoning_tokens,
+            content_from,
+        } = self.split_reasoning(
+            final_text,
+            &token_ends,
+            ReasoningSource {
+                wanted: original_request.separate_reasoning && reasoning_parser_available,
+                in_prefill: original_request.reasoning_in_prefill,
+                parser_name: reasoning_parser_name,
                 model,
-            ) {
-                // Request building decided whether the rendered prompt ends
-                // inside the model's thinking block; the parser then starts in
-                // reasoning mode.
-                if original_request.reasoning_in_prefill {
-                    parser.mark_reasoning_started();
-                }
-
-                match parser.detect_and_parse_reasoning(&processed_text) {
-                    Ok(result) => {
-                        if !result.reasoning_text.is_empty() {
-                            reasoning_tokens = reasoning_span_tokens(
-                                &token_ends,
-                                &processed_text,
-                                &result.reasoning_text,
-                                &result.normal_text,
-                            );
-                            content_from = reasoning_span(
-                                &processed_text,
-                                &result.reasoning_text,
-                                &result.normal_text,
-                            )
-                            .1;
-                            reasoning_text = Some(result.reasoning_text);
-                        }
-                        processed_text = result.normal_text;
-                    }
-                    Err(e) => {
-                        warn!("Reasoning parsing error, skipping parsing: {e}");
-                    }
-                }
-            }
-        }
-
-        // Step 2: Handle tool call parsing
-        let mut tool_calls: Option<Vec<ToolCall>> = None;
-        let tool_choice_enabled = !matches!(
-            &original_request.tool_choice,
-            Some(ToolChoice::Value(ToolChoiceValue::None))
+            },
         );
-
-        if tool_choice_enabled && original_request.tools.is_some() {
-            // Check if JSON schema constraint was used (specific function or required mode)
-            let native_tool_format = self
-                .tool_parser_factory
-                .registry()
-                .uses_native_tool_format(tool_parser_name);
-            let used_json_schema = if native_tool_format {
-                false
-            } else {
-                original_request
-                    .tool_choice
-                    .as_ref()
-                    .is_some_and(ToolChoice::forces_call)
-            };
-
-            if used_json_schema {
-                (tool_calls, processed_text) = utils::parse_json_schema_response(
-                    &processed_text,
-                    original_request.tool_choice.as_ref(),
+        let (tool_calls, processed_text) = self
+            .parse_calls(
+                processed_text,
+                ToolCallSource {
+                    tools: original_request.tools.as_deref(),
+                    tool_choice: original_request.tool_choice.as_ref(),
                     model,
+                    parser_name: tool_parser_name,
+                    parser_available: tool_parser_available,
                     history_tool_calls_count,
-                );
-            } else if tool_parser_available {
-                (tool_calls, processed_text) = self
-                    .parse_tool_calls(
-                        &processed_text,
-                        model,
-                        tool_parser_name,
-                        original_request.tools.as_deref().unwrap_or(&[]),
-                        history_tool_calls_count,
-                    )
-                    .await;
-            }
-        }
-
-        if original_request.first_tool_call_only {
-            utils::keep_first_tool_call(&mut tool_calls);
-        }
+                    first_call_only: original_request.first_tool_call_only,
+                },
+            )
+            .await;
 
         // Step 3: Determine finish reason (a local stop beats the engine's).
         let finish_reason_str = finish_after_local_stop(stopped, complete);
@@ -301,9 +240,14 @@ impl ResponseProcessor {
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<(ChatChoice, u32), String> {
         let tools = original_request.tools.clone().unwrap_or_default();
-        let mut reader =
-            Reader::new(assignment, tools)?.first_call_only(original_request.first_tool_call_only);
-        let (mut events, stopped) = reader.read(stop_decoder, complete.output_ids())?;
+        // The output as one delta, then the decoder's last text: two deltas the events borrow,
+        // both outliving the buffer.
+        let mut delta = Delta::default();
+        let mut flushed = Delta::default();
+        let mut events = Events::new();
+        let mut reader = Reader::new(assignment, tools, &mut events)?
+            .first_call_only(original_request.first_tool_call_only);
+        let stopped = reader.read(stop_decoder, complete.output_ids(), &mut delta, &mut events)?;
         // Complete token decoding, including bytes and a partial stop match, as
         // on the older path; the text it releases is the last token's.
         let tail = stop_decoder
@@ -313,7 +257,7 @@ impl ResponseProcessor {
         if let SequenceDecoderOutput::Text(text) | SequenceDecoderOutput::StoppedWithText(text) =
             tail
         {
-            events.extend(reader.tail(&text)?);
+            reader.tail(text, &mut flushed, &mut events)?;
         }
         let reason = finish_after_local_stop(stopped || stop_decoder.is_stopped(), complete);
         let who = Who {
@@ -321,8 +265,9 @@ impl ResponseProcessor {
             model,
             choice: index as u32,
         };
-        events.extend(reader.end(engine_finish(reason), who)?);
-        let reasoning_tokens = finished(&events).map_or(0, |finished| finished.reasoning_tokens);
+        reader.end(engine_finish(reason), who, &mut events)?;
+        let reasoning_tokens =
+            finished(events.as_slice()).map_or(0, |finished| finished.reasoning_tokens);
         let mut choice = adapt::chat::message(index as u32, &events);
         choice.matched_stop = matched_stop_value(stop_decoder, complete);
         // The content's tokens alone keep their logprobs, as on the older path: none when
@@ -341,7 +286,7 @@ impl ResponseProcessor {
             } = &mut logprobs
             {
                 let keep = if has_content {
-                    content_tokens(reader.token_ends(), &content_spans(&events))
+                    content_tokens(reader.token_ends(), &content_spans(events.as_slice()))
                 } else {
                     Vec::new()
                 };
@@ -370,10 +315,13 @@ impl ResponseProcessor {
         request: &MessagesResponseSpec,
         stop_decoder: &mut StopSequenceDecoder,
     ) -> Result<Message, SymphonyError> {
-        let mut reader = Reader::new(assignment, Arc::clone(&request.chat_tools))?
+        let mut delta = Delta::default();
+        let mut flushed = Delta::default();
+        let mut events = Events::new();
+        let mut reader = Reader::new(assignment, Arc::clone(&request.chat_tools), &mut events)?
             .first_call_only(request.first_tool_call_only);
         stop_decoder.reset();
-        let (mut events, stopped) = reader.read(stop_decoder, complete.output_ids())?;
+        let stopped = reader.read(stop_decoder, complete.output_ids(), &mut delta, &mut events)?;
         let tail = stop_decoder
             .finish()
             .map_err(|e| SymphonyError::Read(format!("Failed to finish token decoding: {e}")))?;
@@ -381,7 +329,7 @@ impl ResponseProcessor {
         if let SequenceDecoderOutput::Text(text) | SequenceDecoderOutput::StoppedWithText(text) =
             tail
         {
-            events.extend(reader.tail(&text)?);
+            reader.tail(text, &mut flushed, &mut events)?;
         }
         let reason = finish_after_local_stop(stopped || stop_decoder.is_stopped(), complete);
         let who = Who {
@@ -389,7 +337,7 @@ impl ResponseProcessor {
             model: &dispatch.model,
             choice: 0,
         };
-        events.extend(reader.end(engine_finish(reason), who)?);
+        reader.end(engine_finish(reason), who, &mut events)?;
         let mut output = adapt::messages::output(&events);
         // A `tool_use` block carries `{}` only where the parser said the arguments are none;
         // arguments that are JSON no `input` value holds would leave as `{}` with no word, so the
@@ -413,7 +361,8 @@ impl ResponseProcessor {
         let stop_sequence = stop_sequence
             .filter(|_| matches!(stop_reason, Some(messages::StopReason::StopSequence)));
         let thinking_requested = request.thinking_requested;
-        let reasoning_tokens = finished(&events).map_or(0, |finished| finished.reasoning_tokens);
+        let reasoning_tokens =
+            finished(events.as_slice()).map_or(0, |finished| finished.reasoning_tokens);
         Ok(Message {
             id: dispatch.request_id.clone(),
             message_type: "message".to_string(),
@@ -549,6 +498,105 @@ impl ResponseProcessor {
             .maybe_system_fingerprint(dispatch.weight_version.clone())
             .build();
         Ok((response, counts))
+    }
+
+    /// Split the reasoning out of a decoded choice when the request wants
+    /// it, with a fresh parser (non-streaming extraction keeps no state
+    /// across requests, so the shared pooled mutex is not serialized on); a
+    /// prompt that ends inside the thinking block starts the parser in
+    /// reasoning mode. A parse error leaves the text whole, as before.
+    fn split_reasoning(
+        &self,
+        text: String,
+        token_ends: &[usize],
+        source: ReasoningSource<'_>,
+    ) -> ReasoningSplit {
+        let mut split = ReasoningSplit {
+            content: text,
+            reasoning: None,
+            reasoning_tokens: 0,
+            content_from: 0,
+        };
+        if !source.wanted {
+            return split;
+        }
+        let Some(mut parser) = utils::create_reasoning_parser(
+            &self.reasoning_parser_factory,
+            source.parser_name,
+            source.model,
+        ) else {
+            return split;
+        };
+        if source.in_prefill {
+            parser.mark_reasoning_started();
+        }
+        match parser.detect_and_parse_reasoning(&split.content) {
+            Ok(result) => {
+                if !result.reasoning_text.is_empty() {
+                    split.reasoning_tokens = reasoning_span_tokens(
+                        token_ends,
+                        &split.content,
+                        &result.reasoning_text,
+                        &result.normal_text,
+                    );
+                    split.content_from =
+                        reasoning_span(&split.content, &result.reasoning_text, &result.normal_text)
+                            .1;
+                    split.reasoning = Some(result.reasoning_text);
+                }
+                split.content = result.normal_text;
+            }
+            Err(e) => {
+                warn!("Reasoning parsing error, skipping parsing: {e}");
+            }
+        }
+        split
+    }
+
+    /// Parse the tool calls out of the content when the request offers tools
+    /// and its choice allows calls: through the JSON-schema path when the
+    /// choice forced a call and the parser's format is not native (the
+    /// constraint shaped the output), else through the tool parser when one
+    /// is available; the first call alone when the request asked for it.
+    async fn parse_calls(
+        &self,
+        content: String,
+        source: ToolCallSource<'_>,
+    ) -> (Option<Vec<ToolCall>>, String) {
+        let mut tool_calls: Option<Vec<ToolCall>> = None;
+        let mut content = content;
+        let enabled = !matches!(
+            source.tool_choice,
+            Some(ToolChoice::Value(ToolChoiceValue::None))
+        );
+        if let (true, Some(tools)) = (enabled, source.tools) {
+            let native_tool_format = self
+                .tool_parser_factory
+                .registry()
+                .uses_native_tool_format(source.parser_name);
+            if forced_call_shapes_output(native_tool_format, source.tool_choice) {
+                (tool_calls, content) = utils::parse_json_schema_response(
+                    &content,
+                    source.tool_choice,
+                    source.model,
+                    source.history_tool_calls_count,
+                );
+            } else if source.parser_available {
+                (tool_calls, content) = self
+                    .parse_tool_calls(
+                        &content,
+                        source.model,
+                        source.parser_name,
+                        tools,
+                        source.history_tool_calls_count,
+                    )
+                    .await;
+            }
+        }
+        if source.first_call_only {
+            utils::keep_first_tool_call(&mut tool_calls);
+        }
+        (tool_calls, content)
     }
 
     /// Parse tool calls using model-specific parser
@@ -819,84 +867,42 @@ impl ResponseProcessor {
                 stop_decoder.skip_special_tokens(),
             );
 
-        // Step 1: Parse reasoning content
-        let mut reasoning_text: Option<String> = None;
-        let mut thinking_tokens = 0;
-        let mut processed_text = final_text;
-
-        if reasoning_parser_available {
-            // Fresh parser per request: non-streaming extraction keeps no state
-            // across requests, so avoid serializing on the shared pooled mutex.
-            if let Some(mut parser) = utils::create_reasoning_parser(
-                &self.reasoning_parser_factory,
-                reasoning_parser_name.as_deref(),
+        // Steps 1 and 2: the reasoning split out, then the tool calls parsed
+        // from the content (shared with the chat reader); the Messages tool
+        // choice reads as its chat form, whose `forces_call` is the one rule
+        // for the JSON-schema path.
+        let ReasoningSplit {
+            content: processed_text,
+            reasoning: reasoning_text,
+            reasoning_tokens: thinking_tokens,
+            content_from: _,
+        } = self.split_reasoning(
+            final_text,
+            &token_ends,
+            ReasoningSource {
+                wanted: reasoning_parser_available,
+                in_prefill: messages_request.reasoning_in_prefill,
+                parser_name: reasoning_parser_name.as_deref(),
                 model,
-            ) {
-                if messages_request.reasoning_in_prefill {
-                    parser.mark_reasoning_started();
-                }
-
-                match parser.detect_and_parse_reasoning(&processed_text) {
-                    Ok(result) => {
-                        if !result.reasoning_text.is_empty() {
-                            thinking_tokens = reasoning_span_tokens(
-                                &token_ends,
-                                &processed_text,
-                                &result.reasoning_text,
-                                &result.normal_text,
-                            );
-                            reasoning_text = Some(result.reasoning_text);
-                        }
-                        processed_text = result.normal_text;
-                    }
-                    Err(e) => {
-                        warn!("Reasoning parsing error, skipping parsing: {e}");
-                    }
-                }
-            }
-        }
-
-        // Step 2: Parse tool calls
-        let mut tool_calls: Option<Vec<ToolCall>> = None;
-
-        if tool_choice_enabled && messages_request.has_tools {
-            // Check if JSON schema constraint was used (specific tool or any/required mode)
-            let native_tool_format = self
-                .tool_parser_factory
-                .registry()
-                .uses_native_tool_format(tool_parser_name.as_deref());
-            let used_json_schema = !native_tool_format
-                && matches!(
-                    &messages_request.tool_choice,
-                    Some(messages::ToolChoice::Tool { .. } | messages::ToolChoice::Any { .. })
-                );
-
-            if used_json_schema {
-                // Bridge Messages ToolChoice to Chat ToolChoice for reuse
-                let chat_tool_choice = messages_request.tool_choice.as_ref().map(ToolChoice::from);
-
-                (tool_calls, processed_text) = utils::parse_json_schema_response(
-                    &processed_text,
-                    chat_tool_choice.as_ref(),
+            },
+        );
+        let chat_tool_choice = messages_request.tool_choice.as_ref().map(ToolChoice::from);
+        let (tool_calls, processed_text) = self
+            .parse_calls(
+                processed_text,
+                ToolCallSource {
+                    tools: messages_request
+                        .has_tools
+                        .then_some(&messages_request.chat_tools[..]),
+                    tool_choice: chat_tool_choice.as_ref(),
                     model,
-                    messages_request.history_tool_calls_count,
-                );
-            } else if tool_parser_available {
-                (tool_calls, processed_text) = self
-                    .parse_tool_calls(
-                        &processed_text,
-                        model,
-                        tool_parser_name.as_deref(),
-                        &messages_request.chat_tools,
-                        messages_request.history_tool_calls_count,
-                    )
-                    .await;
-            }
-        }
-
-        if messages_request.first_tool_call_only {
-            utils::keep_first_tool_call(&mut tool_calls);
-        }
+                    parser_name: tool_parser_name.as_deref(),
+                    parser_available: tool_parser_available,
+                    history_tool_calls_count: messages_request.history_tool_calls_count,
+                    first_call_only: messages_request.first_tool_call_only,
+                },
+            )
+            .await;
 
         // Step 3: Build content blocks
         let mut content_blocks: Vec<messages::ContentBlock> = Vec::new();
@@ -1118,6 +1124,49 @@ impl ResponseProcessor {
             system_fingerprint: dispatch.weight_version.clone(),
         })
     }
+}
+
+/// The reasoning split out of a decoded choice: the content after it, the
+/// reasoning text, the reasoning's tokens by the token ends, and where the
+/// content starts in the decoded text (for the content's logprobs).
+struct ReasoningSplit {
+    content: String,
+    reasoning: Option<String>,
+    reasoning_tokens: u32,
+    content_from: usize,
+}
+
+/// What the reasoning split reads from the request: whether the request
+/// wants the split at all (its separate-reasoning switch, with a parser
+/// available), whether the rendered prompt ends inside the thinking block,
+/// the parser the request resolved to, and the model.
+struct ReasoningSource<'a> {
+    wanted: bool,
+    in_prefill: bool,
+    parser_name: Option<&'a str>,
+    model: &'a str,
+}
+
+/// What a tool-call parse reads from the request: the tools it offered (none
+/// when it offered none), its tool choice in the chat form, the model, the
+/// parser the request resolved to and whether it is available, how many
+/// calls the history already holds, and whether the first call alone is kept.
+struct ToolCallSource<'a> {
+    tools: Option<&'a [Tool]>,
+    tool_choice: Option<&'a ToolChoice>,
+    model: &'a str,
+    parser_name: Option<&'a str>,
+    parser_available: bool,
+    history_tool_calls_count: usize,
+    first_call_only: bool,
+}
+
+/// Whether a forced call shaped the output as JSON the constraint dictated
+/// (so the JSON-schema path reads it): the choice forces a call and the
+/// parser's format is not native. One rule for the chat choice and the
+/// Messages choice read as its chat form.
+fn forced_call_shapes_output(native_tool_format: bool, tool_choice: Option<&ToolChoice>) -> bool {
+    !native_tool_format && tool_choice.is_some_and(ToolChoice::forces_call)
 }
 
 /// A choice's output decoded through the stop decoder, as every non-streaming
@@ -1587,6 +1636,66 @@ mod responses_finish_reason_tests {
             env!("CARGO_MANIFEST_DIR"),
             "/tests/common/scripted_tokenizer.rs"
         ));
+    }
+
+    /// The Messages tool choice read as its chat form decides the JSON-schema
+    /// path exactly as the chat choice does: a named tool and `any` force a
+    /// call, `auto` and `none` do not, and a native format never takes it.
+    #[test]
+    fn a_messages_choice_forces_a_call_as_its_chat_form_does() {
+        let named = messages::ToolChoice::Tool {
+            name: "lookup".to_string(),
+            disable_parallel_tool_use: None,
+        };
+        let any = messages::ToolChoice::Any {
+            disable_parallel_tool_use: None,
+        };
+        let auto = messages::ToolChoice::Auto {
+            disable_parallel_tool_use: None,
+        };
+        for (choice, forces) in [
+            (named, true),
+            (any, true),
+            (auto, false),
+            (messages::ToolChoice::None, false),
+        ] {
+            let chat = ToolChoice::from(&choice);
+            assert_eq!(
+                forced_call_shapes_output(false, Some(&chat)),
+                forces,
+                "{choice:?}"
+            );
+            assert!(
+                !forced_call_shapes_output(true, Some(&chat)),
+                "{choice:?} native"
+            );
+        }
+        assert!(!forced_call_shapes_output(false, None));
+    }
+
+    /// Without a parser the split leaves the text whole and the content at 0.
+    #[test]
+    fn splitting_without_a_reasoning_parser_leaves_the_text_whole() {
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        );
+        let split = processor.split_reasoning(
+            "<think>a</think>b".to_string(),
+            &[8, 9, 17],
+            ReasoningSource {
+                wanted: true,
+                in_prefill: false,
+                parser_name: None,
+                model: "no-such-model",
+            },
+        );
+        assert_eq!(split.content, "<think>a</think>b");
+        assert_eq!(
+            (split.reasoning, split.reasoning_tokens, split.content_from),
+            (None, 0, 0)
+        );
     }
 
     /// One decode for every reader: the text, where each token's text ends,

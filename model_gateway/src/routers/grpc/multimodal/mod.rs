@@ -90,8 +90,9 @@ pub(crate) use plan::{
 pub(crate) use process::process_multimodal_plan;
 pub(crate) use refs::{
     assemble_media_refs, ensure_selection_supports_media_refs, media_refs_pipeline_pin,
-    resolve_mm_processing, worker_accepts_media_refs, worker_runs_gateway_pipeline, MmProcessing,
-    MmRefsError, GATEWAY_PIPELINE_PROCESSOR,
+    models_without_media_processing, pool_processes_media_refs,
+    registration_lacks_media_processing, resolve_mm_processing, worker_accepts_media_refs,
+    worker_runs_gateway_pipeline, MmProcessing, MmRefsError, GATEWAY_PIPELINE_PROCESSOR,
 };
 pub(crate) use serialize::WireMismatch;
 pub(crate) use settings::{init_mm_settings, mm_settings, MultimodalSettings};
@@ -323,27 +324,44 @@ pub(crate) struct PrecomputedMultimodalIntermediate {
     pub encoder_input_key: Option<String>,
 }
 
+/// Sets the decoder availability gauges (`smg_mm_turbojpeg_available`,
+/// `smg_mm_webp_available`) on the recorder in force and returns what they
+/// read: the call [`report_jpeg_decoder`] makes every time it runs, kept
+/// apart so a test can run it against a recorder of its own. The gateway
+/// installs its Prometheus recorder before its report (`server.rs`): a gauge
+/// set before that lands in the no-op recorder and never reaches /metrics,
+/// which is why the gauges are set on every report and not once.
+pub(crate) fn record_decoder_availability() -> (bool, bool) {
+    use crate::observability::metrics::Metrics;
+    let available = llm_multimodal::jpeg_turbo::turbojpeg_available();
+    Metrics::set_mm_turbojpeg_available(available);
+    let webp = llm_multimodal::webp_native::webp_available();
+    Metrics::set_mm_webp_available(webp);
+    (available, webp)
+}
+
 /// Say once which JPEG and WebP decoders this process has, and publish them:
 /// without libjpeg-turbo the pure-Rust decoder's pixels differ from PIL's by a
 /// few levels, an embedding shift against an engine that decodes with PIL;
 /// without libwebp the WebP fallback is correct but several times slower.
 pub(crate) fn report_jpeg_decoder() {
-    use crate::observability::metrics::Metrics;
     static ONCE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    // The gauges on every call, the log lines once: a caller that builds the
+    // multimodal components before the start-up installs its recorder would
+    // otherwise consume the once block on the no-op recorder, and the
+    // start-up's own call could set neither gauge.
+    let (available, _webp) = record_decoder_availability();
     ONCE.get_or_init(|| {
-        let available = llm_multimodal::jpeg_turbo::turbojpeg_available();
-        Metrics::set_mm_turbojpeg_available(available);
         if available {
             tracing::info!("JPEG decode uses libjpeg-turbo with PIL's defaults");
         } else {
             tracing::warn!(
                 "libturbojpeg not found: JPEGs decode with the pure-Rust decoder, whose pixels \
                  differ from PIL's by a few levels; install libjpeg-turbo for exact parity with \
-                 an engine that decodes with PIL"
+                 an engine that decodes with PIL, or start with `--mm-turbojpeg require` to \
+                 refuse to serve without it"
             );
         }
-        let webp = llm_multimodal::webp_native::webp_available();
-        Metrics::set_mm_webp_available(webp);
         match llm_multimodal::webp_native::webp_version() {
             Some(version) => tracing::info!(%version, "WebP decode uses libwebp"),
             None => tracing::info!(
@@ -352,6 +370,30 @@ pub(crate) fn report_jpeg_decoder() {
             ),
         }
     });
+}
+
+/// Apply the operator's TurboJPEG policy to this process. Under `require` a
+/// process whose loader did not find the library does not come up, with the
+/// library and the gauge named, instead of serving the fallback decoder's
+/// pixels behind the one warning above; under `prefer` nothing changes. The
+/// router calls it once at start-up, in every routing mode, before anything
+/// binds (a gRPC router created behind the gateway's try-register would
+/// otherwise log its refusal and the process would start without it), and
+/// again where its components and the worker pipeline are built, for an
+/// embedded or test caller; the line under `require` is said once.
+pub(crate) fn enforce_jpeg_decoder_policy(
+    policy: llm_multimodal::jpeg_turbo::TurboJpegPolicy,
+) -> anyhow::Result<()> {
+    static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    llm_multimodal::jpeg_turbo::enforce_policy(policy).map_err(|error| {
+        anyhow::anyhow!("{error} (the gauge smg_mm_turbojpeg_available reads 0 for this process)")
+    })?;
+    if policy == llm_multimodal::jpeg_turbo::TurboJpegPolicy::Require {
+        SAID.get_or_init(|| {
+            tracing::info!("libjpeg-turbo is required by the TurboJPEG policy and was loaded");
+        });
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -364,7 +406,7 @@ mod tests {
 
     use super::{
         encoder_budget::ItemOverEncoderBudget, processing_failed_message,
-        processing_failed_response, Response,
+        processing_failed_response, record_decoder_availability, report_jpeg_decoder, Response,
     };
 
     async fn status_and_error(response: Response) -> (u16, serde_json::Value) {
@@ -530,6 +572,54 @@ mod tests {
             assert_eq!(body["error"]["code"], code, "{message}: {body}");
             assert_eq!(body["error"]["type"], kind, "{message}: {body}");
             assert_eq!(body["error"]["message"], message, "{body}");
+        }
+    }
+
+    /// The decoder availability gauges land in the recorder in force when the
+    /// report runs: the gateway installs its recorder first (`server.rs`),
+    /// so `smg_mm_turbojpeg_available` and `smg_mm_webp_available` are on
+    /// /metrics under every policy; a report made before the recorder would
+    /// set them on the no-op one, once, and they would never appear.
+    #[test]
+    fn the_decoder_availability_gauges_land_in_the_installed_recorder() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let (available, webp) =
+            ::metrics::with_local_recorder(&recorder, record_decoder_availability);
+        let rendered = handle.render();
+        let reads = |name: &str, value: bool| {
+            rendered.lines().any(|line| {
+                line.starts_with(name) && line.ends_with(if value { " 1" } else { " 0" })
+            })
+        };
+        assert!(reads("smg_mm_turbojpeg_available", available), "{rendered}");
+        assert!(reads("smg_mm_webp_available", webp), "{rendered}");
+    }
+
+    /// The report sets the gauges on every call, the log lines once: a report
+    /// made before the gateway's recorder exists (a caller building the
+    /// components early) does not leave the start-up's own report with
+    /// nothing to set.
+    #[test]
+    fn a_second_report_still_sets_the_gauges_on_the_recorder_in_force() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        // The first report, on whatever recorder is in force here: the once
+        // block is consumed by it (or was, by another test of this process).
+        report_jpeg_decoder();
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        ::metrics::with_local_recorder(&recorder, report_jpeg_decoder);
+        let rendered = handle.render();
+        for gauge in ["smg_mm_turbojpeg_available", "smg_mm_webp_available"] {
+            assert!(
+                rendered.lines().any(|line| line.starts_with(gauge)
+                    && (line.ends_with(" 1") || line.ends_with(" 0"))),
+                "{gauge} is set by the second report:\n{rendered}"
+            );
         }
     }
 }
