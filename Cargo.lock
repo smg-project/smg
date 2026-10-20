@@ -4045,7 +4045,7 @@ dependencies = [
  "foldhash 0.2.0",
  "futures",
  "hf-hub",
- "minijinja",
+ "minijinja 2.24.0",
  "minijinja-contrib",
  "openai-protocol",
  "rayon",
@@ -4406,13 +4406,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "minijinja-contrib"
-version = "2.24.0"
+name = "minijinja"
+version = "3.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd3e5f077bc2379f0f7d911e7cfdd921114ed99fc884533dca502944cb355b11"
+checksum = "789a6b737c4a13bec43cd3c1b982aa8a8a192ff4bf444e0fb1fd5a324f064fd1"
+
+[[package]]
+name = "minijinja-contrib"
+version = "3.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e15d0d31fbf10ce99b313a238406d62dd5913d95a9be5fa081f1232e31292fc7"
 dependencies = [
- "minijinja",
- "serde",
+ "minijinja 3.0.1",
 ]
 
 [[package]]
