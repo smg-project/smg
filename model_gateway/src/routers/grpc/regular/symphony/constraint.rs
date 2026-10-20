@@ -1055,9 +1055,11 @@ mod tests {
     /// A prompt the template leaves without a turn opener (a system message rendered in place
     /// after the user turn) starts the model inside its thought on the DeepSeek V4 table, and the
     /// grammar built for the request reads it as the engine does, whatever the thinking switch
-    /// said: the answer tag of a JSON `response_format` takes the thought first, as it does on a
-    /// prompt that opened the thought. A prompt that opened and closed the thought (thinking off)
-    /// leaves the model in the content, and the legacy choice asks the table nothing.
+    /// said: the answer tag of a JSON `response_format` takes the closed thought first where the
+    /// engine starts the grammar at the first token, and is the engine's own schema where it does
+    /// not say or starts after its reasoning parser's gate, as on a prompt that opened the
+    /// thought. A prompt that opened and closed the thought (thinking off) leaves the model in
+    /// the content, and the legacy choice asks the table nothing.
     #[test]
     fn a_turn_the_prompt_leaves_unopened_is_inside_the_thought_for_the_grammar_too() {
         let model = "deepseek-ai/DeepSeek-V4-Flash";
@@ -1075,12 +1077,14 @@ mod tests {
         assert_eq!(is_open(ParserChoice::Symphony, thinking), Some(true));
         assert_eq!(is_open(ParserChoice::Symphony, closed), Some(false));
         assert_eq!(is_open(ParserChoice::Legacy, unopened), None);
-        // The JSON answer's tag on the unopened prompt is the thinking prompt's, thought first;
-        // with the thought closed the schema alone is the engine's own constraint, and no tag.
+        // The JSON answer's tag on the unopened prompt is the thinking prompt's: the closed
+        // thought first where the engine starts at the first token, and otherwise the schema
+        // alone, the engine's own constraint and no tag; with the thought closed the schema alone
+        // on every start.
         let request = request(json!({
             "model": model, "response_format": {"type": "json_object"}
         }));
-        let answer = |prompt| {
+        let answer = |prompt, start| {
             super::constraint(
                 ParserChoice::Symphony,
                 &names(None, None),
@@ -1088,12 +1092,28 @@ mod tests {
                 &[],
                 is_open(ParserChoice::Symphony, prompt) == Some(true),
                 false,
-                symphony::GrammarStart::Unknown,
+                start,
                 &templates(),
             )
         };
-        assert_eq!(tag_of(answer(unopened)), tag_of(answer(thinking)));
-        assert!(matches!(answer(closed), Ok(None)));
+        let first = tag_of(answer(unopened, symphony::GrammarStart::FirstToken));
+        assert_eq!(
+            first,
+            tag_of(answer(thinking, symphony::GrammarStart::FirstToken))
+        );
+        assert_eq!(first["format"]["elements"][0]["end"], "</think>", "{first}");
+        for start in [
+            symphony::GrammarStart::Unknown,
+            symphony::GrammarStart::AfterReasoning,
+        ] {
+            assert!(matches!(answer(unopened, start), Ok(None)), "{start:?}");
+            assert!(matches!(answer(thinking, start), Ok(None)), "{start:?}");
+            assert!(matches!(answer(closed, start), Ok(None)), "{start:?}");
+        }
+        assert!(matches!(
+            answer(closed, symphony::GrammarStart::FirstToken),
+            Ok(None)
+        ));
     }
 
     #[test]

@@ -626,9 +626,9 @@ async fn always_constrains_the_calls_a_request_allows_under_auto() {
     assert_eq!(requested.last_constraint(), None);
 
     // On a registry table too. A JSON response_format is the request's own constraint, which
-    // the auto tag never displaces: the answer's constraint is sent instead, the JSON where the
-    // calls' block would be (its shape on this template, whose prompt leaves the thought open:
-    // `a_registry_tables_json_answer_follows_the_thought_the_prompt_leaves_open`).
+    // the auto tag never displaces: the answer's constraint is sent instead; on a worker that
+    // names no grammar start that is the engine's own schema, whatever the prompt
+    // (`a_registry_tables_json_answer_follows_the_thought_the_prompt_leaves_open`).
     let registry = serve(Setup {
         constrained_decoding: Some(ConstrainedDecoding::Always),
         tool_parser: Some("qwen"),
@@ -645,9 +645,10 @@ async fn always_constrains_the_calls_a_request_allows_under_auto() {
         json!({"tools": tools(), "response_format": {"type": "json_object"}}),
     )
     .await;
-    let (kind, tag) = registry.last_constraint().expect("the answer's constraint");
-    assert_eq!(kind, "structural_tag");
-    assert_eq!(block_of(&tag), "json_schema", "{tag}");
+    let (kind, schema) = registry.last_constraint().expect("the answer's constraint");
+    assert_eq!(kind, "json_schema");
+    let schema: Value = serde_json::from_str(&schema).expect("the schema as JSON");
+    assert_eq!(schema, json!({"type": "object"}));
 }
 
 /// A registry table's JSON `response_format` under `always` follows the prompt as the table and
