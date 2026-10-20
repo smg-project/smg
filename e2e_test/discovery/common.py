@@ -1,8 +1,12 @@
-"""What the host-process discovery e2e lanes share: the binaries, free ports,
-the in-process fake engine, the mock-worker launcher, and the gateway driver.
+"""What the file and Slurm discovery e2e lanes share: the binaries, free
+ports, the in-process fake engine, the mock-worker launcher, and the gateway
+driver.
 
-Each lane (file, slurm, slurm_smoke) adds the source it drives and
-the flags that select its provider.
+The file lane runs its gateway and engines as processes on this host. The
+Slurm lane runs them in its cluster's containers, so it takes only the model,
+a free port, the gateway driver (subclassed to run on the controller) and
+`served_by`. Each lane adds the source it drives and the flags that select
+its provider.
 """
 
 from __future__ import annotations

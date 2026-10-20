@@ -2,8 +2,8 @@
 # and mock-worker binaries. One image runs every container of the test
 # cluster: `controller` (munge, slurmctld, and the gateway the test starts)
 # or `node` (munge, slurmd). The build context is a staging directory holding
-# this directory's files and the two binaries, built on the runner
-# (ubuntu-latest, the same release).
+# this directory's files and the two binaries, built on the runner, which the
+# workflow pins to ubuntu-24.04 so the binaries' glibc matches this image's.
 #
 # The munge key is baked in so every container shares it. It authenticates
 # nothing outside the test cluster.

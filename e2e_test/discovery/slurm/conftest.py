@@ -7,8 +7,8 @@ controller and polls the real squeue and scontrol. Each job starts
 mock-worker on every node of its allocation with srun, so every worker
 listens on the same port on its own node, as a Slurm deployment's do.
 
-Slurm 23.11 ignores squeue's filters under --json, all but --user, so the
-provider's own filtering is what these tests watch. One cluster serves every
+Slurm 23.11 ignores squeue's filters under --json, all but --user (--me
+included), so the provider's own filtering is what these tests watch. One cluster serves every
 test; each test gets an empty queue and a gateway of its own.
 
 Gated behind SMG_SLURM_E2E=1, with SMG_SLURM_IMAGE naming the image; needs
@@ -33,13 +33,17 @@ import pytest
 
 from .harness import ControllerGateway, SlurmCluster
 
+HERE = Path(__file__).parent
+
 
 def pytest_collection_modifyitems(config, items):
     if os.environ.get("SMG_SLURM_E2E") == "1":
         return
     skip = pytest.mark.skip(reason="Slurm-discovery e2e disabled (set SMG_SLURM_E2E=1)")
+    # Every conftest gets the whole session's items: mark this lane's alone.
     for item in items:
-        item.add_marker(skip)
+        if item.path.is_relative_to(HERE):
+            item.add_marker(skip)
 
 
 @pytest.fixture(scope="module")

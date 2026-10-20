@@ -133,10 +133,11 @@ def test_job_names_map_to_roles_within_the_scope(slurm, gateway):
     """Two prefill job names and a decode one, beside jobs the mapping or the
     scope leaves out, each with a running engine that would register if it were
     let through: a name no flag maps, another user's job, and one in another
-    partition. Slurm 23.11 lists them all under --json; only the mapped jobs
-    of this user, account and partition get workers, with the bootstrap port
-    on prefill alone. The account is configured in another case than the one
-    Slurm stores."""
+    partition. The gateway's squeue runs with --me, and under --json Slurm
+    23.11 ignores it, as every filter but --user, so it lists them all; only
+    the mapped jobs of this user, account and partition get workers, with the
+    bootstrap port on prefill alone. The account is configured in another case
+    than the one Slurm stores."""
     prefill_a, prefill_b, decode = unique("prefill-a"), unique("prefill-b"), unique("decode")
     scope = {"account": "acct-e2e", "partition": "debug"}
     slurm.submit(prefill_a, worker_command(), nodes="node1", **scope)

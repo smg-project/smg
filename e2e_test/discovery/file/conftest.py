@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 
@@ -28,13 +29,17 @@ from ..common import engines as engines  # noqa: F401  (fixture)
 from ..common import mock_worker as mock_worker  # noqa: F401  (fixture)
 from .harness import Manifest, file_gateway
 
+HERE = Path(__file__).parent
+
 
 def pytest_collection_modifyitems(config, items):
     if os.environ.get("SMG_FILE_E2E") == "1":
         return
     skip = pytest.mark.skip(reason="file-discovery e2e disabled (set SMG_FILE_E2E=1)")
+    # Every conftest gets the whole session's items: mark this lane's alone.
     for item in items:
-        item.add_marker(skip)
+        if item.path.is_relative_to(HERE):
+            item.add_marker(skip)
 
 
 @pytest.fixture

@@ -2,9 +2,11 @@ name: E2E Kind Discovery
 
 # Run automatically for service-discovery code and test-infrastructure
 # changes, and weekly: the Slurm lane installs Slurm from Ubuntu's archive,
-# whose updates can change it with no change here. GitHub-hosted ubuntu-latest
-# provides Docker for the kind node and the Slurm cluster; manual dispatch
-# keeps the runner selectable for ad-hoc validation.
+# whose updates can change it with no change here. GitHub-hosted ubuntu-24.04
+# provides Docker for the kind node and the Slurm cluster. It is pinned, not
+# ubuntu-latest: the binaries built here run in Ubuntu 24.04 images (the
+# Slurm one for its Slurm 23.11), so they need its glibc or an older one.
+# Manual dispatch keeps the runner selectable for ad-hoc validation.
 on:
   pull_request:
     paths:
@@ -25,9 +27,9 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: Runner label (needs Docker for the kind node container)
+        description: Runner label (needs Docker, and glibc no newer than Ubuntu 24.04's)
         required: false
-        default: ubuntu-latest
+        default: ubuntu-24.04
 
 env:
   RUSTC_WRAPPER: sccache
@@ -35,7 +37,7 @@ env:
 
 jobs:
   kind-discovery:
-    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
@@ -98,6 +100,9 @@ jobs:
             e2e_test/discovery/slurm/cgroup.conf e2e_test/discovery/slurm/entrypoint.sh \
             target/debug/smg target/debug/mock-worker "$stage"
           docker build -t smg-slurm:e2e "$stage"
+          # Fail here, before the cluster starts, if the binaries built above
+          # need a newer glibc than the image's (smg checks for both).
+          docker run --rm --entrypoint smg smg-slurm:e2e --help >/dev/null
           SMG_SLURM_E2E=1 SMG_SLURM_IMAGE=smg-slurm:e2e \
             SMG_SLURM_LOGS="$RUNNER_TEMP/slurm-logs" \
             pytest e2e_test/discovery/slurm --confcutdir e2e_test/discovery/slurm -v
