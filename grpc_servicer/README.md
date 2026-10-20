@@ -745,6 +745,11 @@ python -m smg_grpc_servicer.sglang.headless \
 
 `smg serve --backend sglang --connection-mode zmq` runs exactly this for each
 worker, with the handshake port SMG derives from the worker's `ipc://` URL.
+SMG's wait for the scheduler's HELLO, and for the READY and the registration
+that follow it, is bounded per stage by the router's
+`--zmq-startup-timeout-secs` (default 3600 s; `--router-zmq-startup-timeout-secs`
+from `smg serve`): the scheduler dials in only after its model is loaded, so the
+bound has to cover that load.
 The launcher spawns the scheduler ranks the way SGLang's engine does; the
 scheduler keeps its tokenizer (SMG tokenizes prompts, but SGLang's grammar
 backend for constrained decoding only exists alongside a tokenizer). Inside
