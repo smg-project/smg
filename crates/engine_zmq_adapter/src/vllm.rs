@@ -17,7 +17,8 @@ use engine_zmq_client::{
         request::{EngineCoreRequest, MmFeaturesPayload},
         sampling::EngineCoreSamplingParams,
         structured_outputs::{
-            has_xgrammar_unsupported_json_features, StructuredOutputBackend,
+            xgrammar_unsupported_feature_in_schema_text,
+            xgrammar_unsupported_feature_in_structural_tag, StructuredOutputBackend,
             StructuredOutputsParams,
         },
     },
@@ -916,31 +917,81 @@ pub(crate) fn validate_sampling(sp: &vllm::SamplingParams, max_tokens: u32) -> R
 /// compile when the backend is xgrammar (`validate_xgrammar_grammar`, a 400):
 /// xgrammar's converter drops those keywords and the engine answers off the
 /// schema with a 200. The same refusal here for every config that resolves to
-/// xgrammar, `auto` included; a backend that enforces such a schema itself
-/// takes it as is. The constraint is one `JsonSchema` whatever built it: a
-/// `response_format` schema, or the tool parameters of a forced tool call on
-/// a parser without structural tags; the message names both.
+/// xgrammar, `auto` included, for a JSON-schema constraint and for the
+/// schemas a structural tag carries alike (its `json_schema` elements go
+/// through the same converter); a backend that enforces such a schema itself
+/// takes the constraint as is. A `JsonSchema` constraint is one schema
+/// whatever built it: a `response_format` schema, or the tool parameters of a
+/// forced tool call on a parser without structural tags. A `StructuralTag`
+/// carries the tool parameters of a constrained call (`tool_choice` required
+/// or a named function; on an always-constrained worker every turn's tag,
+/// `auto` included, so a tool list with one such schema is refused on every
+/// turn there), or a JSON answer's schema; vLLM's own frontend checks a
+/// structural tag only for compiling, so this refusal reaches the schemas
+/// inside tags, which that check does not. The message names the source, the
+/// keyword, where it stands and, in a tag, the tags around it by their
+/// `begin` (a call's opens with the tool's name).
 pub(crate) fn refuse_schema_xgrammar_cannot_enforce(
     sp: &vllm::SamplingParams,
     structured_backend: StructuredOutputsBackendConfig,
 ) -> Result<(), String> {
+    use vllm::sampling_params::Constraint;
     if structured_backend.backend() != StructuredOutputBackend::Xgrammar {
         return Ok(());
     }
-    let Some(vllm::sampling_params::Constraint::JsonSchema(schema)) = sp.constraint.as_ref() else {
+    let (source, feature) = match sp.constraint.as_ref() {
+        Some(Constraint::JsonSchema(schema)) => (
+            "The JSON schema constraint (a response_format schema, or the tool parameters of a \
+             forced tool call)",
+            xgrammar_unsupported_feature_in_schema_text(schema),
+        ),
+        Some(Constraint::StructuralTag(tag)) => (
+            "The structural tag constraint (the tool parameters of a constrained tool call: \
+             `tool_choice` required, a named function, or every turn on an always-constrained \
+             worker; or a JSON answer's schema)",
+            xgrammar_unsupported_feature_in_structural_tag(tag),
+        ),
+        _ => return Ok(()),
+    };
+    let Some(feature) = feature else {
         return Ok(());
     };
-    if has_xgrammar_unsupported_json_features(&serde_json::Value::String(schema.clone())) {
-        return Err(
-            "The JSON schema constraint (a response_format schema, or the tool parameters of a \
-             forced tool call) contains features not supported by xgrammar, the \
-             structured-output backend this engine runs (multipleOf; uniqueItems or contains; \
-             an unsupported string format; minLength/maxLength beside pattern or format; \
-             propertyNames or patternProperties beside other property keywords)"
-                .to_string(),
-        );
+    let place = if feature.pointer.is_empty() {
+        "its root".to_string()
+    } else {
+        format!("`{}`", feature.pointer)
+    };
+    let around = match feature.openers.as_slice() {
+        [] => String::new(),
+        [one] => format!(" (inside the tag that begins `{}`)", printable(one)),
+        many => {
+            let begins: Vec<String> = many
+                .iter()
+                .map(|begin| format!("`{}`", printable(begin)))
+                .collect();
+            format!(" (inside the tags that begin {})", begins.join(" then "))
+        }
+    };
+    Err(format!(
+        "{source} uses `{}` at {place}{around}, a JSON-schema feature not supported by xgrammar, \
+         the structured-output backend this engine runs: xgrammar would drop it and answer off \
+         the schema",
+        feature.keyword
+    ))
+}
+
+/// `text` for an error message: its control characters (a tag's `begin`
+/// often ends in a newline) written as escapes, the rest as it is.
+fn printable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() {
+            out.extend(ch.escape_default());
+        } else {
+            out.push(ch);
+        }
     }
-    Ok(())
+    out
 }
 
 /// Map the proto `constraint` oneof onto typed structured-output params (the
@@ -1803,8 +1854,11 @@ mod tests {
     /// and the engine would answer off the schema. A pinned guidance enforces
     /// such a schema and takes it as is. The tool parameters of a forced tool
     /// call reach this translation as the same `JsonSchema` constraint (a
-    /// parser without structural tags builds one from the tools), so a tool
-    /// whose parameters use such a keyword is refused the same way.
+    /// parser without structural tags builds one from the tools), or inside
+    /// a `StructuralTag` (a parser with structural tags embeds each tool's
+    /// parameters as a `json_schema` element), so a tool whose parameters use
+    /// such a keyword is refused the same way on both; the message names the
+    /// keyword and where it stands.
     #[test]
     fn a_schema_xgrammar_cannot_enforce_is_refused_wherever_xgrammar_is_the_backend() {
         use engine_zmq_client::protocol::vllm::structured_outputs::StructuredOutputConstraint;
@@ -1839,9 +1893,73 @@ mod tests {
         let tool_parameters = r#"{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string"},"uniqueItems":true}},"required":["tags"]}"#;
         let refused = translate(schema(tool_parameters), Auto).expect_err("refused");
         assert!(
-            refused.contains("tool parameters of a forced tool call"),
+            refused.contains("tool parameters of a forced tool call")
+                && refused.contains("`uniqueItems` at `/properties/tags`"),
             "{refused}"
         );
+        let refused = translate(schema(multiple_of), Auto).expect_err("refused");
+        assert!(refused.contains("`multipleOf` at its root"), "{refused}");
+        // The same parameters inside a forced call's structural tag, as a
+        // parser with structural tags sends them (one `tag` per tool, the
+        // parameters its `json_schema` content): refused under `auto` and a
+        // pinned xgrammar, the message naming the keyword and where it
+        // stands in the tag; a pinned guidance takes the tag as it is; a tag
+        // whose schemas xgrammar compiles whole passes, stamped xgrammar.
+        let tag = |parameters: serde_json::Value| {
+            let tag = serde_json::json!({"format": {"type": "triggered_tags",
+                "triggers": ["<tool_call>"], "tags": [
+                    {"begin": "<tool_call>{\"name\": \"plain\", \"arguments\": ",
+                     "content": {"type": "json_schema", "json_schema":
+                        {"type": "object", "properties": {"city": {"type": "string"}}}},
+                     "end": "}</tool_call>"},
+                    {"begin": "<tool_call>{\"name\": \"tagged\", \"arguments\": ",
+                     "content": {"type": "json_schema", "json_schema": parameters},
+                     "end": "}</tool_call>"},
+                ], "at_least_one": true}});
+            tokenized_req(vllm::SamplingParams {
+                constraint: Some(vllm::sampling_params::Constraint::StructuralTag(
+                    tag.to_string(),
+                )),
+                ..Default::default()
+            })
+        };
+        let unique_items: serde_json::Value = serde_json::from_str(tool_parameters).unwrap();
+        for config in [Auto, Pinned(StructuredOutputBackend::Xgrammar)] {
+            let refused = translate(tag(unique_items.clone()), config).expect_err("refused");
+            assert!(
+                refused.contains("structural tag constraint")
+                    && refused.contains(
+                        "`uniqueItems` at `/format/tags/1/content/json_schema/properties/tags` \
+                         (inside the tag that begins `<tool_call>{\"name\": \"tagged\", \
+                         \"arguments\": `)"
+                    )
+                    && refused.contains("not supported by xgrammar"),
+                "{config:?}: {refused}"
+            );
+        }
+        let params = translate(tag(unique_items), Pinned(StructuredOutputBackend::Guidance))
+            .expect("translated")
+            .sampling_params
+            .and_then(|sp| sp.structured_outputs)
+            .expect("structured outputs");
+        assert_eq!(params.backend, StructuredOutputBackend::Guidance);
+        assert!(matches!(
+            params.constraint,
+            StructuredOutputConstraint::StructuralTag(_)
+        ));
+        let params = translate(
+            tag(serde_json::json!({"type": "object", "properties": {"n": {"type": "integer"}}})),
+            Auto,
+        )
+        .expect("translated")
+        .sampling_params
+        .and_then(|sp| sp.structured_outputs)
+        .expect("structured outputs");
+        assert_eq!(params.backend, StructuredOutputBackend::Xgrammar);
+        assert!(matches!(
+            params.constraint,
+            StructuredOutputConstraint::StructuralTag(_)
+        ));
         let params = translate(
             schema(multiple_of),
             Pinned(StructuredOutputBackend::Guidance),

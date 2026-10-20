@@ -1186,6 +1186,47 @@ async fn structured_output_backend_follows_the_launcher_config() {
     ));
     let status = h.client.generate(request).await.expect_err("refused");
     assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status.message().contains("`multipleOf` at its root"),
+        "{}",
+        status.message()
+    );
+    // The same keyword inside a forced call's structural tag (a parser with
+    // structural tags embeds each tool's parameters as a `json_schema`
+    // element) is refused under `auto` the same way, before the engine.
+    let mut request = generate_request("so5", true, Vec::new());
+    request.sampling_params.as_mut().unwrap().constraint = Some(Constraint::StructuralTag(
+        serde_json::json!({"format": {"type": "triggered_tags", "triggers": ["<tool_call>"],
+            "tags": [{"begin": "<tool_call>{\"name\": \"t\", \"arguments\": ",
+                      "content": {"type": "json_schema", "json_schema": {"type": "object",
+                          "properties": {"tags": {"type": "array", "items": {"type": "string"},
+                                                  "uniqueItems": true}}}},
+                      "end": "}</tool_call>"}],
+            "at_least_one": true}})
+        .to_string(),
+    ));
+    let status = h.client.generate(request).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status.message().contains(
+            "`uniqueItems` at `/format/tags/0/content/json_schema/properties/tags` (inside the \
+             tag that begins `<tool_call>{\"name\": \"t\", \"arguments\": `)"
+        ),
+        "{}",
+        status.message()
+    );
+    // Nothing refused reached the engine: its next request is the next one
+    // served.
+    let mut request = generate_request("so6", true, Vec::new());
+    request.sampling_params.as_mut().unwrap().constraint = Some(Constraint::JsonObject(true));
+    streams.push(
+        h.client
+            .generate(request)
+            .await
+            .expect("generate")
+            .into_inner(),
+    );
+    assert_eq!(recv_add(&mut h.engine_in).await.request_id, "so6");
     drop(streams);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

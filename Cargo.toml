@@ -61,6 +61,7 @@ tikv-jemallocator = { version = "0.6", default-features = false, features = ["ba
 tikv-jemalloc-ctl = { version = "0.6", default-features = false }
 http = "1.4.2"
 lru = "0.18.0"
+memchr = "2"
 num-traits = "0.2"
 parking_lot = "0.12.5"
 rand = "0.10.1"

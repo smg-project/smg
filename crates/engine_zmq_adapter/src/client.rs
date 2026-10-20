@@ -1253,7 +1253,11 @@ mod tests {
     /// settled on, and that backend is the one a structural tag compiles on,
     /// so the kind of the first request never decides whether a forced tool
     /// call compiles later; a schema that backend cannot enforce is refused
-    /// before the engine instead of being answered off the schema.
+    /// before the engine instead of being answered off the schema, whether it
+    /// comes as a JSON-schema constraint or inside the structural tag of a
+    /// forced call (`tool_choice` required or a named function; the tag an
+    /// always-constrained worker takes for `auto` alike), and nothing refused
+    /// reaches the engine; an `auto` call carries no constraint and passes.
     #[tokio::test]
     async fn the_first_structured_request_never_strands_a_later_one() {
         use engine_zmq_client::protocol::vllm::structured_outputs::{
@@ -1287,34 +1291,90 @@ mod tests {
         // backend; a later request stamped for another would fail at grammar
         // build (or, for a tag, compile on a backend that has no such format).
         let mut engine_backend: Option<StructuredOutputBackend> = None;
+        // A forced call's structural tag as a parser with structural tags
+        // sends one: a `tag` per tool, its parameters the `json_schema`
+        // content; `at_least_one` for a forced call, off for the tag an
+        // always-constrained worker takes under `auto`.
+        let call_tag = |tools: &[(&str, serde_json::Value)], at_least_one: bool| {
+            let tags: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|(name, parameters)| {
+                    serde_json::json!({
+                        "begin": format!("<tool_call>\n{{\"name\": \"{name}\", \"arguments\": "),
+                        "content": {"type": "json_schema", "json_schema": parameters},
+                        "end": "}\n</tool_call>",
+                    })
+                })
+                .collect();
+            serde_json::json!({"format": {"type": "triggered_tags", "triggers": ["<tool_call>"],
+                "tags": tags, "at_least_one": at_least_one}})
+            .to_string()
+        };
+        let plain = (
+            "plain",
+            serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}}),
+        );
+        // An array parameter under `uniqueItems`, the shape tool corpora
+        // carry; a string with a length bound beside a pattern.
+        let tagged = (
+            "tagged",
+            serde_json::json!({"type": "object", "properties": {"tags": {"type": "array",
+                "items": {"type": "string"}, "uniqueItems": true}}, "required": ["tags"]}),
+        );
+        let bounded = (
+            "bounded",
+            serde_json::json!({"type": "object", "properties": {"code": {"type": "string",
+                "pattern": "^[a-z]+$", "maxLength": 8}}}),
+        );
         // Held open: dropping a stream aborts its request on the same socket.
         let mut streams = Vec::new();
         for (id, constraint) in [
             (
                 "json-answer-first",
-                Constraint::JsonSchema(
+                Some(Constraint::JsonSchema(
                     r#"{"type":"object","properties":{"city":{"type":"string"}}}"#.to_string(),
-                ),
+                )),
             ),
             (
                 "forced-call",
-                Constraint::StructuralTag(
-                    r#"{"format":{"type":"triggered_tags","triggers":["<tool_call>"],"tags":[]}}"#
-                        .to_string(),
-                ),
+                Some(Constraint::StructuralTag(call_tag(
+                    std::slice::from_ref(&plain),
+                    true,
+                ))),
             ),
-            ("json-object", Constraint::JsonObject(true)),
-            ("regex", Constraint::Regex("[0-9]+".to_string())),
-            ("grammar", Constraint::Grammar("root ::= \"a\"".to_string())),
+            ("json-object", Some(Constraint::JsonObject(true))),
+            ("regex", Some(Constraint::Regex("[0-9]+".to_string()))),
+            (
+                "grammar",
+                Some(Constraint::Grammar("root ::= \"a\"".to_string())),
+            ),
             (
                 "choice",
-                Constraint::Choice(vllm::ChoiceConstraint {
+                Some(Constraint::Choice(vllm::ChoiceConstraint {
                     choices: vec!["yes".to_string(), "no".to_string()],
-                }),
+                })),
+            ),
+            (
+                "required-call-unenforceable",
+                Some(Constraint::StructuralTag(call_tag(
+                    &[plain.clone(), tagged.clone()],
+                    true,
+                ))),
+            ),
+            (
+                "named-call-unenforceable",
+                Some(Constraint::StructuralTag(call_tag(&[bounded], true))),
+            ),
+            ("auto-call", None),
+            (
+                "auto-tag-unenforceable",
+                Some(Constraint::StructuralTag(call_tag(&[plain, tagged], false))),
             ),
             (
                 "schema-xgrammar-lacks",
-                Constraint::JsonSchema(r#"{"type":"integer","multipleOf":3}"#.to_string()),
+                Some(Constraint::JsonSchema(
+                    r#"{"type":"integer","multipleOf":3}"#.to_string(),
+                )),
             ),
         ] {
             let request = vllm::GenerateRequest {
@@ -1327,25 +1387,68 @@ mod tests {
                 )),
                 sampling_params: Some(vllm::SamplingParams {
                     max_tokens: Some(8),
-                    constraint: Some(constraint),
+                    constraint,
                     ..Default::default()
                 }),
                 stream: true,
                 ..Default::default()
             };
             let outcome = client.generate_vllm_streams(request).await;
-            if id == "schema-xgrammar-lacks" {
-                // Refused before the engine, as vLLM's frontend refuses it
-                // under `backend=xgrammar`: xgrammar would compile it with
-                // `multipleOf` dropped and answer off the schema.
+            // Refused before the engine, as vLLM's frontend refuses a schema
+            // under `backend=xgrammar`: xgrammar would compile it with the
+            // keyword dropped and answer off the schema. The message names
+            // the keyword, where it stands and, in a tag, the call's tag by
+            // its `begin`, which carries the tool's name.
+            let refused_at = match id {
+                "required-call-unenforceable" | "auto-tag-unenforceable" => Some((
+                    "uniqueItems",
+                    "`/format/tags/1/content/json_schema/properties/tags`",
+                    Some("tagged"),
+                )),
+                "named-call-unenforceable" => Some((
+                    "minLength/maxLength beside pattern or format",
+                    "`/format/tags/0/content/json_schema/properties/code`",
+                    Some("bounded"),
+                )),
+                "schema-xgrammar-lacks" => Some(("multipleOf", "its root", None)),
+                _ => None,
+            };
+            if let Some((keyword, place, tool)) = refused_at {
                 let status = outcome.err().expect("refused");
                 assert_eq!(status.code(), Code::InvalidArgument, "{id}");
+                let message = status.message();
+                let call = tool.map_or(String::new(), |tool| {
+                    format!(
+                        " (inside the tag that begins `<tool_call>\\n{{\"name\": \"{tool}\", \
+                         \"arguments\": `)"
+                    )
+                });
+                assert!(
+                    message.contains(&format!("`{keyword}` at {place}{call}")),
+                    "{id}: {message}"
+                );
                 continue;
             }
             streams.push(outcome.expect("generate"));
             let EngineInbound::Add(engine_request) = engine.recv().await.expect("inbound") else {
                 panic!("{id}: expected an add request");
             };
+            // Nothing refused reached the engine: its next request is this one.
+            assert_eq!(
+                engine_request.request_id, id,
+                "{id}: another request reached the engine"
+            );
+            if id == "auto-call" {
+                // `auto` carries no constraint, so nothing to refuse.
+                assert!(
+                    engine_request
+                        .sampling_params
+                        .and_then(|sp| sp.structured_outputs)
+                        .is_none(),
+                    "{id}: an auto call carries no constraint"
+                );
+                continue;
+            }
             let structured = engine_request
                 .sampling_params
                 .and_then(|sp| sp.structured_outputs)
