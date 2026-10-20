@@ -290,8 +290,9 @@ impl Skip {
 /// times out, or one whose output does not parse. A job that cannot be placed
 /// is left out alone, and the rest of the poll stands: one whose hostlist does
 /// not expand, with a node `scontrol` does not know or that has no usable
-/// address, or running with no start time. So is an address two placements
-/// claim: only one server can listen there, and which one is unknown.
+/// address, or running with no start time. An address two placements claim
+/// stays with the job that started first (the lower id within a second),
+/// whose server holds the port, and is left out for the later ones.
 async fn poll(
     client: &dyn SlurmClient,
     config: &SlurmProviderConfig,
