@@ -48,7 +48,7 @@ enum Renderer {
     Jinja,
     DeepseekV32,
     DeepseekV4(deepseek_v4::EffortEncoding),
-    DeepseekV41,
+    DeepseekV41(deepseek_v41::EffortTable),
 }
 
 impl Renderer {
@@ -59,7 +59,7 @@ impl Renderer {
             Self::Jinja => None,
             Self::DeepseekV32 => Some(deepseek_v32::PROFILE),
             Self::DeepseekV4(encoding) => Some(encoding.profile()),
-            Self::DeepseekV41 => Some(deepseek_v41::PROFILE),
+            Self::DeepseekV41(_) => Some(deepseek_v41::PROFILE),
         }
     }
 }
@@ -1527,7 +1527,7 @@ impl HuggingFaceTokenizer {
             Renderer::Jinja => Err(Error::msg("the Jinja renderer renders no marked prompt")),
             Renderer::DeepseekV32 => apply_deepseek_v32(messages, &params),
             Renderer::DeepseekV4(encoding) => apply_deepseek_v4(messages, &params, encoding),
-            Renderer::DeepseekV41 => apply_deepseek_v41(messages, &params),
+            Renderer::DeepseekV41(table) => apply_deepseek_v41(messages, &params, table),
         }
     }
 }
@@ -1773,8 +1773,9 @@ fn detect_renderer_from_config(dir: &Path) -> Renderer {
     // but some checkpoints identify themselves only via `model_type`.
     let model_type = value.get("model_type").and_then(|v| v.as_str());
     if arch_strs.contains(&"DeepseekV41ForCausalLM") || model_type == Some("deepseek_v41") {
-        debug!(?path, "selected DeepseekV41 chat-template renderer");
-        return Renderer::DeepseekV41;
+        let table = detect_dsv41_effort_table(dir);
+        debug!(?path, ?table, "selected DeepseekV41 chat-template renderer");
+        return Renderer::DeepseekV41(table);
     }
     if arch_strs.contains(&"DeepseekV4ForCausalLM") {
         let encoding = detect_dsv4_effort_encoding(dir);
@@ -1800,6 +1801,18 @@ fn detect_dsv4_effort_encoding(dir: &Path) -> deepseek_v4::EffortEncoding {
     match std::fs::read_to_string(dir.join("encoding").join("encoding_dsv4.py")) {
         Ok(source) => deepseek_v4::EffortEncoding::detect_from_encoder_source(&source),
         Err(_) => deepseek_v4::EffortEncoding::V0731,
+    }
+}
+
+/// Pick the effort table of a V4.1 checkpoint from its shipped
+/// `encoding/encoding.py` (`config.json` and `tokenizer_config.json` are the
+/// same across the revisions). Without it (a tokenizer directory streamed
+/// from a worker carries no `encoding/`), the rescaled table the checkpoint
+/// carries today, which its chat template writes too.
+fn detect_dsv41_effort_table(dir: &Path) -> deepseek_v41::EffortTable {
+    match std::fs::read_to_string(dir.join("encoding").join("encoding.py")) {
+        Ok(source) => deepseek_v41::EffortTable::detect_from_encoder_source(&source),
+        Err(_) => deepseek_v41::EffortTable::Rescaled,
     }
 }
 
@@ -2083,6 +2096,7 @@ fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_j
 fn apply_deepseek_v41(
     messages: &[serde_json::Value],
     params: &ChatTemplateParams,
+    effort_table: deepseek_v41::EffortTable,
 ) -> Result<String> {
     // `template_kwargs["response_format"]` is deliberately not attached to a
     // message: the engine's Python renderer never renders V4.1's `## Response Format:` block
@@ -2154,6 +2168,7 @@ fn apply_deepseek_v41(
         add_default_bos_token: true,
         drop_thinking,
         reasoning_effort,
+        effort_table,
     };
     deepseek_v41::render_messages(&msgs, thinking_mode, &encode_params)
         .map_err(|e| Error::msg(format!("DeepSeek V4.1 encode failed: {e}")))
@@ -2524,7 +2539,7 @@ mod segment_tests {
             )
             .expect("added tokens");
         let mut wrapped = HuggingFaceTokenizer::from_tokenizer(tokenizer);
-        wrapped.renderer = Renderer::DeepseekV41;
+        wrapped.renderer = Renderer::DeepseekV41(deepseek_v41::EffortTable::Rescaled);
         wrapped.profile = wrapped.renderer.profile();
         wrapped
     }
@@ -2756,7 +2771,34 @@ mod segment_tests {
         reasoning_effort: Option<Value>,
         drop_thinking: bool,
         continue_final_message: bool,
+        /// The checkpoint revision whose encoder recorded the text, when it
+        /// is not the file's `revision`: the revisions differ in their
+        /// effort table.
+        encoder_revision: Option<String>,
         text: String,
+    }
+
+    /// The fixture file: the effort tiers of the revision that recorded the
+    /// cases without an `encoder_revision` of their own, those of the
+    /// current revision, and the cases.
+    #[derive(serde::Deserialize)]
+    struct Fixtures {
+        revision: String,
+        effort_tiers: HashMap<String, u8>,
+        current_revision: String,
+        current_effort_tiers: HashMap<String, u8>,
+        cases: Vec<Case>,
+    }
+
+    /// The effort table a recorded tier map is, by the rule
+    /// [`deepseek_v41::EffortTable::detect_from_encoder_source`] applies to
+    /// the encoder source: `low` at 25 is the first published table.
+    fn effort_table_of(tiers: &HashMap<String, u8>) -> deepseek_v41::EffortTable {
+        if tiers.get("low") == Some(&25) {
+            deepseek_v41::EffortTable::Original
+        } else {
+            deepseek_v41::EffortTable::Rescaled
+        }
     }
 
     #[derive(serde::Deserialize)]
@@ -2779,22 +2821,19 @@ mod segment_tests {
         let Some(path) = dir.join("tokenizer.json").to_str().map(str::to_owned) else {
             return;
         };
-        let Ok(tok) = HuggingFaceTokenizer::from_file(&path) else {
+        let Ok(mut tok) = HuggingFaceTokenizer::from_file(&path) else {
             eprintln!(
                 "skipping: no DeepSeek-V4.1 tokenizer under {}",
                 dir.display()
             );
             return;
         };
-        assert!(matches!(tok.renderer, Renderer::DeepseekV41));
-        let cases: Vec<Case> = serde_json::from_value(
-            serde_json::from_str::<Value>(include_str!(
-                "../tests/fixtures/deepseek_v41/render_fixtures.json"
-            ))
-            .expect("fixtures")["cases"]
-                .clone(),
-        )
-        .expect("the Case shape");
+        assert!(matches!(tok.renderer, Renderer::DeepseekV41(_)));
+        let fixtures: Fixtures = serde_json::from_str(include_str!(
+            "../tests/fixtures/deepseek_v41/render_fixtures.json"
+        ))
+        .expect("the fixture shape");
+        let cases = &fixtures.cases;
         let ids: Vec<IdCase> = serde_json::from_value(
             serde_json::from_str::<Value>(include_str!(
                 "../tests/fixtures/deepseek_v41/render_ids_fixtures.json"
@@ -2823,6 +2862,19 @@ mod segment_tests {
                 template_kwargs: Some(&kwargs),
                 ..Default::default()
             };
+            // The text was recorded by the encoder of one of the file's two
+            // revisions; the renderer writes that revision's effort table.
+            let tiers = match case.encoder_revision.as_deref() {
+                Some(revision) if revision == fixtures.current_revision => {
+                    &fixtures.current_effort_tiers
+                }
+                Some(revision) if revision != fixtures.revision => panic!(
+                    "case {}: encoder_revision {revision} is neither revision nor current_revision",
+                    case.name
+                ),
+                _ => &fixtures.effort_tiers,
+            };
+            tok.renderer = Renderer::DeepseekV41(effort_table_of(tiers));
             let marked = tok
                 .render_marked(&case.messages, params)
                 .unwrap_or_else(|e| panic!("case {}: {e}", case.name));

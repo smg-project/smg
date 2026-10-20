@@ -448,17 +448,58 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
-        "deepseek-v4.1-flash/render/*",
-        "the gateway renders continue_final_message by popping the assistant turn and \
-         appending its text after the generation header, which does not reproduce this \
-         template's continued turn (smg-project/smg#2779); and the gateway's default \
-         reasoning effort for this family is not the template's own default \
-         (smg-project/smg-lab#33); and add_generation_prompt is not a field of SMG's chat \
-         request; the header is always appended (smg-project/smg#2780); and SMG's request \
-         schema types tool-call arguments as a string, as the API and the engines do; the \
-         template accepts an object (smg-project/bellwether#12); and the gateway parses \
-         tool-call arguments into objects before rendering, which this template does not \
-         render as the reference does (smg-project/smg#2783)",
+        "deepseek-v4.1-flash/render/hermes-func-calling-*",
+        "the checkpoint's own encoder, which this renderer follows and the engines port, \
+         parses a history call's `arguments` string into one DSML parameter per key; the \
+         checkpoint's Jinja template cannot read JSON text and writes the string whole as a \
+         single `arguments` parameter, so the reference is the template's own rendering of \
+         a call history, not the encoder's (the single-turn set under this prefix matches)",
+    ),
+    (
+        "deepseek-v4.1-flash/render/hermes-glaive-func-calling-*",
+        "the checkpoint's own encoder, which this renderer follows and the engines port, \
+         parses a history call's `arguments` string into one DSML parameter per key; the \
+         checkpoint's Jinja template cannot read JSON text and writes the string whole as a \
+         single `arguments` parameter, so the reference is the template's own rendering of \
+         a call history, not the encoder's (the cases without a call history match)",
+    ),
+    (
+        "deepseek-v4.1-flash/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "deepseek-v4.1-flash/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
+         engines do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
+        "deepseek-v4.1-flash/render/tools-history-content-and-call",
+        "the checkpoint's own encoder, which this renderer follows and the engines port, \
+         parses a history call's `arguments` string into one DSML parameter per key; the \
+         checkpoint's Jinja template writes the string whole as a single `arguments` \
+         parameter",
+    ),
+    (
+        "deepseek-v4.1-flash/render/tools-history-parallel-calls",
+        "the checkpoint's own encoder, which this renderer follows and the engines port, \
+         parses a history call's `arguments` string into one DSML parameter per key; the \
+         checkpoint's Jinja template writes the string whole as a single `arguments` \
+         parameter",
+    ),
+    (
+        "deepseek-v4.1-flash/render/tools-history-results-reordered",
+        "the checkpoint's own encoder, which this renderer follows and the engines port, \
+         parses a history call's `arguments` string into one DSML parameter per key; the \
+         checkpoint's Jinja template writes the string whole as a single `arguments` \
+         parameter",
+    ),
+    (
+        "deepseek-v4.1-flash/render/tools-history-single-call",
+        "the checkpoint's own encoder, which this renderer follows and the engines port, \
+         parses a history call's `arguments` string into one DSML parameter per key; the \
+         checkpoint's Jinja template writes the string whole as a single `arguments` \
+         parameter",
     ),
     (
         "dots3-note-prev/render/no-generation-prompt",

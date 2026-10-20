@@ -112,7 +112,69 @@ pub const REASONING_EFFORT_TEMPLATE: &str =
     "Reasoning Effort: {budget} (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
 const DEFAULT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
 
-/// Reasoning effort for the V4.1 numeric prompt prefix.
+/// Which budgets the effort names stand for: the checkpoint's own encoder
+/// (`encoding/encoding.py`, its `REASONING_EFFORT_MAPPINGS`) moved them once.
+///
+/// The first published encoder mapped low/high/xhigh/max to 25/50/75/100.
+/// The refresh that followed maps low/high/max to 50/75/100 and has no
+/// `xhigh`; the chat template the checkpoint ships since carries the same
+/// numbers. A checkpoint directory without its encoder (a tokenizer
+/// directory streamed from a worker carries none) gets the rescaled table,
+/// the one the checkpoint carries today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EffortTable {
+    /// low 25, high 50, xhigh 75, max 100.
+    Original,
+    /// low 50, high 75, max 100; `xhigh` renders `high`'s budget.
+    #[default]
+    Rescaled,
+}
+
+impl EffortTable {
+    /// The budget `effort` renders under this table.
+    pub const fn budget(self, effort: ReasoningEffort) -> u8 {
+        match (self, effort) {
+            (_, ReasoningEffort::Budget(budget)) => budget,
+            (_, ReasoningEffort::Max) => 100,
+            (Self::Original, ReasoningEffort::Low) => 25,
+            (Self::Original, ReasoningEffort::High) => 50,
+            (Self::Original, ReasoningEffort::XHigh) => 75,
+            (Self::Rescaled, ReasoningEffort::Low) => 50,
+            (Self::Rescaled, ReasoningEffort::High | ReasoningEffort::XHigh) => 75,
+        }
+    }
+
+    /// Identify the table from the checkpoint's own `encoding/encoding.py`
+    /// source: the budget its `REASONING_EFFORT_MAPPINGS` gives `low`, 25 in
+    /// the first published encoder. Any other value, or no readable mapping,
+    /// is the rescaled table.
+    pub fn detect_from_encoder_source(source: &str) -> Self {
+        const MAPPINGS: &str = "REASONING_EFFORT_MAPPINGS";
+        const LOW: &str = "\"low\"";
+        let Some(mappings) = source.find(MAPPINGS) else {
+            return Self::Rescaled;
+        };
+        let after = &source[mappings + MAPPINGS.len()..];
+        let Some(low) = after.find(LOW) else {
+            return Self::Rescaled;
+        };
+        let Some(value) = after[low + LOW.len()..].trim_start().strip_prefix(':') else {
+            return Self::Rescaled;
+        };
+        let digits: String = value
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        match digits.parse::<u8>() {
+            Ok(25) => Self::Original,
+            _ => Self::Rescaled,
+        }
+    }
+}
+
+/// Reasoning effort for the V4.1 numeric prompt prefix; what each name
+/// renders is the [`EffortTable`]'s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReasoningEffort {
     Low,
@@ -124,18 +186,6 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    /// Spec D1: engine table. Flip these four numbers if the serving engines adopt
-    /// DeepSeek's 50/75/100.
-    pub const fn budget(self) -> u8 {
-        match self {
-            Self::Low => 25,
-            Self::High => 50,
-            Self::XHigh => 75,
-            Self::Max => 100,
-            Self::Budget(n) => n,
-        }
-    }
-
     /// Parse one of [`NATIVE_EFFORT_VALUES`].
     fn from_native(value: &str) -> Option<Self> {
         match value {
@@ -174,16 +224,18 @@ pub fn parse_reasoning_effort(value: &Value) -> Result<Option<ReasoningEffort>, 
 }
 
 /// Mirrors `render_reasoning_effort`: the prefix exists in thinking mode, at
-/// index 0, only.
+/// index 0, only; the budget is `table`'s for the effort, `high`'s when none
+/// was given.
 fn render_reasoning_effort(
     index: usize,
     thinking_mode: ThinkingMode,
     effort: Option<ReasoningEffort>,
+    table: EffortTable,
 ) -> String {
     if index != 0 || thinking_mode != ThinkingMode::Thinking {
         return String::new();
     }
-    let budget = effort.unwrap_or(DEFAULT_REASONING_EFFORT).budget();
+    let budget = table.budget(effort.unwrap_or(DEFAULT_REASONING_EFFORT));
     REASONING_EFFORT_TEMPLATE.replace("{budget}", &budget.to_string())
 }
 
@@ -355,10 +407,11 @@ fn render_message(
     thinking_mode: ThinkingMode,
     drop_thinking: bool,
     reasoning_effort: Option<ReasoningEffort>,
+    effort_table: EffortTable,
 ) -> Result<String, DsEncodingError> {
     let turn = Turn::read(index, messages)?;
     let last_user_idx = find_last_turn_index(messages);
-    let mut prompt = render_prefix(&turn, thinking_mode, reasoning_effort);
+    let mut prompt = render_prefix(&turn, thinking_mode, reasoning_effort, effort_table);
     match turn.role {
         "system" => render_system(&turn, &mut prompt),
         "developer" => render_developer(&turn, &mut prompt)?,
@@ -396,9 +449,10 @@ fn render_prefix(
     turn: &Turn<'_>,
     thinking_mode: ThinkingMode,
     reasoning_effort: Option<ReasoningEffort>,
+    effort_table: EffortTable,
 ) -> String {
     let reasoning_effort_prompt =
-        render_reasoning_effort(turn.index, thinking_mode, reasoning_effort);
+        render_reasoning_effort(turn.index, thinking_mode, reasoning_effort, effort_table);
     let mut prompt = String::new();
     if turn.index == 0 && (!reasoning_effort_prompt.is_empty() || turn.role == "system") {
         prompt.push_str(SYSTEM);
@@ -608,6 +662,8 @@ pub struct EncodeParams {
     pub add_default_bos_token: bool,
     pub drop_thinking: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// The checkpoint revision's effort table (see [`EffortTable`]).
+    pub effort_table: EffortTable,
 }
 impl Default for EncodeParams {
     fn default() -> Self {
@@ -615,6 +671,7 @@ impl Default for EncodeParams {
             add_default_bos_token: true,
             drop_thinking: true,
             reasoning_effort: None,
+            effort_table: EffortTable::Rescaled,
         }
     }
 }
@@ -674,6 +731,7 @@ pub(crate) fn render_messages(
             thinking_mode,
             effective_drop_thinking,
             params.reasoning_effort,
+            params.effort_table,
         )?);
     }
     Ok(prompt)
@@ -696,6 +754,7 @@ mod tests {
             add_default_bos_token: true,
             drop_thinking: true,
             reasoning_effort: effort,
+            effort_table: EffortTable::Rescaled,
         }
     }
 
@@ -709,27 +768,93 @@ mod tests {
     }
 
     #[test]
-    fn thinking_mode_prefixes_effort_line_with_default_50() {
+    fn thinking_mode_prefixes_effort_line_with_the_tables_default() {
+        // No effort given: `high` of the table, 75 under the rescaled one
+        // (what the checkpoint's template writes) and 50 under the original.
         let out = encode_messages(&[user("q")], ThinkingMode::Thinking, &params(None)).unwrap();
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>");
+        let original = EncodeParams {
+            effort_table: EffortTable::Original,
+            ..params(None)
+        };
+        let out = encode_messages(&[user("q")], ThinkingMode::Thinking, &original).unwrap();
         assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>");
     }
 
     #[test]
-    fn effort_tiers_follow_engine_table() {
-        for (tier, n) in [
-            (ReasoningEffort::Low, 25),
-            (ReasoningEffort::High, 50),
-            (ReasoningEffort::XHigh, 75),
-            (ReasoningEffort::Max, 100),
-            (ReasoningEffort::Budget(42), 42),
+    fn effort_tiers_follow_the_checkpoints_table() {
+        // The first published encoder's table and the rescaled one the
+        // checkpoint carries since (its chat template agrees); an integer
+        // budget renders as given under both.
+        for (table, tiers) in [
+            (
+                EffortTable::Original,
+                [
+                    (ReasoningEffort::Low, 25),
+                    (ReasoningEffort::High, 50),
+                    (ReasoningEffort::XHigh, 75),
+                    (ReasoningEffort::Max, 100),
+                    (ReasoningEffort::Budget(42), 42),
+                ],
+            ),
+            (
+                EffortTable::Rescaled,
+                [
+                    (ReasoningEffort::Low, 50),
+                    (ReasoningEffort::High, 75),
+                    (ReasoningEffort::XHigh, 75),
+                    (ReasoningEffort::Max, 100),
+                    (ReasoningEffort::Budget(42), 42),
+                ],
+            ),
         ] {
-            let out =
-                encode_messages(&[user("q")], ThinkingMode::Thinking, &params(Some(tier))).unwrap();
-            assert!(
-                out.contains(&format!("Reasoning Effort: {n} (range")),
-                "{tier:?}"
+            for (tier, n) in tiers {
+                let encode_params = EncodeParams {
+                    effort_table: table,
+                    ..params(Some(tier))
+                };
+                let out =
+                    encode_messages(&[user("q")], ThinkingMode::Thinking, &encode_params).unwrap();
+                assert!(
+                    out.contains(&format!("Reasoning Effort: {n} (range")),
+                    "{table:?} {tier:?}: {out}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn effort_table_detected_from_the_encoders_mapping() {
+        let original = "REASONING_EFFORT_MAPPINGS: Dict[str, int] = {\n    \"low\": 25,\n    \"high\": 50,\n    \"xhigh\": 75,\n    \"max\": 100,\n}\n";
+        let rescaled = "REASONING_EFFORT_MAPPINGS: Dict[str, int] = {\n    \"low\": 50,\n    \"high\": 75,\n    \"max\": 100,\n}\n";
+        assert_eq!(
+            EffortTable::detect_from_encoder_source(original),
+            EffortTable::Original
+        );
+        assert_eq!(
+            EffortTable::detect_from_encoder_source(rescaled),
+            EffortTable::Rescaled
+        );
+        // One-line spelling, and a mention of the name before the mapping.
+        assert_eq!(
+            EffortTable::detect_from_encoder_source(
+                "# see REASONING_EFFORT_MAPPINGS below\nREASONING_EFFORT_MAPPINGS = {\"low\": 25, \"max\": 100}"
+            ),
+            EffortTable::Original
+        );
+        // No mapping, no `low`, or a value that is not a budget: the rescaled table.
+        for source in [
+            "",
+            "REASONING_EFFORT_MAPPINGS = {}",
+            "REASONING_EFFORT_MAPPINGS = {\"low\": x}",
+        ] {
+            assert_eq!(
+                EffortTable::detect_from_encoder_source(source),
+                EffortTable::Rescaled,
+                "{source:?}"
             );
         }
+        assert_eq!(EffortTable::default(), EffortTable::Rescaled);
     }
 
     #[test]
@@ -887,7 +1012,7 @@ mod tests {
             json!({"role": "assistant", "reasoning_content": "r", "content": "Sure,", "wo_eos": true}),
         ];
         let out = encode_messages(&msgs, ThinkingMode::Thinking, &params(None)).unwrap();
-        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>r</think>Sure,");
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>r</think>Sure,");
     }
 
     #[test]
@@ -923,7 +1048,15 @@ mod tests {
     #[test]
     fn bare_tool_role_reaching_render_message_errors() {
         let msgs = [json!({"role": "tool", "content": "x"})];
-        let err = render_message(0, &msgs, ThinkingMode::Chat, true, None).unwrap_err();
+        let err = render_message(
+            0,
+            &msgs,
+            ThinkingMode::Chat,
+            true,
+            None,
+            EffortTable::Rescaled,
+        )
+        .unwrap_err();
         assert!(matches!(err, DsEncodingError::UnmergedToolRole(0)), "{err}");
     }
 
@@ -934,7 +1067,10 @@ mod tests {
         assert!(matches!(err, DsEncodingError::UnknownRole(ref r) if r == "moderator"));
     }
 
-    /// Acceptance oracle: every prompt recorded from the reference encoder.
+    /// Acceptance oracle: every prompt recorded from the reference encoder,
+    /// under the effort table of the revision that recorded it (the file's
+    /// `revision` for the cases without an `encoder_revision` of their own,
+    /// its `current_revision` for the others).
     #[test]
     fn render_fixtures_match_recorded_text() {
         const FIXTURES: &str =
@@ -942,10 +1078,29 @@ mod tests {
 
         let doc: Value = serde_json::from_str(FIXTURES).unwrap();
         let cases = doc["cases"].as_array().unwrap();
-        assert_eq!(cases.len(), 29, "fixture case count");
+        assert_eq!(cases.len(), 32, "fixture case count");
+        let recorded_low = |tiers: &Value| tiers["low"].as_u64().unwrap();
+        let table_of = |tiers: &Value| match recorded_low(tiers) {
+            25 => EffortTable::Original,
+            50 => EffortTable::Rescaled,
+            other => panic!("no effort table gives low a budget of {other}"),
+        };
+        let recorded_table = table_of(&doc["effort_tiers"]);
+        let current_table = table_of(&doc["current_effort_tiers"]);
+        assert_ne!(
+            recorded_table, current_table,
+            "the fixture pins two revisions"
+        );
 
         for case in cases {
             let name = case["name"].as_str().unwrap();
+            let effort_table = match case.get("encoder_revision").and_then(Value::as_str) {
+                None => recorded_table,
+                Some(revision) if Some(revision) == doc["current_revision"].as_str() => {
+                    current_table
+                }
+                Some(revision) => panic!("case {name}: unknown encoder revision {revision}"),
+            };
             let mut messages: Vec<Value> = case["messages"].as_array().unwrap().clone();
 
             // Rule D4, as the generator and the shim's
@@ -977,6 +1132,7 @@ mod tests {
                 add_default_bos_token: true,
                 drop_thinking: case["drop_thinking"].as_bool().unwrap_or(true),
                 reasoning_effort: parse_reasoning_effort(&case["reasoning_effort"]).unwrap(),
+                effort_table,
             };
 
             let out = encode_messages(&messages, thinking_mode, &encode_params).unwrap();

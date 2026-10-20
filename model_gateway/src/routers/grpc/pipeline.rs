@@ -4313,6 +4313,9 @@ mod request_release_tests {
     /// for a recorded multi-turn chat-mode case, and a `continue_final_message`
     /// request keeps its trailing assistant message and renders it the
     /// reference way (no EOS, no generation header) instead of as a prefix.
+    /// The thinking-mode case is the one recorded at the checkpoint's current
+    /// revision: the tokenizer directory here carries no encoder, so the
+    /// renderer writes that revision's effort budget.
     #[tokio::test]
     async fn deepseek_v41_prompt_ids_match_the_reference_through_the_pipeline() {
         let Some(dir) = deepseek_v41_model_dir() else {
@@ -4344,7 +4347,7 @@ mod request_release_tests {
             "hf_2: prompt ids differ from the reference"
         );
 
-        let (case, expected) = v41_fixture("continue_final_message");
+        let (case, expected) = v41_fixture("continue_final_message_current");
         let (status, body, ids, _) = v41_run_chat(
             &dir,
             serde_json::json!({
