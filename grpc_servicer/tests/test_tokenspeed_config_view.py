@@ -123,24 +123,21 @@ def _attn(**kw):
 
 
 @pytest.mark.parametrize(
-    ("field", "mapping", "expected"),
+    ("mapping", "expected"),
     [
-        # The resolved width, read off the mapping where the layout is plain.
-        (None, _attn(tp_size=2, dp_size=1), 2),
-        (2, _attn(tp_size=4, dp_size=1), 4),
-        (None, _attn(tp_size=0), None),
-        # No resolved layout: nothing is read (the engine's own field goes out as is).
-        (2, None, None),
-        (None, None, None),
-        # Attention DP or context parallelism: the attention width is narrower
-        # than the engine's, so nothing is read.
-        (None, _attn(tp_size=2, dp_size=4), None),
-        (None, _attn(tp_size=4, qcp_size=2), None),
-        (None, _attn(tp_size=4, kvp_size=2), None),
+        # SGLang's convention: tp_size is the engine-wide width, every GPU of a
+        # pipeline stage, whatever the attention layout.
+        (_attn(world_size=2, tp_size=2, dp_size=1), 2),
+        (_attn(world_size=8, tp_size=2, dp_size=4), 8),
+        (_attn(world_size=4, tp_size=4, qcp_size=2), 4),
+        (_attn(world_size=4, tp_size=4, kvp_size=2), 4),
+        (_attn(world_size=0), None),
+        (_attn(tp_size=2), None),
+        (None, None),
     ],
 )
-def test_the_tp_width_is_read_off_a_plain_resolved_layout(field, mapping, expected):
-    args = _server_args(attn_tp_size=field)
+def test_the_tp_width_is_the_engines_width(mapping, expected):
+    args = _server_args(attn_tp_size=2)
     args.mapping = mapping
     assert EngineConfigView(args).server_args.tp_size == expected
 

@@ -70,35 +70,37 @@ def test_server_info_reports_the_engines_constrained_decoding_policy(
 
 
 def _advertised_tp(info):
-    return info.server_args["attn_tp_size"] if "attn_tp_size" in info.server_args else None
+    return info.server_args["tp_size"] if "tp_size" in info.server_args else None
 
 
-def test_the_resolved_tp_width_is_advertised_when_the_field_is_unset(
-    tokenspeed_servicer_mod, monkeypatch
+@pytest.mark.parametrize(
+    ("attn", "expected"),
+    [
+        (SimpleNamespace(world_size=2, tp_size=2, dp_size=1), 2),
+        (SimpleNamespace(world_size=8, tp_size=2, dp_size=4), 8),
+    ],
+    ids=["plain", "attention-dp"],
+)
+def test_the_engine_wide_tp_width_is_advertised(
+    tokenspeed_servicer_mod, monkeypatch, attn, expected
 ):
-    # TokenSpeed keeps the resolved width on ``mapping``; the gateway reads
-    # ``attn_tp_size`` as the worker's ``tp_size``.
+    info = _server_info(
+        tokenspeed_servicer_mod, monkeypatch, attn_tp_size=None, mapping=SimpleNamespace(attn=attn)
+    )
+    assert _advertised_tp(info) == expected
+
+
+def test_the_resolved_attention_width_is_advertised_beside_it(tokenspeed_servicer_mod, monkeypatch):
     info = _server_info(
         tokenspeed_servicer_mod,
         monkeypatch,
         attn_tp_size=None,
-        mapping=SimpleNamespace(attn=SimpleNamespace(tp_size=2, dp_size=1)),
+        mapping=SimpleNamespace(attn=SimpleNamespace(world_size=8, tp_size=2, dp_size=4)),
     )
-    assert _advertised_tp(info) == 2
+    assert (_advertised_tp(info), info.server_args["attn_tp_size"]) == (8, 2)
 
 
-def test_no_tp_width_is_advertised_when_the_engine_gives_none(tokenspeed_servicer_mod, monkeypatch):
-    info = _server_info(tokenspeed_servicer_mod, monkeypatch, attn_tp_size=None)
+def test_no_tp_width_is_advertised_without_a_resolved_layout(tokenspeed_servicer_mod, monkeypatch):
+    info = _server_info(tokenspeed_servicer_mod, monkeypatch, attn_tp_size=2)
     assert _advertised_tp(info) is None
-
-
-@pytest.mark.parametrize(
-    "mapping",
-    [None, SimpleNamespace(attn=SimpleNamespace(tp_size=2, dp_size=4))],
-    ids=["no-resolved-layout", "attention-dp"],
-)
-def test_the_engines_own_field_goes_out_as_is_where_the_layout_is_not_plain(
-    tokenspeed_servicer_mod, monkeypatch, mapping
-):
-    info = _server_info(tokenspeed_servicer_mod, monkeypatch, attn_tp_size=2, mapping=mapping)
-    assert _advertised_tp(info) == 2
+    assert info.server_args["attn_tp_size"] == 2

@@ -980,9 +980,10 @@ const SGLANG_GRPC_KEYS: &[&str] = &[
 
 /// Keys worth extracting from TokenSpeed gRPC `server_args` (post-rename: bare
 /// names, not `_path` variants — TokenSpeed dropped the legacy suffixes).
-/// TokenSpeed spells its parallelism `attn_tp_size` / `pipeline_parallel_size`
-/// / `data_parallel_size`; `normalize_grpc_keys` folds those into the
-/// canonical `tp_size` / `pp_size` / `dp_size`.
+/// TokenSpeed's servicer advertises the engine-wide `tp_size` (SGLang's
+/// convention) and the attention width as its own `attn_tp_size`;
+/// `normalize_grpc_keys` folds `pipeline_parallel_size` / `data_parallel_size`
+/// into the canonical `pp_size` / `dp_size`.
 const TOKENSPEED_GRPC_KEYS: &[&str] = &[
     "model",
     "served_model_name",
