@@ -3648,10 +3648,14 @@ mod tests {
     }
 
     /// Build a ZMQ worker whose sockets no engine will ever dial, plus the
-    /// data-plane socket path its handshake driver binds.
+    /// data-plane socket path its handshake driver binds. The handshake takes
+    /// an OS-assigned loopback port: the port derived from a temporary ipc
+    /// path is a hash into a band other listeners on the host may hold, and a
+    /// collision there fails the bind these tests wait for.
     fn unattended_zmq_worker(dir: &std::path::Path) -> (BasicWorker, std::path::PathBuf) {
         let worker = BasicWorkerBuilder::new(format!("ipc://{}", dir.join("ts0.ipc").display()))
             .connection_mode(ConnectionMode::Zmq)
+            .zmq_handshake_address("tcp://127.0.0.1:0")
             .health_config(no_health_check())
             .build();
         (worker, dir.join("ts0.ipc-in.sock"))
