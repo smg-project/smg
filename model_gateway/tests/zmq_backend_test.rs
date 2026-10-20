@@ -26,8 +26,8 @@ use portpicker::pick_unused_port;
 use serial_test::serial;
 use smg::{
     middleware::{RouteRequestMeta, TenantKey},
-    routers::RouterTrait,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
+    routers::{grpc::backend_client::BackendClient, RouterTrait},
+    worker::{BasicWorker, BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
 };
 
 const MODEL: &str = "zmq-backend-test-model";
@@ -64,11 +64,18 @@ fn zmq_fixture() -> ZmqFixture {
 
 /// Spawn `count` mock EngineCore ranks dialing `handshake`, canned mode.
 /// Each rank runs until the test process exits.
+fn start_mock_zmq_engines(handshake: &str, count: u16) {
+    start_mock_zmq_engines_with_delay(handshake, count, Duration::ZERO);
+}
+
+/// [`start_mock_zmq_engines`] with `gen_delay` ahead of every canned token:
+/// an engine that holds a request's first token for that long is silent on
+/// its stream from the dispatch on.
 #[expect(
     clippy::disallowed_methods,
     reason = "test helper - the mock engine tasks are fire-and-forget for the test process's lifetime"
 )]
-fn start_mock_zmq_engines(handshake: &str, count: u16) {
+fn start_mock_zmq_engines_with_delay(handshake: &str, count: u16, gen_delay: Duration) {
     let cfg = Arc::new(mock_worker::config::Config {
         admin_port: None,
         context_length: 32768,
@@ -82,7 +89,7 @@ fn start_mock_zmq_engines(handshake: &str, count: u16) {
         zmq_start_index: 0,
         model_id: MODEL.to_string(),
         tokenizer_path: MODEL.to_string(),
-        gen_delay: Duration::ZERO,
+        gen_delay,
         output_tokens: OUTPUT_TOKENS,
         realistic: false,
         engine: mock_worker::engine::EngineParams::default(),
@@ -101,14 +108,30 @@ fn start_mock_zmq_engines(handshake: &str, count: u16) {
 /// against `fixture`. `engine_count > 1` registers a grouped worker: one
 /// worker, one socket set, N engines dialing in.
 async fn build_router(fixture: &ZmqFixture, engine_count: usize) -> Box<dyn RouterTrait> {
+    build_router_with(fixture, engine_count, Duration::from_secs(60))
+        .await
+        .0
+}
+
+/// [`build_router`] under `request_timeout` (`--request-timeout-secs`), the
+/// bound the registration step hands the ZMQ worker's link from the router
+/// config; here the worker is built directly, so the test hands it over. The
+/// retry layer is off: one attempt answers the client. The worker comes back
+/// with the router, for a look at its load and its link.
+async fn build_router_with(
+    fixture: &ZmqFixture,
+    engine_count: usize,
+    request_timeout: Duration,
+) -> (Box<dyn RouterTrait>, Arc<BasicWorker>) {
     let config = grpc_router_config()
         .regular_mode(vec![])
         .random_policy()
-        .request_timeout_secs(60)
+        .request_timeout_secs(request_timeout.as_secs())
         .worker_startup_timeout_secs(5)
         .worker_startup_check_interval_secs(1)
         .max_concurrent_requests(64)
         .queue_timeout_secs(60)
+        .disable_retries()
         .build_unchecked();
 
     let mut builder = BasicWorkerBuilder::new(fixture.worker_url.clone())
@@ -116,6 +139,7 @@ async fn build_router(fixture: &ZmqFixture, engine_count: usize) -> Box<dyn Rout
         .connection_mode(ConnectionMode::Zmq)
         .runtime_type(RuntimeType::Vllm)
         .zmq_handshake_address(fixture.handshake.clone())
+        .zmq_request_timeout(request_timeout)
         .model(ModelCard::new(MODEL))
         .health_config(health_checks_off());
     if engine_count > 1 {
@@ -136,7 +160,49 @@ async fn build_router(fixture: &ZmqFixture, engine_count: usize) -> Box<dyn Rout
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    router
+    (router, worker)
+}
+
+/// The worker idle again after a request the gateway cut, within a short
+/// grace for the detached release: its load back at zero (the gateway's
+/// slot), and its ZMQ link's in-flight accounting released (the engine
+/// request retired by the abort the cut sent).
+#[expect(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test helper - panicking on failure is intentional"
+)]
+#[expect(
+    clippy::print_stderr,
+    reason = "the worker's state after the cut is the test's report"
+)]
+async fn expect_worker_idle(worker: &Arc<BasicWorker>, what: &str) {
+    let settled = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let link = worker
+            .get_backend_client()
+            .await
+            .ok()
+            .flatten()
+            .expect("the worker's link is up");
+        let BackendClient::Zmq(zmq) = link.as_ref() else {
+            panic!("the worker under test is a ZMQ worker");
+        };
+        let (load, pending, in_flight) = (
+            worker.load(),
+            zmq.prefill_pending_tokens(),
+            zmq.output_silence(),
+        );
+        if load == 0 && pending == 0 && in_flight.is_none() {
+            eprintln!("{what}: worker load {load}, prefill pending {pending} tokens, requests in flight on the link: none");
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < settled,
+            "{what}: the worker is not idle: load {load}, prefill pending {pending}, in flight for {in_flight:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[expect(
@@ -261,4 +327,86 @@ async fn grouped_zmq_worker_serves_requests_from_either_rank() {
             .await;
         assert_eq!(response.status(), http::StatusCode::OK);
     }
+}
+
+/// An engine that goes silent on a request (here: one that holds the first
+/// token well past the bound) no longer keeps the client waiting: the
+/// gateway ends the request at `--request-timeout-secs` counted from its
+/// dispatch, as it ends one to an HTTP worker. A streamed response ends with
+/// the `stream_error` event naming the timeout, then `[DONE]`; a non-streamed
+/// one is the 504 under `worker_stream_failed`. Either way the engine request
+/// is aborted at the cut, not when the engine would have answered.
+#[tokio::test]
+#[serial]
+#[expect(
+    clippy::print_stderr,
+    reason = "the measured times to the cut are the test's report"
+)]
+async fn a_silent_zmq_engine_ends_the_request_at_the_request_timeout() {
+    const REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+    // The mock holds every first token this long: longer than both requests
+    // below take to be cut, so an answer never arrives in time.
+    const FIRST_TOKEN_AFTER: Duration = Duration::from_secs(20);
+    let fixture = zmq_fixture();
+    start_mock_zmq_engines_with_delay(&fixture.handshake, 1, FIRST_TOKEN_AFTER);
+    let (router, worker) = build_router_with(&fixture, 1, REQUEST_TIMEOUT).await;
+
+    let dispatched = tokio::time::Instant::now();
+    let response = router
+        .route_generate(None, &test_meta(), generate_request(true), MODEL)
+        .await;
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+    let cut_after = dispatched.elapsed();
+    let text = String::from_utf8(body.to_vec()).expect("utf8 sse body");
+    assert!(
+        text.contains("\"type\":\"stream_error\"")
+            && text.contains("Stream error: request timed out after 1s"),
+        "the stream ends with the timeout's error event: {text}"
+    );
+    assert!(
+        text.trim_end().ends_with("data: [DONE]"),
+        "the error event is followed by [DONE]: {text}"
+    );
+    assert!(
+        text.matches("\"finish_reason\":null").count() == 0,
+        "no token reached the client before the cut: {text}"
+    );
+    assert!(
+        cut_after >= REQUEST_TIMEOUT && cut_after < FIRST_TOKEN_AFTER / 2,
+        "the stream ended {cut_after:?} after its dispatch, at the {REQUEST_TIMEOUT:?} bound"
+    );
+    eprintln!("streamed: the error event and [DONE] {cut_after:?} after the dispatch");
+    expect_worker_idle(&worker, "streamed, after the cut").await;
+
+    let dispatched = tokio::time::Instant::now();
+    let response = router
+        .route_generate(None, &test_meta(), generate_request(false), MODEL)
+        .await;
+    let cut_after = dispatched.elapsed();
+    assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+    assert_eq!(
+        json.pointer("/error/code")
+            .and_then(serde_json::Value::as_str),
+        Some("worker_stream_failed"),
+        "{json}"
+    );
+    assert!(
+        json.pointer("/error/message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| message.contains("request timed out after 1s")),
+        "{json}"
+    );
+    assert!(
+        cut_after >= REQUEST_TIMEOUT && cut_after < FIRST_TOKEN_AFTER / 2,
+        "the answer came {cut_after:?} after its dispatch, at the {REQUEST_TIMEOUT:?} bound"
+    );
+    eprintln!("non-streamed: the 504 {cut_after:?} after the dispatch");
+    expect_worker_idle(&worker, "non-streamed, after the cut").await;
 }

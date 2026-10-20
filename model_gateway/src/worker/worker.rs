@@ -115,6 +115,7 @@ async fn connect_zmq_backend(
     handshake_override: Option<String>,
     engine_count: usize,
     startup: Duration,
+    request_timeout: Option<Duration>,
 ) -> WorkerResult<Arc<BackendClient>> {
     zmq_client::connect_for_worker(
         &base_url,
@@ -123,6 +124,7 @@ async fn connect_zmq_backend(
         handshake_override.as_deref(),
         engine_count,
         startup,
+        request_timeout,
     )
     .await
     .map(|client| Arc::new(BackendClient::Zmq(client)))
@@ -1231,6 +1233,13 @@ pub struct WorkerMetadata {
     /// silent (from router config); it alone covers the engine's init between
     /// its HELLO and its READY, which the gateway sees nothing of otherwise.
     pub zmq_startup_timeout: Duration,
+    /// The bound on a request over the worker's ZMQ link, from its dispatch
+    /// to its last message (resolved at registration as the HTTP worker
+    /// client's per-request timeout is: the worker's own
+    /// `http_pool.timeout_secs`, else the router's `request_timeout_secs`);
+    /// `None` leaves the link's streams open for as long as the client reads
+    /// them.
+    pub zmq_request_timeout: Option<Duration>,
     /// Effective absolute overload thresholds (per signal: `spec.overload`
     /// override, else gateway default). Resolved once at registration; the
     /// load monitor's ingestion predicate scores every report against these,
@@ -1545,6 +1554,7 @@ impl BasicWorker {
         let handshake_override = self.metadata.spec.zmq_handshake_address.clone();
         let engine_count = self.metadata.zmq_engine_count();
         let startup = self.metadata.zmq_startup_timeout;
+        let request_timeout = self.metadata.zmq_request_timeout;
         // Capture the readiness signal and the revision at hand-off. The
         // manager only promotes if this revision still matches, so a
         // same-URL replacement racing the handshake is discarded.
@@ -1566,6 +1576,7 @@ impl BasicWorker {
                         handshake_override,
                         engine_count,
                         startup,
+                        request_timeout,
                     )
                 })
                 .await
@@ -3474,6 +3485,7 @@ mod tests {
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
             zmq_startup_timeout: Duration::from_secs(600),
+            zmq_request_timeout: None,
             overload: OverloadThresholds::default(),
             http2: false,
             discovered_labels: Arc::default(),
@@ -3502,6 +3514,7 @@ mod tests {
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
             zmq_startup_timeout: Duration::from_secs(600),
+            zmq_request_timeout: None,
             overload: OverloadThresholds::default(),
             http2: false,
             discovered_labels: Arc::default(),

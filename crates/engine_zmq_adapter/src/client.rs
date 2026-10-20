@@ -36,7 +36,7 @@ use crate::{
         SglangProfileStart,
     },
     sockets::{ensure_ipc_socket_dir, zmq_socket_addresses, Handshake},
-    stream::ZmqGenerateStream,
+    stream::{RequestDeadline, ZmqGenerateStream},
     tokenspeed::{
         fan_out_tokenspeed_requests, translate_request_tokenspeed_for, GridTensors,
         TokenSpeedGenerateStream,
@@ -109,6 +109,11 @@ pub(crate) struct ZmqConnectionMeta {
     /// The engine's supported tasks (`get_supported_tasks`), fetched on first
     /// use and kept for the connection, as vLLM's frontend keeps them.
     supported_tasks: tokio::sync::OnceCell<Arc<[String]>>,
+    /// The bound on every generate request this connection opens, from its
+    /// dispatch to its last message, set once by the caller that knows it
+    /// (see [`ZmqEngineClient::set_request_timeout`]); unset leaves the
+    /// streams unbounded.
+    request_timeout: OnceLock<Duration>,
 }
 
 /// Bind the SMG-side ZMQ sockets and complete the handshake with the
@@ -120,8 +125,12 @@ pub(crate) struct ZmqConnectionMeta {
 /// (an engine's HELLO, its READY, its registration on the input socket) may
 /// stay silent: the gateway did not launch the engine and sees no sign of
 /// life from it beside the wire, so this bound alone must cover the engine's
-/// init between its HELLO and its READY. Errors are plain reasons; the worker
-/// layer wraps them in its own error type.
+/// init between its HELLO and its READY. `request_timeout` is the gateway's
+/// bound on a request to a worker (`--request-timeout-secs`), which every
+/// generate stream this connection opens ends at, counted from its dispatch
+/// (see [`ZmqEngineClient::set_request_timeout`]); `None` leaves the
+/// streams unbounded. Errors are plain reasons; the worker layer wraps them
+/// in its own error type.
 pub async fn connect_for_worker(
     base_url: &str,
     model_id: String,
@@ -129,6 +138,7 @@ pub async fn connect_for_worker(
     handshake_override: Option<&str>,
     engine_count: usize,
     startup: Duration,
+    request_timeout: Option<Duration>,
 ) -> Result<ZmqEngineClient, String> {
     // The engine can't stop at EOS on its own (it has no tokenizer or model
     // config); resolve the EOS ids from the local model dir so every request
@@ -147,7 +157,7 @@ pub async fn connect_for_worker(
         );
         EosTokenIds::default()
     };
-    connect_with_eos(
+    let client = connect_with_eos(
         base_url,
         model_id,
         runtime,
@@ -156,7 +166,11 @@ pub async fn connect_for_worker(
         eos,
         startup,
     )
-    .await
+    .await?;
+    if let Some(timeout) = request_timeout {
+        client.set_request_timeout(timeout);
+    }
+    Ok(client)
 }
 
 /// [`connect_for_worker`] with the EOS set supplied by the caller: bind the
@@ -298,6 +312,7 @@ impl ZmqEngineClient {
                 tokenizer_eos: OnceLock::new(),
                 structured_outputs_backend: OnceLock::new(),
                 supported_tasks: tokio::sync::OnceCell::new(),
+                request_timeout: OnceLock::new(),
             }),
         })
     }
@@ -330,6 +345,30 @@ impl ZmqEngineClient {
     /// the engine's `auto`: xgrammar on every request.
     pub fn set_structured_outputs_backend(&self, config: StructuredOutputsBackendConfig) {
         let _ = self.meta.structured_outputs_backend.set(config);
+    }
+
+    /// Bound every generate request this connection opens from here on by
+    /// `timeout`, counted from the request's dispatch over the call that
+    /// opens its stream and over every message on it: a merged stream
+    /// ([`ZmqGenerateStream`]) still waiting on the engine at the deadline
+    /// ends there with a `DEADLINE_EXCEEDED` and its engine-side requests
+    /// are aborted, as a dropped stream's are.
+    /// The gateway's worker link sets its `--request-timeout-secs` here, the
+    /// bound its HTTP worker client carries; a connection nobody bounds
+    /// (a servicer's own link, whose caller bounds the gRPC call) leaves its
+    /// streams open for as long as the caller reads them. Set once: a later
+    /// call changes nothing.
+    pub fn set_request_timeout(&self, timeout: Duration) {
+        let _ = self.meta.request_timeout.set(timeout);
+    }
+
+    /// The deadline of a generate request dispatched now, when the
+    /// connection bounds its requests (see [`Self::set_request_timeout`]).
+    fn request_deadline(&self) -> Option<RequestDeadline> {
+        self.meta
+            .request_timeout
+            .get()
+            .map(|timeout| RequestDeadline::after(*timeout))
     }
 
     /// The tasks the engine's model runner serves (vLLM's
@@ -651,11 +690,13 @@ impl ZmqEngineClient {
                 "TokenSpeed ZMQ backend expects a TokenSpeed generate request",
             ));
         }
+        // The deadline counts from the dispatch: before the submits.
+        let deadline = self.request_deadline();
         let mut streams = SelectAll::new();
         for stream in self.generate_vllm_streams(req).await? {
             streams.push(stream);
         }
-        Ok(ZmqGenerateStream::Vllm(streams))
+        Ok(ZmqGenerateStream::vllm(streams).with_deadline(deadline))
     }
 
     /// [`Self::generate_vllm`] for a TokenSpeed backend and request.
@@ -663,11 +704,12 @@ impl ZmqEngineClient {
         &self,
         req: tokenspeed_proto::GenerateRequest,
     ) -> Result<ZmqGenerateStream, tonic::Status> {
+        let deadline = self.request_deadline();
         let mut streams = SelectAll::new();
         for stream in self.generate_tokenspeed_streams(req).await? {
             streams.push(stream);
         }
-        Ok(ZmqGenerateStream::TokenSpeed(streams))
+        Ok(ZmqGenerateStream::tokenspeed(streams).with_deadline(deadline))
     }
 
     /// [`Self::generate_vllm_streams`] for a TokenSpeed backend: the `n > 1`
@@ -725,11 +767,12 @@ impl ZmqEngineClient {
                 "selected-token logprobs require the SGLang gRPC servicer",
             ));
         }
+        let deadline = self.request_deadline();
         let mut streams = SelectAll::new();
         for stream in self.generate_sglang_streams(req).await? {
             streams.push(stream);
         }
-        Ok(ZmqGenerateStream::Sglang(streams))
+        Ok(ZmqGenerateStream::sglang(streams).with_deadline(deadline))
     }
 
     /// [`Self::generate_tokenspeed_streams`] for an SGLang backend: the

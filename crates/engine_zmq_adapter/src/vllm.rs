@@ -123,6 +123,11 @@ impl VllmGenerateStream {
         self.index
     }
 
+    /// The engine-side id of this choice's request.
+    pub fn request_id(&self) -> &str {
+        self.inner.request_id()
+    }
+
     /// The data-parallel rank this choice's engine request went to; `None`
     /// for an engine whose identity names no index.
     pub fn engine_index(&self) -> Option<u32> {

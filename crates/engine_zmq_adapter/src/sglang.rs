@@ -70,6 +70,11 @@ impl SglangGenerateStream {
         self.reasoning_tokens
     }
 
+    /// The engine-side id of this choice's request.
+    pub fn request_id(&self) -> &str {
+        self.inner.request_id()
+    }
+
     /// Convert a stream item without discarding SGLang-only score rows.
     pub fn to_sglang_response(
         &self,

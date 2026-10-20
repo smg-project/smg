@@ -77,6 +77,7 @@ impl GrpcWorker {
             // The binding's workers speak gRPC and never run the ZMQ startup handshake:
             // the bound is the router's default, and nothing reads it here.
             zmq_startup_timeout: Duration::from_secs(DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS),
+            zmq_request_timeout: None,
             http2: false,
         };
         Self {

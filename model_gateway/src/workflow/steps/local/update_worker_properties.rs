@@ -297,6 +297,12 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
             if let Some(config) = circuit_breaker_config {
                 builder = builder.circuit_breaker_config(config);
             }
+            // The ZMQ link's request bound, resolved at registration (the
+            // worker's own pool timeout, else the router's), is kept across the
+            // rebuild as the handshake bound is.
+            if let Some(timeout) = worker.metadata().zmq_request_timeout {
+                builder = builder.zmq_request_timeout(timeout);
+            }
             if refresh {
                 // A connector or role the operator configured none of follows
                 // the engine's report; a configured one stands, as at

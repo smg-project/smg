@@ -38,6 +38,11 @@ pub struct BasicWorkerBuilder {
     /// The per-stage silence bound of a ZMQ engine's startup handshake; the
     /// router config's default when not set.
     zmq_startup_timeout: Option<Duration>,
+    /// The bound on a request over the worker's ZMQ link, from its dispatch
+    /// to its last message (the worker's own `http_pool.timeout_secs`, else
+    /// the router config's `request_timeout_secs`, as the registration step
+    /// resolves it); the link's streams are unbounded when not set.
+    zmq_request_timeout: Option<Duration>,
     circuit_breaker_config: CircuitBreakerConfig,
     backend_client: Option<BackendClient>,
     /// Pre-built worker-directed HTTP client (if not set, a default is created).
@@ -77,6 +82,7 @@ impl BasicWorkerBuilder {
             health_config: None,
             health_endpoint: "/health".to_string(),
             zmq_startup_timeout: None,
+            zmq_request_timeout: None,
             circuit_breaker_config: CircuitBreakerConfig::default(),
             backend_client: None,
             http_client: None,
@@ -179,6 +185,18 @@ impl BasicWorkerBuilder {
     /// engine's init between its HELLO and its READY.
     pub fn zmq_startup_timeout(mut self, timeout: Duration) -> Self {
         self.zmq_startup_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the bound on a request over the worker's ZMQ link, from its
+    /// dispatch to its last message (internal-only: the registration step
+    /// resolves it as the HTTP worker client resolves its per-request
+    /// timeout, the worker's own `http_pool.timeout_secs` else the router's
+    /// `--request-timeout-secs`): a stream the engine leaves silent ends at
+    /// it with the gateway's timeout and the engine request is aborted. Unset
+    /// leaves the link's streams open for as long as the client reads them.
+    pub fn zmq_request_timeout(mut self, timeout: Duration) -> Self {
+        self.zmq_request_timeout = Some(timeout);
         self
     }
 
@@ -335,6 +353,7 @@ impl BasicWorkerBuilder {
             zmq_startup_timeout: self
                 .zmq_startup_timeout
                 .unwrap_or(Duration::from_secs(DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS)),
+            zmq_request_timeout: self.zmq_request_timeout,
             http2: self.http2,
             discovered_labels: Arc::new(self.discovered_labels),
         };
@@ -559,6 +578,24 @@ mod tests {
             worker.metadata().spec.zmq_handshake_address.as_deref(),
             Some("tcp://127.0.0.1:30500")
         );
+    }
+
+    /// The connect driver reads the request bound from the built worker's
+    /// metadata; a builder that sets none leaves the link's streams unbounded.
+    #[test]
+    fn zmq_request_timeout_reaches_the_built_metadata() {
+        let bounded = BasicWorkerBuilder::new("ipc:///tmp/w.ipc")
+            .connection_mode(ConnectionMode::Zmq)
+            .zmq_request_timeout(Duration::from_secs(90))
+            .build();
+        assert_eq!(
+            bounded.metadata().zmq_request_timeout,
+            Some(Duration::from_secs(90))
+        );
+        let unbounded = BasicWorkerBuilder::new("ipc:///tmp/w2.ipc")
+            .connection_mode(ConnectionMode::Zmq)
+            .build();
+        assert_eq!(unbounded.metadata().zmq_request_timeout, None);
     }
 
     #[test]
