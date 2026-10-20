@@ -406,11 +406,15 @@ render no tool call at all. What the table says beyond the others:
   none before `[TOOL_CALLS]`; the table reads the space as the model's bytes, as the v13 table
   reads what its template writes around the content, and the module tests expect it. Whether
   the family's own tokenizer shows that space to a client is for the live reading to say.
-- **A forced call is the list behind the marker, with no end.** `Format::grammar` writes one tag:
-  `[TOOL_CALLS]`, the list of the tools' calls as Llama Nemotron's tag holds it, and nothing after
-  it, as the template writes nothing and the turn ends the region (the v13 table's tags end the
-  same way). A list with no marker is content to this table, so the tag never writes one; the
-  `id` the template writes after each call's arguments is left to the model.
+- **A forced call is the list behind the marker, its own `]` the end.** `Format::grammar` writes
+  one tag: `[TOOL_CALLS]`, the list of the tools' calls as Llama Nemotron's tag holds it, and the
+  list's closing `]` as the tag's end, since the template writes nothing after the list and the
+  turn ends the region. The `]` is the end rather than the content's last byte because the
+  engines' structural-tag parsers refuse a content that may grow without bound (the further
+  calls) behind an empty end (`Grammar::check` holds every table's tag to that rule); the v13
+  table's tags, one JSON object each, end with nothing. A list with no marker is content to this
+  table, so the tag never writes one; the `id` the template writes after each call's arguments is
+  left to the model.
 
 What the table leaves open: the live reading on an engine (owed with the family's weights);
 Magistral Small 2506, whose recommended system prompt has the model write its thought as plain

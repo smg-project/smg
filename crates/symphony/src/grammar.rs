@@ -199,6 +199,72 @@ impl Grammar {
             }
         }
     }
+
+    /// The rule the engines' structural-tag parsers hold a tag to before they compile it, checked
+    /// here so a table's tag never leaves the gateway to be refused: a tag whose content may grow
+    /// without bound ([`Self::unbounded`]) ends with a text, since nothing else tells the parser
+    /// where the tag stops and the free text or the next tag begins (xgrammar's analyzer: "When
+    /// the content is unlimited, at least one end string must be non-empty"). `Err` names the
+    /// tag's begin.
+    pub fn check(&self) -> Result<(), String> {
+        match self {
+            Self::ConstString(_)
+            | Self::AnyText { .. }
+            | Self::Regex(_)
+            | Self::JsonSchema { .. }
+            | Self::Ebnf(_)
+            | Self::Token(_) => Ok(()),
+            Self::Sequence(elements) | Self::Or(elements) => {
+                elements.iter().try_for_each(Self::check)
+            }
+            Self::Optional(content) | Self::Star(content) | Self::Plus(content) => content.check(),
+            Self::Tag(tag) => tag.check(),
+            Self::TriggeredTags { tags, .. } | Self::TagsWithSeparator { tags, .. } => {
+                tags.iter().try_for_each(Tag::check)
+            }
+        }
+    }
+
+    /// Whether the grammar may match text of any length, as the engines' parsers count it: free
+    /// text, a repetition, tags with free text between or around them; a sequence or a choice
+    /// with such an element; not a JSON value, a regular expression or an EBNF grammar, which
+    /// the parsers take as bounded whatever they accept.
+    fn unbounded(&self) -> bool {
+        match self {
+            Self::AnyText { .. }
+            | Self::Star(_)
+            | Self::Plus(_)
+            | Self::TriggeredTags { .. }
+            | Self::TagsWithSeparator { .. } => true,
+            Self::Sequence(elements) | Self::Or(elements) => elements.iter().any(Self::unbounded),
+            Self::Optional(content) => content.unbounded(),
+            Self::ConstString(_)
+            | Self::Regex(_)
+            | Self::JsonSchema { .. }
+            | Self::Ebnf(_)
+            | Self::Token(_)
+            | Self::Tag(_) => false,
+        }
+    }
+}
+
+impl Tag {
+    /// [`Grammar::check`] for one tag: its content checked, and an end with a text when the
+    /// content is unbounded.
+    fn check(&self) -> Result<(), String> {
+        self.content.check()?;
+        let ended = match &self.end {
+            Bound::Text(text) => !text.is_empty(),
+            Bound::Texts(texts) => texts.iter().any(|text| !text.is_empty()),
+        };
+        if self.content.unbounded() && !ended {
+            return Err(format!(
+                "the tag that begins with {:?} has a content of any length and no end to stop it",
+                self.begin
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// A grammar under `format`, as a request carries it.
@@ -714,7 +780,7 @@ impl Format {
             // has no thought: the list is the same either way; a call alone (`json`) is forced as
             // the list, as the gateway's older `json` parser forces it. Between markers (Llama
             // Nemotron) the list is one tag's content, and the thought takes the prefix; behind
-            // one marker the turn ends (the Mistral list) it is one tag that ends with nothing.
+            // one marker the turn ends (the Mistral list) it is one tag its own `]` ends.
             CallSyntax::JsonList | CallSyntax::JsonAlone(_) => match markers {
                 None => match self.opened_list_markers() {
                     Some(opened) => (json::list_tag(&opened, &named, count), true),
@@ -1321,10 +1387,10 @@ impl Format {
     }
 
     /// The markers of a list a marker opens and the turn ends, the Mistral list behind
-    /// `[TOOL_CALLS]`: no row closes the arguments state, so [`Self::region`] names no region, and
-    /// the tag ends with nothing, as the v13 table's do. `None` for a list that stands alone in the
-    /// turn (xLAM's, `json`'s), which no row enters: a tag for it would write a marker the table
-    /// never reads.
+    /// `[TOOL_CALLS]`: no row closes the arguments state, so [`Self::region`] names no region, the
+    /// close is empty, and the list's own `]` ends the tag ([`json::list_tag`]). `None` for a list
+    /// that stands alone in the turn (xLAM's, `json`'s), which no row enters: a tag for it would
+    /// write a marker the table never reads.
     fn opened_list_markers(&self) -> Option<CallMarkers<'_>> {
         let arguments = self.state_emitting(Emits::Arguments)?;
         let (_, open, _) = self
@@ -2462,21 +2528,29 @@ mod tests {
     }
 
     #[test]
-    fn mistral_list_derives_one_tag_behind_the_marker_with_no_end() {
+    fn mistral_list_derives_one_tag_behind_the_marker_that_its_own_bracket_ends() {
         // The Mistral list: `[TOOL_CALLS]` opens the region and the turn ends it, so the tag is
-        // the marker, xLAM's list of the tools' calls, and an empty end, as the v13 table's tags
-        // end with nothing. A bare list would be content to this table, which starts in content.
+        // the marker, xLAM's list of the tools' calls, and the list's own `]` as the end: the
+        // further calls make the content unbounded, and the engines refuse an unbounded content
+        // behind an empty end (`Grammar::check`). A bare list would be content to this table,
+        // which starts in content.
         let tools = weather_tools();
-        let payload = formats::mistral()
+        let grammar = formats::mistral()
             .grammar(&tools, true, false)
-            .expect("a grammar")
-            .payload();
-        let list = formats::xlam()
+            .expect("a grammar");
+        grammar.check().expect("a tag the engines take");
+        let mut list = formats::xlam()
             .grammar(&tools, true, false)
             .expect("a grammar")
             .to_json();
+        let bracket = list["elements"]
+            .as_array_mut()
+            .expect("the list's elements")
+            .pop()
+            .expect("the list's close");
+        assert_eq!(bracket, value!({"type": "const_string", "value": "]"}));
         assert_eq!(
-            payload,
+            grammar.payload(),
             value!({"format": {
                 "type": "triggered_tags",
                 "triggers": ["[TOOL_CALLS]"],
@@ -2484,11 +2558,77 @@ mod tests {
                     "type": "tag",
                     "begin": "[TOOL_CALLS]",
                     "content": list,
-                    "end": "",
+                    "end": "]",
                 }],
                 "at_least_one": true,
             }})
         );
+        // One call: no further calls, so the content is bounded, and the `]` still ends the tag.
+        let one = formats::mistral()
+            .grammar_for(
+                &tools,
+                Options {
+                    at_least_one: true,
+                    one_call: true,
+                    ..Options::default()
+                },
+            )
+            .expect("a grammar");
+        one.check().expect("a tag the engines take");
+        assert_eq!(one.payload()["format"]["tags"][0]["end"], value!("]"));
+        assert_eq!(one.payload()["format"]["stop_after_first"], value!(true));
+    }
+
+    #[test]
+    fn a_tag_whose_content_may_grow_without_bound_needs_an_end() {
+        // The engines' rule: an unbounded content (a repetition, free text, tags) behind an empty
+        // end is refused; a bounded one (a JSON value, the v13 table's tags) may end with nothing.
+        let object = Grammar::JsonSchema {
+            schema: value!({"type": "object"}),
+            style: None,
+            excludes: Vec::new(),
+            whitespace: Whitespace::Free,
+        };
+        let grows = Grammar::Sequence(vec![
+            Grammar::ConstString("[".to_string()),
+            Grammar::Star(Box::new(object.clone())),
+        ]);
+        let tagged = |content: Grammar, end: Bound| Grammar::TriggeredTags {
+            triggers: vec!["<c>".to_string()],
+            tags: vec![Tag::bounded("<c>", content, end)],
+            at_least_one: true,
+            stop_after_first: false,
+        };
+        assert_eq!(
+            tagged(grows.clone(), Bound::Text(String::new())).check(),
+            Err("the tag that begins with \"<c>\" has a content of any length and no end to stop it"
+                .to_string())
+        );
+        assert_eq!(
+            tagged(grows.clone(), Bound::Texts(vec![String::new(), String::new()])).check(),
+            Err("the tag that begins with \"<c>\" has a content of any length and no end to stop it"
+                .to_string())
+        );
+        assert_eq!(
+            tagged(grows.clone(), Bound::Text("]".to_string())).check(),
+            Ok(())
+        );
+        assert_eq!(
+            tagged(grows, Bound::Texts(vec![String::new(), "]".to_string()])).check(),
+            Ok(())
+        );
+        assert_eq!(tagged(object, Bound::Text(String::new())).check(), Ok(()));
+        // The rule reaches a tag inside another's content.
+        let inner = Grammar::Tag(Tag::new(
+            "<i>",
+            Grammar::AnyText {
+                excludes: Vec::new(),
+            },
+            "",
+        ));
+        assert!(Grammar::Tag(Tag::new("<o>", inner, "</o>"))
+            .check()
+            .is_err());
     }
 
     #[test]

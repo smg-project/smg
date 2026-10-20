@@ -149,6 +149,14 @@ pub(super) fn named_arguments_calls(
 /// `{"name": NAME, "arguments": ` and the tool's schema, `, ` between calls, `]`; with one
 /// call, that call alone, and after the `]` what the count writes after the last call.
 fn list(tools: &[&Tool], count: Count<'_>) -> Grammar {
+    let mut list = list_open(tools, count);
+    list.push(Grammar::ConstString(count.end("]")));
+    Grammar::Sequence(list)
+}
+
+/// The list without its close: `[` and the calls, as [`list`] writes them; the caller writes the
+/// `]`, in the list or as the end of the tag the list fills ([`list_tag`]).
+fn list_open(tools: &[&Tool], count: Count<'_>) -> Vec<Grammar> {
     let one_call = Grammar::Or(
         tools
             .iter()
@@ -174,8 +182,7 @@ fn list(tools: &[&Tool], count: Count<'_>) -> Grammar {
             one_call,
         ]))));
     }
-    list.push(Grammar::ConstString(count.end("]")));
-    Grammar::Sequence(list)
+    list
 }
 
 /// xLAM's list: the whole output is `[`, the calls joined by `, `, `]`, each call a JSON object
@@ -204,16 +211,21 @@ pub(super) fn list_calls(tools: &[&Tool], count: Count<'_>) -> Grammar {
     }
 }
 
-/// Llama Nemotron's list between its markers: one tag, the opener, the list, the closer.
+/// Llama Nemotron's list between its markers: one tag, the opener, the list, the closer. A list
+/// with no closer, which the turn ends (the Mistral list), ends its tag with its own `]`: the
+/// engines' structural-tag parsers refuse a tag whose content may grow without bound (the further
+/// calls) behind an empty end, since nothing would tell them where the tag stops
+/// ([`Grammar::check`]).
 pub(super) fn list_tag(markers: &CallMarkers<'_>, tools: &[&Tool], count: Count<'_>) -> Grammar {
     // The tag's end carries the end of the turn, so the list inside it writes none.
     let inside = Count { last: "", ..count };
+    let (content, close) = if markers.call_close.is_empty() {
+        (Grammar::Sequence(list_open(tools, inside)), "]")
+    } else {
+        (list(tools, inside), markers.call_close)
+    };
     count.triggered(
         vec![markers.call_open.to_string()],
-        vec![Tag::new(
-            markers.call_open,
-            list(tools, inside),
-            markers.call_close,
-        )],
+        vec![Tag::new(markers.call_open, content, close)],
     )
 }

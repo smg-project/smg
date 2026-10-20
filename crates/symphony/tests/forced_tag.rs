@@ -5,7 +5,9 @@
 //! table that writes none leaves the request to the gateway's older path, a JSON-schema
 //! constraint whose output the table never reads, so the forced call comes back as raw text. The
 //! gaps known today are listed with their cause and checked both ways: a listed gap that closes
-//! fails the test until its entry goes, so the list stays what is true.
+//! fails the test until its entry goes, so the list stays what is true. Every tag written passes
+//! the rule the engines' structural-tag parsers hold it to (`Grammar::check`), so a table's tag is
+//! refused here and not by the engine at the first forced call.
 
 use openai_protocol::common::{Function, Tool};
 use serde_json::json;
@@ -131,12 +133,19 @@ fn every_table_that_reads_calls_writes_a_forced_tag_in_every_configuration() {
                     table.name()
                 );
             } else {
-                assert!(
-                    tag.is_some(),
-                    "{} ({configuration}): no structural tag, so a forced call on this table goes \
-                     to the older path",
-                    table.name()
-                );
+                let tag = tag.unwrap_or_else(|| {
+                    panic!(
+                        "{} ({configuration}): no structural tag, so a forced call on this table \
+                         goes to the older path",
+                        table.name()
+                    )
+                });
+                tag.check().unwrap_or_else(|why| {
+                    panic!(
+                        "{} ({configuration}): the engines refuse the tag: {why}",
+                        table.name()
+                    )
+                });
             }
             checked += 1;
         }
