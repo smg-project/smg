@@ -140,10 +140,11 @@ pub(crate) fn grammar_start_from(start: WorkerGrammarStart) -> GrammarStart {
 /// Where the model's `workers` start a grammar, before one is selected: the start every one of
 /// them names in its `constrained_decoding_start` label, a prefill or encode worker left out
 /// since it generates no token a grammar constrains (the roles that do are allow-listed, so a
-/// role added later is left out until it is named); unknown when none says, and `Either` when
-/// they differ, so that the tag takes what fits either kind of engine (a forced call's prefix
-/// on either, an answer's schema alone on the first and its prefix on the second:
-/// [`Format::answer_grammar_for`]).
+/// role added later is left out until it is named); `Either` when one that starts at the first
+/// token stands beside one that does not, since no one tag fits both (the answer keeps the
+/// prefix a forced call takes: [`Format::answer_grammar_for`]); unknown when none says, and
+/// when workers that start after their reasoning parser stand beside ones that do not say,
+/// since the unknown start's tags fit both (a forced call's prefix, an answer's schema alone).
 pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
     let mut starts = workers
         .iter()
@@ -166,10 +167,15 @@ pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
     let Some(first) = starts.next() else {
         return GrammarStart::Unknown;
     };
-    if starts.all(|start| start == first) {
+    let starts: Vec<_> = std::iter::once(first).chain(starts).collect();
+    if starts.iter().all(|start| *start == first) {
         grammar_start_from(first)
-    } else {
+    } else if starts.contains(&WorkerGrammarStart::FirstToken) {
+        // An engine that starts at the first token beside one that does not: no one tag fits both.
         GrammarStart::Either
+    } else {
+        // After the reasoning parser beside not saying: the unknown start's tags fit both.
+        GrammarStart::Unknown
     }
 }
 
@@ -778,9 +784,10 @@ mod tests {
             None,
             "the schema stands alone where the workers do not say"
         );
-        // Where the workers name different starts, the request may land on an engine of either
-        // kind, and no one tag fits both: the answer keeps the prefix a forced call takes, the
-        // free text closing the thought, loosely, as before.
+        // Where a worker that starts at the first token stands beside one that does not, the
+        // request may land on an engine of either kind, and no one tag fits both: the answer
+        // keeps the prefix a forced call takes, the free text closing the thought, loosely, as
+        // before.
         let either = tag_of(symphony::GrammarStart::Either).expect("a tag");
         assert_eq!(either["format"]["type"], "sequence", "{either}");
         assert_eq!(
@@ -978,8 +985,9 @@ mod tests {
     }
 
     /// The model's workers name the start when they all carry the same label; none or a missing
-    /// label leaves it unknown, and a disagreement names either kind. A worker's own label maps
-    /// one to one.
+    /// label leaves it unknown, as does a pool of workers that start after their reasoning parser
+    /// beside ones that do not say, and a first-token worker beside another kind names either
+    /// kind. A worker's own label maps one to one.
     #[test]
     fn the_models_workers_name_the_grammar_start_when_they_agree() {
         let worker = |start: Option<&str>| -> Arc<dyn Worker> {
@@ -1010,12 +1018,22 @@ mod tests {
             grammar_start_of(&[worker(Some("after_reasoning")), worker(Some("first_token"))]),
             symphony::GrammarStart::Either
         );
+        // After the reasoning parser beside not saying: the unknown start's tags fit both (a
+        // forced call's prefix, an answer's schema alone), so the pool needs no prefix.
         assert_eq!(
             grammar_start_of(&[worker(Some("after_reasoning")), worker(None)]),
-            symphony::GrammarStart::Either
+            symphony::GrammarStart::Unknown
         );
         assert_eq!(
             grammar_start_of(&[worker(Some("first_token")), worker(None)]),
+            symphony::GrammarStart::Either
+        );
+        assert_eq!(
+            grammar_start_of(&[
+                worker(Some("after_reasoning")),
+                worker(None),
+                worker(Some("first_token"))
+            ]),
             symphony::GrammarStart::Either
         );
         // A prefill worker generates no token a grammar constrains: its label does not count.

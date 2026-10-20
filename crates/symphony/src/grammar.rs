@@ -520,9 +520,9 @@ pub struct Options {
 /// trigger opens what follows (a block of calls), which fits either kind; where none does (an
 /// answer's schema) it gets the schema alone, the engine's own constraint applied where that
 /// engine starts, since free text before a schema constrains nothing
-/// ([`Format::answer_grammar_for`]). Engines of either kind, named by the engines a request may
-/// run on when they differ, keep the prefix for the answer too, loosely, since no other tag fits
-/// both. Where the
+/// ([`Format::answer_grammar_for`]). Engines of either kind, one starting at the first token
+/// beside one that does not among those a request may run on, keep the prefix for the answer too,
+/// loosely, since no other tag fits both. Where the
 /// prompt opens no thought, the start is read by the answer tag of a table whose thought is a
 /// message of its own alone, and only where it names the first token
 /// ([`Format::answer_grammar`]): an engine that starts after its parser may gate on it whatever
@@ -533,8 +533,8 @@ pub enum GrammarStart {
     /// The engine does not say where it starts.
     #[default]
     Unknown,
-    /// The request may run on an engine of either kind: the engines that may take it name
-    /// different starts, so the tag takes what fits either.
+    /// The request may run on an engine of either kind: one of the engines that may take it
+    /// starts at the first token and another does not, so the tag takes what fits either.
     Either,
     /// The engine starts the grammar once its reasoning parser has seen the thought's close.
     AfterReasoning,
