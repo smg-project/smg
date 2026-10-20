@@ -1,8 +1,10 @@
 name: E2E Kind Discovery
 
 # Run automatically for service-discovery code and test-infrastructure
-# changes. GitHub-hosted ubuntu-latest provides Docker for the kind node;
-# manual dispatch keeps the runner selectable for ad-hoc validation.
+# changes, and weekly: the Slurm lane installs Slurm from Ubuntu's archive,
+# whose updates can change it with no change here. GitHub-hosted ubuntu-latest
+# provides Docker for the kind node and the Slurm cluster; manual dispatch
+# keeps the runner selectable for ad-hoc validation.
 on:
   pull_request:
     paths:
@@ -18,6 +20,8 @@ on:
       - e2e_test/discovery/slurm/**
       - e2e_test/discovery/common.py
       - .github/workflows/e2e-kind-discovery.yml
+  schedule:
+    - cron: '0 6 * * 1'
   workflow_dispatch:
     inputs:
       runner:
@@ -32,7 +36,7 @@ env:
 jobs:
   kind-discovery:
     runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
@@ -82,12 +86,26 @@ jobs:
           SMG_FILE_E2E=1 pytest e2e_test/discovery/file \
             --confcutdir e2e_test/discovery/file -v
 
-      # The gateway against stand-in squeue and scontrol on its PATH, with
-      # one engine per loopback address (127.0.0.2, ...) on a shared port.
+      # A real Slurm 23.11 cluster in containers (a controller and six
+      # nodes), with the gateway on the controller polling squeue and scontrol.
       - name: Run Slurm discovery e2e
         if: ${{ !cancelled() }}
-        timeout-minutes: 10
+        timeout-minutes: 20
         run: |
           pip install pytest requests
-          SMG_SLURM_E2E=1 pytest e2e_test/discovery/slurm \
-            --confcutdir e2e_test/discovery/slurm -v -rs
+          stage=$(mktemp -d)
+          cp e2e_test/discovery/slurm/Dockerfile e2e_test/discovery/slurm/slurm.conf \
+            e2e_test/discovery/slurm/cgroup.conf e2e_test/discovery/slurm/entrypoint.sh \
+            target/debug/smg target/debug/mock-worker "$stage"
+          docker build -t smg-slurm:e2e "$stage"
+          SMG_SLURM_E2E=1 SMG_SLURM_IMAGE=smg-slurm:e2e \
+            SMG_SLURM_LOGS="$RUNNER_TEMP/slurm-logs" \
+            pytest e2e_test/discovery/slurm --confcutdir e2e_test/discovery/slurm -v
+
+      - name: Upload the Slurm, gateway and job logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: slurm-discovery-logs
+          path: ${{ runner.temp }}/slurm-logs
+          if-no-files-found: warn

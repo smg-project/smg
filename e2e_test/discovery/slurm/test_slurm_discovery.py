@@ -1,189 +1,170 @@
-"""CLI-contract e2e for Slurm discovery.
+"""Slurm-discovery e2e against a real Slurm 23.11 cluster (see conftest.py).
 
-The real gateway polls stand-in `squeue` and `scontrol` commands, which
-answer as Slurm 23.11 does: `squeue`'s filters are accepted but not applied,
-so every job in the state comes back and the provider's own filtering is what
-these tests watch. The scenarios: a multi-node allocation's lifecycle, a
-requeue and a node address change, a failed node lookup and an engine that
-starts late, a gateway restart, and the job-name role mappings with a user,
-account and partition scope.
+The scenarios: a multi-node allocation's lifecycle, a requeue replacing the
+worker, a controller that goes away and comes back while a job's engine starts
+late, a gateway restart, and the job-name role mappings with a user, account
+and partition scope. What a small real cluster cannot stage (a node address
+changing under a running job, a federation's other clusters, a node with no
+address) is covered by the unit tests on recorded Slurm output.
 """
 
 from __future__ import annotations
 
 import time
+import uuid
 
-from ..common import MODEL, served_by
+from ..common import served_by
+from .harness import worker_command, worker_url
 
 PROVIDER = "smg.ai/discovery-provider"
 ID = "smg.ai/discovery-id"
-WORKER = ("--slurm-job-name", "smg-worker")
+# A requeued job is held for about two minutes before it runs again.
+REQUEUE = 420.0
+
+
+def unique(name: str) -> str:
+    return f"{name}-{uuid.uuid4().hex[:6]}"
 
 
 def ids_by_url(workers: list[dict]) -> dict[str, str]:
     return {w["url"]: w.get("labels", {}).get(ID, "") for w in workers}
 
 
-def test_an_allocation_registers_its_nodes_and_leaves_with_them(gateway, slurm, node_engines):
-    node1, node2, node3 = node_engines("127.0.0.2", "127.0.0.3", "127.0.0.4")
-    # node1 by its NodeAddr, beside a hostname that resolves nowhere; node2
-    # by its NodeHostname, with no NodeAddr reported.
-    slurm.node("node1", address="127.0.0.2", hostname="node1.invalid")
-    slurm.node("node2", hostname="127.0.0.3")
-    slurm.node("node3", address="127.0.0.4")
-    slurm.job(1, "smg-worker", "node[1-2]", ["node1", "node2"])
-    slurm.write()
-    gateway.start(*WORKER)
-
-    workers = gateway.wait_for_urls({node1.url, node2.url}, "both nodes of the allocation")
-    assert all(w["labels"][PROVIDER] == "slurm" for w in workers), workers
-    assert sorted(ids_by_url(workers).values()) == [
-        "e2e/1/1700000000/0/node1/regular",
-        "e2e/1/1700000000/0/node2/regular",
-    ]
-    assert served_by(gateway, 10) == {node1.served_by, node2.served_by}
-    hostnames = [call["argv"] for call in slurm.calls("scontrol") if call["argv"][0] == "show"]
-    assert ["show", "hostnames", "node[1-2]"] in hostnames
-
-    slurm.job(2, "smg-worker", "node3", ["node3"])
-    slurm.write()
-    gateway.wait_for_urls({node1.url, node2.url, node3.url}, "a second allocation joining")
-
-    slurm.remove_job(1)
-    slurm.write()
-    gateway.wait_for_urls({node3.url}, "the first allocation's nodes leaving with its job")
-
-    slurm.state["jobs"] = []
-    slurm.write()
-    gateway.wait_for_urls(set(), "an empty job list clearing the fleet")
+def id_parts(discovery_id: str) -> list[str]:
+    """cluster/job/start time/restart count/node/type"""
+    return discovery_id.split("/")
 
 
-def test_a_requeue_and_an_address_change_replace_the_worker(gateway, slurm, node_engines):
-    first, moved = node_engines("127.0.0.2", "127.0.0.3")
-    slurm.node("node1", address="127.0.0.2")
-    slurm.job(1, "smg-worker", "node1", ["node1"])
-    slurm.write()
-    gateway.start(*WORKER)
-    (worker,) = gateway.wait_for_urls({first.url}, "the job's worker")
-    before = worker["labels"][ID]
+def test_an_allocation_registers_its_nodes_and_leaves_with_them(slurm, gateway):
+    name = unique("smg-worker")
+    gateway.start("--slurm-job-name", name)
 
-    # Requeued: the same job id, started again.
-    slurm.update_job(1, restart_cnt=1, start_time=1_700_000_100)
-    slurm.write()
-    workers = gateway.wait_for(
-        "the requeued job's new instance",
-        lambda workers: ids_by_url(workers) == {first.url: "e2e/1/1700000100/1/node1/regular"},
+    first = slurm.submit(name, worker_command(), nodes="node[1-2]")
+    slurm.wait_for_state(first, "RUNNING")
+    # Slurm reports the allocation compressed; scontrol expands it.
+    assert slurm.exec("squeue", "-h", "-j", str(first), "-o", "%N").strip() == "node[1-2]"
+    workers = gateway.wait_for_urls(
+        {worker_url("node1"), worker_url("node2")}, "both nodes of the allocation"
     )
-    assert workers[0]["labels"][ID] != before
+    assert all(w["labels"][PROVIDER] == "slurm" for w in workers), workers
+    for url, discovery_id in ids_by_url(workers).items():
+        cluster, job, _, restarts, node, kind = id_parts(discovery_id)
+        assert (cluster, job, restarts, kind) == ("e2e", str(first), "0", "regular"), url
+        assert url == worker_url(node), discovery_id
+    assert served_by(gateway, 4), "no request was served"
+    slurm.record("allocation")
 
-    # The node's address changes: its worker follows it.
-    slurm.node("node1", address="127.0.0.3")
-    slurm.write()
-    gateway.wait_for_urls({moved.url}, "the worker at the node's new address")
+    second = slurm.submit(name, worker_command(), nodes="node3")
+    gateway.wait_for_urls(
+        {worker_url("node1"), worker_url("node2"), worker_url("node3")},
+        "a second allocation joining",
+    )
 
+    slurm.exec("scancel", str(first))
+    gateway.wait_for_urls({worker_url("node3")}, "the first allocation's nodes leaving")
 
-def test_a_failed_lookup_keeps_the_fleet_and_a_late_engine_registers(gateway, slurm, node_engines):
-    (node1,) = node_engines("127.0.0.2")
-    slurm.node("node1", address="127.0.0.2")
-    slurm.node("node2", address="127.0.0.3")
-    slurm.job(1, "smg-worker", "node1", ["node1"])
-    slurm.write()
-    gateway.start(*WORKER)
-    gateway.wait_for_urls({node1.url}, "the first job's worker")
-
-    # The node lookup fails while a second job appears: the poll is
-    # rejected whole, so neither change applies and nothing is removed.
-    slurm.state["fail"] = ["nodes"]
-    slurm.job(2, "smg-worker", "node2", ["node2"])
-    slurm.write()
-    gateway.wait_for_log("Slurm poll failed", "the failed node lookup reported")
-    failed = len(slurm.calls("scontrol"))
-    deadline = time.monotonic() + 30
-    while len(slurm.calls("scontrol")) < failed + 4:
-        assert time.monotonic() < deadline, "the gateway stopped polling"
-        time.sleep(0.25)
-    assert {w["url"] for w in gateway.workers() or []} == {node1.url}
-
-    # Restored: node2 is a candidate now, but nothing listens there, so it
-    # gets no worker.
-    slurm.state["fail"] = []
-    slurm.write()
-    gateway.wait_for_log("Slurm lists 2 worker(s)", "the restored poll taking both jobs")
-    time.sleep(3)
-    assert {w["url"] for w in gateway.workers() or []} == {node1.url}
-
-    # Its engine starts, with Slurm unchanged: a later poll registers it.
-    (node2,) = node_engines("127.0.0.3")
-    gateway.wait_for_urls({node1.url, node2.url}, "the late engine registered")
+    slurm.exec("scancel", str(second))
+    gateway.wait_for_urls(set(), "an empty queue clearing the fleet")
 
 
-def test_a_restarted_gateway_rebuilds_the_fleet(gateway, slurm, node_engines):
-    node1, node2 = node_engines("127.0.0.2", "127.0.0.3")
-    slurm.node("node1", address="127.0.0.2")
-    slurm.node("node2", address="127.0.0.3")
-    slurm.job(7, "smg-worker", "node[1-2]", ["node1", "node2"], start_time=1_700_000_007)
-    slurm.write()
-    gateway.start(*WORKER)
-    before = ids_by_url(gateway.wait_for_urls({node1.url, node2.url}, "the fleet"))
+def test_a_requeue_replaces_the_worker(slurm, gateway):
+    name = unique("smg-worker")
+    gateway.start("--slurm-job-name", name)
+    job = slurm.submit(name, worker_command(), nodes="node1")
+    (worker,) = gateway.wait_for_urls({worker_url("node1")}, "the job's worker")
+    first = worker["labels"][ID]
+    assert id_parts(first)[3] == "0", first
 
-    gateway.restart(*WORKER)
-    after = ids_by_url(gateway.wait_for_urls({node1.url, node2.url}, "the fleet rebuilt"))
+    # Requeued, the job leaves RUNNING and its worker goes; when it runs again
+    # it is a new instance at the same address.
+    slurm.exec("scontrol", "requeue", str(job))
+    gateway.wait_for_urls(set(), "the requeued job's worker removed")
+    slurm.record("requeued")
+    (worker,) = gateway.wait_for(
+        "the requeued job running again as a new instance",
+        lambda workers: (
+            [w["url"] for w in workers] == [worker_url("node1")]
+            and workers[0]["labels"][ID] != first
+        ),
+        within=REQUEUE,
+    )
+    second = id_parts(worker["labels"][ID])
+    assert second[1] == str(job) and second[3] == "1", second
+
+
+def test_a_lost_controller_keeps_the_fleet_and_a_late_engine_registers(slurm, gateway):
+    name = unique("smg-worker")
+    gateway.start("--slurm-job-name", name)
+    slurm.submit(name, worker_command(), nodes="node1")
+    gateway.wait_for_urls({worker_url("node1")}, "the first job's worker")
+
+    # With slurmctld down, squeue fails: the poll is rejected and the fleet
+    # stays as it was.
+    slurm.exec("pkill", "-x", "slurmctld")
+    gateway.wait_for_log("Slurm poll failed", "the failed poll reported")
+    time.sleep(6)
+    assert {w["url"] for w in gateway.workers() or []} == {worker_url("node1")}
+
+    # Back, it still holds the job, and takes a new one whose engine starts
+    # late: no worker until it listens, then one with Slurm unchanged.
+    slurm.exec("slurmctld")
+    slurm.wait_for_responding_nodes()
+    late = slurm.submit(name, worker_command(delay_secs=25), nodes="node2")
+    slurm.wait_for_state(late, "RUNNING")
+    time.sleep(10)
+    assert {w["url"] for w in gateway.workers() or []} == {worker_url("node1")}
+    gateway.wait_for_urls({worker_url("node1"), worker_url("node2")}, "the late engine registered")
+
+
+def test_a_restarted_gateway_rebuilds_the_fleet(slurm, gateway):
+    name = unique("smg-worker")
+    gateway.start("--slurm-job-name", name)
+    slurm.submit(name, worker_command(), nodes="node[1-2]")
+    urls = {worker_url("node1"), worker_url("node2")}
+    before = ids_by_url(gateway.wait_for_urls(urls, "the fleet"))
+
+    gateway.stop()
+    gateway.start("--slurm-job-name", name)
+    after = ids_by_url(gateway.wait_for_urls(urls, "the fleet rebuilt"))
     assert after == before
 
 
-def test_job_names_map_to_roles_within_the_scope(gateway, slurm, port, mock_worker):
-    """Two prefill job names, a decode one, and jobs the mapping or the scope
-    leaves out. Only the local cluster's mapped jobs of user `svc` in account
-    `acct` and partition `gpu` get workers, with the bootstrap port on
-    prefill alone."""
-    addresses = ["127.0.0.2", "127.0.0.3", "127.0.0.4", "127.0.0.5", "127.0.0.6", "127.0.0.7"]
-    for address in addresses:
-        mock_worker(
-            *("--host", address, "--http-base-port", str(port), "--http-count", "1"),
-            *("--model", MODEL),
-            ready_port=port,
-            ready_host=address,
-        )
-    for n, address in enumerate(addresses, start=1):
-        slurm.node(f"node{n}", address=address)
-    scope = {"user": "svc", "account": "acct", "partition": "gpu"}
-    slurm.job(1, "smg-prefill-a", "node1", ["node1"], **scope)
-    slurm.job(2, "smg-prefill-b", "node2", ["node2"], **scope)
-    slurm.job(3, "smg-decode", "node3", ["node3"], **scope)
-    # A name no flag maps, another user's job, one in another partition, and
-    # one a federation lists from another cluster, on a node named like a
-    # local one: it must not take node1's address.
-    slurm.job(4, "smg-other", "node4", ["node4"], **scope)
-    slurm.job(5, "smg-decode", "node5", ["node5"], **{**scope, "user": "alice"})
-    slurm.job(6, "smg-decode", "node6", ["node6"], **{**scope, "partition": "cpu"})
-    slurm.job(7, "smg-decode", "node1", ["node1"], **{**scope, "cluster": "remote"})
-    slurm.write()
+def test_job_names_map_to_roles_within_the_scope(slurm, gateway):
+    """Two prefill job names and a decode one, beside jobs the mapping or the
+    scope leaves out, each with a running engine that would register if it were
+    let through: a name no flag maps, another user's job, and one in another
+    partition. Slurm 23.11 lists them all under --json; only the mapped jobs
+    of this user, account and partition get workers, with the bootstrap port
+    on prefill alone. The account is configured in another case than the one
+    Slurm stores."""
+    prefill_a, prefill_b, decode = unique("prefill-a"), unique("prefill-b"), unique("decode")
+    scope = {"account": "acct-e2e", "partition": "debug"}
+    slurm.submit(prefill_a, worker_command(), nodes="node1", **scope)
+    slurm.submit(prefill_b, worker_command(), nodes="node2", **scope)
+    slurm.submit(decode, worker_command(), nodes="node3", **scope)
+    slurm.submit(unique("other"), worker_command(), nodes="node4", **scope)
+    slurm.submit(decode, worker_command(), nodes="node5", user="alice", **scope)
+    slurm.submit(decode, worker_command(), nodes="node6", account="acct-e2e", partition="other")
+
     gateway.start(
         "--pd-disaggregation",
-        *("--slurm-prefill-job-name", "smg-prefill-a"),
-        *("--slurm-prefill-job-name", "smg-prefill-b"),
-        *("--slurm-decode-job-name", "smg-decode"),
+        *("--slurm-prefill-job-name", prefill_a),
+        *("--slurm-prefill-job-name", prefill_b),
+        *("--slurm-decode-job-name", decode),
         *("--slurm-bootstrap-port", "8998"),
-        *("--slurm-user", "svc"),
-        *("--slurm-account", "acct"),
-        *("--slurm-partition", "gpu"),
+        *("--slurm-account", "ACCT-E2E"),
+        *("--slurm-partition", "debug"),
     )
-
-    prefill_a, prefill_b, decode = (f"http://{address}:{port}" for address in addresses[:3])
-    workers = gateway.wait_for_urls({prefill_a, prefill_b, decode}, "the mapped jobs' workers")
+    expected = {worker_url("node1"), worker_url("node2"), worker_url("node3")}
+    workers = gateway.wait_for_urls(expected, "the mapped jobs' workers")
+    slurm.record("roles")
     roles = {w["url"]: (w["worker_type"], w.get("bootstrap_port")) for w in workers}
     assert roles == {
-        prefill_a: ("prefill", 8998),
-        prefill_b: ("prefill", 8998),
-        decode: ("decode", None),
+        worker_url("node1"): ("prefill", 8998),
+        worker_url("node2"): ("prefill", 8998),
+        worker_url("node3"): ("decode", None),
     }
-
-    assert slurm.calls("squeue")[-1]["argv"] == [
-        "--json",
-        "--local",
-        "--states=RUNNING",
-        "--name=smg-decode,smg-prefill-a,smg-prefill-b",
-        "--user=svc",
-        "--account=acct",
-        "--partition=gpu",
-    ]
+    # Every decoy runs, so its absence is the provider's filtering.
+    assert len(slurm.exec("squeue", "-h", "-t", "RUNNING", "-o", "%i").split()) == 6
+    time.sleep(6)
+    assert {w["url"] for w in gateway.workers() or []} == expected
