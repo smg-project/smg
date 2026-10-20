@@ -1,12 +1,12 @@
 """The file-discovery e2e's own pieces: the manifest writer, and the flags
-that point a gateway at it. The rest is in e2e_test/discovery_common.py."""
+that point a gateway at it. The rest is in e2e_test/discovery/common.py."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-from ..discovery_common import Gateway
+from ..common import Gateway
 
 # A periodic reread no test outlives: under it, only the startup read and
 # the watcher read the manifest.

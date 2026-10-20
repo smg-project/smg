@@ -1,6 +1,6 @@
 """Host-process e2e for file discovery.
 
-The Kubernetes lane's scenarios (e2e_test/kind_discovery/test_kind_discovery.py),
+The Kubernetes lane's scenarios (e2e_test/discovery/kind/test_kind_discovery.py),
 as they apply to a manifest: registration and provenance, round-robin over
 the discovered fleet, one edit adding or removing several workers, a gateway
 restart, a new instance at a reused address, an engine failing its health
@@ -15,7 +15,7 @@ and an invalid edit and its fix.
 
 from __future__ import annotations
 
-from ..discovery_common import MODEL, free_port_range, served_by
+from ..common import MODEL, free_port_range, served_by
 from .harness import NO_REREAD_SECS
 
 # How long a watched change may take to apply: the event settling, one read,

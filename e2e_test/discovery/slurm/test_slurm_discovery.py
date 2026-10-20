@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import time
 
-from ..discovery_common import MODEL, served_by
+from ..common import MODEL, served_by
 
 PROVIDER = "smg.ai/discovery-provider"
 ID = "smg.ai/discovery-id"

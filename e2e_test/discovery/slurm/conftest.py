@@ -13,7 +13,7 @@ lane stops with an error rather than passing without running.
 
 Gated behind SMG_SLURM_E2E=1. Run locally (Linux):
     cargo build -p smg -p mock-worker && \\
-        SMG_SLURM_E2E=1 pytest e2e_test/slurm_discovery --confcutdir e2e_test/slurm_discovery
+        SMG_SLURM_E2E=1 pytest e2e_test/discovery/slurm --confcutdir e2e_test/discovery/slurm
 """
 
 from __future__ import annotations
@@ -24,8 +24,8 @@ from collections.abc import Callable, Iterator
 
 import pytest
 
-from ..discovery_common import FakeEngine, Gateway, free_port
-from ..discovery_common import mock_worker as mock_worker  # noqa: F401  (fixture)
+from ..common import FakeEngine, Gateway, free_port
+from ..common import mock_worker as mock_worker  # noqa: F401  (fixture)
 from .harness import FakeSlurm, slurm_gateway
 
 # Loopback addresses standing in for the nodes.

@@ -1,6 +1,6 @@
 """The Slurm-discovery e2e's own pieces: the state the stand-in `squeue` and
 `scontrol` answer from, and the flags that point a gateway at them. The rest
-is in e2e_test/discovery_common.py."""
+is in e2e_test/discovery/common.py."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import json
 import os
 from pathlib import Path
 
-from ..discovery_common import Gateway
+from ..common import Gateway
 
 FAKE_BIN = Path(__file__).parent / "fake_bin"
 

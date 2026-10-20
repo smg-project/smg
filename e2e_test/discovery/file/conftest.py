@@ -4,7 +4,7 @@ Each test drives the real smg binary against engines on this host and edits
 the manifest file directly, so a change reaches the gateway when its watch
 sees the file change, or on its next periodic reread. No cluster is
 involved: the in-cluster ConfigMap path is covered by
-e2e_test/kind_discovery/test_file_discovery_in_cluster.py.
+e2e_test/discovery/kind/test_file_discovery_in_cluster.py.
 
 Engines are either in-process fakes, whose health a test flips directly and
 whose answers name their port, or the real mock-worker binary, for scale and
@@ -13,7 +13,7 @@ scenario cannot cascade into the next.
 
 Gated behind SMG_FILE_E2E=1. Run locally:
     cargo build -p smg -p mock-worker && \\
-        SMG_FILE_E2E=1 pytest e2e_test/file_discovery --confcutdir e2e_test/file_discovery
+        SMG_FILE_E2E=1 pytest e2e_test/discovery/file --confcutdir e2e_test/discovery/file
 """
 
 from __future__ import annotations
@@ -23,9 +23,9 @@ from collections.abc import Iterator
 
 import pytest
 
-from ..discovery_common import Gateway
-from ..discovery_common import engines as engines  # noqa: F401  (fixture)
-from ..discovery_common import mock_worker as mock_worker  # noqa: F401  (fixture)
+from ..common import Gateway
+from ..common import engines as engines  # noqa: F401  (fixture)
+from ..common import mock_worker as mock_worker  # noqa: F401  (fixture)
 from .harness import Manifest, file_gateway
 
 

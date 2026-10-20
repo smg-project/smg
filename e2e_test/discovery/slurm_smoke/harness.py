@@ -1,5 +1,5 @@
 """The real-Slurm smoke's pieces: the container running a one-node Slurm, and
-the gateway running inside it. The rest is in e2e_test/discovery_common.py."""
+the gateway running inside it. The rest is in e2e_test/discovery/common.py."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import requests
 
-from ..discovery_common import Gateway, free_port
+from ..common import Gateway, free_port
 
 # Where the gateway listens inside the container, and where it logs.
 GATEWAY_PORT = 3000
@@ -18,7 +18,7 @@ GATEWAY_LOG = "/var/log/smg/gateway.log"
 
 
 class SlurmNode:
-    """One container from e2e_test/slurm_smoke/Dockerfile: munge, slurmctld and
+    """One container from e2e_test/discovery/slurm_smoke/Dockerfile: munge, slurmctld and
     one slurmd, as root. Commands run in it through `docker exec`."""
 
     def __init__(self, image: str, logs: Path | None):

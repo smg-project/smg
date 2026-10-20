@@ -1,7 +1,7 @@
 """What the host-process discovery e2e lanes share: the binaries, free ports,
 the in-process fake engine, the mock-worker launcher, and the gateway driver.
 
-Each lane (file_discovery, slurm_discovery) adds the source it drives and
+Each lane (file, slurm, slurm_smoke) adds the source it drives and
 the flags that select its provider.
 """
 
