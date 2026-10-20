@@ -3741,9 +3741,12 @@ async fn a_streamed_turn_of_parallel_calls_runs_them_in_one_round_trip_as_unstre
 /// `response.output_item.done` (an `incomplete` item is a call cut short),
 /// with the arguments either carries (`{}` for none). A turn the upstream
 /// ends `incomplete` or `failed` short of that ends the stream on the one
-/// terminal of that kind, carrying the loop's items, and the record is that
-/// response. An `error` event is the stream's last frame and leaves no
-/// record. A body that ends short of that is the answer as it stands.
+/// terminal of that kind; a body that ends short of it is the answer as it
+/// stands. Either way no call of the turn runs, and each is closed as not
+/// executed. Every item the stream announces is closed once, under its own
+/// id, and is in the terminal's response as closed; the record is that
+/// response. An `error` event is the stream's last frame, and leaves no
+/// record.
 #[tokio::test]
 async fn a_streamed_turn_runs_its_whole_calls_and_ends_as_the_upstream_ends_it() {
     use std::{
@@ -3764,6 +3767,22 @@ async fn a_streamed_turn_runs_its_whole_calls_and_ends_as_the_upstream_ends_it()
     let delta = json!({"type": "response.function_call_arguments.delta", "output_index": 0, "item_id": "fc_stub", "delta": part});
     let args_done = |arguments: &str| json!({"type": "response.function_call_arguments.done", "output_index": 0, "item_id": "fc_stub", "arguments": arguments});
     let item_done = |arguments: &str, status: &str| json!({"type": "response.output_item.done", "output_index": 0, "item": call(arguments, status)});
+    // The second of two parallel calls: at index 1, under its own ids.
+    let two = |mut item: Value| {
+        item["id"] = "fc_two".into();
+        item["call_id"] = "call_two".into();
+        item
+    };
+    let second = |mut event: Value| {
+        event["output_index"] = 1.into();
+        if event.get("item_id").is_some() {
+            event["item_id"] = "fc_two".into();
+        }
+        if let Some(item) = event.get_mut("item") {
+            *item = two(item.take());
+        }
+        event
+    };
     // A terminal event, its response's status, output, and the error or the
     // incomplete_details the upstream gives it.
     let end = |status: &str, output: Value| {
@@ -3826,48 +3845,116 @@ async fn a_streamed_turn_runs_its_whole_calls_and_ends_as_the_upstream_ends_it()
         args_done(part),
     );
     let (done, done_empty, item) = (args_done(args), args_done(""), item_done(args, "completed"));
+    let (second_added, second_delta) = (second(added.clone()), second(delta.clone()));
+    let (second_done, second_item) = (second(done.clone()), second(item.clone()));
+    let both = |status: &str, second_arguments: &str, second_status: &str| {
+        end(
+            status,
+            json!([
+                call(args, "completed"),
+                two(call(second_arguments, second_status))
+            ]),
+        )
+    };
+    let (both_cut, both_failed, both_incomplete) = (
+        both("incomplete", part, "incomplete"),
+        both("failed", args, "completed"),
+        both("incomplete", args, "completed"),
+    );
     let one = |events: &[&Value]| {
         vec![events
             .iter()
             .map(|&event| event.clone())
             .collect::<Vec<_>>()]
     };
+    let two_whole = |terminal: &Value| {
+        one(&[
+            &added,
+            &done,
+            &item,
+            &second_added,
+            &second_done,
+            &second_item,
+            terminal,
+        ])
+    };
     let then = |event: &Value| vec![whole.clone(), vec![event.clone()]];
+    // (case, the request's max_tool_calls, the upstream's turns)
     let cases = [
-        ("no call, incomplete", one(&[&cut_off])),
-        ("no call, error", one(&[&error])),
-        ("added, failed", one(&[&added, &added_failed])),
+        ("no call, incomplete", None, one(&[&cut_off])),
+        ("no call, error", None, one(&[&error])),
+        ("added, failed", None, one(&[&added, &added_failed])),
         (
             "added, partial arguments, failed",
+            None,
             one(&[&added, &delta, &partial_failed]),
         ),
         (
             "added, partial arguments, incomplete",
+            None,
             one(&[&added, &delta, &cut]),
         ),
         (
             "a call cut short, incomplete",
+            None,
             one(&[&added, &delta, &cut_done, &cut_item, &cut]),
         ),
         (
+            "one call whole, the next cut, incomplete",
+            None,
+            one(&[
+                &added,
+                &done,
+                &item,
+                &second_added,
+                &second_delta,
+                &both_cut,
+            ]),
+        ),
+        (
             "added, partial arguments, body ends",
+            None,
             one(&[&added, &delta]),
         ),
-        ("added, arguments done, body ends", one(&[&added, &done])),
-        ("added, output_item.done, body ends", one(&[&added, &item])),
+        (
+            "added, arguments done, body ends",
+            None,
+            one(&[&added, &done]),
+        ),
+        (
+            "added, output_item.done, body ends",
+            None,
+            one(&[&added, &item]),
+        ),
         (
             "added, no arguments done, body ends",
+            None,
             one(&[&added, &done_empty]),
         ),
-        ("added, error", one(&[&added, &error])),
-        ("whole call, error", one(&[&added, &done, &item, &error])),
+        ("added, error", None, one(&[&added, &error])),
+        (
+            "whole call, error",
+            None,
+            one(&[&added, &done, &item, &error]),
+        ),
         (
             "added, error, the call's rest",
+            None,
             one(&[&added, &error, &done, &item]),
         ),
-        ("a call, then incomplete", then(&cut_off)),
-        ("a call, then failed", then(&failed_mid)),
-        ("a call, then error", then(&error)),
+        ("a call, then incomplete", None, then(&cut_off)),
+        ("a call, then failed", None, then(&failed_mid)),
+        ("a call, then error", None, then(&error)),
+        (
+            "two whole calls over max_tool_calls 1, failed",
+            Some(1),
+            two_whole(&both_failed),
+        ),
+        (
+            "two whole calls over max_tool_calls 1, incomplete",
+            Some(1),
+            two_whole(&both_incomplete),
+        ),
     ];
     let terminal = |frame: &Value| {
         matches!(
@@ -3877,10 +3964,10 @@ async fn a_streamed_turn_runs_its_whole_calls_and_ends_as_the_upstream_ends_it()
     };
     let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
     let mut got = Vec::new();
-    for (n, (case, case_turns)) in cases.into_iter().enumerate() {
+    for (n, (case, limit, case_turns)) in cases.into_iter().enumerate() {
         *script.lock().expect("the script") = (format!("resp_case{n}"), case_turns.into());
         let (turns_before, calls_before) = (turns.load(Ordering::SeqCst), mcp.call_count());
-        let body = stream_body(router.as_ref(), mcp_request(&mcp.url(), None, true, true)).await;
+        let body = stream_body(router.as_ref(), mcp_request(&mcp.url(), limit, true, true)).await;
         // Every frame, the sentinel too: its event, or `{"type": "[DONE]"}`.
         let frames: Vec<Value> = sse_frames(&body)
             .iter()
@@ -3892,11 +3979,18 @@ async fn a_streamed_turn_runs_its_whole_calls_and_ends_as_the_upstream_ends_it()
                 serde_json::from_str(data).unwrap_or_else(|_| json!({ "type": data }))
             })
             .collect();
+        // A response's items, and its incomplete_details or error when it has one.
         let items = |response: &Value| {
             let shapes = item_shapes(response)
                 .into_iter()
                 .map(|(kind, status, _)| format!("{kind}:{status}"));
-            shapes.collect::<Vec<_>>().join(", ")
+            let mut items = shapes.collect::<Vec<_>>().join(", ");
+            for field in ["incomplete_details", "error"] {
+                if !response[field].is_null() {
+                    items.push_str(&format!("; {field} {}", response[field]));
+                }
+            }
+            items
         };
         // From the first terminal on: each frame's type, with a response's items.
         let ends: Vec<String> = frames
@@ -3907,7 +4001,7 @@ async fn a_streamed_turn_runs_its_whole_calls_and_ends_as_the_upstream_ends_it()
                 None => text(&frame["type"]),
             })
             .collect();
-        let ran: Vec<String> = frames
+        let closed: Vec<String> = frames
             .iter()
             .filter(|frame| {
                 frame["type"] == "response.output_item.done" && frame["item"]["type"] == "mcp_call"
@@ -3920,65 +4014,103 @@ async fn a_streamed_turn_runs_its_whole_calls_and_ends_as_the_upstream_ends_it()
                 )
             })
             .collect();
+        let ended = frames
+            .iter()
+            .rev()
+            .find(|frame| terminal(frame))
+            .and_then(|frame| frame.get("response"));
+        // Each item the stream announced: closed once, under its own id, and in
+        // the terminal's response as it was closed.
+        let mut lifecycles = Vec::new();
+        for added in frames
+            .iter()
+            .filter(|frame| frame["type"] == "response.output_item.added")
+        {
+            let dones: Vec<&Value> = frames
+                .iter()
+                .filter(|frame| {
+                    frame["type"] == "response.output_item.done"
+                        && frame["output_index"] == added["output_index"]
+                })
+                .map(|frame| &frame["item"])
+                .collect();
+            let in_terminal = |item: &Value| {
+                ended.is_none_or(|response| {
+                    response["output"]
+                        .as_array()
+                        .is_some_and(|output| output.contains(item))
+                })
+            };
+            let lifecycle = match dones.as_slice() {
+                [] => "never closed".to_string(),
+                [item] if item["id"] != added["item"]["id"] => {
+                    format!("closed as {}", text(&item["id"]))
+                }
+                [item] if !in_terminal(item) => "not in the terminal as closed".to_string(),
+                [_] => continue,
+                more => format!("closed {} times", more.len()),
+            };
+            lifecycles.push(format!("{} {lifecycle}", text(&added["item"]["id"])));
+        }
         let id = smg_data_connector::ResponseId::from(text(&frames[0]["response"]["id"]));
         let record = ctx
             .response_storage
             .get_response(&id)
             .await
             .expect("storage");
-        let ended = frames
-            .iter()
-            .rev()
-            .find(|frame| terminal(frame))
-            .and_then(|frame| frame.get("response"));
-        let facts = |response: &Value| {
-            (
-                response["status"].clone(),
-                item_shapes(response),
-                item_errors(response),
-                response["error"].clone(),
-                response["incomplete_details"].clone(),
-            )
-        };
         let stored = match (record.map(|stored| stored.raw_response), ended) {
             (None, _) => "no record".to_string(),
-            (Some(record), Some(ended)) if facts(&record) == facts(ended) => {
-                "the record is the terminal's".to_string()
+            (Some(record), Some(ended)) if record == *ended => {
+                "the record is the terminal's response".to_string()
             }
-            (Some(record), _) => format!("a record {} [{}]", record["status"], items(&record)),
+            (Some(record), _) => format!(
+                "a {} record unlike the terminal's response",
+                record["status"]
+            ),
+        };
+        let lifecycle = if lifecycles.is_empty() {
+            "every item closed in the terminal".to_string()
+        } else {
+            lifecycles.join("; ")
         };
         let (turns, calls) = (
             turns.load(Ordering::SeqCst) - turns_before,
             mcp.call_count() - calls_before,
         );
-        got.push(format!(
-            "{case}: turns {turns}, MCP calls {calls}, ran [{}], ends [{}], {stored}",
-            ran.join("; "),
-            ends.join(", ")
-        ));
+        got.push(format!("{case}: turns {turns}, MCP calls {calls}, closed [{}], ends [{}], {lifecycle}, {stored}", closed.join("; "), ends.join(", ")));
     }
 
-    let ran = "completed {\"query\":\"smg\"}";
-    let stored = "the record is the terminal's";
+    let (ran, unran, unran_part) = (
+        "completed {\"query\":\"smg\"}",
+        "failed {\"query\":\"smg\"}",
+        "failed {\"query\":\"sm",
+    );
+    let incomplete = "incomplete_details {\"reason\":\"max_output_tokens\"}";
+    let failed = "error {\"code\":\"server_error\",\"message\":\"the model failed\"}";
+    let at_limit = "incomplete_details {\"reason\":\"max_tool_calls\"}";
+    let whole_stored = "every item closed in the terminal, the record is the terminal's response";
     assert_eq!(
         got,
         [
-            format!("no call, incomplete: turns 1, MCP calls 0, ran [], ends [response.incomplete [mcp_list_tools:, message:incomplete], [DONE]], {stored}"),
-            "no call, error: turns 1, MCP calls 0, ran [], ends [error], no record".to_string(),
-            format!("added, failed: turns 1, MCP calls 0, ran [], ends [response.failed [mcp_list_tools:, function_call:in_progress], [DONE]], {stored}"),
-            format!("added, partial arguments, failed: turns 1, MCP calls 0, ran [], ends [response.failed [mcp_list_tools:, function_call:in_progress], [DONE]], {stored}"),
-            format!("added, partial arguments, incomplete: turns 1, MCP calls 0, ran [], ends [response.incomplete [mcp_list_tools:, function_call:incomplete], [DONE]], {stored}"),
-            format!("a call cut short, incomplete: turns 1, MCP calls 0, ran [], ends [response.incomplete [mcp_list_tools:, function_call:incomplete], [DONE]], {stored}"),
-            format!("added, partial arguments, body ends: turns 1, MCP calls 0, ran [], ends [response.completed [mcp_list_tools:], [DONE]], {stored}"),
-            format!("added, arguments done, body ends: turns 2, MCP calls 1, ran [{ran}], ends [response.completed [mcp_list_tools:, mcp_call:completed, message:completed], [DONE]], {stored}"),
-            format!("added, output_item.done, body ends: turns 2, MCP calls 1, ran [{ran}], ends [response.completed [mcp_list_tools:, mcp_call:completed, message:completed], [DONE]], {stored}"),
-            format!("added, no arguments done, body ends: turns 2, MCP calls 1, ran [completed {{}}], ends [response.completed [mcp_list_tools:, mcp_call:completed, message:completed], [DONE]], {stored}"),
-            "added, error: turns 1, MCP calls 0, ran [], ends [error], no record".to_string(),
-            "whole call, error: turns 1, MCP calls 0, ran [], ends [error], no record".to_string(),
-            "added, error, the call's rest: turns 1, MCP calls 0, ran [], ends [error], no record".to_string(),
-            format!("a call, then incomplete: turns 2, MCP calls 1, ran [{ran}], ends [response.incomplete [mcp_list_tools:, mcp_call:completed, message:incomplete], [DONE]], {stored}"),
-            format!("a call, then failed: turns 2, MCP calls 1, ran [{ran}], ends [response.failed [mcp_list_tools:, mcp_call:completed, message:in_progress], [DONE]], {stored}"),
-            format!("a call, then error: turns 2, MCP calls 1, ran [{ran}], ends [error], no record"),
+            format!("no call, incomplete: turns 1, MCP calls 0, closed [], ends [response.incomplete [mcp_list_tools:, message:incomplete; {incomplete}], [DONE]], {whole_stored}"),
+            "no call, error: turns 1, MCP calls 0, closed [], ends [error], every item closed in the terminal, no record".to_string(),
+            format!("added, failed: turns 1, MCP calls 0, closed [failed {{}}], ends [response.failed [mcp_list_tools:, mcp_call:failed; {failed}], [DONE]], {whole_stored}"),
+            format!("added, partial arguments, failed: turns 1, MCP calls 0, closed [{unran_part}], ends [response.failed [mcp_list_tools:, mcp_call:failed; {failed}], [DONE]], {whole_stored}"),
+            format!("added, partial arguments, incomplete: turns 1, MCP calls 0, closed [{unran_part}], ends [response.incomplete [mcp_list_tools:, mcp_call:failed; {incomplete}], [DONE]], {whole_stored}"),
+            format!("a call cut short, incomplete: turns 1, MCP calls 0, closed [{unran_part}], ends [response.incomplete [mcp_list_tools:, mcp_call:failed; {incomplete}], [DONE]], {whole_stored}"),
+            format!("one call whole, the next cut, incomplete: turns 1, MCP calls 0, closed [{unran}; {unran_part}], ends [response.incomplete [mcp_list_tools:, mcp_call:failed, mcp_call:failed; {incomplete}], [DONE]], {whole_stored}"),
+            format!("added, partial arguments, body ends: turns 1, MCP calls 0, closed [{unran_part}], ends [response.completed [mcp_list_tools:, mcp_call:failed], [DONE]], {whole_stored}"),
+            format!("added, arguments done, body ends: turns 2, MCP calls 1, closed [{ran}], ends [response.completed [mcp_list_tools:, mcp_call:completed, message:completed], [DONE]], {whole_stored}"),
+            format!("added, output_item.done, body ends: turns 2, MCP calls 1, closed [{ran}], ends [response.completed [mcp_list_tools:, mcp_call:completed, message:completed], [DONE]], {whole_stored}"),
+            format!("added, no arguments done, body ends: turns 2, MCP calls 1, closed [completed {{}}], ends [response.completed [mcp_list_tools:, mcp_call:completed, message:completed], [DONE]], {whole_stored}"),
+            "added, error: turns 1, MCP calls 0, closed [], ends [error], mcp_stub never closed, no record".to_string(),
+            "whole call, error: turns 1, MCP calls 0, closed [], ends [error], mcp_stub never closed, no record".to_string(),
+            "added, error, the call's rest: turns 1, MCP calls 0, closed [], ends [error], mcp_stub never closed, no record".to_string(),
+            format!("a call, then incomplete: turns 2, MCP calls 1, closed [{ran}], ends [response.incomplete [mcp_list_tools:, mcp_call:completed, message:incomplete; {incomplete}], [DONE]], {whole_stored}"),
+            format!("a call, then failed: turns 2, MCP calls 1, closed [{ran}], ends [response.failed [mcp_list_tools:, mcp_call:completed, message:in_progress; {failed}], [DONE]], {whole_stored}"),
+            format!("a call, then error: turns 2, MCP calls 1, closed [{ran}], ends [error], every item closed in the terminal, no record"),
+            format!("two whole calls over max_tool_calls 1, failed: turns 1, MCP calls 1, closed [{ran}; {unran}], ends [response.completed [mcp_list_tools:, mcp_call:completed, mcp_call:failed; {at_limit}], [DONE]], {whole_stored}"),
+            format!("two whole calls over max_tool_calls 1, incomplete: turns 1, MCP calls 1, closed [{ran}; {unran}], ends [response.completed [mcp_list_tools:, mcp_call:completed, mcp_call:failed; {at_limit}], [DONE]], {whole_stored}"),
         ]
     );
     server.abort();

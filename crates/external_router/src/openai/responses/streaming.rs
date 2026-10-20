@@ -56,7 +56,8 @@ use crate::{
             build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
             mcp_list_tools_bindings_to_emit, prepare_mcp_tools_as_functions, retained_output_items,
             send_mcp_list_tools_events, skip_streaming_tool_calls, StreamAction,
-            StreamingToolHandler, ToolLoopState, TOOL_CALL_LIMIT_REASON,
+            StreamingToolHandler, ToolLoopState, NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
+            NOT_EXECUTED_AT_UPSTREAM_END, TOOL_CALL_LIMIT_REASON,
         },
     },
     persistence_utils::persist_conversation_items,
@@ -546,28 +547,18 @@ fn end_at_tool_call_limit(response: &mut Value, original_request: &ResponsesRequ
     );
 }
 
-/// Send the terminal event that ends the tool loop's stream: the final
-/// response built from the handler's snapshot, the loop's items in place,
-/// the client's view of the tools, the request's metadata, and the note of a
-/// loop stopped at its tool-call allowance. It is `response.completed`, unless
-/// the upstream ended its turn on a terminal of its own: that kind and status.
-/// Returns false if client disconnected
-pub(super) async fn send_final_response_event(
+/// The response that ends the tool loop's stream, built once for its
+/// terminal event and its record alike: the handler's snapshot, the loop's
+/// items in place, the client's view of the tools, the request's metadata,
+/// and the note of a loop stopped at its tool-call allowance. Its status is
+/// `completed`, unless the upstream ended its turn on a terminal of its own.
+pub(super) fn final_response(
     handler: &StreamingToolHandler,
-    tx: &SseSender,
-    enc: &mut SseEncoder,
-    sequence_number: &mut u64,
     state: &ToolLoopState,
     ctx: &StreamingEventContext<'_>,
     end: ToolLoopEnd,
-) -> bool {
-    let mut final_response = match handler.snapshot_final_response() {
-        Some(resp) => resp,
-        None => {
-            warn!("Final response snapshot unavailable; skipping synthetic completion event");
-            return true;
-        }
-    };
+) -> Option<Value> {
+    let mut final_response = handler.snapshot_final_response()?;
 
     if let Some(original_id) = handler.original_response_id() {
         if let Some(obj) = final_response.as_object_mut() {
@@ -579,10 +570,8 @@ pub(super) async fn send_final_response_event(
         inject_mcp_metadata_streaming(&mut final_response, state, session);
     }
 
-    // With the session, the wire hides what the record hides: the internal
-    // servers' items and the calls to their tools. The asks for the session's
-    // exposed tools that a limit stop leaves beside their not-executed items
-    // are dropped by `end_at_tool_call_limit` below.
+    // With the session, the response hides the internal servers' items and
+    // the calls to their tools.
     restore_original_tools(&mut final_response, ctx.original_request, ctx.session);
     patch_response_with_request_metadata(
         &mut final_response,
@@ -590,19 +579,43 @@ pub(super) async fn send_final_response_event(
         ctx.previous_response_id,
     );
 
-    let terminal = match end {
-        ToolLoopEnd::UpstreamTerminal(terminal) => terminal,
-        ToolLoopEnd::Answered | ToolLoopEnd::ToolCallLimit => {
-            if let Some(obj) = final_response.as_object_mut() {
-                obj.insert("status".to_string(), Value::String("completed".to_string()));
+    // A run the loop ends itself is `completed`, whatever the last upstream
+    // turn it ran calls of ended as, and carries no error of that turn.
+    if !matches!(end, ToolLoopEnd::UpstreamTerminal(_)) {
+        if let Some(obj) = final_response.as_object_mut() {
+            obj.insert("status".to_string(), Value::String("completed".to_string()));
+            if obj.get("error").is_some_and(|error| !error.is_null()) {
+                obj.insert("error".to_string(), Value::Null);
             }
-            ResponseEvent::COMPLETED
         }
-    };
+    }
     if end == ToolLoopEnd::ToolCallLimit {
         end_at_tool_call_limit(&mut final_response, ctx.original_request);
+    } else if let Some(output) = final_response
+        .get_mut("output")
+        .and_then(Value::as_array_mut)
+    {
+        // The asks for server calls leave as at the limit: each call ran, or
+        // was closed as not executed, and has its own item.
+        *output = retained_output_items(output, ctx.original_request);
     }
+    Some(final_response)
+}
 
+/// Send the terminal event carrying `final_response`: `response.completed`,
+/// or the kind of the upstream's own terminal.
+/// Returns false if client disconnected
+pub(super) async fn send_final_response_event(
+    tx: &SseSender,
+    enc: &mut SseEncoder,
+    sequence_number: &mut u64,
+    final_response: &Value,
+    end: ToolLoopEnd,
+) -> bool {
+    let terminal = match end {
+        ToolLoopEnd::UpstreamTerminal(terminal) => terminal,
+        ToolLoopEnd::Answered | ToolLoopEnd::ToolCallLimit => ResponseEvent::COMPLETED,
+    };
     let payload = json!({
         "type": terminal,
         "sequence_number": *sequence_number,
@@ -964,6 +977,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                                                     list_tools_index,
                                                     &mut sequence_number,
                                                     server_key,
+                                                    &mut state.mcp_list_tools_items,
                                                 )
                                                 .await
                                                 {
@@ -1044,15 +1058,30 @@ pub(super) fn handle_streaming_with_tool_interception(
                 preserved_response_id = Some(id);
             }
 
-            if let Some(terminal) = upstream_terminal {
-                break (handler, ToolLoopEnd::UpstreamTerminal(terminal));
-            }
-
-            // The model answered without asking for a tool: the loop's end. A
-            // body that closed before its terminal event ends the turn too,
-            // and its calls run all the same if each of them is whole.
-            if !tool_calls_detected && !handler.has_runnable_calls() {
-                break (handler, ToolLoopEnd::Answered);
+            // The model answered without asking for a tool, or the upstream
+            // ended its turn on its own terminal: the loop's end. A body that
+            // closed before its terminal event ends the turn too, and its
+            // calls run all the same if each of them is whole. Calls that do
+            // not run are closed as not executed, their items the response's.
+            if upstream_terminal.is_some()
+                || (!tool_calls_detected && !handler.has_runnable_calls())
+            {
+                if !skip_streaming_tool_calls(
+                    handler.take_pending_calls(),
+                    &session,
+                    &format_registry,
+                    &tx,
+                    &mut state,
+                    &mut sequence_number,
+                    NOT_EXECUTED_AT_UPSTREAM_END,
+                )
+                .await
+                {
+                    return;
+                }
+                let end =
+                    upstream_terminal.map_or(ToolLoopEnd::Answered, ToolLoopEnd::UpstreamTerminal);
+                break (handler, end);
             }
 
             // Execute tools
@@ -1109,6 +1138,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                     &tx,
                     &mut state,
                     &mut sequence_number,
+                    NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
                 )
                 .await
                 {
@@ -1144,45 +1174,26 @@ pub(super) fn handle_streaming_with_tool_interception(
         };
 
         // The loop's end, answered, stopped at the tool-call allowance or on
-        // the upstream's terminal: the terminal event, the record, the sentinel.
-        if !send_final_response_event(
-            &handler,
-            &tx,
-            &mut sse_encoder,
-            &mut sequence_number,
-            &state,
-            &streaming_ctx,
-            end,
-        )
-        .await
-        {
-            return;
+        // the upstream's terminal: the terminal event, the record (the same
+        // response), the sentinel.
+        let final_response = final_response(&handler, &state, &streaming_ctx, end);
+        if let Some(response) = &final_response {
+            if !send_final_response_event(
+                &tx,
+                &mut sse_encoder,
+                &mut sequence_number,
+                response,
+                end,
+            )
+            .await
+            {
+                return;
+            }
+        } else {
+            warn!("Final response snapshot unavailable; skipping synthetic completion event");
         }
 
-        let final_response_json = if should_store {
-            handler.accumulator.into_final_response()
-        } else {
-            None
-        };
-
-        if let Some(mut response_json) = final_response_json {
-            if let Some(ref id) = preserved_response_id {
-                if let Some(obj) = response_json.as_object_mut() {
-                    obj.insert("id".to_string(), Value::String(id.clone()));
-                }
-            }
-            inject_mcp_metadata_streaming(&mut response_json, &state, &session);
-
-            restore_original_tools(&mut response_json, &original_request, Some(&session));
-            patch_response_with_request_metadata(
-                &mut response_json,
-                &original_request,
-                previous_response_id.as_deref(),
-            );
-            if end == ToolLoopEnd::ToolCallLimit {
-                end_at_tool_call_limit(&mut response_json, &original_request);
-            }
-
+        if let Some(response_json) = final_response.filter(|_| should_store) {
             // Always persist conversation items and response (even without conversation)
             if let Err(err) = persist_conversation_items(
                 storage.conversation.clone(),
@@ -1317,17 +1328,10 @@ mod tests {
             let (tx, mut rx) = sse_channel();
             let mut enc = SseEncoder::new();
             let mut sequence_number = 7;
+            let response = final_response(&handler, &state, &ctx, end).expect("a response");
             assert!(
-                send_final_response_event(
-                    &handler,
-                    &tx,
-                    &mut enc,
-                    &mut sequence_number,
-                    &state,
-                    &ctx,
-                    end,
-                )
-                .await
+                send_final_response_event(&tx, &mut enc, &mut sequence_number, &response, end)
+                    .await
             );
             drop(tx);
             assert_eq!(sequence_number, 8, "{end:?}");
