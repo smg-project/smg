@@ -29,7 +29,7 @@ use super::{
     HarmonyParserAdapter,
 };
 use crate::{
-    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    observability::metrics::{metrics_labels, LocalStopAbort, Metrics, StreamingMetricsParams},
     rate_limit::SharedReservationHandle,
     routers::{
         common::{
@@ -286,7 +286,15 @@ impl HarmonyStreamingProcessor {
             match response.into_response() {
                 ProtoResponseVariant::Chunk(chunk) => {
                     decode
-                        .chunk(&chunk, dispatch, original_request, tx, router_stop_strings)
+                        .chunk(
+                            &chunk,
+                            dispatch,
+                            original_request,
+                            tx,
+                            router_stop_strings,
+                            prompt_tokens,
+                            cached_tokens,
+                        )
                         .await?;
                 }
                 ProtoResponseVariant::Complete(complete) => {
@@ -303,10 +311,16 @@ impl HarmonyStreamingProcessor {
                 }
                 ProtoResponseVariant::None => {}
             }
+            // An engine that outlived the client's stream (every choice closed, a router-stopped
+            // one streaming on past its stop) is not polled again: the driver aborts the engine
+            // stream.
+            if decode.engine_outlived_now(original_request.choices()) {
+                decode.engine_outlived = true;
+                break;
+            }
         }
 
-        // Mark stream as completed successfully to prevent abort on drop
-        decode_stream.mark_completed();
+        decode.release_engine(decode_stream, &original_request.model);
 
         decode
             .finish(
@@ -1060,6 +1074,16 @@ struct ChatDecode {
     // only ever set from this stream's own Complete messages, so it can't be fooled by prefill
     // data into thinking decode produced authoritative usage it didn't.
     decode_completed_indices: HashSet<u32>,
+    // Router-stopped indices the engine streamed a chunk for after their stop: it is generating
+    // past the stop (an engine that ends the choice on that step sends its Complete next).
+    tailed: HashSet<u32>,
+    // The engine was streaming past a stop when every choice had closed (its Complete came, or
+    // the router's stop ended it): the loop stopped polling it, and the driver aborts it instead
+    // of marking it completed (see `release_engine`).
+    engine_outlived: bool,
+    // Tokens the engine streamed for choices after their router-side stop, read before the
+    // abort: the tail generated for nobody.
+    tail_tokens: u64,
     // Reusable SSE encoder shared across every chunk emitted for this stream.
     encoder: SseEncoder,
 }
@@ -1081,14 +1105,70 @@ impl ChatDecode {
             spec_drafted: HashMap::new(),
             parsed_reasoning_tokens: 0,
             decode_completed_indices: HashSet::new(),
+            tailed: HashSet::new(),
+            engine_outlived: false,
+            tail_tokens: 0,
             encoder: SseEncoder::new(),
         }
     }
 
+    /// Choices closed by their decode `Complete` or by the router's stop.
+    fn closed_choices(&self) -> u32 {
+        (self.decode_completed_indices.len()
+            + self
+                .router_stopped
+                .difference(&self.decode_completed_indices)
+                .count()) as u32
+    }
+
+    /// Whether the engine has outlived the client's stream: every expected choice is closed
+    /// while a router-stopped choice without its Complete has streamed on past its stop, so the
+    /// engine is generating a tail nobody receives. A stopped choice whose next message has not
+    /// come yet is waited for: an engine that ends the choice on that step sends its Complete
+    /// next, and nothing is aborted; a chunk instead is the tail. Nothing to look at while no
+    /// stop has fired.
+    fn engine_outlived_now(&self, expected_choices: u32) -> bool {
+        if self.router_stopped.is_empty() {
+            return false;
+        }
+        let mut open_stops = 0u32;
+        let mut tailed = false;
+        for index in self
+            .router_stopped
+            .difference(&self.decode_completed_indices)
+        {
+            open_stops += 1;
+            tailed |= self.tailed.contains(index);
+        }
+        tailed && self.decode_completed_indices.len() as u32 + open_stops >= expected_choices
+    }
+
+    /// The engine stream, released before the usage chunk is written. An engine the router's
+    /// stop outlived is aborted now: dropping the stream un-marked is the abort path a client
+    /// disconnect takes, so the slot goes back to the engine's batch within a step instead of
+    /// running to `max_tokens` for nobody. An engine that ended on its own is marked completed,
+    /// so that its drop sends no abort.
+    fn release_engine(&self, mut decode_stream: ProtoStream, model: &str) {
+        if !self.engine_outlived {
+            decode_stream.mark_completed();
+            return;
+        }
+        Metrics::record_local_stop_abort(LocalStopAbort {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: metrics_labels::BACKEND_HARMONY,
+            model_id: model,
+            endpoint: metrics_labels::ENDPOINT_CHAT,
+            tail_tokens: self.tail_tokens,
+        });
+        drop(decode_stream);
+    }
+
     /// One chunk of one choice: its parser made on the first, its tokens counted and parsed,
     /// the router's stop strings scanned, and the delta emitted (the choice's role chunk first);
-    /// a router-side stop emits the choice's final chunk and swallows the rest of its stream
-    /// (the engine keeps generating until its own limits).
+    /// a router-side stop emits the choice's final chunk, closes the choice with the chunk's
+    /// counts and swallows the rest of its stream (the request is aborted once every choice has
+    /// closed).
+    #[expect(clippy::too_many_arguments)]
     async fn chunk(
         &mut self,
         chunk: &ProtoGenerateStreamChunk,
@@ -1096,12 +1176,24 @@ impl ChatDecode {
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
         router_stop_strings: &[String],
+        prompt_tokens: &mut HashMap<u32, u32>,
+        cached_tokens: &mut HashMap<u32, u32>,
     ) -> Result<(), utils::StreamFailure> {
         let index = chunk.index();
 
         // Track first token time for TTFT metric
         if self.first_token_time.is_none() {
             self.first_token_time = Some(Instant::now());
+        }
+
+        // A choice's engine chunk after its router-side stop is the tail the engine generated
+        // for nobody (an engine that ends the choice on that step sends its Complete instead):
+        // counted, not read; the request is aborted once every choice has closed, until then
+        // another choice may still be streaming.
+        if self.router_stopped.contains(&index) {
+            self.tail_tokens += chunk.token_ids().len() as u64;
+            self.tailed.insert(index);
+            return Ok(());
         }
 
         // Initialize parser for this index if needed
@@ -1138,9 +1230,6 @@ impl ChatDecode {
         let Some(mut delta) = delta_result else {
             return Ok(());
         };
-        if self.router_stopped.contains(&index) {
-            return Ok(());
-        }
         let mut stop_matched: Option<String> = None;
         if !router_stop_strings.is_empty() {
             if let Some(text) = delta.analysis_delta.take() {
@@ -1195,7 +1284,7 @@ impl ChatDecode {
         }
 
         // A router-side stop fired: emit the final chunk now and swallow the rest of this
-        // index's stream (the engine keeps generating until its own limits).
+        // index's stream (the request is aborted once every choice has closed).
         if let Some(stop) = stop_matched {
             HarmonyStreamingProcessor::emit_final_chunk(
                 index,
@@ -1208,6 +1297,25 @@ impl ChatDecode {
             )
             .await?;
             self.router_stopped.insert(index);
+            // The choice closes here, as its Complete would close it: the counts of the chunk
+            // the stop matched in are its counts (the engine's own server counts a stopped
+            // request through that step as well), the tracker settles what the stream had
+            // reached, and the parser is finalized for the reasoning tokens it counted. What the
+            // engine generates past this step is the tail the abort cuts, never the client's
+            // usage.
+            prompt_tokens
+                .entry(index)
+                .or_insert_with(|| chunk.prompt_tokens());
+            cached_tokens
+                .entry(index)
+                .or_insert_with(|| chunk.cached_tokens());
+            self.reasoning_tokens
+                .insert(index, chunk.reasoning_tokens());
+            self.completion_tokens.record_local_stop(index);
+            if let Some(parser) = self.parsers.get_mut(&index) {
+                let final_output = parser.finalize("stop".to_string());
+                self.parsed_reasoning_tokens += final_output.reasoning_token_count;
+            }
         }
         Ok(())
     }
@@ -1215,7 +1323,7 @@ impl ChatDecode {
     /// One choice's terminal frame: its metadata and counters stored, the choice opened with
     /// its role chunk if nothing opened it, its parser finalized, the scanners' held text
     /// released, and its final chunk emitted (a choice a router-side stop already closed gets
-    /// none).
+    /// none, and one the engine streamed past its stop adds only its speculative counts).
     async fn complete(
         &mut self,
         complete: &ProtoGenerateComplete,
@@ -1227,6 +1335,17 @@ impl ChatDecode {
     ) -> Result<(), utils::StreamFailure> {
         let index = complete.index();
         self.decode_completed_indices.insert(index);
+        self.spec_accepted
+            .insert(index, complete.spec_accepted_tokens());
+        self.spec_drafted
+            .insert(index, complete.spec_draft_tokens());
+
+        // The Complete of a choice the engine generated past the router's stop (another choice
+        // kept the stream open) is the tail's end: the choice closed at its stop with that
+        // step's counts, and only the counts the stop could not know are taken from it.
+        if self.tailed.contains(&index) {
+            return Ok(());
+        }
 
         // Store final metadata
         self.matched_stops
@@ -1240,18 +1359,18 @@ impl ChatDecode {
             .or_insert_with(|| complete.cached_tokens());
         self.reasoning_tokens
             .insert(index, complete.reasoning_tokens());
-        self.spec_accepted
-            .insert(index, complete.spec_accepted_tokens());
-        self.spec_drafted
-            .insert(index, complete.spec_draft_tokens());
+
+        // A router-side stop already closed this choice: its final chunk went out at the stop
+        // and its parser was finalized there; the Complete's counters above are all it adds.
+        if self.router_stopped.contains(&index) {
+            return Ok(());
+        }
 
         // A choice that reaches its Complete unopened (its only engine output is this Complete,
         // or every Chunk before it was header tokens without content) opens here with its role
         // chunk, as a choice with content opened on its first delta, and is the stream's first
-        // output when nothing preceded it. A router-side stop already closed its choice.
-        if !self.router_stopped.contains(&index)
-            && self.is_firsts.get(&index).copied().unwrap_or(true)
-        {
+        // output when nothing preceded it.
+        if self.is_firsts.get(&index).copied().unwrap_or(true) {
             if self.first_token_time.is_none() {
                 self.first_token_time = Some(Instant::now());
             }
@@ -1287,11 +1406,6 @@ impl ChatDecode {
 
         let final_output = parser.finalize(complete.finish_reason().to_string());
         self.parsed_reasoning_tokens += final_output.reasoning_token_count;
-
-        // A router-side stop already closed this choice.
-        if self.router_stopped.contains(&index) {
-            return Ok(());
-        }
 
         // Release scanner-held text that never became a match.
         let flushed = HarmonyChannelDelta {
@@ -1360,14 +1474,14 @@ impl ChatDecode {
         };
 
         if let Some(handle) = reservation {
-            // A clean decode EOF with fewer decode `Complete` messages than this request's `n>1`
-            // choices has only partial usage -- settling with that would understate the real
-            // cost. Deliberately checked against `decode_completed_indices`, not
-            // `prompt_tokens`: in PD mode `prompt_tokens` can already be non-empty from the
-            // prefill phase alone, which would otherwise mask a decode phase that never actually
-            // finished.
+            // A clean decode EOF with fewer closed choices (a decode `Complete`, or the router's
+            // stop with the chunk's counts) than this request's `n>1` choices has only partial
+            // usage -- settling with that would understate the real cost. Deliberately checked
+            // against the decode stream's own closes, not `prompt_tokens`: in PD mode
+            // `prompt_tokens` can already be non-empty from the prefill phase alone, which would
+            // otherwise mask a decode phase that never actually finished.
             let expected_choices = original_request.choices();
-            if (self.decode_completed_indices.len() as u32) < expected_choices {
+            if self.closed_choices() < expected_choices {
                 handle.close_reserved_only().await;
             } else {
                 handle.settle_success(counts.settlement()).await;
@@ -1415,6 +1529,8 @@ impl Default for HarmonyStreamingProcessor {
     }
 }
 
+#[cfg(test)]
+mod local_stop_tests;
 #[cfg(test)]
 mod lone_complete_tests;
 #[cfg(test)]

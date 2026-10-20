@@ -514,6 +514,14 @@ pub(crate) fn init_metrics() {
         "smg_router_generation_duration_seconds",
         "Total generation time by router_type, backend_type, model, endpoint (gRPC only)"
     );
+    describe_counter!(
+        "smg_router_local_stop_aborts_total",
+        "Streamed requests the gateway aborted at the engine because its own stop (a stop string or stop token id matched in the gateway, not by the engine) had ended every choice for the client while the engine was still generating, by router_type, backend_type, model, endpoint (gRPC only)"
+    );
+    describe_counter!(
+        "smg_router_local_stop_tail_tokens_total",
+        "Output tokens the engine streamed for a choice after the gateway's own stop had ended that choice, read before the request was aborted (the tail generated for nobody; what the abort cuts on the engine side is never read, so never counted), by router_type, backend_type, model, endpoint (gRPC only)"
+    );
 
     // Layer 2: PD disaggregation metrics (signals only SMG can measure — it is the
     // only component that observes both the prefill and decode sides of a request).
@@ -1352,6 +1360,19 @@ pub(crate) mod allocator_stats {
 /// - Static labels use the metrics crate's internal caching
 pub struct Metrics;
 
+/// A streamed request the gateway aborted at the engine because its own
+/// stop had ended every choice for the client while the engine was still
+/// generating (see `smg_router_local_stop_aborts_total`).
+pub struct LocalStopAbort<'a> {
+    pub router_type: &'static str,
+    pub backend_type: &'static str,
+    pub model_id: &'a str,
+    pub endpoint: &'static str,
+    /// Output tokens the engine streamed for the stopped choices after their
+    /// stop, read before the abort.
+    pub tail_tokens: u64,
+}
+
 /// Parameters for recording streaming metrics.
 pub struct StreamingMetricsParams<'a> {
     /// Router type label (e.g., "grpc", "http")
@@ -1730,6 +1751,37 @@ impl Metrics {
     // ========================================================================
     // Layer 2: Router inference metrics (gRPC only)
     // ========================================================================
+
+    /// A request the gateway's own stop ended for the client while the
+    /// engine was still generating: aborted at the engine, with the tail it
+    /// had streamed past the stop. At most once per stream, so the handles
+    /// are not kept.
+    pub fn record_local_stop_abort(abort: LocalStopAbort<'_>) {
+        let LocalStopAbort {
+            router_type,
+            backend_type,
+            model_id,
+            endpoint,
+            tail_tokens,
+        } = abort;
+        let model = intern_model_label(model_id);
+        counter!(
+            "smg_router_local_stop_aborts_total",
+            "router_type" => router_type,
+            "backend_type" => backend_type,
+            "model" => model.clone(),
+            "endpoint" => endpoint
+        )
+        .increment(1);
+        counter!(
+            "smg_router_local_stop_tail_tokens_total",
+            "router_type" => router_type,
+            "backend_type" => backend_type,
+            "model" => model,
+            "endpoint" => endpoint
+        )
+        .increment(tail_tokens);
+    }
 
     /// Record all streaming metrics in a single batch call.
     ///

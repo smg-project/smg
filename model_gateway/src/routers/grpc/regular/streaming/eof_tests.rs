@@ -37,6 +37,19 @@ use crate::{
 pub(super) struct CharacterTokenizer {
     special_tokens: SpecialTokens,
     eager_steps: AtomicUsize,
+    /// The ids `eos_token_ids` reports (none by default).
+    eos: Vec<u32>,
+}
+
+impl CharacterTokenizer {
+    /// A tokenizer whose EOS ids are `eos`: the gateway's stop decoder takes
+    /// them as stops, as it does a model's.
+    pub(super) fn with_eos(eos: Vec<u32>) -> Self {
+        Self {
+            eos,
+            ..Self::default()
+        }
+    }
 }
 
 impl llm_tokenizer::traits::Encoder for CharacterTokenizer {
@@ -83,6 +96,10 @@ impl Tokenizer for CharacterTokenizer {
 
     fn get_special_tokens(&self) -> &SpecialTokens {
         &self.special_tokens
+    }
+
+    fn eos_token_ids(&self) -> &[u32] {
+        &self.eos
     }
 
     fn token_to_id(&self, token: &str) -> Option<u32> {
@@ -161,7 +178,7 @@ pub(crate) async fn scripted_stream(
 
 /// [`scripted_stream`] with the frames after `first` held back until `gate`
 /// fires: the processor sees the first engine output on its own.
-pub(super) async fn gated_stream(
+pub(crate) async fn gated_stream(
     first: Vec<proto::GenerateResponse>,
     gate: oneshot::Receiver<()>,
     rest: Vec<proto::GenerateResponse>,
@@ -300,6 +317,7 @@ async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
             .map(|id| proto::GenerateResponse {
                 response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
                     token_ids: vec![*id],
+                    prompt_tokens: 1,
                     completion_tokens: 1,
                     ..Default::default()
                 })),
@@ -870,7 +888,7 @@ async fn byte_fallback_messages_transport_eof_preserves_text_without_input_usage
 }
 
 #[tokio::test]
-async fn byte_fallback_messages_transport_eof_reports_local_stop_without_input_usage() {
+async fn byte_fallback_messages_transport_eof_reports_local_stop_with_the_chunk_counts() {
     let tokenizer = byte_fallback_reasoning_tokenizer();
     let ids = [0xC3 + 1, 0xA9 + 1];
     assert_eq!(tokenizer.decode(&ids, true).unwrap(), "é");
@@ -904,10 +922,9 @@ async fn byte_fallback_messages_transport_eof_reports_local_stop_without_input_u
         .unwrap();
     assert_eq!(final_delta["delta"]["stop_reason"], "stop_sequence");
     assert_eq!(final_delta["delta"]["stop_sequence"], "é");
-    assert!(
-        final_delta["usage"]["input_tokens"].is_null(),
-        "{final_delta}"
-    );
+    // The gateway's own stop closed the message with the counts of the chunk
+    // it matched in (these frames carry none), as settled as a Complete's.
+    assert_eq!(final_delta["usage"]["input_tokens"], 0, "{final_delta}");
 }
 
 #[tokio::test]
@@ -1002,8 +1019,11 @@ async fn byte_fallback_completion_transport_eof_reports_local_stop_without_compl
                 .collect();
             assert_eq!(finishes, ["stop"], "{events:?}");
             if status == "0" {
+                // The gateway's own stop closed the choice with the counts of
+                // the chunk it matched in (these frames carry none), as
+                // settled as a Complete's.
                 let outcome = result.unwrap();
-                assert!(!outcome.saw_complete);
+                assert!(outcome.saw_complete);
                 assert_eq!(outcome.prompt_tokens, 0);
             }
             assert!(events.iter().all(|event| !event["usage"].is_object()));

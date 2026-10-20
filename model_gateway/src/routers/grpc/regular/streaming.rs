@@ -40,7 +40,7 @@ use super::symphony::{
     engine_finish, finished, reasoning_text_tokens, telemetry::Who, Delta, Reader,
 };
 use crate::{
-    observability::metrics::{metrics_labels, Metrics, StreamingMetricsParams},
+    observability::metrics::{metrics_labels, LocalStopAbort, Metrics, StreamingMetricsParams},
     rate_limit::{SharedReservationHandle, UsageSettlement},
     routers::{
         common::{
@@ -408,6 +408,7 @@ impl StreamingProcessor {
             pd_timing,
         );
         stream.read_engine(&mut grpc_stream).await?;
+        stream.release_engine(grpc_stream, metrics_labels::ENDPOINT_CHAT);
         let usage = stream.usage_snapshot();
         stream.flush_parsers(usage.as_ref()).await?;
         let final_usage = stream.final_usage();
@@ -415,9 +416,6 @@ impl StreamingProcessor {
             .send_finish_chunks(final_usage.as_ref(), usage.as_ref())
             .await?;
         stream.send_usage_chunk(final_usage).await?;
-
-        // Mark stream as completed successfully to prevent abort on drop
-        grpc_stream.mark_completed();
 
         stream.settle_and_record(reservation).await;
         Ok(())
@@ -1778,13 +1776,11 @@ impl StreamingProcessor {
         )?;
         stream.send_message_start().await?;
         stream.read_engine(&mut grpc_stream).await?;
+        stream.release_engine(grpc_stream);
         stream.flush_parsers().await?;
         stream.close_open_blocks().await?;
         stream.send_message_delta().await?;
         stream.send_message_stop().await?;
-
-        // Mark stream completed
-        grpc_stream.mark_completed();
 
         stream.settle_and_record(reservation).await;
         Ok(())
@@ -2119,9 +2115,8 @@ impl StreamingProcessor {
             tx,
         );
         stream.read_engine(&mut grpc_stream).await?;
+        stream.release_engine(grpc_stream, self.backend_type);
         stream.finish_open_choices().await?;
-
-        grpc_stream.mark_completed();
 
         Ok(stream.outcome())
     }
@@ -2328,6 +2323,23 @@ struct ChatStream<'a> {
     /// Indices whose local stop decoder fired: their finish reason is pinned
     /// to "stop" and later engine output for the index is ignored.
     stopped_indices: HashSet<u32>,
+    /// Indices whose engine `Complete` came. A choice is closed by its
+    /// Complete or by its local stop; once every expected choice is closed
+    /// while a stopped one streams on without its Complete, the engine has
+    /// outlived the client's stream (see [`Self::engine_outlived_now`]).
+    completed_indices: HashSet<u32>,
+    /// Stopped indices the engine streamed a chunk for after their stop: it
+    /// is generating past the stop, which only a stop it cannot see does (an
+    /// engine that saw the stop ends the choice on that step and sends its
+    /// Complete next).
+    tailed_indices: HashSet<u32>,
+    /// The engine was streaming past a stop when every choice had closed:
+    /// the loop stopped polling it, and the driver aborts it instead of
+    /// marking it completed (see [`Self::release_engine`]).
+    engine_outlived: bool,
+    /// Tokens the engine streamed for choices after their local stop, read
+    /// before the abort: the tail generated for nobody.
+    tail_tokens: u64,
     prompt_tokens: HashMap<u32, u32>,
     completion_tokens: CompletionTokenTracker,
     cached_tokens: HashMap<u32, u32>,
@@ -2492,6 +2504,10 @@ impl<'a> ChatStream<'a> {
             finish_reasons: HashMap::new(),
             matched_stops: HashMap::new(),
             stopped_indices: HashSet::new(),
+            completed_indices: HashSet::new(),
+            tailed_indices: HashSet::new(),
+            engine_outlived: false,
+            tail_tokens: 0,
             prompt_tokens: HashMap::new(),
             completion_tokens: CompletionTokenTracker::new(),
             cached_tokens: HashMap::new(),
@@ -2575,7 +2591,14 @@ impl<'a> ChatStream<'a> {
         grpc_stream: &mut ProtoStream,
     ) -> Result<(), utils::StreamFailure> {
         loop {
-            let response = if self.final_indices.is_none() {
+            // An engine that outlived the client's stream (every choice
+            // closed, a locally stopped one streaming on past its stop) is
+            // not polled again: the loop ends as it does at the engine's
+            // end, and the driver aborts the engine stream.
+            if self.final_indices.is_none() && !self.engine_outlived && self.engine_outlived_now() {
+                self.engine_outlived = true;
+            }
+            let response = if self.final_indices.is_none() && !self.engine_outlived {
                 // The chunks written so far leave as a frame before the
                 // engine is polled, so every engine message reaches the
                 // client as its own frame as soon as it is processed; the
@@ -2639,9 +2662,14 @@ impl<'a> ChatStream<'a> {
 
         let index = chunk.index();
 
-        // Once the local stop decoder has fired for an index, ignore
-        // any further engine output the backend emits for it.
+        // Once the local stop decoder has fired for an index, any further
+        // engine chunk for it is the tail the engine generated for nobody
+        // (an engine that saw the stop sends its Complete instead): counted,
+        // not read; the request is aborted once every choice has closed,
+        // until then another choice may still be streaming.
         if self.stopped_indices.contains(&index) {
+            self.tail_tokens += chunk.token_ids().len() as u64;
+            self.tailed_indices.insert(index);
             return Ok(None);
         }
 
@@ -2711,6 +2739,17 @@ impl<'a> ChatStream<'a> {
                     .map(|s| Value::String(s.to_string()))
             });
             self.stopped_indices.insert(index);
+            // The choice closes here, as its Complete would close it: the
+            // counts of the chunk the stop matched in are its counts (the
+            // engine's own server counts a stopped request through that
+            // step as well), and the tracker settles what the stream had
+            // reached. What the engine generates past this step is the tail
+            // the abort cuts, never the client's usage.
+            self.prompt_tokens.insert(index, chunk.prompt_tokens());
+            self.cached_tokens.insert(index, chunk.cached_tokens());
+            self.reasoning_tokens
+                .insert(index, chunk.reasoning_tokens());
+            self.completion_tokens.record_local_stop(index);
         }
 
         if let Some((mut events, _)) = symphony_events {
@@ -2738,6 +2777,12 @@ impl<'a> ChatStream<'a> {
             .await?;
             self.spare = events.recycle();
             self.delta = delta;
+            // The stop ended the choice's output: the reader ends it now,
+            // with the finish "stop", as its Complete would have (the
+            // decoder holds no tail past a stop).
+            if should_stop {
+                self.end_reader(index, None).await?;
+            }
             return Ok(None);
         }
         self.delta = delta;
@@ -2758,13 +2803,27 @@ impl<'a> ChatStream<'a> {
     /// A choice's Complete: its decoder finished, its counts and finish
     /// reason recorded (a local stop match keeps precedence), and, for a
     /// choice Symphony reads, its output ended here; otherwise the text the
-    /// decoder still held goes to the emission.
+    /// decoder still held goes to the emission. The Complete of a choice the
+    /// engine streamed past its local stop adds only its speculative counts.
     async fn read_complete(
         &mut self,
         complete: ProtoGenerateComplete,
     ) -> Result<Option<PendingText>, utils::StreamFailure> {
         let index = complete.index();
         let request_id = &self.dispatch.request_id;
+
+        // The Complete of a choice the engine generated past its local stop
+        // (another choice kept the stream open) is the tail's end: the
+        // choice closed at its stop with that step's counts, so only the
+        // counts the stop could not know are taken from it.
+        if self.tailed_indices.contains(&index) {
+            self.completed_indices.insert(index);
+            self.spec_accepted
+                .insert(index, complete.spec_accepted_tokens());
+            self.spec_drafted
+                .insert(index, complete.spec_draft_tokens());
+            return Ok(None);
+        }
 
         // Complete byte decoding before routing held text through the
         // same reasoning/tool parsers as ordinary chunks.
@@ -2794,6 +2853,7 @@ impl<'a> ChatStream<'a> {
         };
 
         // Store metadata
+        self.completed_indices.insert(index);
         self.prompt_tokens.insert(index, complete.prompt_tokens());
 
         self.completion_tokens.record_complete(&complete);
@@ -2828,67 +2888,22 @@ impl<'a> ChatStream<'a> {
         }
 
         // Symphony ends the choice's output here: the decoder's last
-        // text, then the engine's finish. The finish chunk is Phase 4's,
-        // with the matched stop; the `Finish` event gives it the calls
-        // made, and the usage the reasoning tokens. A choice whose first
-        // engine output is its Complete has no reader yet: it gets one
-        // for its end, so an output of no tokens is recorded as every
-        // output is.
-        let mut delta = std::mem::take(&mut self.delta);
-        let mut events: Events<'_> = std::mem::take(&mut self.spare);
-        let reader = match self.readers.entry(index) {
-            Entry::Occupied(reader) => Some(reader.into_mut()),
-            Entry::Vacant(slot) => match self.spec.symphony.as_ref() {
-                Some(assignment) => Some(
-                    slot.insert(
-                        Reader::new(
-                            assignment,
-                            self.spec.tools.clone().unwrap_or_default(),
-                            &mut events,
-                        )?
-                        .first_call_only(self.spec.first_tool_call_only),
-                    ),
-                ),
-                None => None,
-            },
-        };
-        if let Some(reader) = reader {
-            let reason = self
-                .finish_reasons
+        // text, then the engine's finish (a choice the gateway's own stop
+        // ended was ended at its stop). The finish chunk is Phase 4's, with
+        // the matched stop; the `Finish` event gives it the calls made, and
+        // the usage the reasoning tokens. A choice whose first engine output
+        // is its Complete has no reader yet: it gets one for its end, so an
+        // output of no tokens is recorded as every output is.
+        if self.spec.symphony.is_some() {
+            if !self
+                .readers
                 .get(&index)
-                .map_or("stop", String::as_str);
-            if let Some(text) = flushed {
-                reader.tail(text, &mut delta, &mut events)?;
+                .is_some_and(|reader| reader.ended())
+            {
+                self.end_reader(index, flushed).await?;
             }
-            let who = Who {
-                request_id,
-                model: &self.dispatch.model,
-                choice: index,
-            };
-            reader.end(engine_finish(reason), who, &mut events)?;
-            if let Some(finished) = finished(events.as_slice()) {
-                self.has_tool_calls.insert(index, finished.tool_calls > 0);
-                self.parsed_reasoning_tokens
-                    .insert(index, finished.reasoning_tokens);
-            }
-            let usage = self.usage_snapshot();
-            StreamingProcessor::push_events(
-                self.tx,
-                &mut self.sse_buffer,
-                &self.chunk_frame,
-                index,
-                &mut events,
-                None,
-                usage.as_ref(),
-                self.emit_usage_null,
-            )
-            .await?;
-            self.spare = events.recycle();
-            self.delta = delta;
             return Ok(None);
         }
-        self.spare = events.recycle();
-        self.delta = delta;
 
         // Don't break - continue reading all Complete messages for n>1
         // Text the decoder held for a partial stop match: the
@@ -2901,6 +2916,115 @@ impl<'a> ChatStream<'a> {
                 self.held_tokens.remove(&index).unwrap_or(0),
             )
         }))
+    }
+
+    /// A choice Symphony reads ends: the decoder's last text (`flushed`) is
+    /// the reader's, then its output ends with the choice's finish reason
+    /// (the engine's, or the "stop" a local stop pinned). The `Finish` event
+    /// says what the Complete frame would have: the calls made, for the
+    /// finish reason, and the reasoning tokens, for the usage. A choice
+    /// without a reader yet (its first engine output is its Complete) gets
+    /// one for its end, so an output of no tokens is recorded as every
+    /// output is.
+    async fn end_reader(
+        &mut self,
+        index: u32,
+        flushed: Option<String>,
+    ) -> Result<(), utils::StreamFailure> {
+        let Some(assignment) = self.spec.symphony.as_ref() else {
+            return Ok(());
+        };
+        let request_id = &self.dispatch.request_id;
+        let reason = self
+            .finish_reasons
+            .get(&index)
+            .map_or("stop", String::as_str);
+        let mut delta = std::mem::take(&mut self.delta);
+        let mut events: Events<'_> = std::mem::take(&mut self.spare);
+        let reader = match self.readers.entry(index) {
+            Entry::Occupied(reader) => reader.into_mut(),
+            Entry::Vacant(slot) => slot.insert(
+                Reader::new(
+                    assignment,
+                    self.spec.tools.clone().unwrap_or_default(),
+                    &mut events,
+                )?
+                .first_call_only(self.spec.first_tool_call_only),
+            ),
+        };
+        if let Some(text) = flushed {
+            reader.tail(text, &mut delta, &mut events)?;
+        }
+        let who = Who {
+            request_id,
+            model: &self.dispatch.model,
+            choice: index,
+        };
+        reader.end(engine_finish(reason), who, &mut events)?;
+        if let Some(finished) = finished(events.as_slice()) {
+            self.has_tool_calls.insert(index, finished.tool_calls > 0);
+            self.parsed_reasoning_tokens
+                .insert(index, finished.reasoning_tokens);
+        }
+        let usage = self.usage_snapshot();
+        StreamingProcessor::push_events(
+            self.tx,
+            &mut self.sse_buffer,
+            &self.chunk_frame,
+            index,
+            &mut events,
+            None,
+            usage.as_ref(),
+            self.emit_usage_null,
+        )
+        .await?;
+        self.spare = events.recycle();
+        self.delta = delta;
+        Ok(())
+    }
+
+    /// Whether the engine has outlived the client's stream: every expected
+    /// choice is closed (its Complete came or its local stop fired) while a
+    /// stopped choice without its Complete has streamed on past its stop,
+    /// so the engine is generating a tail nobody receives. A stopped choice
+    /// whose next message has not come yet is waited for: an engine that
+    /// saw the stop (an EOS id, a stop the request also gave it) ends the
+    /// choice on that step and its Complete is the next message, so nothing
+    /// is aborted and the Complete is read as always; a chunk instead is
+    /// the tail. Nothing to look at while no stop has fired.
+    fn engine_outlived_now(&self) -> bool {
+        if self.stopped_indices.is_empty() {
+            return false;
+        }
+        let mut open_stops = 0u32;
+        let mut tailed = false;
+        for index in self.stopped_indices.difference(&self.completed_indices) {
+            open_stops += 1;
+            tailed |= self.tailed_indices.contains(index);
+        }
+        tailed && self.completed_indices.len() as u32 + open_stops >= self.spec.expected_choices
+    }
+
+    /// The engine stream, released before the client's finish is written.
+    /// An engine the gateway's own stop outlived is aborted now: dropping
+    /// the stream un-marked is the abort path a client disconnect takes (the
+    /// abort RPC or frame, and the worker's end of the stream drained off
+    /// this task), so the slot goes back to the engine's batch within a step
+    /// instead of running to `max_tokens` for nobody. An engine that ended
+    /// on its own is marked completed, so that its drop sends no abort.
+    fn release_engine(&self, mut grpc_stream: ProtoStream, endpoint: &'static str) {
+        if !self.engine_outlived {
+            grpc_stream.mark_completed();
+            return;
+        }
+        Metrics::record_local_stop_abort(LocalStopAbort {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: self.processor.backend_type,
+            model_id: &self.dispatch.model,
+            endpoint,
+            tail_tokens: self.tail_tokens,
+        });
+        drop(grpc_stream);
     }
 
     /// The engine's end, one pass per call: first the choices Symphony reads
@@ -3369,11 +3493,11 @@ impl<'a> ChatStream<'a> {
         let counts = self.counts();
         let (total_prompt, total_completion) = (counts.prompt, counts.completion);
         if let Some(handle) = reservation {
-            // `prompt_tokens` is only ever populated from a `Complete` message,
-            // one entry per index. A clean EOF that didn't produce one for
-            // every expected `n>1` choice has only partial usage -- settling
-            // with that would understate the real cost. Keep the reserved
-            // amount as final instead.
+            // `prompt_tokens` has one entry per closed index: from its
+            // `Complete`, or from the chunk the gateway's own stop matched
+            // in. A clean EOF that didn't close every expected `n>1` choice
+            // has only partial usage -- settling with that would understate
+            // the real cost. Keep the reserved amount as final instead.
             let expected_choices = self.spec.expected_choices;
             if (self.prompt_tokens.len() as u32) < expected_choices {
                 handle.close_reserved_only().await;
@@ -3600,6 +3724,21 @@ struct MessagesStream<'a> {
     /// Set once the local stop decoder fires: pins "stop" and ignores later
     /// engine output (the backend has no stop-string detection over ZMQ).
     stopped: bool,
+    /// The gateway's own stop closed the message with the counts of the
+    /// chunk it matched in: its usage is as settled as a Complete's.
+    closed_by_stop: bool,
+    /// The engine streamed a chunk after the local stop: it is generating
+    /// past the stop, which only a stop it cannot see does (an engine that
+    /// saw the stop ends the request on that step and sends its Complete
+    /// next).
+    tailed: bool,
+    /// The engine was streaming past the stop when the message had closed:
+    /// the loop stopped polling it, and the driver aborts it instead of
+    /// marking it completed (see [`Self::release_engine`]).
+    engine_outlived: bool,
+    /// Tokens the engine streamed after the local stop, read before the
+    /// abort: the tail generated for nobody.
+    tail_tokens: u64,
     /// Thinking tokens of the turn: the engine's count when it keeps one,
     /// else the tokens the parser routed to thinking, chunk by chunk.
     parsed_thinking_tokens: u32,
@@ -3761,6 +3900,10 @@ impl<'a> MessagesStream<'a> {
             finish_reason_str: String::new(),
             matched_stop: None,
             stopped: false,
+            closed_by_stop: false,
+            tailed: false,
+            engine_outlived: false,
+            tail_tokens: 0,
             parsed_thinking_tokens: 0,
             engine_thinking_tokens: 0,
             cached_tokens: 0,
@@ -3785,6 +3928,41 @@ impl<'a> MessagesStream<'a> {
             .stop_decoder
             .matched_stop()
             .map(|s| Value::String(s.to_string()));
+    }
+
+    /// The gateway's own stop closed the message, as its Complete would
+    /// close it: the counts of the chunk the stop matched in are the
+    /// message's (the engine's own server counts a stopped request through
+    /// that step as well), and the tracker settles what the stream had
+    /// reached. What the engine generates past this step is the tail the
+    /// abort cuts, never the client's usage.
+    fn close_on_local_stop(&mut self, chunk: &ProtoGenerateStreamChunk) {
+        self.prompt_tokens = chunk.prompt_tokens();
+        self.cached_tokens = chunk.cached_tokens();
+        self.engine_thinking_tokens = chunk.reasoning_tokens();
+        self.completion_tokens.record_local_stop(0);
+        self.closed_by_stop = true;
+    }
+
+    /// The engine stream, released before the message's end is written.
+    /// An engine the gateway's own stop outlived is aborted now: dropping
+    /// the stream un-marked is the abort path a client disconnect takes, so
+    /// the slot goes back to the engine's batch within a step instead of
+    /// running to `max_tokens` for nobody. An engine that ended on its own
+    /// is marked completed, so that its drop sends no abort.
+    fn release_engine(&self, mut grpc_stream: ProtoStream) {
+        if !self.engine_outlived {
+            grpc_stream.mark_completed();
+            return;
+        }
+        Metrics::record_local_stop_abort(LocalStopAbort {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type: self.processor.backend_type,
+            model_id: &self.dispatch.model,
+            endpoint: metrics_labels::ENDPOINT_MESSAGES,
+            tail_tokens: self.tail_tokens,
+        });
+        drop(grpc_stream);
     }
 
     /// Phase 1: the `message_start` with the skeleton message.
@@ -3823,7 +4001,14 @@ impl<'a> MessagesStream<'a> {
     ) -> Result<(), utils::StreamFailure> {
         let mut final_chunk = false;
         while !final_chunk {
-            let response = if self.decoder_finished_at_eof {
+            // An engine that outlived the message (the local stop closed
+            // it, and the engine streamed on instead of sending its
+            // Complete) is not polled again: the loop ends as it does at
+            // the engine's end, and the driver aborts the engine stream.
+            if !self.decoder_finished_at_eof && self.stopped && !self.saw_complete && self.tailed {
+                self.engine_outlived = true;
+            }
+            let response = if self.decoder_finished_at_eof || self.engine_outlived {
                 None
             } else {
                 grpc_stream.next().await.transpose().map_err(|e| {
@@ -3863,9 +4048,13 @@ impl<'a> MessagesStream<'a> {
             self.first_token_time = Some(Instant::now());
         }
 
-        // Once the local stop decoder has fired, ignore further
-        // engine output for this (single-choice) request.
+        // Once the local stop decoder has fired, a further engine chunk is
+        // the tail the engine generated for nobody (an engine that saw the
+        // stop sends its Complete instead): counted, not read; the request
+        // is aborted as soon as the loop turns.
         if self.stopped {
+            self.tail_tokens += chunk.token_ids().len() as u64;
+            self.tailed = true;
             return Ok(None);
         }
 
@@ -3881,14 +4070,6 @@ impl<'a> MessagesStream<'a> {
                 &mut delta,
                 &mut events,
             )?;
-            if should_stop {
-                self.stopped = true;
-                self.finish_reason_str = "stop".to_string();
-                self.matched_stop = self
-                    .stop_decoder
-                    .matched_stop()
-                    .map(|s| Value::String(s.to_string()));
-            }
             self.parsed_thinking_tokens += reasoning_text_tokens(events.as_slice());
             self.symphony_stop = StreamingProcessor::send_symphony_blocks(
                 self.tx,
@@ -3901,6 +4082,10 @@ impl<'a> MessagesStream<'a> {
             .or_else(|| self.symphony_stop.take());
             self.spare = events.recycle();
             self.delta = delta;
+            if should_stop {
+                self.note_local_stop();
+                self.close_on_local_stop(&chunk);
+            }
             return Ok(None);
         }
 
@@ -3913,6 +4098,7 @@ impl<'a> MessagesStream<'a> {
             // first). Pre-stop text in `chunk_text` is still emitted
             // below; Phase 4 derives StopSequence from `matched_stop`.
             self.note_local_stop();
+            self.close_on_local_stop(&chunk);
         }
 
         if chunk_text.is_empty() {
@@ -4364,7 +4550,9 @@ impl<'a> MessagesStream<'a> {
                 },
                 usage: StreamingProcessor::final_messages_delta_usage(
                     self.completion_tokens.total(),
-                    self.saw_complete.then_some(self.prompt_tokens),
+                    // The input count is the engine's Complete's, or the
+                    // count of the chunk the gateway's own stop matched in.
+                    (self.saw_complete || self.closed_by_stop).then_some(self.prompt_tokens),
                     self.spec
                         .thinking_requested
                         .then_some(self.engine_thinking_tokens.max(self.parsed_thinking_tokens)),
@@ -4390,7 +4578,9 @@ impl<'a> MessagesStream<'a> {
     /// closed without one), and the stream's metrics recorded.
     async fn settle_and_record(self, reservation: Option<Arc<SharedReservationHandle>>) {
         if let Some(handle) = reservation {
-            if self.saw_complete {
+            // The usage is settled by the engine's Complete, or by the
+            // gateway's own stop with the counts of the chunk it matched in.
+            if self.saw_complete || self.closed_by_stop {
                 handle
                     .settle_success(UsageSettlement {
                         actual_input_tokens: self.prompt_tokens,
@@ -4450,8 +4640,21 @@ struct CompletionStream<'a> {
     /// from `reasoning_tokens` (which exists for a different purpose and
     /// only incidentally gets exactly one insert per completed index
     /// today) so the completeness gate doesn't silently break if that
-    /// insert behavior ever changes.
+    /// insert behavior ever changes. A choice is closed by its Complete or
+    /// by its local stop (whose usage is as settled, see `read_chunk`).
     completed_indices: HashSet<u32>,
+    /// Stopped indices the engine streamed a chunk for after their stop: it
+    /// is generating past the stop, which only a stop it cannot see does (an
+    /// engine that saw the stop ends the choice on that step and sends its
+    /// Complete next).
+    tailed_indices: HashSet<u32>,
+    /// The engine was streaming past a stop when every choice had closed:
+    /// the loop stopped polling it, and the driver aborts it instead of
+    /// marking it completed (see [`Self::release_engine`]).
+    engine_outlived: bool,
+    /// Tokens the engine streamed for choices after their local stop, read
+    /// before the abort: the tail generated for nobody.
+    tail_tokens: u64,
 
     /// The per-chunk SSE frames: the bytes around a chunk's choice are the
     /// same for every chunk of this stream and are serialized once; per
@@ -4515,6 +4718,9 @@ impl<'a> CompletionStream<'a> {
             is_firsts: HashMap::new(),
             stopped_indices: HashSet::new(),
             completed_indices: HashSet::new(),
+            tailed_indices: HashSet::new(),
+            engine_outlived: false,
+            tail_tokens: 0,
             frame,
             sse_buffer: BytesMut::with_capacity(4096),
             total_prompt: 0,
@@ -4542,6 +4748,13 @@ impl<'a> CompletionStream<'a> {
                 ProtoResponseVariant::Complete(complete) => self.read_complete(complete).await?,
                 ProtoResponseVariant::None => continue,
             }
+            // An engine that outlived the unit (every choice closed, a
+            // locally stopped one streaming on past its stop) is not polled
+            // again: the driver aborts the engine stream.
+            if self.engine_outlived_now() {
+                self.engine_outlived = true;
+                break;
+            }
         }
         Ok(())
     }
@@ -4559,7 +4772,14 @@ impl<'a> CompletionStream<'a> {
 
         let index = self.index_offset + chunk.index();
 
+        // A choice's engine chunk after its local stop is the tail the
+        // engine generated for nobody (an engine that saw the stop sends
+        // its Complete instead): counted, not read; the unit is aborted
+        // once every choice has closed, until then another choice may
+        // still be streaming.
         if self.stopped_indices.contains(&index) {
+            self.tail_tokens += chunk.token_ids().len() as u64;
+            self.tailed_indices.insert(index);
             return Ok(());
         }
 
@@ -4604,6 +4824,17 @@ impl<'a> CompletionStream<'a> {
             // the backend's eventual Complete carries "length". This is
             // intentional — the local stop sequence fired first.
             self.stopped_indices.insert(index);
+            // The choice closes here, as its Complete would close it: the
+            // counts of the chunk the stop matched in are its counts (the
+            // engine's own server counts a stopped request through that
+            // step as well), and the tracker settles what the stream had
+            // reached. What the engine generates past this step is the tail
+            // the abort cuts, never the client's usage.
+            self.total_prompt = self.total_prompt.max(chunk.prompt_tokens());
+            self.total_cached = self.total_cached.max(chunk.cached_tokens());
+            self.reasoning_tokens
+                .insert(index, chunk.reasoning_tokens());
+            self.total_completion.record_local_stop(index);
 
             if let Some(sfx) = self.spec.suffix.as_deref() {
                 StreamingProcessor::send_completion_chunk(
@@ -4626,23 +4857,32 @@ impl<'a> CompletionStream<'a> {
         Ok(())
     }
 
-    /// The engine's `Complete` for a choice: its counts into the totals;
-    /// unless a local stop closed the choice already, the echo if no chunk
-    /// carried it, the decoder's tail, the suffix and the finish chunk.
+    /// The engine's `Complete` for a choice: its counts into the totals
+    /// (only its speculative counts for a choice the engine streamed past
+    /// its local stop); unless a local stop closed the choice already, the
+    /// echo if no chunk carried it, the decoder's tail, the suffix and the
+    /// finish chunk.
     async fn read_complete(
         &mut self,
         complete: ProtoGenerateComplete,
     ) -> Result<(), utils::StreamFailure> {
         let index = self.index_offset + complete.index();
         self.completed_indices.insert(index);
-        self.total_prompt = self.total_prompt.max(complete.prompt_tokens());
-        self.total_cached = self.total_cached.max(complete.cached_tokens());
-        self.reasoning_tokens
-            .insert(index, complete.reasoning_tokens());
         self.spec_accepted
             .insert(index, complete.spec_accepted_tokens());
         self.spec_drafted
             .insert(index, complete.spec_draft_tokens());
+        // The Complete of a choice the engine generated past its local stop
+        // (another choice of the unit kept the stream open) is the tail's
+        // end: the choice closed at its stop with that step's counts, and
+        // only the counts the stop could not know are taken from it.
+        if self.tailed_indices.contains(&index) {
+            return Ok(());
+        }
+        self.total_prompt = self.total_prompt.max(complete.prompt_tokens());
+        self.total_cached = self.total_cached.max(complete.cached_tokens());
+        self.reasoning_tokens
+            .insert(index, complete.reasoning_tokens());
         self.total_completion.record_complete(&complete);
 
         if self.stopped_indices.contains(&index) {
@@ -4746,13 +4986,63 @@ impl<'a> CompletionStream<'a> {
         Ok(())
     }
 
+    /// Choices closed by their Complete or by their local stop.
+    fn closed_choices(&self) -> u32 {
+        (self.completed_indices.len()
+            + self
+                .stopped_indices
+                .difference(&self.completed_indices)
+                .count()) as u32
+    }
+
+    /// Whether the engine has outlived the unit: every expected choice is
+    /// closed while a stopped choice without its Complete has streamed on
+    /// past its stop, so the engine is generating a tail nobody receives. A
+    /// stopped choice whose next message has not come yet is waited for: an
+    /// engine that saw the stop ends the choice on that step and its
+    /// Complete is the next message, so nothing is aborted; a chunk instead
+    /// is the tail. Nothing to look at while no stop has fired.
+    fn engine_outlived_now(&self) -> bool {
+        if self.stopped_indices.is_empty() {
+            return false;
+        }
+        let mut open_stops = 0u32;
+        let mut tailed = false;
+        for index in self.stopped_indices.difference(&self.completed_indices) {
+            open_stops += 1;
+            tailed |= self.tailed_indices.contains(index);
+        }
+        tailed && self.completed_indices.len() as u32 + open_stops >= self.spec.choices_per_prompt
+    }
+
+    /// The engine stream, released before the unit's open choices are
+    /// finished. An engine the gateway's own stop outlived is aborted now:
+    /// dropping the stream un-marked is the abort path a client disconnect
+    /// takes, so the slot goes back to the engine's batch within a step
+    /// instead of running to `max_tokens` for nobody. An engine that ended
+    /// on its own is marked completed, so that its drop sends no abort.
+    fn release_engine(&self, mut grpc_stream: ProtoStream, backend_type: &'static str) {
+        if !self.engine_outlived {
+            grpc_stream.mark_completed();
+            return;
+        }
+        Metrics::record_local_stop_abort(LocalStopAbort {
+            router_type: metrics_labels::ROUTER_GRPC,
+            backend_type,
+            model_id: &self.dispatch.model,
+            endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
+            tail_tokens: self.tail_tokens,
+        });
+        drop(grpc_stream);
+    }
+
     /// The unit's totals for the coordinator. `completed_indices` counts
     /// distinct indices that finished cleanly via a `Complete` message. A
     /// clean EOF partway through this unit's `n>1` choices (some completed,
     /// others didn't) must not be treated as full usage.
     fn outcome(self) -> CompletionStreamOutcome {
         let expected_choices = self.spec.choices_per_prompt;
-        let saw_complete = self.completed_indices.len() as u32 >= expected_choices;
+        let saw_complete = self.closed_choices() >= expected_choices;
         CompletionStreamOutcome {
             prompt_tokens: self.total_prompt,
             cached_tokens: self.total_cached,
@@ -4988,6 +5278,8 @@ fn assistant_choice(
 pub(crate) mod eof_tests;
 #[cfg(test)]
 mod failure_tests;
+#[cfg(test)]
+mod local_stop_tests;
 #[cfg(test)]
 mod pd_usage_tests;
 #[cfg(test)]
