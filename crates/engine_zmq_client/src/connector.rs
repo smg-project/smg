@@ -214,10 +214,8 @@ impl<O: EngineOutput> RequestRegistry<O> {
         let mut entry = self.requests.remove(request_id)?;
         let now = Instant::now();
         if !entry.started {
-            let explained = now
-                .saturating_duration_since(entry.registered)
-                .min(self.prefill_allowance(entry.prompt_tokens));
-            self.explain_silence(explained, now);
+            let allowance = self.prefill_allowance(entry.prompt_tokens);
+            self.explain_silence(entry.registered, allowance, now);
         }
         self.prefilled(&mut entry);
         if entry.every_step {
@@ -232,20 +230,25 @@ impl<O: EngineOutput> RequestRegistry<O> {
         Some(entry)
     }
 
-    /// Take `explained` off the engine's unanswered work: from the busy
-    /// period it is in first (its start moves up, never past `now`), the
-    /// rest from the periods that ended since the last output.
-    fn explain_silence(&mut self, explained: Duration, now: Instant) {
-        if explained.is_zero() {
+    /// Take the stretch a prompt registered at `registered` explains, its
+    /// stay up to `allowance`, off the engine's unanswered work: the busy
+    /// period it is in starts later by that much, and never before the
+    /// prompt's registration or past `now`. A prompt's stay lies within its
+    /// busy period (the period cannot end while it is in flight), so the
+    /// periods before it (`unanswered_before`) are evidence it never
+    /// overlapped and stay as they are; and what an output or an earlier
+    /// withdrawal already moved the period's start past is not taken
+    /// twice, so two long prompts withdrawn together explain their one
+    /// shared stretch once.
+    fn explain_silence(&mut self, registered: Instant, allowance: Duration, now: Instant) {
+        let Some(since) = self.in_flight_since else {
             return;
-        }
-        let mut left = explained;
-        if let Some(since) = self.in_flight_since {
-            let taken = left.min(now.saturating_duration_since(since));
-            self.in_flight_since = Some(since + taken);
-            left -= taken;
-        }
-        self.unanswered_before = self.unanswered_before.saturating_sub(left);
+        };
+        let end = registered
+            .checked_add(allowance)
+            .map_or(now, |until| until.min(now));
+        let taken = end.saturating_duration_since(since.max(registered));
+        self.in_flight_since = Some(since + taken);
     }
 
     /// The engine answered (an output of any kind): nothing in flight is
@@ -4788,6 +4791,67 @@ mod tests {
             .expect("an item")
             .expect("served")
             .finished());
+    }
+
+    /// Two long prompts withdrawn together explain their one shared stretch
+    /// of silence once, and only their own: the unanswered work before them
+    /// (short requests a hung engine read and never answered) stands, so the
+    /// next request is given up on for what is left of the window, not
+    /// handed a whole one.
+    #[tokio::test]
+    async fn prompts_withdrawn_together_explain_their_shared_stretch_once_and_nothing_before_it() {
+        let (client, mut engine, _ns) = connect().await;
+        let window = Duration::from_secs(1);
+        client.set_silence_death_timeout(window);
+        client.set_prefill_tokens_per_sec(10_000);
+        // Evidence first: a short request the engine reads and never answers,
+        // abandoned after 600 ms.
+        let stream = client.submit(request_for("req-short", 0)).await.unwrap();
+        engine.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        drop(stream);
+        match engine.recv().await.unwrap() {
+            EngineInbound::Abort(ids) => assert_eq!(ids, ["req-short"]),
+            other => panic!("expected the abort, got {other:?}"),
+        }
+        // Two 20k-token prompts (two seconds of allowance each), withdrawn
+        // together after 300 ms.
+        let first = client
+            .submit(long_request("req-long-1", 20_000))
+            .await
+            .unwrap();
+        engine.recv().await.unwrap();
+        let second = client
+            .submit(long_request("req-long-2", 20_000))
+            .await
+            .unwrap();
+        engine.recv().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(first);
+        drop(second);
+        for _ in 0..2 {
+            match engine.recv().await.unwrap() {
+                EngineInbound::Abort(ids) => assert!(ids[0].starts_with("req-long-"), "{ids:?}"),
+                other => panic!("expected an abort, got {other:?}"),
+            }
+        }
+        // The 600 ms of evidence stand: the next request has 400 ms, not a
+        // whole window.
+        let started = std::time::Instant::now();
+        let mut stream = client.submit(request_for("req-next", 0)).await.unwrap();
+        engine.recv().await.unwrap();
+        let error = stream
+            .next()
+            .await
+            .expect("an item")
+            .expect_err("the unanswered work before the prompts stands");
+        assert!(is_engine_dead(&error), "{error:?}");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < window,
+            "given up on for what was left of the window after the evidence, not a whole one: {elapsed:?}"
+        );
+        assert!(!client.is_alive());
     }
 
     /// The default allowance: 500 s per million prompt tokens pending, none

@@ -195,6 +195,30 @@ def env_float(
     return value
 
 
+def env_int(
+    name: str,
+    default: int,
+    *,
+    environ: Mapping[str, str] | None = None,
+    minimum: int | None = None,
+) -> int:
+    """``int(environ[name])``, ``default`` when the variable is unset or
+    empty. A value that is not a whole number, or below ``minimum``, is a
+    :class:`ServicerConfigError` naming the variable: a fraction is refused
+    rather than rounded, so ``0.5`` does not become a silent ``0``."""
+    source = os.environ if environ is None else environ
+    raw = source.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ServicerConfigError(f"{name}={raw!r} is not a whole number") from None
+    if minimum is not None and value < minimum:
+        raise ServicerConfigError(f"{name}={raw!r} must be at least {minimum}")
+    return value
+
+
 def env_port(name: str, *, environ: Mapping[str, str] | None = None) -> int | None:
     """A TCP port from ``environ[name]``, 1 to 65535; ``None`` when the
     variable is unset, empty or 0 (the caller picks a free port). Anything
@@ -294,13 +318,8 @@ def read_launcher_knobs(
         silence_timeout_secs=env_float(
             silence_timeout_secs_env, DEFAULT_SILENCE_TIMEOUT_SECS, environ=environ, positive=True
         ),
-        prefill_tokens_per_sec=int(
-            env_float(
-                prefill_tokens_per_sec_env,
-                DEFAULT_PREFILL_TOKENS_PER_SEC,
-                environ=environ,
-                minimum=0.0,
-            )
+        prefill_tokens_per_sec=env_int(
+            prefill_tokens_per_sec_env, DEFAULT_PREFILL_TOKENS_PER_SEC, environ=environ, minimum=0
         ),
         socket_dir=prepare_socket_dir(
             default_socket_dir(environ) if socket_dir is None else socket_dir

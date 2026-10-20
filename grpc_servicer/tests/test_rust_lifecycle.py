@@ -645,6 +645,20 @@ def test_env_float_names_the_variable_on_a_value_it_cannot_use():
     assert issubclass(ConfigError, ValueError)
 
 
+def test_env_int_takes_a_whole_number_and_refuses_a_fraction():
+    ConfigError = rust_lifecycle.ServicerConfigError
+    assert rust_lifecycle.env_int("X_RATE", 2000, environ={}) == 2000
+    assert rust_lifecycle.env_int("X_RATE", 2000, environ={"X_RATE": " "}) == 2000
+    assert rust_lifecycle.env_int("X_RATE", 2000, environ={"X_RATE": "0"}, minimum=0) == 0
+    assert rust_lifecycle.env_int("X_RATE", 2000, environ={"X_RATE": "1500"}) == 1500
+    with pytest.raises(ConfigError, match="X_RATE='0.5' is not a whole number"):
+        rust_lifecycle.env_int("X_RATE", 2000, environ={"X_RATE": "0.5"})
+    with pytest.raises(ConfigError, match="X_RATE='abc' is not a whole number"):
+        rust_lifecycle.env_int("X_RATE", 2000, environ={"X_RATE": "abc"})
+    with pytest.raises(ConfigError, match="X_RATE='-1' must be at least 0"):
+        rust_lifecycle.env_int("X_RATE", 2000, environ={"X_RATE": "-1"}, minimum=0)
+
+
 def test_env_port_takes_a_port_or_none_and_refuses_the_rest():
     ConfigError = rust_lifecycle.ServicerConfigError
     assert rust_lifecycle.env_port("X_PORT", environ={}) is None
@@ -719,6 +733,7 @@ def test_read_launcher_knobs_reads_every_knob_once_with_its_default(tmp_path):
         ("X_SILENCE", "0", "must be greater than 0"),
         ("X_SILENCE", "abc", "is not a number"),
         ("X_PREFILL", "-1", "must be at least 0"),
+        ("X_PREFILL", "0.5", "is not a whole number"),
     ]:
         with pytest.raises(rust_lifecycle.ServicerConfigError, match=f"{name}='{value}' {text}"):
             rust_lifecycle.read_launcher_knobs(**names, environ={name: value, **socket_dir})
