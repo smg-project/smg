@@ -54,11 +54,15 @@
 //! Cost: a clean output records one counter increment through a key built once per table (the
 //! `metrics` macros build a key, with a `Vec` of labels, on every call), no allocation. A
 //! malformed one adds a histogram observation, the per-reason counters, and, when the table's
-//! token bucket allows it, one `warn` line: the only allocations. The run's text is model output
-//! and is never logged, at any level: `at` and `bytes` locate it in the response for a reader with
-//! access to it. Suppressed calls are counted and write no line. A request the legacy parsers
-//! read under Symphony records one counter increment, through a key built once per reason and
-//! table, and nothing where a table reads.
+//! token bucket allows it, one `warn` line: the only allocations. One counted `unknown_tool` adds
+//! the per-reason counters, the first undeclared name cut to [`NAME_SHOWN`] bytes (one small
+//! allocation, made when the call starts) and, from a bucket of its own, one `warn` line; no
+//! histogram observation, the table having read it whole. A run's text is model output and is
+//! never logged, at any level: `at` and `bytes` locate it in the response for a reader with
+//! access to it; the undeclared name on the `unknown_tool` line is the one exception, an
+//! identifier where a declared name was expected. Suppressed calls are counted and write no line.
+//! A request the legacy parsers read under Symphony records one counter increment, through a key
+//! built once per reason and table, and nothing where a table reads.
 
 use std::{
     sync::{
@@ -80,7 +84,8 @@ use super::names::Fallback;
 pub(crate) const OUTPUTS: &str = "smg_symphony_outputs_total";
 /// Malformed runs, by `table` and `reason`.
 pub(crate) const MALFORMED: &str = "smg_symphony_malformed_total";
-/// The bytes of the malformed runs of one output, by `table`; observed for an output with one.
+/// The bytes of the malformed runs of one output, by `table`; observed for an output counted
+/// `malformed`.
 pub(crate) const MALFORMED_BYTES: &str = "smg_symphony_malformed_bytes";
 /// Calls after the first dropped under `parallel_tool_calls: false`, by `table`.
 pub(crate) const CALLS_SUPPRESSED: &str = "smg_symphony_calls_suppressed_total";
@@ -266,7 +271,9 @@ pub(crate) struct Who<'a> {
     pub choice: u32,
 }
 
-/// The first malformed run of an output, as the line shows it.
+/// The first malformed run of an output the table refused or kept as content, as the malformed
+/// line shows it. The event of no bytes before a call to a function the request did not declare
+/// is not one: the `unknown_tool` line locates that call ([`Undeclared`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FirstRun {
     /// Its `reason` label.
@@ -277,6 +284,18 @@ pub(crate) struct FirstRun {
     pub at: usize,
     /// Its length in bytes: the event's own, and the bytes a syntax refused right after it.
     pub bytes: usize,
+}
+
+/// The first call of an output to a function the request did not declare, as the `unknown_tool`
+/// line shows it.
+#[derive(Debug)]
+struct Undeclared {
+    /// The function's name, cut to [`NAME_SHOWN`] bytes.
+    name: Box<str>,
+    /// The name's whole length in bytes.
+    bytes: usize,
+    /// Where the call starts in the output, in bytes.
+    at: usize,
 }
 
 /// What the reader has seen of one output so far, counted as the events are drained.
@@ -292,11 +311,11 @@ pub(crate) struct Tally {
     /// The event before the next is the first run's: refused bytes that follow it are its size.
     announced: bool,
     /// The next call to start names a function the request did not declare: its `UnknownTool`
-    /// event came right before it, and the first such name is the line's.
+    /// event came right before it, and the first such call is the `unknown_tool` line's.
     naming: bool,
-    /// The first undeclared function's name, cut to [`NAME_SHOWN`] bytes, with its whole length;
-    /// allocated only for an output with one.
-    undeclared: Option<(Box<str>, usize)>,
+    /// The first call to a function the request did not declare, as the `unknown_tool` line
+    /// shows it; allocated only for an output with one.
+    undeclared: Option<Undeclared>,
     suppressed_calls: u32,
     tool_calls: u32,
     /// The bytes the client was shown: content, reasoning, malformed text kept as content, and
@@ -336,12 +355,14 @@ impl Tally {
                 self.reasons
                     .get_or_insert_with(|| Box::new([0; REASONS.len()]))[reason_index(*why)] += 1;
                 self.malformed_bytes += text.text.len() as u64;
-                // The engine's event of no bytes before a call to a function the request did not
-                // declare: the call starts next, and its name is the line's.
+                // The event of no bytes before a call to a function the request did not declare:
+                // the call starts next, and the first such call is the `unknown_tool` line's. The
+                // malformed line's first run is one the table refused or kept as content, never
+                // this event, so its `reason`, `at` and `bytes` locate debris, not a call read
+                // whole.
                 if matches!(why, MalformedReason::UnknownTool) {
                     self.naming = true;
-                }
-                if self.first.is_none() {
+                } else if self.first.is_none() {
                     self.first = Some(FirstRun {
                         reason: reason_label(*why),
                         why: why.sentence(),
@@ -386,7 +407,11 @@ impl Tally {
                     self.suppressed_calls += 1;
                 }
                 if naming && self.undeclared.is_none() {
-                    self.undeclared = Some((shown_name(name), name.len()));
+                    self.undeclared = Some(Undeclared {
+                        name: shown_name(name),
+                        bytes: name.len(),
+                        at: self.at,
+                    });
                 }
             }
             Event::Finish {
@@ -477,11 +502,10 @@ impl Tally {
         let Some(suppressed_lines) = series.unknown_tool_lines.allow() else {
             return;
         };
-        let (tool, tool_bytes) = match &self.undeclared {
-            Some((name, bytes)) => (&**name, *bytes),
-            None => ("", 0),
+        let (tool, tool_bytes, at) = match &self.undeclared {
+            Some(call) => (&*call.name, call.bytes, call.at),
+            None => ("", 0, 0),
         };
-        let at = self.first.as_ref().map_or(0, |first| first.at);
         warn!(
             target: "smg::symphony",
             request_id = who.request_id,
@@ -1768,6 +1792,11 @@ mod tests {
         assert!(logs_contain(
             "Symphony did not read the whole output as content, reasoning and calls"
         ));
+        // The line's first run is the refused one, after the undeclared call's 20 bytes; the
+        // event of no bytes before that call is not a run the line locates.
+        assert!(logs_contain("reason=\"unterminated_region\""));
+        assert!(logs_contain("at=20 bytes=12"));
+        assert!(!logs_contain("reason=\"unknown_tool\""));
         assert!(logs_contain("reasons=unterminated_region,unknown_tool"));
         assert!(!logs_contain(
             "Symphony read a call to a function the request did not declare"
