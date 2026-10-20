@@ -3111,7 +3111,13 @@ mod tests {
     /// the module docs describe.
     #[test]
     fn the_wedge_drain_table_of_transitions() {
+        // A Ready worker: the routing reads below (`eligible`,
+        // `is_healthy_and_eligible`, `is_available`) gate on readiness first,
+        // and a Pending one would read as out of routing whatever the probe
+        // veto said.
         let w = worker();
+        w.set_status(WorkerStatus::Ready);
+        assert!(w.is_available());
         assert_eq!(w.wedge_drain(), WedgeDrain::Off);
 
         // 1. Wedged with the drain on: the veto stands, the drain is not
@@ -3169,12 +3175,17 @@ mod tests {
         // 9. Held until the hold is over ...
         sweep_drain(&w, DRAIN);
         assert_eq!(w.wedge_drain(), WedgeDrain::Held);
-        // 10. ... then probing: routable while nothing is in flight.
+        // 10. ... then probing: routable while nothing is in flight, by
+        //     every read routing has (the worker is Ready, see above, so the
+        //     reads turn on the probe veto alone).
         thread::sleep(DRAIN.hold + Duration::from_millis(10));
         sweep_drain(&w, DRAIN);
         assert_eq!(w.wedge_drain(), WedgeDrain::Probing);
         assert!(w.stall_reason().is_none(), "routable for a probe");
         assert!(!w.routing_state().stalled);
+        assert!(w.routing_state().eligible());
+        assert!(w.is_healthy_and_eligible());
+        assert!(w.is_available(), "routable for a probe, to every policy");
         // 11. One probe at a time: with one in flight the worker is vetoed,
         //     for routing alone: the rules judge the probe.
         tracked_pile(&w, 1);
