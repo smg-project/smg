@@ -1035,6 +1035,104 @@ async fn a_malformed_region_in_a_stream_is_counted_and_written_once() {
     assert!(logs_contain("choice=0"));
 }
 
+/// A streamed call to a function the request did not declare: the deltas carry the name as the
+/// model wrote it and the arguments whole, the wire's finish is `tool_calls`, and the output is counted
+/// once under `unknown_tool`, the call under its reason, with one line naming the function and
+/// the table. Nothing on the wire says so.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_streamed_call_to_an_undeclared_function_goes_out_as_written_and_is_counted() {
+    let output = QWEN3_OUTPUT.replace("\"lookup\"", "\"lookup_v2\"");
+    let spec = assigned(
+        chat_spec(true),
+        qwen3(CallSyntax::Json),
+        "<|im_start|>assistant\n",
+    );
+    // Cut inside the thought and inside the call's opening marker, as the declared call is.
+    let responses = vec![
+        chunk(0, &output[..9]),
+        chunk(0, &output[9..32]),
+        chunk(0, &output[32..]),
+        complete(0, "stop"),
+    ];
+    let ((result, events), scrape) = scraped(stream_events(responses, true, spec)).await;
+    assert!(result.is_ok(), "{result:?}");
+    let calls = tool_call_deltas(&events);
+    assert_eq!(calls[0]["function"]["name"], "lookup_v2", "{calls:#?}");
+    assert!(
+        calls[1..]
+            .iter()
+            .all(|call| call["function"]["name"].is_null()),
+        "{calls:#?}"
+    );
+    let arguments: String = calls
+        .iter()
+        .filter_map(|call| call["function"]["arguments"].as_str())
+        .collect();
+    assert_eq!(
+        serde_json::from_str::<Value>(&arguments).expect("the arguments as JSON"),
+        json!({"q": 1})
+    );
+    let finish = events
+        .iter()
+        .filter_map(|event| event["choices"][0]["finish_reason"].as_str())
+        .next_back()
+        .expect("a finish");
+    assert_eq!(finish, "tool_calls");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"unknown_tool\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    let runs = series_line(
+        &scrape,
+        "smg_symphony_malformed_total",
+        &["table=\"qwen3\"", "reason=\"unknown_tool\""],
+    )
+    .expect("the reason counter");
+    assert!(runs.ends_with(" 1"), "{runs}");
+    assert!(logs_contain(
+        "Symphony read a call to a function the request did not declare; the call went out as the model named it"
+    ));
+    assert!(logs_contain("table=\"qwen3\""));
+    assert!(logs_contain("tool=\"lookup_v2\""));
+    assert!(logs_contain("undeclared_calls=1"));
+    // The line carries the engine's finish; `tool_calls` is the wire's refinement of it.
+    assert!(logs_contain("finish=\"stop\""));
+}
+
+/// The same call in a whole response: the message keeps it as the model named it, and the output
+/// is counted the same way.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_whole_output_calling_an_undeclared_function_keeps_the_call_and_is_counted() {
+    let output = QWEN3_OUTPUT.replace("\"lookup\"", "\"lookup_v2\"");
+    let ((choice, _), scrape) = scraped(fold(&output)).await;
+    assert_eq!(
+        choice.message.content.as_deref().map(str::trim),
+        Some("Hello")
+    );
+    let calls = choice.message.tool_calls.as_ref().expect("tool calls");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].function.name, "lookup_v2");
+    let arguments: Value =
+        serde_json::from_str(calls[0].function.arguments.as_deref().unwrap_or(""))
+            .expect("the arguments as JSON");
+    assert_eq!(arguments, json!({"q": 1}));
+    assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"unknown_tool\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert!(logs_contain("tool=\"lookup_v2\""));
+    assert!(logs_contain("tool_calls=1"));
+}
+
 /// An output of whitespace alone: the table holds it as the lead of the content and drops it
 /// when nothing follows; the reader delivers it as one content delta before the finish chunk,
 /// so the stream carries the answer the engine's own server would stream. The output is

@@ -379,7 +379,7 @@ pub(crate) fn init_metrics() {
     // (`routers::grpc::regular::symphony::telemetry`).
     describe_counter!(
         symphony_telemetry::OUTPUTS,
-        "Outputs a Symphony table read to their end, by table and outcome: clean, malformed (a call region the table gave up on, or a marker of the table where no row leads, kept as content), failed (the table refused the output and the request failed)"
+        "Outputs a Symphony table read to their end, by table and outcome: clean, malformed (a call region the table gave up on, or a marker of the table where no row leads, kept as content), failed (the table refused the output and the request failed), empty (no text, reasoning or call: whitespace and framing alone, or nothing), unknown_tool (read whole, with a call to a function the request did not declare, delivered as the model named it)"
     );
     describe_counter!(
         symphony_telemetry::MALFORMED,
@@ -387,7 +387,7 @@ pub(crate) fn init_metrics() {
     );
     describe_histogram!(
         symphony_telemetry::MALFORMED_BYTES,
-        "Bytes of the malformed runs of one output a Symphony table read, by table; observed for every output with at least one"
+        "Bytes of the malformed runs of one output a Symphony table read, by table; observed for every output counted malformed"
     );
     describe_counter!(
         symphony_telemetry::CALLS_SUPPRESSED,

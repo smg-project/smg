@@ -1648,4 +1648,205 @@ mod tests {
         });
         assert!(!scrape.contains(telemetry::FALLBACK), "{scrape}");
     }
+
+    /// The events of `output` read whole by `format` after `prompt`, with the request's one
+    /// declared tool, under a recorder of their own: the events and the scrape.
+    fn read_scraped(format: Format, prompt: &str, output: &str) -> (Vec<Event<'static>>, String) {
+        let mut events = Vec::new();
+        let scrape = rendered(|| {
+            let assignment = Assignment {
+                format: Arc::new(format),
+                prompt: prompt.to_string(),
+            };
+            let mut replayed = Events::new();
+            let mut reader =
+                Reader::new(&assignment, tools().into(), &mut replayed).expect("a reader");
+            events.extend(replayed.into_owned().drain());
+            events.extend(read_tail(&mut reader, output));
+        });
+        (events, scrape)
+    }
+
+    /// Where the `UnknownTool` events stand among `events`, each with the name of the call that
+    /// starts right after it.
+    fn undeclared_calls(events: &[Event<'_>]) -> Vec<(usize, String)> {
+        events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| {
+                matches!(
+                    event,
+                    Event::Malformed {
+                        why: symphony::MalformedReason::UnknownTool,
+                        ..
+                    }
+                )
+            })
+            .map(|(at, event)| {
+                assert_eq!(telemetry::bytes_of(event), 0, "an event of no bytes");
+                match &events[at + 1] {
+                    Event::ToolCallStart { name, .. } => (at, name.clone()),
+                    other => panic!("a call start right after the event, not {other:?}"),
+                }
+            })
+            .collect()
+    }
+
+    /// The calls among `events`: each name with its arguments joined.
+    fn calls_of(events: &[Event<'_>]) -> Vec<(String, Value)> {
+        let mut calls: Vec<(String, String)> = Vec::new();
+        for event in events {
+            match event {
+                Event::ToolCallStart { name, .. } => calls.push((name.clone(), String::new())),
+                Event::ToolCallArguments { index, json, .. } => {
+                    calls[*index as usize].1.push_str(json);
+                }
+                _ => {}
+            }
+        }
+        calls
+            .into_iter()
+            .map(|(name, arguments)| {
+                let arguments = serde_json::from_str(&arguments).expect("arguments as JSON");
+                (name, arguments)
+            })
+            .collect()
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_call_to_a_function_the_request_did_not_declare_goes_out_as_written_and_is_counted() {
+        // The request declares `lookup`; the model calls `lookup_v2`. The engine announces it
+        // with its event of no bytes right before the call's start, and the call's events are
+        // the ones a declared call gets, the name as written. The output counts once under
+        // `unknown_tool`, the call under its reason, and one line names the table and the
+        // function; nothing on the wire says so.
+        let output = QWEN3_OUTPUT.replace("\"lookup\"", "\"lookup_v2\"");
+        let (events, scrape) =
+            read_scraped(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", &output);
+        let undeclared = undeclared_calls(&events);
+        assert_eq!(undeclared.len(), 1, "{events:?}");
+        assert_eq!(undeclared[0].1, "lookup_v2");
+        assert_eq!(
+            calls_of(&events),
+            vec![("lookup_v2".to_string(), json!({"q": 1}))]
+        );
+        assert_eq!(content_of(&events).trim(), "Hello");
+        assert!(
+            matches!(events.last(), Some(Event::Finish { tool_calls: 1, .. })),
+            "{events:?}"
+        );
+        let outputs = line_with(
+            &scrape,
+            telemetry::OUTPUTS,
+            &["table=\"qwen3\"", "outcome=\"unknown_tool\""],
+        )
+        .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        let runs = line_with(
+            &scrape,
+            telemetry::MALFORMED,
+            &["table=\"qwen3\"", "reason=\"unknown_tool\""],
+        )
+        .expect("the reason counter");
+        assert!(runs.ends_with(" 1"), "{runs}");
+        assert!(logs_contain(
+            "Symphony read a call to a function the request did not declare"
+        ));
+        assert!(logs_contain("table=\"qwen3\""));
+        assert!(logs_contain("tool=\"lookup_v2\""));
+        assert!(logs_contain("undeclared_calls=1"));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_declared_and_an_undeclared_call_in_one_output_announce_the_undeclared_one_alone() {
+        // Two keyed blocks back to back, the second to a function the request did not declare:
+        // one event, right before the second call's start; both calls go out, in order, with
+        // their arguments; the output counts once, with two calls and one undeclared.
+        let output = concat!(
+            "plan</think>Sure.",
+            "<tool_call>lookup<arg_key>q</arg_key><arg_value>1</arg_value></tool_call>",
+            "<tool_call>lookup_v2<arg_key>q</arg_key><arg_value>2</arg_value></tool_call>"
+        );
+        let (events, scrape) =
+            read_scraped(symphony::formats::glm(), "<|assistant|>\n<think>", output);
+        let undeclared = undeclared_calls(&events);
+        assert_eq!(undeclared.len(), 1, "{events:?}");
+        assert_eq!(undeclared[0].1, "lookup_v2");
+        assert!(
+            matches!(
+                &events[undeclared[0].0 + 1],
+                Event::ToolCallStart { index: 1, .. }
+            ),
+            "{events:?}"
+        );
+        assert_eq!(
+            calls_of(&events),
+            vec![
+                ("lookup".to_string(), json!({"q": 1})),
+                ("lookup_v2".to_string(), json!({"q": 2})),
+            ]
+        );
+        assert!(
+            matches!(events.last(), Some(Event::Finish { tool_calls: 2, .. })),
+            "{events:?}"
+        );
+        let outputs = line_with(
+            &scrape,
+            telemetry::OUTPUTS,
+            &["table=\"glm\"", "outcome=\"unknown_tool\""],
+        )
+        .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        assert!(logs_contain("table=\"glm\""));
+        assert!(logs_contain("tool=\"lookup_v2\""));
+        assert!(logs_contain("undeclared_calls=1"));
+        assert!(logs_contain("tool_calls=2"));
+    }
+
+    #[test]
+    fn a_forced_call_reads_as_before_the_name_being_the_requests() {
+        // `tool_choice` naming a function: the table reads the output under its structural tag,
+        // whose grammar holds the name to the declared one; the reader adds no rule of its own,
+        // so the forced call reads clean, as it did.
+        let declared = serde_json::to_value(tools()).expect("tools");
+        let forced = request(json!({
+            "tools": declared,
+            "tool_choice": {"type": "function", "function": {"name": "lookup"}},
+        }));
+        let tag = ("structural_tag".to_string(), "{}".to_string());
+        let assigned = assign(
+            ParserChoice::Symphony,
+            &ModelNames::default(),
+            &forced,
+            Some(&tag),
+            "<|im_start|>assistant\n",
+        )
+        .expect("assigned");
+        assert_eq!(assigned.format.name(), "qwen3");
+        let (events, scrape) = read_scraped(
+            Arc::unwrap_or_clone(assigned.format),
+            "<|im_start|>assistant\n",
+            "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"q\": 1}}\n</tool_call>",
+        );
+        assert!(undeclared_calls(&events).is_empty(), "{events:?}");
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Malformed { .. })),
+            "{events:?}"
+        );
+        assert_eq!(
+            calls_of(&events),
+            vec![("lookup".to_string(), json!({"q": 1}))]
+        );
+        let outputs = line_with(
+            &scrape,
+            telemetry::OUTPUTS,
+            &["table=\"qwen3\"", "outcome=\"clean\""],
+        )
+        .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+    }
 }
