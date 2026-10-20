@@ -204,9 +204,10 @@ impl Grammar {
     /// whose content may grow without bound (`Self::unbounded`) ends with a text, since nothing
     /// else tells the parser where the tag stops and the free text or the next tag begins
     /// (xgrammar's analyzer: "When the content is unlimited, at least one end string must be
-    /// non-empty"). The crate's tests hold every table's forced, `auto` and answer grammar to it
-    /// (`tests/forced_tag.rs`), so a tag the engines would refuse fails there and not at a request;
-    /// the request path sends the grammar as derived. `Err` names the tag's begin.
+    /// non-empty"). The tests hold every registry table's forced, `auto` and answer grammar to it
+    /// (`tests/forced_tag.rs`) and the tags of the layouts learned from the recorded templates (the
+    /// template tests), so a tag the engines would refuse fails there and not at a request; the
+    /// request path sends the grammar as derived. `Err` names the tag's begin.
     pub fn check(&self) -> Result<(), String> {
         match self {
             Self::ConstString(_)
