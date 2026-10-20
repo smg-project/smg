@@ -851,6 +851,33 @@ impl fmt::Display for PoolState {
     }
 }
 
+/// Every group of a pool weighs 0 among the workers the steering default
+/// admits: the pool is drained and the default declines (the caller reports
+/// the miss) rather than serve from the drained build.
+struct Drained;
+
+/// Under `--traffic-split`, the group the pair placement's steering default
+/// confines a pair to, drawn over `pool` as the policies draw it: `Ok(None)`
+/// for a pool of one group among the workers `takes` admits (nothing to
+/// confine), `Ok(Some(group))` for the arm of the request's key where it has
+/// one and of a random draw otherwise, `Err(Drained)` when every group weighs
+/// 0 among those.
+fn default_arm<'a>(
+    key: Option<&str>,
+    pool: &'a [Arc<dyn Worker>],
+    takes: &dyn Fn(&dyn Worker) -> bool,
+) -> Result<Option<&'a str>, Drained> {
+    if traffic_split::drained(pool, takes) {
+        return Err(Drained);
+    }
+    Ok(
+        traffic_split::Split::plan(pool, takes).map(|split| match key {
+            Some(key) => split.arm_for_key(key).name,
+            None => split.arm_at_random(&mut rand::rng()).name,
+        }),
+    )
+}
+
 /// The steering default for a disaggregated placement whose failed pool is
 /// vetoed on every worker the request may use (`failed_pool`, see
 /// [`admitted_pool`]), by the overload thresholds or by the liveness
@@ -863,20 +890,70 @@ impl fmt::Display for PoolState {
 /// `None` when the failed pool is not all-vetoed (an unhealthy pool keeps its
 /// unavailable answer), when it is all-overloaded under shedding (the caller
 /// sheds), or when nothing pairs; a prefill admission gate still has the last
-/// word.
+/// word. Under `--traffic-split` the pair is confined to one group first,
+/// drawn as the policies draw it ([`default_arm`]), and a pool whose groups
+/// all weigh 0 is declined, so a drained build serves no fallback either.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the steering default threads every routing input the pair placement does"
+)]
 fn relaxed_pair(
     registry: &WorkerRegistry,
+    policies: &PolicyRegistry,
     model_id: &str,
     pairs: &PdPairIndex,
     wire: Option<WireConstraint>,
     prefill_capacity: Option<&PrefillSelectionContext<'_>>,
     inputs: &PlacementInputs<'_>,
+    failed_role: WorkerRole,
     failed_pool: &[Arc<dyn Worker>],
 ) -> Option<Result<Pair, Box<PairFailure>>> {
     let shedding = registry.overload_shed_enabled();
     if !overload::all_vetoed(failed_pool) || (shedding && overload::all_overloaded(failed_pool)) {
         return None;
     }
+    // Under `--traffic-split` the default narrows the pair to one group
+    // first, as the single-worker default does (`overload_fallback`), so a
+    // canary takes its weight's share of an all-vetoed pool and not the
+    // least-loaded pair's. The arms admit what this default can take; the
+    // prefill side leads, as under the policies, where the decode follows the
+    // prefill's group, and a prefill pool of one group leaves a failed decode
+    // pool to its own groups; a pool whose groups all weigh 0 among those is
+    // declined (the caller reports the miss) rather than served from the
+    // drained build; both sides of the pair come from the arm's group, so a
+    // pair never spans two groups; one group keeps the least-loaded pair over
+    // the whole pool.
+    let arm_group = if policies.traffic_split_enabled() {
+        let takes = |w: &dyn Worker| {
+            w.is_healthy()
+                && w.circuit_breaker_can_execute()
+                && WireConstraint::admits(wire, w)
+                && inputs.candidate_filter.is_none_or(|accepts| accepts(w))
+                && !(shedding && w.is_overloaded())
+        };
+        let key = policies
+            .effective_sticky_key(&SelectWorkerInfo {
+                request_text: inputs.text,
+                tokens: inputs.tokens,
+                headers: inputs.headers,
+                routing_key: policies.resolve_routing_key(inputs.headers),
+                rid_key: inputs.rid_key,
+                cache_namespace: inputs.cache_namespace,
+                hash_ring: None,
+                role: failed_role,
+                overload_lifted: false,
+            })
+            .map(|(key, _)| key);
+        match default_arm(key, &pairs.prefill, &takes).ok()? {
+            Some(group) => Some(group),
+            None if failed_role == WorkerRole::Decode => {
+                default_arm(key, &pairs.decode_pool, &takes).ok()?
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
     let eligible = |w: &Arc<dyn Worker>| {
         w.is_healthy()
             && w.circuit_breaker_can_execute()
@@ -884,6 +961,7 @@ fn relaxed_pair(
             && inputs
                 .candidate_filter
                 .is_none_or(|accepts| accepts(w.as_ref()))
+            && arm_group.is_none_or(|group| traffic_split::group_of(w.as_ref()) == group)
     };
     // Equal loads draw uniformly (partner and pair alike), so an equally
     // loaded pool does not send every fallback to its first pair.
@@ -1081,11 +1159,13 @@ pub(crate) fn select_pair(
         let admitted = admitted_pool(&pairs.prefill, wire, &inputs);
         if let Some(pair) = relaxed_pair(
             registry,
+            policies,
             model_id,
             pairs,
             wire,
             prefill_capacity,
             &inputs,
+            WorkerRole::Prefill,
             &admitted,
         ) {
             return pair;
@@ -1144,11 +1224,13 @@ pub(crate) fn select_pair(
         let admitted = admitted_pool(failed_pool, wire, &inputs);
         if let Some(pair) = relaxed_pair(
             registry,
+            policies,
             model_id,
             pairs,
             wire,
             prefill_capacity,
             &inputs,
+            role,
             &admitted,
         ) {
             return pair;
@@ -1208,11 +1290,13 @@ pub(crate) fn select_pair(
             let admitted = admitted_pool(&pairs.prefill, wire, &inputs);
             if let Some(pair) = relaxed_pair(
                 registry,
+                policies,
                 model_id,
                 pairs,
                 wire,
                 prefill_capacity,
                 &inputs,
+                WorkerRole::Prefill,
                 &admitted,
             ) {
                 return pair;
