@@ -3183,6 +3183,7 @@ mod tests {
         assert!(w.routing_state().stalled);
         assert!(!w.routing_state().eligible());
         assert!(!w.is_healthy_and_eligible());
+        assert!(!w.is_available(), "every selection filter leaves it out");
         // 12. The probe makes no progress: a sweep within the wedge bound
         //     leaves it probing, the first sweep past the bound wedges the
         //     worker again (the production order: the sweep interval is

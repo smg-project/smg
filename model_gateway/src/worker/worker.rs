@@ -527,12 +527,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     fn record_circuit_breaker_outcome(&self, success: bool);
 
     /// Check if the worker is available (healthy + circuit closed/half-open +
-    /// not vetoed by the absolute overload guard).
+    /// not vetoed by the absolute overload guard, by liveness or by its one
+    /// probe in flight).
     fn is_available(&self) -> bool {
         self.is_healthy()
             && self.circuit_breaker_can_execute()
             && !self.is_overloaded()
-            && self.stall_reason().is_none()
+            && !self.vetoed_for_routing()
     }
 
     /// [`Self::is_healthy`] fused with the overload veto. For the hash policies,
@@ -2136,6 +2137,7 @@ impl Worker for BasicWorker {
         rt.status() == WorkerStatus::Ready
             && !rt.is_overloaded()
             && rt.stall_reason().is_none()
+            && !rt.probe_in_flight()
             && self.circuit_breaker.load().can_execute()
     }
 
