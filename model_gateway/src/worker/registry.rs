@@ -5551,7 +5551,7 @@ mod tests {
     /// binds derived from `dir`. The handshake takes an OS-assigned loopback
     /// port: the port derived from a temporary ipc path is a hash into a band
     /// other listeners on the host may hold, and a collision there fails the
-    /// driver before it holds anything.
+    /// handshake bind after the data-plane sockets are already bound.
     async fn connecting_zmq_worker(dir: &std::path::Path) -> Arc<crate::worker::BasicWorker> {
         let worker = Arc::new(
             BasicWorkerBuilder::new(format!("ipc://{}", dir.join("ts0.ipc").display()))
