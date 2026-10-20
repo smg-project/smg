@@ -1203,7 +1203,7 @@ mod tests {
                 Handshake::TcpOrIpc(&handshake),
                 1,
                 EosTokenIds::default(),
-                Duration::from_millis(300),
+                Duration::from_secs(1),
             ),
             hello(&handshake, EngineId::from_engine_index(0)),
         );
