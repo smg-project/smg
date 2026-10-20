@@ -1100,6 +1100,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_strict_tokenspeed_read_fails_when_its_server_info_fails() {
+        // A label refresh must not take a failed read for an engine that
+        // reports less; registration keeps what the other endpoints gave.
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let router = Router::new()
+            .route(
+                "/get_server_info",
+                get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .route(
+                "/v1/models",
+                get(|| async {
+                    Json(json!({"object": "list", "data": [{"id": "qwen-served"}]}))
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only mock TokenSpeed control server; handle is aborted at test end"
+        )]
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = crate::http_client::client();
+        let url = format!("http://{addr}");
+
+        let strict = fetch_tokenspeed_http_metadata_checked(&client, &url, None, true).await;
+        let tolerant = fetch_tokenspeed_http_metadata_checked(&client, &url, None, false).await;
+        server.abort();
+
+        let err = strict.expect_err("a failed get_server_info fails a strict read");
+        assert!(err.starts_with("get_server_info:"), "{err}");
+        let labels = tolerant.expect("registration tolerates it");
+        assert_eq!(
+            labels.get("served_model_name").map(String::as_str),
+            Some("qwen-served")
+        );
+    }
+
+    #[tokio::test]
     async fn test_sglang_http_metadata_uses_models_identity() {
         use axum::{routing::get, Json, Router};
         use serde_json::json;
