@@ -36,8 +36,9 @@ use smg::{
         ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, ParserChoice,
         PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig,
         RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
-        SlurmDiscoveryConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
-        TurboJpegPolicy, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
+        SlurmDiscoveryConfig, TenantApiKeyEntry, TlsClientAuth, TlsClientIdentity,
+        TokenizerCacheConfig, TraceConfig, TurboJpegPolicy, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
+        DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
@@ -1737,6 +1738,34 @@ struct IntegrationArgs {
     #[arg(long, num_args = 0.., help_heading = "TLS/mTLS Security")]
     ca_cert_paths: Vec<String>,
 
+    /// A PEM bundle of the CAs client certificates on the HTTPS listener must chain to (with
+    /// --tls-client-auth)
+    #[arg(long, help_heading = "TLS/mTLS Security")]
+    tls_client_ca_path: Option<String>,
+
+    /// Client-certificate authentication on the HTTPS listener: off; optional (a certificate
+    /// chaining to --tls-client-ca-path identifies the caller when presented, a connection
+    /// without one is served and authenticated by the API keys as before); required (the
+    /// handshake fails without one; with no --api-key and no control-plane authentication the
+    /// admin and worker-management routes are closed too). A verified certificate's identity is
+    /// the caller's tenant auth:<identity>, the one a --tenant-api-key for the same id resolves
+    /// to for cn and san-dns (a URI identity is addressed as auth:<uri> in the rate-limit
+    /// configuration); no bearer is needed on such a connection. The admin listener
+    /// (--admin-port) serves TLS without client authentication.
+    #[arg(
+        long,
+        default_value = "off",
+        value_parser = ["off", "optional", "required"],
+        help_heading = "TLS/mTLS Security"
+    )]
+    tls_client_auth: String,
+
+    /// The field of a verified client certificate that is the caller's identity: san-uri (the
+    /// first URI subject alternative name, a SPIFFE id; the default), san-dns (the first DNS
+    /// name) or cn (the subject's common name)
+    #[arg(long, value_parser = ["san-uri", "san-dns", "cn"], help_heading = "TLS/mTLS Security")]
+    tls_client_identity: Option<String>,
+
     // ==================== Tracing (OpenTelemetry) ====================
     /// Enable OpenTelemetry tracing
     #[arg(
@@ -2942,6 +2971,14 @@ impl CliArgs {
                     "without --priority-scheduler-enabled",
                 ),
             ),
+            (
+                self.integrations.tls_client_identity.is_some()
+                    && self.integrations.tls_client_auth == "off",
+                ignored(
+                    "--tls-client-identity",
+                    "without --tls-client-auth optional or required",
+                ),
+            ),
         ];
         warnings
             .into_iter()
@@ -3412,9 +3449,36 @@ impl CliArgs {
             .maybe_server_cert_and_key(
                 self.integrations.tls_cert_path.as_ref(),
                 self.integrations.tls_key_path.as_ref(),
-            );
+            )
+            .maybe_tls_client_ca_path(self.integrations.tls_client_ca_path.as_ref())
+            .tls_client_auth(self.tls_client_auth_mode()?)
+            .tls_client_identity(self.tls_client_identity_field()?);
 
         builder.build()
+    }
+
+    /// `--tls-client-auth` as a mode (clap admits the three spellings).
+    fn tls_client_auth_mode(&self) -> ConfigResult<TlsClientAuth> {
+        self.integrations
+            .tls_client_auth
+            .parse()
+            .map_err(|reason| ConfigError::InvalidValue {
+                field: "tls_client_auth".to_string(),
+                value: self.integrations.tls_client_auth.clone(),
+                reason,
+            })
+    }
+
+    /// `--tls-client-identity` as a field, the default without the flag.
+    fn tls_client_identity_field(&self) -> ConfigResult<TlsClientIdentity> {
+        let Some(field) = self.integrations.tls_client_identity.as_deref() else {
+            return Ok(TlsClientIdentity::default());
+        };
+        field.parse().map_err(|reason| ConfigError::InvalidValue {
+            field: "tls_client_identity".to_string(),
+            value: field.to_string(),
+            reason,
+        })
     }
 
     /// Combine validated router settings with listener, discovery, and authentication flags.
@@ -4268,6 +4332,153 @@ mod tests {
             err.to_string().contains("mesh_tls_key"),
             "the error names the flag: {err}"
         );
+    }
+
+    /// A self-signed PEM certificate and a key file for the client-auth
+    /// flags (their chain is not checked at configuration time).
+    fn client_auth_tls_files(tag: &str) -> [String; 3] {
+        use openssl::{
+            asn1::Asn1Time, hash::MessageDigest, pkey::PKey, rsa::Rsa, x509::X509Builder,
+        };
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut builder = X509Builder::new().unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        builder.sign(&key, MessageDigest::sha256()).unwrap();
+        let certificate = builder.build().to_pem().unwrap();
+        let dir = std::env::temp_dir().join(format!("smg-tls-client-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, content: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, content).unwrap();
+            path.to_string_lossy().into_owned()
+        };
+        [
+            write("server.pem", &certificate),
+            write("server-key.pem", &key.private_key_to_pem_pkcs8().unwrap()),
+            write("client-ca.pem", &certificate),
+        ]
+    }
+
+    /// The client-authentication flags configure the listener: the mode,
+    /// the bundle (read) and the identity field; a mode without the bundle
+    /// or the listener, and a bundle without a mode, are refused by name;
+    /// the identity field alone is a companion warning.
+    #[test]
+    fn tls_client_auth_flags_configure_the_listener() {
+        let [cert, key, ca] = client_auth_tls_files("flow");
+        let tls = [
+            "--tls-cert-path",
+            cert.as_str(),
+            "--tls-key-path",
+            key.as_str(),
+        ];
+        fn with<'a>(base: &[&'a str], rest: &[&'a str]) -> Vec<&'a str> {
+            base.iter().chain(rest).copied().collect()
+        }
+
+        let config = cli_args_from(&with(
+            &tls,
+            &[
+                "--tls-client-ca-path",
+                &ca,
+                "--tls-client-auth",
+                "required",
+                "--tls-client-identity",
+                "san-dns",
+            ],
+        ))
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        assert_eq!(config.tls_client_auth, TlsClientAuth::Required);
+        assert_eq!(config.tls_client_identity, TlsClientIdentity::SanDns);
+        assert_eq!(config.tls_client_ca_path.as_deref(), Some(ca.as_str()));
+        assert_eq!(
+            config.tls_client_ca,
+            Some(std::fs::read(&ca).unwrap()),
+            "the bundle is read"
+        );
+
+        let config = cli_args_from(&with(
+            &tls,
+            &["--tls-client-ca-path", &ca, "--tls-client-auth", "optional"],
+        ))
+        .to_router_config(vec![], vec![])
+        .unwrap();
+        assert_eq!(config.tls_client_auth, TlsClientAuth::Optional);
+        assert_eq!(
+            config.tls_client_identity,
+            TlsClientIdentity::SanUri,
+            "the default field"
+        );
+
+        let config = cli_args_from(&with(&tls, &[]))
+            .to_router_config(vec![], vec![])
+            .unwrap();
+        assert_eq!(config.tls_client_auth, TlsClientAuth::Off);
+        assert_eq!(config.tls_client_ca, None);
+
+        for (args, named) in [
+            (
+                with(&tls, &["--tls-client-auth", "required"]),
+                "--tls-client-ca-path",
+            ),
+            (
+                vec![
+                    "--tls-client-ca-path",
+                    ca.as_str(),
+                    "--tls-client-auth",
+                    "required",
+                ],
+                "--tls-cert-path",
+            ),
+            (
+                with(&tls, &["--tls-client-ca-path", ca.as_str()]),
+                "never checked",
+            ),
+            (
+                with(
+                    &tls,
+                    &[
+                        "--tls-client-ca-path",
+                        &key,
+                        "--tls-client-auth",
+                        "required",
+                    ],
+                ),
+                "tls_client_ca_path",
+            ),
+        ] {
+            let err = cli_args_from(&args)
+                .to_router_config(vec![], vec![])
+                .expect_err(&args.join(" "));
+            assert!(err.to_string().contains(named), "{}: {err}", args.join(" "));
+        }
+
+        let err = Cli::try_parse_from(["smg", "--tls-client-auth", "sometimes"])
+            .expect_err("an unknown mode");
+        assert!(err.to_string().contains("sometimes"), "{err}");
+
+        let ignored = cli_args_from(&["--tls-client-identity", "cn"]).ignored_companions(&[], &[]);
+        assert!(
+            ignored
+                .iter()
+                .any(|m| m.starts_with("--tls-client-identity") && m.contains("--tls-client-auth")),
+            "{ignored:?}"
+        );
+        let paired = cli_args_from(&[
+            "--tls-client-identity",
+            "cn",
+            "--tls-client-auth",
+            "required",
+        ])
+        .ignored_companions(&[], &[]);
+        assert!(paired.is_empty(), "{paired:?}");
     }
 
     /// With no `--prometheus-host`, the metrics listener follows the serving

@@ -51,6 +51,7 @@ use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
 use wfaas::LoggingSubscriber;
 
+pub mod client_identity;
 pub mod connection_limit;
 pub mod connection_timeouts;
 
@@ -77,6 +78,7 @@ use crate::{
         RouterTrait,
     },
     server::{
+        client_identity::ClientIdentityAcceptor,
         connection_limit::ConnectionLimitAcceptor,
         connection_timeouts::{ConnectionTimeoutAcceptor, ConnectionTimeouts},
     },
@@ -1844,12 +1846,43 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         &config.router_config.server_cert,
         &config.router_config.server_key,
     ) {
-        (Some(cert), Some(key)) => Some(
-            axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
+        // With client authentication on, the listener asks for and verifies
+        // client certificates against the configured CA bundle.
+        (Some(cert), Some(key)) => Some(match &config.router_config.tls_client_ca {
+            Some(client_ca) if config.router_config.tls_client_auth.is_on() => {
+                client_identity::rustls_config_with_client_auth(
+                    cert,
+                    key,
+                    client_ca,
+                    config.router_config.tls_client_auth,
+                )
+                .map_err(|e| format!("Failed to create TLS config: {e}"))?
+            }
+            _ => axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
                 .await
                 .map_err(|e| format!("Failed to create TLS config: {e}"))?,
-        ),
+        }),
         _ => None,
+    };
+    // The admin listener (`--admin-port`) serves TLS with the same server
+    // certificate and no client authentication: its routes are guarded by the
+    // control-plane authentication, never by a certificate identity, and an
+    // orchestrator's probes present no certificate.
+    let admin_tls_config = match (
+        &config.router_config.server_cert,
+        &config.router_config.server_key,
+    ) {
+        (Some(cert), Some(key))
+            if config.router_config.admin_port.is_some()
+                && config.router_config.tls_client_auth.is_on() =>
+        {
+            Some(
+                axum_server::tls_rustls::RustlsConfig::from_pem(cert.clone(), key.clone())
+                    .await
+                    .map_err(|e| format!("Failed to create TLS config: {e}"))?,
+            )
+        }
+        _ => tls_config.clone(),
     };
 
     static LOGGING_INITIALIZED: AtomicBool = AtomicBool::new(false);
@@ -2148,7 +2181,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // keys when falling back to simple API-key auth (no control-plane auth
     // configured) — a tenant credential must not be able to reach
     // `/workers`, `/flush_cache`, etc. Only the shared gateway-wide key does.
-    let serving_auth_config = app_context.gateway_auth.clone();
+    // A verified client certificate on the HTTPS listener authenticates the
+    // serving routes' caller; the admin fallback stays with the shared key.
+    let serving_auth_config = app_context
+        .gateway_auth
+        .clone()
+        .with_client_certificates(config.router_config.tls_client_auth);
     let admin_auth_config = AuthConfig::new(config.router_config.api_key.clone());
 
     // Initialize control plane authentication if configured
@@ -2344,11 +2382,19 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         );
     }
 
+    // The client-certificate identity field, when client authentication is on:
+    // the data listener's TLS acceptor reads it; the admin listener asks for no
+    // certificate and reads nothing.
+    let client_auth = config.router_config.tls_client_auth;
+    let client_identity = client_auth
+        .is_on()
+        .then_some(config.router_config.tls_client_identity);
     // The admin listener serves the control plane with the data listener's
-    // TLS material and connection timeouts, but outside its connection limit
-    // (`--max-connections`), so the control plane and the probes it serves
-    // stay reachable while the data plane is saturated; it drains with it
-    // (the shutdown above closes both handles together).
+    // server certificate (no client authentication) and connection timeouts,
+    // but outside its connection limit (`--max-connections`), so the control
+    // plane and the probes it serves stay reachable while the data plane is
+    // saturated; it drains with it (the shutdown above closes both handles
+    // together).
     let admin_serving: Serving = match (admin_listener, admin_app) {
         (Some(admin_listener), Some(admin_app)) => {
             let admin_addr = admin_listener.local_addr()?;
@@ -2357,10 +2403,10 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                  admin, worker-registry and RL routes answer there, and 404 on {addr}"
             );
             let admin_app = admin_app.into_make_service_with_connect_info::<std::net::SocketAddr>();
-            match tls_config.clone() {
-                Some(tls_config) => Box::pin(
-                    axum_server::from_tcp_rustls(admin_listener, tls_config)?
-                        .map(|acceptor| tls_acceptor(acceptor, connection_timeouts))
+            match admin_tls_config {
+                Some(admin_tls_config) => Box::pin(
+                    axum_server::from_tcp_rustls(admin_listener, admin_tls_config)?
+                        .map(|acceptor| tls_acceptor(acceptor, connection_timeouts, None))
                         .handle(admin_handle)
                         .serve(admin_app),
                 ),
@@ -2376,13 +2422,23 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     };
     let app = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
     let data_serving: Serving = if let Some(tls_config) = tls_config {
-        info!("TLS enabled");
+        match client_identity {
+            Some(field) => {
+                metrics::Metrics::init_tls_client_auth_series();
+                info!(
+                    client_auth = %client_auth,
+                    client_identity = %field,
+                    "TLS enabled with client-certificate authentication"
+                );
+            }
+            None => info!("TLS enabled"),
+        }
 
         Box::pin(
             axum_server::from_tcp_rustls(listener, tls_config)?
                 .map(|acceptor| {
                     ConnectionLimitAcceptor::new(
-                        tls_acceptor(acceptor, connection_timeouts),
+                        tls_acceptor(acceptor, connection_timeouts, client_identity),
                         max_connections,
                     )
                 })
@@ -2848,16 +2904,25 @@ fn http_acceptor(
 
 /// The TLS acceptor: Nagle buffering disabled on the accepted TCP socket
 /// before the handshake, as [`http_acceptor`] does for plain HTTP, so small
-/// streaming records need not wait for the client's delayed ACK; the
-/// connections that carry no request are bounded around the handshake.
+/// streaming records need not wait for the client's delayed ACK; the client
+/// certificate's identity read after the handshake (`client_identity` names
+/// the field; `None` with client authentication off) for the requests of the
+/// connection; the connections that carry no request are bounded around the
+/// handshake.
 fn tls_acceptor(
     acceptor: axum_server::tls_rustls::RustlsAcceptor,
     timeouts: ConnectionTimeouts,
+    client_identity: Option<crate::config::TlsClientIdentity>,
 ) -> ConnectionTimeoutAcceptor<
-    axum_server::tls_rustls::RustlsAcceptor<axum_server::accept::NoDelayAcceptor>,
+    ClientIdentityAcceptor<
+        axum_server::tls_rustls::RustlsAcceptor<axum_server::accept::NoDelayAcceptor>,
+    >,
 > {
     ConnectionTimeoutAcceptor::new(
-        acceptor.acceptor(axum_server::accept::NoDelayAcceptor::new()),
+        ClientIdentityAcceptor::new(
+            acceptor.acceptor(axum_server::accept::NoDelayAcceptor::new()),
+            client_identity,
+        ),
         timeouts,
     )
 }
@@ -3580,6 +3645,7 @@ mod tests {
             let acceptor = tls_acceptor(
                 RustlsAcceptor::new(RustlsConfig::from_config(Arc::new(config))),
                 ConnectionTimeouts::disabled(),
+                None,
             );
             assert!(acceptor.accept(socket, ()).await.is_err());
             assert!(probe.nodelay().unwrap());

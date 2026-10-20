@@ -102,6 +102,33 @@ impl TestCertificates {
         Ok((cert_path, key_path))
     }
 
+    /// A client identity signed by the CA: a certificate for client
+    /// authentication with `uri` as its URI subject alternative name (a
+    /// SPIFFE id), `name` as its DNS name and its common name, and its
+    /// PKCS#8 key, written next to the other files. Returns the
+    /// (certificate, key) paths.
+    pub fn client_identity(
+        &self,
+        name: &str,
+        uri: &str,
+    ) -> Result<(PathBuf, PathBuf), Box<dyn std::error::Error>> {
+        let ca_cert = X509::from_pem(&std::fs::read(&self.ca_cert_path)?)?;
+        let ca_key = PKey::private_key_from_pem(&std::fs::read(&self.ca_key_path)?)?;
+        let key = generate_rsa_key()?;
+        let cert = generate_identity_certificate(name, uri, &key, &ca_cert, &ca_key)?;
+        let cert_path = self
+            .temp_dir
+            .path()
+            .join(format!("{name}_identity_cert.pem"));
+        let key_path = self
+            .temp_dir
+            .path()
+            .join(format!("{name}_identity_key.pem"));
+        std::fs::write(&cert_path, cert.to_pem()?)?;
+        std::fs::write(&key_path, key.private_key_to_pem_pkcs8()?)?;
+        Ok((cert_path, key_path))
+    }
+
     /// Get paths as string references for use with RouterConfig builder
     #[expect(
         clippy::unwrap_used,
@@ -271,6 +298,47 @@ fn generate_leaf_certificate(
 
     cert_builder.sign(ca_key, MessageDigest::sha256())?;
 
+    Ok(cert_builder.build())
+}
+
+/// A client certificate signed by the CA that names its holder: `uri` as a
+/// URI subject alternative name, `common_name` as a DNS name and the CN.
+fn generate_identity_certificate(
+    common_name: &str,
+    uri: &str,
+    key: &PKey<Private>,
+    ca_cert: &X509,
+    ca_key: &PKey<Private>,
+) -> Result<X509, Box<dyn std::error::Error>> {
+    let mut name_builder = X509NameBuilder::new()?;
+    name_builder.append_entry_by_text("O", "Test Client Organization")?;
+    name_builder.append_entry_by_text("CN", common_name)?;
+    let name = name_builder.build();
+
+    let mut cert_builder = X509Builder::new()?;
+    cert_builder.set_version(2)?;
+    let serial = {
+        let mut bn = BigNum::new()?;
+        bn.rand(128, MsbOption::MAYBE_ZERO, false)?;
+        bn.to_asn1_integer()?
+    };
+    cert_builder.set_serial_number(&serial)?;
+    cert_builder.set_subject_name(&name)?;
+    cert_builder.set_issuer_name(ca_cert.subject_name())?;
+    cert_builder.set_pubkey(key)?;
+    let not_before = Asn1Time::days_from_now(0)?;
+    let not_after = Asn1Time::days_from_now(365)?;
+    cert_builder.set_not_before(&not_before)?;
+    cert_builder.set_not_after(&not_after)?;
+    cert_builder.append_extension(BasicConstraints::new().build()?)?;
+    cert_builder.append_extension(KeyUsage::new().critical().digital_signature().build()?)?;
+    cert_builder.append_extension(ExtendedKeyUsage::new().client_auth().build()?)?;
+    let san = SubjectAlternativeName::new()
+        .uri(uri)
+        .dns(common_name)
+        .build(&cert_builder.x509v3_context(Some(ca_cert), None))?;
+    cert_builder.append_extension(san)?;
+    cert_builder.sign(ca_key, MessageDigest::sha256())?;
     Ok(cert_builder.build())
 }
 

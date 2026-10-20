@@ -618,6 +618,12 @@ class RouterArgs:
     # Per-tenant token/request rate limiting
     tenant_rate_limit_config: str | None = None
     tenant_rate_limit_enabled: bool = False
+    # Client-certificate authentication on the HTTPS listener: the CA bundle client
+    # certificates chain to, the mode (off, optional, required) and the field of a
+    # verified certificate that is the caller's identity (san-uri, san-dns, cn)
+    tls_client_auth: str = "off"
+    tls_client_ca_path: str | None = None
+    tls_client_identity: str = "san-uri"
     # Tokenizer cache configuration
     tokenizer_cache_enable_l0: bool = False
     tokenizer_cache_enable_l1: bool = False
@@ -2725,6 +2731,45 @@ class RouterArgs:
             type=str,
             default=None,
             help="Path to server TLS private key (PEM format)",
+        )
+        tls_group.add_argument(
+            f"--{prefix}tls-client-ca-path",
+            type=str,
+            default=None,
+            help=(
+                "A PEM bundle of the CAs client certificates on the HTTPS listener must"
+                " chain to (with --tls-client-auth)."
+            ),
+        )
+        tls_group.add_argument(
+            f"--{prefix}tls-client-auth",
+            type=str,
+            choices=["off", "optional", "required"],
+            default="off",
+            help=(
+                "Client-certificate authentication on the HTTPS listener: off; optional (a"
+                " certificate chaining to --tls-client-ca-path identifies the caller when"
+                " presented, a connection without one is served and authenticated by the"
+                " API keys as before); required (the handshake fails without one; with no"
+                " --api-key and no control-plane authentication the admin and"
+                " worker-management routes are closed too). A verified certificate's"
+                " identity is the caller's tenant auth:<identity>, the one a"
+                " --tenant-api-key for the same id resolves to for cn and san-dns (a URI"
+                " identity is addressed as auth:<uri> in the rate-limit configuration); no"
+                " bearer is needed on such a connection. The admin listener (--admin-port)"
+                " serves TLS without client authentication."
+            ),
+        )
+        tls_group.add_argument(
+            f"--{prefix}tls-client-identity",
+            type=str,
+            choices=["san-uri", "san-dns", "cn"],
+            default="san-uri",
+            help=(
+                "The field of a verified client certificate that is the caller's identity:"
+                " san-uri (the first URI subject alternative name, a SPIFFE id), san-dns"
+                " (the first DNS name) or cn (the subject's common name)."
+            ),
         )
 
         # Tracing configuration

@@ -571,6 +571,22 @@ pub struct RouterConfig {
     /// (the key itself is in `client_identity`)
     #[serde(skip)]
     pub client_key_path: Option<String>,
+    /// The CA bundle (PEM) client certificates on the HTTPS listener must
+    /// chain to (`--tls-client-ca-path`), read during config creation; acts
+    /// with [`Self::tls_client_auth`]
+    #[serde(skip)]
+    pub tls_client_ca: Option<Vec<u8>>,
+    /// The path the client CA bundle was read from, for messages
+    #[serde(skip)]
+    pub tls_client_ca_path: Option<String>,
+    /// Client-certificate authentication on the HTTPS listener
+    /// (`--tls-client-auth`); off by default
+    #[serde(default)]
+    pub tls_client_auth: TlsClientAuth,
+    /// The field of a verified client certificate that is the caller's
+    /// identity (`--tls-client-identity`)
+    #[serde(default)]
+    pub tls_client_identity: TlsClientIdentity,
     /// Combined certificate + key in PEM format, loaded from client_cert_path and client_key_path during config creation
     #[serde(skip)]
     pub client_identity: Option<Vec<u8>>,
@@ -609,6 +625,115 @@ pub struct RouterConfig {
 pub struct TenantResolutionConfig {
     pub trust_tenant_header: bool,
     pub tenant_header_name: String,
+}
+
+/// Client-certificate authentication on the HTTPS listener (the data
+/// listener; the admin listener serves TLS without it). A verified
+/// certificate identifies the caller: the field [`TlsClientIdentity`] names
+/// becomes the tenant identity `auth:<identity>`, the one a
+/// `--tenant-api-key` for the same id resolves to for a common name or a DNS
+/// name (a URI identity is addressed as `auth:<uri>` in the rate-limit
+/// configuration), so the tenant limits and the stored-state scoping apply
+/// to it the same way; a request on such a connection needs no bearer
+/// credential.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TlsClientAuth {
+    /// No client certificate is requested (the default).
+    #[default]
+    Off,
+    /// A client certificate is requested: one that is presented must chain
+    /// to the client CA bundle and identifies the caller; a connection
+    /// without one is served and authenticated by the other means (API
+    /// keys), as without client authentication.
+    Optional,
+    /// A client certificate chaining to the client CA bundle is required:
+    /// the handshake fails without one. With no API key and no control-plane
+    /// authentication, the admin and worker-management routes are closed as
+    /// well: a tenant credential never reaches them.
+    Required,
+}
+
+impl TlsClientAuth {
+    /// The mode as the flag spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Optional => "optional",
+            Self::Required => "required",
+        }
+    }
+
+    /// Whether client certificates are requested at all.
+    pub fn is_on(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+impl std::fmt::Display for TlsClientAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TlsClientAuth {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "optional" => Ok(Self::Optional),
+            "required" => Ok(Self::Required),
+            other => Err(format!(
+                "unknown client authentication mode '{other}': expected off, optional or required"
+            )),
+        }
+    }
+}
+
+/// The field of a verified client certificate that names the caller.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TlsClientIdentity {
+    /// The first URI subject alternative name (a SPIFFE id), the default.
+    #[default]
+    SanUri,
+    /// The first DNS subject alternative name.
+    SanDns,
+    /// The subject's common name.
+    Cn,
+}
+
+impl TlsClientIdentity {
+    /// The field as the flag spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SanUri => "san-uri",
+            Self::SanDns => "san-dns",
+            Self::Cn => "cn",
+        }
+    }
+}
+
+impl std::fmt::Display for TlsClientIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TlsClientIdentity {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "san-uri" => Ok(Self::SanUri),
+            "san-dns" => Ok(Self::SanDns),
+            "cn" => Ok(Self::Cn),
+            other => Err(format!(
+                "unknown client identity field '{other}': expected san-uri, san-dns or cn"
+            )),
+        }
+    }
 }
 
 /// A single tenant-scoped API key for serving-path authentication.
@@ -1970,6 +2095,10 @@ impl Default for RouterConfig {
             server_key: None,
             server_key_path: None,
             client_key_path: None,
+            tls_client_ca: None,
+            tls_client_ca_path: None,
+            tls_client_auth: TlsClientAuth::Off,
+            tls_client_identity: TlsClientIdentity::SanUri,
         }
     }
 }
