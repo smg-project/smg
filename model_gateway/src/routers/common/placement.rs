@@ -408,10 +408,15 @@ fn overload_fallback(
                     Some((key, _)) => split.arm_for_key(key),
                     None => split.arm_at_random(&mut rand::rng()),
                 };
-                let members: Vec<Arc<dyn Worker>> = arm
-                    .members
+                // The arm's group whole, not the admitted members alone: the
+                // fallback's own all-vetoed check and readiness and shed filters
+                // run over the group as they do over a pool, so a group with a
+                // worker that is down but not vetoed keeps its unavailable
+                // answer; the other groups stay out, a drained one among them.
+                let members: Vec<Arc<dyn Worker>> = candidates
                     .iter()
-                    .map(|&idx| Arc::clone(&candidates[idx]))
+                    .filter(|worker| traffic_split::group_of(worker.as_ref()) == arm.name)
+                    .cloned()
                     .collect();
                 let selected = overload::fallback_if_all_vetoed(
                     &members,
@@ -2207,10 +2212,10 @@ mod tests {
             .is_none(),
             "a pool whose groups all weigh 0 is declined, not served"
         );
-        // A stalled member still joins its group's arm: under the shed, where
-        // an overloaded worker is never taken, the arm's answer is the wedged
-        // stable worker, not a miss; and a wedged stable fleet beside an
-        // overloaded canary at 0 still serves from the stable fleet.
+        // A stalled member still joins its group's arm. Under the shed, where
+        // an overloaded worker is never taken, the shed empties the canary
+        // group here, so the pool is one group and the least-loaded pick is
+        // the wedged stable worker, not a miss.
         let registry = grouped("90", "10");
         registry.set_overload_shed(true);
         let wedged = registry.get_by_url("http://s:2").expect("registered");
@@ -2220,9 +2225,68 @@ mod tests {
             assert_eq!(
                 pick(&registry, &policies, PlacementInputs::default()).base_url(),
                 "http://s:2",
-                "the shed left the arm without its stalled worker"
+                "the shed left the pool without its stalled worker"
             );
         }
+        // With a wedged worker in each group the shed leaves two groups, and
+        // the arm's answer is its wedged worker, the canary's at its weight.
+        let registry = grouped("90", "10");
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("http://c:2")
+                    .model(ModelCard::new(MODEL))
+                    .worker_type(WorkerType::Regular)
+                    .connection_mode(ConnectionMode::Http)
+                    .runtime_type(RuntimeType::Sglang)
+                    .label("traffic_group", "canary")
+                    .label("traffic_weight", "10")
+                    .health_config(HealthCheckConfig {
+                        disable_health_check: true,
+                        ..Default::default()
+                    })
+                    .build(),
+            ))
+            .expect("worker registers");
+        registry.set_overload_shed(true);
+        for url in ["http://s:2", "http://c:2"] {
+            let worker = registry.get_by_url(url).expect("registered");
+            registry.set_worker_overloaded(&worker, false);
+            worker.set_stall(Some(StallReason::Wedged));
+        }
+        let mut canary = 0;
+        for _ in 0..100 {
+            let picked = pick(&registry, &policies, PlacementInputs::default());
+            assert!(
+                picked.base_url() == "http://s:2" || picked.base_url() == "http://c:2",
+                "the arm answered with an overloaded worker under the shed: {}",
+                picked.base_url()
+            );
+            if picked.base_url() == "http://c:2" {
+                canary += 1;
+            }
+        }
+        assert!(
+            canary <= 25,
+            "the canary took {canary} of 100 at weight 10 under the shed"
+        );
+        // A group with a worker that is down but not vetoed keeps the pool's
+        // unavailable answer, as the single-group and the split-off paths do.
+        let registry = grouped("90", "10");
+        let down = registry.get_by_url("http://s:2").expect("registered");
+        registry.set_worker_overloaded(&down, false);
+        down.set_status(WorkerStatus::NotReady);
+        assert!(
+            select_single(
+                &registry,
+                &policies,
+                MODEL,
+                RoutingPool::HttpRegular,
+                None,
+                PlacementInputs::default(),
+            )
+            .is_none(),
+            "a not-ready worker in the stable group was hidden from the all-vetoed check"
+        );
         let registry = grouped("90", "0");
         for url in ["http://s:1", "http://s:2"] {
             let worker = registry.get_by_url(url).expect("registered");
