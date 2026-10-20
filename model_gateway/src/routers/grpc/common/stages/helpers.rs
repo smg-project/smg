@@ -30,7 +30,7 @@ use crate::{
                 assemble_multimodal_data_after_encode, assembly_error_response,
                 reserve_multimodal_inflight,
             },
-            proto_wrapper::{MultimodalData, ProtoGenerateRequest},
+            proto_wrapper::{AnswerConstraint, MultimodalData, ProtoGenerateRequest},
             utils,
         },
     },
@@ -377,12 +377,19 @@ impl SamplingBaseline {
 }
 
 /// A structural tag the table derives for where a worker's engine starts the
-/// grammar (`regular::symphony::AutoTag`): the attempt stamp asks it for the
-/// worker each retry takes, as request building asked it for the first.
+/// grammar (`regular::symphony::AutoTag`, `regular::symphony::AnswerTag`): the
+/// attempt stamp asks it for the worker each retry takes, as request building
+/// asked it for the first.
 pub(crate) trait TagForStart: fmt::Debug + Send + Sync {
     /// The tag for an engine whose grammar starts at `start`, or `None` where
     /// the table gives that engine no tag.
     fn tag_for(&self, start: GrammarStart) -> Result<Option<String>, String>;
+
+    /// The request's own JSON schema, where the tag is a JSON answer's: the
+    /// constraint a worker the table gives no tag takes in its place, the
+    /// engine's own, serialized only when a request takes it; `None` where
+    /// no tag leaves the request unconstrained (the `auto` tag).
+    fn schema(&self) -> Option<&serde_json::Value>;
 }
 
 /// A request's tool constraint as each attempt's worker must take it. Request
@@ -401,12 +408,16 @@ pub(crate) enum ToolConstraintStamp {
         /// The configured tool parser the shaping reads its reasoning prefix from.
         parser: Option<String>,
     },
-    /// The table's `auto` tag the selected worker's policy chose, shaped for
-    /// where that worker's engine starts the grammar; the retry's worker gets
-    /// it derived again for its own start, or no tag where the table gives
-    /// its engine none. Captured only where the first worker got a tag: a
-    /// plan built without one carries no stamp, so a retry's worker the table
-    /// would give one goes without it too.
+    /// The table's tag the selected worker took, shaped for where its engine
+    /// starts the grammar: the `auto` tag its policy chose, or a JSON
+    /// answer's; the retry's worker gets it derived again for its own start.
+    /// Where the table gives that engine none, the `auto` tag leaves the
+    /// request unconstrained, and a JSON answer's gives way to the request's
+    /// own schema, the engine's constraint ([`TagForStart::schema`]), from
+    /// which a later retry takes the tag back. An `auto` tag is captured only
+    /// where the first worker got a tag: a plan built without one carries no
+    /// stamp, so a retry's worker the table would give one goes without it
+    /// too.
     Table(Arc<dyn TagForStart>),
 }
 
@@ -429,15 +440,21 @@ impl ToolConstraintStamp {
         })
     }
 
-    /// Capture the stamp for a built request that carries the table's `auto`
-    /// tag, with what derives the tag for a worker's start. Nothing is
-    /// captured when the backend's builder let the request's `response_format`
-    /// outrank the tag, as for [`Self::capture`].
+    /// Capture the stamp for a built request that carries the table's tag,
+    /// with what derives the tag for a worker's start; for a JSON answer's, a
+    /// request that carries the answer's schema instead, the engine's own
+    /// where the table gave the first worker no tag ([`TagForStart::schema`]).
+    /// Nothing is captured when the backend's builder let the request's
+    /// `response_format` outrank an `auto` tag, as for [`Self::capture`].
     pub(crate) fn capture_table(
         tag: Arc<dyn TagForStart>,
         request: &ProtoGenerateRequest,
     ) -> Option<Self> {
-        request.structural_tag()?;
+        let carried = request.structural_tag().is_some()
+            || (request.json_schema().is_some() && tag.schema().is_some());
+        if !carried {
+            return None;
+        }
         Some(Self::Table(tag))
     }
 
@@ -476,9 +493,19 @@ impl ToolConstraintStamp {
             }
             Self::Table(tag) => {
                 let start = utils::WorkerDecoding::of(Some(workers)).start;
-                match tag.tag_for(start).map_err(failed)? {
-                    Some(tag) => request.restore_structural_tag(tag),
-                    None => request.clear_structural_tag(),
+                let shaped = tag.tag_for(start).map_err(failed)?;
+                match (shaped, tag.schema()) {
+                    // A JSON answer's: the tag, or the request's own schema
+                    // where the table gives this worker none, the one in the
+                    // other's place.
+                    (shaped, Some(schema)) => {
+                        request.restore_answer_constraint(match shaped {
+                            Some(tag) => AnswerConstraint::StructuralTag(tag),
+                            None => AnswerConstraint::JsonSchema(schema.to_string()),
+                        });
+                    }
+                    (Some(tag), None) => request.restore_structural_tag(tag),
+                    (None, None) => request.clear_structural_tag(),
                 }
             }
         }
@@ -1837,6 +1864,170 @@ mod tool_constraint_restamp_tests {
                 GrammarStart::FirstToken => Some(THOUGHT_TABLE_TAG.to_string()),
                 GrammarStart::Unknown => None,
             })
+        }
+
+        fn schema(&self) -> Option<&Value> {
+            None
+        }
+    }
+
+    /// A JSON answer's tag as a test derives it per start: the closed thought
+    /// then the schema for an engine starting at the first token, none for
+    /// the others, which take the request's own schema (held here) in its
+    /// place.
+    #[derive(Debug)]
+    struct AnswerTag(Value);
+
+    impl TagForStart for AnswerTag {
+        fn tag_for(&self, start: GrammarStart) -> Result<Option<String>, String> {
+            Ok((start == GrammarStart::FirstToken).then(|| THOUGHT_ANSWER_TAG.to_string()))
+        }
+
+        fn schema(&self) -> Option<&Value> {
+            Some(&self.0)
+        }
+    }
+
+    const ANSWER_SCHEMA: &str = r#"{"type":"object"}"#;
+    const THOUGHT_ANSWER_TAG: &str = r#"{"format":{"type":"sequence","elements":[{"type":"tag","begin":"","content":{"type":"any_text","excludes":[]},"end":"</think>"},{"type":"json_schema","json_schema":{"type":"object"}}]}}"#;
+
+    /// Each backend's built request carrying `schema` where its builder places
+    /// the request's own JSON schema.
+    fn requests_with_schema(schema: &str) -> Vec<(&'static str, ProtoGenerateRequest)> {
+        vec![
+            (
+                "sglang",
+                ProtoGenerateRequest::Sglang(Box::new(sglang_proto::GenerateRequest {
+                    sampling_params: Some(sglang_proto::SamplingParams {
+                        constraint: Some(sglang_proto::sampling_params::Constraint::JsonSchema(
+                            schema.to_string(),
+                        )),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+            ),
+            (
+                "vllm",
+                ProtoGenerateRequest::Vllm(Box::new(vllm_proto::GenerateRequest {
+                    sampling_params: Some(vllm_proto::SamplingParams {
+                        constraint: Some(vllm_proto::sampling_params::Constraint::JsonSchema(
+                            schema.to_string(),
+                        )),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+            ),
+            (
+                "tokenspeed",
+                ProtoGenerateRequest::TokenSpeed(Box::new(tokenspeed_proto::GenerateRequest {
+                    sampling_params: Some(tokenspeed_proto::SamplingParams {
+                        constraint: Some(
+                            tokenspeed_proto::sampling_params::Constraint::JsonSchema(
+                                schema.to_string(),
+                            ),
+                        ),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                })),
+            ),
+            (
+                "trtllm",
+                ProtoGenerateRequest::Trtllm(Box::new(trtllm_proto::GenerateRequest {
+                    guided_decoding: Some(trtllm_proto::GuidedDecodingParams {
+                        guide_type: trtllm_proto::guided_decoding_params::GuideType::JsonSchema
+                            as i32,
+                        guide: schema.to_string(),
+                    }),
+                    ..Default::default()
+                })),
+            ),
+        ]
+    }
+
+    /// The plan's constraint: its structural tag and its JSON schema, one of
+    /// them at most.
+    fn plan_constraint(plan: &ExecutionPlan) -> (Option<String>, Option<String>) {
+        match plan {
+            ExecutionPlan::Single(ProtoRequest::Generate(request)) => (
+                request.structural_tag().map(str::to_string),
+                request.json_schema().map(str::to_string),
+            ),
+            _ => panic!("expected a single generate plan"),
+        }
+    }
+
+    /// A JSON answer's tag, shaped at build for the selected worker's start,
+    /// reaches a retry's worker derived again for that worker's own start, the
+    /// request's own schema standing in where the table gives it no tag: from
+    /// a first attempt that carried the tag and from one that carried the
+    /// schema alike, on every backend that carries a constraint. The `auto`
+    /// tag's derivation stands in for nothing, so a request built with the
+    /// schema captures none of it, as before.
+    #[test]
+    fn retry_derives_the_json_answers_tag_for_its_own_workers_start_or_its_schema() {
+        let factory = ToolParserFactory::new();
+        let after_reasoning = worker(&[("constrained_decoding_start", "after_reasoning")]);
+        let first_token = worker(&[("constrained_decoding_start", "first_token")]);
+        let silent = worker(&[]);
+        let answer: Arc<dyn TagForStart> =
+            Arc::new(AnswerTag(serde_json::from_str(ANSWER_SCHEMA).unwrap()));
+        let the_tag = (Some(THOUGHT_ANSWER_TAG.to_string()), None);
+        let the_schema = (None, Some(ANSWER_SCHEMA.to_string()));
+
+        let built = requests_with_tag(THOUGHT_ANSWER_TAG)
+            .into_iter()
+            .map(|(backend, request)| (backend, "the tag", request))
+            .chain(
+                requests_with_schema(ANSWER_SCHEMA)
+                    .into_iter()
+                    .map(|(backend, request)| (backend, "the schema", request)),
+            );
+        for (backend, carried, request) in built {
+            let stamp = AttemptStamp {
+                id: IdStamp::Exact,
+                sampling_mask: None,
+                sampling_baseline: None,
+                inject_pd_metadata: false,
+                tool_constraint: ToolConstraintStamp::capture_table(Arc::clone(&answer), &request),
+            };
+            assert!(
+                matches!(stamp.tool_constraint, Some(ToolConstraintStamp::Table(_))),
+                "{backend}, built with {carried}: the answer's derivation goes with the plan"
+            );
+            let mut plan = ExecutionPlan::generate(ExecutionPlanKind::Single, request);
+
+            restamp_plan_for_attempt(&mut plan, &stamp, &after_reasoning, &factory).unwrap();
+            assert_eq!(
+                plan_constraint(&plan),
+                the_schema,
+                "{backend}, built with {carried}: after the gate, the request's own schema"
+            );
+
+            restamp_plan_for_attempt(&mut plan, &stamp, &first_token, &factory).unwrap();
+            assert_eq!(
+                plan_constraint(&plan),
+                the_tag,
+                "{backend}, built with {carried}: from the first token, the closed thought then \
+                 the schema"
+            );
+
+            restamp_plan_for_attempt(&mut plan, &stamp, &silent, &factory).unwrap();
+            assert_eq!(
+                plan_constraint(&plan),
+                the_schema,
+                "{backend}, built with {carried}: a worker that does not say, the schema"
+            );
+        }
+
+        for (backend, request) in requests_with_schema(ANSWER_SCHEMA) {
+            let auto: Arc<dyn TagForStart> = Arc::new(TableTag);
+            assert!(
+                ToolConstraintStamp::capture_table(auto, &request).is_none(),
+                "{backend}: the auto tag's derivation is not captured over the schema"
+            );
         }
     }
 

@@ -1289,6 +1289,16 @@ pub(crate) const VLLM_MROPE_GRID_KEYS: [&str; 4] = [
     "video_second_per_grid",
 ];
 
+/// A JSON answer's constraint as the worker of an attempt takes it: the table's
+/// structural tag, or the request's own schema where the table gives that
+/// worker none (`regular::symphony::worker_constraint`); across attempts the
+/// one stands in for the other.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AnswerConstraint {
+    StructuralTag(String),
+    JsonSchema(String),
+}
+
 impl ProtoGenerateRequest {
     /// Append stop token ids to the request's sampling params (TRT-LLM keeps
     /// them on the request itself). Requests without sampling params are left
@@ -1794,6 +1804,32 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// The JSON schema the request's constraint carries, when that is its
+    /// constraint (TRT-LLM: a JSON-schema guide; MLX: never, its builder
+    /// refuses constraints).
+    pub fn json_schema(&self) -> Option<&str> {
+        match self {
+            Self::Sglang(req) => match req.sampling_params.as_ref()?.constraint.as_ref()? {
+                sglang::sampling_params::Constraint::JsonSchema(schema) => Some(schema),
+                _ => None,
+            },
+            Self::Vllm(req) => match req.sampling_params.as_ref()?.constraint.as_ref()? {
+                vllm::sampling_params::Constraint::JsonSchema(schema) => Some(schema),
+                _ => None,
+            },
+            Self::TokenSpeed(req) => match req.sampling_params.as_ref()?.constraint.as_ref()? {
+                tokenspeed::sampling_params::Constraint::JsonSchema(schema) => Some(schema),
+                _ => None,
+            },
+            Self::Trtllm(req) => {
+                let guided = req.guided_decoding.as_ref()?;
+                (guided.guide_type == trtllm::guided_decoding_params::GuideType::JsonSchema as i32)
+                    .then_some(guided.guide.as_str())
+            }
+            Self::Mlx(_) => None,
+        }
+    }
+
     /// Replace the structural tag the request's constraint carries; a request
     /// whose constraint is anything else, or none, is left as it is.
     pub fn set_structural_tag(&mut self, tag: String) {
@@ -1924,6 +1960,76 @@ impl ProtoGenerateRequest {
                         == trtllm::guided_decoding_params::GuideType::StructuralTag as i32
                 }) {
                     req.guided_decoding = None;
+                }
+            }
+            Self::Mlx(_) => {}
+        }
+    }
+
+    /// Set `constraint` as the request's constraint where the request carries
+    /// a structural tag, a JSON schema or none, the forms a JSON answer's
+    /// constraint takes on the attempts before ([`AnswerConstraint`]); a
+    /// request whose constraint is anything else (a regex, a grammar) is left
+    /// as it is, like one without sampling params.
+    pub fn restore_answer_constraint(&mut self, constraint: AnswerConstraint) {
+        match self {
+            Self::Sglang(req) => {
+                use sglang::sampling_params::Constraint;
+                if let Some(params) = req.sampling_params.as_mut() {
+                    if matches!(
+                        params.constraint,
+                        None | Some(Constraint::StructuralTag(_) | Constraint::JsonSchema(_))
+                    ) {
+                        params.constraint = Some(match constraint {
+                            AnswerConstraint::StructuralTag(tag) => Constraint::StructuralTag(tag),
+                            AnswerConstraint::JsonSchema(schema) => Constraint::JsonSchema(schema),
+                        });
+                    }
+                }
+            }
+            Self::Vllm(req) => {
+                use vllm::sampling_params::Constraint;
+                if let Some(params) = req.sampling_params.as_mut() {
+                    if matches!(
+                        params.constraint,
+                        None | Some(Constraint::StructuralTag(_) | Constraint::JsonSchema(_))
+                    ) {
+                        params.constraint = Some(match constraint {
+                            AnswerConstraint::StructuralTag(tag) => Constraint::StructuralTag(tag),
+                            AnswerConstraint::JsonSchema(schema) => Constraint::JsonSchema(schema),
+                        });
+                    }
+                }
+            }
+            Self::TokenSpeed(req) => {
+                use tokenspeed::sampling_params::Constraint;
+                if let Some(params) = req.sampling_params.as_mut() {
+                    if matches!(
+                        params.constraint,
+                        None | Some(Constraint::StructuralTag(_) | Constraint::JsonSchema(_))
+                    ) {
+                        params.constraint = Some(match constraint {
+                            AnswerConstraint::StructuralTag(tag) => Constraint::StructuralTag(tag),
+                            AnswerConstraint::JsonSchema(schema) => Constraint::JsonSchema(schema),
+                        });
+                    }
+                }
+            }
+            Self::Trtllm(req) => {
+                use trtllm::guided_decoding_params::GuideType;
+                let answers = |guided: &trtllm::GuidedDecodingParams| {
+                    guided.guide_type == GuideType::StructuralTag as i32
+                        || guided.guide_type == GuideType::JsonSchema as i32
+                };
+                if req.guided_decoding.as_ref().is_none_or(answers) {
+                    let (guide_type, guide) = match constraint {
+                        AnswerConstraint::StructuralTag(tag) => (GuideType::StructuralTag, tag),
+                        AnswerConstraint::JsonSchema(schema) => (GuideType::JsonSchema, schema),
+                    };
+                    req.guided_decoding = Some(trtllm::GuidedDecodingParams {
+                        guide_type: guide_type as i32,
+                        guide,
+                    });
                 }
             }
             Self::Mlx(_) => {}

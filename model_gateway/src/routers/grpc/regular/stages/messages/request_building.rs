@@ -50,8 +50,9 @@ impl MessageRequestBuildingStage {
 /// `constrained_decoding_start` label, `utils::tool_constraints_for_worker`),
 /// the sampling defaults, the stops and the PD metadata; returns the plan
 /// and the attempt stamp, which carries the unshaped constraint, or what
-/// derives the table's `auto` tag for a start, so a retry gives the worker it
-/// selects the same shaping (`helpers::ToolConstraintStamp`).
+/// derives the table's tag for a start (the `auto` tag, a JSON answer's), so
+/// a retry gives the worker it selects the same shaping
+/// (`helpers::ToolConstraintStamp`).
 #[expect(clippy::too_many_arguments)]
 fn build_messages_backed_plan(
     ctx: &mut RequestContext,
@@ -59,7 +60,7 @@ fn build_messages_backed_plan(
     processed_text: String,
     token_ids: Vec<u32>,
     tool_constraints: Option<(String, String)>,
-    auto_tag: Option<Arc<dyn TagForStart>>,
+    table_tag: Option<Arc<dyn TagForStart>>,
     require_reasoning: bool,
     multimodal_data: Option<MultimodalData>,
     inject_pd_metadata: bool,
@@ -130,8 +131,8 @@ fn build_messages_backed_plan(
         "MessageRequestBuildingStage::build",
     )?;
 
-    let tool_constraint = match auto_tag {
-        Some(auto_tag) => helpers::ToolConstraintStamp::capture_table(auto_tag, &proto_request),
+    let tool_constraint = match table_tag {
+        Some(table_tag) => helpers::ToolConstraintStamp::capture_table(table_tag, &proto_request),
         None => helpers::ToolConstraintStamp::capture(
             unshaped_tool_constraints,
             tool_parser.as_deref(),
@@ -200,7 +201,7 @@ impl BuildStage for MessageRequestBuildingStage {
         // tools the template sees. The state records which parser reads the
         // message, for the response's header.
         let reading::Decided {
-            auto_tag,
+            table_tag,
             tool_constraints,
             assignment,
             ..
@@ -249,7 +250,7 @@ impl BuildStage for MessageRequestBuildingStage {
             processed_messages.text,
             token_ids,
             tool_constraints,
-            auto_tag,
+            table_tag,
             require_reasoning,
             multimodal_data,
             self.inject_pd_metadata,

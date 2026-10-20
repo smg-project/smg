@@ -131,7 +131,7 @@ pub(crate) fn choice(
 pub(crate) use self::{
     constraint::{
         constraint, grammar_start_of, turn_constraint, worker_constraint, Asks, AutoRequest,
-        AutoTag, PreparedConstraint,
+        AutoTag, Prepared, PreparedConstraint,
     },
     names::{
         check_names, keeps_special_tokens, labels_select_nothing, named_table, reasoning_open,
