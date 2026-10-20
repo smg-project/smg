@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::codec::{dtype::ModelDtype, OpaqueValue};
 
@@ -112,9 +112,18 @@ pub struct EngineCoreReadyResponse {
     /// tagged struct's tag is not counted). A protocol whose requests are
     /// positional checks the prefixes it encodes against it once, at connect
     /// time ([`EngineProtocol::check_layouts`](crate::protocol::EngineProtocol::check_layouts)).
-    /// Empty from an engine that declares none.
-    #[serde(default)]
+    /// Empty from an engine that declares none, whether it leaves the key
+    /// out or sends it as nil.
+    #[serde(default, deserialize_with = "nil_as_empty_map")]
     pub positional_layouts: BTreeMap<String, Vec<String>>,
+}
+
+/// A map an engine may send as nil (a Python `None` in a struct that omits
+/// nothing): the same as leaving the key out.
+fn nil_as_empty_map<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Vec<String>>, D::Error> {
+    Ok(Option::<BTreeMap<String, Vec<String>>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// Frontend-owned ZMQ addresses sent to the engine during handshake init.
@@ -206,6 +215,13 @@ mod tests {
             resp.positional_layouts["SamplingParams"],
             vec!["max_new_tokens".to_string(), "stop".to_string()]
         );
+        // An engine that sends the key as nil declares nothing, like one
+        // that leaves it out.
+        let mut json = json;
+        json["positional_layouts"] = serde_json::Value::Null;
+        let bytes = rmp_serde::to_vec_named(&json).unwrap();
+        let resp: EngineCoreReadyResponse = decode_msgpack(&bytes).unwrap();
+        assert!(resp.positional_layouts.is_empty());
     }
 
     #[test]

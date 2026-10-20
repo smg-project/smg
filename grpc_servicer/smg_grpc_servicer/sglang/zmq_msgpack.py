@@ -143,8 +143,10 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
     # The field order of each positional struct this side decodes, by class
     # name (the tag of a tagged struct not counted): SMG compares the prefixes
     # it encodes with it once, at the handshake, so a release that moved a
-    # field is named there instead of refusing every request.
-    positional_layouts: dict[str, list[str]] | None = None
+    # field is named there instead of refusing every request. Empty, never
+    # None: the key goes out on every response (nothing is omitted here), and
+    # an empty map is what SMG reads as "nothing declared".
+    positional_layouts: dict[str, list[str]] = {}
 
 
 # ----------------------------------------------------------------------------
