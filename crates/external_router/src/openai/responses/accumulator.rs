@@ -11,8 +11,10 @@ use super::common::{extract_output_index, get_event_type, parse_sse_block};
 pub(crate) struct StreamingResponseAccumulator {
     /// The initial `response.created` payload (if emitted).
     initial_response: Option<Value>,
-    /// The final `response.completed` payload (if emitted).
-    completed_response: Option<Value>,
+    /// The response of the terminal event that ended the stream
+    /// (`response.completed`, `response.incomplete` or `response.failed`), if
+    /// one did.
+    terminal_response: Option<Value>,
     /// Collected output items keyed by the upstream output index, used when
     /// a final response payload is absent and we need to synthesize one.
     output_items: Vec<(usize, Value)>,
@@ -24,7 +26,7 @@ impl StreamingResponseAccumulator {
     pub fn new() -> Self {
         Self {
             initial_response: None,
-            completed_response: None,
+            terminal_response: None,
             output_items: Vec::new(),
             encountered_error: None,
         }
@@ -40,8 +42,8 @@ impl StreamingResponseAccumulator {
 
     /// Consume the accumulator and produce the best-effort final response value.
     pub fn into_final_response(mut self) -> Option<Value> {
-        if self.completed_response.is_some() {
-            return self.completed_response;
+        if self.terminal_response.is_some() {
+            return self.terminal_response;
         }
 
         self.build_fallback_response()
@@ -59,7 +61,7 @@ impl StreamingResponseAccumulator {
     }
 
     pub fn snapshot_final_response(&self) -> Option<Value> {
-        if let Some(resp) = &self.completed_response {
+        if let Some(resp) = &self.terminal_response {
             return Some(resp.clone());
         }
         self.build_fallback_response_snapshot()
@@ -109,9 +111,9 @@ impl StreamingResponseAccumulator {
                     self.initial_response = Some(response.clone());
                 }
             }
-            ResponseEvent::COMPLETED => {
+            ResponseEvent::COMPLETED | ResponseEvent::INCOMPLETE | ResponseEvent::FAILED => {
                 if let Some(response) = parsed.get("response") {
-                    self.completed_response = Some(response.clone());
+                    self.terminal_response = Some(response.clone());
                 }
             }
             OutputItemEvent::DONE => {

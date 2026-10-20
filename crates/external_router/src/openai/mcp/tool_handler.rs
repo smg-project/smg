@@ -23,8 +23,7 @@ fn is_tool_call_item_type(item_type: &str) -> bool {
     is_function_call_type(item_type) || openai_bridge::is_hosted_tool_call_item_type(item_type)
 }
 
-/// The `error` event of a Responses stream: the upstream failed the request
-/// mid-stream.
+/// The `error` event of a Responses stream.
 const ERROR_EVENT: &str = "error";
 
 /// Action to take based on streaming event processing
@@ -35,13 +34,9 @@ pub(crate) enum StreamAction {
     /// Accumulate the event for tool execution, do not send downstream.
     ///
     /// Also the upstream umbrella `output_item.done` of a call the handler
-    /// tracks: forwarding it would emit a duplicate umbrella
-    /// `response.output_item.done` that fires BEFORE the sub-event
-    /// `response.<type>.completed` — violating the spec sub-event ordering
-    /// (spec §streaming: the umbrella `output_item.done` is always the LAST
-    /// event for a given item). The tool_loop's
-    /// `send_tool_call_completion_events` emits the correct umbrella
-    /// `output_item.done` in its proper position once the call has run.
+    /// tracks, which would fire BEFORE `response.<type>.completed` (spec
+    /// §streaming: the umbrella is an item's LAST event): the tool_loop's
+    /// `send_tool_call_completion_events` emits it once the call has run.
     Buffer,
     /// Drop the upstream event from the wire without triggering tool
     /// execution.
@@ -62,25 +57,18 @@ pub(crate) enum StreamAction {
     /// The upstream ended its turn holding tool calls, each of them whole —
     /// run them now, every call of the turn as one batch.
     ///
-    /// A turn of parallel calls streams them one item after another, each
-    /// call complete (`function_call_arguments.done`, then its
-    /// `output_item.done`) before the next is added, so no call's own
-    /// completion says the batch is whole: only the turn's terminal event
-    /// does (`response.completed`, or `response.incomplete` /
-    /// `response.failed`), and only when every call it holds is named and
-    /// its arguments concluded. The terminal is not forwarded; the tool loop
-    /// ends the client's stream with its own `response.completed`.
+    /// A turn streams its parallel calls one item after another, so no call's
+    /// own completion says the batch is whole: only the turn's terminal event
+    /// does (`response.completed`, `response.incomplete`, `response.failed`).
+    /// It is not forwarded; the tool loop ends the stream with its own.
     ExecuteTools,
-    /// Pass this event to the client and end the client's stream on it: the
-    /// upstream ended its turn `incomplete` or `failed` without a whole batch
-    /// of calls (none at all, or one still streaming its arguments), or sent
-    /// an `error` event.
-    ///
-    /// The tool loop stops reading the upstream here, runs none of the
-    /// turn's calls (a call cut off mid-arguments has no arguments to run
-    /// with, and the calls beside it do not run without it), and sends no
-    /// terminal of its own after this one.
-    ForwardTerminal,
+    /// The upstream ended its turn with this terminal (`response.incomplete`
+    /// or `response.failed`) and no whole batch: no call runs, and the tool
+    /// loop ends the stream on a terminal of that kind, finished as its own.
+    EndTurn(&'static str),
+    /// Pass this `error` event and end the stream on it, as the tool loop ends
+    /// it on an error of its own: no call runs, nothing follows it.
+    ForwardError,
 }
 
 /// Maps upstream output indices to sequential downstream indices
@@ -132,11 +120,8 @@ pub(crate) struct FunctionCallInProgress {
     pub output_index: usize,
     pub last_obfuscation: Option<String>,
     pub assigned_output_index: Option<usize>,
-    /// Whether the upstream concluded the call's arguments: its
-    /// `function_call_arguments.done`, or its `output_item.done`, arrived.
-    /// Until then `arguments_buffer` may hold a prefix of them; once set it
-    /// holds them whole, even when that is the empty string of a call that
-    /// takes none.
+    /// Set by the call's `function_call_arguments.done` or `output_item.done`:
+    /// `arguments_buffer` then holds them whole, even when empty.
     pub arguments_concluded: bool,
 }
 
@@ -163,12 +148,10 @@ impl FunctionCallInProgress {
         self.is_complete() && self.arguments_concluded
     }
 
-    /// Conclude the call with the final `item` its upstream
-    /// `output_item.done` carries. An upstream that sends no arguments events
-    /// sends the call's arguments only there, so a function call's item
-    /// replaces whatever the buffer holds, and its name and ids replace the
-    /// ones the call was added with. An item of another type at the call's
-    /// index says only that the call is done.
+    /// Conclude the call with the final `item` of its `output_item.done`: a
+    /// function call's item replaces its arguments, name and ids. An item
+    /// whose status is not `completed` (`incomplete`: cut short) leaves the
+    /// arguments unconcluded, whatever concluded them before.
     fn conclude_with_item(&mut self, item: &Value) {
         let field = |name: &str| item.get(name).and_then(Value::as_str);
         if field("type").is_some_and(is_function_call_type) {
@@ -186,7 +169,7 @@ impl FunctionCallInProgress {
                 self.item_id = Some(item_id.to_string());
             }
         }
-        self.arguments_concluded = true;
+        self.arguments_concluded = field("status").is_none_or(|status| status == "completed");
     }
 
     pub fn effective_output_index(&self) -> usize {
@@ -282,23 +265,18 @@ impl StreamingToolHandler {
             }
             // The upstream's turn ends here, however it ended it. Its calls
             // stream one item after another, so only the terminal says the
-            // batch is whole: when each call of the turn is named and its
-            // arguments concluded, every one of them runs now, as the
+            // batch is whole: every call of the turn runs now, as the
             // non-streamed loop runs every call of the response it reads.
             ResponseEvent::COMPLETED | ResponseEvent::INCOMPLETE | ResponseEvent::FAILED
                 if self.has_runnable_calls() =>
             {
                 StreamAction::ExecuteTools
             }
-            // Otherwise a completed turn is the answer's; the tool loop ends
-            // the client's stream with its own terminal once the body ends.
+            // Otherwise a completed turn is the answer's.
             ResponseEvent::COMPLETED => StreamAction::Forward,
-            // An incomplete or failed turn, or an error, ends the client's
-            // stream as the upstream ended it, a call cut off mid-arguments
-            // and the calls beside it left unrun.
-            ResponseEvent::INCOMPLETE | ResponseEvent::FAILED | ERROR_EVENT => {
-                StreamAction::ForwardTerminal
-            }
+            ResponseEvent::INCOMPLETE => StreamAction::EndTurn(ResponseEvent::INCOMPLETE),
+            ResponseEvent::FAILED => StreamAction::EndTurn(ResponseEvent::FAILED),
+            ERROR_EVENT => StreamAction::ForwardError,
             OutputItemEvent::ADDED => self.handle_output_item_added(&parsed),
             FunctionCallEvent::ARGUMENTS_DELTA => self.handle_arguments_delta(&parsed),
             FunctionCallEvent::ARGUMENTS_DONE => self.handle_arguments_done(&parsed),
@@ -341,11 +319,8 @@ impl StreamingToolHandler {
                 // kicks in for items tracked by `pending_calls`.
                 let belongs_to_pending_call = done_output_index
                     .is_some_and(|idx| self.pending_calls.iter().any(|c| c.output_index == idx));
-                // The tracked call's own umbrella concludes it with the final
-                // item it carries: the call's arguments, for an upstream that
-                // sends no arguments events. This comes before the gate below,
-                // so a call this names is one whose umbrella the gate holds
-                // back.
+                // The tracked call's own umbrella concludes it (before the gate
+                // below, so a call its item names is one the gate holds back).
                 if is_tool_call_done {
                     let item = &parsed["item"];
                     if let Some(call) = done_output_index.and_then(|idx| self.find_call_mut(idx)) {
@@ -362,10 +337,8 @@ impl StreamingToolHandler {
                 // the upstream envelope rather than forwarding it, so the
                 // wire order the client sees satisfies the spec invariant
                 // that `output_item.done` is the LAST event for a given
-                // item. Unlike the MCP-dispatch arm, whose umbrella the
-                // tool loop emits itself once it has run the call, this
-                // path has nothing to dispatch (the item was not
-                // intercepted).
+                // item. Unlike the MCP-dispatch arm, this path has nothing
+                // to dispatch (the item was not intercepted).
                 //
                 // We `take()` the index out of the set (via `remove`) so
                 // that only the FIRST `output_item.done` for a
@@ -380,9 +353,7 @@ impl StreamingToolHandler {
                     // MCP-dispatch path (R6.7b): suppress the upstream
                     // umbrella event — the tool loop will emit its own
                     // `output_item.done` at the correct position, AFTER
-                    // `response.<type>.completed`. It does not kick the tool
-                    // loop yet: a turn of parallel calls adds its next call
-                    // after this one's umbrella, and the turn's calls run
+                    // `response.<type>.completed`, once the turn's calls run
                     // together at its terminal event.
                     StreamAction::Buffer
                 } else if is_tool_call_done
@@ -498,11 +469,9 @@ impl StreamingToolHandler {
             }
         }
 
-        // Forward the event — `function_call_arguments.done` becomes
-        // `mcp_call_arguments.done` which is a sub-event belonging BEFORE
-        // `response.<type>.completed` and therefore safe to forward inline
-        // here. One call's arguments being done does not end the turn: the
-        // turn's calls run together at its terminal event.
+        // Forward the event: it becomes `mcp_call_arguments.done`, a sub-event
+        // belonging BEFORE `response.<type>.completed`. The turn's calls run
+        // together at its terminal event.
         StreamAction::Forward
     }
 
@@ -586,9 +555,6 @@ impl StreamingToolHandler {
             .expect("Just pushed to pending_calls, must have at least one element")
     }
 
-    /// Whether the turn holds calls, each of them named: the calls whose
-    /// upstream umbrella the gate holds back. Their arguments may still be
-    /// streaming; [`Self::has_runnable_calls`] says whether they can run.
     fn has_complete_calls(&self) -> bool {
         !self.pending_calls.is_empty() && self.pending_calls.iter().all(|c| c.is_complete())
     }
@@ -811,105 +777,98 @@ mod tests {
         );
     }
 
-    /// The `output_item.added` of call `id` at `index`: the call named, its
-    /// arguments to come.
-    fn added(index: usize, id: &str) -> (&'static str, String) {
-        let item = serde_json::json!({
-            "type": "function_call", "id": format!("fc_{id}"), "call_id": format!("call_{id}"),
-            "name": "search", "arguments": "", "status": "in_progress"
-        });
-        let event = serde_json::json!({"type": OutputItemEvent::ADDED, "output_index": index, "item": item});
-        (OutputItemEvent::ADDED, event.to_string())
-    }
-
-    /// A `function_call_arguments.delta` of call `id` at `index`.
-    fn delta(index: usize, id: &str, delta: &str) -> (&'static str, String) {
-        let event = serde_json::json!({
-            "type": FunctionCallEvent::ARGUMENTS_DELTA, "output_index": index,
-            "item_id": format!("fc_{id}"), "delta": delta
-        });
-        (FunctionCallEvent::ARGUMENTS_DELTA, event.to_string())
-    }
-
-    /// The `function_call_arguments.done` of call `id` at `index`, carrying
-    /// `arguments` whole.
-    fn arguments_done(index: usize, id: &str, arguments: &str) -> (&'static str, String) {
-        let event = serde_json::json!({
-            "type": FunctionCallEvent::ARGUMENTS_DONE, "output_index": index,
-            "item_id": format!("fc_{id}"), "arguments": arguments
-        });
-        (FunctionCallEvent::ARGUMENTS_DONE, event.to_string())
-    }
-
-    /// The `output_item.done` of call `id` at `index`: its final item, with
-    /// `arguments`.
-    fn item_done(index: usize, id: &str, arguments: &str) -> (&'static str, String) {
-        let item = serde_json::json!({
-            "type": "function_call", "id": format!("fc_{id}"), "call_id": format!("call_{id}"),
-            "name": "search", "arguments": arguments, "status": "completed"
-        });
-        let event =
-            serde_json::json!({"type": OutputItemEvent::DONE, "output_index": index, "item": item});
-        (OutputItemEvent::DONE, event.to_string())
-    }
-
-    /// A handler that has read `events`, in order.
-    fn handler_after(events: &[(&str, String)]) -> StreamingToolHandler {
-        let mut handler = StreamingToolHandler::with_starting_index(0);
-        for (name, data) in events {
-            let _ = handler.process_event(Some(name), data);
-        }
-        handler
-    }
-
     #[test]
     fn the_turns_terminal_runs_its_calls_only_when_each_is_whole() {
         // The terminal event ends the upstream's turn. The handler asks the
         // loop to run the turn's calls (the terminal itself is not
         // forwarded) only when each of them is named and its arguments
-        // concluded; a call still streaming its arguments has none to run
-        // with, and the calls beside it wait for it. Short of that, a
-        // completed turn is the answer's, while an incomplete or failed turn
-        // ends the client's stream on its terminal; an error event ends it
-        // whatever the turn holds.
-        let arguments = "{\"query\":\"a\"}";
+        // concluded by its `function_call_arguments.done` or its
+        // `output_item.done`, which carry them whole whatever the deltas
+        // built; the latter also gives the call the ids its
+        // `output_item.added` left out, and a call that takes no arguments
+        // runs with none (the loop sends it `{}`). An `output_item.done`
+        // whose item is `incomplete` says the call was cut short. A call still
+        // streaming its arguments, or cut, has none to run with, and the calls
+        // beside it wait for it: a completed turn is then the answer's, and an
+        // incomplete or failed turn ends the client's stream on a terminal of
+        // its kind. An error event ends it whatever the turn holds.
+        let item = |id: &str, arguments: &str, status: &str| serde_json::json!({"type": "function_call", "id": format!("fc_{id}"), "call_id": format!("call_{id}"), "name": "search", "arguments": arguments, "status": status});
+        let event = |kind: &'static str, mut fields: Value| {
+            fields["type"] = kind.into();
+            (kind, fields.to_string())
+        };
+        let added = |index: usize, id: &str| {
+            event(
+                OutputItemEvent::ADDED,
+                serde_json::json!({"output_index": index, "item": item(id, "", "in_progress")}),
+            )
+        };
+        let delta = |delta: &str| {
+            event(
+                FunctionCallEvent::ARGUMENTS_DELTA,
+                serde_json::json!({"output_index": 0, "item_id": "fc_a", "delta": delta}),
+            )
+        };
+        let done = |arguments: &str| {
+            event(
+                FunctionCallEvent::ARGUMENTS_DONE,
+                serde_json::json!({"output_index": 0, "item_id": "fc_a", "arguments": arguments}),
+            )
+        };
+        let item_done = |arguments: &str, status: &str| {
+            event(
+                OutputItemEvent::DONE,
+                serde_json::json!({"output_index": 0, "item": item("a", arguments, status)}),
+            )
+        };
+        let added_without_ids = event(
+            OutputItemEvent::ADDED,
+            serde_json::json!({"output_index": 0, "item": {"type": "function_call", "name": "search", "arguments": "", "status": "in_progress"}}),
+        );
+        let (arguments, part) = ("{\"query\":\"a\"}", "{\"query\":");
         let turns = [
             ("no call", vec![]),
             ("added", vec![added(0, "a")]),
+            ("added, partial arguments", vec![added(0, "a"), delta(part)]),
             (
-                "added, partial arguments",
-                vec![added(0, "a"), delta(0, "a", "{\"query\":")],
+                "deltas, then arguments done",
+                vec![added(0, "a"), delta(part), delta("\"a\"}"), done(arguments)],
             ),
             (
-                "arguments done",
-                vec![
-                    added(0, "a"),
-                    delta(0, "a", arguments),
-                    arguments_done(0, "a", arguments),
-                ],
+                "deltas short, arguments done",
+                vec![added(0, "a"), delta(part), done(arguments)],
             ),
+            ("arguments done alone", vec![added(0, "a"), done(arguments)]),
             (
                 "output_item.done alone",
-                vec![added(0, "a"), item_done(0, "a", arguments)],
+                vec![added(0, "a"), item_done(arguments, "completed")],
+            ),
+            (
+                "output_item.done with the ids",
+                vec![added_without_ids, item_done(arguments, "completed")],
+            ),
+            (
+                "no arguments, arguments done",
+                vec![added(0, "a"), done("")],
+            ),
+            (
+                "no arguments, output_item.done",
+                vec![added(0, "a"), item_done("", "completed")],
+            ),
+            (
+                "arguments done, output_item.done incomplete",
+                vec![added(0, "a"), done(part), item_done(part, "incomplete")],
             ),
             (
                 "one call whole, the next added",
                 vec![
                     added(0, "a"),
-                    arguments_done(0, "a", arguments),
-                    item_done(0, "a", arguments),
+                    done(arguments),
+                    item_done(arguments, "completed"),
                     added(1, "b"),
                 ],
             ),
         ];
-        let terminal_event = |terminal: &str| {
-            if terminal == ERROR_EVENT {
-                serde_json::json!({"type": terminal, "code": "server_error", "message": "failed"})
-            } else {
-                serde_json::json!({"type": terminal, "response": {"id": "resp_test"}})
-            }
-            .to_string()
-        };
         let terminals = [
             ResponseEvent::COMPLETED,
             ResponseEvent::INCOMPLETE,
@@ -919,164 +878,87 @@ mod tests {
 
         let mut got = Vec::new();
         for (turn, events) in &turns {
-            for terminal in terminals {
-                let mut handler = handler_after(events);
-                let action = handler.process_event(Some(terminal), &terminal_event(terminal));
-                got.push((*turn, terminal, action));
-            }
+            let mut batch = Vec::new();
+            let actions = terminals.map(|terminal| {
+                let mut handler = StreamingToolHandler::with_starting_index(0);
+                for (name, data) in events {
+                    let _ = handler.process_event(Some(name), data);
+                }
+                let action = handler.process_event(
+                    Some(terminal),
+                    &event(
+                        terminal,
+                        serde_json::json!({"response": {"id": "resp_test"}}),
+                    )
+                    .1,
+                );
+                if terminal == ResponseEvent::COMPLETED {
+                    batch = handler
+                        .take_pending_calls()
+                        .into_iter()
+                        .map(|call| (call.call_id, call.item_id, call.arguments_buffer))
+                        .collect();
+                }
+                action
+            });
+            got.push((*turn, actions, batch));
         }
 
-        let ends = |turn, completed, incomplete_or_failed, error| {
-            [
-                (turn, ResponseEvent::COMPLETED, completed),
-                (turn, ResponseEvent::INCOMPLETE, incomplete_or_failed),
-                (turn, ResponseEvent::FAILED, incomplete_or_failed),
-                (turn, ERROR_EVENT, error),
-            ]
-        };
-        use StreamAction::{ExecuteTools, Forward, ForwardTerminal};
-        let expected: Vec<_> = [
-            ends("no call", Forward, ForwardTerminal, ForwardTerminal),
-            ends("added", Forward, ForwardTerminal, ForwardTerminal),
-            ends(
-                "added, partial arguments",
-                Forward,
-                ForwardTerminal,
-                ForwardTerminal,
-            ),
-            ends(
-                "arguments done",
-                ExecuteTools,
-                ExecuteTools,
-                ForwardTerminal,
-            ),
-            ends(
-                "output_item.done alone",
-                ExecuteTools,
-                ExecuteTools,
-                ForwardTerminal,
-            ),
-            ends(
-                "one call whole, the next added",
-                Forward,
-                ForwardTerminal,
-                ForwardTerminal,
-            ),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
-        assert_eq!(
-            got, expected,
-            "(how far the turn's calls streamed, its terminal, the action)"
-        );
-    }
-
-    #[test]
-    fn a_call_runs_with_the_arguments_its_upstream_concludes_it_with() {
-        // `function_call_arguments.done` and the call's `output_item.done`
-        // each carry the call's arguments whole, whatever the deltas before
-        // them built, and the latter is all an upstream that sends no
-        // arguments events gives; its item also gives the call the ids its
-        // `output_item.added` left out. A call that takes no arguments is
-        // concluded with none and runs (the loop sends it `{}`); a call whose
-        // arguments are not concluded does not.
-        let arguments = "{\"query\":\"a\"}";
-        let added_without_ids = (
-            OutputItemEvent::ADDED,
-            serde_json::json!({
-                "type": OutputItemEvent::ADDED, "output_index": 0,
-                "item": {"type": "function_call", "name": "search", "arguments": "", "status": "in_progress"}
-            })
-            .to_string(),
-        );
-        let calls = [
-            (
-                "deltas, then arguments done",
-                vec![
-                    added(0, "a"),
-                    delta(0, "a", "{\"query\":"),
-                    delta(0, "a", "\"a\"}"),
-                    arguments_done(0, "a", arguments),
-                ],
-            ),
-            (
-                "deltas short of the arguments, then arguments done",
-                vec![
-                    added(0, "a"),
-                    delta(0, "a", "{\"query\":"),
-                    arguments_done(0, "a", arguments),
-                ],
-            ),
-            (
-                "arguments done alone",
-                vec![added(0, "a"), arguments_done(0, "a", arguments)],
-            ),
-            (
-                "output_item.done alone",
-                vec![added(0, "a"), item_done(0, "a", arguments)],
-            ),
-            (
-                "output_item.done giving the call its ids",
-                vec![added_without_ids, item_done(0, "a", arguments)],
-            ),
-            (
-                "no arguments, arguments done",
-                vec![added(0, "a"), arguments_done(0, "a", "")],
-            ),
-            (
-                "no arguments, output_item.done",
-                vec![added(0, "a"), item_done(0, "a", "")],
-            ),
-            ("added", vec![added(0, "a")]),
+        use StreamAction::{EndTurn, ExecuteTools, Forward, ForwardError};
+        // The actions at the four terminals, in order: the turn's calls run,
+        // or none does.
+        let runs = [ExecuteTools, ExecuteTools, ExecuteTools, ForwardError];
+        let no_run = [
+            Forward,
+            EndTurn(ResponseEvent::INCOMPLETE),
+            EndTurn(ResponseEvent::FAILED),
+            ForwardError,
         ];
-
-        let mut got = Vec::new();
-        for (call, events) in &calls {
-            let mut handler = handler_after(events);
-            let completed = serde_json::json!({"type": ResponseEvent::COMPLETED}).to_string();
-            let action = handler.process_event(Some(ResponseEvent::COMPLETED), &completed);
-            let batch: Vec<(String, Option<String>, String)> = handler
-                .take_pending_calls()
-                .into_iter()
-                .map(|call| (call.call_id, call.item_id, call.arguments_buffer))
-                .collect();
-            got.push((*call, action, batch));
-        }
-
-        let call_a = |arguments: &str| {
-            vec![(
-                "call_a".to_string(),
-                Some("fc_a".to_string()),
+        let call = |id: &str, arguments: &str| {
+            (
+                format!("call_{id}"),
+                Some(format!("fc_{id}")),
                 arguments.to_string(),
-            )]
+            )
         };
-        use StreamAction::{ExecuteTools, Forward};
         assert_eq!(
             got,
             [
+                ("no call", no_run, vec![]),
+                ("added", no_run, vec![call("a", "")]),
+                ("added, partial arguments", no_run, vec![call("a", part)]),
                 (
                     "deltas, then arguments done",
-                    ExecuteTools,
-                    call_a(arguments)
+                    runs,
+                    vec![call("a", arguments)]
                 ),
                 (
-                    "deltas short of the arguments, then arguments done",
-                    ExecuteTools,
-                    call_a(arguments)
+                    "deltas short, arguments done",
+                    runs,
+                    vec![call("a", arguments)]
                 ),
-                ("arguments done alone", ExecuteTools, call_a(arguments)),
-                ("output_item.done alone", ExecuteTools, call_a(arguments)),
+                ("arguments done alone", runs, vec![call("a", arguments)]),
+                ("output_item.done alone", runs, vec![call("a", arguments)]),
                 (
-                    "output_item.done giving the call its ids",
-                    ExecuteTools,
-                    call_a(arguments)
+                    "output_item.done with the ids",
+                    runs,
+                    vec![call("a", arguments)]
                 ),
-                ("no arguments, arguments done", ExecuteTools, call_a("")),
-                ("no arguments, output_item.done", ExecuteTools, call_a("")),
-                ("added", Forward, call_a("")),
+                ("no arguments, arguments done", runs, vec![call("a", "")]),
+                ("no arguments, output_item.done", runs, vec![call("a", "")]),
+                (
+                    "arguments done, output_item.done incomplete",
+                    no_run,
+                    vec![call("a", part)]
+                ),
+                (
+                    "one call whole, the next added",
+                    no_run,
+                    vec![call("a", arguments), call("b", "")]
+                ),
             ],
-            "(how the call streamed, the action at response.completed, the call it runs)"
+            "(how far the turn's calls streamed, the actions at response.completed, \
+             response.incomplete, response.failed and error, the calls held at response.completed)"
         );
     }
 

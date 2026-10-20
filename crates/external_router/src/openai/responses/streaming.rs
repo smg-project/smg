@@ -520,6 +520,9 @@ async fn maybe_inject_tool_in_progress(
 pub(super) enum ToolLoopEnd {
     Answered,
     ToolCallLimit,
+    /// Neither: the upstream ended its turn on this terminal
+    /// (`response.incomplete` or `response.failed`), and so does the stream.
+    UpstreamTerminal(&'static str),
 }
 
 /// What the non-streamed loop does to a response it ended at the request's
@@ -543,10 +546,11 @@ fn end_at_tool_call_limit(response: &mut Value, original_request: &ResponsesRequ
     );
 }
 
-/// Send the `response.completed` event that ends the tool loop's stream:
-/// the final response built from the handler's snapshot, the loop's items
-/// in place, the client's view of the tools, the request's metadata, and
-/// the note of a loop stopped at its tool-call allowance.
+/// Send the terminal event that ends the tool loop's stream: the final
+/// response built from the handler's snapshot, the loop's items in place,
+/// the client's view of the tools, the request's metadata, and the note of a
+/// loop stopped at its tool-call allowance. It is `response.completed`, unless
+/// the upstream ended its turn on a terminal of its own: that kind and status.
 /// Returns false if client disconnected
 pub(super) async fn send_final_response_event(
     handler: &StreamingToolHandler,
@@ -586,30 +590,32 @@ pub(super) async fn send_final_response_event(
         ctx.previous_response_id,
     );
 
-    if let Some(obj) = final_response.as_object_mut() {
-        obj.insert("status".to_string(), Value::String("completed".to_string()));
-    }
+    let terminal = match end {
+        ToolLoopEnd::UpstreamTerminal(terminal) => terminal,
+        ToolLoopEnd::Answered | ToolLoopEnd::ToolCallLimit => {
+            if let Some(obj) = final_response.as_object_mut() {
+                obj.insert("status".to_string(), Value::String("completed".to_string()));
+            }
+            ResponseEvent::COMPLETED
+        }
+    };
     if end == ToolLoopEnd::ToolCallLimit {
         end_at_tool_call_limit(&mut final_response, ctx.original_request);
     }
 
-    let completed_payload = json!({
-        "type": ResponseEvent::COMPLETED,
+    let payload = json!({
+        "type": terminal,
         "sequence_number": *sequence_number,
         "response": final_response
     });
     *sequence_number += 1;
 
-    match enc.encode_event(ResponseEvent::COMPLETED, &completed_payload) {
+    match enc.encode_event(terminal, &payload) {
         Ok(bytes) => tx.send(Ok(bytes)).await.is_ok(),
         Err(e) => {
-            warn!("failed to encode response.completed via SseEncoder, falling back: {e}");
-            let completed_event = format!(
-                "event: {}\ndata: {}\n\n",
-                ResponseEvent::COMPLETED,
-                completed_payload
-            );
-            tx.send(Ok(Bytes::from(completed_event))).await.is_ok()
+            warn!("failed to encode {terminal} via SseEncoder, falling back: {e}");
+            let event = format!("event: {terminal}\ndata: {payload}\n\n");
+            tx.send(Ok(Bytes::from(event))).await.is_ok()
         }
     }
 }
@@ -838,8 +844,6 @@ pub(super) fn handle_streaming_with_tool_interception(
         let auth_header =
             provider.extract_auth_header(headers_opt.as_ref(), worker_api_key.as_ref());
 
-        // `end` is `None` when the upstream ended the client's stream with a
-        // terminal of its own, already forwarded.
         let (handler, end) = loop {
             // Make streaming request
             let mut request_builder = client_clone.post(&url_clone).json(&current_payload);
@@ -879,7 +883,7 @@ pub(super) fn handle_streaming_with_tool_interception(
             }
             let mut chunk_processor = ChunkProcessor::new();
             let mut tool_calls_detected = false;
-            let mut terminal_forwarded = false;
+            let mut upstream_terminal = None;
             let mut seen_in_progress = false;
 
             while let Some(chunk_result) = upstream_stream.next().await {
@@ -899,12 +903,14 @@ pub(super) fn handle_streaming_with_tool_interception(
                             let action = handler.process_event(event_name, data.as_ref());
 
                             match action {
-                                StreamAction::Forward => {
+                                StreamAction::Forward | StreamAction::ForwardError => {
                                     // Parse data once and reuse for skip check, forwarding, and in_progress check
                                     let parsed = serde_json::from_str::<Value>(data.as_ref()).ok();
 
                                     // Skip response.created and response.in_progress on subsequent iterations
-                                    let should_skip = if is_first_iteration {
+                                    let should_skip = if is_first_iteration
+                                        || action == StreamAction::ForwardError
+                                    {
                                         false
                                     } else {
                                         parsed.as_ref().is_some_and(|v| {
@@ -917,7 +923,8 @@ pub(super) fn handle_streaming_with_tool_interception(
                                     };
 
                                     // Check in_progress before moving parsed into SseEventData
-                                    let is_in_progress = !seen_in_progress
+                                    let is_in_progress = action == StreamAction::Forward
+                                        && !seen_in_progress
                                         && parsed.as_ref().is_some_and(|v| {
                                             v.get("type").and_then(|t| t.as_str())
                                                 == Some(ResponseEvent::IN_PROGRESS)
@@ -967,16 +974,17 @@ pub(super) fn handle_streaming_with_tool_interception(
                                             mcp_list_tools_sent = true;
                                         }
                                     }
+
+                                    // An upstream error ends the stream as the loop's own
+                                    // errors do: no call runs, no record, nothing after it.
+                                    if action == StreamAction::ForwardError {
+                                        return;
+                                    }
                                 }
                                 StreamAction::Buffer => {
-                                    // Don't forward, just buffer. That includes the
-                                    // upstream umbrella `output_item.done` of a tracked
-                                    // call: forwarding it would emit
-                                    // `response.output_item.done` BEFORE
-                                    // `response.<tool>.completed`, violating spec
-                                    // sub-event ordering. The tool loop emits its own
-                                    // `output_item.done` at the correct position after
-                                    // the `.completed` sub-event.
+                                    // Don't forward, just buffer (a tracked call's
+                                    // umbrella too: the tool loop emits it after
+                                    // `response.<tool>.completed`).
                                 }
                                 StreamAction::Drop => {
                                     // R6.7c native passthrough: upstream
@@ -994,46 +1002,25 @@ pub(super) fn handle_streaming_with_tool_interception(
                                     // kick the tool loop — there is no
                                     // dispatched call to finish.
                                 }
-                                StreamAction::ExecuteTools => {
-                                    // The upstream ended its turn holding calls, each
-                                    // of them whole. A turn of parallel calls streams
-                                    // them one after another, so only now is every
-                                    // call of the turn read; the terminal itself is not
-                                    // forwarded (the loop ends the client's stream with
-                                    // its own).
-                                    tool_calls_detected = true;
-                                    break; // Exit stream processing to execute the turn's calls
-                                }
-                                StreamAction::ForwardTerminal => {
-                                    // The upstream ended its turn `incomplete` or
-                                    // `failed` without a whole batch of calls, or sent
-                                    // an error: its event ends the client's stream. No
-                                    // call runs, nothing more of the upstream is read,
-                                    // and the loop sends no terminal of its own.
-                                    if !forward_streaming_event(
-                                        SseEventData {
-                                            raw_block: &raw_block,
-                                            event_name,
-                                            data: data.as_ref(),
-                                            pre_parsed: None,
-                                        },
-                                        &mut handler,
-                                        &tx,
-                                        &mut sse_encoder,
-                                        &streaming_ctx,
-                                        &mut sequence_number,
-                                    )
-                                    .await
-                                    {
-                                        return;
-                                    }
-                                    terminal_forwarded = true;
+                                StreamAction::EndTurn(terminal) => {
+                                    // Not forwarded: the loop ends the stream on a
+                                    // terminal of this kind, nothing more of the body read.
+                                    upstream_terminal = Some(terminal);
                                     break;
+                                }
+                                StreamAction::ExecuteTools => {
+                                    // The upstream ended its turn holding calls. A
+                                    // turn of parallel calls streams them one after
+                                    // another, so only now is every call of the turn
+                                    // read; the terminal itself is not forwarded (the
+                                    // loop ends the client's stream with its own).
+                                    tool_calls_detected = true;
+                                    break; // Exit stream processing to execute tools
                                 }
                             }
                         }
 
-                        if tool_calls_detected || terminal_forwarded {
+                        if tool_calls_detected || upstream_terminal.is_some() {
                             break;
                         }
                     }
@@ -1057,16 +1044,15 @@ pub(super) fn handle_streaming_with_tool_interception(
                 preserved_response_id = Some(id);
             }
 
-            if terminal_forwarded {
-                break (handler, None);
+            if let Some(terminal) = upstream_terminal {
+                break (handler, ToolLoopEnd::UpstreamTerminal(terminal));
             }
 
             // The model answered without asking for a tool: the loop's end. A
-            // body that closed before its terminal event ends the turn too:
-            // its calls run all the same when each of them is whole, and
-            // otherwise none does.
+            // body that closed before its terminal event ends the turn too,
+            // and its calls run all the same if each of them is whole.
             if !tool_calls_detected && !handler.has_runnable_calls() {
-                break (handler, Some(ToolLoopEnd::Answered));
+                break (handler, ToolLoopEnd::Answered);
             }
 
             // Execute tools
@@ -1128,7 +1114,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                 {
                     return;
                 }
-                break (handler, Some(ToolLoopEnd::ToolCallLimit));
+                break (handler, ToolLoopEnd::ToolCallLimit);
             }
 
             // Build resume payload
@@ -1157,24 +1143,20 @@ pub(super) fn handle_streaming_with_tool_interception(
             }
         };
 
-        // The loop's end, answered or stopped at the tool-call allowance: the
-        // terminal event, the record, the sentinel. A stream the upstream
-        // ended with its own terminal has it already: the record and the
-        // sentinel alone.
-        if let Some(end) = end {
-            if !send_final_response_event(
-                &handler,
-                &tx,
-                &mut sse_encoder,
-                &mut sequence_number,
-                &state,
-                &streaming_ctx,
-                end,
-            )
-            .await
-            {
-                return;
-            }
+        // The loop's end, answered, stopped at the tool-call allowance or on
+        // the upstream's terminal: the terminal event, the record, the sentinel.
+        if !send_final_response_event(
+            &handler,
+            &tx,
+            &mut sse_encoder,
+            &mut sequence_number,
+            &state,
+            &streaming_ctx,
+            end,
+        )
+        .await
+        {
+            return;
         }
 
         let final_response_json = if should_store {
@@ -1197,7 +1179,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                 &original_request,
                 previous_response_id.as_deref(),
             );
-            if end == Some(ToolLoopEnd::ToolCallLimit) {
+            if end == ToolLoopEnd::ToolCallLimit {
                 end_at_tool_call_limit(&mut response_json, &original_request);
             }
 
