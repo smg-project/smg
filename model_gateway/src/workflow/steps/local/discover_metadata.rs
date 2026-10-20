@@ -1114,9 +1114,7 @@ mod tests {
             )
             .route(
                 "/v1/models",
-                get(|| async {
-                    Json(json!({"object": "list", "data": [{"id": "qwen-served"}]}))
-                }),
+                get(|| async { Json(json!({"object": "list", "data": [{"id": "qwen-served"}]})) }),
             );
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
