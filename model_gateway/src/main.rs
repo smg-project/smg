@@ -631,8 +631,8 @@ struct RoutingArgs {
     #[arg(long, default_value_t = 0.15, help_heading = "Routing Policy")]
     least_load_kv_pressure_weight: f64,
 
-    /// Fallback generation throughput (tokens/s) for least_load when a backend
-    /// reports no live throughput
+    /// Input throughput (tokens/s) for least_load prefill workers; fallback
+    /// output throughput for other workers when no live rate is reported
     #[arg(long, default_value_t = 2000.0, help_heading = "Routing Policy")]
     least_load_default_throughput: f64,
 

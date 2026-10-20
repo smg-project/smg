@@ -933,6 +933,38 @@ fn string_tree_unique_hit_keeps_affinity_and_credits_expected_wait() {
     assert_only_final_worker_credited(&policy, &workers, 0, 1024);
 }
 
+/// A prefill cache miss favors less queued input regardless of output rate.
+#[test]
+fn prefill_miss_ignores_generation_rate() {
+    for generated in [0.0, 0.5, 10_000.0] {
+        let policy = CacheAwarePolicy::with_config(test_config());
+        let workers: Vec<Arc<dyn Worker>> = ["http://p1:8000", "http://p2:8000"]
+            .into_iter()
+            .map(|url| {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .worker_type(WorkerType::Prefill)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>
+            })
+            .collect();
+        policy.init_workers(&workers);
+        let feed = TestFeed::attached_to(&policy.load_scorer);
+        feed.publish(&HashMap::from([
+            (
+                workers[0].url().to_string(),
+                expected_wait_load(2_000, 0.0, generated),
+            ),
+            (
+                workers[1].url().to_string(),
+                expected_wait_load(4_000, 0.0, 2_000.0),
+            ),
+        ]));
+        assert_eq!(route_text(&policy, &workers, "new prefill prompt"), Some(0));
+    }
+}
+
 #[test]
 fn string_tree_miss_uses_expected_wait_and_records_final_worker() {
     let policy = CacheAwarePolicy::with_config(test_config());

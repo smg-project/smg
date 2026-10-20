@@ -1245,9 +1245,10 @@ pub enum PolicyConfig {
         /// when a request's token count is unknown at routing time.
         #[serde(default = "default_least_load_mean_prefill")]
         mean_prefill_tokens: u32,
-        /// Fallback generation throughput (tokens/s) for the expected-wait term
-        /// when a backend reports no live `gen_throughput`. Set to the fleet's
-        /// per-replica generation rate; co-tunes with `kv_pressure_weight`.
+        /// Throughput (tokens/s) for prefill workers, and fallback when other
+        /// workers report no live `gen_throughput`. Set to per-replica input
+        /// tokens/s for prefill, output tokens/s otherwise; co-tunes with
+        /// `kv_pressure_weight`.
         #[serde(default = "default_least_load_throughput")]
         default_throughput: f64,
         /// Per-worker waiting-queue cap: skip workers whose reported waiting
