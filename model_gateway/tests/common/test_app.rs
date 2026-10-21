@@ -240,13 +240,20 @@ fn build_test_apps(
 }
 
 /// Create a minimal test AppContext for unit tests
+pub async fn create_test_app_context() -> Arc<AppContext> {
+    create_test_app_context_with_config(&RouterConfig::default()).await
+}
+
+/// [`create_test_app_context`] over the test's own `router_config` (its
+/// payload cap, policy or timeouts), no server bound. Borrowed: an async fn
+/// keeps a by-value argument twice in its future, and the callers' futures
+/// sit close to the size lint.
 #[expect(
     clippy::unwrap_used,
     clippy::expect_used,
     reason = "test helper - panicking on failure is intentional"
 )]
-pub async fn create_test_app_context() -> Arc<AppContext> {
-    let router_config = RouterConfig::default();
+pub async fn create_test_app_context_with_config(router_config: &RouterConfig) -> Arc<AppContext> {
     // A test's upstreams are its own loopback servers; the environment's
     // proxy would otherwise sit in the path of every request.
     let client = smg::clients::http_client_builder()
@@ -284,7 +291,7 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
 
     Arc::new(
         AppContext::builder()
-            .router_config(router_config)
+            .router_config(router_config.clone())
             .client(client)
             .rate_limiter(None)
             .tokenizer_registry(Arc::new(TokenizerRegistry::new()))

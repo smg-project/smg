@@ -1250,20 +1250,29 @@ impl Router {
             *response.headers_mut() = response_headers;
             response
         } else {
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            header_utils::insert_routed_worker_id(&mut response_headers, worker.url());
-            match res.bytes().await {
+            let response_headers = header_utils::preserve_response_headers(res.headers());
+            // The same capped read as every typed route's buffered answer: a
+            // body above the ingress payload limit is a misbehaving worker
+            // and ends as a 502 before memory grows, and the request's own
+            // timeout ends the request as it does before the head.
+            let mut response = match Self::read_worker_body_capped(
+                res.bytes_stream(),
+                self.max_payload_size,
+            )
+            .await
+            {
                 Ok(body) => {
                     let mut response = Response::new(Body::from(body));
                     *response.status_mut() = status;
                     *response.headers_mut() = response_headers;
                     response
                 }
-                Err(e) => error::internal_error(
-                    "read_response_body_failed",
-                    format!("Failed to read response body: {e}"),
-                ),
-            }
+                Err(error_response) => error_response,
+            };
+            // The routed worker's id on the error answers too, as the typed
+            // routes' buffered arm sets it.
+            header_utils::insert_routed_worker_id(response.headers_mut(), worker.url());
+            response
         };
 
         // Non-streaming: classify metrics off the final response the client
