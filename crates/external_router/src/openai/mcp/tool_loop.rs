@@ -1541,7 +1541,10 @@ mod tests {
         is_internal_mcp_response_item, mcp_list_tools_bindings_to_emit,
         not_executed_tool_call_item, ToolLoopState, NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
     };
-    use crate::openai_bridge::{FormatRegistry, ResponseFormat};
+    use crate::{
+        openai::mcp::test_support,
+        openai_bridge::{FormatRegistry, ResponseFormat},
+    };
 
     fn test_tool(name: &str) -> Tool {
         let mut schema = serde_json::Map::new();
@@ -1613,40 +1616,22 @@ mod tests {
 
     #[tokio::test]
     async fn internal_filter_keeps_builtin_passthrough_mcp_call_items() {
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: Some(BuiltinToolType::WebSearchPreview),
-                builtin_tool_name: Some("brave_web_search".to_string()),
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
+        let orchestrator = test_support::internal_orchestrator(Some((
+            BuiltinToolType::WebSearchPreview,
+            "brave_web_search",
+        )))
+        .await;
 
         orchestrator
             .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+                test_support::INTERNAL_SERVER,
                 test_tool("brave_web_search"),
             ));
 
         let session = McpToolSession::new(
             &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
+            vec![test_support::internal_binding()],
             "test-request",
         );
 
@@ -1661,46 +1646,28 @@ mod tests {
 
     #[tokio::test]
     async fn internal_filter_keeps_builtin_passthrough_mcp_call_items_with_mixed_tools() {
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: Some(BuiltinToolType::WebSearchPreview),
-                builtin_tool_name: Some("brave_web_search".to_string()),
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
+        let orchestrator = test_support::internal_orchestrator(Some((
+            BuiltinToolType::WebSearchPreview,
+            "brave_web_search",
+        )))
+        .await;
 
         orchestrator
             .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+                test_support::INTERNAL_SERVER,
                 test_tool("brave_web_search"),
             ));
         orchestrator
             .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+                test_support::INTERNAL_SERVER,
                 test_tool("internal_non_builtin_tool"),
             ));
 
         let session = McpToolSession::new(
             &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
+            vec![test_support::internal_binding()],
             "test-request",
         );
 

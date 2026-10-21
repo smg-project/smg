@@ -422,14 +422,12 @@ mod tests {
         responses::{FunctionTool, McpTool, ResponseInput, ResponseTool, ResponsesRequest},
     };
     use serde_json::json;
-    use smg_mcp::{
-        BuiltinToolType, McpConfig, McpOrchestrator, McpServerBinding, McpServerConfig,
-        McpToolSession, McpTransport, Tool, ToolEntry,
-    };
+    use smg_mcp::{BuiltinToolType, McpToolSession, Tool, ToolEntry};
 
     use super::{
         patch_response_with_request_metadata, restore_original_tools, rewrite_streaming_block,
     };
+    use crate::openai::mcp::test_support;
 
     fn test_tool(name: &str) -> Tool {
         let mut schema = serde_json::Map::new();
@@ -451,38 +449,16 @@ mod tests {
             input: ResponseInput::Text("hello".to_string()),
             ..Default::default()
         };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
+        let orchestrator = test_support::internal_orchestrator(None).await;
         orchestrator
             .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+                test_support::INTERNAL_SERVER,
                 test_tool("internal_search"),
             ));
         let session = McpToolSession::new(
             &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
+            vec![test_support::internal_binding()],
             "test-request",
         );
         let mut response = serde_json::json!({
@@ -512,38 +488,16 @@ mod tests {
             input: ResponseInput::Text("hello".to_string()),
             ..Default::default()
         };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
+        let orchestrator = test_support::internal_orchestrator(None).await;
         orchestrator
             .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+                test_support::INTERNAL_SERVER,
                 test_tool("internal_search"),
             ));
         let session = McpToolSession::new(
             &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
+            vec![test_support::internal_binding()],
             "test-request",
         );
         let mut response = serde_json::json!({
@@ -573,38 +527,16 @@ mod tests {
             input: ResponseInput::Text("hello".to_string()),
             ..Default::default()
         };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
+        let orchestrator = test_support::internal_orchestrator(None).await;
         orchestrator
             .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+                test_support::INTERNAL_SERVER,
                 test_tool("internal_search"),
             ));
         let session = McpToolSession::new(
             &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
+            vec![test_support::internal_binding()],
             "test-request",
         );
         let mut response = serde_json::json!({
@@ -644,38 +576,16 @@ mod tests {
             input: ResponseInput::Text("hello".to_string()),
             ..Default::default()
         };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
+        let orchestrator = test_support::internal_orchestrator(None).await;
         orchestrator
             .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+                test_support::INTERNAL_SERVER,
                 test_tool("internal_search"),
             ));
         let session = McpToolSession::new(
             &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
+            vec![test_support::internal_binding()],
             "test-request",
         );
         let mut response = serde_json::json!({
@@ -711,38 +621,16 @@ mod tests {
             input: ResponseInput::Text("hello".to_string()),
             ..Default::default()
         };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
+        let orchestrator = test_support::internal_orchestrator(None).await;
         orchestrator
             .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+                test_support::INTERNAL_SERVER,
                 test_tool("internal_search"),
             ));
         let session = McpToolSession::new(
             &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
+            vec![test_support::internal_binding()],
             "test-request",
         );
         let mut response = serde_json::json!({
@@ -777,32 +665,10 @@ mod tests {
             input: ResponseInput::Text("hello".to_string()),
             ..Default::default()
         };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
+        let orchestrator = test_support::internal_orchestrator(None).await;
         let session = McpToolSession::new(
             &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
+            vec![test_support::internal_binding()],
             "test-request",
         );
         let mut response = serde_json::json!({
@@ -842,38 +708,20 @@ mod tests {
             input: ResponseInput::Text("hello".to_string()),
             ..Default::default()
         };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: Some(BuiltinToolType::WebSearchPreview),
-                builtin_tool_name: Some("brave_web_search".to_string()),
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
+        let orchestrator = test_support::internal_orchestrator(Some((
+            BuiltinToolType::WebSearchPreview,
+            "brave_web_search",
+        )))
+        .await;
         orchestrator
             .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+                test_support::INTERNAL_SERVER,
                 test_tool("brave_web_search"),
             ));
         let session = McpToolSession::new(
             &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
+            vec![test_support::internal_binding()],
             "test-request",
         );
         let mut response = serde_json::json!({
@@ -929,38 +777,20 @@ mod tests {
             input: ResponseInput::Text("hello".to_string()),
             ..Default::default()
         };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: Some(BuiltinToolType::WebSearchPreview),
-                builtin_tool_name: Some("brave_web_search".to_string()),
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
+        let orchestrator = test_support::internal_orchestrator(Some((
+            BuiltinToolType::WebSearchPreview,
+            "brave_web_search",
+        )))
+        .await;
         orchestrator
             .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+                test_support::INTERNAL_SERVER,
                 test_tool("brave_web_search"),
             ));
         let session = McpToolSession::new(
             &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
+            vec![test_support::internal_binding()],
             "test-request",
         );
         let mut response = serde_json::json!({
@@ -1004,44 +834,26 @@ mod tests {
             input: ResponseInput::Text("hello".to_string()),
             ..Default::default()
         };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: Some(BuiltinToolType::WebSearchPreview),
-                builtin_tool_name: Some("brave_web_search".to_string()),
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
+        let orchestrator = test_support::internal_orchestrator(Some((
+            BuiltinToolType::WebSearchPreview,
+            "brave_web_search",
+        )))
+        .await;
         orchestrator
             .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+                test_support::INTERNAL_SERVER,
                 test_tool("brave_web_search"),
             ));
         orchestrator
             .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+                test_support::INTERNAL_SERVER,
                 test_tool("internal_non_builtin_tool"),
             ));
         let session = McpToolSession::new(
             &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
+            vec![test_support::internal_binding()],
             "test-request",
         );
         let mut response = serde_json::json!({
@@ -1108,38 +920,16 @@ mod tests {
             ]),
             ..Default::default()
         };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
+        let orchestrator = test_support::internal_orchestrator(None).await;
         orchestrator
             .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+                test_support::INTERNAL_SERVER,
                 test_tool("internal_search"),
             ));
         let session = McpToolSession::new(
             &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
+            vec![test_support::internal_binding()],
             "test-request",
         );
         let mut response = serde_json::json!({
@@ -1186,38 +976,20 @@ mod tests {
             input: ResponseInput::Text("hello".to_string()),
             ..Default::default()
         };
-        let orchestrator = McpOrchestrator::new(McpConfig {
-            servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: Default::default(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: Some(BuiltinToolType::WebSearchPreview),
-                builtin_tool_name: Some("brave_web_search".to_string()),
-                internal: true,
-            }],
-            ..Default::default()
-        })
-        .await
-        .expect("orchestrator");
+        let orchestrator = test_support::internal_orchestrator(Some((
+            BuiltinToolType::WebSearchPreview,
+            "brave_web_search",
+        )))
+        .await;
         orchestrator
             .tool_inventory()
             .insert_entry(ToolEntry::from_server_tool(
-                "internal-server",
+                test_support::INTERNAL_SERVER,
                 test_tool("brave_web_search"),
             ));
         let session = McpToolSession::new(
             &orchestrator,
-            vec![McpServerBinding {
-                label: "internal-label".to_string(),
-                server_key: "internal-server".to_string(),
-                allowed_tools: None,
-            }],
+            vec![test_support::internal_binding()],
             "test-request",
         );
         let mut response = serde_json::json!({
