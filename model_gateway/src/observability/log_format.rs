@@ -14,15 +14,24 @@
 //! JSON format with `flatten_event`, file and line number on (the tests run
 //! both formats over the same callsites), so nothing that reads the log
 //! changes.
+//!
+//! The stock text format writes every styled piece of a line (the span
+//! names, the field names, the `=` and `:` signs, the target, the file) as a
+//! painted `Display` of its own, each a formatting call with the style's
+//! prefix and suffix formatted around it, whether or not ANSI is on, and a
+//! span's first fields reach its field string piece by piece, so the string
+//! is reallocated at every doubling. [`TextFields`] and [`TextLine`] write
+//! the same bytes (the tests run both formats over the same callsites, with
+//! ANSI on and off) with direct writes, and a span's first fields in one.
 
-use std::{fmt, io};
+use std::{fmt, fmt::Write as _, io};
 
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use serde::Serialize;
 use tracing::{
     field::{Field, Visit},
     span::Record,
-    Event, Subscriber,
+    Event, Level, Subscriber,
 };
 use tracing_log::NormalizeEvent;
 use tracing_subscriber::{
@@ -359,6 +368,435 @@ impl<W: fmt::Write> Visit for EventEntries<'_, W> {
     }
 }
 
+// The bytes of the stock text format's styles (nu_ansi_term's for bold,
+// dimmed, italic and the reset), written as they are.
+const BOLD: &str = "\x1b[1m";
+const DIMMED: &str = "\x1b[2m";
+const ITALIC: &str = "\x1b[3m";
+const RESET: &str = "\x1b[0m";
+
+/// The level column of the stock text format: five characters, and the
+/// colour it is painted in when ANSI is on.
+fn level_column(level: Level) -> (&'static str, &'static str) {
+    match level {
+        Level::TRACE => ("\x1b[35m", "TRACE"),
+        Level::DEBUG => ("\x1b[34m", "DEBUG"),
+        Level::INFO => ("\x1b[32m", " INFO"),
+        Level::WARN => ("\x1b[33m", " WARN"),
+        Level::ERROR => ("\x1b[31m", "ERROR"),
+    }
+}
+
+/// `text` under `style` when ANSI is on (the style's bytes, the text, the
+/// reset), the text alone otherwise.
+fn styled<W: fmt::Write + ?Sized>(out: &mut W, ansi: bool, style: &str, text: &str) -> fmt::Result {
+    if ansi {
+        out.write_str(style)?;
+        out.write_str(text)?;
+        out.write_str(RESET)
+    } else {
+        out.write_str(text)
+    }
+}
+
+/// [`styled`] as a `Display`, for a piece inside a `format_args!`.
+struct Styled<'a>(bool, &'static str, &'a str);
+
+impl fmt::Display for Styled<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        styled(f, self.0, self.1, self.2)
+    }
+}
+
+/// Writes through to its writer with the characters a terminal could read as
+/// the start of an escape sequence spelled out, as the stock format sanitizes
+/// a message and an error: ESC, BEL, BS, FF and DEL as `\xNN`, the C1 range
+/// as `\u{NN}`.
+struct Sanitizing<'a, W: fmt::Write + ?Sized>(&'a mut W);
+
+impl<W: fmt::Write + ?Sized> fmt::Write for Sanitizing<'_, W> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        // A C1 character is the bytes C2 80..C2 9F in UTF-8.
+        if !s
+            .bytes()
+            .any(|byte| matches!(byte, 0x1b | 0x07 | 0x08 | 0x0c | 0x7f | 0xc2))
+        {
+            return self.0.write_str(s);
+        }
+        for ch in s.chars() {
+            match ch {
+                '\x1b' => self.0.write_str("\\x1b")?,
+                '\x07' => self.0.write_str("\\x07")?,
+                '\x08' => self.0.write_str("\\x08")?,
+                '\x0c' => self.0.write_str("\\x0c")?,
+                '\x7f' => self.0.write_str("\\x7f")?,
+                ch if (0x80..=0x9f).contains(&(ch as u32)) => {
+                    write!(self.0, "\\u{{{:x}}}", ch as u32)?;
+                }
+                ch => self.0.write_char(ch)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A value's `Display` text, sanitized when the format sanitizes; as a
+/// `Debug` the same text (the stock lists an error's sources this way).
+struct Sanitized<T> {
+    value: T,
+    sanitize: bool,
+}
+
+impl<T: fmt::Display> fmt::Display for Sanitized<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.sanitize {
+            write!(Sanitizing(f), "{}", self.value)
+        } else {
+            write!(f, "{}", self.value)
+        }
+    }
+}
+
+impl<T: fmt::Display> fmt::Debug for Sanitized<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+/// An error's sources as the stock format lists them: `[source, its source,
+/// ...]`, each its sanitized text.
+struct Sources<'a> {
+    error: &'a (dyn std::error::Error + 'static),
+    sanitize: bool,
+}
+
+impl fmt::Display for Sources<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut list = f.debug_list();
+        let mut current = Some(self.error);
+        while let Some(error) = current {
+            list.entry(&Sanitized {
+                value: error,
+                sanitize: self.sanitize,
+            });
+            current = error.source();
+        }
+        list.finish()
+    }
+}
+
+/// Whether `str`'s `Debug` form is the string itself between quotes: every
+/// character printable ASCII and neither a quote nor a backslash.
+fn debug_is_quoted_verbatim(text: &str) -> bool {
+    text.bytes()
+        .all(|byte| (0x20..=0x7e).contains(&byte) && byte != b'"' && byte != b'\\')
+}
+
+/// Writes fields as the stock text format's visitor does: `name=value`
+/// entries with a space between them, the name italic and the `=` dimmed
+/// when ANSI is on, `r#` stripped from a raw name, a bridged record's `log.*`
+/// fields skipped; a `message` as its text (sanitized), a string in its
+/// `Debug` form, an error as its text with its sources listed, anything else
+/// in its `Debug` form.
+struct TextVisitor<'a, W: fmt::Write + ?Sized> {
+    out: &'a mut W,
+    ansi: bool,
+    sanitize: bool,
+    first: bool,
+    result: fmt::Result,
+}
+
+impl<'a, W: fmt::Write + ?Sized> TextVisitor<'a, W> {
+    fn new(out: &'a mut W, ansi: bool, sanitize: bool, first: bool) -> Self {
+        Self {
+            out,
+            ansi,
+            sanitize,
+            first,
+            result: Ok(()),
+        }
+    }
+
+    /// One entry: the space before it (not before the first), then `write`.
+    fn entry(&mut self, write: impl FnOnce(&mut W, bool) -> fmt::Result) {
+        if self.result.is_err() {
+            return;
+        }
+        let first = std::mem::replace(&mut self.first, false);
+        let ansi = self.ansi;
+        self.result = (|| {
+            if !first {
+                self.out.write_char(' ')?;
+            }
+            write(self.out, ansi)
+        })();
+    }
+}
+
+/// `name=` as the stock writes it.
+fn key<W: fmt::Write + ?Sized>(out: &mut W, ansi: bool, name: &str) -> fmt::Result {
+    let name = name.strip_prefix("r#").unwrap_or(name);
+    styled(out, ansi, ITALIC, name)?;
+    styled(out, ansi, DIMMED, "=")
+}
+
+impl<W: fmt::Write + ?Sized> Visit for TextVisitor<'_, W> {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        let name = field.name();
+        if name == "message" {
+            return self.record_debug(field, &format_args!("{value}"));
+        }
+        if name.starts_with("log.") {
+            return;
+        }
+        self.entry(|out, ansi| {
+            key(out, ansi, name)?;
+            if debug_is_quoted_verbatim(value) {
+                out.write_char('"')?;
+                out.write_str(value)?;
+                out.write_char('"')
+            } else {
+                write!(out, "{value:?}")
+            }
+        });
+    }
+
+    fn record_error(&mut self, field: &Field, value: &(dyn std::error::Error + 'static)) {
+        let (ansi, sanitize) = (self.ansi, self.sanitize);
+        let text = Sanitized { value, sanitize };
+        match value.source() {
+            Some(source) => self.record_debug(
+                field,
+                &format_args!(
+                    "{} {}{}{}{}",
+                    text,
+                    Styled(ansi, ITALIC, field.name()),
+                    Styled(ansi, ITALIC, ".sources"),
+                    Styled(ansi, DIMMED, "="),
+                    Sources {
+                        error: source,
+                        sanitize
+                    }
+                ),
+            ),
+            None => self.record_debug(field, &format_args!("{text}")),
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        let name = field.name();
+        if name.starts_with("log.") {
+            return;
+        }
+        let sanitize = self.sanitize;
+        self.entry(|out, ansi| {
+            if name == "message" {
+                if sanitize {
+                    write!(Sanitizing(out), "{value:?}")
+                } else {
+                    write!(out, "{value:?}")
+                }
+            } else {
+                key(out, ansi, name)?;
+                write!(out, "{value:?}")
+            }
+        });
+    }
+}
+
+/// The room on the stack for a span's first fields.
+const PIECE_BYTES: usize = 512;
+
+/// A span's first fields, formatted on the stack so that they reach the
+/// span's field string in one write, which sizes the string once (written
+/// piece by piece from empty, the string was reallocated at every doubling);
+/// a longer set spills to the heap.
+struct Piece {
+    stack: [u8; PIECE_BYTES],
+    len: usize,
+    heap: Option<String>,
+}
+
+impl Piece {
+    fn new() -> Self {
+        Self {
+            stack: [0; PIECE_BYTES],
+            len: 0,
+            heap: None,
+        }
+    }
+
+    fn as_str(&self) -> Result<&str, fmt::Error> {
+        match &self.heap {
+            Some(heap) => Ok(heap),
+            // Whole `str`s were copied in, so the bytes are UTF-8.
+            None => std::str::from_utf8(&self.stack[..self.len]).map_err(|_| fmt::Error),
+        }
+    }
+}
+
+impl fmt::Write for Piece {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        if let Some(heap) = &mut self.heap {
+            heap.push_str(s);
+            return Ok(());
+        }
+        let end = self.len + s.len();
+        if end <= PIECE_BYTES {
+            self.stack[self.len..end].copy_from_slice(s.as_bytes());
+            self.len = end;
+            return Ok(());
+        }
+        let mut heap = String::with_capacity(end * 2);
+        heap.push_str(self.as_str()?);
+        heap.push_str(s);
+        self.heap = Some(heap);
+        Ok(())
+    }
+}
+
+/// The span-field format of the text layer: the entries of the stock
+/// format's default field format, byte for byte, written without a styled
+/// `Display` per piece, and a span's first fields written in one piece.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TextFields;
+
+impl<'writer> FormatFields<'writer> for TextFields {
+    fn format_fields<R: RecordFields>(
+        &self,
+        mut writer: Writer<'writer>,
+        fields: R,
+    ) -> fmt::Result {
+        let mut piece = Piece::new();
+        let mut visitor = TextVisitor::new(
+            &mut piece,
+            writer.has_ansi_escapes(),
+            writer.sanitizes_ansi_escapes(),
+            true,
+        );
+        fields.record(&mut visitor);
+        visitor.result?;
+        writer.write_str(piece.as_str()?)
+    }
+
+    fn add_fields(
+        &self,
+        current: &'writer mut FormattedFields<Self>,
+        fields: &Record<'_>,
+    ) -> fmt::Result {
+        let first = current.fields.is_empty();
+        let mut writer = current.as_writer();
+        let (ansi, sanitize) = (writer.has_ansi_escapes(), writer.sanitizes_ansi_escapes());
+        let mut visitor = TextVisitor::new(&mut writer, ansi, sanitize, first);
+        fields.record(&mut visitor);
+        visitor.result
+    }
+}
+
+/// The event format of the text layer: the stock full format's line
+/// (timestamp, level, the span scope with each span's fields, target, file
+/// and line number, the event's fields) with file and line number on, byte
+/// for byte, with ANSI on or off, written with direct writes instead of a
+/// styled `Display` per piece.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TextLine<T = UtcSeconds> {
+    timer: T,
+}
+
+impl TextLine {
+    /// The line format with the UTC timestamp.
+    pub fn new() -> Self {
+        Self { timer: UtcSeconds }
+    }
+}
+
+impl<T> TextLine<T> {
+    pub fn with_timer(timer: T) -> Self {
+        Self { timer }
+    }
+}
+
+impl<S, T> FormatEvent<S, TextFields> for TextLine<T>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+    T: FormatTime,
+{
+    fn format_event(
+        &self,
+        ctx: &FmtContext<'_, S, TextFields>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        let normalized = event.normalized_metadata();
+        let meta = normalized.as_ref().unwrap_or_else(|| event.metadata());
+        let ansi = writer.has_ansi_escapes();
+
+        if ansi {
+            writer.write_str(DIMMED)?;
+        }
+        if self.timer.format_time(&mut writer).is_err() {
+            writer.write_str("<unknown time>")?;
+        }
+        if ansi {
+            writer.write_str(RESET)?;
+        }
+        writer.write_char(' ')?;
+
+        let (colour, column) = level_column(*meta.level());
+        styled(&mut writer, ansi, colour, column)?;
+        writer.write_char(' ')?;
+
+        if let Some(scope) = ctx.event_scope() {
+            let mut seen = false;
+            for span in scope.from_root() {
+                styled(&mut writer, ansi, BOLD, span.metadata().name())?;
+                seen = true;
+                let extensions = span.extensions();
+                if let Some(fields) = extensions.get::<FormattedFields<TextFields>>() {
+                    if !fields.fields.is_empty() {
+                        styled(&mut writer, ansi, BOLD, "{")?;
+                        writer.write_str(&fields.fields)?;
+                        styled(&mut writer, ansi, BOLD, "}")?;
+                    }
+                }
+                styled(&mut writer, ansi, DIMMED, ":")?;
+            }
+            if seen {
+                writer.write_char(' ')?;
+            }
+        }
+
+        styled(&mut writer, ansi, DIMMED, meta.target())?;
+        styled(&mut writer, ansi, DIMMED, ":")?;
+        writer.write_char(' ')?;
+
+        let line = meta.line();
+        if let Some(file) = meta.file() {
+            styled(&mut writer, ansi, DIMMED, file)?;
+            styled(&mut writer, ansi, DIMMED, ":")?;
+            if line.is_none() {
+                writer.write_char(' ')?;
+            }
+        }
+        if let Some(line) = line {
+            if ansi {
+                writer.write_str(DIMMED)?;
+            }
+            write!(writer, "{line}:")?;
+            if ansi {
+                writer.write_str(RESET)?;
+            }
+            writer.write_char(' ')?;
+        }
+
+        let sanitize = writer.sanitizes_ansi_escapes();
+        let mut fields = TextVisitor::new(&mut writer, ansi, sanitize, true);
+        event.record(&mut fields);
+        fields.result?;
+        writer.write_char('\n')
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -601,5 +1039,132 @@ mod tests {
                 .event_format(JsonLine::new()),
         );
         println!("ns per JSON access-log line: stock {stock:.0}, this format {fast:.0}");
+    }
+
+    /// Beyond `scenario`: the kinds the text format spells out on its own.
+    /// An error with and without a source, a message and a string with the
+    /// characters the stock sanitizes or escapes, a span without fields, a
+    /// span whose first fields are longer than the stack piece, TRACE and
+    /// DEBUG lines, a raw field name, a field recorded with characters the
+    /// quick quoted form cannot take.
+    fn text_scenario() {
+        #[derive(Debug)]
+        struct Outer(io::Error);
+        impl fmt::Display for Outer {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("the outer error")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let inner = io::Error::other("the inner one \x1b[31m");
+        let outer = Outer(io::Error::other("the \x07 source"));
+        let plain = info_span!("plain");
+        let plain_entered = plain.enter();
+        let long_path = "/v1/".repeat(200);
+        let request = info_span!(
+            target: "smg::otel-trace",
+            "http_request",
+            method = "GET",
+            path = %long_path,
+            r#struct = "raw",
+            module = "smg",
+            request_id = tracing::field::Empty
+        );
+        let entered = request.enter();
+        tracing::trace!("a trace line");
+        tracing::debug!(count = 1u64, "a debug line");
+        warn!(
+            error = &inner as &(dyn std::error::Error + 'static),
+            "without a source"
+        );
+        tracing::error!(
+            error = &outer as &(dyn std::error::Error + 'static),
+            "with a source"
+        );
+        info!(
+            text = "quote \" backslash \\ newline \n tab \t unicode é emoji 😀 del \x7f",
+            "message with \x1b[2m escape, \x07 bell, \u{85} C1 and \x7f del"
+        );
+        request.record("request_id", "id with \"quotes\" and é");
+        info!("after the record");
+        drop(entered);
+        drop(plain_entered);
+        info!(parent: &plain, "the parent given");
+    }
+
+    fn stock_text_lines(ansi: bool, run: fn()) -> String {
+        let capture = Capture::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(ansi)
+            .with_file(true)
+            .with_line_number(true)
+            .with_timer(FixedTime)
+            .with_writer(capture.clone());
+        tracing::subscriber::with_default(Registry::default().with(layer), run);
+        capture.text()
+    }
+
+    fn fast_text_lines(ansi: bool, run: fn()) -> String {
+        let capture = Capture::default();
+        let layer = tracing_subscriber::fmt::layer()
+            .with_ansi(ansi)
+            .with_writer(capture.clone())
+            .fmt_fields(TextFields)
+            .event_format(TextLine::with_timer(FixedTime));
+        tracing::subscriber::with_default(Registry::default().with(layer), run);
+        capture.text()
+    }
+
+    #[test]
+    fn the_lines_are_those_of_the_stock_text_format() {
+        for ansi in [false, true] {
+            for (name, run) in [
+                ("scenario", scenario as fn()),
+                ("text_scenario", text_scenario as fn()),
+            ] {
+                let stock = stock_text_lines(ansi, run);
+                let fast = fast_text_lines(ansi, run);
+                assert!(stock.lines().count() >= 7, "{name}: {stock}");
+                for (stock_line, fast_line) in stock.lines().zip(fast.lines()) {
+                    assert_eq!(fast_line, stock_line, "{name}, ansi {ansi}");
+                }
+                assert_eq!(fast, stock, "{name}, ansi {ansi}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_text_lines_carry_the_styles_only_when_ansi_is_on() {
+        let styled = fast_text_lines(true, scenario);
+        assert!(
+            styled.contains(
+                "\x1b[32m INFO\x1b[0m \x1b[1mhttp_request\x1b[0m\x1b[1m{\x1b[0m\x1b[3mmethod\x1b[0m\x1b[2m=\x1b[0m\"POST\" "
+            ),
+            "{styled}"
+        );
+        let plain = fast_text_lines(false, scenario);
+        assert!(
+            plain.contains(
+                " INFO http_request{method=\"POST\" path=\"/v1/chat/completions\" version=Shape { side: 1 } module=\"smg\"}: smg::request: "
+            ),
+            "{plain}"
+        );
+        assert!(!plain.contains('\x1b'), "{plain}");
+    }
+
+    #[test]
+    fn a_first_field_set_longer_than_the_piece_arrives_whole() {
+        use std::fmt::Write as _;
+        let mut piece = Piece::new();
+        let long = "x".repeat(PIECE_BYTES - 3);
+        piece.write_str(&long).expect("fits");
+        assert!(piece.heap.is_none());
+        piece.write_str("tail é").expect("spills");
+        assert!(piece.heap.is_some());
+        assert_eq!(piece.as_str().expect("text"), format!("{long}tail é"));
     }
 }

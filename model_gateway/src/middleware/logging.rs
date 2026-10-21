@@ -1283,7 +1283,7 @@ mod field_tests {
         },
         observability::{
             inflight_tracker::InFlightRequestTracker,
-            log_format::{JsonLine, SpanFields},
+            log_format::{JsonLine, SpanFields, TextFields, TextLine},
         },
     };
 
@@ -1341,7 +1341,9 @@ mod field_tests {
         Registry::default().with(
             tracing_subscriber::fmt::layer()
                 .with_ansi(false)
-                .with_writer(capture.clone()),
+                .with_writer(capture.clone())
+                .fmt_fields(TextFields)
+                .event_format(TextLine::new()),
         )
     }
 

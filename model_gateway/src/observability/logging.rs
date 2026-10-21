@@ -39,7 +39,7 @@ use tracing_subscriber::{
 };
 
 use super::{
-    log_format::{JsonLine, SpanFields, UtcSeconds},
+    log_format::{JsonLine, SpanFields, TextFields, TextLine, UtcSeconds},
     otel_trace::get_otel_layer,
 };
 use crate::{config::TraceConfig, observability::metrics::Metrics};
@@ -473,15 +473,19 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         .with_timer(UtcSeconds)
         .with_writer(stdout_writer);
 
-    // The JSON lines are the stock format's, written by `log_format` (the
-    // span's fields appended to, never re-parsed per record or per line).
+    // Both line formats are the stock formats' bytes, written by `log_format`
+    // (the span's fields appended to, never re-parsed per record or per
+    // line; the text line without a styled `Display` per piece).
     let stdout_layer = if config.json_format {
         stdout_layer
             .fmt_fields(SpanFields)
             .event_format(JsonLine::new())
             .boxed()
     } else {
-        stdout_layer.boxed()
+        stdout_layer
+            .fmt_fields(TextFields)
+            .event_format(TextLine::new())
+            .boxed()
     };
 
     layers.push(stdout_layer);
@@ -526,7 +530,10 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
                         .event_format(JsonLine::new())
                         .boxed()
                 } else {
-                    file_layer.boxed()
+                    file_layer
+                        .fmt_fields(TextFields)
+                        .event_format(TextLine::new())
+                        .boxed()
                 };
 
                 layers.push(file_layer);
