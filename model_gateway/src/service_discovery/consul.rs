@@ -56,15 +56,17 @@
 //! its nodes.
 //!
 //! Configuration follows Consul's own clients. The address is
-//! `--consul-address`, else `CONSUL_HTTP_ADDR`, else `127.0.0.1:8500`; one
-//! that names no scheme is spoken to over HTTP, or HTTPS when
-//! `CONSUL_HTTP_SSL` is true.
+//! `--consul-address`, else `CONSUL_HTTP_ADDR`, else `127.0.0.1:8500`. It is
+//! spoken to over HTTP unless it names `https`, or `CONSUL_HTTP_SSL` is true:
+//! once that asks for TLS, an address that names `http` is spoken to over
+//! HTTPS too, as Consul's clients never fall back to plaintext.
 //! The token is read from the file `CONSUL_HTTP_TOKEN_FILE` names, else
 //! `CONSUL_HTTP_TOKEN`, and never taken as a flag. Over HTTPS, `CONSUL_CACERT`
 //! adds a CA bundle and `CONSUL_CLIENT_CERT` with `CONSUL_CLIENT_KEY` a client
-//! certificate. Settings this provider does not implement (`CONSUL_CAPATH`,
-//! `CONSUL_TLS_SERVER_NAME`, `CONSUL_NAMESPACE`, `CONSUL_PARTITION`, and
-//! `CONSUL_HTTP_SSL_VERIFY=false`) refuse to start rather than be ignored.
+//! certificate. Settings this provider does not implement (`CONSUL_HTTP_AUTH`,
+//! `CONSUL_CAPATH`, `CONSUL_TLS_SERVER_NAME`, `CONSUL_NAMESPACE`,
+//! `CONSUL_PARTITION`, and `CONSUL_HTTP_SSL_VERIFY=false`) refuse to start
+//! rather than be ignored.
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -121,7 +123,12 @@ const BODY_EXCERPT: usize = 200;
 /// Consul's environment variables whose meaning this provider does not
 /// implement: each would change what is read or how it is trusted, so one
 /// that is set refuses to start rather than be ignored.
-const UNSUPPORTED_ENV: [(&str, &str); 4] = [
+const UNSUPPORTED_ENV: [(&str, &str); 5] = [
+    (
+        "CONSUL_HTTP_AUTH",
+        "HTTP basic authentication is not supported; give an ACL token in \
+         CONSUL_HTTP_TOKEN or CONSUL_HTTP_TOKEN_FILE",
+    ),
     (
         "CONSUL_CAPATH",
         "a CA directory is not supported; give a CA bundle in CONSUL_CACERT",
@@ -211,9 +218,10 @@ impl ConsulProviderConfig {
             reason: reason.to_string(),
         };
 
+        // Named, not repeated: `CONSUL_HTTP_AUTH` holds a password.
         for (name, reason) in UNSUPPORTED_ENV {
-            if let Some(value) = env(name) {
-                return Err(refuse(name, value, reason));
+            if env(name).is_some() {
+                return Err(refuse(name, "(set)".to_string(), reason));
             }
         }
         let flag = |name: &str| {
@@ -404,12 +412,13 @@ impl ConsulProviderConfig {
 }
 
 /// An address as Consul's clients read it: a URL, or a `host:port` that HTTP
-/// is spoken to (HTTPS with `https`). It names no path, query or credentials.
+/// is spoken to. With `https`, HTTPS is spoken to an `http` URL too, on the
+/// port it names. It names no path, query or credentials.
 fn parse_address(address: &str, https: bool) -> Result<Url, String> {
     if address.starts_with("unix://") {
         return Err("A Unix socket address is not supported; give an http or https URL".into());
     }
-    let url = if address.contains("://") {
+    let mut url = if address.contains("://") {
         Url::parse(address)
     } else {
         let scheme = if https { "https" } else { "http" };
@@ -430,6 +439,13 @@ fn parse_address(address: &str, https: bool) -> Result<Url, String> {
     }
     if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
         return Err("Must name only a scheme, a host and a port".into());
+    }
+    // Consul's clients never fall back to HTTP once TLS is asked for.
+    if https && url.scheme() == "http" {
+        let port = url.port_or_known_default();
+        url.set_scheme("https")
+            .and_then(|()| url.set_port(port))
+            .map_err(|()| "Cannot be spoken to over HTTPS".to_string())?;
     }
     Ok(url)
 }
@@ -1336,11 +1352,21 @@ mod tests {
                 ][..],
                 "https://consul.internal:8501",
             ),
+            // Asked for, TLS stands for an address that names http too.
             (
                 Some("http://flag:8500"),
                 &[("CONSUL_HTTP_ADDR", "env:8500"), ("CONSUL_HTTP_SSL", "1")][..],
-                "http://flag:8500",
+                "https://flag:8500",
             ),
+            (
+                None,
+                &[
+                    ("CONSUL_HTTP_ADDR", "http://consul.internal"),
+                    ("CONSUL_HTTP_SSL", "true"),
+                ][..],
+                "https://consul.internal:80",
+            ),
+            (Some("http://flag:8500"), &[][..], "http://flag:8500"),
             (
                 Some("https://consul.internal/"),
                 &[][..],
@@ -1382,7 +1408,7 @@ mod tests {
                 "discovery.address",
             ),
             (
-                Some("http://user:pw@consul:8500"),
+                Some("http://user:secret-pw@consul:8500"),
                 &[][..],
                 "discovery.address",
             ),
@@ -1391,6 +1417,11 @@ mod tests {
                 None,
                 &[("CONSUL_HTTP_ADDR", "http://consul:8500?x=1")][..],
                 "CONSUL_HTTP_ADDR",
+            ),
+            (
+                None,
+                &[("CONSUL_HTTP_AUTH", "user:secret-pw")][..],
+                "CONSUL_HTTP_AUTH",
             ),
             (
                 None,
@@ -1442,7 +1473,10 @@ mod tests {
                     ..
                 }) => {
                     assert_eq!(actual, field, "{flag:?} {env:?}");
-                    assert!(!value.contains("pw@"), "the password was repeated: {value}");
+                    assert!(
+                        !value.contains("secret-pw"),
+                        "the password was repeated: {value}"
+                    );
                 }
                 other => panic!("{flag:?} {env:?}: expected a refusal, got {other:?}"),
             }
