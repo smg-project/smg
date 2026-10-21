@@ -38,6 +38,13 @@ use crate::{
     script::{self, Answer, MatchedStop},
 };
 
+// zeromq queues sends and exposes no flush/linger operation. Keep both sockets
+// alive briefly after the last queued output so its background writer and the
+// frontend can consume it before input EOF fails the frontend's requests.
+// This is best-effort transport linger, not a delivery acknowledgement; the
+// process-wide drain deadline still bounds shutdown if the frontend is stuck.
+const OUTPUT_LINGER: Duration = Duration::from_secs(1);
+
 /// Run one mock ZMQ EngineCore rank: connect to `handshake_address`, then serve
 /// requests until the frontend disconnects.
 pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u32) {
@@ -46,7 +53,7 @@ pub async fn serve(cfg: Arc<Config>, handshake_address: String, engine_index: u3
 
 /// [`serve`] until `shutdown` resolves as well: from then on the rank admits
 /// no request and returns once the ones in flight have finished and their
-/// last outputs are on the socket (the drain of a termination signal), as an
+/// last outputs have had a bounded transport linger (the drain of a signal), as an
 /// engine process does under SIGTERM.
 pub async fn serve_until(
     cfg: Arc<Config>,
@@ -113,9 +120,11 @@ pub async fn serve_until(
         while let Some(outputs) = out_rx.recv().await {
             if let Err(error) = output.send_outputs(&outputs).await {
                 tracing::warn!("zmq engine output send failed: {error}");
-                break;
+                return;
             }
         }
+        tokio::time::sleep(OUTPUT_LINGER).await;
+        drop(output);
     });
 
     let mut shutdown = pin!(shutdown);
@@ -282,10 +291,9 @@ pub async fn serve_until(
     };
     if drained {
         // The last forwarder's terminal batch is only in the funnel so far.
-        // Closing the funnel lets the writer end once everything queued is on
-        // the socket, and the rank returns after that, not before: the
-        // process exits right behind its last rank, and a batch still in the
-        // funnel would go with it.
+        // Closing the funnel queues the remaining batches and starts the
+        // writer's transport linger. Keep the input alive until that finishes:
+        // dropping it early makes the frontend fail even queued final outputs.
         drop(out_tx);
         if let Err(e) = writer.await {
             tracing::error!("zmq engine {engine_index} output writer panicked: {e}");
