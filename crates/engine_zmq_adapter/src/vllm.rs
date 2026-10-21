@@ -1060,6 +1060,8 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
 
         let req = vllm::GenerateRequest {
@@ -1269,6 +1271,8 @@ mod tests {
             };
             assert_eq!(request.sampling_params.as_ref().unwrap().logprobs, Some(2));
             output.send_outputs(&outputs).await.unwrap();
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
 
         let req = vllm::GenerateRequest {
@@ -1413,6 +1417,8 @@ mod tests {
             );
             output.send_outputs(&prefill).await.unwrap();
             output.send_outputs(&decode).await.unwrap();
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
 
         let req = vllm::GenerateRequest {
@@ -2219,6 +2225,8 @@ mod tests {
                 .send_outputs(&batch("r1-1", 11, None, Some(EngineCoreFinishReason::Stop)))
                 .await
                 .unwrap();
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
 
         let mut req = tokenized_req(vllm::SamplingParams {

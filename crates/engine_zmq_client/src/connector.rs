@@ -33,7 +33,7 @@ use tokio::{
     time::Instant,
 };
 use tracing::{trace, warn};
-use zeromq::RouterSendHalf;
+use zeromq::{RouterSendHalf, SocketRecv};
 
 use crate::{
     codec::OpaqueValue,
@@ -373,10 +373,60 @@ struct InputFrame {
 
 /// The bound on add-request frames waiting behind a blocked input (see
 /// [`ClientInner::admit_add`]).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct InputQueueLimit {
     frames: usize,
     bytes: usize,
+}
+
+/// Logical payloads still owned by zeromq, including its pending writer message.
+/// Codec/kernel buffers are separate; an oversized message may occupy an empty
+/// budget alone, preserving support for tensors larger than the byte limit.
+#[derive(Default)]
+struct InputBudget {
+    used: Mutex<InputQueueLimit>,
+    released: Notify,
+}
+
+/// A queue credit lives until the last transport-owned frame reference is dropped,
+/// not until send returns, the caller cancels, or the request registry is retired.
+struct InputCredit {
+    budget: Arc<InputBudget>,
+    bytes: usize,
+}
+
+impl Drop for InputCredit {
+    /// Return both credits exactly once, after every frame owner has gone away.
+    fn drop(&mut self) {
+        let mut used = self.budget.used.lock();
+        used.frames -= 1;
+        used.bytes -= self.bytes;
+        drop(used);
+        self.budget.released.notify_one();
+    }
+}
+
+/// Carry queue credit through zeromq's Bytes clones without copying the payload.
+struct BudgetedBytes {
+    bytes: Bytes,
+    _credit: Arc<InputCredit>,
+}
+
+impl AsRef<[u8]> for BudgetedBytes {
+    /// Preserve the original bytes and wire representation.
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl InputCredit {
+    /// Attach ownership accounting to one frame; clones share the same credit.
+    fn wrap(self: &Arc<Self>, bytes: Bytes) -> Bytes {
+        Bytes::from_owner(BudgetedBytes {
+            bytes,
+            _credit: self.clone(),
+        })
+    }
 }
 
 struct ClientInner<P: EngineProtocol> {
@@ -395,6 +445,8 @@ struct ClientInner<P: EngineProtocol> {
     /// [`ENGINE_INPUT_QUEUE_BYTES`] unless [`Client::set_input_queue_limit`]
     /// changed it.
     input_queue_limit: Mutex<InputQueueLimit>,
+    /// Separate bounded allowance for payload references handed to zeromq.
+    input_budget: Arc<InputBudget>,
     /// Add-request frames waiting in the input queue (not the one being
     /// written) and their payload bytes, for the bound.
     waiting_adds: AtomicUsize,
@@ -560,9 +612,36 @@ impl<P: EngineProtocol> ClientInner<P> {
         }
     }
 
+    /// Wait for room in the transport-owned payload budget. The single input
+    /// writer reserves before enqueueing, so the upstream's 100k-message queue
+    /// cannot bypass SMG's frame/byte bound. A single oversized frame is allowed
+    /// only while this budget is empty; every following frame waits for release.
+    async fn reserve_input(&self, bytes: usize) -> Arc<InputCredit> {
+        loop {
+            let released = self.input_budget.released.notified();
+            {
+                let limit = *self.input_queue_limit.lock();
+                let mut used = self.input_budget.used.lock();
+                if used.frames == 0
+                    || (used.frames < limit.frames
+                        && used.bytes <= limit.bytes
+                        && bytes <= limit.bytes.saturating_sub(used.bytes))
+                {
+                    used.frames += 1;
+                    used.bytes += bytes;
+                    return Arc::new(InputCredit {
+                        budget: self.input_budget.clone(),
+                        bytes,
+                    });
+                }
+            }
+            released.await;
+        }
+    }
+
     /// Queue a frame in submission order and wait for local zeromq admission.
     /// Completion is not a transport flush or engine acknowledgement. Once the
-    /// upstream peer queue fills, the send timeout fails this request while the
+    /// transport-owned payload budget fills, the send timeout fails this request while the
     /// independent writer continues; the input-death timeout closes the client
     /// if admission remains stalled. Output silence detects admitted requests
     /// that never produce output, and the input monitor detects disconnects.
@@ -594,7 +673,7 @@ impl<P: EngineProtocol> ClientInner<P> {
 
     /// Admit an add-request of `bytes` to the input queue. Free while the
     /// zeromq accepts frames locally; once admission has stalled for a whole
-    /// send window (the upstream peer queue is full), a request that would take the waiting
+    /// send window (the transport-owned payload budget is full), a request that would take the waiting
     /// add-requests past the queue bound is refused at once with
     /// [`Error::EngineInputFull`]: it is better served elsewhere than parked
     /// here for the death window, and the frames already waiting keep their
@@ -893,12 +972,14 @@ impl<P: EngineProtocol> Client<P> {
     /// Build a client over a connected transport, spawning the input writer,
     /// the output loop and the dispatcher. Background tasks are aborted when
     /// the client is dropped, but already admitted zeromq frames may still arrive.
-    /// Upstream peer queues are outside the SMG waiting-frame/byte limits.
+    /// Transport-owned payloads have a separate allowance with the same limits.
+    /// Codec and kernel buffers are not included in either allowance.
     pub fn new(transport: ConnectedTransport) -> Self {
         let ConnectedTransport {
             engines,
             input_send,
             mut input_events,
+            mut input_recv,
             output_socket,
             ..
         } = transport;
@@ -921,6 +1002,7 @@ impl<P: EngineProtocol> Client<P> {
                 frames: ENGINE_INPUT_QUEUE_FRAMES,
                 bytes: ENGINE_INPUT_QUEUE_BYTES,
             }),
+            input_budget: Arc::new(InputBudget::default()),
             waiting_adds: AtomicUsize::new(0),
             waiting_add_bytes: AtomicUsize::new(0),
             writing_since: Mutex::new(None),
@@ -946,6 +1028,13 @@ impl<P: EngineProtocol> Client<P> {
         let input_task = tokio::spawn(async move {
             tokio::select! {
                 () = run_input_writer::<P>(input_send, input_rx, writer_inner.clone()) => {}
+                () = async {
+                    // Polling the receive half drives read-side EOF detection even
+                    // when no more writes are sent to a disconnected engine.
+                    while input_recv.recv().await.is_ok() {}
+                    std::future::pending::<()>().await;
+                } => {}
+
                 () = async {
                     while let Some(event) = input_events.next().await {
                         if let zeromq::SocketEvent::Disconnected(peer) = event {
@@ -1017,9 +1106,12 @@ impl<P: EngineProtocol> Client<P> {
     /// Bound the add-requests that may wait behind a blocked input before new
     /// ones are refused at once with [`Error::EngineInputFull`]
     /// ([`ENGINE_INPUT_QUEUE_FRAMES`] frames and [`ENGINE_INPUT_QUEUE_BYTES`]
-    /// payload bytes by default).
+    /// payload bytes by default). The same limits independently bound frames
+    /// still owned by zeromq. That budget admits one oversized message alone;
+    /// it is released by transport ownership, never by caller cancellation.
     pub fn set_input_queue_limit(&self, frames: usize, bytes: usize) {
         *self.inner.input_queue_limit.lock() = InputQueueLimit { frames, bytes };
+        self.inner.input_budget.released.notify_one();
     }
 
     /// The latest per-rank load for one engine index (DP routing signal), if
@@ -1303,10 +1395,11 @@ const ENGINE_INPUT_DEATH_TIMEOUT: Duration = ENGINE_SILENCE_DEATH_TIMEOUT;
 /// submission that would take the waiting add-requests past either is refused
 /// at once instead of parking its payload for the death window (a gateway that
 /// retries every send window would otherwise grow the queue for as long as the
-/// engine does not read). These limits cover SMG's waiting Adds only, not
-/// zeromq's per-peer queue (100,000 messages with no byte limit), codec or
-/// kernel buffers. They do not bound end-to-end retained memory. Aborts and
-/// other control frames are never bounded.
+/// engine does not read). A separate allowance with these same limits covers
+/// payload references still owned by zeromq, including control messages. It
+/// admits an oversized message only when empty. Codec/kernel buffers remain
+/// outside these logical budgets; this is not an allocator/RSS limit. Control
+/// frames bypass the waiting-Add limit but not the transport-owned allowance.
 const ENGINE_INPUT_QUEUE_FRAMES: usize = 256;
 const ENGINE_INPUT_QUEUE_BYTES: usize = 32 << 20;
 
@@ -1491,13 +1584,23 @@ async fn run_input_writer<P: EngineProtocol>(
         }
         let death_timeout = *inner.input_death_timeout.lock();
         *inner.writing_since.lock() = Some(Instant::now());
-        let write = send_message(
-            &mut input_send,
-            &frame.engine_id,
-            frame.request_type,
-            frame.payload,
-            frame.aux_frames,
-        );
+        let write = async {
+            let bytes =
+                frame.payload.len() + frame.aux_frames.iter().map(Bytes::len).sum::<usize>();
+            let credit = inner.reserve_input(bytes).await;
+            send_message(
+                &mut input_send,
+                &frame.engine_id,
+                credit.wrap(frame.request_type),
+                credit.wrap(frame.payload),
+                frame
+                    .aux_frames
+                    .into_iter()
+                    .map(|bytes| credit.wrap(bytes))
+                    .collect(),
+            )
+            .await
+        };
         let result = tokio::time::timeout(death_timeout, write).await;
         *inner.writing_since.lock() = None;
         let result = match result {
@@ -3118,29 +3221,18 @@ mod tests {
         )
     }
 
-    /// Fill the pinned upstream peer queue and verify sustained backpressure.
+    /// Queue large frames until our ownership budget stalls the writer, without
+    /// depending on the upstream's private channel capacity. No engine reads.
     async fn saturate_input(client: &EngineCoreClient) {
-        let (request, aux) = large_request("queue-saturation");
-        client
-            .inner
-            .queue_frame(
-                &EngineId::from_engine_index(0),
-                VllmProtocol::add_frame(),
-                encode_msgpack(&request).unwrap(),
-                aux,
-                None,
-                None,
-            )
-            .unwrap();
-        let padding = encode_msgpack(&Vec::<String>::new()).unwrap();
-        for _ in 0..100_010 {
+        for _ in 0..3 {
+            let (request, aux) = large_request("queue-saturation");
             client
                 .inner
                 .queue_frame(
                     &EngineId::from_engine_index(0),
-                    VllmProtocol::abort_frame(),
-                    padding.clone(),
-                    vec![],
+                    VllmProtocol::add_frame(),
+                    encode_msgpack(&request).unwrap(),
+                    aux,
                     None,
                     None,
                 )
@@ -3160,7 +3252,7 @@ mod tests {
             }
         })
         .await
-        .expect("upstream peer queue becomes full");
+        .expect("transport-owned payload budget becomes full");
     }
 
     /// A finished one-token output for `request_id` on rank 0.
@@ -3234,6 +3326,130 @@ mod tests {
         assert!(
             matches!(engines[0].recv().await.unwrap(), EngineInbound::Add(request) if request.request_id == "stalled")
         );
+    }
+
+    /// Idle read-side EOF fails even a small request whose send already flushed.
+    #[tokio::test]
+    async fn idle_disconnect_fails_a_flushed_small_request() {
+        let (client, mut engine, _ns) = connect().await;
+        let mut stream = client
+            .submit(request_for("idle-disconnect", 0))
+            .await
+            .unwrap();
+        assert!(matches!(
+            engine.recv().await.unwrap(),
+            EngineInbound::Add(_)
+        ));
+        drop(engine);
+        assert!(tokio::time::timeout(TIMEOUT, stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(!client.is_alive());
+    }
+
+    /// The budget counts clones until the last owner drops, and cancelled
+    /// reservations neither take credit nor lose the next release notification.
+    #[tokio::test]
+    async fn input_budget_tracks_frame_owners_and_cancelled_reservations() {
+        let (client, _engine, _ns) = connect().await;
+        client.set_input_queue_limit(2, 1024);
+        let credit = client.inner.reserve_input(1024).await;
+        let frame = credit.wrap(Bytes::from(vec![0; 1024]));
+        let cloned = frame.clone();
+        drop(credit);
+        drop(frame);
+        assert_eq!(client.inner.input_budget.used.lock().bytes, 1024);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), client.inner.reserve_input(1))
+                .await
+                .is_err()
+        );
+        assert_eq!(client.inner.input_budget.used.lock().frames, 1);
+        drop(cloned);
+        let credit = tokio::time::timeout(TIMEOUT, client.inner.reserve_input(2048))
+            .await
+            .unwrap();
+        assert_eq!(client.inner.input_budget.used.lock().bytes, 2048);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), client.inner.reserve_input(1))
+                .await
+                .is_err()
+        );
+        drop(credit);
+        let first = client.inner.reserve_input(1).await;
+        let second = client.inner.reserve_input(1).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), client.inner.reserve_input(1))
+                .await
+                .is_err()
+        );
+        drop((first, second));
+        assert_eq!(client.inner.input_budget.used.lock().frames, 0);
+        assert_eq!(client.inner.input_budget.used.lock().bytes, 0);
+    }
+
+    /// A non-reading engine cannot accumulate the upstream's 100k-message
+    /// backlog: ordinary payloads exhaust our byte budget and callers time out.
+    #[tokio::test]
+    async fn a_stalled_peer_cannot_bypass_the_transport_byte_budget() {
+        let (client, engine, _ns) = connect().await;
+        client.set_send_timeout(SEND_WINDOW);
+        let (request, aux) = large_request("codec-blocker");
+        let mut streams = vec![client.submit_with_aux(request, aux).await.unwrap()];
+        let mut blocked = false;
+        for index in 0..32 {
+            let result = client
+                .submit_with_aux(
+                    request_for(&format!("queued-{index}"), 0),
+                    vec![Bytes::from(vec![0; 2 << 20])],
+                )
+                .await;
+            match result {
+                Ok(stream) => streams.push(stream),
+                Err(Error::EngineInputBlocked { .. }) => {
+                    blocked = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected error: {error}"),
+            }
+        }
+        assert!(
+            blocked,
+            "the byte budget must apply before 32 payloads are admitted"
+        );
+        assert!(client.is_alive());
+        let bytes = client.inner.input_budget.used.lock().bytes;
+        assert!(bytes > 0 && bytes <= ENGINE_INPUT_QUEUE_BYTES);
+        assert!(streams.len() <= 17, "at most 32 MiB plus the codec blocker");
+        drop(streams);
+        assert_eq!(client.inner.input_budget.used.lock().bytes, bytes);
+        drop(engine);
+    }
+
+    /// Cancelling an admitted request cannot release credits for bytes still
+    /// queued behind a stalled transport; peer close eventually releases them.
+    #[tokio::test]
+    async fn cancelled_request_keeps_transport_owned_payload_credit() {
+        let (client, engine, _ns) = connect().await;
+        let (request, aux) = large_request("first");
+        let first = client.submit_with_aux(request, aux).await.unwrap();
+        let (request, aux) = large_request("second");
+        let second = client.submit_with_aux(request, aux).await.unwrap();
+        let budget = client.inner.input_budget.clone();
+        assert!(budget.used.lock().bytes >= 64 << 20);
+        drop((first, second));
+        assert!(budget.used.lock().bytes >= 64 << 20);
+        drop(client);
+        drop(engine);
+        tokio::time::timeout(TIMEOUT, async {
+            while budget.used.lock().frames != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("peer close releases upstream payload owners");
     }
 
     /// A transport disconnect fails requests already accepted by the local queue.
@@ -3316,11 +3532,10 @@ mod tests {
     async fn a_full_peer_queue_times_out_requests_without_closing_the_client() {
         let (client, mut engine, _ns) = connect().await;
         client.set_send_timeout(SEND_WINDOW);
-        client.set_input_queue_limit(256, usize::MAX);
         let mut in_flight = client.submit(request_for("req-small", 0)).await.unwrap();
 
         saturate_input(&client).await;
-        let (request, aux) = large_request("req-large");
+        let (request, aux) = (request_for("req-large", 0), Vec::new());
         let started = std::time::Instant::now();
         let error = client
             .submit_with_aux(request, aux)
@@ -3570,9 +3785,9 @@ mod tests {
     async fn a_blocked_input_refuses_add_requests_past_the_frame_bound() {
         let (client, mut engine, _ns) = connect().await;
         client.set_send_timeout(SEND_WINDOW);
-        client.set_input_queue_limit(3, usize::MAX);
+        client.set_input_queue_limit(3, ENGINE_INPUT_QUEUE_BYTES);
         saturate_input(&client).await;
-        let (request, aux) = large_request("req-large");
+        let (request, aux) = (request_for("req-large", 0), Vec::new());
         let error = client
             .submit_with_aux(request, aux)
             .await

@@ -19,7 +19,7 @@ use tracing::{debug, error, info, trace, warn};
 use zeromq::{
     prelude::{Socket, SocketRecv, SocketSend},
     util::PeerIdentity,
-    PullSocket, RouterSendHalf, RouterSocket, SocketEvent, ZmqError, ZmqMessage,
+    PullSocket, RouterRecvHalf, RouterSendHalf, RouterSocket, SocketEvent, ZmqError, ZmqMessage,
 };
 
 use crate::{
@@ -135,6 +135,8 @@ pub struct ConnectedTransport {
     pub input_send: RouterSendHalf,
     /// Reports asynchronous disconnects after local send admission.
     pub input_events: SocketEvents<SocketEvent>,
+    /// Drives read-side disconnect detection after the registration handshake.
+    pub input_recv: RouterRecvHalf,
     /// The shared output PULL socket for receiving all engines' responses.
     pub output_socket: PullSocket,
 }
@@ -296,7 +298,7 @@ pub async fn connect_handshake(
         wait_for_input_registrations(&mut input_socket, engines.into_keys(), &clock).await?;
     info!(engine_count = engines.len(), "engines connected");
 
-    let (input_send, _) = input_socket.split();
+    let (input_send, input_recv) = input_socket.split();
 
     Ok(ConnectedTransport {
         input_address,
@@ -304,6 +306,7 @@ pub async fn connect_handshake(
         engines,
         input_send,
         input_events,
+        input_recv,
         output_socket,
     })
 }

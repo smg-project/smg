@@ -1022,6 +1022,8 @@ mod tests {
                     .await
                     .unwrap();
             }
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
 
         let req = sglang_proto::GenerateRequest {
@@ -1147,6 +1149,8 @@ mod tests {
                 .send_frames(vec![bytes::Bytes::from(encode_msgpack(&done).unwrap())])
                 .await
                 .unwrap();
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
         let req = sglang_proto::GenerateRequest {
             request_id: "r1".to_string(),
@@ -1238,6 +1242,8 @@ mod tests {
                     .await
                     .unwrap();
             }
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
         for (rid, code) in [
             ("r2", tonic::Code::InvalidArgument),

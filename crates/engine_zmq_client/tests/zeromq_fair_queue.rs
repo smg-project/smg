@@ -12,26 +12,33 @@ use zeromq::{Socket, SocketRecv, SocketSend};
 #[test]
 fn large_frame_receive_yields() {
     const CHILD: &str = "SMG_ZMQ_FAIR_QUEUE_CHILD";
-    if std::env::var_os(CHILD).is_some() {
+    if let Some(marker) = std::env::var_os(CHILD) {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
             .unwrap()
             .block_on(receive_large_frames());
+        std::fs::write(marker, b"done").unwrap();
         return;
     }
 
+    let marker_dir = tempfile::tempdir().unwrap();
+    let marker = marker_dir.path().join("done");
     // Tokio timeouts cannot stop a FairQueue poll that spins forever.
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "large_frame_receive_yields", "--nocapture"])
-        .env(CHILD, "1")
+        .env(CHILD, &marker)
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             assert!(status.success(), "large-frame receiver failed: {status}");
+            assert!(
+                marker.exists(),
+                "child did not run the large-frame regression"
+            );
             break;
         }
         if Instant::now() >= deadline {
@@ -95,7 +102,7 @@ async fn receive_large_frames() {
     drop(connected);
 }
 
-/// Cancel an idle receive, then preserve empty/many-part frames and the next message.
+/// Cancel an idle receive, then preserve empty/multipart frames and the next message.
 #[tokio::test]
 async fn cancelled_receive_preserves_multipart_and_following_message() {
     let mut receiver = zeromq::PullSocket::new();
