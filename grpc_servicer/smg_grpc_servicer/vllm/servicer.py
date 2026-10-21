@@ -7,6 +7,7 @@ Implements the VllmEngine gRPC service on top of vLLM's EngineClient.
 
 import asyncio
 import itertools
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Sequence
 from datetime import datetime, timezone
@@ -77,6 +78,7 @@ from smg_grpc_servicer.vllm.model_info import (
     running_window,
     server_facts,
 )
+from smg_grpc_servicer.vllm.warmup import WARMUP_ENV, start_engine_warmup
 
 from .mm_keys import (
     batches_missing_pixels,
@@ -314,6 +316,14 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             self._mm_processor.name if self._mm_processor is not None else "off",
             self._mm_settings.source,
         )
+        # The planned warm-up (:mod:`smg_grpc_servicer.vllm.warmup`): in a
+        # launcher's process (the plugin kept its parse, the serving coroutine
+        # runs) the plan runs over the engine on the event loop and the health
+        # service holds NOT_SERVING until it is over; a servicer built
+        # elsewhere (a test, a harness) warms nothing.
+        self._warmup = None
+        if launcher_settings() is not None:
+            self._warmup = start_engine_warmup(async_llm, setting_text=os.environ.get(WARMUP_ENV))
 
     async def _acquire_mm_slot(self) -> None:
         """Take one multimodal slot, shedding load instead of queueing forever.

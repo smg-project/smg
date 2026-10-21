@@ -328,6 +328,41 @@ tokens/s on one connection with its lock uncontended; raise it to 2-4 when one
 engine serves more than about 512 concurrent streams and their inter-token p99
 matters more than the servicer's CPU).
 
+##### Planned warm-up before SERVING (`SMG_VLLM_SERVICER_WARMUP`)
+
+The engine selects and compiles kernels lazily: the first scheduler step at a
+token count it has not seen (a new prefill length class, a new running-batch
+size, a count off the alignment its compiler specialised on) pays a kernel
+search or a compile of up to several seconds, and every request in flight
+during that step waits. The engine's own start warms a fixed set of shapes
+(its graph-capture sizes, one tuning pass at the admission step's full token
+count), so the shapes a traffic ramp reaches first were paid for by the ramp's
+requests, on every engine of a fleet at once. Both servicers now run a planned
+warm-up over the engine before they report SERVING: a decode staircase (as
+many concurrent requests as the running window holds, each asking for one more
+token than the last, so every running-batch size runs once), a prefill ladder
+(one request per 128-token length class up to `--max-num-batched-tokens`, the
+graph-capture sizes, lengths one above the tuners' bucket grid), and a second
+pass over the bucket grid whose timings show what the first pass paid. Every
+request carries its own token ids, so prefix caching never hides a prefill,
+and the engine's prefix cache is flushed at the end. One INFO line per shape
+with its time; readiness (the gRPC health service, so the startup and
+readiness probes) stays NOT_SERVING until the pass ran, and flips SERVING
+whatever the pass returned (a failed request is a logged line, never a worker
+kept out of rotation). `SMG_VLLM_SERVICER_WARMUP` = `full` (the default:
+every 128-token class; about a minute on a 16k step), `fast` (the tuners'
+bucket grid only: seconds), `off`, a budget in seconds (`120`) or
+`<level>:<seconds>` (`fast:30`); the budget (default 300 s) bounds the pass:
+it ends between shapes, the remaining ones named in the log, and each
+request's timeout is clamped to what is left of it (one second at least), so
+a shape that hangs cannot hold readiness past the budget. On the Rust path the
+pass runs over the servicer's own gRPC port between the engine's handshake and
+SERVING; the Python servicer runs it over its in-process engine with its
+health service holding NOT_SERVING meanwhile. Under data parallelism every
+rank is a scheduler of its own: the plan runs the staircase once per rank and
+every prefill shape on every rank at once, each request pinned to its rank
+(`data_parallel_rank`), so the log's step count is per rank.
+
 Worker-side media processing uses the same `--mm-processor` /
 `SMG_VLLM_MM_PROCESSOR` setting as the Python servicer, with one more choice:
 
@@ -566,6 +601,13 @@ hybrid model's State groups leave it off, as above).
 Tuning:
 `SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT` (default: a
 free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
+`SMG_TOKENSPEED_SERVICER_WARMUP` (the planned warm-up before SERVING, as for
+vLLM above: `full` by default, `fast`, `off`, a budget in seconds or
+`<level>:<seconds>`; planned from `--max-num-seqs` and the chunk size or
+`--max-prefill-tokens`; the Python servicer runs the same plan over its own
+port after its first warm-up request, and both skip it on a disaggregation
+role; under attention data parallelism the servicer routes a request by load,
+not by rank, so each prefill shape warms one rank and the log says so),
 `SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
 `SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
 bounds as for vLLM above: the launcher reports the scheduler process alive each
@@ -767,6 +809,14 @@ included; `SMG_SGLANG_SERVICER_KV_EVENTS=0` leaves the publisher off). SGLang's
 HTTP sidecar (metrics and profiling endpoints) is not started on this path.
 Tuning: `SMG_SGLANG_SERVICER_HANDSHAKE_PORT` (default: a
 free port), `SMG_SGLANG_SERVICER_DRAIN_SECS` (default 5),
+`SMG_SGLANG_SERVICER_WARMUP` (the planned warm-up before SERVING, as for vLLM
+above: `full` by default, `fast`, `off`, a budget in seconds or
+`<level>:<seconds>`; planned from `--max-running-requests` and
+`--chunked-prefill-size` or `--max-prefill-tokens`, the engine's defaults
+where unset; the Python servicer runs the same plan over its own port after
+its first warm-up request, and both skip it on a disaggregation role; under
+data parallelism the servicer routes a request by load, not by rank, so each
+prefill shape warms one rank and the log says so),
 `SMG_SGLANG_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
 `SMG_SGLANG_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
 bounds as for vLLM above: the launcher reports the scheduler process alive each

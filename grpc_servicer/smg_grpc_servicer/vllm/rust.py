@@ -82,6 +82,7 @@ from smg_grpc_servicer.vllm.model_info import (
     model_facts,
     server_facts,
 )
+from smg_grpc_servicer.vllm.warmup import WARMUP_ENV, warmup_inputs_from_config, warmup_wire
 
 logger = logging.getLogger(__name__)
 
@@ -518,11 +519,18 @@ class VllmLauncher(RustLauncher):
     startup_ceiling_secs_env = STARTUP_CEILING_SECS_ENV
     kv_events_env = KV_EVENTS_ENV
     without_tokenizer = "string stops will be refused"
+    warmup_env = WARMUP_ENV
 
     def __init__(self) -> None:
         self.vllm_config: Any = None
         self.media: Any = None
         self.encoder_budget: int = 0
+
+    def warmup_inputs(self, args: argparse.Namespace, facts: Mapping[str, Any]) -> Any:
+        return warmup_inputs_from_config(self.vllm_config)
+
+    def warmup_wire(self, target: str) -> Any:
+        return warmup_wire(target)
 
     def prepare(self, args: argparse.Namespace) -> None:
         configure_logging()

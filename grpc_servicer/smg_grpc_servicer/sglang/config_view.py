@@ -40,6 +40,12 @@ class ServerArgsSection:
     revision: Any
     # The operator's ``--max-running-requests`` when it is a count, else ``None``.
     max_running_requests: int | None
+    # The scheduler's step budget in prompt tokens, when the args carry one as
+    # a count: the chunk size under chunked prefill, else the prefill budget.
+    chunked_prefill_size: int | None
+    max_prefill_tokens: int | None
+    # The operator's context length when the args carry one, else ``None``.
+    context_length: int | None
     # The data-parallel width when the args carry a count, else ``None``.
     dp_size: int | None
     enable_dp_attention: bool
@@ -66,6 +72,9 @@ class ServerArgsSection:
             preferred_sampling_params=getattr(server_args, "preferred_sampling_params", None),
             revision=getattr(server_args, "revision", None),
             max_running_requests=positive_int(getattr(server_args, "max_running_requests", None)),
+            chunked_prefill_size=positive_int(getattr(server_args, "chunked_prefill_size", None)),
+            max_prefill_tokens=positive_int(getattr(server_args, "max_prefill_tokens", None)),
+            context_length=positive_int(getattr(server_args, "context_length", None)),
             dp_size=positive_int(getattr(server_args, "dp_size", None)),
             enable_dp_attention=bool(getattr(server_args, "enable_dp_attention", False)),
             attn_dp_size=positive_int(getattr(server_args, "attn_dp_size", None)),

@@ -281,6 +281,49 @@ def test_generation_warmup_sends_valid_sampling_defaults(monkeypatch, server_mod
     channel.close.assert_called_once()
 
 
+def test_a_failed_planned_warm_up_never_ends_the_server(monkeypatch, server_mod, caplog):
+    """The planned pass is an optimisation: when it raises past its own
+    guards, the first warm-up request still counts and the process stays up
+    (the outer guard of the warm-up would otherwise kill the process tree)."""
+    caplog.set_level(logging.ERROR)
+    complete = Mock()
+    complete.HasField.return_value = True
+    stub = Mock()
+    stub.GetModelInfo.return_value = pb.GetModelInfoResponse(is_generation=True)
+    stub.Generate.return_value = [complete]
+    channel = Mock()
+    killed = Mock()
+
+    monkeypatch.setattr(
+        server_mod.grpc, "insecure_channel", Mock(return_value=channel), raising=False
+    )
+    monkeypatch.setattr(server_mod, "sglang_scheduler_pb2", pb)
+    monkeypatch.setattr(
+        server_mod,
+        "sglang_scheduler_pb2_grpc",
+        SimpleNamespace(SglangSchedulerStub=lambda _channel: stub),
+    )
+    monkeypatch.setattr(
+        server_mod, "DisaggregationMode", SimpleNamespace(NULL=SimpleNamespace(value="null"))
+    )
+    monkeypatch.setattr(server_mod.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(server_mod, "kill_process_tree", killed)
+
+    def broken(_server_args, _facts):
+        raise AttributeError("no such argument on this engine release")
+
+    monkeypatch.setattr(server_mod, "warmup_inputs", broken)
+
+    server_args = SimpleNamespace(host="127.0.0.1", port=30000, disaggregation_mode="null")
+    assert server_mod._execute_grpc_server_warmup(server_args) is True
+    killed.assert_not_called()
+    channel.close.assert_called_once()
+    assert any(
+        "The planned warm-up failed; the server serves without it" in r.getMessage()
+        for r in caplog.records
+    )
+
+
 def _serving_server(monkeypatch, server_mod, events, *, scheduler_exited):
     """`serve_grpc` up to the wait for the scheduler, every collaborator stood in
     for; the wait reports `scheduler_exited`."""

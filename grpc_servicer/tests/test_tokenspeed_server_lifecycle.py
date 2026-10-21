@@ -485,3 +485,48 @@ def test_a_host_with_no_free_publisher_port_is_a_named_exit_on_the_python_path_t
     assert raised.value.code == 2
     assert refusal in caplog.text and "--kv-events-config" in caplog.text
     launched.assert_not_called()
+
+
+def test_a_failed_planned_warm_up_still_flips_the_worker_to_serving(
+    monkeypatch, server_mod, caplog
+):
+    """The planned pass is an optimisation: when it raises past its own
+    guards, the one-token warm-up still counts and the health flips to
+    SERVING (a raise would otherwise leave the warm-up thread before it)."""
+    caplog.set_level(logging.ERROR)
+    final = Mock()
+    final.HasField.return_value = True
+    stub = Mock()
+    stub.GetModelInfo.return_value = SimpleNamespace(max_context_length=4096, vocab_size=32000)
+    stub.Generate.return_value = [final]
+    channel = Mock()
+    monkeypatch.setattr(server_mod.grpc, "insecure_channel", Mock(return_value=channel))
+    monkeypatch.setattr(
+        server_mod.tokenspeed_scheduler_pb2_grpc, "TokenSpeedSchedulerStub", lambda _channel: stub
+    )
+    monkeypatch.setattr(
+        server_mod,
+        "tokenspeed_scheduler_pb2",
+        SimpleNamespace(
+            GetModelInfoRequest=lambda: None,
+            GenerateRequest=lambda **kwargs: SimpleNamespace(**kwargs),
+            TokenizedInput=lambda **kwargs: SimpleNamespace(**kwargs),
+            SamplingParams=lambda **kwargs: SimpleNamespace(**kwargs),
+        ),
+    )
+
+    def broken(_server_args, _facts):
+        raise AttributeError("no such argument on this engine release")
+
+    monkeypatch.setattr(server_mod, "warmup_inputs", broken)
+    health = SimpleNamespace(set_serving=Mock())
+    server_args = SimpleNamespace(host="127.0.0.1", port=30000, disaggregation_mode="null")
+
+    server_mod._wait_and_warmup(server_args, health)
+
+    health.set_serving.assert_called_once_with()
+    channel.close.assert_called_once()
+    assert any(
+        "The planned warm-up failed; the server serves without it" in r.getMessage()
+        for r in caplog.records
+    )

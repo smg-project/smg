@@ -15,6 +15,7 @@ from smg_grpc_servicer.health_frame import NOT_SERVING, SERVING, HealthFrame
 # The launcher imports this module before it defines serve_grpc: the moment
 # the servicer switch has to be in place (see launcher_switch).
 from smg_grpc_servicer.vllm.launcher_switch import install_launcher_switch
+from smg_grpc_servicer.vllm.warmup import warmup_in_progress
 
 install_launcher_switch()
 
@@ -35,7 +36,11 @@ class VllmHealthServicer(HealthFrame):
        - for readiness probes
 
     Health is determined by calling async_llm.check_health(), the same
-    EngineClient protocol method used by vLLM's HTTP /health endpoint.
+    EngineClient protocol method used by vLLM's HTTP /health endpoint; while
+    the servicer's planned warm-up runs over the engine
+    (:mod:`smg_grpc_servicer.vllm.warmup`), both services answer NOT_SERVING,
+    so nothing is routed here before the engine's lazily tuned shapes are paid
+    for.
     """
 
     VLLM_SERVICE = "vllm.grpc.engine.VllmEngine"
@@ -62,6 +67,8 @@ class VllmHealthServicer(HealthFrame):
         return self._shutting_down
 
     async def engine_status(self, service_name: str) -> int:
+        if warmup_in_progress():
+            return NOT_SERVING
         try:
             await self.async_llm.check_health()
         except Exception:

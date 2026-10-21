@@ -362,6 +362,21 @@ class EngineConfigView:
         return positive_int(getattr(scheduler, "max_num_seqs", None)) or 0
 
     @cached_property
+    def max_num_batched_tokens(self) -> int:
+        """The scheduler's admission step (``--max-num-batched-tokens``), as
+        the engine resolved it; 0 when the config does not carry a count."""
+        scheduler = getattr(self._config, "scheduler_config", None)
+        return positive_int(getattr(scheduler, "max_num_batched_tokens", None)) or 0
+
+    @cached_property
+    def cudagraph_capture_sizes(self) -> tuple[int, ...]:
+        """The token counts the engine captures graphs for, as its
+        compilation config resolved them; empty when it carries none."""
+        compilation = getattr(self._config, "compilation_config", None)
+        sizes = getattr(compilation, "cudagraph_capture_sizes", None) or ()
+        return tuple(sorted({size for size in sizes if positive_int(size)}))
+
+    @cached_property
     def cache(self) -> CacheSection:
         return CacheSection.read(self._config)
 

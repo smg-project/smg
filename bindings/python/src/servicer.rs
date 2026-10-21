@@ -864,9 +864,17 @@ impl PyVllmGrpcServer {
         self.inner.active_requests()
     }
 
-    /// Announce SERVING (`True`) or drain (`False`); health flips at once.
+    /// Announce SERVING (`True`) or drain (`False`); health flips at once and
+    /// admission closes with the drain.
     fn set_serving(&self, serving: bool) {
         self.inner.set_serving(serving);
+    }
+
+    /// Hold (`False`) or release (`True`) readiness alone: health flips,
+    /// admission stays open for the launcher's own requests before SERVING
+    /// (its planned warm-up); `set_serving(False)` is the drain switch.
+    fn set_ready(&self, ready: bool) {
+        self.inner.set_ready(ready);
     }
 
     /// Stop the server: open streams are cancelled, connections get most of
@@ -1058,9 +1066,17 @@ impl PyTokenSpeedGrpcServer {
         self.inner.active_requests()
     }
 
-    /// Announce SERVING (`True`) or drain (`False`); health flips at once.
+    /// Announce SERVING (`True`) or drain (`False`); health flips at once and
+    /// admission closes with the drain.
     fn set_serving(&self, serving: bool) {
         self.inner.set_serving(serving);
+    }
+
+    /// Hold (`False`) or release (`True`) readiness alone: health flips,
+    /// admission stays open for the launcher's own requests before SERVING
+    /// (its planned warm-up); `set_serving(False)` is the drain switch.
+    fn set_ready(&self, ready: bool) {
+        self.inner.set_ready(ready);
     }
 
     /// Stop the server: open streams are cancelled, connections get most of
@@ -1246,9 +1262,17 @@ impl PySglangGrpcServer {
         self.inner.active_requests()
     }
 
-    /// Announce SERVING (`True`) or drain (`False`); health flips at once.
+    /// Announce SERVING (`True`) or drain (`False`); health flips at once and
+    /// admission closes with the drain.
     fn set_serving(&self, serving: bool) {
         self.inner.set_serving(serving);
+    }
+
+    /// Hold (`False`) or release (`True`) readiness alone: health flips,
+    /// admission stays open for the launcher's own requests before SERVING
+    /// (its planned warm-up); `set_serving(False)` is the drain switch.
+    fn set_ready(&self, ready: bool) {
+        self.inner.set_ready(ready);
     }
 
     /// Stop the server: open streams are cancelled, connections get most of
