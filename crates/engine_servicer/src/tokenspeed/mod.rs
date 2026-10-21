@@ -394,9 +394,15 @@ impl TokenSpeedServicerServer {
     }
 
     /// Announce SERVING (`true`) or drain (`false`): health flips at once,
-    /// in-flight streams keep running until `stop`.
+    /// new admission closes while in-flight streams keep running until `stop`.
     pub fn set_serving(&self, serving: bool) {
+        self.state.registry.set_accepting(serving);
         self.state.serving.store(serving, Ordering::Release);
+    }
+
+    /// Admitted requests still preprocessing, streaming, or unwinding an abort.
+    pub fn active_requests(&self) -> usize {
+        self.state.registry.active()
     }
 
     /// Signal shutdown and wait up to `timeout` for the server thread;

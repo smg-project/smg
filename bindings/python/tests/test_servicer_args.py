@@ -92,6 +92,7 @@ def test_a_bad_servicer_argument_is_refused_with_one_message_by_every_class(
 
 @pytest.mark.parametrize("server", SERVERS, ids=class_name)
 def test_every_class_starts_and_stops_on_the_servicers_block_alone(server, tmp_path):
+    """All bindings expose an empty request count before and during drain."""
     # The listener is bound and the engine's handshake endpoint opened under
     # the test's own directory; no engine dials in, and ``stop`` ends the wait.
     started = server(
@@ -107,6 +108,9 @@ def test_every_class_starts_and_stops_on_the_servicers_block_alone(server, tmp_p
         assert int(port) > 0
         assert started.running
         assert not started.engine_ready
+        assert started.active_requests == 0
+        started.set_serving(False)
+        assert started.active_requests == 0
     finally:
         started.stop(timeout_secs=5.0)
     assert not started.running

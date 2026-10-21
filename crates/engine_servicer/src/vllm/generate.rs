@@ -128,11 +128,13 @@ async fn submit(
     let request_id = req.request_id.clone();
     // Register before anything slow: an `Abort` landing while the media is
     // processed must find the entry, and a duplicate id is refused up front.
-    let (registration, cancel) = state.registry.register(&request_id).inspect_err(|_| {
+    let (registration, cancel) = state.registry.register(&request_id).inspect_err(|error| {
         // The id names a request that is still live; a notice under it would
         // reuse it (and, past an `n > 1` fan-out, get in and free the live
         // side's blocks).
-        notice.disarm();
+        if error.code() == tonic::Code::AlreadyExists {
+            notice.disarm();
+        }
     })?;
     // Worker-side media: the request's references become engine features
     // and its prompt the expanded one, before the frontend duties below.

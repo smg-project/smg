@@ -446,6 +446,8 @@ async fn streams_chunks_then_a_cumulative_complete() {
         .expect("generate")
         .into_inner();
 
+    assert_eq!(h.server.active_requests(), 1);
+    h.server.set_serving(false);
     let request = recv_add(&mut h.engine_in).await;
     assert_eq!(request.request_id, "r1");
     assert_eq!(request.prompt_token_ids, Some(vec![1, 2, 3]));
@@ -500,6 +502,7 @@ async fn streams_chunks_then_a_cumulative_complete() {
     assert_eq!(done.finish_reason, "length");
     assert_eq!(done.completion_tokens, 2);
     assert!(stream.message().bounded().await.unwrap().is_none());
+    assert_eq!(h.server.active_requests(), 0);
 }
 
 /// A non-streaming request gets the terminal `Complete` only, as from the
@@ -3844,4 +3847,22 @@ async fn expanded_context_rejection_preserves_pd_cleanup() {
         assert_eq!(accepted.prompt_token_ids, Some(vec![7, 8, 9, 10]));
         h.server.stop(Duration::from_secs(5)).expect("clean stop");
     }
+}
+
+/// Refusing a decode request during drain still releases its remote prefill blocks.
+#[tokio::test]
+async fn drain_refuses_new_decode_requests_but_keeps_the_rejection_notice() {
+    let mut h = harness(model_info(), None).await;
+    h.server.set_serving(false);
+    assert_eq!(h.server.active_requests(), 0);
+    let mut request = generate_request("draining", true, Vec::new());
+    request.kv_transfer_params_json =
+        Some(r#"{"do_remote_prefill":true,"remote_block_ids":[3]}"#.to_string());
+    let status = h.client.generate(request).await.expect_err("draining");
+    assert_eq!(status.code(), Code::Unavailable);
+    let notice = recv_add(&mut h.engine_in).await;
+    assert_eq!(notice.request_id, "draining");
+    assert!(notice.abort_immediately);
+    assert_eq!(h.server.active_requests(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }

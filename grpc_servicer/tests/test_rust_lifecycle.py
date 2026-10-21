@@ -1067,3 +1067,124 @@ def test_the_kv_events_default_announcement_is_one_line_for_both_implementations
         f"it; pass --kv-events-config to name the endpoint, or set {env}=0 to leave it off"
     )
     assert [record.getMessage() for record in caplog.records] == [line, line]
+
+
+@pytest.mark.parametrize("counts", [[0], [2, 1, 0]])
+def test_drain_finishes_when_requests_reach_zero(counts):
+    """An idle or completed server exits well before the configured deadline."""
+
+    class Server:
+        running = True
+        last_error = None
+
+        @property
+        def active_requests(self):
+            """Advance the simulated request lifetimes at each poll."""
+            return counts.pop(0)
+
+    async def run():
+        """Bound the test independently of the long drain deadline."""
+        engine = types.SimpleNamespace(poll=lambda: None)
+        return await asyncio.wait_for(rust_lifecycle.drain_server(Server(), engine, 1100, 0.001), 1)
+
+    assert asyncio.run(run())
+    assert not counts
+
+
+@pytest.mark.parametrize("count", [None, 1])
+def test_drain_deadline_bounds_active_requests_and_older_bindings(count):
+    """Pending work and old bindings retain the bounded grace period."""
+    server = types.SimpleNamespace(running=True, last_error=None)
+    if count is not None:
+        server.active_requests = count
+    engine = types.SimpleNamespace(poll=lambda: None)
+
+    async def run():
+        """Measure that pending requests receive their full grace period."""
+        start = asyncio.get_running_loop().time()
+        assert await rust_lifecycle.drain_server(server, engine, 0.01, 0.002)
+        assert asyncio.get_running_loop().time() - start >= 0.01
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("failure", ["engine", "server", "error"])
+def test_drain_detects_failure_without_waiting_for_deadline(failure):
+    """Each supervised failure interrupts draining promptly."""
+    server = types.SimpleNamespace(running=True, last_error=None, active_requests=1)
+    engine = types.SimpleNamespace(poll=lambda: None)
+
+    async def run():
+        """Inject the failure after draining has started."""
+        task = asyncio.create_task(rust_lifecycle.drain_server(server, engine, 1100, 0.001))
+        await asyncio.sleep(0)
+        if failure == "engine":
+            engine.poll = lambda: 1
+        elif failure == "server":
+            server.running = False
+        else:
+            server.last_error = "failed"
+        assert not await asyncio.wait_for(task, 1)
+
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("cancel_drain", [False, True])
+def test_supervise_stops_server_then_engine_even_if_drain_is_cancelled(monkeypatch, cancel_drain):
+    """Normal completion and cancellation preserve teardown order."""
+    events = []
+    server = types.SimpleNamespace(
+        running=True,
+        last_error=None,
+        active_requests=int(cancel_drain),
+        set_serving=lambda serving: events.append(("serving", serving)),
+        stop=lambda timeout: events.append("server stopped"),
+    )
+    engine = types.SimpleNamespace(poll=lambda: None)
+    monkeypatch.setattr(
+        rust_lifecycle, "terminate_engine", lambda _: events.append("engine stopped")
+    )
+
+    async def run():
+        """Start shutdown and optionally cancel its drain wait."""
+        stop = asyncio.Event()
+        stop.set()
+        task = asyncio.create_task(
+            rust_lifecycle.supervise(server, engine, stop_event=stop, drain_secs=1100)
+        )
+        if cancel_drain:
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            assert await asyncio.wait_for(task, 1) == 0
+
+    asyncio.run(run())
+    assert events == [("serving", False), "server stopped", "engine stopped"]
+
+
+@pytest.mark.parametrize("failure", ["engine", "server", "error"])
+def test_supervise_reports_a_failure_at_the_drain_boundary(monkeypatch, failure):
+    """A signal racing with a failure must still produce a failing exit code."""
+    events = []
+    server = types.SimpleNamespace(
+        running=failure != "server",
+        last_error="failed" if failure == "error" else None,
+        active_requests=0,
+        set_serving=lambda serving: events.append(("serving", serving)),
+        stop=lambda timeout: events.append("server stopped"),
+    )
+    engine = types.SimpleNamespace(poll=lambda: 1 if failure == "engine" else None)
+    monkeypatch.setattr(
+        rust_lifecycle, "terminate_engine", lambda _: events.append("engine stopped")
+    )
+
+    async def run():
+        """Enter supervision with the shutdown signal already pending."""
+        stop = asyncio.Event()
+        stop.set()
+        return await rust_lifecycle.supervise(server, engine, stop_event=stop, drain_secs=1100)
+
+    assert asyncio.run(run()) == 1
+    assert events == [("serving", False), "server stopped", "engine stopped"]

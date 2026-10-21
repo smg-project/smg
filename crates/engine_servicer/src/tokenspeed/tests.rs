@@ -504,6 +504,15 @@ async fn streaming_generate_maps_steps_to_chunks_and_a_complete() {
         .expect("generate")
         .into_inner();
 
+    assert_eq!(h.server.active_requests(), 1);
+    h.server.set_serving(false);
+    let status = h
+        .client
+        .generate(generate_request("late", true, Vec::new()))
+        .await
+        .expect_err("draining");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert_eq!(h.server.active_requests(), 1);
     let request = recv_add(&mut h.engine_in).await;
     assert_eq!(request.rid, "r1");
     assert_eq!(request.input_ids, vec![1, 2, 3]);
@@ -530,6 +539,7 @@ async fn streaming_generate_maps_steps_to_chunks_and_a_complete() {
     assert_eq!(done.completion_tokens, 2);
     assert_eq!(done.index, 0);
     assert!(stream.message().bounded().await.unwrap().is_none());
+    assert_eq!(h.server.active_requests(), 0);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 

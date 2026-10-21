@@ -1000,6 +1000,30 @@ def terminate_engine(engine: Any, timeout: float = ENGINE_TERMINATE_SECS) -> Non
         )
 
 
+async def drain_server(server: Any, engine: Any, timeout: float, poll_secs: float) -> bool:
+    """Wait at most ``timeout`` for admitted requests; false means a failure.
+
+    Older bindings without a count retain their bounded grace period.
+    Health/admission must already have been closed by ``set_serving(False)``.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    logger.info("Draining for up to %.1fs before stopping", timeout)
+    while True:
+        if engine.poll() is not None or server.last_error or not server.running:
+            logger.error("Engine or Rust servicer failed during drain")
+            return False
+        active = getattr(server, "active_requests", None)
+        if active == 0:
+            logger.info("Drain complete; no requests remain")
+            return True
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            logger.info("Drain deadline reached; active requests: %s", active)
+            return True
+        await asyncio.sleep(min(poll_secs, remaining))
+
+
 async def supervise(
     server: Any,
     engine: Any,
@@ -1019,7 +1043,7 @@ async def supervise(
     server first reports it connected, its start and its spawning over.
 
     Signals drain: health flips to NOT_SERVING at once (the Router stops
-    routing here), in-flight streams get ``drain_secs`` to finish with the
+    routing here), in-flight streams get up to ``drain_secs`` to finish with the
     engine still up, then the server stops and the engine is terminated.
     Returns the process exit code.
     """
@@ -1060,11 +1084,15 @@ async def supervise(
                 pass
     finally:
         mark_not_serving(server)
-        if stop_event.is_set() and drain_secs > 0 and engine.poll() is None:
-            logger.info("Draining for %.1fs before stopping", drain_secs)
-            await asyncio.sleep(drain_secs)
-        await stop_server(server, stop_timeout)
-        terminate_engine(engine)
+        try:
+            if stop_event.is_set() and drain_secs > 0:
+                if not await drain_server(server, engine, drain_secs, poll_secs):
+                    exit_code = 1
+        finally:
+            try:
+                await stop_server(server, stop_timeout)
+            finally:
+                terminate_engine(engine)
     return exit_code
 
 

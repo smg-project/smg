@@ -858,6 +858,12 @@ impl PyVllmGrpcServer {
         self.inner.last_error().map_err(to_py_err)
     }
 
+    /// Admitted requests whose processing or response stream has not ended.
+    #[getter]
+    fn active_requests(&self) -> usize {
+        self.inner.active_requests()
+    }
+
     /// Announce SERVING (`True`) or drain (`False`); health flips at once.
     fn set_serving(&self, serving: bool) {
         self.inner.set_serving(serving);
@@ -1046,6 +1052,12 @@ impl PyTokenSpeedGrpcServer {
         self.inner.last_error().map_err(to_py_err)
     }
 
+    /// Admitted requests whose processing or response stream has not ended.
+    #[getter]
+    fn active_requests(&self) -> usize {
+        self.inner.active_requests()
+    }
+
     /// Announce SERVING (`True`) or drain (`False`); health flips at once.
     fn set_serving(&self, serving: bool) {
         self.inner.set_serving(serving);
@@ -1226,6 +1238,12 @@ impl PySglangGrpcServer {
     #[getter]
     fn last_error(&self) -> PyResult<Option<String>> {
         self.inner.last_error().map_err(to_py_err)
+    }
+
+    /// Admitted requests whose processing or response stream has not ended.
+    #[getter]
+    fn active_requests(&self) -> usize {
+        self.inner.active_requests()
     }
 
     /// Announce SERVING (`True`) or drain (`False`); health flips at once.

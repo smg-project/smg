@@ -7,7 +7,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
 };
@@ -43,6 +43,8 @@ pub(crate) const SHUTDOWN_MESSAGE: &str =
 pub(crate) struct RequestRegistry {
     entries: Mutex<HashMap<String, (u64, oneshot::Sender<CancelReason>)>>,
     generation: AtomicU64,
+    draining: AtomicBool,
+    active: AtomicUsize,
 }
 
 /// Keeps a request's registry entry for the stream's lifetime; dropping it
@@ -55,7 +57,9 @@ pub(crate) struct Registration {
 }
 
 impl Drop for Registration {
+    /// Release this lifetime independently of the cancellation-map entry.
     fn drop(&mut self) {
+        self.registry.active.fetch_sub(1, Ordering::AcqRel);
         if let Ok(mut entries) = self.registry.entries.lock() {
             if entries
                 .get(&self.request_id)
@@ -86,7 +90,11 @@ impl RequestRegistry {
                 "request {request_id} is already in flight"
             )));
         }
+        if self.draining.load(Ordering::Acquire) {
+            return Err(Status::unavailable("servicer is draining"));
+        }
         entries.insert(request_id.to_string(), (generation, cancel_tx));
+        self.active.fetch_add(1, Ordering::AcqRel);
         drop(entries);
         Ok((
             Registration {
@@ -96,6 +104,19 @@ impl RequestRegistry {
             },
             cancel_rx,
         ))
+    }
+
+    /// Serialize admission with the drain boundary. Once closed, a zero
+    /// active count cannot race with a newly admitted request.
+    pub(crate) fn set_accepting(&self, accepting: bool) {
+        let _entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        self.draining.store(!accepting, Ordering::Release);
+    }
+
+    /// Count request lifetimes, including aborted streams still unwinding.
+    /// The cancellation map alone loses those entries before their cleanup.
+    pub(crate) fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
     }
 
     /// Fire the cancellation of every given id that is live, as the caller's
@@ -176,6 +197,31 @@ mod tests {
     };
 
     use super::*;
+
+    /// Aborting removes the handle, but only dropping the guard finishes a request.
+    #[test]
+    fn drain_closes_admission_and_counts_aborted_lifetimes() {
+        let registry = Arc::new(RequestRegistry::default());
+        let (first, _cancel) = registry.register("first").unwrap();
+        assert_eq!(registry.active(), 1);
+        registry.abort(&["first".to_string()]).unwrap();
+        assert_eq!(registry.len(), 0);
+        assert_eq!(registry.active(), 1);
+        let (second, _cancel) = registry.register("first").unwrap();
+        registry.set_accepting(false);
+        assert!(
+            matches!(registry.register("late"), Err(e) if e.code() == tonic::Code::Unavailable)
+        );
+        drop(first);
+        assert_eq!(registry.active(), 1);
+        assert_eq!(registry.len(), 1);
+        registry.cancel_all().unwrap();
+        assert_eq!(registry.active(), 1);
+        drop(second);
+        assert_eq!(registry.active(), 0);
+        registry.set_accepting(true);
+        assert!(registry.register("resumed").is_ok());
+    }
 
     /// A choice as the shutdown sees it, in the shape of the servicers' own:
     /// a `Complete` queued for the next poll, an engine stream that may hold
