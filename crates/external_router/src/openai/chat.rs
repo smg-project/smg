@@ -8,7 +8,10 @@ use axum::{
     response::Response,
 };
 use futures_util::StreamExt;
-use openai_protocol::{chat::ChatCompletionRequest, common::to_value_exact, model_type::Endpoint};
+use openai_protocol::{
+    chat::ChatCompletionRequest, common::to_value_exact, model_type::Endpoint,
+    profile::ProviderProfile,
+};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -117,6 +120,18 @@ async fn buffered_body(resp: reqwest::Response, status: StatusCode) -> Response 
     }
 }
 
+/// The chat request as the upstream reads it: this router forwards the typed
+/// request to a server that renders the prompt itself, so the vendor
+/// profile's reading of a field the gateway's own renderer reads differently
+/// (a DeepSeek V4.1 `medium` effort: the template's level there, the
+/// vendor's `high` here) is applied once, where the request is committed to
+/// the upstream, as the gateway's HTTP routers do. The profile is the one
+/// request validation selected, from the model the client asked for.
+fn chat_for_upstream(mut body: ChatCompletionRequest) -> ChatCompletionRequest {
+    ProviderProfile::for_model(&body.model).normalize_chat_for_upstream(&mut body);
+    body
+}
+
 /// Route a chat completion request to the appropriate upstream worker.
 pub(super) async fn route_chat(
     deps: &ChatRouterContext<'_>,
@@ -128,6 +143,7 @@ pub(super) async fn route_chat(
     let start = Instant::now();
     let model = model_id;
     let streaming = body.stream;
+    let body = chat_for_upstream(body);
 
     Metrics::record_router_request(
         metrics_labels::ROUTER_OPENAI,
@@ -361,6 +377,39 @@ mod tests {
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
             .map(str::to_string)
+    }
+
+    /// A DeepSeek V4.1 `medium` effort goes to the upstream as the vendor's
+    /// `high`, in both top-level spellings; a chat-template kwarg and another
+    /// vendor's request go out as sent.
+    #[test]
+    fn a_v41_medium_effort_reaches_the_upstream_as_the_vendors_high() {
+        let request = |model: &str| {
+            serde_json::from_value::<ChatCompletionRequest>(serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "reasoning_effort": "medium",
+                "thinking": {"effort": "medium"},
+                "chat_template_kwargs": {"reasoning_effort": "medium"},
+            }))
+            .unwrap()
+        };
+        let body = chat_for_upstream(request("deepseek-v4.1-flash"));
+        assert_eq!(body.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            body.thinking
+                .as_ref()
+                .and_then(|thinking| thinking.effort.as_deref()),
+            Some("high")
+        );
+        assert_eq!(
+            body.chat_template_kwargs
+                .as_ref()
+                .and_then(|kwargs| kwargs.get("reasoning_effort")),
+            Some(&serde_json::json!("medium"))
+        );
+        let body = chat_for_upstream(request("gpt-4o"));
+        assert_eq!(body.reasoning_effort.as_deref(), Some("medium"));
     }
 
     #[tokio::test]
