@@ -829,7 +829,7 @@ impl SchedulerPermit {
     }
 
     /// Mark the first response byte. Called by the edge's body wrapper (the
-    /// [`Permit`] below) on the first data frame. Returns `false` if the
+    /// `Permit` below) on the first data frame. Returns `false` if the
     /// scheduler already won the preemption CAS — the body wrapper treats
     /// that as "preempted, end the stream." The TTFT value is `admitted_at`
     /// elapsed in millis, clamped by the handle to `[1, u64::MAX - 1]`.

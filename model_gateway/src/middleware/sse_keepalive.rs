@@ -6,8 +6,8 @@
 //! the gateway cuts a connection that carries no byte for its idle window
 //! (sixty seconds is a common setting), and the client sees a stream that
 //! ends before it began. [`sse_keepalive_middleware`] gives every SSE
-//! response a [`KeepAlive`], carried by the edge's one body wrapper (the
-//! metrics layer's [`EdgeBody`](super::edge_body::EdgeBody)), so an interval
+//! response a `KeepAlive`, carried by the edge's one body wrapper (the
+//! metrics layer's `EdgeBody`), so an interval
 //! of silence is broken by a frame the client ignores: an SSE comment on the
 //! OpenAI-shaped routes, the `ping` event the Messages API specifies on
 //! `/v1/messages`. The interval runs from the headers and from every frame

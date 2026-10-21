@@ -3,7 +3,7 @@
 //! and echoes it back via `x-request-id`.
 //!
 //! An inbound id is honoured when it is one to
-//! [`MAX_INBOUND_REQUEST_ID_LEN`] visible-ASCII characters. Anything else
+//! `MAX_INBOUND_REQUEST_ID_LEN` visible-ASCII characters. Anything else
 //! (longer, empty, a space or control character, a byte outside ASCII) is
 //! dropped for a generated id: the value is neither echoed nor logged, and
 //! the header on the request is rewritten to carry the chosen id as its only

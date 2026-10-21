@@ -8,7 +8,7 @@
 //! not entered per body frame, so a long SSE stream costs no span bookkeeping
 //! per chunk. The span stays open until the body ends, so an exported trace
 //! still covers the whole stream: it rides on the edge's one body wrapper
-//! (the metrics layer's [`EdgeBody`](super::edge_body::EdgeBody)), handed
+//! (the metrics layer's `EdgeBody`), handed
 //! over through the response's extensions with the client-close line the
 //! access log owes if the body is dropped first.
 

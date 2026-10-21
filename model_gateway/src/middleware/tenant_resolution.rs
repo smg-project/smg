@@ -158,7 +158,7 @@ fn extract_trusted_tenant_id<'a>(
 }
 
 /// The request's route meta, or the answer a request with an unusable tenant
-/// header gets (see [`resolve_raw_tenant_key`]).
+/// header gets (see `resolve_raw_tenant_key`).
 pub fn resolve_route_request_meta(
     state: &TenantResolutionState,
     request: &Request<Body>,

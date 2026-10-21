@@ -8,10 +8,10 @@
 //! ends) and the SSE keep-alive (a frame after an interval of silence). Each
 //! used to wrap the body in a boxed `Body` type of its own, so a streamed
 //! frame crossed four boxed `poll_frame`s, and two of them evaluated the
-//! "has the body ended" rule. The body is wrapped once instead: [`EdgeBody`],
+//! "has the body ended" rule. The body is wrapped once instead: `EdgeBody`,
 //! built by the metrics layer, the outermost of the four, which wraps every
 //! response. The layers inside hand it what they used to keep in their own
-//! wrappers through the response's extensions ([`BodyDuties`]) and wrap
+//! wrappers through the response's extensions (`BodyDuties`) and wrap
 //! nothing themselves.
 //!
 //! The hand-over rides on the response's extensions, so it holds across the
@@ -20,7 +20,7 @@
 //! modify phases do, with `Response::builder()`) drops the duties handed so
 //! far with the old response: the permit and the keep-alive end there, as
 //! their in-body wrappers did when such a layer drained the old body, and
-//! the span closes with the head ([`BodyDuties`]' drop). A layer that
+//! the span closes with the head (`BodyDuties`' drop). A layer that
 //! replaces the body but keeps the parts (the Messages error envelope) keeps
 //! them.
 //!
