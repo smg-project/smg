@@ -313,16 +313,18 @@ impl GrpcRouter {
         response
     }
 
-    /// Main route_chat implementation
-    async fn route_chat_impl(
+    /// The chat request as the pipeline takes it: validated, its `model`
+    /// field canonical, in the `Arc` the request context holds, with the
+    /// pipeline that serves it. Done before the async hops of
+    /// [`Self::route_chat_impl`], so that only the handle travels through
+    /// their state machines, not a copy of the 1 KiB request per hop.
+    fn chat_request_for_pipeline(
         &self,
-        headers: Option<&HeaderMap>,
-        tenant_meta: &TenantRequestMeta,
         body: ChatCompletionRequest,
         model_id: &str,
-    ) -> Response {
+    ) -> Result<(Arc<ChatCompletionRequest>, String, &RequestPipeline), Response> {
         if let Err(response) = super::validate_text_only_output(&body) {
-            return *response;
+            return Err(*response);
         }
 
         // EPD has no Harmony pipeline, so its chat requests all use the single
@@ -349,16 +351,28 @@ impl GrpcRouter {
         // response metadata and parser selection to read.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
-        canonical_body.model = model_id_cloned.clone();
+        canonical_body.model.clone_from(&model_id_cloned);
+        Ok((Arc::new(canonical_body), model_id_cloned, pipeline))
+    }
 
+    /// Main route_chat implementation, over the request
+    /// [`Self::chat_request_for_pipeline`] prepared.
+    async fn route_chat_impl(
+        &self,
+        headers: Option<&HeaderMap>,
+        tenant_meta: &TenantRequestMeta,
+        body: Arc<ChatCompletionRequest>,
+        model_id: String,
+        pipeline: &RequestPipeline,
+    ) -> Response {
         // The request Arc moves into the pipeline: no handle survives out
         // here, so the parsed request frees at the build boundary.
         self.execute_reserved(
-            model_id_cloned,
+            model_id,
             |model_id, rate_limit_cell, retry_config| async move {
                 pipeline
                     .execute_chat(
-                        Arc::new(canonical_body),
+                        body,
                         headers.cloned(),
                         model_id,
                         self.shared_components.clone(),
@@ -417,7 +431,7 @@ impl GrpcRouter {
 
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
         // doc comment. Rewrite the body's `model` field to match; see
-        // `route_chat_impl`.
+        // `chat_request_for_pipeline`.
         let model_id_cloned = self.resolve_canonical_model_id(&resolved_model_id);
         let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
@@ -722,7 +736,7 @@ impl GrpcRouter {
 
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
         // doc comment. Rewrite the body's `model` field to match; see
-        // `route_chat_impl`.
+        // `chat_request_for_pipeline`.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
@@ -979,7 +993,7 @@ impl GrpcRouter {
 
         // Canonicalize once, up front -- see `resolve_canonical_model_id`'s
         // doc comment. Rewrite the body's `model` field to match; see
-        // `route_chat_impl`.
+        // `chat_request_for_pipeline`.
         let model_id_cloned = self.resolve_canonical_model_id(model_id);
         let mut canonical_body = body;
         canonical_body.model = model_id_cloned.clone();
@@ -1133,8 +1147,13 @@ impl RouterTrait for GrpcRouter {
         body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.route_chat_impl(headers, tenant_meta, body, model_id)
-            .await
+        match self.chat_request_for_pipeline(body, model_id) {
+            Ok((body, model_id, pipeline)) => {
+                self.route_chat_impl(headers, tenant_meta, body, model_id, pipeline)
+                    .await
+            }
+            Err(response) => response,
+        }
     }
 
     async fn route_responses(
