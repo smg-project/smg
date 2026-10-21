@@ -43,7 +43,7 @@ from smg_grpc_servicer import mm_shm
 from smg_grpc_servicer.health_probe import await_probe
 from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
 from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
-from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
+from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView, advertise_layout
 from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthServicer
 from smg_grpc_servicer.tokenspeed.kv_events import (
     resolve_kv_events_config,
@@ -668,6 +668,8 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
             # single-rank engines simply stay label-free.
             if dp_size is not None and dp_size > 1:
                 server_args_dict["dp_size"] = dp_size
+
+        advertise_layout(server_args_dict, self._config.server_args)
 
         # The operator's PD pairing protocol rides with the server args, so
         # the gateway reads it as the worker's `pairing_protocol` label.

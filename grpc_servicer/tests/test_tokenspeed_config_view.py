@@ -118,6 +118,30 @@ def test_the_attention_dp_width_is_a_count_or_none(mapping, expected):
     assert EngineConfigView(args).server_args.attention_dp_size == expected
 
 
+def _attn(**kw):
+    return SimpleNamespace(attn=SimpleNamespace(**kw))
+
+
+@pytest.mark.parametrize(
+    ("mapping", "expected"),
+    [
+        # SGLang's convention: tp_size is the engine-wide width, every GPU of a
+        # pipeline stage, whatever the attention layout.
+        (_attn(world_size=2, tp_size=2, dp_size=1), 2),
+        (_attn(world_size=8, tp_size=2, dp_size=4), 8),
+        (_attn(world_size=4, tp_size=4, qcp_size=2), 4),
+        (_attn(world_size=4, tp_size=4, kvp_size=2), 4),
+        (_attn(world_size=0), None),
+        (_attn(tp_size=2), None),
+        (None, None),
+    ],
+)
+def test_the_tp_width_is_the_engines_width(mapping, expected):
+    args = _server_args(attn_tp_size=2)
+    args.mapping = mapping
+    assert EngineConfigView(args).server_args.tp_size == expected
+
+
 def test_the_running_window_takes_either_spelling_and_reads_zero_when_unset():
     assert EngineConfigView(SimpleNamespace(max_num_seqs=16)).server_args.running_window == 16
     assert (

@@ -48,6 +48,14 @@ class ServerArgsSection:
     reasoning_parser: Any
     # The attention-DP width (``mapping.attn.dp_size``) when the args carry one.
     attention_dp_size: int | None
+    # The engine-wide TP width, as SGLang reports ``tp_size``: every GPU of a
+    # pipeline stage (``mapping.attn.world_size``), whatever the attention
+    # layout; the attention width is this over ``attention_dp_size``. None
+    # without a resolved layout.
+    tp_size: int | None
+    # The resolved attention TP width (``mapping.attn.tp_size``), advertised
+    # beside ``tp_size`` so the split stays readable where ``dp_size`` is not.
+    attention_tp_size: int | None
     # The admission window, under TokenSpeed's spelling or the frontend's; 0 when unset.
     running_window: int
     page_size: int
@@ -77,6 +85,10 @@ class ServerArgsSection:
             attention_dp_size=positive_int(
                 getattr(getattr(mapping, "attn", None), "dp_size", None)
             ),
+            tp_size=positive_int(getattr(getattr(mapping, "attn", None), "world_size", None)),
+            attention_tp_size=positive_int(
+                getattr(getattr(mapping, "attn", None), "tp_size", None)
+            ),
             running_window=int(
                 getattr(server_args, "max_num_seqs", 0)
                 or getattr(server_args, "max_running_requests", 0)
@@ -90,6 +102,15 @@ class ServerArgsSection:
                 getattr(server_args, "constrained_decoding", None)
             ),
         )
+
+
+def advertise_layout(args: dict[str, Any], section: ServerArgsSection) -> None:
+    """Advertise ``tp_size`` as the engine-wide width, SGLang's convention, and
+    ``attn_tp_size`` as the resolved attention width."""
+    if section.tp_size is not None:
+        args["tp_size"] = section.tp_size
+    if section.attention_tp_size is not None:
+        args["attn_tp_size"] = section.attention_tp_size
 
 
 @dataclasses.dataclass(frozen=True)

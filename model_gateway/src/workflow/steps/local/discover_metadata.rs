@@ -533,11 +533,6 @@ async fn sampling_defaults_label(path: &std::path::Path) -> HashMap<String, Stri
 fn normalize_grpc_keys(labels: &mut HashMap<String, String>) {
     for &(from, to) in &[
         ("tensor_parallel_size", "tp_size"),
-        // TokenSpeed reports no `tp_size`: `attn_tp_size` is its attention
-        // TP width, the full width for a dense model and narrower than
-        // `world_size` only under attention DP or CP. A `tp_size` the engine
-        // does report wins, as for every canonical label below.
-        ("attn_tp_size", "tp_size"),
         ("pipeline_parallel_size", "pp_size"),
         ("context_parallel_size", "cp_size"),
         ("data_parallel_size", "dp_size"),
@@ -749,7 +744,8 @@ mod tests {
     use super::*;
 
     /// Every engine's spelling of the parallelism widths folds into the
-    /// canonical labels, and an existing canonical label is never overwritten.
+    /// canonical labels, an existing canonical label is never overwritten, and
+    /// TokenSpeed's attention width stays a label of its own, not `tp_size`.
     #[test]
     fn normalize_grpc_keys_canonicalises_every_parallelism_spelling() {
         let mut labels: HashMap<String, String> = [
@@ -764,11 +760,14 @@ mod tests {
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
         normalize_grpc_keys(&mut labels);
-        assert_eq!(labels.get("tp_size").map(String::as_str), Some("2"));
+        assert!(
+            !labels.contains_key("tp_size"),
+            "the attention width is not tp_size"
+        );
+        assert_eq!(labels.get("attn_tp_size").map(String::as_str), Some("2"));
         assert_eq!(labels.get("pp_size").map(String::as_str), Some("1"));
         assert_eq!(labels.get("dp_size").map(String::as_str), Some("4"));
         assert_eq!(labels.get("cp_size").map(String::as_str), Some("1"));
-        assert!(!labels.contains_key("attn_tp_size"));
         assert_eq!(labels.get("page_size").map(String::as_str), Some("16"));
         assert!(!labels.contains_key("block_size"));
         assert!(!labels.contains_key("uptime_seconds"));
@@ -780,7 +779,7 @@ mod tests {
             .collect();
         normalize_grpc_keys(&mut attn);
         assert_eq!(attn.get("tp_size").map(String::as_str), Some("8"));
-        assert!(!attn.contains_key("attn_tp_size"));
+        assert_eq!(attn.get("attn_tp_size").map(String::as_str), Some("2"));
 
         let mut both: HashMap<String, String> = [("tp_size", "8"), ("tensor_parallel_size", "2")]
             .into_iter()

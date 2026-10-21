@@ -22,7 +22,7 @@ def _server_info(tokenspeed_servicer_mod, monkeypatch, **server_args):
     cls = tokenspeed_servicer_mod.TokenSpeedSchedulerServicer
     servicer = cls.__new__(cls)
     servicer.server_args = SimpleNamespace(
-        model="m", mapping=SimpleNamespace(attn=SimpleNamespace(dp_size=1)), **server_args
+        **{"model": "m", "mapping": SimpleNamespace(attn=SimpleNamespace(dp_size=1)), **server_args}
     )
     servicer.scheduler_info = {}
     servicer.start_time = 0.0
@@ -67,3 +67,40 @@ def test_server_info_reports_the_engines_constrained_decoding_policy(
     assert silent.constrained_decoding == ""
     unknown = _server_info(tokenspeed_servicer_mod, monkeypatch, constrained_decoding="sometimes")
     assert unknown.constrained_decoding == ""
+
+
+def _advertised_tp(info):
+    return info.server_args["tp_size"] if "tp_size" in info.server_args else None
+
+
+@pytest.mark.parametrize(
+    ("attn", "expected"),
+    [
+        (SimpleNamespace(world_size=2, tp_size=2, dp_size=1), 2),
+        (SimpleNamespace(world_size=8, tp_size=2, dp_size=4), 8),
+    ],
+    ids=["plain", "attention-dp"],
+)
+def test_the_engine_wide_tp_width_is_advertised(
+    tokenspeed_servicer_mod, monkeypatch, attn, expected
+):
+    info = _server_info(
+        tokenspeed_servicer_mod, monkeypatch, attn_tp_size=None, mapping=SimpleNamespace(attn=attn)
+    )
+    assert _advertised_tp(info) == expected
+
+
+def test_the_resolved_attention_width_is_advertised_beside_it(tokenspeed_servicer_mod, monkeypatch):
+    info = _server_info(
+        tokenspeed_servicer_mod,
+        monkeypatch,
+        attn_tp_size=None,
+        mapping=SimpleNamespace(attn=SimpleNamespace(world_size=8, tp_size=2, dp_size=4)),
+    )
+    assert (_advertised_tp(info), info.server_args["attn_tp_size"]) == (8, 2)
+
+
+def test_no_tp_width_is_advertised_without_a_resolved_layout(tokenspeed_servicer_mod, monkeypatch):
+    info = _server_info(tokenspeed_servicer_mod, monkeypatch, attn_tp_size=2)
+    assert _advertised_tp(info) is None
+    assert info.server_args["attn_tp_size"] == 2

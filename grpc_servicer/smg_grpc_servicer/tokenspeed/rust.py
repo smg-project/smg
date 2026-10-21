@@ -65,7 +65,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
 from smg_grpc_servicer.servicer_impl_flag import (
     add_servicer_impl_argument as _add_servicer_impl_argument,
 )
-from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
+from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView, advertise_layout
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
 from smg_grpc_servicer.tokenspeed.loads import running_window
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
@@ -234,9 +234,11 @@ def server_facts(server_args: Any) -> dict[str, Any]:
         args_dict = dataclasses.asdict(server_args)
     else:
         args_dict = dict(getattr(server_args, "__dict__", {}))
-    dp_size = EngineConfigView(server_args).server_args.attention_dp_size
+    section = EngineConfigView(server_args).server_args
+    dp_size = section.attention_dp_size
     if dp_size is not None and dp_size > 1:
         args_dict["dp_size"] = dp_size
+    advertise_layout(args_dict, section)
     pairing_protocol = pairing_protocol_from_env()
     if pairing_protocol:
         args_dict["pairing_protocol"] = pairing_protocol
