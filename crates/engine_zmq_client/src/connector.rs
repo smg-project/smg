@@ -1031,7 +1031,18 @@ impl<P: EngineProtocol> Client<P> {
                 () = async {
                     // Polling the receive half drives read-side EOF detection even
                     // when no more writes are sent to a disconnected engine.
-                    while input_recv.recv().await.is_ok() {}
+                    loop {
+                        match input_recv.recv().await {
+                            Ok(message) => trace!(
+                                frames = message.len(),
+                                "ignoring unexpected post-registration input message"
+                            ),
+                            Err(error) => {
+                                warn!(%error, "input receiver ended; idle disconnect detection stopped");
+                                break;
+                            }
+                        }
+                    }
                     std::future::pending::<()>().await;
                 } => {}
 
