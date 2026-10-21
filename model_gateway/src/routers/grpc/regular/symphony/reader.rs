@@ -893,6 +893,25 @@ mod tests {
             [(text, opener), (opener, output.len())],
             "{events:?}"
         );
+        // A block held, then text, then a block: the hold started over behind the text, so the
+        // released range is the second block's alone, from its opener; the first block is debris
+        // and no range of it is content.
+        let mut events = Events::new();
+        let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
+        let output = concat!(
+            "</think><tool_call>a(x=1)</tool_call>",
+            "Sorry.",
+            "<tool_call>b(y=2)</tool_call>"
+        );
+        let events = read_tail(&mut reader, output);
+        let text = "</think><tool_call>a(x=1)</tool_call>".len();
+        let opener = "</think><tool_call>a(x=1)</tool_call>Sorry.".len();
+        assert_eq!(reader.released_spans(), [(opener, output.len())]);
+        assert_eq!(
+            reader.content_spans(&events),
+            [(text, opener), (opener, output.len())],
+            "{events:?}"
+        );
         // An output that made a call: nothing released, the crate's spans.
         let mut events = Events::new();
         let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
@@ -1198,6 +1217,24 @@ mod tests {
                 ],
                 "{events:?}"
             );
+            // A block held before the text, then the text, then a block: the first is debris
+            // beside the text (the table's rule), the hold starts over behind the text, and the
+            // second goes out alone, from its opener.
+            let events = read_pieces(
+                glm(),
+                GLM_PROMPT,
+                &[
+                    "</think><tool_call>a(x=1)</tool_call>",
+                    "Sorry.",
+                    "<tool_call>b(y=2)</tool_call>",
+                ],
+                EngineFinish::Stop,
+            );
+            assert_eq!(
+                content_events(&events).0,
+                vec!["Sorry.", "<tool_call>b(y=2)</tool_call>"],
+                "{events:?}"
+            );
             // Other keyed tables, whose templates write a newline after the thought's close.
             let block = "<tool_call>get_weather(city=\"Paris\")</tool_call>";
             let pieces = ["\n<think>plan</think>\nI'll check.", block];
@@ -1227,7 +1264,7 @@ mod tests {
             );
             assert!(finish_last, "{events:?}");
         });
-        for (table, count) in [("glm", " 5"), ("glm4", " 1"), ("ling", " 1")] {
+        for (table, count) in [("glm", " 6"), ("glm4", " 1"), ("ling", " 1")] {
             let label = format!("table=\"{table}\"");
             let outputs = line_with(
                 &scrape,
