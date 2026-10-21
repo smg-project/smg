@@ -71,11 +71,8 @@ use crate::{
         metrics_server, otel_trace, runtime_metrics,
     },
     routers::{
-        common::realtime::ws::RealtimeQueryParams,
-        error as route_error,
-        gateway::Gateway,
-        grpc::common::responses::spawn_unstored_sweeper,
-        http::router::{stream_eligible_request_bodies, StreamBodyState},
+        common::realtime::ws::RealtimeQueryParams, error as route_error, gateway::Gateway,
+        grpc::common::responses::spawn_unstored_sweeper, http::router::StreamBodyState,
         RouterTrait,
     },
     server::{
@@ -1253,10 +1250,9 @@ pub fn build_apps(
             )
             // Per-request buffer-vs-stream decision for typed-JSON bodies;
             // declined requests pass to the handlers untouched.
-            .route_layer(axum::middleware::from_fn_with_state(
-                StreamBodyState::new(app_state.router.clone(), app_state.context.clone()),
-                stream_eligible_request_bodies,
-            ))
+            .route_layer(
+                StreamBodyState::new(app_state.router.clone(), app_state.context.clone()).layer(),
+            )
             // Every SSE stream of these routes carries a keep-alive through an
             // upstream silence (a comment; the Messages API's ping event),
             // written between frames, nothing while frames flow.

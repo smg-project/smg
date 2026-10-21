@@ -1,23 +1,27 @@
 use std::{
+    convert::Infallible,
     error::Error as _,
     future::Future,
     sync::Arc,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
 
 use axum::{
     body::{to_bytes, Body},
-    extract::{Request, State},
+    extract::Request,
     http::{
         header::{CONTENT_LENGTH, CONTENT_TYPE},
         HeaderMap, HeaderValue, Method, StatusCode,
     },
-    middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
 use bytes::{Bytes, BytesMut};
-use futures_util::{stream, Stream, StreamExt};
+use futures_util::{
+    future::{BoxFuture, Either},
+    stream, Stream, StreamExt,
+};
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
@@ -40,6 +44,7 @@ use openai_protocol::{
 use reqwest::multipart::{Form, Part};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
+use tower::{Layer, Service};
 use tracing::{error, warn};
 
 use crate::{
@@ -1996,9 +2001,9 @@ impl Router {
     }
 }
 
-/// State for [`stream_eligible_request_bodies`]: the app-level router handle
-/// (the manager in production, a concrete router in tests) and the app
-/// context carrying the WASM manager.
+/// State of [`StreamBodyLayer`]: the app-level router handle (the manager in
+/// production, a concrete router in tests) and the app context carrying the
+/// WASM manager.
 #[derive(Clone)]
 pub struct StreamBodyState {
     router: Arc<dyn RouterTrait>,
@@ -2008,6 +2013,15 @@ pub struct StreamBodyState {
 impl StreamBodyState {
     pub fn new(router: Arc<dyn RouterTrait>, context: Arc<AppContext>) -> Self {
         Self { router, context }
+    }
+
+    /// The per-request buffer-vs-stream decision as a lean route layer: a
+    /// request on a route outside the typed set, or on a family that
+    /// buffers, is handed to the route as the route's own future; the route
+    /// service is cloned, the preemption token read and a future boxed only
+    /// for a request a forward-capable router may stream.
+    pub fn layer(self) -> StreamBodyLayer {
+        StreamBodyLayer { state: self }
     }
 
     /// WASM OnRequest hooks read (and may rewrite) the buffered body, so
@@ -2023,63 +2037,130 @@ impl StreamBodyState {
                     .map_or(true, |modules| !modules.is_empty())
             })
     }
+
+    /// The regular HTTP router a request may be streamed through, or the
+    /// reason it is buffered instead: the family's own [`BodyPolicy`], or a
+    /// registration race that turned dispatch model-addressed again (either
+    /// arm of the manager lookup).
+    fn forward_capable_router(&self) -> Result<Arc<dyn RouterTrait>, &'static str> {
+        if let BodyPolicy::MustBuffer(reason) = self.router.request_body_policy() {
+            return Err(reason);
+        }
+        let resolved = match self.router.as_any().downcast_ref::<Gateway>() {
+            Some(manager) => manager
+                .select_router_for_request(None)
+                .ok_or(REASON_MODEL_SELECTION)?,
+            None => Arc::clone(&self.router),
+        };
+        if resolved.as_any().downcast_ref::<Router>().is_none() {
+            return Err(REASON_MODEL_SELECTION);
+        }
+        Ok(resolved)
+    }
 }
 
-/// Route-layer middleware: every typed-JSON request on an eligible route is
-/// classified by the router family's [`BodyPolicy`]. A `MustBuffer` family
-/// is accounted and passed to the untouched handler; a `ForwardCapable`
-/// router then decides per request between the streamed pass-through and
-/// the handler's buffered `Json`/`ValidatedJson` path, always with the body
-/// unconsumed on decline. Sits inside the admission layer, so streamed
-/// requests hold an admission permit and race the preemption token.
-pub async fn stream_eligible_request_bodies(
-    State(state): State<StreamBodyState>,
-    cancel: PreemptionGuard,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
-    let route: &'static str = match req.uri().path() {
+/// The typed routes whose bodies may be streamed, by path; `None` for any
+/// other route.
+fn streamable_route(path: &str) -> Option<&'static str> {
+    Some(match path {
         "/generate" => "/generate",
         "/v1/chat/completions" => "/v1/chat/completions",
         "/v1/completions" => "/v1/completions",
         "/v1/messages" => "/v1/messages",
         "/v1/embeddings" => "/v1/embeddings",
         "/v1/classify" => "/v1/classify",
-        _ => return next.run(req).await,
-    };
-    if let BodyPolicy::MustBuffer(reason) = state.router.request_body_policy() {
-        Metrics::record_request_body_path(BODY_PATH_BUFFERED, reason);
-        return next.run(req).await;
+        _ => return None,
+    })
+}
+
+/// [`StreamBodyState::layer`].
+#[derive(Clone)]
+pub struct StreamBodyLayer {
+    state: StreamBodyState,
+}
+
+impl<S> Layer<S> for StreamBodyLayer {
+    type Service = StreamBodyService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        StreamBodyService {
+            inner,
+            state: self.state.clone(),
+        }
     }
-    // ForwardCapable: resolve the concrete regular router behind an optional
-    // manager. Either arm can only fail on a registration race that turned
-    // dispatch model-addressed again.
-    let resolved = match state.router.as_any().downcast_ref::<Gateway>() {
-        Some(manager) => match manager.select_router_for_request(None) {
-            Some(selected) => selected,
-            None => {
-                Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_MODEL_SELECTION);
-                return next.run(req).await;
+}
+
+/// The service [`StreamBodyLayer`] wraps a route in. Every typed-JSON
+/// request on an eligible route is classified by the router family's
+/// [`BodyPolicy`]. A `MustBuffer` family is accounted and passed to the
+/// untouched route; a `ForwardCapable` router then decides per request
+/// between the streamed pass-through and the route's buffered
+/// `Json`/`ValidatedJson` path, always with the body unconsumed on decline.
+/// Sits inside the admission layer, so streamed requests hold an admission
+/// permit and race the preemption token.
+#[derive(Clone)]
+pub struct StreamBodyService<S> {
+    inner: S,
+    state: StreamBodyState,
+}
+
+impl<S> Service<Request<Body>> for StreamBodyService<S>
+where
+    S: Service<Request<Body>, Response = Response, Error = Infallible> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+{
+    type Response = Response;
+    type Error = Infallible;
+    type Future = Either<S::Future, BoxFuture<'static, Result<Response, Infallible>>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
+        let Some(route) = streamable_route(req.uri().path()) else {
+            return Either::Left(self.inner.call(req));
+        };
+        let resolved = match self.state.forward_capable_router() {
+            Ok(resolved) => resolved,
+            Err(reason) => {
+                Metrics::record_request_body_path(BODY_PATH_BUFFERED, reason);
+                return Either::Left(self.inner.call(req));
             }
-        },
-        None => Arc::clone(&state.router),
-    };
-    let Some(http) = resolved.as_any().downcast_ref::<Router>() else {
-        Metrics::record_request_body_path(BODY_PATH_BUFFERED, REASON_MODEL_SELECTION);
-        return next.run(req).await;
-    };
-    let wasm_request_hooks = state.wasm_request_hooks();
-    cancel
-        .guard(async move {
-            match http
-                .route_streaming_request(req, route, wasm_request_hooks)
-                .await
-            {
-                Ok(response) => response,
-                Err(req) => next.run(req).await,
-            }
-        })
-        .await
+        };
+        let wasm_request_hooks = self.state.wasm_request_hooks();
+        let cancel = PreemptionGuard::from_extensions(req.extensions());
+        // The route service a declined request is handed to is the one that
+        // reported ready, as tower's contract has it; the clone stays here.
+        let clone = self.inner.clone();
+        let inner = std::mem::replace(&mut self.inner, clone);
+        Either::Right(Box::pin(async move {
+            let response = cancel
+                .guard(async move {
+                    let Some(http) = resolved.as_any().downcast_ref::<Router>() else {
+                        return route_request(inner, req).await;
+                    };
+                    match http
+                        .route_streaming_request(req, route, wasm_request_hooks)
+                        .await
+                    {
+                        Ok(response) => response,
+                        Err(req) => route_request(inner, req).await,
+                    }
+                })
+                .await;
+            Ok(response)
+        }))
+    }
+}
+
+/// The route's own answer to a request the layer does not stream.
+async fn route_request<S>(mut route: S, req: Request<Body>) -> Response
+where
+    S: Service<Request<Body>, Response = Response, Error = Infallible>,
+{
+    let Ok(response) = route.call(req).await;
+    response
 }
 
 #[async_trait]
@@ -2436,6 +2517,7 @@ mod tests {
             },
             request_lease::test_probe::{spawn_release_gated_stub, DropProbeRequest},
         },
+        service_discovery::testing::create_test_app_context,
         worker::{circuit_breaker::CircuitState, BasicWorkerBuilder},
     };
 
@@ -5433,6 +5515,142 @@ mod tests {
             all, expected,
             "the re-slicing changes the cuts, not the text"
         );
+    }
+
+    /// A family that buffers every body (the trait's default policy).
+    #[derive(Debug)]
+    struct BufferingStub;
+
+    #[async_trait]
+    impl RouterTrait for BufferingStub {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn router_type(&self) -> &'static str {
+            "stub"
+        }
+    }
+
+    /// Routes behind the stream-body layer that answer with the body they
+    /// were handed.
+    fn echo_app(state: StreamBodyState) -> axum::Router {
+        let echo = || axum::routing::post(|body: Bytes| async move { body });
+        axum::Router::new()
+            .route("/v1/chat/completions", echo())
+            .route("/generate", echo())
+            .route("/other", echo())
+            .route_layer(state.layer())
+    }
+
+    async fn posted(app: axum::Router, request: Request<Body>) -> (StatusCode, Bytes) {
+        use tower::ServiceExt;
+
+        let response = app.oneshot(request).await.unwrap();
+        let status = response.status();
+        (
+            status,
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+        )
+    }
+
+    fn sized_post(path: &str, body: &'static str) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .header(CONTENT_LENGTH, body.len())
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    /// The lean layer does what the `from_fn` form did on the paths that do
+    /// not stream: a family that buffers, and a route outside the typed set,
+    /// hand the request to the route with its body intact.
+    #[tokio::test]
+    async fn the_stream_body_layer_passes_a_buffering_family_and_other_routes_through() {
+        let context = create_test_app_context();
+        let app = echo_app(StreamBodyState::new(Arc::new(BufferingStub), context));
+
+        assert_eq!(
+            posted(
+                app.clone(),
+                sized_post("/v1/chat/completions", r#"{"a":1}"#)
+            )
+            .await,
+            (StatusCode::OK, Bytes::from_static(br#"{"a":1}"#))
+        );
+        assert_eq!(
+            posted(app, sized_post("/other", "plain")).await,
+            (StatusCode::OK, Bytes::from_static(b"plain"))
+        );
+    }
+
+    /// On a forward-capable router the path filter decides first: a sized
+    /// request to a route outside the typed set is the route's own answer
+    /// and never reaches the upstream. Then the decision itself: a router
+    /// that declines (no content length, so no streamed forward) hands the
+    /// route the body unconsumed; one that streams relays the upstream's
+    /// answer and the route never runs.
+    #[tokio::test]
+    async fn the_stream_body_layer_declines_to_the_route_and_streams_past_it() {
+        let (url, captured) = spawn_capture_stub("application/json", r#"{"text":"ok"}"#).await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let context = create_test_app_context();
+        let app = echo_app(StreamBodyState::new(Arc::new(router), context));
+
+        assert_eq!(
+            posted(app.clone(), sized_post("/other", "plain")).await,
+            (StatusCode::OK, Bytes::from_static(b"plain"))
+        );
+        assert!(
+            captured.lock().await.is_none(),
+            "a request outside the typed set reached the upstream"
+        );
+
+        let declined = Request::builder()
+            .method(Method::POST)
+            .uri("/generate")
+            .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+            .body(Body::from(r#"{"text":"hello"}"#))
+            .unwrap();
+        assert_eq!(
+            posted(app.clone(), declined).await,
+            (StatusCode::OK, Bytes::from_static(br#"{"text":"hello"}"#))
+        );
+        assert!(
+            captured.lock().await.is_none(),
+            "a declined request reached the upstream"
+        );
+
+        let (status, body) = posted(app, streamed_request(&[b"{\"text\":\"", b"hello\"}"])).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.as_ref(), br#"{"text":"ok"}"#);
+        let (_headers, forwarded) = captured.lock().await.take().unwrap();
+        assert_eq!(forwarded.as_ref(), b"{\"text\":\"hello\"}");
+    }
+
+    /// A request preempted while its streamed forward is in flight gets the
+    /// preemption answer through the layer, as it did through the extractor.
+    #[tokio::test]
+    async fn the_stream_body_layer_answers_a_preempted_streamed_request() {
+        use tokio_util::sync::CancellationToken;
+
+        // An upstream that accepts connections and never answers: only the
+        // token can end the request.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+        let context = create_test_app_context();
+        let app = echo_app(StreamBodyState::new(Arc::new(router), context));
+
+        let token = CancellationToken::new();
+        let mut request = streamed_request(&[b"{\"text\":\"hello\"}"]);
+        request.extensions_mut().insert(token.clone());
+        token.cancel();
+        let (status, _) = posted(app, request).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        drop(listener);
     }
 }
 
