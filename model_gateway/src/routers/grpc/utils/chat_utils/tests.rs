@@ -1,4 +1,4 @@
-use llm_tokenizer::chat_template::ChatTemplateContentFormat;
+use llm_tokenizer::{chat_template::ChatTemplateContentFormat, traits::RendererCapabilities};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent},
     common::{AudioUrl, ContentPart, ImageUrl, InputAudio, VideoUrl},
@@ -897,9 +897,8 @@ fn a_named_tool_choice_renders_every_tool() {
     };
 
     let named = request(json!({"type": "function", "function": {"name": "get_weather"}}));
-    let plain = RendererCapabilities::default();
     assert_eq!(
-        names(&request_as_rendered(&named, plain)),
+        names(&request_as_rendered(&named)),
         ["get_weather", "get_time"]
     );
     assert_eq!(
@@ -915,11 +914,11 @@ fn a_named_tool_choice_renders_every_tool() {
         "type": "allowed_tools", "mode": "auto",
         "tools": [{"type": "function", "name": "get_time"}]
     }));
-    assert_eq!(names(&request_as_rendered(&allowed, plain)), ["get_time"]);
+    assert_eq!(names(&request_as_rendered(&allowed)), ["get_time"]);
 
     let auto = request(json!("auto"));
     assert_eq!(
-        names(&request_as_rendered(&auto, plain)),
+        names(&request_as_rendered(&auto)),
         ["get_weather", "get_time"]
     );
 }
@@ -936,36 +935,31 @@ fn tool_choice_none_request() -> ChatCompletionRequest {
         .expect("chat request")
 }
 
-/// `tool_choice: none` renders no tool: the model is not offered a call
-/// it may not make, and the request's other fields render as sent.
+/// `tool_choice: none` renders the tools as `auto` renders them: the request
+/// renders as sent (borrowed, nothing narrowed), so the prompt is the one the
+/// engine's own server renders for it and the one the session's other turns
+/// rendered; the choice itself reaches the template as a kwarg.
 #[test]
-fn tool_choice_none_renders_no_tool() {
+fn tool_choice_none_renders_the_tools_as_auto_does() {
     let request = tool_choice_none_request();
-    let rendered = request_as_rendered(&request, RendererCapabilities::default());
-    assert!(rendered.tools.is_none());
-    assert_eq!(rendered.messages.len(), request.messages.len());
-    // The request itself keeps its tools for the rest of the pipeline.
-    assert!(request.tools.is_some());
-}
-
-/// A renderer that declares the tools under `tool_choice: none` itself
-/// (and forbids the call in the prompt, as its reference does) gets them:
-/// the request renders as sent.
-#[test]
-fn a_renderer_that_declares_tools_under_tool_choice_none_keeps_them() {
-    let request = tool_choice_none_request();
-    let rendered = request_as_rendered(
-        &request,
-        RendererCapabilities {
-            declares_tools_under_tool_choice_none: true,
-            ..RendererCapabilities::default()
-        },
-    );
+    let rendered = request_as_rendered(&request);
     assert!(matches!(rendered, std::borrow::Cow::Borrowed(_)));
     assert_eq!(
         rendered.tools.as_deref().map(<[_]>::len),
         Some(1),
-        "the tool declaration stays for the renderer to write"
+        "the tool declaration stays for the template to write"
+    );
+    let mut auto = request.clone();
+    auto.tool_choice = Some(ToolChoice::Value(ToolChoiceValue::Auto));
+    let under_auto = request_as_rendered(&auto);
+    assert_eq!(
+        serde_json::to_value(&under_auto.tools).expect("tools"),
+        serde_json::to_value(&rendered.tools).expect("tools"),
+        "the same tools render under none and under auto"
+    );
+    assert_eq!(
+        build_chat_template_kwargs(&request)[TOOL_CHOICE_KEY],
+        json!("none")
     );
 }
 
@@ -1340,7 +1334,6 @@ const NATIVE_CONTINUATION: RendererCapabilities = RendererCapabilities {
     enable_thinking_alias: false,
     native_assistant_continuation: true,
     raw_tool_call_arguments: false,
-    declares_tools_under_tool_choice_none: false,
     leading_system_only: false,
 };
 const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
@@ -1348,7 +1341,6 @@ const RAW_ARGUMENTS: RendererCapabilities = RendererCapabilities {
     enable_thinking_alias: false,
     native_assistant_continuation: false,
     raw_tool_call_arguments: true,
-    declares_tools_under_tool_choice_none: false,
     leading_system_only: false,
 };
 

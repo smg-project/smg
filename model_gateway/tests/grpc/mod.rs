@@ -12,3 +12,4 @@ mod kimi_k3_tool_choice_none;
 mod media_fault_breaker_test;
 mod response_template_test;
 mod tenant_rate_limiting_grpc_test;
+mod tool_choice_none_renders_the_tools;

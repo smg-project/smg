@@ -34,6 +34,10 @@ pub(crate) struct Assignment {
     /// The table, shared with every reader of the response and every request it reads for.
     pub format: Arc<Format>,
     pub prompt: String,
+    /// The request forbade the calls the table reads (`tool_choice: none`,
+    /// [`Asks::forbids_calls`]): the reader drops every call, as the engine's own server reads
+    /// such a call and withholds it.
+    pub forbids_calls: bool,
 }
 
 impl Assignment {
@@ -44,18 +48,29 @@ impl Assignment {
 }
 
 /// The assignment of `format` to a response, with the part of `prompt` the engine replays.
-pub(super) fn assignment(format: Arc<Format>, model: &str, prompt: &str) -> Assignment {
+pub(super) fn assignment(
+    format: Arc<Format>,
+    model: &str,
+    prompt: &str,
+    forbids_calls: bool,
+) -> Assignment {
     debug!(model, table = format.name(), "Symphony reads the response");
     let prompt = format.replay(prompt).to_string();
-    Assignment { format, prompt }
+    Assignment {
+        format,
+        prompt,
+        forbids_calls,
+    }
 }
 
 /// The table as the request's asks make it: without its calls when the legacy path would run no
-/// tool parser (the request asks for none, or its response is not scanned for calls:
+/// tool parser (the response is not scanned for calls:
 /// [`scans_for_tool_calls`](crate::routers::grpc::spec::scans_for_tool_calls)), so a table that reads calls from the output's first byte (`json`,
 /// `xlam`) is content from it; without its thought when the request keeps the reasoning in the
 /// content, as the legacy path runs no reasoning parser then. A variant is a copy of the shared
-/// table; a request that asks for neither reads with the shared table itself.
+/// table; a request that asks for neither reads with the shared table itself. A `tool_choice` of
+/// `none` asks for no variant: the table keeps its calls and the reader drops them
+/// ([`Assignment::forbids_calls`]).
 pub(super) fn asked(format: Arc<Format>, no_calls: bool, no_reasoning: bool) -> Arc<Format> {
     if !no_calls && !no_reasoning {
         return format;
@@ -170,7 +185,12 @@ pub(crate) fn assign(
         return Ok(None);
     }
     let format = asked(format, asks.no_calls(), asks.no_reasoning());
-    Ok(Some(assignment(format, asks.model(), prompt)))
+    Ok(Some(assignment(
+        format,
+        asks.model(),
+        prompt,
+        asks.forbids_calls(),
+    )))
 }
 
 /// The engine's finish reason as Symphony takes it.
@@ -250,6 +270,10 @@ pub(crate) struct Reader {
     ended: bool,
     /// Drop the events of every call after the first.
     first_call_only: bool,
+    /// Drop the events of every call: the request forbade them (`tool_choice: none`), the table
+    /// read them whole, and the engine's own server delivers nothing of such a call
+    /// ([`Assignment::forbids_calls`]).
+    forbids_calls: bool,
     /// Whether the output showed the client anything yet: text, reasoning or a call.
     shown: bool,
     /// The whitespace the table dropped before the output showed anything: the template's
@@ -299,6 +323,7 @@ impl Reader {
             read: 0,
             ended: false,
             first_call_only: false,
+            forbids_calls: assignment.forbids_calls,
             shown: false,
             unshown: String::new(),
             called: false,
@@ -483,7 +508,11 @@ impl Reader {
         // Where the step's first event starts in the output: the held runs below are placed by it.
         let start = self.tally.at();
         for event in fresh.iter() {
-            self.tally.see(event, self.first_call_only);
+            if self.forbids_calls {
+                self.tally.see_forbidden(event);
+            } else {
+                self.tally.see(event, self.first_call_only);
+            }
         }
         // While the output makes no call, the bytes of the call blocks the table refuses are
         // kept for the end ([`Self::end`]), with the marker that led into the first and what the
@@ -556,7 +585,9 @@ impl Reader {
                 }
             }
         }
-        if self.first_call_only {
+        if self.forbids_calls {
+            symphony::event::forbidden_calls(fresh);
+        } else if self.first_call_only {
             symphony::event::first_call_only(fresh);
         }
         Ok(())
@@ -688,6 +719,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(format),
             prompt: prompt.to_string(),
+            forbids_calls: false,
         };
         // A step's events borrow its delta, as a stream's do: each piece is a step of its own,
         // its events taken owned before the next.
@@ -1613,7 +1645,7 @@ mod tests {
         // The legacy path scans a response for calls when the request declares tools, an empty
         // list included, or when the model's provider reads calls without any; the table keeps
         // its calls exactly then, so a call the conversation established comes back as a call
-        // under either parser, and a `tool_choice` of `none` drops them under either.
+        // under either parser, and a `tool_choice` of `none` keeps them for the reader to drop.
         let table = |request: &ChatCompletionRequest| {
             reads(
                 ParserChoice::Symphony,
@@ -1645,10 +1677,20 @@ mod tests {
         let refused = request(json!({
             "model": "MiniMax-M3", "messages": retry_messages(), "tool_choice": "none"
         }));
+        let forbidden = assign(
+            ParserChoice::Symphony,
+            &ModelNames::default(),
+            &refused,
+            None,
+            PROMPT,
+        )
+        .expect("assigned");
         assert_eq!(
-            *assigned(&refused),
-            Arc::unwrap_or_clone(table(&refused)).without_calls()
+            forbidden.format,
+            table(&refused),
+            "none keeps the calls the provider reads; the reader drops them"
         );
+        assert!(forbidden.forbids_calls);
         let declared_none = request(json!({"tools": []}));
         assert!(scans_for_tool_calls(&declared_none));
         assert_eq!(
@@ -1752,6 +1794,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(symphony::formats::inkling().without_calls()),
             prompt: "<|message_model|>".to_string(),
+            forbids_calls: false,
         };
         let json = "{\"city\": \"Oslo\", \"country\": \"Norway\"}";
         let thought = "<|content_thinking|>plan<|end_message|><|message_model|><|content_text|>";
@@ -1822,6 +1865,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(glm4()),
             prompt: GLM4_PROMPT.to_string(),
+            forbids_calls: false,
         };
         let pieces = [
             "\n<think></think>\n<tool_call>answer_string\n<arg_key>answer</arg_key>\n<arg_value>",
@@ -1877,6 +1921,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
+            forbids_calls: false,
         };
         let mut events = Events::new();
         let mut reader = Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
@@ -1898,6 +1943,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
+            forbids_calls: false,
         };
         let tokenizer: Arc<dyn Tokenizer> = Arc::new(Refusing::default());
         let mut decoder = StopSequenceDecoder::new(
@@ -2021,6 +2067,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: "<|im_start|>assistant\n".to_string(),
+            forbids_calls: false,
         };
         let calls = |first_only: bool| {
             let mut events = Events::new();
@@ -2050,6 +2097,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),
             prompt: String::new(),
+            forbids_calls: false,
         };
         let first_run_at = |steps: &[&str]| -> (Option<usize>, usize) {
             let mut events = Events::new();
@@ -2096,6 +2144,7 @@ mod tests {
         let assignment = Assignment {
             format: Arc::new(symphony::formats::json().without_calls()),
             prompt: String::new(),
+            forbids_calls: false,
         };
         let mut events = Events::new();
         let mut reader = Reader::new(&assignment, Arc::default(), &mut events).expect("a reader");
@@ -2116,6 +2165,76 @@ mod tests {
             panic!("a finish");
         };
         assert_eq!(*tool_calls, 0);
+    }
+
+    /// `tool_choice: none` over declared tools: the table keeps its calls, the call the model
+    /// writes anyway is read whole, and the reader drops it, as the engine's own server reads
+    /// and withholds such a call; the thought and the text are what they are under `auto`, the
+    /// finish is the engine's `stop`, and the call is counted per table as forbidden.
+    #[test]
+    fn a_call_the_request_forbade_is_dropped_whole_and_counted() {
+        use symphony::{formats::qwen3, CallSyntax, FinishReason};
+        let assignment = Assignment {
+            format: Arc::new(qwen3(CallSyntax::Json)),
+            prompt: "<|im_start|>assistant\n".to_string(),
+            forbids_calls: true,
+        };
+        let mut events = Vec::new();
+        let scrape = rendered(|| {
+            let mut out = Events::new();
+            let mut reader = Reader::new(&assignment, tools().into(), &mut out).expect("a reader");
+            events = read_tail(&mut reader, QWEN3_OUTPUT);
+        });
+        assert!(
+            events.iter().all(|event| !matches!(
+                event,
+                Event::ToolCallStart { .. }
+                    | Event::ToolCallArguments { .. }
+                    | Event::ToolCallEnd { .. }
+            )),
+            "no call is delivered: {events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(e, Event::Reasoning(_))));
+        assert_eq!(content_of(&events).trim(), "Hello");
+        let dropped: String = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped {
+                    text,
+                    why: DropReason::ForbiddenCall,
+                } => Some(&*text.text),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            dropped.contains("lookup"),
+            "the call's bytes are dropped text, not content: {dropped:?}"
+        );
+        assert!(
+            matches!(
+                events.last(),
+                Some(Event::Finish {
+                    reason: FinishReason::Stop,
+                    tool_calls: 0,
+                    ..
+                })
+            ),
+            "{events:?}"
+        );
+        let forbidden = line_with(&scrape, telemetry::CALLS_FORBIDDEN, &["table=\"qwen3\""])
+            .expect("the forbidden counter");
+        assert!(forbidden.ends_with(" 1"), "{forbidden}");
+        // The same output under `auto` is a call: the ask, not the table, decides.
+        let allowed = Assignment {
+            forbids_calls: false,
+            ..assignment
+        };
+        let mut out = Events::new();
+        let mut reader = Reader::new(&allowed, tools().into(), &mut out).expect("a reader");
+        let events = read_tail(&mut reader, QWEN3_OUTPUT);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::ToolCallStart { name, .. } if name == "lookup")));
     }
 
     #[test]
@@ -2300,6 +2419,7 @@ mod tests {
             let assignment = Assignment {
                 format: Arc::new(format),
                 prompt: prompt.to_string(),
+                forbids_calls: false,
             };
             let mut replayed = Events::new();
             let mut reader =

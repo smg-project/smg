@@ -216,6 +216,57 @@ async fn large_chat_body_streams_to_worker_chunked() {
     ctx.shutdown().await;
 }
 
+/// The buffered typed path re-serializes a chat request: one with tools and
+/// `tool_choice: "none"` reaches the worker with both as sent, so an upstream
+/// that renders the prompt itself declares the tools, as the engine's own
+/// server does for such a request.
+#[tokio::test]
+async fn tool_choice_none_forwards_the_tools_to_the_worker() {
+    let (app, captured, ctx) =
+        streaming_app(least_load_policy(), 64 * 1024, 64 * 1024 * 1024).await;
+    let payload = serde_json::to_vec(&json!({
+        "model": "mock-model",
+        "messages": [{"role": "user", "content": "What is the weather in Paris?"}],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
+            }
+        }],
+        "tool_choice": "none"
+    }))
+    .unwrap();
+
+    let req = chunked_json_request(
+        "/v1/chat/completions",
+        payload.clone(),
+        Some(payload.len() as u64),
+    );
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let captured = captured.lock().await;
+    let (headers, body) = captured.first().unwrap();
+    assert!(
+        headers.get(CONTENT_LENGTH).is_some(),
+        "the buffered typed path re-serializes the request"
+    );
+    let forwarded: Value = serde_json::from_slice(body).unwrap();
+    assert_eq!(forwarded["tool_choice"], json!("none"), "{forwarded}");
+    assert_eq!(
+        forwarded["tools"].as_array().map(Vec::len),
+        Some(1),
+        "the tools reach the upstream under none: {forwarded}"
+    );
+    assert_eq!(
+        forwarded["tools"][0]["function"]["name"],
+        json!("get_weather")
+    );
+    drop(captured);
+    ctx.shutdown().await;
+}
+
 #[tokio::test]
 async fn body_under_retry_buffer_cap_stays_buffered() {
     let (app, captured, ctx) =

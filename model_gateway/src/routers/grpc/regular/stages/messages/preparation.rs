@@ -85,11 +85,8 @@ impl MessagePreparationStage {
         // the same prompt; the constraints read the narrowed tools too, the
         // parsers read them all from the spec.
         let spec = Box::new(MessagesResponseSpec::from(request));
-        let filtered_tools = message_utils::template_tools(
-            &spec.chat_tools,
-            request.tool_choice.as_ref(),
-            tokenizer.renderer_capabilities(),
-        );
+        let filtered_tools =
+            message_utils::template_tools(&spec.chat_tools, request.tool_choice.as_ref());
         let chat_tool_choice = request.tool_choice.as_ref().map(ToolChoice::from);
         let tools_for_template = (!filtered_tools.is_empty()).then_some(&*filtered_tools);
 

@@ -336,9 +336,13 @@ fn custom_tool_output_text(output: &CustomToolCallOutputContent) -> String {
 /// `tool_choice: none` forbids calls; offering the schemas anyway makes the
 /// model re-issue calls on replayed histories, and with parsing disabled the
 /// raw call markup leaks into the message text, so the request's own tools are
-/// withheld then while the MCP tools stay offered. Under the loop the list is
-/// present even when both are empty, as the loop has always sent one; the
-/// plain conversion carries none when there are no tools.
+/// withheld then while the MCP tools stay offered. The chat and Messages paths
+/// render the tools under `none` as the engine's own server does for every
+/// API (`utils::request_as_rendered`), so the same request renders a different
+/// prompt here: a known divergence, kept until this API's rule is decided on
+/// its own. Under the loop the list is present even when both are empty, as
+/// the loop has always sent one; the plain conversion carries none when there
+/// are no tools.
 fn chat_tools(
     req: &ResponsesRequest,
     mcp_chat_tools: Option<&[Tool]>,

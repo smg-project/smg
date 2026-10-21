@@ -47,6 +47,7 @@ pub(super) fn assigned(
     spec.symphony = Some(Assignment {
         format: Arc::new(format),
         prompt: prompt.to_string(),
+        forbids_calls: false,
     });
     spec
 }
@@ -693,6 +694,7 @@ pub(super) fn assigned_message(
         symphony: Some(Assignment {
             format: Arc::new(format),
             prompt: prompt.to_string(),
+            forbids_calls: false,
         }),
     }
 }

@@ -433,6 +433,16 @@ What the table says beyond the others:
   between the dropped framing (`search<|content_invoke_tool_json|>{...}`), as the legacy path
   leaves it. Before this, the variant showed `<|end_message|><|message_model|><|content_text|>`
   and the answer's `<|end_message|>` as content on every request without tools.
+- **A request with tools and `tool_choice: none` reads with the table itself.** The gateway
+  renders such a request's tools as it renders them under `auto`, as the engine's own server does
+  (its prompt keeps the definitions unless an operator excludes them; the choice reaches the
+  template as a kwarg), so the model may write a call anyway. The table reads it whole, and the
+  gateway's reader drops its events (`event::forbidden_calls`: every call's bytes become
+  `Dropped { ForbiddenCall }`, the finish counts none and a `tool_calls` finish is `stop` again),
+  counted per table as `smg_symphony_calls_forbidden_total`; the text around the call is content
+  as under `auto`, and nothing of the call reaches the client as a call or as content, which is
+  what the engine's own server delivers for it. A request with no tools anywhere still reads with
+  the variant without calls, whatever its `tool_choice`.
 
 What the table leaves out, for want of fixtures: image and audio messages, which the template writes
 for the user and never for the model; and the text-mode invocation, `<|content_invoke_tool_text|>`,

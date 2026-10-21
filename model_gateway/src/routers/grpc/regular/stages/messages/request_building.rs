@@ -218,24 +218,18 @@ impl BuildStage for MessageRequestBuildingStage {
             &spec.chat_tools,
             &processed_messages.text,
             tool_constraints,
-            |ctx| {
+            |_| {
                 // The tag shares the spec's tools where `tool_choice` narrows
                 // nothing (the common case): no copy of the schemas on the
                 // first attempt; a narrowed list is the one the narrowing owns.
-                let tools: Arc<[_]> = ctx
-                    .tokenizer_arc()
-                    .map(|tokenizer| {
-                        match utils::template_tools(
-                            &spec.chat_tools,
-                            messages_request.tool_choice.as_ref(),
-                            tokenizer.renderer_capabilities(),
-                        ) {
-                            Cow::Owned(narrowed) => Arc::from(narrowed),
-                            Cow::Borrowed([]) => Arc::default(),
-                            Cow::Borrowed(_) => Arc::clone(&spec.chat_tools),
-                        }
-                    })
-                    .unwrap_or_default();
+                let tools: Arc<[_]> = match utils::template_tools(
+                    &spec.chat_tools,
+                    messages_request.tool_choice.as_ref(),
+                ) {
+                    Cow::Owned(narrowed) => Arc::from(narrowed),
+                    Cow::Borrowed([]) => Arc::default(),
+                    Cow::Borrowed(_) => Arc::clone(&spec.chat_tools),
+                };
                 reading::Auto {
                     request: symphony::AutoRequest::Messages {
                         request: Arc::clone(&messages_request),

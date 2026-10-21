@@ -1319,8 +1319,8 @@ impl Drop for StopOnPanic<'_> {
 /// migration, the `tool_choice` default; a request the gateway would answer
 /// with 400 is a difference, not a rendering), then the tools narrowed by
 /// `tool_choice` as the chat preparation stage does before rendering (every
-/// tool for a named choice, the subset for `allowed_tools`, none for `none`
-/// unless the renderer declares them itself), through the stage's own rule.
+/// tool for a named choice, the subset for `allowed_tools`, every tool under
+/// `none`), through the stage's own rule.
 /// `process_chat_messages` then renders it exactly as the gateway does before
 /// tokenizing, and the ids are the flat encode of that text, which is the
 /// gateway's tokenize step for a renderer that returns text to encode.
@@ -1337,8 +1337,8 @@ fn render(tok: &dyn Tokenizer, model: &str, request: &Value) -> Result<Rendered,
     // The preparation stage's own rule: a named `tool_choice` renders every
     // tool (the engine's own server renders them all and forces the call with
     // its grammar); an `allowed_tools` choice renders its subset; `none`
-    // renders no tool unless the renderer declares the tools itself.
-    let request = request_as_rendered(&request, tok.renderer_capabilities());
+    // renders every tool, as the engine's own server does.
+    let request = request_as_rendered(&request);
     let processed = process_chat_messages(&request, tok, None)?;
     let ids = tok
         .encode(&processed.text, false)

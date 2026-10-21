@@ -70,11 +70,6 @@ pub struct RendererCapabilities {
     /// concatenates them cannot render an object); the gateway must forward
     /// them as written instead of pre-parsing them.
     pub raw_tool_call_arguments: bool,
-    /// The renderer declares the request's tools when `tool_choice` is
-    /// `none` and tells the model not to call them, as its reference does;
-    /// the gateway keeps the tools for it. Without it the gateway renders no
-    /// tool under `none`, so the model is not offered a call it may not make.
-    pub declares_tools_under_tool_choice_none: bool,
     /// The renderer's reference writes a turn of its own, and the assistant
     /// header after the last one, for user and developer messages only: a
     /// `system` message after the first renders as bare text with no role

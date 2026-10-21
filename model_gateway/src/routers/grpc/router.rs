@@ -865,11 +865,7 @@ impl GrpcRouter {
                     .as_ref(),
             ));
         };
-        let tools = message_utils::template_tools(
-            chat_tools,
-            tool_choice,
-            tokenizer.renderer_capabilities(),
-        );
+        let tools = message_utils::template_tools(chat_tools, tool_choice);
         // A token count is not a request the media series count; the
         // `max_tokens: 0` answer is one, and the caller says which.
         let media = message_utils::resolve_messages_media(

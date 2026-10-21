@@ -322,20 +322,34 @@ impl<'a> Asks<'a> {
     }
 
     /// The table reads no calls from the output: the legacy path would run no tool parser for the
-    /// request (a `tool_choice` of `none`; a chat response it would not scan for calls, no tools
-    /// declared anywhere, for a provider that reads calls only with them: [`scans_for_tool_calls`];
-    /// a Messages request that declares no tools, an empty list being a declaration).
+    /// request (a chat response it would not scan for calls, no tools declared anywhere, for a
+    /// provider that reads calls only with them: [`scans_for_tool_calls`]; a Messages request
+    /// that declares no tools, an empty list being a declaration). A `tool_choice` of `none` is
+    /// not this: the table keeps its calls and the reader delivers none of them
+    /// ([`Asks::forbids_calls`]).
     pub(super) fn no_calls(self) -> bool {
+        match self {
+            Self::Chat(request) => !scans_for_tool_calls(request),
+            Self::Messages { request, .. } => request.tools.is_none(),
+        }
+    }
+
+    /// The request forbids the calls its response would be scanned for (`tool_choice: none` over
+    /// declared tools, or over a provider that reads calls without any): the table keeps its
+    /// calls, so a call the model writes anyway is read whole, and the reader drops it, as the
+    /// engine's own server reads such a call and withholds it. The prompt declares the tools as
+    /// under `auto` (`utils::request_as_rendered`), so the model may well write one.
+    pub(super) fn forbids_calls(self) -> bool {
         match self {
             Self::Chat(request) => {
                 matches!(
                     request.tool_choice,
                     Some(ToolChoice::Value(ToolChoiceValue::None))
-                ) || !scans_for_tool_calls(request)
+                ) && scans_for_tool_calls(request)
             }
             Self::Messages { request, .. } => {
                 matches!(request.tool_choice, Some(MessagesToolChoice::None))
-                    || request.tools.is_none()
+                    && request.tools.is_some()
             }
         }
     }
@@ -1854,7 +1868,8 @@ mod tests {
                 .expect("read")
                 .is_none()
         );
-        // A tool_choice of none takes the table without its calls.
+        // A tool_choice of none over no tools takes the table without its calls, as every
+        // request without tools does; over declared tools it keeps them, for the reader to drop.
         let no_calls = super::super::assign(
             symphony,
             &plain,
@@ -1870,6 +1885,29 @@ mod tests {
         .expect("assigned");
         assert_eq!(no_calls.format.name(), "qwen3");
         assert_eq!(no_calls.format.call_syntax(), None);
+        assert!(!no_calls.forbids_calls);
+        let forbidden = super::super::assign(
+            symphony,
+            &plain,
+            Asks::Messages {
+                request: &message_request(json!({
+                    "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}],
+                    "tool_choice": {"type": "none"}
+                })),
+                continues: false,
+            },
+            None,
+            PROMPT,
+            &templates(),
+        )
+        .expect("read")
+        .expect("assigned");
+        assert_eq!(forbidden.format.name(), "qwen3");
+        assert!(
+            forbidden.format.call_syntax().is_some(),
+            "the table keeps its calls under none over declared tools"
+        );
+        assert!(forbidden.forbids_calls);
         let constrain = |extra: Value| {
             super::constraint(
                 symphony,
