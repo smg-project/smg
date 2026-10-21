@@ -30,7 +30,7 @@ fn validate_distinct_listener_ports(listeners: &[(&str, &str, u16)]) -> ConfigRe
 
 /// The mesh listener's port against the HTTP, metrics and probe ports. The
 /// mesh configuration lives beside the router configuration, out of
-/// [`ConfigValidator`]'s sight, so `server::startup` runs this check: it is
+/// `ConfigValidator`'s sight, so `server::startup` runs this check: it is
 /// the one place every way of building the server configuration (the CLI,
 /// the Python binding, a library caller) passes through.
 pub fn validate_mesh_listener_port(
@@ -187,7 +187,7 @@ pub fn validate_mesh_server_name(name: &str) -> ConfigResult<()> {
 }
 
 /// Validate a single worker URL: non-empty, an allowed scheme, and a
-/// parseable host. Shared by [`ConfigValidator::validate_urls`] (startup
+/// parseable host. Shared by `ConfigValidator::validate_urls` (startup
 /// config) and the worker-management API so both reject schemeless or
 /// unparsable URLs identically. Rejecting at the API boundary prevents
 /// the orphaned `url_to_id` reservation from #1533: the AddWorker

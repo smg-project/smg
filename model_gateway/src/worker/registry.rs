@@ -499,7 +499,7 @@ impl WorkerRegistry {
     /// `None` otherwise.
     ///
     /// A scheme-less `host:port` input is canonicalized against the registered
-    /// `http://`/`grpc://` form — see [`Self::resolve_url_to_id`].
+    /// `http://`/`grpc://` form — see `Self::resolve_url_to_id`.
     pub fn get_by_url(&self, url: &str) -> Option<Arc<dyn Worker>> {
         self.resolve_url_to_id(url).and_then(|id| self.get(&id))
     }
@@ -511,7 +511,7 @@ impl WorkerRegistry {
     /// `transition_status_if_revision` with the current worker revision.
     ///
     /// A scheme-less `host:port` input is canonicalized against the registered
-    /// `http://`/`grpc://` form — see [`Self::resolve_url_to_id`].
+    /// `http://`/`grpc://` form — see `Self::resolve_url_to_id`.
     pub fn get_id_by_url(&self, url: &str) -> Option<WorkerId> {
         self.resolve_url_to_id(url)
     }

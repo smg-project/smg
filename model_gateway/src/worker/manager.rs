@@ -3,7 +3,7 @@
 //! admin fan-outs (cache flush, profiling, engine metrics, fleet loads).
 //!
 //! The schedule is one deadline per probed worker. Every slot a worker is
-//! given comes from one decision, [`ProbeSlot::of`]: what the schedule does
+//! given comes from one decision, `ProbeSlot::of`: what the schedule does
 //! with a worker of a given status under the manager's configuration (a
 //! removed worker's slot and the lag recovery's rebuild are the only writes
 //! beside it). A worker's deadline is re-armed when its probe launches

@@ -359,7 +359,7 @@ impl CircuitBreaker {
     /// Put an open circuit on trial now instead of at its timeout, because
     /// the worker's health has returned: the failures that opened it belong
     /// to an outage the probes have seen end. The trial is the one the
-    /// timeout would have started ([`Self::cas_open_to_half_open`]):
+    /// timeout would have started (`Self::cas_open_to_half_open`):
     /// requests flow again, `success_threshold` successes close the circuit
     /// and one failure reopens it for a full timeout. A circuit that is not
     /// open is left alone. Returns whether the circuit moved.
