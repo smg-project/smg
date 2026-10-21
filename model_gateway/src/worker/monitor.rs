@@ -231,6 +231,9 @@ enum NativeLoads {
     Absent,
     /// Nothing was learned about the endpoint — retry on the next tick.
     Inconclusive,
+    /// The endpoint is there and its handler fails (500) — retry after a
+    /// back-off.
+    ServerError,
 }
 
 /// A route that answers with the native load schema.
@@ -277,6 +280,24 @@ impl NativeLoadsPath {
     }
 }
 
+/// How long a route that answered 500 is left alone; each further 500 in a
+/// row doubles it, up to [`MAX_SERVER_ERROR_BACKOFF`].
+const SERVER_ERROR_BACKOFF: Duration = Duration::from_secs(10);
+
+/// The longest a recovered engine waits to be read natively again.
+const MAX_SERVER_ERROR_BACKOFF: Duration = Duration::from_secs(60);
+
+/// A poll reads the clock a little after its tick fired, so a back-off ends
+/// this much early: a 10 s wait is then over by the next tick of a 10 s
+/// interval, not the one after.
+const TICK_SLACK: Duration = Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ServerErrors {
+    streak: u32,
+    retry_after: Option<Instant>,
+}
+
 /// What a worker's probes have established about its native load routes.
 ///
 /// Absence is tracked per route, not per worker: a 404 on one route is a
@@ -284,34 +305,61 @@ impl NativeLoadsPath {
 /// single "answered nothing" flag would discard the 404 whenever the other
 /// route was merely inconclusive, and the dead route would be re-asked on
 /// every tick forever.
+///
+/// A 500 is not absence, so it is never memoized as such; a route that keeps
+/// answering it waits a doubling time between probes instead.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct NativeLoadsMemo {
     answered: Option<NativeLoadsPath>,
     absent: [bool; NativeLoadsPath::DISCOVERY.len()],
+    failing: [ServerErrors; NativeLoadsPath::DISCOVERY.len()],
 }
 
 impl NativeLoadsMemo {
-    /// Routes worth probing this tick, in discovery order: the route that
-    /// answered last if there is one, else everything not known absent.
-    fn candidates(self) -> impl Iterator<Item = NativeLoadsPath> {
+    /// Routes worth probing at `now`, in discovery order: the route that
+    /// answered last if there is one, else everything not known absent;
+    /// either way, none that is backing off.
+    fn candidates(self, now: Instant) -> impl Iterator<Item = NativeLoadsPath> {
         NativeLoadsPath::DISCOVERY
             .into_iter()
             .filter(move |&path| match self.answered {
                 Some(answered) => path == answered,
                 None => !self.absent[path.index()],
             })
+            .filter(move |&path| {
+                self.failing[path.index()]
+                    .retry_after
+                    .is_none_or(|at| now >= at)
+            })
     }
 
     fn record_answered(&mut self, path: NativeLoadsPath) {
         self.answered = Some(path);
         self.absent[path.index()] = false;
+        self.end_streak(path);
     }
 
     fn record_absent(&mut self, path: NativeLoadsPath) {
         self.absent[path.index()] = true;
+        self.end_streak(path);
         if self.answered == Some(path) {
             self.answered = None;
         }
+    }
+
+    fn end_streak(&mut self, path: NativeLoadsPath) {
+        self.failing[path.index()] = ServerErrors::default();
+    }
+
+    /// The k-th 500 in a row leaves the route alone for
+    /// `SERVER_ERROR_BACKOFF * 2^(k-1)`, capped.
+    fn record_server_error(&mut self, path: NativeLoadsPath, now: Instant) {
+        let errors = &mut self.failing[path.index()];
+        errors.streak = errors.streak.saturating_add(1);
+        let backoff = SERVER_ERROR_BACKOFF
+            .saturating_mul(2u32.saturating_pow(errors.streak - 1))
+            .min(MAX_SERVER_ERROR_BACKOFF);
+        errors.retry_after = Some(now + backoff.saturating_sub(TICK_SLACK));
     }
 
     #[cfg(test)]
@@ -1057,37 +1105,43 @@ impl WorkerMonitor {
             .and_then(|store| store.get(worker.url()).map(|hit| *hit))
             .unwrap_or_default();
         let mut memo = known;
+        let now = Instant::now();
 
-        let mut response = None;
-        for path in known.candidates() {
+        let mut native = None;
+        for path in known.candidates(now) {
             match Self::probe_native_loads(worker, path).await {
                 NativeLoads::Available(load) => {
                     memo.record_answered(path);
-                    response = Some(load);
+                    native = Some(load);
                     break;
                 }
                 NativeLoads::Absent => memo.record_absent(path),
-                NativeLoads::Inconclusive => {}
+                NativeLoads::ServerError => memo.record_server_error(path, now),
+                NativeLoads::Inconclusive => memo.end_streak(path),
             }
         }
-        // Write back only what a probe actually settled, so a tick that
-        // learned nothing leaves the memo alone and retries next time.
+
+        // Write back only what changed, and before the gauge fetch below, so
+        // only the probes' window is left in which a concurrent eviction can
+        // be written back.
         if let Some(store) = native_loads_memo {
             if memo != known {
                 store.insert(worker.url().to_string(), memo);
             }
         }
-        if response.is_some() {
-            liveness::on_contact(worker);
-            return response;
-        }
 
-        match worker.metadata().spec.runtime_type {
-            RuntimeType::Vllm => Self::fetch_http_load_vllm(worker).await,
-            RuntimeType::Sglang => Self::fetch_http_load_sglang(worker).await,
-            // Custom engines expose no gauge schema we can parse; the native
-            // routes above were their only path.
-            _ => None,
+        match native {
+            Some(load) => {
+                liveness::on_contact(worker);
+                Some(load)
+            }
+            None => match worker.metadata().spec.runtime_type {
+                RuntimeType::Vllm => Self::fetch_http_load_vllm(worker).await,
+                RuntimeType::Sglang => Self::fetch_http_load_sglang(worker).await,
+                // Custom engines expose no gauge schema we can parse; the
+                // native routes above were their only path.
+                _ => None,
+            },
         }
     }
 
@@ -1096,7 +1150,8 @@ impl WorkerMonitor {
     /// Distinguishing [`NativeLoads::Absent`] from [`NativeLoads::Inconclusive`]
     /// is what makes the memo safe. Collapsing both into "unsupported" would
     /// let one timeout demote a healthy backend to the expensive `/metrics`
-    /// path permanently.
+    /// path permanently. A 500 is neither: the route is there and failing, so
+    /// it backs off for a while instead ([`NativeLoads::ServerError`]).
     async fn probe_native_loads(worker: &Arc<dyn Worker>, path: NativeLoadsPath) -> NativeLoads {
         let url = path.probe_url(worker);
         let resp = match Self::authed_request(worker, &url).send().await {
@@ -1112,8 +1167,11 @@ impl WorkerMonitor {
         ) {
             return NativeLoads::Absent;
         }
+        if status == StatusCode::INTERNAL_SERVER_ERROR {
+            return NativeLoads::ServerError;
+        }
         if !status.is_success() {
-            // 5xx and auth failures are conditions, not routing facts.
+            // 502/503/504 and auth failures are conditions, not routing facts.
             return NativeLoads::Inconclusive;
         }
 
@@ -2940,6 +2998,7 @@ mod native_loads_tests {
     async fn spawn_backend(
         gateway: (StatusCode, &'static str),
         engine: (StatusCode, &'static str),
+        metrics: &'static str,
     ) -> Stub {
         fn route(
             hits: &Arc<AtomicUsize>,
@@ -2968,7 +3027,10 @@ mod native_loads_tests {
         let app = axum::Router::new()
             .route("/loads", route(&gateway_probes, &gateway_query, gateway))
             .route("/v1/loads", route(&probes, &engine_query, engine))
-            .route("/metrics", axum::routing::get(|| async { VLLM_METRICS }));
+            .route(
+                "/metrics",
+                axum::routing::get(move || async move { metrics }),
+            );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2992,12 +3054,17 @@ mod native_loads_tests {
 
     /// An engine: serves `/v1/loads`, 404s the gateway route.
     async fn spawn_engine(status: StatusCode, body: &'static str) -> Stub {
-        spawn_backend((StatusCode::NOT_FOUND, ""), (status, body)).await
+        spawn_backend((StatusCode::NOT_FOUND, ""), (status, body), VLLM_METRICS).await
     }
 
     /// A gateway registered as a worker: serves `/loads` only.
     async fn spawn_gateway(body: &'static str) -> Stub {
-        spawn_backend((StatusCode::OK, body), (StatusCode::NOT_FOUND, "")).await
+        spawn_backend(
+            (StatusCode::OK, body),
+            (StatusCode::NOT_FOUND, ""),
+            VLLM_METRICS,
+        )
+        .await
     }
 
     fn vllm_worker(url: &str) -> Arc<dyn Worker> {
@@ -3447,6 +3514,185 @@ mod native_loads_tests {
         assert_eq!(hit.answered(), None);
         assert_eq!(stub.probes.load(Ordering::SeqCst), 3, "probe must retry");
         assert_eq!(stub.gateway_probes.load(Ordering::SeqCst), 1);
+    }
+
+    /// Polls `worker` once and says whether the native route answered:
+    /// `NATIVE_BODY` reports 3 running requests, the `/metrics` gauges 7.
+    async fn served_natively(
+        worker: &Arc<dyn Worker>,
+        memo: &DashMap<String, NativeLoadsMemo>,
+    ) -> bool {
+        let resp = WorkerMonitor::fetch_http_load(worker, Some(memo))
+            .await
+            .expect("load response");
+        resp.loads[0].num_running_reqs == 3
+    }
+
+    #[tokio::test]
+    async fn a_route_that_answers_500_is_not_asked_again_at_once() {
+        // SGLang 0.5.15 answers every `/v1/loads` with a 500.
+        let stub = spawn_engine(StatusCode::INTERNAL_SERVER_ERROR, "").await;
+        let worker = vllm_worker(&stub.url);
+        let memo = DashMap::new();
+
+        for _ in 0..5 {
+            assert!(!served_natively(&worker, &memo).await, "served by /metrics");
+        }
+
+        assert_eq!(
+            stub.probes.load(Ordering::SeqCst),
+            1,
+            "the gauges serve the load while the failing route waits"
+        );
+    }
+
+    fn worker_with_runtime(url: &str, runtime: RuntimeType) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .runtime_type(runtime)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    /// SGLang's gauges as served with `--enable-metrics`, 7 requests running.
+    const SGLANG_GAUGES: &str = r#"
+sglang:num_running_reqs{model_name="llama"} 7.0
+sglang:num_queue_reqs{model_name="llama"} 1.0
+sglang:token_usage{model_name="llama"} 0.5
+"#;
+
+    #[tokio::test]
+    async fn an_sglang_worker_backs_off_while_its_gauges_serve_the_load() {
+        let stub = spawn_backend(
+            (StatusCode::NOT_FOUND, ""),
+            (StatusCode::INTERNAL_SERVER_ERROR, ""),
+            SGLANG_GAUGES,
+        )
+        .await;
+        let worker = worker_with_runtime(&stub.url, RuntimeType::Sglang);
+        let memo = DashMap::new();
+
+        for _ in 0..5 {
+            assert!(!served_natively(&worker, &memo).await, "served by /metrics");
+        }
+
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_sglang_worker_with_its_gauges_off_backs_off_too() {
+        // SGLang serves `/metrics` only with `--enable-metrics`. Without its
+        // gauges the worker has no load while the route fails either way;
+        // the back-off only spaces the probes.
+        let stub = spawn_engine(StatusCode::INTERNAL_SERVER_ERROR, "").await;
+        let worker = worker_with_runtime(&stub.url, RuntimeType::Sglang);
+        let memo = DashMap::new();
+
+        for _ in 0..3 {
+            assert!(WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+                .await
+                .is_none());
+        }
+
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_worker_with_no_gauge_fallback_backs_off_too() {
+        let stub = spawn_engine(StatusCode::INTERNAL_SERVER_ERROR, "").await;
+        let worker = worker_with_runtime(&stub.url, RuntimeType::TokenSpeed);
+        let memo = DashMap::new();
+
+        for _ in 0..3 {
+            assert!(WorkerMonitor::fetch_http_load(&worker, Some(&memo))
+                .await
+                .is_none());
+        }
+
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 1);
+    }
+
+    fn engine_route_due(memo: NativeLoadsMemo, at: Instant) -> bool {
+        memo.candidates(at).any(|p| p == NativeLoadsPath::Engine)
+    }
+
+    #[test]
+    fn a_route_that_keeps_answering_500_waits_twice_as_long_each_time_up_to_a_minute() {
+        let mut memo = NativeLoadsMemo::default();
+        let mut now = Instant::now();
+        for wait in [10, 20, 40, 60, 60] {
+            memo.record_server_error(NativeLoadsPath::Engine, now);
+            let due = now + Duration::from_secs(wait) - TICK_SLACK;
+            assert!(!engine_route_due(memo, due - Duration::from_millis(1)));
+            assert!(engine_route_due(memo, due));
+            now = due;
+        }
+    }
+
+    #[test]
+    fn a_ten_second_wait_is_over_by_the_next_tick_of_a_ten_second_interval() {
+        // The poll reads the clock a little after its tick fired.
+        let tick = Instant::now();
+        let mut memo = NativeLoadsMemo::default();
+        memo.record_server_error(NativeLoadsPath::Engine, tick + Duration::from_millis(5));
+        assert!(engine_route_due(memo, tick + Duration::from_secs(10)));
+    }
+
+    #[tokio::test]
+    async fn a_poll_whose_route_does_not_answer_500_ends_the_streak() {
+        let stub = spawn_engine(StatusCode::SERVICE_UNAVAILABLE, "").await;
+        let worker = vllm_worker(&stub.url);
+        let mut streak = NativeLoadsMemo::default();
+        streak.failing[NativeLoadsPath::Engine.index()] = ServerErrors {
+            streak: 3,
+            retry_after: Some(Instant::now()),
+        };
+        let memo = DashMap::new();
+        memo.insert(worker.url().to_string(), streak);
+
+        served_natively(&worker, &memo).await;
+
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 1);
+        let mut after = memo.get(worker.url()).map(|hit| *hit).expect("memo entry");
+        let now = Instant::now();
+        after.record_server_error(NativeLoadsPath::Engine, now);
+        assert!(
+            engine_route_due(after, now + SERVER_ERROR_BACKOFF),
+            "the 503 ended the streak, so the next 500 waits the first back-off"
+        );
+    }
+
+    #[test]
+    fn an_answer_ends_the_back_off() {
+        let mut memo = NativeLoadsMemo::default();
+        let now = Instant::now();
+        for _ in 0..3 {
+            memo.record_server_error(NativeLoadsPath::Engine, now);
+        }
+        memo.record_answered(NativeLoadsPath::Engine);
+        assert!(engine_route_due(memo, now));
+
+        memo.record_server_error(NativeLoadsPath::Engine, now);
+        assert!(engine_route_due(memo, now + SERVER_ERROR_BACKOFF));
+    }
+
+    #[test]
+    fn a_probe_that_is_not_a_500_ends_the_streak() {
+        let mut memo = NativeLoadsMemo::default();
+        let now = Instant::now();
+        for _ in 0..3 {
+            memo.record_server_error(NativeLoadsPath::Engine, now);
+        }
+        memo.end_streak(NativeLoadsPath::Engine);
+
+        memo.record_server_error(NativeLoadsPath::Engine, now);
+        assert!(engine_route_due(memo, now + SERVER_ERROR_BACKOFF));
     }
 
     #[tokio::test]
