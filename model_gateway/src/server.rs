@@ -1130,6 +1130,18 @@ pub fn build_apps(
 
     let tenant_resolution_state =
         middleware::TenantResolutionState::new(&app_state.context.router_config)?;
+    // The serving auth layer, built once for every route group that takes
+    // it: with no serving key configured it would pass every request through,
+    // so it is not installed then (a from_fn layer clones and boxes per request
+    // whatever it does). The keys are fixed at start-up, so the decision at
+    // build time is the one the layer made per request.
+    let serving_auth_layer =
+        tower::util::option_layer(serving_auth_config.is_enabled().then(|| {
+            axum::middleware::from_fn_with_state(
+                serving_auth_config.clone(),
+                middleware::auth_middleware,
+            )
+        }));
 
     // Choose the admission path once at startup: priority scheduler when
     // enabled (and it starts cleanly), otherwise the legacy concurrency limit.
@@ -1218,17 +1230,15 @@ pub fn build_apps(
         &admission_mode,
         app_state.clone(),
     )
-    .route_layer(axum::middleware::from_fn_with_state(
-        tenant_resolution_state.clone(),
-        middleware::route_request_meta_middleware,
-    ))
-    .route_layer(axum::middleware::from_fn_with_state(
-        serving_auth_config.clone(),
-        middleware::auth_middleware,
-    ))
-    .route_layer(axum::middleware::from_fn_with_state(
-        app_state.clone(),
-        middleware::wasm_middleware,
+    .route_layer(tenant_resolution_state.clone().layer())
+    .route_layer(serving_auth_layer.clone())
+    // The wasm hooks run only with wasm enabled and a module manager; the
+    // layer is not installed otherwise.
+    .route_layer(tower::util::option_layer(
+        (app_state.context.router_config.enable_wasm && app_state.context.wasm_manager.is_some())
+            .then(|| {
+                axum::middleware::from_fn_with_state(app_state.clone(), middleware::wasm_middleware)
+            }),
     ))
     // Outermost on these routes: a refusal by any layer inside (authentication,
     // admission, the body timeout) leaves in the Messages envelope as well.
@@ -1244,14 +1254,8 @@ pub fn build_apps(
         &admission_mode,
         app_state.clone(),
     )
-    .route_layer(axum::middleware::from_fn_with_state(
-        tenant_resolution_state.clone(),
-        middleware::route_request_meta_middleware,
-    ))
-    .route_layer(axum::middleware::from_fn_with_state(
-        serving_auth_config.clone(),
-        middleware::auth_middleware,
-    ));
+    .route_layer(tenant_resolution_state.clone().layer())
+    .route_layer(serving_auth_layer.clone());
 
     // Multipart upload routes: auth + concurrency but NO WASM middleware.
     // The WASM OnRequest phase buffers the full body into a `Vec<u8>` subject
@@ -1263,14 +1267,8 @@ pub fn build_apps(
         &admission_mode,
         app_state.clone(),
     )
-    .route_layer(axum::middleware::from_fn_with_state(
-        tenant_resolution_state,
-        middleware::route_request_meta_middleware,
-    ))
-    .route_layer(axum::middleware::from_fn_with_state(
-        serving_auth_config.clone(),
-        middleware::auth_middleware,
-    ));
+    .route_layer(tenant_resolution_state.layer())
+    .route_layer(serving_auth_layer.clone());
 
     let public_routes = Router::new()
         .route("/liveness", get(liveness))

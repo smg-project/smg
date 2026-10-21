@@ -38,7 +38,8 @@ pub use request_id::{RequestId, RequestIdLayer, RequestIdMiddleware};
 pub use sse_keepalive::{sse_keepalive_middleware, SseKeepAlive, SseKeepAliveLayer};
 pub use storage_context::storage_context_middleware;
 pub use tenant_resolution::{
-    ordinary_tenant_resolution_middleware, route_request_meta_middleware, TenantResolutionState,
+    ordinary_tenant_resolution_middleware, route_request_meta_middleware, RouteRequestMetaLayer,
+    RouteRequestMetaService, TenantResolutionState,
 };
 pub use token_bucket::TokenBucket;
 pub use wasm::wasm_middleware;
