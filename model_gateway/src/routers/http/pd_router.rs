@@ -2768,7 +2768,8 @@ impl RouterTrait for PDRouter {
         body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.route_pd(headers, body, model_id).await
+        self.route_pd(headers, super::chat_for_upstream(body), model_id)
+            .await
     }
 
     async fn route_messages(

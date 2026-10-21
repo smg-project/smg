@@ -254,6 +254,53 @@ fn deepseek_v41_reads_a_template_kwarg_medium_as_a_level_of_its_own() {
 }
 
 #[test]
+fn deepseek_v41_forwards_the_vendors_reading_of_medium_to_an_upstream_renderer() {
+    // The gateway's own renderer takes V4.1's `medium` as the template's
+    // level; an upstream that renders itself gets the vendor's alias, `high`,
+    // in both top-level spellings.
+    let mut req = request(json!({
+        "model": "deepseek-v4.1-flash",
+        "reasoning_effort": "medium",
+        "thinking": {"effort": "medium"},
+    }));
+    assert_eq!(req.effective_reasoning_effort(), Some("medium"));
+    ProviderProfile::DeepSeek.normalize_chat_for_upstream(&mut req);
+    assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(
+        req.thinking
+            .as_ref()
+            .and_then(|thinking| thinking.effort.as_deref()),
+        Some("high")
+    );
+
+    // `xhigh` and a template kwarg go out as sent.
+    let mut req = request(json!({
+        "model": "deepseek-v4.1-flash",
+        "reasoning_effort": "xhigh",
+        "chat_template_kwargs": {"reasoning_effort": "medium"},
+    }));
+    ProviderProfile::DeepSeek.normalize_chat_for_upstream(&mut req);
+    assert_eq!(req.reasoning_effort.as_deref(), Some("xhigh"));
+    assert_eq!(
+        req.chat_template_kwargs
+            .as_ref()
+            .and_then(|kwargs| kwargs.get("reasoning_effort")),
+        Some(&json!("medium"))
+    );
+
+    // V4 aliased `medium` at normalization already; nothing more happens.
+    let mut req = request(json!({"model": "deepseek-v4-pro", "reasoning_effort": "medium"}));
+    assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
+    ProviderProfile::DeepSeek.normalize_chat_for_upstream(&mut req);
+    assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
+
+    // Another vendor's profile forwards the field as sent.
+    let mut req = request(json!({"model": "gpt-4o", "reasoning_effort": "medium"}));
+    ProviderProfile::for_model(&req.model).normalize_chat_for_upstream(&mut req);
+    assert_eq!(req.reasoning_effort.as_deref(), Some("medium"));
+}
+
+#[test]
 fn deepseek_v41_accepts_native_integer_budgets() {
     for budget in [1, 42, 75, 100] {
         for mut body in [
