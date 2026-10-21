@@ -267,8 +267,68 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     }
 
 
+def cache_layer_labels(model_config: Any) -> tuple[str, ...]:
+    """The served model's per-layer cache-group labels, read as TokenSpeed's
+    cache recipes read them off its ``ModelConfig`` (the checkpoint's
+    ``cache_layer_types``, else its ``layer_types``, on the config the engine
+    holds, else on the text config nested in it); empty for a checkpoint that
+    declares none, whose layers are all full attention."""
+    hf_config = getattr(model_config, "hf_config", None)
+    for config in (hf_config, getattr(hf_config, "text_config", None)):
+        labels = getattr(config, "cache_layer_types", None) or getattr(config, "layer_types", None)
+        if labels:
+            return tuple(str(label) for label in labels)
+    return ()
+
+
+def kv_events_unpublishable(server_args: Any, model_config: Any = None) -> str | None:
+    """Why TokenSpeed's KV event publisher cannot serve the model this process
+    loads, or ``None`` when it can.
+
+    TokenSpeed keeps a hybrid model's recurrent state (its Gated DeltaNet,
+    Mamba or KDA layers) in State groups of its cache: blocks that hold one
+    checkpoint each and span no tokens. Its KV-event drain walks every cache
+    group of a published boundary for a token-span quantity, and a State
+    group has none: the scheduler's assertion (``a State group has no token
+    span``) ends the engine process at the first drain of a request's tail,
+    under the fused scheduler as under the prefill and decode roles. Which
+    layer labels get a State group is the engine's own vocabulary (the
+    recipes' ``STATE_LAYER_TYPES``, over :func:`cache_layer_labels`), so the
+    answer follows the engine installed: one without that vocabulary has no
+    State groups, and a model whose labels are all history (full, sliding or
+    sparse attention) is served. ``model_config`` is TokenSpeed's
+    ``ModelConfig`` for the served model, built here when not given
+    (:func:`_model_config`), after the vocabulary was found."""
+    try:
+        from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import STATE_LAYER_TYPES
+    except ImportError as error:
+        # An engine that does not spell its State-group vocabulary there (an
+        # older one, with no State groups, or one that moved the module), or
+        # no engine at all (the launcher's unit tests): the default is not
+        # guarded, and the log says so, since a hybrid model on an engine
+        # that moved the module would abort in the drain again.
+        logger.info(
+            "TokenSpeed's State-group vocabulary could not be read (%s): the KV-events default "
+            "is not guarded against State groups on this engine",
+            error,
+        )
+        return None
+    if model_config is None:
+        model_config = _model_config(server_args)
+    labels = cache_layer_labels(model_config)
+    state = [label for label in labels if label in STATE_LAYER_TYPES]
+    if not state:
+        return None
+    return (
+        f"{EngineConfigView(server_args).server_args.model} keeps recurrent state in "
+        f"{len(state)} of its {len(labels)} layers ({', '.join(sorted(set(state)))}): State "
+        "groups of TokenSpeed's cache, which span no tokens, and TokenSpeed's KV-event drain "
+        "aborts the engine on a group with no token span"
+    )
+
+
 def default_kv_events_config(
-    server_args: Any, environ: Mapping[str, str] | None = None
+    server_args: Any, environ: Mapping[str, str] | None = None, model_config: Any = None
 ) -> str | None:
     """Turn TokenSpeed's KV event publisher on when the launcher was given no
     ``--kv-events-config``; returns the configuration applied, or None: the
@@ -276,13 +336,17 @@ def default_kv_events_config(
     :func:`default_kv_events_json` at a free port of this host, one per
     attention-DP rank (each publishes at the port after its predecessor's),
     applied to the server args before the facts and the schedulers are built
-    from them."""
+    from them, unless the engine cannot serve the publisher for this model
+    (:func:`kv_events_unpublishable`, on ``model_config`` when the caller has
+    TokenSpeed's ``ModelConfig`` already): then the publisher stays off and
+    the reason is logged once."""
     return apply_kv_events_default(
         server_args,
         default_kv_events_json,
         env_name=KV_EVENTS_ENV,
         environ=environ,
         ranks=EngineConfigView(server_args).server_args.attention_dp_size or 1,
+        unless=lambda: kv_events_unpublishable(server_args, model_config),
     )
 
 
@@ -460,12 +524,24 @@ class TokenSpeedLauncher(RustLauncher):
     startup_ceiling_secs_env = STARTUP_CEILING_SECS_ENV
     kv_events_env = KV_EVENTS_ENV
     without_tokenizer = "string stops will be refused"
+    # TokenSpeed's ``ModelConfig`` for the served model, built on first use
+    # and kept for the hooks after it: the KV-events default reads the cache's
+    # layer labels off it, the facts the rest.
+    _cached_model_config: Any = None
+
+    def model_config(self, args: Any) -> Any:
+        if self._cached_model_config is None:
+            self._cached_model_config = _model_config(args)
+        return self._cached_model_config
 
     def kv_events_default(self, args: Any) -> str | None:
-        return default_kv_events_config(args)
+        # The config is built here rather than in the facts: the facts need
+        # it a hook later in any case, so an explicit configuration or the
+        # opt-out, which do not read it, cost nothing extra.
+        return default_kv_events_config(args, model_config=self.model_config(args))
 
     def facts(self, args: Any) -> dict[str, Any]:
-        return {**model_facts(args), **server_facts(args)}
+        return {**model_facts(args, self.model_config(args)), **server_facts(args)}
 
     def tokenizer_dir(self, args: Any) -> str | None:
         return tokenizer_dir_for(args)

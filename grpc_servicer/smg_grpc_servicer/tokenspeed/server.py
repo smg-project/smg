@@ -117,10 +117,14 @@ async def serve_grpc(server_args: ServerArgs) -> None:
     # a port found free on this host, before the engine and the servicer are
     # built from them, so SubscribeKvEvents relays the events a cache-aware
     # router routes by (the rule, the opt-out and the log line of
-    # `RustLauncher.serve`); a host with no free block of ports is refused as
-    # on the Rust path: one named ERROR line and exit code 2, not a traceback.
-    # An encode worker runs the vision tower only, with no KV cache to publish
-    # from: its server args are left as given.
+    # `RustLauncher.serve`), unless the engine cannot serve the publisher for
+    # this model (a hybrid model's State groups, which its KV-event drain
+    # aborts on: `kv_events_unpublishable`, read off the model config the
+    # engine builds, which costs one read of the checkpoint's config here);
+    # a host with no free block of ports is refused as on the Rust path: one
+    # named ERROR line and exit code 2, not a traceback. An encode worker runs
+    # the vision tower only, with no KV cache to publish from: its server args
+    # are left as given.
     encode_worker = server_args.disaggregation_mode == "encode"
     try:
         if not encode_worker and default_kv_events_config(server_args) is not None:

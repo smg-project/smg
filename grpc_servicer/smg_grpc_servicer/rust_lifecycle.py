@@ -2,8 +2,9 @@
 launchers: the servicer switch (which implementation serves the process, from
 the launcher's flag or the engine's variable), the launcher's knobs, the
 KV-events default (the engine's publisher on, at a free port, unless the
-launcher or its variable says otherwise, and its log line; the Python
-servicer's entry points apply the same rule), a free port and socket directory
+launcher or its variable says otherwise, or the engine says its publisher
+cannot serve the model, and its log lines; the Python servicer's entry points
+apply the same rule), a free port and socket directory
 for the handshake,
 the engine as a ``Popen``-shaped handle (one spawned headless engine, the
 engine cores a manager started from this process, or the scheduler processes
@@ -439,6 +440,7 @@ def apply_kv_events_default(
     env_name: str,
     environ: Mapping[str, str] | None = None,
     ranks: int = 1,
+    unless: Callable[[], str | None] | None = None,
 ) -> Any | None:
     """Turn the engine's KV event publisher on when the launcher was given no
     ``--kv-events-config``; returns the configuration applied, or ``None``.
@@ -460,13 +462,25 @@ def apply_kv_events_default(
     empty string, is kept as given, its endpoint and off included; ``env_name``
     set to one of ``KV_EVENTS_OFF_VALUES`` keeps the publisher off without one;
     a ``target`` that cannot be written (frozen server args) is left as it is,
-    with a warning.
+    with a warning. ``unless`` is the engine's own word on whether its
+    publisher can serve the model this process loads: a reason it cannot, or
+    ``None``; it is asked only once a default would otherwise apply, and a
+    reason keeps the publisher off, said once with what turns it on, before
+    any port is drawn.
     """
     source = os.environ if environ is None else environ
     given = getattr(target, "kv_events_config", None)
     if given is not None and given != "":
         return None
     if str(source.get(env_name, "")).strip().lower() in KV_EVENTS_OFF_VALUES:
+        return None
+    reason = unless() if unless is not None else None
+    if reason:
+        logger.info(
+            "KV event publishing left off: %s; pass --kv-events-config to turn the publisher "
+            "on anyway",
+            reason,
+        )
         return None
     config = default(free_kv_events_endpoint(ranks))
     try:

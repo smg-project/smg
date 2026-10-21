@@ -942,6 +942,39 @@ def test_the_kv_events_default_turns_the_publisher_on_unless_told_otherwise(capl
         assert apply(target, build, env_name=env, environ={}) is None
         assert target.kv_events_config is given
     assert len(built) == 4
+    # The engine's own word: a reason its publisher cannot serve this model
+    # keeps it off, said once with what turns it on, and no port is drawn; no
+    # reason, and the default applies. The question is not asked when a
+    # configuration was given or the variable says off.
+    asked: list[str | None] = []
+
+    def unless(reason: str | None):
+        def ask() -> str | None:
+            asked.append(reason)
+            return reason
+
+        return ask
+
+    target = types.SimpleNamespace(kv_events_config=None)
+    with caplog.at_level("INFO", logger=rust_lifecycle.logger.name):
+        assert apply(target, build, env_name=env, environ={}, unless=unless("no span")) is None
+    assert target.kv_events_config is None and len(built) == 4
+    assert (
+        "KV event publishing left off: no span; pass --kv-events-config to turn the publisher "
+        "on anyway"
+    ) in caplog.text
+    target = types.SimpleNamespace(kv_events_config=None)
+    assert apply(target, build, env_name=env, environ={}, unless=unless(None)) == {
+        "publisher": "zmq",
+        "endpoint": built[-1],
+    }
+    assert target.kv_events_config is not None and len(built) == 5
+    assert asked == ["no span", None]
+    given = types.SimpleNamespace(kv_events_config='{"publisher": "zmq"}')
+    assert apply(given, build, env_name=env, environ={}, unless=unless("no span")) is None
+    off = types.SimpleNamespace(kv_events_config=None)
+    assert apply(off, build, env_name=env, environ={env: "0"}, unless=unless("no span")) is None
+    assert asked == ["no span", None] and len(built) == 5
     # Server args that cannot be written are left alone, with a warning.
 
     class Frozen:

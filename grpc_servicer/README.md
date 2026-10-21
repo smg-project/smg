@@ -535,7 +535,12 @@ so `SubscribeKvEvents` relays the events a cache-aware router routes by and
 workers that share a host do not collide; an explicit configuration is kept as
 given, its endpoint and off included, and `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0`
 leaves the publisher off. An encode worker (`--disaggregation-mode encode`) has
-no KV cache and is left as given.
+no KV cache and is left as given. A hybrid model (Gated DeltaNet, Mamba or KDA
+layers) keeps its recurrent state in State groups of TokenSpeed's cache, which
+span no tokens, and TokenSpeed's KV-event drain aborts the engine on such a
+group: for a model whose layer labels the engine's own cache recipes map to a
+State group, the servicer leaves the publisher off and logs why once
+(`KV event publishing left off: ...`); `--kv-events-config` turns it on anyway.
 
 This is the process `ts serve` spawns for its gRPC worker; `--servicer-impl`
 is this package's flag (listed first by `--help`, ahead of TokenSpeed's own
@@ -556,7 +561,8 @@ TokenSpeed's ZMQ KV-event publisher, which the servicer turns on by itself, on
 this path as on the Python one, when the launcher is given no
 `--kv-events-config`, at a port found free on the host rather than
 TokenSpeed's fixed default (an explicit one is kept as given, its endpoint
-included; `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` leaves the publisher off).
+included; `SMG_TOKENSPEED_SERVICER_KV_EVENTS=0` leaves the publisher off; a
+hybrid model's State groups leave it off, as above).
 Tuning:
 `SMG_TOKENSPEED_SERVICER_HANDSHAKE_PORT` (default: a
 free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
