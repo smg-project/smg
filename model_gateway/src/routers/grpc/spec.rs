@@ -17,7 +17,7 @@ use openai_protocol::{
     completion::CompletionRequest,
     generate::GenerateRequest,
     messages::{self, CreateMessageRequest},
-    profile::ProviderProfile,
+    profile::{ModelProfile, ProviderProfile},
     responses::ResponsesRequest,
 };
 
@@ -76,6 +76,8 @@ pub(crate) struct ChatResponseSpec {
     /// Provider dialect of the model the client asked for, as request
     /// validation selects it; picks provider-specific response behaviour.
     pub provider: ProviderProfile,
+    /// The resolved version-specific contract, independent of dispatch model names.
+    pub model_profile: ModelProfile,
     pub separate_reasoning: bool,
     pub tool_choice: Option<ToolChoice>,
     /// The tools the response is read against, shared with the readers that
@@ -115,15 +117,14 @@ pub(crate) struct ChatResponseSpec {
 /// (`regular::symphony::assign`), so a call the conversation established
 /// without a tool inventory comes back as a call under either parser.
 pub(crate) fn scans_for_tool_calls(request: &ChatCompletionRequest) -> bool {
-    request.declares_tools()
-        || ProviderProfile::for_model(&request.model).parses_tool_calls_without_tools()
+    request.declares_tools() || request.provider_profile().parses_tool_calls_without_tools()
 }
 
 impl From<&ChatCompletionRequest> for ChatResponseSpec {
     fn from(request: &ChatCompletionRequest) -> Self {
-        let provider = ProviderProfile::for_model(&request.model);
         Self {
-            provider,
+            provider: request.provider_profile(),
+            model_profile: request.model_profile(),
             separate_reasoning: request.separate_reasoning,
             tool_choice: request.tool_choice.clone(),
             // Every tool the model may call, dynamic tools declared on messages

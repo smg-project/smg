@@ -16,6 +16,7 @@ use openai_protocol::{
     completion::{CompletionChoice, CompletionResponse},
     generate::{GenerateMetaInfo, GenerateResponse},
     messages::{self, Message},
+    profile::ModelProfile,
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use symphony::{adapt, Events};
@@ -146,6 +147,7 @@ impl ResponseProcessor {
                     parser_available: tool_parser_available,
                     history_tool_calls_count,
                     first_call_only: original_request.first_tool_call_only,
+                    profile: Some(original_request.model_profile),
                 },
             )
             .await;
@@ -583,6 +585,7 @@ impl ResponseProcessor {
                     source.tool_choice,
                     source.model,
                     source.history_tool_calls_count,
+                    source.profile,
                 );
             } else if source.parser_available {
                 (tool_calls, content) = self
@@ -592,6 +595,7 @@ impl ResponseProcessor {
                         source.parser_name,
                         tools,
                         source.history_tool_calls_count,
+                        source.profile,
                     )
                     .await;
             }
@@ -611,6 +615,7 @@ impl ResponseProcessor {
         tool_parser_name: Option<&str>,
         tools: &[Tool],
         history_tool_calls_count: usize,
+        profile: Option<ModelProfile>,
     ) -> (Option<Vec<ToolCall>>, String) {
         // Get pooled parser for this model
         let pooled_parser =
@@ -638,7 +643,8 @@ impl ResponseProcessor {
                     .enumerate()
                     .map(|(index, tc)| {
                         // Generate ID for this tool call
-                        let id = utils::generate_tool_call_id(
+                        let id = utils::generate_tool_call_id_with_profile(
+                            profile,
                             model,
                             &tc.function.name,
                             index,
@@ -903,6 +909,7 @@ impl ResponseProcessor {
                     parser_available: tool_parser_available,
                     history_tool_calls_count: messages_request.history_tool_calls_count,
                     first_call_only: messages_request.first_tool_call_only,
+                    profile: None,
                 },
             )
             .await;
@@ -1162,6 +1169,9 @@ struct ToolCallSource<'a> {
     parser_available: bool,
     history_tool_calls_count: usize,
     first_call_only: bool,
+    /// The chat request's resolved contract; `None` on the Messages path,
+    /// whose tool-call ids follow the model name.
+    profile: Option<ModelProfile>,
 }
 
 /// Whether a forced call shaped the output as JSON the constraint dictated
@@ -1756,6 +1766,51 @@ mod responses_finish_reason_tests {
             matched_stop_string(&decoder, &complete).as_deref(),
             Some("world")
         );
+    }
+
+    #[tokio::test]
+    async fn resolved_k3_profile_controls_nonstream_tool_ids_on_generic_names() {
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(scripted_tokenizer::ScriptedTokenizer::new(
+            "<tool_call>\n{\"name\":\"user_tool\",\"arguments\":{}}\n</tool_call>",
+        ));
+        let mut request: ChatCompletionRequest=serde_json::from_value(serde_json::json!({
+            "model":"vllm-model","messages":[{"role":"user","content":"call the tool"}],
+            "tools":[{"type":"function","function":{"name":"user_tool","parameters":{"type":"object"}}}]
+        })).unwrap();
+        request.resolved_model_profile = Some(ModelProfile::KimiK3);
+        let processor = ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        );
+        let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
+            output_ids: vec![100],
+            finish_reason: "stop".into(),
+            ..Default::default()
+        });
+        let mut decoder = StopSequenceDecoder::new(
+            tokenizer.clone(),
+            llm_tokenizer::StopSequenceConfig::default(),
+            false,
+        );
+        let (choice, _) = processor
+            .process_single_choice(
+                "req-k3",
+                &complete,
+                0,
+                &ChatResponseSpec::from(&request),
+                "vllm-model",
+                &tokenizer,
+                &mut decoder,
+                3,
+                false,
+                true,
+                None,
+                Some("qwen"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(choice.message.tool_calls.unwrap()[0].id, "user_tool_3");
     }
 
     #[tokio::test]

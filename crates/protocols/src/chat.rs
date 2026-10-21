@@ -17,7 +17,7 @@ use super::{
 use crate::{
     builders::{ChatCompletionResponseBuilder, ChatCompletionStreamResponseBuilder},
     ext::kimi::{KimiAssistantExt, KimiDeveloperExt, KimiSystemExt, KimiUserExt},
-    profile::ProviderProfile,
+    profile::{ModelProfile, ProviderProfile},
     validated::Normalizable,
 };
 
@@ -178,6 +178,11 @@ pub struct ChatCompletionRequest {
 
     /// ID of the model to use
     pub model: String,
+
+    /// Trusted gateway metadata, resolved before normalization. Never accepted from or sent over JSON.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub resolved_model_profile: Option<ModelProfile>,
 
     /// Number between -2.0 and 2.0. Positive values penalize new tokens based on their existing frequency in the text so far
     #[validate(range(min = -2.0, max = 2.0))]
@@ -436,6 +441,16 @@ impl ThinkingParam {
 }
 
 impl ChatCompletionRequest {
+    /// The resolved contract stays fixed even if dispatch rewrites the serving name.
+    pub fn model_profile(&self) -> ModelProfile {
+        self.resolved_model_profile
+            .unwrap_or_else(|| ModelProfile::for_model(&self.model))
+    }
+
+    pub fn provider_profile(&self) -> ProviderProfile {
+        self.model_profile().provider()
+    }
+
     /// The cap the client put on the completion: `max_completion_tokens`,
     /// else the deprecated `max_tokens`; when the client wrote both, the
     /// current name wins, as the serving engines resolve the pair. The
@@ -461,7 +476,7 @@ impl ChatCompletionRequest {
         let toggle = self.thinking_toggle();
         if toggle == Some(false)
             && self.effective_reasoning_effort().is_some()
-            && ProviderProfile::for_model(&self.model).effort_outranks_thinking_disabled()
+            && self.provider_profile().effort_outranks_thinking_disabled()
         {
             return None;
         }
@@ -473,7 +488,7 @@ impl ChatCompletionRequest {
     /// `reasoning_effort` ([`ProviderProfile::thinking_from_reasoning_effort`]).
     pub fn template_thinking(&self) -> Option<bool> {
         self.effective_thinking_toggle().or_else(|| {
-            ProviderProfile::for_model(&self.model)
+            self.provider_profile()
                 .thinking_from_reasoning_effort(self.effective_reasoning_effort())
         })
     }
@@ -693,12 +708,12 @@ fn validate_chat_cross_parameters(
         ));
     }
 
-    // 10. Provider-profile contract rules, selected from the model id. Both
-    //     token limits at once are judged there: the request keeps whichever
-    //     the client wrote and `output_token_cap` reads `max_completion_tokens`
-    //     first, the precedence the serving engines apply themselves; only
-    //     OpenAI's own contract refuses the pair.
-    ProviderProfile::for_model(&req.model).validate_chat(req)?;
+    // 10. Provider-profile contract rules, from the request's resolved
+    //     contract. Both token limits at once are judged there: the request
+    //     keeps whichever the client wrote and `output_token_cap` reads
+    //     `max_completion_tokens` first, the precedence the serving engines
+    //     apply themselves; only OpenAI's own contract refuses the pair.
+    req.provider_profile().validate_chat(req)?;
 
     Ok(())
 }
@@ -783,7 +798,7 @@ impl ChatCompletionRequest {
     /// request's provider profile defines them (Kimi K3 dynamic tools on
     /// system and developer messages; see [`ProviderProfile::dynamic_tools`]).
     pub fn dynamic_tools(&self) -> impl Iterator<Item = &Tool> {
-        ProviderProfile::for_model(&self.model).dynamic_tools(self)
+        self.provider_profile().dynamic_tools(self)
     }
 
     /// Whether the request offers the model any tool: a request-level `tools`
@@ -891,7 +906,7 @@ impl Normalizable for ChatCompletionRequest {
     /// its upstream with the cap under the name the client wrote, and the
     /// router reads the number through [`Self::output_token_cap`].
     fn normalize(&mut self) {
-        ProviderProfile::for_model(&self.model).normalize_chat(self);
+        self.provider_profile().normalize_chat(self);
 
         // Migrate deprecated functions → tools
         #[expect(deprecated)]
@@ -944,6 +959,10 @@ impl Normalizable for ChatCompletionRequest {
 // ============================================================================
 
 impl GenerationRequest for ChatCompletionRequest {
+    fn provider_profile(&self) -> ProviderProfile {
+        ChatCompletionRequest::provider_profile(self)
+    }
+
     fn rid(&self) -> Option<&str> {
         self.rid.as_deref()
     }

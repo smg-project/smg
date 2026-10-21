@@ -185,7 +185,7 @@ fn output_budget(request_type: &RequestType) -> Option<u32> {
     let RequestType::Chat(request) = request_type else {
         return None;
     };
-    if ProviderProfile::for_model(&request.model) != ProviderProfile::Zai {
+    if request.provider_profile() != ProviderProfile::Zai {
         return None;
     }
     #[expect(deprecated, reason = "the request may predate normalization")]

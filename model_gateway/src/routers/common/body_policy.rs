@@ -24,6 +24,7 @@ pub(crate) const BODY_PATH_BUFFERED: &str = "buffered";
 
 pub(crate) const REASON_ROUTING_KEY_OVERRIDE: &str = "routing_key_override";
 pub(crate) const REASON_POLICY_NEEDS_TEXT: &str = "policy_needs_text";
+pub(crate) const REASON_MODEL_PROFILE: &str = "model_profile";
 pub(crate) const REASON_MODEL_AMBIGUOUS: &str = "model_ambiguous";
 pub(crate) const REASON_WORKER_MUTATES_BODY: &str = "worker_mutates_body";
 pub(crate) const REASON_WASM_REQUEST_HOOK: &str = "wasm_request_hook";

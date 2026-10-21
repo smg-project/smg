@@ -411,6 +411,28 @@ where
     type Rejection = Response;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        Self::from_request_with(req, state, |_| Ok(())).await
+    }
+}
+
+#[cfg(feature = "axum")]
+impl<T> ValidatedJson<T>
+where
+    T: DeserializeOwned + Validate + Normalizable + Send,
+{
+    /// [`FromRequest::from_request`] with `prepare` run on the deserialized
+    /// body before normalization and validation: where a caller that knows
+    /// more than the body (the gateway, its worker registry) stamps trusted
+    /// metadata onto the request. The protocol crate stays independent of it.
+    pub async fn from_request_with<S, F>(
+        req: Request,
+        state: &S,
+        prepare: F,
+    ) -> Result<Self, Response>
+    where
+        S: Send + Sync,
+        F: FnOnce(&mut T) -> Result<(), Response> + Send,
+    {
         // A body under the plain `application/json` content type is read and
         // parsed once, directly; axum's extractor parses it a second time only
         // when that fails, so that the rejection names the path of the failing
@@ -432,6 +454,8 @@ where
                 .await
                 .map_err(json_rejection)?
         };
+
+        prepare(&mut data)?;
 
         // Normalize the request (apply defaults based on other fields)
         data.normalize();

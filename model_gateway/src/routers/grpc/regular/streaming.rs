@@ -26,7 +26,7 @@ use openai_protocol::{
         self, ContentBlock, ContentBlockDelta, Message, MessageDelta, MessageDeltaUsage,
         MessageStreamEvent,
     },
-    profile::ProviderProfile,
+    profile::{ModelProfile, ProviderProfile},
 };
 use reasoning_parser::{ParserFactory as ReasoningParserFactory, ParserResult, ReasoningParser};
 use serde::Serialize;
@@ -1164,6 +1164,7 @@ impl StreamingProcessor {
         tool_choice: Option<&ToolChoice>,
         model: &str,
         history_tool_calls_count: usize,
+        profile: ModelProfile,
     ) -> Vec<ChatStreamChoice> {
         let mut chunks = Vec::new();
 
@@ -1174,7 +1175,8 @@ impl StreamingProcessor {
                 // First chunk: send name and id
                 has_tool_calls.insert(index, true);
 
-                let tool_call_id = utils::generate_tool_call_id(
+                let tool_call_id = utils::generate_tool_call_id_with_profile(
+                    Some(profile),
                     model,
                     &function.name,
                     0,
@@ -1234,6 +1236,7 @@ impl StreamingProcessor {
         history_tool_calls_count: usize,
         use_json_parser: bool,
         first_tool_call_only: bool,
+        profile: ModelProfile,
     ) -> Vec<ChatStreamChoice> {
         let mut chunks = Vec::new();
 
@@ -1271,7 +1274,8 @@ impl StreamingProcessor {
                         has_tool_calls.insert(index, true);
 
                         let tool_call_id = if let Some(ref name) = tool_call_item.name {
-                            Some(utils::generate_tool_call_id(
+                            Some(utils::generate_tool_call_id_with_profile(
+                                Some(profile),
                                 model,
                                 name,
                                 tool_call_item.tool_index,
@@ -3122,6 +3126,7 @@ impl<'a> ChatStream<'a> {
                         self.spec.tool_choice.as_ref(),
                         model,
                         self.spec.history_tool_calls_count,
+                        self.spec.model_profile,
                     )
                 } else {
                     // Use incremental parser for regular/required modes
@@ -3137,6 +3142,7 @@ impl<'a> ChatStream<'a> {
                             self.spec.history_tool_calls_count,
                             self.used_json_schema,
                             self.spec.first_tool_call_only,
+                            self.spec.model_profile,
                         )
                         .await
                 };

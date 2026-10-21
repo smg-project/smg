@@ -4,6 +4,7 @@ use std::{
 };
 
 use axum::http::{HeaderName, HeaderValue, Uri};
+use openai_protocol::profile::ModelProfile;
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
@@ -483,6 +484,46 @@ impl ConfigValidator {
                     alias,
                     "Alias must differ from the canonical model ID",
                 ));
+            }
+        }
+        // The vendor-named aliases of one served model must bind it to one
+        // contract: `ProviderProfile::register_model_aliases` keeps the first
+        // it is handed, and the alias map iterates in no fixed order, so a
+        // disagreeing set would give the served model a contract that changes
+        // from one start to the next. A served model whose own name selects a
+        // vendor contract binds no alias contract and cannot disagree.
+        let mut bound: std::collections::HashMap<&str, (&str, ModelProfile)> =
+            std::collections::HashMap::new();
+        let mut aliases: Vec<(&str, &str)> = config
+            .model_aliases
+            .iter()
+            .map(|(alias, canonical)| (alias.as_str(), canonical.as_str()))
+            .collect();
+        aliases.sort_unstable();
+        for (alias, canonical) in aliases {
+            if ModelProfile::for_model_name(canonical).is_vendor_contract() {
+                continue;
+            }
+            let profile = ModelProfile::for_model_name(alias);
+            if !profile.is_vendor_contract() {
+                continue;
+            }
+            match bound.get(canonical) {
+                Some((earlier, existing)) if *existing != profile => {
+                    return Err(ConfigError::invalid_value(
+                        "model_aliases",
+                        format!("{alias}={canonical}"),
+                        format!(
+                            "Alias '{alias}' selects the {profile:?} contract for '{canonical}' \
+                             but alias '{earlier}' selects {existing:?}; the aliases of one \
+                             served model must select one contract"
+                        ),
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    bound.insert(canonical, (alias, profile));
+                }
             }
         }
 
@@ -3194,6 +3235,51 @@ mod tests {
                 ConfigValidator::validate(&config),
                 Err(ConfigError::InvalidValue { ref field, .. }) if field == "model_aliases"
             ));
+        }
+    }
+
+    #[test]
+    fn the_aliases_of_one_served_model_must_select_one_contract() {
+        let mut config = regular_mode_config();
+        let aliases = |pairs: &[(&str, &str)]| {
+            std::collections::HashMap::from_iter(
+                pairs
+                    .iter()
+                    .map(|(alias, canonical)| (alias.to_string(), canonical.to_string())),
+            )
+        };
+        // One contract under two names, and a compatibility name that binds
+        // nothing, pass.
+        config.model_aliases = aliases(&[
+            ("deepseek-flash", "vllm-model"),
+            ("deepseek-v4-flash", "vllm-model"),
+            ("gpt-4o", "vllm-model"),
+        ]);
+        assert!(ConfigValidator::validate(&config).is_ok());
+        // A served model whose own name is a vendor's binds no alias contract.
+        config.model_aliases = aliases(&[
+            ("deepseek-v4.1-flash", "deepseek-v4-flash"),
+            ("deepseek-flash", "deepseek-v4-flash"),
+        ]);
+        assert!(ConfigValidator::validate(&config).is_ok());
+        for (first, second) in [
+            ("deepseek-flash", "deepseek-v4.1-flash"),
+            ("glm-5", "glm-5.3-flash"),
+            ("kimi-latest", "kimi-k3"),
+            ("kimi-k3", "MiniMax-M2"),
+        ] {
+            config.model_aliases = aliases(&[(first, "vllm-model"), (second, "vllm-model")]);
+            let error = ConfigValidator::validate(&config).expect_err("refused");
+            assert!(
+                matches!(
+                    error,
+                    ConfigError::InvalidValue { ref field, ref reason, .. }
+                        if field == "model_aliases"
+                            && reason.contains(first)
+                            && reason.contains(second)
+                ),
+                "{first} + {second}: {error}"
+            );
         }
     }
 

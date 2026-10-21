@@ -12,6 +12,7 @@ use serde_json::Value;
 use crate::{
     chat::{ChatCompletionRequest, ThinkingType},
     common::{invalid, ToolChoice},
+    profile::ModelProfile,
 };
 
 const V41_MODELS: [&str; 2] = ["deepseek-v4.1-flash", "deepseek-v4.1-flash-1017"];
@@ -23,7 +24,7 @@ pub(super) fn matches_model(segment: &str) -> bool {
         .any(|model| segment.eq_ignore_ascii_case(model))
 }
 
-fn is_v41_model(model: &str) -> bool {
+pub(super) fn is_v41_model(model: &str) -> bool {
     model.split('/').any(|segment| {
         V41_MODELS
             .iter()
@@ -32,7 +33,7 @@ fn is_v41_model(model: &str) -> bool {
 }
 
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
-    let is_v41 = is_v41_model(&req.model);
+    let is_v41 = req.model_profile() == ModelProfile::DeepSeekV41;
     for effort in [
         req.reasoning_effort.as_mut(),
         req.thinking
@@ -109,7 +110,7 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
     {
         // The V4.1 native renderer restores ASCII-digit strings to 1..=100
         // budgets. Other V4 renderers do not support that extension.
-        let is_v41 = is_v41_model(&req.model);
+        let is_v41 = req.model_profile() == ModelProfile::DeepSeekV41;
         let native_budget = is_v41
             && effort.bytes().all(|byte| byte.is_ascii_digit())
             && effort

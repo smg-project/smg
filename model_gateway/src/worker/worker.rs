@@ -1013,6 +1013,13 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.metadata().spec.models.all().iter().any(pred)
     }
 
+    /// The same cards [`Self::models`] returns, read in place by `visitor`:
+    /// for a read on the request path that needs more than [`Self::any_model`]
+    /// answers. The slice lives for the call only.
+    fn with_models(&self, visitor: &mut dyn FnMut(&[ModelCard])) {
+        visitor(self.metadata().spec.models.all());
+    }
+
     /// Context window (in tokens) this worker advertises for `model_id`, from
     /// the matching model card (falling back to the primary card). `None`
     /// when the worker never advertised one; callers then leave the length
@@ -2125,6 +2132,10 @@ impl Worker for BasicWorker {
 
     fn any_model(&self, pred: &mut dyn FnMut(&ModelCard) -> bool) -> bool {
         self.with_model_cards(|cards| cards.iter().any(pred))
+    }
+
+    fn with_models(&self, visitor: &mut dyn FnMut(&[ModelCard])) {
+        self.with_model_cards(visitor);
     }
 
     fn context_length(&self, model_id: &str) -> Option<u32> {

@@ -473,7 +473,7 @@ pub fn chat_reasoning_starts_in_rendered_prefill(
         request.effective_thinking_toggle(),
         continued_final_message,
         tokenizer,
-        ProviderProfile::for_model(&request.model),
+        request.provider_profile(),
     )
 }
 

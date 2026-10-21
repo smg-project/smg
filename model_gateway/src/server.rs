@@ -18,7 +18,6 @@ use axum::{
 use llm_tokenizer::TokenizerRegistry;
 use metrics_exporter_prometheus::PrometheusHandle;
 use openai_protocol::{
-    chat::ChatCompletionRequest,
     classify::ClassifyRequest,
     completion::CompletionRequest,
     decisions::DecisionsRequest,
@@ -62,6 +61,7 @@ use crate::{
     mesh::MeshAdapters,
     mesh_discovery::{start_mesh_discovery, MeshDiscoveryConfig},
     middleware::{self, AdmissionQueue, AuthConfig},
+    model_profile::ProfiledChatJson,
     observability::{
         heap_profile, history_metrics,
         inflight_tracker::InFlightRequestTracker,
@@ -223,7 +223,7 @@ async fn v1_chat_completions(
     headers: HeaderMap,
     Extension(tenant_meta): Extension<middleware::TenantRequestMeta>,
     cancel: middleware::scheduler::PreemptionGuard,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    ProfiledChatJson(body): ProfiledChatJson,
 ) -> Response {
     let model = body.model.clone();
     cancel
@@ -2959,6 +2959,7 @@ mod tests {
 
     use axum::response::sse::{Event, Sse};
     use axum_server::accept::Accept;
+    use openai_protocol::chat::ChatCompletionRequest;
     use tokio::net::{TcpListener, TcpStream};
 
     use super::*;
