@@ -446,6 +446,15 @@ async fn a_refused_block_released_as_the_answer_keeps_its_tokens_logprobs() {
     assert_eq!(choice.message.content.as_deref(), Some(released));
     assert!(choice.message.tool_calls.is_none());
     assert_eq!(kept_logprob_tokens(&choice), released);
+    // The answer's text, then the block: the text's tokens and the block's keep their logprobs,
+    // the block's where the output wrote them.
+    let output = "plan</think>Let me look:<tool_call>get_stock_info(company=\"Apple\")</tool_call>";
+    let (choice, _) = fold_with(output, glm(), "<|assistant|><think>").await;
+    let content = "Let me look:<tool_call>get_stock_info(company=\"Apple\")</tool_call>";
+    assert_eq!(choice.message.content.as_deref(), Some(content));
+    assert!(choice.message.tool_calls.is_none());
+    assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
+    assert_eq!(kept_logprob_tokens(&choice), content);
 }
 
 #[tokio::test]
@@ -1465,5 +1474,84 @@ async fn a_stream_of_two_refused_blocks_carries_the_bytes_between_them_before_th
     )
     .expect("the outputs counter");
     assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert!(logs_contain(&format!("released_bytes={}", released.len())));
+}
+
+/// The answer's text, then a call written as Python inside the block's markers (the recorded
+/// shape): the text streams as it comes, and the block, the tail of the answer, goes out from its
+/// opener as one content delta right before the finish chunk, which stays last; no call delta is
+/// made of it. The output counts as malformed under its reason, and its line says how many bytes
+/// went out.
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_stream_whose_text_ends_in_a_python_call_in_the_tag_carries_the_block_as_content_before_the_finish(
+) {
+    let spec = assigned(chat_spec(true), glm(), "<|assistant|><think>");
+    let text = "I'll place both orders for you.";
+    let released = "<tool_call>whole_foods_order(location=\"downtown\")</tool_call>";
+    let ((result, events), scrape) = scraped(stream_events(
+        vec![
+            chunk(0, "plan</think>"),
+            chunk(0, "I'll place both "),
+            chunk(0, "orders for you."),
+            chunk(0, "<tool_call>"),
+            chunk(0, "whole_foods_order(location="),
+            chunk(0, "\"downtown\")</tool_call>"),
+            complete(0, "stop"),
+        ],
+        true,
+        spec,
+    ))
+    .await;
+    result.expect("the stream ends well");
+    assert_eq!(chat_text(&events, 0, "reasoning_content"), "plan");
+    assert_eq!(
+        chat_text(&events, 0, "content"),
+        format!("{text}{released}")
+    );
+    assert!(tool_call_deltas(&events).is_empty(), "{events:#?}");
+    let chunks: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["choices"][0].is_object())
+        .collect();
+    let contents: Vec<(usize, &str)> = chunks
+        .iter()
+        .enumerate()
+        .filter_map(|(at, chunk)| {
+            chunk["choices"][0]["delta"]["content"]
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .map(|text| (at, text))
+        })
+        .collect();
+    let finish_at = chunks
+        .iter()
+        .position(|chunk| chunk["choices"][0]["finish_reason"].is_string())
+        .expect("a finish chunk");
+    // The text's deltas as they came, then the block as one delta right before the finish chunk.
+    let (last_at, last) = contents.last().copied().expect("a content delta");
+    assert_eq!((last_at, last), (finish_at - 1, released), "{events:#?}");
+    let streamed: String = contents[..contents.len() - 1]
+        .iter()
+        .map(|(_, text)| *text)
+        .collect();
+    assert_eq!(streamed, text, "{events:#?}");
+    assert!(contents.len() >= 2, "{events:#?}");
+    assert_eq!(finish_at, chunks.len() - 1, "{events:#?}");
+    assert_eq!(chunks[finish_at]["choices"][0]["finish_reason"], "stop");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"glm\"", "outcome=\"malformed\""],
+    )
+    .expect("the outputs counter");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    let reason = series_line(
+        &scrape,
+        "smg_symphony_malformed_total",
+        &["table=\"glm\"", "reason=\"text_where_the_name_should_be\""],
+    )
+    .expect("the reason counter");
+    assert!(reason.ends_with(" 1"), "{reason}");
     assert!(logs_contain(&format!("released_bytes={}", released.len())));
 }

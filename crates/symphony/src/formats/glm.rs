@@ -549,6 +549,48 @@ mod tests {
         }
     }
 
+    /// A call written as Python inside the block's markers after the answer's text (the recorded
+    /// shape: a sentence, then the block): the text is content, and the block is refused whole as
+    /// when it stands alone (the text where the name goes, then the marker that ended it), behind
+    /// events of no bytes, the first saying that text stands where the name should be; the
+    /// content ends where the text does, and what a client sees of the block is the reader's
+    /// decision. Every chunking says the same.
+    #[test]
+    fn a_call_written_as_python_after_the_text_is_refused_whole_and_the_text_is_content() {
+        let output =
+            "</think>Let me check.<tool_call>get_stock_info(company=\"Apple\")</tool_call>";
+        for pieces in plans(output) {
+            let events = run_with(stock_tools(), PROMPT, &pieces);
+            let place = || format!("{} pieces", pieces.len());
+            assert_eq!(bytes(&events), output, "{}", place());
+            assert_eq!(content(&events), "Let me check.", "{}", place());
+            assert!(calls_of(&events).is_empty(), "{}", place());
+            let malformed = malformed(&events);
+            assert!(
+                malformed.iter().all(|(_, text)| text.is_empty()),
+                "{}: {malformed:?}",
+                place()
+            );
+            assert_eq!(
+                malformed.first().map(|(why, _)| *why),
+                Some(MalformedReason::TextWhereTheNameShouldBe),
+                "{}",
+                place()
+            );
+            assert_eq!(
+                refused(&events),
+                "get_stock_info(company=\"Apple\")</tool_call>",
+                "{}",
+                place()
+            );
+            assert!(
+                matches!(events.last(), Some(Event::Finish { tool_calls: 0, .. })),
+                "{}",
+                place()
+            );
+        }
+    }
+
     /// A recorded output: one well-formed call whose last value close the model wrote twice.
     const RECORDED_STRAY_CLOSE: &str = concat!(
         "The user wants to perform a t-test between two datasets:\n- Dataset A: [12, 24, 36]\n",
