@@ -1341,7 +1341,8 @@ impl StreamingProcessor {
     /// delta each event has, the chunk's logprobs on its first text delta. The
     /// `Finish` event writes nothing here: the finish chunk is the loop's, with
     /// the matched stop. The opening chunk carried the role, so the deltas do
-    /// not repeat it, as the older path's do not. The step's events are consumed
+    /// not repeat it, as the older path's do not (and are built without it, one
+    /// allocation per delta saved). The step's events are consumed
     /// out of the buffer, which keeps its room for the next step: what an event
     /// owns moves into its chunk, a borrowed text is copied into it once.
     #[expect(clippy::too_many_arguments)]
@@ -1356,13 +1357,12 @@ impl StreamingProcessor {
         emit_usage_null: bool,
     ) -> Result<(), String> {
         for event in events.consume() {
-            let Some(mut choice) = adapt::chat::into_delta(index, event) else {
+            let Some(mut choice) = adapt::chat::into_delta_without_role(index, event) else {
                 continue;
             };
             if choice.finish_reason.is_some() {
                 continue;
             }
-            choice.delta.role = None;
             if choice.delta.content.is_some() || choice.delta.reasoning_content.is_some() {
                 choice.logprobs = logprobs.take();
             }

@@ -20,6 +20,11 @@ use crate::event::{Event, FinishReason};
 /// choice carries a copy of the text it takes from the event; [`into_delta`] takes the event and
 /// its text.
 pub fn delta(choice: u32, event: &Event<'_>) -> Option<ChatStreamChoice> {
+    delta_without_role(choice, event).map(with_role)
+}
+
+/// [`delta`] without the assistant role on the delta (see [`into_delta_without_role`]).
+pub fn delta_without_role(choice: u32, event: &Event<'_>) -> Option<ChatStreamChoice> {
     match event {
         Event::Content(text) | Event::Malformed { text, .. } => {
             content(choice, text.text.to_string())
@@ -42,6 +47,12 @@ pub fn delta(choice: u32, event: &Event<'_>) -> Option<ChatStreamChoice> {
 /// [`delta`] over an event the caller gives up: the choice takes the event's text in place of a
 /// copy, which a stream that renders every delta once need not make.
 pub fn into_delta(choice: u32, event: Event<'_>) -> Option<ChatStreamChoice> {
+    into_delta_without_role(choice, event).map(with_role)
+}
+
+/// [`into_delta`] without the assistant role on the delta, for a stream whose opening chunk
+/// carried the role and whose later deltas do not repeat it (the public API's shape).
+pub fn into_delta_without_role(choice: u32, event: Event<'_>) -> Option<ChatStreamChoice> {
     match event {
         Event::Content(text) | Event::Malformed { text, .. } => {
             content(choice, text.text.into_owned())
@@ -68,7 +79,7 @@ fn content(choice: u32, text: String) -> Option<ChatStreamChoice> {
             choice,
             ChatMessageDelta {
                 content: Some(text),
-                ..assistant()
+                ..bare()
             },
         )
     })
@@ -81,7 +92,7 @@ fn reasoning(choice: u32, text: String) -> Option<ChatStreamChoice> {
             choice,
             ChatMessageDelta {
                 reasoning_content: Some(text),
-                ..assistant()
+                ..bare()
             },
         )
     })
@@ -101,7 +112,7 @@ fn call_start(choice: u32, index: u32, id: String, name: String) -> ChatStreamCh
                     arguments: None,
                 }),
             }]),
-            ..assistant()
+            ..bare()
         },
     )
 }
@@ -121,7 +132,7 @@ fn arguments(choice: u32, index: u32, json: String) -> Option<ChatStreamChoice> 
                         arguments: Some(json),
                     }),
                 }]),
-                ..assistant()
+                ..bare()
             },
         )
     })
@@ -222,14 +233,26 @@ fn finish_reason(reason: &FinishReason, tool_calls: u32) -> String {
     .to_string()
 }
 
-/// An assistant delta with nothing in it yet.
-fn assistant() -> ChatMessageDelta {
+/// A delta with nothing in it yet and no role: the role goes on with
+/// [`with_role`] where a caller wants it on every delta, and stays off where
+/// the stream's opening chunk carried it (one allocation per delta saved,
+/// measured 2026-10-21: 128 per 128-delta stream).
+fn bare() -> ChatMessageDelta {
     ChatMessageDelta {
-        role: Some("assistant".to_string()),
+        role: None,
         content: None,
         tool_calls: None,
         reasoning_content: None,
     }
+}
+
+/// `choice` with the assistant role on its delta, as the deltas always had it;
+/// the finishing choice keeps its empty delta.
+fn with_role(mut choice: ChatStreamChoice) -> ChatStreamChoice {
+    if choice.finish_reason.is_none() {
+        choice.delta.role = Some("assistant".to_string());
+    }
+    choice
 }
 
 /// The byte ranges of the output that are the message's content, from the events' sources in
@@ -355,6 +378,32 @@ mod tests {
             let owned = into_delta(3, event.clone())
                 .map(|choice| serde_json::to_value(choice).expect("wire"));
             assert_eq!(borrowed, owned, "{event:?}");
+        }
+    }
+
+    /// The `_without_role` forms are the forms with the role, minus the role: for every event the
+    /// same choice or none, the role on the delta exactly where the forms with it put one (every
+    /// delta but the finishing choice's, which keeps its empty delta).
+    #[test]
+    fn a_delta_without_the_role_is_the_delta_minus_its_role() {
+        let json = |choice: &ChatStreamChoice| serde_json::to_value(choice).expect("wire");
+        for event in one_of_each() {
+            let with = into_delta(3, event.clone());
+            let without = into_delta_without_role(3, event.clone());
+            assert_eq!(with.is_some(), without.is_some(), "{event:?}");
+            if let (Some(with), Some(without)) = (&with, &without) {
+                let expected_role = with.finish_reason.is_none().then_some("assistant");
+                assert_eq!(with.delta.role.as_deref(), expected_role, "{event:?}");
+                assert_eq!(without.delta.role, None, "{event:?}");
+                let mut stripped = with.clone();
+                stripped.delta.role = None;
+                assert_eq!(json(&stripped), json(without), "{event:?}");
+            }
+            assert_eq!(
+                delta_without_role(3, &event).map(|choice| json(&choice)),
+                without.as_ref().map(json),
+                "the borrowing form without the role: {event:?}"
+            );
         }
     }
 
