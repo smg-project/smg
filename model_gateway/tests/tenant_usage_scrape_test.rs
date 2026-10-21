@@ -45,7 +45,7 @@ async fn usage_families_render_in_the_scrape_with_help_text_and_the_other_row() 
     tenant_usage::record("header:bravo", "model-b", usage(7, 3, 100));
     tenant_usage::record("ip:203.0.113.9", "model-a", usage(1000, 1, 1000));
 
-    let body = smg::http_client::client()
+    let body = smg::clients::http_client()
         .get(format!("http://{addr}/metrics"))
         .send()
         .await
