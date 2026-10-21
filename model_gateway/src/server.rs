@@ -1075,10 +1075,10 @@ where
 ///
 /// `AdmissionMode::Priority` installs the priority scheduler middleware
 /// (carrying its own `Arc<SchedulerState>`); `AdmissionMode::Legacy` installs
-/// the original `concurrency_limit_middleware` when a rate limiter is
-/// configured, and nothing otherwise (it would pass every request through).
-/// Either runs innermost of the protective layers (closest to the handler),
-/// after tenant resolution has populated `RouteRequestMeta`.
+/// the original concurrency limit (`ConcurrencyLimitLayer`) when a rate
+/// limiter is configured, and nothing otherwise (it would pass every request
+/// through). Either runs innermost of the protective layers (closest to the
+/// handler), after tenant resolution has populated `RouteRequestMeta`.
 ///
 /// Invariant: a request parked at admission keeps its body unread — bodies
 /// are collected only at handler extraction, after a permit is granted.
@@ -1095,15 +1095,12 @@ fn with_admission_layer(
             ))
         }
         // Without a rate limiter the legacy layer passes every request through;
-        // it is not installed then (a from_fn layer clones and boxes per
-        // request whatever it does).
+        // it is not installed then (axum wraps every route in a boxed service
+        // for any layer it is given, this lean one included).
         middleware::scheduler::AdmissionMode::Legacy
             if app_state.context.rate_limiter.is_some() =>
         {
-            router.route_layer(axum::middleware::from_fn_with_state(
-                app_state,
-                middleware::concurrency_limit_middleware,
-            ))
+            router.route_layer(middleware::ConcurrencyLimitLayer::new(app_state))
         }
         middleware::scheduler::AdmissionMode::Legacy => router,
     }

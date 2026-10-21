@@ -33,7 +33,7 @@ pub struct SchedulerState {
 /// Which admission path the protected routes use. Chosen once at startup.
 #[derive(Clone)]
 pub enum AdmissionMode {
-    /// Legacy `concurrency_limit_middleware` (default; zero behavior change).
+    /// Legacy concurrency limit layer (default; zero behavior change).
     Legacy,
     /// Priority scheduler enabled.
     Priority(Arc<SchedulerState>),
