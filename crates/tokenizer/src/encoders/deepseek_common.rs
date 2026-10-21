@@ -132,7 +132,7 @@ pub enum DsEncodingError {
     // --- V4.1 only -----------------------------------------------------
     #[error("Message text contains the image special token `<｜deepseek_image｜>`; images must be sent as image content parts")]
     PlaceholderInText,
-    #[error("Invalid reasoning effort `{0}`: expected an integer within [1, 100] or one of low, high, xhigh, max")]
+    #[error("Invalid reasoning effort `{0}`: expected an integer within [1, 100] or one of low, medium, high, xhigh, max")]
     InvalidReasoningEffort(String),
     #[error("Unsupported content part type `{0}`: only text and image parts are supported")]
     UnsupportedContentPart(String),

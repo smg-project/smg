@@ -2134,8 +2134,8 @@ fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_j
 /// 1. an explicit `template_kwargs["thinking"]` boolean decides;
 /// 2. else the `reasoning_effort` kwarg: `"none"`/`"minimal"` (the gateway's
 ///    thinking switch, `thinking_from_reasoning_effort`) switch thinking off,
-///    a native effort name (`low`/`high`/`xhigh`/`max`) switches it on, and
-///    an integer budget has no opinion;
+///    a native effort name (`low`/`medium`/`high`/`xhigh`/`max`) switches it
+///    on, and an integer budget has no opinion;
 /// 3. else `params.thinking` (the gateway's projection of the typed
 ///    `thinking.type` toggle, else `Some(false)` for a `none`/`minimal`
 ///    effective `reasoning_effort`);

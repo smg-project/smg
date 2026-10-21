@@ -44,9 +44,9 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
     {
         match effort.as_str() {
             "minimal" => *effort = "low".into(),
-            "medium" => *effort = "high".into(),
-            // V4.1 accepts xhigh natively (its renderer gives it a budget).
-            "xhigh" if !is_v41 => *effort = "high".into(),
+            // V4.1 accepts medium and xhigh natively (its renderer gives each
+            // the budget of the checkpoint's own table).
+            "medium" | "xhigh" if !is_v41 => *effort = "high".into(),
             _ => {}
         }
     }
@@ -121,7 +121,7 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
             return Err(invalid(
                 "reasoning_effort_not_allowed",
                 if is_v41 {
-                    "DeepSeek V4.1 reasoning effort must be none, low, high, xhigh, max or an integer budget from 1 to 100 (minimal and medium aliases are accepted)"
+                    "DeepSeek V4.1 reasoning effort must be none, low, medium, high, xhigh, max or an integer budget from 1 to 100 (the minimal alias is accepted)"
                 } else {
                     "DeepSeek V4 reasoning effort must be none, low, high or max (minimal, medium and xhigh aliases are accepted)"
                 },
@@ -159,6 +159,9 @@ fn thinking_enabled(req: &ChatCompletionRequest) -> bool {
                 .and_then(|effort| match effort {
                     "none" | "minimal" => Some(false),
                     "low" | "high" | "xhigh" | "max" => Some(true),
+                    // A level of V4.1's own table; under V4 an alias the
+                    // renderer maps, with no opinion on the mode.
+                    "medium" if is_v41_model(&req.model) => Some(true),
                     _ => None,
                 })
         })

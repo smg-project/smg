@@ -659,7 +659,7 @@ DEFAULT_REASONING_EFFORT = "high""#;
         assert_eq!(tokenizer.thinking_toggle(), ThinkingToggle::DefaultOn);
         assert_eq!(
             tokenizer.native_reasoning_effort_values(),
-            &["low", "high", "xhigh", "max"]
+            &["low", "medium", "high", "xhigh", "max"]
         );
         assert!(tokenizer.think_in_prefill());
         let out = tokenizer
@@ -711,9 +711,23 @@ DEFAULT_REASONING_EFFORT = "high""#;
         // tokenizer directory streamed from a worker carries none), the
         // rescaled table the checkpoint carries today. `xhigh` stays a
         // native word of the renderer and renders `high`'s budget where the
-        // table has none of its own.
-        let original = [("low", 25), ("high", 50), ("xhigh", 75), ("max", 100)];
-        let rescaled = [("low", 50), ("high", 75), ("xhigh", 75), ("max", 100)];
+        // table has none of its own; `medium`, the chat template's own
+        // level, renders its 62 under the rescaled table and `high`'s budget
+        // under the first encoder, which has none for it.
+        let original = [
+            ("low", 25),
+            ("high", 50),
+            ("xhigh", 75),
+            ("max", 100),
+            ("medium", 50),
+        ];
+        let rescaled = [
+            ("low", 50),
+            ("high", 75),
+            ("xhigh", 75),
+            ("max", 100),
+            ("medium", 62),
+        ];
         for (encoder, expected) in [
             (Some(V41_ORIGINAL_ENCODER_SNIPPET), original),
             (Some(V41_RESCALED_ENCODER_SNIPPET), rescaled),
@@ -762,17 +776,17 @@ DEFAULT_REASONING_EFFORT = "high""#;
             "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}></think>"
         );
 
-        let medium_kwargs = HashMap::from([("reasoning_effort".to_string(), json!("medium"))]);
+        let bad_kwargs = HashMap::from([("reasoning_effort".to_string(), json!("turbo"))]);
         let err = tokenizer
             .apply_chat_template(
                 &messages,
                 ChatTemplateParams {
                     add_generation_prompt: true,
-                    template_kwargs: Some(&medium_kwargs),
+                    template_kwargs: Some(&bad_kwargs),
                     ..Default::default()
                 },
             )
-            .expect_err("expected an error for reasoning_effort=medium")
+            .expect_err("expected an error for reasoning_effort=turbo")
             .to_string();
         assert!(err.contains("Invalid reasoning effort"), "{err}");
     }
@@ -805,7 +819,7 @@ DEFAULT_REASONING_EFFORT = "high""#;
                 .to_string();
             assert_eq!(
                 err,
-                format!("DeepSeek V4.1 reasoning_effort invalid: Invalid reasoning effort `{bad}`: expected an integer within [1, 100] or one of low, high, xhigh, max"),
+                format!("DeepSeek V4.1 reasoning_effort invalid: Invalid reasoning effort `{bad}`: expected an integer within [1, 100] or one of low, medium, high, xhigh, max"),
                 "{bad:?}"
             );
         }
@@ -1173,6 +1187,7 @@ DEFAULT_REASONING_EFFORT = "high""#;
         use openai_protocol::{chat::ChatCompletionRequest, validated::Normalizable};
         let (_tmp, tokenizer) = v41_tokenizer();
         for (effort, budget) in [
+            (json!("medium"), 62),
             (json!("xhigh"), 75),
             (json!(42), 42),
             (json!(1), 1),

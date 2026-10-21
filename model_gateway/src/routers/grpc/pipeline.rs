@@ -1968,7 +1968,8 @@ mod request_release_tests {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     use futures::Stream;
     use llm_tokenizer::{
-        traits::Tokenizer, HuggingFaceTokenizer, MockTokenizer, TokenizerRegistry,
+        traits::{Decoder, Tokenizer},
+        HuggingFaceTokenizer, MockTokenizer, TokenizerRegistry,
     };
     use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::{
@@ -4427,7 +4428,7 @@ mod request_release_tests {
             serde_json::json!({
                 "model": MODEL,
                 "messages": [{"role": "user", "content": "Hi"}],
-                "reasoning_effort": "medium",
+                "reasoning_effort": "turbo",
                 "max_tokens": 1,
             }),
             false,
@@ -4437,6 +4438,50 @@ mod request_release_tests {
         assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("Invalid reasoning effort"), "{body}");
         assert!(ids.is_empty(), "nothing must reach the worker");
+    }
+
+    /// `medium` is a level of the checkpoint's own chat template (budget
+    /// 62): the top-level field and the template kwarg both render it
+    /// instead of refusing the request.
+    #[tokio::test]
+    async fn deepseek_v41_medium_effort_renders_the_checkpoints_budget() {
+        let Some(dir) = deepseek_v41_model_dir() else {
+            skip_no_tokenizer();
+            return;
+        };
+        let tokenizer = HuggingFaceTokenizer::from_file(
+            dir.join("tokenizer.json")
+                .to_str()
+                .expect("utf-8 tokenizer path"),
+        )
+        .expect("load the DeepSeek-V4.1 tokenizer");
+        for request in [
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "reasoning_effort": "medium",
+                "max_tokens": 1,
+            }),
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "chat_template_kwargs": {"reasoning_effort": "medium"},
+                "max_tokens": 1,
+            }),
+        ] {
+            let (status, body, ids, _) = v41_run_chat(&dir, request.clone(), false).await;
+            assert_eq!(
+                status,
+                http::StatusCode::OK,
+                "{request}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let prompt = tokenizer.decode(&ids[0], false).expect("decode the prompt");
+            assert!(
+                prompt.contains("Reasoning Effort: 62 (range"),
+                "{request}: {prompt}"
+            );
+        }
     }
 
     /// One image expands to exactly the reference span: `<｜deepseek_image｜>`
