@@ -14,7 +14,7 @@ use tracing::{debug, error, info_span, warn, Instrument};
 
 use super::{
     helpers::{maybe_inject_pd_metadata, maybe_inject_pd_rendezvous},
-    pd_protocol::{DpPlacement, PdDispatch, PdProtocol},
+    pd_protocol::{PdDispatch, PdProtocol},
 };
 use crate::{
     observability::{
@@ -516,27 +516,10 @@ async fn execute_pd_dispatch(
         }
         PdDispatch::Parallel => match pd_fanout_width(&proto_request, protocol) {
             Some(n) => {
-                execute_fanout_pd(
-                    proto_request,
-                    n,
-                    clients,
-                    workers,
-                    protocol,
-                    prefill_guard,
-                    ledger,
-                )
-                .await
+                execute_fanout_pd(proto_request, n, clients, workers, prefill_guard, ledger).await
             }
             None => {
-                execute_parallel_pd(
-                    proto_request,
-                    clients,
-                    workers,
-                    protocol,
-                    prefill_guard,
-                    ledger,
-                )
-                .await
+                execute_parallel_pd(proto_request, clients, workers, prefill_guard, ledger).await
             }
         },
     }?;
@@ -598,7 +581,6 @@ async fn execute_fanout_pd(
     n: u32,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
-    protocol: PdProtocol,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
@@ -616,9 +598,7 @@ async fn execute_fanout_pd(
     let guards = prefill_guard.replicate_to(subs.len());
     let dispatches = subs.into_iter().zip(guards).map(|(sub, guard)| {
         let mut clients = clients.clone();
-        async move {
-            execute_parallel_pd(sub, &mut clients, workers, protocol, guard, ledger).await
-        }
+        async move { execute_parallel_pd(sub, &mut clients, workers, guard, ledger).await }
     });
     let results = try_join_all(dispatches).await?;
 
@@ -984,7 +964,6 @@ async fn execute_parallel_pd(
     proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
-    protocol: PdProtocol,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
@@ -994,7 +973,7 @@ async fn execute_parallel_pd(
         .unwrap_or("");
     let (prefill_client, decode_client) =
         clients.disaggregated_or_mismatch("execute_parallel_pd")?;
-    let (prefill_request, decode_request) = parallel_pd_requests(proto_request, workers, protocol);
+    let (prefill_request, decode_request) = parallel_pd_requests(proto_request, workers);
 
     // `generate` only establishes the prefill stream here (SMG does not drain
     // it on this path), so prefill duration cannot be measured — only TTFT,
@@ -1067,11 +1046,10 @@ async fn execute_parallel_pd(
 
 /// The parallel dispatch's two requests from the client's: the prefill side is
 /// the request itself, the decode side its pixel-free clone, each pinned to its
-/// worker's DP rank where the engine reads placement from the request.
+/// worker's selected DP rank.
 fn parallel_pd_requests(
     proto_request: ProtoGenerateRequest,
     workers: &WorkerSelection,
-    protocol: PdProtocol,
 ) -> (ProtoGenerateRequest, ProtoGenerateRequest) {
     // Decode consumes the KV handoff from prefill, but TokenSpeed still
     // needs multimodal metadata to pad placeholders and compute MRoPE in
@@ -1081,17 +1059,11 @@ fn parallel_pd_requests(
     let mut prefill_request = proto_request;
     let mut decode_request = prefill_request.clone_without_mm_pixels();
     decode_request.clear_encode_bootstrap_info();
-    // Pin each side's DP rank only when the engine reads placement from
-    // the request field; `RoomResidue` engines take it from the bootstrap
-    // room minted in maybe_inject_pd_rendezvous, ignore the pin, and spam
-    // conflict warnings on a mismatched decode-side pin.
-    if protocol.dp_placement == DpPlacement::PinField {
-        if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
-            prefill_request.set_data_parallel_rank(rank as i32);
-        }
-        if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
-            decode_request.set_data_parallel_rank(rank as i32);
-        }
+    if let Some(rank) = workers.prefill_worker().and_then(|w| w.dp_rank()) {
+        prefill_request.set_data_parallel_rank(rank as i32);
+    }
+    if let Some(rank) = workers.decode_worker().and_then(|w| w.dp_rank()) {
+        decode_request.set_data_parallel_rank(rank as i32);
     }
     (prefill_request, decode_request)
 }
@@ -2927,6 +2899,57 @@ mod tests {
             prefill: worker("grpc://prefill:30000", WorkerType::Prefill),
             decode: worker("grpc://decode:30000", WorkerType::Decode),
             runtime_type: RuntimeType::TokenSpeed,
+        }
+    }
+
+    #[test]
+    fn tokenspeed_parallel_pd_forwards_selected_ranks_without_changing_the_room() {
+        for (p_rank, p_size, d_rank, d_size) in [
+            (Some(0), 1, Some(7), 16),
+            (Some(3), 16, Some(7), 16),
+            (Some(3), 8, Some(11), 16),
+            (None, 1, None, 1),
+        ] {
+            let worker = |url, role, rank, size| -> Arc<dyn Worker> {
+                let mut builder = BasicWorkerBuilder::new(url)
+                    .worker_type(role)
+                    .runtime_type(RuntimeType::TokenSpeed)
+                    .connection_mode(ConnectionMode::Grpc);
+                if let Some(rank) = rank {
+                    builder = builder.dp_config(rank, size);
+                }
+                Arc::new(builder.build())
+            };
+            let workers = WorkerSelection::Disaggregated {
+                encode_assignments: None,
+                prefill: worker("grpc://prefill:30000", WorkerType::Prefill, p_rank, p_size),
+                decode: worker("grpc://decode:30000", WorkerType::Decode, d_rank, d_size),
+                runtime_type: RuntimeType::TokenSpeed,
+            };
+            let mut request = tokenspeed_request(1, None);
+            maybe_inject_pd_rendezvous(&mut request, &workers);
+            let ProtoGenerateRequest::TokenSpeed(original) = &request else {
+                panic!("expected TokenSpeed request");
+            };
+            let bootstrap = original.kv_bootstrap_info.clone();
+            let (prefill, decode) = parallel_pd_requests(request, &workers);
+            let (
+                ProtoGenerateRequest::TokenSpeed(prefill),
+                ProtoGenerateRequest::TokenSpeed(decode),
+            ) = (prefill, decode)
+            else {
+                panic!("expected TokenSpeed requests");
+            };
+            assert_eq!(prefill.data_parallel_rank, p_rank.map(|r| r as i32));
+            assert_eq!(decode.data_parallel_rank, d_rank.map(|r| r as i32));
+            assert_eq!(prefill.kv_bootstrap_info, bootstrap);
+            assert_eq!(decode.kv_bootstrap_info, bootstrap);
+            if let Some(rank) = p_rank {
+                assert_eq!(
+                    bootstrap.unwrap().bootstrap_room % p_size as i64,
+                    rank as i64
+                );
+            }
         }
     }
 
