@@ -82,7 +82,7 @@ reqwest = { workspace = true, features = ["stream", "blocking", "json", "rustls-
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["full"] }
 tokio-util.workspace = true
-uuid = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["serde", "fast-rng"] }
 
 # Workspace crates
 openai-protocol = { workspace = true, features = ["axum"] }
