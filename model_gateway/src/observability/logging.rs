@@ -16,7 +16,8 @@
 //! is visible a few milliseconds later at most.
 
 use std::{
-    io::{self, Write},
+    ffi::OsStr,
+    io::{self, IsTerminal, Write},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -71,6 +72,9 @@ pub struct LoggingConfig {
     pub level: Level,
     pub json_format: bool,
     pub log_dir: Option<String>,
+    /// ANSI color on the console lines; [`color_for_stdout`] is the default
+    /// (a terminal yes, a pipe or a file no, `NO_COLOR` and `FORCE_COLOR` /
+    /// `CLICOLOR_FORCE` respected). The file sink never colors.
     pub colorize: bool,
     pub log_file_name: String,
     pub log_targets: Option<Vec<String>>,
@@ -83,11 +87,47 @@ impl Default for LoggingConfig {
             level: Level::INFO,
             json_format: false,
             log_dir: None,
-            colorize: true,
+            colorize: color_for_stdout(),
             log_file_name: "smg".to_string(),
             log_targets: None, // None = use workspace crate filter
         }
     }
+}
+
+/// Whether the console log is colored when nothing asked either way: ANSI
+/// escapes go to a terminal, not into a pipe or a file (a redirected start,
+/// a container runtime collecting stdout), where they are bytes on every line
+/// that nothing renders and a consumer has to strip. `NO_COLOR` set to a
+/// non-empty value turns color off on a terminal too; `FORCE_COLOR` or
+/// `CLICOLOR_FORCE` set to a non-empty value other than `0` turns it on into
+/// a pipe too (the no-color.org and clicolors conventions, where `0` means
+/// "do not force"; an explicit ask wins).
+pub fn color_for_stdout() -> bool {
+    color_for(
+        io::stdout().is_terminal(),
+        set(std::env::var_os("NO_COLOR").as_deref()),
+        truthy(std::env::var_os("FORCE_COLOR").as_deref())
+            || truthy(std::env::var_os("CLICOLOR_FORCE").as_deref()),
+    )
+}
+
+/// The decision behind [`color_for_stdout`]: forced wins over refused, and
+/// refused over the terminal.
+fn color_for(terminal: bool, refused: bool, forced: bool) -> bool {
+    forced || (terminal && !refused)
+}
+
+/// Whether an environment variable's value counts as set: present and
+/// non-empty (an empty value counts as unset, as the conventions say).
+fn set(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty())
+}
+
+/// Whether an environment variable's value forces: present, non-empty and
+/// not `0`, the clicolors reading of a force variable, where `0` means "do
+/// not force" (and what the common `FORCE_COLOR=0` of other tools means).
+fn truthy(value: Option<&OsStr>) -> bool {
+    value.is_some_and(|value| !value.is_empty() && value != "0")
 }
 
 /// What `init_logging` hands back. The writer threads live in `SINKS` for
@@ -1084,5 +1124,43 @@ mod filter_tests {
         assert_eq!(hint("warn,smg=info"), Some(LevelFilter::INFO));
         assert_eq!(hint("warn,smg=debug,"), Some(LevelFilter::DEBUG));
         assert_eq!(hint("error"), Some(LevelFilter::ERROR));
+    }
+}
+
+#[cfg(test)]
+mod color_tests {
+    use std::ffi::OsStr;
+
+    use super::{color_for, set, truthy};
+
+    #[test]
+    fn a_terminal_is_colored_unless_refused_and_a_pipe_only_when_forced() {
+        // (terminal, refused, forced)
+        assert!(color_for(true, false, false));
+        assert!(!color_for(true, true, false));
+        assert!(color_for(true, true, true));
+        assert!(!color_for(false, false, false));
+        assert!(!color_for(false, true, false));
+        assert!(color_for(false, false, true));
+        assert!(color_for(false, true, true));
+    }
+
+    /// A force variable set to `0` does not force (clicolors); `NO_COLOR` set
+    /// to anything non-empty, `0` included, refuses (no-color.org); an empty
+    /// value is unset for both. The readers are pure: the process environment
+    /// is not touched (the lib tests run in parallel and read it).
+    #[test]
+    fn a_force_variable_set_to_zero_does_not_force_and_an_empty_one_is_unset() {
+        let zero = Some(OsStr::new("0"));
+        let empty = Some(OsStr::new(""));
+        let one = Some(OsStr::new("1"));
+        assert!(set(zero));
+        assert!(!truthy(zero));
+        assert!(!set(empty));
+        assert!(!truthy(empty));
+        assert!(set(one));
+        assert!(truthy(one));
+        assert!(!set(None));
+        assert!(!truthy(None));
     }
 }

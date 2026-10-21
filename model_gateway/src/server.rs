@@ -1873,7 +1873,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
                     .unwrap_or(Level::INFO),
                 json_format: config.log_json,
                 log_dir: config.log_dir.clone(),
-                colorize: true,
+                colorize: logging::color_for_stdout(),
                 log_file_name: "smg".to_string(),
                 log_targets: None,
             },
