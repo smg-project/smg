@@ -878,6 +878,8 @@ impl ServerInfo {
                 if let Some(ref args) = info.server_args {
                     pick_prost_fields(&mut labels, args, TOKENSPEED_GRPC_KEYS);
                 }
+                // TokenSpeed's global request window is shared by its attention-DP ranks.
+                labels.insert("enable_dp_attention".to_string(), "true".to_string());
                 if !info.tokenspeed_version.is_empty() {
                     labels.insert("version".to_string(), info.tokenspeed_version.clone());
                 }

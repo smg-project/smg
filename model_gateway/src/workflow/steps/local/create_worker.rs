@@ -951,7 +951,7 @@ fn validate_zmq_worker_type(
 /// window), which becomes the rank's share, so the PD admission gate and the
 /// capacity sum bound each rank worker by what its rank runs instead of the
 /// whole engine's window `size` times over. Engines whose figure is per rank
-/// already (`max_num_seqs`) carry no such label and keep theirs; an
+/// already (e.g. vLLM's `max_num_seqs`) carry no such label and keep theirs; an
 /// unexpanded worker stands for the whole engine and keeps the whole window.
 /// A window the operator set by hand on the worker (`set_by_hand`, the
 /// spec's own labels, which win the merge) is the operator's statement
@@ -2379,8 +2379,62 @@ mod tests {
 mod rank_window_tests {
     use std::collections::HashMap;
 
-    use super::labels_for_rank;
-    use crate::worker::worker::merge_labels;
+    use smg_grpc_client::tokenspeed_proto;
+
+    use super::{dp_rank_expansion, labels_for_rank};
+    use crate::{
+        routers::grpc::client::ServerInfo,
+        worker::{worker::merge_labels, BasicWorkerBuilder, ConnectionMode, Worker},
+        workflow::steps::local::discover_dp::dp_info_from_labels,
+    };
+
+    #[test]
+    fn tokenspeed_discovery_bounds_each_rank_by_its_local_window() {
+        for (size, total, expected) in [(1, 1024, 1024), (16, 1024, 64), (16, 1031, 64)] {
+            for window_key in ["max_num_seqs", "max_running_requests"] {
+                let info =
+                    ServerInfo::TokenSpeed(Box::new(tokenspeed_proto::GetServerInfoResponse {
+                        server_args: Some(prost_types::Struct {
+                            fields: [("dp_size", size), (window_key, total)]
+                                .into_iter()
+                                .map(|(key, value)| {
+                                    (
+                                        key.to_string(),
+                                        prost_types::Value {
+                                            kind: Some(prost_types::value::Kind::NumberValue(
+                                                value as f64,
+                                            )),
+                                        },
+                                    )
+                                })
+                                .collect(),
+                        }),
+                        ..Default::default()
+                    }));
+                let engine = info.to_labels();
+                let dp = dp_info_from_labels(&engine).unwrap();
+                let ranks =
+                    dp_rank_expansion(Some(&dp), ConnectionMode::Grpc, "grpc://w:30000").unwrap();
+                assert_eq!(ranks.len(), size as usize);
+                for rank in ranks {
+                    let worker = BasicWorkerBuilder::new("grpc://w:30000")
+                        .labels(discovered(&engine, rank))
+                        .build();
+                    assert_eq!(worker.max_running_requests(), Some(expected));
+                    let window = usize::from(worker.max_running_requests().unwrap());
+                    assert!(worker.try_admit_pd(window, window));
+                    assert!(!worker.try_admit_pd(1, window));
+
+                    let override_labels = labels(&[("max_running_requests", "32")]);
+                    let merged = merge_labels(&engine, &override_labels);
+                    let overridden = BasicWorkerBuilder::new("grpc://w:30000")
+                        .labels(labels_for_rank(&merged, rank, &override_labels))
+                        .build();
+                    assert_eq!(overridden.max_running_requests(), Some(32));
+                }
+            }
+        }
+    }
 
     fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs

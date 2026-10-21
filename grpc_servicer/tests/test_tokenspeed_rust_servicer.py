@@ -336,7 +336,7 @@ def test_server_facts_carry_labels_window_and_kv_events(monkeypatch):
     assert server_args["dp_size"] == 2
     assert server_args["pairing_protocol"] == "nixl"
     assert json.loads(facts["scheduler_info_json"]) == {"shm_namespace_id": "boot:7"}
-    assert facts["max_running_requests"] == 64
+    assert facts["max_running_requests"] == 32
     assert facts["data_parallel_size"] == 2
     assert (facts["kv_events_endpoint"], facts["kv_events_topic"]) == ("tcp://*:5600", "kv")
     assert facts["kv_events_replay_endpoint"] == "tcp://*:5601"
