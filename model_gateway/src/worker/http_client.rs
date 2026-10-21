@@ -17,7 +17,10 @@ use crate::config::RouterConfig;
 
 /// Default pool settings for worker-directed HTTP clients.
 const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 500;
-const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// The connect timeout every gateway HTTP client starts from (the worker
+/// clients and the shared external-provider client), clamped below the
+/// request timeout by [`connect_timeout_secs_below`].
+pub(crate) const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 /// The connect timeout a client may use under `request_timeout_secs`: the
 /// requested `connect_timeout_secs`, clamped to one second below the request

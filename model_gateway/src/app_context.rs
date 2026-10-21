@@ -36,7 +36,7 @@ use crate::{
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{
-        http_client::{build_client, connect_timeout_secs_below},
+        http_client::{build_client, connect_timeout_secs_below, DEFAULT_CONNECT_TIMEOUT_SECS},
         liveness, KvEventMonitor, PrefillAdmission, WorkerHttpClientCache, WorkerMonitor,
         WorkerRegistry, WorkerService,
     },
@@ -693,7 +693,7 @@ impl AppContextBuilder {
                 // external host fails as a connect timeout, not as the
                 // request's own.
                 .connect_timeout(Duration::from_secs(connect_timeout_secs_below(
-                    10,
+                    DEFAULT_CONNECT_TIMEOUT_SECS,
                     timeout_secs,
                 )))
                 .tcp_nodelay(true)
