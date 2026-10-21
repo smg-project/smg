@@ -327,7 +327,7 @@ output, with nothing pending prefill, before the servicer treats it as dead,
 fails them and closes the link for the launcher to restart the pair; a hard
 engine death sends nothing over the wire, so silence is the only sign of it),
 `SMG_VLLM_SERVICER_PREFILL_TOKENS_PER_SEC` (default 2000: the prompt tokens
-pending prefill, those of the in-flight requests the engine has produced
+pending prefill, those of the requests the engine has accepted and produced
 nothing for yet, extend that bound by the time they take at this rate, 500 s
 per million tokens; a wire that says nothing until a prompt's first token is
 silent through a whole prefill, and a batch of long prompts prefills for
