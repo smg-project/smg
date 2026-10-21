@@ -1960,7 +1960,8 @@ mod tests {
 
     use super::*;
     use crate::core::config::{
-        ArgMappingConfig, ResponseFormatConfig, Tool as McpTool, ToolConfig,
+        test_support::sse_server, ArgMappingConfig, ResponseFormatConfig, Tool as McpTool,
+        ToolConfig,
     };
 
     fn create_test_tool(name: &str) -> McpTool {
@@ -2269,18 +2270,8 @@ mod tests {
         );
 
         let config = McpServerConfig {
-            name: "web-search".to_string(),
-            transport: McpTransport::Sse {
-                url: "http://localhost:8080/sse".to_string(),
-                token: None,
-                headers: HashMap::new(),
-            },
-            proxy: None,
-            required: false,
             tools: Some(tools),
-            builtin_type: None,
-            builtin_tool_name: None,
-            internal: false,
+            ..sse_server("web-search", "http://localhost:8080/sse")
         };
 
         orchestrator.apply_tool_configs(&config);
@@ -2430,25 +2421,14 @@ mod tests {
 
     #[test]
     fn test_find_builtin_server_web_search() {
-        use std::collections::HashMap;
-
         use crate::approval::{audit::AuditLog, policy::PolicyEngine};
 
         // Create config with a server configured for web_search_preview
         let config = McpConfig {
             servers: vec![McpServerConfig {
-                name: "brave".to_string(),
-                transport: McpTransport::Sse {
-                    url: "https://mcp.brave.com/sse".to_string(),
-                    token: None,
-                    headers: HashMap::new(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
                 builtin_type: Some(BuiltinToolType::WebSearchPreview),
                 builtin_tool_name: Some("brave_web_search".to_string()),
-                internal: false,
+                ..sse_server("brave", "https://mcp.brave.com/sse")
             }],
             ..Default::default()
         };
@@ -2506,18 +2486,10 @@ mod tests {
 
         let config = McpConfig {
             servers: vec![McpServerConfig {
-                name: "custom-search".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: HashMap::new(),
-                },
-                proxy: None,
-                required: false,
                 tools: Some(tools),
                 builtin_type: Some(BuiltinToolType::WebSearchPreview),
                 builtin_tool_name: Some("my_search".to_string()),
-                internal: false,
+                ..sse_server("custom-search", "http://localhost:3000/sse")
             }],
             ..Default::default()
         };
