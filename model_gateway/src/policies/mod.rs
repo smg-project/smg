@@ -52,7 +52,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Select a single worker from the available workers
     ///
     /// This is used for regular routing mode where requests go to a single worker.
-    /// Now uses Arc<dyn Worker> for better performance and to avoid unnecessary cloning.
+    /// Now uses `Arc<dyn Worker>` for better performance and to avoid unnecessary cloning.
     ///
     /// # Arguments
     /// * `workers` - Available workers to select from

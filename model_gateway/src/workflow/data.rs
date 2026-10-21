@@ -97,7 +97,7 @@ pub enum WorkerRegistrationMode {
 /// Wrapper for worker list that can be serialized
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WorkerList {
-    /// Worker URLs (we can't serialize Arc<dyn Worker>, so we store URLs)
+    /// Worker URLs (we can't serialize `Arc<dyn Worker>`, so we store URLs)
     pub worker_urls: Vec<String>,
 }
 

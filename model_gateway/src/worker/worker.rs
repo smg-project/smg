@@ -552,7 +552,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Set the overload veto, returning `true` when the flag actually changed.
     ///
-    /// Route writes through [`WorkerRegistry::set_worker_overloaded`] instead of
+    /// Route writes through [`WorkerRegistry::set_worker_overloaded`](crate::worker::WorkerRegistry::set_worker_overloaded) instead of
     /// calling this directly: the per-model counters and the
     /// `smg_workers_overloaded` gauge move only on transitions.
     fn set_overloaded(&self, _overloaded: bool) -> bool {

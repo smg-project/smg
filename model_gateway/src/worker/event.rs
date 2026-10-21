@@ -1,4 +1,4 @@
-//! Events emitted by [`WorkerRegistry`] on state mutations.
+//! Events emitted by [`WorkerRegistry`](crate::worker::WorkerRegistry) on state mutations.
 
 use std::sync::Arc;
 

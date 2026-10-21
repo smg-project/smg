@@ -279,7 +279,7 @@ pub struct WorkerRegistry {
     workers: Arc<DashMap<WorkerId, Arc<dyn Worker>>>,
 
     /// Model index for O(1) lookups using immutable snapshots.
-    /// Uses Arc<[T]> instead of Arc<RwLock<Vec<T>>> for lock-free reads.
+    /// Uses `Arc<[T]>` instead of `Arc<RwLock<Vec<T>>>` for lock-free reads.
     model_index: ModelIndex,
 
     /// Immutable snapshot spanning every registered worker, tagged with the

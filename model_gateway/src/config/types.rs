@@ -1597,7 +1597,7 @@ pub struct KubernetesDiscoveryConfig {
     /// Annotation key to read mesh port from Router Pods
     #[serde(default = "default_router_mesh_port_annotation")]
     pub router_mesh_port_annotation: String,
-    /// Source for per-worker model_id override: "namespace", "label:<key>", or "annotation:<key>"
+    /// Source for per-worker model_id override: `namespace`, `label:<key>`, or `annotation:<key>`
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id_source: Option<String>,
 }
