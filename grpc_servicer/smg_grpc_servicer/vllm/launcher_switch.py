@@ -60,7 +60,7 @@ import types
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from smg_grpc_servicer.vllm import SERVICER_IMPL_ENV
+from smg_grpc_servicer.vllm import SERVICER_IMPL_ENV, attach_vllm_logging, settle_logging
 
 
 @dataclasses.dataclass(frozen=True)
@@ -144,6 +144,11 @@ def with_servicer_switch(
 
     @functools.wraps(serve_grpc)
     async def serve_grpc_with_switch(args: Any, *rest: Any, **kwargs: Any) -> Any:
+        # The launcher configured logging between its argument parse and this
+        # call (vLLM 0.31; the releases before it at import): what the plugin's
+        # parse step logged (the capture-cap decision) comes out now, through
+        # vLLM's handlers, ahead of everything the launch logs from here.
+        attach_vllm_logging()
         from smg_grpc_servicer.rust_lifecycle import (
             ServicerConfigError,
             announce_kv_events_default,
@@ -181,6 +186,11 @@ def with_servicer_switch(
             # code 2, not the launcher's traceback.
             configure_logging()
             raise configuration_exit(error) from None
+        # The launcher's own coroutine goes on with the logging it has: a hold
+        # nothing released by now (no handler anywhere) ends here, so the
+        # package's warnings and errors reach stderr as they do without it.
+        # (The Rust path's configure_logging ended it above.)
+        settle_logging()
         return await serve_grpc(args, *rest, **kwargs)
 
     setattr(serve_grpc_with_switch, _SWITCH_MARK, True)

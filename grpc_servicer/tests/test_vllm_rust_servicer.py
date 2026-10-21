@@ -1443,16 +1443,34 @@ def _signals(core: _FakeCore) -> list[str]:
     return [event for event in core.events if not event.startswith("join")]
 
 
-def test_configure_logging_gives_the_package_a_handler(monkeypatch):
+def test_configure_logging_gives_the_package_a_handler(monkeypatch, capsys):
+    """No handler anywhere (vLLM configured none, no launcher of its own did):
+    the Rust path's lifecycle lines get a plain stderr handler, and what the
+    package logged before (the plugin's parse step) comes out through it first."""
     import logging
+
+    from smg_grpc_servicer.vllm import attach_vllm_logging
 
     root = logging.getLogger()
     pkg = logging.getLogger("smg_grpc_servicer")
     monkeypatch.setattr(root, "handlers", [])
     monkeypatch.setattr(pkg, "handlers", [])
     monkeypatch.setattr(logging.getLogger("vllm"), "handlers", [])
-    rust.configure_logging()
-    assert root.handlers or pkg.handlers
+    monkeypatch.delenv("VLLM_LOGGING_LEVEL", raising=False)
+    level_before = root.level
+    try:
+        assert attach_vllm_logging() is False  # the hold, as at the parse
+        logging.getLogger("smg_grpc_servicer.vllm.capture_cap").info(
+            "CUDA-graph capture cap: held until a handler exists"
+        )
+        rust.configure_logging()
+        assert root.handlers
+        assert pkg.handlers == []  # the hold is over
+        logging.getLogger("smg_grpc_servicer.vllm.rust").info("listening")
+    finally:
+        root.setLevel(level_before)
+    err = capsys.readouterr().err
+    assert err.index("CUDA-graph capture cap: held until a handler exists") < err.index("listening")
 
 
 # vLLM's own default for its ZMQ publisher's endpoint: one fixed port, which

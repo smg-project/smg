@@ -34,7 +34,7 @@ from vllm.sampling_params import RequestOutputKind, StructuredOutputsParams
 from smg_grpc_servicer.kv_relay import Engine, relay
 from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 from smg_grpc_servicer.trace_context import trace_headers
-from smg_grpc_servicer.vllm import attach_vllm_logging
+from smg_grpc_servicer.vllm import attach_vllm_logging, settle_logging
 from smg_grpc_servicer.vllm.admin import flush_cache
 from smg_grpc_servicer.vllm.config_view import EngineConfigView, uses_mrope
 from smg_grpc_servicer.vllm.errors import grpc_code_for
@@ -275,8 +275,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         from smg_grpc_servicer.vllm.rust import require_python_impl
 
         require_python_impl()
-        # vLLM 0.31+ configures logging after this module is imported; attach again.
-        attach_vllm_logging()
+        # vLLM 0.31+ configures logging after this module is imported: attach
+        # again, and end the hold of what was logged before (the launcher
+        # configured logging by now, if it was going to).
+        settle_logging()
         self.engine = async_llm
         self.start_time = start_time
         # Resolve KV-event publishing config from the engine. Non-None only when

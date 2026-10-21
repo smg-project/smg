@@ -6,15 +6,18 @@ launcher builds the engine from."""
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import dataclasses
 import importlib.machinery
+import io
 import json
 import logging
 import sys
 import types
 
 import pytest
-from smg_grpc_servicer.vllm import capture_cap, launcher_switch, plugin
+from smg_grpc_servicer.vllm import capture_cap, launcher_switch, plugin, rust
 from smg_grpc_servicer.vllm.capture_cap import (
     CAPTURE_CAP_ENV,
     DEFAULT_CEILING,
@@ -489,3 +492,125 @@ def test_without_the_top_level_flag_the_parsers_default_config_is_never_written(
     assert parser.get_default("compilation_config").max_cudagraph_capture_size is None
     again = parser.parse_args(["--grpc", *DRILL])
     assert again.compilation_config.max_cudagraph_capture_size == 512
+
+
+# ---------------------------------------------------------------------------
+# The line's way out: vLLM's handlers, configured before the parse (0.28
+# through 0.30: at import) or after it (0.31: the launcher, after parse_args)
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _no_handlers_anywhere():
+    """A launcher process before vLLM configures logging: no handler on vLLM's
+    logger, on the package's, or on the root logger they propagate to (where
+    the test runner's own capture handler sits)."""
+    loggers = (
+        logging.getLogger(),
+        logging.getLogger("vllm"),
+        logging.getLogger("smg_grpc_servicer"),
+    )
+    saved = [(list(lg.handlers), lg.level, lg.propagate) for lg in loggers]
+    try:
+        for lg in loggers:
+            lg.handlers = []
+            lg.setLevel(logging.WARNING if lg is loggers[0] else logging.NOTSET)
+            lg.propagate = True
+        yield
+    finally:
+        for lg, (handlers, level, propagate) in zip(loggers, saved, strict=True):
+            lg.handlers = handlers
+            lg.setLevel(level)
+            lg.propagate = propagate
+
+
+def _vllm_configures_logging(stream: io.StringIO) -> None:
+    """What vLLM's configure_logging_from_args(args) does on 0.31, and its import
+    did before: one handler on its own logger, a format with file and line."""
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(levelname)s [%(filename)s:%(lineno)d] %(message)s"))
+    vllm_logger = logging.getLogger("vllm")
+    vllm_logger.handlers = [handler]
+    vllm_logger.setLevel(logging.INFO)
+
+
+def _the_launcher_runs_serve_grpc(parsed: argparse.Namespace, monkeypatch) -> None:
+    """The launcher's ``uvloop.run(serve_grpc(args))`` after its parse, with the
+    switch bound over ``serve_grpc`` and the Rust path a stand-in that returns."""
+
+    async def serve_grpc(args):
+        raise AssertionError("the Rust selection never reaches the launcher's own coroutine")
+
+    async def serve_rust(args):
+        return 0
+
+    monkeypatch.setattr(rust, "serve_rust", serve_rust)
+    parsed.servicer_impl = "rust"
+    with pytest.raises(SystemExit):
+        asyncio.run(launcher_switch.with_servicer_switch(serve_grpc)(parsed))
+
+
+def test_the_decision_logged_at_a_parse_before_vllm_configures_logging_comes_out_once_it_has(
+    parser_class, monkeypatch
+):
+    """vLLM 0.31: the launcher parses, then configures logging, then runs
+    serve_grpc. The line logged at the parse has no handler then; it comes out
+    at the switch's first act, through vLLM's handlers, under its own file."""
+    monkeypatch.delenv("VLLM_LOGGING_LEVEL", raising=False)
+    stream = io.StringIO()
+    with _no_handlers_anywhere():
+        parsed = _serve_parser(parser_class).parse_args(["--grpc", *DRILL])
+        assert parsed.max_cudagraph_capture_size == 512
+        assert stream.getvalue() == ""
+        _vllm_configures_logging(stream)
+        _the_launcher_runs_serve_grpc(parsed, monkeypatch)
+        lines = stream.getvalue().splitlines()
+    assert len(lines) == 1
+    assert lines[0].startswith("INFO [capture_cap.py:")
+    assert (
+        "CUDA-graph capture cap: 512, derived from the admission step (--max-num-batched-tokens 16384"
+        in lines[0]
+    )
+
+
+def test_the_decision_prints_at_the_parse_where_vllm_configured_logging_before_it_and_never_twice(
+    parser_class, monkeypatch
+):
+    """vLLM 0.28 through 0.30 configured logging at import: the line prints at
+    the parse, as before, and the switch's first act replays nothing."""
+    monkeypatch.delenv("VLLM_LOGGING_LEVEL", raising=False)
+    stream = io.StringIO()
+    with _no_handlers_anywhere():
+        _vllm_configures_logging(stream)
+        parsed = _serve_parser(parser_class).parse_args(["--grpc", *DRILL])
+        at_the_parse = stream.getvalue().splitlines()
+        _the_launcher_runs_serve_grpc(parsed, monkeypatch)
+        lines = stream.getvalue().splitlines()
+    assert len(at_the_parse) == 1 and "512, derived" in at_the_parse[0]
+    assert lines == at_the_parse
+
+
+def test_the_python_path_ends_a_hold_nothing_released_before_the_launchers_coroutine(
+    parser_class, monkeypatch, capsys
+):
+    """A launcher that configured no logging at all, Python servicer: the
+    switch ends the hold before the launcher's own coroutine runs, so the
+    package's warnings and errors reach stderr from there as without the hold
+    (the held INFO line has nowhere to go, as before)."""
+    monkeypatch.delenv("VLLM_LOGGING_LEVEL", raising=False)
+    monkeypatch.setattr(rust, "require_python_media_mode", lambda args: None)
+    monkeypatch.setattr(rust, "default_kv_events_config", lambda args: None)
+    pkg_logger = logging.getLogger("smg_grpc_servicer")
+
+    async def serve_grpc(args):
+        logging.getLogger("smg_grpc_servicer.vllm.servicer").error("from the launcher's coroutine")
+        return "python ran"
+
+    with _no_handlers_anywhere():
+        parsed = _serve_parser(parser_class).parse_args(["--grpc", *DRILL])
+        assert len(pkg_logger.handlers) == 1  # the hold, with the capture-cap line
+        parsed.servicer_impl = "python"
+        result = asyncio.run(launcher_switch.with_servicer_switch(serve_grpc)(parsed))
+        assert result == "python ran"
+        assert pkg_logger.handlers == []
+    assert capsys.readouterr().err == "from the launcher's coroutine\n"

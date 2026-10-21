@@ -294,7 +294,9 @@ _logged: set[str] = set()
 
 def log_capture_cap(cap: CaptureCap) -> bool:
     """One INFO line at start for what a launch does about the capture cap,
-    through vLLM's handlers once vLLM configured them; returns whether this
+    through vLLM's handlers once vLLM configured them (held until then by
+    :func:`~smg_grpc_servicer.vllm.attach_vllm_logging`: a parse under vLLM
+    0.31 runs before the launcher configures logging); returns whether this
     decision was new to the process."""
     if cap.detail in _logged:
         return False

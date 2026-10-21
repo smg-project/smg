@@ -787,13 +787,15 @@ def configure_logging() -> None:
     """Route this package's logs through vLLM's handlers when vLLM configured
     them, else a plain stderr handler: the Rust path's lifecycle messages
     (listener, engine launch, drain) must not vanish into an unconfigured
-    logger."""
-    from smg_grpc_servicer.vllm import attach_vllm_logging
+    logger. What the package logged before any handler existed (the plugin's
+    parse step, under a vLLM that configures logging after the parse) comes
+    out first, through whichever handler this leaves in place."""
+    from smg_grpc_servicer.vllm import attach_vllm_logging, has_handlers, release_held_records
 
-    attach_vllm_logging()
-    package_logger = logging.getLogger("smg_grpc_servicer")
-    if not package_logger.handlers and not logging.getLogger().handlers:
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
-        )
+    if attach_vllm_logging() or has_handlers():
+        return
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
+    )
+    release_held_records()
