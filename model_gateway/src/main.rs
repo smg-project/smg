@@ -1191,7 +1191,8 @@ struct DiscoveryArgs {
     consul_service: Option<String>,
 
     /// Consul's HTTP API address (default: `CONSUL_HTTP_ADDR`, else
-    /// http://127.0.0.1:8500). The ACL token and TLS settings come from
+    /// 127.0.0.1:8500; HTTPS for one with no scheme when `CONSUL_HTTP_SSL` is
+    /// true). The ACL token and TLS settings come from
     /// Consul's environment variables: `CONSUL_HTTP_TOKEN` or
     /// `CONSUL_HTTP_TOKEN_FILE`, `CONSUL_CACERT`, `CONSUL_CLIENT_CERT` and
     /// `CONSUL_CLIENT_KEY`

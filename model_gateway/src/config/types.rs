@@ -1731,7 +1731,7 @@ pub struct SlurmDiscoveryConfig {
 /// Consul is read with blocking queries, so a change applies as soon as
 /// Consul reports it; every `check_interval_secs` the last good list is
 /// reconciled again. `address` is Consul's HTTP API, by default
-/// `CONSUL_HTTP_ADDR` or `http://127.0.0.1:8500`; `datacenter` is by default
+/// `CONSUL_HTTP_ADDR` or `127.0.0.1:8500`; `datacenter` is by default
 /// the agent's own. The ACL token and the TLS settings come from Consul's own
 /// environment variables, never from this configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -44,16 +44,21 @@
 //! `smg_discovery_skipped_total` and logged when it first appears. A query
 //! that fails, or an answer that does not parse, applies nothing.
 //!
-//! Consul leaves out of an answer whatever the ACL token cannot read, and says
-//! so only in part, so two answers are rejected rather than applied: one it
-//! marks as filtered (`X-Consul-Results-Filtered-By-ACLs`), and an empty one
-//! from a default-deny Consul to a gateway with no token, which is what a
-//! missing token looks like. The token needs `service:read` on the service
-//! and `node:read` on its nodes.
+//! Consul leaves out of an answer whatever the ACL token cannot read. An
+//! answer it marks as filtered (`X-Consul-Results-Filtered-By-ACLs`) is
+//! rejected rather than applied, since instances it holds are missing from
+//! it. One it does not mark is applied as it stands: a token that cannot read
+//! the service at all gets an empty answer, like a service with no instances.
+//! An empty answer from a Consul that denies by default, to a gateway with no
+//! token, is the likeliest case, and is warned about while it lasts; it is
+//! still applied, because the agent's default token may be what reads the
+//! service. The token needs `service:read` on the service and `node:read` on
+//! its nodes.
 //!
 //! Configuration follows Consul's own clients. The address is
-//! `--consul-address`, else `CONSUL_HTTP_ADDR` (HTTPS when `CONSUL_HTTP_SSL`
-//! is true and the address names no scheme), else `http://127.0.0.1:8500`.
+//! `--consul-address`, else `CONSUL_HTTP_ADDR`, else `127.0.0.1:8500`; one
+//! that names no scheme is spoken to over HTTP, or HTTPS when
+//! `CONSUL_HTTP_SSL` is true.
 //! The token is read from the file `CONSUL_HTTP_TOKEN_FILE` names, else
 //! `CONSUL_HTTP_TOKEN`, and never taken as a flag. Over HTTPS, `CONSUL_CACERT`
 //! adds a CA bundle and `CONSUL_CLIENT_CERT` with `CONSUL_CLIENT_KEY` a client
@@ -74,7 +79,7 @@ use openai_protocol::worker::WorkerType;
 use reqwest::{header::HeaderMap, StatusCode, Url};
 use serde::Deserialize;
 use tokio::{task, time};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{
     provider::{endpoint_at, DiscoveredWorker, DiscoveryKind, Roles},
@@ -103,7 +108,9 @@ const RETRY_MIN: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
 
 /// Consul's address when neither the flag nor `CONSUL_HTTP_ADDR` gives one.
-const DEFAULT_ADDRESS: &str = "http://127.0.0.1:8500";
+/// It names no scheme, so `CONSUL_HTTP_SSL` decides it, as it does for
+/// Consul's clients.
+const DEFAULT_ADDRESS: &str = "127.0.0.1:8500";
 
 /// The prefix of the service metadata keys this provider reads.
 const METADATA_PREFIX: &str = "smg_";
@@ -628,14 +635,6 @@ fn read(answer: Answer, config: &ConsulProviderConfig) -> Result<Outcome, Consul
             ),
         });
     }
-    if answer.entries.is_empty() && answer.default_deny && config.token.is_none() {
-        return Err(ConsulError::Invalid {
-            reason: "Consul denies by default and no ACL token is set (CONSUL_HTTP_TOKEN or \
-                     CONSUL_HTTP_TOKEN_FILE), so its empty answer may hide every instance"
-                .to_string(),
-        });
-    }
-
     let mut skipped = Vec::new();
     let mut placed = Vec::new();
     for entry in &answer.entries {
@@ -812,6 +811,9 @@ struct ConsulDiscovery {
     retry: Duration,
     /// When the query in flight starts, or started.
     query_starts: time::Instant,
+    /// Whether the empty answers of a default-deny Consul to no token, which
+    /// may be hiding the instances, have been warned about.
+    warned_tokenless: bool,
 }
 
 impl ConsulDiscovery {
@@ -830,6 +832,7 @@ impl ConsulDiscovery {
             index: 0,
             retry: RETRY_MIN,
             query_starts: time::Instant::now(),
+            warned_tokenless: false,
         }
     }
 
@@ -869,10 +872,21 @@ impl ConsulDiscovery {
     fn take(&mut self, answer: Result<Answer, ConsulError>) -> Duration {
         let read = answer.and_then(|answer| {
             let index = answer.index;
-            read(answer, &self.config).map(|outcome| (index, outcome))
+            let tokenless_deny =
+                answer.entries.is_empty() && answer.default_deny && self.config.token.is_none();
+            read(answer, &self.config).map(|outcome| (index, tokenless_deny, outcome))
         });
         match read {
-            Ok((index, outcome)) => {
+            Ok((index, tokenless_deny, outcome)) => {
+                if tokenless_deny && !self.warned_tokenless {
+                    warn!(
+                        "Consul answered no instance of {}, and it denies by default while no \
+                         ACL token is set (CONSUL_HTTP_TOKEN or CONSUL_HTTP_TOKEN_FILE): unless \
+                         the agent's default token reads the service, its instances are hidden",
+                        self.config.service
+                    );
+                }
+                self.warned_tokenless = tokenless_deny;
                 let next = next_index(self.index, index);
                 if next == 0 {
                     info!(
@@ -1225,11 +1239,10 @@ mod tests {
     }
 
     /// Consul empties an answer of what the token cannot read. An answer it
-    /// says it filtered, and an empty one a default-deny Consul gives a
-    /// gateway with no token, are rejected; other empty answers are an empty
-    /// fleet.
+    /// says it filtered is rejected, whatever the token; any other answer is
+    /// applied, an empty one as an empty fleet.
     #[test]
-    fn answers_acls_may_have_emptied_are_rejected() {
+    fn an_answer_consul_says_it_filtered_is_rejected() {
         let config = config_in(&pd());
         let empty = |filtered, default_deny| Answer {
             index: 3,
@@ -1241,26 +1254,44 @@ mod tests {
             Err(ConsulError::Invalid { reason }) => reason,
             other => panic!("expected a rejection, got {other:?}"),
         };
-        assert!(rejected(empty(true, false), &config).contains("node:read"));
-        assert!(rejected(empty(false, true), &config).contains("no ACL token is set"));
-
         let mut with_token = config.clone();
         with_token.token = Some(Token("t".to_string()));
+        assert!(rejected(empty(true, false), &config).contains("node:read"));
         assert!(rejected(empty(true, true), &with_token).contains("node:read"));
-        assert!(read(empty(false, true), &with_token)
-            .unwrap()
-            .workers
-            .is_empty());
-        assert!(read(empty(false, false), &config)
-            .unwrap()
-            .workers
-            .is_empty());
 
-        // Anonymous reads may be granted: instances in a default-deny answer
-        // are applied.
+        for (answer, config) in [
+            (empty(false, true), &config),
+            (empty(false, true), &with_token),
+            (empty(false, false), &config),
+        ] {
+            assert!(read(answer, config).unwrap().workers.is_empty());
+        }
         let mut granted = answer(PASSING_2_0_4);
         granted.default_deny = true;
         assert_eq!(read(granted, &config).unwrap().workers.len(), 4);
+    }
+
+    /// With no token, a default-deny Consul may read through the agent's
+    /// default token, so an empty answer after instances is the last one
+    /// leaving: it empties the fleet rather than keeping the instance that
+    /// left, and the warning about a missing token stands while it lasts.
+    #[tokio::test]
+    async fn the_last_instance_leaves_a_default_deny_consul_read_with_no_token() {
+        let config = config_in(&pd());
+        let client = config.client().unwrap();
+        let mut discovery = ConsulDiscovery::new(config, create_test_app_context(), client);
+        let deny = |mut answer: Answer| {
+            answer.default_deny = true;
+            answer
+        };
+        discovery.take(Ok(deny(answer(PASSING_2_0_4))));
+        assert_eq!(listed(&discovery).map(|ids| ids.len()), Some(4));
+        assert!(!discovery.warned_tokenless);
+        discovery.take(Ok(deny(answer("[]"))));
+        assert_eq!(listed(&discovery).map(|ids| ids.len()), Some(0));
+        assert!(discovery.warned_tokenless);
+        discovery.take(Ok(deny(answer(PASSING_2_0_4))));
+        assert!(!discovery.warned_tokenless);
     }
 
     #[test]
@@ -1282,6 +1313,11 @@ mod tests {
         let health = "/v1/health/service/smg-worker";
         for (flag, env, url) in [
             (None, &[][..], "http://127.0.0.1:8500"),
+            (
+                None,
+                &[("CONSUL_HTTP_SSL", "true")][..],
+                "https://127.0.0.1:8500",
+            ),
             (
                 None,
                 &[("CONSUL_HTTP_ADDR", "")][..],

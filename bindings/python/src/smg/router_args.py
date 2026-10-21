@@ -334,7 +334,7 @@ class RouterArgs:
     client_cert_path: str | None = None
     client_key_path: str | None = None
     # Consul discovery (discovery_provider="consul"): Consul's HTTP API address
-    # (None = CONSUL_HTTP_ADDR, else http://127.0.0.1:8500), the datacenter
+    # (None = CONSUL_HTTP_ADDR, else 127.0.0.1:8500), the datacenter
     # (None = the agent's own), and the service whose passing instances are the
     # workers. The ACL token and TLS settings come from Consul's environment
     # variables only.
@@ -1912,7 +1912,8 @@ class RouterArgs:
             default=None,
             help=(
                 "Consul's HTTP API address (default: CONSUL_HTTP_ADDR, else"
-                " http://127.0.0.1:8500). The ACL token and TLS settings come from"
+                " 127.0.0.1:8500; HTTPS for one with no scheme when CONSUL_HTTP_SSL is"
+                " true). The ACL token and TLS settings come from"
                 " Consul's environment variables: CONSUL_HTTP_TOKEN or"
                 " CONSUL_HTTP_TOKEN_FILE, CONSUL_CACERT, CONSUL_CLIENT_CERT and"
                 " CONSUL_CLIENT_KEY"

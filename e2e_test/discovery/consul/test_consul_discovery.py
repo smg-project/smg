@@ -5,7 +5,9 @@ one away, as Consul reports it; metadata configuring PD workers, an invalid
 instance left out alone, and an edit updating a worker in place; a lost Consul
 keeping the fleet, and one that comes back empty read afresh; a gateway
 restart; ACLs (no token, a token that cannot read the nodes, one that can);
-and HTTPS with a client certificate. What a real agent does not do on demand
+the agent's default token reading for a gateway with none, the last instance
+leaving included; and HTTPS with a client certificate. What a real agent does
+not do on demand
 (an index going backwards or answered as 0) is covered by the unit tests
 against a scripted Consul.
 """
@@ -162,7 +164,9 @@ def test_acls_apply_nothing_without_a_token_that_reads_the_nodes(acl_agent, engi
     service_only = acl_agent.token(service)
     reader = acl_agent.token(f'{service}\nnode_prefix "" {{ policy = "read" }}')
 
-    # Consul answers both with an empty list; neither empties the fleet.
+    # Consul answers both with an empty list. With no token it is applied, and
+    # warned about; the service-only one Consul marks as filtered, and it is
+    # rejected. Neither registers the instance.
     for name, env, needle in [
         ("no-token", {}, "no ACL token is set"),
         ("service-only", {"CONSUL_HTTP_TOKEN": service_only}, "node:read"),
@@ -183,6 +187,29 @@ def test_acls_apply_nothing_without_a_token_that_reads_the_nodes(acl_agent, engi
     finally:
         gateway.stop()
     assert reader not in log.read_text()
+
+
+def test_the_agents_default_token_reads_for_a_gateway_with_none(acl_agent, engines, tmp_path):
+    """Consul reads a request with no token through the agent's default
+    token. Under default deny the gateway then sees the instances, and the
+    last one leaving empties the fleet rather than being kept."""
+    (a,) = engines(1)
+    acl_agent.register("node-a", "worker-a", a.port)
+    reader = acl_agent.token(
+        f'service "{SERVICE}" {{ policy = "read" }}\nnode_prefix "" {{ policy = "read" }}'
+    )
+    acl_agent.put("/v1/agent/token/default", {"Token": reader})
+    gateway = consul_gateway(acl_agent, tmp_path / "default-token.log")
+    try:
+        gateway.start(check_interval_secs=NO_PASS_SECS)
+        gateway.wait_for_urls({a.url}, "the instance read through the default token")
+        acl_agent.deregister("node-a", "worker-a")
+        gateway.wait_for_urls(set(), "the last instance leaving")
+    finally:
+        gateway.stop()
+        acl_agent.session.put(
+            f"{acl_agent.address}/v1/agent/token/default", json={"Token": ""}, timeout=10
+        )
 
 
 def test_https_needs_the_client_certificate_consul_asks_for(tls_agent, tls_dir, engines, tmp_path):
