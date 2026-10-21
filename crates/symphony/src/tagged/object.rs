@@ -89,8 +89,9 @@ impl Object {
         super::refuse(std::mem::take(&mut self.carried), why, out);
     }
 
-    /// Whitespace carried before text that is reported: the template's, dropped so the report
-    /// holds only the text; nothing when none.
+    /// Whitespace carried before text that is reported: the template's, after a tag the syntax
+    /// read, dropped so the report holds only the text (after text released already an assembler
+    /// keeps it with the report instead); nothing when none.
     pub(super) fn drop_carried(&mut self, out: &mut Events) {
         if self.carried.is_empty() {
             return;

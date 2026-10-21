@@ -270,6 +270,12 @@ pub struct Assembler {
     stage: Stage,
     /// The function's name once its tag is whole, which is when `ToolCallStart` was pushed.
     function: Option<String>,
+    /// Whether text between tags was released as content since the last tag the syntax read: a
+    /// word where the syntax has tags, a tag out of its place, a tag reported with its bytes. The
+    /// whitespace carried after it is the model's, between two pieces of its text, and leaves with
+    /// the next piece; before any, the whitespace after a tag is the template's, dropped before a
+    /// report or carried into the next event's source.
+    released: bool,
     done: bool,
 }
 
@@ -333,6 +339,7 @@ impl Assembler {
             object: Object::new(index),
             stage: Stage::FunctionName,
             function: None,
+            released: false,
             done: false,
         }
     }
@@ -473,15 +480,12 @@ impl Assembler {
             // A tag cuts a name or a tag's tail short: the bytes so far are reported, and the tag
             // is read where they began.
             _ => {
-                self.object.report(MalformedReason::TagCutShort, out);
+                self.report(MalformedReason::TagCutShort, out);
                 self.stage = Stage::Between;
                 if self.started() {
                     self.tag_between(tag, out);
                 } else {
-                    out.push(Event::Malformed {
-                        text: Text::uncounted(bytes),
-                        why: MalformedReason::TagOutOfPlace,
-                    });
+                    self.release(bytes, MalformedReason::TagOutOfPlace, out);
                 }
             }
         }
@@ -497,11 +501,7 @@ impl Assembler {
                 start: self.object.carried.len(),
             };
         } else {
-            self.object.drop_carried(out);
-            out.push(Event::Malformed {
-                text: Text::uncounted(bytes),
-                why: MalformedReason::TagOutOfPlace,
-            });
+            self.release(bytes, MalformedReason::TagOutOfPlace, out);
         }
     }
 
@@ -514,7 +514,7 @@ impl Assembler {
                     let name = self.object.carried.clone();
                     self.object.carried.push('"');
                     if name.is_empty() {
-                        self.object.report(MalformedReason::EmptyName, out);
+                        self.report(MalformedReason::EmptyName, out);
                         self.stage = Stage::Between;
                     } else {
                         self.stage = Stage::FunctionTail {
@@ -554,7 +554,7 @@ impl Assembler {
                         let key = self.object.carried[start..].to_string();
                         self.object.carried.push('"');
                         if key.is_empty() {
-                            self.object.report(MalformedReason::EmptyName, out);
+                            self.report(MalformedReason::EmptyName, out);
                             self.stage = Stage::Between;
                         } else {
                             self.stage = Stage::ParameterTail {
@@ -602,19 +602,40 @@ impl Assembler {
         }
     }
 
-    /// Text where the syntax has tags: whitespace is the template's, anything else is reported.
+    /// Text where the syntax has tags: whitespace is carried, since whose it is depends on what
+    /// follows ([`Self::release`]), anything else is released.
     fn text_between(&mut self, text: &str, out: &mut Events) {
         for (run, space) in runs(text) {
             if space {
                 self.object.carried.push_str(run);
             } else {
-                self.object.drop_carried(out);
-                out.push(Event::Malformed {
-                    text: Text::uncounted(run.to_owned()),
-                    why: MalformedReason::TextBetweenTags,
-                });
+                self.release(run, MalformedReason::TextBetweenTags, out);
             }
         }
+    }
+
+    /// `text` the syntax has no place for (a word between tags, a tag out of its place), released
+    /// as `Malformed` with `why`, which the chat surface shows as content. The whitespace carried
+    /// before it is the template's after a tag the syntax read, and is dropped so the report holds
+    /// the model's text alone; after text released already it is the model's, between two pieces
+    /// of its text, and leaves with this one, so that a client reads what the model wrote, byte
+    /// for byte, however the bytes were cut.
+    fn release(&mut self, text: &str, why: MalformedReason, out: &mut Events) {
+        if !self.released {
+            self.object.drop_carried(out);
+        }
+        self.object.carried.push_str(text);
+        self.report(why, out);
+    }
+
+    /// The carried bytes as `Malformed` with `why` ([`Object::report`]), when there are any:
+    /// released, so the whitespace after them is the model's.
+    fn report(&mut self, why: MalformedReason, out: &mut Events) {
+        if self.object.carried.is_empty() {
+            return;
+        }
+        self.object.report(why, out);
+        self.released = true;
     }
 
     /// The invoke tag is whole: the call starts. A tail after the name's quote is reported first,
@@ -648,6 +669,7 @@ impl Assembler {
             self.object.carried.push_str(&close);
         }
         self.stage = Stage::Between;
+        self.released = false;
     }
 
     /// The parameter tag is whole: the value begins, typed by what the tool declares for the key,
@@ -673,7 +695,7 @@ impl Assembler {
             }
             (Typing::TypeAttribute, tail) if typed(tail).is_some() => (None, Mode::Whole),
             _ => {
-                self.object.report(MalformedReason::TagTail, out);
+                self.report(MalformedReason::TagTail, out);
                 self.stage = Stage::Between;
                 return;
             }
@@ -692,6 +714,7 @@ impl Assembler {
             held: String::new(),
             leading_newline_due: self.tags.value_on_its_own_line,
         });
+        self.released = false;
     }
 
     /// The next bytes of a value. Where the family writes CDATA sections, the first bytes decide
@@ -839,6 +862,7 @@ impl Assembler {
         };
         self.object.close_member(fragment, tag, out);
         self.stage = Stage::Between;
+        self.released = false;
     }
 }
 
@@ -940,6 +964,28 @@ mod tests {
             .iter()
             .filter_map(|event| match event {
                 Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn dropped(events: &[Event]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped { text, .. } => Some(text.text.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The content a chat client reads: every content and malformed text, in order, as the chat
+    /// adapter folds it.
+    fn shown(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Content(text) | Event::Malformed { text, .. } => Some(&*text.text),
                 _ => None,
             })
             .collect()
@@ -1164,6 +1210,88 @@ mod tests {
                 ],
                 "{tag}"
             );
+        }
+    }
+
+    /// A parameter tag written with another attribute's name, `<parameter key="s">`, which the
+    /// syntax has no tag for, in every family's spelling: the invoke is read with no arguments,
+    /// and the model's lines reach the client as content, byte for byte, the whitespace between
+    /// the words and the newline between the lines included, the same however the bytes are cut.
+    /// The template's newline after the invoke tag, where the family writes one, is dropped, and
+    /// the one before its close is the object's source.
+    #[test]
+    fn text_between_tags_reaches_the_client_as_the_model_wrote_it_in_every_spelling() {
+        const M2_CALL: &str = concat!(
+            "f\">\n<parameter key=\"s\">Paris</parameter>\n",
+            "<parameter key=\"n\">three or four</parameter>\n"
+        );
+        const M2_LINES: &str = concat!(
+            "<parameter key=\"s\">Paris</parameter>\n",
+            "<parameter key=\"n\">three or four</parameter>"
+        );
+        const CPM_CALL: &str =
+            "f\"><param key=\"s\">Paris</param><param key=\"n\">three or four</param>";
+        const DSML_CALL: &str = concat!(
+            "f\">\n<｜DSML｜ parameter key=\"s\" string=\"true\">Paris</｜DSML｜ parameter>\n",
+            "<｜DSML｜ parameter key=\"n\" string=\"true\">three or four</｜DSML｜ parameter>\n"
+        );
+        const DSML_V4_CALL: &str = concat!(
+            "f\">\n<｜DSML｜parameter key=\"s\" string=\"true\">Paris</｜DSML｜parameter>\n",
+            "<｜DSML｜parameter key=\"n\" string=\"true\">three or four</｜DSML｜parameter>\n"
+        );
+        const XTML_CALL: &str = concat!(
+            "f\" index=\"1\"<|sep|>",
+            "<|open|>argument name=\"s\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|>",
+            "<|open|>argument name=\"n\" type=\"string\"<|sep|>three or four<|close|>argument<|sep|>"
+        );
+        for (tags, call, lines, before) in [
+            (Tags::MINIMAX_M2, M2_CALL, M2_LINES, vec!["\n"]),
+            (Tags::DOTS3, M2_CALL, M2_LINES, vec!["\n"]),
+            (Tags::MINICPM5, CPM_CALL, &CPM_CALL[3..], vec![]),
+            (
+                Tags::DSML,
+                DSML_CALL,
+                &DSML_CALL[4..DSML_CALL.len() - 1],
+                vec!["\n"],
+            ),
+            (
+                Tags::DSML_V4,
+                DSML_V4_CALL,
+                &DSML_V4_CALL[4..DSML_V4_CALL.len() - 1],
+                vec!["\n"],
+            ),
+            (Tags::XTML, XTML_CALL, &XTML_CALL[19..], vec![]),
+        ] {
+            let all = format!("{call}{}", tags.invoke_close);
+            let whole = run_with(tags, &[call], false);
+            assert!(
+                matches!(&whole[0], Event::ToolCallStart { name, .. } if name == "f"),
+                "{tags:?}: {whole:?}"
+            );
+            assert_eq!(arguments(&whole), "{}", "{tags:?}");
+            assert_eq!(shown(&whole), lines, "{tags:?}");
+            assert_eq!(dropped(&whole), before, "{tags:?}");
+            assert_eq!(bytes(&whole), all, "{tags:?}");
+            nothing_empty(&whole);
+            // At every two-way cut and one character at a time the events differ, the bytes a
+            // client reads do not.
+            let mut cuts: Vec<Vec<&str>> = (1..call.len())
+                .filter(|&cut| call.is_char_boundary(cut))
+                .map(|cut| vec![&call[..cut], &call[cut..]])
+                .collect();
+            cuts.push(
+                call.char_indices()
+                    .map(|(at, c)| &call[at..at + c.len_utf8()])
+                    .collect(),
+            );
+            for pieces in cuts {
+                let events = run_with(tags, &pieces, false);
+                assert_eq!(shown(&events), lines, "{tags:?}: {pieces:?}");
+                assert_eq!(arguments(&events), "{}", "{tags:?}: {pieces:?}");
+                assert_eq!(dropped(&events), before, "{tags:?}: {pieces:?}");
+                assert_eq!(bytes(&events), all, "{tags:?}: {pieces:?}");
+                nothing_empty(&events);
+            }
         }
     }
 
