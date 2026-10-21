@@ -427,9 +427,11 @@ What the syntax says, and what the assembler does with it:
   past 256 KiB) and read whole by an assembler of its own: when every byte is a call's or the list's
   wrapping and every call names a tool the request declares, its events are the turn's; when any
   byte is malformed (a positional argument, an operator, prose between calls) or a name is no
-  tool's, the whole is content, since code holds `[name(` of its own. After the
-  list's `]` whitespace is wrapping and anything else malformed, as after xLAM's list. A stream
-  cut while a `[` or a list is held gives it back as content, since no call began.
+  tool's, the whole is content, since code holds `[name(` of its own. After the list's `]`
+  whitespace alone is wrapping; once text follows, every byte after the `]` is the model's prose,
+  whitespace included, malformed as after xLAM's list, one event per word with the whitespace
+  before it. A stream cut while a `[` or a list is held gives it back as content, since no call
+  began.
 - **A dialect whose quotes carry no type** (`Values::Quoted`, Llama 4's template writing `"%s"`
   of every value): the text between a value's double quotes, as written and with no escape
   decoded, is typed by the kind the request's tool declares for the parameter, through the value

@@ -567,8 +567,10 @@ list and nothing after it; no thought. What the table says beyond the others:
 - **One state, no markers, the list bare in the turn.** As `xlam` and `json`, the output starts in
   the arguments state; the pythonic assembler reads the turn bare (`pythonic::Assembler::bare`).
   A turn that starts, after whitespace alone, with a `[` that a name and its `(` follow is the
-  list, read as it arrives, the whitespace its wrapping; after the list's `]` whitespace is
-  dropped and anything else malformed. A turn that starts with anything else is content, and a
+  list, read as it arrives, the whitespace its wrapping; after the list's `]` whitespace alone is
+  dropped, and once text follows every byte after the `]` is the model's prose, whitespace
+  included, reported malformed (the rule the `json` table's list reader states). A turn that
+  starts with anything else is content, and a
   `[name(` after that content, the shape the template renders for a message that holds both
   (`Let me check.[get_weather(city="Paris")]`), is held until the `]` that closes it and read as
   its calls only when the whole is a well-formed list of calls with keyword arguments to tools

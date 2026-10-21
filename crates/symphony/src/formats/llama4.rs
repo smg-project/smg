@@ -44,6 +44,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        adapt::chat,
         engine::Engine,
         event::{DropReason, Event, Events, FinishReason, MalformedReason},
         input::{EngineFinish, Input},
@@ -426,12 +427,17 @@ mod tests {
     }
 
     #[test]
-    fn text_after_the_list_is_wrapping_or_malformed_and_a_cut_call_stays_cut() {
+    fn text_after_the_list_is_the_models_prose_and_a_cut_call_stays_cut() {
+        // Once text follows the list, every byte after the `]` is the model's prose, the
+        // whitespace before its first word included; whitespace alone is the template's wrapping.
         let events = run(PROMPT, &["[get_weather(city=\"Paris\")]\n\nDone."]);
         assert_eq!(calls(&events).len(), 1);
         assert_eq!(content(&events), "");
-        assert_eq!(malformed(&events), "Done.");
-        assert!(dropped(&events).contains(&"\n\n"));
+        assert_eq!(malformed(&events), "\n\nDone.");
+        assert_eq!(dropped(&events), ["[", "]"]);
+        let events = run(PROMPT, &["[get_weather(city=\"Paris\")]\n\n"]);
+        assert_eq!(malformed(&events), "");
+        assert_eq!(dropped(&events), ["[", "]", "\n\n"]);
         let events = run_until(PROMPT, &["[get_weather(city=\"Par"], EngineFinish::Length);
         assert_eq!(content(&events), "");
         // A value is held until its extent is known, so a cut one comes back as the unterminated
@@ -447,6 +453,51 @@ mod tests {
         let events = run_until(PROMPT, &["[get_wea"], EngineFinish::Length);
         assert_eq!(content(&events), "[get_wea");
         assert!(calls(&events).is_empty());
+    }
+
+    /// The model explains which call it would make, the list inside the sentence: the chat
+    /// message's content and the stream's content deltas are the model's prose, byte for byte,
+    /// the whitespace between the words after the list included, whole and at every cut alike;
+    /// the list is the call.
+    #[test]
+    fn prose_after_a_list_written_mid_sentence_reaches_the_client_as_the_model_wrote_it() {
+        let output = concat!(
+            "I can look that up. For example, [get_weather(city=\"Honolulu\")] would give you ",
+            "the current weather in Honolulu."
+        );
+        let prose =
+            "I can look that up. For example,  would give you the current weather in Honolulu.";
+        let content = |events: &[Event]| chat::message(0, events).message.content;
+        let streamed = |events: &[Event]| -> String {
+            chat::deltas(0, events)
+                .into_iter()
+                .filter_map(|choice| choice.delta.content)
+                .collect()
+        };
+        let whole = run(PROMPT, &[output]);
+        let message = chat::message(0, &whole).message;
+        assert_eq!(message.content.as_deref(), Some(prose));
+        let calls = message.tool_calls.expect("a call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(
+            calls[0].function.arguments.as_deref(),
+            Some(r#"{"city": "Honolulu"}"#)
+        );
+        assert_eq!(streamed(&whole), prose);
+        assert_eq!(dropped(&whole), ["[", "]"]);
+        for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
+            let events = run(PROMPT, &[&output[..cut], &output[cut..]]);
+            assert_eq!(content(&events).as_deref(), Some(prose), "cut at {cut}");
+            assert_eq!(streamed(&events), prose, "cut at {cut}");
+        }
+        let pieces: Vec<&str> = output
+            .char_indices()
+            .map(|(at, c)| &output[at..at + c.len_utf8()])
+            .collect();
+        let events = run(PROMPT, &pieces);
+        assert_eq!(content(&events).as_deref(), Some(prose));
+        assert_eq!(streamed(&events), prose);
     }
 
     #[test]

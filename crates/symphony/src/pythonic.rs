@@ -24,7 +24,8 @@
 //! several, bare or in a list, and gives each its own index. Where no marker frames the list
 //! ([`Assembler::bare`]), it reads the whole turn: the list where the turn starts with one, after
 //! whitespace alone, as it arrives; content otherwise, and after content a list only once it is
-//! whole and well formed; the template's wrapping after the list.
+//! whole and well formed; after the list whitespace alone is the template's wrapping, and prose
+//! is the model's, whitespace included.
 //!
 //! Notes on what this module decides, and on what it leaves open: `docs/assemblers.md`.
 
@@ -125,6 +126,11 @@ pub struct Assembler {
     /// Under the bare list: whether the turn has read anything but whitespace before the list's
     /// `[`; after that a list is held until it is whole.
     begun: bool,
+    /// Under the bare list: whether text followed the list's `]`. From there on every byte,
+    /// whitespace included, is the model's prose after its calls, which the template's reference
+    /// keeps as written; before it, whitespace is held, the template's wrapping if nothing
+    /// follows.
+    prose_after: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -155,8 +161,9 @@ enum Stage {
         start: usize,
         scan: Extent,
     },
-    /// Under the bare list: after the list's `]`. `carried` holds the current run, whitespace or
-    /// not; whitespace is the template's wrapping, anything else malformed.
+    /// Under the bare list: after the list's `]`. `carried` holds whitespace nothing has followed
+    /// yet, the template's wrapping if nothing does, or the prose's next word with the whitespace
+    /// before it, which leaves when the word ends (`prose_after`).
     After,
 }
 
@@ -276,6 +283,7 @@ impl Assembler {
             values: dialect.values,
             bare: false,
             begun: false,
+            prose_after: false,
         }
     }
 
@@ -287,9 +295,10 @@ impl Assembler {
     /// closes it and read as its calls only if the whole is a well-formed list of calls with
     /// keyword arguments to tools the request declares, since code holds `[name(` of its own
     /// (`[f(a+h) - f(a)]/h`, `[Authorize(Roles = "Manager")]`); anything else, a list the stream's
-    /// end cut included, is content. After the list's `]` whitespace is
-    /// the template's wrapping and anything else malformed, as it is after xLAM's bare list. A `[`
-    /// that no call follows (`[Note]`, `[1, 2]`, a markdown link) is content too.
+    /// end cut included, is content. After the list's `]` whitespace alone is the template's
+    /// wrapping; once text follows, every byte after the `]` is the model's prose, whitespace
+    /// included, reported malformed as it is after xLAM's bare list. A `[` that no call follows
+    /// (`[Note]`, `[1, 2]`, a markdown link) is content too.
     pub fn bare(first: u32, ids: CallIds, dialect: Dialect) -> Self {
         Self {
             stage: Stage::Prose,
@@ -305,12 +314,15 @@ impl Assembler {
         for c in bytes.chars() {
             self.take(c, declared, out);
         }
-        // Content and the text after a bare list are given back as they arrive, run by run; a
-        // `[` under consideration and a list held after content stay held, and so does the
-        // whitespace before the turn's first byte, which a list would make its wrapping.
+        // Content and the words after a bare list are given back as they arrive; a `[` under
+        // consideration and a list held after content stay held, and so do the whitespace before
+        // the turn's first byte, which a list would make its wrapping, and the whitespace after
+        // the list, which the next word makes the prose's and the end the template's.
         match self.stage {
             Stage::Prose if self.begun => self.release_content(out),
-            Stage::After => self.release_after(out),
+            Stage::After if self.prose_after && !self.carried.ends_with(char::is_whitespace) => {
+                self.release_after(out);
+            }
             _ => {}
         }
     }
@@ -571,9 +583,11 @@ impl Assembler {
                 }
             }
             Stage::After => {
-                let space = c.is_whitespace();
-                let run_is_space = self.carried.chars().next().is_some_and(char::is_whitespace);
-                if !self.carried.is_empty() && run_is_space != space {
+                // Whitespace is held until what follows says whose it is; a word leaves where it
+                // ends, with the whitespace before it, once text followed the list.
+                if !c.is_whitespace() {
+                    self.prose_after = true;
+                } else if self.prose_after && !self.carried.ends_with(char::is_whitespace) {
                     self.release_after(out);
                 }
                 self.carried.push(c);
@@ -707,22 +721,23 @@ impl Assembler {
         ))));
     }
 
-    /// The run held after the bare list, given back: whitespace as the template's wrapping,
-    /// anything else as text after the list's end.
+    /// What is held after the bare list, given back: the model's prose after its calls once text
+    /// followed the list, whitespace included; whitespace nothing followed as the template's
+    /// wrapping.
     fn release_after(&mut self, out: &mut Events) {
         if self.carried.is_empty() {
             return;
         }
         let text = Text::uncounted(std::mem::take(&mut self.carried));
-        out.push(if text.text.chars().all(char::is_whitespace) {
-            Event::Dropped {
-                text,
-                why: DropReason::Wrapper,
-            }
-        } else {
+        out.push(if self.prose_after {
             Event::Malformed {
                 text,
                 why: MalformedReason::TextAfterTheList,
+            }
+        } else {
+            Event::Dropped {
+                text,
+                why: DropReason::Wrapper,
             }
         });
     }
@@ -1335,24 +1350,30 @@ mod tests {
     }
 
     #[test]
-    fn text_after_the_bare_list_is_wrapping_or_malformed_and_a_cut_list_stays_cut() {
+    fn text_after_the_bare_list_is_the_models_prose_or_wrapping_and_a_cut_list_stays_cut() {
+        // Once text follows the list, every byte after the `]` is the model's prose, the
+        // whitespace before its first word and after its last included.
         let text = "[get_weather(city=\"Paris\")]\n\nDone.\n";
         let events = run_bare(&tools(), &[text]);
         assert_eq!(bytes(&events), text);
         assert_eq!(content(&events), "");
         assert_eq!(calls(&events).len(), 1);
-        assert_eq!(malformed(&events), "Done.");
-        assert!(events.iter().any(|event| matches!(
+        assert_eq!(malformed(&events), "\n\nDone.\n");
+        assert!(events.iter().all(|event| !matches!(
             event,
-            Event::Malformed {
-                why: MalformedReason::TextAfterTheList,
-                ..
-            }
+            Event::Malformed { why, .. } if *why != MalformedReason::TextAfterTheList
         )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            Event::Dropped { text, why: DropReason::Wrapper } if text.text == "\n\n"
-        )));
+        assert_eq!(dropped(&events), ["[", "]"]);
+        // Whitespace alone after the list is the template's wrapping, however it arrives.
+        for pieces in [
+            &["[get_weather(city=\"Paris\")]\n\n"][..],
+            &["[get_weather(city=\"Paris\")]", "\n", "\n"],
+        ] {
+            let events = run_bare(&tools(), pieces);
+            assert_eq!(calls(&events).len(), 1);
+            assert_eq!(malformed(&events), "");
+            assert_eq!(dropped(&events), ["[", "]", "\n\n"]);
+        }
         // Cut inside a value: the call ends with nothing of its own, and the value, held until
         // its extent is known, comes back as the unterminated region's text.
         let events = run_bare(&tools(), &["[get_weather(city=\"Par"]);
@@ -1366,6 +1387,69 @@ mod tests {
             Event::Malformed { text, why: MalformedReason::UnterminatedRegion }
                 if text.text == "city=\"Par"
         )));
+    }
+
+    #[test]
+    fn prose_after_a_list_written_mid_sentence_keeps_its_whitespace_whole_and_in_pieces() {
+        // The model explains which call it would make, the list inside the sentence: the words
+        // after the list keep the spaces between them, one `Malformed` event per word with the
+        // whitespace before it, whole, at every two-way cut and one character at a time.
+        let text = "For example, [get_weather(city=\"Honolulu\")] would give you the answer.";
+        let prose = " would give you the answer.";
+        let whole = run_bare(&tools(), &[text]);
+        assert_eq!(bytes(&whole), text);
+        assert_eq!(content(&whole), "For example, ");
+        assert_eq!(
+            calls(&whole),
+            [(
+                0,
+                "get_weather".to_string(),
+                r#"{"city": "Honolulu"}"#.to_string()
+            )]
+        );
+        assert_eq!(malformed(&whole), prose);
+        assert_eq!(
+            words(&whole),
+            [" would", " give", " you", " the", " answer."]
+        );
+        assert_eq!(dropped(&whole), ["[", "]"]);
+        for cut in 1..text.len() {
+            let events = run_bare(&tools(), &[&text[..cut], &text[cut..]]);
+            assert_eq!(bytes(&events), text, "cut at {cut}");
+            assert_eq!(calls(&events), calls(&whole), "cut at {cut}");
+            assert_eq!(content(&events), "For example, ", "cut at {cut}");
+            assert_eq!(malformed(&events), prose, "cut at {cut}");
+            assert_eq!(dropped(&events), ["[", "]"], "cut at {cut}");
+        }
+        let events = run_bare(
+            &tools(),
+            &by_the_character(text)
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(bytes(&events), text);
+        assert_eq!(calls(&events), calls(&whole));
+        assert_eq!(content(&events), "For example, ");
+        assert_eq!(malformed(&events), prose);
+        assert_eq!(dropped(&events), ["[", "]"]);
+        // A trailing run of whitespace after the prose is the prose's too, and a word cut by a
+        // delta boundary leaves in two pieces, the same text joined.
+        let text = "[get_weather(city=\"Paris\")]\n\nDone, see above.\n";
+        let whole = run_bare(&tools(), &[text]);
+        assert_eq!(malformed(&whole), "\n\nDone, see above.\n");
+        assert_eq!(words(&whole), ["\n\nDone,", " see", " above.", "\n"]);
+        let events = run_bare(
+            &tools(),
+            &[
+                "[get_weather(city=\"Paris\")]\n\nDo",
+                "ne, see ",
+                "above.\n",
+            ],
+        );
+        assert_eq!(malformed(&events), malformed(&whole));
+        assert_eq!(words(&events), ["\n\nDo", "ne,", " see", " above.", "\n"]);
+        assert_eq!(dropped(&events), ["[", "]"]);
     }
 
     #[test]
