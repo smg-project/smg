@@ -58,9 +58,10 @@ use crate::{
 /// backpressure to a slow client.
 pub(crate) type SseSender = sse::SseSender;
 
-/// The body of an SSE error event, `{"error":{"message":...,"type":...}}`,
-/// serialized straight into its frame: the message is written through
-/// `Display` into the JSON escaper, so the frame is the one allocation.
+/// The body of an SSE error event, `{"error":{"message":...,"type":...}}`
+/// (with a `code` when the failure has one of its own), serialized straight
+/// into its frame: the message is written through `Display` into the JSON
+/// escaper, so the frame is the one allocation.
 #[derive(Serialize)]
 #[serde(bound = "M: fmt::Display")]
 struct SseErrorFrame<'a, M: fmt::Display> {
@@ -74,6 +75,11 @@ struct SseErrorBody<'a, M: fmt::Display> {
     message: M,
     #[serde(rename = "type")]
     error_type: &'a str,
+    /// The code the HTTP answer to the same failure carries, for a failure
+    /// that has one (`constraint_failed`); absent otherwise, so the frames
+    /// clients have been reading do not change.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'a str>,
 }
 
 fn serialize_display<M: fmt::Display, S: serde::Serializer>(
@@ -90,6 +96,17 @@ fn serialize_display<M: fmt::Display, S: serde::Serializer>(
 /// `async` because the sender is bounded: awaits if the buffer is full so the
 /// terminal error frame still applies backpressure rather than being dropped.
 pub(crate) async fn send_error_sse(tx: &SseSender, message: impl fmt::Display, error_type: &str) {
+    send_error_sse_with_code(tx, message, error_type, None).await;
+}
+
+/// [`send_error_sse`] with the failure's own `code` in the body when it has
+/// one: `data: {"error":{"message":"...","type":"...","code":"..."}}\n\n`.
+pub(crate) async fn send_error_sse_with_code(
+    tx: &SseSender,
+    message: impl fmt::Display,
+    error_type: &str,
+    code: Option<&str>,
+) {
     const PREFIX: &[u8] = b"data: ";
     let mut frame = Vec::with_capacity(256);
     frame.extend_from_slice(PREFIX);
@@ -97,6 +114,7 @@ pub(crate) async fn send_error_sse(tx: &SseSender, message: impl fmt::Display, e
         error: SseErrorBody {
             message,
             error_type,
+            code,
         },
     };
     // Unreachable in practice: a `Vec` writer never fails, and serde_json

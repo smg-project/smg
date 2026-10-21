@@ -3,10 +3,15 @@
 use axum::response::Response;
 use http::StatusCode;
 use llm_multimodal::MediaErrorCode;
-use smg_grpc_client::{is_transport_failure, WorkerMediaFault};
+use smg_grpc_client::{is_constraint_failure, is_transport_failure, WorkerMediaFault};
 use tonic::Code;
 
-use crate::routers::error;
+use crate::routers::{common::retry::mark_non_retryable, error};
+
+/// The code the public API answers when the engine could not continue the
+/// request under the request's own constraint (see
+/// [`TonicStatusExt::constraint_failure_response`]).
+pub(crate) const CONSTRAINT_FAILED_CODE: &str = "constraint_failed";
 
 /// Extension methods for `tonic::Status`.
 pub(crate) trait TonicStatusExt {
@@ -43,8 +48,21 @@ pub(crate) trait TonicStatusExt {
 
     /// The HTTP status the circuit breaker samples for this failure; `None`
     /// for a failure of the request's media, which says nothing about the
-    /// worker that fetched it.
+    /// worker that fetched it, and for a constraint the engine could not
+    /// continue the request under, which says nothing about the worker
+    /// either.
     fn breaker_status(&self) -> Option<u16>;
+
+    /// The client's answer when the status is a worker's report that the
+    /// engine could not continue the request under the request's own
+    /// constraint (the `smg-constraint-failed` trailer, see
+    /// `smg_grpc_client::constraint_failure`): a 422 under
+    /// [`CONSTRAINT_FAILED_CODE`] with the worker's words, terminal for the
+    /// retry layer. The request was well formed and the engine admitted it,
+    /// so it is not a 400; the same tokens fail the same way on a replay, on
+    /// this worker or another of its kind, each replay a prefill, so it is
+    /// not a transient 5xx either. `None` for any other status.
+    fn constraint_failure_response(&self) -> Option<Response>;
 }
 
 /// Whether a status message is the media connector's account of a fetch that
@@ -58,6 +76,9 @@ fn names_a_fetch_failure(message: &str) -> bool {
 
 impl TonicStatusExt for tonic::Status {
     fn http_status(&self) -> StatusCode {
+        if is_constraint_failure(self) {
+            return StatusCode::UNPROCESSABLE_ENTITY;
+        }
         if self.media_fault().is_some() {
             return StatusCode::BAD_REQUEST;
         }
@@ -113,10 +134,19 @@ impl TonicStatusExt for tonic::Status {
     }
 
     fn breaker_status(&self) -> Option<u16> {
-        match self.media_fault() {
-            Some(_) => None,
-            None => Some(self.http_status().as_u16()),
+        if is_constraint_failure(self) || self.media_fault().is_some() {
+            return None;
         }
+        Some(self.http_status().as_u16())
+    }
+
+    fn constraint_failure_response(&self) -> Option<Response> {
+        if !is_constraint_failure(self) {
+            return None;
+        }
+        let mut response = self.to_http_error(CONSTRAINT_FAILED_CODE, self.message().to_string());
+        mark_non_retryable(&mut response);
+        Some(response)
     }
 }
 
@@ -173,6 +203,34 @@ mod tests {
             tonic::Status::resource_exhausted("busy").http_status(),
             StatusCode::TOO_MANY_REQUESTS
         );
+    }
+
+    /// A worker's report that the engine could not continue the request under
+    /// its constraint is answered for the constraint: a 422 under its own
+    /// code with the worker's words, terminal for the retry layer, sampled by
+    /// no breaker; the same code without the report keeps its 400.
+    #[test]
+    fn a_constraint_failure_is_a_terminal_422_the_breaker_does_not_sample() {
+        use smg_grpc_client::constraint_failed_status;
+
+        use crate::routers::{common::retry::is_retryable_response, error};
+
+        let status = constraint_failed_status("the scheduler aborted the request: Aborted");
+        assert_eq!(status.http_status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let result: Result<(), tonic::Status> = Err(status.clone());
+        assert_eq!(result.breaker_status(), None);
+        let response = status
+            .constraint_failure_response()
+            .expect("the report is answered");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            CONSTRAINT_FAILED_CODE
+        );
+        assert!(!is_retryable_response(&response));
+        let plain = tonic::Status::failed_precondition("the scheduler aborted the request");
+        assert_eq!(plain.http_status(), StatusCode::BAD_REQUEST);
+        assert!(plain.constraint_failure_response().is_none());
     }
 
     #[test]

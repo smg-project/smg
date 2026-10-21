@@ -7,6 +7,7 @@ including tensor parallelism, pipeline parallelism, and data parallelism configu
 
 import logging
 import multiprocessing as mp
+import os
 import signal
 
 from sglang.srt.arg_groups.model_override_base import resolved_view
@@ -19,6 +20,7 @@ from sglang.srt.utils import configure_logger, numa_utils
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 from smg_grpc_servicer.rust_lifecycle import READY_POLL_SECS
+from smg_grpc_servicer.sglang import GRAMMAR_ATTRIBUTION_ENV
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +102,13 @@ def launch_scheduler_process_only(
 
     # Fix CUDA multiprocessing issues - must be called before any CUDA operations
     mp.set_start_method("spawn", force=True)
+
+    # The scheduler ranks load this package's SGLang plugin; with this set they
+    # name the abort of a request whose grammar rejected a sampled token (see
+    # `zmq_plugin.register_grammar_attribution`), which the servicer answers as
+    # the constraint failing (`utils.grammar_abort`). Inherited by every rank,
+    # the data-parallel controller's included.
+    os.environ.setdefault(GRAMMAR_ATTRIBUTION_ENV, "1")
 
     # Allocate ports for inter-process communications
     if port_args is None:

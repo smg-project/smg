@@ -409,6 +409,42 @@ compile. The vLLM servicer reads the backend off `--structured-outputs-config`,
 the SGLang and TokenSpeed servicers off their engine's `--grammar-backend` (see
 their sections); a backend the servicer does not know is left to the engine.
 
+A constraint the engine admitted and then could not continue the request under
+(a sampled token the grammar rejects, as speculative decoding can produce) is
+one status on every servicer that can tell it apart, Rust and Python:
+`FAILED_PRECONDITION` with the trailer `smg-constraint-failed: engine`, the
+message naming the constraint and keeping the engine's own words. Behind the
+servicers a router answers the client a 422 under the code `constraint_failed`,
+replays nothing (the same tokens fail the same way, each replay a prefill), and
+samples no circuit breaker against the worker; a router that predates the
+trailer answers a 400 for the code and retries nothing. The status is raised
+only on the engine's own attribution, never inferred from the request carrying
+a constraint: an engine aborts or fails requests for other reasons too (a pause
+or an abort-all, a decode side's failed KV handoff, a capacity abort), and
+those keep the status they have on any request. Per engine:
+
+- SGLang: the scheduler's grammar paths end such a request with a bare
+  `FINISH_ABORT()` (message `Aborted`, no status, no `err_type`), the finish an
+  abort-all gives every running request too. This package's SGLang plugin
+  (`smg_grpc_servicer.sglang.zmq_plugin`, loaded in every scheduler rank)
+  hooks those paths (`SchedulerBatchResultProcessor._accept_grammar_tokens`,
+  `_apply_prefill_grammar`, and the PD decode side's `process_prebuilt`) and
+  stamps the finish they set with `err_type` `GrammarRejectedToken`; the ZMQ
+  wire carries it in the slim batch's `finished_err_types` column, the Python
+  servicer reads it off the finish dict. The hooks register under the ZMQ
+  handshake and under `SMG_SGLANG_ATTRIBUTE_GRAMMAR_ABORTS=1`, which the Python
+  servicer sets for the ranks it spawns; a release without one of the paths
+  keeps that path's aborts bare, which the servicers answer as before.
+- vLLM: the engine finishes a grammar rejection, a grammar compile error, a
+  failed KV load, an encoder-cache miss and a pre-processing fault alike with
+  `error`, and a pause or shutdown with `abort`; nothing on its wire names the
+  cause, so an `error` stays the engine's own report (retried, charged and
+  probed as such) and an `abort` keeps its shape.
+- TokenSpeed: the engine's abort codes name transfer, numerical and capacity
+  failures and the pause's abort, none the grammar (a rejected token is dropped
+  on the speculative path); the slim wire carries the finish type alone. Its
+  finishes keep their shapes.
+
 Both vLLM servicers also advertise the engine's reasoning parser
 (`engine_reasoning_parser`; `reasoning_parser` is the per-model parser override
 a router reads off a worker's labels) and where its grammar starts on a prompt

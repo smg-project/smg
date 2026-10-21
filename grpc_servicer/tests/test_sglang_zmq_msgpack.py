@@ -190,7 +190,43 @@ def test_slim_output_pins_its_positional_layout():
         [[], []],  # input_top_logprobs_idx
         [[], []],  # output_token_ids_logprobs_val
         [[], []],  # output_token_ids_logprobs_idx
+        [None, None],  # finished_err_types: no abort
     ]
+
+
+def test_slim_output_carries_the_schedulers_abort_err_type():
+    """The scheduler's `err_type` of an abort (the plugin's grammar stamp, a
+    release's own name) rides the last appended column; a bare abort and
+    every other finish leave it None."""
+    full = _full_output()
+    full.finished_reasons = [
+        {"type": "abort", "message": "Aborted", "status_code": None, "err_type": None},
+        {
+            "type": "abort",
+            "message": "the grammar rejected a sampled token",
+            "status_code": None,
+            "err_type": "GrammarRejectedToken",
+        },
+    ]
+    slim = wire.BatchTokenIDSlimOutput.from_full(full, engine_index=1)
+    assert slim.finished_reasons == ["abort", "abort"]
+    assert slim.finished_messages == ["Aborted", "the grammar rejected a sampled token"]
+    assert slim.finished_status == [None, None]
+    assert slim.finished_err_types == [None, "GrammarRejectedToken"]
+    encoded = msgspec.msgpack.decode(msgspec.msgpack.encode(slim))
+    assert len(encoded) == 27 and encoded[26] == [None, "GrammarRejectedToken"]
+    # Pin for the Rust decoder (`protocol/sglang/output.rs`, PYTHON_SLIM27).
+    print("PIN_SLIM27", msgspec.msgpack.encode(slim).hex())
+    # A PD decode side's grammar failure carries the name next to its 500.
+    full.finished_reasons[1] = {
+        "type": "abort",
+        "message": "Grammar accept_token failed for req b with token 7: Tokens not accepted: 7",
+        "status_code": 500,
+        "err_type": "GrammarRejectedToken",
+    }
+    slim = wire.BatchTokenIDSlimOutput.from_full(full)
+    assert slim.finished_status == [None, 500]
+    assert slim.finished_err_types == [None, "GrammarRejectedToken"]
 
 
 class _FakeSmg:
@@ -490,8 +526,9 @@ def test_slim_output_appends_prompt_logprobs_and_reasoning_tokens():
     full.input_top_logprobs_idx = [None, [None, [2], [3]]]
     slim = wire.BatchTokenIDSlimOutput.from_full(full)
     encoded = msgspec.msgpack.decode(msgspec.msgpack.encode(slim))
-    assert len(encoded) == 26
-    assert encoded[24:] == [[[], []], [[], []]]
+    assert len(encoded) == 27
+    assert encoded[24:26] == [[[], []], [[], []]]
+    assert encoded[26] == [None, None]  # finished_err_types: no abort
     assert encoded[19] == [0, 4]
     assert encoded[20] == [[], [None, -0.7, -1.1]] and encoded[21] == [[], [1, 2, 3]]
     assert encoded[22] == [[], [[], [-0.7], [-1.1]]] and encoded[23] == [[], [[], [2], [3]]]

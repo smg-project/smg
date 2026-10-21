@@ -319,7 +319,15 @@ impl MappedGenerateStream for VllmGenerateStream {
 
         // An engine-side request failure (e.g. grammar compilation) must
         // surface as an error, not as a normal completion with empty output —
-        // that would produce a 200 with no content.
+        // that would produce a 200 with no content. The engine names no cause
+        // on this wire: the same `Error` ends a request whose grammar rejected
+        // a token, a decode side whose KV load failed, an encoder-cache miss
+        // and a pre-processing fault, and an `Abort` the frontend did not ask
+        // for is a pause or a shutdown aborting every request; so a
+        // constrained request's `Error` stays the engine's own report (the
+        // router retries, charges and probes it as such) and its `Abort` keeps
+        // its shape. The constraint-failure status is raised only by a wire
+        // whose engine attributes the failure (see the SGLang stream).
         if matches!(output.finish_reason, Some(EngineCoreFinishReason::Error)) {
             return Err(tonic::Status::internal(
                 "engine finished the request with an error (see engine logs)",
@@ -2433,5 +2441,135 @@ mod tests {
             .expect_err(field);
             assert!(error.contains(field), "{field}: {error}");
         }
+    }
+
+    /// This wire's engine names no cause: an `Error` finish on a constrained
+    /// request is as often a decode side's failed KV load (the request
+    /// carries `kv_transfer_params`) as a grammar rejection, and an `Abort` the
+    /// frontend did not ask for is a pause or a shutdown. Both keep the shape
+    /// they have on every request: the `Error` is the engine's own report (the
+    /// internal status the router retries, charges and probes), the `Abort` a
+    /// `Complete` with finish reason `abort`; neither is the constraint-failure
+    /// status, which only an engine's own attribution raises.
+    #[tokio::test]
+    async fn an_error_or_abort_finish_of_a_constrained_request_keeps_the_engines_own_shape() {
+        use smg_grpc_client::is_constraint_failure;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let (client, engine) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                1,
+                "m".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::Vllm,
+                Duration::from_secs(10)
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        let client = client.expect("adapter connect");
+        let engine = engine.expect("mock engine");
+        // (rid, the finish, constrained, a decode side carrying its KV handoff)
+        let cases = [
+            ("r1", EngineCoreFinishReason::Error, true, true),
+            ("r2", EngineCoreFinishReason::Error, true, false),
+            ("r3", EngineCoreFinishReason::Abort, true, false),
+            ("r4", EngineCoreFinishReason::Error, false, false),
+            ("r5", EngineCoreFinishReason::Abort, false, false),
+        ];
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "engine task ends after responding"
+        )]
+        let engine_task = tokio::spawn(async move {
+            let (mut input, mut output) = engine.split();
+            for (rid, finish, _, _) in cases {
+                let request = loop {
+                    match input.recv().await.unwrap() {
+                        EngineInbound::Add(request) => break request,
+                        // A dropped stream's abort of a request the engine
+                        // already finished.
+                        EngineInbound::Abort(_) => continue,
+                        other => panic!("expected Add, got {other:?}"),
+                    }
+                };
+                assert_eq!(request.request_id, rid);
+                output
+                    .send_outputs(&batch(rid, 10, None, Some(finish)))
+                    .await
+                    .unwrap();
+            }
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
+        });
+
+        for (rid, finish, constrained, decode_side) in cases {
+            let req = vllm::GenerateRequest {
+                request_id: rid.to_string(),
+                input: Some(vllm::generate_request::Input::Tokenized(
+                    vllm::TokenizedInput {
+                        original_text: String::new(),
+                        input_ids: vec![1, 2, 3],
+                    },
+                )),
+                sampling_params: Some(vllm::SamplingParams {
+                    max_tokens: Some(8),
+                    constraint: constrained.then(|| {
+                        vllm::sampling_params::Constraint::JsonSchema(
+                            r#"{"type":"object"}"#.to_string(),
+                        )
+                    }),
+                    ..Default::default()
+                }),
+                kv_transfer_params_json: decode_side.then(|| {
+                    r#"{"do_remote_prefill":true,"remote_host":"prefill","remote_port":5600}"#
+                        .to_string()
+                }),
+                stream: true,
+                ..Default::default()
+            };
+            let mut stream = client.generate_vllm(req).await.expect("generate");
+            let item = stream.next().await.expect("an item");
+            match finish {
+                EngineCoreFinishReason::Error => {
+                    let error = item.expect_err("an error");
+                    assert_eq!(error.code(), tonic::Code::Internal, "{rid}");
+                    assert_eq!(
+                        error.message(),
+                        "engine finished the request with an error (see engine logs)",
+                        "{rid}: the engine's own report, word for word"
+                    );
+                    assert!(!is_constraint_failure(&error), "{rid}: {error}");
+                }
+                _ => {
+                    // The tick's token goes out as a chunk; the parked
+                    // `Complete` keeps the abort finish.
+                    assert!(
+                        matches!(
+                            item.expect("a chunk").response,
+                            Some(vllm::generate_response::Response::Chunk(_))
+                        ),
+                        "{rid}"
+                    );
+                    let complete = stream.next().await.expect("an item").expect("a response");
+                    match complete.response {
+                        Some(vllm::generate_response::Response::Complete(complete)) => {
+                            assert_eq!(complete.finish_reason, "abort", "{rid}");
+                        }
+                        other => panic!("{rid}: expected a Complete, got {other:?}"),
+                    }
+                }
+            }
+        }
+        engine_task.await.unwrap();
     }
 }

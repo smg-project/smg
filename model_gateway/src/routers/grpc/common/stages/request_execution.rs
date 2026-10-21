@@ -887,6 +887,19 @@ fn start_failure_response(
         mark_non_retryable(&mut response);
         return response;
     }
+    // The engine could not continue the request under its constraint (see
+    // `TonicStatusExt::constraint_failure_response`): the request's outcome,
+    // not the worker's failure, and final (a replay runs the same tokens into
+    // the same grammar).
+    if let Some(response) = e.constraint_failure_response() {
+        warn!(
+            function = function,
+            error = %e,
+            "{}: the engine could not continue the request under its constraint",
+            description
+        );
+        return response;
+    }
     if e.http_status().is_client_error() {
         warn!(function = function, error = %e, "{}: engine rejected the request", description);
     } else {

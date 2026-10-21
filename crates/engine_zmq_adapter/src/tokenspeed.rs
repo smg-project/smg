@@ -221,6 +221,13 @@ impl MappedGenerateStream for TokenSpeedGenerateStream {
 
         // An engine-side failure must surface as an error, not a normal
         // completion with empty output — mirroring the vLLM stream's guard.
+        // The slim wire carries the finish type alone (no message, status or
+        // abort code), and the engine has no abort code for its grammar
+        // anyway: an `abort` the frontend did not ask for is a pause or a
+        // capacity abort, an `error` a transfer or numerical failure. So a
+        // constrained request's finishes keep the shapes every request has;
+        // the constraint-failure status is raised only by a wire whose engine
+        // attributes the failure (see the SGLang stream).
         if output.finish_reason.as_deref() == Some("error") {
             return Err(tonic::Status::internal(
                 "engine finished the request with an error (see engine logs)",
@@ -1337,5 +1344,122 @@ mod tests {
         assert_eq!(normalize_finish_reason("error"), "error");
         // An unknown wire value falls back to "stop".
         assert_eq!(normalize_finish_reason("garbage"), "stop");
+    }
+
+    /// This wire carries the finish type alone and its engine has no abort
+    /// code for its grammar: an `abort` on a constrained request is as often
+    /// a pause aborting every request in flight (the finish an RL driver
+    /// resubmits on) as anything else, an `error` a transfer or numerical
+    /// failure. Both keep the shape every request has, the `abort` a
+    /// `Complete` with finish reason `abort` and the `error` the engine's own
+    /// report; neither is the constraint-failure status, which only an
+    /// engine's own attribution raises.
+    #[tokio::test]
+    async fn an_abort_or_error_finish_of_a_constrained_request_keeps_the_engines_own_shape() {
+        use engine_zmq_client::{
+            codec::encode_msgpack, protocol::tokenspeed::output::BatchTokenIDOutSlim,
+        };
+        use smg_grpc_client::is_constraint_failure;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let (client, engine) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                1,
+                "m".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::TokenSpeed,
+                Duration::from_secs(10)
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        let client = client.expect("adapter connect");
+        let engine = engine.expect("mock engine");
+        let cases = [
+            ("r1", "abort", true),
+            ("r2", "error", true),
+            ("r3", "abort", false),
+            ("r4", "error", false),
+        ];
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "engine task ends after responding"
+        )]
+        let engine_task = tokio::spawn(async move {
+            let (mut input, mut output) = engine.split();
+            for (rid, finish, _) in cases {
+                let _ = input.recv_frames().await.unwrap();
+                let done = BatchTokenIDOutSlim {
+                    rids: vec![rid.into()],
+                    output_ids: vec![vec![]],
+                    finished_reasons: vec![finish.into()],
+                    prompt_tokens: vec![3],
+                    completion_tokens: vec![0],
+                    cached_tokens: vec![0],
+                    output_token_logprobs_val: vec![vec![]],
+                    output_token_logprobs_idx: vec![vec![]],
+                    ..Default::default()
+                };
+                output
+                    .send_frames(vec![bytes::Bytes::from(encode_msgpack(&done).unwrap())])
+                    .await
+                    .unwrap();
+            }
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
+        });
+
+        for (rid, finish, constrained) in cases {
+            let req = tokenspeed_proto::GenerateRequest {
+                request_id: rid.to_string(),
+                tokenized: Some(tokenspeed_proto::TokenizedInput {
+                    input_ids: vec![1, 2, 3],
+                    original_text: String::new(),
+                }),
+                sampling_params: Some(tokenspeed_proto::SamplingParams {
+                    max_new_tokens: Some(8),
+                    constraint: constrained.then(|| {
+                        tokenspeed_proto::sampling_params::Constraint::JsonSchema(
+                            r#"{"type":"object"}"#.to_string(),
+                        )
+                    }),
+                    ..Default::default()
+                }),
+                stream: true,
+                ..Default::default()
+            };
+            let mut stream = client.generate_tokenspeed(req).await.expect("generate");
+            let item = stream.next().await.expect("an item");
+            if finish == "error" {
+                let error = item.expect_err("an error");
+                assert_eq!(error.code(), tonic::Code::Internal, "{rid}");
+                assert_eq!(
+                    error.message(),
+                    "engine finished the request with an error (see engine logs)",
+                    "{rid}: the engine's own report, word for word"
+                );
+                assert!(!is_constraint_failure(&error), "{rid}: {error}");
+            } else {
+                match item.expect("a response").response {
+                    Some(vllm::generate_response::Response::Complete(complete)) => {
+                        assert_eq!(
+                            complete.finish_reason, "abort",
+                            "{rid} (constrained: {constrained})"
+                        );
+                    }
+                    other => panic!("{rid}: expected a Complete, got {other:?}"),
+                }
+            }
+        }
+        engine_task.await.unwrap();
     }
 }
