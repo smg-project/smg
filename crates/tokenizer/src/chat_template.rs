@@ -3,12 +3,20 @@
 //! This module provides functionality to apply chat templates to messages,
 //! similar to HuggingFace transformers' apply_chat_template method.
 
-use std::{borrow::Cow, collections::HashMap, fs, io, iter, sync::OnceLock};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    fs, io, iter,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        OnceLock,
+    },
+};
 
 use anyhow::{anyhow, Result};
 use chrono::{
     format::{strftime::StrftimeItems, Item},
-    DateTime, FixedOffset, Local, TimeZone,
+    DateTime, FixedOffset, Local, TimeZone, Utc,
 };
 use minijinja::{
     context,
@@ -1429,7 +1437,58 @@ fn render_instant() -> DateTime<FixedOffset> {
                 .single()
                 .map(|instant| instant.fixed_offset())
         })
-        .unwrap_or_else(|| Local::now().fixed_offset())
+        .unwrap_or_else(local_now)
+}
+
+/// `Local::now()` as a fixed offset, with the zone's offset remembered per
+/// second: a zone changes its offset only on a whole second (its transitions
+/// are whole seconds), so every render within one second shares the offset
+/// the first one looked up, from one atomic word, instead of each walking the
+/// zone's transitions through chrono's thread-local cache. The first render
+/// of a new second looks the offset up again, which is also where chrono
+/// notices a changed `TZ` or `/etc/localtime`.
+fn local_now() -> DateTime<FixedOffset> {
+    /// The second and its offset, packed by [`pack_offset`]; 0 = none yet.
+    static OFFSET_OF_SECOND: AtomicU64 = AtomicU64::new(0);
+    let utc = Utc::now();
+    let second = utc.timestamp();
+    let remembered = OFFSET_OF_SECOND.load(Ordering::Relaxed);
+    let offset = match unpack_offset(remembered) {
+        Some((remembered_second, offset)) if remembered_second == second => offset,
+        _ => {
+            let offset = Local.offset_from_utc_datetime(&utc.naive_utc());
+            if let Some(packed) = pack_offset(second, offset) {
+                OFFSET_OF_SECOND.store(packed, Ordering::Relaxed);
+            }
+            offset
+        }
+    };
+    utc.with_timezone(&offset)
+}
+
+/// One word for a Unix second (the upper 40 bits, seconds from 1970 to the
+/// year 36812) and an offset east of UTC in seconds (the lower 24 bits, two's
+/// complement: zones lie within a day of UTC); `None` for a second the word
+/// cannot hold (before 1970 or past the 40 bits), never 0 for a held pair.
+fn pack_offset(second: i64, offset: FixedOffset) -> Option<u64> {
+    if !(1..1 << 40).contains(&second) {
+        return None;
+    }
+    let seconds_east = offset.local_minus_utc();
+    if !(-(1 << 23)..1 << 23).contains(&seconds_east) {
+        return None;
+    }
+    Some(((second as u64) << 24) | (u64::from(seconds_east as u32) & 0xFF_FFFF))
+}
+
+/// The pair [`pack_offset`] packed; `None` for 0 (nothing held yet).
+fn unpack_offset(packed: u64) -> Option<(i64, FixedOffset)> {
+    if packed == 0 {
+        return None;
+    }
+    let second = (packed >> 24) as i64;
+    let seconds_east = ((packed as u32) << 8) as i32 >> 8;
+    FixedOffset::east_opt(seconds_east).map(|offset| (second, offset))
 }
 
 /// Whether the template mentions the `developer` role at all (the engine's
@@ -1757,9 +1816,15 @@ fn render_messages<'a>(
         .map_err(|e| anyhow!("Failed to get template: {e}"))?;
 
     // transformers adds `strftime_now` to the template environment; here it is
-    // a callable of the render context, bound to the render's instant.
-    let now = params.now.unwrap_or_else(render_instant);
-    let strftime_now = Value::from_function(move |format: String| strftime(&now, &format));
+    // a callable of the render context, bound to the render's instant, which
+    // is read when the template first calls it: a template that never asks
+    // for the time (most of them) costs no clock and no zone lookup.
+    let named = params.now;
+    let instant: OnceLock<DateTime<FixedOffset>> = OnceLock::new();
+    let strftime_now = Value::from_function(move |format: String| {
+        let now = instant.get_or_init(|| named.unwrap_or_else(render_instant));
+        strftime(now, &format)
+    });
 
     // Convert messages to minijinja::Value (messages already processed by router)
     let minijinja_messages: Vec<Value> = messages.map(Value::from_serialize).collect();
@@ -2399,6 +2464,46 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("strftime_now"), "{error}");
+    }
+
+    /// The remembered offset is the zone's: `local_now` and `Local::now`
+    /// agree on the offset and on the second (a boundary may fall between the
+    /// two reads), on a first and on a repeated read within the second.
+    #[test]
+    fn local_now_is_the_local_clock_with_its_offset() {
+        for _ in 0..3 {
+            let ours = local_now();
+            let chrono = Local::now().fixed_offset();
+            assert_eq!(ours.offset(), chrono.offset());
+            assert!(
+                (chrono - ours).num_seconds().abs() <= 1,
+                "{ours} vs {chrono}"
+            );
+        }
+    }
+
+    /// The word holds the second and the offset exactly, for offsets east
+    /// and west of UTC and at the edges of a day, and refuses what it cannot
+    /// hold (a second before 1970, an offset beyond a day).
+    #[test]
+    fn a_second_and_its_offset_pack_into_one_word_exactly() {
+        let seconds = [1_i64, 1_761_061_000, (1 << 40) - 1];
+        let offsets = [
+            -86_399, -43_200, -3_600, 0, 1, 7_200, 19_800, 50_400, 86_399,
+        ];
+        for &second in &seconds {
+            for &east in &offsets {
+                let offset = FixedOffset::east_opt(east).unwrap();
+                let packed = pack_offset(second, offset).unwrap();
+                assert_ne!(packed, 0);
+                assert_eq!(unpack_offset(packed), Some((second, offset)));
+            }
+        }
+        let utc = FixedOffset::east_opt(0).unwrap();
+        assert_eq!(pack_offset(0, utc), None);
+        assert_eq!(pack_offset(-1, utc), None);
+        assert_eq!(pack_offset(1 << 40, utc), None);
+        assert_eq!(unpack_offset(0), None);
     }
 
     /// Jinja2's `dict()` is Python's: it builds a map from nothing, from a
