@@ -30,7 +30,6 @@ use axum::{
     body::Body,
     extract::{connect_info::ConnectInfo, Request},
     http::{header::USER_AGENT, HeaderMap, HeaderName},
-    middleware::Next,
     response::Response,
 };
 use opentelemetry::trace::TraceContextExt;
@@ -364,10 +363,10 @@ fn record_trace_id(span: &Span) {
 /// Echo the request's trace context on the response (`traceparent`, plus
 /// `tracestate` when the caller sent one), so a client holding a reply can
 /// look its trace up without an attribute search. Runs under the request
-/// span (inside [`create_logging_layer`]'s trace layer); a no-op while
-/// tracing is off.
-pub async fn trace_context_response(request: Request, next: Next) -> Response {
-    let mut response = next.run(request).await;
+/// span (inside [`create_logging_layer`]'s trace layer) as the response map of
+/// `tower::util::MapResponseLayer` (the response's own future carries it,
+/// nothing is cloned or boxed per request); a no-op while tracing is off.
+pub fn trace_context_on_response(mut response: Response) -> Response {
     let headers = response.headers_mut();
     inject_trace_context_http(headers);
     // The propagator writes `tracestate` even when there is none to carry.

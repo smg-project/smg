@@ -7733,6 +7733,7 @@ dependencies = [
  "opentelemetry-proto 0.33.0",
  "opentelemetry_sdk 0.32.1",
  "parking_lot",
+ "pin-project-lite",
  "portpicker",
  "prost",
  "prost-types",

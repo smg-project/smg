@@ -1198,10 +1198,9 @@ pub fn build_apps(
             // Every SSE stream of these routes carries a keep-alive through an
             // upstream silence (a comment; the Messages API's ping event),
             // written between frames, nothing while frames flow.
-            .route_layer(axum::middleware::from_fn_with_state(
-                middleware::SseKeepAlive::from_config(&app_state.context.router_config),
-                middleware::sse_keepalive_middleware,
-            ))
+            .route_layer(
+                middleware::SseKeepAlive::from_config(&app_state.context.router_config).layer(),
+            )
             // Tokenize / Detokenize endpoints
             .route("/v1/tokenize", post(v1_tokenize))
             .route("/v1/detokenize", post(v1_detokenize))
@@ -1232,9 +1231,7 @@ pub fn build_apps(
     ))
     // Outermost on these routes: a refusal by any layer inside (authentication,
     // admission, the body timeout) leaves in the Messages envelope as well.
-    .route_layer(axum::middleware::from_fn(
-        middleware::messages_error_envelope_middleware,
-    ));
+    .route_layer(middleware::MessagesErrorEnvelopeLayer);
 
     // WebSocket and WebRTC routes: auth + concurrency but NO WASM middleware.
     // WASM OnResponse reconstructs the response from status/headers/body,
@@ -1441,11 +1438,9 @@ where
         // The Messages envelope once more, outside the body-size limit: a
         // declared over-limit length is refused by the limit layer before any
         // route layer runs, and still leaves in the envelope.
-        .layer(axum::middleware::from_fn(
-            middleware::messages_error_envelope_middleware,
-        ))
-        .layer(axum::middleware::from_fn(
-            middleware::trace_context_response,
+        .layer(middleware::MessagesErrorEnvelopeLayer)
+        .layer(tower::util::MapResponseLayer::new(
+            middleware::trace_context_on_response,
         ))
         .layer(middleware::create_logging_layer(access_log_fields))
         .layer(middleware::HttpMetricsLayer::new(inflight_tracker))

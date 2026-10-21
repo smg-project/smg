@@ -30,7 +30,9 @@ use axum::{
 };
 use bytes::Bytes;
 use http_body::Body as HttpBody;
+use pin_project_lite::pin_project;
 use tokio::time::{Instant, Sleep};
+use tower::{Layer, Service};
 
 use super::edge_body::BodyDuties;
 use crate::{
@@ -99,8 +101,87 @@ fn is_event_stream(response: &Response) -> bool {
         .is_some_and(|head| head.eq_ignore_ascii_case("text/event-stream"))
 }
 
+impl SseKeepAlive {
+    /// This keep-alive as a route layer: the service's own future maps the
+    /// response, nothing is cloned or boxed per request (the `from_fn` form
+    /// did both, on every request of the routes, streamed or not).
+    pub fn layer(self) -> SseKeepAliveLayer {
+        SseKeepAliveLayer { keep_alive: self }
+    }
+}
+
+/// [`SseKeepAlive::layer`].
+#[derive(Clone, Copy, Debug)]
+pub struct SseKeepAliveLayer {
+    keep_alive: SseKeepAlive,
+}
+
+impl<S> Layer<S> for SseKeepAliveLayer {
+    type Service = SseKeepAliveService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        SseKeepAliveService {
+            inner,
+            keep_alive: self.keep_alive,
+        }
+    }
+}
+
+/// The service [`SseKeepAliveLayer`] wraps a route in.
+#[derive(Clone, Debug)]
+pub struct SseKeepAliveService<S> {
+    inner: S,
+    keep_alive: SseKeepAlive,
+}
+
+impl<S, E> Service<Request<Body>> for SseKeepAliveService<S>
+where
+    S: Service<Request<Body>, Response = Response, Error = E>,
+{
+    type Response = Response;
+    type Error = E;
+    type Future = KeepAliveFuture<S::Future>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: Request<Body>) -> Self::Future {
+        let messages = request.uri().path() == MESSAGES_ROUTE;
+        KeepAliveFuture {
+            inner: self.inner.call(request),
+            keep_alive: self.keep_alive,
+            messages,
+        }
+    }
+}
+
+pin_project! {
+    /// The inner service's future, its response given the keep-alive.
+    pub struct KeepAliveFuture<F> {
+        #[pin]
+        inner: F,
+        keep_alive: SseKeepAlive,
+        messages: bool,
+    }
+}
+
+impl<F, E> Future for KeepAliveFuture<F>
+where
+    F: Future<Output = Result<Response, E>>,
+{
+    type Output = Result<Response, E>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        let response = std::task::ready!(this.inner.poll(cx))?;
+        Poll::Ready(Ok(this.keep_alive.apply(response, *this.messages)))
+    }
+}
+
 /// Route-layer middleware: the keep-alive on every SSE response of the
-/// routes it wraps.
+/// routes it wraps ([`SseKeepAlive::layer`] is the same without the per-request
+/// clone and boxes of `from_fn`).
 pub async fn sse_keepalive_middleware(
     State(keep_alive): State<SseKeepAlive>,
     request: Request<Body>,
@@ -326,10 +407,7 @@ mod tests {
         Router::new()
             .route("/v1/chat/completions", post(move || async move { chat() }))
             .route(MESSAGES_ROUTE, post(move || async move { response() }))
-            .route_layer(axum::middleware::from_fn_with_state(
-                SseKeepAlive::every_secs(SECS),
-                sse_keepalive_middleware,
-            ))
+            .route_layer(SseKeepAlive::every_secs(SECS).layer())
             .layer(HttpMetricsLayer::new(InFlightRequestTracker::new()))
     }
 
