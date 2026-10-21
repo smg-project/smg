@@ -23,6 +23,7 @@ use tracing::warn;
 use crate::{
     fanout::fan_out_n,
     stream::{poll_mapped, MappedGenerateStream, StreamState},
+    structured_outputs::ConstraintRef,
 };
 
 /// Streaming generate output for one SGLang sub-request, mapping each
@@ -68,6 +69,11 @@ impl SglangGenerateStream {
     /// Reasoning tokens the scheduler has counted for this choice so far.
     pub fn reasoning_tokens(&self) -> u32 {
         self.reasoning_tokens
+    }
+
+    /// The engine-side id of this choice's request.
+    pub fn request_id(&self) -> &str {
+        self.inner.request_id()
     }
 
     /// Convert a stream item without discarding SGLang-only score rows.
@@ -129,6 +135,13 @@ impl SglangGenerateStream {
             }
             None => {}
         }
+    }
+
+    /// Whether the engine already finished this choice and its terminal
+    /// `Complete` is parked behind the chunk just yielded (the finish tick
+    /// carried new tokens).
+    pub fn has_parked_complete(&self) -> bool {
+        self.pending.is_some()
     }
 
     /// End this choice as aborted: the engine's own parked `Complete` when it
@@ -336,11 +349,11 @@ impl MappedGenerateStream for SglangGenerateStream {
 
         // SGLang has no separate error finish: a request it could not serve
         // (rejected by the plugin's validation, refused at admission, dropped
-        // from a full queue) ends as `abort` with the reason and, when the
-        // request is at fault, HTTP 400. The frontend never asked for it (its
-        // own aborts drop the stream first), so it is an error to the caller,
-        // not an empty success, with the status mapped as SGLang's gRPC
-        // servicer maps it.
+        // from a full queue) ends as `abort` with the reason and an HTTP-style
+        // status (400 when the request is at fault). The frontend never asked
+        // for it (its own aborts drop the stream first), so it is an error to
+        // the caller, not an empty success, with the status mapped by the one
+        // table the engine's front ends share (`scheduler_abort_status`).
         if output.finish_reason.as_deref() == Some("abort") {
             let message = format!(
                 "the scheduler aborted the request: {}",
@@ -349,11 +362,7 @@ impl MappedGenerateStream for SglangGenerateStream {
                     .as_deref()
                     .unwrap_or("no reason reported")
             );
-            return Err(match output.finish_status {
-                Some(400) => tonic::Status::invalid_argument(message),
-                Some(503) => tonic::Status::unavailable(message),
-                _ => tonic::Status::internal(message),
-            });
+            return Err(scheduler_abort_status(output.finish_status, message));
         }
         let finish = output.finish_reason.map(|reason| {
             (
@@ -668,6 +677,36 @@ pub(crate) fn translate_sampling_sglang(sp: sglang_proto::SamplingParams) -> Sgl
     params
 }
 
+/// The request's constraint as the shared refusal reads it
+/// ([`crate::structured_outputs::refuse_unenforceable_constraint`]): the
+/// proto `constraint` one-of by kind, with its text.
+pub(crate) fn constraint_ref(sp: &sglang_proto::SamplingParams) -> Option<ConstraintRef<'_>> {
+    use sglang_proto::sampling_params::Constraint;
+    Some(match sp.constraint.as_ref()? {
+        Constraint::JsonSchema(schema) => ConstraintRef::JsonSchema(schema),
+        Constraint::Regex(regex) => ConstraintRef::Regex(regex),
+        Constraint::EbnfGrammar(grammar) => ConstraintRef::Ebnf(grammar),
+        Constraint::StructuralTag(tag) => ConstraintRef::StructuralTag(tag),
+    })
+}
+
+/// The gRPC status for a request the scheduler aborted with an HTTP-style
+/// status: the table the engine's Python servicer uses for the same status,
+/// so the two front ends of one engine answer alike. 400 is the caller's
+/// fault, 404 a missing resource, 408 and 504 a deadline, 429 a full queue,
+/// 503 an unavailable engine; anything else, a missing status included, is
+/// internal.
+pub(crate) fn scheduler_abort_status(status: Option<u16>, message: String) -> tonic::Status {
+    match status {
+        Some(400) => tonic::Status::invalid_argument(message),
+        Some(404) => tonic::Status::not_found(message),
+        Some(408 | 504) => tonic::Status::deadline_exceeded(message),
+        Some(429) => tonic::Status::resource_exhausted(message),
+        Some(503) => tonic::Status::unavailable(message),
+        _ => tonic::Status::internal(message),
+    }
+}
+
 /// Normalize an SGLang finish reason into the canonical set the gateway's
 /// response layer exact-matches (`stop`, `length`, `abort`).
 pub(crate) fn normalize_finish_reason(reason: &str) -> &'static str {
@@ -704,6 +743,26 @@ mod tests {
     use crate::{client::ZmqEngineClient, eos::EosTokenIds};
 
     #[test]
+    fn a_scheduler_abort_carries_the_status_its_http_code_means() {
+        let rows = [
+            (Some(400), tonic::Code::InvalidArgument),
+            (Some(404), tonic::Code::NotFound),
+            (Some(408), tonic::Code::DeadlineExceeded),
+            (Some(429), tonic::Code::ResourceExhausted),
+            (Some(500), tonic::Code::Internal),
+            (Some(503), tonic::Code::Unavailable),
+            (Some(504), tonic::Code::DeadlineExceeded),
+            (Some(418), tonic::Code::Internal),
+            (None, tonic::Code::Internal),
+        ];
+        for (status, code) in rows {
+            let got = scheduler_abort_status(status, "why".to_string());
+            assert_eq!(got.code(), code, "{status:?}");
+            assert_eq!(got.message(), "why");
+        }
+    }
+
+    #[test]
     fn sglang_sampling_translation_keeps_the_api_form_and_maps_the_constraint() {
         let params = translate_sampling_sglang(sglang_proto::SamplingParams {
             temperature: 0.7,
@@ -732,7 +791,7 @@ mod tests {
         assert_eq!(params.n, 1);
         assert_eq!(params.json_schema.as_deref(), Some("{}"));
         assert_eq!(params.logit_bias.unwrap()["5"], 1.5);
-        assert!(!params.is_normalized);
+        assert!(params.stop_regex.is_none() && params.custom_params.is_none());
     }
 
     #[test]
@@ -963,6 +1022,8 @@ mod tests {
                     .await
                     .unwrap();
             }
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
 
         let req = sglang_proto::GenerateRequest {
@@ -1088,6 +1149,8 @@ mod tests {
                 .send_frames(vec![bytes::Bytes::from(encode_msgpack(&done).unwrap())])
                 .await
                 .unwrap();
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
         let req = sglang_proto::GenerateRequest {
             request_id: "r1".to_string(),
@@ -1179,6 +1242,8 @@ mod tests {
                     .await
                     .unwrap();
             }
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
         for (rid, code) in [
             ("r2", tonic::Code::InvalidArgument),

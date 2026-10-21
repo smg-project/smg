@@ -8,12 +8,15 @@ use axum::response::Response;
 use tracing::error;
 
 use super::{chat::ChatPreparationStage, generate::GeneratePreparationStage};
-use crate::routers::{
-    error as grpc_error,
-    grpc::{
-        common::stages::PipelineStage,
-        context::{RequestContext, RequestType},
+use crate::{
+    routers::{
+        error as grpc_error,
+        grpc::{
+            common::stages::PipelineStage,
+            context::{RequestContext, RequestType},
+        },
     },
+    worker::RoutingPool,
 };
 
 /// Preparation stage for chat + generate pipelines
@@ -23,17 +26,13 @@ pub(crate) struct ChatGeneratePreparationStage {
 }
 
 impl ChatGeneratePreparationStage {
-    pub fn new() -> Self {
+    /// `wire_pools`: the pools the pipeline's mode selects from, for the
+    /// multimodal wire dtype.
+    pub fn new(wire_pools: &'static [RoutingPool]) -> Self {
         Self {
-            chat_stage: ChatPreparationStage,
+            chat_stage: ChatPreparationStage::new(wire_pools),
             generate_stage: GeneratePreparationStage,
         }
-    }
-}
-
-impl Default for ChatGeneratePreparationStage {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

@@ -111,7 +111,7 @@ impl Branch {
 /// Characters of routing text treated as one token's worth of prefix. Four is
 /// the usual rule of thumb for English text, so an untokenized request hashes
 /// roughly the same span of the prompt as `prefix_token_count` would cover.
-const CHARS_PER_TOKEN: usize = 4;
+pub(super) const CHARS_PER_TOKEN: usize = 4;
 
 /// Prefix Hash load balancing policy
 ///

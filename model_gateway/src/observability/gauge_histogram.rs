@@ -156,14 +156,6 @@ impl GaugeHistogramHandle {
     pub fn bucket_count(&self) -> usize {
         self.gauges.len()
     }
-
-    /// Zero out all gauges. **Zero allocation.**
-    #[inline]
-    pub fn zero_counts(&self) {
-        for gauge in &self.gauges {
-            gauge.set(0.0);
-        }
-    }
 }
 
 /// Factory for creating pre-registered histogram handles.

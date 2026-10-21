@@ -88,7 +88,7 @@ class TokenSpeedEncoderServicer(tokenspeed_encoder_pb2_grpc.TokenSpeedEncoderSer
     def _items_from_proto(self, mm_inputs, bootstrap_room: int = 0):
         """Reconstruct the engine MultimodalDataItem(s) for the encode worker.
 
-        Unlike the prefill leg, the encode worker NEEDS each item's encoder_input
+        Unlike the prefill side, the encode worker NEEDS each item's encoder_input
         (it runs the tower). Proto placeholders carry the output token spans the
         executor uses to split the packed tower output back into items.
         """

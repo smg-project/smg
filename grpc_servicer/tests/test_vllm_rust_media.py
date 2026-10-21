@@ -132,7 +132,7 @@ def test_submit_relays_what_the_input_processor_produced(loop):
     assert engine_input["mm_hashes"] == {"image": ["h0"]}
 
 
-def test_a_pd_prefill_leg_gets_the_media_identity(loop):
+def test_a_pd_prefill_side_gets_the_media_identity(loop):
     pytest.importorskip("torch")  # the identity module builds grid tensors with it
     kind, payload = submit(bridge(loop), want_identity=True)
     assert kind == "ok"
@@ -140,6 +140,19 @@ def test_a_pd_prefill_leg_gets_the_media_identity(loop):
     assert list(identity.prompt_token_ids) == [1, 2, 2, 2, 3]
     assert list(identity.mm_inputs.mm_hashes) == ["h0"]
     assert identity.mm_inputs.mm_placeholders[0].offset == 1
+
+
+def test_the_kind_sort_keeps_the_callers_codes_apart_and_sends_unknown_codes_to_internal():
+    import grpc
+    from smg_grpc_servicer.vllm.rust_media import kind_for_code
+
+    code = grpc.StatusCode
+    for retryable in (code.UNAVAILABLE, code.RESOURCE_EXHAUSTED, code.DEADLINE_EXCEEDED):
+        assert kind_for_code(retryable) == "unavailable", retryable
+    for callers in (code.INVALID_ARGUMENT, code.NOT_FOUND):
+        assert kind_for_code(callers) == "invalid", callers
+    for other in (code.INTERNAL, code.UNIMPLEMENTED, code.PERMISSION_DENIED, code.UNKNOWN):
+        assert kind_for_code(other) == "internal", other
 
 
 def test_failures_are_classified_like_the_python_servicers_statuses(loop):

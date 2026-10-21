@@ -39,6 +39,58 @@ def _model_config(**overrides):
     return config
 
 
+def test_constrained_decoding_start_follows_the_reasoning_parser():
+    # No structured-outputs section (an older vLLM): neither fact is known,
+    # and the Router keeps the grammar shape that fits either kind of engine.
+    bare = SimpleNamespace(model_config=_model_config())
+    assert model_info.engine_reasoning_parser(bare) == ""
+    assert model_info.constrained_decoding_start(bare) == ""
+    # A section that predates the reasoning parser attribute says nothing either.
+    older = SimpleNamespace(
+        model_config=_model_config(), structured_outputs_config=SimpleNamespace(backend="auto")
+    )
+    assert model_info.engine_reasoning_parser(older) == ""
+    assert model_info.constrained_decoding_start(older) == ""
+    # Without a reasoning parser the grammar runs from the first token.
+    no_parser = SimpleNamespace(
+        model_config=_model_config(),
+        structured_outputs_config=SimpleNamespace(reasoning_parser="", enable_in_reasoning=False),
+    )
+    assert model_info.engine_reasoning_parser(no_parser) == ""
+    assert model_info.constrained_decoding_start(no_parser) == "first_token"
+    # With one, vLLM's structured-output manager holds the grammar back until
+    # the parser has seen the thought's end...
+    gated = SimpleNamespace(
+        model_config=_model_config(),
+        structured_outputs_config=SimpleNamespace(
+            reasoning_parser="glm45", enable_in_reasoning=False
+        ),
+    )
+    assert model_info.engine_reasoning_parser(gated) == "glm45"
+    assert model_info.constrained_decoding_start(gated) == "after_reasoning"
+    # ...unless the operator asked for structured output inside the reasoning.
+    in_reasoning = SimpleNamespace(
+        model_config=_model_config(),
+        structured_outputs_config=SimpleNamespace(
+            reasoning_parser="glm45", enable_in_reasoning=True
+        ),
+    )
+    assert model_info.engine_reasoning_parser(in_reasoning) == "glm45"
+    assert model_info.constrained_decoding_start(in_reasoning) == "first_token"
+    # Both ride in `GetServerInfo` as the proto names them.
+    fields = vllm_engine_pb2.GetServerInfoResponse.DESCRIPTOR.fields_by_name
+    assert fields["engine_reasoning_parser"].number == 23
+    assert fields["constrained_decoding_start"].number == 24
+    info = vllm_engine_pb2.GetServerInfoResponse(
+        engine_reasoning_parser=model_info.engine_reasoning_parser(gated),
+        constrained_decoding_start=model_info.constrained_decoding_start(gated),
+    )
+    parsed = vllm_engine_pb2.GetServerInfoResponse.FromString(info.SerializeToString())
+    assert parsed.engine_reasoning_parser == "glm45"
+    assert parsed.constrained_decoding_start == "after_reasoning"
+    assert vllm_engine_pb2.GetServerInfoResponse().constrained_decoding_start == ""
+
+
 def test_mm_item_limits_follow_the_engines_per_prompt_limits():
     # A text model, and a multimodal config without vLLM's accessor, advertise
     # nothing: the Router keeps its own caps.
@@ -57,6 +109,37 @@ def test_mm_item_limits_follow_the_engines_per_prompt_limits():
     info = vllm_engine_pb2.GetServerInfoResponse(mm_item_limits=label)
     parsed = vllm_engine_pb2.GetServerInfoResponse.FromString(info.SerializeToString())
     assert parsed.mm_item_limits == "image=8,video=2"
+
+
+def test_mm_encoder_budget_is_the_engines_own(caplog):
+    # A text model has none.
+    assert model_info.mm_encoder_budget(SimpleNamespace(model_config=_model_config())) == 0
+    assert model_info.mm_encoder_budget(None) == 0
+    # A multimodal engine's budget comes from vLLM's own helper over its config,
+    # as the number the scheduler places one item under.
+    config = SimpleNamespace(model_config=_model_config(is_multimodal_model=True))
+    seen = []
+
+    def factory(vllm_config):
+        seen.append(vllm_config)
+        return SimpleNamespace(get_encoder_budget=lambda: 192000)
+
+    assert model_info.mm_encoder_budget(config, budget_factory=factory) == 192000
+    assert seen == [config]
+
+    # A helper that cannot tell (or a vLLM without one) leaves the item's size
+    # to the engine, as before, and says so.
+    def failing(vllm_config):
+        raise RuntimeError("no dummy data for this processor")
+
+    with caplog.at_level(logging.WARNING):
+        assert model_info.mm_encoder_budget(config, budget_factory=failing) == 0
+        assert model_info.mm_encoder_budget(config) == 0  # no vLLM in this environment
+    assert sum("encoder budget" in r.getMessage() for r in caplog.records) == 2
+    # The proto carries it as it is.
+    info = vllm_engine_pb2.GetServerInfoResponse(mm_encoder_budget=192000)
+    parsed = vllm_engine_pb2.GetServerInfoResponse.FromString(info.SerializeToString())
+    assert parsed.mm_encoder_budget == 192000
 
 
 def test_model_facts_build_the_proto_as_they_are(caplog):

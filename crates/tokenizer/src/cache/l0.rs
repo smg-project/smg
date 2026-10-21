@@ -6,6 +6,14 @@
 //! and by bytes. An input that would take more than a quarter of the byte
 //! budget on its own is not cached.
 //!
+//! The map is keyed on a 64-bit hash of the text and the `add_special_tokens`
+//! flag. The hash is a keyed one that runs at memory speed (foldhash, seeded
+//! per cache), computed once per request: a [`L0Cache::lookup`] that misses
+//! hands it to the [`L0Cache::fill`] that follows, and the map's own hasher
+//! passes it through. A hit is never taken on the hash alone: the entry's
+//! text is compared byte for byte, so two texts with one hash can cost the
+//! later one its slot, never a wrong answer.
+//!
 //! Eviction is approximate LRU by sampling: [`EVICTION_SAMPLE_SIZE`] entries
 //! are drawn uniformly from an index of all keys and the least recently used
 //! of them goes. Uniform sampling is what gives the approximation its
@@ -15,48 +23,89 @@
 //! is practically never the oldest of eight random ones.
 //!
 //! Reads take no lock beyond the map's shard; inserts and evictions
-//! serialize on the index, which they also keep consistent with the maps.
+//! serialize on the index, which they also keep consistent with the map.
 
-use std::sync::{
-    atomic::{AtomicU64, AtomicUsize, Ordering},
-    Arc, Mutex,
+use std::{
+    hash::{BuildHasher, BuildHasherDefault, Hasher},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use dashmap::DashMap;
 
 use super::activity::L0;
-use crate::traits::Encoding;
+use crate::traits::{Encoding, TokenIdType};
 
 /// Entries sampled per eviction; the oldest of them is removed.
 const EVICTION_SAMPLE_SIZE: usize = 8;
-/// What an entry costs beyond its text and ids: the map slot, the shared
-/// key, the value and its timestamp, the index entry.
+/// What an entry costs beyond its text and ids: the map slot, the value and
+/// its timestamp, the shared ids, the index entry.
 const ENTRY_OVERHEAD_BYTES: usize = 128;
 /// Byte budget when a caller gives none (`L0Cache::new`).
 pub const DEFAULT_MAX_BYTES: usize = 256 * 1024 * 1024;
 
+/// The map's hasher. Its keys are key hashes already (see [`L0Cache::key`]),
+/// so a key passes through unchanged.
+#[derive(Default, Clone, Copy)]
+struct PassThrough(u64);
+
+impl Hasher for PassThrough {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        // The map's keys are `u64`s and arrive through `write_u64`; anything
+        // else is folded in so the hasher stays total.
+        for &byte in bytes {
+            self.0 = (self.0 ^ u64::from(byte)).wrapping_mul(0x0100_0000_01B3);
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+
 struct CachedEntry {
+    /// The text, compared byte for byte on every hit.
+    text: Box<str>,
+    add_special_tokens: bool,
     encoding: Arc<Encoding>,
     last_accessed: AtomicU64,
     /// The bytes this entry counts against the budget.
     bytes: usize,
 }
 
-/// One key in the eviction index, with the map it lives in.
-struct IndexEntry {
-    key: Arc<str>,
-    special: bool,
+/// What a [`L0Cache::lookup`] found: the ids, or what the [`L0Cache::fill`]
+/// after a miss needs.
+pub(crate) enum L0Lookup {
+    Hit(Arc<Encoding>),
+    Miss(L0Miss),
+}
+
+/// A miss: the key the lookup computed, carried to [`L0Cache::fill`] so the
+/// text is hashed once per request.
+#[derive(Debug)]
+pub(crate) struct L0Miss {
+    hash: u64,
+    add_special_tokens: bool,
 }
 
 /// L0 cache implementation using DashMap for lock-free reads.
 pub struct L0Cache {
-    /// Entries encoded without special tokens.
-    map_plain: DashMap<Arc<str>, CachedEntry>,
-    /// Entries encoded with special tokens.
-    map_special: DashMap<Arc<str>, CachedEntry>,
-    /// Every key of both maps, for uniform eviction sampling. Also the lock
+    /// Entries by key hash.
+    map: DashMap<u64, CachedEntry, BuildHasherDefault<PassThrough>>,
+    /// The key of every entry, for uniform eviction sampling. Also the lock
     /// that serializes inserts and evictions.
-    index: Mutex<Vec<IndexEntry>>,
+    index: Mutex<Vec<u64>>,
+    /// The keyed hash of texts, seeded for this cache.
+    keys: foldhash::fast::RandomState,
     max_entries: usize,
     max_bytes: usize,
     bytes: AtomicUsize,
@@ -77,11 +126,11 @@ impl L0Cache {
     /// A cache of at most `max_entries` entries and `max_bytes` bytes (texts,
     /// ids and per-entry overhead).
     pub fn with_limits(max_entries: usize, max_bytes: usize) -> Self {
-        let per_map = max_entries.min(1024) / 2 + 1;
+        let initial = max_entries.min(1024);
         Self {
-            map_plain: DashMap::with_capacity(per_map),
-            map_special: DashMap::with_capacity(per_map),
-            index: Mutex::new(Vec::with_capacity(max_entries.min(1024))),
+            map: DashMap::with_capacity_and_hasher(initial, BuildHasherDefault::default()),
+            index: Mutex::new(Vec::with_capacity(initial)),
+            keys: foldhash::fast::RandomState::default(),
             max_entries,
             max_bytes,
             bytes: AtomicUsize::new(0),
@@ -93,14 +142,13 @@ impl L0Cache {
         }
     }
 
-    /// Get the appropriate map based on add_special_tokens flag
+    /// The key of a text under a flag: one pass over the bytes.
     #[inline]
-    fn map_for(&self, add_special_tokens: bool) -> &DashMap<Arc<str>, CachedEntry> {
-        if add_special_tokens {
-            &self.map_special
-        } else {
-            &self.map_plain
-        }
+    fn key(&self, text: &str, add_special_tokens: bool) -> u64 {
+        let mut hasher = self.keys.build_hasher();
+        hasher.write(text.as_bytes());
+        hasher.write_u8(u8::from(add_special_tokens));
+        hasher.finish()
     }
 
     /// Get the next monotonic timestamp for access tracking.
@@ -109,23 +157,36 @@ impl L0Cache {
         self.access_counter.fetch_add(1, Ordering::Relaxed)
     }
 
+    /// The cached encoding of a text under `add_special_tokens`, or the miss
+    /// that [`L0Cache::fill`] completes once the text is encoded. A hit is an
+    /// entry whose text equals `text` byte for byte.
+    #[inline]
+    pub(crate) fn lookup(&self, text: &str, add_special_tokens: bool) -> L0Lookup {
+        let hash = self.key(text, add_special_tokens);
+        if let Some(entry) = self.map.get(&hash) {
+            if entry.add_special_tokens == add_special_tokens && *entry.text == *text {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                L0.hit(text.len());
+                let ts = self.next_timestamp();
+                entry.last_accessed.store(ts, Ordering::Relaxed);
+                return L0Lookup::Hit(Arc::clone(&entry.encoding));
+            }
+        }
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        L0.miss();
+        L0Lookup::Miss(L0Miss {
+            hash,
+            add_special_tokens,
+        })
+    }
+
     /// Look up a cached encoding for the given input text and
     /// add_special_tokens flag. Returns an Arc clone (cheap) if found.
     #[inline]
     pub fn get(&self, key: &str, add_special_tokens: bool) -> Option<Arc<Encoding>> {
-        match self.map_for(add_special_tokens).get(key) {
-            Some(entry) => {
-                self.hits.fetch_add(1, Ordering::Relaxed);
-                L0.hit(key.len());
-                let ts = self.next_timestamp();
-                entry.value().last_accessed.store(ts, Ordering::Relaxed);
-                Some(Arc::clone(&entry.value().encoding))
-            }
-            None => {
-                self.misses.fetch_add(1, Ordering::Relaxed);
-                L0.miss();
-                None
-            }
+        match self.lookup(key, add_special_tokens) {
+            L0Lookup::Hit(encoding) => Some(encoding),
+            L0Lookup::Miss(_) => None,
         }
     }
 
@@ -143,16 +204,15 @@ impl L0Cache {
     /// Removes the least recently used of [`EVICTION_SAMPLE_SIZE`] entries
     /// drawn uniformly from the index (every entry when the cache holds no
     /// more than that). The caller holds the index lock.
-    fn evict_one(&self, index: &mut Vec<IndexEntry>) {
+    fn evict_one(&self, index: &mut Vec<u64>) {
         if index.is_empty() {
             return;
         }
         let mut oldest: Option<(usize, u64)> = None;
         let mut consider = |cache: &Self, position: usize| {
-            let entry = &index[position];
             let timestamp = cache
-                .map_for(entry.special)
-                .get(&*entry.key)
+                .map
+                .get(&index[position])
                 .map_or(0, |found| found.last_accessed.load(Ordering::Relaxed));
             if oldest.is_none_or(|(_, ts)| timestamp < ts) {
                 oldest = Some((position, timestamp));
@@ -172,26 +232,29 @@ impl L0Cache {
             return;
         };
         let victim = index.swap_remove(position);
-        if let Some((_, removed)) = self.map_for(victim.special).remove(&*victim.key) {
+        if let Some((_, removed)) = self.map.remove(&victim) {
             self.bytes.fetch_sub(removed.bytes, Ordering::Relaxed);
             self.entries.fetch_sub(1, Ordering::Relaxed);
             L0.evict();
         }
     }
 
-    /// Insert an encoding into the cache. Only the ids are kept. An input
-    /// whose entry would exceed a quarter of the byte budget is not cached.
-    pub fn insert(&self, key: String, add_special_tokens: bool, value: Encoding) {
-        let ids = match value {
-            Encoding::Plain(ids) => ids,
-            other => other.token_ids().to_vec(),
-        };
-        let bytes = key.len() + ids.len() * 4 + ENTRY_OVERHEAD_BYTES;
+    /// Caches the ids of the text a [`L0Cache::lookup`] missed on, under the
+    /// key that lookup computed: `text` must be the text given to it. The
+    /// text is copied once, into the entry. An entry that would exceed a
+    /// quarter of the byte budget is not cached.
+    pub(crate) fn fill(&self, miss: L0Miss, text: &str, ids: Vec<TokenIdType>) {
+        let L0Miss {
+            hash,
+            add_special_tokens,
+        } = miss;
+        let bytes = text.len() + ids.len() * 4 + ENTRY_OVERHEAD_BYTES;
         if bytes > self.max_bytes / 4 {
             return;
         }
-        let key: Arc<str> = key.into();
         let entry = CachedEntry {
+            text: text.into(),
+            add_special_tokens,
             encoding: Arc::new(Encoding::Plain(ids)),
             last_accessed: AtomicU64::new(self.next_timestamp()),
             bytes,
@@ -200,8 +263,19 @@ impl L0Cache {
             .index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let map = self.map_for(add_special_tokens);
-        let replacing = map.get(&*key).map(|existing| existing.bytes);
+        // What the slot holds: the same text (a concurrent miss filled it
+        // first; replaced below) or, under the same hash, another text, which
+        // keeps its slot so that every key stays one entry in the map and in
+        // the index.
+        let replacing = match self.map.get(&hash) {
+            Some(resident)
+                if resident.add_special_tokens == add_special_tokens && *resident.text == *text =>
+            {
+                Some(resident.bytes)
+            }
+            Some(_) => return,
+            None => None,
+        };
         let incoming = bytes.saturating_sub(replacing.unwrap_or(0));
         let new_entry = replacing.is_none();
         while !index.is_empty()
@@ -210,19 +284,31 @@ impl L0Cache {
         {
             self.evict_one(&mut index);
         }
-        match map.insert(Arc::clone(&key), entry) {
+        match self.map.insert(hash, entry) {
             Some(old) => {
                 self.bytes.fetch_sub(old.bytes, Ordering::Relaxed);
             }
             None => {
-                index.push(IndexEntry {
-                    key,
-                    special: add_special_tokens,
-                });
+                index.push(hash);
                 self.entries.fetch_add(1, Ordering::Relaxed);
             }
         }
         self.bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// Insert an encoding into the cache. Only the ids are kept. The request
+    /// path uses [`L0Cache::lookup`] and [`L0Cache::fill`], which hash the
+    /// text once between them.
+    pub fn insert(&self, key: String, add_special_tokens: bool, value: Encoding) {
+        let ids = match value {
+            Encoding::Plain(ids) => ids,
+            other => other.token_ids().to_vec(),
+        };
+        let miss = L0Miss {
+            hash: self.key(&key, add_special_tokens),
+            add_special_tokens,
+        };
+        self.fill(miss, &key, ids);
     }
 
     /// Number of cached entries.
@@ -264,8 +350,7 @@ impl L0Cache {
             .index
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        self.map_plain.clear();
-        self.map_special.clear();
+        self.map.clear();
         index.clear();
         self.bytes.store(0, Ordering::Relaxed);
         self.entries.store(0, Ordering::Relaxed);
@@ -286,6 +371,7 @@ pub struct CacheStats {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::{traits::Encoding, *};
 
     fn mock_encoding(tokens: Vec<u32>) -> Encoding {
@@ -592,5 +678,124 @@ mod tests {
             }
         }
         assert_eq!(cache.len(), 100);
+    }
+
+    #[test]
+    fn a_miss_filled_is_a_hit_with_the_same_ids() {
+        let cache = L0Cache::new(10);
+        let text = "<|im_start|>user\nhello<|im_end|>";
+        let L0Lookup::Miss(miss) = cache.lookup(text, true) else {
+            panic!("an empty cache misses");
+        };
+        cache.fill(miss, text, vec![5, 6, 7]);
+        let L0Lookup::Hit(hit) = cache.lookup(text, true) else {
+            panic!("the filled text hits");
+        };
+        assert_eq!(hit.token_ids(), &[5, 6, 7]);
+        // The other flag value is another key.
+        assert!(matches!(cache.lookup(text, false), L0Lookup::Miss(_)));
+        let stats = cache.stats();
+        assert_eq!((stats.hits, stats.misses, stats.entries), (1, 2, 1));
+    }
+
+    #[test]
+    fn texts_that_differ_in_one_byte_are_distinct_entries() {
+        // Long texts whose difference sits at the end or in the middle: each
+        // is its own entry and only its own text hits it.
+        let cache = L0Cache::new(10);
+        let base = "the same long paragraph, repeated ".repeat(400);
+        let variants = [
+            base.clone(),
+            format!("{base}."),
+            format!(
+                "{}X{}",
+                &base[..base.len() / 2],
+                &base[base.len() / 2 + 1..]
+            ),
+            base[..base.len() - 1].to_string(),
+        ];
+        for (i, text) in variants.iter().enumerate() {
+            assert!(
+                cache.get(text, false).is_none(),
+                "variant {i} before its insert"
+            );
+            cache.insert(text.clone(), false, mock_encoding(vec![i as u32; 3]));
+        }
+        for (i, text) in variants.iter().enumerate() {
+            assert_eq!(
+                cache.get(text, false).unwrap().token_ids(),
+                &[i as u32; 3],
+                "variant {i}"
+            );
+        }
+        assert_eq!(cache.len(), variants.len());
+    }
+
+    #[test]
+    fn a_fill_for_a_text_filled_meanwhile_replaces_it_once() {
+        // Two misses on one text (two threads encoding it at once), two fills:
+        // one entry, counted once, holding the later ids.
+        let cache = L0Cache::with_limits(10, 100_000);
+        let text = "shared prompt";
+        let L0Lookup::Miss(first) = cache.lookup(text, false) else {
+            panic!("miss");
+        };
+        let L0Lookup::Miss(second) = cache.lookup(text, false) else {
+            panic!("miss");
+        };
+        cache.fill(first, text, vec![1; 10]);
+        let once = cache.bytes();
+        cache.fill(second, text, vec![2; 20]);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.bytes(), once + 40);
+        assert_eq!(cache.get(text, false).unwrap().token_ids(), &[2; 20]);
+    }
+
+    #[test]
+    fn two_texts_under_one_key_keep_the_resident_and_never_cross() {
+        // A 64-bit collision cannot be produced on demand, so the misses are
+        // forged with one key: the later text is not cached, the resident
+        // keeps its slot, and a lookup of either text by its real key never
+        // returns the other's ids.
+        let cache = L0Cache::new(10);
+        let forged = |hash| L0Miss {
+            hash,
+            add_special_tokens: false,
+        };
+        cache.fill(forged(7), "first", vec![1]);
+        cache.fill(forged(7), "second", vec![2]);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.index.lock().unwrap().as_slice(), &[7]);
+        let resident = cache.map.get(&7).unwrap();
+        assert_eq!(&*resident.text, "first");
+        drop(resident);
+        assert!(cache.get("second", false).is_none());
+        // A real lookup of "first" computes its own key, not the forged one.
+        assert!(cache.get("first", false).is_none());
+    }
+
+    #[test]
+    fn eviction_tracks_entries_by_key() {
+        // Entries filled through lookup/fill evict like inserted ones: the
+        // index holds one key per entry, and removing a victim frees its bytes.
+        let cache = L0Cache::with_limits(3, 1 << 20);
+        for i in 0..6u32 {
+            let text = format!("prompt {i}");
+            let L0Lookup::Miss(miss) = cache.lookup(&text, false) else {
+                panic!("miss");
+            };
+            cache.fill(miss, &text, vec![i; 4]);
+            assert!(cache.len() <= 3, "{} entries after fill {i}", cache.len());
+            assert_eq!(cache.index.lock().unwrap().len(), cache.len());
+        }
+        let live: usize = (0..6u32)
+            .filter(|i| cache.get(&format!("prompt {i}"), false).is_some())
+            .count();
+        assert_eq!(live, 3);
+        let expected: usize = (0..6u32)
+            .filter(|i| cache.get(&format!("prompt {i}"), false).is_some())
+            .map(|i| format!("prompt {i}").len() + 16 + ENTRY_OVERHEAD_BYTES)
+            .sum();
+        assert_eq!(cache.bytes(), expected);
     }
 }

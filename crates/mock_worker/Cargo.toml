@@ -18,16 +18,25 @@ path = "src/main.rs"
 name = "replay"
 path = "src/bin/replay.rs"
 
+# The open-loop stress client of scripts/bench/grpc_stress (chat, tools,
+# responses, image traffic at a fixed rate against the gateway).
+[[bin]]
+name = "stress_load"
+path = "src/bin/stress_load.rs"
+
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 clap = { version = "4", features = ["derive"] }
-reqwest = { workspace = true, features = ["json", "stream", "rustls"] }
+reqwest = { workspace = true, features = ["json", "stream", "rustls-no-provider"] }
 serde = { workspace = true, features = ["derive"] }
 smg-grpc-client.workspace = true
+llm-tokenizer.workspace = true
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic.workspace = true
+prost-types.workspace = true
 axum.workspace = true
 serde_json.workspace = true
 futures.workspace = true
@@ -35,6 +44,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 rmpv.workspace = true
 zeromq.workspace = true
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [dev-dependencies]
 tempfile = "3"

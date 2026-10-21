@@ -1,7 +1,7 @@
 //! Gemma 4 image and video preprocessing.
 //!
 //! Port of transformers' `Gemma4ImageProcessor` (its torchvision backend, the
-//! one vLLM runs) in the form the engine's Gemma 4 model consumes: per image a
+//! one the serving engine runs) in the form the engine's Gemma 4 model consumes: per image a
 //! flat `(max_patches, patch_pixels)` tensor of `patch_size` x `patch_size`
 //! RGB patches in row-major order, zero-padded to `max_patches =
 //! max_soft_tokens * pooling_kernel_size^2`, and per patch its `(x, y)` grid
@@ -14,7 +14,7 @@
 //! one soft token, so an image costs `num_patches / pooling_kernel_size^2`
 //! tokens: 280 at most with the default budget, 256 for a square image.
 //!
-//! Video has no processor of its own in the engine: vLLM runs the image
+//! Video has no processor of its own in the engine: it runs the image
 //! processor over the sampled frames with the video budget (70 soft tokens per
 //! frame by default), so a clip is encoded here as its frames stacked along
 //! the first dimension, with `video_frame_counts` saying how many belong to
@@ -59,7 +59,7 @@ impl Params {
     fn from_config(config: &PreProcessorConfig, video: bool) -> Result<Self, TransformError> {
         let patch = config.get_patch_size(DEFAULT_PATCH_SIZE);
         let pool = extra_usize(config, "pooling_kernel_size", DEFAULT_POOLING_KERNEL_SIZE)?;
-        // vLLM feeds frames to the image processor at the video processor's
+        // The engine feeds frames to the image processor at the video processor's
         // default budget whatever the configs say; the video processor's own
         // config is honoured when it is the one handed in (its budget is that
         // default on the released checkpoints), the image config's budget is
@@ -390,25 +390,20 @@ fn preprocess_video_frames<F: RgbSource>(
     )
 }
 
+/// A `usize` extra key under [`PreProcessorConfig::extra_usize`]'s rule, absent -> `default`.
 fn extra_usize(
     config: &PreProcessorConfig,
     key: &str,
     default: usize,
 ) -> Result<usize, TransformError> {
-    let Some(value) = config.extra.get(key) else {
-        return Ok(default);
-    };
-    if let Some(n) = value.as_u64() {
-        return Ok(n as usize);
-    }
-    if let Some(f) = value.as_f64() {
-        if f >= 0.0 && f.fract() == 0.0 && f <= f64::from(u32::MAX) {
-            return Ok(f as usize);
-        }
-    }
-    Err(shape(format!(
-        "Gemma 4 preprocessor key {key} must be a non-negative integer, got {value}"
-    )))
+    config
+        .extra_usize(key)
+        .map(|value| value.unwrap_or(default))
+        .map_err(|value| {
+            shape(format!(
+                "Gemma 4 preprocessor key {key} must be a non-negative integer, got {value}"
+            ))
+        })
 }
 
 fn shape(message: impl Into<String>) -> TransformError {
@@ -475,16 +470,17 @@ impl VisionPreProcessor for Gemma4Processor {
         preprocess_video_frames(frames, config)
     }
 
-    /// Soft tokens for an image of this size; `0` when the size cannot be
-    /// processed (the request fails at preprocessing with the reason).
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        Params::from_config(config, false)
-            .and_then(|params| {
-                params
-                    .target_size(height as usize, width as usize)
-                    .map(|target| params.soft_tokens(target))
-            })
-            .unwrap_or(0)
+    /// Soft tokens for an image of this size; the preprocessing error for a
+    /// config or a size the reference rule cannot resize.
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
+        let params = Params::from_config(config, false)?;
+        let target = params.target_size(height as usize, width as usize)?;
+        Ok(params.soft_tokens(target))
     }
 
     fn model_name(&self) -> &'static str {
@@ -680,13 +676,44 @@ mod tests {
     }
 
     #[test]
+    fn token_count_reports_what_preprocessing_refuses() {
+        // A config the parameters cannot be read from is the same error for
+        // the count as for the preprocessing, not a count of zero.
+        let mut config = image_config();
+        config.extra.insert(
+            "pooling_kernel_size".to_string(),
+            serde_json::json!("three"),
+        );
+        let processor = Gemma4Processor::new();
+        let counted = processor
+            .calculate_num_tokens(512, 512, &config)
+            .unwrap_err()
+            .to_string();
+        let preprocessed = processor
+            .preprocess(&[solid(512, 512, [0; 3])], &config)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(counted, preprocessed);
+    }
+
+    #[test]
     fn token_counts_and_degenerate_inputs() {
         let processor = Gemma4Processor::new();
         let config = image_config();
-        assert_eq!(processor.calculate_num_tokens(512, 512, &config), 256);
-        assert_eq!(processor.calculate_num_tokens(1920, 1080, &config), 264);
-        assert_eq!(processor.calculate_num_tokens(3000, 10, &config), 280);
-        assert_eq!(processor.calculate_num_tokens(0, 10, &config), 0);
+        assert_eq!(
+            processor.calculate_num_tokens(512, 512, &config).unwrap(),
+            256
+        );
+        assert_eq!(
+            processor.calculate_num_tokens(1920, 1080, &config).unwrap(),
+            264
+        );
+        assert_eq!(
+            processor.calculate_num_tokens(3000, 10, &config).unwrap(),
+            280
+        );
+        assert!(processor.calculate_num_tokens(0, 10, &config).is_err());
         assert_eq!(processor.model_name(), "gemma4");
         assert!(processor.supports_per_image_preprocessing());
         assert_eq!(processor.get_processed_size(&config), None);

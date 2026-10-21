@@ -159,7 +159,7 @@ fn http_client(
     max_inflight: usize,
     pins: &[(String, Vec<std::net::SocketAddr>)],
 ) -> reqwest::Result<reqwest::Client> {
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(600));
+    let mut builder = http_client_builder().timeout(Duration::from_secs(600));
     for (host, addrs) in pins {
         builder = builder.resolve_to_addrs(host, addrs);
     }
@@ -177,6 +177,18 @@ fn http_client(
         }
         Connections::Pooled => builder.pool_max_idle_per_host(max_inflight).build(),
     }
+}
+
+/// A client builder with the process-level TLS crypto provider installed
+/// (`ring`, the only backend compiled in, unless one is there already):
+/// the tool's clients all come from here.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the tool's one direct client construction; the process TLS crypto provider is installed first"
+)]
+fn http_client_builder() -> reqwest::ClientBuilder {
+    mock_worker::tls::install_crypto_provider();
+    reqwest::Client::builder()
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1079,6 +1091,7 @@ async fn sample_fleet(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    mock_worker::tls::install_crypto_provider();
     let args = Args::parse();
     let text = fs::read_to_string(&args.trace)
         .with_context(|| format!("reading {}", args.trace.display()))?;
@@ -1417,10 +1430,7 @@ mod tests {
         let path = dir.join("fleet.csv");
         let (stop, rx) = watch::channel(false);
         // The test server is local: no proxy from the environment.
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("client");
+        let client = http_client_builder().no_proxy().build().expect("client");
         let mut sampler: JoinSet<Result<usize>> = JoinSet::new();
         sampler.spawn(sample_fleet(
             client,

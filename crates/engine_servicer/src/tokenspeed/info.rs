@@ -133,6 +133,7 @@ pub(super) fn server_info(state: &State) -> ts::GetServerInfoResponse {
         max_total_num_tokens,
         tokenspeed_version: version,
         start_time: Some(Timestamp::from(state.started_at)),
+        constrained_decoding: model.constrained_decoding.clone(),
     }
 }
 

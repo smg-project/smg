@@ -10,6 +10,7 @@ use image::DynamicImage;
 
 use super::qwen_vl_base::{QwenVLConfig, QwenVLProcessorBase, QwenVideoResizeMode};
 use crate::{
+    encoder_inputs::EncoderDtype,
     types::RgbFrameRef,
     vision::{
         preprocessor_config::PreProcessorConfig,
@@ -158,6 +159,17 @@ impl VisionPreProcessor for Qwen3OmniVisionProcessor {
             .preprocess(images, config)
     }
 
+    fn preprocess_wire(
+        &self,
+        images: &[DynamicImage],
+        config: &PreProcessorConfig,
+        dtype: EncoderDtype,
+    ) -> Option<Result<PreprocessedEncoderInputs, TransformError>> {
+        self.with_image_preprocessor_config(config)
+            .inner
+            .preprocess_wire(images, config, dtype)
+    }
+
     fn preprocess_video(
         &self,
         frames: &[DynamicImage],
@@ -178,7 +190,12 @@ impl VisionPreProcessor for Qwen3OmniVisionProcessor {
             .preprocess_video_rgb(frames, config)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
         self.with_image_preprocessor_config(config)
             .inner
             .calculate_num_tokens(width, height, config)

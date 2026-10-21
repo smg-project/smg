@@ -15,13 +15,16 @@ use std::{
     time::Duration,
 };
 
-use llm_multimodal::Modality;
-use openai_protocol::worker::TransportMode;
+use llm_multimodal::{EncoderDtype, Modality};
+use openai_protocol::worker::{RuntimeType, TransportMode};
 use smg_mm_rdma::{RdmaConfig, RdmaExporter};
 use tracing::{error, info, warn};
 
-use super::settings::mm_settings;
-use crate::routers::grpc::{context::WorkerSelection, proto_wrapper::mm_shm_dev_writable};
+use super::{serialize::wire_dtype, settings::mm_settings};
+use crate::{
+    routers::grpc::{context::WorkerSelection, proto_wrapper::mm_shm_dev_writable},
+    worker::{RoutingPool, Worker, WorkerRegistry},
+};
 
 const DEFAULT_SHM_MIN_BYTES: usize = 64 * 1024;
 
@@ -131,7 +134,7 @@ fn read_env_nonempty(name: &str) -> Option<String> {
 /// Resolve whether large multimodal tensors should use the SHM transport for
 /// this request: per-worker override → router default. `shm` forces SHM whenever
 /// SMG can write `/dev/shm` (the operator asserts co-location); `auto` also
-/// requires the receiving worker leg to be verified as sharing SMG's `/dev/shm`;
+/// requires the receiving worker to be verified as sharing SMG's `/dev/shm`;
 /// `inline` (the default) keeps the gRPC path.
 pub(super) fn resolve_mm_shm_enabled(
     workers: Option<&WorkerSelection>,
@@ -347,7 +350,7 @@ fn worker_shm_min_bytes_override(workers: Option<&WorkerSelection>) -> Option<us
 /// The worker whose per-worker overrides apply. Multimodal tensors are sent to
 /// wherever the vision encoder runs: the encode worker in EPD (so its spec wins),
 /// otherwise the single/prefill worker that does the encoding itself.
-fn primary_worker(workers: Option<&WorkerSelection>) -> Option<&Arc<dyn crate::worker::Worker>> {
+fn primary_worker(workers: Option<&WorkerSelection>) -> Option<&Arc<dyn Worker>> {
     match workers? {
         WorkerSelection::Single { worker } => Some(worker),
         WorkerSelection::Disaggregated {
@@ -448,24 +451,147 @@ pub(super) const MM_DEVICE_DO_NORMALIZE_LABEL: &str = "mm_device_do_normalize";
 /// Whether the selected vLLM worker normalizes pixels on device, in which
 /// case it takes the pixels' own bytes and would normalize floats twice.
 pub(super) fn mm_vllm_device_normalizes(workers: Option<&WorkerSelection>) -> bool {
-    primary_worker(workers).is_some_and(|worker| {
-        worker
-            .metadata()
-            .spec
-            .labels
-            .get(MM_DEVICE_DO_NORMALIZE_LABEL)
-            .is_some_and(|value| value == "true")
-    })
+    primary_worker(workers).is_some_and(|worker| device_normalizes(worker.as_ref()))
+}
+
+fn device_normalizes(worker: &dyn Worker) -> bool {
+    worker
+        .metadata()
+        .spec
+        .labels
+        .get(MM_DEVICE_DO_NORMALIZE_LABEL)
+        .is_some_and(|value| value == "true")
 }
 
 fn mm_encoder_input_dtype_from_worker(workers: Option<&WorkerSelection>) -> Option<String> {
-    primary_worker(workers)?
+    encoder_dtype_label(primary_worker(workers)?.as_ref())
+}
+
+/// The `multimodal_encoder_dtype` label a worker advertises, when it does.
+fn encoder_dtype_label(worker: &dyn Worker) -> Option<String> {
+    worker
         .metadata()
         .spec
         .labels
         .get("multimodal_encoder_dtype")
         .filter(|dtype| !dtype.is_empty())
         .cloned()
+}
+
+/// The router's own encoder dtype overrides, read once from the environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct DtypeOverrides {
+    vllm: Option<String>,
+    image: Option<String>,
+    default: Option<String>,
+}
+
+impl DtypeOverrides {
+    fn from_env() -> Self {
+        Self {
+            vllm: mm_vllm_encoder_input_dtype_from_env(),
+            image: mm_modality_encoder_input_dtype_from_env(Modality::Image),
+            default: mm_default_encoder_input_dtype_from_env(),
+        }
+    }
+}
+
+/// The dtype every worker of the model's routing pools `pools` (the
+/// pipeline mode's pools) reads its image encoder input in, resolved before
+/// any of them is selected from what each already advertises (its runtime,
+/// its `multimodal_encoder_dtype` label) and the router's overrides, by the
+/// rules assembly applies to the selected worker. The pools are read as the
+/// selection reads them (the wildcard model id resolves over the global
+/// snapshot), so the workers resolved here are the workers that can be
+/// picked. `None` for an empty or a disagreeing set, and whenever a worker is
+/// served otherwise (the pixels' own bytes for an engine that normalizes on
+/// device, a wire that carries no preprocessed floats): the per-destination
+/// write then stays as it is. `None` as well when the one-pass wire write
+/// is switched off (the `one_pass_wire` setting, `SMG_MM_ONE_PASS_WIRE=0`):
+/// every request then takes the two-pass path (the patch layout, then the
+/// write in the worker's dtype at assembly), which writes the same bytes.
+pub(crate) fn mm_shared_image_wire_dtype_over(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    pools: &[RoutingPool],
+) -> Option<EncoderDtype> {
+    if !mm_settings().one_pass_wire.value {
+        return None;
+    }
+    shared_image_wire_dtype_over(registry, model_id, pools, &DtypeOverrides::from_env())
+}
+
+fn shared_image_wire_dtype_over(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    pools: &[RoutingPool],
+    overrides: &DtypeOverrides,
+) -> Option<EncoderDtype> {
+    let workers: Vec<Arc<dyn Worker>> = pools
+        .iter()
+        .flat_map(|pool| {
+            registry
+                .get_routing_pool(model_id, *pool)
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    shared_image_wire_dtype(&workers, overrides)
+}
+
+fn shared_image_wire_dtype(
+    workers: &[Arc<dyn Worker>],
+    overrides: &DtypeOverrides,
+) -> Option<EncoderDtype> {
+    let mut shared = None;
+    for worker in workers {
+        let dtype = image_wire_dtype(
+            worker.metadata().spec.runtime_type,
+            encoder_dtype_label(worker.as_ref()),
+            device_normalizes(worker.as_ref()),
+            overrides,
+        )?;
+        match shared {
+            None => shared = Some(dtype),
+            Some(existing) if existing == dtype => {}
+            Some(_) => return None,
+        }
+    }
+    shared
+}
+
+/// One worker's image wire dtype under assembly's rules; `None` when no
+/// one-pass layout can serve it.
+fn image_wire_dtype(
+    runtime: RuntimeType,
+    label: Option<String>,
+    device_normalizes: bool,
+    overrides: &DtypeOverrides,
+) -> Option<EncoderDtype> {
+    let dtype = match runtime {
+        // Pinned on that wire, as its assembly pins it.
+        RuntimeType::Sglang => EncoderDtype::Float32,
+        RuntimeType::Vllm if device_normalizes => return None,
+        RuntimeType::Vllm => wire_dtype(
+            &resolve_mm_vllm_encoder_input_dtype(overrides.vllm.clone(), label),
+            true,
+        ),
+        RuntimeType::TokenSpeed => wire_dtype(
+            &resolve_mm_encoder_input_dtype(
+                overrides.image.clone(),
+                overrides.default.clone(),
+                label,
+            ),
+            false,
+        ),
+        RuntimeType::Trtllm
+        | RuntimeType::Mlx
+        | RuntimeType::Generic
+        | RuntimeType::External
+        | RuntimeType::Unspecified => return None,
+    };
+    (dtype != EncoderDtype::Uint8).then_some(dtype)
 }
 
 fn log_transport_config_once(defaults: MmTransportDefaults) {
@@ -544,7 +670,7 @@ fn worker_shares_dev_shm(workers: Option<&WorkerSelection>, skip_pixel_values: b
     }
 }
 
-fn worker_matches_shm_namespace(worker: &Arc<dyn crate::worker::Worker>, local: &str) -> bool {
+fn worker_matches_shm_namespace(worker: &Arc<dyn Worker>, local: &str) -> bool {
     worker
         .metadata()
         .spec
@@ -579,7 +705,289 @@ fn compute_shm_namespace_id() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::worker::HealthCheckConfig;
+
     use super::*;
+    use crate::worker::{BasicWorkerBuilder, ModelCard, WorkerType};
+
+    fn worker(url: &str, runtime: RuntimeType, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
+        let mut builder = BasicWorkerBuilder::new(url)
+            .model(ModelCard::new("qwen3-vl"))
+            .worker_type(WorkerType::Regular)
+            .runtime_type(runtime)
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            });
+        for (key, value) in labels {
+            builder = builder.label(*key, *value);
+        }
+        Arc::new(builder.build())
+    }
+
+    #[test]
+    fn a_worker_image_wire_dtype_is_what_its_assembly_writes() {
+        let plain = DtypeOverrides::default();
+        let bf16 = || Some("bfloat16".to_string());
+        assert_eq!(
+            image_wire_dtype(RuntimeType::Sglang, bf16(), false, &plain),
+            Some(EncoderDtype::Float32)
+        );
+        assert_eq!(
+            image_wire_dtype(RuntimeType::Vllm, None, false, &plain),
+            Some(EncoderDtype::Float32)
+        );
+        assert_eq!(
+            image_wire_dtype(RuntimeType::Vllm, bf16(), false, &plain),
+            Some(EncoderDtype::BFloat16)
+        );
+        assert_eq!(
+            image_wire_dtype(RuntimeType::Vllm, bf16(), true, &plain),
+            None,
+            "an engine normalizing on device takes the pixels' own bytes"
+        );
+        assert_eq!(
+            image_wire_dtype(RuntimeType::Vllm, Some("uint8".to_string()), false, &plain),
+            None
+        );
+        assert_eq!(
+            image_wire_dtype(RuntimeType::TokenSpeed, None, false, &plain),
+            Some(EncoderDtype::BFloat16)
+        );
+        assert_eq!(
+            image_wire_dtype(
+                RuntimeType::TokenSpeed,
+                Some("uint8".to_string()),
+                false,
+                &plain
+            ),
+            Some(EncoderDtype::Float32),
+            "that wire reads float widths only"
+        );
+        assert_eq!(
+            image_wire_dtype(RuntimeType::Trtllm, bf16(), false, &plain),
+            None
+        );
+        let overridden = DtypeOverrides {
+            vllm: Some("float16".to_string()),
+            image: Some("float32".to_string()),
+            default: bf16(),
+        };
+        assert_eq!(
+            image_wire_dtype(RuntimeType::Vllm, bf16(), false, &overridden),
+            Some(EncoderDtype::Float16)
+        );
+        assert_eq!(
+            image_wire_dtype(RuntimeType::TokenSpeed, bf16(), false, &overridden),
+            Some(EncoderDtype::Float32)
+        );
+        assert_eq!(
+            image_wire_dtype(RuntimeType::Sglang, bf16(), false, &overridden),
+            Some(EncoderDtype::Float32)
+        );
+    }
+
+    #[test]
+    fn the_shared_image_wire_dtype_needs_every_worker_to_agree() {
+        let plain = DtypeOverrides::default();
+        let bf16 = |url| {
+            worker(
+                url,
+                RuntimeType::Vllm,
+                &[("multimodal_encoder_dtype", "bfloat16")],
+            )
+        };
+        assert_eq!(shared_image_wire_dtype(&[], &plain), None);
+        assert_eq!(
+            shared_image_wire_dtype(&[bf16("http://a"), bf16("http://b")], &plain),
+            Some(EncoderDtype::BFloat16)
+        );
+        assert_eq!(
+            shared_image_wire_dtype(
+                &[
+                    bf16("http://a"),
+                    worker(
+                        "http://c",
+                        RuntimeType::TokenSpeed,
+                        &[("multimodal_encoder_dtype", "bfloat16")],
+                    ),
+                ],
+                &plain
+            ),
+            Some(EncoderDtype::BFloat16),
+            "two runtimes reading the same width agree"
+        );
+        assert_eq!(
+            shared_image_wire_dtype(
+                &[bf16("http://a"), worker("http://d", RuntimeType::Vllm, &[])],
+                &plain
+            ),
+            None,
+            "a worker without the label reads float32"
+        );
+        assert_eq!(
+            shared_image_wire_dtype(
+                &[
+                    bf16("http://a"),
+                    worker(
+                        "http://e",
+                        RuntimeType::Vllm,
+                        &[
+                            ("multimodal_encoder_dtype", "bfloat16"),
+                            (MM_DEVICE_DO_NORMALIZE_LABEL, "true"),
+                        ],
+                    ),
+                ],
+                &plain
+            ),
+            None
+        );
+        assert_eq!(
+            shared_image_wire_dtype(&[worker("http://f", RuntimeType::Sglang, &[])], &plain),
+            Some(EncoderDtype::Float32)
+        );
+    }
+
+    /// The stages see the fleet's wire dtype by default: the one-pass wire
+    /// write is on unless its switch turns it off, and then they get no
+    /// dtype whatever the fleet agrees on (every request takes the two-pass
+    /// path) while the resolution itself still answers. The default is read
+    /// off the settings' built-in values; the wrapper is checked against the
+    /// process's own setting, so the test holds whether or not the
+    /// environment it runs in switches the write off. The switch's spellings
+    /// are the settings module's tests.
+    #[test]
+    fn the_one_pass_wire_write_is_the_default_and_its_switch_turns_it_off() {
+        use crate::{
+            routers::grpc::{mode::Mode, multimodal::MultimodalSettings},
+            worker::{ConnectionMode, WorkerRegistry},
+        };
+
+        let registry = WorkerRegistry::new();
+        for url in ["grpc://regular-1:8000", "grpc://regular-2:8000"] {
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new("qwen3-vl"))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::TokenSpeed)
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                ))
+                .expect("register");
+        }
+        let pools = Mode::Regular.multimodal_wire_pools();
+        assert_eq!(
+            shared_image_wire_dtype_over(&registry, "qwen3-vl", pools, &DtypeOverrides::default()),
+            Some(EncoderDtype::BFloat16),
+            "the fleet agrees on one dtype"
+        );
+        assert!(
+            MultimodalSettings::default().one_pass_wire.value,
+            "the one-pass wire write is on by default"
+        );
+        let expected = if mm_settings().one_pass_wire.value {
+            Some(EncoderDtype::BFloat16)
+        } else {
+            None
+        };
+        assert_eq!(
+            mm_shared_image_wire_dtype_over(&registry, "qwen3-vl", pools),
+            expected,
+            "the stages see the fleet's wire dtype unless the switch turns the one-pass write off"
+        );
+    }
+
+    /// The dtype is resolved over the pools a mode's request can reach:
+    /// the regular workers for the regular pipeline, the prefill and decode
+    /// pools for a disaggregated one. A fleet whose pools read another width
+    /// than its regular workers keeps the per-destination write (`None`)
+    /// over the union, never a wire for the wrong pool.
+    #[test]
+    fn the_wire_dtype_is_resolved_over_the_pools_a_modes_pixels_can_reach() {
+        use crate::{
+            routers::grpc::mode::Mode,
+            worker::{ConnectionMode, WorkerRegistry},
+        };
+
+        let plain = DtypeOverrides::default();
+        let registry = WorkerRegistry::new();
+        let worker =
+            |url: &str, worker_type: WorkerType, runtime: RuntimeType| -> Arc<dyn Worker> {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new("qwen3-vl"))
+                        .worker_type(worker_type)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(runtime)
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                )
+            };
+        // Regular workers reading bfloat16 (the TokenSpeed default) next to
+        // prefill and decode workers pinned to float32 (SGLang).
+        for worker in [
+            worker(
+                "grpc://regular-1:8000",
+                WorkerType::Regular,
+                RuntimeType::TokenSpeed,
+            ),
+            worker(
+                "grpc://regular-2:8000",
+                WorkerType::Regular,
+                RuntimeType::TokenSpeed,
+            ),
+            worker(
+                "grpc://prefill-1:8000",
+                WorkerType::Prefill,
+                RuntimeType::Sglang,
+            ),
+            worker(
+                "grpc://decode-1:8000",
+                WorkerType::Decode,
+                RuntimeType::Sglang,
+            ),
+        ] {
+            registry.register(worker).expect("register");
+        }
+        let over = |pools: &[RoutingPool]| {
+            shared_image_wire_dtype_over(&registry, "qwen3-vl", pools, &plain)
+        };
+        assert_eq!(
+            over(Mode::Regular.multimodal_wire_pools()),
+            Some(EncoderDtype::BFloat16)
+        );
+        assert_eq!(
+            over(Mode::PrefillDecode.multimodal_wire_pools()),
+            Some(EncoderDtype::Float32)
+        );
+        assert_eq!(
+            over(Mode::EncodePrefillDecode.multimodal_wire_pools()),
+            Some(EncoderDtype::Float32),
+            "no encode worker registered: the prefill and decode workers decide"
+        );
+        assert_eq!(
+            over(&[
+                RoutingPool::GrpcPipelineRegular,
+                RoutingPool::GrpcPrefill,
+                RoutingPool::GrpcDecode,
+            ]),
+            None,
+            "pools that disagree with the regular workers keep the per-destination write"
+        );
+        assert_eq!(
+            over(&[RoutingPool::GrpcEncode]),
+            None,
+            "an empty pool has nothing to agree on"
+        );
+    }
 
     #[test]
     fn modality_dtype_precedes_global_then_worker_with_bfloat16_fallback() {

@@ -18,6 +18,7 @@ use std::{
 
 use jsonwebtoken::jwk::{Jwk, JwkSet};
 use parking_lot::{Mutex, RwLock};
+use rustls::crypto::{ring, CryptoProvider};
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -38,6 +39,12 @@ pub enum JwksError {
 
     #[error("Failed to parse OIDC discovery document: {0}")]
     DiscoveryParse(String),
+
+    #[error("OIDC discovery document is for the issuer {discovered:?}, not the configured issuer {configured:?} (OpenID Connect Discovery 1.0 requires the two to be identical)")]
+    IssuerMismatch {
+        configured: String,
+        discovered: String,
+    },
 
     #[error("JWKS URI not found in discovery document")]
     JwksUriNotFound,
@@ -196,7 +203,8 @@ pub(crate) fn validate_url(url_str: &str) -> Result<Url, JwksError> {
 #[derive(Debug, serde::Deserialize)]
 struct OidcDiscovery {
     jwks_uri: String,
-    #[expect(dead_code)]
+    /// The issuer the document is for: identical to the issuer the document
+    /// was requested for, or the document is refused (Discovery 1.0, section 4.3).
     issuer: String,
 }
 
@@ -228,6 +236,65 @@ pub(crate) struct JwksProvider {
     last_fetch_attempt: Mutex<Option<Instant>>,
 }
 
+/// Installs `ring` as the process-level TLS crypto provider unless one is
+/// installed already. The HTTP client takes the process provider (reqwest's
+/// `rustls-no-provider` feature) and panics at build time when there is
+/// none, so the client factory installs it before building the client; a
+/// provider the embedding process installed earlier stays.
+fn install_crypto_provider() {
+    if CryptoProvider::get_default().is_none() {
+        // An error here means another thread installed one in between,
+        // which is the outcome wanted.
+        let _ = ring::default_provider().install_default();
+    }
+}
+
+/// The provider's HTTP client: a 10 s timeout and no redirects (SSRF).
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the crate's one direct client construction; the process TLS crypto provider is installed first"
+)]
+fn http_client() -> Result<reqwest::Client, JwksError> {
+    install_crypto_provider();
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none()) // Prevent SSRF via redirects
+        .build()
+        .map_err(|e| JwksError::HttpClientError(e.to_string()))
+}
+
+/// The response body, bounded by [`MAX_JWKS_RESPONSE_SIZE`] as it is read: a
+/// declared length over the limit is refused before the read, and a body that
+/// declares no length (a chunked response) is refused the moment the bytes
+/// read pass the limit, so no fetch holds more than the limit in memory.
+/// `fetch_error` wraps a transport failure in the caller's variant.
+async fn bounded_body(
+    mut response: reqwest::Response,
+    fetch_error: fn(String) -> JwksError,
+) -> Result<Vec<u8>, JwksError> {
+    if let Some(content_length) = response.content_length() {
+        if content_length > MAX_JWKS_RESPONSE_SIZE {
+            return Err(JwksError::ResponseTooLarge(
+                content_length,
+                MAX_JWKS_RESPONSE_SIZE,
+            ));
+        }
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| fetch_error(e.to_string()))?
+    {
+        let read = body.len() as u64 + chunk.len() as u64;
+        if read > MAX_JWKS_RESPONSE_SIZE {
+            return Err(JwksError::ResponseTooLarge(read, MAX_JWKS_RESPONSE_SIZE));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 impl JwksProvider {
     /// Create a new JWKS provider with explicit JWKS URI.
     /// The URL is validated for SSRF protection.
@@ -237,11 +304,7 @@ impl JwksProvider {
         // Validate URL for SSRF protection
         validate_url(&jwks_uri)?;
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none()) // Prevent SSRF via redirects
-            .build()
-            .map_err(|e| JwksError::HttpClientError(e.to_string()))?;
+        let client = http_client()?;
 
         Ok(Self {
             client,
@@ -253,20 +316,22 @@ impl JwksProvider {
     }
 
     /// Create a new JWKS provider using OIDC discovery.
-    /// Both issuer and discovered JWKS URI are validated for SSRF protection.
+    /// Both issuer and discovered JWKS URI are validated for SSRF protection,
+    /// and the document is taken only when its `issuer` is identical to the
+    /// configured issuer (OpenID Connect Discovery 1.0, section 4.3).
     pub async fn from_issuer(issuer: &str, ttl: Duration) -> Result<Self, JwksError> {
-        // Normalize and validate issuer URL
-        let issuer = issuer.trim_end_matches('/');
-        let discovery_url = format!("{issuer}/.well-known/openid-configuration");
+        // The discovery URL is the issuer without its terminating slash plus the
+        // well-known path (Discovery 1.0, section 4.1); the document's issuer is
+        // compared with the issuer as configured.
+        let discovery_url = format!(
+            "{}/.well-known/openid-configuration",
+            issuer.trim_end_matches('/')
+        );
 
         // Validate discovery URL for SSRF protection
         validate_url(&discovery_url)?;
 
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|e| JwksError::HttpClientError(e.to_string()))?;
+        let client = http_client()?;
 
         info!("Fetching OIDC discovery from: {}", discovery_url);
 
@@ -283,20 +348,22 @@ impl JwksProvider {
             )));
         }
 
-        // Check response size before parsing
-        if let Some(content_length) = response.content_length() {
-            if content_length > MAX_JWKS_RESPONSE_SIZE {
-                return Err(JwksError::ResponseTooLarge(
-                    content_length,
-                    MAX_JWKS_RESPONSE_SIZE,
-                ));
-            }
-        }
+        let body = bounded_body(response, JwksError::DiscoveryFetch).await?;
+        let discovery: OidcDiscovery =
+            serde_json::from_slice(&body).map_err(|e| JwksError::DiscoveryParse(e.to_string()))?;
 
-        let discovery: OidcDiscovery = response
-            .json()
-            .await
-            .map_err(|e| JwksError::DiscoveryParse(e.to_string()))?;
+        // The document's issuer must be identical to the issuer it was requested
+        // for (Discovery 1.0, section 4.3): a document for another issuer names
+        // another issuer's key set. The comparison is exact, as the one of a
+        // token's `iss` claim against the configured issuer is, so a document
+        // whose issuer differs only in a terminating slash is refused here as
+        // its tokens would be.
+        if discovery.issuer != issuer {
+            return Err(JwksError::IssuerMismatch {
+                configured: issuer.to_string(),
+                discovered: discovery.issuer,
+            });
+        }
 
         // Validate discovered JWKS URI for SSRF protection
         validate_url(&discovery.jwks_uri)?;
@@ -310,12 +377,6 @@ impl JwksProvider {
             ttl,
             last_fetch_attempt: Mutex::new(None),
         })
-    }
-
-    /// Get the JWKS URI.
-    #[expect(dead_code)]
-    pub fn jwks_uri(&self) -> &str {
-        &self.jwks_uri
     }
 
     /// Fetch JWKS from the endpoint.
@@ -335,33 +396,23 @@ impl JwksProvider {
             return Err(JwksError::JwksFetch(format!("HTTP {}", response.status())));
         }
 
-        // Check response size before reading body
-        if let Some(content_length) = response.content_length() {
-            if content_length > MAX_JWKS_RESPONSE_SIZE {
-                return Err(JwksError::ResponseTooLarge(
-                    content_length,
-                    MAX_JWKS_RESPONSE_SIZE,
-                ));
-            }
-        }
-
-        // Read body with size limit
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| JwksError::JwksFetch(e.to_string()))?;
-
-        if bytes.len() as u64 > MAX_JWKS_RESPONSE_SIZE {
-            return Err(JwksError::ResponseTooLarge(
-                bytes.len() as u64,
-                MAX_JWKS_RESPONSE_SIZE,
-            ));
-        }
-
+        let bytes = bounded_body(response, JwksError::JwksFetch).await?;
         let jwks: JwkSet =
             serde_json::from_slice(&bytes).map_err(|e| JwksError::JwksParse(e.to_string()))?;
 
         debug!("Fetched JWKS with {} keys", jwks.keys.len());
+        Ok(jwks)
+    }
+
+    /// Fetch the key set and make it the cached one: the step behind an expiry
+    /// refresh and an unknown-`kid` refresh alike.
+    async fn refresh(&self) -> Result<JwkSet, JwksError> {
+        let jwks = self.fetch_jwks().await?;
+        *self.cache.write() = Some(CachedJwks {
+            jwks: jwks.clone(),
+            fetched_at: Instant::now(),
+            ttl: self.ttl,
+        });
         Ok(jwks)
     }
 
@@ -377,20 +428,8 @@ impl JwksProvider {
             }
         }
 
-        // Cache miss or expired, fetch new JWKS
-        let jwks = self.fetch_jwks().await?;
-
-        // Update cache
-        {
-            let mut cache = self.cache.write();
-            *cache = Some(CachedJwks {
-                jwks: jwks.clone(),
-                fetched_at: Instant::now(),
-                ttl: self.ttl,
-            });
-        }
-
-        Ok(jwks)
+        // Cache miss or expired.
+        self.refresh().await
     }
 
     /// Get a specific key by kid (key ID).
@@ -412,18 +451,7 @@ impl JwksProvider {
             return Err(JwksError::KeyNotFound(kid.to_string()));
         }
         warn!("Key {} not found in cached JWKS, refreshing...", kid);
-        let jwks = self.fetch_jwks().await?;
-
-        // Update cache
-        {
-            let mut cache = self.cache.write();
-            *cache = Some(CachedJwks {
-                jwks: jwks.clone(),
-                fetched_at: Instant::now(),
-                ttl: self.ttl,
-            });
-        }
-
+        let jwks = self.refresh().await?;
         jwks.find(kid)
             .cloned()
             .ok_or_else(|| JwksError::KeyNotFound(kid.to_string()))
@@ -440,18 +468,40 @@ impl JwksProvider {
         *last_attempt = Some(Instant::now());
         true
     }
+}
 
-    /// Force refresh the JWKS cache.
-    #[expect(dead_code)]
-    pub async fn refresh(&self) -> Result<(), JwksError> {
-        let jwks = self.fetch_jwks().await?;
-        let mut cache = self.cache.write();
-        *cache = Some(CachedJwks {
-            jwks,
-            fetched_at: Instant::now(),
-            ttl: self.ttl,
+/// A loopback OIDC discovery endpoint for the tests of the provider and of
+/// the validator built on it.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use axum::{routing::get, Json, Router};
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    /// An OIDC discovery endpoint over loopback. Returns the server's origin,
+    /// the issuer a document served there is requested for; the document names
+    /// `document_issuer(origin)` as its issuer and the origin's `/jwks.json` as
+    /// its key set.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the server lives exactly as long as the test"
+    )]
+    pub(crate) async fn discovery_server(document_issuer: impl FnOnce(&str) -> String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let document = json!({
+            "issuer": document_issuer(&origin),
+            "jwks_uri": format!("{origin}/jwks.json"),
         });
-        Ok(())
+        let app = Router::new().route(
+            "/.well-known/openid-configuration",
+            get(move || {
+                let document = document.clone();
+                async move { Json(document) }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        origin
     }
 }
 
@@ -466,7 +516,7 @@ mod tests {
     use serde_json::{json, Value};
     use tokio::net::TcpListener;
 
-    use super::*;
+    use super::{test_support::discovery_server, *};
 
     #[test]
     fn test_cached_jwks_expiration() {
@@ -739,5 +789,159 @@ mod tests {
             Err(JwksError::KeyNotFound(_))
         ));
         assert_eq!(server.hits(), 2);
+    }
+
+    /// The expiry refresh and the unknown-`kid` refresh are one step: each
+    /// fetches once and leaves the fetched set cached, fresh.
+    #[tokio::test]
+    async fn an_expiry_refresh_and_an_unknown_kid_refresh_cache_the_fetched_set_alike() {
+        let server = JwksServer::start(&["k1"]).await;
+        let provider = server.provider();
+        let cached_kids = |provider: &JwksProvider| -> Vec<String> {
+            let cache = provider.cache.read();
+            let cached = cache.as_ref().unwrap();
+            assert!(!cached.is_expired());
+            cached
+                .jwks
+                .keys
+                .iter()
+                .filter_map(|key| key.common.key_id.clone())
+                .collect()
+        };
+        provider.get_key("k1").await.unwrap();
+        assert_eq!(cached_kids(&provider), ["k1"]);
+
+        // The unknown-kid refresh, once the interval has passed.
+        *server.keys.write() = vec!["k2"];
+        *provider.last_fetch_attempt.lock() = Some(Instant::now() - UNKNOWN_KID_REFRESH_INTERVAL);
+        provider.get_key("k2").await.unwrap();
+        assert_eq!(cached_kids(&provider), ["k2"]);
+        assert_eq!(server.hits(), 2);
+
+        // The expiry refresh.
+        *server.keys.write() = vec!["k3"];
+        provider.cache.write().as_mut().unwrap().fetched_at =
+            Instant::now() - TTL - Duration::from_secs(1);
+        assert_eq!(provider.get_jwks().await.unwrap().keys.len(), 1);
+        assert_eq!(cached_kids(&provider), ["k3"]);
+        assert_eq!(server.hits(), 3);
+    }
+
+    const TTL: Duration = Duration::from_secs(3600);
+
+    /// A loopback HTTP/1.1 server that answers one request with a chunked
+    /// body (no declared length) of `chunks` times 64 KiB of JSON-looking
+    /// text, then hangs up. Returns its origin. A refusal that comes within
+    /// one chunk past the limit shows the body was stopped as it was read; a
+    /// read-then-check would report the whole body.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the server lives exactly as long as the test"
+    )]
+    async fn chunked_server(chunks: usize) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut head = vec![0u8; 4096];
+            let _ = socket.read(&mut head).await;
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .await;
+            let chunk = vec![b'['; 64 * 1024];
+            for _ in 0..chunks {
+                // The client may hang up once it has refused the body: a write
+                // error ends the server, as it should.
+                if socket
+                    .write_all(format!("{:x}\r\n", chunk.len()).as_bytes())
+                    .await
+                    .is_err()
+                    || socket.write_all(&chunk).await.is_err()
+                    || socket.write_all(b"\r\n").await.is_err()
+                {
+                    return;
+                }
+            }
+            let _ = socket.write_all(b"0\r\n\r\n").await;
+        });
+        origin
+    }
+
+    #[tokio::test]
+    async fn a_chunked_key_set_past_the_limit_is_refused_as_it_is_read() {
+        let origin = chunked_server(20).await; // 1.25 MiB over a 1 MiB limit
+        let provider = JwksProvider::new(format!("{origin}/jwks.json"), TTL).unwrap();
+        let err = provider.get_jwks().await.unwrap_err();
+        assert!(
+            matches!(err, JwksError::ResponseTooLarge(read, max) if read > max && read <= max + 64 * 1024 && max == MAX_JWKS_RESPONSE_SIZE),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_chunked_discovery_document_past_the_limit_is_refused_as_it_is_read() {
+        let origin = chunked_server(20).await;
+        let Err(err) = JwksProvider::from_issuer(&origin, TTL).await else {
+            panic!("a chunked discovery document past the limit must be refused");
+        };
+        assert!(
+            matches!(err, JwksError::ResponseTooLarge(read, max) if read > max && read <= max + 64 * 1024 && max == MAX_JWKS_RESPONSE_SIZE),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_discovery_document_for_another_issuer_is_refused() {
+        let origin = discovery_server(|origin| format!("{origin}/another-tenant")).await;
+        let other = format!("{origin}/another-tenant");
+
+        let Err(err) = JwksProvider::from_issuer(&origin, TTL).await else {
+            panic!("a discovery document for another issuer must be refused");
+        };
+
+        assert!(
+            matches!(
+                &err,
+                JwksError::IssuerMismatch { configured, discovered }
+                    if configured == &origin && discovered == &other
+            ),
+            "{err:?}"
+        );
+        // The error names both issuers.
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!("{other:?}")) && message.contains(&format!("{origin:?}")),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_discovery_document_for_the_configured_issuer_is_accepted() {
+        let origin = discovery_server(str::to_string).await;
+
+        let provider = JwksProvider::from_issuer(&origin, TTL).await.unwrap();
+
+        assert_eq!(provider.jwks_uri, format!("{origin}/jwks.json"));
+    }
+
+    #[tokio::test]
+    async fn an_issuer_with_a_terminating_slash_is_compared_as_configured() {
+        // The discovery URL carries one slash before the well-known path, and the
+        // document must name the issuer with its slash, as the tokens' `iss` does.
+        let origin = discovery_server(|origin| format!("{origin}/")).await;
+
+        let provider = JwksProvider::from_issuer(&format!("{origin}/"), TTL)
+            .await
+            .unwrap();
+        assert_eq!(provider.jwks_uri, format!("{origin}/jwks.json"));
+
+        // The same document is not for the issuer without the slash.
+        let Err(err) = JwksProvider::from_issuer(&origin, TTL).await else {
+            panic!("a document naming the issuer with a slash is not for the issuer without it");
+        };
+        assert!(matches!(err, JwksError::IssuerMismatch { .. }), "{err:?}");
     }
 }

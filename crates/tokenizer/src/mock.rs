@@ -6,7 +6,8 @@ use anyhow::Result;
 
 use crate::{
     chat_template::{
-        ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
+        ChatTemplateContentFormat, ChatTemplateParams, ChatTemplateProcessor, ThinkingKeyName,
+        ThinkingToggle,
     },
     traits::{
         ChatTemplateOutput, Decoder, EncodeJob, Encoder, Encoding, PromptEncoding,
@@ -35,10 +36,19 @@ pub struct MockTokenizer {
     native_reasoning_effort_off_values: &'static [&'static str],
     renderer_capabilities: RendererCapabilities,
     content_format: ChatTemplateContentFormat,
+    /// Reported from `think_in_prefill`: the generation prompt opens the
+    /// think block.
+    think_in_prefill: bool,
+    /// Reported from `prefill_opens_think_block`; `None` mirrors
+    /// `think_in_prefill`, as the trait's default does.
+    prefill_opens_think_block: Option<bool>,
     /// When set, `apply_chat_template` renders the message list and the
     /// generation-prompt flag as JSON, so a test can assert exactly what
     /// reached the template.
     json_chat_template: bool,
+    response_template: Option<serde_json::Value>,
+    /// When set, `apply_chat_template` renders with this template, as a checkpoint's would.
+    chat_template: Option<ChatTemplateProcessor>,
 }
 
 impl Default for MockTokenizer {
@@ -97,9 +107,13 @@ impl MockTokenizer {
             thinking_key_name: None,
             native_reasoning_effort_values: &[],
             native_reasoning_effort_off_values: &[],
+            think_in_prefill: false,
+            prefill_opens_think_block: None,
             renderer_capabilities: RendererCapabilities::default(),
             content_format: ChatTemplateContentFormat::default(),
             json_chat_template: false,
+            response_template: None,
+            chat_template: None,
         }
     }
 
@@ -121,6 +135,19 @@ impl MockTokenizer {
     /// Report `n` unbilled prompt tokens on every rendering.
     pub fn with_unbilled_prompt_tokens(mut self, n: u32) -> Self {
         self.unbilled_prompt_tokens = n;
+        self
+    }
+
+    /// Report `value` from `think_in_prefill()`.
+    pub fn with_think_in_prefill(mut self, value: bool) -> Self {
+        self.think_in_prefill = value;
+        self
+    }
+
+    /// Report `value` from `prefill_opens_think_block()` instead of
+    /// mirroring `think_in_prefill()`.
+    pub fn with_prefill_opens_think_block(mut self, value: bool) -> Self {
+        self.prefill_opens_think_block = Some(value);
         self
     }
 
@@ -164,12 +191,43 @@ impl MockTokenizer {
     }
 
     /// Render `{"messages": [...], "add_generation_prompt": bool}`, plus
-    /// `"tools": [...]` when the call carries tools, instead of the
-    /// `role: content` lines, so a test can assert on the exact message list
-    /// and tool list the template received.
+    /// `"tools": [...]` when the call carries tools and `"template_kwargs":
+    /// {...}` when it carries kwargs, instead of the `role: content` lines, so
+    /// a test can assert on the exact message list, tool list and kwargs the
+    /// template received.
     pub fn with_json_chat_template(mut self) -> Self {
         self.json_chat_template = true;
         self
+    }
+
+    /// Add `(token, id)` pairs to the vocabulary.
+    pub fn with_tokens(mut self, tokens: &[(&str, u32)]) -> Self {
+        for &(token, id) in tokens {
+            self.vocab.insert(token.to_string(), id);
+            self.reverse_vocab.insert(id, token.to_string());
+        }
+        self
+    }
+
+    /// Name `text` as the end-of-sequence token: the one `eos_token_ids` reports, in the
+    /// vocabulary under the `<eos>` id.
+    pub fn with_eos_token(mut self, text: &str) -> Self {
+        self.vocab.insert(text.to_string(), 999);
+        self.reverse_vocab.insert(999, text.to_string());
+        self.special_tokens.eos_token = Some(text.to_string());
+        self
+    }
+
+    /// Report `template` from `response_template()`.
+    pub fn with_response_template(mut self, template: serde_json::Value) -> Self {
+        self.response_template = Some(template);
+        self
+    }
+
+    /// Render `apply_chat_template` with the Jinja `template`, as a checkpoint's tokenizer would.
+    pub fn with_chat_template(mut self, template: &str) -> Result<Self> {
+        self.chat_template = Some(ChatTemplateProcessor::new(template.to_string())?);
+        Ok(self)
     }
 }
 
@@ -238,6 +296,15 @@ impl TokenizerTrait for MockTokenizer {
         self.thinking_toggle
     }
 
+    fn think_in_prefill(&self) -> bool {
+        self.think_in_prefill
+    }
+
+    fn prefill_opens_think_block(&self) -> bool {
+        self.prefill_opens_think_block
+            .unwrap_or(self.think_in_prefill)
+    }
+
     fn thinking_key_name(&self) -> Option<ThinkingKeyName> {
         self.thinking_key_name
     }
@@ -265,6 +332,9 @@ impl TokenizerTrait for MockTokenizer {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<String> {
+        if let Some(processor) = &self.chat_template {
+            return processor.apply_chat_template(messages, params);
+        }
         if self.json_chat_template {
             let mut rendered = serde_json::json!({
                 "messages": messages,
@@ -272,6 +342,9 @@ impl TokenizerTrait for MockTokenizer {
             });
             if let Some(tools) = params.tools {
                 rendered["tools"] = serde_json::Value::from(tools.to_vec());
+            }
+            if let Some(kwargs) = params.template_kwargs.filter(|kwargs| !kwargs.is_empty()) {
+                rendered["template_kwargs"] = serde_json::to_value(kwargs)?;
             }
             return Ok(rendered.to_string());
         }
@@ -299,6 +372,7 @@ impl TokenizerTrait for MockTokenizer {
         params: ChatTemplateParams,
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
+        let continued_final_message = params.continue_final_message;
         let mut text = self.apply_chat_template(messages, params)?;
         if let Some(prefix) = assistant_prefix {
             text.push_str(prefix);
@@ -320,10 +394,15 @@ impl TokenizerTrait for MockTokenizer {
             text,
             encoding,
             unbilled_prompt_tokens: self.unbilled_prompt_tokens,
+            continued_final_message,
         })
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+
+    fn response_template(&self) -> Option<&serde_json::Value> {
+        self.response_template.as_ref()
     }
 }

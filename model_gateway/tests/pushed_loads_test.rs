@@ -12,37 +12,24 @@ use std::{
     time::{Duration, Instant},
 };
 
-use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer, TokenizerRegistry};
-use openai_protocol::worker::{ConnectionMode, HealthCheckConfig, RuntimeType, WorkerType};
+use common::grpc_harness::{grpc_test_context, grpc_worker, serve_mock_worker_with};
+use openai_protocol::worker::{RuntimeType, WorkerType};
 use smg::{
     config::RouterConfig,
     observability::{
         metrics::{start_prometheus, PrometheusConfig},
         metrics_server::start_metrics_server,
     },
-    worker::{BasicWorkerBuilder, KvEventMonitor, ModelCard},
+    worker::{KvEventMonitor, ModelCard},
 };
-use tokio::net::TcpListener;
 
 const MODEL: &str = "mock-model";
 const WORKERS: usize = 8;
 
 /// A realistic mock gRPC worker with prefix caching (so it streams KV events)
 /// and vLLM-like load reports.
-#[expect(
-    clippy::expect_used,
-    clippy::disallowed_methods,
-    reason = "test helper - panicking on failure is intentional; the mock server task is fire-and-forget"
-)]
 async fn start_realistic_worker() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock gRPC worker");
-    let port = listener
-        .local_addr()
-        .expect("mock gRPC worker address")
-        .port();
-    let cfg = Arc::new(mock_worker::config::Config {
+    serve_mock_worker_with(|port| mock_worker::config::Config {
         host: "127.0.0.1".to_string(),
         http_count: 0,
         grpc_base_port: port,
@@ -56,9 +43,8 @@ async fn start_realistic_worker() -> u16 {
         },
         loads_like: mock_worker::engine::LoadsLike::Vllm,
         ..mock_worker::config::Config::default()
-    });
-    tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
-    port
+    })
+    .await
 }
 
 #[tokio::test]
@@ -80,48 +66,33 @@ async fn eight_workers_loads_reach_the_gateway_through_the_event_streams() {
     // Cache-aware routing (the KV-event subscriptions) with the load poll held
     // off: the monitor's loops are never started, so every load the gateway
     // learns came through an event stream.
-    let mut config = RouterConfig::builder()
+    let config = RouterConfig::builder()
         .grpc_connection()
         .cache_aware_policy(0.5, 32, 1.1, 60, 1_000_000)
         .load_monitor_interval_secs(3600)
         .host("127.0.0.1")
         .port(0)
         .build_unchecked();
-    config.health_check.disable_health_check = true;
-    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-    tokenizer_registry
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .unwrap();
-    let app_context =
-        common::create_test_context_with_tokenizer_registry(config, tokenizer_registry).await;
+    let app_context = grpc_test_context(config, MODEL).await;
     let worker_monitor = app_context
         .worker_monitor
         .clone()
         .expect("the test context builds a worker monitor");
-    let kv_monitor = Arc::new(KvEventMonitor::new(None));
+    let kv_monitor = Arc::new(KvEventMonitor::new());
     kv_monitor.set_load_sink(&worker_monitor);
 
     let mut urls = Vec::with_capacity(WORKERS);
     for port in &ports {
         let url = format!("grpc://127.0.0.1:{port}");
-        let worker = BasicWorkerBuilder::new(url.clone())
-            .worker_type(WorkerType::Regular)
-            .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(RuntimeType::TokenSpeed)
-            .model(ModelCard::new(MODEL))
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build();
-        let worker: Arc<dyn smg::worker::Worker> = Arc::new(worker);
+        let worker: Arc<dyn smg::worker::Worker> = Arc::new(
+            grpc_worker(
+                *port,
+                WorkerType::Regular,
+                RuntimeType::TokenSpeed,
+                ModelCard::new(MODEL),
+            )
+            .build(),
+        );
         worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
         app_context
             .worker_registry
@@ -133,7 +104,7 @@ async fn eight_workers_loads_reach_the_gateway_through_the_event_streams() {
 
     // Idle engines publish no KV events; their streams still send the load
     // record as heartbeats within a second or so of the subscription.
-    let client = reqwest::Client::builder()
+    let client = smg::clients::http_client_builder()
         .no_proxy()
         .build()
         .expect("test client");

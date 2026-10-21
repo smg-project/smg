@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,6 +41,35 @@ type GrpcClient struct {
 	bufferSizes     ChannelBufferSizes
 	timeouts        Timeouts
 	requestCounter  uint64 // Atomic counter to ensure unique request IDs
+	// The engine's weight version, the chunks' system_fingerprint (the
+	// gateway's value); read once from the engine's model information at
+	// the first stream, blank when the engine reports none or does not
+	// answer in time (the converter then uses the gateway's default).
+	weightVersion     string
+	weightVersionOnce sync.Once
+}
+
+// modelInfoBound is how long the first stream waits for the engine's model
+// information before going on without a weight version.
+const modelInfoBound = 2 * time.Second
+
+// weightVersionOf reads the engine's weight version once, under its own
+// bound: the first caller's cancellation or deadline must not pin the value
+// for the client's lifetime, so the lookup detaches from the request context
+// and keeps only its values. A failure is logged, and the converter uses the
+// gateway's default from then on.
+func (c *GrpcClient) weightVersionOf(ctx context.Context) string {
+	c.weightVersionOnce.Do(func() {
+		infoCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), modelInfoBound)
+		defer cancel()
+		info, err := c.client.GetModelInfo(infoCtx, &proto.GetModelInfoRequest{})
+		if err != nil {
+			log.Printf("smg: model info lookup failed; system_fingerprint is the default: %v", err)
+			return
+		}
+		c.weightVersion = info.GetWeightVersion()
+	})
+	return c.weightVersion
 }
 
 type ChannelBufferSizes struct {
@@ -152,13 +182,17 @@ func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON str
 		RequireReasoning: requireReasoning,
 	}
 
-	// Set sampling parameters
+	// Set sampling parameters. Special tokens are skipped as the request
+	// asks, unless the response parser needs the engine's tool-call markers
+	// kept (tools under a choice that allows calls, no JSON-schema
+	// constraint): the preprocessor derives the flag the way the in-library
+	// request paths do, and the converter below decodes with the same one.
 	samplingParams := &proto.SamplingParams{
 		Temperature:                1.0,
 		TopP:                       1.0,
 		TopK:                       -1,
 		RepetitionPenalty:          1.0,
-		SkipSpecialTokens:          true,
+		SkipSpecialTokens:          preprocessed.SkipSpecialTokens,
 		SpacesBetweenSpecialTokens: true,
 	}
 
@@ -220,11 +254,10 @@ func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON str
 	if err != nil {
 		return nil, fmt.Errorf("failed to create gRPC stream: %w", err)
 	}
-	toolsJSON := ""
-	if tools, ok := reqMap["tools"].([]interface{}); ok && len(tools) > 0 {
-		toolsBytes, _ := json.Marshal(tools)
-		toolsJSON = string(toolsBytes)
-	}
+	// The tools the response parser resolves calls against: the request-level
+	// tools and the tools declared on messages, as the preprocessor resolved
+	// them (the set its constraint was built from).
+	toolsJSON := preprocessed.ToolsJSON
 
 	toolChoiceJSON := ""
 	if toolChoice, ok := reqMap["tool_choice"]; ok {
@@ -247,11 +280,6 @@ func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON str
 		}
 	}
 
-	skipSpecialTokens := true
-	if skipSpecialTokensVal, ok := reqMap["skip_special_tokens"].(bool); ok {
-		skipSpecialTokens = skipSpecialTokensVal
-	}
-
 	if c.tokenizerHandle == nil {
 		stream.CloseSend()
 		return nil, fmt.Errorf("tokenizer handle is nil (should be created at startup)")
@@ -265,8 +293,9 @@ func (c *GrpcClient) CreateChatCompletionStream(ctx context.Context, reqJSON str
 		toolChoiceJSON,
 		stopJSON,
 		stopTokenIDs,
-		skipSpecialTokens,
+		preprocessed.SkipSpecialTokens,
 		preprocessed.PromptTokens, // Pass initial prompt tokens from preprocessing
+		c.weightVersionOf(ctx),
 	)
 	if err != nil {
 		stream.CloseSend()
@@ -307,7 +336,8 @@ type GrpcChatCompletionStream struct {
 	batchSize          int
 	ctx                context.Context
 	cancel             context.CancelFunc
-	closed             int32
+	closed             int32     // 1 once the read loop is done or Close has stopped it
+	releaseOnce        sync.Once // the converter handle goes exactly once, on every path
 	resultJSONChan     chan string
 	errChan            chan error
 	readLoopDone       chan struct{}
@@ -560,38 +590,53 @@ func (s *GrpcChatCompletionStream) SetClientDisconnected() {
 	atomic.StoreInt32(&s.clientDisconnected, 1)
 }
 
+// Close stops the stream if it is still running and releases what it holds.
+// The converter handle is freed exactly once, whether the read loop ended on
+// its own (a completed or failed request), was stopped by this call, or an
+// earlier Close already ran.
 func (s *GrpcChatCompletionStream) Close() error {
-	if !atomic.CompareAndSwapInt32(&s.closed, 0, 1) {
-		return nil
-	}
-
+	// Cancelling is idempotent, and it also lets go a chunk processor still
+	// waiting for a reader, which the loop's cleanup waits for in turn.
 	if s.cancel != nil {
 		s.cancel()
 	}
+	// The flag says whether the read loop still has to be stopped: a loop that
+	// ended on its own set it in its cleanup, and so did an earlier Close. Only
+	// then is the stream half-closed from this side, and not when the client
+	// disconnected. The half-close does not reach the engine: the generated
+	// client half-closed the stream when it sent the request, and the call runs
+	// on the caller's context, so a request the engine is still generating is
+	// not aborted by Close (the receive goroutine returns when the engine ends
+	// the stream or the caller's context does).
+	if atomic.CompareAndSwapInt32(&s.closed, 0, 1) && atomic.LoadInt32(&s.clientDisconnected) == 0 {
+		_ = s.stream.CloseSend()
+	}
 
-	clientDisconnected := atomic.LoadInt32(&s.clientDisconnected) == 1
-
-	select {
-	case <-s.readLoopDone:
-		// readLoop completed
-	default:
-		if !clientDisconnected {
-			// Call CloseSend() if client didn't disconnect
-			_ = s.stream.CloseSend()
-		}
+	// The loop's cleanup waits for the in-flight chunk processors; the handle
+	// must outlive them. Should this wait give up, release still frees the
+	// handle under the postprocessor's lock, behind a processor still inside it.
+	if s.readLoopDone != nil {
 		select {
 		case <-s.readLoopDone:
 		case <-time.After(s.closeTimeout):
 		}
 	}
 
-	_, _ = s.flushBatch()
+	s.releaseOnce.Do(s.release)
+	return nil
+}
 
-	if s.converterHandle != nil {
+// release flushes what the batch postprocessor still holds and frees the
+// converter handle, under the lock every chunk takes: a processor still
+// inside the converter finishes first, and a chunk that arrives later meets a
+// closed postprocessor, not freed memory.
+func (s *GrpcChatCompletionStream) release() {
+	_, _ = s.flushBatch()
+	if s.batchPostprocessor != nil {
+		s.batchPostprocessor.Close()
+	} else if s.converterHandle != nil {
 		ffi.FreeGrpcResponseConverter(s.converterHandle)
 	}
-
-	return nil
 }
 
 func (s *GrpcChatCompletionStream) flushBatch() ([]string, error) {

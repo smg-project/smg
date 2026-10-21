@@ -127,6 +127,14 @@ impl KimiK3Processor {
 }
 
 impl VisionPreProcessor for KimiK3Processor {
+    /// K3's reference processor receives the image as stored, alpha channel
+    /// included (the serving engines' loaders keep the original image mode for
+    /// this model), and composites transparent pixels over its configured
+    /// chessboard after the resize; the gateway decodes its frames the same way.
+    fn keeps_alpha(&self) -> bool {
+        true
+    }
+
     fn default_mean(&self) -> [f64; 3] {
         KIMI_K3_MEAN
     }
@@ -148,11 +156,17 @@ impl VisionPreProcessor for KimiK3Processor {
         )
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        self.params
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
+        Ok(self
+            .params
             .resolved(config)
             .compute_resize_config(width as usize, height as usize)
-            .num_tokens
+            .num_tokens)
     }
 
     fn model_name(&self) -> &'static str {
@@ -168,6 +182,12 @@ impl VisionPreProcessor for KimiK3Processor {
 mod tests {
     use image::{Rgb, RgbImage, Rgba, RgbaImage};
     use serde_json::json;
+
+    #[test]
+    fn k3_keeps_alpha_for_its_own_background_and_k25_does_not() {
+        assert!(KimiK3Processor::new().keeps_alpha());
+        assert!(!KimiK25Processor::new().keeps_alpha());
+    }
 
     use super::*;
     use crate::vision::processors::kimi_k25::{
@@ -208,8 +228,8 @@ mod tests {
 
         // 4000x3000 is well past both budgets, so the difference shows up
         // directly in how far each model downscales.
-        let k3_tokens = k3.calculate_num_tokens(4000, 3000, &config);
-        let k25_tokens = k25.calculate_num_tokens(4000, 3000, &config);
+        let k3_tokens = k3.calculate_num_tokens(4000, 3000, &config).unwrap();
+        let k25_tokens = k25.calculate_num_tokens(4000, 3000, &config).unwrap();
         assert!(
             k3_tokens > k25_tokens,
             "K3 should keep more tokens than K2.5 ({k3_tokens} vs {k25_tokens})"

@@ -4549,6 +4549,52 @@ fn background_and_the_sampling_extensions_stay_accepted() {
     assert!(request.validate().is_ok());
 }
 
+/// `background: true` with `store: false` is accepted as the public API
+/// accepts it (the response is kept for its polling window), like every other
+/// pairing of the two parameters.
+#[test]
+fn background_without_storage_is_accepted() {
+    for body in [
+        json!({"model": "m", "input": "hi", "background": true, "store": false, "max_output_tokens": 64}),
+        json!({"model": "m", "input": "hi", "background": true, "store": true}),
+        json!({"model": "m", "input": "hi", "background": true}),
+        json!({"model": "m", "input": "hi", "background": false, "store": false}),
+        json!({"model": "m", "input": "hi", "store": false}),
+    ] {
+        let request = plain_request(body.clone()).unwrap();
+        assert!(request.validate().is_ok(), "{body} must be accepted");
+    }
+}
+
+/// `top_p` above 1 and more than four `stop` sequences (an extension of the
+/// Responses request) name the bound crossed, as on Chat Completions.
+#[test]
+fn bounds_crossed_are_named_as_the_public_api_names_them() {
+    for (field, value, code) in [
+        ("top_p", json!(1.5), "decimal_above_max_value"),
+        ("top_p", json!(0.0), "decimal_below_min_value"),
+        (
+            "stop",
+            json!(["a", "b", "c", "d", "e"]),
+            "array_above_max_length",
+        ),
+    ] {
+        let mut body = json!({"model": "m", "input": "hi"});
+        body[field] = value;
+        let request = plain_request(body).unwrap();
+        let errors = request.validate().unwrap_err();
+        assert_eq!(errors.field_errors()[field][0].code, code, "{field}");
+    }
+    for (field, value) in [("top_p", json!(1.0)), ("stop", json!(["a", "b", "c", "d"]))] {
+        let mut body = json!({"model": "m", "input": "hi"});
+        body[field] = value;
+        assert!(
+            plain_request(body).unwrap().validate().is_ok(),
+            "{field} within its bound"
+        );
+    }
+}
+
 #[test]
 fn unknown_input_message_role_is_rejected() {
     let request = plain_request(json!({
@@ -4572,14 +4618,22 @@ fn unknown_input_message_role_is_rejected() {
     }
 }
 
+/// `max_output_tokens` takes any count from 1, as `max_tokens` does on the
+/// chat endpoint; the vendors' Responses contracts accept the small values
+/// their conformance cases send (8 for a one-word answer).
 #[test]
-fn max_output_tokens_below_sixteen_is_rejected() {
+fn max_output_tokens_below_one_is_rejected_and_small_values_pass() {
+    // The range rule's own code; the public API's `integer_below_min_value`
+    // is what the body extractor makes of a `range` error with a `min`.
     let request =
-        plain_request(json!({"model": "m", "input": "hi", "max_output_tokens": 1})).unwrap();
-    assert!(validation_code(&request).contains("integer_below_min_value"));
-    let request =
-        plain_request(json!({"model": "m", "input": "hi", "max_output_tokens": 16})).unwrap();
-    assert!(request.validate().is_ok());
+        plain_request(json!({"model": "m", "input": "hi", "max_output_tokens": 0})).unwrap();
+    assert!(validation_code(&request).contains("range"));
+    for value in [1, 8, 16] {
+        let request =
+            plain_request(json!({"model": "m", "input": "hi", "max_output_tokens": value}))
+                .unwrap();
+        assert!(request.validate().is_ok(), "max_output_tokens {value}");
+    }
 }
 
 #[test]

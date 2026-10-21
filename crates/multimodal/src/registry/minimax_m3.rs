@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
-
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     media::FrameSampling,
@@ -31,7 +29,7 @@ const DEFAULT_VIDEO_SAMPLE_FPS: f32 = 1.0;
 /// `]<]image[>[` (or `]<]video[>[`) with no surrounding markers, so this spec
 /// owns the whole wrapper: each placeholder expands to
 /// `<start> + N * <pad> + <end>`, with
-/// N = `grid_t * grid_h * grid_w / merge_size^2`. That mirrors vLLM's
+/// N = `grid_t * grid_h * grid_w / merge_size^2`. That mirrors the engine's
 /// `_get_prompt_updates`, which builds
 /// `[start_token_id] + [image_token_id] * N + [end_token_id]`.
 ///
@@ -100,17 +98,6 @@ impl MiniMaxM3VisionSpec {
     fn supports_video(metadata: &ModelMetadata) -> bool {
         metadata.config_u32(&["video_token_index"]).is_some()
             || metadata.token_id(Self::VIDEO_TOKEN).is_ok()
-    }
-
-    /// Encode timestamp text on its own with no special tokens, as vLLM does.
-    fn encode_plain_text(metadata: &ModelMetadata, text: &str) -> RegistryResult<Vec<TokenId>> {
-        let ids = metadata.tokenizer.encode_text(text).ok_or_else(|| {
-            ModelRegistryError::TextEncodingFailed {
-                spec: "minimax_m3",
-                text: text.to_string(),
-            }
-        })?;
-        Ok(ids.into_iter().map(|id| id as TokenId).collect())
     }
 
     /// The `]<]X.X seconds[>[` stamp for one temporal frame, from its first sampled source frame clamped to the last one; `None` when nothing was sampled.
@@ -229,7 +216,9 @@ impl MiniMaxM3VisionSpec {
         let mut ranges = Vec::with_capacity(grid_t);
         for frame in 0..grid_t {
             if let Some(stamps) = &stamps {
-                tokens.extend(Self::encode_plain_text(metadata, &stamps[frame])?);
+                // The stamp is encoded on its own, with no special tokens, as the
+                // reference processor encodes it.
+                tokens.extend(metadata.encode_plain("minimax_m3", &stamps[frame])?);
             }
             tokens.push(start_id);
             ranges.push(PlaceholderRange {
@@ -337,7 +326,8 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         Self::image_token_id(metadata)
     }
 
-    /// The bare `]<]image[>[` / `]<]video[>[` are vLLM's single-token targets.
+    /// The bare `]<]image[>[` / `]<]video[>[` are the single-token targets the
+    /// serving engine expands itself.
     fn worker_expandable(&self, modality: Modality) -> bool {
         matches!(modality, Modality::Image | Modality::Video)
     }
@@ -397,10 +387,6 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
         FrameSampling::Interval
     }
 
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
-    }
-
     fn prompt_replacements(
         &self,
         metadata: &ModelMetadata,
@@ -448,7 +434,11 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
             Modality::Video => {
                 let placeholder_token = self.placeholder_token_for(metadata, Modality::Video)?;
                 let temporal_patch_size =
-                    MiniMaxM3VisionProcessor::temporal_patch_size_from(preprocessor_config);
+                    MiniMaxM3VisionProcessor::temporal_patch_size_from(preprocessor_config)
+                        .map_err(|error| ModelRegistryError::InvalidConfigField {
+                            field: "img_token_compression_config.temporal_patch_size".to_string(),
+                            reason: error.to_string(),
+                        })?;
                 let stamps: Vec<Option<ClipStamps<'_>>> = media
                     .iter()
                     .map(|item| {
@@ -465,7 +455,7 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
-        // Mirrors vLLM's `_get_mm_fields_config` for M3: the pixel tensors are
+        // Mirrors the engine's `_get_mm_fields_config` for M3: the pixel tensors are
         // flat over patches and sliced per item by the grid product, while the
         // grid triples are batched one row per item. The frame spacing the
         // shared video processor emits is listed too: M3 reads the timing off
@@ -513,7 +503,7 @@ impl ModelProcessorSpec for MiniMaxM3VisionSpec {
     }
 
     fn keep_on_cpu_keys(&self) -> Vec<String> {
-        // vLLM marks both grid tensors keep_on_cpu=True.
+        // The engine marks both grid tensors keep_on_cpu=True.
         vec!["image_grid_thw".to_string(), "video_grid_thw".to_string()]
     }
 }
@@ -523,7 +513,7 @@ mod tests {
     use std::sync::OnceLock;
 
     use serde::Deserialize;
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     use super::*;
     use crate::registry::{test_helpers::TestTokenizer, ModelMetadata, Tokenizer};
@@ -1091,6 +1081,44 @@ mod tests {
     }
 
     #[test]
+    fn malformed_temporal_patch_size_is_rejected_on_the_stamp_path() {
+        // The construction path refuses a present but unusable block value;
+        // the stamp path reports the same configuration error instead of
+        // pairing the frames by the default.
+        let meta = metadata();
+        let mut config = PreProcessorConfig::default();
+        config.extra.insert(
+            "img_token_compression_config".to_string(),
+            json!({ "temporal_patch_size": "two" }),
+        );
+        assert!(
+            MiniMaxM3VisionProcessor::from_preprocessor_config(&config).is_err(),
+            "the construction path refuses this config"
+        );
+
+        let error = MiniMaxM3VisionSpec
+            .prompt_replacements_with_media(
+                &meta,
+                &preprocessed_video(vec![12], 3),
+                Modality::Video,
+                &[sampled(&[0, 15, 30, 45, 60], 30.0)],
+                &config,
+            )
+            .unwrap_err()
+            .to_string();
+
+        // The registry's own error, naming the key, with the construction
+        // path's reason behind it.
+        assert!(
+            error.starts_with(
+                "config field 'img_token_compression_config.temporal_patch_size' is present but unusable: "
+            ),
+            "{error}"
+        );
+        assert!(error.contains("must be a positive integer"), "{error}");
+    }
+
+    #[test]
     fn unusable_sampling_falls_back_to_the_unstamped_layout() {
         let meta = metadata();
         let unstamped = MiniMaxM3VisionSpec
@@ -1350,7 +1378,7 @@ mod tests {
 
     #[test]
     fn grid_tensors_stay_on_cpu() {
-        // vLLM marks both grid tensors keep_on_cpu=True.
+        // The engine marks both grid tensors keep_on_cpu=True.
         let spec = MiniMaxM3VisionSpec;
         let keys = spec.keep_on_cpu_keys();
 

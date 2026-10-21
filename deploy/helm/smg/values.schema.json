@@ -49,18 +49,36 @@
         "postgres": {
           "type": "object",
           "properties": {
+            "url": { "type": "string" },
+            "existingSecret": { "type": "string" },
+            "secretKey": { "type": "string" },
             "poolMax": { "type": "integer", "minimum": 1 }
           }
         },
         "redis": {
           "type": "object",
           "properties": {
+            "url": { "type": "string" },
+            "existingSecret": { "type": "string" },
+            "secretKey": { "type": "string" },
             "poolMax": { "type": "integer", "minimum": 1 }
           }
         },
         "oracle": {
           "type": "object",
           "properties": {
+            "dsn": { "type": "string" },
+            "user": { "type": "string" },
+            "password": { "type": "string" },
+            "existingSecret": { "type": "string" },
+            "secretKeys": {
+              "type": "object",
+              "properties": {
+                "dsn": { "type": "string" },
+                "user": { "type": "string" },
+                "password": { "type": "string" }
+              }
+            },
             "poolMax": { "type": "integer", "minimum": 1 }
           }
         }

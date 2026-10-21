@@ -17,12 +17,19 @@
 //!   worker would serve from cache for that prompt right now;
 //!   `GET /admin/truth`: per worker, what it served over every admitted
 //!   request.
+//! - `POST /admin/script/{worker}` with one scripted answer or an array of
+//!   them: what the worker's next requests get, in order (`all`: whichever
+//!   worker gets the request), or, with a `key` or `input_ids`, what every
+//!   worker answers to that prompt; `GET` reads the queue length and the hit
+//!   and miss counts, `DELETE` drops the queue ([`crate::script`]); a name no
+//!   worker of the process has is a 404, as on the fault routes.
 //!
 //! Worker names are `grpc:<port>` / `http:<port>` / `zmq:<index>`; `all`
 //! addresses every worker.
 
 use std::{
     collections::{BTreeMap, HashMap},
+    future::{pending, Future},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -40,6 +47,7 @@ use tokio::net::TcpListener;
 use crate::{
     config::Config,
     engine::{self, Engine, FaultScope, RequestFault},
+    script,
 };
 
 struct AdminState {
@@ -59,6 +67,7 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}/delay", post(fault_delay))
         .route("/admin/fault/{worker}/admit-delay", post(fault_admit_delay))
         .route("/admin/fault/{worker}/admit-rate", post(fault_admit_rate))
+        .route("/admin/fault/{worker}/cold-shape", post(fault_cold_shape))
         .route(
             "/admin/fault/{worker}/restart-publisher",
             post(fault_restart_publisher),
@@ -68,11 +77,113 @@ fn router(state: Arc<AdminState>) -> Router {
         .route("/admin/fault/{worker}/fail", post(fault_fail))
         .route("/admin/truth", get(truth_served))
         .route("/admin/truth/{worker}", post(truth_prompt))
+        .route(
+            "/admin/script/{worker}",
+            get(script_status).post(script_enqueue).delete(script_clear),
+        )
+        // What a gRPC worker reports about itself, by port: whether its
+        // health check answers serving, and the info the gateway turns into
+        // labels. For beds that change an engine's reported settings between
+        // two health transitions.
+        .route("/admin/serving/{port}", get(serving_get).post(serving_set))
+        .route("/admin/info/{port}", get(info_get).post(info_patch))
         .with_state(state)
+}
+
+async fn serving_get(Path(port): Path<u16>) -> Json<Value> {
+    Json(json!({ "port": port, "serving": crate::overrides::for_port(port).serving() }))
+}
+
+/// Body `{"serving": true|false}`: whether the worker's gRPC health check
+/// answers healthy from now on.
+async fn serving_set(Path(port): Path<u16>, Json(body): Json<Value>) -> Response {
+    match body.get("serving").and_then(Value::as_bool) {
+        Some(serving) => {
+            crate::overrides::for_port(port).set_serving(serving);
+            Json(json!({ "port": port, "serving": serving })).into_response()
+        }
+        None => (StatusCode::BAD_REQUEST, "body: {\"serving\": true|false}").into_response(),
+    }
+}
+
+async fn info_get(Path(port): Path<u16>) -> Json<Value> {
+    Json(Value::Object(
+        crate::overrides::for_port(port)
+            .info()
+            .into_iter()
+            .collect(),
+    ))
+}
+
+/// Body: a JSON object merged into the info the worker reports (its gRPC
+/// `server_args`, and `supports_vision` of its model info); a `null` removes
+/// a key. Answers the info as it is now.
+async fn info_patch(Path(port): Path<u16>, Json(body): Json<Value>) -> Response {
+    match body.as_object() {
+        Some(patch) => {
+            let overrides = crate::overrides::for_port(port);
+            overrides.patch_info(patch);
+            Json(Value::Object(overrides.info().into_iter().collect())).into_response()
+        }
+        None => (StatusCode::BAD_REQUEST, "body: a JSON object").into_response(),
+    }
+}
+
+/// Body: one scripted answer or an array of them ([`script::Answer::parse`]
+/// names the fields). Each goes to the end of the worker's queue (`all`: the
+/// queue every worker falls back to), or under its prompt's key when it has
+/// one. Answers the worker's script state.
+async fn script_enqueue(Path(worker): Path<String>, Json(body): Json<Value>) -> Response {
+    let items: Vec<&Value> = match &body {
+        Value::Array(items) => items.iter().collect(),
+        one => vec![one],
+    };
+    let mut answers = Vec::with_capacity(items.len());
+    for (n, item) in items.into_iter().enumerate() {
+        match script::Answer::parse(item) {
+            Ok(scripted) => answers.push(scripted),
+            Err(why) => {
+                return (StatusCode::BAD_REQUEST, format!("answer {n}: {why}")).into_response()
+            }
+        }
+    }
+    script_state(script::enqueue(&worker, answers))
+}
+
+/// The worker's queued answers, hits and misses, and the keyed answers of
+/// the process.
+async fn script_status(Path(worker): Path<String>) -> Response {
+    script_state(script::status(&worker))
+}
+
+/// Drop the worker's queued answers (`all`: every queue); keyed answers stay.
+async fn script_clear(Path(worker): Path<String>) -> Response {
+    script_state(script::clear(&worker))
+}
+
+/// A script route's answer: the state, or 404 for a name no worker of the
+/// process has (the fault routes' answer to the same mistake).
+fn script_state(state: Option<Value>) -> Response {
+    match state {
+        Some(state) => Json(state).into_response(),
+        None => (StatusCode::NOT_FOUND, "unknown worker").into_response(),
+    }
 }
 
 /// Serve the admin API on `port` until the process exits.
 pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
+    serve_until(cfg, host, port, pending()).await;
+}
+
+/// Serve the admin API on `port` until `shutdown` resolves (the drain of a
+/// termination signal): the requests in flight are answered, no new one is
+/// accepted.
+pub async fn serve_until(
+    cfg: Arc<Config>,
+    host: String,
+    port: u16,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
     let listener = match TcpListener::bind((host.as_str(), port)).await {
         Ok(listener) => listener,
         Err(e) => {
@@ -81,7 +192,10 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
         }
     };
     let state = Arc::new(AdminState { cfg });
-    if let Err(e) = axum::serve(listener, router(state)).await {
+    if let Err(e) = axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown)
+        .await
+    {
         tracing::error!("admin server stopped: {e}");
     }
 }
@@ -124,6 +238,7 @@ fn status_json(e: &Engine) -> Value {
         "delay_ms": s.delay_ms,
         "admit_delay_ms": s.admit_delay_ms,
         "admit_per_sec": s.admit_per_sec,
+        "cold_shape_ms": s.cold_shape_ms,
         "paused": s.paused,
         "generation": s.generation,
         "restarts": s.restarts,
@@ -131,6 +246,7 @@ fn status_json(e: &Engine) -> Value {
         "fail_pending": fail_pending,
         "fail_secs_left": fail_secs_left,
         "fail_after_tokens": fail.and_then(|f| f.after_tokens),
+        "fail_finish_error": fail.is_some_and(|f| f.finish_error),
         "fail_stall_ms": fail.map_or(0, |f| f.stall.as_millis() as u64),
         "failed_total": s.failed_total,
         "cut_total": s.cut_total,
@@ -166,23 +282,32 @@ fn optional<T: std::str::FromStr>(
 /// `status=S` (0, or 400 to 599) answered instead of serving, for the next
 /// `count=N` requests or every request for `secs=T` (neither: until cleared),
 /// after a `stall_ms=M` hold; `after_tokens=K` serves K tokens first and cuts
-/// the stream with S. `status=0` alone clears; with `stall_ms` it stalls and
-/// then serves.
+/// the stream with S. `finish=error` ends the stream as an engine that failed
+/// the request does, a `Complete` with finish reason `error` after K tokens
+/// (0 when unset), with no status needed. `status=0` alone clears; with
+/// `stall_ms` it stalls and then serves.
 fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, String> {
     let status: u16 = optional(q, "status")?.unwrap_or(0);
     let count: Option<u32> = optional(q, "count")?;
     let secs: Option<f64> = optional(q, "secs")?;
-    let after_tokens: Option<u32> = optional(q, "after_tokens")?;
+    let mut after_tokens: Option<u32> = optional(q, "after_tokens")?;
     let stall_ms: u64 = optional(q, "stall_ms")?.unwrap_or(0);
+    let finish_error = match q.get("finish").map(String::as_str) {
+        None => false,
+        Some("error") => true,
+        Some(other) => return Err(format!("finish must be \"error\", got {other}")),
+    };
     if status != 0 && !(400..=599).contains(&status) {
         return Err(format!(
             "status must be 0 or an error status (400-599), got {status}"
         ));
     }
-    if status == 0 && after_tokens.is_some() {
+    if finish_error {
+        after_tokens = Some(after_tokens.unwrap_or(0));
+    } else if status == 0 && after_tokens.is_some() {
         return Err("after_tokens needs a status to cut the stream with".to_string());
     }
-    if status == 0 && stall_ms == 0 {
+    if status == 0 && stall_ms == 0 && !finish_error {
         return Ok(None);
     }
     let scope = match (count, secs) {
@@ -201,6 +326,7 @@ fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, Strin
         status,
         stall: Duration::from_millis(stall_ms),
         after_tokens,
+        finish_error,
         scope,
     }))
 }
@@ -355,6 +481,17 @@ async fn fault_admit_delay(
         Err(response) => return response,
     };
     apply(&worker, |e| e.fault_admit_delay_ms(ms))
+}
+
+async fn fault_cold_shape(
+    Path(worker): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    let ms: u64 = match param(&q, "ms") {
+        Ok(v) => v,
+        Err(response) => return response,
+    };
+    apply(&worker, |e| e.fault_cold_shape_ms(ms))
 }
 
 async fn fault_admit_rate(

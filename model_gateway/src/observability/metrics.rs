@@ -3,7 +3,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
 
 use dashmap::DashMap;
-use llm_tokenizer::cache::{cache_activity_stats, CacheActivityStats};
+use llm_tokenizer::{
+    cache::{cache_activity_stats, CacheActivityStats},
+    decode_activity_stats, encode_fallbacks, encode_path_loads,
+};
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge, histogram};
 use metrics_exporter_prometheus::{
     DistributionBuilder, Matcher, PrometheusBuilder, PrometheusHandle,
@@ -17,6 +20,7 @@ pub use smg_external_router::metrics::{
 };
 
 use super::worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder};
+use crate::routers::grpc::regular::symphony::telemetry as symphony_telemetry;
 
 // Interned strings are never freed; only intern low-cardinality, server-controlled
 // labels (model IDs, worker URLs, normalized paths), never user-controlled input.
@@ -47,6 +51,146 @@ pub(crate) fn intern_string(s: &str) -> Arc<str> {
 #[cfg(test)]
 pub(crate) fn interner_size() -> usize {
     STRING_INTERNER.len()
+}
+
+/// Per-worker caches of the handles the gateway's per-request records go
+/// through: the HTTP layer's, the stream-timing set's and the per-worker
+/// request counter's. The helpers, the installed flag and the router's
+/// request and duration caches are the external router crate's
+/// (`smg_external_router::metrics::handles`), so every router records the
+/// same way.
+mod handles {
+    use std::{
+        cell::{OnceCell, RefCell},
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicU64, Ordering},
+            Arc,
+        },
+    };
+
+    use metrics::{Counter, Gauge, Histogram};
+    #[cfg(test)]
+    pub(super) use smg_external_router::metrics::handles::force_on_this_thread;
+    pub(super) use smg_external_router::metrics::handles::{
+        keep_handles, nested, recorder_installed, with_handle, with_model_handle, ByLabels,
+    };
+
+    /// Handles by the matched path (the only label a request computes).
+    pub(super) type ByPath<H> = HashMap<String, H>;
+    /// Handles by method, then matched path.
+    pub(super) type ByMethodAndPath<H> = HashMap<&'static str, ByPath<H>>;
+    /// Response counters by matched path, then status code, then error code.
+    pub(super) type ByPathStatusAndError = HashMap<String, HashMap<u16, ByPath<Counter>>>;
+
+    /// The static labels of the stream-timing set.
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    pub(super) struct StreamLabels {
+        pub(super) router_type: &'static str,
+        pub(super) backend_type: &'static str,
+        pub(super) endpoint: &'static str,
+    }
+
+    /// The handles of one label set of the stream-timing set, each built
+    /// the first time a stream has something for it, so the series that
+    /// exist are exactly the ones recorded to.
+    #[derive(Default)]
+    pub(super) struct StreamHandles {
+        /// `smg_router_ttft_seconds`.
+        pub(super) ttft: OnceCell<Histogram>,
+        /// `smg_router_tpot_seconds`.
+        pub(super) tpot: OnceCell<Histogram>,
+        /// `smg_router_generation_duration_seconds`.
+        pub(super) generation: OnceCell<Histogram>,
+        /// `smg_router_tokens_total{token_type="input"}`.
+        pub(super) input_tokens: OnceCell<Counter>,
+        /// `smg_router_tokens_total{token_type="output"}`.
+        pub(super) output_tokens: OnceCell<Counter>,
+    }
+
+    /// Every registration or removal of a worker moves this on, and a
+    /// thread whose kept worker counters are from an earlier state drops
+    /// them at its next record: a removal drops the address's series from
+    /// the per-worker store, so a handle kept from before feeds nothing,
+    /// and a handle built while the address was retired is a no-op one,
+    /// which a re-registration would otherwise leave in place.
+    static WORKER_SET_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+    /// A worker registered or was removed: the kept worker counters are
+    /// stale.
+    pub(super) fn worker_set_changed() {
+        WORKER_SET_GENERATION.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// This thread's kept `smg_worker_requests_total` handles, by worker
+    /// URL then the model label as the interner gave it, with the
+    /// worker-set generation they were kept under.
+    #[derive(Default)]
+    pub(super) struct WorkerRequests {
+        generation: u64,
+        by_worker: HashMap<String, HashMap<Arc<str>, Counter>>,
+    }
+
+    impl WorkerRequests {
+        /// The handles by model for `worker_url`, after dropping every kept
+        /// handle if the worker set changed since they were kept.
+        pub(super) fn for_worker(&mut self, worker_url: &str) -> &mut HashMap<Arc<str>, Counter> {
+            let generation = WORKER_SET_GENERATION.load(Ordering::Acquire);
+            if self.generation != generation {
+                self.by_worker.clear();
+                self.generation = generation;
+            }
+            nested(&mut self.by_worker, worker_url)
+        }
+    }
+
+    thread_local! {
+        /// `smg_http_requests_total`.
+        pub(super) static HTTP_REQUESTS: RefCell<ByMethodAndPath<Counter>> = RefCell::new(HashMap::new());
+        /// `smg_http_request_duration_seconds`.
+        pub(super) static HTTP_DURATIONS: RefCell<ByMethodAndPath<Histogram>> = RefCell::new(HashMap::new());
+        /// `smg_http_responses_total`.
+        pub(super) static HTTP_RESPONSES: RefCell<ByPathStatusAndError> = RefCell::new(HashMap::new());
+        /// `smg_http_rate_limit_total` by result.
+        pub(super) static HTTP_RATE_LIMITS: RefCell<HashMap<&'static str, Counter>> = RefCell::new(HashMap::new());
+        /// `smg_http_connections_active`: one series, a handle to it per worker.
+        pub(super) static HTTP_CONNECTIONS_ACTIVE: RefCell<Option<Gauge>> = const { RefCell::new(None) };
+        /// The stream-timing set by its static labels, then the model.
+        pub(super) static STREAMS: RefCell<ByLabels<StreamLabels, StreamHandles>> = RefCell::new(HashMap::new());
+        /// `smg_worker_requests_total`.
+        pub(super) static WORKER_REQUESTS: RefCell<WorkerRequests> = RefCell::new(WorkerRequests::default());
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset() {
+        force_on_this_thread(None);
+        HTTP_REQUESTS.with_borrow_mut(HashMap::clear);
+        HTTP_DURATIONS.with_borrow_mut(HashMap::clear);
+        HTTP_RESPONSES.with_borrow_mut(HashMap::clear);
+        HTTP_RATE_LIMITS.with_borrow_mut(HashMap::clear);
+        HTTP_CONNECTIONS_ACTIVE.set(None);
+        STREAMS.with_borrow_mut(HashMap::clear);
+        WORKER_REQUESTS.with_borrow_mut(|kept| *kept = WorkerRequests::default());
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn kept_worker_counters_go_when_the_worker_set_changes() {
+            // The generation is process-wide and other tests register and
+            // remove workers: the steady state is read off the map one
+            // `for_worker` call handed out, with no second call in between
+            // that a bump elsewhere could clear.
+            let mut kept = WorkerRequests::default();
+            let counters = kept.for_worker("http://w1");
+            counters.insert(Arc::from("m"), Counter::noop());
+            assert_eq!(counters.len(), 1);
+            worker_set_changed();
+            assert!(kept.for_worker("http://w1").is_empty());
+        }
+    }
 }
 
 // =============================================================================
@@ -188,17 +332,31 @@ pub(crate) const WORKER_RETRY_BACKOFF_BUCKETS: &[f64] = &[
 ];
 
 /// Jemalloc's run-time options for a long-running gateway, for every final
-/// artifact (the `smg` executable, the Python extension) to export as
+/// artifact (the `smg` executable, the Python extension, the Go FFI library)
+/// to export as
 /// `_rjem_malloc_conf` next to its `#[global_allocator]`. With the stock
 /// settings a thread's freed pages decay back to the OS only when that thread
 /// allocates again, so after a traffic burst an idle gateway kept ~1.5 GB
 /// resident over ~270 MB of live objects (soak s2, ten hours). A background
 /// thread purges on schedule instead; dirty pages are returned after 10 s and
-/// muzzy pages at once. This is jemalloc's application-provided `malloc_conf`
-/// string under the vendored build's `_rjem_` prefix; the `_RJEM_MALLOC_CONF`
-/// environment variable is read after it and overrides it entry by entry.
-pub const SERVER_MALLOC_CONF: &[u8; 61] =
-    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0\0";
+/// muzzy pages at once.
+///
+/// jemalloc runs 16 arenas. Its default is four per CPU of the affinity mask
+/// (one on a single CPU) with every thread on an arena of its own, and each
+/// (arena, size class) pair keeps at least one partly used slab, a 64 KiB
+/// page on the aarch64 build: with ~240 threads on a many-core host a gateway
+/// holding 235 MB of live objects kept 1.6 GB of slabs (1.17 GB resident)
+/// under a steady multi-turn mix, and every new blocking-pool thread added a
+/// fresh set. With 16 arenas the same load and live heap took 0.4 GB of slabs
+/// (0.46 GB resident) at the same CPU per request; 4 arenas saved little more
+/// and cost 12 % CPU in arena contention. On a host with fewer than four CPUs
+/// the fixed count is more arenas than the default, a few mostly empty slabs.
+///
+/// This is jemalloc's application-provided `malloc_conf` string under the
+/// vendored build's `_rjem_` prefix; the `_RJEM_MALLOC_CONF` environment
+/// variable is read after it and overrides it entry by entry.
+pub const SERVER_MALLOC_CONF: &[u8; 72] =
+    b"background_thread:true,dirty_decay_ms:10000,muzzy_decay_ms:0,narenas:16\0";
 
 /// Marks jemalloc as the final artifact's Rust global allocator.
 ///
@@ -217,12 +375,37 @@ pub fn register_jemalloc_as_global_allocator() {
 }
 
 pub(crate) fn init_metrics() {
+    // What the Symphony tables read that was not content, reasoning or a call
+    // (`routers::grpc::regular::symphony::telemetry`).
+    describe_counter!(
+        symphony_telemetry::OUTPUTS,
+        "Outputs a Symphony table read to their end, by table and outcome: clean, malformed (a call region the table gave up on, or a marker of the table where no row leads, kept as content), failed (the table refused the output and the request failed), empty (no text, reasoning or call: whitespace and framing alone, or nothing), unknown_tool (read whole, with a call to a function the request did not declare, delivered as the model named it)"
+    );
+    describe_counter!(
+        symphony_telemetry::MALFORMED,
+        "Malformed runs in the outputs a Symphony table read, by table and reason: the crate's own name of the reason (unterminated_region, invalid_arguments, unknown_tool, tag_out_of_place, text_where_the_name_should_be, key_without_a_value, ..., marker_out_of_place), other for a reason this build does not name"
+    );
+    describe_histogram!(
+        symphony_telemetry::MALFORMED_BYTES,
+        "Bytes of the malformed runs of one output a Symphony table read, by table; observed for every output counted malformed"
+    );
+    describe_counter!(
+        symphony_telemetry::CALLS_SUPPRESSED,
+        "Tool calls after the first that a Symphony table read and the gateway dropped under parallel_tool_calls: false, by table"
+    );
+    describe_counter!(
+        symphony_telemetry::FALLBACK,
+        "Requests Symphony was configured for (the --parser flag or the request's X-SMG-Parser header) that the legacy parsers read instead of a table, by reason (no_table: the registry has no table for the model and nothing names one; reasoning_name_only: a reasoning parser name alone that no table answers to; legacy_tool_name: a legacy tool-call parser name no table answers to; passthrough; forced_call_without_tag: the table has no structural tag for the request's forced or required call, so the older registry's JSON schema constrains the output) and table (the table that had no tag; none where no table reads the model)"
+    );
     describe_counter!("smg_tokenizer_cache_lookups_total", "Tokenizer cache lookups by layer and result; L1 includes inputs without cacheable boundaries and excludes L0 hits");
     describe_counter!(
         "smg_tokenizer_cache_evictions_total",
         "Tokenizer cache entries removed for capacity; excludes clear, drop and replacement"
     );
     describe_counter!("smg_tokenizer_cache_reused_bytes_total", "UTF-8 input bytes served by tokenizer cache hits: whole inputs for L0, matched prefixes for L1; not memory usage");
+    describe_counter!("smg_detokenize_prefix_mismatch_total", "Incremental decode steps and end-of-input finishes whose output no longer started with the text already decoded and went on with the remainder (several per stream are possible; unary responses count too), by kind: byte_run (an invalid byte collapsed a ByteFallback run whose characters were already decoded) or decoder (another decoder step rewrote the decoded prefix)");
+    describe_counter!("smg_tokenizer_encode_path_loads_total", "Hugging Face tokenizers loaded, by the encode path chosen at load: v1 (the opt-in tokenizers v1 pipeline), native (the direct byte-level encoder) or tokenizers (the reference implementation); a tokenizer loaded twice counts twice");
+    describe_counter!("smg_tokenizer_encode_fallbacks_total", "Inputs the direct byte-level encoder gave up to the reference implementation after the load's choice, by reason: not_nfc (text not in NFC under an NFC normalizer) or piece_declined (the model declined a piece)");
 
     #[cfg(all(
         feature = "jemalloc-stats",
@@ -246,11 +429,26 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_http_responses_total",
-        "Total HTTP responses by path, status_code and error_code"
+        "Total HTTP responses by path, status_code and error_code, counted once the \
+         response has gone out in full (its last frame, or the length it declared); a \
+         request whose client closed the connection first counts as status_code 499 \
+         with error_code client_closed_request, as does the rare request the server \
+         dropped unanswered (a handler panic, a forced shutdown); a response whose body \
+         failed after its head (an upstream stream that broke mid-body) keeps its head's \
+         status_code with error_code stream_error, unless the head carried a gateway \
+         error code"
     );
     describe_gauge!(
         "smg_http_connections_active",
         "Currently active HTTP connections"
+    );
+    describe_counter!(
+        "smg_http_connection_timeouts_total",
+        "HTTP connections closed for carrying no request, by the timeout that closed them (header_read, idle)"
+    );
+    describe_counter!(
+        "smg_http_connections_rejected_total",
+        "HTTP connections closed at accept for arriving beyond the connection limit (max_connections): nothing was read from or written to them"
     );
     describe_counter!(
         "smg_http_rate_limit_total",
@@ -272,7 +470,7 @@ pub(crate) fn init_metrics() {
     // Layer 2: Router metrics
     describe_counter!(
         "smg_router_requests_total",
-        "Total routed requests by router_type, backend_type, connection_mode, model, endpoint, streaming"
+        "Total routed requests by router_type, backend_type, connection_mode, model, endpoint, streaming; model is the served model's id, unknown for a request that names no model, or other for a model the gateway does not serve"
     );
     describe_histogram!(
         "smg_router_request_duration_seconds",
@@ -280,11 +478,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_router_request_errors_total",
-        "Router errors by router_type, backend_type, connection_mode, model, endpoint, error_type"
-    );
-    describe_histogram!(
-        "smg_router_stage_duration_seconds",
-        "Pipeline stage duration by router_type and stage (gRPC only)"
+        "Router errors by router_type, backend_type, connection_mode, model, endpoint, error_type; model is the served model's id, unknown for a request that names no model, or other for a model the gateway does not serve"
     );
     describe_counter!(
         "smg_router_upstream_responses_total",
@@ -322,26 +516,44 @@ pub(crate) fn init_metrics() {
     );
 
     // Layer 2: PD disaggregation metrics (signals only SMG can measure — it is the
-    // only component that observes both the prefill and decode legs of a request).
+    // only component that observes both the prefill and decode sides of a request).
+    //
+    // The PD time to first token is split into phases the gateway bounds itself.
+    // Under sequential dispatch (the gRPC router relays the sides) the three
+    // phase families add up to `smg_pd_ttft_seconds` exactly:
+    //   prefill  smg_pd_prefill_duration_seconds    prefill dispatch -> prefill response drained
+    //   relay    smg_pd_kv_transfer_duration_seconds prefill drained -> decode dispatch (gateway work only)
+    //   decode   smg_pd_decode_ttft_seconds          decode dispatch -> first decode token
+    // The engines' own KV transfer runs inside the decode phase. Parallel
+    // dispatch sends both sides together: the decode phase is the whole TTFT and
+    // there is no relay phase.
     describe_histogram!(
         "smg_pd_prefill_duration_seconds",
-        "Prefill-leg RPC duration by backend_type, model, runtime"
+        "PD prefill phase: prefill dispatch to the end of the prefill response, the prefill engine's queueing and compute included, by backend_type, model, runtime"
     );
     describe_histogram!(
         "smg_pd_kv_transfer_duration_seconds",
-        "KV-transfer window (prefill drain to decode send) by backend_type, model, runtime (vLLM sequential PD)"
+        "PD relay phase (sequential dispatch): end of the prefill response to the decode dispatch, gateway work only; not the engines' KV transfer, which runs inside smg_pd_decode_ttft_seconds; by backend_type, model, runtime"
+    );
+    describe_histogram!(
+        "smg_pd_decode_ttft_seconds",
+        "PD decode phase: decode dispatch to the first decode token, the engines' KV transfer and the decode scheduling included (the whole TTFT under parallel dispatch), by backend_type, model, runtime"
     );
     describe_histogram!(
         "smg_pd_ttft_seconds",
-        "Honest end-to-end TTFT (prefill start to first decode token) by backend_type, model, runtime"
+        "PD time to first token: prefill dispatch to the first decode token (the decode response head on the HTTP router); under sequential dispatch the prefill, relay and decode phases add up to it; by backend_type, model, runtime"
     );
     describe_counter!(
         "smg_pd_kv_connector_mode_total",
-        "KV connector mode decisions by mode (mooncake/nixl/moriio/passthrough)"
+        "KV connector mode decisions by mode (mooncake/nixl/moriio/store/passthrough)"
     );
     describe_counter!(
         "smg_pd_bootstrap_failures_total",
         "PD bootstrap injection failures"
+    );
+    describe_counter!(
+        "smg_pd_rendezvous_failures_total",
+        "PD rendezvous failures by side (the worker type of the side whose rendezvous failed) and phase: a bootstrap port that refused the registration probe (probe) or the same probe run when a decode side's engine failed a request without a reason (request, on the prefill side whose port it is), and the failures the engines report on the gRPC path when the sides never met (bootstrap) or the KV handoff after they met failed (transfer)"
     );
     describe_counter!(
         "smg_pd_kv_transfer_failures_total",
@@ -380,10 +592,6 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_worker_pool_size",
         "Current worker pool size by worker_type, connection_mode, model"
-    );
-    describe_gauge!(
-        "smg_worker_connections_active",
-        "Active connections to workers by worker_type, connection_mode"
     );
     describe_gauge!(
         "smg_worker_requests_active",
@@ -435,7 +643,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_kv_event_batches_total",
-        "KV event batches by worker and disposition (applied, stale, tail_overflow, snapshot)"
+        "KV event batches by worker and disposition (applied, stale, snapshot, load_only)"
     );
     describe_counter!(
         "smg_engine_load_polls_total",
@@ -482,15 +690,11 @@ pub(crate) fn init_metrics() {
     describe_histogram!(
         "smg_kv_index_lookup_seconds",
         "Time of one KV index lookup (overlap scoring of a request's block hashes) \
-         in cache-aware routing, by index kind (positional, chain)"
+         in cache-aware routing, by index kind"
     );
     describe_gauge!(
         "smg_kv_event_degraded_ranks",
         "KV event ranks whose index may be stale after an unreplayed gap, by worker"
-    );
-    describe_gauge!(
-        "smg_kv_event_tail_depth",
-        "Live KV event batches held while a snapshot resync is in flight, by worker"
     );
     describe_gauge!(
         "smg_log_dropped_lines",
@@ -504,8 +708,7 @@ pub(crate) fn init_metrics() {
     );
     describe_gauge!(
         "smg_kv_index_entries",
-        "Distinct entries in the KV index, by model: (position, content hash) pairs in \
-         the positional indexer, distinct blocks on a chain in the chain index"
+        "Distinct entries in the KV index, by model: distinct blocks on a chain"
     );
     describe_gauge!(
         "smg_kv_index_runs_live",
@@ -541,7 +744,7 @@ pub(crate) fn init_metrics() {
     );
     describe_gauge!(
         "smg_kv_index_blocks",
-        "Blocks the positional index holds for a worker, as the index counts them; \
+        "Blocks the index holds for a worker, as the index counts them; \
          set when a KV event batch is applied, when the worker's state is reset \
          and when the worker is removed"
     );
@@ -564,8 +767,9 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_worker_overload_fallback_total",
-        "Requests routed to the least-loaded worker because every worker for the model is \
-         overloaded and shedding is off, by stage"
+        "Requests placed although every worker they could use is overloaded and shedding is \
+         off, by stage: routed to the least-loaded worker, or, for a cache-aware prefill pool \
+         of a prefill/decode pair, placed by that policy"
     );
     describe_counter!(
         "smg_worker_liveness_fallback_total",
@@ -621,6 +825,11 @@ pub(crate) fn init_metrics() {
          first_healthy_fallback)"
     );
     describe_counter!(
+        "smg_cache_aware_prefix_margin_held_total",
+        "Cache-aware affinity picks the spill gate's swing-sized margin alone would have spilled, \
+         kept on their holder by the price of the prefix it holds (--balance-prefix-margin-tokens)"
+    );
+    describe_counter!(
         "smg_policy_inflight_reconciled_total",
         "Policy bookings released at the per-poll in-flight reconciliation because their \
          completion never arrived, by policy"
@@ -650,6 +859,11 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_worker_cb_consecutive_successes",
         "Current consecutive success count per worker"
+    );
+    describe_counter!(
+        "smg_worker_cb_health_readmissions_total",
+        "Times a worker's open circuit breaker went half-open because the worker's health \
+         returned (its promotion to Ready) rather than at the breaker's timeout, by worker"
     );
 
     // Layer 3: Worker resilience metrics (retry)
@@ -721,6 +935,14 @@ pub(crate) fn init_metrics() {
         "smg_discovery_workers_discovered",
         "Workers known via discovery by source"
     );
+    describe_counter!(
+        "smg_discovery_snapshot_errors_total",
+        "Discovery source observations rejected, by source and reason"
+    );
+    describe_counter!(
+        "smg_discovery_skipped_total",
+        "Discovered workers left out of an otherwise good snapshot, by source and reason"
+    );
 
     // Layer 5: MCP metrics
     describe_counter!(
@@ -736,21 +958,6 @@ pub(crate) fn init_metrics() {
         "smg_mcp_tool_iterations_total",
         "Tool loop iterations in Responses API by model"
     );
-
-    // Layer 6: Database metrics
-    describe_counter!(
-        "smg_db_operations_total",
-        "Total database operations by storage_type, operation, result"
-    );
-    describe_histogram!(
-        "smg_db_operation_duration_seconds",
-        "Database operation duration by storage_type, operation"
-    );
-    describe_gauge!(
-        "smg_db_connections_active",
-        "Active database connections by storage_type"
-    );
-    describe_counter!("smg_db_items_stored", "Total items stored by storage_type");
 
     // Multimodal tensor transport (shm vs inline), labeled by runtime.
     describe_counter!(
@@ -772,6 +979,10 @@ pub(crate) fn init_metrics() {
     describe_gauge!(
         "smg_mm_turbojpeg_available",
         "1 when JPEGs decode through libjpeg-turbo (PIL's pixels), 0 through the pure-Rust fallback"
+    );
+    describe_gauge!(
+        "smg_mm_webp_available",
+        "1 when WebP files decode through libwebp, 0 through the pure-Rust fallback"
     );
     // The router-side pixel cache (--mm-pixel-cache-mb): one per process,
     // shared by every model, keyed by image and model configuration.
@@ -796,9 +1007,14 @@ pub(crate) fn init_metrics() {
         "smg_responses_stream_failures_total",
         "Responses streams that ended with a response.failed terminal, by model and reason"
     );
+    describe_counter!(
+        "smg_responses_not_stored_total",
+        "Responses with store: true whose record or conversation linking was not written, by mode (foreground: the request was answered with the failure; background: the record keeps what it had) and step (record: nothing is stored; linking: the record is stored, its items are not in the conversation)"
+    );
 
     // Layer 0: Tokio runtime self-observability (event-loop canary + sampler).
     super::runtime_metrics::describe();
+    super::history_metrics::describe();
 
     // Initialize mesh metrics
     smg_mesh::init_mesh_metrics();
@@ -837,6 +1053,9 @@ pub fn init_startup_series() {
     }
     counter!("smg_worker_overload_fallback_total", "stage" => STAGE_SELECTION).absolute(0);
     counter!("smg_worker_liveness_fallback_total", "stage" => STAGE_SELECTION).absolute(0);
+    // The connection limit's refusals: a zero series from the first scrape,
+    // bound or no bound, so a dashboard reads nothing refused as a zero.
+    counter!("smg_http_connections_rejected_total").absolute(0);
 
     // The retrying dispatch loops label their endpoint through
     // `route_to_endpoint`, whose values these are, for regular and
@@ -881,6 +1100,26 @@ pub(super) fn record_tokenizer_cache_activity() {
     }
 }
 
+pub(super) fn record_detokenize_activity() {
+    for stats in decode_activity_stats() {
+        counter!("smg_detokenize_prefix_mismatch_total", "kind" => stats.kind)
+            .absolute(stats.prefix_mismatches);
+    }
+}
+
+/// Publish the encode path chosen per tokenizer load and the inputs that left
+/// the direct encoder, process-lifetime totals like the cache activity.
+pub(super) fn record_tokenizer_encode_activity() {
+    for stats in encode_path_loads() {
+        counter!("smg_tokenizer_encode_path_loads_total", "path" => stats.path.as_str())
+            .absolute(stats.loads);
+    }
+    for stats in encode_fallbacks() {
+        counter!("smg_tokenizer_encode_fallbacks_total", "reason" => stats.reason)
+            .absolute(stats.encodes);
+    }
+}
+
 fn record_tokenizer_cache_activity_snapshot(stats: CacheActivityStats) {
     counter!("smg_tokenizer_cache_lookups_total", "layer" => stats.layer, "result" => "hit")
         .absolute(stats.hits);
@@ -922,6 +1161,7 @@ pub fn start_prometheus(config: PrometheusConfig) -> PrometheusHandle {
     worker_metrics::install(Arc::clone(&workers));
     metrics::set_global_recorder(WorkerSeriesRecorder::new(recorder, workers))
         .expect("failed to install Prometheus recorder");
+    handles::recorder_installed();
     #[cfg(all(
         feature = "jemalloc-stats",
         not(target_env = "msvc"),
@@ -987,6 +1227,10 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     // (seconds): its own buckets, or the recorder renders it as a summary.
     let retry_backoff_matcher = Matcher::Full(String::from("smg_worker_retry_backoff_seconds"));
 
+    // The malformed bytes of an output run from a marker's worth to a whole
+    // answer: their own buckets, or the recorder renders them as a summary.
+    let malformed_bytes_matcher = Matcher::Full(String::from(symphony_telemetry::MALFORMED_BYTES));
+
     HashMap::from([
         (duration_matcher, duration_bucket.clone()),
         (ttft_matcher, duration_bucket.clone()),
@@ -1003,6 +1247,10 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
         (kv_apply_matcher, KV_INDEX_MICRO_BUCKETS.to_vec()),
         (kv_lag_matcher, KV_EVENT_LAG_BUCKETS.to_vec()),
         (retry_backoff_matcher, WORKER_RETRY_BACKOFF_BUCKETS.to_vec()),
+        (
+            malformed_bytes_matcher,
+            symphony_telemetry::MALFORMED_BYTES_BUCKETS.to_vec(),
+        ),
     ])
 }
 
@@ -1176,23 +1424,6 @@ impl Metrics {
             error_type,
         );
     }
-    pub fn record_router_tokens(
-        router_type: &'static str,
-        backend_type: &'static str,
-        model_id: &str,
-        endpoint: &'static str,
-        token_type: &'static str,
-        count: u64,
-    ) {
-        RouterMetrics::record_router_tokens(
-            router_type,
-            backend_type,
-            model_id,
-            endpoint,
-            token_type,
-            count,
-        );
-    }
     pub fn record_worker_retry(worker_type: &'static str, endpoint: &'static str) {
         RouterMetrics::record_worker_retry(worker_type, endpoint);
     }
@@ -1215,53 +1446,126 @@ impl Metrics {
     /// Here we want a metric to directly reflect user's experience ("I am sending a request")
     /// when viewing the router as a blackbox, and is bumped immediately when the request arrives.
     pub fn record_http_request(method: &'static str, path: &str) {
-        let path_interned = intern_string(path);
-        counter!(
-            "smg_http_requests_total",
-            "method" => method,
-            "path" => path_interned,
-        )
-        .increment(1);
+        let build = || {
+            let path_interned = intern_string(path);
+            counter!(
+                "smg_http_requests_total",
+                "method" => method,
+                "path" => path_interned,
+            )
+        };
+        if !handles::keep_handles() {
+            build().increment(1);
+            return;
+        }
+        handles::HTTP_REQUESTS.with_borrow_mut(|by_method| {
+            handles::with_handle(
+                by_method.entry(method).or_default(),
+                path,
+                build,
+                |counter| {
+                    counter.increment(1);
+                },
+            );
+        });
     }
 
     /// Record HTTP request duration.
     /// For best performance, pass static strings for method.
     pub fn record_http_duration(method: &'static str, path: &str, duration: Duration) {
-        let path_interned = intern_string(path);
-        histogram!(
-            "smg_http_request_duration_seconds",
-            "method" => method,
-            "path" => path_interned
-        )
-        .record(duration.as_secs_f64());
+        let build = || {
+            let path_interned = intern_string(path);
+            histogram!(
+                "smg_http_request_duration_seconds",
+                "method" => method,
+                "path" => path_interned
+            )
+        };
+        let seconds = duration.as_secs_f64();
+        if !handles::keep_handles() {
+            build().record(seconds);
+            return;
+        }
+        handles::HTTP_DURATIONS.with_borrow_mut(|by_method| {
+            handles::with_handle(
+                by_method.entry(method).or_default(),
+                path,
+                build,
+                |histogram| {
+                    histogram.record(seconds);
+                },
+            );
+        });
     }
 
     /// Set active HTTP connections count
     pub fn set_http_connections_active(count: usize) {
-        gauge!("smg_http_connections_active").set(count as f64);
+        if !handles::keep_handles() {
+            gauge!("smg_http_connections_active").set(count as f64);
+            return;
+        }
+        handles::HTTP_CONNECTIONS_ACTIVE.with_borrow_mut(|gauge| {
+            gauge
+                .get_or_insert_with(|| gauge!("smg_http_connections_active"))
+                .set(count as f64);
+        });
     }
 
     /// Record HTTP response.
     pub fn record_http_response(path: &str, status_code: u16, error_code: &str) {
-        let path_interned = intern_string(path);
-        let status_str: Cow<'static, str> = status_code_to_cow(status_code);
-        let error_interned = intern_string(error_code);
+        let build = || {
+            let path_interned = intern_string(path);
+            let status_str: Cow<'static, str> = status_code_to_cow(status_code);
+            let error_interned = intern_string(error_code);
+            counter!(
+                "smg_http_responses_total",
+                "path" => path_interned,
+                "status_code" => status_str,
+                "error_code" => error_interned
+            )
+        };
+        if !handles::keep_handles() {
+            build().increment(1);
+            return;
+        }
+        handles::HTTP_RESPONSES.with_borrow_mut(|by_path| {
+            handles::with_handle(
+                handles::nested(by_path, path)
+                    .entry(status_code)
+                    .or_default(),
+                error_code,
+                build,
+                |counter| counter.increment(1),
+            );
+        });
+    }
+
+    /// Record a connection closed by one of the HTTP edge's connection
+    /// timeouts (`header_read` or `idle`).
+    pub fn record_http_connection_timeout(timeout: &'static str) {
         counter!(
-            "smg_http_responses_total",
-            "path" => path_interned,
-            "status_code" => status_str,
-            "error_code" => error_interned
+            "smg_http_connection_timeouts_total",
+            "timeout" => timeout
         )
         .increment(1);
     }
 
+    /// Record a connection closed at accept for arriving beyond the
+    /// connection limit.
+    pub fn record_http_connection_rejected() {
+        counter!("smg_http_connections_rejected_total").increment(1);
+    }
+
     /// Record rate limit decision.
     pub fn record_http_rate_limit(result: &'static str) {
-        counter!(
-            "smg_http_rate_limit_total",
-            "result" => result
-        )
-        .increment(1);
+        let build = || counter!("smg_http_rate_limit_total", "result" => result);
+        if !handles::keep_handles() {
+            build().increment(1);
+            return;
+        }
+        handles::HTTP_RATE_LIMITS.with_borrow_mut(|by_result| {
+            by_result.entry(result).or_insert_with(build).increment(1);
+        });
     }
 
     /// Track a request entering the admission queue.
@@ -1309,6 +1613,10 @@ impl Metrics {
         gauge!("smg_mm_turbojpeg_available").set(if available { 1.0 } else { 0.0 });
     }
 
+    pub fn set_mm_webp_available(available: bool) {
+        gauge!("smg_mm_webp_available").set(if available { 1.0 } else { 0.0 });
+    }
+
     /// The pixel cache's occupancy and eviction series, at zero: called when
     /// the cache is built, so they are on the first scrape.
     pub fn init_mm_pixel_cache_series() {
@@ -1349,6 +1657,18 @@ impl Metrics {
         .increment(1);
     }
 
+    /// A `store: true` response whose record (`step` record: nothing is
+    /// stored) or conversation linking (`step` linking) was not written, by
+    /// `mode` (foreground, background).
+    pub fn record_response_not_stored(mode: &'static str, step: &'static str) {
+        counter!(
+            "smg_responses_not_stored_total",
+            "mode" => mode,
+            "step" => step
+        )
+        .increment(1);
+    }
+
     pub fn record_mm_processing(model_id: &str, mode: &'static str, reason: &'static str) {
         let model = intern_model_label(model_id);
         counter!(
@@ -1363,21 +1683,6 @@ impl Metrics {
     // ========================================================================
     // Layer 2: Router metrics
     // ========================================================================
-
-    /// Record pipeline stage duration (gRPC only).
-    /// All labels are static, so this is very fast.
-    pub fn record_router_stage_duration(
-        router_type: &'static str,
-        stage: &'static str,
-        duration: Duration,
-    ) {
-        histogram!(
-            "smg_router_stage_duration_seconds",
-            "router_type" => router_type,
-            "stage" => stage
-        )
-        .record(duration.as_secs_f64());
-    }
 
     /// Record a single-shot resend after a pre-response transport failure.
     pub fn record_upstream_send_retry(router_type: &'static str) {
@@ -1426,65 +1731,6 @@ impl Metrics {
     // Layer 2: Router inference metrics (gRPC only)
     // ========================================================================
 
-    /// Record time to first token.
-    /// Uses string interning for model_id.
-    pub fn record_router_ttft(
-        router_type: &'static str,
-        backend_type: &'static str,
-        model_id: &str,
-        endpoint: &'static str,
-        duration: Duration,
-    ) {
-        let model = intern_model_label(model_id);
-        histogram!(
-            "smg_router_ttft_seconds",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "model" => model,
-            "endpoint" => endpoint
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    /// Record time per output token
-    pub fn record_router_tpot(
-        router_type: &'static str,
-        backend_type: &'static str,
-        model_id: &str,
-        endpoint: &'static str,
-        duration: Duration,
-    ) {
-        let model = intern_model_label(model_id);
-        histogram!(
-            "smg_router_tpot_seconds",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "model" => model,
-            "endpoint" => endpoint
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    /// Record total generation duration.
-    /// Uses string interning for model_id.
-    pub fn record_router_generation_duration(
-        router_type: &'static str,
-        backend_type: &'static str,
-        model_id: &str,
-        endpoint: &'static str,
-        duration: Duration,
-    ) {
-        let model = intern_model_label(model_id);
-        histogram!(
-            "smg_router_generation_duration_seconds",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "model" => model,
-            "endpoint" => endpoint
-        )
-        .record(duration.as_secs_f64());
-    }
-
     /// Record all streaming metrics in a single batch call.
     ///
     /// This consolidates TTFT, TPOT, generation duration, and token metrics
@@ -1501,80 +1747,126 @@ impl Metrics {
             output_tokens,
         } = params;
 
-        // Intern model string once - Arc::clone is just a ref count increment
-        let model = intern_model_label(model_id);
+        // TPOT is only meaningful past the first token.
+        let tpot = ttft.and_then(|ttft| {
+            (output_tokens > 1)
+                .then(|| generation_duration.saturating_sub(ttft) / (output_tokens as u32 - 1))
+        });
 
-        // TTFT and TPOT (only if we have a first token time)
-        if let Some(ttft_duration) = ttft {
+        // The handles, built the first time a stream has something for
+        // each of them; the model label is interned once per build.
+        let model = || intern_model_label(model_id);
+        let ttft_histogram = || {
             histogram!(
                 "smg_router_ttft_seconds",
                 "router_type" => router_type,
                 "backend_type" => backend_type,
-                "model" => Arc::clone(&model),
+                "model" => model(),
                 "endpoint" => endpoint
             )
-            .record(ttft_duration.as_secs_f64());
-
-            // TPOT - only meaningful with >1 output token
-            if output_tokens > 1 {
-                let time_after_first = generation_duration.saturating_sub(ttft_duration);
-                let tpot = time_after_first / (output_tokens as u32 - 1);
-                histogram!(
-                    "smg_router_tpot_seconds",
-                    "router_type" => router_type,
-                    "backend_type" => backend_type,
-                    "model" => Arc::clone(&model),
-                    "endpoint" => endpoint
-                )
-                .record(tpot.as_secs_f64());
-            }
-        }
-
-        // Generation duration (always recorded)
-        histogram!(
-            "smg_router_generation_duration_seconds",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "model" => Arc::clone(&model),
-            "endpoint" => endpoint
-        )
-        .record(generation_duration.as_secs_f64());
-
-        // Input tokens (if available)
-        if let Some(input) = input_tokens {
+        };
+        let tpot_histogram = || {
+            histogram!(
+                "smg_router_tpot_seconds",
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "model" => model(),
+                "endpoint" => endpoint
+            )
+        };
+        let generation_histogram = || {
+            histogram!(
+                "smg_router_generation_duration_seconds",
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "model" => model(),
+                "endpoint" => endpoint
+            )
+        };
+        let input_counter = || {
             counter!(
                 "smg_router_tokens_total",
                 "router_type" => router_type,
                 "backend_type" => backend_type,
-                "model" => Arc::clone(&model),
+                "model" => model(),
                 "endpoint" => endpoint,
                 "token_type" => metrics_labels::TOKEN_INPUT
             )
-            .increment(input);
+        };
+        let output_counter = || {
+            counter!(
+                "smg_router_tokens_total",
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "model" => model(),
+                "endpoint" => endpoint,
+                "token_type" => metrics_labels::TOKEN_OUTPUT
+            )
+        };
+
+        if !handles::keep_handles() {
+            if let Some(ttft) = ttft {
+                ttft_histogram().record(ttft.as_secs_f64());
+            }
+            if let Some(tpot) = tpot {
+                tpot_histogram().record(tpot.as_secs_f64());
+            }
+            generation_histogram().record(generation_duration.as_secs_f64());
+            if let Some(input) = input_tokens {
+                input_counter().increment(input);
+            }
+            output_counter().increment(output_tokens);
+            return;
         }
 
-        // Output tokens (always recorded - move model on final use)
-        counter!(
-            "smg_router_tokens_total",
-            "router_type" => router_type,
-            "backend_type" => backend_type,
-            "model" => model,
-            "endpoint" => endpoint,
-            "token_type" => metrics_labels::TOKEN_OUTPUT
-        )
-        .increment(output_tokens);
+        let labels = handles::StreamLabels {
+            router_type,
+            backend_type,
+            endpoint,
+        };
+        handles::STREAMS.with_borrow_mut(|by_labels| {
+            handles::with_model_handle(
+                by_labels.entry(labels).or_default(),
+                model_id,
+                |_label| handles::StreamHandles::default(),
+                |kept| {
+                    if let Some(ttft) = ttft {
+                        kept.ttft
+                            .get_or_init(ttft_histogram)
+                            .record(ttft.as_secs_f64());
+                    }
+                    if let Some(tpot) = tpot {
+                        kept.tpot
+                            .get_or_init(tpot_histogram)
+                            .record(tpot.as_secs_f64());
+                    }
+                    kept.generation
+                        .get_or_init(generation_histogram)
+                        .record(generation_duration.as_secs_f64());
+                    if let Some(input) = input_tokens {
+                        kept.input_tokens
+                            .get_or_init(input_counter)
+                            .increment(input);
+                    }
+                    kept.output_tokens
+                        .get_or_init(output_counter)
+                        .increment(output_tokens);
+                },
+            );
+        });
     }
 
     // ========================================================================
     // Layer 2: PD disaggregation metrics
     //
     // Per-request, engine-agnostic signals that no backend can self-report: SMG
-    // is the only component that sees both the prefill and decode legs. All
+    // is the only component that sees both the prefill and decode sides. All
     // durations come from a monotonic clock and are recorded once per request
     // (never per retry attempt).
     // ========================================================================
 
-    /// Record prefill-leg RPC duration.
+    /// Record the PD prefill phase: prefill dispatch to the end of the prefill
+    /// response.
     /// Uses string interning for model_id; runtime is a static label.
     pub fn record_pd_prefill_duration(
         backend_type: &'static str,
@@ -1592,8 +1884,11 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Record the KV-transfer window (prefill drain to decode send) for vLLM
-    /// sequential PD. Uses string interning for model_id; runtime is a static label.
+    /// Record the PD relay phase of sequential dispatch: the gateway's own gap
+    /// between the drained prefill response and the decode dispatch. The family
+    /// name predates the phase model and stays for compatibility; this is not
+    /// the engines' KV transfer, which runs inside the decode phase.
+    /// Uses string interning for model_id; runtime is a static label.
     pub fn record_pd_kv_transfer_duration(
         backend_type: &'static str,
         model_id: &str,
@@ -1610,12 +1905,36 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Record honest end-to-end TTFT: prefill start to first decode token.
+    /// Record the PD decode phase: decode dispatch to the first decode token.
+    /// Under sequential dispatch this is where the engines' KV transfer and the
+    /// decode scheduling show up; under parallel dispatch both sides go out
+    /// together and the value is the end-to-end TTFT.
+    /// Uses string interning for model_id; runtime is a static label.
+    pub fn record_pd_decode_ttft(
+        backend_type: &'static str,
+        model_id: &str,
+        runtime: &'static str,
+        duration: Duration,
+    ) {
+        let model = intern_model_label(model_id);
+        histogram!(
+            "smg_pd_decode_ttft_seconds",
+            "backend_type" => backend_type,
+            "model" => model,
+            "runtime" => runtime
+        )
+        .record(duration.as_secs_f64());
+    }
+
+    /// Record the PD time to first token: prefill dispatch to the first decode
+    /// token.
     ///
-    /// INVARIANT: this is the user-facing complement to
-    /// `smg_router_ttft_seconds{backend_type="pd"}`, which measures only the
-    /// decode leg (first decode token minus decode-send). For sequential PD the
-    /// two differ by the prefill + KV-transfer time; both are kept on purpose.
+    /// `smg_router_ttft_seconds{backend_type="pd"}` shares the prefill-dispatch
+    /// anchor on the gRPC streaming paths (their stream base is the prefill
+    /// dispatch). This family adds the runtime label and is the total that the
+    /// phase families (`record_pd_prefill_duration`,
+    /// `record_pd_kv_transfer_duration`, `record_pd_decode_ttft`) add up to
+    /// under sequential dispatch.
     /// Uses string interning for model_id; runtime is a static label.
     pub fn record_pd_ttft(
         backend_type: &'static str,
@@ -1633,7 +1952,7 @@ impl Metrics {
         .record(duration.as_secs_f64());
     }
 
-    /// Record a KV connector mode decision (mooncake/nixl/moriio/passthrough).
+    /// Record a KV connector mode decision (mooncake/nixl/moriio/store/passthrough).
     pub fn record_pd_kv_connector_mode(mode: &'static str) {
         counter!(
             "smg_pd_kv_connector_mode_total",
@@ -1645,6 +1964,22 @@ impl Metrics {
     /// Record a PD bootstrap injection failure.
     pub fn record_pd_bootstrap_failure() {
         counter!("smg_pd_bootstrap_failures_total").increment(1);
+    }
+
+    /// Record a PD rendezvous failure by `side` (the worker type of the side
+    /// whose rendezvous failed) and `phase` (`probe` at registration and
+    /// `request` on the request path, the prefill side's port probed by the
+    /// gateway; `bootstrap` or `transfer` as the engine reported it). Its
+    /// own family: the injection
+    /// failures above keep their unlabelled series, so a bare selector on
+    /// it still reads them alone.
+    pub fn record_pd_rendezvous_failure(side: &'static str, phase: &'static str) {
+        counter!(
+            "smg_pd_rendezvous_failures_total",
+            "leg" => side,
+            "phase" => phase
+        )
+        .increment(1);
     }
 
     /// Record a PD KV-transfer failure (missing connector params at handoff).
@@ -1720,20 +2055,6 @@ impl Metrics {
         .set(size as f64);
     }
 
-    /// Set active worker connections
-    pub fn set_worker_connections_active(
-        worker_type: &'static str,
-        connection_mode: &'static str,
-        count: usize,
-    ) {
-        gauge!(
-            "smg_worker_connections_active",
-            "worker_type" => worker_type,
-            "connection_mode" => connection_mode
-        )
-        .set(count as f64);
-    }
-
     /// Record health check result
     pub fn record_worker_health_check(worker_type: &'static str, result: &'static str) {
         counter!(
@@ -1794,8 +2115,10 @@ impl Metrics {
         .increment(1);
     }
 
-    /// Record a request steered to the least-loaded worker because every
-    /// worker for the model is overloaded and shedding is off.
+    /// Record a request placed although every worker it could use is
+    /// overloaded and shedding is off: steered to the least-loaded worker,
+    /// or, for a cache-aware prefill pool of a prefill/decode pair, placed by
+    /// that policy (which counts the pick as a selection too).
     pub fn record_worker_overload_fallback(stage: &'static str) {
         counter!(
             "smg_worker_overload_fallback_total",
@@ -1871,6 +2194,13 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record a cache-aware affinity pick that the spill gate's swing-sized
+    /// margin alone would have spilled, kept on its holder by the held
+    /// prefix's price
+    pub fn record_cache_aware_prefix_margin_held() {
+        counter!("smg_cache_aware_prefix_margin_held_total").increment(1);
+    }
+
     /// Record bookings a policy released at the in-flight reconciliation
     /// tick: dispatches whose completion never reached it.
     pub fn record_policy_inflight_reconciled(policy: &'static str, released: usize) {
@@ -1906,12 +2236,23 @@ impl Metrics {
     }
 
     /// Set running requests per worker
-    /// A request dispatched to a worker (each attempt, each PD leg), counted
+    /// A request dispatched to a worker (each attempt, each PD side), counted
     /// at the send. The per-worker gauges miss short requests and cannot be
     /// summed over a window, so this is how the share of traffic per worker
     /// is read from the scrape.
     pub fn record_worker_request(worker_url: &str, model_id: &str) {
-        Self::worker_requests(worker_url, model_id).increment(1);
+        if !handles::keep_handles() {
+            Self::worker_requests(worker_url, model_id).increment(1);
+            return;
+        }
+        handles::WORKER_REQUESTS.with_borrow_mut(|kept| {
+            handles::with_model_handle(
+                kept.for_worker(worker_url),
+                model_id,
+                |_label| Self::worker_requests(worker_url, model_id),
+                |counter| counter.increment(1),
+            );
+        });
     }
 
     /// A worker registered: its request counter exists from zero, so a
@@ -2171,12 +2512,7 @@ impl Metrics {
             .set(count as f64);
     }
 
-    /// Live batches held for a worker while a snapshot resync is in flight.
-    pub fn set_kv_event_tail_depth(worker_url: &str, depth: usize) {
-        gauge!("smg_kv_event_tail_depth", "worker" => intern_string(worker_url)).set(depth as f64);
-    }
-
-    /// Publish the blocks the positional index holds for a worker. Called from
+    /// Publish the blocks the index holds for a worker. Called from
     /// the KV event subscriber where it already counts applied batches, never
     /// from the lookup path, so routing reads nothing that writes.
     pub fn set_kv_index_blocks(worker_url: &str, blocks: usize) {
@@ -2264,6 +2600,28 @@ impl Metrics {
         .increment(1);
     }
 
+    /// Record an open circuit breaker put on trial (half-open) by the
+    /// worker's return to health rather than by its timeout.
+    pub fn record_worker_cb_health_readmission(worker: &str) {
+        let worker_interned = intern_string(worker);
+        counter!(
+            "smg_worker_cb_health_readmissions_total",
+            "worker" => worker_interned
+        )
+        .increment(1);
+    }
+
+    /// Publish the health-readmission counter at zero, so the series exists
+    /// before the worker's first return.
+    pub fn init_worker_cb_health_readmissions(worker: &str) {
+        let worker_interned = intern_string(worker);
+        counter!(
+            "smg_worker_cb_health_readmissions_total",
+            "worker" => worker_interned
+        )
+        .absolute(0);
+    }
+
     /// Set circuit breaker consecutive failures
     pub fn set_worker_cb_consecutive_failures(worker: &str, count: u32) {
         let worker_interned = intern_string(worker);
@@ -2330,6 +2688,28 @@ impl Metrics {
         .set(count as f64);
     }
 
+    /// Record a discovered worker a provider left out of a snapshot it
+    /// otherwise applied
+    pub fn record_discovery_skip(source: &'static str, reason: &'static str) {
+        counter!(
+            "smg_discovery_skipped_total",
+            "source" => source,
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
+    /// Record a discovery source observation that was rejected; the provider
+    /// keeps reconciling its last good snapshot meanwhile
+    pub fn record_discovery_snapshot_error(source: &'static str, reason: &'static str) {
+        counter!(
+            "smg_discovery_snapshot_errors_total",
+            "source" => source,
+            "reason" => reason
+        )
+        .increment(1);
+    }
+
     // ========================================================================
     // Layer 5: MCP metrics
     // ========================================================================
@@ -2337,57 +2717,6 @@ impl Metrics {
     /// Set active MCP servers count
     pub fn set_mcp_servers_active(count: usize) {
         gauge!("smg_mcp_servers_active").set(count as f64);
-    }
-
-    // ========================================================================
-    // Layer 6: Database metrics
-    // ========================================================================
-
-    /// Record database operation
-    pub fn record_db_operation(
-        storage_type: &'static str,
-        operation: &'static str,
-        result: &'static str,
-    ) {
-        counter!(
-            "smg_db_operations_total",
-            "storage_type" => storage_type,
-            "operation" => operation,
-            "result" => result
-        )
-        .increment(1);
-    }
-
-    /// Record database operation duration
-    pub fn record_db_operation_duration(
-        storage_type: &'static str,
-        operation: &'static str,
-        duration: Duration,
-    ) {
-        histogram!(
-            "smg_db_operation_duration_seconds",
-            "storage_type" => storage_type,
-            "operation" => operation
-        )
-        .record(duration.as_secs_f64());
-    }
-
-    /// Set active database connections
-    pub fn set_db_connections_active(storage_type: &'static str, count: usize) {
-        gauge!(
-            "smg_db_connections_active",
-            "storage_type" => storage_type
-        )
-        .set(count as f64);
-    }
-
-    /// Record item stored
-    pub fn increment_db_items_stored(storage_type: &'static str) {
-        counter!(
-            "smg_db_items_stored",
-            "storage_type" => storage_type
-        )
-        .increment(1);
     }
 
     // ========================================================================
@@ -2501,6 +2830,7 @@ impl Metrics {
         if let Some(series) = worker_metrics::installed() {
             series.activate(worker_url);
         }
+        handles::worker_set_changed();
     }
 
     /// The registration at `worker_url` was removed: drop the address's
@@ -2512,6 +2842,7 @@ impl Metrics {
         if let Some(series) = worker_metrics::installed() {
             series.retire(worker_url);
         }
+        handles::worker_set_changed();
         STRING_INTERNER.remove(worker_url);
     }
 
@@ -2610,6 +2941,32 @@ mod tests {
                     .any(|line| line.starts_with(&format!("{name}{{"))
                         && line.contains(&format!("layer=\"{layer}\""))));
             }
+        }
+    }
+
+    #[test]
+    fn encode_path_activity_registers_every_path_and_reason_on_scrape() {
+        let rendered = render_with_recorder(|| {
+            init_metrics();
+            record_tokenizer_encode_activity();
+        });
+        for path in ["v1", "native", "tokenizers"] {
+            assert!(
+                rendered.lines().any(|line| {
+                    line.starts_with("smg_tokenizer_encode_path_loads_total{")
+                        && line.contains(&format!("path=\"{path}\""))
+                }),
+                "missing path {path}: {rendered}"
+            );
+        }
+        for reason in ["not_nfc", "piece_declined"] {
+            assert!(
+                rendered.lines().any(|line| {
+                    line.starts_with("smg_tokenizer_encode_fallbacks_total{")
+                        && line.contains(&format!("reason=\"{reason}\""))
+                }),
+                "missing reason {reason}: {rendered}"
+            );
         }
     }
 
@@ -3255,6 +3612,71 @@ mod tests {
     }
 
     #[test]
+    fn test_record_pd_decode_ttft_emits_histogram() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::record_pd_decode_ttft(
+                metrics_labels::BACKEND_PD,
+                "m",
+                "vllm",
+                Duration::from_millis(321),
+            );
+        });
+        assert!(
+            rendered.contains("smg_pd_decode_ttft_seconds_count")
+                && rendered.contains(r#"runtime="vllm""#),
+            "pd decode ttft histogram not emitted; rendered:\n{rendered}"
+        );
+    }
+
+    /// The PD phase families say on `/metrics` what they bound: the relay
+    /// family is the gateway's own gap and not the engines' KV transfer, and
+    /// the prefill phase, the decode phase and the total name their anchors.
+    #[test]
+    fn pd_phase_families_describe_what_they_measure() {
+        let (rendered, ()) = with_test_recorder(|| {
+            init_metrics();
+            let sample = Duration::from_millis(5);
+            Metrics::record_pd_prefill_duration(metrics_labels::BACKEND_PD, "m", "vllm", sample);
+            Metrics::record_pd_kv_transfer_duration(
+                metrics_labels::BACKEND_PD,
+                "m",
+                "vllm",
+                sample,
+            );
+            Metrics::record_pd_decode_ttft(metrics_labels::BACKEND_PD, "m", "vllm", sample);
+            Metrics::record_pd_ttft(metrics_labels::BACKEND_PD, "m", "vllm", sample);
+        });
+        let help = |family: &str| -> String {
+            rendered
+                .lines()
+                .find_map(|line| line.strip_prefix(&format!("# HELP {family} ")))
+                .unwrap_or_else(|| panic!("no # HELP for {family}; rendered:\n{rendered}"))
+                .to_owned()
+        };
+        let prefill = help("smg_pd_prefill_duration_seconds");
+        assert!(
+            prefill.contains("prefill dispatch to the end of the prefill response"),
+            "{prefill}"
+        );
+        let relay = help("smg_pd_kv_transfer_duration_seconds");
+        assert!(
+            relay.contains("relay phase") && relay.contains("not the engines' KV transfer"),
+            "{relay}"
+        );
+        let decode = help("smg_pd_decode_ttft_seconds");
+        assert!(
+            decode.contains("decode dispatch to the first decode token"),
+            "{decode}"
+        );
+        let total = help("smg_pd_ttft_seconds");
+        assert!(
+            total.contains("prefill dispatch to the first decode token")
+                && total.contains("add up to it"),
+            "{total}"
+        );
+    }
+
+    #[test]
     fn test_record_pd_kv_connector_mode_counts_by_mode() {
         let (rendered, ()) = with_test_recorder(|| {
             Metrics::record_pd_kv_connector_mode(metrics_labels::KV_CONNECTOR_MOONCAKE);
@@ -3286,5 +3708,415 @@ mod tests {
             rendered.contains("smg_pd_kv_transfer_failures_total 2"),
             "kv transfer failure counter wrong; rendered:\n{rendered}"
         );
+    }
+
+    #[test]
+    fn test_record_pd_rendezvous_failure_by_side_and_phase() {
+        let (rendered, ()) = with_test_recorder(|| {
+            Metrics::record_pd_bootstrap_failure();
+            Metrics::record_pd_rendezvous_failure(metrics_labels::WORKER_PREFILL, "probe");
+            Metrics::record_pd_rendezvous_failure(metrics_labels::WORKER_DECODE, "bootstrap");
+            Metrics::record_pd_rendezvous_failure(metrics_labels::WORKER_DECODE, "bootstrap");
+        });
+        // Two families: the injection series keeps its unlabelled shape, and
+        // the labelled rendezvous counts never join it.
+        assert!(
+            rendered.contains("smg_pd_bootstrap_failures_total 1"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("smg_pd_bootstrap_failures_total{"),
+            "{rendered}"
+        );
+        let labelled: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_pd_rendezvous_failures_total{"))
+            .collect();
+        assert_eq!(labelled.len(), 2, "{rendered}");
+        assert!(
+            labelled.iter().any(|line| line.contains(r#"leg="prefill""#)
+                && line.contains(r#"phase="probe""#)
+                && line.ends_with(" 1")),
+            "{rendered}"
+        );
+        assert!(
+            labelled.iter().any(|line| line.contains(r#"leg="decode""#)
+                && line.contains(r#"phase="bootstrap""#)
+                && line.ends_with(" 2")),
+            "{rendered}"
+        );
+    }
+
+    /// With handles kept, the records update the recorder's own series: the
+    /// rendered counts are those of the records. The keeping is this
+    /// thread's say, so the test runs with the others.
+    #[test]
+    fn kept_handles_update_the_recorders_series() {
+        let rendered = render_with_recorder(|| {
+            handles::force_on_this_thread(Some(true));
+            for _ in 0..3 {
+                Metrics::record_http_request("POST", "/v1/chat/completions");
+            }
+            Metrics::record_http_request("GET", "/v1/models");
+            for _ in 0..2 {
+                Metrics::record_http_response("/v1/chat/completions", 200, "");
+            }
+            Metrics::record_http_response("/v1/chat/completions", 429, "rate_limited");
+            Metrics::record_http_duration("POST", "/v1/chat/completions", Duration::from_millis(5));
+            Metrics::record_http_rate_limit("allowed");
+            Metrics::record_http_rate_limit("allowed");
+            Metrics::set_http_connections_active(7);
+            Metrics::record_http_connection_rejected();
+            handles::reset();
+        });
+        for expected in [
+            "smg_http_requests_total{method=\"POST\",path=\"/v1/chat/completions\"} 3",
+            "smg_http_requests_total{method=\"GET\",path=\"/v1/models\"} 1",
+            "smg_http_responses_total{path=\"/v1/chat/completions\",status_code=\"200\",error_code=\"\"} 2",
+            "smg_http_responses_total{path=\"/v1/chat/completions\",status_code=\"429\",error_code=\"rate_limited\"} 1",
+            "smg_http_rate_limit_total{result=\"allowed\"} 2",
+            "smg_http_connections_active 7",
+            "smg_http_connections_rejected_total 1",
+        ] {
+            assert!(
+                rendered.lines().any(|line| line == expected),
+                "missing {expected} in:\n{rendered}"
+            );
+        }
+        assert!(rendered.contains("smg_http_request_duration_seconds_count{method=\"POST\",path=\"/v1/chat/completions\"} 1"));
+    }
+
+    /// The cost of one HTTP record with and without the kept handles, for
+    /// the Numbers table; run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "a timing, not a check"]
+    #[expect(clippy::print_stdout, reason = "the timing is the output")]
+    fn time_per_http_record() {
+        use std::time::Instant;
+        const ROUNDS: u32 = 200_000;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let time = |label: &str| {
+            metrics::with_local_recorder(&recorder, || {
+                let start = Instant::now();
+                for _ in 0..ROUNDS {
+                    Metrics::record_http_request("POST", "/v1/chat/completions");
+                    Metrics::set_http_connections_active(3);
+                    Metrics::record_http_duration(
+                        "POST",
+                        "/v1/chat/completions",
+                        Duration::from_millis(2),
+                    );
+                    Metrics::record_http_response("/v1/chat/completions", 200, "");
+                }
+                let per_request = start.elapsed().as_nanos() as f64 / f64::from(ROUNDS);
+                println!(
+                    "ns per request for the HTTP layer's four records, {label}: {per_request:.0}"
+                );
+            });
+        };
+        time("keys built per record");
+        handles::force_on_this_thread(Some(true));
+        time("handles kept per worker");
+        handles::reset();
+    }
+
+    /// The lines of a scrape that are series (not `# HELP` or `# TYPE`),
+    /// sorted, for comparing two recorders' output.
+    fn sorted_series(rendered: &str) -> Vec<&str> {
+        let mut series: Vec<&str> = rendered
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .collect();
+        series.sort_unstable();
+        series
+    }
+
+    /// The stream-timing set recorded through kept handles renders exactly
+    /// as it does with a key built per record: the same series with the
+    /// same values, and no series a stream had nothing for (no TTFT or
+    /// TPOT for a model whose streams gave no token, no input tokens for an
+    /// endpoint that reports none).
+    #[test]
+    fn the_stream_timing_set_renders_the_same_through_kept_handles() {
+        let records = || {
+            for (ttft, output_tokens, input_tokens) in [
+                (Some(Duration::from_millis(10)), 5, Some(100)),
+                (None, 1, None),
+                (Some(Duration::from_millis(5)), 1, Some(7)),
+            ] {
+                Metrics::record_streaming_metrics(StreamingMetricsParams {
+                    router_type: metrics_labels::ROUTER_GRPC,
+                    backend_type: metrics_labels::BACKEND_REGULAR,
+                    model_id: "m1",
+                    endpoint: metrics_labels::ENDPOINT_CHAT,
+                    ttft,
+                    generation_duration: Duration::from_millis(50),
+                    input_tokens,
+                    output_tokens,
+                });
+            }
+            Metrics::record_streaming_metrics(StreamingMetricsParams {
+                router_type: metrics_labels::ROUTER_GRPC,
+                backend_type: metrics_labels::BACKEND_REGULAR,
+                model_id: "m2",
+                endpoint: metrics_labels::ENDPOINT_GENERATE,
+                ttft: None,
+                generation_duration: Duration::from_millis(20),
+                input_tokens: None,
+                output_tokens: 1,
+            });
+        };
+        let built = render_with_recorder(records);
+        let mut kept_label_sets = 0;
+        let kept = render_with_recorder(|| {
+            handles::force_on_this_thread(Some(true));
+            records();
+            kept_label_sets = handles::STREAMS
+                .with_borrow(|by_labels| by_labels.values().map(HashMap::len).sum::<usize>());
+            handles::reset();
+        });
+        assert_eq!(sorted_series(&kept), sorted_series(&built));
+        assert_eq!(kept_label_sets, 2, "one bundle per label set and model");
+        for expected in [
+            "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\",token_type=\"output\"} 7",
+            "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\",token_type=\"input\"} 107",
+            "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\",endpoint=\"generate\",token_type=\"output\"} 1",
+            "smg_router_ttft_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 2",
+            "smg_router_tpot_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 1",
+            "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 3",
+            "smg_router_generation_duration_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\",endpoint=\"generate\"} 1",
+        ] {
+            assert!(
+                kept.lines().any(|line| line == expected),
+                "missing {expected} in:\n{kept}"
+            );
+        }
+        for absent in [
+            "smg_router_ttft_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
+            "smg_router_tpot_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
+            "model=\"m2\",endpoint=\"generate\",token_type=\"input\"",
+        ] {
+            assert!(!kept.contains(absent), "unexpected {absent} in:\n{kept}");
+        }
+    }
+
+    /// The kept worker counters follow the worker set: a removal drops the
+    /// address's series and the handles kept to them, so a write after the
+    /// removal lands nowhere, and a re-registration starts the counter over
+    /// instead of feeding the handle built while the address was retired.
+    #[test]
+    fn kept_worker_counters_follow_the_workers_registrations() {
+        let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+            parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )));
+        let recorder = WorkerSeriesRecorder::new(
+            PrometheusBuilder::new().build_recorder(),
+            Arc::clone(&workers),
+        );
+        // The rendered `smg_worker_requests_total` of each worker, in order.
+        let counts = || {
+            let mut rendered = String::new();
+            workers.render_into(&mut rendered);
+            ["http://w1", "http://w2"].map(|worker| {
+                rendered
+                    .lines()
+                    .find(|line| {
+                        line.starts_with("smg_worker_requests_total{")
+                            && line.contains(&format!("worker=\"{worker}\""))
+                    })
+                    .map(|line| line.rsplit(' ').next().unwrap_or_default().to_owned())
+            })
+        };
+        handles::force_on_this_thread(Some(true));
+        metrics::with_local_recorder(&recorder, || {
+            Metrics::record_worker_request("http://w1", "m");
+            Metrics::record_worker_request("http://w1", "m");
+            Metrics::record_worker_request("http://w2", "m");
+            assert_eq!(counts(), [Some("2".to_owned()), Some("1".to_owned())]);
+
+            workers.retire("http://w1");
+            handles::worker_set_changed();
+            // A send racing the removal: its write is dropped, not kept.
+            Metrics::record_worker_request("http://w1", "m");
+            assert_eq!(counts(), [None, Some("1".to_owned())]);
+
+            workers.activate("http://w1");
+            handles::worker_set_changed();
+            Metrics::record_worker_request("http://w1", "m");
+            Metrics::record_worker_request("http://w1", "m");
+            Metrics::record_worker_request("http://w2", "m");
+            assert_eq!(counts(), [Some("2".to_owned()), Some("2".to_owned())]);
+        });
+        handles::reset();
+    }
+
+    /// The registry's registration and removal hooks are what move the
+    /// worker-set generation the kept counters are checked against.
+    #[test]
+    fn a_registration_or_a_removal_drops_the_kept_worker_counters() {
+        let mut kept = handles::WorkerRequests::default();
+        kept.for_worker("http://w")
+            .insert(Arc::from("m"), metrics::Counter::noop());
+        Metrics::remove_worker_metrics("http://gone");
+        assert!(kept.for_worker("http://w").is_empty(), "a removal");
+        kept.for_worker("http://w")
+            .insert(Arc::from("m"), metrics::Counter::noop());
+        Metrics::worker_registered("http://new");
+        assert!(kept.for_worker("http://w").is_empty(), "a registration");
+    }
+
+    /// The cost of the router's per-request records with and without the
+    /// kept handles, for the Numbers table: the request counter, the
+    /// worker counter (through the per-worker store) and the duration
+    /// histogram of a unary request, and the stream-timing set on top for a
+    /// streamed one; run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "a timing, not a check"]
+    #[expect(clippy::print_stdout, reason = "the timing is the output")]
+    fn time_per_router_record() {
+        use std::time::Instant;
+        const ROUNDS: u32 = 200_000;
+        const WORKER: &str = "grpc://worker-1:20000";
+        const MODEL: &str = "model-a";
+        let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+            parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )));
+        let recorder =
+            WorkerSeriesRecorder::new(PrometheusBuilder::new().build_recorder(), workers);
+        let request = |streaming: &'static str| {
+            Metrics::record_router_request(
+                metrics_labels::ROUTER_GRPC,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_GRPC,
+                MODEL,
+                metrics_labels::ENDPOINT_CHAT,
+                streaming,
+            );
+            Metrics::record_worker_request(WORKER, MODEL);
+        };
+        let duration = || {
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_GRPC,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_GRPC,
+                MODEL,
+                metrics_labels::ENDPOINT_CHAT,
+                Duration::from_millis(20),
+            );
+        };
+        let unary = || {
+            request(STREAMING_FALSE);
+            duration();
+        };
+        let streamed = || {
+            request(STREAMING_TRUE);
+            Metrics::record_streaming_metrics(StreamingMetricsParams {
+                router_type: metrics_labels::ROUTER_GRPC,
+                backend_type: metrics_labels::BACKEND_REGULAR,
+                model_id: MODEL,
+                endpoint: metrics_labels::ENDPOINT_CHAT,
+                ttft: Some(Duration::from_millis(50)),
+                generation_duration: Duration::from_secs(1),
+                input_tokens: Some(128),
+                output_tokens: 128,
+            });
+            duration();
+        };
+        let time = |label: &str| {
+            metrics::with_local_recorder(&recorder, || {
+                for (name, records) in [
+                    ("unary (3 records)", &unary as &dyn Fn()),
+                    ("streamed (8 records)", &streamed as &dyn Fn()),
+                ] {
+                    let start = Instant::now();
+                    for _ in 0..ROUNDS {
+                        records();
+                    }
+                    let per_request = start.elapsed().as_nanos() as f64 / f64::from(ROUNDS);
+                    println!("ns per {name} request, {label}: {per_request:.0}");
+                }
+            });
+        };
+        time("keys built per record");
+        handles::force_on_this_thread(Some(true));
+        time("handles kept per worker");
+        handles::reset();
+    }
+
+    /// The same unary records from eight threads at once, as runtime
+    /// workers record them: the interner's and the registry's lock traffic
+    /// between workers, which one thread cannot show. Thread time per
+    /// request (the wall time of the eight threads, times eight, over the
+    /// requests); run with `--ignored --nocapture` on eight free cores.
+    #[test]
+    #[ignore = "a timing, not a check"]
+    #[expect(clippy::print_stdout, reason = "the timing is the output")]
+    fn time_per_router_record_contended() {
+        use std::time::Instant;
+        const ROUNDS: u32 = 400_000;
+        const THREADS: u32 = 8;
+        const WORKER: &str = "grpc://worker-1:20000";
+        const MODEL: &str = "model-a";
+        let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+            parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )));
+        let recorder =
+            WorkerSeriesRecorder::new(PrometheusBuilder::new().build_recorder(), workers);
+        let unary = || {
+            Metrics::record_router_request(
+                metrics_labels::ROUTER_GRPC,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_GRPC,
+                MODEL,
+                metrics_labels::ENDPOINT_CHAT,
+                STREAMING_FALSE,
+            );
+            Metrics::record_worker_request(WORKER, MODEL);
+            Metrics::record_router_duration(
+                metrics_labels::ROUTER_GRPC,
+                metrics_labels::BACKEND_REGULAR,
+                metrics_labels::CONNECTION_GRPC,
+                MODEL,
+                metrics_labels::ENDPOINT_CHAT,
+                Duration::from_millis(20),
+            );
+        };
+        let time = |label: &str, keep: bool| {
+            let start = Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..THREADS {
+                    scope.spawn(|| {
+                        handles::force_on_this_thread(Some(keep));
+                        metrics::with_local_recorder(&recorder, || {
+                            for _ in 0..ROUNDS / THREADS {
+                                unary();
+                            }
+                        });
+                    });
+                }
+            });
+            let per_request =
+                start.elapsed().as_nanos() as f64 * f64::from(THREADS) / f64::from(ROUNDS);
+            println!(
+                "ns of thread time per unary request, {THREADS} threads at once, {label}: {per_request:.0}"
+            );
+        };
+        time("keys built per record", false);
+        time("handles kept per worker", true);
     }
 }

@@ -145,6 +145,25 @@ impl ByteLevelTable {
         Some(table.finish())
     }
 
+    /// Decode a complete HF sequence using the same bytes as incremental decode.
+    /// Unknown IDs are dropped, as in tokenizers; lossy UTF-8 conversion happens
+    /// only after concatenation so characters may span token boundaries.
+    #[cfg(any(feature = "tokenizers-v1", test))]
+    pub(crate) fn decode(&self, ids: &[TokenIdType], skip_special_tokens: bool) -> String {
+        let mut bytes = Vec::with_capacity(ids.len().saturating_mul(4));
+        for &id in ids {
+            if let Some((token_bytes, special)) = self.entry(id) {
+                if !skip_special_tokens || !special {
+                    bytes.extend_from_slice(token_bytes);
+                }
+            }
+        }
+        match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(error) => String::from_utf8_lossy(error.as_bytes()).into_owned(),
+        }
+    }
+
     /// The bytes of `id` and whether it is special; `None` for an id the
     /// vocabulary lacks.
     #[inline]
@@ -490,6 +509,71 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn full_decode_matches_hf_at_byte_boundaries() {
+        let mut tokenizer = byte_level_tokenizer();
+        // Outside the byte alphabet: the entire added token must stay UTF-8.
+        tokenizer
+            .add_tokens([AddedToken::from("工具Ġ", false)])
+            .expect("add Unicode token");
+        let table = ByteLevelTable::build(&tokenizer).expect("table");
+        let smg = crate::HuggingFaceTokenizer::from_tokenizer(tokenizer.clone());
+        let special = tokenizer.token_to_id(SPECIAL).expect("special");
+        let unicode = tokenizer.token_to_id("工具Ġ").expect("Unicode");
+        for a in 0..256 {
+            for b in 0..256 {
+                for skip in [false, true] {
+                    let ids = [a, special, b, u32::MAX, unicode];
+                    let expected = tokenizer.decode(&ids, skip).expect("HF decode");
+                    assert_eq!(table.decode(&ids, skip), expected, "{ids:?} {skip}");
+                    assert_eq!(
+                        crate::traits::Decoder::decode(&smg, &ids, skip).expect("SMG decode"),
+                        expected
+                    );
+                }
+            }
+        }
+        for ids in [vec![], vec![u32::MAX], vec![0xF0, 0x9F], vec![0xFF]] {
+            assert_eq!(
+                table.decode(&ids, false),
+                tokenizer.decode(&ids, false).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn full_decode_drops_sparse_vocabulary_holes() {
+        let model = BPE::builder()
+            .vocab_and_merges(
+                Vocab::from_iter([("a".to_owned(), 0), ("b".to_owned(), 2)]),
+                vec![],
+            )
+            .build()
+            .expect("sparse BPE");
+        let mut tokenizer = HfTokenizer::new(model);
+        tokenizer.with_decoder(Some(ByteLevelDecoder::default()));
+        let smg = crate::HuggingFaceTokenizer::from_tokenizer(tokenizer.clone());
+        for skip in [false, true] {
+            let ids = [0, 1, 2, u32::MAX];
+            assert_eq!(
+                crate::traits::Decoder::decode(&smg, &ids, skip).unwrap(),
+                tokenizer.decode(&ids, skip).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn full_decode_preserves_non_byte_level_decoder() {
+        let mut tokenizer = byte_level_tokenizer();
+        tokenizer.with_decoder(Some(Metaspace::default()));
+        let smg = crate::HuggingFaceTokenizer::from_tokenizer(tokenizer.clone());
+        let ids = [b'h' as u32, b'e' as u32, u32::MAX];
+        assert_eq!(
+            crate::traits::Decoder::decode(&smg, &ids, false).unwrap(),
+            tokenizer.decode(&ids, false).unwrap()
+        );
     }
 
     #[test]

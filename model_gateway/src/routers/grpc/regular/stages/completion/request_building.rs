@@ -19,8 +19,8 @@ use crate::routers::{
         backend_client::BackendClient,
         common::stages::{helpers, BuildStage},
         context::{
-            AttemptStamp, BuildOutput, ClientSelection, CompletionItem, ExecutionPlan,
-            ExecutionPlanKind, PreparationOutput, RequestContext, WorkerSelection,
+            stage_output, AttemptStamp, BuildOutput, ClientSelection, CompletionItem,
+            ExecutionPlan, ExecutionPlanKind, PreparationOutput, RequestContext, WorkerSelection,
         },
         proto_wrapper::ProtoGenerateRequest,
         spec::{CompletionResponseSpec, ResponseSpec},
@@ -96,13 +96,10 @@ impl CompletionRequestBuildingStage {
 #[async_trait]
 impl BuildStage for CompletionRequestBuildingStage {
     async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
-        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
-            error!(
-                function = "CompletionRequestBuildingStage::build",
-                "Preparation not completed"
-            );
-            error::internal_error("preparation_not_completed", "Preparation not completed")
-        })?;
+        let prep = stage_output(
+            ctx.state.preparation.as_ref(),
+            "CompletionRequestBuildingStage::build",
+        )?;
 
         let PreparationOutput::Completion { items, .. } = prep else {
             error!(
@@ -115,16 +112,10 @@ impl BuildStage for CompletionRequestBuildingStage {
             ));
         };
 
-        let clients = ctx.state.clients.as_ref().ok_or_else(|| {
-            error!(
-                function = "CompletionRequestBuildingStage::build",
-                "Client acquisition not completed"
-            );
-            error::internal_error(
-                "client_acquisition_not_completed",
-                "Client acquisition not completed",
-            )
-        })?;
+        let clients = stage_output(
+            ctx.state.clients.as_ref(),
+            "CompletionRequestBuildingStage::build",
+        )?;
 
         let completion_request = ctx.completion_request_arc();
 
@@ -222,6 +213,7 @@ impl BuildStage for CompletionRequestBuildingStage {
                 sampling_mask,
                 sampling_baseline,
                 inject_pd_metadata: self.inject_pd_metadata,
+                tool_constraint: None,
             },
         })
     }

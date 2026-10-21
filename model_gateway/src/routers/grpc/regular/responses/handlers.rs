@@ -28,17 +28,19 @@ use axum::{
     http,
     response::{IntoResponse, Response},
 };
-use openai_protocol::responses::ResponsesRequest;
+use openai_protocol::responses::{ResponsesRequest, ResponsesResponse};
 use tracing::debug;
 use uuid::Uuid;
 
-use super::{
-    common::{load_conversation_history, ResponsesCallContext},
-    conversions, non_streaming, streaming,
-};
-use crate::routers::{
-    error,
-    grpc::common::responses::{ensure_mcp_connection, ResponsesContext},
+use super::{common::ResponsesCallContext, conversions, non_streaming, streaming};
+use crate::{
+    middleware::TenantRequestMeta,
+    routers::{
+        error,
+        grpc::common::responses::{
+            ensure_mcp_connection, load_history, BackgroundStream, ResponsesContext,
+        },
+    },
 };
 
 /// Main handler for POST /v1/responses
@@ -48,7 +50,7 @@ pub(crate) async fn route_responses(
     ctx: &ResponsesContext,
     request: Arc<ResponsesRequest>,
     headers: Option<http::HeaderMap>,
-    tenant_request_meta: crate::middleware::TenantRequestMeta,
+    tenant_request_meta: TenantRequestMeta,
     model_id: String,
 ) -> Response {
     // Route based on execution mode
@@ -60,7 +62,7 @@ pub(crate) async fn route_responses(
             response_id: None,
             tenant_request_meta,
         };
-        route_responses_streaming(ctx, request, params).await
+        route_responses_streaming(ctx, request, params, None).await
     } else {
         let params = ResponsesCallContext {
             headers,
@@ -70,6 +72,45 @@ pub(crate) async fn route_responses(
         };
         route_responses_sync(ctx, request, params).await
     }
+}
+
+/// The work of a background response (`background: true` without a stream):
+/// the sync path under the id its `queued` record was stored under; the
+/// terminal object is persisted under that id by the path itself.
+pub(crate) async fn route_responses_background(
+    ctx: &ResponsesContext,
+    request: Arc<ResponsesRequest>,
+    headers: Option<http::HeaderMap>,
+    tenant_request_meta: TenantRequestMeta,
+    model_id: String,
+    response_id: String,
+) -> Result<ResponsesResponse, Response> {
+    let params = ResponsesCallContext {
+        headers,
+        model_id,
+        response_id: Some(response_id),
+        tenant_request_meta,
+    };
+    non_streaming::route_responses_internal(ctx, request, params).await
+}
+
+/// A background response the client streams: the stream runs under the id
+/// its `queued` record was stored under and carries `response.queued`.
+pub(crate) async fn route_responses_background_stream(
+    ctx: &ResponsesContext,
+    request: Arc<ResponsesRequest>,
+    headers: Option<http::HeaderMap>,
+    tenant_request_meta: TenantRequestMeta,
+    model_id: String,
+    background: BackgroundStream,
+) -> Response {
+    let params = ResponsesCallContext {
+        headers,
+        model_id,
+        response_id: Some(background.id().to_string()),
+        tenant_request_meta,
+    };
+    route_responses_streaming(ctx, request, params, Some(background)).await
 }
 
 // ============================================================================
@@ -97,12 +138,15 @@ async fn route_responses_streaming(
     ctx: &ResponsesContext,
     request: Arc<ResponsesRequest>,
     params: ResponsesCallContext,
+    background: Option<BackgroundStream>,
 ) -> Response {
-    // 1. Load conversation history
-    let modified_request = match load_conversation_history(ctx, &request).await {
-        Ok(req) => req,
-        Err(response) => return response, // Already a Response with proper status code
-    };
+    // 1. Load conversation history, as the caller's tenant may see it
+    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
+    let modified_request =
+        match load_history(ctx.history_stores(), &request, tenant.as_deref()).await {
+            Ok(req) => req,
+            Err(response) => return response, // Already a Response with proper status code
+        };
 
     // 2. Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = match ensure_mcp_connection(
@@ -125,6 +169,7 @@ async fn route_responses_streaming(
             &request,
             params,
             mcp_servers,
+            background,
         )
         .await;
     }
@@ -141,5 +186,12 @@ async fn route_responses_streaming(
     };
 
     // 4. Execute chat pipeline and convert streaming format (no MCP tools)
-    streaming::convert_chat_stream_to_responses_stream(ctx, chat_request, params, &request).await
+    streaming::convert_chat_stream_to_responses_stream(
+        ctx,
+        chat_request,
+        params,
+        &request,
+        background,
+    )
+    .await
 }

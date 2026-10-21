@@ -322,15 +322,15 @@ message GenerateComplete {
   uint32 spec_accepted_tokens = 13;
   uint32 spec_draft_tokens = 14;
 
-  // Identity of worker-processed media, returned by the prefill leg so the
-  // decode leg can be served without pixels: the expanded prompt ids plus one
+  // Identity of worker-processed media, returned by the prefill side so the
+  // decode side can be served without pixels: the expanded prompt ids plus one
   // pixel-less MultimodalInputs per modality (hashes, placeholders, grid
   // tensors). Absent on non-PD requests and from older servicers.
   MediaIdentity media_identity = 15;
 }
 
 // What the prefill worker learned about the media it processed, in the shape
-// the decode leg already accepts from a router-preprocessed request.
+// the decode side already accepts from a router-preprocessed request.
 message MediaIdentity {
   repeated uint32 prompt_token_ids = 1;
   MultimodalInputs mm_inputs = 2;
@@ -416,7 +416,7 @@ message GetServerInfoResponse {
 
   // PD pairing protocol: what a prefill and a decode must agree on for a KV
   // handoff to work. These mirror the factors vLLM's NIXL compatibility hash
-  // is built from, so the router can keep incompatible legs apart before the
+  // is built from, so the router can keep incompatible workers apart before the
   // engines reject each other at handshake.
   string kv_cache_dtype = 11;     // cache_config.cache_dtype ("auto", "fp8", ...)
   int32 block_size = 12;          // cache_config.block_size (0 until the engine resolves it)
@@ -465,6 +465,37 @@ message GetServerInfoResponse {
   // Uses the model dtype, matching TokenSpeed; empty when unknown.
   // Flattened into the worker label used to cast multimodal input tensors.
   string multimodal_encoder_dtype = 22;
+
+  // The engine's reasoning parser (`--reasoning-parser`, as the structured
+  // outputs config carries it: "glm45", "deepseek_r1", ...); "" when it runs
+  // none. Flattened into the `engine_reasoning_parser` worker label, a name of
+  // its own: `reasoning_parser` is the per-model parser override the router
+  // reads off a worker's labels and validates against its own registry at
+  // registration, and the engine's parser names are the engine's, not the
+  // router's.
+  string engine_reasoning_parser = 23;
+
+  // Where the engine starts applying a request's grammar (structured outputs)
+  // on a prompt that ends inside the model's thinking block:
+  // "after_reasoning" when its structured-output manager waits until the
+  // reasoning parser has seen the thought's end (a reasoning parser is set and
+  // `enable_in_reasoning` is off), "first_token" when the grammar runs from the
+  // first generated token; "" when the engine's config does not say.
+  // Flattened into the `constrained_decoding_start` worker label, which shapes
+  // the router's forced tool-call grammar: the bare calls behind a reasoning
+  // parser's gate (the call is forced right there, as the engine's own server
+  // does), the thought and then the calls from the first token.
+  string constrained_decoding_start = 24;
+
+  // The engine's encoder budget in feature tokens: the most one media item
+  // may carry and still be scheduled (vLLM: the lesser of its encoder compute
+  // budget and its encoder cache size, the "budget of N tokens" of its
+  // encoder-cache start-up line; its own front end refuses an item above it).
+  // 0 when unknown, or not a multimodal model. Flattened into the
+  // `mm_encoder_budget` worker label, which the router's own media pipeline
+  // holds each item to; the worker-side pipeline takes the same number from
+  // its launcher.
+  int32 mm_encoder_budget = 25;
 }
 
 // =====================

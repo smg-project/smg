@@ -1,10 +1,175 @@
-use std::net::{IpAddr, SocketAddr};
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::Path,
+};
 
-use axum::http::HeaderName;
+use axum::http::{HeaderName, HeaderValue, Uri};
 use sha2::{Digest, Sha256};
+use tokio::sync::Semaphore;
 
 use super::*;
-use crate::policies::cost as selection_cost;
+use crate::{middleware::scheduler, policies::cost as selection_cost};
+
+/// Each listener needs its own port. `listeners` are `(field, flag, port)`
+/// in configuration order; the first two on one port are refused under the
+/// later listener's field, naming both flags.
+fn validate_distinct_listener_ports(listeners: &[(&str, &str, u16)]) -> ConfigResult<()> {
+    for (i, (field, flag, port)) in listeners.iter().enumerate() {
+        if let Some((_, other_flag, _)) = listeners[..i].iter().find(|(_, _, p)| p == port) {
+            return Err(ConfigError::invalid_value(
+                *field,
+                port,
+                format!(
+                    "{flag} and {other_flag} are both {port}; each listener needs its own port"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The mesh listener's port against the HTTP, metrics and probe ports. The
+/// mesh configuration lives beside the router configuration, out of
+/// [`ConfigValidator`]'s sight, so `server::startup` runs this check: it is
+/// the one place every way of building the server configuration (the CLI,
+/// the Python binding, a library caller) passes through.
+pub fn validate_mesh_listener_port(
+    mesh_port: u16,
+    port: u16,
+    metrics_port: Option<u16>,
+    health_check_port: Option<u16>,
+    admin_port: Option<u16>,
+) -> ConfigResult<()> {
+    let listeners = [
+        Some(("port", "--port", port)),
+        metrics_port.map(|port| ("metrics.port", "--prometheus-port", port)),
+        health_check_port.map(|port| ("health_check_port", "--health-check-port", port)),
+        admin_port.map(|port| ("admin_port", "--admin-port", port)),
+        Some(("mesh_port", "--mesh-port", mesh_port)),
+    ];
+    let listeners: Vec<_> = listeners.into_iter().flatten().collect();
+    validate_distinct_listener_ports(&listeners)
+}
+
+/// Whether a tokenizer source names a path on this host rather than a hub
+/// id: absolute or explicitly relative, more than one separator (a hub id is
+/// `owner/name`), or simply present on disk.
+fn names_a_local_path(source: &str) -> bool {
+    source.starts_with('/')
+        || source.starts_with("./")
+        || source.starts_with("../")
+        || source.starts_with('~')
+        || source.matches('/').count() > 1
+        || Path::new(source).exists()
+}
+
+/// Whether a gRPC worker can still bring the tokenizer when the local source
+/// is missing: the connection mode is gRPC; IGW mode takes registrations at
+/// run time (`POST /workers` with `grpc://` URLs); a discovery provider adds
+/// workers later (bare `host:port` URLs whose mode is probed when they
+/// register); or a start-up URL names a gRPC worker itself. The connection
+/// mode alone misses the middle two: it follows the start-up URLs only.
+fn a_grpc_worker_may_register(config: &RouterConfig) -> bool {
+    if config.connection_mode == crate::worker::ConnectionMode::Grpc
+        || config.enable_igw
+        || config.discovery.is_some()
+    {
+        return true;
+    }
+    let grpc = |url: &str| url.starts_with("grpc://") || url.starts_with("grpcs://");
+    match &config.mode {
+        RoutingMode::Regular { worker_urls } => worker_urls.iter().any(|url| grpc(url)),
+        RoutingMode::PrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        }
+        | RoutingMode::EncodePrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        } => {
+            prefill_urls.iter().any(|(url, _)| grpc(url)) || decode_urls.iter().any(|url| grpc(url))
+        }
+        // External providers: no worker of ours registers.
+        RoutingMode::OpenAI { .. } | RoutingMode::Anthropic { .. } | RoutingMode::Gemini { .. } => {
+            false
+        }
+    }
+}
+
+/// Why a local tokenizer source cannot serve.
+#[derive(Debug, PartialEq, Eq)]
+enum SourceProblem {
+    /// Nothing at the path on this host.
+    Missing,
+    /// The path is there and cannot serve, for the reason given.
+    Unusable(String),
+}
+
+impl SourceProblem {
+    fn reason(self) -> String {
+        match self {
+            Self::Missing => "does not exist".to_string(),
+            Self::Unusable(reason) => reason,
+        }
+    }
+}
+
+/// Why `path` cannot serve as a local tokenizer source, if it cannot: it
+/// must exist and be readable; a directory must hold one of the layouts the
+/// tokenizer loader recognizes, a file must not be empty.
+fn local_tokenizer_source_error(path: &Path) -> Result<(), SourceProblem> {
+    let unusable = |reason: String| SourceProblem::Unusable(reason);
+    let metadata = std::fs::metadata(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => SourceProblem::Missing,
+        _ => unusable(format!("cannot be read: {error}")),
+    })?;
+    if !metadata.is_dir() {
+        std::fs::File::open(path).map_err(|error| unusable(format!("cannot be read: {error}")))?;
+        if metadata.len() == 0 {
+            return Err(unusable("is empty".to_string()));
+        }
+        return Ok(());
+    }
+    let mut entries =
+        std::fs::read_dir(path).map_err(|error| unusable(format!("cannot be read: {error}")))?;
+    // The loader's own rule: one of the single files, or the vocab.json +
+    // merges.txt pair (vocab.json alone is not a layout it loads).
+    let holds_a_tokenizer = entries.any(|entry| {
+        entry.is_ok_and(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name == "tokenizer.json" || name == "tiktoken.model" || name.ends_with(".tiktoken")
+        })
+    }) || (path.join("vocab.json").is_file()
+        && path.join("merges.txt").is_file());
+    if holds_a_tokenizer {
+        Ok(())
+    } else {
+        Err(unusable(
+            "contains no tokenizer file (tokenizer.json, tiktoken.model, *.tiktoken, or vocab.json with merges.txt)"
+                .to_string(),
+        ))
+    }
+}
+
+/// Why `path` is not a readable, non-empty text file, if it is not.
+fn text_file_error(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => "does not exist".to_string(),
+        _ => format!("cannot be read: {error}"),
+    })?;
+    if metadata.is_dir() {
+        return Err("is a directory, not a file".to_string());
+    }
+    let content =
+        std::fs::read_to_string(path).map_err(|error| format!("cannot be read: {error}"))?;
+    if content.trim().is_empty() {
+        return Err("is empty".to_string());
+    }
+    Ok(())
+}
 
 /// Validate a user-supplied mesh server name. The name keys rate-limit
 /// shards as `rl:{counter}:{name}`, so an empty name or one containing the
@@ -12,11 +177,11 @@ use crate::policies::cost as selection_cost;
 /// panic at mesh adapter construction during startup.
 pub fn validate_mesh_server_name(name: &str) -> ConfigResult<()> {
     if name.is_empty() || name.contains(':') {
-        return Err(ConfigError::InvalidValue {
-            field: "mesh_server_name".to_string(),
-            value: name.to_string(),
-            reason: "must be non-empty and must not contain ':'".to_string(),
-        });
+        return Err(ConfigError::invalid_value(
+            "mesh_server_name",
+            name,
+            "must be non-empty and must not contain ':'",
+        ));
     }
     Ok(())
 }
@@ -31,11 +196,11 @@ pub fn validate_mesh_server_name(name: &str) -> ConfigResult<()> {
 /// worker.
 pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     if url.is_empty() {
-        return Err(ConfigError::InvalidValue {
-            field: "worker_url".to_string(),
-            value: url.to_string(),
-            reason: "URL cannot be empty".to_string(),
-        });
+        return Err(ConfigError::invalid_value(
+            "worker_url",
+            url,
+            "URL cannot be empty",
+        ));
     }
 
     // Exact (lowercase) scheme allow-list. Case-insensitive matching is
@@ -46,12 +211,12 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     const ALLOWED_SCHEMES: &[&str] = &["http", "https", "grpc", "grpcs", "ipc"];
     let scheme = url.split_once("://").map_or("", |(s, _)| s);
     if !ALLOWED_SCHEMES.contains(&scheme) {
-        return Err(ConfigError::InvalidValue {
-            field: "worker_url".to_string(),
-            value: url.to_string(),
-            reason: "URL must start with a lowercase http://, https://, grpc://, grpcs://, or ipc:// scheme"
-                .to_string(),
-        });
+        return Err(ConfigError::invalid_value(
+            "worker_url",
+            url,
+            "URL must start with a lowercase http://, https://, grpc://, grpcs://, or ipc:// \
+             scheme",
+        ));
     }
 
     // ipc:// worker URLs are same-host ZMQ unix-socket paths (no host); validate
@@ -59,11 +224,11 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     if scheme == "ipc" {
         let path = url.strip_prefix("ipc://").unwrap_or("");
         if path.is_empty() {
-            return Err(ConfigError::InvalidValue {
-                field: "worker_url".to_string(),
-                value: url.to_string(),
-                reason: "ipc:// worker URL must include a socket path".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "worker_url",
+                url,
+                "ipc:// worker URL must include a socket path",
+            ));
         }
         return Ok(());
     }
@@ -71,19 +236,19 @@ pub fn validate_worker_url(url: &str) -> ConfigResult<()> {
     match ::url::Url::parse(url) {
         Ok(parsed) => {
             if parsed.host_str().is_none() {
-                return Err(ConfigError::InvalidValue {
-                    field: "worker_url".to_string(),
-                    value: url.to_string(),
-                    reason: "URL must have a valid host".to_string(),
-                });
+                return Err(ConfigError::invalid_value(
+                    "worker_url",
+                    url,
+                    "URL must have a valid host",
+                ));
             }
         }
         Err(e) => {
-            return Err(ConfigError::InvalidValue {
-                field: "worker_url".to_string(),
-                value: url.to_string(),
-                reason: format!("Invalid URL format: {e}"),
-            });
+            return Err(ConfigError::invalid_value(
+                "worker_url",
+                url,
+                format!("Invalid URL format: {e}"),
+            ));
         }
     }
     Ok(())
@@ -115,21 +280,80 @@ pub fn bind_socket_addr(host: &str, port: u16) -> Result<SocketAddr, String> {
     parse_bind_host(host).map(|ip| SocketAddr::new(ip, port))
 }
 
+/// The listener address of the RDMA pixel lane's metadata exchange
+/// (`--rdma-listen-ip`, `SMG_RDMA_LISTEN_IP`): a plain IPv4 or IPv6 address,
+/// surrounding whitespace aside. The workers connect to the address as it is
+/// written, so a hostname, a port or the brackets of a `host:port` string are
+/// refused with everything else that is not an IP address; `999.1.1.1` used
+/// to pass and fail only when the lane came up, far from the flag.
+pub(crate) fn parse_listen_ip(value: &str) -> Result<IpAddr, String> {
+    value.trim().parse::<IpAddr>().map_err(|_| {
+        format!("invalid listen IP '{value}': expected an IP address such as 10.0.0.7 or fd00::1")
+    })
+}
+
+/// The most worker threads an explicit `runtime_worker_threads` may ask
+/// for, on every host alike: the counts that are a typo or a misread unit
+/// (10,000; 100,000), each of which is a stack and a thread the scheduler
+/// wakes for nothing, are refused without reading the host, so a
+/// configuration that validates on one host validates on another (a pod
+/// under a cgroup CPU quota included). A few times the CPUs of the largest
+/// hosts, not a budget.
+pub const RUNTIME_WORKER_THREADS_CEILING: usize = 4096;
+
+/// Worker threads per CPU available to the process above which an explicit
+/// count is an oversubscription worth a warning: a worker thread beyond the
+/// CPUs only waits for one. Advice at start-up, not a refusal: a runtime
+/// deliberately oversubscribed (handlers that block a worker) is the
+/// operator's choice, which the host's quota must not veto.
+pub const RUNTIME_WORKER_THREADS_PER_CPU: usize = 4;
+
+/// The warning for an explicit `runtime_worker_threads` above
+/// [`RUNTIME_WORKER_THREADS_PER_CPU`] x the `cpus` available to the process
+/// (never under one CPU's worth: a parallelism that cannot be read counts as
+/// one), `None` within it. Pure over the CPU count so the rule is testable;
+/// start-up logs it where it logs the runtime's size.
+pub fn runtime_worker_threads_oversubscription(threads: usize, cpus: usize) -> Option<String> {
+    let advised = cpus.max(1).saturating_mul(RUNTIME_WORKER_THREADS_PER_CPU);
+    (threads > advised).then(|| {
+        format!(
+            "runtime_worker_threads {threads} is above {advised}, \
+             {RUNTIME_WORKER_THREADS_PER_CPU} x the {cpus} CPUs available to this process: a \
+             worker thread beyond the CPUs only waits for one and costs its stack"
+        )
+    })
+}
+
+/// The CPUs available to this process, as the runtime's own default reads
+/// them (the affinity mask and the cgroup quota included); 1 when the count
+/// cannot be read.
+pub fn available_cpus() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from)
+}
+
 /// Configuration validator
 pub(crate) struct ConfigValidator;
 impl ConfigValidator {
     pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
+        bounds::validate(config)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_cache_boundaries(&config.cache_boundaries)?;
         Self::validate_server_settings(config)?;
+        Self::validate_cors_allowed_origins(config)?;
+        Self::validate_value_shapes(config)?;
+        Self::validate_log_dir(config)?;
+        Self::validate_access_log_fields(config)?;
         Self::validate_storage_context_headers(config)?;
         Self::validate_routing_key_headers(config)?;
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
+        Self::validate_memory_history(config)?;
         Self::validate_model_aliases(config)?;
         Self::validate_rl(config)?;
+        Self::validate_kv_index(config)?;
         Self::validate_prefill_admission(config)?;
+        Self::validate_priority_scheduler(config)?;
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
         }
@@ -148,6 +372,7 @@ impl ConfigValidator {
         let cb_cfg = config.effective_circuit_breaker_config();
         Self::validate_retry(&retry_cfg)?;
         Self::validate_circuit_breaker(&cb_cfg)?;
+        Self::validate_health_check(&config.health_check)?;
 
         if config.history_backend == HistoryBackend::Oracle {
             if config.oracle.is_none() {
@@ -159,8 +384,31 @@ impl ConfigValidator {
                 Self::validate_oracle(oracle)?;
             }
         }
+        // The Redis and Postgres configurations carry their own numeric rules
+        // (the pool size, the call bound, a retention of 0 days that would
+        // expire every record as it is written); the command line ran them
+        // while building its config, the bindings and a directly built
+        // RouterConfig did not, so they run here for every start-up. The
+        // connection string's shape is the driver's: a socket path or a
+        // key=value string the driver understands is not refused here (the
+        // command line's own URL check stays with the command line).
+        if config.history_backend == HistoryBackend::Redis {
+            if let Some(redis) = &config.redis {
+                redis
+                    .validate_bounds()
+                    .map_err(|reason| ConfigError::ValidationFailed { reason })?;
+            }
+        }
+        if config.history_backend == HistoryBackend::Postgres {
+            if let Some(postgres) = &config.postgres {
+                postgres
+                    .validate_bounds()
+                    .map_err(|reason| ConfigError::ValidationFailed { reason })?;
+            }
+        }
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+        Self::validate_tokenizer_sources(config)?;
 
         Ok(())
     }
@@ -194,34 +442,84 @@ impl ConfigValidator {
         if config.effective_prefill_queue_size() > 0
             && config.effective_prefill_queue_timeout_secs() == 0
         {
-            return Err(ConfigError::InvalidValue {
-                field: "prefill_queue_timeout_secs".to_string(),
-                value: "0".to_string(),
-                reason: "Must be > 0 when the Prefill queue is enabled".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "prefill_queue_timeout_secs",
+                "0",
+                "Must be > 0 when the Prefill queue is enabled",
+            ));
         }
 
         Ok(())
     }
 
+    /// With the priority scheduler enabled, the optional YAML file must be
+    /// readable, parsable (no key the scheduler does not know) and valid, and
+    /// the default max class must name one of the four classes: an operator
+    /// who asked for tenant priorities gets a start-up error naming the field
+    /// instead of a gateway that serves with the legacy admission or with a
+    /// policy they did not write (the contract of `tenant_rate_limit_config`).
+    /// Without the flag neither is read.
+    fn validate_priority_scheduler(config: &RouterConfig) -> ConfigResult<()> {
+        if !config.priority_scheduler_enabled {
+            return Ok(());
+        }
+        scheduler::settings_from_config(config)
+            .map(drop)
+            .map_err(|e| ConfigError::invalid_value(e.field, e.value, e.reason))
+    }
+
     fn validate_model_aliases(config: &RouterConfig) -> ConfigResult<()> {
         for (alias, canonical) in &config.model_aliases {
             if alias.is_empty() || canonical.is_empty() {
-                return Err(ConfigError::InvalidValue {
-                    field: "model_aliases".to_string(),
-                    value: format!("{alias}={canonical}"),
-                    reason: "Alias and canonical model ID must be non-empty".to_string(),
-                });
+                return Err(ConfigError::invalid_value(
+                    "model_aliases",
+                    format!("{alias}={canonical}"),
+                    "Alias and canonical model ID must be non-empty",
+                ));
             }
             if alias == canonical {
-                return Err(ConfigError::InvalidValue {
-                    field: "model_aliases".to_string(),
-                    value: alias.clone(),
-                    reason: "Alias must differ from the canonical model ID".to_string(),
-                });
+                return Err(ConfigError::invalid_value(
+                    "model_aliases",
+                    alias,
+                    "Alias must differ from the canonical model ID",
+                ));
             }
         }
 
+        Ok(())
+    }
+
+    /// The fields whose value has a required shape, refused by name when the
+    /// shape is wrong, on every path that builds a `RouterConfig` (the
+    /// command line, a configuration file, the language binding): checked on
+    /// the command line alone, a wrong shape from a binding still matched no
+    /// request's id header or switched authentication on with an empty
+    /// credential, in silence. The CORS origins and the health-check endpoint
+    /// have rules of their own (`validate_cors_allowed_origins`,
+    /// `validate_health_check`); the command line keeps the shapes of what
+    /// never reaches `RouterConfig`.
+    fn validate_value_shapes(config: &RouterConfig) -> ConfigResult<()> {
+        let invalid = |field: &str, value: &str, reason: &str| {
+            ConfigError::invalid_value(field, value, reason)
+        };
+        for name in config.request_id_headers.iter().flatten() {
+            if HeaderName::try_from(name.as_str()).is_err() {
+                return Err(invalid(
+                    "request_id_headers",
+                    name,
+                    "not a valid HTTP header name: it could never match a request",
+                ));
+            }
+        }
+        if let Some(key) = &config.api_key {
+            if key.trim().is_empty() {
+                return Err(invalid(
+                    "api_key",
+                    "",
+                    "an empty credential would switch authentication on with a key nothing can present",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -237,6 +535,14 @@ impl ConfigValidator {
                     reason: "storage_context_headers must not contain empty header names"
                         .to_string(),
                 });
+            }
+
+            if HeaderName::try_from(header_name).is_err() {
+                return Err(ConfigError::invalid_value(
+                    "storage_context_headers",
+                    header_name,
+                    "not a valid HTTP header name: it could never match a request",
+                ));
             }
 
             if context_key.is_empty() {
@@ -265,6 +571,34 @@ impl ConfigValidator {
                     "routing_key_override.headers contains an invalid HTTP header name '{name}': {e}"
                 ),
             })?;
+        }
+        Ok(())
+    }
+
+    /// The memory history backend's bounds: at least one record of each kind.
+    fn validate_memory_history(config: &RouterConfig) -> ConfigResult<()> {
+        if let Some(memory) = &config.memory {
+            memory
+                .validate()
+                .map_err(|reason| ConfigError::ValidationFailed { reason })?;
+        }
+        Ok(())
+    }
+
+    /// `access_log_fields` names each optional field of the access-log
+    /// record once: a field listed twice is a slip in the configuration, not
+    /// a request for a second column, and is refused by name.
+    fn validate_access_log_fields(config: &RouterConfig) -> ConfigResult<()> {
+        let mut seen: Vec<AccessLogField> = Vec::with_capacity(config.access_log_fields.len());
+        for field in &config.access_log_fields {
+            if seen.contains(field) {
+                return Err(ConfigError::invalid_value(
+                    "access_log_fields",
+                    field,
+                    "listed twice",
+                ));
+            }
+            seen.push(*field);
         }
         Ok(())
     }
@@ -321,6 +655,17 @@ impl ConfigValidator {
                     reason: format!(
                         "tenant_api_keys tenant_id '{}' must not have surrounding whitespace",
                         entry.tenant_id
+                    ),
+                });
+            }
+            // The canonical key is stored with every response and
+            // conversation, in a 255-byte column on the SQL backends.
+            if entry.tenant_id.len() > crate::tenant::MAX_TENANT_ID_LEN {
+                return Err(ConfigError::ValidationFailed {
+                    reason: format!(
+                        "tenant_api_keys tenant_id '{}' is longer than {} bytes",
+                        entry.tenant_id,
+                        crate::tenant::MAX_TENANT_ID_LEN
                     ),
                 });
             }
@@ -389,27 +734,27 @@ impl ConfigValidator {
         }
 
         if oracle.pool_min < 1 {
-            return Err(ConfigError::InvalidValue {
-                field: "oracle.pool_min".to_string(),
-                value: oracle.pool_min.to_string(),
-                reason: "Must be at least 1".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "oracle.pool_min",
+                oracle.pool_min,
+                "Must be at least 1",
+            ));
         }
 
         if oracle.pool_max < oracle.pool_min {
-            return Err(ConfigError::InvalidValue {
-                field: "oracle.pool_max".to_string(),
-                value: oracle.pool_max.to_string(),
-                reason: "Must be >= oracle.pool_min".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "oracle.pool_max",
+                oracle.pool_max,
+                "Must be >= oracle.pool_min",
+            ));
         }
 
         if oracle.pool_timeout_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "oracle.pool_timeout_secs".to_string(),
-                value: oracle.pool_timeout_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "oracle.pool_timeout_secs",
+                oracle.pool_timeout_secs,
+                "Must be > 0",
+            ));
         }
 
         Ok(())
@@ -443,11 +788,11 @@ impl ConfigValidator {
                 for (_url, port) in prefill_urls {
                     if let Some(port) = port {
                         if *port == 0 {
-                            return Err(ConfigError::InvalidValue {
-                                field: "bootstrap_port".to_string(),
-                                value: port.to_string(),
-                                reason: "Port must be between 1 and 65535".to_string(),
-                            });
+                            return Err(ConfigError::invalid_value(
+                                "bootstrap_port",
+                                port,
+                                "Port must be between 1 and 65535",
+                            ));
                         }
                     }
                 }
@@ -476,11 +821,11 @@ impl ConfigValidator {
                     for (_url, port) in urls {
                         if let Some(port) = port {
                             if *port == 0 {
-                                return Err(ConfigError::InvalidValue {
-                                    field: "bootstrap_port".to_string(),
-                                    value: port.to_string(),
-                                    reason: "Port must be between 1 and 65535".to_string(),
-                                });
+                                return Err(ConfigError::invalid_value(
+                                    "bootstrap_port",
+                                    port,
+                                    "Port must be between 1 and 65535",
+                                ));
                             }
                         }
                     }
@@ -546,6 +891,8 @@ impl ConfigValidator {
                 cache_boundaries,
                 selection_policy,
                 selection_accounting_ttl_ms: _,
+                balance_prefix_margin_tokens: _,
+                balance_uncached_credit: _,
             } => {
                 Self::validate_cache_boundaries(cache_boundaries)?;
 
@@ -557,149 +904,136 @@ impl ConfigValidator {
                 if let Err(err) =
                     selection_cost::build(selection_policy_name, *selection_temperature)
                 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "selection_policy".to_string(),
-                        value: selection_policy_name.to_string(),
-                        reason: err.to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "selection_policy",
+                        selection_policy_name,
+                        err.to_string(),
+                    ));
                 }
 
                 if *cache_ttl_secs == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "cache_ttl_secs".to_string(),
-                        value: cache_ttl_secs.to_string(),
-                        reason: "Must be > 0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "cache_ttl_secs",
+                        cache_ttl_secs,
+                        "Must be > 0",
+                    ));
                 }
 
                 if *cache_index == CacheIndexKind::Hash && cache_boundaries.is_empty() {
-                    return Err(ConfigError::InvalidValue {
-                        field: "cache_index".to_string(),
-                        value: "hash".to_string(),
-                        reason: "cache_index=hash requires non-empty cache_boundaries".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "cache_index",
+                        "hash",
+                        "cache_index=hash requires non-empty cache_boundaries",
+                    ));
                 }
 
                 if !overlap_decay.is_finite() || *overlap_decay < 0.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "overlap_decay".to_string(),
-                        value: overlap_decay.to_string(),
-                        reason: "Must be finite and >= 0.0 (0.0 disables)".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "overlap_decay",
+                        overlap_decay,
+                        "Must be finite and >= 0.0 (0.0 disables)",
+                    ));
                 }
 
                 if !selection_temperature.is_finite() || *selection_temperature < 0.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "selection_temperature".to_string(),
-                        value: selection_temperature.to_string(),
-                        reason: "Must be finite and >= 0.0 (0.0 is argmax)".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "selection_temperature",
+                        selection_temperature,
+                        "Must be finite and >= 0.0 (0.0 is argmax)",
+                    ));
                 }
 
                 if *block_size == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "block_size".to_string(),
-                        value: block_size.to_string(),
-                        reason: "Must be > 0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "block_size",
+                        block_size,
+                        "Must be > 0",
+                    ));
                 }
 
-                if *balance_token_usage_threshold <= 0.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "balance_token_usage_threshold".to_string(),
-                        value: balance_token_usage_threshold.to_string(),
-                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
-                    });
+                // NaN passes every comparison and an infinite threshold is a typo
+                // for "disabled": both are refused with the sign errors.
+                if !balance_token_usage_threshold.is_finite()
+                    || *balance_token_usage_threshold <= 0.0
+                {
+                    return Err(ConfigError::invalid_value(
+                        "balance_token_usage_threshold",
+                        balance_token_usage_threshold,
+                        "Must be finite and > 0.0 (use >= 1.0 to disable)",
+                    ));
                 }
 
-                if *overload_token_usage_threshold <= 0.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "overload_token_usage_threshold".to_string(),
-                        value: overload_token_usage_threshold.to_string(),
-                        reason: "Must be > 0.0 (use >= 1.0 to disable)".to_string(),
-                    });
+                if !overload_token_usage_threshold.is_finite()
+                    || *overload_token_usage_threshold <= 0.0
+                {
+                    return Err(ConfigError::invalid_value(
+                        "overload_token_usage_threshold",
+                        overload_token_usage_threshold,
+                        "Must be finite and > 0.0 (use >= 1.0 to disable)",
+                    ));
                 }
 
                 if !(0.0..=1.0).contains(cache_threshold) {
-                    return Err(ConfigError::InvalidValue {
-                        field: "cache_threshold".to_string(),
-                        value: cache_threshold.to_string(),
-                        reason: "Must be between 0.0 and 1.0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "cache_threshold",
+                        cache_threshold,
+                        "Must be between 0.0 and 1.0",
+                    ));
                 }
 
-                if *balance_rel_threshold < 1.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "balance_rel_threshold".to_string(),
-                        value: balance_rel_threshold.to_string(),
-                        reason: "Must be >= 1.0".to_string(),
-                    });
+                if !balance_rel_threshold.is_finite() || *balance_rel_threshold < 1.0 {
+                    return Err(ConfigError::invalid_value(
+                        "balance_rel_threshold",
+                        balance_rel_threshold,
+                        "Must be finite and >= 1.0",
+                    ));
                 }
 
                 if *eviction_interval_secs == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "eviction_interval_secs".to_string(),
-                        value: eviction_interval_secs.to_string(),
-                        reason: "Must be > 0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "eviction_interval_secs",
+                        eviction_interval_secs,
+                        "Must be > 0",
+                    ));
                 }
 
                 if *max_tree_size == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "max_tree_size".to_string(),
-                        value: max_tree_size.to_string(),
-                        reason: "Must be > 0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "max_tree_size",
+                        max_tree_size,
+                        "Must be > 0",
+                    ));
                 }
             }
-            PolicyConfig::PowerOfTwo {
-                load_check_interval_secs,
-            } => {
-                if *load_check_interval_secs == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "load_check_interval_secs".to_string(),
-                        value: load_check_interval_secs.to_string(),
-                        reason: "Must be > 0".to_string(),
-                    });
-                }
-            }
+            PolicyConfig::PowerOfTwo { .. } => {}
             PolicyConfig::LeastLoad {
-                load_check_interval_secs,
                 kv_pressure_weight,
                 mean_prefill_tokens,
                 default_throughput,
                 max_waiting_requests: _,
             } => {
-                if *load_check_interval_secs == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "load_check_interval_secs".to_string(),
-                        value: load_check_interval_secs.to_string(),
-                        reason: "Must be > 0".to_string(),
-                    });
-                }
-
                 if !kv_pressure_weight.is_finite() || *kv_pressure_weight < 0.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "kv_pressure_weight".to_string(),
-                        value: kv_pressure_weight.to_string(),
-                        reason: "Must be finite and >= 0.0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "kv_pressure_weight",
+                        kv_pressure_weight,
+                        "Must be finite and >= 0.0",
+                    ));
                 }
 
                 if *mean_prefill_tokens == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "mean_prefill_tokens".to_string(),
-                        value: mean_prefill_tokens.to_string(),
-                        reason: "Must be > 0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "mean_prefill_tokens",
+                        mean_prefill_tokens,
+                        "Must be > 0",
+                    ));
                 }
 
                 if !default_throughput.is_finite() || *default_throughput <= 0.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "default_throughput".to_string(),
-                        value: default_throughput.to_string(),
-                        reason: "Must be finite and > 0.0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "default_throughput",
+                        default_throughput,
+                        "Must be finite and > 0.0",
+                    ));
                 }
             }
             PolicyConfig::Bucket {
@@ -707,27 +1041,27 @@ impl ConfigValidator {
                 balance_rel_threshold,
                 bucket_adjust_interval_secs,
             } => {
-                if *balance_rel_threshold < 1.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "balance_rel_threshold".to_string(),
-                        value: balance_rel_threshold.to_string(),
-                        reason: "Must be >= 1.0".to_string(),
-                    });
+                if !balance_rel_threshold.is_finite() || *balance_rel_threshold < 1.0 {
+                    return Err(ConfigError::invalid_value(
+                        "balance_rel_threshold",
+                        balance_rel_threshold,
+                        "Must be finite and >= 1.0",
+                    ));
                 }
 
                 if *bucket_adjust_interval_secs < 1 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "bucket_adjust_interval_secs".to_string(),
-                        value: bucket_adjust_interval_secs.to_string(),
-                        reason: "Must be >= 1s".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "bucket_adjust_interval_secs",
+                        bucket_adjust_interval_secs,
+                        "Must be >= 1s",
+                    ));
                 }
                 if *bucket_adjust_interval_secs >= 4294967296 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "bucket_adjust_interval_secs".to_string(),
-                        value: bucket_adjust_interval_secs.to_string(),
-                        reason: "Must be < 4294967296s".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "bucket_adjust_interval_secs",
+                        bucket_adjust_interval_secs,
+                        "Must be < 4294967296s",
+                    ));
                 }
             }
             PolicyConfig::PrefixHash {
@@ -737,19 +1071,19 @@ impl ConfigValidator {
                 cache_boundaries,
             } => {
                 if *prefix_token_count == 0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "prefix_token_count".to_string(),
-                        value: prefix_token_count.to_string(),
-                        reason: "Must be > 0".to_string(),
-                    });
+                    return Err(ConfigError::invalid_value(
+                        "prefix_token_count",
+                        prefix_token_count,
+                        "Must be > 0",
+                    ));
                 }
 
-                if *load_factor < 1.0 {
-                    return Err(ConfigError::InvalidValue {
-                        field: "load_factor".to_string(),
-                        value: load_factor.to_string(),
-                        reason: "Must be >= 1.0".to_string(),
-                    });
+                if !load_factor.is_finite() || *load_factor < 1.0 {
+                    return Err(ConfigError::invalid_value(
+                        "load_factor",
+                        load_factor,
+                        "Must be finite and >= 1.0",
+                    ));
                 }
 
                 Self::validate_cache_boundaries(cache_boundaries)?;
@@ -760,18 +1094,18 @@ impl ConfigValidator {
 
     fn validate_cache_boundaries(boundaries: &[usize]) -> ConfigResult<()> {
         if boundaries.first() == Some(&0) {
-            return Err(ConfigError::InvalidValue {
-                field: "cache_boundaries".to_string(),
-                value: "0".to_string(),
-                reason: "Boundaries must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "cache_boundaries",
+                "0",
+                "Boundaries must be > 0",
+            ));
         }
         if boundaries.windows(2).any(|w| w[0] >= w[1]) {
-            return Err(ConfigError::InvalidValue {
-                field: "cache_boundaries".to_string(),
-                value: format!("{boundaries:?}"),
-                reason: "Boundaries must be strictly ascending".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "cache_boundaries",
+                format!("{boundaries:?}"),
+                "Boundaries must be strictly ascending",
+            ));
         }
         Ok(())
     }
@@ -790,19 +1124,28 @@ impl ConfigValidator {
 
     fn validate_server_settings(config: &RouterConfig) -> ConfigResult<()> {
         if let Err(reason) = parse_bind_host(&config.host) {
-            return Err(ConfigError::InvalidValue {
-                field: "host".to_string(),
-                value: config.host.clone(),
-                reason,
-            });
+            return Err(ConfigError::invalid_value("host", &config.host, reason));
+        }
+
+        // The RDMA pixel lane's listener: an IP address or nothing (blank is
+        // unset, as the lane reads it). Anything else used to pass here and
+        // fail when the lane came up, far from the flag that caused it.
+        if let Some(ip) = config
+            .rdma_listen_ip
+            .as_deref()
+            .filter(|ip| !ip.trim().is_empty())
+        {
+            if let Err(reason) = parse_listen_ip(ip) {
+                return Err(ConfigError::invalid_value("rdma_listen_ip", ip, reason));
+            }
         }
 
         if config.port == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "port".to_string(),
-                value: config.port.to_string(),
-                reason: "Port must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "port",
+                config.port,
+                "Port must be > 0",
+            ));
         }
 
         // Reject a configured dedicated probe port of 0: 0 means "OS-assigned
@@ -811,28 +1154,102 @@ impl ConfigValidator {
         // itself still accepts 0 so the ephemeral-port unit tests can bind;
         // only the config-sourced value is rejected here.)
         if config.health_check_port == Some(0) {
-            return Err(ConfigError::InvalidValue {
-                field: "health_check_port".to_string(),
-                value: "0".to_string(),
-                reason: "Port must be > 0 (0 would request an unstable OS-ephemeral port)"
-                    .to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "health_check_port",
+                "0",
+                "Port must be > 0 (0 would request an unstable OS-ephemeral port)",
+            ));
         }
 
+        // The admin listener: a port of 0 would be an unstable ephemeral one
+        // (as for the probe listener), a host without a port names a listener
+        // that does not exist, and the host must be a bind host.
+        if config.admin_port == Some(0) {
+            return Err(ConfigError::invalid_value(
+                "admin_port",
+                "0",
+                "Port must be > 0 (0 would request an unstable OS-ephemeral port)",
+            ));
+        }
+        if let Some(admin_host) = &config.admin_host {
+            if config.admin_port.is_none() {
+                return Err(ConfigError::invalid_value(
+                    "admin_host",
+                    admin_host,
+                    "--admin-host needs --admin-port: the admin listener exists only \
+                             with a port",
+                ));
+            }
+            if let Err(reason) = parse_bind_host(admin_host) {
+                return Err(ConfigError::invalid_value("admin_host", admin_host, reason));
+            }
+        }
+
+        // Each listener needs its own port. Two of them on one port used to
+        // bind the first, answer, and die at the second bind with a raw
+        // AddrInUse that named no flag: a partial start an operator's
+        // monitoring saw come up and vanish.
+        let listeners = [
+            Some(("port", "--port", config.port)),
+            config
+                .metrics
+                .as_ref()
+                .map(|metrics| ("metrics.port", "--prometheus-port", metrics.port)),
+            config
+                .health_check_port
+                .map(|port| ("health_check_port", "--health-check-port", port)),
+            config
+                .admin_port
+                .map(|port| ("admin_port", "--admin-port", port)),
+        ];
+        let listeners: Vec<_> = listeners.into_iter().flatten().collect();
+        validate_distinct_listener_ports(&listeners)?;
+
         if config.max_payload_size == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "max_payload_size".to_string(),
-                value: config.max_payload_size.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "max_payload_size",
+                config.max_payload_size,
+                "Must be > 0",
+            ));
         }
 
         if config.mm_per_request_image_limit == Some(0) {
-            return Err(ConfigError::InvalidValue {
-                field: "mm_per_request_image_limit".to_string(),
-                value: "0".to_string(),
-                reason: "Must be at least 1".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "mm_per_request_image_limit",
+                "0",
+                "Must be at least 1",
+            ));
+        }
+
+        // The async runtime builder panics on zero worker threads; refuse it
+        // here like every other count that must be positive. Above the
+        // ceiling every worker thread is one more stack and one more thread
+        // the scheduler wakes for nothing: a count of 100,000 used to pass,
+        // build its threads for over a minute and hold gigabytes before the
+        // first bind. Both are refused here, before the command line builds
+        // the runtime, so a refused count costs no thread. The ceiling reads
+        // nothing of the host, so the verdict is the same on every host; an
+        // oversubscription of the host's CPUs is a warning at start-up.
+        match config.runtime_worker_threads {
+            Some(0) => {
+                return Err(ConfigError::invalid_value(
+                    "runtime_worker_threads",
+                    "0",
+                    "Must be >= 1",
+                ));
+            }
+            Some(threads) if threads > RUNTIME_WORKER_THREADS_CEILING => {
+                return Err(ConfigError::invalid_value(
+                    "runtime_worker_threads",
+                    threads,
+                    format!(
+                        "Must be at most {RUNTIME_WORKER_THREADS_CEILING} (a worker thread is a \
+                         stack and a thread the scheduler wakes; a count this size is a typo or \
+                         a misread unit)"
+                    ),
+                ));
+            }
+            Some(_) | None => {}
         }
 
         // A zero-capacity job channel panics at construction and a
@@ -842,18 +1259,18 @@ impl ConfigValidator {
         // the same guarantees (zero panics at channel construction; unbounded
         // values are allocation hazards).
         if !(1..=1_000_000).contains(&config.job_queue_capacity) {
-            return Err(ConfigError::InvalidValue {
-                field: "job_queue_capacity".to_string(),
-                value: config.job_queue_capacity.to_string(),
-                reason: "Must be in 1..=1000000".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "job_queue_capacity",
+                config.job_queue_capacity,
+                "Must be in 1..=1000000",
+            ));
         }
         if !(1..=100_000).contains(&config.job_queue_concurrency) {
-            return Err(ConfigError::InvalidValue {
-                field: "job_queue_concurrency".to_string(),
-                value: config.job_queue_concurrency.to_string(),
-                reason: "Must be in 1..=100000".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "job_queue_concurrency",
+                config.job_queue_concurrency,
+                "Must be in 1..=100000",
+            ));
         }
 
         // Overload thresholds are `>=` comparisons, so the excluded ends of
@@ -861,88 +1278,263 @@ impl ConfigValidator {
         // unconditionally. Mirrors the CLI parsers for the config-file and
         // bindings paths.
         if config.worker_overload_waiting_requests == Some(0) {
-            return Err(ConfigError::InvalidValue {
-                field: "worker_overload_waiting_requests".to_string(),
-                value: "0".to_string(),
-                reason: "Must be >= 1 (0 would mark every worker overloaded)".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "worker_overload_waiting_requests",
+                "0",
+                "Must be >= 1 (0 would mark every worker overloaded)",
+            ));
         }
         if let Some(threshold) = config.worker_overload_token_usage {
             if !threshold.is_finite() || threshold <= 0.0 || threshold > 1.0 {
-                return Err(ConfigError::InvalidValue {
-                    field: "worker_overload_token_usage".to_string(),
-                    value: threshold.to_string(),
-                    reason: "Must be a fraction in (0.0, 1.0]".to_string(),
-                });
+                return Err(ConfigError::invalid_value(
+                    "worker_overload_token_usage",
+                    threshold,
+                    "Must be a fraction in (0.0, 1.0]",
+                ));
             }
         }
 
         if config.request_timeout_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "request_timeout_secs".to_string(),
-                value: config.request_timeout_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "request_timeout_secs",
+                config.request_timeout_secs,
+                "Must be > 0",
+            ));
+        }
+
+        // The connection limit is a semaphore's permit count, and the
+        // runtime refuses more than its maximum at construction (a panic):
+        // a named configuration error here instead, for the config-file and
+        // bindings paths as much as the CLI.
+        if config.max_connections > Semaphore::MAX_PERMITS {
+            return Err(ConfigError::invalid_value(
+                "max_connections",
+                config.max_connections,
+                format!("Must be at most {} (0 = no bound)", Semaphore::MAX_PERMITS),
+            ));
         }
 
         if config.queue_size > 0 && config.queue_timeout_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "queue_timeout_secs".to_string(),
-                value: config.queue_timeout_secs.to_string(),
-                reason: "Must be > 0 when queue_size > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "queue_timeout_secs",
+                config.queue_timeout_secs,
+                "Must be > 0 when queue_size > 0",
+            ));
         }
 
         if let Some(tokens_per_second) = config.rate_limit_tokens_per_second {
             // Allow 0 for pure concurrency limiting (semaphore behavior)
             if tokens_per_second < 0 {
-                return Err(ConfigError::InvalidValue {
-                    field: "rate_limit_tokens_per_second".to_string(),
-                    value: tokens_per_second.to_string(),
-                    reason: "Must be >= 0 when specified".to_string(),
-                });
+                return Err(ConfigError::invalid_value(
+                    "rate_limit_tokens_per_second",
+                    tokens_per_second,
+                    "Must be >= 0 when specified",
+                ));
             }
         }
 
         if config.worker_startup_timeout_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "worker_startup_timeout_secs".to_string(),
-                value: config.worker_startup_timeout_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "worker_startup_timeout_secs",
+                config.worker_startup_timeout_secs,
+                "Must be > 0",
+            ));
         }
 
         if config.worker_startup_check_interval_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "worker_startup_check_interval_secs".to_string(),
-                value: config.worker_startup_check_interval_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "worker_startup_check_interval_secs",
+                config.worker_startup_check_interval_secs,
+                "Must be > 0",
+            ));
+        }
+
+        if config.zmq_startup_timeout_secs == 0 {
+            return Err(ConfigError::invalid_value(
+                "zmq_startup_timeout_secs",
+                config.zmq_startup_timeout_secs,
+                "Must be > 0",
+            ));
         }
 
         if config.load_monitor_interval_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "load_monitor_interval_secs".to_string(),
-                value: config.load_monitor_interval_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "load_monitor_interval_secs",
+                config.load_monitor_interval_secs,
+                "Must be > 0",
+            ));
         }
 
         Ok(())
     }
 
+    /// `cors_allowed_origins`: exact origins, or a lone `*` for the open
+    /// policy. This is the one place the rule is checked, so the Python
+    /// launcher and library callers (`RouterConfig::builder().build()`)
+    /// refuse the same values by name as `smg launch` does.
+    fn validate_cors_allowed_origins(config: &RouterConfig) -> ConfigResult<()> {
+        let invalid = |origin: &str, reason: &str| {
+            ConfigError::invalid_value("cors_allowed_origins", origin, reason)
+        };
+        for origin in &config.cors_allowed_origins {
+            // A lone `*` is the open policy; next to an origin it would be
+            // either a typo or a list the layer cannot express.
+            if origin == "*" {
+                if config.cors_allowed_origins.len() == 1 {
+                    continue;
+                }
+                return Err(invalid(
+                    origin,
+                    "'*' stands alone: either any origin or a list of exact origins",
+                ));
+            }
+            // Exactly what a browser sends as `Origin`: the scheme and the host
+            // in lower case, no userinfo, no default port, nothing after the
+            // authority (not even `/`); anything else never matches the exact
+            // comparison of the CORS layer.
+            let default_port = |scheme: &str| match scheme {
+                "http" | "ws" => Some(80),
+                "https" | "wss" => Some(443),
+                _ => None,
+            };
+            let parsed = Uri::try_from(origin.as_str()).ok().filter(|uri| {
+                matches!((uri.scheme_str(), uri.authority()), (Some(scheme), Some(authority))
+                    if origin.as_str() == format!("{scheme}://{authority}")
+                        && authority.as_str() == authority.as_str().to_ascii_lowercase()
+                        && !authority.as_str().contains('@')
+                        && authority
+                            .port_u16()
+                            .is_none_or(|port| Some(port) != default_port(scheme)))
+            });
+            if parsed.is_none() || HeaderValue::from_str(origin).is_err() {
+                return Err(invalid(
+                    origin,
+                    "not exactly an origin (lower-case scheme://host[:port], no userinfo, no default port, nothing after it); the policy would silently narrow to the origins that match",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// `log_dir` names the directory the file log appender writes to, so it
+    /// is checked before anything binds: a path that exists must be a
+    /// directory the gateway can write; one that does not exist must sit
+    /// under a directory the gateway can write (its nearest existing
+    /// ancestor), where logging start-up creates it, as it always did.
+    /// Anything else is a configuration error naming the path and the
+    /// reason, where the appender used to panic (an existing file) or the
+    /// gateway started without any log output at all (a path it could not
+    /// create). Nothing is created here: `validate()` is also run by
+    /// callers that build or check a configuration without starting the
+    /// gateway, and leaves no directory behind on their host.
+    fn validate_log_dir(config: &RouterConfig) -> ConfigResult<()> {
+        let Some(log_dir) = config.log_dir.as_deref() else {
+            return Ok(());
+        };
+        let invalid = |reason: String| ConfigError::invalid_value("log_dir", log_dir, reason);
+        if log_dir.trim().is_empty() {
+            return Err(invalid("must name a directory".to_string()));
+        }
+        let path = Path::new(log_dir);
+        let (probed, missing) = match std::fs::metadata(path) {
+            Ok(metadata) if metadata.is_dir() => (path, false),
+            Ok(_) => return Err(invalid("exists and is not a directory".to_string())),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                // Logging start-up creates the missing part under the nearest
+                // existing ancestor, which must therefore be a directory the
+                // gateway can write.
+                (
+                    Self::nearest_existing_ancestor(path).map_err(&invalid)?,
+                    true,
+                )
+            }
+            Err(error) => return Err(invalid(format!("cannot be read: {error}"))),
+        };
+        // The appender opens a file for writing in this directory (or creates
+        // the directory under the ancestor); an unnamed temporary file is the
+        // same permission check with nothing left behind.
+        tempfile::tempfile_in(probed).map(drop).map_err(|error| {
+            if missing {
+                invalid(format!(
+                    "cannot be created: {} is not writable: {error}",
+                    probed.display()
+                ))
+            } else {
+                invalid(format!("is not writable: {error}"))
+            }
+        })
+    }
+
+    /// The nearest existing ancestor of a path that does not exist: the
+    /// directory the missing part would be created under. A relative path's
+    /// last ancestor is "", which is the current directory but does not
+    /// stat, so it reads as ".". The error is the reason of the refusal when
+    /// there is no such ancestor or it is not a directory: a file in the way
+    /// is named, which explains the failure better than the OS error for the
+    /// leaf.
+    fn nearest_existing_ancestor(path: &Path) -> Result<&Path, String> {
+        let ancestor = path
+            .ancestors()
+            .skip(1)
+            .map(|ancestor| {
+                if ancestor.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    ancestor
+                }
+            })
+            .find(|ancestor| ancestor.exists())
+            .ok_or_else(|| "cannot be created: no existing ancestor".to_string())?;
+        if !ancestor.is_dir() {
+            return Err(format!(
+                "cannot be created: {} is not a directory",
+                ancestor.display()
+            ));
+        }
+        Ok(ancestor)
+    }
+
+    /// The deprecated `kv_index` field: the chain index is the only KV index,
+    /// so `chain` (in any case) is the one value accepted; `positional` names
+    /// the index that was removed and is refused with the reason, as is any
+    /// other value.
+    fn validate_kv_index(config: &RouterConfig) -> ConfigResult<()> {
+        let Some(value) = config.kv_index.as_deref() else {
+            return Ok(());
+        };
+        match value.trim().to_ascii_lowercase().as_str() {
+            "chain" => Ok(()),
+            "positional" => Err(ConfigError::invalid_value(
+                "kv_index",
+                value,
+                "the positional KV index was removed (kv-index 2.0.0): the chain index \
+                         is the only KV index, drop kv_index",
+            )),
+            _ => Err(ConfigError::invalid_value(
+                "kv_index",
+                value,
+                "the chain index is the only KV index, so kv_index takes chain only \
+                         (and is deprecated)",
+            )),
+        }
+    }
+
     fn validate_rl(config: &RouterConfig) -> ConfigResult<()> {
-        config
-            .rl
-            .validate()
-            .map_err(|reason| ConfigError::InvalidValue {
-                field: "rl".to_string(),
-                value: format!(
+        config.rl.validate().map_err(|reason| {
+            ConfigError::invalid_value(
+                "rl",
+                format!(
                     "control_timeout_secs={} fanout_concurrency={}",
                     config.rl.control_timeout_secs, config.rl.fanout_concurrency
                 ),
                 reason,
-            })
+            )
+        })
     }
 
     fn validate_discovery(discovery: &DiscoveryConfig, mode: &RoutingMode) -> ConfigResult<()> {
@@ -950,7 +1542,183 @@ impl ConfigValidator {
             DiscoveryConfig::Kubernetes(kubernetes) => {
                 Self::validate_kubernetes_discovery(kubernetes, mode)
             }
+            DiscoveryConfig::File(file) => Self::validate_file_discovery(file, mode),
+            DiscoveryConfig::Slurm(slurm) => Self::validate_slurm_discovery(slurm, mode),
         }
+    }
+
+    /// What `squeue` and `scontrol` report is checked at every poll, not here.
+    /// This checks that the job names map onto the routing mode's pools.
+    fn validate_slurm_discovery(
+        discovery: &SlurmDiscoveryConfig,
+        mode: &RoutingMode,
+    ) -> ConfigResult<()> {
+        let invalid = |field: &str, value: String, reason: &str| ConfigError::InvalidValue {
+            field: field.to_string(),
+            value,
+            reason: reason.to_string(),
+        };
+        if discovery.port == 0 {
+            return Err(invalid(
+                "discovery.port",
+                "0".to_string(),
+                "Port must be > 0",
+            ));
+        }
+        if discovery.bootstrap_port == Some(0) {
+            return Err(invalid(
+                "discovery.bootstrap_port",
+                "0".to_string(),
+                "Port must be > 0",
+            ));
+        }
+        if discovery.check_interval_secs == 0 {
+            return Err(invalid(
+                "discovery.check_interval_secs",
+                "0".to_string(),
+                "Must be > 0",
+            ));
+        }
+
+        let roles = [
+            ("discovery.job_names", "regular", &discovery.job_names),
+            (
+                "discovery.encode_job_names",
+                "encode",
+                &discovery.encode_job_names,
+            ),
+            (
+                "discovery.prefill_job_names",
+                "prefill",
+                &discovery.prefill_job_names,
+            ),
+            (
+                "discovery.decode_job_names",
+                "decode",
+                &discovery.decode_job_names,
+            ),
+        ];
+        // Each value reaches `squeue` inside a comma-separated list, where a
+        // comma would split it into two filters.
+        let scopes = [
+            ("discovery.user", &discovery.user),
+            ("discovery.account", &discovery.account),
+            ("discovery.partition", &discovery.partition),
+        ];
+        let values = roles
+            .iter()
+            .flat_map(|(field, _, names)| names.iter().map(move |name| (*field, name)))
+            .chain(
+                scopes
+                    .iter()
+                    .filter_map(|(field, value)| value.as_ref().map(|value| (*field, value))),
+            );
+        for (field, value) in values {
+            if value.is_empty() || value.contains(',') {
+                return Err(invalid(
+                    field,
+                    value.clone(),
+                    "Must be non-empty and contain no comma",
+                ));
+            }
+        }
+
+        let mut role_of = std::collections::HashMap::<&str, &str>::new();
+        for (_, role, names) in &roles {
+            for name in *names {
+                if let Some(other) = role_of.insert(name, role) {
+                    if other != *role {
+                        return Err(ConfigError::ValidationFailed {
+                            reason: format!(
+                                "Slurm job name '{name}' maps to both {other} and {role} workers"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        let [regular, encode, prefill, decode] = roles.map(|(_, _, names)| !names.is_empty());
+        let (needed, unused) = match mode {
+            RoutingMode::Regular { .. } => (
+                (!regular)
+                    .then_some("Regular mode with Slurm discovery requires a regular job name"),
+                (encode || prefill || decode).then_some(
+                    "Regular mode has no encode, prefill or decode workers to map Slurm jobs to",
+                ),
+            ),
+            RoutingMode::PrefillDecode { .. } => (
+                (!(prefill || decode)).then_some(
+                    "PD mode with Slurm discovery requires a prefill or decode job name",
+                ),
+                (regular || encode)
+                    .then_some("PD mode has no regular or encode workers to map Slurm jobs to"),
+            ),
+            RoutingMode::EncodePrefillDecode { .. } => (
+                (!(encode && prefill && decode)).then_some(
+                    "EPD mode with Slurm discovery requires encode, prefill and decode job names",
+                ),
+                regular.then_some("EPD mode has no regular workers to map Slurm jobs to"),
+            ),
+            RoutingMode::OpenAI { .. } => {
+                (Some("OpenAI mode does not support service discovery"), None)
+            }
+            RoutingMode::Anthropic { .. } => (
+                Some("Anthropic mode does not support service discovery"),
+                None,
+            ),
+            RoutingMode::Gemini { .. } => {
+                (Some("Gemini mode does not support service discovery"), None)
+            }
+        };
+        if let Some(reason) = needed.or(unused) {
+            return Err(ConfigError::ValidationFailed {
+                reason: reason.to_string(),
+            });
+        }
+        if discovery.bootstrap_port.is_some() && !(encode || prefill) {
+            return Err(ConfigError::ValidationFailed {
+                reason: "A Slurm bootstrap port applies only to encode and prefill workers"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The manifest's own contents (worker types against the routing mode
+    /// included) are checked each time it is read, not here: it may not exist
+    /// yet, and it changes while the router runs.
+    fn validate_file_discovery(
+        discovery: &FileDiscoveryConfig,
+        mode: &RoutingMode,
+    ) -> ConfigResult<()> {
+        if discovery.path.as_os_str().is_empty() {
+            return Err(ConfigError::invalid_value(
+                "discovery.path",
+                String::new(),
+                "File discovery needs a manifest path",
+            ));
+        }
+
+        if discovery.check_interval_secs == 0 {
+            return Err(ConfigError::invalid_value(
+                "discovery.check_interval_secs",
+                discovery.check_interval_secs,
+                "Must be > 0",
+            ));
+        }
+
+        let unsupported = match mode {
+            RoutingMode::Regular { .. }
+            | RoutingMode::PrefillDecode { .. }
+            | RoutingMode::EncodePrefillDecode { .. } => return Ok(()),
+            RoutingMode::OpenAI { .. } => "OpenAI",
+            RoutingMode::Anthropic { .. } => "Anthropic",
+            RoutingMode::Gemini { .. } => "Gemini",
+        };
+        Err(ConfigError::ValidationFailed {
+            reason: format!("{unsupported} mode does not support service discovery"),
+        })
     }
 
     fn validate_kubernetes_discovery(
@@ -958,19 +1726,19 @@ impl ConfigValidator {
         mode: &RoutingMode,
     ) -> ConfigResult<()> {
         if discovery.port == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "discovery.port".to_string(),
-                value: discovery.port.to_string(),
-                reason: "Port must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "discovery.port",
+                discovery.port,
+                "Port must be > 0",
+            ));
         }
 
         if discovery.check_interval_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "discovery.check_interval_secs".to_string(),
-                value: discovery.check_interval_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "discovery.check_interval_secs",
+                discovery.check_interval_secs,
+                "Must be > 0",
+            ));
         }
 
         for (field, value) in [
@@ -985,12 +1753,11 @@ impl ConfigValidator {
         ] {
             let trimmed = value.trim();
             if trimmed.is_empty() || trimmed != value {
-                return Err(ConfigError::InvalidValue {
-                    field: field.to_string(),
-                    value: value.clone(),
-                    reason: "Annotation name must not be empty or padded with whitespace"
-                        .to_string(),
-                });
+                return Err(ConfigError::invalid_value(
+                    field,
+                    value,
+                    "Annotation name must not be empty or padded with whitespace",
+                ));
             }
         }
 
@@ -1042,27 +1809,27 @@ impl ConfigValidator {
 
     fn validate_metrics(metrics: &MetricsConfig) -> ConfigResult<()> {
         if metrics.port == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "metrics.port".to_string(),
-                value: metrics.port.to_string(),
-                reason: "Port must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "metrics.port",
+                metrics.port,
+                "Port must be > 0 (0 would request an unstable OS-ephemeral port)",
+            ));
         }
 
         if metrics.host.is_empty() {
-            return Err(ConfigError::InvalidValue {
-                field: "metrics.host".to_string(),
-                value: metrics.host.clone(),
-                reason: "Host cannot be empty".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "metrics.host",
+                &metrics.host,
+                "Host cannot be empty",
+            ));
         }
 
         if let Err(reason) = parse_bind_host(&metrics.host) {
-            return Err(ConfigError::InvalidValue {
-                field: "metrics.host".to_string(),
-                value: metrics.host.clone(),
+            return Err(ConfigError::invalid_value(
+                "metrics.host",
+                &metrics.host,
                 reason,
-            });
+            ));
         }
 
         Ok(())
@@ -1074,10 +1841,8 @@ impl ConfigValidator {
         }
 
         let endpoint = &trace_config.otlp_traces_endpoint;
-        let invalid = |reason: String| ConfigError::InvalidValue {
-            field: "trace_config.otlp_traces_endpoint".to_string(),
-            value: endpoint.clone(),
-            reason,
+        let invalid = |reason: String| {
+            ConfigError::invalid_value("trace_config.otlp_traces_endpoint", endpoint, reason)
         };
         const EXPECTED: &str = "expected <host>:<port> or http(s)://<host>:<port>, with an \
                                 IPv6 literal in brackets, e.g. otel-collector:4317, \
@@ -1105,131 +1870,221 @@ impl ConfigValidator {
         if url.host_str().is_none_or(str::is_empty) {
             return Err(invalid(format!("{EXPECTED}: host part cannot be empty")));
         }
-        // `Url` drops a scheme-default port (`:80`, `:443`) from `port()`;
-        // accept one that was written, reject a missing port and port 0.
-        let authority = with_scheme
-            .split_once("://")
-            .map_or("", |(_, rest)| rest)
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or("");
-        let written_default_port = url
-            .port_or_known_default()
-            .is_some_and(|default| authority.ends_with(&format!(":{default}")));
-        match url.port() {
-            Some(0) => {
-                return Err(invalid(format!(
-                    "{EXPECTED}: port must be a number between 1 and 65535"
-                )))
-            }
-            Some(_) => {}
-            None if written_default_port => {}
-            None => {
-                return Err(invalid(format!(
-                    "{EXPECTED}: port must be a number between 1 and 65535"
-                )))
-            }
+        // A missing port and port 0 are refused; a scheme-default port that
+        // was written passes although `Url::port()` drops it.
+        if !matches!(Self::written_port(&with_scheme, &url), Some(1..)) {
+            return Err(invalid(format!(
+                "{EXPECTED}: port must be a number between 1 and 65535"
+            )));
         }
 
         Ok(())
     }
 
+    /// The port of `with_scheme` as written: `Url::port()` drops a
+    /// scheme-default port (`:80`, `:443`), so one that was written is read
+    /// back off the authority; `None` when the endpoint names no port.
+    fn written_port(with_scheme: &str, url: &::url::Url) -> Option<u16> {
+        url.port().or_else(|| {
+            let authority = with_scheme
+                .split_once("://")
+                .map_or("", |(_, rest)| rest)
+                .split(['/', '?', '#'])
+                .next()
+                .unwrap_or("");
+            url.port_or_known_default()
+                .filter(|default| authority.ends_with(&format!(":{default}")))
+        })
+    }
+
     fn validate_retry(retry: &RetryConfig) -> ConfigResult<()> {
         if retry.max_retries < 1 {
-            return Err(ConfigError::InvalidValue {
-                field: "retry.max_retries".to_string(),
-                value: retry.max_retries.to_string(),
-                reason: "Must be >= 1 (set to 1 to effectively disable retries)".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "retry.max_retries",
+                retry.max_retries,
+                "Must be >= 1 (set to 1 to effectively disable retries)",
+            ));
         }
         if retry.initial_backoff_ms == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "retry.initial_backoff_ms".to_string(),
-                value: retry.initial_backoff_ms.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "retry.initial_backoff_ms",
+                retry.initial_backoff_ms,
+                "Must be > 0",
+            ));
         }
         if retry.max_backoff_ms < retry.initial_backoff_ms {
-            return Err(ConfigError::InvalidValue {
-                field: "retry.max_backoff_ms".to_string(),
-                value: retry.max_backoff_ms.to_string(),
-                reason: "Must be >= initial_backoff_ms".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "retry.max_backoff_ms",
+                retry.max_backoff_ms,
+                "Must be >= initial_backoff_ms",
+            ));
         }
-        if retry.backoff_multiplier < 1.0 {
-            return Err(ConfigError::InvalidValue {
-                field: "retry.backoff_multiplier".to_string(),
-                value: retry.backoff_multiplier.to_string(),
-                reason: "Must be >= 1.0".to_string(),
-            });
+        if !retry.backoff_multiplier.is_finite() || retry.backoff_multiplier < 1.0 {
+            return Err(ConfigError::invalid_value(
+                "retry.backoff_multiplier",
+                retry.backoff_multiplier,
+                "Must be finite and >= 1.0",
+            ));
         }
         if !(0.0..=1.0).contains(&retry.jitter_factor) {
-            return Err(ConfigError::InvalidValue {
-                field: "retry.jitter_factor".to_string(),
-                value: retry.jitter_factor.to_string(),
-                reason: "Must be between 0.0 and 1.0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "retry.jitter_factor",
+                retry.jitter_factor,
+                "Must be between 0.0 and 1.0",
+            ));
         }
         Ok(())
     }
 
     fn validate_circuit_breaker(cb: &CircuitBreakerConfig) -> ConfigResult<()> {
         if cb.failure_threshold < 1 {
-            return Err(ConfigError::InvalidValue {
-                field: "circuit_breaker.failure_threshold".to_string(),
-                value: cb.failure_threshold.to_string(),
-                reason: "Must be >= 1 (set to u32::MAX to effectively disable CB)".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "circuit_breaker.failure_threshold",
+                cb.failure_threshold,
+                "Must be >= 1 (set to u32::MAX to effectively disable CB)",
+            ));
         }
         if cb.success_threshold < 1 {
-            return Err(ConfigError::InvalidValue {
-                field: "circuit_breaker.success_threshold".to_string(),
-                value: cb.success_threshold.to_string(),
-                reason: "Must be >= 1".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "circuit_breaker.success_threshold",
+                cb.success_threshold,
+                "Must be >= 1",
+            ));
         }
         if cb.timeout_duration_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "circuit_breaker.timeout_duration_secs".to_string(),
-                value: cb.timeout_duration_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "circuit_breaker.timeout_duration_secs",
+                cb.timeout_duration_secs,
+                "Must be > 0",
+            ));
         }
         if cb.window_duration_secs == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "circuit_breaker.window_duration_secs".to_string(),
-                value: cb.window_duration_secs.to_string(),
-                reason: "Must be > 0".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "circuit_breaker.window_duration_secs",
+                cb.window_duration_secs,
+                "Must be > 0",
+            ));
+        }
+        Ok(())
+    }
+
+    /// The worker health checker's knobs: the interval and the timeout are
+    /// periods in whole seconds, the thresholds counts of consecutive
+    /// probes, and none of them means anything at 0. An interval of 0 made
+    /// the checker a busy loop (thousands of probes per second against every
+    /// worker, one core at 100 %); a timeout of 0 times every probe out at
+    /// once; a threshold of 0 flips a worker's state without a probe. The
+    /// interval is refused with probing disabled too: the checker's loop
+    /// still sleeps on it between connect signals.
+    fn validate_health_check(health_check: &HealthCheckConfig) -> ConfigResult<()> {
+        if !health_check.endpoint.starts_with('/') {
+            return Err(ConfigError::invalid_value(
+                "health_check.endpoint",
+                &health_check.endpoint,
+                "must start with '/': it is appended to every HTTP worker's URL",
+            ));
+        }
+        let knobs = [
+            (
+                "health_check.check_interval_secs",
+                health_check.check_interval_secs,
+                "--health-check-interval-secs 0 would probe every worker in a busy loop; \
+                 --disable-health-check turns probing off",
+            ),
+            (
+                "health_check.timeout_secs",
+                health_check.timeout_secs,
+                "--health-check-timeout-secs 0 would time every probe out at once",
+            ),
+            (
+                "health_check.failure_threshold",
+                u64::from(health_check.failure_threshold),
+                "--health-failure-threshold 0 would fail a worker without a probe",
+            ),
+            (
+                "health_check.success_threshold",
+                u64::from(health_check.success_threshold),
+                "--health-success-threshold 0 would pass a worker without a probe",
+            ),
+        ];
+        for (field, value, consequence) in knobs {
+            if value == 0 {
+                return Err(ConfigError::invalid_value(
+                    field,
+                    value,
+                    format!("Must be >= 1 ({consequence})"),
+                ));
+            }
         }
         Ok(())
     }
 
     fn validate_tokenizer_cache(cache: &TokenizerCacheConfig) -> ConfigResult<()> {
         if cache.enable_l0 && cache.l0_max_entries == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "tokenizer_cache.l0_max_entries".to_string(),
-                value: cache.l0_max_entries.to_string(),
-                reason: "Must be > 0 when L0 cache is enabled".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "tokenizer_cache.l0_max_entries",
+                cache.l0_max_entries,
+                "Must be > 0 when L0 cache is enabled",
+            ));
         }
 
         if cache.enable_l0 && cache.l0_max_memory == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "tokenizer_cache.l0_max_memory".to_string(),
-                value: cache.l0_max_memory.to_string(),
-                reason: "Must be > 0 when L0 cache is enabled".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "tokenizer_cache.l0_max_memory",
+                cache.l0_max_memory,
+                "Must be > 0 when L0 cache is enabled",
+            ));
         }
 
         if cache.enable_l1 && cache.l1_max_memory == 0 {
-            return Err(ConfigError::InvalidValue {
-                field: "tokenizer_cache.l1_max_memory".to_string(),
-                value: cache.l1_max_memory.to_string(),
-                reason: "Must be > 0 when L1 cache is enabled".to_string(),
-            });
+            return Err(ConfigError::invalid_value(
+                "tokenizer_cache.l1_max_memory",
+                cache.l1_max_memory,
+                "Must be > 0 when L1 cache is enabled",
+            ));
         }
 
+        Ok(())
+    }
+
+    /// The tokenizer source the gateway will load is checked before anything
+    /// binds: `tokenizer_path`, else `model_path` (the source start-up and
+    /// worker registration read, so a `model_path` beside an explicit
+    /// tokenizer path is never read as one and not checked), when it names a
+    /// path on this host (absolute, explicitly relative, more than one
+    /// separator, or present on disk; anything else is a hub id the loader
+    /// fetches lazily, as before), and `chat_template` always. A path that
+    /// exists must be readable, a directory must hold a layout the loader
+    /// knows, a file must not be empty. A path that does not exist is left
+    /// alone when a gRPC worker can still register (the gateway then loads
+    /// the tokenizer from the first one, and a model path that exists on the
+    /// worker hosts only is a supported layout; see
+    /// [`a_grpc_worker_may_register`]) and is a configuration error when
+    /// none can. The load itself stays where it was, a background job at
+    /// start-up and at worker registration: this is the part of it that can
+    /// be known before serving. With autoload disabled the paths are never
+    /// read and are not checked.
+    fn validate_tokenizer_sources(config: &RouterConfig) -> ConfigResult<()> {
+        if config.disable_tokenizer_autoload {
+            return Ok(());
+        }
+        let (field, source) = match config.tokenizer_path.as_deref() {
+            Some(tokenizer_path) => ("tokenizer_path", Some(tokenizer_path)),
+            None => ("model_path", config.model_path.as_deref()),
+        };
+        if let Some(source) = source.filter(|source| names_a_local_path(source)) {
+            match local_tokenizer_source_error(Path::new(source)) {
+                Ok(()) => {}
+                Err(SourceProblem::Missing) if a_grpc_worker_may_register(config) => {}
+                Err(problem) => {
+                    return Err(ConfigError::invalid_value(field, source, problem.reason()));
+                }
+            }
+        }
+        if let Some(template) = config.chat_template.as_deref() {
+            text_file_error(Path::new(template))
+                .map_err(|reason| ConfigError::invalid_value("chat_template", template, reason))?;
+        }
         Ok(())
     }
 
@@ -1281,7 +2136,8 @@ impl ConfigValidator {
 
         Self::validate_mtls(config)?;
 
-        if !has_service_discovery {
+        // Under dp_aware each URL registers one worker per DP rank.
+        if !has_service_discovery && !config.dp_aware {
             if let PolicyConfig::PowerOfTwo { .. } = &config.policy {
                 let worker_count = config.mode.worker_count();
                 if worker_count < 2 {
@@ -1547,6 +2403,692 @@ mod tests {
             ..Default::default()
         };
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// The deprecated `kv_index` field, as a config file or a binding sets
+    /// it: `chain` in any case is accepted, the removed `positional` index
+    /// is refused with the removal in the reason, any other value is refused.
+    #[test]
+    fn kv_index_takes_chain_only() {
+        for value in ["chain", "Chain", " CHAIN "] {
+            let config = RouterConfig {
+                kv_index: Some(value.to_string()),
+                ..Default::default()
+            };
+            assert!(ConfigValidator::validate(&config).is_ok(), "{value:?}");
+        }
+
+        let config = RouterConfig {
+            kv_index: Some("positional".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, ref reason, .. })
+                if field == "kv_index" && reason.contains("positional KV index was removed")
+        ));
+
+        let config = RouterConfig {
+            kv_index: Some("run".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "kv_index"
+        ));
+    }
+
+    /// A `RouterConfig` built directly, as a language binding or a library
+    /// caller builds one: the validator refuses each malformed shape by its
+    /// field, and accepts the well-formed values.
+    #[test]
+    fn malformed_value_shapes_are_refused_by_name_on_a_directly_built_router_config() {
+        let defaults = RouterConfig::default;
+        let cases: Vec<(&str, RouterConfig)> = vec![
+            (
+                "health_check.endpoint",
+                RouterConfig {
+                    health_check: HealthCheckConfig {
+                        endpoint: "health".to_owned(),
+                        ..HealthCheckConfig::default()
+                    },
+                    ..defaults()
+                },
+            ),
+            (
+                "request_id_headers",
+                RouterConfig {
+                    request_id_headers: Some(vec!["bad header".to_owned()]),
+                    ..defaults()
+                },
+            ),
+            (
+                "storage_context_headers",
+                RouterConfig {
+                    storage_context_headers: [("bad header".to_owned(), "tenant".to_owned())]
+                        .into_iter()
+                        .collect(),
+                    ..defaults()
+                },
+            ),
+            (
+                "api_key",
+                RouterConfig {
+                    api_key: Some(" ".to_owned()),
+                    ..defaults()
+                },
+            ),
+        ];
+        for (field, config) in cases {
+            match ConfigValidator::validate(&config) {
+                Err(ConfigError::InvalidValue { field: named, .. }) => {
+                    assert_eq!(named, field);
+                }
+                other => panic!("{field}: expected a refusal by name, got {other:?}"),
+            }
+        }
+        let accepted = RouterConfig {
+            health_check: HealthCheckConfig {
+                endpoint: "/health".to_owned(),
+                ..HealthCheckConfig::default()
+            },
+            request_id_headers: Some(vec!["x-request-id".to_owned()]),
+            storage_context_headers: [("x-tenant".to_owned(), "tenant".to_owned())]
+                .into_iter()
+                .collect(),
+            api_key: Some("secret".to_owned()),
+            ..defaults()
+        };
+        assert!(ConfigValidator::validate(&accepted).is_ok());
+    }
+
+    fn scheduler_config(path: Option<&str>) -> RouterConfig {
+        RouterConfig {
+            priority_scheduler_enabled: true,
+            priority_scheduler_config: path.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    /// A class entry with every field, `queue_timeout_secs` set to `timeout`.
+    fn class_yaml(class: &str, timeout: u64) -> String {
+        format!(
+            "classes:\n  {class}:\n    reserved_floor: 1\n    queue_size: 16\n    \
+             queue_timeout_secs: {timeout}\n    starvation_threshold_secs: 10\n    \
+             can_preempt: false\n"
+        )
+    }
+
+    /// The `(value, reason)` of the `priority_scheduler_config` error a
+    /// configuration is refused with.
+    fn refused_scheduler_config(config: &RouterConfig) -> (String, String) {
+        match ConfigValidator::validate(config) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) if field == "priority_scheduler_config" => (value, reason),
+            other => panic!("expected a priority_scheduler_config error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_priority_scheduler_config_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing.yaml");
+        let path = path.to_str().unwrap();
+        let (value, reason) = refused_scheduler_config(&scheduler_config(Some(path)));
+        assert_eq!(value, path);
+        assert!(
+            reason.starts_with("reading ") && reason.contains(path),
+            "the reason names the file and the read error: {reason}"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_priority_scheduler_config_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("garbage.yaml");
+        std::fs::write(&path, "not: [valid: yaml\n").unwrap();
+        let path = path.to_str().unwrap();
+        let (value, reason) = refused_scheduler_config(&scheduler_config(Some(path)));
+        assert_eq!(value, path);
+        assert!(
+            reason.starts_with("parsing ") && reason.contains(path),
+            "the reason names the file and the parse error: {reason}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_priority_scheduler_config_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        // A class the scheduler does not know.
+        let unknown_class = dir.path().join("unknown-class.yaml");
+        std::fs::write(&unknown_class, class_yaml("gold", 1)).unwrap();
+        let (value, reason) = refused_scheduler_config(&scheduler_config(unknown_class.to_str()));
+        assert_eq!(value, unknown_class.to_str().unwrap());
+        assert!(
+            reason.contains("gold"),
+            "the reason names the unknown class: {reason}"
+        );
+        // A value the scheduler's own validation refuses.
+        let zero_timeout = dir.path().join("zero-timeout.yaml");
+        std::fs::write(&zero_timeout, class_yaml("bulk", 0)).unwrap();
+        let (value, reason) = refused_scheduler_config(&scheduler_config(zero_timeout.to_str()));
+        assert_eq!(value, zero_timeout.to_str().unwrap());
+        assert!(
+            reason.contains("queue_timeout_secs must be > 0"),
+            "the reason is the scheduler's own: {reason}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_priority_scheduler_default_max_class_is_a_configuration_error() {
+        for unknown in ["gold", "urgent"] {
+            let config = RouterConfig {
+                priority_scheduler_default_max_class: unknown.to_owned(),
+                ..scheduler_config(None)
+            };
+            match ConfigValidator::validate(&config) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value,
+                    reason,
+                }) if field == "priority_scheduler_default_max_class" => {
+                    assert_eq!(value, unknown);
+                    assert!(
+                        ["system", "interactive", "default", "bulk"]
+                            .iter()
+                            .all(|class| reason.contains(class)),
+                        "the reason names the four classes: {reason}"
+                    );
+                }
+                other => panic!(
+                    "`{unknown}` was not refused as a priority_scheduler_default_max_class error: {other:?}"
+                ),
+            }
+        }
+        // The four names in any case are accepted.
+        for known in ["system", "Interactive", " default ", "BULK"] {
+            let config = RouterConfig {
+                priority_scheduler_default_max_class: known.to_owned(),
+                ..scheduler_config(None)
+            };
+            assert!(ConfigValidator::validate(&config).is_ok(), "{known}");
+        }
+        // Not enabled: the flag is not read, like the path.
+        let config = RouterConfig {
+            priority_scheduler_default_max_class: "gold".to_owned(),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn a_priority_scheduler_config_with_an_unknown_key_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let unknown_key = dir.path().join("unknown-key.yaml");
+        std::fs::write(
+            &unknown_key,
+            "classes: {}\ntenant_policies: {}\nextra_field: 1\n",
+        )
+        .unwrap();
+        let (value, reason) = refused_scheduler_config(&scheduler_config(unknown_key.to_str()));
+        assert_eq!(value, unknown_key.to_str().unwrap());
+        assert!(
+            reason.starts_with("parsing ") && reason.contains("extra_field"),
+            "the reason names the file and the unknown key: {reason}"
+        );
+        // A misspelt section is an unknown key, not an empty section.
+        let misspelt = dir.path().join("misspelt.yaml");
+        std::fs::write(
+            &misspelt,
+            "tenant_polices:\n  \"header:a\":\n    max_class: bulk\n",
+        )
+        .unwrap();
+        let (_, reason) = refused_scheduler_config(&scheduler_config(misspelt.to_str()));
+        assert!(
+            reason.contains("tenant_polices"),
+            "the reason names the misspelt section: {reason}"
+        );
+    }
+
+    #[test]
+    fn a_valid_or_absent_priority_scheduler_config_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let valid = dir.path().join("scheduler.yaml");
+        let tenant_policies = "tenant_policies:\n  \"header:a\":\n    max_class: bulk\n";
+        std::fs::write(
+            &valid,
+            format!("{}{tenant_policies}", class_yaml("interactive", 5)),
+        )
+        .unwrap();
+        assert!(ConfigValidator::validate(&scheduler_config(valid.to_str())).is_ok());
+        // Enabled without a file: the built-in class defaults.
+        assert!(ConfigValidator::validate(&scheduler_config(None)).is_ok());
+        // Not enabled: the path is not read, as for the tenant rate limiter.
+        let missing = dir.path().join("missing.yaml");
+        let config = RouterConfig {
+            priority_scheduler_config: missing.to_str().map(str::to_owned),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn zero_runtime_worker_threads_is_rejected() {
+        let config = RouterConfig {
+            runtime_worker_threads: Some(0),
+            ..Default::default()
+        };
+        assert!(matches!(
+            ConfigValidator::validate(&config),
+            Err(ConfigError::InvalidValue { ref field, .. }) if field == "runtime_worker_threads"
+        ));
+
+        let config = RouterConfig {
+            runtime_worker_threads: Some(4),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// The ceiling on the count reads nothing of the host: 1, the host's CPU
+    /// count, a deliberate oversubscription of it and the ceiling itself pass
+    /// on every host, while one more and the 100,000 that a typo once got
+    /// through with are refused naming the ceiling.
+    #[test]
+    fn runtime_worker_threads_above_the_ceiling_are_rejected_on_every_host_alike() {
+        let cpus = available_cpus();
+        assert!(cpus >= 1);
+        let with = |threads: usize| RouterConfig {
+            runtime_worker_threads: Some(threads),
+            ..Default::default()
+        };
+        // The host's counts clamped to the ceiling: the test passes on a host
+        // with more CPUs than the ceiling allows for, as the rule does.
+        for ok in [
+            1,
+            cpus.min(RUNTIME_WORKER_THREADS_CEILING),
+            cpus.saturating_mul(RUNTIME_WORKER_THREADS_PER_CPU + 4)
+                .min(RUNTIME_WORKER_THREADS_CEILING),
+            RUNTIME_WORKER_THREADS_CEILING,
+        ] {
+            assert!(
+                ConfigValidator::validate(&with(ok)).is_ok(),
+                "{ok} worker threads, at most {RUNTIME_WORKER_THREADS_CEILING}"
+            );
+        }
+        for bad in [RUNTIME_WORKER_THREADS_CEILING + 1, 100_000] {
+            match ConfigValidator::validate(&with(bad)) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value,
+                    reason,
+                }) => {
+                    assert_eq!(field, "runtime_worker_threads", "{bad}");
+                    assert_eq!(value, bad.to_string());
+                    assert!(
+                        reason.contains(&format!("at most {RUNTIME_WORKER_THREADS_CEILING}")),
+                        "{bad}: {reason}"
+                    );
+                }
+                other => panic!("{bad} worker threads: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// A count above a small multiple of the CPUs available to the process
+    /// is a warning, not a refusal: the pure rule names the advised count
+    /// and the CPUs, says nothing within it, counts an unreadable
+    /// parallelism as one CPU, and the validator passes such a count.
+    #[test]
+    fn runtime_worker_threads_above_four_per_cpu_warn_without_a_refusal() {
+        assert_eq!(runtime_worker_threads_oversubscription(8, 2), None);
+        assert_eq!(runtime_worker_threads_oversubscription(1, 0), None);
+        let warning = runtime_worker_threads_oversubscription(16, 2).expect("a warning");
+        assert!(
+            warning.contains("runtime_worker_threads 16 is above 8")
+                && warning.contains("2 CPUs available"),
+            "{warning}"
+        );
+        let warning = runtime_worker_threads_oversubscription(5, 0).expect("a warning");
+        assert!(warning.contains("is above 4"), "{warning}");
+
+        let config = RouterConfig {
+            runtime_worker_threads: Some(
+                available_cpus()
+                    .saturating_mul(16)
+                    .min(RUNTIME_WORKER_THREADS_CEILING),
+            ),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// The RDMA lane's listener address is an IP address or nothing: a plain
+    /// IPv4 or IPv6 literal passes (padding aside; blank is unset, as the lane
+    /// reads it), while a non-address, a hostname, a port or brackets are
+    /// refused naming the field, before the lane comes up.
+    #[test]
+    fn rdma_listen_ip_must_be_an_ip_address_when_set() {
+        for ok in [
+            None,
+            Some(""),
+            Some("   "),
+            Some("10.0.0.7"),
+            Some(" 10.0.0.7 "),
+            Some("0.0.0.0"),
+            Some("fd00::1"),
+            Some("::1"),
+        ] {
+            let config = RouterConfig {
+                rdma_listen_ip: ok.map(str::to_string),
+                ..Default::default()
+            };
+            assert!(ConfigValidator::validate(&config).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "999.1.1.1",
+            "10.0.0",
+            "gateway.example",
+            "10.0.0.7:18515",
+            "[fd00::1]",
+            "fd00::1%eth0",
+            "::1/128",
+        ] {
+            let config = RouterConfig {
+                rdma_listen_ip: Some(bad.to_string()),
+                ..Default::default()
+            };
+            match ConfigValidator::validate(&config) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value,
+                    reason,
+                }) => {
+                    assert_eq!(field, "rdma_listen_ip", "{bad}");
+                    assert_eq!(value, bad);
+                    assert!(reason.contains("expected an IP address"), "{bad}: {reason}");
+                }
+                other => panic!("{bad}: expected a refusal, got {other:?}"),
+            }
+        }
+    }
+
+    /// Each optional field of the access-log record is listed once; a field
+    /// listed twice is refused by name, the rest of the list is accepted.
+    #[test]
+    fn an_access_log_field_listed_twice_is_a_configuration_error() {
+        let accepted = RouterConfig {
+            access_log_fields: AccessLogField::ALL.to_vec(),
+            ..Default::default()
+        };
+        ConfigValidator::validate(&accepted).expect("every field once is accepted");
+
+        let twice = RouterConfig {
+            access_log_fields: vec![
+                AccessLogField::Tenant,
+                AccessLogField::Worker,
+                AccessLogField::Tenant,
+            ],
+            ..Default::default()
+        };
+        match ConfigValidator::validate(&twice) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "access_log_fields");
+                assert_eq!(value, "tenant");
+                assert_eq!(reason, "listed twice");
+            }
+            other => panic!("expected an access_log_fields error, got {other:?}"),
+        }
+    }
+
+    fn log_dir_config(log_dir: &str) -> RouterConfig {
+        RouterConfig {
+            log_dir: Some(log_dir.to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// The `(value, reason)` of the `log_dir` error a configuration is
+    /// refused with.
+    fn refused_log_dir(config: &RouterConfig) -> (String, String) {
+        match ConfigValidator::validate(config) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) if field == "log_dir" => (value, reason),
+            other => panic!("expected a log_dir error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_log_dir_that_is_a_file_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let file = file.to_str().unwrap();
+        let (value, reason) = refused_log_dir(&log_dir_config(file));
+        assert_eq!(value, file);
+        assert!(reason.contains("not a directory"), "{reason}");
+    }
+
+    #[test]
+    fn a_log_dir_that_cannot_be_created_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let under_a_file = file.join("logs");
+        let file = file.to_str().unwrap();
+        let under = under_a_file.to_str().unwrap();
+        let (value, reason) = refused_log_dir(&log_dir_config(under));
+        assert_eq!(value, under);
+        assert!(
+            reason.contains("cannot be created") && reason.contains(file),
+            "the reason names the file in the way: {reason}"
+        );
+        assert!(!under_a_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_log_dir_the_gateway_cannot_write_is_a_configuration_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let writable = std::fs::metadata(&locked).unwrap().permissions();
+        let mut read_only = writable.clone();
+        read_only.set_mode(0o555);
+        std::fs::set_permissions(&locked, read_only).unwrap();
+        // A privileged process writes regardless of the mode: nothing to test.
+        let privileged = std::fs::File::create(locked.join("probe")).is_ok();
+        let verdict = ConfigValidator::validate(&log_dir_config(locked.to_str().unwrap()));
+        std::fs::set_permissions(&locked, writable).unwrap();
+        if privileged {
+            return;
+        }
+        match verdict {
+            Err(ConfigError::InvalidValue { field, reason, .. }) if field == "log_dir" => {
+                assert!(reason.contains("not writable"), "{reason}");
+            }
+            other => panic!("expected a log_dir error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_missing_log_dir_under_a_writable_directory_is_accepted_and_not_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("created").join("logs");
+        assert!(ConfigValidator::validate(&log_dir_config(fresh.to_str().unwrap())).is_ok());
+        assert!(
+            !fresh.exists() && !dir.path().join("created").exists(),
+            "validation leaves no directory behind; logging start-up creates it"
+        );
+        assert!(ConfigValidator::validate(&log_dir_config(dir.path().to_str().unwrap())).is_ok());
+        assert!(ConfigValidator::validate(&RouterConfig::default()).is_ok());
+    }
+
+    /// A relative `--log-dir` (a systemd `WorkingDirectory=`, a container
+    /// `WORKDIR`, a local run) that does not exist yet is accepted: its
+    /// nearest existing ancestor is the working directory, which the walk
+    /// reaches as "" and must read as ".". Nothing is created.
+    #[test]
+    fn a_missing_relative_log_dir_under_the_working_directory_is_accepted() {
+        let leaf = format!(
+            "log-dir-validation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+        for relative in [leaf.clone(), format!("{leaf}/run/logs")] {
+            assert!(
+                ConfigValidator::validate(&log_dir_config(&relative)).is_ok(),
+                "{relative}"
+            );
+            assert!(
+                !Path::new(&leaf).exists(),
+                "{relative}: created by the validation"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_log_dir_under_a_directory_the_gateway_cannot_write_is_a_configuration_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let writable = std::fs::metadata(&locked).unwrap().permissions();
+        let mut read_only = writable.clone();
+        read_only.set_mode(0o555);
+        std::fs::set_permissions(&locked, read_only).unwrap();
+        let privileged = std::fs::File::create(locked.join("probe")).is_ok();
+        let under = locked.join("gateway").join("logs");
+        let verdict = ConfigValidator::validate(&log_dir_config(under.to_str().unwrap()));
+        std::fs::set_permissions(&locked, writable).unwrap();
+        if privileged {
+            return;
+        }
+        match verdict {
+            Err(ConfigError::InvalidValue { field, reason, .. }) if field == "log_dir" => {
+                assert!(
+                    reason.contains("cannot be created")
+                        && reason.contains(locked.to_str().unwrap())
+                        && reason.contains("not writable"),
+                    "the reason names the ancestor: {reason}"
+                );
+            }
+            other => panic!("expected a log_dir error, got {other:?}"),
+        }
+        assert!(!under.exists());
+    }
+
+    /// The Redis configuration's own rules run through the shared validation
+    /// too, so the bindings and a directly built configuration refuse a
+    /// retention of 0 days (every record expired as it is written) as the
+    /// command line does; unset, the retention is persistent and passes.
+    #[test]
+    fn a_redis_retention_of_zero_days_is_refused_through_the_shared_validation() {
+        let redis = |retention_days| RedisConfig {
+            url: "redis://localhost:6379".to_string(),
+            pool_max: 4,
+            op_timeout_secs: RedisConfig::default_op_timeout_secs(),
+            schema: None,
+            retention_days,
+        };
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Redis,
+            redis: Some(redis(Some(0))),
+            ..Default::default()
+        };
+        match ConfigValidator::validate(&config) {
+            Err(ConfigError::ValidationFailed { reason }) => {
+                assert!(
+                    reason.contains("retention_days must be at least 1"),
+                    "{reason}"
+                );
+            }
+            other => panic!("expected the Redis rule, got {other:?}"),
+        }
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Redis,
+            redis: Some(redis(None)),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+        // Another backend leaves the Redis block unread.
+        let config = RouterConfig {
+            redis: Some(redis(Some(0))),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// The shared validation holds the stores' numeric rules and leaves the
+    /// connection string to the driver: a Redis socket path and a Postgres
+    /// key=value string, which the drivers accept and the command line's URL
+    /// check does not, pass it; a zero bound in the same configuration does
+    /// not.
+    #[test]
+    fn the_shared_validation_leaves_the_store_connection_string_to_the_driver() {
+        let redis = |pool_max| RedisConfig {
+            url: "unix:///run/redis.sock".to_string(),
+            pool_max,
+            op_timeout_secs: RedisConfig::default_op_timeout_secs(),
+            schema: None,
+            retention_days: Some(7),
+        };
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Redis,
+            redis: Some(redis(4)),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Redis,
+            redis: Some(redis(0)),
+            ..Default::default()
+        };
+        match ConfigValidator::validate(&config) {
+            Err(ConfigError::ValidationFailed { reason }) => {
+                assert!(reason.contains("pool_max"), "{reason}");
+            }
+            other => panic!("expected the Redis bound, got {other:?}"),
+        }
+
+        let postgres = |op_timeout_secs| PostgresConfig {
+            db_url: "host=/var/run/postgresql dbname=smg user=smg".to_string(),
+            pool_max: 4,
+            op_timeout_secs,
+            schema: None,
+        };
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Postgres,
+            postgres: Some(postgres(5)),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+        let config = RouterConfig {
+            history_backend: HistoryBackend::Postgres,
+            postgres: Some(postgres(0)),
+            ..Default::default()
+        };
+        match ConfigValidator::validate(&config) {
+            Err(ConfigError::ValidationFailed { reason }) => {
+                assert!(reason.contains("op_timeout_secs"), "{reason}");
+            }
+            other => panic!("expected the Postgres bound, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1873,6 +3415,215 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_file_discovery() {
+        let file = |path: &str, check_interval_secs| {
+            Some(DiscoveryConfig::File(FileDiscoveryConfig {
+                path: path.into(),
+                check_interval_secs,
+            }))
+        };
+
+        let mut config = regular_mode_config();
+        config.discovery = file("/run/smg/workers.json", 30);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        for (discovery, field) in [
+            (file("", 30), "discovery.path"),
+            (
+                file("/run/smg/workers.json", 0),
+                "discovery.check_interval_secs",
+            ),
+        ] {
+            config.discovery = discovery;
+            assert!(matches!(
+                ConfigValidator::validate(&config),
+                Err(ConfigError::InvalidValue { field: ref actual, .. }) if actual == field
+            ));
+        }
+
+        let mut openai = RouterConfig {
+            mode: RoutingMode::OpenAI {
+                worker_urls: vec![],
+            },
+            ..Default::default()
+        };
+        openai.discovery = file("/run/smg/workers.json", 30);
+        assert!(matches!(
+            ConfigValidator::validate(&openai),
+            Err(ConfigError::ValidationFailed { ref reason })
+                if reason.contains("does not support service discovery")
+        ));
+    }
+
+    fn slurm(names: [&[&str]; 4]) -> SlurmDiscoveryConfig {
+        let [regular, encode, prefill, decode] =
+            names.map(|names| names.iter().map(|name| name.to_string()).collect());
+        SlurmDiscoveryConfig {
+            job_names: regular,
+            encode_job_names: encode,
+            prefill_job_names: prefill,
+            decode_job_names: decode,
+            port: 8000,
+            bootstrap_port: None,
+            user: None,
+            account: None,
+            partition: None,
+            check_interval_secs: 30,
+        }
+    }
+
+    #[test]
+    fn test_validate_slurm_discovery() {
+        let epd = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![],
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        let validate = |mode: &RoutingMode, discovery: SlurmDiscoveryConfig| {
+            let config = RouterConfig {
+                mode: mode.clone(),
+                discovery: Some(DiscoveryConfig::Slurm(discovery)),
+                ..Default::default()
+            };
+            ConfigValidator::validate(&config)
+        };
+        let regular = regular_mode_config().mode;
+        let pd = pd_mode_config().mode;
+
+        // Each mode with the job names it needs; a repeated name in one role
+        // is harmless.
+        for (mode, discovery) in [
+            (&regular, slurm([&["w", "w2"], &[], &[], &[]])),
+            (&pd, slurm([&[], &[], &["p", "p2"], &["d"]])),
+            (&pd, slurm([&[], &[], &["p"], &[]])),
+            (&epd, slurm([&[], &["e"], &["p"], &["d"]])),
+            (&regular, slurm([&["w", "w"], &[], &[], &[]])),
+            (
+                &pd,
+                SlurmDiscoveryConfig {
+                    bootstrap_port: Some(8998),
+                    user: Some("svc".to_string()),
+                    account: Some("acct".to_string()),
+                    partition: Some("gpu".to_string()),
+                    ..slurm([&[], &[], &["p"], &["d"]])
+                },
+            ),
+        ] {
+            assert!(validate(mode, discovery.clone()).is_ok(), "{discovery:?}");
+        }
+
+        for (mode, discovery, expected) in [
+            (
+                &regular,
+                slurm([&[], &[], &[], &[]]),
+                "requires a regular job name",
+            ),
+            (
+                &regular,
+                slurm([&["w"], &[], &["p"], &[]]),
+                "has no encode, prefill or decode",
+            ),
+            (
+                &pd,
+                slurm([&[], &[], &[], &[]]),
+                "requires a prefill or decode job name",
+            ),
+            (
+                &pd,
+                slurm([&["w"], &[], &["p"], &["d"]]),
+                "has no regular or encode",
+            ),
+            (
+                &epd,
+                slurm([&[], &["e"], &["p"], &[]]),
+                "requires encode, prefill and decode",
+            ),
+            (
+                &epd,
+                slurm([&["w"], &["e"], &["p"], &["d"]]),
+                "has no regular workers",
+            ),
+            (
+                &pd,
+                slurm([&[], &[], &["x"], &["x"]]),
+                "maps to both prefill and decode",
+            ),
+            (
+                &regular,
+                SlurmDiscoveryConfig {
+                    bootstrap_port: Some(8998),
+                    ..slurm([&["w"], &[], &[], &[]])
+                },
+                "applies only to encode and prefill",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    validate(mode, discovery.clone()),
+                    Err(ConfigError::ValidationFailed { ref reason }) if reason.contains(expected)
+                ),
+                "{discovery:?}: expected {expected:?}, got {:?}",
+                validate(mode, discovery.clone())
+            );
+        }
+
+        let base = || slurm([&["w"], &[], &[], &[]]);
+        for (discovery, field) in [
+            (SlurmDiscoveryConfig { port: 0, ..base() }, "discovery.port"),
+            (
+                SlurmDiscoveryConfig {
+                    bootstrap_port: Some(0),
+                    ..base()
+                },
+                "discovery.bootstrap_port",
+            ),
+            (
+                SlurmDiscoveryConfig {
+                    check_interval_secs: 0,
+                    ..base()
+                },
+                "discovery.check_interval_secs",
+            ),
+            (slurm([&["a,b"], &[], &[], &[]]), "discovery.job_names"),
+            (slurm([&[""], &[], &[], &[]]), "discovery.job_names"),
+            (
+                SlurmDiscoveryConfig {
+                    user: Some(String::new()),
+                    ..base()
+                },
+                "discovery.user",
+            ),
+            (
+                SlurmDiscoveryConfig {
+                    partition: Some("gpu,cpu".to_string()),
+                    ..base()
+                },
+                "discovery.partition",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    validate(&regular, discovery.clone()),
+                    Err(ConfigError::InvalidValue { field: ref actual, .. }) if actual == field
+                ),
+                "{discovery:?}: expected {field}"
+            );
+        }
+
+        let openai = RoutingMode::OpenAI {
+            worker_urls: vec![],
+        };
+        assert!(matches!(
+            validate(&openai, base()),
+            Err(ConfigError::ValidationFailed { ref reason })
+                if reason.contains("does not support service discovery")
+        ));
+    }
+
+    #[test]
     fn test_validate_invalid_kv_annotation_names() {
         for (field, kv_connector_annotation, kv_engine_id_annotation) in [
             (
@@ -1941,6 +3692,8 @@ mod tests {
                 cache_boundaries: Vec::new(),
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
+                balance_prefix_margin_tokens: 0,
+                balance_uncached_credit: false,
             },
         );
 
@@ -1973,6 +3726,8 @@ mod tests {
                     cache_boundaries: Vec::new(),
                     selection_policy: None,
                     selection_accounting_ttl_ms: 0,
+                    balance_prefix_margin_tokens: 0,
+                    balance_uncached_credit: false,
                 },
             )
         };
@@ -1985,6 +3740,157 @@ mod tests {
         assert!(ConfigValidator::validate(&make(0.0, -1.0)).is_err());
         assert!(ConfigValidator::validate(&make(f32::NAN, 0.0)).is_err());
         assert!(ConfigValidator::validate(&make(0.0, f32::INFINITY)).is_err());
+    }
+
+    /// NaN passes every `<` and `<=` comparison and an infinity passes the
+    /// ones written as a lower bound, so the thresholds a policy compares
+    /// that way are checked for finiteness first: a spill gate, token-usage
+    /// threshold or load factor that is NaN never fires, which reads as a
+    /// quiet routing change instead of the typo it is.
+    #[test]
+    fn non_finite_policy_thresholds_are_rejected() {
+        fn refused_field(config: &RouterConfig) -> String {
+            match ConfigValidator::validate(config) {
+                Err(ConfigError::InvalidValue { field, .. }) => field,
+                other => panic!("accepted, or refused for another reason: {other:?}"),
+            }
+        }
+        let two_workers = || RoutingMode::Regular {
+            worker_urls: vec![
+                "http://worker1:8000".to_string(),
+                "http://worker2:8000".to_string(),
+            ],
+        };
+        let cache_aware = |balance_rel_threshold: f32,
+                           balance_token_usage_threshold: f32,
+                           overload_token_usage_threshold: f32| {
+            RouterConfig::new(
+                two_workers(),
+                PolicyConfig::CacheAware {
+                    cache_threshold: 0.5,
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold,
+                    eviction_interval_secs: 60,
+                    max_tree_size: 1000,
+                    block_size: 16,
+                    balance_token_usage_threshold,
+                    overload_token_usage_threshold,
+                    overlap_decay: 0.0,
+                    selection_temperature: 0.0,
+                    cache_index: Default::default(),
+                    cache_ttl_secs: 180,
+                    cache_boundaries: Vec::new(),
+                    selection_policy: None,
+                    selection_accounting_ttl_ms: 0,
+                    balance_prefix_margin_tokens: 0,
+                    balance_uncached_credit: false,
+                },
+            )
+        };
+        let bucket = |balance_rel_threshold: f32| {
+            RouterConfig::new(
+                two_workers(),
+                PolicyConfig::Bucket {
+                    balance_abs_threshold: 32,
+                    balance_rel_threshold,
+                    bucket_adjust_interval_secs: 60,
+                },
+            )
+        };
+        let prefix_hash = |load_factor: f64| {
+            RouterConfig::new(
+                two_workers(),
+                PolicyConfig::PrefixHash {
+                    prefix_token_count: 256,
+                    load_factor,
+                    balance_abs_threshold: 10,
+                    cache_boundaries: Vec::new(),
+                },
+            )
+        };
+        assert!(ConfigValidator::validate(&cache_aware(1.5, 1.0, 1.0)).is_ok());
+        assert!(ConfigValidator::validate(&bucket(1.5)).is_ok());
+        assert!(ConfigValidator::validate(&prefix_hash(1.25)).is_ok());
+        for bad in [f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                refused_field(&cache_aware(bad, 1.0, 1.0)),
+                "balance_rel_threshold",
+                "{bad}"
+            );
+            assert_eq!(
+                refused_field(&cache_aware(1.5, bad, 1.0)),
+                "balance_token_usage_threshold",
+                "{bad}"
+            );
+            assert_eq!(
+                refused_field(&cache_aware(1.5, 1.0, bad)),
+                "overload_token_usage_threshold",
+                "{bad}"
+            );
+            assert_eq!(
+                refused_field(&bucket(bad)),
+                "balance_rel_threshold",
+                "{bad}"
+            );
+            assert_eq!(
+                refused_field(&prefix_hash(f64::from(bad))),
+                "load_factor",
+                "{bad}"
+            );
+        }
+    }
+
+    /// The retry backoff multiplier is a lower bound too.
+    #[test]
+    fn a_non_finite_retry_backoff_multiplier_is_rejected() {
+        let with_multiplier = |backoff_multiplier: f32| {
+            let mut config = regular_mode_config();
+            config.retry = RetryConfig {
+                backoff_multiplier,
+                ..Default::default()
+            };
+            config
+        };
+        assert!(ConfigValidator::validate(&with_multiplier(1.5)).is_ok());
+        for bad in [f32::NAN, f32::INFINITY, 0.5] {
+            assert!(
+                matches!(
+                    ConfigValidator::validate(&with_multiplier(bad)),
+                    Err(ConfigError::InvalidValue { ref field, .. })
+                        if field == "retry.backoff_multiplier"
+                ),
+                "{bad}"
+            );
+        }
+    }
+
+    /// The metrics port is a stable, operator-configured port like the other
+    /// listeners' ports: 0 (an OS-assigned ephemeral port) is refused naming
+    /// the field, as the flag help says.
+    #[test]
+    fn a_metrics_port_of_zero_is_rejected() {
+        let mut config = regular_mode_config();
+        config.metrics = Some(MetricsConfig {
+            port: 0,
+            host: "127.0.0.1".to_string(),
+        });
+        match ConfigValidator::validate(&config) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "metrics.port");
+                assert_eq!(value, "0");
+                assert!(reason.contains("ephemeral"), "{reason}");
+            }
+            other => panic!("a metrics port of 0 was accepted: {other:?}"),
+        }
+        config.metrics = Some(MetricsConfig {
+            port: 29000,
+            host: "127.0.0.1".to_string(),
+        });
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]
@@ -2010,6 +3916,8 @@ mod tests {
                     cache_boundaries: boundaries,
                     selection_policy: None,
                     selection_accounting_ttl_ms: 0,
+                    balance_prefix_margin_tokens: 0,
+                    balance_uncached_credit: false,
                 },
             )
         };
@@ -2064,6 +3972,8 @@ mod tests {
                 cache_boundaries: Vec::new(),
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
+                balance_prefix_margin_tokens: 0,
+                balance_uncached_credit: false,
             },
         );
 
@@ -2187,6 +4097,8 @@ mod tests {
                 cache_boundaries: Vec::new(),
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
+                balance_prefix_margin_tokens: 0,
+                balance_uncached_credit: false,
             },
         );
 
@@ -2205,7 +4117,7 @@ mod tests {
                 ],
             },
             PolicyConfig::PowerOfTwo {
-                load_check_interval_secs: 60,
+                load_metric: Default::default(),
             },
         );
 
@@ -2241,9 +4153,11 @@ mod tests {
                     cache_boundaries: Vec::new(),
                     selection_policy: None,
                     selection_accounting_ttl_ms: 0,
+                    balance_prefix_margin_tokens: 0,
+                    balance_uncached_credit: false,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 60,
+                    load_metric: Default::default(),
                 }),
             },
             PolicyConfig::Random, // Main policy as fallback
@@ -2255,7 +4169,7 @@ mod tests {
 
     #[test]
     fn test_validate_pd_mode_power_of_two_insufficient_workers() {
-        let config = RouterConfig::new(
+        let mut config = RouterConfig::new(
             RoutingMode::PrefillDecode {
                 prefill_urls: vec![("http://prefill1:8000".to_string(), None)], // Only 1 prefill
                 decode_urls: vec![
@@ -2263,7 +4177,7 @@ mod tests {
                     "http://decode2:8000".to_string(),
                 ],
                 prefill_policy: Some(PolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 60,
+                    load_metric: Default::default(),
                 }), // Requires 2+ workers
                 decode_policy: None,
             },
@@ -2275,6 +4189,9 @@ mod tests {
         if let Err(e) = result {
             assert!(e.to_string().contains("prefill requires at least 2"));
         }
+
+        config.dp_aware = true;
+        assert!(ConfigValidator::validate(&config).is_ok());
     }
 
     #[test]
@@ -2295,7 +4212,7 @@ mod tests {
                     bucket_adjust_interval_secs: 5,
                 }),
                 decode_policy: Some(PolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 60,
+                    load_metric: Default::default(),
                 }),
             },
             PolicyConfig::Random, // Main policy as fallback
@@ -2374,6 +4291,8 @@ mod tests {
                     cache_boundaries: Vec::new(),
                     selection_policy: None,
                     selection_accounting_ttl_ms: 0,
+                    balance_prefix_margin_tokens: 0,
+                    balance_uncached_credit: false,
                 }),
                 prefill_policy: None,
                 decode_policy: None,
@@ -2388,7 +4307,6 @@ mod tests {
                 prefill_urls: vec![("http://prefill:8000".to_string(), None)],
                 decode_urls: vec!["http://decode:8000".to_string()],
                 encode_policy: Some(PolicyConfig::LeastLoad {
-                    load_check_interval_secs: 5,
                     kv_pressure_weight: 0.15,
                     mean_prefill_tokens: 1024,
                     default_throughput: 2000.0,
@@ -2483,10 +4401,264 @@ mod tests {
         );
 
         config.connection_mode = ConnectionMode::Grpc;
-        config.tokenizer_path = Some("/path/to/tokenizer.json".to_string());
+        let dir = tempfile::tempdir().unwrap();
+        let tokenizer = dir.path().join("tokenizer.json");
+        std::fs::write(&tokenizer, "{}").unwrap();
+        config.tokenizer_path = Some(tokenizer.to_string_lossy().into_owned());
 
         let result = ConfigValidator::validate(&config);
         assert!(result.is_ok());
+    }
+
+    /// A directory with the one file the tokenizer loader looks for first.
+    fn tokenizer_dir(dir: &tempfile::TempDir) -> String {
+        let tok = dir.path().join("tok");
+        std::fs::create_dir(&tok).unwrap();
+        std::fs::write(tok.join("tokenizer.json"), "{}").unwrap();
+        tok.to_str().unwrap().to_string()
+    }
+
+    /// The `(value, reason)` of the `expected_field` error a configuration
+    /// is refused with.
+    fn refused_source(config: &RouterConfig, expected_field: &str) -> (String, String) {
+        match ConfigValidator::validate(config) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) if field == expected_field => (value, reason),
+            other => panic!("expected a {expected_field} error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_tokenizer_or_model_path_that_cannot_be_read_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let empty_dir = dir.path().join("empty-dir");
+        std::fs::create_dir(&empty_dir).unwrap();
+        let empty_file = dir.path().join("empty.json");
+        std::fs::write(&empty_file, "").unwrap();
+        let cases = [
+            (missing.to_str().unwrap(), "does not exist"),
+            (empty_dir.to_str().unwrap(), "contains no tokenizer file"),
+            (empty_file.to_str().unwrap(), "is empty"),
+        ];
+        for (path, expected) in cases {
+            let as_tokenizer = RouterConfig {
+                tokenizer_path: Some(path.to_string()),
+                ..Default::default()
+            };
+            let as_model = RouterConfig {
+                model_path: Some(path.to_string()),
+                ..Default::default()
+            };
+            for (field, config) in [("tokenizer_path", as_tokenizer), ("model_path", as_model)] {
+                let (value, reason) = refused_source(&config, field);
+                assert_eq!(value, path);
+                assert!(reason.contains(expected), "{field} {path}: {reason}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_tokenizer_path_is_a_configuration_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let unreadable = dir.path().join("unreadable.json");
+        std::fs::write(&unreadable, "{}").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // A privileged process reads regardless of the mode: nothing to test.
+        let privileged = std::fs::File::open(&unreadable).is_ok();
+        let config = RouterConfig {
+            tokenizer_path: Some(unreadable.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        let verdict = ConfigValidator::validate(&config);
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if privileged {
+            return;
+        }
+        match verdict {
+            Err(ConfigError::InvalidValue { field, reason, .. }) if field == "tokenizer_path" => {
+                assert!(reason.contains("cannot be read"), "{reason}");
+            }
+            other => panic!("expected a tokenizer_path error, got {other:?}"),
+        }
+    }
+
+    /// Only the source the gateway loads is checked: a `model_path` beside an
+    /// explicit tokenizer path is never read as a tokenizer source.
+    #[test]
+    fn a_model_path_beside_an_explicit_tokenizer_path_is_not_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = tokenizer_dir(&dir);
+        let config = RouterConfig {
+            tokenizer_path: Some(tok),
+            model_path: Some(format!("{}/missing", dir.path().to_str().unwrap())),
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// A source that does not exist on this host is left to the worker
+    /// fallback wherever a gRPC worker can still register: gRPC start-up
+    /// URLs, IGW mode, a discovery provider; it is refused where none can
+    /// (http URLs only, no IGW, no discovery), and one that exists and cannot
+    /// serve is refused everywhere.
+    #[test]
+    fn a_missing_source_is_left_to_the_worker_fallback_where_a_grpc_worker_may_register() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = format!("{}/models/on-the-worker", dir.path().to_str().unwrap());
+        let regular = |urls: &[&str]| RoutingMode::Regular {
+            worker_urls: urls.iter().map(|u| u.to_string()).collect(),
+        };
+        let with =
+            |mode: RoutingMode, igw: bool, discovery: Option<DiscoveryConfig>| RouterConfig {
+                mode,
+                enable_igw: igw,
+                discovery,
+                model_path: Some(missing.clone()),
+                ..Default::default()
+            };
+        let discovery = DiscoveryConfig::File(FileDiscoveryConfig {
+            path: dir.path().join("workers.json"),
+            check_interval_secs: 5,
+        });
+        for (name, config) in [
+            ("igw", with(regular(&[]), true, None)),
+            ("discovery", with(regular(&[]), false, Some(discovery))),
+            (
+                "a grpcs url",
+                with(regular(&["grpcs://b:50051"]), false, None),
+            ),
+            (
+                "a grpc url beside an http one",
+                with(regular(&["http://a:8000", "grpc://b:50051"]), false, None),
+            ),
+        ] {
+            assert!(ConfigValidator::validate(&config).is_ok(), "{name}");
+        }
+        for (name, config) in [
+            (
+                "explicit http urls only",
+                with(regular(&["http://a:8000", "https://b:8443"]), false, None),
+            ),
+            (
+                "no urls, no igw, no discovery",
+                with(regular(&[]), false, None),
+            ),
+        ] {
+            let (value, reason) = refused_source(&config, "model_path");
+            assert_eq!(value, missing, "{name}");
+            assert!(reason.contains("does not exist"), "{name}: {reason}");
+        }
+    }
+
+    #[test]
+    fn a_missing_source_is_left_to_the_worker_fallback_in_grpc_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = format!("{}/models/on-the-worker", dir.path().to_str().unwrap());
+        let empty_dir = dir.path().join("empty-dir");
+        std::fs::create_dir(&empty_dir).unwrap();
+        let grpc = |model_path: &str| {
+            let mut config = RouterConfig::new(
+                RoutingMode::Regular {
+                    worker_urls: vec!["grpc://worker:50051".to_string()],
+                },
+                PolicyConfig::Random,
+            );
+            config.connection_mode = ConnectionMode::Grpc;
+            config.model_path = Some(model_path.to_string());
+            config
+        };
+        assert!(ConfigValidator::validate(&grpc(&missing)).is_ok());
+        let (value, reason) = refused_source(&grpc(empty_dir.to_str().unwrap()), "model_path");
+        assert_eq!(value, empty_dir.to_str().unwrap());
+        assert!(reason.contains("contains no tokenizer file"), "{reason}");
+        let http = RouterConfig {
+            model_path: Some(missing.clone()),
+            ..Default::default()
+        };
+        let (value, reason) = refused_source(&http, "model_path");
+        assert_eq!(value, missing);
+        assert!(reason.contains("does not exist"), "{reason}");
+    }
+
+    /// The directory rule is the loader's: `vocab.json` counts with
+    /// `merges.txt` beside it, not alone.
+    #[test]
+    fn a_directory_with_vocab_json_alone_is_not_a_tokenizer_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let bpe = dir.path().join("bpe");
+        std::fs::create_dir(&bpe).unwrap();
+        std::fs::write(bpe.join("vocab.json"), "{}").unwrap();
+        let config = RouterConfig {
+            tokenizer_path: Some(bpe.to_str().unwrap().to_string()),
+            ..Default::default()
+        };
+        let (_, reason) = refused_source(&config, "tokenizer_path");
+        assert!(reason.contains("vocab.json with merges.txt"), "{reason}");
+        std::fs::write(bpe.join("merges.txt"), "#version: 0.2\n").unwrap();
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn a_hub_id_or_a_present_local_tokenizer_is_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = tokenizer_dir(&dir);
+        let sources = [
+            tok.clone(),
+            format!("{tok}/tokenizer.json"),
+            "some-org/some-model".to_string(),
+        ];
+        for source in sources {
+            let config = RouterConfig {
+                tokenizer_path: Some(source.clone()),
+                ..Default::default()
+            };
+            assert!(ConfigValidator::validate(&config).is_ok(), "{source}");
+            let config = RouterConfig {
+                model_path: Some(source.clone()),
+                ..Default::default()
+            };
+            assert!(ConfigValidator::validate(&config).is_ok(), "{source}");
+        }
+        // With autoload disabled the paths are never read, so not checked.
+        let config = RouterConfig {
+            tokenizer_path: Some(format!("{}/missing", dir.path().to_str().unwrap())),
+            disable_tokenizer_autoload: true,
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn a_chat_template_that_cannot_be_used_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = tokenizer_dir(&dir);
+        let missing = dir.path().join("missing.jinja");
+        let blank = dir.path().join("blank.jinja");
+        std::fs::write(&blank, " \n").unwrap();
+        let template = dir.path().join("template.jinja");
+        std::fs::write(&template, "{{ messages }}").unwrap();
+        let with_template = |path: &str| RouterConfig {
+            tokenizer_path: Some(tok.clone()),
+            chat_template: Some(path.to_string()),
+            ..Default::default()
+        };
+        let cases = [
+            (missing.to_str().unwrap(), "does not exist"),
+            (blank.to_str().unwrap(), "is empty"),
+            (dir.path().to_str().unwrap(), "is a directory"),
+        ];
+        for (path, expected) in cases {
+            let (value, reason) = refused_source(&with_template(path), "chat_template");
+            assert_eq!(value, path);
+            assert!(reason.contains(expected), "{path}: {reason}");
+        }
+        assert!(ConfigValidator::validate(&with_template(template.to_str().unwrap())).is_ok());
     }
 
     #[test]
@@ -2539,6 +4711,171 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Two listeners on one port are refused naming both flags; distinct
+    /// ports pass.
+    #[test]
+    fn equal_listener_ports_are_rejected() {
+        let listeners = |port: u16, metrics_port: u16, probe_port: Option<u16>| RouterConfig {
+            port,
+            metrics: Some(MetricsConfig {
+                port: metrics_port,
+                host: "127.0.0.1".to_string(),
+            }),
+            health_check_port: probe_port,
+            ..Default::default()
+        };
+        let refused = |config: &RouterConfig| match ConfigValidator::validate(config) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => (field, value, reason),
+            other => panic!("expected an InvalidValue, got {other:?}"),
+        };
+
+        let (field, value, reason) = refused(&listeners(30001, 30001, None));
+        assert_eq!((field.as_str(), value.as_str()), ("metrics.port", "30001"));
+        assert!(
+            reason.contains("--prometheus-port") && reason.contains("--port"),
+            "{reason}"
+        );
+
+        let (field, _, reason) = refused(&listeners(30001, 30002, Some(30001)));
+        assert_eq!(field, "health_check_port");
+        assert!(
+            reason.contains("--health-check-port") && reason.contains("--port"),
+            "{reason}"
+        );
+
+        let (field, _, reason) = refused(&listeners(30001, 30002, Some(30002)));
+        assert_eq!(field, "health_check_port");
+        assert!(
+            reason.contains("--health-check-port") && reason.contains("--prometheus-port"),
+            "{reason}"
+        );
+
+        assert!(ConfigValidator::validate(&listeners(30001, 30002, Some(30003))).is_ok());
+    }
+
+    /// The mesh listener cannot share a port with the HTTP, metrics or probe
+    /// listener: refused under the mesh port's field, naming both flags. The
+    /// check runs in `server::startup`, so it holds for every way the server
+    /// configuration is built.
+    #[test]
+    fn mesh_port_equal_to_another_listener_is_rejected() {
+        for (flag, taken) in [
+            ("--port", 30001),
+            ("--prometheus-port", 30002),
+            ("--health-check-port", 30003),
+            ("--admin-port", 30004),
+        ] {
+            match validate_mesh_listener_port(taken, 30001, Some(30002), Some(30003), Some(30004)) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value,
+                    reason,
+                }) => {
+                    assert_eq!(field, "mesh_port");
+                    assert_eq!(value, taken.to_string());
+                    assert!(
+                        reason.contains("--mesh-port") && reason.contains(flag),
+                        "{reason}"
+                    );
+                }
+                other => panic!("--mesh-port equal to {flag} must be rejected, got {other:?}"),
+            }
+        }
+        assert!(
+            validate_mesh_listener_port(30005, 30001, Some(30002), Some(30003), Some(30004))
+                .is_ok()
+        );
+        assert!(validate_mesh_listener_port(30002, 30001, None, None, None).is_ok());
+    }
+
+    /// The admin listener's settings: a port of 0 is refused (an ephemeral
+    /// port is no stable control-plane address), a host without a port names
+    /// a listener that does not exist, the host must be a bind host, and the
+    /// port must differ from the other listeners'; a port alone, or with a
+    /// bind host, passes.
+    #[test]
+    fn admin_listener_settings_are_validated() {
+        let config = |admin_port: Option<u16>, admin_host: Option<&str>| RouterConfig {
+            port: 30001,
+            metrics: Some(MetricsConfig {
+                port: 30002,
+                host: "127.0.0.1".to_string(),
+            }),
+            health_check_port: Some(30003),
+            admin_port,
+            admin_host: admin_host.map(str::to_string),
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            ..Default::default()
+        };
+        let refused = |config: &RouterConfig| match ConfigValidator::validate(config) {
+            Err(ConfigError::InvalidValue { field, reason, .. }) => (field, reason),
+            other => panic!("expected an InvalidValue, got {other:?}"),
+        };
+        for (admin_port, admin_host) in [
+            (None, None),
+            (Some(30004), None),
+            (Some(30004), Some("[::1]")),
+        ] {
+            ConfigValidator::validate(&config(admin_port, admin_host))
+                .unwrap_or_else(|e| panic!("{admin_port:?} {admin_host:?}: {e}"));
+        }
+
+        let (field, _) = refused(&config(Some(0), None));
+        assert_eq!(field, "admin_port");
+        let (field, reason) = refused(&config(None, Some("127.0.0.1")));
+        assert_eq!(field, "admin_host");
+        assert!(reason.contains("--admin-port"), "{reason}");
+        let (field, _) = refused(&config(Some(30004), Some("localhost")));
+        assert_eq!(field, "admin_host");
+        for (taken, flag) in [
+            (30001, "--port"),
+            (30002, "--prometheus-port"),
+            (30003, "--health-check-port"),
+        ] {
+            let (field, reason) = refused(&config(Some(taken), None));
+            assert_eq!(field, "admin_port");
+            assert!(
+                reason.contains("--admin-port") && reason.contains(flag),
+                "{reason}"
+            );
+        }
+    }
+
+    /// A connection limit above the runtime's permit maximum is refused by
+    /// name; no bound (0) and ordinary counts pass.
+    #[test]
+    fn a_connection_limit_above_the_permit_maximum_is_rejected() {
+        let config = |max_connections: usize| RouterConfig {
+            max_connections,
+            mode: RoutingMode::Regular {
+                worker_urls: vec!["http://worker:8000".to_string()],
+            },
+            ..Default::default()
+        };
+        for accepted in [0, 1, 4096, Semaphore::MAX_PERMITS] {
+            ConfigValidator::validate(&config(accepted))
+                .unwrap_or_else(|e| panic!("max_connections {accepted}: {e}"));
+        }
+        match ConfigValidator::validate(&config(Semaphore::MAX_PERMITS + 1)) {
+            Err(ConfigError::InvalidValue {
+                field,
+                value,
+                reason,
+            }) => {
+                assert_eq!(field, "max_connections");
+                assert_eq!(value, (Semaphore::MAX_PERMITS + 1).to_string());
+                assert!(reason.contains("0 = no bound"), "{reason}");
+            }
+            other => panic!("expected an invalid max_connections, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_reject_health_check_port_zero() {
         let mut config = RouterConfig::new(
@@ -2560,6 +4897,89 @@ mod tests {
         assert!(ConfigValidator::validate(&config).is_ok());
         config.health_check_port = None;
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    /// Every health-check knob at 0 is refused naming the field; the smallest
+    /// values pass; a zero interval is refused with probing disabled too.
+    #[test]
+    fn zero_health_check_knobs_are_rejected() {
+        let zeroed = [
+            (
+                "health_check.check_interval_secs",
+                HealthCheckConfig {
+                    check_interval_secs: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "health_check.timeout_secs",
+                HealthCheckConfig {
+                    timeout_secs: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "health_check.failure_threshold",
+                HealthCheckConfig {
+                    failure_threshold: 0,
+                    ..Default::default()
+                },
+            ),
+            (
+                "health_check.success_threshold",
+                HealthCheckConfig {
+                    success_threshold: 0,
+                    ..Default::default()
+                },
+            ),
+        ];
+        for (name, health_check) in zeroed {
+            let config = RouterConfig {
+                health_check,
+                ..Default::default()
+            };
+            match ConfigValidator::validate(&config) {
+                Err(ConfigError::InvalidValue {
+                    field,
+                    value,
+                    reason,
+                }) => {
+                    assert_eq!(field, name);
+                    assert_eq!(value, "0");
+                    assert!(reason.starts_with("Must be >= 1"), "{name}: {reason}");
+                }
+                other => panic!("{name}: expected an InvalidValue, got {other:?}"),
+            }
+        }
+
+        let smallest = RouterConfig {
+            health_check: HealthCheckConfig {
+                check_interval_secs: 1,
+                timeout_secs: 1,
+                failure_threshold: 1,
+                success_threshold: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(ConfigValidator::validate(&smallest).is_ok());
+        assert!(ConfigValidator::validate(&RouterConfig::default()).is_ok());
+
+        let disabled_but_zero = RouterConfig {
+            health_check: HealthCheckConfig {
+                check_interval_secs: 0,
+                disable_health_check: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                ConfigValidator::validate(&disabled_but_zero),
+                Err(ConfigError::InvalidValue { ref field, .. }) if field == "health_check.check_interval_secs"
+            ),
+            "the checker's loop sleeps on the interval with probing disabled too"
+        );
     }
 
     /// The CLI parsers reject these, but TOML/JSON and the Python bindings
@@ -2632,5 +5052,57 @@ mod tests {
             })
             .build_unchecked();
         assert!(ConfigValidator::validate(&ok).is_ok());
+    }
+
+    /// The CORS origin rule holds on every construction path, not only in
+    /// the CLI: a lone `*` is the open policy, `*` next to an origin and a
+    /// value that is not exactly an origin are refused by name.
+    #[test]
+    fn cors_allowed_origins_are_exact_origins_or_a_lone_wildcard_on_every_path() {
+        let config = |origins: &[&str]| {
+            RouterConfig::builder()
+                .regular_mode(vec![])
+                .round_robin_policy()
+                .cors_allowed_origins(origins.iter().map(|origin| (*origin).to_string()).collect())
+                .build_unchecked()
+        };
+        for accepted in [
+            &[][..],
+            &["*"][..],
+            &["https://app.example"][..],
+            &["https://app.example", "http://localhost:3000"][..],
+        ] {
+            assert!(
+                ConfigValidator::validate(&config(accepted)).is_ok(),
+                "{accepted:?} is accepted"
+            );
+        }
+        for (refused, named) in [
+            (&["*", "https://app.example"][..], "*"),
+            (&["https://app.example", "*"][..], "*"),
+            (&["https://Example.com"][..], "https://Example.com"),
+            (&["example.com"][..], "example.com"),
+            (&["https://example.com/"][..], "https://example.com/"),
+        ] {
+            match ConfigValidator::validate(&config(refused)) {
+                Err(ConfigError::InvalidValue { field, value, .. }) => {
+                    assert_eq!(
+                        (field.as_str(), value.as_str()),
+                        ("cors_allowed_origins", named)
+                    );
+                }
+                other => panic!("{refused:?}: {other:?}"),
+            }
+        }
+        // The launcher's path: the builder's validating `build()`.
+        let built = RouterConfig::builder()
+            .regular_mode(vec![])
+            .round_robin_policy()
+            .cors_allowed_origins(vec!["*".to_string(), "https://app.example".to_string()])
+            .build();
+        assert!(
+            matches!(built, Err(ConfigError::InvalidValue { ref field, .. }) if field == "cors_allowed_origins"),
+            "{built:?}"
+        );
     }
 }

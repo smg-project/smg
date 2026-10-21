@@ -12,7 +12,10 @@ use llm_tokenizer::{
 };
 use serde_json::Value;
 
-use super::error::{clear_error_message, set_error_message, SglErrorCode};
+use super::{
+    args::{read_json_arg, write_string_result},
+    error::{clear_error_message, set_error_message, SglErrorCode},
+};
 
 #[cfg(target_os = "macos")]
 type BooleanT = libc::boolean_t;
@@ -188,56 +191,28 @@ pub unsafe extern "C" fn sgl_tokenizer_apply_chat_template_with_tools(
         return SglErrorCode::InvalidArgument;
     }
 
-    let messages_str = match CStr::from_ptr(messages_json).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            set_error_message(error_out, "Invalid UTF-8 in messages_json");
-            return SglErrorCode::InvalidArgument;
-        }
+    let messages: Vec<Value> = match read_json_arg(messages_json, "messages_json", error_out) {
+        Ok(messages) => messages,
+        Err(code) => return code,
     };
 
-    let messages: Vec<Value> = match serde_json::from_str(messages_str) {
-        Ok(msgs) => msgs,
-        Err(e) => {
-            set_error_message(error_out, &format!("Failed to parse messages JSON: {e}"));
-            return SglErrorCode::InvalidArgument;
-        }
-    };
-
-    // Parse tools JSON if provided
-    let tools: Option<Vec<Value>> = if tools_json.is_null() {
-        None
-    } else {
-        match CStr::from_ptr(tools_json).to_str() {
-            Ok("") => None,
-            Ok(s) => match serde_json::from_str::<Vec<Value>>(s) {
-                Ok(t) => Some(t),
-                Err(e) => {
-                    set_error_message(error_out, &format!("Failed to parse tools JSON: {e}"));
-                    return SglErrorCode::InvalidArgument;
-                }
-            },
-            Err(_) => {
-                set_error_message(error_out, "Invalid UTF-8 in tools_json");
-                return SglErrorCode::InvalidArgument;
+    // The tools, when given: null or an empty string means none.
+    let tools: Option<Vec<Value>> =
+        if tools_json.is_null() || CStr::from_ptr(tools_json).to_bytes().is_empty() {
+            None
+        } else {
+            match read_json_arg(tools_json, "tools_json", error_out) {
+                Ok(tools) => Some(tools),
+                Err(code) => return code,
             }
-        }
-    };
+        };
 
     let handle_ref = &*handle;
     match apply_chat_template_impl(handle_ref.tokenizer.as_ref(), messages, tools.as_deref()) {
-        Ok(result) => {
-            let result_cstr = match CString::new(result) {
-                Ok(s) => s,
-                Err(e) => {
-                    set_error_message(error_out, &format!("Failed to create result string: {e}"));
-                    return SglErrorCode::MemoryError;
-                }
-            };
-            *result_out = result_cstr.into_raw();
-            clear_error_message(error_out);
-            SglErrorCode::Success
-        }
+        Ok(result) => match write_string_result(result, result_out, error_out) {
+            Ok(()) => SglErrorCode::Success,
+            Err(code) => code,
+        },
         Err((code, msg)) => {
             set_error_message(error_out, msg);
             code
@@ -274,36 +249,17 @@ pub unsafe extern "C" fn sgl_tokenizer_apply_chat_template(
         return SglErrorCode::InvalidArgument;
     }
 
-    let messages_str = match CStr::from_ptr(messages_json).to_str() {
-        Ok(s) => s,
-        Err(_) => {
-            set_error_message(error_out, "Invalid UTF-8 in messages_json");
-            return SglErrorCode::InvalidArgument;
-        }
-    };
-
-    let messages: Vec<Value> = match serde_json::from_str(messages_str) {
-        Ok(msgs) => msgs,
-        Err(e) => {
-            set_error_message(error_out, &format!("Failed to parse messages JSON: {e}"));
-            return SglErrorCode::InvalidArgument;
-        }
+    let messages: Vec<Value> = match read_json_arg(messages_json, "messages_json", error_out) {
+        Ok(messages) => messages,
+        Err(code) => return code,
     };
 
     let handle_ref = &*handle;
     match apply_chat_template_impl(handle_ref.tokenizer.as_ref(), messages, None) {
-        Ok(result) => {
-            let result_cstr = match CString::new(result) {
-                Ok(s) => s,
-                Err(e) => {
-                    set_error_message(error_out, &format!("Failed to create result string: {e}"));
-                    return SglErrorCode::MemoryError;
-                }
-            };
-            *result_out = result_cstr.into_raw();
-            clear_error_message(error_out);
-            SglErrorCode::Success
-        }
+        Ok(result) => match write_string_result(result, result_out, error_out) {
+            Ok(()) => SglErrorCode::Success,
+            Err(code) => code,
+        },
         Err((code, msg)) => {
             set_error_message(error_out, msg);
             code
@@ -356,18 +312,10 @@ pub unsafe extern "C" fn sgl_tokenizer_decode(
 
     let tokenizer = &(*handle).tokenizer;
     match tokenizer.decode(token_slice, skip_special_tokens != 0) {
-        Ok(text) => {
-            let result_cstr = match CString::new(text) {
-                Ok(s) => s,
-                Err(e) => {
-                    set_error_message(error_out, &format!("Failed to create result string: {e}"));
-                    return SglErrorCode::MemoryError;
-                }
-            };
-            *result_out = result_cstr.into_raw();
-            clear_error_message(error_out);
-            SglErrorCode::Success
-        }
+        Ok(text) => match write_string_result(text, result_out, error_out) {
+            Ok(()) => SglErrorCode::Success,
+            Err(code) => code,
+        },
         Err(e) => {
             set_error_message(error_out, &e.to_string());
             SglErrorCode::TokenizationError

@@ -5,9 +5,10 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use llm_multimodal::{
-    registry::modality_limit_override, MediaContentPart, MediaPartOrder, Modality, ModelMetadata,
+    registry::modality_limit_override, EncoderInputFormat, MediaContentPart, MediaPartOrder,
+    Modality, ModelMetadata,
 };
-use llm_tokenizer::TokenizerTrait;
+use llm_tokenizer::{traits::PromptEncoding, TokenizerTrait};
 use openai_protocol::worker::MmProcessingMode;
 
 use super::{
@@ -79,7 +80,7 @@ impl MediaPlan {
         &self.parts
     }
 
-    /// Whether every part is a plain image/video URL without per-item
+    /// Whether every part is a plain image/audio/video URL without per-item
     /// processing hints, i.e. something a worker can fetch and process itself.
     pub(crate) fn is_forwardable(&self) -> bool {
         self.parts.iter().all(|part| {
@@ -88,11 +89,12 @@ impl MediaPlan {
                 MediaContentPart::ImageUrl {
                     max_long_side_pixel: None,
                     ..
-                } | MediaContentPart::VideoUrl {
-                    fps: None,
-                    max_long_side_pixel: None,
-                    ..
-                }
+                } | MediaContentPart::AudioUrl { .. }
+                    | MediaContentPart::VideoUrl {
+                        fps: None,
+                        max_long_side_pixel: None,
+                        ..
+                    }
             )
         })
     }
@@ -109,6 +111,8 @@ pub(crate) struct PlaceholderTokens {
     tokens: HashMap<Modality, String>,
     /// Modalities whose anchor a vLLM worker can expand itself.
     worker_expandable: HashMap<Modality, bool>,
+    /// Multi-token text the template writes in place of an anchor, with that anchor.
+    rendered_markers: Vec<(String, String)>,
     /// The model matched no registry spec: the router knows no anchors and
     /// no limits for it, so it writes and checks none; its media can only go
     /// to a worker that processes media itself, whose engine owns the
@@ -136,6 +140,10 @@ impl PlaceholderTokens {
 
     pub(crate) fn get(&self, modality: Modality) -> Option<&str> {
         self.tokens.get(&modality).map(String::as_str)
+    }
+
+    pub(crate) fn add_rendered_marker(&mut self, marker: String, anchor: String) {
+        self.rendered_markers.push((marker, anchor));
     }
 
     pub(crate) fn set_worker_expandable(&mut self, modality: Modality, expandable: bool) {
@@ -166,7 +174,13 @@ impl PlaceholderTokens {
 /// A model without a spec is refused only where the router would process
 /// the media itself (`--mm-processing router`); otherwise its request is
 /// marked worker-only and goes on to a worker that processes media itself
-/// (see [`PlaceholderTokens::worker_only`]).
+/// (see [`PlaceholderTokens::worker_only`]). A spec whose encoder input
+/// format the engines that would receive the request do not read
+/// (`reads_format` false) counts as no spec.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent input of the one lookup"
+)]
 pub(crate) async fn prepare_placeholder_tokens(
     plan: &MediaPlan,
     model_id: &str,
@@ -175,6 +189,7 @@ pub(crate) async fn prepare_placeholder_tokens(
     tokenizer_id: &str,
     tokenizer_source: &str,
     engine_limits: &HashMap<Modality, EngineItemLimit>,
+    reads_format: impl Fn(EncoderInputFormat) -> bool,
 ) -> Result<PlaceholderTokens> {
     anyhow::ensure!(!plan.is_empty(), "multimodal media plan is empty");
     let model_config = components
@@ -187,7 +202,11 @@ pub(crate) async fn prepare_placeholder_tokens(
         tokenizer: &registry_tokenizer,
         config: &model_config.config,
     };
-    let Some(spec) = components.model_registry.lookup(&metadata) else {
+    let Some(spec) = components
+        .model_registry
+        .lookup(&metadata)
+        .filter(|spec| reads_format(spec.encoder_input_format()))
+    else {
         anyhow::ensure!(
             components.processing != MmProcessingMode::Router,
             "multimodal not supported for model: {model_id} on the router (no media spec for \
@@ -233,6 +252,9 @@ pub(crate) async fn prepare_placeholder_tokens(
             tokenizer.token_to_id(&token).is_some(),
             "{modality} placeholder token '{token}' is missing from the tokenizer vocabulary"
         );
+        if let Some(marker) = spec.rendered_marker_for(modality) {
+            placeholders.add_rendered_marker(marker.to_string(), token.clone());
+        }
         placeholders.insert(modality, token);
         placeholders.set_worker_expandable(modality, spec.worker_expandable(modality));
     }
@@ -241,8 +263,10 @@ pub(crate) async fn prepare_placeholder_tokens(
 }
 
 /// Resolve the media-part ordering for a model from the same registry that owns
-/// its placeholder/prompt logic. Falls back to vLLM-compatible media-first when
-/// the model matches no spec.
+/// its placeholder/prompt logic: where media goes relative to text when the
+/// template takes one string per message (a template that takes parts places
+/// them itself, in the request's order). Falls back to the engine's media-first
+/// placement when the model matches no spec.
 pub(crate) async fn resolve_media_part_order(
     model_id: &str,
     tokenizer: &dyn TokenizerTrait,
@@ -269,6 +293,23 @@ pub(crate) async fn resolve_media_part_order(
         .lookup(&metadata)
         .map(|spec| spec.media_part_order())
         .unwrap_or(MediaPartOrder::MediaFirst)
+}
+
+/// The prompt text to tokenize: a text-rendered prompt gets each template
+/// marker replaced by its anchor token (see
+/// `ModelProcessorSpec::rendered_marker_for`); other prompts pass through.
+pub(crate) fn anchor_rendered_markers(
+    placeholders: Option<&PlaceholderTokens>,
+    encoding: &PromptEncoding,
+    text: String,
+) -> String {
+    match (placeholders, encoding) {
+        (Some(placeholders), PromptEncoding::FromText) => placeholders
+            .rendered_markers
+            .iter()
+            .fold(text, |text, (marker, anchor)| text.replace(marker, anchor)),
+        _ => text,
+    }
 }
 
 /// Verify a rendered/tokenized multimodal prompt contains exactly one
@@ -319,12 +360,13 @@ mod tests {
 
     use super::{
         super::{
+            capability::fleet_reads_format,
             config::{MultimodalConfigRegistry, MultimodalModelConfig},
             settings::MultimodalSettings,
         },
         *,
     };
-    use crate::worker::RuntimeType;
+    use crate::worker::{RuntimeType, WorkerRegistry};
 
     fn image_urls(count: usize) -> MediaPlan {
         MediaPlan::new((0..count).map(|i| MediaContentPart::ImageUrl {
@@ -372,6 +414,7 @@ mod tests {
             "tok",
             "unused",
             &engine,
+            |_| true,
         )
         .await
         .unwrap_err()
@@ -393,6 +436,7 @@ mod tests {
             "tok",
             "unused",
             &HashMap::new(),
+            |_| true,
         )
         .await
         .unwrap_err()
@@ -470,6 +514,26 @@ mod tests {
         assert!(error.to_string().contains("image anchor count mismatch"));
     }
 
+    #[test]
+    fn rendered_markers_become_their_anchor_in_text_prompts() {
+        let mut placeholders = PlaceholderTokens::default();
+        placeholders.add_rendered_marker("<video>".to_string(), "<SPECIAL_30>".to_string());
+        let text = "a<video>\nb <video><audio>";
+        assert_eq!(
+            anchor_rendered_markers(
+                Some(&placeholders),
+                &PromptEncoding::FromText,
+                text.to_string()
+            ),
+            "a<SPECIAL_30>\nb <SPECIAL_30><audio>"
+        );
+        // A text-only request carries no placeholders.
+        assert_eq!(
+            anchor_rendered_markers(None, &PromptEncoding::FromText, text.to_string()),
+            text
+        );
+    }
+
     fn components(mode: MmProcessingMode) -> MultimodalComponents {
         use super::super::{config::MultimodalConfigRegistry, settings::MultimodalSettings};
         let mut components = MultimodalComponents::new(
@@ -481,6 +545,123 @@ mod tests {
         .expect("components");
         components.processing = mode;
         components
+    }
+
+    /// A registry holding one worker of `runtime` for model "m".
+    fn fleet(runtime: RuntimeType) -> WorkerRegistry {
+        use openai_protocol::model_card::ModelCard;
+
+        use crate::worker::{BasicWorkerBuilder, ConnectionMode, WorkerType};
+
+        let registry = WorkerRegistry::new();
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("grpc://10.0.0.1:1")
+                    .model(ModelCard::new("m"))
+                    .worker_type(WorkerType::Regular)
+                    .runtime_type(runtime)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .build(),
+            ))
+            .expect("register");
+        registry
+    }
+
+    /// A spec emitting packed inputs applies only to a fleet that reads them:
+    /// on TokenSpeed it anchors each modality and rewrites the template's
+    /// `<video>`; behind another engine the model is handled as having no spec.
+    #[tokio::test]
+    async fn a_packed_spec_applies_only_to_a_fleet_that_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            serde_json::json!({
+                "model_type": "NemotronH_Nano_Omni_Reasoning_V3",
+                "patch_size": 16,
+                "downsample_ratio": 0.5,
+                "norm_mean": [0.48145466, 0.4578275, 0.40821073],
+                "norm_std": [0.26862954, 0.26130258, 0.27577711],
+                "vision_config": {
+                    "args": {"min_num_patches": 1024, "max_num_patches": 13312},
+                    "video_target_num_patches": 1024,
+                    "video_temporal_patch_size": 2,
+                    "video_maintain_aspect_ratio": true
+                },
+                "sound_config": {"sampling_rate": 16000, "num_mel_bins": 128, "subsampling_factor": 8}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let source = dir.path().to_str().unwrap();
+        let tokenizer = MockTokenizer::new().with_tokens(&[
+            ("<image>", 18),
+            ("<img>", 19),
+            ("</img>", 20),
+            ("<so_embedding>", 27),
+            ("<so_start>", 28),
+            ("<so_end>", 29),
+            ("<SPECIAL_30>", 30),
+        ]);
+        let plan = MediaPlan::new([
+            MediaContentPart::ImageUrl {
+                url: "https://a/1.png".to_string(),
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: None,
+            },
+            MediaContentPart::VideoUrl {
+                url: "https://a/v.mp4".to_string(),
+                uuid: None,
+                fps: None,
+                max_long_side_pixel: None,
+            },
+            MediaContentPart::AudioUrl {
+                url: "https://a/a.wav".to_string(),
+                uuid: None,
+            },
+        ]);
+        let prepare = |mode, runtime| {
+            let components = components(mode);
+            let plan = &plan;
+            let tokenizer = &tokenizer;
+            async move {
+                prepare_placeholder_tokens(
+                    plan,
+                    "m",
+                    tokenizer,
+                    &components,
+                    "tok",
+                    source,
+                    &HashMap::new(),
+                    |format| fleet_reads_format(&fleet(runtime), "m", format),
+                )
+                .await
+            }
+        };
+
+        let placeholders = prepare(MmProcessingMode::Auto, RuntimeType::TokenSpeed)
+            .await
+            .expect("served by TokenSpeed, the spec applies");
+        assert!(!placeholders.is_worker_only());
+        assert_eq!(placeholders.get(Modality::Image), Some("<image>"));
+        assert_eq!(placeholders.get(Modality::Video), Some("<SPECIAL_30>"));
+        assert_eq!(placeholders.get(Modality::Audio), Some("<so_embedding>"));
+        assert_eq!(
+            anchor_rendered_markers(
+                Some(&placeholders),
+                &PromptEncoding::FromText,
+                "Frame <video> end".to_string()
+            ),
+            "Frame <SPECIAL_30> end"
+        );
+
+        for runtime in [RuntimeType::Vllm, RuntimeType::Sglang] {
+            let placeholders = prepare(MmProcessingMode::Auto, runtime)
+                .await
+                .expect("another engine's workers process the media themselves");
+            assert!(placeholders.is_worker_only());
+            assert!(prepare(MmProcessingMode::Router, runtime).await.is_err());
+        }
     }
 
     /// A model whose family has no registry spec: the router refuses it only
@@ -513,6 +694,7 @@ mod tests {
                 "tok",
                 source,
                 &HashMap::new(),
+                |_| true,
             )
             .await
             .unwrap_or_else(|error| panic!("{mode:?} placement: {error:#}"));
@@ -533,6 +715,7 @@ mod tests {
             "tok",
             source,
             &HashMap::new(),
+            |_| true,
         )
         .await
         .expect_err("the router cannot process media it has no spec for");

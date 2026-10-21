@@ -23,7 +23,7 @@ fn profile_for_card(worker: &dyn Worker, card: &ModelCard, single_model: bool) -
         return ModelProfile::KimiK3;
     }
     let profile = ModelProfile::for_model_name(&card.id);
-    if profile != ModelProfile::OpenAi {
+    if profile.is_vendor_contract() {
         return profile;
     }
     // A worker-level path identifies only a single-model worker. Never apply
@@ -31,7 +31,7 @@ fn profile_for_card(worker: &dyn Worker, card: &ModelCard, single_model: bool) -
     if single_model {
         if let Some(path) = worker.metadata().spec.labels.get("model_path") {
             let profile = ModelProfile::for_model_name(path);
-            if profile != ModelProfile::OpenAi {
+            if profile.is_vendor_contract() {
                 return profile;
             }
         }
@@ -44,11 +44,11 @@ pub(crate) fn worker_requires_chat_profile(worker: &dyn Worker) -> bool {
     let mut requires_profile = false;
     worker.with_models(&mut |cards| {
         requires_profile = if cards.is_empty() {
-            ModelProfile::for_model(worker.model_id()) != ModelProfile::OpenAi
+            ModelProfile::for_model(worker.model_id()).is_vendor_contract()
         } else {
-            cards.iter().any(|card| {
-                profile_for_card(worker, card, cards.len() == 1) != ModelProfile::OpenAi
-            })
+            cards
+                .iter()
+                .any(|card| profile_for_card(worker, card, cards.len() == 1).is_vendor_contract())
         };
     });
     requires_profile

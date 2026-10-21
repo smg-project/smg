@@ -19,7 +19,8 @@
 //! boolean is JSON `true` or `false`; `null` is the word. A property the schema leaves untyped, or
 //! one whose `$ref` points at nothing, keeps its key but takes any type and any value; a schema
 //! without properties takes any number of such arguments. The engine then accepts exactly what
-//! the XTML assembler reads ([`tagged::xtml`](crate::tagged::xtml)).
+//! the attributed assembler reads with Kimi's tags
+//! ([`tagged::attributed`](crate::tagged::attributed)).
 
 use openai_protocol::common::Tool;
 use serde_json::Value;
@@ -27,7 +28,7 @@ use serde_json::Value;
 use super::{
     block_of,
     schema::{self, shape, Definitions},
-    CallMarkers, Grammar, WayIn,
+    CallMarkers, Count, Grammar, WayIn,
 };
 
 const OPEN: &str = "<|open|>";
@@ -36,13 +37,13 @@ const SEP: &str = "<|sep|>";
 /// The call's count of the turn's calls, from one.
 const INDEX: &str = "[1-9][0-9]*";
 
-/// The block of calls for `tools`, entered by `ways_in`, or `None` for a table whose calls sit
-/// in no block.
+/// The block of calls for `tools`, entered by `ways_in`, as many as `count` lets the model write,
+/// or `None` for a table whose calls sit in no block.
 pub(super) fn calls(
     markers: &CallMarkers<'_>,
     ways_in: &[WayIn<'_>],
     tools: &[&Tool],
-    at_least_one: bool,
+    count: Count<'_>,
 ) -> Option<Grammar> {
     let block = markers.block.as_ref()?;
     let one_call = Grammar::Or(
@@ -51,8 +52,8 @@ pub(super) fn calls(
             .map(|tool| call(markers, &tool.function.name, &tool.function.parameters))
             .collect(),
     );
-    let content = Grammar::Plus(Box::new(one_call));
-    Some(block_of(ways_in, content, block.close, at_least_one))
+    let content = count.calls(one_call);
+    Some(block_of(ways_in, content, block.close, count))
 }
 
 /// One call: the call's opener and the tool's name, its index, the arguments and the call's close.
@@ -306,7 +307,8 @@ mod tests {
         let slots = call["elements"][3]["elements"]
             .as_array()
             .expect("four slots");
-        // The `$ref` lends its target's type, and the definitions travel with the schema.
+        // The `$ref` lends its target's type, and the definition it reaches travels with the
+        // schema; the unreached one does not.
         assert_eq!(
             slots[0]["elements"][0]["value"],
             "<|open|>argument key=\"count\" type=\"number\"<|sep|>"
@@ -315,7 +317,7 @@ mod tests {
             slots[0]["elements"][1]["json_schema"],
             value!({
                 "$ref": "#/$defs/Count",
-                "$defs": {"Count": {"type": "integer"}, "Unused": {"type": "string"}},
+                "$defs": {"Count": {"type": "integer"}},
             })
         );
         // A pointer at nothing, no type, or a pointer to the root (the property's own document once

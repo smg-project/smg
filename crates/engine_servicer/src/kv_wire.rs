@@ -646,6 +646,23 @@ impl Counts {
     pub fn dropped(&self, reason: DropReason) -> u64 {
         self.dropped.get(&reason).copied().unwrap_or(0)
     }
+
+    /// `other` added to this tally: several streams' counters summed.
+    pub fn add(&mut self, other: &Counts) {
+        self.forwarded_stored += other.forwarded_stored;
+        self.forwarded_removed += other.forwarded_removed;
+        self.forwarded_cleared += other.forwarded_cleared;
+        self.duplicate_stores += other.duplicate_stores;
+        self.bigram_stores += other.bigram_stores;
+        self.hash_checked += other.hash_checked;
+        self.hash_mismatch += other.hash_mismatch;
+        self.hash_unverifiable += other.hash_unverifiable;
+        self.window_only_stores += other.window_only_stores;
+        self.tail_aligned_stores += other.tail_aligned_stores;
+        for (reason, count) in &other.dropped {
+            *self.dropped.entry(*reason).or_insert(0) += count;
+        }
+    }
 }
 
 /// The cache namespace block hashes were computed under.

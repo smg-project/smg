@@ -25,66 +25,7 @@
 //! content comes first, reasoning after content follows the message, and a second reasoning region
 //! is a second item.
 //!
-//! The items are the ones SMG's gateway builds today from a finished chat message, in OpenAI's
-//! order, so items replayed as the next turn's input rebuild the same turn:
-//!
-//! - one `reasoning` item when there was reasoning, its text as one `reasoning_text` part and an
-//!   empty summary;
-//! - one `message` when the content is not whitespace: `role: "assistant"`, one `output_text` part
-//!   with every content and malformed text in order, and no annotations;
-//! - one `function_call` per call in the order the calls started, its argument fragments joined;
-//!   `output` is absent, since running the call belongs to the next turn.
-//!
-//! This is the same folding as `chat::message`, so the two adapters agree on what a turn contains.
-//!
-//! Ids: the reasoning item is `rs_<response id>` and the message `msg_<response id>`, the prefixes
-//! the Responses API uses; a call's `id` and `call_id` are both the id from its event. The old
-//! gateway used two schemes, `reasoning_` and `msg_` before the response id when it converted a
-//! finished message and fresh `rs_`, `msg_` and `fc_` ids when it streamed; this is one. A second
-//! reasoning item, which only a model that thinks again after answering produces, carries its
-//! output index after the response id (`rs_<response id>_<output index>`), so ids stay unique.
-//!
-//! Status, from the `Finish` event: `stop` and `tool_calls` complete the response; `length` leaves
-//! it `incomplete` with `max_output_tokens` as the reason; the engine's `failed` or `error` fails
-//! it; `abort` cancels it, where the old path called an aborted response complete; any other
-//! engine-specific reason completes it. A sequence without `Finish` is `in_progress`.
-//!
-//! Item statuses follow. While the response has not finished, and when the engine failed, an item
-//! is `in_progress` unless its own events ended it: a reasoning item whose region closed is
-//! `completed`, a call that ended is `completed`, and the message, which ends only with the
-//! response, is `in_progress`. Once the response finished otherwise, every item is `completed`. In
-//! either case a call whose argument fragments never became a whole JSON value is `incomplete`
-//! rather than `completed`. Three of these differ from the old path, which called the reasoning
-//! item `completed` whatever the response's state, left every item of a failed response
-//! `in_progress`, what had finished included, and marked a call `incomplete` only after `length`;
-//! here each status describes its item. A reasoning region ends at `ReasoningEnd`, or when content
-//! with substance or a call comes after it, in the fold as in the stream. A call with empty
-//! arguments is complete: the formats start a call only once its arguments value has begun or its
-//! object has closed, so a call without arguments is one the model closed.
-//!
-//! Policy this adapter sets, where the events say more than the Responses API can:
-//!
-//! - `ReasoningStart` and `Dropped` shape nothing, and `ReasoningEnd` and `ToolCallEnd` only end
-//!   their items (the statuses above, and the stream's `done` events): the markers a format
-//!   consumes never reach the client.
-//! - `Malformed` text is content, as in `chat`: the model wrote it, and the client sees it rather
-//!   than losing it.
-//! - Argument fragments for a call that never started cannot occur under the `Event` contract;
-//!   should one arrive, its text joins the content so that no byte is lost. In the stream the same
-//!   goes for a fragment of a call whose item is already complete.
-//! - In the stream, whitespace-only content opens no message item until content with substance
-//!   joins it, and leads that content when it does; held whitespace with nothing after it is let go
-//!   at the end, as the fold leaves whitespace-only content out. The old emitter opened a message
-//!   item for any non-empty content.
-//! - In the stream, a call's item completes when the call ends and the reasoning item when its
-//!   region ends; the old emitter completed every call at the end of the response and the
-//!   reasoning item when the answer began. The items and parts are the typed ones, so a message's
-//!   `output_item.added` carries `status: "in_progress"` and a text part its empty `annotations`,
-//!   as the API's own events do; the old emitter's hand-written JSON left them out.
-//!
-//! What stays with the driver, since it depends on the request rather than the output: the `error`
-//! payload of a failed response, encrypted reasoning content, and a function's namespace and the
-//! `custom_tool_call` shape, both read from the request's tool list.
+//! Notes on what this module decides, and on what it leaves open: `docs/adapters.md`.
 
 use std::mem;
 
@@ -94,6 +35,7 @@ use openai_protocol::responses::{
 };
 use serde::{de::IgnoredAny, Serialize};
 
+use super::fold::{fold, Call};
 use crate::event::{Event, FinishReason};
 
 /// A whole output as the Responses API reports it: the items and the response status.
@@ -108,88 +50,31 @@ pub struct Output {
     pub incomplete_details: Option<IncompleteDetails>,
 }
 
-/// One started call and what its events said.
-#[derive(Clone, Debug)]
-struct Call {
-    index: u32,
-    id: String,
-    name: String,
-    arguments: String,
-    /// Whether `ToolCallEnd` came for it.
-    ended: bool,
-}
-
 /// The output of the response `response_id`, folded from a whole event sequence.
-pub fn output<'a>(response_id: &str, events: impl IntoIterator<Item = &'a Event>) -> Output {
-    let mut content = String::new();
-    let mut reasoning = String::new();
-    let mut reasoning_ended = false;
-    let mut calls: Vec<Call> = Vec::new();
-    let mut finish = None;
-    for event in events {
-        match event {
-            Event::Content(text) | Event::Malformed { text, .. } => {
-                content.push_str(&text.text);
-                if !text.text.trim().is_empty() {
-                    reasoning_ended = true;
-                }
-            }
-            Event::Reasoning(text) => {
-                reasoning.push_str(&text.text);
-                reasoning_ended = false;
-            }
-            Event::ReasoningEnd => reasoning_ended = true,
-            Event::ToolCallStart {
-                index, id, name, ..
-            } => {
-                reasoning_ended = true;
-                calls.push(Call {
-                    index: *index,
-                    id: id.clone(),
-                    name: name.clone(),
-                    arguments: String::new(),
-                    ended: false,
-                });
-            }
-            Event::ToolCallArguments { index, json, .. } => {
-                match calls.iter_mut().find(|call| call.index == *index) {
-                    Some(call) => call.arguments.push_str(json),
-                    None => {
-                        content.push_str(json);
-                        if !json.trim().is_empty() {
-                            reasoning_ended = true;
-                        }
-                    }
-                }
-            }
-            Event::ToolCallEnd { index, .. } => {
-                if let Some(call) = calls.iter_mut().find(|call| call.index == *index) {
-                    call.ended = true;
-                }
-            }
-            Event::Finish { reason, .. } => finish = Some(reason),
-            Event::ReasoningStart | Event::Dropped { .. } => {}
-        }
-    }
-
-    let (status, incomplete_details) = response_status(finish);
+pub fn output<'a, 'd: 'a>(
+    response_id: &str,
+    events: impl IntoIterator<Item = &'a Event<'d>>,
+) -> Output {
+    let folded = fold(events);
+    let (status, incomplete_details) =
+        response_status(folded.finish.as_ref().map(|finish| &finish.reason));
 
     let mut items = Vec::new();
-    if !reasoning.is_empty() {
+    if !folded.reasoning.is_empty() {
         items.push(reasoning_item(
             format!("rs_{response_id}"),
-            reasoning,
-            item_status(&status, reasoning_ended),
+            folded.reasoning,
+            item_status(&status, folded.reasoning_ended),
         ));
     }
-    if !content.trim().is_empty() {
+    if !folded.content.trim().is_empty() {
         items.push(message_item(
             format!("msg_{response_id}"),
-            content,
+            folded.content,
             item_status(&status, false),
         ));
     }
-    items.extend(calls.into_iter().map(|call| {
+    items.extend(folded.calls.into_iter().map(|call| {
         let status = item_status(&status, call.ended);
         call_item(call, status)
     }));
@@ -386,7 +271,7 @@ impl Stream {
 
     /// Appends the stream events `event` produces to `out`, in order. Returns the response's
     /// [`Output`] when `event` is `Finish`, after completing every open item.
-    pub fn feed(&mut self, event: &Event, out: &mut Vec<StreamEvent>) -> Option<Output> {
+    pub fn feed(&mut self, event: &Event<'_>, out: &mut Vec<StreamEvent>) -> Option<Output> {
         match event {
             Event::Content(text) | Event::Malformed { text, .. } => self.content(&text.text, out),
             Event::Reasoning(text) => self.reasoning(&text.text, out),
@@ -798,7 +683,7 @@ mod tests {
     use super::*;
     use crate::event::{DropReason, MalformedReason, Text};
 
-    fn call(index: u32, name: &str) -> Event {
+    fn call(index: u32, name: &str) -> Event<'static> {
         Event::ToolCallStart {
             index,
             id: format!("call_{index}"),
@@ -807,7 +692,7 @@ mod tests {
         }
     }
 
-    fn arguments(index: u32, json: &str) -> Event {
+    fn arguments(index: u32, json: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index,
             json: json.into(),
@@ -815,14 +700,14 @@ mod tests {
         }
     }
 
-    fn end(index: u32) -> Event {
+    fn end(index: u32) -> Event<'static> {
         Event::ToolCallEnd {
             index,
             source: Text::default(),
         }
     }
 
-    fn finish(reason: FinishReason, tool_calls: u32) -> Event {
+    fn finish(reason: FinishReason, tool_calls: u32) -> Event<'static> {
         Event::Finish {
             reason,
             tool_calls,

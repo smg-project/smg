@@ -1,7 +1,10 @@
 //! Scripted gRPC worker for terminal-state contract tests.
 use std::{
     pin::Pin,
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use futures::{stream, Stream};
@@ -16,9 +19,15 @@ use ts::{
 
 pub struct ScriptedWorker {
     pub output_tokens: u32,
+    /// One finish reason per generation, the last standing for the rest; `"unavailable"` in a
+    /// generation's place refuses that `Generate` with the gRPC status instead of answering, the
+    /// request recorded all the same.
     pub finish_reasons: Vec<&'static str>,
     pub generation: AtomicUsize,
+    /// Every generate request received, for a test to read what the gateway sent.
+    pub requests: Arc<Mutex<Vec<ts::GenerateRequest>>>,
 }
+
 impl ScriptedWorker {
     #[expect(
         clippy::expect_used,
@@ -46,8 +55,31 @@ impl TokenSpeedScheduler for ScriptedWorker {
         request: Request<ts::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
         // Match ScriptedTokenizer: generated token IDs begin at 100.
-        let request_id = request.into_inner().request_id;
+        let request = request.into_inner();
+        if let Ok(mut requests) = self.requests.lock() {
+            requests.push(request.clone());
+        }
+        let finish_reason = self
+            .finish_reasons
+            .get(self.generation.fetch_add(1, Ordering::SeqCst))
+            .or_else(|| self.finish_reasons.last())
+            .copied()
+            .unwrap_or("stop");
+        if finish_reason == "unavailable" {
+            return Err(Status::unavailable(
+                "scripted worker: unavailable this generation",
+            ));
+        }
+        let (request_id, return_logprob) = (request.request_id, request.return_logprob);
         let ids: Vec<u32> = (0..self.output_tokens).map(|i| 100 + i).collect();
+        // When asked, token `100 + i` reports logprob `-(i + 1)`.
+        let logprobs = |ids: &[u32]| {
+            return_logprob.then(|| ts::OutputLogProbs {
+                token_logprobs: ids.iter().map(|id| 99.0 - *id as f32).collect(),
+                token_ids: ids.to_vec(),
+                top_logprobs: Vec::new(),
+            })
+        };
 
         let mut items: Vec<Result<ts::GenerateResponse, Status>> = Vec::new();
         for id in &ids {
@@ -58,27 +90,22 @@ impl TokenSpeedScheduler for ScriptedWorker {
                     prompt_tokens: 1,
                     completion_tokens: 1,
                     cached_tokens: 0,
-                    output_logprobs: None,
+                    output_logprobs: logprobs(&[*id]),
                     weight_version: None,
                     index: 0,
                 })),
             }));
         }
+        let output_logprobs = logprobs(&ids);
         items.push(Ok(ts::GenerateResponse {
             request_id,
             response: Some(GenResp::Complete(ts::GenerateComplete {
                 output_ids: ids,
-                finish_reason: self
-                    .finish_reasons
-                    .get(self.generation.fetch_add(1, Ordering::SeqCst))
-                    .or_else(|| self.finish_reasons.last())
-                    .copied()
-                    .unwrap_or("stop")
-                    .to_string(),
+                finish_reason: finish_reason.to_string(),
                 prompt_tokens: 1,
                 completion_tokens: self.output_tokens,
                 cached_tokens: 0,
-                output_logprobs: None,
+                output_logprobs,
                 matched_stop: None,
                 index: 0,
                 ..Default::default()

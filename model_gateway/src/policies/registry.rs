@@ -1,11 +1,14 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, OnceLock, Weak},
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc, OnceLock, Weak,
+    },
 };
 
 use dashmap::DashMap;
 use http::{header::HeaderName, HeaderMap};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 
 /// Policy Registry for managing model-to-policy mappings
@@ -18,17 +21,16 @@ use super::{
     get_healthy_worker_indices,
     manual::{ExecutionBranch, PinState},
     normalize_model_key, BucketPolicy, CacheAwarePolicy, DPRankLoadPolicy, LoadBalancingPolicy,
-    ManualConfig, ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerLeg,
+    ManualConfig, ManualPolicy, PolicyFactory, SelectWorkerInfo, WorkerRole,
 };
 use crate::{
     config::types::{ManualAssignmentMode, PdPairingMode, PolicyConfig, RoutingKeyOverrideConfig},
     mesh::adapters::TreeSyncAdapter,
     observability::{cache_trace, metrics::Metrics},
-    policies::cache_aware::LoadReceiver,
     routers::common::header_utils::{
         extract_routing_key_hint_named, parse_routing_tokens_hint, ROUTING_KEY_HINT_MAX_BYTES,
     },
-    worker::{KvEventMonitor, RequestCompletionSink, Worker, WorkerType},
+    worker::{load_state::LoadReceiver, KvEventMonitor, RequestCompletionSink, Worker, WorkerType},
 };
 
 /// Routes a request completion to the policy that placed the request: the
@@ -51,11 +53,82 @@ impl RequestCompletionSink for PolicyCompletionSink {
     }
 }
 
+/// What the policies a registry answers the text questions for (its default
+/// and its per-model policies) say, as four bits: each of the two questions
+/// ([`LoadBalancingPolicy::needs_request_text`] and the with-tokens form)
+/// over every policy, and over the policies the routing-key override does
+/// not supersede, which is what a request with a valid routing key asks. A
+/// policy's answers are constants, so the bits change only where a policy is
+/// added or removed, and a request reads one byte instead of walking the
+/// per-model map.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TextNeeds(u8);
+
+impl TextNeeds {
+    const TEXT: u8 = 1;
+    const TEXT_UNDER_KEY: u8 = 1 << 1;
+    const TEXT_WITH_TOKENS: u8 = 1 << 2;
+    const TEXT_WITH_TOKENS_UNDER_KEY: u8 = 1 << 3;
+
+    /// What `policy` answers.
+    fn of(policy: &dyn LoadBalancingPolicy) -> Self {
+        let keeps_text_under_key = !PolicyRegistry::routing_key_override_applies(policy.name());
+        let mut bits = 0;
+        for (wants, any, under_key) in [
+            (
+                policy.needs_request_text(),
+                Self::TEXT,
+                Self::TEXT_UNDER_KEY,
+            ),
+            (
+                policy.needs_request_text_with_tokens(),
+                Self::TEXT_WITH_TOKENS,
+                Self::TEXT_WITH_TOKENS_UNDER_KEY,
+            ),
+        ] {
+            if wants {
+                bits |= any;
+                if keeps_text_under_key {
+                    bits |= under_key;
+                }
+            }
+        }
+        Self(bits)
+    }
+
+    fn join(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// Whether some policy wants the text of a request that carries token
+    /// ids (`with_tokens`) or not, under a valid routing key
+    /// (`keyed_override`) or without one.
+    fn answer(self, with_tokens: bool, keyed_override: bool) -> bool {
+        let bit = match (with_tokens, keyed_override) {
+            (false, false) => Self::TEXT,
+            (false, true) => Self::TEXT_UNDER_KEY,
+            (true, false) => Self::TEXT_WITH_TOKENS,
+            (true, true) => Self::TEXT_WITH_TOKENS_UNDER_KEY,
+        };
+        self.0 & bit != 0
+    }
+}
+
 /// Registry for managing model-to-policy mappings
 #[derive(Clone)]
 pub struct PolicyRegistry {
     /// Model ID -> Policy instance mapping (lock-free reads via DashMap)
     model_policies: Arc<DashMap<String, Arc<dyn LoadBalancingPolicy>>>,
+
+    /// The text questions' answers over the default and the per-model
+    /// policies ([`TextNeeds`]), recomputed where one is added or removed
+    /// ([`Self::refresh_text_needs`]).
+    text_needs: Arc<AtomicU8>,
+
+    /// Serializes the recomputations of `text_needs`: a removal's walk that
+    /// started before a concurrent addition's insert must not publish over
+    /// the bits that addition published.
+    text_needs_refresh: Arc<Mutex<()>>,
 
     /// Model ID -> Worker count for cleanup tracking (lock-free reads via DashMap)
     model_worker_counts: Arc<DashMap<String, usize>>,
@@ -169,8 +242,11 @@ impl PolicyRegistry {
                 }
             })
             .collect();
+        let text_needs = TextNeeds::of(default_policy.as_ref());
         Self {
             model_policies: Arc::new(DashMap::new()),
+            text_needs: Arc::new(AtomicU8::new(text_needs.0)),
+            text_needs_refresh: Arc::new(Mutex::new(())),
             model_worker_counts: Arc::new(DashMap::new()),
             default_policy,
             default_policy_config,
@@ -330,18 +406,18 @@ impl PolicyRegistry {
         Metrics::record_routing_key_source(source);
 
         // WorkerLoadGuard records the raw session key, so the cap must query
-        // that same key. Model/leg-scoped cap accounting is a separate contract.
+        // that same key. Model/role-scoped cap accounting is a separate contract.
         let load_key = key;
 
-        // Models and PD legs stick independently while sharing one bounded map.
+        // Models and PD roles stick independently while sharing one bounded map.
         // Length-prefix the model so delimiters in model IDs cannot cross fields.
         let model = normalize_model_key(model_id);
-        let leg = match info.leg {
-            WorkerLeg::Single => 's',
-            WorkerLeg::Prefill => 'p',
-            WorkerLeg::Decode => 'd',
+        let role = match info.role {
+            WorkerRole::Single => 's',
+            WorkerRole::Prefill => 'p',
+            WorkerRole::Decode => 'd',
         };
-        let namespaced = format!("{}:{model}:{leg}:{key}", model.len());
+        let namespaced = format!("{}:{model}:{role}:{key}", model.len());
         let key = namespaced.as_str();
 
         let over_cap =
@@ -361,7 +437,7 @@ impl PolicyRegistry {
             result
         };
 
-        let healthy = get_healthy_worker_indices(workers);
+        let healthy = get_healthy_worker_indices(workers, info);
         if healthy.is_empty() {
             return finish(None, ExecutionBranch::NoHealthyWorkers);
         }
@@ -450,32 +526,43 @@ impl PolicyRegistry {
         }
     }
 
-    /// Set the backend load-snapshot receiver (thread-safe, can be called after
-    /// initialization). Propagates to all existing cache-aware policies.
+    /// Hand every policy the worker monitor's load feed (thread-safe, can be
+    /// called after initialization); a policy created later takes it from
+    /// the registry (see [`Self::publish_with_shared_state`]).
     pub(crate) fn set_load_receiver(&self, rx: Option<LoadReceiver>) {
         {
             let mut guard = self.load_rx.write();
             guard.clone_from(&rx);
         }
-        Self::maybe_inject_load_rx(&self.default_policy, rx.as_ref());
-        if let Some(p) = self.prefill_policy.get() {
-            Self::maybe_inject_load_rx(p, rx.as_ref());
-        }
-        if let Some(p) = self.decode_policy.get() {
-            Self::maybe_inject_load_rx(p, rx.as_ref());
-        }
-        if let Some(p) = self.encode_policy.get() {
-            Self::maybe_inject_load_rx(p, rx.as_ref());
-        }
-        for entry in self.model_policies.iter() {
-            Self::maybe_inject_load_rx(entry.value(), rx.as_ref());
-        }
+        self.each_policy(|policy| policy.set_load_receiver(rx.clone()));
     }
 
-    /// Inject the load receiver into a policy if it's cache-aware.
-    fn maybe_inject_load_rx(policy: &Arc<dyn LoadBalancingPolicy>, rx: Option<&LoadReceiver>) {
-        if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
-            cache_aware.set_load_receiver(rx.cloned());
+    /// Visit every policy the registry holds once: the default, the PD and
+    /// EPD roles, then the per-model policies. A policy shared between slots
+    /// (a model with no hint takes the default) is visited for the first
+    /// slot it stands in only, so a visit that does work, a worker's
+    /// removal, is not repeated per model.
+    fn each_policy(&self, mut visit: impl FnMut(&Arc<dyn LoadBalancingPolicy>)) {
+        let mut seen: Vec<*const ()> = Vec::new();
+        let mut once = |policy: &Arc<dyn LoadBalancingPolicy>| {
+            let ptr = Arc::as_ptr(policy) as *const ();
+            if !seen.contains(&ptr) {
+                seen.push(ptr);
+                visit(policy);
+            }
+        };
+        once(&self.default_policy);
+        for role in [
+            &self.prefill_policy,
+            &self.decode_policy,
+            &self.encode_policy,
+        ] {
+            if let Some(policy) = role.get() {
+                once(policy);
+            }
+        }
+        for entry in self.model_policies.iter() {
+            once(entry.value());
         }
     }
 
@@ -586,6 +673,7 @@ impl PolicyRegistry {
             self.model_policies
                 .insert(model_id.to_string(), Arc::clone(&policy));
         });
+        self.refresh_text_needs();
 
         policy
     }
@@ -605,7 +693,7 @@ impl PolicyRegistry {
         let load_rx = self.load_rx.read();
         let mesh = self.mesh_tree_sync.read();
         Self::maybe_inject_monitor(policy, monitor.as_ref());
-        Self::maybe_inject_load_rx(policy, load_rx.as_ref());
+        policy.set_load_receiver(load_rx.as_ref().cloned());
         Self::maybe_inject_mesh_tree_sync(policy, mesh.as_ref());
         publish();
     }
@@ -643,6 +731,7 @@ impl PolicyRegistry {
                     policy.name(),
                     model_id
                 );
+                self.refresh_text_needs();
             }
         }
     }
@@ -665,14 +754,14 @@ impl PolicyRegistry {
 
     /// Every distinct policy this registry might dispatch requests
     /// through for `model_id`, ordered from most-specific to least
-    /// (per-model → default → PD/EPD legs). Deduplicated by `Arc`
+    /// (per-model → default → PD/EPD roles). Deduplicated by `Arc`
     /// pointer identity so a policy that appears in multiple slots
     /// (e.g. the same `CacheAwarePolicy` as both default and prefill
-    /// leg) is returned once.
+    /// role) is returned once.
     ///
     /// The tree-sync bridge uses this to reach every `CacheAwarePolicy`
     /// that could have produced a delta for `model_id` — reaching
-    /// only `model_policies` misses PD-leg and default-fallback
+    /// only `model_policies` misses PD-role and default-fallback
     /// deployments, and inbound deltas never resolve.
     pub(crate) fn policies_for_model(&self, model_id: &str) -> Vec<Arc<dyn LoadBalancingPolicy>> {
         let mut out: Vec<Arc<dyn LoadBalancingPolicy>> = Vec::new();
@@ -766,14 +855,15 @@ impl PolicyRegistry {
     pub fn clear(&self) {
         self.model_policies.clear();
         self.model_worker_counts.clear();
+        self.refresh_text_needs();
     }
 
     /// Set the prefill policy for PD mode (set once at startup).
     ///
-    /// The router factory sets the prefill leg after the app context wired the
+    /// The router factory sets the prefill policy after the app context wired the
     /// KV event monitor, the load feed and the mesh tree bridge into the
     /// registry, and those setters only reach policies that already exist,
-    /// so the leg takes that state here, under the shared-state read guards.
+    /// so the policy takes that state here, under the shared-state read guards.
     pub fn set_prefill_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
         self.publish_with_shared_state(&policy, || {
             // OnceLock::set returns Err if already set, which we ignore since
@@ -795,10 +885,10 @@ impl PolicyRegistry {
 
     /// Set the decode policy for PD mode (set once at startup).
     ///
-    /// The router factory sets the decode leg after the app context wired the
+    /// The router factory sets the decode policy after the app context wired the
     /// KV event monitor, the load feed and the mesh tree bridge into the
     /// registry, and those setters only reach policies that already exist,
-    /// so the leg takes that state here, under the shared-state read guards.
+    /// so the policy takes that state here, under the shared-state read guards.
     pub fn set_decode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
         self.publish_with_shared_state(&policy, || {
             // OnceLock::set returns Err if already set, which we ignore since
@@ -809,10 +899,10 @@ impl PolicyRegistry {
 
     /// Set the encode policy for EPD mode (set once at startup).
     ///
-    /// The router factory sets the encode leg after the app context wired the
+    /// The router factory sets the encode policy after the app context wired the
     /// KV event monitor, the load feed and the mesh tree bridge into the
     /// registry, and those setters only reach policies that already exist,
-    /// so the leg takes that state here, under the shared-state read guards.
+    /// so the policy takes that state here, under the shared-state read guards.
     pub fn set_encode_policy(&self, policy: Arc<dyn LoadBalancingPolicy>) {
         self.publish_with_shared_state(&policy, || {
             // OnceLock::set returns Err if already set, which we ignore since
@@ -857,76 +947,51 @@ impl PolicyRegistry {
     /// before it reads text. Hints are validated by the same extractors
     /// selection uses, so malformed or over-cap values lift nothing.
     pub fn any_policy_needs_request_text(&self, headers: Option<&HeaderMap>) -> bool {
+        self.any_policy_wants_text(headers, false)
+    }
+
+    /// [`Self::any_policy_needs_request_text`] for a request whose token ids
+    /// are available: a policy that routes on the ids and reads text only
+    /// without them ([`LoadBalancingPolicy::needs_request_text_with_tokens`])
+    /// does not count, so the ids go into the selection snapshot alone.
+    pub fn any_policy_needs_request_text_with_tokens(&self, headers: Option<&HeaderMap>) -> bool {
+        self.any_policy_wants_text(headers, true)
+    }
+
+    /// The two text questions' shared rules: a valid routing-tokens hint
+    /// lifts the requirement, and a valid routing key under the sticky
+    /// override lifts it for the policies the override supersedes; what the
+    /// policies answer is read from [`Self::text_needs`], kept current where
+    /// a policy is added or removed, so a request walks nothing.
+    fn any_policy_wants_text(&self, headers: Option<&HeaderMap>, with_tokens: bool) -> bool {
         if parse_routing_tokens_hint(headers).is_some() {
             return false;
         }
         let keyed_override =
             self.routing_key_sticky.is_some() && self.resolve_routing_key(headers).is_some();
-        let needs_text = |policy: &Arc<dyn LoadBalancingPolicy>| {
-            policy.needs_request_text()
-                && !(keyed_override && Self::routing_key_override_applies(policy.name()))
-        };
-        needs_text(&self.default_policy)
-            || self
-                .model_policies
-                .iter()
-                .any(|entry| needs_text(entry.value()))
+        TextNeeds(self.text_needs.load(Ordering::Acquire)).answer(with_tokens, keyed_override)
     }
 
-    /// Get all load-aware policies that need periodic load updates (lock-free).
-    ///
-    /// Membership is policy-reported via
-    /// [`LoadBalancingPolicy::needs_backend_loads`]: `power_of_two` and
-    /// `least_load` always consume load reports; `cache_aware` does when its
-    /// pressure knobs are configured.
-    pub fn get_all_load_aware_policies(&self) -> Vec<Arc<dyn LoadBalancingPolicy>> {
-        let mut policies = Vec::new();
-
-        if self.default_policy.needs_backend_loads() {
-            policies.push(Arc::clone(&self.default_policy));
-        }
-
-        // Get prefill, decode, and encode policies (lock-free via OnceLock::get)
-        let prefill_policy_opt = self.prefill_policy.get();
-        let decode_policy_opt = self.decode_policy.get();
-        let encode_policy_opt = self.encode_policy.get();
-
-        if let Some(policy) = prefill_policy_opt {
-            if policy.needs_backend_loads() && !Arc::ptr_eq(policy, &self.default_policy) {
-                policies.push(Arc::clone(policy));
-            }
-        }
-
-        if let Some(policy) = decode_policy_opt {
-            if policy.needs_backend_loads()
-                && !Arc::ptr_eq(policy, &self.default_policy)
-                && !prefill_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
-            {
-                policies.push(Arc::clone(policy));
-            }
-        }
-
-        if let Some(policy) = encode_policy_opt {
-            if policy.needs_backend_loads()
-                && !Arc::ptr_eq(policy, &self.default_policy)
-                && !prefill_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
-                && !decode_policy_opt.is_some_and(|p| Arc::ptr_eq(p, policy))
-            {
-                policies.push(Arc::clone(policy));
-            }
-        }
-
+    /// Recompute [`Self::text_needs`] over the policies the text questions
+    /// range over: the default policy and the per-model policies. Called
+    /// where the per-model map changes; one recomputation at a time, so the
+    /// bits published last are those of a walk that saw every earlier change.
+    fn refresh_text_needs(&self) {
+        let _one_at_a_time = self.text_needs_refresh.lock();
+        let mut needs = TextNeeds::of(self.default_policy.as_ref());
         for entry in self.model_policies.iter() {
-            let policy = entry.value();
-            if policy.needs_backend_loads() {
-                let already_added = policies.iter().any(|p| Arc::ptr_eq(p, policy));
-                if !already_added {
-                    policies.push(Arc::clone(policy));
-                }
-            }
+            needs = needs.join(TextNeeds::of(entry.value().as_ref()));
         }
+        self.text_needs.store(needs.0, Ordering::Release);
+    }
 
-        policies
+    /// Whether any policy routes on backend load (see
+    /// [`LoadBalancingPolicy::needs_backend_loads`]): with load monitoring
+    /// off, the worker monitor still polls a group while this holds.
+    pub fn needs_backend_loads(&self) -> bool {
+        let mut needs = false;
+        self.each_policy(|policy| needs |= policy.needs_backend_loads());
+        needs
     }
 
     /// Initialize cache-aware policy with workers if applicable
@@ -1010,16 +1075,12 @@ impl PolicyRegistry {
         }
     }
 
-    /// Drop a removed worker's cached load report from all load-aware
-    /// policies.
-    ///
-    /// Push-model policies cache per-worker load reports keyed by URL;
-    /// without this their caches would grow unbounded under worker churn.
-    /// Called on worker removal alongside the cache-aware cleanup above.
-    pub fn remove_worker_from_load_aware(&self, worker_url: &str) {
-        for policy in self.get_all_load_aware_policies() {
-            policy.remove_worker(worker_url);
-        }
+    /// Drop the state every policy keeps on a removed worker (a load-aware
+    /// policy's dispatch tally; see [`LoadBalancingPolicy::remove_worker`]),
+    /// which would otherwise grow without bound under worker churn. Called
+    /// on worker removal alongside the cache-aware cleanup above.
+    pub fn remove_worker_from_policies(&self, worker_url: &str) {
+        self.each_policy(|policy| policy.remove_worker(worker_url));
     }
 
     /// Initialize cache-aware policies for PD mode (prefill and decode) - lock-free
@@ -1087,19 +1148,23 @@ impl std::fmt::Debug for PolicyRegistry {
             .field("model_policies", &self.model_policies)
             .field("model_worker_counts", &self.model_worker_counts)
             .field("default_policy", &self.default_policy.name())
+            .field(
+                "text_needs",
+                &TextNeeds(self.text_needs.load(Ordering::Relaxed)),
+            )
             .finish()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use openai_protocol::worker::HealthCheckConfig;
+    use openai_protocol::worker::{HealthCheckConfig, SchedulerLoadSnapshot, WorkerLoadResponse};
     use tokio::sync::watch;
     use tracing_test::traced_test;
 
     use super::*;
     use crate::{
-        policies::{CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
+        policies::{BucketConfig, CacheAwareConfig, LeastLoadPolicy, SelectWorkerInfo},
         worker::{
             load_state::LoadSnapshot, BasicWorkerBuilder, HashRing, Worker, WorkerLoadGuard,
             WorkerType,
@@ -1316,6 +1381,8 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         }
     }
 
@@ -1370,6 +1437,162 @@ mod tests {
         assert!(reg.any_policy_needs_request_text(None));
         assert!(!reg.any_policy_needs_request_text(Some(&headers_with_tokens("1,2,3"))));
         assert!(!reg.any_policy_needs_request_text(Some(&headers_with_key("session-A"))));
+    }
+
+    /// The answer follows the per-model map: a text policy's model lifts the
+    /// requirement while one of its workers stands, its last worker's removal
+    /// drops it, and so does clearing the registry. A model on the text-free
+    /// default policy changes nothing either way.
+    #[test]
+    fn text_requirement_follows_the_per_model_policies() {
+        let reg = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        reg.on_worker_added("plain", None);
+        assert!(!reg.any_policy_needs_request_text(None));
+
+        reg.on_worker_added("affine", Some("cache_aware"));
+        reg.on_worker_added("affine", Some("cache_aware"));
+        assert!(reg.any_policy_needs_request_text(None));
+        reg.on_worker_removed("affine");
+        assert!(reg.any_policy_needs_request_text(None));
+        reg.on_worker_removed("affine");
+        assert!(!reg.any_policy_needs_request_text(None));
+        reg.on_worker_removed("plain");
+        assert!(!reg.any_policy_needs_request_text(None));
+
+        reg.on_worker_added("affine", Some("cache_aware"));
+        assert!(reg.any_policy_needs_request_text(None));
+        reg.clear();
+        assert!(!reg.any_policy_needs_request_text(None));
+    }
+
+    /// The override's exemption is per policy: a sticky-exempt text policy
+    /// (`consistent_hashing` honours the key itself and reads no text, so the
+    /// stand-in here is a test policy by that name) keeps the requirement
+    /// under a valid key where `cache_aware` loses it, as a per-model policy
+    /// beside the default; the requirement leaves with it. (No hint names
+    /// the stand-in, so it goes into the map directly and the test refreshes
+    /// what registration and removal refresh.)
+    #[test]
+    fn text_requirement_under_a_key_counts_the_exempt_policies_only() {
+        let reg = PolicyRegistry::with_override(cache_aware_config(), enabled_override());
+        let keyed = headers_with_key("session-A");
+        assert!(reg.any_policy_needs_request_text(None));
+        assert!(!reg.any_policy_needs_request_text(Some(&keyed)));
+        assert!(!reg.any_policy_needs_request_text_with_tokens(None));
+        assert_eq!(
+            TextNeeds(reg.text_needs.load(Ordering::Relaxed)),
+            TextNeeds(TextNeeds::TEXT)
+        );
+
+        reg.model_policies
+            .insert("keyed-text".to_string(), Arc::new(TextBesideIdsExempt));
+        reg.refresh_text_needs();
+        assert!(reg.any_policy_needs_request_text(Some(&keyed)));
+        assert!(reg.any_policy_needs_request_text_with_tokens(Some(&keyed)));
+        assert!(reg.any_policy_needs_request_text_with_tokens(None));
+        assert!(!reg.any_policy_needs_request_text(Some(&headers_with_tokens("1,2,3"))));
+        assert_eq!(
+            TextNeeds(reg.text_needs.load(Ordering::Relaxed)),
+            TextNeeds(
+                TextNeeds::TEXT
+                    | TextNeeds::TEXT_UNDER_KEY
+                    | TextNeeds::TEXT_WITH_TOKENS
+                    | TextNeeds::TEXT_WITH_TOKENS_UNDER_KEY
+            )
+        );
+
+        reg.model_policies.remove("keyed-text");
+        reg.refresh_text_needs();
+        assert!(!reg.any_policy_needs_request_text(Some(&keyed)));
+        assert!(!reg.any_policy_needs_request_text_with_tokens(None));
+        assert_eq!(
+            TextNeeds(reg.text_needs.load(Ordering::Relaxed)),
+            TextNeeds(TextNeeds::TEXT)
+        );
+    }
+
+    /// A text policy the routing-key override leaves alone (by name).
+    #[derive(Debug)]
+    struct TextBesideIdsExempt;
+
+    impl LoadBalancingPolicy for TextBesideIdsExempt {
+        fn select_worker(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            _info: &SelectWorkerInfo,
+        ) -> Option<usize> {
+            (!workers.is_empty()).then_some(0)
+        }
+
+        fn name(&self) -> &'static str {
+            "consistent_hashing"
+        }
+
+        fn needs_request_text(&self) -> bool {
+            true
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A policy that reads the text beside the ids; none of the built-in
+    /// ones does, so the trait's default is what such a policy gets.
+    #[derive(Debug)]
+    struct TextBesideIds;
+
+    impl LoadBalancingPolicy for TextBesideIds {
+        fn select_worker(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            _info: &SelectWorkerInfo,
+        ) -> Option<usize> {
+            (!workers.is_empty()).then_some(0)
+        }
+
+        fn name(&self) -> &'static str {
+            "text_beside_ids"
+        }
+
+        fn needs_request_text(&self) -> bool {
+            true
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// Beside token ids the text is wanted only by a policy that reads it
+    /// there: `cache_aware` and `bucket` route on the ids and answer no, as
+    /// the default and as a per-model policy, with the same hint rules; a
+    /// policy that says nothing about the ids keeps its text answer.
+    #[test]
+    fn text_beside_token_ids_is_wanted_only_by_a_policy_that_reads_it_there() {
+        let reg = PolicyRegistry::new(cache_aware_config());
+        assert!(reg.any_policy_needs_request_text(None));
+        assert!(!reg.any_policy_needs_request_text_with_tokens(None));
+        assert!(!reg.any_policy_needs_request_text_with_tokens(Some(&headers_with_tokens("1,2,3"))));
+        for policy in ["cache_aware", "bucket"] {
+            let reg = PolicyRegistry::with_override(PolicyConfig::RoundRobin, enabled_override());
+            reg.on_worker_added("llama-3", Some(policy));
+            assert!(reg.any_policy_needs_request_text(None), "{policy}");
+            assert!(
+                !reg.any_policy_needs_request_text_with_tokens(None),
+                "{policy}"
+            );
+        }
+        // A per-model policy that reads text beside the ids makes the
+        // registry ask for it, under the same hint rule. (The policy goes
+        // into the map directly, as no hint names it, so the test refreshes
+        // what `on_worker_added` refreshes after its insert.)
+        let reg = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        reg.model_policies
+            .insert("llama-text".to_string(), Arc::new(TextBesideIds));
+        reg.refresh_text_needs();
+        assert!(reg.any_policy_needs_request_text_with_tokens(None));
+        assert!(!reg.any_policy_needs_request_text_with_tokens(Some(&headers_with_tokens("1,2,3"))));
     }
 
     #[test]
@@ -1727,6 +1950,8 @@ mod tests {
                 cache_boundaries: Vec::new(),
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
+                balance_prefix_margin_tokens: 0,
+                balance_uncached_credit: false,
             },
             rid_override(ManualAssignmentMode::Delegate),
         );
@@ -2117,6 +2342,27 @@ mod tests {
         assert_eq!(registry.get_worker_counts().get("llama-3"), None);
     }
 
+    /// A policy shared between slots is visited once: a model with no hint
+    /// takes the registry's default, so one worker's removal reaches that
+    /// policy once, however many models stand on it, not once per model.
+    #[test]
+    fn a_policy_shared_between_slots_is_visited_once() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        for model in ["m1", "m2", "m3"] {
+            registry.on_worker_added(model, None);
+        }
+        registry.on_worker_added("hinted", Some("least_load"));
+        let mut visits: Vec<*const ()> = Vec::new();
+        registry.each_policy(|policy| visits.push(Arc::as_ptr(policy) as *const ()));
+        assert_eq!(
+            visits.len(),
+            2,
+            "the shared default once, the hinted policy once"
+        );
+        let default = Arc::as_ptr(&registry.default_policy) as *const ();
+        assert_eq!(visits.iter().filter(|p| **p == default).count(), 1);
+    }
+
     #[test]
     fn test_passthrough_is_not_load_aware() {
         // Passthrough must not be polled by the WorkerMonitor: with it as the
@@ -2124,7 +2370,50 @@ mod tests {
         // set stays empty.
         let registry = PolicyRegistry::new(PolicyConfig::Passthrough);
         registry.on_worker_added("m", Some("passthrough"));
-        assert!(registry.get_all_load_aware_policies().is_empty());
+        assert!(!registry.needs_backend_loads());
+    }
+
+    /// The load feed reaches every policy that scores on it, not only the
+    /// cache-aware ones: a power-of-two default routes on the snapshot the
+    /// registry handed it, and a model policy created afterwards takes the
+    /// feed from the registry.
+    #[test]
+    fn the_load_feed_reaches_every_policy_that_scores_on_it() {
+        fn report(queued_tokens: i32) -> WorkerLoadResponse {
+            WorkerLoadResponse {
+                loads: vec![SchedulerLoadSnapshot {
+                    num_waiting_uncached_tokens: queued_tokens,
+                    gen_throughput: 100.0,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }
+        }
+
+        let registry = PolicyRegistry::new(PolicyConfig::PowerOfTwo {
+            load_metric: Default::default(),
+        });
+        let (_tx, rx) = watch::channel(LoadSnapshot::from_loads_for_test(vec![
+            ("http://a:8000".to_string(), report(100_000)),
+            ("http://b:8000".to_string(), report(0)),
+        ]));
+        registry.set_load_receiver(Some(rx));
+        let later = registry.on_worker_added("m", Some("least_load"));
+
+        let workers = vec![
+            worker("http://a:8000", WorkerType::Regular),
+            worker("http://b:8000", WorkerType::Regular),
+        ];
+        for policy in [registry.get_default_policy(), later] {
+            for _ in 0..20 {
+                assert_eq!(
+                    policy.select_worker(&workers, &SelectWorkerInfo::default()),
+                    Some(1),
+                    "{} did not route on the feed",
+                    policy.name()
+                );
+            }
+        }
     }
 
     #[test]
@@ -2150,13 +2439,15 @@ mod tests {
                 cache_boundaries: Vec::new(),
                 selection_policy: None,
                 selection_accounting_ttl_ms: 0,
+                balance_prefix_margin_tokens: 0,
+                balance_uncached_credit: false,
             }
         }
 
         // Even without pressure tuning, misses, spills, and equal-affinity
         // ties use LeastLoad's expected-wait snapshots.
         let plain = PolicyRegistry::new(cache_aware(0.0, 1.0, 1.0));
-        assert_eq!(plain.get_all_load_aware_policies().len(), 1);
+        assert!(plain.needs_backend_loads());
 
         // Pressure knobs do not change that load-aware membership.
         for pressured in [
@@ -2165,7 +2456,7 @@ mod tests {
             cache_aware(0.0, 1.0, 0.9),
         ] {
             let registry = PolicyRegistry::new(pressured);
-            assert_eq!(registry.get_all_load_aware_policies().len(), 1);
+            assert!(registry.needs_backend_loads());
         }
     }
 
@@ -2200,6 +2491,8 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         });
 
         // Hinted policy is a fresh per-model instance, not the shared default.
@@ -2233,7 +2526,6 @@ mod tests {
     #[test]
     fn hinted_policy_inherits_operator_least_load_config() {
         let registry = PolicyRegistry::new(PolicyConfig::LeastLoad {
-            load_check_interval_secs: 10,
             kv_pressure_weight: 0.4,
             mean_prefill_tokens: 2048,
             default_throughput: 555.0,
@@ -2274,10 +2566,12 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         }));
 
         for round in 0..64 {
-            let monitor = Arc::new(KvEventMonitor::new(Some(4)));
+            let monitor = Arc::new(KvEventMonitor::new());
             let barrier = Arc::new(Barrier::new(ADDERS + 1));
             let handles: Vec<_> = (0..ADDERS)
                 .map(|k| {
@@ -2312,12 +2606,12 @@ mod tests {
         }
     }
 
-    /// The PD/EPD legs are set after the app context wired the shared state
+    /// The PD/EPD policies are set after the app context wired the shared state
     /// into the registry (the KV event monitor, the load feed, and the mesh
-    /// tree bridge that `MeshAdapters::start` attaches), so the leg setters
+    /// tree bridge that `MeshAdapters::start` attaches), so the policy setters
     /// hand all of it over themselves.
     #[tokio::test]
-    async fn pd_leg_policies_receive_the_shared_state_set_before_them() {
+    async fn pd_role_policies_receive_the_shared_state_set_before_them() {
         use std::collections::BTreeMap;
 
         use smg_mesh::MeshKV;
@@ -2325,7 +2619,7 @@ mod tests {
         use crate::{mesh::MeshAdapters, worker::WorkerRegistry};
 
         let registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
-        registry.set_kv_event_monitor(Some(Arc::new(KvEventMonitor::new(Some(4)))));
+        registry.set_kv_event_monitor(Some(Arc::new(KvEventMonitor::new())));
         let (_load_tx, load_rx) = watch::channel(LoadSnapshot::from_loads_for_test(Vec::new()));
         registry.set_load_receiver(Some(load_rx));
         let mesh = MeshKV::new("node-a".into());
@@ -2344,19 +2638,19 @@ mod tests {
         registry.set_decode_policy(Arc::clone(&decode));
         registry.set_encode_policy(Arc::clone(&encode));
 
-        for (leg, policy) in [("prefill", prefill), ("decode", decode), ("encode", encode)] {
+        for (role, policy) in [("prefill", prefill), ("decode", decode), ("encode", encode)] {
             let cache_aware = policy.as_any().downcast_ref::<CacheAwarePolicy>().unwrap();
             assert!(
                 cache_aware.kv_event_monitor_is_set_for_test(),
-                "{leg} leg missed the KV event monitor"
+                "{role} policy missed the KV event monitor"
             );
             assert!(
                 cache_aware.has_load_receiver_for_test(),
-                "{leg} leg missed the load feed"
+                "{role} policy missed the load feed"
             );
             assert!(
                 cache_aware.should_populate_hash_index_for_test(),
-                "{leg} leg missed the mesh tree bridge"
+                "{role} policy missed the mesh tree bridge"
             );
         }
     }
@@ -2532,5 +2826,100 @@ mod tests {
                 ("grpc://decode:9000".to_string(), 0)
             ]
         );
+    }
+
+    /// A policy that remembers which workers it was told to forget and
+    /// consumes no load reports.
+    #[derive(Debug, Default)]
+    struct RemovalRecorder {
+        removed: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl LoadBalancingPolicy for RemovalRecorder {
+        fn select_worker(
+            &self,
+            workers: &[Arc<dyn Worker>],
+            _info: &SelectWorkerInfo,
+        ) -> Option<usize> {
+            (!workers.is_empty()).then_some(0)
+        }
+
+        fn remove_worker(&self, url: &str) {
+            self.removed.lock().unwrap().push(url.to_string());
+        }
+
+        fn name(&self) -> &'static str {
+            "removal_recorder"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// A worker's removal reaches every policy instance once: the ones that
+    /// consume load reports and the ones that do not, a shared instance once
+    /// however many roles it serves.
+    #[test]
+    fn worker_removal_reaches_every_policy_once() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        let shared = Arc::new(RemovalRecorder::default());
+        registry.set_prefill_policy(Arc::clone(&shared) as Arc<dyn LoadBalancingPolicy>);
+        registry.set_decode_policy(Arc::clone(&shared) as Arc<dyn LoadBalancingPolicy>);
+        let per_model = Arc::new(RemovalRecorder::default());
+        registry.model_policies.insert(
+            "m1".to_string(),
+            Arc::clone(&per_model) as Arc<dyn LoadBalancingPolicy>,
+        );
+
+        registry.remove_worker_from_policies("http://w2:8000");
+
+        assert_eq!(
+            shared.removed.lock().unwrap().as_slice(),
+            ["http://w2:8000"]
+        );
+        assert_eq!(
+            per_model.removed.lock().unwrap().as_slice(),
+            ["http://w2:8000"]
+        );
+    }
+
+    /// A prefill worker's removal reaches the bucket policy, which keeps the
+    /// prefill workers' size partition without consuming load reports: every
+    /// request size still selects one of the workers left.
+    #[test]
+    fn removing_a_prefill_worker_reaches_the_bucket_policy() {
+        let registry = PolicyRegistry::new(PolicyConfig::RoundRobin);
+        registry.set_prefill_policy(Arc::new(BucketPolicy::with_config(BucketConfig {
+            balance_abs_threshold: usize::MAX,
+            bucket_adjust_interval_secs: 3600,
+            ..Default::default()
+        })));
+        let prefill = vec![
+            worker("http://prefill-1:8000", WorkerType::Prefill),
+            worker("http://prefill-2:8000", WorkerType::Prefill),
+            worker("http://prefill-3:8000", WorkerType::Prefill),
+        ];
+        registry.init_pd_bucket_policies(&prefill);
+
+        registry.remove_worker_from_policies("http://prefill-2:8000");
+
+        let remaining = [Arc::clone(&prefill[0]), Arc::clone(&prefill[2])];
+        let policy = registry.get_prefill_policy();
+        for size in [0, 1364, 1365, 2000, 2729, 2730, 10_000] {
+            let text = "a".repeat(size);
+            let info = SelectWorkerInfo {
+                request_text: Some(&text),
+                ..Default::default()
+            };
+            let selected = policy
+                .select_worker(&remaining, &info)
+                .unwrap_or_else(|| panic!("a request of {size} chars selects no prefill worker"));
+            assert_ne!(
+                remaining[selected].url(),
+                "http://prefill-2:8000",
+                "size {size}"
+            );
+        }
     }
 }

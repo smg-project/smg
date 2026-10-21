@@ -1,30 +1,104 @@
-//! Helpers shared by the DeepSeek V4-family renderers (V4, V4.1, ...).
+//! What the DeepSeek renderers (V3.2, V4, V4.1) share, implemented and
+//! tested once: the JSON spelling and the OpenAI-shape readers every one of
+//! them uses, the last-user index predicates, the quick-instruction task
+//! tokens, and the V4 family's message preprocessing (tool-message merging,
+//! tool-result sorting, drop-thinking, DSML argument rendering, the tools
+//! template), which V4 and V4.1 run with their own DSML tag strings (V4 bare
+//! `invoke`/`parameter`; V4.1 ` invoke`/` parameter` with a leading space).
 //!
-//! `deepseek_v4.rs` and the upcoming `deepseek_v41.rs` are otherwise
-//! standalone 1:1 ports of their respective Python encoders — message
-//! merging, tool-result sorting, drop-thinking, and DSML argument rendering
-//! are identical between the two revisions except for the DSML tag strings
-//! (V4 uses bare `invoke`/`parameter`; V4.1 uses ` invoke`/` parameter` with a
-//! leading space). This module holds exactly that shared behaviour so it is
-//! implemented, and tested, once.
-//!
-//! V3.2 is intentionally *not* wired through this module beyond the two index
-//! predicates it shares (`find_last_user_index`, `at_or_after_last_user`): its
-//! tool-message handling and drop-thinking role set are genuinely different
-//! algorithms that merely happen to share some function names, not the same
-//! logic.
+//! V3.2's tool-message handling, drop-thinking role set, DSML argument
+//! rendering and tools template are different algorithms and texts under
+//! some of the same names; they stay in `deepseek_v32.rs`.
 
+use std::{borrow::Cow, sync::OnceLock};
+
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use serde_json::{json, Value};
 use thiserror::Error;
 
-const DSML_TOKEN: &str = "｜DSML｜";
+use super::marks::{self, control};
+
+// ---------------------------------------------------------------------------
+// The family's special tokens, shared by the V3.2, V4 and V4.1 renderers (each
+// re-exports the public ones under its own path). Copied verbatim from the
+// Python sources, which agree on them; a version's own markers stay with it.
+// ---------------------------------------------------------------------------
+pub const BOS_TOKEN: &str = "<｜begin▁of▁sentence｜>";
+pub const EOS_TOKEN: &str = "<｜end▁of▁sentence｜>";
+pub const THINKING_START_TOKEN: &str = "<think>";
+pub const THINKING_END_TOKEN: &str = "</think>";
+pub const DSML_TOKEN: &str = "｜DSML｜";
+#[cfg(test)]
+pub(super) const USER_SP_TOKEN: &str = "<｜User｜>";
+#[cfg(test)]
+pub(super) const ASSISTANT_SP_TOKEN: &str = "<｜Assistant｜>";
+#[cfg(test)]
+pub(super) const LATEST_REMINDER_SP_TOKEN: &str = "<｜latest_reminder｜>";
+
+// The same tokens as the renderers write them into a prompt: marked as the
+// renderer's own control tokens (see `marks`), so that the same spelling in
+// request text stays text. The flat `encode_messages` output strips the marks.
+pub(super) const BOS: &str = control!("<｜begin▁of▁sentence｜>");
+pub(super) const EOS: &str = control!("<｜end▁of▁sentence｜>");
+pub(super) const THINKING_START: &str = control!("<think>");
+pub(super) const THINKING_END: &str = control!("</think>");
+pub(super) const DSML: &str = control!("｜DSML｜");
+pub(super) const USER: &str = control!("<｜User｜>");
+pub(super) const ASSISTANT: &str = control!("<｜Assistant｜>");
+pub(super) const LATEST_REMINDER: &str = control!("<｜latest_reminder｜>");
+
+/// The grounding tokens of the V4 family. Their spellings in an assistant
+/// message's content or reasoning are the one place the family's reference
+/// library turns request text into control tokens (a vision model's earlier
+/// answer quotes them); every other spelling there stays text.
+const GROUNDING_TOKENS: [&str; 8] = [
+    "<｜ref｜>",
+    "<｜/ref｜>",
+    "<｜box｜>",
+    "<｜/box｜>",
+    "<｜point｜>",
+    "<｜/point｜>",
+    "<｜polygon｜>",
+    "<｜/polygon｜>",
+];
+
+/// Assistant content or reasoning with each grounding token in it marked as
+/// a control token, the rest left as it is; borrowed when it has none.
+pub(super) fn mark_grounding_tokens(text: &str) -> Cow<'_, str> {
+    static MATCHER: OnceLock<AhoCorasick> = OnceLock::new();
+    if !text.contains('<') {
+        return Cow::Borrowed(text);
+    }
+    let matcher = MATCHER.get_or_init(|| {
+        #[expect(
+            clippy::expect_used,
+            reason = "a fixed list of non-empty literal patterns always builds"
+        )]
+        AhoCorasickBuilder::new()
+            .match_kind(MatchKind::LeftmostLongest)
+            .build(GROUNDING_TOKENS)
+            .expect("the grounding tokens form an automaton")
+    });
+    let mut marked = String::new();
+    let mut cursor = 0;
+    for found in matcher.find_iter(text) {
+        marked.push_str(&text[cursor..found.start()]);
+        marked.push_str(&marks::mark(GROUNDING_TOKENS[found.pattern().as_usize()]));
+        cursor = found.end();
+    }
+    if cursor == 0 {
+        return Cow::Borrowed(text);
+    }
+    marked.push_str(&text[cursor..]);
+    Cow::Owned(marked)
+}
 
 /// DSML tag strings that differ between the V4-family DSML dialects.
 ///
 /// V4 uses bare `invoke`/`parameter`; V4.1 uses ` invoke`/` parameter` (a
-/// leading space on each). The block name (`tool_calls` vs. ` calls`) is not
-/// included here since it is only ever used by each renderer's own
-/// `render_message`/tools-template code, never by the shared helpers below.
+/// leading space on each). The block name (`tool_calls` vs. ` calls`) is
+/// passed beside the tags where it is needed ([`render_v4_tools_template`]),
+/// since each renderer's `render_message` writes it on its own as well.
 #[derive(Debug)]
 pub(super) struct DsmlTags {
     pub invoke: &'static str,
@@ -89,6 +163,30 @@ pub(super) fn at_or_after_last_user(index: usize, last_user_idx: Option<usize>) 
     match last_user_idx {
         Some(idx) => index >= idx,
         None => true,
+    }
+}
+
+/// Returns `true` when `index > last_user_idx` in the Python sense, with the
+/// same reading of "no user message" as [`at_or_after_last_user`].
+pub(super) fn after_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
+    match last_user_idx {
+        Some(idx) => index > idx,
+        None => true,
+    }
+}
+
+/// The quick-instruction task tokens (`<｜action｜>`, `<｜query｜>`, ...) of
+/// the V4 family, by the `task` a user message names, marked as the
+/// renderer's control tokens; `None` for a task the encoders reject.
+pub(super) fn task_sp_token(task: &str) -> Option<&'static str> {
+    match task {
+        "action" => Some(control!("<｜action｜>")),
+        "query" => Some(control!("<｜query｜>")),
+        "authority" => Some(control!("<｜authority｜>")),
+        "domain" => Some(control!("<｜domain｜>")),
+        "title" => Some(control!("<｜title｜>")),
+        "read_url" => Some(control!("<｜read_url｜>")),
+        _ => None,
     }
 }
 
@@ -317,20 +415,93 @@ pub(super) fn encode_arguments_to_dsml(arguments: &Value, tags: &DsmlTags) -> St
             other => ("false", to_json(other)),
         };
         parts.push(format!(
-            "<{DSML_TOKEN}{p} name=\"{key}\" string=\"{is_str}\">{value_str}</{DSML_TOKEN}{p}>",
+            "<{DSML}{p} name=\"{key}\" string=\"{is_str}\">{value_str}</{DSML}{p}>",
             p = tags.parameter,
         ));
     }
     parts.join("\n")
 }
 
-// Python's `to_json` is `json.dumps(value, ensure_ascii=False)`: spaced
-// separators, raw UTF-8. Compact `serde_json::to_string` would change the
-// prompt bytes the model was trained on. Each renderer module keeps its own copy of
-// this tiny wrapper (see `deepseek_v4::to_json`); this one is for
-// `encode_arguments_to_dsml`'s exclusive use.
-fn to_json(value: &Value) -> String {
+/// Python's `to_json`: `json.dumps(value, ensure_ascii=False)`, spaced
+/// separators and raw UTF-8. Compact `serde_json::to_string` would change the
+/// prompt bytes the model was trained on.
+pub(super) fn to_json(value: &Value) -> String {
     crate::json_dumps::to_string(value)
+}
+
+/// `[tool["function"] for tool in tools]`
+pub(super) fn tools_from_openai_format(tools: &[Value]) -> Vec<Value> {
+    tools
+        .iter()
+        .filter_map(|tool| tool.get("function").cloned())
+        .collect()
+}
+
+/// `[{ "name": tc["function"]["name"], "arguments": tc["function"]["arguments"] } for tc in tool_calls]`
+pub(super) fn tool_calls_from_openai_format(tool_calls: &[Value]) -> Vec<Value> {
+    tool_calls
+        .iter()
+        .filter_map(|tool_call| {
+            let function = tool_call.get("function")?;
+            Some(json!({
+                "name": function.get("name").cloned().unwrap_or(Value::Null),
+                "arguments": function.get("arguments").cloned().unwrap_or(Value::Null),
+            }))
+        })
+        .collect()
+}
+
+/// The tool schemas as the tools templates take them: each tool's JSON, one
+/// per line.
+pub(super) fn tool_schemas(tools: &[Value]) -> String {
+    let schemas: Vec<String> = tools.iter().map(to_json).collect();
+    schemas.join("\n")
+}
+
+/// Python's `if msg.get("tools"):` — absent, null and `[]` are all falsy.
+pub(super) fn has_tools(msg: &Value) -> bool {
+    msg.get("tools")
+        .and_then(|v| v.as_array())
+        .is_some_and(|tools| !tools.is_empty())
+}
+
+/// The V4 family's `TOOLS_TEMPLATE`, one text for both dialects: `block` is
+/// the tool-calls block name (`tool_calls` for V4, ` calls` for V4.1) and
+/// `tags` the invoke and parameter tags, around the `tool_schemas` lines.
+pub(super) fn render_v4_tools_template(block: &str, tags: &DsmlTags, tool_schemas: &str) -> String {
+    let dsml = DSML;
+    let invoke = tags.invoke;
+    let parameter = tags.parameter;
+    let tstart = THINKING_START;
+    let tend = THINKING_END;
+    format!(
+"## Tools
+
+You have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<{dsml}{block}>\" block like the following:
+
+<{dsml}{block}>
+<{dsml}{invoke} name=\"$TOOL_NAME\">
+<{dsml}{parameter} name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</{dsml}{parameter}>
+...
+</{dsml}{invoke}>
+<{dsml}{invoke} name=\"$TOOL_NAME2\">
+...
+</{dsml}{invoke}>
+</{dsml}{block}>
+
+String parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.
+
+If thinking_mode is enabled (triggered by {tstart}), you MUST output your complete reasoning inside {tstart}...{tend} BEFORE any tool calls or final response.
+
+Otherwise, output directly after {tend} with tool calls or final response.
+
+### Available Tool Schemas
+
+{tool_schemas}
+
+You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
+"
+    )
 }
 
 #[cfg(test)]
@@ -338,6 +509,75 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::*;
+
+    /// The DSML arguments as the flat prompt spells them (the control-token
+    /// marks around `｜DSML｜` stripped).
+    fn dsml(arguments: &Value, tags: &DsmlTags) -> String {
+        marks::strip(&encode_arguments_to_dsml(arguments, tags)).into_owned()
+    }
+
+    /// The family's special tokens, as the three renderers' Python sources
+    /// spell them; each renderer re-exports these, so one value serves all.
+    #[test]
+    fn the_familys_special_tokens_are_the_ones_the_renderers_share() {
+        assert_eq!(BOS_TOKEN, "<｜begin▁of▁sentence｜>");
+        assert_eq!(EOS_TOKEN, "<｜end▁of▁sentence｜>");
+        assert_eq!(THINKING_START_TOKEN, "<think>");
+        assert_eq!(THINKING_END_TOKEN, "</think>");
+        assert_eq!(DSML_TOKEN, "｜DSML｜");
+        assert_eq!(USER_SP_TOKEN, "<｜User｜>");
+        assert_eq!(ASSISTANT_SP_TOKEN, "<｜Assistant｜>");
+        assert_eq!(LATEST_REMINDER_SP_TOKEN, "<｜latest_reminder｜>");
+    }
+
+    #[test]
+    fn the_marked_tokens_spell_the_special_tokens() {
+        for (marked, spelling) in [
+            (BOS, BOS_TOKEN),
+            (EOS, EOS_TOKEN),
+            (THINKING_START, THINKING_START_TOKEN),
+            (THINKING_END, THINKING_END_TOKEN),
+            (DSML, DSML_TOKEN),
+            (USER, USER_SP_TOKEN),
+            (ASSISTANT, ASSISTANT_SP_TOKEN),
+            (LATEST_REMINDER, LATEST_REMINDER_SP_TOKEN),
+        ] {
+            assert_eq!(marked, marks::mark(spelling));
+            assert_eq!(marks::strip(marked), spelling);
+        }
+        for task in [
+            "action",
+            "query",
+            "authority",
+            "domain",
+            "title",
+            "read_url",
+        ] {
+            let token = task_sp_token(task).unwrap();
+            assert_eq!(marks::strip(token), format!("<｜{task}｜>"));
+        }
+    }
+
+    #[test]
+    fn grounding_tokens_in_assistant_text_become_control_tokens_and_nothing_else_does() {
+        assert!(matches!(mark_grounding_tokens("plain"), Cow::Borrowed(_)));
+        assert!(matches!(
+            mark_grounding_tokens("a </think> b <｜User｜>"),
+            Cow::Borrowed(_)
+        ));
+        let marked =
+            mark_grounding_tokens("see <｜ref｜>cat<｜/ref｜><｜box｜>[[1,2,3,4]]<｜/box｜>.");
+        assert_eq!(
+            marked,
+            format!(
+                "see {}cat{}{}[[1,2,3,4]]{}.",
+                marks::mark("<｜ref｜>"),
+                marks::mark("<｜/ref｜>"),
+                marks::mark("<｜box｜>"),
+                marks::mark("<｜/box｜>")
+            )
+        );
+    }
 
     /// V4.1's dialect (a leading space on both tags), the one the fixture
     /// cases `assistant_tool_call_array_string_args` and
@@ -357,15 +597,15 @@ mod tests {
     #[test]
     fn v4_non_object_arguments_render_one_parameter_like_the_reference() {
         assert_eq!(
-            encode_arguments_to_dsml(&Value::Null, &V4_TAGS),
+            dsml(&Value::Null, &V4_TAGS),
             "<｜DSML｜parameter name=\"arguments\" string=\"false\">null</｜DSML｜parameter>"
         );
         assert_eq!(
-            encode_arguments_to_dsml(&json!([1, 2]), &V4_TAGS),
+            dsml(&json!([1, 2]), &V4_TAGS),
             "<｜DSML｜parameter name=\"arguments\" string=\"false\">[1, 2]</｜DSML｜parameter>"
         );
         assert_eq!(
-            encode_arguments_to_dsml(&json!("\"{\\\"a\\\": 1}\""), &V4_TAGS),
+            dsml(&json!("\"{\\\"a\\\": 1}\""), &V4_TAGS),
             "<｜DSML｜parameter name=\"a\" string=\"false\">1</｜DSML｜parameter>"
         );
     }
@@ -373,7 +613,7 @@ mod tests {
     #[test]
     fn object_arguments_render_one_parameter_per_key() {
         assert_eq!(
-            encode_arguments_to_dsml(&json!({"n": 3, "s": "raw <x>"}), &V41_TAGS),
+            dsml(&json!({"n": 3, "s": "raw <x>"}), &V41_TAGS),
             "<｜DSML｜ parameter name=\"n\" string=\"false\">3</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"s\" string=\"true\">raw <x></｜DSML｜ parameter>"
         );
     }
@@ -381,7 +621,7 @@ mod tests {
     #[test]
     fn string_arguments_that_parse_to_an_object_render_its_keys() {
         assert_eq!(
-            encode_arguments_to_dsml(&json!("{\"a\": 1}"), &V41_TAGS),
+            dsml(&json!("{\"a\": 1}"), &V41_TAGS),
             "<｜DSML｜ parameter name=\"a\" string=\"false\">1</｜DSML｜ parameter>"
         );
     }
@@ -391,7 +631,7 @@ mod tests {
         // The reference wraps the ORIGINAL value: the client's raw string is
         // one string parameter, not the array it parses to.
         assert_eq!(
-            encode_arguments_to_dsml(&json!("[1, 2]"), &V41_TAGS),
+            dsml(&json!("[1, 2]"), &V41_TAGS),
             "<｜DSML｜ parameter name=\"arguments\" string=\"true\">[1, 2]</｜DSML｜ parameter>"
         );
     }
@@ -401,7 +641,7 @@ mod tests {
         // `process_tool_call_arguments` has already parsed the client's
         // `"[1, 2]"`, so the renderer receives the array itself.
         assert_eq!(
-            encode_arguments_to_dsml(&json!([1, 2]), &V41_TAGS),
+            dsml(&json!([1, 2]), &V41_TAGS),
             "<｜DSML｜ parameter name=\"arguments\" string=\"false\">[1, 2]</｜DSML｜ parameter>"
         );
     }
@@ -409,11 +649,11 @@ mod tests {
     #[test]
     fn number_and_bool_arguments_wrap_the_value_as_json() {
         assert_eq!(
-            encode_arguments_to_dsml(&json!(42), &V41_TAGS),
+            dsml(&json!(42), &V41_TAGS),
             "<｜DSML｜ parameter name=\"arguments\" string=\"false\">42</｜DSML｜ parameter>"
         );
         assert_eq!(
-            encode_arguments_to_dsml(&json!(true), &V41_TAGS),
+            dsml(&json!(true), &V41_TAGS),
             "<｜DSML｜ parameter name=\"arguments\" string=\"false\">true</｜DSML｜ parameter>"
         );
     }
@@ -421,7 +661,7 @@ mod tests {
     #[test]
     fn null_arguments_wrap_null_as_json() {
         assert_eq!(
-            encode_arguments_to_dsml(&Value::Null, &V41_TAGS),
+            dsml(&Value::Null, &V41_TAGS),
             "<｜DSML｜ parameter name=\"arguments\" string=\"false\">null</｜DSML｜ parameter>"
         );
     }
@@ -431,7 +671,7 @@ mod tests {
         // The JSON string `"{\"a\": 1}"`: the first parse yields the text
         // `{"a": 1}`, the second the object.
         assert_eq!(
-            encode_arguments_to_dsml(&json!("\"{\\\"a\\\": 1}\""), &V41_TAGS),
+            dsml(&json!("\"{\\\"a\\\": 1}\""), &V41_TAGS),
             "<｜DSML｜ parameter name=\"a\" string=\"false\">1</｜DSML｜ parameter>"
         );
     }
@@ -445,7 +685,7 @@ mod tests {
         assert_eq!(twice, "\"{\\\"a\\\": 1}\"");
         let thrice = serde_json::to_string(&twice).unwrap();
         assert_eq!(
-            encode_arguments_to_dsml(&Value::String(thrice.clone()), &V41_TAGS),
+            dsml(&Value::String(thrice.clone()), &V41_TAGS),
             format!("<｜DSML｜ parameter name=\"arguments\" string=\"true\">{thrice}</｜DSML｜ parameter>")
         );
     }
@@ -453,7 +693,7 @@ mod tests {
     #[test]
     fn unparsable_string_arguments_are_wrapped_verbatim() {
         assert_eq!(
-            encode_arguments_to_dsml(&json!("{oops"), &V41_TAGS),
+            dsml(&json!("{oops"), &V41_TAGS),
             "<｜DSML｜ parameter name=\"arguments\" string=\"true\">{oops</｜DSML｜ parameter>"
         );
     }

@@ -10,6 +10,8 @@ contract from Rust; see :mod:`smg_grpc_servicer.sglang.rust`.
 """
 
 __all__ = [
+    "ENGINE_INDEX_ENV",
+    "HANDSHAKE_ENV",
     "SERVICER_IMPL_ENV",
     "SGLangSchedulerServicer",
     "resolve_servicer_impl",
@@ -18,6 +20,11 @@ __all__ = [
 
 # The flag that selects the Rust request path; see `smg_grpc_servicer.sglang.rust`.
 SERVICER_IMPL_ENV = "SMG_SGLANG_SERVICER_IMPL"
+# Whoever spawns the scheduler ranks (the Rust servicer, or the standalone
+# headless launcher) sets these for them; the ZMQ plugin reads them in each
+# rank (see `smg_grpc_servicer.sglang.zmq_plugin`).
+HANDSHAKE_ENV = "SMG_SGLANG_ZMQ_HANDSHAKE"
+ENGINE_INDEX_ENV = "SMG_SGLANG_ZMQ_ENGINE_INDEX"
 
 
 def __getattr__(name: str):

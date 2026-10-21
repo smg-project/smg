@@ -24,6 +24,7 @@ use crate::{
     error,
     header_utils::extract_auth_header,
     metrics::{metrics_labels, Metrics},
+    upstream_body,
     worker::ExternalWorker,
 };
 
@@ -463,26 +464,22 @@ async fn setup_and_spawn_bridge(
         worker.http_client(),
         bind_addr,
         stun_server,
+        model,
     )
     .await
     {
         Ok(result) => result,
         Err(e) => {
             return match e {
-                BridgeSetupError::UpstreamHttp {
-                    status,
-                    body,
-                    content_type,
-                } => {
+                BridgeSetupError::UpstreamHttp { error } => {
+                    let status = error.status;
                     worker.record_outcome(status.as_u16());
                     warn!(call_id, model, %status, "Upstream rejected WebRTC bridge setup ({label})");
-                    let mut builder = Response::builder().status(status);
-                    if let Some(ct) = content_type {
-                        builder = builder.header("Content-Type", ct);
-                    }
-                    builder
-                        .body(axum::body::Body::from(body))
-                        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
+                    // The provider's refusal as the bridge read it: its
+                    // account identifiers removed, its body bounded, under
+                    // its status. Nothing is awaited in this arm: the
+                    // finished setup future would be held across it.
+                    upstream_body::error_response(error)
                 }
                 BridgeSetupError::Other(ref err) => {
                     error!(call_id, model, error = %err, "Failed to create WebRTC bridge ({label})");

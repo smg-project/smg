@@ -680,7 +680,7 @@ async fn test_deepseek_dsml_v4_streaming_bpe_chunked_opener() {
 }
 
 /// Same BPE-chunking scenario for V3.2 (block name `function_calls`).
-/// The bug is identical across variants — the `has_dsml` check is the same
+/// The bug is identical across variants: the opener detection is the same
 /// code path for both.
 #[tokio::test]
 async fn test_deepseek_dsml_v32_streaming_bpe_chunked_opener() {
@@ -793,12 +793,14 @@ async fn test_deepseek_v4_streaming_holds_back_unparsed_false_values() {
 
 /// End of stream right after the block opener: the opener is tool syntax,
 /// not content, so nothing is flushed; a held-back `<` with no sentinel is.
+/// The space before the opener waits for the next piece and is trimmed when
+/// the opener follows, as the one-shot path trims it.
 #[tokio::test]
 async fn test_deepseek_v4_end_of_stream_drops_a_truncated_opener() {
     let tools = create_test_tools();
     let mut parser = DeepSeekDsmlParser::v4();
     let first = parser.parse_incremental("Hello ", &tools).await.unwrap();
-    assert_eq!(first.normal_text, "Hello ");
+    assert_eq!(first.normal_text, "Hello");
     let second = parser
         .parse_incremental("<｜DSML｜tool_calls>", &tools)
         .await
@@ -808,8 +810,15 @@ async fn test_deepseek_v4_end_of_stream_drops_a_truncated_opener() {
     assert_eq!(parser.take_unstreamed_normal_text(), "");
 
     let mut parser = DeepSeekDsmlParser::v4();
-    parser.parse_incremental("a <", &tools).await.unwrap();
-    assert_eq!(parser.take_unstreamed_normal_text(), "a <");
+    let flushed = parser.parse_incremental("a <", &tools).await.unwrap();
+    assert_eq!(
+        format!(
+            "{}{}",
+            flushed.normal_text,
+            parser.take_unstreamed_normal_text()
+        ),
+        "a <"
+    );
 }
 
 /// Shared streaming fix: a `string="true"` value starting with a newline and
@@ -837,4 +846,241 @@ async fn test_deepseek_v4_streaming_keeps_leading_whitespace_in_string_values() 
         }
     }
     assert_eq!(args, "{\"query\":\"\\n杭州市\"}");
+}
+
+/// The tool the recorded answers call, by name (V3.2/V4 filter unknown names).
+#[expect(
+    clippy::expect_used,
+    reason = "test helper: a malformed tool literal must fail the test"
+)]
+fn add_integers_tool() -> Vec<openai_protocol::common::Tool> {
+    vec![serde_json::from_value(serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "add_integers",
+            "description": "Add two integers",
+            "parameters": {
+                "type": "object",
+                "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+                "required": ["a", "b"]
+            }
+        }
+    }))
+    .expect("a function tool")]
+}
+
+/// Feed `pieces` to `parser` one by one; the visible text (every
+/// `normal_text`, then what the parser gives back at the end of the stream)
+/// and the tool calls' names and concatenated arguments.
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper: a parse error must fail the test"
+)]
+async fn stream_pieces(
+    parser: &mut DeepSeekDsmlParser,
+    tools: &[openai_protocol::common::Tool],
+    pieces: &[&str],
+) -> (String, Vec<String>, String) {
+    let mut text = String::new();
+    let mut names = Vec::new();
+    let mut args = String::new();
+    for piece in pieces {
+        let result = parser.parse_incremental(piece, tools).await.unwrap();
+        text.push_str(&result.normal_text);
+        for call in result.calls {
+            if let Some(name) = call.name {
+                names.push(name);
+            }
+            args.push_str(&call.parameters);
+        }
+    }
+    if let Some(items) = parser.get_unstreamed_tool_args() {
+        for item in items {
+            args.push_str(&item.parameters);
+        }
+    }
+    text.push_str(&parser.take_unstreamed_normal_text());
+    (text, names, args)
+}
+
+/// The pieces of a streamed tool-call answer in the shape a recorded engine
+/// delivered them: the opener and the block close each come as `<｜DSML｜` /
+/// `</｜DSML｜` plus sub-word pieces, with the model's newlines around them.
+fn recorded_v4_pieces() -> Vec<&'static str> {
+    vec![
+        "",
+        "\n\n",
+        "<｜DSML｜",
+        "tool",
+        "_c",
+        "all",
+        "s",
+        ">",
+        "\n",
+        "<｜DSML｜",
+        "invoke",
+        " name",
+        "=\"",
+        "add",
+        "_integers",
+        "\">",
+        "\n",
+        "<｜DSML｜",
+        "parameter",
+        " name",
+        "=\"a\"",
+        " string",
+        "=\"false\"",
+        ">",
+        "17",
+        "</｜DSML｜",
+        "parameter",
+        ">",
+        "\n",
+        "<｜DSML｜",
+        "parameter",
+        " name",
+        "=\"b\"",
+        " string",
+        "=\"false\"",
+        ">",
+        "25",
+        "</｜DSML｜",
+        "parameter",
+        ">",
+        "\n",
+        "</｜DSML｜",
+        "invoke",
+        ">",
+        "\n",
+        "</｜DSML｜",
+        "tool",
+        "_c",
+        "all",
+        "s",
+        ">",
+    ]
+}
+
+/// A streamed tool-call answer carries no markup in its visible text: the
+/// block close arriving as `</｜DSML｜` + `tool` + `_c` + `all` + `s` + `>` after
+/// the last invoke, and the newline before it, are dropped as the one-shot
+/// path never shows them; the leading blank line is trimmed the same way.
+#[tokio::test]
+async fn test_deepseek_v4_streaming_drops_the_block_close_delivered_in_pieces() {
+    let tools = add_integers_tool();
+    let mut parser = DeepSeekDsmlParser::v4();
+    let (text, names, args) = stream_pieces(&mut parser, &tools, &recorded_v4_pieces()).await;
+    assert_eq!(names, vec!["add_integers"]);
+    assert_eq!(args, r#"{"a":17,"b":25}"#);
+    assert_eq!(text, "", "no markup and no padding in the visible text");
+}
+
+/// The same for V3.2's block name.
+#[tokio::test]
+async fn test_deepseek32_streaming_drops_the_block_close_delivered_in_pieces() {
+    let tools = add_integers_tool();
+    let mut parser = DeepSeekDsmlParser::v32();
+    let pieces: Vec<String> = recorded_v4_pieces()
+        .into_iter()
+        .map(|piece| match piece {
+            "tool" => "function".to_string(),
+            other => other.to_string(),
+        })
+        .collect();
+    let pieces: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    let (text, names, args) = stream_pieces(&mut parser, &tools, &pieces).await;
+    assert_eq!(names, vec!["add_integers"]);
+    assert_eq!(args, r#"{"a":17,"b":25}"#);
+    assert_eq!(text, "");
+}
+
+/// Whatever the piece boundaries, the streamed visible text is the one-shot
+/// path's content and the arguments are the one-shot path's arguments: the
+/// answer split in two at every character boundary, and fed one character
+/// at a time.
+#[tokio::test]
+async fn test_deepseek_v4_streaming_matches_the_one_shot_answer_at_every_split() {
+    let tools = add_integers_tool();
+    let answer = concat!(
+        "Sure, adding them.\n\n",
+        "<｜DSML｜tool_calls>\n",
+        "<｜DSML｜invoke name=\"add_integers\">\n",
+        "<｜DSML｜parameter name=\"a\" string=\"false\">17</｜DSML｜parameter>\n",
+        "<｜DSML｜parameter name=\"b\" string=\"false\">25</｜DSML｜parameter>\n",
+        "</｜DSML｜invoke>\n",
+        "</｜DSML｜tool_calls>",
+    );
+    let (one_shot_text, one_shot_calls) = DeepSeekDsmlParser::v4()
+        .parse_complete(answer)
+        .await
+        .unwrap();
+    assert_eq!(one_shot_text, "Sure, adding them.");
+    assert_eq!(one_shot_calls.len(), 1);
+    let one_shot_args = one_shot_calls[0].function.arguments.clone();
+
+    let boundaries: Vec<usize> = answer.char_indices().map(|(i, _)| i).skip(1).collect();
+    for cut in boundaries {
+        let mut parser = DeepSeekDsmlParser::v4();
+        let (text, names, args) =
+            stream_pieces(&mut parser, &tools, &[&answer[..cut], &answer[cut..]]).await;
+        assert_eq!(
+            text, one_shot_text,
+            "visible text with the cut at byte {cut}"
+        );
+        assert!(
+            !text.contains('<'),
+            "no markup in the visible text with the cut at byte {cut}: {text:?}"
+        );
+        assert_eq!(
+            names,
+            vec!["add_integers"],
+            "tool name with the cut at byte {cut}"
+        );
+        assert_eq!(args, one_shot_args, "arguments with the cut at byte {cut}");
+    }
+
+    let chars: Vec<String> = answer.chars().map(String::from).collect();
+    let pieces: Vec<&str> = chars.iter().map(String::as_str).collect();
+    let mut parser = DeepSeekDsmlParser::v4();
+    let (text, names, args) = stream_pieces(&mut parser, &tools, &pieces).await;
+    assert_eq!(
+        text, one_shot_text,
+        "visible text fed one character at a time"
+    );
+    assert!(!text.contains('<'), "{text:?}");
+    assert_eq!(names, vec!["add_integers"]);
+    assert_eq!(args, one_shot_args);
+}
+
+/// A stream with no tool call keeps every byte of its text, its newlines
+/// included: whitespace only waits for the next piece (or the end of the
+/// stream) and nothing a tag could start with is lost when it turns out to
+/// be text.
+#[tokio::test]
+async fn test_deepseek_v4_streaming_keeps_plain_text_and_its_newlines() {
+    let tools = add_integers_tool();
+    let mut parser = DeepSeekDsmlParser::v4();
+    let pieces = ["Hello", "\n", "\n", "a < b and c </ d", "\n", "world", "\n"];
+    let (text, names, _) = stream_pieces(&mut parser, &tools, &pieces).await;
+    assert_eq!(text, "Hello\n\na < b and c </ d\nworld\n");
+    assert!(names.is_empty());
+}
+
+/// Content that reaches the parser in the same piece as the opener is the
+/// content before the block, trimmed as the one-shot path trims it.
+#[tokio::test]
+async fn test_deepseek_v4_streaming_lead_in_arriving_with_the_opener_is_content() {
+    let tools = add_integers_tool();
+    let mut parser = DeepSeekDsmlParser::v4();
+    let pieces = [
+        "Sure.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"add_integers\">\n",
+        "<｜DSML｜parameter name=\"a\" string=\"false\">17</｜DSML｜parameter>\n",
+        "<｜DSML｜parameter name=\"b\" string=\"false\">25</｜DSML｜parameter>\n</｜DSML｜invoke>\n",
+        "</｜DSML｜tool_calls>\n",
+    ];
+    let (text, names, args) = stream_pieces(&mut parser, &tools, &pieces).await;
+    assert_eq!(text, "Sure.");
+    assert_eq!(names, vec!["add_integers"]);
+    assert_eq!(args, r#"{"a":17,"b":25}"#);
 }

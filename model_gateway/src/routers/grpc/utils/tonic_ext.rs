@@ -2,27 +2,86 @@
 
 use axum::response::Response;
 use http::StatusCode;
+use llm_multimodal::MediaErrorCode;
+use smg_grpc_client::{is_transport_failure, WorkerMediaFault};
 use tonic::Code;
 
 use crate::routers::error;
 
 /// Extension methods for `tonic::Status`.
 pub(crate) trait TonicStatusExt {
-    /// Map gRPC status code to the corresponding HTTP status code.
+    /// Map gRPC status code to the corresponding HTTP status code. A failure
+    /// of the request's media (see [`TonicStatusExt::media_fault`]) is
+    /// answered for the media, a 400 whichever side of the fetch failed: a
+    /// reference the request got wrong and an origin that does not deliver
+    /// within the fetch budget are both the request's input, which the
+    /// reference APIs answer a 4xx for; the worker's own trouble with the
+    /// media stays the worker's 5xx (it carries no media fault). A
+    /// `CANCELLED` the worker answered is the worker's side ending the
+    /// call (its connection closed under it, its server reset the stream):
+    /// a bad gateway, never the request's fault. So is a status tonic made
+    /// of an HTTP/2 fault under the call (the connection went away, a stream
+    /// reset below gRPC, a protocol fault), whatever code tonic picked from
+    /// the frame's reason.
     fn http_status(&self) -> StatusCode;
 
     /// Convert this gRPC error into an HTTP error response with the appropriate status code.
     fn to_http_error(&self, code: &str, msg: String) -> Response;
+
+    /// The worker's report that the request's media failed, when the status
+    /// carries one: the `smg-media-fault` trailer, or, from a worker that
+    /// predates the trailer, the media connector's own words on
+    /// `UNAVAILABLE`.
+    fn media_fault(&self) -> Option<WorkerMediaFault>;
+
+    /// The code the public API answers for a failure of the request's media
+    /// (see [`TonicStatusExt::media_fault`]): the one the worker names in its
+    /// `smg-media-code` trailer (`media_too_large` for a size refusal), or
+    /// `media_fetch_failed` from a worker that names none or one this router
+    /// does not know.
+    fn media_code(&self) -> MediaErrorCode;
+
+    /// The HTTP status the circuit breaker samples for this failure; `None`
+    /// for a failure of the request's media, which says nothing about the
+    /// worker that fetched it.
+    fn breaker_status(&self) -> Option<u16>;
+}
+
+/// Whether a status message is the media connector's account of a fetch that
+/// failed: a connection that could not be made or broke, or a fetch that ran
+/// out of its budget. A worker that predates the `smg-media-fault` trailer
+/// reports these on `UNAVAILABLE`, in the connector's words.
+fn names_a_fetch_failure(message: &str) -> bool {
+    message.contains("HTTP error while fetching media")
+        || (message.contains("media fetch") && message.contains("timed out after"))
 }
 
 impl TonicStatusExt for tonic::Status {
     fn http_status(&self) -> StatusCode {
+        if self.media_fault().is_some() {
+            return StatusCode::BAD_REQUEST;
+        }
+        // tonic makes a status of a failure in the HTTP/2 layer under the
+        // call (the connection went away: a GOAWAY of either side, the one
+        // the gateway's own client issues over too many locally-reset
+        // streams included; a stream reset below gRPC; a protocol fault) and
+        // picks its code from the frame's reason: ENHANCE_YOUR_CALM reads as
+        // RESOURCE_EXHAUSTED, which would answer the client a 429 rate limit
+        // it never hit, PROTOCOL_ERROR as INTERNAL, the code of a worker's
+        // own answer. The worker's connection failed under the call: a 502
+        // the breaker samples and the retry layer replays elsewhere.
+        if is_transport_failure(self) {
+            return StatusCode::BAD_GATEWAY;
+        }
         match self.code() {
             Code::Ok => StatusCode::OK,
-            Code::InvalidArgument
-            | Code::FailedPrecondition
-            | Code::OutOfRange
-            | Code::Cancelled => StatusCode::BAD_REQUEST,
+            Code::InvalidArgument | Code::FailedPrecondition | Code::OutOfRange => {
+                StatusCode::BAD_REQUEST
+            }
+            // The worker's side ended the call: what a connection that closed
+            // under it or a server that reset the stream produce, nothing the
+            // request did (the liveness monitor reads the code the same way).
+            Code::Cancelled => StatusCode::BAD_GATEWAY,
             Code::Unauthenticated => StatusCode::UNAUTHORIZED,
             Code::PermissionDenied => StatusCode::FORBIDDEN,
             Code::NotFound => StatusCode::NOT_FOUND,
@@ -39,19 +98,42 @@ impl TonicStatusExt for tonic::Status {
     fn to_http_error(&self, code: &str, msg: String) -> Response {
         error::create_error(self.http_status(), code, msg)
     }
+
+    fn media_fault(&self) -> Option<WorkerMediaFault> {
+        WorkerMediaFault::from_status(self).or_else(|| {
+            (self.code() == Code::Unavailable && names_a_fetch_failure(self.message()))
+                .then_some(WorkerMediaFault::Transient)
+        })
+    }
+
+    fn media_code(&self) -> MediaErrorCode {
+        smg_grpc_client::media_code(self)
+            .and_then(MediaErrorCode::parse)
+            .unwrap_or(MediaErrorCode::FetchFailed)
+    }
+
+    fn breaker_status(&self) -> Option<u16> {
+        match self.media_fault() {
+            Some(_) => None,
+            None => Some(self.http_status().as_u16()),
+        }
+    }
 }
 
-/// Extension for `Result<T, tonic::Status>` to extract HTTP status for CB recording.
+/// Extension for `Result<T, tonic::Status>`: what the circuit breaker samples.
 pub(crate) trait TonicResultExt {
-    /// Returns the HTTP status code for circuit breaker recording.
-    /// `Ok` → 200, `Err(status)` → mapped HTTP status code.
-    fn cb_status_code(&self) -> u16;
+    /// The HTTP status the circuit breaker samples for this outcome: `Ok` →
+    /// 200, `Err(status)` → its mapped HTTP status, or `None` for a failure of
+    /// the request's media (see [`TonicStatusExt::breaker_status`]).
+    fn breaker_status(&self) -> Option<u16>;
 }
 
 impl<T> TonicResultExt for Result<T, tonic::Status> {
-    fn cb_status_code(&self) -> u16 {
-        self.as_ref()
-            .map_or_else(|e| e.http_status().as_u16(), |_| 200)
+    fn breaker_status(&self) -> Option<u16> {
+        match self {
+            Ok(_) => Some(200),
+            Err(status) => status.breaker_status(),
+        }
     }
 }
 
@@ -62,6 +144,37 @@ mod tests {
         DEFAULT_CAPACITY_STATUS_CODES, DEFAULT_RETRYABLE_STATUS_CODES,
     };
 
+    /// A status tonic made of an HTTP/2 fault under the call (the h2 error in
+    /// its source chain) is the worker's connection failing, whatever code
+    /// tonic picked from the frame's reason: a 502 the breaker samples and
+    /// the retry layer replays elsewhere, never the 429 a GOAWAY
+    /// ENHANCE_YOUR_CALM reads as (a rate limit the client never hit) nor the
+    /// 500 of a worker's own answer. The worker's own RESOURCE_EXHAUSTED, in
+    /// its trailers, stays capacity pushback.
+    #[test]
+    fn an_http2_fault_under_the_call_is_a_retryable_502_whatever_its_code() {
+        use smg_grpc_client::h2::{Error, Reason};
+
+        for (reason, code) in [
+            (Reason::ENHANCE_YOUR_CALM, Code::ResourceExhausted),
+            (Reason::PROTOCOL_ERROR, Code::Internal),
+            (Reason::FLOW_CONTROL_ERROR, Code::Internal),
+            (Reason::REFUSED_STREAM, Code::Unavailable),
+            (Reason::CANCEL, Code::Cancelled),
+        ] {
+            let status = tonic::Status::from_error(Box::new(Error::from(reason)));
+            assert_eq!(status.code(), code, "tonic's own code for {reason:?}");
+            assert_eq!(status.http_status(), StatusCode::BAD_GATEWAY, "{reason:?}");
+            let result: Result<(), tonic::Status> = Err(status);
+            assert_eq!(result.breaker_status(), Some(502), "{reason:?}");
+        }
+        assert!(DEFAULT_RETRYABLE_STATUS_CODES.contains(&502));
+        assert_eq!(
+            tonic::Status::resource_exhausted("busy").http_status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+    }
+
     #[test]
     fn invalid_argument_maps_to_400_and_is_not_a_circuit_breaker_failure() {
         for status in [
@@ -71,8 +184,20 @@ mod tests {
         ] {
             assert_eq!(status.http_status(), StatusCode::BAD_REQUEST);
             let result: Result<(), tonic::Status> = Err(status);
-            assert_eq!(result.cb_status_code(), 400);
+            assert_eq!(result.breaker_status(), Some(400));
         }
+        assert!(!DEFAULT_RETRYABLE_STATUS_CODES.contains(&400));
+    }
+
+    /// A call the worker's side cancelled is the worker's failure: a 502 the
+    /// retry layer replays elsewhere and the breaker samples, never a 400.
+    #[test]
+    fn a_cancelled_call_maps_to_502_and_is_a_retryable_circuit_breaker_failure() {
+        let status = tonic::Status::cancelled("operation was canceled");
+        assert_eq!(status.http_status(), StatusCode::BAD_GATEWAY);
+        let result: Result<(), tonic::Status> = Err(status);
+        assert_eq!(result.breaker_status(), Some(502));
+        assert!(DEFAULT_RETRYABLE_STATUS_CODES.contains(&502));
         assert!(!DEFAULT_RETRYABLE_STATUS_CODES.contains(&400));
     }
 
@@ -85,7 +210,7 @@ mod tests {
         ] {
             assert_eq!(status.http_status(), StatusCode::INTERNAL_SERVER_ERROR);
             let result: Result<(), tonic::Status> = Err(status);
-            assert_eq!(result.cb_status_code(), 500);
+            assert_eq!(result.breaker_status(), Some(500));
         }
         assert!(DEFAULT_RETRYABLE_STATUS_CODES.contains(&500));
     }
@@ -102,6 +227,86 @@ mod tests {
         );
         assert!(DEFAULT_CAPACITY_STATUS_CODES.contains(&429));
         let ok: Result<(), tonic::Status> = Ok(());
-        assert_eq!(ok.cb_status_code(), 200);
+        assert_eq!(ok.breaker_status(), Some(200));
+    }
+
+    /// A worker's report that the request's media failed is answered for the
+    /// media (a 400 for the request's own fault and for the media host's
+    /// alike) and is no circuit-breaker sample, whichever code carries it.
+    /// The API's code is the one the worker names, `media_fetch_failed` when
+    /// it names none or one this router does not know.
+    #[test]
+    fn a_media_fault_answers_for_the_media_and_is_no_breaker_sample() {
+        let client = WorkerMediaFault::Client.stamp(tonic::Status::invalid_argument(
+            "HTTP error while fetching media: HTTP status client error (404 Not Found) for \
+             url (https://media.example/missing.png)",
+        ));
+        assert_eq!(client.media_fault(), Some(WorkerMediaFault::Client));
+        assert_eq!(client.http_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(client.media_code(), MediaErrorCode::FetchFailed);
+        assert_eq!(client.breaker_status(), None);
+
+        let transient = WorkerMediaFault::Transient.stamp(tonic::Status::unavailable(
+            "media fetch of https://media.example/a.png timed out after 10s",
+        ));
+        assert_eq!(transient.media_fault(), Some(WorkerMediaFault::Transient));
+        assert_eq!(transient.http_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(transient.media_code(), MediaErrorCode::FetchFailed);
+        let result: Result<(), tonic::Status> = Err(transient);
+        assert_eq!(result.breaker_status(), None);
+
+        let too_large = smg_grpc_client::stamp_media_code(
+            WorkerMediaFault::Client.stamp(tonic::Status::invalid_argument(
+                "decoded video RGB payload would be 2208384000 bytes, exceeding \
+                 SMG_VIDEO_MAX_DECODED_BYTES=1073741824",
+            )),
+            "media_too_large",
+        );
+        assert_eq!(too_large.media_fault(), Some(WorkerMediaFault::Client));
+        assert_eq!(too_large.http_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(too_large.media_code(), MediaErrorCode::TooLarge);
+        assert_eq!(too_large.breaker_status(), None);
+
+        let unknown = smg_grpc_client::stamp_media_code(
+            WorkerMediaFault::Client.stamp(tonic::Status::invalid_argument("new words")),
+            "media_from_the_future",
+        );
+        assert_eq!(unknown.media_code(), MediaErrorCode::FetchFailed);
+    }
+
+    /// A worker that predates the trailer reports a fetch failure on
+    /// `UNAVAILABLE` in the connector's words; it is read as the media host's
+    /// fault and answered for the media. The worker's own trouble, and a
+    /// caller fault the worker already answers 4xx, are read as before.
+    #[test]
+    fn a_fetch_failure_in_the_connectors_words_is_read_without_the_trailer() {
+        for message in [
+            "Failed to finalize multimodal tracker: HTTP error while fetching media: error \
+             sending request for url (https://media.example/a.png)",
+            "Failed to finalize multimodal tracker: media fetch timed out after 10s",
+            "Failed to finalize multimodal tracker: media fetch of https://media.example/a.png \
+             timed out after 30s",
+        ] {
+            let legacy = tonic::Status::unavailable(message);
+            assert_eq!(
+                legacy.media_fault(),
+                Some(WorkerMediaFault::Transient),
+                "{message}"
+            );
+            assert_eq!(legacy.http_status(), StatusCode::BAD_REQUEST);
+            assert_eq!(legacy.media_code(), MediaErrorCode::FetchFailed);
+            assert_eq!(legacy.breaker_status(), None);
+        }
+        let sidecar = tonic::Status::unavailable("sidecar_timeout: no result");
+        assert_eq!(sidecar.media_fault(), None);
+        assert_eq!(sidecar.breaker_status(), Some(503));
+        let engine = tonic::Status::unavailable("engine is restarting");
+        assert_eq!(engine.breaker_status(), Some(503));
+        let decode = tonic::Status::invalid_argument(
+            "Failed to finalize multimodal tracker: image decode error: The image format \
+             could not be determined",
+        );
+        assert_eq!(decode.media_fault(), None);
+        assert_eq!(decode.breaker_status(), Some(400));
     }
 }

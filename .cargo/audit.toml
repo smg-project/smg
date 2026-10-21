@@ -1,0 +1,64 @@
+# cargo-audit configuration. `cargo audit` runs on every pull request that changes the dependency
+# graph (the cargo-audit job of pr-test-rust.yml) and daily on main (cargo-audit-nightly.yml), both
+# through scripts/ci_cargo_audit.sh. A vulnerability that is not listed here fails the job; an
+# unmaintained or yanked crate is printed as an allowed warning. Every entry needs a reason and a
+# review date, and goes when the fixed release is in the lockfile.
+[advisories]
+ignore = [
+    # RUSTSEC-2023-0071: rsa 0.9, a timing side channel on RSA private-key operations (Marvin),
+    # with no fixed release. rsa reaches the runtime graph only through jsonwebtoken's rust_crypto
+    # backend (crates/auth); the direct rsa dev-dependencies of crates/auth and model_gateway
+    # generate test keys only, and keep the crate in Cargo.lock as long as they stay. The gateway
+    # verifies JWT signatures with public keys (DecodingKey built from JWKS components) and never
+    # signs or decrypts with an RSA private key outside its test suite, so the side channel has no
+    # secret to leak. Review by 2027-01-15.
+    "RUSTSEC-2023-0071",
+
+    # Unmaintained crates without a release that drops them. cargo-audit reports them as warnings
+    # (the job stays green); they are listed so that a new warning stands out in the job's output
+    # and each one carries its exit and a review date.
+
+    # RUSTSEC-2025-0012: backoff 0.4, the retry policy of the workflow engine (crates/workflow;
+    # crates/mcp declares it as well). RUSTSEC-2024-0384: instant 0.1, pulled by backoff alone.
+    # Both go with a maintained retry crate or a local exponential backoff in crates/workflow.
+    # Review by 2027-01-15.
+    "RUSTSEC-2025-0012",
+    "RUSTSEC-2024-0384",
+    # RUSTSEC-2025-0141: bincode 1.3, the byte encoding of crates/kv_index snapshots, of the
+    # crates/mesh CRDT operations and of the gateway's mesh worker state (model_gateway's
+    # mesh/adapters/worker_sync.rs); crates/engine_servicer gets it through kv_index alone. nixl-sys
+    # (the optional nixl feature of crates/mm_rdma) requires it as well, so the version stays in
+    # the lockfile while that feature exists, whatever our crates do. Goes with a move to bincode
+    # 2's API or to another codec in the three crates that write the bytes: they are exchanged
+    # between peers, so it is a format decision, not a lockfile bump. Review by 2027-01-15.
+    "RUSTSEC-2025-0141",
+    # RUSTSEC-2025-0057: fxhash 0.2, through ptr_hash 2.1 under the optional tokenizers 1.0
+    # release candidate of crates/tokenizer (feature tokenizers-v1); no ptr_hash release is
+    # without it. Review by 2027-01-15.
+    "RUSTSEC-2025-0057",
+    # RUSTSEC-2024-0436: paste 1.0, a complete proc macro under malachite-bigint (rustpython-parser,
+    # used by crates/tool_parser), oracle 0.6 (crates/data_connector), tokenizers, rav1e, pulp,
+    # tikv-jemalloc-ctl and tk-encode; it leaves the graph only when every one of them has a
+    # release without it, and none has one today. Review by 2027-01-15.
+    "RUSTSEC-2024-0436",
+    # RUSTSEC-2025-0134: rustls-pemfile 2.2, the PEM reader of the crates/mesh mTLS setup and of
+    # the gateway's TLS test helpers. Goes with the PEM parsing of rustls-pki-types (a code change
+    # in both). Review by 2027-01-15.
+    "RUSTSEC-2025-0134",
+    # RUSTSEC-2025-0081, -0075, -0080, -0090, -0100, -0098: the unic-* 0.9 crates under
+    # rustpython-parser 0.4 (crates/tool_parser), whose latest release still depends on them.
+    # Review by 2027-01-15.
+    "RUSTSEC-2025-0081",
+    "RUSTSEC-2025-0075",
+    "RUSTSEC-2025-0080",
+    "RUSTSEC-2025-0090",
+    "RUSTSEC-2025-0100",
+    "RUSTSEC-2025-0098",
+    # RUSTSEC-2024-0449: unsafe-libyaml 0.2 under serde_yaml 0.9 (deprecated), the YAML reader of
+    # the gateway's config, scheduler and rate-limit files, of crates/mcp, of the Python binding
+    # (bindings/python) and of kube-client 3, and under serde_yaml_ng 0.10 (clients/openapi-gen),
+    # which depends on it too, so that crate is no exit. Goes with a YAML crate that does not build
+    # on it in the three crates and in openapi-gen, and the kube release that dropped serde_yaml.
+    # Review by 2027-01-15.
+    "RUSTSEC-2024-0449",
+]

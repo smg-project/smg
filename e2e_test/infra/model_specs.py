@@ -16,6 +16,8 @@ import os
 
 # Environment variable for local model paths (CI uses local copies for speed)
 ROUTER_LOCAL_MODEL_PATH = os.environ.get("ROUTER_LOCAL_MODEL_PATH", "")
+# Nightly benchmarks skip --enforce-eager for performance measurement
+_is_nightly = os.environ.get("E2E_NIGHTLY") == "1"
 
 
 def _resolve_model_path(hf_path: str) -> str:
@@ -75,7 +77,7 @@ MODEL_SPECS: dict[str, dict] = {
         "model": _resolve_model_path("Qwen/Qwen3-30B-A3B"),
         "tp": 1,
         "features": ["chat", "streaming", "thinking", "reasoning"],
-        "vllm_args": ["--enforce-eager"],
+        "vllm_args": [] if _is_nightly else ["--enforce-eager"],
         "trtllm_extra_config": {"kv_cache_config": {"free_gpu_memory_fraction": 0.8}},
     },
     # Qwen3.8-27B — thinking VLM with XML tool calls (reuses the qwen3_5 arch).
@@ -153,7 +155,7 @@ MODEL_SPECS: dict[str, dict] = {
         "features": ["chat", "streaming", "multimodal"],
     },
     # Standard-RoPE vision model for the PD multimodal KV-isolation test:
-    # M-RoPE models (Qwen-VL) cannot decode on the tensor-stripped PD leg.
+    # M-RoPE models (Qwen-VL) cannot decode on the tensor-stripped PD side.
     "microsoft/Phi-3.5-vision-instruct": {
         "model": _resolve_model_path("microsoft/Phi-3.5-vision-instruct"),
         "tp": 1,

@@ -40,6 +40,7 @@ pub struct ServerInfo {
     pub served_model_name: Option<String>,
     pub tp_size: Option<usize>,
     pub dp_size: Option<usize>,
+    pub attn_dp_size: Option<usize>,
     pub pp_size: Option<usize>,
     pub load_balance_method: Option<String>,
     pub disaggregation_mode: Option<String>,
@@ -52,6 +53,12 @@ pub struct ServerInfo {
     /// closes the HTTP-only path so capacity-aware consumers (e.g. WorkerCapacity)
     /// see the same label regardless of transport.
     pub max_running_requests: Option<usize>,
+    /// Whether the engine splits `max_running_requests` across its
+    /// attention-DP workers (`attn_dp_size` above carries that width as its
+    /// newer releases resolve it): under `--dp-aware` each rank worker then
+    /// gets its share of the window (`create_worker::labels_for_rank`), on
+    /// this path as on the gRPC one.
+    pub enable_dp_attention: Option<bool>,
     pub weight_version: Option<String>,
 }
 
@@ -93,12 +100,43 @@ struct VersionResponse {
 // ---------------------------------------------------------------------------
 
 /// GET JSON with optional bearer auth, with 404 fallback to `/get_<endpoint>`.
+/// Why a metadata endpoint gave no answer: the engine does not offer it (a
+/// 404 on every spelling), or the read failed (transport, timeout, a non-2xx
+/// other than 404, an unparsable body). Registration tolerates both; a strict
+/// refresh tolerates only the first.
+#[derive(Debug)]
+enum MetadataError {
+    NotOffered,
+    Failed(String),
+}
+
+impl std::fmt::Display for MetadataError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotOffered => f.write_str("not offered (404)"),
+            Self::Failed(reason) => f.write_str(reason),
+        }
+    }
+}
+
+/// GET JSON with optional bearer auth, with 404 fallback to `/get_<endpoint>`.
 async fn get_json_with_fallback<T: serde::de::DeserializeOwned>(
     client: &Client,
     base_url: &str,
     endpoint: &str,
     api_key: Option<&str>,
 ) -> Result<T, String> {
+    get_json_with_fallback_classified(client, base_url, endpoint, api_key)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+async fn get_json_with_fallback_classified<T: serde::de::DeserializeOwned>(
+    client: &Client,
+    base_url: &str,
+    endpoint: &str,
+    api_key: Option<&str>,
+) -> Result<T, MetadataError> {
     let url = format!("{base_url}/{endpoint}");
     let mut req = client.get(&url).timeout(METADATA_TIMEOUT);
     if let Some(key) = api_key {
@@ -108,7 +146,7 @@ async fn get_json_with_fallback<T: serde::de::DeserializeOwned>(
     let response = req
         .send()
         .await
-        .map_err(|e| format!("Failed to connect to {url}: {e}"))?;
+        .map_err(|e| MetadataError::Failed(format!("Failed to connect to {url}: {e}")))?;
 
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         // Fallback to deprecated /get_<endpoint> prefix
@@ -121,32 +159,42 @@ async fn get_json_with_fallback<T: serde::de::DeserializeOwned>(
         let resp = req
             .send()
             .await
-            .map_err(|e| format!("Failed to connect to {old_url}: {e}"))?;
+            .map_err(|e| MetadataError::Failed(format!("Failed to connect to {old_url}: {e}")))?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(MetadataError::NotOffered);
+        }
         if !resp.status().is_success() {
-            return Err(format!("status {} from {}", resp.status(), old_url));
+            return Err(MetadataError::Failed(format!(
+                "status {} from {}",
+                resp.status(),
+                old_url
+            )));
         }
         return resp
             .json::<T>()
             .await
-            .map_err(|e| format!("Failed to parse {old_url}: {e}"));
+            .map_err(|e| MetadataError::Failed(format!("Failed to parse {old_url}: {e}")));
     }
 
     if !response.status().is_success() {
-        return Err(format!("status {} from {}", response.status(), url));
+        return Err(MetadataError::Failed(format!(
+            "status {} from {}",
+            response.status(),
+            url
+        )));
     }
 
     response
         .json::<T>()
         .await
-        .map_err(|e| format!("Failed to parse {url}: {e}"))
+        .map_err(|e| MetadataError::Failed(format!("Failed to parse {url}: {e}")))
 }
 
-/// GET JSON (no fallback).
-async fn http_get_json<T: serde::de::DeserializeOwned>(
+async fn http_get_json_classified<T: serde::de::DeserializeOwned>(
     client: &Client,
     url: &str,
     api_key: Option<&str>,
-) -> Result<T, String> {
+) -> Result<T, MetadataError> {
     let mut req = client.get(url).timeout(METADATA_TIMEOUT);
     if let Some(key) = api_key {
         req = req.bearer_auth(key);
@@ -154,13 +202,20 @@ async fn http_get_json<T: serde::de::DeserializeOwned>(
     let resp = req
         .send()
         .await
-        .map_err(|e| format!("Failed to connect to {url}: {e}"))?;
+        .map_err(|e| MetadataError::Failed(format!("Failed to connect to {url}: {e}")))?;
+    if resp.status() == reqwest::StatusCode::NOT_FOUND {
+        return Err(MetadataError::NotOffered);
+    }
     if !resp.status().is_success() {
-        return Err(format!("status {} from {}", resp.status(), url));
+        return Err(MetadataError::Failed(format!(
+            "status {} from {}",
+            resp.status(),
+            url
+        )));
     }
     resp.json::<T>()
         .await
-        .map_err(|e| format!("Failed to parse {url}: {e}"))
+        .map_err(|e| MetadataError::Failed(format!("Failed to parse {url}: {e}")))
 }
 
 pub async fn get_server_info(
@@ -171,95 +226,174 @@ pub async fn get_server_info(
     get_json_with_fallback(client, &http_base_url(url), "server_info", api_key).await
 }
 
-pub async fn get_model_info(
+/// The labels an engine reports about itself, read the way registration
+/// reads them: an HTTP engine's metadata endpoints (by runtime), or a gRPC
+/// engine's model and server info. Callable again for a worker that is
+/// already registered, so its labels can follow the engine when it comes
+/// back into service or finishes loading. Returns the labels and, for a gRPC
+/// engine, the runtime the probe confirmed. Registration reads tolerantly
+/// (`strict == false`: a failed endpoint leaves a gap); a refresh reads
+/// strictly, because a gap would read as labels the engine dropped: a read
+/// that fails (transport, timeout, a non-2xx other than 404, an unparsable
+/// body, an unknown gRPC error) is an error, while an endpoint the engine does
+/// not offer (404 on every spelling, gRPC `Unimplemented`) is tolerated in
+/// both modes.
+pub(crate) async fn discover_engine_labels(
     client: &Client,
     url: &str,
+    connection_mode: ConnectionMode,
+    runtime_type: &str,
     api_key: Option<&str>,
-) -> Result<ModelInfo, String> {
-    get_json_with_fallback(client, &http_base_url(url), "model_info", api_key).await
+    strict: bool,
+) -> Result<(HashMap<String, String>, Option<String>), String> {
+    match connection_mode {
+        ConnectionMode::Http => {
+            let labels = match runtime_type {
+                "vllm" => fetch_vllm_http_metadata_checked(client, url, api_key, strict).await?,
+                _ => fetch_sglang_http_metadata_checked(client, url, api_key, strict).await?,
+            };
+            Ok((labels, None))
+        }
+        ConnectionMode::Grpc => fetch_grpc_metadata(url, runtime_type, strict)
+            .await
+            .map(|(labels, runtime)| (labels, Some(runtime))),
+        ConnectionMode::Zmq => Err(
+            "a ZMQ engine reports its metadata at the handshake, not at an endpoint".to_string(),
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Per-backend metadata fetchers
 // ---------------------------------------------------------------------------
 
+/// The tolerant read as a plain map, kept for the tests of the registration shape.
+#[cfg(test)]
 async fn fetch_sglang_http_metadata(
     client: &Client,
     url: &str,
     api_key: Option<&str>,
 ) -> HashMap<String, String> {
+    fetch_sglang_http_metadata_checked(client, url, api_key, false)
+        .await
+        .unwrap_or_default()
+}
+
+/// The SGLang HTTP metadata. Registration tolerates an endpoint that fails
+/// (`strict == false`: the gap is left); a refresh must not mistake a failed
+/// read for an engine that reports less, so with `strict` every endpoint has
+/// to answer or the read is an error.
+async fn fetch_sglang_http_metadata_checked(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+    strict: bool,
+) -> Result<HashMap<String, String>, String> {
     let base = http_base_url(url);
     let mut labels = HashMap::new();
 
-    if let Ok(info) = get_server_info(client, &base, api_key).await {
-        labels.extend(flat_labels(&info));
+    match get_json_with_fallback_classified::<ServerInfo>(client, &base, "server_info", api_key)
+        .await
+    {
+        Ok(info) => labels.extend(flat_labels(&info)),
+        Err(MetadataError::Failed(e)) if strict => return Err(format!("server_info: {e}")),
+        Err(_) => {}
     }
-    if let Ok(info) = get_model_info(client, &base, api_key).await {
-        labels.extend(flat_labels(&info));
+    match get_json_with_fallback_classified::<ModelInfo>(client, &base, "model_info", api_key).await
+    {
+        Ok(info) => labels.extend(flat_labels(&info)),
+        Err(MetadataError::Failed(e)) if strict => return Err(format!("model_info: {e}")),
+        Err(_) => {}
     }
 
     // /v1/models gives us model identity and max_model_len when a compatible
     // local frontend does not expose the SGLang-specific metadata endpoints.
-    if let Ok(models) =
-        http_get_json::<ModelsResponse>(client, &format!("{base}/v1/models"), api_key).await
+    match http_get_json_classified::<ModelsResponse>(client, &format!("{base}/v1/models"), api_key)
+        .await
     {
-        if let Some(m) = models.data.first() {
-            if let Some(id) = m.id.as_ref().filter(|id| !id.is_empty()) {
-                labels
-                    .entry("served_model_name".to_string())
-                    .or_insert_with(|| id.clone());
-            }
-            if let Some(root) = m.root.as_ref().filter(|root| !root.is_empty()) {
-                labels
-                    .entry("model_path".to_string())
-                    .or_insert_with(|| root.clone());
-            }
-            if let Some(len) = m.max_model_len.filter(|&n| n > 0) {
-                labels
-                    .entry("max_model_len".to_string())
-                    .or_insert_with(|| len.to_string());
+        Ok(models) => {
+            if let Some(m) = models.data.first() {
+                if let Some(id) = m.id.as_ref().filter(|id| !id.is_empty()) {
+                    labels
+                        .entry("served_model_name".to_string())
+                        .or_insert_with(|| id.clone());
+                }
+                if let Some(root) = m.root.as_ref().filter(|root| !root.is_empty()) {
+                    labels
+                        .entry("model_path".to_string())
+                        .or_insert_with(|| root.clone());
+                }
+                if let Some(len) = m.max_model_len.filter(|&n| n > 0) {
+                    labels
+                        .entry("max_model_len".to_string())
+                        .or_insert_with(|| len.to_string());
+                }
             }
         }
+        Err(MetadataError::Failed(e)) if strict => return Err(format!("/v1/models: {e}")),
+        Err(_) => {}
     }
 
-    labels
+    Ok(labels)
 }
 
+/// The tolerant read as a plain map, kept for the tests of the registration shape.
+#[cfg(test)]
 async fn fetch_vllm_http_metadata(
     client: &Client,
     url: &str,
     api_key: Option<&str>,
 ) -> HashMap<String, String> {
+    fetch_vllm_http_metadata_checked(client, url, api_key, false)
+        .await
+        .unwrap_or_default()
+}
+
+/// The vLLM HTTP metadata; `strict` as for the SGLang fetcher.
+async fn fetch_vllm_http_metadata_checked(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+    strict: bool,
+) -> Result<HashMap<String, String>, String> {
     let base = http_base_url(url);
     let mut labels = HashMap::new();
 
     // /v1/models — vLLM uses `root` as model_path, `id` as served_model_name
-    if let Ok(models) =
-        http_get_json::<ModelsResponse>(client, &format!("{base}/v1/models"), api_key).await
+    match http_get_json_classified::<ModelsResponse>(client, &format!("{base}/v1/models"), api_key)
+        .await
     {
-        if let Some(m) = models.data.first() {
-            if let Some(ref root) = m.root {
-                labels.insert("model_path".to_string(), root.clone());
-            }
-            if let Some(ref id) = m.id {
-                labels.insert("served_model_name".to_string(), id.clone());
-            }
-            if let Some(len) = m.max_model_len.filter(|&n| n > 0) {
-                labels.insert("max_model_len".to_string(), len.to_string());
+        Ok(models) => {
+            if let Some(m) = models.data.first() {
+                if let Some(ref root) = m.root {
+                    labels.insert("model_path".to_string(), root.clone());
+                }
+                if let Some(ref id) = m.id {
+                    labels.insert("served_model_name".to_string(), id.clone());
+                }
+                if let Some(len) = m.max_model_len.filter(|&n| n > 0) {
+                    labels.insert("max_model_len".to_string(), len.to_string());
+                }
             }
         }
+        Err(MetadataError::Failed(e)) if strict => return Err(format!("/v1/models: {e}")),
+        Err(_) => {}
     }
 
     // /version
-    if let Ok(v) =
-        http_get_json::<VersionResponse>(client, &format!("{base}/version"), api_key).await
+    match http_get_json_classified::<VersionResponse>(client, &format!("{base}/version"), api_key)
+        .await
     {
-        if !v.version.is_empty() {
-            labels.insert("version".to_string(), v.version);
+        Ok(v) => {
+            if !v.version.is_empty() {
+                labels.insert("version".to_string(), v.version);
+            }
         }
+        Err(MetadataError::Failed(e)) if strict => return Err(format!("/version: {e}")),
+        Err(_) => {}
     }
 
-    labels
+    Ok(labels)
 }
 
 /// Re-read the KV transfer engine id a gRPC engine reports, for a PD worker
@@ -286,9 +420,14 @@ pub(crate) async fn discover_grpc_kv_engine_id(
     Ok(labels.remove("kv_engine_id").filter(|id| !id.is_empty()))
 }
 
+/// The gRPC model and server info as labels. Registration tolerates a
+/// server-info failure (`strict == false`: the model info alone is kept); a
+/// refresh must not mistake it for an engine that reports less, so with
+/// `strict` it is an error.
 async fn fetch_grpc_metadata(
     url: &str,
     runtime_type: &str,
+    strict: bool,
 ) -> Result<(HashMap<String, String>, String), String> {
     let grpc_url = grpc_base_url(url);
 
@@ -304,6 +443,11 @@ async fn fetch_grpc_metadata(
 
     match client.get_server_info().await {
         Ok(info) => labels.extend(info.to_labels()),
+        // An engine that does not implement the call offers nothing to read;
+        // any other failure fails a strict read.
+        Err(e) if strict && e.code() != tonic::Code::Unimplemented => {
+            return Err(format!("Failed to fetch gRPC server info: {e}"));
+        }
         Err(e) => warn!("Failed to fetch gRPC server info: {}", e),
     }
 
@@ -479,12 +623,15 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                         "sglang"
                     });
                 let client = context.data.http_client("discover_metadata")?;
-                let api_key = config.api_key.as_deref();
-                let labels = match runtime {
-                    "vllm" => fetch_vllm_http_metadata(&client, &config.url, api_key).await,
-                    _ => fetch_sglang_http_metadata(&client, &config.url, api_key).await,
-                };
-                Ok((labels, None))
+                discover_engine_labels(
+                    &client,
+                    &config.url,
+                    ConnectionMode::Http,
+                    runtime,
+                    config.api_key.as_deref(),
+                    false,
+                )
+                .await
             }
             ConnectionMode::Grpc => {
                 let config_runtime = config.runtime_type.to_string();
@@ -493,7 +640,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                     .detected_runtime_type
                     .as_deref()
                     .unwrap_or(&config_runtime);
-                fetch_grpc_metadata(&config.url, runtime_type)
+                fetch_grpc_metadata(&config.url, runtime_type, false)
                     .await
                     .map(|(labels, rt)| (labels, Some(rt)))
             }
@@ -654,27 +801,34 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_sglang_http_metadata() {
-        let labels = fetch_sglang_http_metadata(&Client::new(), "http://0.0.0.0:30000", None).await;
+        let labels = fetch_sglang_http_metadata(
+            &crate::clients::http_client(),
+            "http://0.0.0.0:30000",
+            None,
+        )
+        .await;
         dump_labels("SGLang HTTP combined", &labels);
         assert!(labels.contains_key("model_path"));
         assert!(labels.contains_key("tokenizer_path"));
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_vllm_http_metadata() {
-        let labels = fetch_vllm_http_metadata(&Client::new(), "http://0.0.0.0:20000", None).await;
+        let labels =
+            fetch_vllm_http_metadata(&crate::clients::http_client(), "http://0.0.0.0:20000", None)
+                .await;
         dump_labels("vLLM HTTP", &labels);
         assert!(labels.contains_key("model_path"));
         assert!(labels.contains_key("version"));
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_sglang_grpc_metadata() {
-        let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:30001", "sglang")
+        let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:30001", "sglang", false)
             .await
             .expect("grpc metadata");
         dump_labels("SGLang gRPC", &labels);
@@ -682,9 +836,9 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
+    #[ignore = "needs a live engine on a local port; run with --ignored"]
     async fn test_vllm_grpc_metadata() {
-        let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:20001", "vllm")
+        let (labels, _) = fetch_grpc_metadata("grpc://0.0.0.0:20001", "vllm", false)
             .await
             .expect("grpc metadata");
         dump_labels("vLLM gRPC", &labels);
@@ -696,20 +850,63 @@ mod tests {
         // Subset of an actual SGLang /server_info response. The full payload has
         // many more fields; `serde(deny_unknown_fields)` is off by default so
         // they're silently ignored.
+        for (dp_size, attn_dp_size) in [(4, None), (1, Some(4))] {
+            let body = serde_json::json!({
+                "model_path": "Qwen/Qwen3-8B",
+                "tp_size": 4,
+                "dp_size": dp_size,
+                "attn_dp_size": attn_dp_size,
+                "max_running_requests": 256,
+                "context_length": 32768,
+            });
+            let info: ServerInfo = serde_json::from_value(body).expect("deserialize ServerInfo");
+            assert_eq!(info.max_running_requests, Some(256));
+            assert_eq!(info.attn_dp_size, attn_dp_size);
+
+            let labels = flat_labels(&info);
+            assert_eq!(
+                labels.get("max_running_requests").map(String::as_str),
+                Some("256")
+            );
+            let dp_info = super::super::discover_dp::dp_info_from_labels(&labels).unwrap();
+            assert_eq!(dp_info.dp_size, 4);
+        }
+    }
+
+    /// The attention-DP split reaches the labels on this path too, so a
+    /// dp-aware registration over HTTP gives each rank worker its share of
+    /// the window as the gRPC path does.
+    #[test]
+    fn test_sglang_server_info_surfaces_the_attention_dp_split() {
         let body = serde_json::json!({
+            "model_path": "Qwen/Qwen3-8B",
+            "tp_size": 16,
+            "dp_size": 8,
+            "enable_dp_attention": true,
+            "attn_dp_size": 8,
+            "max_running_requests": 16384,
+        });
+        let info: ServerInfo = serde_json::from_value(body).expect("deserialize ServerInfo");
+        let labels = flat_labels(&info);
+        assert_eq!(
+            labels.get("enable_dp_attention").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(labels.get("attn_dp_size").map(String::as_str), Some("8"));
+
+        // Absent fields make no label, so a rank worker of an engine that
+        // reports neither keeps its window as it is.
+        let plain: ServerInfo = serde_json::from_value(serde_json::json!({
             "model_path": "Qwen/Qwen3-8B",
             "tp_size": 1,
             "dp_size": 1,
             "max_running_requests": 256,
-            "context_length": 32768,
-        });
-        let info: ServerInfo = serde_json::from_value(body).expect("deserialize ServerInfo");
-        assert_eq!(info.max_running_requests, Some(256));
-
-        let labels = flat_labels(&info);
-        assert_eq!(
-            labels.get("max_running_requests").map(String::as_str),
-            Some("256")
+        }))
+        .expect("deserialize ServerInfo");
+        let labels = flat_labels(&plain);
+        assert!(
+            !labels.contains_key("enable_dp_attention") && !labels.contains_key("attn_dp_size"),
+            "{labels:?}"
         );
     }
 
@@ -758,8 +955,12 @@ mod tests {
                 .unwrap();
         });
 
-        let labels =
-            fetch_sglang_http_metadata(&Client::new(), &format!("http://{addr}"), None).await;
+        let labels = fetch_sglang_http_metadata(
+            &crate::clients::http_client(),
+            &format!("http://{addr}"),
+            None,
+        )
+        .await;
         server.abort();
 
         assert_eq!(

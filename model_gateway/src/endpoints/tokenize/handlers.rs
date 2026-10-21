@@ -22,7 +22,7 @@ use crate::{
     app_context::AppContext,
     routers::grpc::utils::encode_blocking,
     worker::UNKNOWN_MODEL_ID,
-    workflow::{Job, TokenizerConfigRequest},
+    workflow::{note_tokenizer_removed, Job, TokenizerConfigRequest},
 };
 
 /// Helper to create error responses
@@ -303,6 +303,11 @@ pub async fn remove_tokenizer(context: &Arc<AppContext>, tokenizer_id: &str) -> 
 
     if let Some(entry) = removed {
         context.multimodal_config_registry.remove(&entry.id);
+        note_tokenizer_removed(
+            &context.tokenizer_load_failures,
+            &context.worker_registry,
+            &entry.name,
+        );
         debug!("Removed tokenizer '{}' (id: {})", entry.name, entry.id);
         (
             StatusCode::OK,

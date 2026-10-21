@@ -352,7 +352,7 @@ mod grpc_router_type_tests {
         Arc::new(
             AppContext::builder()
                 .router_config(config)
-                .client(reqwest::Client::new())
+                .client(crate::clients::http_client())
                 .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
                 .reasoning_parser_factory(Some(ReasoningParserFactory::new()))
                 .tool_parser_factory(Some(ToolParserFactory::new()))
@@ -423,7 +423,7 @@ mod grpc_router_type_tests {
                 prefill_urls: vec![],
                 decode_urls: vec![],
                 encode_policy: Some(PolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: 5,
+                    load_metric: Default::default(),
                 }),
                 prefill_policy: Some(PolicyConfig::RoundRobin),
                 decode_policy: Some(PolicyConfig::Passthrough),

@@ -22,11 +22,16 @@ const POSTGRES_V3: Migration = Migration {
     description: "Drop redundant output, metadata, instructions, tool_calls columns from responses",
     up: pg_v3_up,
 };
+const POSTGRES_V4: Migration = Migration {
+    version: 4,
+    description: "Add tenant column to responses, conversations and conversation items",
+    up: pg_v4_up,
+};
 
 /// Core history-backend migrations required by the SQL response/conversation
 /// storage path during normal gateway startup.
-pub(crate) static POSTGRES_HISTORY_MIGRATIONS: [Migration; 3] =
-    [POSTGRES_V1, POSTGRES_V2, POSTGRES_V3];
+pub(crate) static POSTGRES_HISTORY_MIGRATIONS: [Migration; 4] =
+    [POSTGRES_V1, POSTGRES_V2, POSTGRES_V3, POSTGRES_V4];
 
 fn pg_v1_up(schema: &SchemaConfig) -> Vec<String> {
     let s = &schema.responses;
@@ -92,6 +97,25 @@ fn pg_v3_up(schema: &SchemaConfig) -> Vec<String> {
     vec![format!("ALTER TABLE {table} {}", cols_to_drop.join(", "))]
 }
 
+/// The nullable `tenant` column of responses, conversations and conversation
+/// items: the tenant a record is scoped to. Rows from before the column stay
+/// NULL and are served to every caller, as they were.
+fn pg_v4_up(schema: &SchemaConfig) -> Vec<String> {
+    [
+        &schema.responses,
+        &schema.conversations,
+        &schema.conversation_items,
+    ]
+    .into_iter()
+    .filter(|s| !s.is_skipped("tenant"))
+    .map(|s| {
+        let table = s.qualified_table(schema.owner.as_deref());
+        let col = s.col("tenant");
+        format!("ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} VARCHAR(255)")
+    })
+    .collect()
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -105,7 +129,7 @@ mod tests {
             .iter()
             .map(|migration| migration.version)
             .collect();
-        assert_eq!(versions, vec![1, 2, 3]);
+        assert_eq!(versions, vec![1, 2, 3, 4]);
     }
 
     #[test]
@@ -175,6 +199,37 @@ mod tests {
         assert!(
             stmts.is_empty(),
             "should skip drop when user_id is an extra column"
+        );
+    }
+
+    #[test]
+    fn pg_v4_up_adds_the_tenant_column_to_responses_and_conversations() {
+        let stmts = pg_v4_up(&SchemaConfig::default());
+        assert_eq!(
+            stmts,
+            vec![
+                "ALTER TABLE responses ADD COLUMN IF NOT EXISTS tenant VARCHAR(255)",
+                "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS tenant VARCHAR(255)",
+                "ALTER TABLE conversation_items ADD COLUMN IF NOT EXISTS tenant VARCHAR(255)",
+            ]
+        );
+        // A mapped column name and a skipped table are respected.
+        let mut schema = SchemaConfig::default();
+        schema
+            .responses
+            .columns
+            .insert("tenant".to_string(), "tenant_key".to_string());
+        schema
+            .conversations
+            .skip_columns
+            .insert("tenant".to_string());
+        let stmts = pg_v4_up(&schema);
+        assert_eq!(
+            stmts,
+            vec![
+                "ALTER TABLE responses ADD COLUMN IF NOT EXISTS tenant_key VARCHAR(255)",
+                "ALTER TABLE conversation_items ADD COLUMN IF NOT EXISTS tenant VARCHAR(255)",
+            ]
         );
     }
 

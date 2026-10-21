@@ -1,30 +1,36 @@
 [workspace]
-members = ["model_gateway", "crates/protocols", "crates/reasoning_parser", "crates/tool_parser", "crates/symphony", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp",
+members = ["model_gateway", "crates/protocols", "crates/reasoning_parser", "crates/response_template", "crates/tool_parser", "crates/symphony", "crates/workflow", "crates/tokenizer", "crates/auth", "crates/mcp",
     "crates/external_router", "crates/kv_index", "crates/data_connector", "crates/multimodal", "crates/mm_rdma", "crates/wasm", "crates/mesh", "crates/grpc_client", "crates/engine_zmq_client", "crates/engine_zmq_adapter", "crates/engine_servicer", "bindings/python", "bindings/golang", "clients/rust", "clients/openapi-gen", "crates/mock_worker", "crates/rl", "crates/radix_tree"]
 resolver = "2"
 
+[workspace.package]
+# The oldest toolchain the workspace builds with; rust-toolchain.toml pins the same release.
+rust-version = "1.98"
+
 [workspace.dependencies]
 # Internal workspace crates
-openai-protocol = { version = "1.15.0", path = "crates/protocols" }
+openai-protocol = { version = "1.16.0", path = "crates/protocols" }
 smg-mm-rdma = { version = "0.1.1", path = "crates/mm_rdma" }
-reasoning-parser = { version = "1.9.0", path = "crates/reasoning_parser" }
-tool-parser = { version = "1.9.0", path = "crates/tool_parser" }
+reasoning-parser = { version = "1.10.0", path = "crates/reasoning_parser" }
+smg-response-template = { version = "0.1.0", path = "crates/response_template" }
+tool-parser = { version = "1.10.0", path = "crates/tool_parser" }
+smg-symphony = { version = "0.1.0", path = "crates/symphony" }
 wfaas = { version = "1.1.0", path = "crates/workflow" }
-llm-tokenizer = { version = "1.9.0", path = "crates/tokenizer" }
-smg-auth = { version = "1.2.3", path = "crates/auth" }
-smg-mcp = { version = "2.3.4", path = "crates/mcp" }
-smg-external-router = { version = "0.2.0", path = "crates/external_router" }
-kv-index = { version = "1.6.0", path = "crates/kv_index" }
+llm-tokenizer = { version = "1.10.0", path = "crates/tokenizer" }
+smg-auth = { version = "1.2.4", path = "crates/auth" }
+smg-mcp = { version = "2.3.5", path = "crates/mcp" }
+smg-external-router = { version = "0.3.0", path = "crates/external_router" }
+kv-index = { version = "2.0.0", path = "crates/kv_index" }
 smg-radix-tree = { version = "0.1.0", path = "crates/radix_tree" }
-smg-data-connector = { version = "2.3.4", path = "crates/data_connector", package = "data-connector" }
-llm-multimodal = { version = "1.13.0", path = "crates/multimodal" }
+smg-data-connector = { version = "2.4.0", path = "crates/data_connector", package = "data-connector" }
+llm-multimodal = { version = "1.14.0", path = "crates/multimodal" }
 smg-wasm = { version = "1.1.4", path = "crates/wasm", package = "smg-wasm" }
-smg-mesh = { version = "1.4.3", path = "crates/mesh", package = "smg-mesh" }
-smg-grpc-client = { version = "1.14.0", path = "crates/grpc_client" }
-engine-zmq-client = { version = "0.3.0", path = "crates/engine_zmq_client" }
-engine-zmq-adapter = { version = "0.1.0", path = "crates/engine_zmq_adapter" }
-engine-servicer = { version = "0.1.0", path = "crates/engine_servicer" }
-smg-rl = { version = "0.1.0", path = "crates/rl" }
+smg-mesh = { version = "1.4.4", path = "crates/mesh", package = "smg-mesh" }
+smg-grpc-client = { version = "1.15.0", path = "crates/grpc_client" }
+engine-zmq-client = { version = "0.3.1", path = "crates/engine_zmq_client" }
+engine-zmq-adapter = { version = "0.1.1", path = "crates/engine_zmq_adapter" }
+engine-servicer = { version = "0.2.0", path = "crates/engine_servicer" }
+smg-rl = { version = "0.2.0", path = "crates/rl" }
 
 # Shared dependencies
 anyhow = "1.0"
@@ -38,6 +44,7 @@ tonic-health = "0.14.6"
 axum = { version = "0.8.9" }
 blake3 = "1.8"
 lz4_flex = "0.14"
+notify = "8.2"
 bytemuck = { version = "1.25" }
 byteorder = "1.5.0"
 bytes = "1.12.0"
@@ -47,13 +54,14 @@ rmpv = { version = "1.3.1", features = ["with-serde"] }
 serde_default = "0.2.0"
 serde_repr = "0.1.20"
 serde_tuple = "1.1.3"
-zeromq = { version = "0.6.0", default-features = false, features = ["tokio-runtime", "all-transport"] }
+zeromq = { git = "https://github.com/zeromq/zmq.rs", rev = "67dcba97559ebe8e8206dab753710d8b9cb07591", default-features = false, features = ["tokio-runtime", "all-transport"] }
 chrono = { version = "0.4" }
 dashmap = "6.2.1"
 tikv-jemallocator = { version = "0.6", default-features = false, features = ["background_threads_runtime_support"] }
 tikv-jemalloc-ctl = { version = "0.6", default-features = false }
 http = "1.4.2"
 lru = "0.18.0"
+memchr = "2"
 num-traits = "0.2"
 parking_lot = "0.12.5"
 rand = "0.10.1"
@@ -67,13 +75,13 @@ tokio = { version = "1.52.3" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
 uuid = { version = "1.23", features = ["v7", "serde"] }
-wasmtime = { version = "45.0", features = ["component-model", "async"] }
-wasmtime-wasi = "45.0"
+wasmtime = { version = "49.0", features = ["component-model", "async"] }
+wasmtime-wasi = "49.0"
 tokio-util = { version = "0.7", features = ["rt"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 webpki-roots = "1.0"
 multer = "3"
-str0m = { version = "0.23", default-features = false, features = ["openssl"] }
+str0m = { version = "0.24", default-features = false, features = ["openssl"] }
 scopeguard = "1.2"
 bitflags = "2.13.0"
 schemars = "1.2"
@@ -142,29 +150,28 @@ single_match_else = "allow"
 doc_lazy_continuation = "allow"
 
 [profile.release]
-opt-level = "z"     # Optimize for size
-lto = "fat"         # Full LTO for smaller binaries
+# Speed over size. Built for size (opt-level "z") the gateway spent a
+# quarter to a third of its cycles under load in MachineOutliner stubs and
+# size-first call chains on AArch64; at opt-level 3 the same source costs
+# half the CPU per request and 40 % less per streamed frame on the gRPC
+# router path, for a stripped binary half again as large (53 to 80 MB).
+# opt-level 2 measured the same CPU and a 2 MB smaller binary.
+opt-level = 3
+lto = "fat"         # Full LTO: cross-crate inlining, dead code removed
 codegen-units = 1   # Better optimization, slower compile
 strip = false       # Keep symbols so production CPU profiles/flamegraphs are readable (#1575)
-
-# Optimize hot dependencies in the tiktoken encode path.
-[profile.release.package.tiktoken-rs]
-opt-level = 2
-
-[profile.release.package.fancy-regex]
-opt-level = 2
-
-[profile.release.package.regex-automata]
-opt-level = 2
 
 # The compute-heavy crates: image preprocessing (resize kernels, patch
 # gather, wire serialization, base64 and hashing of inline images), the
 # tokenizer path (encode, per-token decode, stop-sequence scan) and the
-# cache-aware routing trees. Built for size they run 25-50% slower; the
-# binary grows by about 1.5 MB (measured in #2768). Note that generic
-# functions are compiled in the crate that instantiates them, at that
-# crate's opt-level: a kv-index entry point generic over a caller closure
-# only benefits once it hands the work to a non-generic inner function.
+# cache-aware routing trees. Built for size they ran 25-50% slower; the
+# binary grew by about 1.5 MB (measured in #2768). With the profile itself
+# at opt-level 3 these entries change nothing; they stay so that the crates
+# keep their speed if the profile's level is lowered for size again. Note
+# that generic functions are compiled in the crate that instantiates them,
+# at that crate's opt-level: a kv-index entry point generic over a caller
+# closure only benefits once it hands the work to a non-generic inner
+# function.
 [profile.release.package.llm-multimodal]
 opt-level = 3
 
@@ -192,6 +199,13 @@ opt-level = 3
 [profile.release.package.tokenizers]
 opt-level = 3
 
+# v1 moves the encode hot path out of the tokenizers umbrella crate.
+[profile.release.package.tk-encode]
+opt-level = 3
+
+[profile.release.package.bitcannon]
+opt-level = 3
+
 [profile.release.package.aho-corasick]
 opt-level = 3
 
@@ -201,6 +215,12 @@ opt-level = 3
 # The cache-aware routing trees, walked on every request (the fused
 # match-and-insert walk is made non-generic in #2766 so it is built here).
 [profile.release.package.kv-index]
+opt-level = 3
+
+# The response-template parser runs on every streamed chunk, so it is built
+# like the other hot crates (#2768): 0.36 to 0.76 of the time it took at
+# opt-level "z", 15 KB larger.
+[profile.release.package.smg-response-template]
 opt-level = 3
 
 [profile.ci]
@@ -231,6 +251,6 @@ inherits = "dev"
 opt-level = 1
 
 [profile.bench]
-opt-level = 3       # Max speed for benchmarks (release uses "z" for size)
+opt-level = 3       # Max speed for benchmarks (as the release profile)
 lto = "thin"        # Good balance of speed and compile time
 codegen-units = 1   # Better optimization

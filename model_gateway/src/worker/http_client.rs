@@ -150,7 +150,7 @@ impl WorkerHttpClientCache {
             .map_err(|e| format!("Failed to add CA certificate: {e}"))?;
 
         let make_builder = || {
-            let mut builder = reqwest::Client::builder()
+            let mut builder = crate::clients::http_client_builder()
                 .pool_max_idle_per_host(key.pool_max_idle_per_host)
                 .pool_idle_timeout(pool_idle_timeout)
                 .timeout(Duration::from_secs(key.timeout_secs))
@@ -197,14 +197,34 @@ pub(crate) fn build_client(
     tls_configured: bool,
     purpose: &str,
 ) -> Result<reqwest::Client, String> {
-    let error = match make_builder().build() {
+    build_with(
+        make_builder,
+        tls_configured,
+        purpose,
+        reqwest::ClientBuilder::build,
+    )
+}
+
+/// [`build_client`] for a client that `build` finishes from the builder (a
+/// library that completes the client it fetches with), with the same
+/// tolerance of a host without a root store: `build` is tried on the
+/// builder, then, with no TLS configured, on the builder without the
+/// platform store. An error of `build`'s own (not the client's) fails the
+/// same way both times and is reported as it is.
+pub(crate) fn build_with<T, E: std::error::Error + 'static>(
+    make_builder: impl Fn() -> reqwest::ClientBuilder,
+    tls_configured: bool,
+    purpose: &str,
+    build: impl Fn(reqwest::ClientBuilder) -> Result<T, E>,
+) -> Result<T, String> {
+    let error = match build(make_builder()) {
         Ok(client) => return Ok(client),
         Err(error) => error,
     };
     if tls_configured {
         return Err(format!("Failed to create {purpose}: {}", describe(&error)));
     }
-    match make_builder().tls_certs_only(std::iter::empty()).build() {
+    match build(make_builder().tls_certs_only(std::iter::empty())) {
         Ok(client) => {
             warn!(
                 "Failed to create {purpose} with the platform's root certificates ({}); no TLS \
@@ -225,9 +245,9 @@ pub(crate) fn build_client(
 /// `reqwest::Error` displays its kind alone ("builder error"); the cause is in
 /// its source chain. Spell the chain out and, when it is the missing platform
 /// root store, say what to do about it.
-fn describe(error: &reqwest::Error) -> String {
+fn describe(error: &(dyn std::error::Error + 'static)) -> String {
     let mut text = error.to_string();
-    let mut source = std::error::Error::source(error);
+    let mut source = error.source();
     while let Some(cause) = source {
         text.push_str(": ");
         text.push_str(&cause.to_string());
@@ -243,7 +263,9 @@ fn describe(error: &reqwest::Error) -> String {
 }
 
 /// Test support: run one `#[test]` of this binary in a child process whose
-/// certificate environment names no root certificate at all.
+/// certificate environment names no root certificate at all. This only removes
+/// native roots on platforms using the file-based verifier; Apple, Windows and
+/// Android use their system trust APIs instead and ignore these variables.
 #[cfg(test)]
 pub(crate) mod no_root_store {
     use std::process::Command;
@@ -363,6 +385,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        any(target_vendor = "apple", windows, target_os = "android"),
+        ignore = "the native verifier does not use SSL_CERT_FILE/SSL_CERT_DIR"
+    )]
     fn plaintext_worker_clients_build_without_a_native_root_store() {
         no_root_store::run(
             &no_root_store::test_name(module_path!(), "child_builds_without_native_roots"),
@@ -371,6 +397,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        any(target_vendor = "apple", windows, target_os = "android"),
+        ignore = "the native verifier does not use SSL_CERT_FILE/SSL_CERT_DIR"
+    )]
     fn a_missing_root_store_is_named_when_tls_is_configured() {
         no_root_store::run(
             &no_root_store::test_name(module_path!(), "child_builds_without_native_roots"),

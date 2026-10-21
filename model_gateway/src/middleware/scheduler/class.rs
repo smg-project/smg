@@ -41,16 +41,25 @@ impl Class {
     /// Avoids allocating: `eq_ignore_ascii_case` does the comparison in place
     /// rather than building a lowercased `String` on every request.
     pub fn parse_header(value: &str) -> Class {
+        Self::lookup(value).unwrap_or(Self::Default)
+    }
+
+    /// Parse a class name an operator configured
+    /// (`--priority-scheduler-default-max-class`). Case-insensitive and
+    /// whitespace-tolerant like the header, but an unknown name is an error
+    /// naming the four classes: a typo in a flag must surface at start-up,
+    /// where the header parser's fallback to [`Class::Default`] would hide it.
+    pub fn parse_name(value: &str) -> Result<Class, UnknownClassName> {
+        Self::lookup(value).ok_or_else(|| UnknownClassName(value.trim().to_owned()))
+    }
+
+    /// The class `value` names, trimmed and case-insensitively; `None` for
+    /// anything else, the empty string included.
+    fn lookup(value: &str) -> Option<Class> {
         let trimmed = value.trim();
-        if trimmed.eq_ignore_ascii_case("system") {
-            Self::System
-        } else if trimmed.eq_ignore_ascii_case("interactive") {
-            Self::Interactive
-        } else if trimmed.eq_ignore_ascii_case("bulk") {
-            Self::Bulk
-        } else {
-            Self::Default
-        }
+        Self::ALL
+            .into_iter()
+            .find(|class| trimmed.eq_ignore_ascii_case(class.as_str()))
     }
 
     /// Lowercase variant name. Used as a metrics label and structured-log field
@@ -64,6 +73,11 @@ impl Class {
         }
     }
 }
+
+/// A configured class name that is none of the four classes.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("unknown priority class `{0}`; expected one of system, interactive, default, bulk")]
+pub struct UnknownClassName(pub String);
 
 #[cfg(test)]
 mod tests {
@@ -89,6 +103,27 @@ mod tests {
         assert_eq!(Class::parse_header("urgent"), Class::Default);
         assert_eq!(Class::parse_header(""), Class::Default);
         assert_eq!(Class::parse_header("123"), Class::Default);
+    }
+
+    #[test]
+    fn test_parse_name_accepts_the_four_classes_in_any_case() {
+        assert_eq!(Class::parse_name("system"), Ok(Class::System));
+        assert_eq!(Class::parse_name("Interactive"), Ok(Class::Interactive));
+        assert_eq!(Class::parse_name(" default "), Ok(Class::Default));
+        assert_eq!(Class::parse_name("BULK"), Ok(Class::Bulk));
+    }
+
+    #[test]
+    fn test_parse_name_refuses_an_unknown_name_naming_the_four_classes() {
+        for unknown in ["gold", "urgent", "", "123"] {
+            let err = Class::parse_name(unknown).unwrap_err();
+            assert_eq!(err, UnknownClassName(unknown.to_owned()));
+            let message = err.to_string();
+            assert!(message.contains(&format!("`{unknown}`")), "{message}");
+            for class in Class::ALL {
+                assert!(message.contains(class.as_str()), "{message}");
+            }
+        }
     }
 
     #[test]

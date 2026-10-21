@@ -1,6 +1,6 @@
 [package]
 name = "engine-zmq-client"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Engine-agnostic ZMQ transport + per-engine protocol modules for same-host SMG backend connections"
 license = "Apache-2.0"
@@ -30,6 +30,9 @@ bytemuck.workspace = true
 byteorder.workspace = true
 bytes.workspace = true
 half.workspace = true
+
+# Keyword scan of a structured-output constraint's text before its parse.
+memchr.workspace = true
 
 # Transport + async runtime.
 zeromq.workspace = true

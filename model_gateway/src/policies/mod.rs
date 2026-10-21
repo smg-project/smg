@@ -5,11 +5,9 @@
 
 use std::{fmt::Debug, sync::Arc};
 
-use openai_protocol::worker::WorkerLoadResponse;
-
 use crate::{
     config::CacheIndexKind,
-    worker::{HashRing, Worker},
+    worker::{load_state::LoadReceiver, runtime::RoutingState, HashRing, Worker},
 };
 
 mod bucket;
@@ -54,7 +52,7 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Select a single worker from the available workers
     ///
     /// This is used for regular routing mode where requests go to a single worker.
-    /// Now uses Arc<dyn Worker> for better performance and to avoid unnecessary cloning.
+    /// Now uses `Arc<dyn Worker>` for better performance and to avoid unnecessary cloning.
     ///
     /// # Arguments
     /// * `workers` - Available workers to select from
@@ -72,32 +70,55 @@ pub trait LoadBalancingPolicy: Send + Sync + Debug {
     /// Get policy name for metrics and debugging
     fn name(&self) -> &'static str;
 
-    /// Check if this policy needs request text for routing decisions
+    /// Check if this policy needs request text for routing decisions. A
+    /// policy's answer is a constant for its lifetime: the registry reads
+    /// it where the policy is registered, not per request.
     fn needs_request_text(&self) -> bool {
         false // Default: most policies don't need request text
     }
 
-    /// Update worker load information
-    ///
-    /// This is called periodically with current load information for load-aware policies.
-    fn update_loads(&self, _loads: &std::collections::HashMap<String, WorkerLoadResponse>) {
-        // Default: no-op for policies that don't use load information
+    /// Whether this policy reads the request text when the request's token
+    /// ids are available as well. A policy that routes on the ids and falls
+    /// back to the text only without them answers `false`, so a tokenized
+    /// request's selection snapshot carries the ids alone instead of a copy
+    /// of the whole rendered prompt next to them. Defaults to
+    /// [`Self::needs_request_text`]; a constant for the policy's lifetime
+    /// as well.
+    fn needs_request_text_with_tokens(&self) -> bool {
+        self.needs_request_text()
     }
 
-    /// Whether routing consumes backend load snapshots, pushed via
-    /// [`Self::update_loads`] or read from the monitor's watch feed. The
-    /// `WorkerMonitor` skips backend load polling while no policy needs it.
+    /// Hand the policy the worker monitor's load feed: the shared snapshot
+    /// of every worker's latest load report, published per poll tick and
+    /// per window of pushed records. A policy that scores on backend load
+    /// keeps the receiver and reads the current snapshot per decision (one
+    /// `Arc` clone, no copy); the default ignores it.
+    fn set_load_receiver(&self, _rx: Option<LoadReceiver>) {}
+
+    /// Whether routing reads the load feed. With load monitoring disabled,
+    /// the `WorkerMonitor` polls a group only while something needs the
+    /// data. A policy's answer is a constant for its lifetime.
     fn needs_backend_loads(&self) -> bool {
         false
     }
 
-    /// Drop any cached per-worker state for a removed worker.
-    ///
-    /// Called when a worker leaves the registry so load-aware policies don't
-    /// accumulate stale load reports under worker churn (autoscaling, rolling
-    /// updates). Default is a no-op for stateless policies.
+    /// Whether this policy weighs a worker's load against the cache it holds
+    /// for the request and moves a request off a saturated holder itself
+    /// (cache-aware's count-pressure spill). Disaggregated pair placement
+    /// then leaves the absolute overload veto off a prefill pool this policy
+    /// places instead of steering a returning session away from the worker
+    /// holding its prefix (see `placement::select_pair`). A constant for the
+    /// policy's lifetime.
+    fn balances_load_against_affinity(&self) -> bool {
+        false
+    }
+
+    /// Drop the state this policy keeps on a removed worker (a load-aware
+    /// policy's dispatch tally), so it does not accumulate under worker
+    /// churn (autoscaling, rolling updates). Default is a no-op for
+    /// stateless policies.
     fn remove_worker(&self, _url: &str) {
-        // Default: no-op for policies that don't cache per-worker state
+        // Default: no-op for policies that don't keep per-worker state
     }
 
     /// Reconcile the state this policy booked on `worker_url` against the
@@ -150,12 +171,35 @@ pub struct CacheAwareConfig {
     /// mean by this many requests AND by `balance_rel_threshold`. Requiring
     /// both keeps the gate quiet on steady-state variance at low means
     /// (absolute) without going blind to a deep queue at high means
-    /// (relative).
+    /// (relative). The margin is capped at the larger of the in-flight
+    /// count's natural swing at the pool's current mean (two standard
+    /// deviations, never under four requests unless this value is lower) and
+    /// the held prefix's price (`balance_prefix_margin_tokens`), so a pool
+    /// whose per-worker in-flight count stays below this value can still
+    /// spill.
     pub balance_abs_threshold: usize,
     /// Relative load margin (multiple of the healthy-fleet mean) for the
     /// per-request candidate gate; fires only together with
     /// `balance_abs_threshold`.
     pub balance_rel_threshold: f32,
+    /// Price of a held prefix in the candidate gate's absolute margin, in
+    /// tokens per request: a holder's margin is at least the tokens of the
+    /// request's prefix it holds over this, rounded up, up to
+    /// `balance_abs_threshold`. A spill gives the held prefix up and the
+    /// spill target prefills it again, so a deep prefix (a long
+    /// conversation's follow-up) keeps its holder through a skew that would
+    /// move a shallow one. `0` (the default) leaves the margin to the swing
+    /// alone. Suits prefill pools serving long multi-turn sessions (e.g.
+    /// 1024, the mean prefill LeastLoad prices a queued request at); decode
+    /// picks are never priced, as a decode worker prefills nothing again.
+    pub balance_prefix_margin_tokens: u32,
+    /// Credit a pick on a worker holding the request's prefix with the
+    /// prompt it still has to prefill (its token count less the held tokens,
+    /// never under the mean prefill nor over the whole prompt) instead of the
+    /// whole prompt, in the expected-wait estimate later picks read: a hit on
+    /// a long cached conversation is not booked as its whole context's work.
+    /// Misses, spills and decode picks keep the whole prompt. Off by default.
+    pub balance_uncached_credit: bool,
     pub eviction_interval_secs: u64,
     pub max_tree_size: usize,
     /// Backend KV cache block size (tokens per block) for event-driven routing.
@@ -217,6 +261,8 @@ impl Default for CacheAwareConfig {
             cache_threshold: 0.5,
             balance_abs_threshold: 32,
             balance_rel_threshold: 1.1,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
             eviction_interval_secs: 30,
             max_tree_size: 10000,
             block_size: 16,
@@ -259,12 +305,23 @@ impl Default for BucketConfig {
 /// [`Worker::is_available`] folds the absolute overload veto into the health +
 /// circuit-breaker test it already performed, under the same guards and with
 /// the same short-circuit order — the veto is one more test on a word already
-/// in hand, never a second walk.
-pub(crate) fn get_healthy_worker_indices(workers: &[Arc<dyn Worker>]) -> Vec<usize> {
+/// in hand, never a second walk. A selection whose caller lifted that veto
+/// ([`SelectWorkerInfo::overload_lifted`]) tests every other veto instead
+/// ([`RoutingState::eligible_ignoring_overload`]).
+pub(crate) fn get_healthy_worker_indices(
+    workers: &[Arc<dyn Worker>],
+    info: &SelectWorkerInfo,
+) -> Vec<usize> {
     workers
         .iter()
         .enumerate()
-        .filter(|(_, w)| w.is_available())
+        .filter(|(_, w)| {
+            if info.overload_lifted {
+                w.routing_state().eligible_ignoring_overload()
+            } else {
+                w.is_available()
+            }
+        })
         .map(|(idx, _)| idx)
         .collect()
 }
@@ -282,24 +339,24 @@ pub(crate) fn normalize_model_key(model_id: &str) -> &str {
     }
 }
 
-/// Which PD leg a selection is for. `Single` is non-PD (the default) and keeps
-/// routing-key stickiness byte-identical to pre-leg behavior.
+/// Which PD role a selection is for. `Single` is non-PD (the default) and keeps
+/// routing-key stickiness byte-identical to the behaviour before roles existed.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum WorkerLeg {
+pub enum WorkerRole {
     #[default]
     Single,
     Prefill,
     Decode,
 }
 
-impl WorkerLeg {
-    /// Prefix used to namespace sticky routing IDs per leg. `Single` is empty so
+impl WorkerRole {
+    /// Prefix used to namespace sticky routing IDs per role. `Single` is empty so
     /// non-PD entries are unchanged.
     pub fn routing_id_prefix(self) -> &'static str {
         match self {
-            WorkerLeg::Single => "",
-            WorkerLeg::Prefill => "prefill:",
-            WorkerLeg::Decode => "decode:",
+            WorkerRole::Single => "",
+            WorkerRole::Prefill => "prefill:",
+            WorkerRole::Decode => "decode:",
         }
     }
 }
@@ -334,9 +391,31 @@ pub struct SelectWorkerInfo<'a> {
     /// Pre-computed hash ring for O(log n) consistent hashing
     /// Built and cached by WorkerRegistry, passed through to avoid per-request rebuilds
     pub hash_ring: Option<Arc<HashRing>>,
-    /// Which PD leg this selection is for (default `Single`); namespaces
+    /// Which PD role this selection is for (default `Single`); namespaces
     /// header-based sticky routing so prefill and decode stick independently.
-    pub leg: WorkerLeg,
+    pub role: WorkerRole,
+    /// The absolute overload veto does not apply to this selection: the
+    /// pool's policy balances load against cache affinity itself
+    /// ([`LoadBalancingPolicy::balances_load_against_affinity`]), so it
+    /// takes a worker over the thresholds as it takes one under them, even
+    /// when every worker is over them (health, the circuit breaker and the
+    /// liveness veto still apply). Set by disaggregated pair placement for
+    /// such a prefill pool (see `placement::select_pair`); every other pool
+    /// keeps the veto and the least-loaded steering default.
+    pub overload_lifted: bool,
+}
+
+impl SelectWorkerInfo<'_> {
+    /// Whether a worker in routing `state` is a candidate for this
+    /// selection: [`RoutingState::eligible`], or every veto but the overload
+    /// one when the caller lifted that veto ([`Self::overload_lifted`]).
+    pub(crate) fn admits(&self, state: RoutingState) -> bool {
+        if self.overload_lifted {
+            state.eligible_ignoring_overload()
+        } else {
+            state.eligible()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -344,7 +423,7 @@ mod tests {
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
 
     use super::*;
-    use crate::worker::{BasicWorkerBuilder, WorkerType};
+    use crate::worker::{runtime::StallReason, BasicWorkerBuilder, WorkerType};
 
     fn no_health_check() -> HealthCheckConfig {
         HealthCheckConfig {
@@ -380,12 +459,12 @@ mod tests {
         ];
 
         // All healthy initially
-        let indices = get_healthy_worker_indices(&workers);
+        let indices = get_healthy_worker_indices(&workers, &SelectWorkerInfo::default());
         assert_eq!(indices, vec![0, 1, 2]);
 
         // Mark one unhealthy
         workers[1].set_status(WorkerStatus::NotReady);
-        let indices = get_healthy_worker_indices(&workers);
+        let indices = get_healthy_worker_indices(&workers, &SelectWorkerInfo::default());
         assert_eq!(indices, vec![0, 2]);
     }
 
@@ -412,7 +491,7 @@ mod tests {
             );
             worker.set_status(status);
             let workers = vec![worker];
-            let indices = get_healthy_worker_indices(&workers);
+            let indices = get_healthy_worker_indices(&workers, &SelectWorkerInfo::default());
             assert_eq!(
                 indices == vec![0],
                 expected_included,
@@ -442,26 +521,49 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
+        assert_eq!(
+            get_healthy_worker_indices(&workers, &SelectWorkerInfo::default()),
+            vec![0, 1, 2]
+        );
 
         // A busy worker is still eligible: load alone is not the veto.
         let _guard = crate::worker::WorkerLoadGuard::new(Arc::clone(&workers[1]), None);
-        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
+        assert_eq!(
+            get_healthy_worker_indices(&workers, &SelectWorkerInfo::default()),
+            vec![0, 1, 2]
+        );
 
         workers[1].set_overloaded(true);
-        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 2]);
+        assert_eq!(
+            get_healthy_worker_indices(&workers, &SelectWorkerInfo::default()),
+            vec![0, 2]
+        );
+
+        // A caller that lifted the veto (every worker of its pool over the
+        // thresholds) gets the worker back; the liveness veto still applies.
+        let lifted = SelectWorkerInfo {
+            overload_lifted: true,
+            ..Default::default()
+        };
+        assert_eq!(get_healthy_worker_indices(&workers, &lifted), vec![0, 1, 2]);
+        workers[1].set_stall(Some(StallReason::Wedged));
+        assert_eq!(get_healthy_worker_indices(&workers, &lifted), vec![0, 2]);
+        workers[1].set_stall(None);
 
         workers[1].set_overloaded(false);
-        assert_eq!(get_healthy_worker_indices(&workers), vec![0, 1, 2]);
+        assert_eq!(
+            get_healthy_worker_indices(&workers, &SelectWorkerInfo::default()),
+            vec![0, 1, 2]
+        );
     }
 
     #[test]
-    fn test_select_worker_info_leg_defaults_to_single() {
+    fn test_select_worker_info_role_defaults_to_single() {
         let info = SelectWorkerInfo::default();
-        assert_eq!(info.leg, WorkerLeg::Single);
-        assert_eq!(WorkerLeg::Single.routing_id_prefix(), "");
-        assert_eq!(WorkerLeg::Prefill.routing_id_prefix(), "prefill:");
-        assert_eq!(WorkerLeg::Decode.routing_id_prefix(), "decode:");
+        assert_eq!(info.role, WorkerRole::Single);
+        assert_eq!(WorkerRole::Single.routing_id_prefix(), "");
+        assert_eq!(WorkerRole::Prefill.routing_id_prefix(), "prefill:");
+        assert_eq!(WorkerRole::Decode.routing_id_prefix(), "decode:");
     }
 
     #[test]

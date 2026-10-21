@@ -55,7 +55,11 @@ impl std::str::FromStr for Role {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JwtConfig {
     /// OIDC issuer URL (e.g., "https://login.microsoftonline.com/{tenant}/v2.0")
-    /// Used to discover JWKS endpoint via .well-known/openid-configuration
+    /// Used to discover JWKS endpoint via .well-known/openid-configuration.
+    /// Exactly the issuer identifier the provider publishes (the `issuer` of
+    /// its discovery document, the `iss` of its tokens), terminating slash
+    /// included when the identifier has one: a discovery document naming
+    /// another issuer is refused, as a token with another `iss` is.
     pub issuer: String,
 
     /// Expected audience claim (usually the client ID or API identifier)

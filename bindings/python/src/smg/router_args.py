@@ -1,9 +1,29 @@
+"""The Python launcher's side of the gateway's command line.
+
+``RouterArgs`` carries the router settings the launcher exposes: three
+positional fields (``worker_urls``, ``host``, ``port``), then every other one
+keyword-only, in alphabetical order (a new field goes at its place in the list,
+never at the tail, so two additions do not touch the same lines). ``add_cli_args``
+is the argparse mapping of those settings, one option per Rust CLI flag with the
+same name, default and second spelling, grouped as the CLI's help headings;
+``from_cli_args`` reads a parsed namespace back into ``RouterArgs`` (with the
+``--router-`` prefixed spellings taking precedence over the backend's when
+the launcher is embedded in a serving command); the ``_parse_*`` helpers
+mirror the Rust parsers of the flags whose values have a shape.
+``tests/test_cli_parity.py`` reads the Rust CLI's flags from its source and
+pins the option set, second spellings included, against them.
+"""
+
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import ipaddress
 import logging
 import os
+import re
+import sys
+from pathlib import Path
 
 from smg.smg_rs import get_available_reasoning_parsers, get_available_tool_call_parsers
 
@@ -25,7 +45,20 @@ COMMON_POLICY_CHOICES = [
 PREFILL_POLICY_CHOICES = [*COMMON_POLICY_CHOICES, "bucket"]
 ENCODE_POLICY_CHOICES = ["random", "round_robin", "consistent_hashing"]
 # Worker discovery providers --discovery-provider accepts.
-DISCOVERY_PROVIDER_CHOICES = ["kubernetes"]
+DISCOVERY_PROVIDER_CHOICES = ["kubernetes", "file", "slurm"]
+
+
+def _parse_kv_index(value: str) -> str:
+    """The deprecated --kv-index value, as the Rust CLI reads it: any case, trimmed;
+    the removed positional index is refused with the reason (the choices refuse
+    the rest)."""
+    normalized = value.strip().lower()
+    if normalized == "positional":
+        raise argparse.ArgumentTypeError(
+            "the positional KV index was removed (kv-index 2.0.0): the chain index is the"
+            " only KV index, drop --kv-index"
+        )
+    return normalized
 
 
 def _parse_int_csv(value: str) -> list[int]:
@@ -42,89 +75,465 @@ def _non_negative_int(value: str) -> int:
     return number
 
 
+def _positive_int(value: str) -> int:
+    """argparse type for a count that must be at least 1: refused here, before
+    anything starts, rather than by the router's validation once it runs."""
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value!r}")
+    return number
+
+
+def _ip_address(value: str) -> str | None:
+    """argparse type for a listener address the router validates as an IP address:
+    a plain IPv4 or IPv6 literal, surrounding whitespace aside (blank is unset, as
+    the router reads it); a hostname, a port or brackets are refused here with the
+    reason, as the CLI refuses them before anything binds."""
+    address = value.strip()
+    if not address:
+        return None
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected an IP address such as 10.0.0.7 or fd00::1, got {value!r}"
+        ) from None
+    if getattr(ip, "scope_id", None):
+        # A scoped IPv6 literal (fd00::1%eth0) parses here and not in the
+        # router; the two refuse the same.
+        raise argparse.ArgumentTypeError(
+            f"expected an IP address such as 10.0.0.7 or fd00::1, got {value!r}"
+        )
+    return address
+
+
+def _strict_ip_address(value: str) -> str:
+    """argparse type for an address the CLI parses as an IP address and nothing
+    else: blank and surrounding whitespace are refused here as clap refuses them,
+    so an unset variable never falls back to the default without a word."""
+    if not value or value != value.strip():
+        raise argparse.ArgumentTypeError(
+            f"expected an IP address such as 10.0.0.7 or fd00::1, got {value!r}"
+        )
+    address = _ip_address(value)
+    assert address is not None
+    return address
+
+
+@dataclasses.dataclass(frozen=True)
+class _SecretSources:
+    """The names of the sources one secret can come from, for the refusals.
+
+    A refusal names sources and paths; none carries a value.
+    """
+
+    what: str
+    flag: str
+    env: str
+    file_flag: str
+    file_env: str
+    # The history backend a store URL belongs to; None for a key.
+    backend: str | None = None
+
+
+_API_KEY_SOURCES = _SecretSources(
+    "the shared API key", "--api-key", "SMG_API_KEY", "--api-key-file", "SMG_API_KEY_FILE"
+)
+_TENANT_API_KEYS_SOURCES = _SecretSources(
+    "the tenant API keys",
+    "--tenant-api-key",
+    "SMG_TENANT_API_KEYS",
+    "--tenant-api-keys-file",
+    "SMG_TENANT_API_KEYS_FILE",
+)
+_POSTGRES_DB_URL_SOURCES = _SecretSources(
+    "the PostgreSQL connection URL",
+    "--postgres-db-url",
+    "SMG_POSTGRES_DB_URL",
+    "--postgres-db-url-file",
+    "SMG_POSTGRES_DB_URL_FILE",
+    backend="postgres",
+)
+_REDIS_URL_SOURCES = _SecretSources(
+    "the Redis connection URL",
+    "--redis-url",
+    "SMG_REDIS_URL",
+    "--redis-url-file",
+    "SMG_REDIS_URL_FILE",
+    backend="redis",
+)
+
+
+def _given_twice(sources: _SecretSources) -> ValueError:
+    """The refusal for a value and a file given for one secret: ranking them
+    would honour a stale secret in silence."""
+    return ValueError(
+        f"{sources.what} is given twice, by {sources.flag} (or {sources.env}) and by"
+        f" {sources.file_flag} (or {sources.file_env}); give one source"
+    )
+
+
+def _value_from_environment(
+    args_dict: dict, name: str, *env_names: str, strip: bool = False
+) -> None:
+    """Sets ``name`` from the first of ``env_names`` that is set, if any; a
+    variable set to the empty string counts as set (the value is refused
+    where it is validated, as an empty flag value is). With ``strip`` the
+    surrounding whitespace is dropped, as it is off a secret file's content:
+    a Secret made from a file usually carries the editor's trailing newline,
+    and no header could carry such a key."""
+    for env_name in env_names:
+        value = os.environ.get(env_name)
+        if value is not None:
+            args_dict[name] = value.strip() if strip else value
+            return
+
+
+def _read_text(path: str, file_flag: str) -> str:
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except OSError as e:
+        # The path is named; the content never is.
+        raise ValueError(f"{file_flag} {path!r}: the file cannot be read: {e}") from None
+
+
+def _read_secret_file(path: str, file_flag: str) -> str:
+    """The one value a secret file holds: its content with the surrounding
+    whitespace (a trailing newline) dropped. An empty file, or one with more
+    than one line, is refused: a tenant key file or a concatenated pair in
+    the place of one value is a mistake, not a value."""
+    value = _read_text(path, file_flag).strip()
+    if not value:
+        raise ValueError(f"{file_flag} {path!r}: the file is empty")
+    if len(value.splitlines()) > 1:
+        raise ValueError(
+            f"{file_flag} {path!r}: the file holds more than one line; it must hold the value alone"
+        )
+    return value
+
+
+def _entries_of(text: str, separator: str) -> list[str]:
+    entries = (entry.strip() for entry in re.split(separator, text))
+    return [entry for entry in entries if entry and not entry.startswith("#")]
+
+
+def _entries_from_environment(sources: _SecretSources) -> list[str]:
+    """The entries of a list-valued secret's environment variable, split at
+    ',' and at line ends; a variable set but holding no entry is refused: it
+    was meant to close the serving routes."""
+    text = os.environ.get(sources.env)
+    if text is None:
+        return []
+    entries = _entries_of(text, r"[,\n]")
+    if not entries:
+        raise ValueError(
+            f"{sources.env} is set but holds no entry; {sources.what} are tenant_id:key"
+            " entries separated by ',' or a newline"
+        )
+    return entries
+
+
+def _read_entries_file(path: str, file_flag: str) -> list[str]:
+    """The entries of a list-valued secret's file, one per line; blank lines
+    and lines starting with '#' are skipped. A file without an entry is
+    refused."""
+    entries = _entries_of(_read_text(path, file_flag), r"\n")
+    if not entries:
+        raise ValueError(
+            f"{file_flag} {path!r}: the file holds no entry; one tenant_id:key per line,"
+            " blank and # lines skipped"
+        )
+    return entries
+
+
+_ACCESS_LOG_FIELD_NAMES = (
+    "client_addr",
+    "forwarded_for",
+    "user_agent",
+    "tenant",
+    "key_id",
+    "request_bytes",
+    "response_bytes",
+    "worker",
+)
+
+
+class _ExtendAccessLogFields(argparse.Action):
+    """``--access-log-fields client_addr worker`` and the Rust CLI's comma form
+    ``--access-log-fields client_addr,worker`` both extend the list, so one
+    spelling works in both CLIs; an unknown name is refused naming the known
+    ones, as ``choices`` would."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        names = list(getattr(namespace, self.dest, None) or [])
+        for value in values:
+            for name in value.split(","):
+                name = name.strip()
+                if not name:
+                    continue
+                if name not in _ACCESS_LOG_FIELD_NAMES:
+                    raise argparse.ArgumentError(
+                        self,
+                        f"invalid choice: {name!r} (choose from "
+                        f"{', '.join(_ACCESS_LOG_FIELD_NAMES)})",
+                    )
+                names.append(name)
+        setattr(namespace, self.dest, names)
+
+
 @dataclasses.dataclass
 class RouterArgs:
-    # Worker configuration
+    # The three positional fields, in this order. Every other field is keyword-only
+    # (enforced from Python 3.10 on) and the keyword-only fields are kept in
+    # alphabetical order: a new field goes at its place in the list, never at the
+    # tail, so two additions do not touch the same lines (tests/test_arg_parser.py
+    # pins the prefix and the order).
     worker_urls: list[str] = dataclasses.field(default_factory=list)
     host: str = "0.0.0.0"
     port: int = 30000
+    # The package installs on 3.9 too (its end of life behind it), where the fields stay
+    # positional-or-keyword: the order below is a contract on no version.
+    if sys.version_info >= (3, 10):  # noqa: UP036
+        _: dataclasses.KW_ONLY
+    # Optional fields of the access-log record; [] keeps the record's fields as they are
+    access_log_fields: list[str] = dataclasses.field(default_factory=list)
+    # The admin listener (bind host and port) for the control-plane routes; None = the
+    # control plane stays on the data listener
+    admin_host: str | None = None
+    admin_port: int | None = None
+    api_key: str | None = None
+    # Routing-key assignment; defaults: random (manual policy), delegate (override)
+    assignment_mode: str | None = None
+    backend: str = "sglang"
+    balance_abs_threshold: int = 64
+    # The spill gate's price of a held prefix, in tokens per request (0: unpriced)
+    balance_prefix_margin_tokens: int = 0
+    balance_rel_threshold: float = 1.5
+    balance_token_usage_threshold: float = 1.0
+    # Credit a pick on a holder with the prompt it still has to prefill
+    balance_uncached_credit: bool = False
+    block_size: int = 16
+    bootstrap_port_annotation: str = "sglang.ai/bootstrap-port"
+    bucket_adjust_interval_secs: int = 5
+    # CA certificates for mTLS to workers (with client_cert_path and client_key_path)
+    ca_cert_paths: list[str] = dataclasses.field(default_factory=list)
+    # Token positions at which serving engines retain reusable prefix state
+    cache_boundaries: list[int] = dataclasses.field(default_factory=list)
+    # cache_aware index under-layer: "tree" or "hash"
+    cache_index: str = "tree"
+    cache_threshold: float = 0.3
+    # Seconds a cache-affinity placement stays routable
+    cache_ttl_secs: int = 180
+    # Circuit breaker configuration (disable_circuit_breaker switches it off)
+    cb_failure_threshold: int = 10
+    cb_success_threshold: int = 3
+    cb_timeout_duration_secs: int = 60
+    cb_window_duration_secs: int = 120
+    chat_template: str | None = None
+    # mTLS for worker communication: the client certificate and key (with ca_cert_paths)
+    client_cert_path: str | None = None
+    client_key_path: str | None = None
+    # API keys for control plane auth (list of tuples: id, name, key, role)
+    control_plane_api_keys: list[tuple] = dataclasses.field(default_factory=list)
+    control_plane_audit_enabled: bool = False
+    cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
+    decode_policy: str | None = None  # Specific policy for decode nodes in PD mode
+    decode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
+    decode_urls: list[str] = dataclasses.field(default_factory=list)
+    disable_circuit_breaker: bool = False
+    disable_health_check: bool = False
+    # Restore the conditional load-monitor poll gate (default: poll always)
+    disable_load_monitoring: bool = False
+    disable_retries: bool = False
+    # Disable automatic tokenizer loading at startup and worker registration
+    disable_tokenizer_autoload: bool = False
+    # The selected provider's periodic pass (None = 30s): Kubernetes and file
+    # discovery apply a change as it happens and retry on it, Slurm discovery
+    # polls on it; and the file provider's manifest path.
+    discovery_check_interval_secs: int | None = None
+    discovery_file: str | None = None
+    # The worker discovery provider. service_discovery=True is the legacy
+    # spelling of discovery_provider="kubernetes"; set one or the other.
+    discovery_provider: str | None = None
+    dp_aware: bool = False
+    dp_minimum_tokens_scheduler: bool = False
+    # Seconds a Ready worker is kept in Draining before it leaves the registry,
+    # on every removal (a discovery deletion, an unhealthy worker's removal, the
+    # API); 0 removes it at once
+    drain_settle_secs: int = 5
+    enable_igw: bool = False  # Enable IGW (Inference Gateway) mode for multi-model support
+    # The mesh server (the mesh_* fields configure it)
+    enable_mesh: bool = False
+    enable_rl: bool = False  # Mount the RL control plane under /v1/rl
+    # Tracing (otlp_traces_endpoint names the collector)
+    enable_trace: bool = False
+    # WASM support
+    enable_wasm: bool = False
+    encode_policy: str | None = None  # Specific policy for encode nodes in EPD mode
+    encode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
+    encode_urls: list[tuple] = dataclasses.field(
+        default_factory=list
+    )  # List of (url, bootstrap_port)
+    # Poll worker loads for the engine gauges even without a load-aware
+    # policy (--engine-metrics)
+    engine_metrics: bool = False
+    epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
+    eviction_interval_secs: int = 60
+    # HTTP edge: seconds to receive a complete request head
+    header_read_timeout_secs: int = 30
+    # Health checks (disable_health_check switches them off)
+    health_check_endpoint: str = "/health"
+    health_check_interval_secs: int = 60
     # Dedicated port for liveness/readiness/health probes (k8s, load balancers, monitors), served from an
     # isolated runtime so probes are not starved by the request runtime.
     # None = dedicated probe listener off (routes stay on the main port).
     health_check_port: int | None = None
-
-    # PD/EPD-specific configuration
+    health_check_timeout_secs: int = 5
+    health_failure_threshold: int = 3
+    health_success_threshold: int = 2
+    # History backend: memory, oracle, postgres or redis (the oracle_*, postgres_* and
+    # redis_* fields configure the stores)
+    history_backend: str = "memory"
+    # Bounds of the memory history backend: the most stored conversation items and
+    # responses kept (the oldest go first) and how long a record is kept (0 = until
+    # a count bound drops it)
+    history_memory_max_items: int = 100000
+    history_memory_max_responses: int = 10000
+    history_memory_retention_secs: int = 86400
+    # HTTP edge: seconds a keep-alive connection may sit with no request in flight
+    # (0 disables)
+    idle_connection_timeout_secs: int = 90
+    # Heap profiles of the router process (a jemalloc-profiling build)
+    jemalloc_prof_dir: str | None = None
+    # Control-plane job queue sizing (worker registration/removal jobs)
+    job_queue_capacity: int = 1000
+    job_queue_concurrency: int = 200
+    # JWT/OIDC configuration for control plane auth
+    jwt_audience: str | None = None
+    jwt_issuer: str | None = None
+    jwt_jwks_uri: str | None = None
+    # The JWT claim that carries the role
+    jwt_role_claim: str = "roles"
+    jwt_role_mapping: dict[str, str] = dataclasses.field(default_factory=dict)
+    kv_connector_annotation: str = "smg.ai/kv-connector"
+    kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
+    # Deprecated: the chain index is the only KV index behind cache-aware
+    # routing, so "chain" is the one value and changes nothing; unset by
+    # default so that only a launch line that still passes it is warned
+    kv_index: str | None = None
+    least_load_default_throughput: float = 2000.0
+    least_load_kv_pressure_weight: float = 0.15
+    least_load_max_waiting_requests: int = 0
+    least_load_mean_prefill_tokens: int = 1024
+    load_monitor_interval: int = 10
+    log_dir: str | None = None
+    log_json: bool = False
+    log_level: str | None = None
+    # Per-request multimodal timing at INFO; False falls back to SMG_LOG_MM_TIMING
+    log_mm_timing: bool = False
+    # Most Responses API requests with background: true in flight at once;
+    # one beyond answers 429. 0 = background mode off (such requests run in
+    # the foreground)
+    max_background_responses: int = 1024
+    # Most bytes the router may buffer for a request it holds only to keep
+    # it retryable; larger eligible requests stream and forfeit router retries
+    max_buffered_request_bytes: int = 1048576
+    # Standing-concurrency cap (-1 to disable); permits span the full response
+    max_concurrent_requests: int = -1
+    # Most client connections the data listener holds open at once (0 = no bound)
+    max_connections: int = 0
+    max_idle_secs: int = 4 * 3600
+    max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
+    max_tree_size: int = 2**26
+    # MCP server configuration
+    mcp_config_path: str | None = None
+    mesh_advertise_host: str | None = None
+    mesh_host: str = "0.0.0.0"
+    mesh_peer_urls: list[str] = dataclasses.field(default_factory=list)
+    mesh_port: int = 39527
+    mesh_server_name: str | None = None
+    # Mesh mTLS: the CA, this node's certificate and key (PEM paths); all three or none.
+    mesh_tls_ca_cert: str | None = None
+    mesh_tls_cert: str | None = None
+    mesh_tls_key: str | None = None
+    # Allow media URLs on loopback, link-local or private addresses (an internal
+    # media origin); False falls back to SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS
+    mm_allow_private_media_hosts: bool = False
+    # Hosts the router fetches client-supplied media URLs from when it processes
+    # media itself (every redirect hop included); None allows any host the
+    # address policy passes
+    mm_allowed_media_domains: list[str] | None = None
+    # Per-request image-count limit replacing model spec limits; None keeps spec limits
+    mm_per_request_image_limit: int | None = None
+    # Pixel cache budget (MiB) for router-side preprocessed media; None falls
+    # back to SMG_MM_PIXEL_CACHE_MB, then 0 (off)
+    mm_pixel_cache_mb: int | None = None
+    # Legacy switch for the RDMA pixel lane; False falls back to SMG_MM_PIXEL_RDMA
+    mm_pixel_rdma: bool = False
+    # Where media for vLLM gRPC workers is fetched and preprocessed:
+    # auto | router | worker; None falls back to SMG_MM_PROCESSING, then auto
+    mm_processing: str | None = None
+    # What the gateway's own media pipeline does when libjpeg-turbo cannot be
+    # loaded: prefer (the pure-Rust fallback decoder, behind one warning) |
+    # require (start-up fails); None falls back to SMG_MM_TURBOJPEG, then prefer
+    mm_turbojpeg: str | None = None
+    model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
+    model_id_from: str | None = None
+    model_path: str | None = None
+    multimodal_max_inflight_bytes: int | None = None
+    multimodal_shm_min_bytes: int | None = None
+    multimodal_tensor_transport: str | None = None
+    oracle_connect_descriptor: str | None = None
+    oracle_external_auth: bool = False
+    oracle_password: str | None = None
+    oracle_pool_max: int = 16
+    oracle_pool_min: int = 1
+    oracle_pool_timeout_secs: int = 30
+    oracle_tns_alias: str | None = None
+    oracle_username: str | None = None
+    oracle_wallet_path: str | None = None
+    otlp_traces_endpoint: str = "localhost:4317"
+    overlap_decay: float = 0.0
+    overload_token_usage_threshold: float = 1.0
+    # Which parser reads a chat completion's reasoning and tool calls: the per-model parsers
+    # ("legacy") or Symphony ("symphony") for the models its registry knows; a request's
+    # X-SMG-Parser header overrides it
+    parser: str = "legacy"
+    # Seconds a PD dispatch waits for a slot in the decode engine's running
+    # window before shedding; 0 sheds immediately
+    pd_admission_wait_secs: int = 30
     pd_disaggregation: bool = False  # Enable PD disaggregated mode
-    epd_disaggregation: bool = False  # Enable Encode-Prefill-Decode disaggregated mode
-    encode_urls: list[tuple] = dataclasses.field(
-        default_factory=list
-    )  # List of (url, bootstrap_port)
+    # Routing policy
+    # How strictly a prefill is paired with a decode on their KV transfer
+    # protocol: off, lenient or strict
+    pd_pairing_mode: str = "lenient"
+    policy: str = "cache_aware"
+    postgres_db_url: str | None = None
+    # The bound on one Postgres history-store call (pool wait, connect and the
+    # operation included)
+    postgres_op_timeout_secs: int = 5
+    postgres_pool_max: int = 16
+    power_of_two_load_metric: str = "expected_wait"
+    prefill_max_inflight_requests_per_worker: int = -1
+    prefill_policy: str | None = None  # Specific policy for prefill nodes in PD mode
+    prefill_queue_size: int | None = None
+    prefill_queue_timeout_secs: int | None = None
+    prefill_selector: dict[str, str] = dataclasses.field(default_factory=dict)
     prefill_urls: list[tuple] = dataclasses.field(
         default_factory=list
     )  # List of (url, bootstrap_port)
-    decode_urls: list[str] = dataclasses.field(default_factory=list)
-
-    # Routing policy
-    policy: str = "cache_aware"
-    encode_policy: str | None = None  # Specific policy for encode nodes in EPD mode
-    prefill_policy: str | None = None  # Specific policy for prefill nodes in PD mode
-    decode_policy: str | None = None  # Specific policy for decode nodes in PD mode
-    worker_startup_timeout_secs: int = 1800
-    worker_startup_check_interval: int = 30
-    load_monitor_interval: int = 10
-    cache_threshold: float = 0.3
-    balance_abs_threshold: int = 64
-    balance_rel_threshold: float = 1.5
-    balance_token_usage_threshold: float = 1.0
-    overload_token_usage_threshold: float = 1.0
-    eviction_interval_secs: int = 60
-    max_tree_size: int = 2**26
-    block_size: int = 16
-    least_load_kv_pressure_weight: float = 0.15
-    least_load_default_throughput: float = 2000.0
-    least_load_mean_prefill_tokens: int = 1024
-    max_idle_secs: int = 4 * 3600
-    # Routing-key assignment; defaults: random (manual policy), delegate (override)
-    assignment_mode: str | None = None
-    max_payload_size: int = 512 * 1024 * 1024  # 512MB default for large batches
-    bucket_adjust_interval_secs: int = 5
-    dp_aware: bool = False
-    multimodal_tensor_transport: str | None = None
-    multimodal_shm_min_bytes: int | None = None
-    routing_key_override: bool = False
-    dp_minimum_tokens_scheduler: bool = False
-    enable_igw: bool = False  # Enable IGW (Inter-Gateway) mode for multi-model support
-    api_key: str | None = None
-    log_dir: str | None = None
-    log_level: str | None = None
-    log_json: bool = False
-    # Service discovery configuration
-    service_discovery: bool = False
-    selector: dict[str, str] = dataclasses.field(default_factory=dict)
-    service_discovery_port: int = 80
-    service_discovery_namespace: str | None = None
-    # PD/EPD service discovery configuration
-    encode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
-    prefill_selector: dict[str, str] = dataclasses.field(default_factory=dict)
-    decode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
-    router_selector: dict[str, str] = dataclasses.field(default_factory=dict)
-    bootstrap_port_annotation: str = "sglang.ai/bootstrap-port"
-    worker_ports_annotation: str = "smg.ai/worker-ports"
-    model_id_from: str | None = None
-    # Prometheus configuration
-    prometheus_port: int | None = None
-    prometheus_host: str | None = None
+    prefix_hash_balance_abs_threshold: int = 10
+    prefix_hash_load_factor: float = 1.25
+    prefix_token_count: int = 256
+    # Priority-aware admission scheduler
+    priority_scheduler_config: str | None = None
+    priority_scheduler_default_max_class: str = "default"
+    priority_scheduler_enabled: bool = False
+    priority_scheduler_tenant_metric_top_n: int = 32
+    # Prometheus exporter
     prometheus_duration_buckets: list[float] | None = None
-    # Request ID headers configuration
-    request_id_headers: list[str] | None = None
-    # HTTP header to storage hook context mapping
-    storage_context_headers: dict[str, str] = dataclasses.field(default_factory=dict)
-    # Request timeout in seconds
-    request_timeout_secs: int = 1800
-    # Grace period in seconds to wait for in-flight requests during shutdown
-    shutdown_grace_period_secs: int = 180
-    # Standing-concurrency cap (-1 to disable); permits span the full response
-    max_concurrent_requests: int = -1
+    prometheus_host: str | None = None
+    prometheus_port: int | None = None
     # Queue size for pending requests when max concurrent limit reached
     queue_size: int = 100
     # Maximum time (in seconds) a request can wait in queue before timing out
@@ -132,213 +541,139 @@ class RouterArgs:
     # Sustained admission rate (requests per second), bursting up to
     # max_concurrent_requests. Unset or 0 = no rate limit
     rate_limit_tokens_per_second: int | None = None
-    # CORS allowed origins
-    cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
-    # Retry configuration
-    retry_max_retries: int = 5
-    retry_initial_backoff_ms: int = 50
-    retry_max_backoff_ms: int = 30_000
-    retry_backoff_multiplier: float = 1.5
-    retry_jitter_factor: float = 0.2
-    disable_retries: bool = False
-    # Health check configuration
-    health_failure_threshold: int = 3
-    health_success_threshold: int = 2
-    health_check_timeout_secs: int = 5
-    health_check_interval_secs: int = 60
-    health_check_endpoint: str = "/health"
-    disable_health_check: bool = False
-    # None = follow service_discovery: recovery works by removal + discovery
-    # re-registration, so it defaults on exactly when discovery can complete
-    # the loop (resolved by the Rust core).
-    remove_unhealthy_workers: bool | None = None
-    # Circuit breaker configuration
-    cb_failure_threshold: int = 10
-    cb_success_threshold: int = 3
-    cb_timeout_duration_secs: int = 60
-    cb_window_duration_secs: int = 120
-    disable_circuit_breaker: bool = False
-    model_path: str | None = None
-    tokenizer_path: str | None = None
-    chat_template: str | None = None
-    # Disable automatic tokenizer loading at startup and worker registration
-    disable_tokenizer_autoload: bool = False
-    # Tokenizer cache configuration
-    tokenizer_cache_enable_l0: bool = False
-    tokenizer_cache_l0_max_entries: int = 10000
-    tokenizer_cache_enable_l1: bool = False
-    tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
-    # Parser configuration
-    reasoning_parser: str | None = None
-    tool_call_parser: str | None = None
-    # MCP server configuration
-    mcp_config_path: str | None = None
-    # Backend selection
-    backend: str = "sglang"
-    # WASM support
-    enable_wasm: bool = False
-    # Storage hooks (WASM)
-    storage_hook_wasm_path: str | None = None
-    # History backend configuration
-    history_backend: str = "memory"
-    oracle_wallet_path: str | None = None
-    oracle_tns_alias: str | None = None
-    oracle_connect_descriptor: str | None = None
-    oracle_username: str | None = None
-    oracle_password: str | None = None
-    oracle_external_auth: bool = False
-    oracle_pool_min: int = 1
-    oracle_pool_max: int = 16
-    oracle_pool_timeout_secs: int = 30
-    postgres_db_url: str | None = None
-    postgres_pool_max: int = 16
-    redis_url: str | None = None
-    redis_pool_max: int = 16
-    redis_retention_days: int = 30
-    schema_config: str | None = None
-    # mTLS configuration for worker communication
-    client_cert_path: str | None = None
-    client_key_path: str | None = None
-    ca_cert_paths: list[str] = dataclasses.field(default_factory=list)
-    # Server TLS configuration
-    server_cert_path: str | None = None
-    server_key_path: str | None = None
-    # Trace
-    enable_trace: bool = False
-    otlp_traces_endpoint: str = "localhost:4317"
-    # Control plane authentication
-    # API keys for control plane auth (list of tuples: id, name, key, role)
-    control_plane_api_keys: list[tuple] = dataclasses.field(default_factory=list)
-    control_plane_audit_enabled: bool = False
-    # JWT/OIDC configuration for control plane auth
-    jwt_issuer: str | None = None
-    jwt_audience: str | None = None
-    jwt_jwks_uri: str | None = None
-    jwt_role_mapping: dict[str, str] = dataclasses.field(default_factory=dict)
-    # Mesh server configuration
-    enable_mesh: bool = False
-    mesh_server_name: str | None = None
-    mesh_host: str = "0.0.0.0"
-    mesh_advertise_host: str | None = None
-    mesh_port: int = 39527
-    mesh_peer_urls: list[str] = dataclasses.field(default_factory=list)
-    # Append new fields here to preserve positional callers.
-    model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
-    worker_startup_delay: int = 0
-    # DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped)
-    zmq_engine_count: int | None = None
-    prefix_token_count: int = 256
-    prefix_hash_load_factor: float = 1.25
-    prefix_hash_balance_abs_threshold: int = 10
-    upstream_http2: bool = False
-    overlap_decay: float = 0.0
-    selection_temperature: float = 0.0
-    upstream_pool_idle_timeout_secs: int = 3
-    least_load_max_waiting_requests: int = 0
-    stream_body_stall_timeout_secs: int = 300
-    # Ordered header names checked for the routing key; first valid wins
-    routing_key_headers: list[str] = dataclasses.field(
-        default_factory=lambda: ["x-smg-routing-key"]
-    )
-    # Token positions at which serving engines retain reusable prefix state
-    cache_boundaries: list[int] = dataclasses.field(default_factory=list)
-    # cache_aware index under-layer: "tree" or "hash"
-    cache_index: str = "tree"
-    # Seconds a cache-affinity placement stays routable
-    cache_ttl_secs: int = 180
-    # Control-plane job queue sizing (worker registration/removal jobs)
-    job_queue_capacity: int = 1000
-    job_queue_concurrency: int = 200
-    # Absolute per-worker overload thresholds, as the Rust CLI defaults them;
-    # None switches one signal off
-    worker_overload_waiting_requests: int | None = 8
-    worker_overload_token_usage: float | None = 0.8
-    # Worker overload protection is on by default; False switches both
-    # thresholds off (--disable-worker-overload-protection)
-    worker_overload_protection: bool = True
-    # Restore the conditional load-monitor poll gate (default: poll always)
-    disable_load_monitoring: bool = False
-    # Most bytes the router may buffer for a request it holds only to keep
-    # it retryable; larger eligible requests stream and forfeit router retries
-    max_buffered_request_bytes: int = 1048576
-    kv_connector_annotation: str = "smg.ai/kv-connector"
-    kv_engine_id_annotation: str = "smg.ai/kv-engine-id"
-    # Per-request image-count limit replacing model spec limits; None keeps spec limits
-    mm_per_request_image_limit: int | None = None
-    # Seconds a PD dispatch waits for a slot in the decode engine's running
-    # window before shedding; 0 sheds immediately
-    pd_admission_wait_secs: int = 30
-    enable_rl: bool = False  # Mount the RL control plane under /v1/rl
-    rl_control_timeout_secs: int = 600  # Timeout for one proxied engine control call
-    rl_fanout_concurrency: int = 32  # Max concurrent engine calls in one fan-out
-    # Appended last so callers that build RouterArgs positionally keep
-    # their existing field order.
-    multimodal_max_inflight_bytes: int | None = None
-    # Where media for vLLM gRPC workers is fetched and preprocessed:
-    # auto | router | worker; None falls back to SMG_MM_PROCESSING, then auto
-    mm_processing: str | None = None
-    # Pixel cache budget (MiB) for router-side preprocessed media; None falls
-    # back to SMG_MM_PIXEL_CACHE_MB, then 0 (off)
-    mm_pixel_cache_mb: int | None = None
-    # Legacy switch for the RDMA pixel lane; False falls back to SMG_MM_PIXEL_RDMA
-    mm_pixel_rdma: bool = False
     # Listener IP for the RDMA metadata exchange; None falls back to SMG_RDMA_LISTEN_IP
     rdma_listen_ip: str | None = None
     # Full-TTL override (seconds) for leased RDMA slots; None falls back to SMG_RDMA_SLOT_TTL_S
     rdma_slot_ttl_s: int | None = None
-    # Per-request multimodal timing at INFO; False falls back to SMG_LOG_MM_TIMING
-    log_mm_timing: bool = False
-    prefill_max_inflight_requests_per_worker: int = -1
-    prefill_queue_size: int | None = None
-    prefill_queue_timeout_secs: int | None = None
-    # The worker discovery provider. service_discovery=True is the legacy
-    # spelling of discovery_provider="kubernetes"; set one or the other.
-    discovery_provider: str | None = None
+    reasoning_parser: str | None = None
+    # The bound on one Redis history-store call (pool wait, connect and the
+    # operation included)
+    redis_op_timeout_secs: int = 5
+    redis_pool_max: int = 16
+    redis_retention_days: int = 30
+    redis_url: str | None = None
+    # None = follow service_discovery: recovery works by removal + discovery
+    # re-registration, so it defaults on exactly when discovery can complete
+    # the loop (resolved by the Rust core).
+    remove_unhealthy_workers: bool | None = None
+    request_id_headers: list[str] | None = None
+    # Request timeout in seconds
+    request_timeout_secs: int = 1800
+    # Retries (disable_retries switches them off)
+    retry_backoff_multiplier: float = 1.5
+    retry_initial_backoff_ms: int = 50
+    retry_jitter_factor: float = 0.2
+    retry_max_backoff_ms: int = 30_000
+    retry_max_retries: int = 5
+    rl_control_timeout_secs: int = 600  # Timeout for one proxied engine control call
+    rl_fanout_concurrency: int = 32  # Max concurrent engine calls in one fan-out
+    router_selector: dict[str, str] = dataclasses.field(default_factory=dict)
+    # Ordered header names checked for the routing key; first valid wins
+    routing_key_headers: list[str] = dataclasses.field(
+        default_factory=lambda: ["x-smg-routing-key"]
+    )
+    routing_key_override: bool = False
+    # Threads of the async runtime, at least 1; None = the runtime's default
+    runtime_worker_threads: int | None = None
+    schema_config: str | None = None
+    # The optimistic accounting TTL (ms) of the cache-aware selection
+    selection_accounting_ttl_ms: int = 0
+    # The cache-aware selection policy
+    selection_policy: str = "cache-aware-default"
+    selection_temperature: float = 0.0
+    selector: dict[str, str] = dataclasses.field(default_factory=dict)
+    # Server TLS configuration
+    server_cert_path: str | None = None
+    server_key_path: str | None = None
+    # Kubernetes service discovery (the legacy spelling of discovery_provider="kubernetes")
+    service_discovery: bool = False
+    service_discovery_namespace: str | None = None
+    service_discovery_port: int = 80
+    # Grace period in seconds to wait for in-flight requests during shutdown
+    shutdown_grace_period_secs: int = 180
+    # Slurm discovery (discovery_provider="slurm"): the account whose jobs are
+    # discovered, the encode and prefill bootstrap port, the job names whose
+    # nodes are each worker type, the partition, the port of every node's
+    # server, and the user (None = the one the router runs as)
+    slurm_account: str | None = None
+    slurm_bootstrap_port: int | None = None
+    slurm_decode_job_name: list[str] = dataclasses.field(default_factory=list)
+    slurm_encode_job_name: list[str] = dataclasses.field(default_factory=list)
+    slurm_job_name: list[str] = dataclasses.field(default_factory=list)
+    slurm_partition: str | None = None
+    slurm_port: int | None = None
+    slurm_prefill_job_name: list[str] = dataclasses.field(default_factory=list)
+    slurm_user: str | None = None
+    # Seconds of upstream silence after which an open SSE stream carries a
+    # keep-alive frame; 0 sends none
+    sse_keepalive_secs: int = 15
+    # Storage-hook request context read from HTTP headers, oriented
+    # {header name: context key}, as `--storage-context-headers
+    # header=context_key` lists them and as the Rust CLI parses the same
+    # entries (the header name is the key, never the value)
+    storage_context_headers: dict[str, str] = dataclasses.field(default_factory=dict)
+    # Storage hooks (WASM)
+    storage_hook_wasm_path: str | None = None
+    stream_body_stall_timeout_secs: int = 300
+    # Per-tenant data-plane keys as (tenant_id, key) pairs (--tenant-api-key)
+    tenant_api_keys: list[tuple] = dataclasses.field(default_factory=list)
+    # The tenant header trust_tenant_header reads
+    tenant_header_name: str = "x-smg-tenant-id"
+    # Per-tenant token/request rate limiting
+    tenant_rate_limit_config: str | None = None
+    tenant_rate_limit_enabled: bool = False
+    # Tokenizer cache configuration
+    tokenizer_cache_enable_l0: bool = False
+    tokenizer_cache_enable_l1: bool = False
+    tokenizer_cache_l0_max_entries: int = 10000
+    # Byte budget of the L0 tokenizer cache (--tokenizer-cache-l0-max-memory)
+    tokenizer_cache_l0_max_memory: int = 256 * 1024 * 1024  # 256MB
+    tokenizer_cache_l1_max_memory: int = 50 * 1024 * 1024  # 50MB
+    tokenizer_path: str | None = None
+    tool_call_parser: str | None = None
+    # Tenant resolution: trust an upstream tenant header (tenant_header_name names it)
+    trust_tenant_header: bool = False
+    upstream_http2: bool = False
+    upstream_pool_idle_timeout_secs: int = 3
+    # WebRTC: the UDP bind address (an IP; None = the unspecified address of
+    # the host's family)
+    webrtc_bind_addr: str | None = None
+    # WebRTC: the STUN server (host:port; "none" disables it)
+    webrtc_stun_server: str | None = None
+    # Worker overload protection is on by default; False switches both
+    # thresholds off (--disable-worker-overload-protection)
+    worker_overload_protection: bool = True
     # Refuse with a 503 when every worker a request could use is overloaded,
-    # instead of routing it to the least-loaded one
+    # instead of routing it to the least-loaded one (or, for a cache-aware
+    # prefill pool of a prefill/decode pair, by its policy)
     worker_overload_shed: bool = False
-    # The event-driven KV index behind cache-aware routing: "positional"
-    # (one entry per block position) or "chain" (chains as runs)
-    kv_index: str = "positional"
-    # Liveness: seconds without contact after a transport failure before a
-    # worker is vetoed; seconds without progress before a loaded one is wedged
-    worker_stall_secs: int = 2
-    worker_wedge_secs: int = 3
+    # Absolute per-worker overload thresholds (token usage, waiting requests), as
+    # the Rust CLI defaults them; None switches one signal off
+    worker_overload_token_usage: float | None = 0.8
+    worker_overload_waiting_requests: int | None = 8
+    worker_ports_annotation: str = "smg.ai/worker-ports"
     # Liveness: seconds without any contact from a worker whose KV-event
     # stream pushes load records before it is vetoed as unreachable (0 = off)
     worker_stale_secs: int = 15
+    # Liveness: seconds without contact after a transport failure before a
+    # worker is vetoed
+    worker_stall_secs: int = 2
+    worker_startup_check_interval: int = 30
+    worker_startup_delay: int = 0
+    worker_startup_timeout_secs: int = 1800
     # Warm-up slice for cache-aware routing (see the --worker-warmup-* flags)
+    worker_warmup_blocks: int = 1024
+    worker_warmup_divert_every: int = 8
     worker_warmup_secs: int = 60
     worker_warmup_share: float = 0.25
-    worker_warmup_blocks: int = 1024
     worker_warmup_thin_ratio: float = 0.5
-    worker_warmup_divert_every: int = 8
-    # The cache-aware selection policy and the optimistic accounting TTL
-    selection_policy: str = "cache-aware-default"
-    selection_accounting_ttl_ms: int = 0
-    # Tenant resolution: trust an upstream tenant header, and its name
-    trust_tenant_header: bool = False
-    tenant_header_name: str = "x-smg-tenant-id"
-    # Per-tenant data-plane keys as (tenant_id, key) pairs (--tenant-api-key)
-    tenant_api_keys: list[tuple] = dataclasses.field(default_factory=list)
-    # Priority-aware admission scheduler
-    priority_scheduler_enabled: bool = False
-    priority_scheduler_default_max_class: str = "default"
-    priority_scheduler_config: str | None = None
-    priority_scheduler_tenant_metric_top_n: int = 32
-    # Per-tenant token/request rate limiting
-    tenant_rate_limit_enabled: bool = False
-    tenant_rate_limit_config: str | None = None
-    # Heap profiles of the router process (a jemalloc-profiling build); appended
-    # last: positional callers bind the fields by position
-    jemalloc_prof_dir: str | None = None
-    # Mesh mTLS: the CA, this node's certificate and key (PEM paths); all three or none.
-    mesh_tls_ca_cert: str | None = None
-    mesh_tls_cert: str | None = None
-    mesh_tls_key: str | None = None
-    # Byte budget of the L0 tokenizer cache (--tokenizer-cache-l0-max-memory);
-    # appended last for the same reason
-    tokenizer_cache_l0_max_memory: int = 256 * 1024 * 1024  # 256MB
+    # Liveness: seconds without progress before a loaded worker is wedged
+    worker_wedge_secs: int = 3
+    # DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped)
+    zmq_engine_count: int | None = None
+    # Seconds any one stage of a ZMQ engine's startup handshake may stay silent;
+    # it alone covers the engine's init between its HELLO and its READY
+    zmq_startup_timeout_secs: int = 3600
 
     @staticmethod
     def add_cli_args(
@@ -371,6 +706,12 @@ class RouterArgs:
         )
         k8s_group = parser.add_argument_group(
             "Service Discovery (Kubernetes)", "Kubernetes-based worker discovery"
+        )
+        file_discovery_group = parser.add_argument_group(
+            "Service Discovery (File)", "Workers listed in a JSON manifest"
+        )
+        slurm_discovery_group = parser.add_argument_group(
+            "Service Discovery (Slurm)", "Workers on the nodes of running Slurm jobs"
         )
         logging_group = parser.add_argument_group("Logging", "Log output configuration")
         prometheus_group = parser.add_argument_group(
@@ -508,6 +849,26 @@ class RouterArgs:
                 " available on the main port)."
             ),
         )
+        worker_group.add_argument(
+            f"--{prefix}admin-port",
+            type=int,
+            default=RouterArgs.admin_port,
+            help=(
+                "Port of the admin listener. When set, the control-plane routes (the admin"
+                " routes, the worker-registry routes /workers and the RL routes /v1/rl) are"
+                " served there, with /health, /liveness and /readiness, and the data listener"
+                " (--port) answers 404 for them. Control-plane authentication applies on it as"
+                " it does on the data listener; the public /loads stays on the data listener."
+                " Each listener needs its own port. Unset = the control plane stays on the data"
+                " listener."
+            ),
+        )
+        worker_group.add_argument(
+            f"--{prefix}admin-host",
+            type=str,
+            default=RouterArgs.admin_host,
+            help="Bind host of the admin listener (needs --admin-port). Defaults to --host.",
+        )
 
         # Routing policy configuration
         routing_group.add_argument(
@@ -573,7 +934,10 @@ class RouterArgs:
             f"--{prefix}prefix-hash-load-factor",
             type=float,
             default=RouterArgs.prefix_hash_load_factor,
-            help="Load factor above which prefix_hash walks the ring (multiple of average load)",
+            help=(
+                "Load factor above which prefix_hash walks the ring (multiple of"
+                " average load; finite, at least 1.0)"
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}prefix-hash-balance-abs-threshold",
@@ -595,8 +959,10 @@ class RouterArgs:
             type=float,
             default=RouterArgs.least_load_default_throughput,
             help=(
-                "Fallback generation throughput (tokens/s) for least_load when a"
-                " backend reports no live throughput"
+                "Input throughput (tokens/s) for least_load prefill workers; fallback"
+                " output throughput for other workers when no live rate is reported."
+                " Shared across roles; separate prefill/decode values require"
+                " constructing RouterConfig programmatically in Rust."
             ),
         )
         routing_group.add_argument(
@@ -619,13 +985,40 @@ class RouterArgs:
             ),
         )
         routing_group.add_argument(
+            f"--{prefix}power-of-two-load-metric",
+            type=str,
+            choices=["expected_wait", "requests", "least_requests"],
+            default=RouterArgs.power_of_two_load_metric,
+            help="What power_of_two compares: expected_wait, requests or least_requests",
+        )
+        routing_group.add_argument(
+            f"--{prefix}pd-pairing-mode",
+            type=str,
+            choices=["off", "lenient", "strict"],
+            default=RouterArgs.pd_pairing_mode,
+            help=(
+                "How strictly PD placement pairs a prefill with a decode on their KV"
+                " transfer protocol. lenient refuses only a known difference in runtime,"
+                " transport or KV layout (unknown components and engine versions pair"
+                " with anything); strict also refuses unknown components and version"
+                " differences; off pairs on nothing"
+            ),
+        )
+        routing_group.add_argument(
             f"--{prefix}balance-abs-threshold",
             f"--{prefix}spill-abs-threshold",
             type=int,
             default=RouterArgs.balance_abs_threshold,
             help=(
-                "Spill gate, absolute part. Balancing is triggered if"
-                " `(max_load - min_load) > abs_threshold` and the relative threshold is also met."
+                "Spill gate, absolute part: a matched worker is skipped for the least-loaded one"
+                " when its load exceeds the healthy-fleet mean by this many requests AND by the"
+                " relative threshold. The margin is this value capped at the larger of the"
+                " in-flight count's natural swing at the pool's current mean (two standard"
+                " deviations, never under four unless this value is lower) and the held prefix's"
+                " price (--balance-prefix-margin-tokens, unpriced by default), so a small pool can"
+                " spill at all. With the bucket policy"
+                " the pair keeps its own rule: balancing when (max_load - min_load) exceeds this"
+                " value and max_load exceeds min_load times the relative threshold."
             ),
         )
         routing_group.add_argument(
@@ -634,8 +1027,41 @@ class RouterArgs:
             type=float,
             default=RouterArgs.balance_rel_threshold,
             help=(
-                "Spill gate, relative part. Balancing is triggered if"
-                " `max_load > min_load * rel_threshold` and the absolute threshold is also met."
+                "Spill gate, relative part: a matched worker is skipped when its load exceeds"
+                " this multiple of the healthy-fleet mean AND the absolute threshold is also met."
+                " Finite, at least 1.0."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}balance-prefix-margin-tokens",
+            type=int,
+            default=RouterArgs.balance_prefix_margin_tokens,
+            help=(
+                "Spill gate, price of a held prefix in tokens per request (0, the default,"
+                " leaves held prefixes unpriced): a matched worker's absolute margin is at least"
+                " the tokens of the request's prefix it holds over this value, rounded up, up to"
+                " the absolute threshold. A spill gives the prefix up and the other worker"
+                " prefills it again, so a priced deep prefix (a long conversation's follow-up)"
+                " keeps its holder through a skew that moves a shallow one. Suits prefill pools"
+                " serving long multi-turn sessions, e.g. 1024 (the mean prefill a queued request"
+                " is priced at). Trade-offs: a deep holder sheds only past the absolute"
+                " threshold; a long prefix many sessions share replicates later; the price counts"
+                " the holder's whole match even when the spill target holds part of it; without"
+                " KV events the held length is the approximate tree's routing history, not"
+                " confirmed engine residency. Decode picks are never priced."
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}balance-uncached-credit",
+            action="store_true",
+            help=(
+                "Credit a cache-aware pick on a worker holding the request's prefix with the"
+                " prompt it still has to prefill (its token count less the held tokens, never"
+                " under the mean prefill nor over the whole prompt) instead of the whole prompt,"
+                " in the expected-wait estimate later picks read, so a hit on a long cached"
+                " conversation does not steer the next miss away from that worker as if it were"
+                " the whole context's work. Misses, spills and decode picks keep the whole"
+                " prompt. Off by default."
             ),
         )
         routing_group.add_argument(
@@ -647,7 +1073,8 @@ class RouterArgs:
                 " coldest backend KV utilization above which cache affinity is"
                 " abandoned for shortest-queue. Catches long-context KV imbalance that"
                 " in-flight request counts miss, and is invariant to gateway replica"
-                " count. Backend must report token_usage. Defaults to 1.0 (disabled)."
+                " count. Backend must report token_usage. Finite and > 0.0; >= 1.0"
+                " disables it. Defaults to 1.0 (disabled)."
             ),
         )
         routing_group.add_argument(
@@ -658,7 +1085,8 @@ class RouterArgs:
                 "Cache-aware KV-utilization CEILING (0.0-1.0): when the hottest backend"
                 " exceeds it, shed load off that engine regardless of spread. A safety"
                 " valve for critically-saturated engines, best set high (e.g. 0.9)."
-                " Backend must report token_usage. Defaults to 1.0 (disabled)."
+                " Backend must report token_usage. Finite and > 0.0; >= 1.0 disables"
+                " it. Defaults to 1.0 (disabled)."
             ),
         )
         routing_group.add_argument(
@@ -670,7 +1098,10 @@ class RouterArgs:
                 " overloaded and left out of routing while another worker is"
                 " under the thresholds; when every worker is over them the"
                 " request goes to the least-loaded one (see"
-                " --worker-overload-shed). The signal is the queued (waiting)"
+                " --worker-overload-shed). Unless --worker-overload-shed is"
+                " set, a cache-aware prefill pool of a prefill/decode pair is"
+                " not steered by the thresholds: its spill gate balances it."
+                " The signal is the queued (waiting)"
                 " request count, summed across DP ranks. Must be >= 1: the"
                 " comparison is inclusive, so 0 would veto every worker"
                 " unconditionally. Defaults to 8."
@@ -722,19 +1153,22 @@ class RouterArgs:
             help=(
                 "Refuse a request with a 503 (worker_overload_protection_shed,"
                 " Retry-After the load poll interval) when every worker it could"
-                " use is overloaded, instead of routing it to the least-loaded one;"
-                " also sheds a worker that crossed a threshold between selection"
+                " use is overloaded, instead of routing it to the least-loaded one"
+                " (or, for a cache-aware prefill pool, by its policy); also sheds"
+                " a worker that crossed a threshold between selection"
                 " and dispatch. Off by default."
             ),
         )
         routing_group.add_argument(
             f"--{prefix}kv-index",
-            type=str,
+            type=_parse_kv_index,
+            choices=["chain"],
             default=RouterArgs.kv_index,
             help=(
-                "The event-driven KV index behind cache-aware routing: 'positional'"
-                " (one entry per block position, the default) or 'chain' (chains as"
-                " runs with per-run worker coverage; lock-free, store-free lookups)."
+                "Deprecated: the chain index is the only KV index behind cache-aware"
+                " routing, so 'chain' is the one value and changes nothing; the flag"
+                " goes in a later release. 'positional' names the index that was"
+                " removed and is refused."
             ),
         )
         routing_group.add_argument(
@@ -790,7 +1224,10 @@ class RouterArgs:
             f"--{prefix}worker-warmup-share",
             type=float,
             default=RouterArgs.worker_warmup_share,
-            help="Share of cache misses offered to warming workers (0.0 to 1.0). Defaults to 0.25.",
+            help=(
+                "Share of cache misses offered to warming workers (a finite value from"
+                " 0.0 to 1.0). Defaults to 0.25."
+            ),
         )
         routing_group.add_argument(
             f"--{prefix}worker-warmup-blocks",
@@ -808,8 +1245,8 @@ class RouterArgs:
             help=(
                 "A worker whose index holds less than this share of the fleet's"
                 " median (or nothing) is thin and receives the warm-up slice until"
-                " it has grown by --worker-warmup-blocks, whatever emptied it. 0"
-                " keeps the age rule alone. Defaults to 0.5."
+                " it has grown by --worker-warmup-blocks, whatever emptied it. A"
+                " finite value from 0.0 to 1.0; 0 keeps the age rule alone. Defaults to 0.5."
             ),
         )
         routing_group.add_argument(
@@ -874,6 +1311,7 @@ class RouterArgs:
         )
         routing_group.add_argument(
             f"--{prefix}eviction-interval-secs",
+            f"--{prefix}eviction-interval",
             type=int,
             default=RouterArgs.eviction_interval_secs,
             help="Interval in seconds between cache eviction operations",
@@ -988,6 +1426,19 @@ class RouterArgs:
                 " pauses while the worker applies backpressure, so a slow"
                 " worker read never trips it. Applies only to streamed"
                 " request bodies. 0 disables"
+            ),
+        )
+        routing_group.add_argument(
+            f"--{prefix}sse-keepalive-secs",
+            type=_non_negative_int,
+            default=RouterArgs.sse_keepalive_secs,
+            help=(
+                "Seconds of upstream silence after which an open SSE stream"
+                " carries a keep-alive frame (an SSE comment on the"
+                " OpenAI-shaped endpoints, the ping event on /v1/messages), so"
+                " an idle-timeout proxy does not cut a stream that is waiting"
+                " on a long prefill. Nothing is sent while frames flow."
+                " 0 sends none"
             ),
         )
         routing_group.add_argument(
@@ -1160,6 +1611,16 @@ class RouterArgs:
                 " (a load-aware policy is always fed regardless)."
             ),
         )
+        parser.add_argument(
+            f"--{prefix}engine-metrics",
+            action="store_true",
+            help=(
+                "Force load polling for the engine Prometheus gauges even without a"
+                " load-aware routing policy. Routing-owned polls are always re-exported."
+                " A worker whose KV-event stream pushes its load feeds the gauges from"
+                " those records and is not polled while they flow (polling is the fallback)."
+            ),
+        )
 
         # Multimodal tensor transport
         parser.add_argument(
@@ -1184,7 +1645,8 @@ class RouterArgs:
                 " once; a request that fits waits briefly for room, then gets"
                 " 429, and one larger than the whole budget gets 413 straight"
                 " away. A waiting request still holds its media, so size memory"
-                " for about twice this value. Zero is refused, not read as unset"
+                " for about twice this value. Counted in whole KiB: a value under 1024 (one"
+                " 1 KiB unit, zero included) is refused, not read as unset"
             ),
         )
         parser.add_argument(
@@ -1205,9 +1667,13 @@ class RouterArgs:
             help=(
                 "Where media for vLLM gRPC workers is fetched and preprocessed: auto"
                 " (worker when the model spec and the worker both allow it, else"
-                " router), router (always the gateway), worker (always the engine;"
-                " models without worker expansion are rejected). Falls back to"
-                " SMG_MM_PROCESSING, then auto"
+                " router), router (always the gateway), worker (the engine, except"
+                " that a request whose items carry per-item hints"
+                " (max_long_side_pixel, fps) is preprocessed by the gateway, which"
+                " applies them; models without worker expansion are rejected unless"
+                " every media-processing worker runs the gateway's own pipeline,"
+                " mm_processor=smg)."
+                " Falls back to SMG_MM_PROCESSING, then auto"
             ),
         )
         parser.add_argument(
@@ -1230,12 +1696,47 @@ class RouterArgs:
             ),
         )
         parser.add_argument(
+            f"--{prefix}mm-allowed-media-domains",
+            type=lambda value: [host.strip() for host in value.split(",") if host.strip()],
+            default=RouterArgs.mm_allowed_media_domains,
+            help=(
+                "Hosts the router fetches client-supplied media URLs from when it"
+                " processes media itself, comma-separated; a redirect to any other"
+                " host is refused. Unset allows any host the address policy passes"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-allow-private-media-hosts",
+            action="store_true",
+            default=RouterArgs.mm_allow_private_media_hosts,
+            help=(
+                "Allow client-supplied media URLs that name or resolve to a loopback,"
+                " link-local or private address (an internal media origin); by default"
+                " such URLs are refused. Falls back to SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-turbojpeg",
+            type=str.lower,
+            choices=["prefer", "require"],
+            default=RouterArgs.mm_turbojpeg,
+            help=(
+                "What the gateway's own media pipeline does when libjpeg-turbo"
+                " (libturbojpeg.so.0) cannot be loaded: prefer (default) decodes JPEGs"
+                " with the pure-Rust decoder, whose pixels differ from the reference"
+                " decoder's by a few levels, warns once and sets the gauge"
+                " smg_mm_turbojpeg_available to 0; require stops start-up instead."
+                " Falls back to SMG_MM_TURBOJPEG"
+            ),
+        )
+        parser.add_argument(
             f"--{prefix}rdma-listen-ip",
-            type=str,
+            type=_ip_address,
             default=RouterArgs.rdma_listen_ip,
             help=(
-                "Listener IP for the RDMA pixel lane's metadata exchange; without one"
-                " the lane stays on the inline path. Falls back to SMG_RDMA_LISTEN_IP"
+                "Listener IP for the RDMA pixel lane's metadata exchange, a plain IPv4 or"
+                " IPv6 address (no hostname, port or brackets); without one the lane stays"
+                " on the inline path. Falls back to SMG_RDMA_LISTEN_IP"
             ),
         )
         parser.add_argument(
@@ -1243,8 +1744,8 @@ class RouterArgs:
             type=_non_negative_int,
             default=RouterArgs.rdma_slot_ttl_s,
             help=(
-                "Seconds a leased RDMA pixel slot lives without a free notification;"
-                " must exceed the worker's hold or it is ignored. Falls back to"
+                "Seconds a leased RDMA pixel slot lives without a free notification"
+                " (at least 1); must exceed the worker's hold or it is ignored. Falls back to"
                 " SMG_RDMA_SLOT_TTL_S"
             ),
         )
@@ -1261,7 +1762,9 @@ class RouterArgs:
             type=str,
             default=None,
             help=(
-                "Directory to store log files. If not specified, logs are only output to console."
+                "Directory for the log files, created at start-up when missing (under a"
+                " writable directory); an existing path must be a writable directory. If not"
+                " specified, logs are only output to console."
             ),
         )
         logging_group.add_argument(
@@ -1276,6 +1779,20 @@ class RouterArgs:
             action="store_true",
             default=RouterArgs.log_json,
             help="Output logs in JSON format",
+        )
+        logging_group.add_argument(
+            f"--{prefix}access-log-fields",
+            type=str,
+            nargs="*",
+            action=_ExtendAccessLogFields,
+            default=[],
+            metavar="{" + ",".join(_ACCESS_LOG_FIELD_NAMES) + "}",
+            help=(
+                "Optional fields of the access-log record, each written once it is listed,"
+                " space- or comma-separated (e.g. client_addr worker response_bytes, or"
+                " client_addr,worker as the Rust CLI takes it). Without this flag the record"
+                " keeps the fields it has always had."
+            ),
         )
 
         # Service discovery configuration
@@ -1294,6 +1811,78 @@ class RouterArgs:
             choices=DISCOVERY_PROVIDER_CHOICES,
             default=None,
             help="Worker discovery provider. Give this or --service-discovery, not both",
+        )
+        file_discovery_group.add_argument(
+            f"--{prefix}discovery-file",
+            type=str,
+            default=None,
+            help=(
+                "JSON manifest listing the workers, for --discovery-provider file."
+                " It may be created after startup"
+            ),
+        )
+        file_discovery_group.add_argument(
+            f"--{prefix}discovery-check-interval-secs",
+            type=int,
+            default=None,
+            help=(
+                "Seconds between periodic discovery passes. Kubernetes and file"
+                " discovery apply a change as it happens and use the pass to retry"
+                " and to catch what went unreported; Slurm discovery polls at this"
+                " interval (default: 30)"
+            ),
+        )
+        for role, workers in [
+            ("", "regular"),
+            ("encode-", "encode"),
+            ("prefill-", "prefill"),
+            ("decode-", "decode"),
+        ]:
+            slurm_discovery_group.add_argument(
+                f"--{prefix}slurm-{role}job-name",
+                type=str,
+                action="append",
+                default=None,
+                help=(
+                    f"Slurm job name whose nodes are {workers} workers, for"
+                    " --discovery-provider slurm. Can be specified multiple times"
+                ),
+            )
+        slurm_discovery_group.add_argument(
+            f"--{prefix}slurm-port",
+            type=int,
+            default=None,
+            help=(
+                "Port of the inference server on every node of a discovered job"
+                " (required with --discovery-provider slurm)"
+            ),
+        )
+        slurm_discovery_group.add_argument(
+            f"--{prefix}slurm-bootstrap-port",
+            type=int,
+            default=None,
+            help="Bootstrap port of the Slurm-discovered encode and prefill workers",
+        )
+        slurm_discovery_group.add_argument(
+            f"--{prefix}slurm-user",
+            type=str,
+            default=None,
+            help=(
+                "Discover this Slurm user's jobs, by name or uid"
+                " (default: the user the router runs as)"
+            ),
+        )
+        slurm_discovery_group.add_argument(
+            f"--{prefix}slurm-account",
+            type=str,
+            default=None,
+            help="Discover only jobs charged to this Slurm account",
+        )
+        slurm_discovery_group.add_argument(
+            f"--{prefix}slurm-partition",
+            type=str,
+            default=None,
+            help="Discover only jobs in this Slurm partition",
         )
         k8s_group.add_argument(
             f"--{prefix}selector",
@@ -1399,10 +1988,7 @@ class RouterArgs:
             f"--{prefix}prometheus-port",
             type=int,
             default=29000,
-            help=(
-                "Port to expose Prometheus metrics (default: 29000)."
-                " 0 binds an OS-assigned ephemeral port, logged at startup."
-            ),
+            help="Port to expose Prometheus metrics (at least 1; default: 29000)",
         )
         prometheus_group.add_argument(
             f"--{prefix}prometheus-host",
@@ -1441,7 +2027,9 @@ class RouterArgs:
             action="extend",
             help=(
                 "Custom HTTP headers to check for request IDs (e.g., x-request-id x-trace-id)."
-                " If not specified, uses common defaults."
+                " If not specified, uses common defaults. The first header present is honoured"
+                " when its value is 1 to 128 visible-ASCII characters; otherwise a fresh id is"
+                " generated."
             ),
         )
         request_group.add_argument(
@@ -1468,10 +2056,62 @@ class RouterArgs:
             help="Grace period in seconds to wait for in-flight requests during shutdown",
         )
         request_group.add_argument(
+            f"--{prefix}header-read-timeout-secs",
+            type=int,
+            default=RouterArgs.header_read_timeout_secs,
+            help=(
+                "Close a connection that has not sent a complete request head"
+                " within this many seconds of being accepted (and a keep-alive"
+                " connection whose next request head stalls for this long after"
+                " its first byte). 0 disables"
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}idle-connection-timeout-secs",
+            type=int,
+            default=RouterArgs.idle_connection_timeout_secs,
+            help=(
+                "Close a keep-alive connection that has had no request in flight"
+                " for this many seconds; an open streaming response counts as in"
+                " flight. The bound starts with the connection's first request (a"
+                " connection that never sends one is bounded by"
+                " --header-read-timeout-secs alone). Keep it above the idle"
+                " timeout of any proxy or load balancer in front of the gateway,"
+                " so that side closes an idle connection first; otherwise a"
+                " request can be sent on a connection the gateway is closing and"
+                " fail with a reset. A connection the proxy opened ahead of time"
+                " and never used is bounded by --header-read-timeout-secs"
+                " instead: keep the proxy's idle timeout under that too, or do"
+                " not pre-open. 0 keeps idle connections open until the client"
+                " closes them"
+            ),
+        )
+        request_group.add_argument(
+            f"--{prefix}max-connections",
+            type=_non_negative_int,
+            default=RouterArgs.max_connections,
+            help=(
+                "Most client connections the data listener (--port) holds open at once,"
+                " counted from accept to close (idle keep-alive connections, connections"
+                " inside a TLS handshake and upgraded connections included). A connection"
+                " beyond the bound is closed at once, before any TLS handshake and without"
+                " a response: the client sees its connection end and should retry with"
+                " backoff; each is counted in smg_http_connections_rejected_total."
+                " Readiness is unaffected. Probes on the data port are subject to the"
+                " bound like any connection: point them at --health-check-port or"
+                " --admin-port, which it does not cover. 0 = no bound"
+            ),
+        )
+        request_group.add_argument(
             f"--{prefix}trust-tenant-header",
             action="store_true",
             default=False,
-            help="Trust an upstream-provided tenant header for canonical tenant resolution.",
+            help=(
+                "Trust an upstream-provided tenant header for canonical tenant resolution."
+                " Stored responses and conversations are scoped to the tenant that created"
+                " them: another tenant's id answers 404; records stored without a tenant"
+                " identity stay readable by every caller."
+            ),
         )
         request_group.add_argument(
             f"--{prefix}tenant-header-name",
@@ -1485,7 +2125,11 @@ class RouterArgs:
             nargs="*",
             action="extend",
             default=[],
-            help="CORS allowed origins (e.g., http://localhost:3000 https://example.com)",
+            help=(
+                "Origins a browser may call the gateway from (e.g., http://localhost:3000"
+                " https://example.com), or '*' alone for any origin. Without this flag the"
+                " gateway makes no cross-origin allowance."
+            ),
         )
 
         # Rate limiting configuration
@@ -1525,6 +2169,16 @@ class RouterArgs:
                 " concurrency. Unset or 0 = no rate limit."
             ),
         )
+        rate_limit_group.add_argument(
+            f"--{prefix}max-background-responses",
+            type=int,
+            default=RouterArgs.max_background_responses,
+            help=(
+                "Most Responses API requests with background: true in flight"
+                " at once; one beyond answers 429. 0 switches background mode"
+                " off: such requests then run in the foreground."
+            ),
+        )
 
         # Priority scheduler configuration
         scheduler_group.add_argument(
@@ -1549,7 +2203,12 @@ class RouterArgs:
             f"--{prefix}priority-scheduler-config",
             type=str,
             default=None,
-            help="Optional path to the priority-scheduler YAML config.",
+            help=(
+                "Optional path to the priority-scheduler YAML config. With "
+                "--priority-scheduler-enabled, a file that cannot be read, parsed "
+                "or validated is a start-up error; without a path the built-in "
+                "class defaults apply."
+            ),
         )
         scheduler_group.add_argument(
             f"--{prefix}priority-scheduler-tenant-metric-top-n",
@@ -1601,7 +2260,7 @@ class RouterArgs:
             f"--{prefix}retry-backoff-multiplier",
             type=float,
             default=RouterArgs.retry_backoff_multiplier,
-            help="Multiplier for exponential backoff between retries",
+            help="Multiplier for exponential backoff between retries (finite, at least 1.0)",
         )
         retry_group.add_argument(
             f"--{prefix}retry-jitter-factor",
@@ -1653,25 +2312,34 @@ class RouterArgs:
             f"--{prefix}health-failure-threshold",
             type=int,
             default=RouterArgs.health_failure_threshold,
-            help=("Number of consecutive health check failures before marking worker unhealthy"),
+            help=(
+                "Number of consecutive health check failures before marking worker unhealthy"
+                " (at least 1)"
+            ),
         )
         health_group.add_argument(
             f"--{prefix}health-success-threshold",
             type=int,
             default=RouterArgs.health_success_threshold,
-            help=("Number of consecutive health check successes before marking worker healthy"),
+            help=(
+                "Number of consecutive health check successes before marking worker healthy"
+                " (at least 1)"
+            ),
         )
         health_group.add_argument(
             f"--{prefix}health-check-timeout-secs",
             type=int,
             default=RouterArgs.health_check_timeout_secs,
-            help="Timeout in seconds for health check requests",
+            help="Timeout in seconds for health check requests (at least 1)",
         )
         health_group.add_argument(
             f"--{prefix}health-check-interval-secs",
             type=int,
             default=RouterArgs.health_check_interval_secs,
-            help="Interval in seconds between runtime health checks",
+            help=(
+                "Interval in seconds between runtime health checks (at least 1;"
+                f" --{prefix}disable-health-check turns probing off)"
+            ),
         )
         health_group.add_argument(
             f"--{prefix}health-check-endpoint",
@@ -1699,25 +2367,46 @@ class RouterArgs:
                 " it off under discovery"
             ),
         )
+        health_group.add_argument(
+            f"--{prefix}drain-settle-secs",
+            type=_non_negative_int,
+            default=RouterArgs.drain_settle_secs,
+            help=(
+                "Seconds to keep a Ready worker in Draining before removing it from the"
+                " registry, on every removal (a discovery deletion, an unhealthy worker's"
+                f" removal under --{prefix}remove-unhealthy-workers, the API); a worker's"
+                " spec may override it per worker. 0 removes immediately without draining"
+            ),
+        )
         # Tokenizer configuration
         tokenizer_group.add_argument(
             f"--{prefix}model-path",
             f"--{prefix}model",
             type=str,
             default=None,
-            help="Model path for loading tokenizer (HuggingFace model ID or local path)",
+            help=(
+                "Model path for loading tokenizer (HuggingFace model ID, fetched lazily, or a"
+                " local path: one that exists must hold a tokenizer layout; one that does not"
+                " is left to the worker's tokenizer where a gRPC worker can still register"
+                " (gRPC worker URLs, IGW mode, worker discovery)"
+                " and refused otherwise). Not read as a tokenizer source when tokenizer_path"
+                " is set."
+            ),
         )
         tokenizer_group.add_argument(
             f"--{prefix}tokenizer-path",
             type=str,
             default=None,
-            help="Explicit tokenizer path (overrides model_path tokenizer if provided)",
+            help=(
+                "Explicit tokenizer path (overrides model_path tokenizer if provided); a local"
+                " path follows the same rule as model_path"
+            ),
         )
         tokenizer_group.add_argument(
             f"--{prefix}chat-template",
             type=str,
             default=None,
-            help="Chat template path (optional)",
+            help="Chat template path (optional): an existing, non-empty template file",
         )
         tokenizer_group.add_argument(
             f"--{prefix}disable-tokenizer-autoload",
@@ -1725,6 +2414,20 @@ class RouterArgs:
             default=RouterArgs.disable_tokenizer_autoload,
             help="Disable automatic tokenizer loading at startup. "
             "Use this when tokenizers are not needed (e.g., pure load balancing).",
+        )
+        tokenizer_group.add_argument(
+            f"--{prefix}parser",
+            type=str,
+            default=RouterArgs.parser,
+            choices=["legacy", "symphony"],
+            help="Which parser reads a chat completion's reasoning and tool calls: the per-model "
+            "parsers (legacy, the default) or Symphony. With Symphony, a model's worker labels decide, "
+            "else Symphony's registry for a model it knows, else --tool-call-parser and --reasoning-parser: "
+            "a Symphony table's name reads with that table, and so does a legacy parser's name whose format "
+            "a table reads (qwen for qwen3, qwen_xml for qwen3_tagged: the table's aliases, so existing flags "
+            "keep a working parser); any other legacy parser's name keeps the legacy parsers (the Symphony "
+            "crate lists each with the reason, passthrough among them), and no name leaves the legacy parsers "
+            "to detect. A request's X-SMG-Parser header overrides the flag for that request.",
         )
         tokenizer_group.add_argument(
             f"--{prefix}tokenizer-cache-enable-l0",
@@ -1764,7 +2467,12 @@ class RouterArgs:
             type=str,
             default=None,
             choices=reasoning_parser_choices,
-            help="Specify the parser for reasoning models (e.g., deepseek_r1, qwen3)",
+            help="Specify the parser for reasoning models (e.g., deepseek_r1, qwen3). Under --parser symphony, "
+            "a worker's labels decide for its model, else Symphony's registry for a model it knows, and this "
+            "flag for the models the registry does not know: a Symphony table's name here (and in "
+            "--tool-call-parser, or here alone) reads them with that table, and so does a legacy parser's "
+            "name whose format a table reads (the table's aliases); any other legacy parser's name keeps "
+            "the legacy parsers for them",
         )
         tool_call_parser_choices = get_available_tool_call_parsers()
         parser_group.add_argument(
@@ -1772,7 +2480,12 @@ class RouterArgs:
             type=str,
             default=None,
             choices=tool_call_parser_choices,
-            help="Specify the parser for tool-call interactions (e.g., json, qwen)",
+            help="Specify the parser for tool-call interactions (e.g., json, qwen). Under --parser symphony, "
+            "a worker's labels decide for its model, else Symphony's registry for a model it knows, and this "
+            "flag for the models the registry does not know: a Symphony table's name here (and in "
+            "--reasoning-parser, or here alone) reads them with that table, and so does a legacy parser's "
+            "name whose format a table reads (the table's aliases); any other legacy parser's name keeps "
+            "the legacy parsers for them",
         )
         parser_group.add_argument(
             f"--{prefix}mcp-config-path",
@@ -1784,6 +2497,7 @@ class RouterArgs:
         # Backend selection
         backend_group.add_argument(
             f"--{prefix}backend",
+            f"--{prefix}runtime",
             type=str,
             default=RouterArgs.backend,
             choices=["sglang", "openai", "anthropic", "vllm", "tokenspeed"],
@@ -1801,6 +2515,20 @@ class RouterArgs:
                 "DP engines per startup ZMQ worker: each ipc:// worker becomes a "
                 "grouped worker whose handshake awaits this many engines on one "
                 "socket set (vLLM and TokenSpeed; default: 1)"
+            ),
+        )
+        backend_group.add_argument(
+            f"--{prefix}zmq-startup-timeout-secs",
+            type=int,
+            default=RouterArgs.zmq_startup_timeout_secs,
+            help=(
+                "Seconds any one stage of a ZMQ engine's startup handshake (its HELLO, "
+                "its READY, its input registration) may stay silent before the router "
+                "gives the handshake up and binds again. The router did not launch the "
+                "engine and sees nothing from it beside the wire, so this alone must "
+                "cover the engine's whole init between its HELLO and its READY; an "
+                "engine says HELLO once and READY once, so a bound shorter than its "
+                "init strands it (default: 3600)"
             ),
         )
         backend_group.add_argument(
@@ -1822,6 +2550,38 @@ class RouterArgs:
             choices=["memory", "none", "oracle", "postgres", "redis"],
             help="History storage backend for conversations and responses (default: memory)",
         )
+        backend_group.add_argument(
+            f"--{prefix}history-memory-max-responses",
+            type=int,
+            default=RouterArgs.history_memory_max_responses,
+            help=(
+                "Most stored responses the memory history backend keeps; the oldest go"
+                " first, on every write (memory backend only; a stored response takes"
+                " about 12 KB)."
+            ),
+        )
+        backend_group.add_argument(
+            f"--{prefix}history-memory-max-items",
+            type=int,
+            default=RouterArgs.history_memory_max_items,
+            help=(
+                "Most conversation items the memory history backend keeps; the oldest go"
+                " first and leave every conversation that listed them (memory backend"
+                " only; an item takes about 1.5 KB)."
+            ),
+        )
+        backend_group.add_argument(
+            f"--{prefix}history-memory-retention-secs",
+            type=int,
+            default=RouterArgs.history_memory_retention_secs,
+            help=(
+                "How long the memory history backend keeps a record, in seconds, checked"
+                " on every write; 0 keeps a record until a count bound drops it. A"
+                " conversation is kept that long after its last use (created, read or"
+                " updated); a background response still running is not dropped by a"
+                " count bound."
+            ),
+        )
 
         # Oracle configuration
         oracle_group.add_argument(
@@ -1838,12 +2598,14 @@ class RouterArgs:
         )
         oracle_group.add_argument(
             f"--{prefix}oracle-connect-descriptor",
+            f"--{prefix}oracle-dsn",
             type=str,
             default=os.getenv("ATP_DSN"),
             help="Oracle connection descriptor/DSN (full connection string) (env: ATP_DSN)",
         )
         oracle_group.add_argument(
             f"--{prefix}oracle-username",
+            f"--{prefix}oracle-user",
             type=str,
             default=os.getenv("ATP_USER"),
             help="Oracle database username (env: ATP_USER)",
@@ -1851,7 +2613,7 @@ class RouterArgs:
         oracle_group.add_argument(
             f"--{prefix}oracle-password",
             type=str,
-            default=os.getenv("ATP_PASSWORD"),
+            default=None,
             help="Oracle database password (env: ATP_PASSWORD)",
         )
         oracle_group.add_argument(
@@ -1883,25 +2645,62 @@ class RouterArgs:
         postgres_group.add_argument(
             f"--{prefix}postgres-db-url",
             type=str,
-            default=os.getenv("POSTGRES_DB_URL"),
-            help="PostgreSQL database connection URL (env: POSTGRES_DB_URL)",
+            default=None,
+            help=(
+                "PostgreSQL database connection URL (env: SMG_POSTGRES_DB_URL, or the"
+                " older POSTGRES_DB_URL; or a file holding it, --postgres-db-url-file)."
+                " The flag beats the environment; a URL and a URL file together are refused."
+            ),
+        )
+        postgres_group.add_argument(
+            f"--{prefix}postgres-db-url-file",
+            type=str,
+            default=None,
+            help=(
+                "File holding the PostgreSQL connection URL alone, such as a mounted"
+                " secret; the surrounding whitespace is dropped (env:"
+                " SMG_POSTGRES_DB_URL_FILE). Read when the history backend is postgres."
+            ),
         )
         postgres_group.add_argument(
             f"--{prefix}postgres-pool-max",
+            f"--{prefix}postgres-pool-max-size",
             type=int,
             default=int(os.getenv("POSTGRES_POOL_MAX", RouterArgs.postgres_pool_max)),
             help="Maximum PostgreSQL connection pool size (default: 16, env: POSTGRES_POOL_MAX)",
+        )
+        postgres_group.add_argument(
+            f"--{prefix}postgres-op-timeout-secs",
+            type=int,
+            default=int(os.getenv("POSTGRES_OP_TIMEOUT_SECS", RouterArgs.postgres_op_timeout_secs)),
+            help="Bound in seconds on each call to the PostgreSQL store (pool wait, connect and the statement); "
+            "a call past it is answered 503 storage_unavailable (default: 5, env: POSTGRES_OP_TIMEOUT_SECS)",
         )
 
         # Redis configuration
         redis_group.add_argument(
             f"--{prefix}redis-url",
             type=str,
-            default=os.getenv("REDIS_URL"),
-            help="Redis connection URL (env: REDIS_URL)",
+            default=None,
+            help=(
+                "Redis connection URL (env: SMG_REDIS_URL, or the older REDIS_URL; or a"
+                " file holding it, --redis-url-file). The flag beats the environment; a"
+                " URL and a URL file together are refused."
+            ),
+        )
+        redis_group.add_argument(
+            f"--{prefix}redis-url-file",
+            type=str,
+            default=None,
+            help=(
+                "File holding the Redis connection URL alone, such as a mounted secret;"
+                " the surrounding whitespace is dropped (env: SMG_REDIS_URL_FILE). Read"
+                " when the history backend is redis."
+            ),
         )
         redis_group.add_argument(
             f"--{prefix}redis-pool-max",
+            f"--{prefix}redis-pool-max-size",
             type=int,
             default=int(os.getenv("REDIS_POOL_MAX", RouterArgs.redis_pool_max)),
             help="Maximum Redis connection pool size (default: 16, env: REDIS_POOL_MAX)",
@@ -1910,7 +2709,18 @@ class RouterArgs:
             f"--{prefix}redis-retention-days",
             type=int,
             default=int(os.getenv("REDIS_RETENTION_DAYS", RouterArgs.redis_retention_days)),
-            help="Redis data retention in days (-1 for persistent, default: 30, env: REDIS_RETENTION_DAYS)",
+            help=(
+                "Redis data retention in days (at least 1; -1 for persistent, default: 30,"
+                " env: REDIS_RETENTION_DAYS)"
+            ),
+        )
+        redis_group.add_argument(
+            f"--{prefix}redis-op-timeout-secs",
+            type=int,
+            default=int(os.getenv("REDIS_OP_TIMEOUT_SECS", RouterArgs.redis_op_timeout_secs)),
+            help="Bound in seconds on each call to the Redis store (pool wait, connect and the command; replaces the "
+            "client library's 500 ms / 1 s defaults); a call past it is answered 503 storage_unavailable "
+            "(default: 5, env: REDIS_OP_TIMEOUT_SECS)",
         )
 
         # Schema configuration
@@ -1918,7 +2728,9 @@ class RouterArgs:
             f"--{prefix}schema-config",
             type=str,
             default=None,
-            help="Path to a YAML schema config file for storage table/column remapping",
+            help="Path to a YAML schema config file for storage table/column remapping; "
+            "auto_migrate: true in it applies pending schema migrations at start-up "
+            "(the environment variable DB_AUTO_MIGRATE=true does the same without a file)",
         )
 
         # TLS/mTLS configuration
@@ -1980,8 +2792,19 @@ class RouterArgs:
             type=str,
             default=None,
             help=(
-                "The api key used for the authorization with the worker."
-                " Useful when the dp aware scheduling strategy is enabled."
+                "Shared API key the serving routes require and the admin routes fall"
+                " back to; a worker registered without a key of its own is sent it too"
+                " (env: SMG_API_KEY; or a file holding it, --api-key-file). The flag"
+                " beats the environment; a key and a key file together are refused."
+            ),
+        )
+        auth_group.add_argument(
+            f"--{prefix}api-key-file",
+            type=str,
+            default=None,
+            help=(
+                "File holding the shared API key alone, such as a mounted secret; the"
+                " surrounding whitespace is dropped (env: SMG_API_KEY_FILE)."
             ),
         )
         dp_auth_group.add_argument(
@@ -1993,7 +2816,22 @@ class RouterArgs:
             help=(
                 "Per-tenant API keys for serving-path auth (format: tenant_id:key,"
                 " repeatable). Layers on top of --api-key, each resolving to its own"
-                " tenant identity."
+                " tenant identity. Stored responses and conversations are scoped to the"
+                " tenant that created them: another tenant's id answers 404; records"
+                " stored without a tenant identity stay readable by every caller."
+                " Also read from the environment (SMG_TENANT_API_KEYS, entries separated"
+                " by ',' or a newline) or a file (--tenant-api-keys-file); the flag beats"
+                " the environment, and entries together with a file are refused."
+            ),
+        )
+        dp_auth_group.add_argument(
+            f"--{prefix}tenant-api-keys-file",
+            type=str,
+            default=None,
+            help=(
+                "File holding the per-tenant API keys, one tenant_id:key per line (blank"
+                " lines and lines starting with # are skipped), such as a mounted secret"
+                " (env: SMG_TENANT_API_KEYS_FILE)."
             ),
         )
         auth_group.add_argument(
@@ -2040,6 +2878,12 @@ class RouterArgs:
                 "Explicit JWKS URI. If not provided, discovered from issuer"
                 " via .well-known/openid-configuration"
             ),
+        )
+        auth_group.add_argument(
+            f"--{prefix}jwt-role-claim",
+            type=str,
+            default=RouterArgs.jwt_role_claim,
+            help="JWT claim name containing the role",
         )
         auth_group.add_argument(
             f"--{prefix}jwt-role-mapping",
@@ -2120,6 +2964,43 @@ class RouterArgs:
             help="This mesh node's private key (PKCS#8 PEM)",
         )
 
+        # WebRTC
+        webrtc_group = parser.add_argument_group("WebRTC", "WebRTC transport settings")
+        webrtc_group.add_argument(
+            f"--{prefix}webrtc-bind-addr",
+            type=_strict_ip_address,
+            default=RouterArgs.webrtc_bind_addr,
+            help=(
+                "Bind address for WebRTC UDP sockets (client-facing ICE candidate IP)."
+                " Default: the unspecified address of the host's family (:: for an IPv6"
+                " host, 0.0.0.0 otherwise), the candidate IP auto-detected via the routing"
+                " table. Set to 127.0.0.1 (or ::1) for local development on the same machine"
+            ),
+        )
+        webrtc_group.add_argument(
+            f"--{prefix}webrtc-stun-server",
+            type=str,
+            default=RouterArgs.webrtc_stun_server,
+            help=(
+                "STUN server for ICE candidate gathering (host:port). Set to your own STUN"
+                " server for deployments that restrict outbound traffic to external STUN"
+                " servers. Defaults to stun.l.google.com:19302; 'none' disables it"
+            ),
+        )
+
+        # Runtime
+        runtime_group = parser.add_argument_group("Runtime", "The async runtime")
+        runtime_group.add_argument(
+            f"--{prefix}runtime-worker-threads",
+            type=_positive_int,
+            default=RouterArgs.runtime_worker_threads,
+            help=(
+                "Explicit async runtime worker-thread count, at least 1. Leave unset to"
+                " use the runtime's default (the available parallelism, which honors the"
+                " cgroup CPU quota and is therefore container-aware)"
+            ),
+        )
+
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace, use_router_prefix: bool = False) -> RouterArgs:
         """
@@ -2150,12 +3031,9 @@ class RouterArgs:
             ):
                 args_dict[attr.name] = cli_args_dict[attr.name]
 
-            # Special handling for CLI args with dashes vs dataclass fields with underscores
-            # e.g. --tls-cert-path maps to tls_cert_path in args namespace,
-            # but we might want server_cert_path in dataclass
-            # Wait, dataclass fields are server_cert_path/server_key_path
-            # CLI args are tls_cert_path/tls_key_path
-            # We need to manually map them if names don't match
+        # The fields whose option is named differently, or whose value has a
+        # shape, are read below: --tls-cert-path/--tls-key-path onto
+        # server_cert_path/server_key_path, and the parsed lists and maps.
 
         # --disable-worker-overload-protection is the CLI spelling of
         # worker_overload_protection=False; the prefixed form wins, the
@@ -2195,7 +3073,7 @@ class RouterArgs:
         args_dict["router_selector"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}router_selector", None)
         )
-        args_dict["storage_context_headers"] = cls._parse_selector(
+        args_dict["storage_context_headers"] = cls._parse_storage_context_headers(
             cli_args_dict.get(f"{prefix}storage_context_headers", None)
         )
         args_dict["model_aliases"] = cls._parse_model_aliases(
@@ -2216,10 +3094,59 @@ class RouterArgs:
             cli_args_dict.get(f"{prefix}jwt_role_mapping", [])
         )
 
-        # Parse per-tenant data-plane API keys
-        args_dict["tenant_api_keys"] = cls._parse_tenant_api_keys(
-            cli_args_dict.get(f"{prefix}tenant_api_key", [])
-        )
+        # The secrets the environment or a file may give in a flag's place:
+        # the shared key, the per-tenant keys and the store URLs. They are
+        # resolved here, not as parser defaults, since the launcher's --help
+        # prints every default. The flag beats the environment; a value from
+        # either together with a file is refused rather than ranked, as the
+        # Rust CLI refuses it. A store URL file is read for the selected
+        # history backend alone, as its flag is.
+        def file_option(sources: _SecretSources) -> str | None:
+            name = sources.file_flag.lstrip("-").replace("-", "_")
+            value = cli_args_dict.get(f"{prefix}{name}")
+            if value is None and not disable_arg_fallback:
+                value = cli_args_dict.get(name) or None
+            if value is None:
+                value = os.environ.get(sources.file_env)
+            return value
+
+        if args_dict.get("oracle_password") is None:
+            # Not a parser default either: --help would print it.
+            _value_from_environment(args_dict, "oracle_password", "ATP_PASSWORD")
+
+        if args_dict.get("api_key") is None:
+            _value_from_environment(args_dict, "api_key", _API_KEY_SOURCES.env, strip=True)
+        api_key_file = file_option(_API_KEY_SOURCES)
+        if api_key_file is not None:
+            if args_dict.get("api_key") is not None:
+                raise _given_twice(_API_KEY_SOURCES)
+            args_dict["api_key"] = _read_secret_file(api_key_file, _API_KEY_SOURCES.file_flag)
+
+        backend = args_dict.get("history_backend", cls.history_backend)
+        for name, sources, older_env in (
+            ("postgres_db_url", _POSTGRES_DB_URL_SOURCES, "POSTGRES_DB_URL"),
+            ("redis_url", _REDIS_URL_SOURCES, "REDIS_URL"),
+        ):
+            if args_dict.get(name) is None:
+                _value_from_environment(args_dict, name, sources.env, older_env, strip=True)
+            url_file = file_option(sources)
+            if url_file is None or backend != sources.backend:
+                continue
+            if args_dict.get(name) is not None:
+                raise _given_twice(sources)
+            args_dict[name] = _read_secret_file(url_file, sources.file_flag)
+
+        # Parse per-tenant data-plane API keys: the flag's entries, else the
+        # environment's (split at ',' and at line ends), else the file's.
+        tenant_entries = list(cli_args_dict.get(f"{prefix}tenant_api_key") or [])
+        if not tenant_entries:
+            tenant_entries = _entries_from_environment(_TENANT_API_KEYS_SOURCES)
+        tenant_file = file_option(_TENANT_API_KEYS_SOURCES)
+        if tenant_file is not None:
+            if tenant_entries:
+                raise _given_twice(_TENANT_API_KEYS_SOURCES)
+            tenant_entries = _read_entries_file(tenant_file, _TENANT_API_KEYS_SOURCES.file_flag)
+        args_dict["tenant_api_keys"] = cls._parse_tenant_api_keys(tenant_entries)
 
         return cls(**args_dict)
 
@@ -2266,6 +3193,10 @@ class RouterArgs:
 
     @staticmethod
     def _parse_selector(selector_list):
+        """The label selectors' ``key=value`` entries as ``{key: value}``. A
+        token without ``=`` is skipped, as the Rust CLI skips it; one argv
+        item may carry several space-separated pairs, the launcher's own
+        allowance."""
         if not selector_list:
             return {}
 
@@ -2278,6 +3209,28 @@ class RouterArgs:
                     key, value = token.split("=", 1)
                     selector[key] = value
         return selector
+
+    @staticmethod
+    def _parse_storage_context_headers(entries):
+        """``--storage-context-headers`` entries as ``{header name: context
+        key}``, the Rust CLI's orientation. An entry without ``=`` is refused
+        with the Rust CLI's message (it used to be skipped, and the router
+        started with no mapping); as with the selectors, one argv item may
+        carry several space-separated entries, which the Rust CLI reads whole."""
+        if not entries:
+            return {}
+
+        headers = {}
+        for item in entries:
+            for token in item.split():
+                if "=" not in token:
+                    raise ValueError(
+                        f"Invalid value for field 'storage_context_headers': {token}"
+                        " - expected 'header-name=context-key'"
+                    )
+                header, context_key = token.split("=", 1)
+                headers[header] = context_key
+        return headers
 
     @staticmethod
     def _parse_model_aliases(alias_list):
@@ -2384,13 +3337,13 @@ class RouterArgs:
         for key_str in api_keys_list:
             parts = key_str.split(":", 3)  # Split into at most 4 parts
             if len(parts) != 4:
-                raise ValueError(
-                    f"Invalid API key format: '{key_str}'. Expected 'id:name:role:key'"
-                )
+                # The entry is not shown: it carries the credential.
+                raise ValueError("Invalid control-plane API key entry: expected 'id:name:role:key'")
             key_id, name, role, key = parts
             role_lower = role.lower()
             if role_lower not in ("admin", "user"):
-                raise ValueError(f"Invalid role: '{role}'. Must be 'admin' or 'user'")
+                # Nor the role field: with the fields out of order it is the credential.
+                raise ValueError("Invalid control-plane API key role: must be 'admin' or 'user'")
             parsed_keys.append((key_id, name, key, role_lower))
         return parsed_keys
 

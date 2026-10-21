@@ -1,0 +1,162 @@
+name: Release SMG+Engine Docker Image
+
+run-name: >-
+  SMG+${{ inputs.engine || 'all engines' }} |
+  base=${{ inputs.base_image_ref || (inputs.source_build && 'source build') || (github.event_name == 'push' && 'release bases' || 'engine default') }} |
+  engine=${{ inputs.engine_commit || 'latest' }} |
+  smg=${{ github.event_name == 'pull_request' && 'main' || inputs.smg_commit || 'release tag' }} |
+  ${{ github.event_name == 'pull_request' && 'dry-run |' || '' }}
+  by @${{ github.actor }}
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - bindings/python/pyproject.toml
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docker/engine.Dockerfile'
+      - '.github/workflows/_build-engine-image.yml'
+      - '.github/workflows/release-engine-docker.yml'
+      - 'scripts/installation/**'
+  workflow_dispatch:
+    inputs:
+      engine:
+        description: 'Engine'
+        required: true
+        type: choice
+        options: [vllm, sglang, tokenspeed, trtllm]
+      base_image_ref:
+        description: 'Base image (empty = the engine''s first release base in release-engine-docker.yml; for tokenspeed the latest dated nightly carrier)'
+        required: false
+        type: string
+      engine_repo:
+        description: 'Engine repo URL (empty = use engine from base image)'
+        required: false
+        type: string
+      engine_commit:
+        description: 'Engine commit/ref ("latest" for HEAD)'
+        required: false
+        default: 'latest'
+        type: string
+      source_build:
+        description: 'Build the engine from engine_repo at engine_commit instead of pulling a base image (the engines the plan marks source_build; base_image_ref stays empty)'
+        required: false
+        default: false
+        type: boolean
+      smg_repo:
+        description: 'SMG repo URL'
+        required: false
+        default: 'https://github.com/smg-project/smg'
+        type: string
+      smg_commit:
+        description: 'SMG commit/ref ("latest" for HEAD; empty = SMG_RELEASE_TAG in release-engine-docker.yml)'
+        required: false
+        type: string
+      tag:
+        description: 'Override image tag (default <smg version>-<engine>-<engine version>)'
+        required: false
+        type: string
+
+env:
+  # The SMG release the images are built from on a push and on a dispatch that names no commit.
+  # scripts/check_release_versions.py reads and bumps this line.
+  SMG_RELEASE_TAG: v1.13.0
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    name: Plan the builds
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.rows.outputs.include }}
+      smg_commit: ${{ steps.smg.outputs.smg_commit }}
+    steps:
+      - name: One row per image
+        id: rows
+        env:
+          EVENT: ${{ github.event_name }}
+          ENGINE: ${{ inputs.engine }}
+          BASE_IMAGE_REF: ${{ inputs.base_image_ref }}
+          ENGINE_REPO: ${{ inputs.engine_repo }}
+          ENGINE_COMMIT: ${{ inputs.engine_commit || 'latest' }}
+          SOURCE_BUILD: ${{ inputs.source_build }}
+        run: |
+          # The release bases per engine; the first is the engine's default. An empty base means
+          # the latest dated TokenSpeed nightly carrier (resolved by the build). source_build marks
+          # the engines the build can compile from their repository instead of pulling a base; a
+          # source build's row carries the repository and the ref, so the table and this plan are
+          # the only places that decide which engine is built from source.
+          engines='{
+            "vllm": {"release_bases": ["vllm/vllm-openai:v0.31.0", "vllm/vllm-openai:v0.27.1", "vllm/vllm-openai:v0.26.0"]},
+            "sglang": {"release_bases": ["lmsysorg/sglang:v0.5.21"]},
+            "trtllm": {"release_bases": ["nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc24", "nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc23", "nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc22"], "source_build": true},
+            "tokenspeed": {"release_bases": [""]}
+          }'
+          case "${EVENT}" in
+            push)              # every engine, every release base
+              rows=$(jq -c 'to_entries | map(.key as $engine | .value.release_bases[] | {engine: $engine, base_image: .})' <<< "${engines}") ;;
+            pull_request)      # every engine, its default base, as a dry run
+              rows=$(jq -c 'to_entries | map({engine: .key, base_image: .value.release_bases[0]})' <<< "${engines}") ;;
+            workflow_dispatch) # the chosen engine: the given base, its default, or none for a source build
+              if [ "${SOURCE_BUILD}" = "true" ]; then
+                if ! jq -e --arg engine "${ENGINE}" '.[$engine].source_build == true' <<< "${engines}" > /dev/null; then
+                  echo "::error::source_build: ${ENGINE} is not built from source; the plan marks the engines that are"
+                  exit 1
+                fi
+                if [ -z "${ENGINE_REPO}" ]; then
+                  echo "::error::source_build needs engine_repo, the repository to build from"
+                  exit 1
+                fi
+                if [ -n "${BASE_IMAGE_REF}" ]; then
+                  echo "::error::source_build and base_image_ref exclude each other: the build makes the base"
+                  exit 1
+                fi
+                rows=$(jq -c --arg engine "${ENGINE}" --arg repo "${ENGINE_REPO}" --arg ref "${ENGINE_COMMIT}" \
+                  '[{engine: $engine, base_image: "", source_build_repo: $repo, source_build_ref: $ref}]' <<< "${engines}")
+              else
+                rows=$(jq -c --arg engine "${ENGINE}" --arg base "${BASE_IMAGE_REF}" \
+                  '[{engine: $engine, base_image: (if $base == "" then .[$engine].release_bases[0] else $base end)}]' <<< "${engines}")
+              fi ;;
+          esac
+          echo "include=${rows}" >> "$GITHUB_OUTPUT"
+          echo "${rows}" | jq .
+
+      - name: The SMG commit to build
+        id: smg
+        env:
+          EVENT: ${{ github.event_name }}
+          SMG_COMMIT: ${{ inputs.smg_commit }}
+        run: |
+          if [ "${EVENT}" = "pull_request" ]; then
+            smg_commit=main
+          else
+            smg_commit="${SMG_COMMIT:-${SMG_RELEASE_TAG}}"
+          fi
+          echo "smg_commit=${smg_commit}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: plan
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.include) }}
+    uses: ./.github/workflows/_build-engine-image.yml
+    with:
+      engine: ${{ matrix.engine }}
+      base_image_ref: ${{ matrix.base_image }}
+      engine_repo: ${{ inputs.engine_repo }}
+      engine_commit: ${{ inputs.engine_commit || 'latest' }}
+      smg_repo: ${{ inputs.smg_repo || 'https://github.com/smg-project/smg' }}
+      smg_commit: ${{ needs.plan.outputs.smg_commit }}
+      tag: ${{ inputs.tag }}
+      source_build_repo: ${{ matrix.source_build_repo || '' }}
+      source_build_ref: ${{ matrix.source_build_ref || 'latest' }}
+      dry_run: ${{ github.event_name == 'pull_request' }}
+    secrets: inherit

@@ -1,7 +1,7 @@
-"""PD legs and worker-side media (needs vLLM: runs on the vLLM e2e lane).
+"""PD sides and worker-side media (needs vLLM: runs on the vLLM e2e lane).
 
-The prefill leg processes the references once and answers with their
-identity; a regular request answers with none; the decode leg, given that
+The prefill side processes the references once and answers with their
+identity; a regular request answers with none; the decode side, given that
 identity, never touches the media processor.
 """
 
@@ -122,7 +122,7 @@ async def _complete(servicer, request):
 
 
 @pytest.mark.asyncio
-async def test_prefill_leg_answers_with_the_media_identity(monkeypatch):
+async def test_prefill_side_answers_with_the_media_identity(monkeypatch):
     processor = _Processor()
     servicer = _servicer(monkeypatch, processor)
     complete = await _complete(servicer, _request(refs=True, kv=True))
@@ -137,7 +137,7 @@ async def test_prefill_leg_answers_with_the_media_identity(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_regular_leg_answers_with_no_identity(monkeypatch):
+async def test_a_regular_request_answers_with_no_identity(monkeypatch):
     processor = _Processor()
     servicer = _servicer(monkeypatch, processor)
     complete = await _complete(servicer, _request(refs=True, kv=False))
@@ -146,13 +146,13 @@ async def test_regular_leg_answers_with_no_identity(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_decode_leg_from_identity_never_touches_the_processor(monkeypatch):
+async def test_decode_side_from_identity_never_touches_the_processor(monkeypatch):
     processor = _Processor()
     servicer = _servicer(monkeypatch, processor)
     prefill = await _complete(servicer, _request(refs=True, kv=True))
     processor.calls.clear()
     decode = await _complete(servicer, _request(kv=True, identity=prefill.media_identity))
-    assert processor.calls == [], "the decode leg carried identity, not references"
+    assert processor.calls == [], "the decode side carried identity, not references"
     assert not decode.HasField("media_identity")
 
 

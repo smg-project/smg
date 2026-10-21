@@ -5,11 +5,12 @@ These tests focus on testing the router configuration logic in isolation,
 including validation of configuration parameters and their interactions.
 """
 
+import inspect
 from unittest.mock import MagicMock, patch
 
 import pytest
 from smg.launch_router import RouterArgs, launch_router
-from smg.router import policy_from_str
+from smg.router import build_control_plane_auth_config, policy_from_str
 from smg.smg_rs import PolicyType
 from smg.smg_rs import Router as _Router
 
@@ -458,6 +459,44 @@ class TestDiscoveryMapping:
     def test_untagged_mapping_reads_as_kubernetes(self):
         _Router(worker_urls=[], discovery=self.kubernetes_fields())
 
+    def test_file_mapping_is_accepted(self):
+        _Router(
+            worker_urls=[],
+            discovery={"provider": "file", "path": "/run/smg/workers.json"},
+        )
+
+    def test_file_mapping_needs_a_path(self):
+        with pytest.raises(ValueError, match="path"):
+            _Router(worker_urls=[], discovery={"provider": "file"})
+
+    def test_kubernetes_interval_is_accepted_with_service_discovery(self):
+        _Router(
+            worker_urls=[],
+            service_discovery=True,
+            selector={"app": "worker"},
+            discovery_check_interval_secs=15,
+        )
+
+    def test_kubernetes_interval_needs_service_discovery(self):
+        with pytest.raises(ValueError, match="check_interval_secs"):
+            _Router(worker_urls=[], discovery_check_interval_secs=15)
+        with pytest.raises(ValueError, match="check_interval_secs"):
+            _Router(
+                worker_urls=[],
+                discovery={"provider": "file", "path": "/run/smg/workers.json"},
+                discovery_check_interval_secs=15,
+            )
+
+    def test_slurm_mapping_is_accepted(self):
+        _Router(
+            worker_urls=[],
+            discovery={"provider": "slurm", "job_names": ["smg-worker"], "port": 8000},
+        )
+
+    def test_slurm_mapping_needs_a_port(self):
+        with pytest.raises(ValueError, match="port"):
+            _Router(worker_urls=[], discovery={"provider": "slurm", "job_names": ["w"]})
+
     def test_mapping_and_service_discovery_conflict(self):
         with pytest.raises(ValueError, match="not both"):
             _Router(
@@ -471,44 +510,110 @@ class TestDiscoveryMapping:
             _Router(worker_urls=[], discovery={"provider": "zookeeper"})
 
 
-class TestRouterPositionalSignature:
-    """External callers construct ``_Router(...)`` positionally, so the order
-    of its parameters is a public contract: a new parameter is appended after
-    the last positional one and before the keyword-only ``discovery``."""
+def out_of_place(names: list[str]) -> str:
+    """Which name breaks the alphabetical order, and where it belongs."""
+    expected = sorted(names)
+    for i, (seen, wanted) in enumerate(zip(names, expected)):
+        if seen != wanted:
+            before = names[i - 1] if i else "the start"
+            return (
+                f"{wanted} is out of alphabetical order: it belongs after {before}, before {seen}"
+            )
+    return "in order"
+
+
+class TestRouterConstructorSignature:
+    """``_Router`` binds four parameters by position (worker_urls, policy, host,
+    port) and every other one by keyword, with a default, so the prefix's order is
+    the only one a caller can depend on. The keyword-only parameters are kept in
+    alphabetical order: a new parameter goes at its place in the signature, never
+    at the tail, so two additions do not touch the same lines."""
+
+    POSITIONAL_PREFIX = ["worker_urls", "policy", "host", "port"]
 
     @staticmethod
-    def positional_names():
+    def parameters() -> list[inspect.Parameter]:
+        return list(inspect.signature(_Router).parameters.values())
+
+    def test_the_positional_prefix_is_frozen(self):
+        positional = [
+            p.name for p in self.parameters() if p.kind is not inspect.Parameter.KEYWORD_ONLY
+        ]
+        assert positional == self.POSITIONAL_PREFIX
+
+    def test_every_other_parameter_is_keyword_only_with_a_default(self):
+        tail = self.parameters()[len(self.POSITIONAL_PREFIX) :]
+        assert all(p.kind is inspect.Parameter.KEYWORD_ONLY for p in tail)
+        assert all(p.default is not inspect.Parameter.empty for p in tail)
+        with pytest.raises(TypeError):
+            _Router(["http://w:8000"], PolicyType.RoundRobin, "0.0.0.0", 3001, 600)
+
+    def test_the_keyword_only_parameters_are_in_alphabetical_order(self):
+        tail = [p.name for p in self.parameters()[len(self.POSITIONAL_PREFIX) :]]
+        assert tail == sorted(tail), out_of_place(tail)
+
+
+class TestControlPlaneAuthHalfJwt:
+    """An issuer without an audience (or the reverse) is refused, not a silently open control plane."""
+
+    def test_half_jwt_configuration_is_refused(self):
+        with pytest.raises(ValueError, match="jwt-audience"):
+            build_control_plane_auth_config({"jwt_issuer": "https://issuer.example"})
+        with pytest.raises(ValueError, match="jwt-issuer"):
+            build_control_plane_auth_config({"jwt_audience": "aud"})
+        assert build_control_plane_auth_config({}) is None
+
+
+class TestKeywordOnlyParametersOfTheCliFlags:
+    """The parameters behind the CLI's --engine-metrics, --pd-pairing-mode,
+    --runtime-worker-threads, --webrtc-bind-addr and --webrtc-stun-server are
+    keyword-only (no positional slot to keep) with the CLI's defaults, and a value
+    the CLI refuses is refused before anything starts."""
+
+    def test_keyword_only_with_the_cli_defaults(self):
         import inspect
 
-        params = list(inspect.signature(_Router).parameters.values())
-        assert params[-1].name == "discovery"
-        assert params[-1].kind is inspect.Parameter.KEYWORD_ONLY
-        return [p.name for p in params if p.kind is not inspect.Parameter.KEYWORD_ONLY]
+        params = inspect.signature(_Router).parameters
+        for name in (
+            "engine_metrics",
+            "pd_pairing_mode",
+            "runtime_worker_threads",
+            "webrtc_bind_addr",
+            "webrtc_stun_server",
+        ):
+            assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+        assert params["engine_metrics"].default is False
+        assert params["runtime_worker_threads"].default is None
+        assert params["webrtc_bind_addr"].default is None
+        assert params["webrtc_stun_server"].default is None
 
-    def test_appended_parameters_follow_prefill_queue_timeout(self):
-        names = self.positional_names()
-        tail = names[names.index("prefill_queue_timeout_secs") :]
-        assert tail == [
-            "prefill_queue_timeout_secs",
-            "worker_overload_shed",
-            "kv_index",
-            "worker_stall_secs",
-            "worker_wedge_secs",
-            "worker_stale_secs",
-            "worker_warmup_secs",
-            "worker_warmup_share",
-            "worker_warmup_blocks",
-            "worker_warmup_thin_ratio",
-            "worker_warmup_divert_every",
-            "selection_policy",
-            "selection_accounting_ttl_ms",
-            "tenant_api_keys",
-            "priority_scheduler_enabled",
-            "priority_scheduler_default_max_class",
-            "priority_scheduler_config",
-            "priority_scheduler_tenant_metric_top_n",
-            "tenant_rate_limit_enabled",
-            "tenant_rate_limit_config",
-            "jemalloc_prof_dir",
-            "tokenizer_cache_l0_max_memory",
-        ]
+    def test_an_unknown_pairing_mode_is_refused(self):
+        with pytest.raises(ValueError, match="pd_pairing_mode"):
+            _Router(worker_urls=["http://w:8000"], pd_pairing_mode="sideways").start()
+
+    def test_zero_runtime_threads_is_refused(self):
+        with pytest.raises(ValueError, match="runtime_worker_threads"):
+            _Router(worker_urls=["http://w:8000"], runtime_worker_threads=0).start()
+
+    def test_a_bind_address_that_is_not_an_ip_is_refused(self):
+        with pytest.raises(ValueError, match="webrtc_bind_addr"):
+            _Router(worker_urls=["http://w:8000"], webrtc_bind_addr="not-an-ip").start()
+
+
+class TestJwtConfigRoleClaim:
+    """The JWT configuration carries the role claim's name (default roles, as the
+    CLI's --jwt-role-claim); appended last, so positional callers bind as before."""
+
+    def test_default_and_positional_value(self):
+        from smg.smg_rs import PyJwtConfig
+
+        assert PyJwtConfig("https://issuer.example", "aud").role_claim == "roles"
+        assert (
+            PyJwtConfig("https://issuer.example", "aud", None, {}, "groups").role_claim == "groups"
+        )
+
+    def test_build_passes_it_on(self):
+        issuer = {"jwt_issuer": "https://issuer.example", "jwt_audience": "aud"}
+        assert build_control_plane_auth_config(issuer).jwt.role_claim == "roles"
+        auth = build_control_plane_auth_config({**issuer, "jwt_role_claim": "groups"})
+        assert auth.jwt.role_claim == "groups"

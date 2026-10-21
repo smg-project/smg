@@ -37,12 +37,14 @@ mod tests {
 
     /// Build a model dir (optionally named, under the temp root) with the
     /// minimal tokenizer, an optional config (`architectures` and/or
-    /// `model_type`), and an optional shipped Python encoder.
+    /// `model_type`), and an optional shipped Python encoder: a file name
+    /// under `encoding/` (`encoding_dsv4.py` for V4, `encoding.py` for V4.1)
+    /// and its source.
     fn write_model_dir(
         model_name: Option<&str>,
         architectures: Option<&[&str]>,
         model_type: Option<&str>,
-        encoder_source: Option<&str>,
+        encoder: Option<(&str, &str)>,
     ) -> (TempDir, String) {
         let temp = TempDir::new().unwrap();
         let model_dir = match model_name {
@@ -66,10 +68,10 @@ mod tests {
             let body = serde_json::Value::Object(config).to_string();
             fs::write(model_dir.join("config.json"), body).unwrap();
         }
-        if let Some(source) = encoder_source {
+        if let Some((file, source)) = encoder {
             let encoding_dir = model_dir.join("encoding");
             fs::create_dir(&encoding_dir).unwrap();
-            fs::write(encoding_dir.join("encoding_dsv4.py"), source).unwrap();
+            fs::write(encoding_dir.join(file), source).unwrap();
         }
         (temp, tok_path.to_str().unwrap().to_string())
     }
@@ -489,7 +491,7 @@ mod tests {
             Some(model_name),
             Some(&["DeepseekV4ForCausalLM"]),
             None,
-            encoder_source,
+            encoder_source.map(|source| ("encoding_dsv4.py", source)),
         )
     }
 
@@ -591,8 +593,26 @@ mod tests {
 
     const V41_BOS: &str = "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}>";
     const V41_EOS: &str = "<\u{FF5C}end\u{2581}of\u{2581}sentence\u{FF5C}>";
-    /// The system header carrying the default budget (thinking mode only).
-    const V41_DEFAULT_EFFORT_HEADER: &str = "<\u{FF5C}System\u{FF5C}>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+    /// The system header carrying the default budget (thinking mode only):
+    /// `high` of the checkpoint's current effort table, 75.
+    const V41_DEFAULT_EFFORT_HEADER: &str = "<\u{FF5C}System\u{FF5C}>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
+    /// The `REASONING_EFFORT_MAPPINGS` block of the checkpoint's first
+    /// published `encoding/encoding.py`, and the block of the refresh that
+    /// followed it (the chat template the checkpoint added later carries the
+    /// refreshed numbers).
+    const V41_ORIGINAL_ENCODER_SNIPPET: &str = r#"REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
+    "low": 25,
+    "high": 50,
+    "xhigh": 75,
+    "max": 100,
+}
+DEFAULT_REASONING_EFFORT = "high""#;
+    const V41_RESCALED_ENCODER_SNIPPET: &str = r#"REASONING_EFFORT_MAPPINGS: Dict[str, int] = {
+    "low": 50,
+    "high": 75,
+    "max": 100,
+}
+DEFAULT_REASONING_EFFORT = "high""#;
     /// Tail of a single-user-turn prompt in thinking mode.
     const V41_THINKING_TAIL: &str = "<\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}><think>";
     /// Tail of a single-user-turn prompt in chat mode.
@@ -602,6 +622,17 @@ mod tests {
         let (tmp, tok) = write_dir(Some(&["DeepseekV41ForCausalLM"]));
         let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
         (tmp, tokenizer)
+    }
+
+    /// A V4.1 model dir with the checkpoint's `encoding/encoding.py` when a
+    /// source is given.
+    fn write_v41_model_dir(encoder_source: Option<&str>) -> (TempDir, String) {
+        write_model_dir(
+            None,
+            Some(&["DeepseekV41ForCausalLM"]),
+            None,
+            encoder_source.map(|source| ("encoding.py", source)),
+        )
     }
 
     /// Render the single user turn `q` with a generation prompt.
@@ -641,7 +672,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            out.starts_with("<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}System\u{FF5C}>Reasoning Effort: 50 (range"),
+            out.starts_with("<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}System\u{FF5C}>Reasoning Effort: 75 (range"),
             "{out}"
         );
         assert!(
@@ -671,6 +702,41 @@ mod tests {
             out,
             format!("{V41_BOS}{V41_DEFAULT_EFFORT_HEADER}{V41_THINKING_TAIL}")
         );
+    }
+
+    #[test]
+    fn v41_shipped_encoder_selects_the_effort_table() {
+        // The checkpoint's own encoder decides the budgets: its first
+        // published table, the rescaled one, and, without an encoder (a
+        // tokenizer directory streamed from a worker carries none), the
+        // rescaled table the checkpoint carries today. `xhigh` stays a
+        // native word of the renderer and renders `high`'s budget where the
+        // table has none of its own.
+        let original = [("low", 25), ("high", 50), ("xhigh", 75), ("max", 100)];
+        let rescaled = [("low", 50), ("high", 75), ("xhigh", 75), ("max", 100)];
+        for (encoder, expected) in [
+            (Some(V41_ORIGINAL_ENCODER_SNIPPET), original),
+            (Some(V41_RESCALED_ENCODER_SNIPPET), rescaled),
+            (None, rescaled),
+        ] {
+            let (_tmp, tok) = write_v41_model_dir(encoder);
+            let tokenizer = HuggingFaceTokenizer::from_file(&tok).unwrap();
+            for (effort, budget) in expected {
+                let kw = HashMap::from([("reasoning_effort".to_string(), json!(effort))]);
+                let out = render_v41_turn(&tokenizer, Some(&kw), None).unwrap();
+                assert!(
+                    out.contains(&format!("Reasoning Effort: {budget} (range")),
+                    "{encoder:?} {effort}: {out}"
+                );
+            }
+            // No effort given: `high`'s budget.
+            let out = render_v41_turn(&tokenizer, None, None).unwrap();
+            let (_, high) = expected[1];
+            assert!(
+                out.contains(&format!("Reasoning Effort: {high} (range")),
+                "{encoder:?} default: {out}"
+            );
+        }
     }
 
     #[test]
@@ -758,7 +824,7 @@ mod tests {
         ]);
         let out = render_v41_turn(&tokenizer, Some(&kw), None).unwrap();
         assert!(out.ends_with(V41_THINKING_TAIL), "{out}");
-        assert!(out.contains("Reasoning Effort: 50 (range"), "{out}");
+        assert!(out.contains("Reasoning Effort: 75 (range"), "{out}");
     }
 
     #[test]
@@ -782,7 +848,7 @@ mod tests {
         ]);
         let out = render_v41_turn(&tokenizer, Some(&kw), None).unwrap();
         assert!(out.ends_with(V41_THINKING_TAIL), "{out}");
-        assert!(out.contains("Reasoning Effort: 50 (range"), "{out}");
+        assert!(out.contains("Reasoning Effort: 75 (range"), "{out}");
     }
 
     #[test]
@@ -816,13 +882,23 @@ mod tests {
         );
     }
 
+    /// Template replacement keeps native capabilities and media preprocessing intact.
     #[test]
     fn v41_reports_its_renderer_capabilities() {
-        let (_tmp, tokenizer) = v41_tokenizer();
+        let (_tmp, mut tokenizer) = v41_tokenizer();
         let caps = tokenizer.renderer_capabilities();
         assert!(caps.enable_thinking_alias, "{caps:?}");
         assert!(caps.native_assistant_continuation, "{caps:?}");
         assert!(caps.raw_tool_call_arguments, "{caps:?}");
+        assert_eq!(
+            caps.media_handling,
+            llm_tokenizer::traits::MediaHandling::Preprocess
+        );
+        // Replacing a Jinja template must not override the native renderer's profile.
+        tokenizer
+            .set_chat_template(include_str!("fixtures/glm53/chat_template.jinja").into())
+            .unwrap();
+        assert_eq!(tokenizer.renderer_capabilities(), caps);
     }
 
     #[test]
@@ -1012,7 +1088,7 @@ mod tests {
         // `add_generation_prompt: false` continues the final message.
         assert_eq!(
             out,
-            "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}System\u{FF5C}>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}><think>r</think>Sure,"
+            "<\u{FF5C}begin\u{2581}of\u{2581}sentence\u{FF5C}><\u{FF5C}System\u{FF5C}>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<\u{FF5C}User\u{FF5C}>q<\u{FF5C}Assistant\u{FF5C}><think>r</think>Sure,"
         );
     }
 

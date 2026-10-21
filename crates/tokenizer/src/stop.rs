@@ -89,6 +89,44 @@ impl StopSequenceDecoder {
         config: StopSequenceConfig,
         skip_special_tokens: bool,
     ) -> Self {
+        Self::with_sequence(
+            Sequence::new_with_options(tokenizer, skip_special_tokens),
+            config,
+        )
+    }
+
+    /// Observe stops at their generated-token position on the engine side.
+    /// Client text uses `new`, which buffers byte runs for exact batch parity.
+    pub fn for_stop_matching(
+        tokenizer: Arc<dyn traits::Tokenizer>,
+        config: StopSequenceConfig,
+        skip_special_tokens: bool,
+    ) -> Self {
+        Self::with_sequence(
+            Sequence::for_stop_matching(tokenizer, skip_special_tokens),
+            config,
+        )
+    }
+
+    /// Whether this decoder omits special tokens from text.
+    pub fn skip_special_tokens(&self) -> bool {
+        self.sequence.skip_special_tokens()
+    }
+
+    /// How many decode steps of this stream found the decoder had rewritten
+    /// text already emitted and streamed a best-effort remainder instead.
+    pub fn prefix_mismatches(&self) -> u32 {
+        self.sequence.prefix_mismatches()
+    }
+
+    /// Tokens the incremental decoder currently holds in its window (the
+    /// emitted prefix's tokens and the pending ones); a test of its bound.
+    #[doc(hidden)]
+    pub fn sequence_window_len(&self) -> usize {
+        self.sequence.token_ids().len()
+    }
+
+    fn with_sequence(sequence: Sequence, config: StopSequenceConfig) -> Self {
         // Build Aho-Corasick automaton from all stop sequences
         // Hidden sequences come first, then visible sequences
         let mut patterns: Vec<&str> = config
@@ -121,7 +159,7 @@ impl StopSequenceDecoder {
         let token_only = aho_corasick.is_none();
 
         StopSequenceDecoder {
-            sequence: Sequence::new_with_options(tokenizer, skip_special_tokens),
+            sequence,
             config,
             aho_corasick,
             visible_boundary_idx,
@@ -178,41 +216,60 @@ impl StopSequenceDecoder {
             return Ok(SequenceDecoderOutput::Stopped);
         }
 
-        // Check for token-level stops first
-        if self.config.stop_tokens.contains(&token_id) {
-            self.stopped = true;
-
-            // Flush any jailed text before stopping - use mem::take to avoid clone
-            if !self.jail_buffer.is_empty() {
-                return Ok(SequenceDecoderOutput::StoppedWithText(std::mem::take(
-                    &mut self.jail_buffer,
-                )));
-            }
-            return Ok(SequenceDecoderOutput::Stopped);
+        let hidden_stop = self.config.stop_tokens.contains(&token_id);
+        let visible_stop = self.config.visible_stop_tokens.contains(&token_id);
+        if self.token_only && !hidden_stop && !visible_stop {
+            // The common path: no string stops and not a stop token, so the
+            // decoded text goes out as it is, with no jail to run.
+            let new_text = self.sequence.append_token(token_id)?;
+            return Ok(if new_text.is_empty() {
+                SequenceDecoderOutput::Held
+            } else {
+                SequenceDecoderOutput::Text(new_text)
+            });
         }
-
-        if self.config.visible_stop_tokens.contains(&token_id) {
+        if hidden_stop || visible_stop {
+            // A stop token closes the byte run before it; it must not discard
+            // pending text, and a string stop within that text takes precedence.
+            let pending = self.sequence.finish()?;
+            let tail = self.process_decoded_text(pending);
+            if self.stopped {
+                return Ok(tail);
+            }
+            let mut output = match tail {
+                SequenceDecoderOutput::Text(text) => text,
+                _ => String::new(),
+            };
+            output.push_str(&std::mem::take(&mut self.jail_buffer));
             self.stopped = true;
-
-            // Include jailed text plus the stop token
-            let stop_text = self
-                .sequence
-                .tokenizer()
-                .decode(&[token_id], self.sequence.skip_special_tokens())?;
-            let output = format!("{}{}", self.jail_buffer, stop_text);
-            self.jail_buffer.clear();
-            return Ok(SequenceDecoderOutput::StoppedWithText(output));
+            if visible_stop && !hidden_stop {
+                output.push_str(
+                    &self
+                        .sequence
+                        .tokenizer()
+                        .decode(&[token_id], self.sequence.skip_special_tokens())?,
+                );
+            }
+            return Ok(if output.is_empty() && hidden_stop {
+                SequenceDecoderOutput::Stopped
+            } else {
+                SequenceDecoderOutput::StoppedWithText(output)
+            });
         }
 
         // Use Sequence for incremental decoding
         let new_text = self.sequence.append_token(token_id)?;
+        Ok(self.process_decoded_text(new_text))
+    }
 
+    #[inline]
+    fn process_decoded_text(&mut self, new_text: String) -> SequenceDecoderOutput {
         // Token-only fast path: no string stops means no jail is needed.
         if self.token_only {
             if new_text.is_empty() {
-                return Ok(SequenceDecoderOutput::Held);
+                return SequenceDecoderOutput::Held;
             }
-            return Ok(SequenceDecoderOutput::Text(new_text));
+            return SequenceDecoderOutput::Text(new_text);
         }
 
         self.jail_buffer.push_str(&new_text);
@@ -230,16 +287,16 @@ impl StopSequenceDecoder {
                     // Visible stop sequence: include it in output
                     let output = self.jail_buffer[..mat.end()].to_string();
                     self.jail_buffer.clear();
-                    return Ok(SequenceDecoderOutput::StoppedWithText(output));
+                    return SequenceDecoderOutput::StoppedWithText(output);
                 } else {
                     // Hidden stop sequence: exclude it from output
                     let output = self.jail_buffer[..mat.start()].to_string();
                     self.jail_buffer.clear();
-                    return Ok(if output.is_empty() {
+                    return if output.is_empty() {
                         SequenceDecoderOutput::Stopped
                     } else {
                         SequenceDecoderOutput::StoppedWithText(output)
-                    });
+                    };
                 }
             }
         }
@@ -251,11 +308,11 @@ impl StopSequenceDecoder {
         if drain_to > 0 {
             let suffix = self.jail_buffer.split_off(drain_to);
             let to_output = std::mem::replace(&mut self.jail_buffer, suffix);
-            return Ok(SequenceDecoderOutput::Text(to_output));
+            return SequenceDecoderOutput::Text(to_output);
         }
 
         // The whole buffer is a partial stop sequence — hold it.
-        Ok(SequenceDecoderOutput::Held)
+        SequenceDecoderOutput::Held
     }
 
     /// Process multiple tokens.
@@ -288,6 +345,24 @@ impl StopSequenceDecoder {
             // Use mem::take to avoid clone - transfers ownership and leaves empty string
             SequenceDecoderOutput::Text(std::mem::take(&mut self.jail_buffer))
         }
+    }
+
+    /// Finish token decoding, enforce stops on its tail, then release held text.
+    pub fn finish(&mut self) -> Result<SequenceDecoderOutput> {
+        if self.stopped {
+            return Ok(SequenceDecoderOutput::Held);
+        }
+        let pending = self.sequence.finish()?;
+        Ok(match self.process_decoded_text(pending) {
+            SequenceDecoderOutput::Text(mut text) => {
+                if let SequenceDecoderOutput::Text(tail) = self.flush() {
+                    text.push_str(&tail);
+                }
+                SequenceDecoderOutput::Text(text)
+            }
+            SequenceDecoderOutput::Held => self.flush(),
+            stopped => stopped,
+        })
     }
 
     /// Check if decoding has stopped

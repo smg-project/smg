@@ -30,7 +30,9 @@ use std::{
 
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughput};
 use engine_servicer::{
-    kv_events::{KvEventRelay, RelayConfig, DEFAULT_HISTORY_BATCHES, DEFAULT_HISTORY_BYTES},
+    kv_events::{
+        KvEventRelay, RankSource, RelayConfig, DEFAULT_HISTORY_BATCHES, DEFAULT_HISTORY_BYTES,
+    },
     kv_history::History,
     kv_state::LiveState,
     kv_wire::{Normalizer, WireBatch},
@@ -217,8 +219,11 @@ fn relay_over_zmq() {
             .expect("publisher binds")
             .to_string();
         let relay = KvEventRelay::new(RelayConfig {
-            endpoint,
-            replay_endpoint: None,
+            sources: vec![RankSource {
+                rank: 0,
+                endpoint,
+                replay_endpoint: None,
+            }],
             topic: "kv".to_string(),
             history_batches: DEFAULT_HISTORY_BATCHES,
             history_bytes: DEFAULT_HISTORY_BYTES,

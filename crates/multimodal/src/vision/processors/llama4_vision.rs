@@ -277,29 +277,14 @@ impl Llama4VisionProcessor {
         let bias: [f32; 3] = std::array::from_fn(|c| -(self.mean[c] as f32) / (self.std[c] as f32));
 
         let mut data = vec![0.0f32; 3 * canvas_pixels];
-        let (r_plane, rest) = data.split_at_mut(canvas_pixels);
-        let (g_plane, b_plane) = rest.split_at_mut(canvas_pixels);
-
-        // Pre-fill with normalized black: 0 * scale + bias = bias
-        r_plane.fill(bias[0]);
-        g_plane.fill(bias[1]);
-        b_plane.fill(bias[2]);
-
-        // Overwrite image region row-by-row using the shared block-optimized helper
-        let rw = img_w.min(canvas_w);
-        let rh = img_h.min(canvas_h);
-        for y in 0..rh {
-            let src_row = &raw[y * img_w * 3..y * img_w * 3 + rw * 3];
-            let dst_offset = y * canvas_w;
-            transforms::deinterleave_rgb_to_planes(
-                src_row,
-                &mut r_plane[dst_offset..dst_offset + rw],
-                &mut g_plane[dst_offset..dst_offset + rw],
-                &mut b_plane[dst_offset..dst_offset + rw],
-                scale,
-                bias,
-            );
-        }
+        transforms::paint_rgb_onto_planes(
+            &raw,
+            (img_w, img_h),
+            (canvas_w, canvas_h),
+            scale,
+            bias,
+            &mut data,
+        );
 
         #[expect(
             clippy::expect_used,
@@ -432,10 +417,7 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
-            return Err(TransformError::InvalidShape {
-                expected: "non-empty image batch".to_string(),
-                actual: vec![0],
-            });
+            return Err(TransformError::EmptyBatch);
         }
 
         let owned_processor;
@@ -470,7 +452,7 @@ impl VisionPreProcessor for Llama4VisionProcessor {
 
         // Concatenate all tiles from all images into a single 4D tensor
         // [total_tiles, C, H, W] — no batch dimension, no zero-padding.
-        // This matches what sglang and vLLM vision models expect.
+        // This matches what the serving engines' vision models expect.
         let encoder_input = if all_outputs.len() == 1 {
             all_outputs.remove(0)
         } else {
@@ -509,7 +491,12 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         })
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
         let processor = Self::from_preprocessor_config(config);
         let image_size = (height, width);
         // target_size from get_best_fit determines the canvas and tile count
@@ -519,7 +506,7 @@ impl VisionPreProcessor for Llama4VisionProcessor {
         let num_tiles_h = target_size.0 as usize / tile;
         let num_tiles_w = target_size.1 as usize / tile;
 
-        processor.calculate_num_tokens_for_aspect_ratio((num_tiles_h, num_tiles_w))
+        Ok(processor.calculate_num_tokens_for_aspect_ratio((num_tiles_h, num_tiles_w)))
     }
 
     fn model_name(&self) -> &'static str {
@@ -723,5 +710,12 @@ mod tests {
             processor.calculate_num_tokens_for_aspect_ratio((1, 2)),
             1728
         );
+    }
+
+    #[test]
+    fn an_empty_batch_is_refused_as_empty_batch() {
+        let processor = Llama4VisionProcessor::new();
+        let result = processor.preprocess(&[], &PreProcessorConfig::default());
+        assert!(matches!(result, Err(TransformError::EmptyBatch)));
     }
 }

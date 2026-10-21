@@ -457,10 +457,7 @@ impl VisionPreProcessor for Phi4VisionProcessor {
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
-            return Err(TransformError::InvalidShape {
-                expected: "non-empty image batch".to_string(),
-                actual: vec![0],
-            });
+            return Err(TransformError::EmptyBatch);
         }
 
         let processor = if config.dynamic_hd.is_some() || config.image_mean.is_some() {
@@ -551,7 +548,12 @@ impl VisionPreProcessor for Phi4VisionProcessor {
         })
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
         let processor = Self::from_preprocessor_config(config);
         let base_res = processor.base_resolution as f64;
 
@@ -572,7 +574,7 @@ impl VisionPreProcessor for Phi4VisionProcessor {
         let mask_area = target_h_crops * target_w_crops * half_res * half_res;
         let mask_col0 = target_h_crops * half_res;
 
-        256 + 1 + mask_area + mask_col0 + 16
+        Ok(256 + 1 + mask_area + mask_col0 + 16)
     }
 
     fn model_name(&self) -> &'static str {
@@ -736,5 +738,12 @@ mod tests {
 
         // Phi4 default dynamic_hd is 36 (vs 16 num_crops in Phi3)
         assert_eq!(processor.dynamic_hd(), 36);
+    }
+
+    #[test]
+    fn an_empty_batch_is_refused_as_empty_batch() {
+        let processor = Phi4VisionProcessor::new();
+        let result = processor.preprocess(&[], &PreProcessorConfig::default());
+        assert!(matches!(result, Err(TransformError::EmptyBatch)));
     }
 }

@@ -1,9 +1,12 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use openai_protocol::{
     model_card::ModelCard,
-    worker::{HealthCheckConfig, OverloadUpdate, WorkerModels, WorkerSpec, WorkerStatus},
+    worker::{
+        ConstrainedDecoding, HealthCheckConfig, OverloadUpdate, WorkerModels, WorkerSpec,
+        WorkerStatus,
+    },
 };
 use tokio::sync::mpsc;
 
@@ -18,8 +21,8 @@ use super::{
     },
 };
 use crate::{
-    observability::metrics::Metrics, routers::grpc::backend_client::BackendClient,
-    worker::pd_pairing::PdPairing,
+    config::types::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS, observability::metrics::Metrics,
+    routers::grpc::backend_client::BackendClient, worker::pd_pairing::PdPairing,
 };
 
 /// Builder for creating BasicWorker instances with fluent API.
@@ -32,6 +35,14 @@ pub struct BasicWorkerBuilder {
     /// If not set, falls back to `HealthCheckConfig::default()`.
     health_config: Option<HealthCheckConfig>,
     health_endpoint: String,
+    /// The per-stage silence bound of a ZMQ engine's startup handshake; the
+    /// router config's default when not set.
+    zmq_startup_timeout: Option<Duration>,
+    /// The bound on a request over the worker's ZMQ link, from its dispatch
+    /// to its last message (the worker's own `http_pool.timeout_secs`, else
+    /// the router config's `request_timeout_secs`, as the registration step
+    /// resolves it); the link's streams are unbounded when not set.
+    zmq_request_timeout: Option<Duration>,
     circuit_breaker_config: CircuitBreakerConfig,
     backend_client: Option<BackendClient>,
     /// Pre-built worker-directed HTTP client (if not set, a default is created).
@@ -51,32 +62,27 @@ pub struct BasicWorkerBuilder {
     /// against. Default empty: a spec block alone still enables protection
     /// for this worker.
     overload_defaults: OverloadThresholds,
+    /// The labels discovery read from the engine, recorded on the worker so a
+    /// later refresh replaces exactly these; empty when none were discovered.
+    discovered_labels: HashMap<String, String>,
 }
 
 impl BasicWorkerBuilder {
     /// Create a new builder with only the URL (uses default WorkerSpec)
     pub fn new(url: impl Into<String>) -> Self {
-        Self {
-            spec: WorkerSpec::new(url),
-            health_config: None,
-            health_endpoint: "/health".to_string(),
-            circuit_breaker_config: CircuitBreakerConfig::default(),
-            backend_client: None,
-            http_client: None,
-            http2: false,
-            resilience: None,
-            initial_status: None,
-            connect_signal_tx: None,
-            overload_defaults: OverloadThresholds::default(),
-        }
+        Self::from_spec(WorkerSpec::new(url))
     }
 
-    /// Create a builder from an existing WorkerSpec.
+    /// Create a builder from an existing WorkerSpec, every other field at its default: no health
+    /// config and `/health` as the endpoint, the default circuit breaker and overload thresholds,
+    /// no clients, HTTP/1, no resilience, no initial status, no connect signal.
     pub fn from_spec(spec: WorkerSpec) -> Self {
         Self {
             spec,
             health_config: None,
             health_endpoint: "/health".to_string(),
+            zmq_startup_timeout: None,
+            zmq_request_timeout: None,
             circuit_breaker_config: CircuitBreakerConfig::default(),
             backend_client: None,
             http_client: None,
@@ -85,25 +91,7 @@ impl BasicWorkerBuilder {
             initial_status: None,
             connect_signal_tx: None,
             overload_defaults: OverloadThresholds::default(),
-        }
-    }
-
-    /// Create a new builder with URL and worker type (for backwards compatibility)
-    pub fn new_with_type(url: impl Into<String>, worker_type: WorkerType) -> Self {
-        let mut spec = WorkerSpec::new(url);
-        spec.worker_type = worker_type;
-        Self {
-            spec,
-            health_config: None,
-            health_endpoint: "/health".to_string(),
-            circuit_breaker_config: CircuitBreakerConfig::default(),
-            backend_client: None,
-            http_client: None,
-            http2: false,
-            resilience: None,
-            initial_status: None,
-            connect_signal_tx: None,
-            overload_defaults: OverloadThresholds::default(),
+            discovered_labels: HashMap::new(),
         }
     }
 
@@ -150,6 +138,14 @@ impl BasicWorkerBuilder {
         self
     }
 
+    /// Record the labels discovery read from the engine for this worker
+    /// (before the operator's labels were merged over them). A later refresh
+    /// replaces exactly these; `labels` stays the merged set the worker shows.
+    pub fn discovered_labels(mut self, labels: HashMap<String, String>) -> Self {
+        self.discovered_labels = labels;
+        self
+    }
+
     /// Add a single label
     pub fn label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.spec.labels.insert(key.into(), value.into());
@@ -181,6 +177,26 @@ impl BasicWorkerBuilder {
     /// Set health check endpoint path (internal-only, from router config).
     pub fn health_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.health_endpoint = endpoint.into();
+        self
+    }
+
+    /// Set the longest any one stage of a ZMQ engine's startup handshake may
+    /// stay silent (internal-only, from router config): it alone covers the
+    /// engine's init between its HELLO and its READY.
+    pub fn zmq_startup_timeout(mut self, timeout: Duration) -> Self {
+        self.zmq_startup_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the bound on a request over the worker's ZMQ link, from its
+    /// dispatch to its last message (internal-only: the registration step
+    /// resolves it as the HTTP worker client resolves its per-request
+    /// timeout, the worker's own `http_pool.timeout_secs` else the router's
+    /// `--request-timeout-secs`): a stream the engine leaves silent ends at
+    /// it with the gateway's timeout and the engine request is aborted. Unset
+    /// leaves the link's streams open for as long as the client reads them.
+    pub fn zmq_request_timeout(mut self, timeout: Duration) -> Self {
+        self.zmq_request_timeout = Some(timeout);
         self
     }
 
@@ -255,6 +271,14 @@ impl BasicWorkerBuilder {
         self
     }
 
+    /// Set when the gateway hands this worker's engine a grammar: on every turn,
+    /// or only when the request asks ([`ConstrainedDecoding`]). Unset, the
+    /// worker's `constrained_decoding` label decides.
+    pub fn constrained_decoding(mut self, policy: ConstrainedDecoding) -> Self {
+        self.spec.constrained_decoding = Some(policy);
+        self
+    }
+
     /// Set worker priority (higher value = higher priority)
     pub fn priority(mut self, priority: u32) -> Self {
         self.spec.priority = priority;
@@ -326,7 +350,12 @@ impl BasicWorkerBuilder {
             spec: Arc::new(self.spec),
             health_config,
             health_endpoint: self.health_endpoint,
+            zmq_startup_timeout: self
+                .zmq_startup_timeout
+                .unwrap_or(Duration::from_secs(DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS)),
+            zmq_request_timeout: self.zmq_request_timeout,
             http2: self.http2,
+            discovered_labels: Arc::new(self.discovered_labels),
         };
 
         // OnceCell for lock-free client access after initialization; ArcSwap so
@@ -431,6 +460,29 @@ mod tests {
     use super::*;
     use crate::worker::worker::Worker;
 
+    /// `new(url)` is `from_spec` of the default spec for `url`: the two constructors give the same
+    /// worker, every default written once.
+    #[test]
+    fn a_builder_from_a_url_is_the_builder_from_its_default_spec() {
+        let from_url = BasicWorkerBuilder::new("http://w:1").build();
+        let from_spec = BasicWorkerBuilder::from_spec(WorkerSpec::new("http://w:1")).build();
+        assert_eq!(
+            format!("{:?}", from_url.metadata().spec),
+            format!("{:?}", from_spec.metadata().spec)
+        );
+        assert_eq!(
+            format!("{:?}", from_url.metadata().health_config),
+            format!("{:?}", from_spec.metadata().health_config)
+        );
+        assert_eq!(from_url.metadata().health_endpoint, "/health");
+        assert_eq!(
+            from_url.metadata().health_endpoint,
+            from_spec.metadata().health_endpoint
+        );
+        assert_eq!(from_url.worker_type(), from_spec.worker_type());
+        assert_eq!(from_url.is_healthy(), from_spec.is_healthy());
+    }
+
     #[test]
     fn zmq_engine_group_sets_size_without_rank_or_url_rewrite() {
         // A grouped ZMQ worker is one worker awaiting N engines: dp_size set,
@@ -471,7 +523,7 @@ mod tests {
     #[test]
     fn provided_http_client_is_used_as_is() {
         let worker = BasicWorkerBuilder::new("http://localhost:8080")
-            .http_client(Arc::new(reqwest::Client::new()))
+            .http_client(Arc::new(crate::clients::http_client()))
             .build();
         assert!(!worker.http_client.cell_is_empty());
     }
@@ -526,6 +578,24 @@ mod tests {
             worker.metadata().spec.zmq_handshake_address.as_deref(),
             Some("tcp://127.0.0.1:30500")
         );
+    }
+
+    /// The connect driver reads the request bound from the built worker's
+    /// metadata; a builder that sets none leaves the link's streams unbounded.
+    #[test]
+    fn zmq_request_timeout_reaches_the_built_metadata() {
+        let bounded = BasicWorkerBuilder::new("ipc:///tmp/w.ipc")
+            .connection_mode(ConnectionMode::Zmq)
+            .zmq_request_timeout(Duration::from_secs(90))
+            .build();
+        assert_eq!(
+            bounded.metadata().zmq_request_timeout,
+            Some(Duration::from_secs(90))
+        );
+        let unbounded = BasicWorkerBuilder::new("ipc:///tmp/w2.ipc")
+            .connection_mode(ConnectionMode::Zmq)
+            .build();
+        assert_eq!(unbounded.metadata().zmq_request_timeout, None);
     }
 
     #[test]

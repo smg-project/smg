@@ -14,18 +14,16 @@ mod common;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
-use openai_protocol::{
-    completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
+use common::grpc_harness::{
+    build_grpc_router, grpc_router_config, grpc_worker, serve_canned_worker, Canned,
 };
+use openai_protocol::{completion::CompletionRequest, model_card::ModelCard};
 use smg::{
-    config::{RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
-    routers::{common::pd_admission, RouterFactory, RouterTrait},
+    routers::{common::pd_admission, RouterTrait},
     tenant::TenantKey,
-    worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    worker::{RuntimeType, WorkerType},
 };
-use tokio::net::TcpListener;
 
 const MODEL: &str = "pd-admission-test-model";
 /// How long the canned mock holds each request before answering, so that a
@@ -34,51 +32,19 @@ const HOLD: Duration = Duration::from_secs(2);
 /// Head start the first request gets before the second is sent.
 const HEAD_START: Duration = Duration::from_millis(200);
 
-#[expect(
-    clippy::disallowed_methods,
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional; the spawned \
-              mock server task is fire-and-forget for the test process's lifetime"
-)]
+/// The canned mock worker: it holds each request for `HOLD`.
 async fn start_mock_grpc_worker() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock gRPC worker");
-    let port = listener
-        .local_addr()
-        .expect("mock gRPC worker address")
-        .port();
-    let cfg = Arc::new(mock_worker::config::Config {
-        admin_port: None,
-        context_length: 32768,
-        host: "127.0.0.1".to_string(),
-        http_base_port: 0,
-        http_count: 0,
-        grpc_base_port: port,
-        grpc_count: 1,
-        zmq_handshake: None,
-        zmq_count: 0,
-        zmq_start_index: 0,
-        model_id: MODEL.to_string(),
-        tokenizer_path: MODEL.to_string(),
+    serve_canned_worker(Canned {
+        model: MODEL,
         gen_delay: HOLD,
         output_tokens: 3,
-        realistic: false,
-        engine: mock_worker::engine::EngineParams::default(),
-        ..mock_worker::config::Config::default()
-    });
-    tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
-    port
+    })
+    .await
 }
 
 /// A PD gRPC router over one mock prefill and one mock decode worker, the
 /// decode carrying `decode_labels` as discovery would have set them, with a
 /// zero admission wait so a full window sheds at once.
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    reason = "test helper - panicking on failure is intentional"
-)]
 async fn build_pd_router(
     prefill_port: u16,
     decode_port: u16,
@@ -87,58 +53,30 @@ async fn build_pd_router(
     // The test context skips the start-up path that latches the config's
     // wait, so latch it here: a full window answers at once.
     pd_admission::set_pd_admission_wait_secs(0);
-    let mut config = RouterConfig::builder()
-        .mode(RoutingMode::PrefillDecode {
-            prefill_urls: vec![],
-            decode_urls: vec![],
-            prefill_policy: None,
-            decode_policy: None,
-        })
-        .grpc_connection()
+    let config = grpc_router_config()
+        .prefill_decode_mode(vec![], vec![])
         .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(1024 * 1024)
         .pd_admission_wait_secs(0)
         .build_unchecked();
-    config.health_check.disable_health_check = true;
-
-    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-    tokenizer_registry
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .unwrap();
-    let app_context =
-        common::create_test_context_with_tokenizer_registry(config, tokenizer_registry).await;
-    for (port, worker_type, labels) in [
-        (prefill_port, WorkerType::Prefill, HashMap::new()),
-        (decode_port, WorkerType::Decode, decode_labels),
-    ] {
-        let worker = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-            .worker_type(worker_type)
-            .connection_mode(ConnectionMode::Grpc)
-            .runtime_type(RuntimeType::TokenSpeed)
-            .model(ModelCard::new(MODEL))
-            .labels(labels)
-            .health_config(HealthCheckConfig {
-                disable_health_check: true,
-                ..Default::default()
-            })
-            .build();
-        app_context
-            .worker_registry
-            .register(Arc::new(worker))
-            .unwrap();
-    }
-    RouterFactory::create_router(&app_context)
-        .await
-        .expect("PD gRPC router should build")
+    let prefill = grpc_worker(
+        prefill_port,
+        WorkerType::Prefill,
+        RuntimeType::TokenSpeed,
+        ModelCard::new(MODEL),
+    );
+    let decode = grpc_worker(
+        decode_port,
+        WorkerType::Decode,
+        RuntimeType::TokenSpeed,
+        ModelCard::new(MODEL),
+    )
+    .labels(decode_labels);
+    build_grpc_router(
+        config,
+        MODEL,
+        vec![Arc::new(prefill.build()), Arc::new(decode.build())],
+    )
+    .await
 }
 
 #[expect(

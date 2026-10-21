@@ -17,10 +17,53 @@
 //!   leaving one ends it, so `calls + call_open = calls` ends the call that was open and starts
 //!   the next. The terminal itself is `Dropped { Wrapper }` on a transition.
 //! - The **call syntax** says how the model writes a call inside an arguments state, and the
-//!   assembler for it. A format with no arguments state has none.
+//!   assembler for it: a family's, or a call given as data ([`CallSyntax::Shaped`]), whose
+//!   terminal opens a call only when the header after it matches. A format with no arguments
+//!   state has none.
 //! - An **ignored terminal** is a spelling the engine drops wherever it stands, a call's arguments
 //!   included, without moving: the separator token MiniMax M3's template writes before every tag.
 //!   No transition can name it.
+//! - A **stop row** names an arguments state whose call the stream's stop closes. A family whose
+//!   last call ends with a stop token writes no other marker after it, and the stop decoder hides
+//!   that token, so without the row the call would read as cut short. With it, a stream that
+//!   stops in that state ends the call as its closing marker would, with no bytes; a stream cut
+//!   for length, or aborted, is still cut, and so is one that ended with any finish but `Stop`.
+//!   `EngineFinish::Stop` also covers a stop sequence of the request's, which the row would take
+//!   for the stop token and close the call on, with whatever arguments had arrived; a driver that
+//!   knows a stop sequence ended the stream hands the end over as another finish
+//!   (`EngineFinish::Other`), and the call stays cut, since a stop sequence never completes a
+//!   call. A table read from a response template may name it for any call, since the template's
+//!   reader closes a region at the end of its text whatever the region's closing pattern: a call
+//!   given as data closes there as [`CallSyntax::Shaped`] says.
+//! - A **framing row** names a content or wrapper state whose text the template discards: the
+//!   space around a response template's fields, which Hugging Face's parser drops (its null sink),
+//!   or a field the API has no place for. Every byte of text there, a terminal with no row from
+//!   the state included, is `Dropped { Wrapper }`, and so is what the scanner still held there
+//!   when the stream ended, at every finish: neither the client nor `Malformed` sees it. The
+//!   state's rows move the engine as before.
+//! - A **trim row** names a content or reasoning state whose text is trimmed stay by stay, as
+//!   Hugging Face's `text` parser strips a field's value (`strip`, on unless a template turns it
+//!   off). A stay is the text between the row that enters the state and the row that leaves it,
+//!   a row back into the same state ending one stay and starting the next. Whitespace before the
+//!   stay's first other character is `Dropped { Whitespace }`; a run of it after the last one is
+//!   held until more text in the stay shows it was inside the text, or the stay ends and drops it.
+//!   Whitespace is what Python's `str.strip` removes: Unicode's white space and the separators
+//!   U+001C to U+001F.
+//! - A **kept row** names a content state whose text stands as written, as Hugging Face's `text`
+//!   parser keeps a field's value under `strip: false`: whitespace alone in a stay is content. A
+//!   content state with neither a trim row nor a kept row holds the whitespace a stay begins with
+//!   until text follows it in the stay, which makes it content, and drops it as
+//!   `Dropped { Whitespace }` when the stay ends without any: a family's template writes that
+//!   spacing (after a thought's close, between two calls), and the whole answer's message shows no
+//!   content for whitespace alone.
+//! - The **stop tokens** are the terminals that are tokens the engine stops on (Harmony's
+//!   `<|call|>`): the stop decoder hides them, so the engine never reads one, and a constraint
+//!   derived from the table can end a region one of them closes with no text of its own, since
+//!   the model's stop ends the region there ([`Format::is_stop_token`]).
+//! - A table **thinks first** when its template writes the thought before every call and answer
+//!   it renders, which the template and its rendering tell, not the call syntax: the structural
+//!   tags then write the thought before the call or the answer when the prompt has not opened it.
+//!   A template whose thought the model may leave out (gpt-oss's analysis channel) does not.
 //!
 //! The first state in the table is where an output starts, unless the prompt moved the engine
 //! before the output began: the engine replays the prompt's terminals over the same table, from
@@ -28,13 +71,54 @@
 //! a marker quoted in an earlier turn moves nothing. A table that names no opener is replayed
 //! from the prompt's start.
 //!
+//! A table read from a response template names its **turn anchors** instead, as Hugging Face's
+//! `start_anchor` does: one literal or several (Gemma 4's template starts a turn after
+//! `<|turn>model\n` or after `<tool_response|>`). The anchors are found as a regular expression's
+//! `finditer` finds an alternation of them: from the prompt's start, the earliest match, of the
+//! anchors that match there the first in the table's order, then on from that match's end, so
+//! that matches never overlap; the last match is the turn's. The replay starts after its end, in
+//! the state the anchor names: the first state, or one the anchor already entered (a template
+//! whose anchor ends with the thought's opener). A prompt that holds no anchor replays nothing,
+//! and the output starts in the first state. A table names a turn opener or turn anchors, not
+//! both.
+//!
+//! A **start row** names the state a turn starts in when it does not start with a terminal: a
+//! response template's open with a `^` alternative (`(?:^|<think>\s*)`), which matches with no
+//! text at the turn's first byte. Hugging Face's parser takes the longest delimiter at a place,
+//! and a regular expression the first alternative that matches: so at the turn's first byte a
+//! terminal whose row leads into another state wins, being longer than the empty match, while a
+//! terminal whose row leads into the start state is text there, the `^` having matched first
+//! (`<think>` at the first byte is the thought's text). Any other first piece starts the turn in
+//! the start state and is read there. The turn's first byte is where the replay starts, after the
+//! anchor; when the prompt leaves nothing to replay, it is the output's. A turn an anchor started
+//! in a state of its own has no start to choose.
+//!
+//! An **unopened row** names the state a turn starts in when the prompt opens no turn for the
+//! model. A template that writes the turn opener after a user message only (DeepSeek's) leaves
+//! the turn unopened when the conversation ends with a system message rendered in place, and the
+//! model starts its turn as its default has it: DeepSeek inside its thought. The prompt opens no
+//! turn when it holds no turn opener, or when the turn's end the row names (`<｜end▁of▁sentence｜>`)
+//! follows the last one: the turn it opened is over, and nothing opened the next. Nothing of such
+//! a prompt is replayed: what it holds is other roles' text, whose markers move nothing, as a
+//! marker quoted in an earlier turn moves nothing. An empty prompt is no prompt, and leaves the
+//! output in the first state.
+//!
 //! The table holds what is static about a format. What belongs to one request, the tools that
 //! type a tagged call's values, reaches the [`Engine`] with the request, not the table.
 //!
 //! [`Engine`]: crate::Engine
 //! [`formats`]: crate::formats
 
-use crate::tagged::{self, keyed};
+use std::sync::Arc;
+
+use crate::{
+    engine::is_strip_space,
+    gemma,
+    markers::{Piece, Scanner},
+    pythonic,
+    shape::{CallShape, Layout, NameSource, ValueRead, Values},
+    tagged::{self, attributed::TagEnd, keyed},
+};
 
 /// How the model writes a call between the call markers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,34 +131,123 @@ pub enum CallSyntax {
     /// and later and Qwen3-Coder (on a line of its own), Seed-OSS and MiMo (between the tags
     /// directly).
     Tagged(tagged::Spelling, tagged::Placement),
-    /// DeepSeek's DSML: the arguments state is one `<｜DSML｜ invoke name="…">` block, whose
-    /// parameter tags carry a `string` attribute that types each value. The terminal that enters
-    /// the state is the invoke tag's opening, and the one that leaves it is the invoke's closing
-    /// tag, which the call's end carries.
-    Dsml,
     /// The call's name as text, then `<arg_key>` and `<arg_value>` pairs, in the family's spelling
     /// of the four tags, typed by the request's tools: GLM, Hy4, Ling, IQuest. The terminals that
     /// enter and leave the state are the call's own markers, and the call's end carries the
     /// closing one.
     Keyed(keyed::Tags),
-    /// Python calls, `name(key=value, ...)`, one or several, bare or in a list: Olmo 3, LFM2.5,
-    /// Llama 3.2's pythonic template. The region's markers are the terminals; each call ends at
-    /// its own `)`, and the region's closing marker is wrapping.
-    Pythonic,
+    /// Python calls, `name(key=value, ...)`, one or several, in the family's dialect: framed as
+    /// its template frames them (one per line: Olmo 3; a Python list: LFM2.5, Llama 3.2's
+    /// pythonic template), the values as it writes them (Python's words and quotes: LFM2.5; JSON,
+    /// through `tojson`: Olmo 3). The region's markers are the terminals; each call ends at its
+    /// own `)`, and the region's closing marker is wrapping. The assembler reads either framing
+    /// and both spellings; the grammar derived from the table writes the dialect named.
+    Pythonic(pythonic::Dialect),
     /// A JSON list of calls with no markers around it, or content: xLAM. The table's one state is
     /// an arguments state entered at the output's start, and the assembler decides at the first
     /// byte that is not whitespace.
     JsonList,
+    /// One JSON call object, or several with `;` or whitespace between them, or a list of them,
+    /// alone in the turn, after the family's call marker where the model writes one, or content:
+    /// Llama 3.1's format, which the gateway's older `json` parser reads. The table's one state is
+    /// an arguments state entered at the output's start, and the assembler decides at the first
+    /// byte that is not whitespace: `{` is one call, and every further object after it, behind a
+    /// `;` or behind whitespace alone, another; `[` a list, anything else content. The marker is
+    /// the one the family's model writes before its first call, when the table names one
+    /// (`<|python_tag|>`, the token Llama 3.1's template reserves for a call): read at the output's
+    /// start only and dropped as the template's wrapping, so that an output with it and one without
+    /// read the same.
+    JsonAlone(Option<&'static str>),
     /// An XML tree of arguments: `<invoke name="…">`, then one element per argument, `<key>` to
     /// `</key>`, nested for an object and with `<item>` elements for a list, typed by the request's
     /// tools at every depth: MiniMax M3. The terminal that enters the state is the invoke tag's
     /// opening, and the one that leaves it is `</invoke>`, which the call's end carries.
     Xml,
-    /// Kimi K3's XTML: the arguments state is one `<|open|>call tool="…" index="N"<|sep|>` block,
-    /// whose argument tags carry a `type` attribute that types each value (`string`, `number`,
-    /// `boolean`, `null`, `array`, `object`). The terminal that enters the state is the call tag's
-    /// opening, and the one that leaves it is `<|close|>call<|sep|>`, which the call's end carries.
-    Xtml,
+    /// Parameters named by an attribute: the arguments state is one `<invoke name="…">` block
+    /// whose `<parameter name="…">` tags carry the key in the attribute, typed by the request's
+    /// tools or by an attribute of the tag, in the family's spelling of the tags: MiniMax M2,
+    /// dots3, MiniCPM5, DeepSeek's DSML, Kimi K3's XTML. The terminal that enters the state is the
+    /// invoke tag's opening, and the one that leaves it is the invoke's closing tag, which the
+    /// call's end carries.
+    Attributed(tagged::attributed::Tags),
+    /// The tool's name as text, then this marker, then one JSON object `{"name": …, "args": …}`:
+    /// Inkling, whose every message starts the arguments state and says what it is only after
+    /// its opener (`<|content_thinking|>`, `<|content_text|>`, or the name and the marker). The
+    /// terminals that leave the state are the message's own; the object's close is the call's end,
+    /// and the message's closing terminal is the region's.
+    NamedJson(&'static str),
+    /// The tool's name as text, then `marker`, then the arguments object alone: Mistral's
+    /// `[TOOL_CALLS]get_weather[ARGS]{"city": "Paris"}`, where the terminal that enters the state
+    /// is the call's opener, which also opens the next call, the object's close is the call's end,
+    /// and the region ends at the next call's opener or the end of the turn, since the template
+    /// writes no closing marker; or DeepSeek V3.1's and V3's calls in a block, each with a close
+    /// of its own. `between_calls` is what the template writes between two calls of a block (V3's
+    /// newline; nothing for V3.1 and Mistral), wrapping the table drops and the structural tag
+    /// writes.
+    NamedArguments {
+        marker: &'static str,
+        between_calls: &'static str,
+    },
+    /// The arguments object alone, named by the function the request forces
+    /// (`Declared::forced`): what the engine writes under the JSON-schema constraint the gateway
+    /// builds when `tool_choice` names a function, the one shape known from the request rather
+    /// than from the model. The table's one state is an arguments state entered at the output's
+    /// start; the object's close ends the call, and what follows is wrapping or malformed.
+    ForcedArguments,
+    /// Gemma's `call:NAME{key:value,…}`: keys bare, a string between two tokens, numbers and
+    /// words bare, lists and objects nested the same way, the keys sorted by the template, in the
+    /// family's spelling of the string token and the null word (Gemma 4: `<|"|>` and `null`;
+    /// FunctionGemma: `<escape>` and `None`). The terminals that enter and leave the state are the
+    /// call's own markers, and the call's end carries the closing one.
+    Gemma(gemma::Spelling),
+    /// A call given as data, as a response template writes one: what follows the region's
+    /// terminal (the header, which may capture the tool's name), how the arguments are written,
+    /// and what comes after them before the region's closing terminal (see
+    /// [`CallShape`]). The terminal that enters the state opens a call only when the header after
+    /// it matches; otherwise it is the text of the state it came in. A closing terminal closes the
+    /// region only where the trailer ends right before it, and is the call's end; otherwise it is
+    /// the call's text. The stream's stop, where [`Format::closes_at_stop`] names the state, closes
+    /// one JSON value or object where the trailer ends with the stream, and tagged parameters
+    /// wherever the trailer stands. The shape is [`intern`](crate::shape::intern)ed, so the syntax
+    /// stays `Copy`.
+    Shaped(&'static CallShape),
+}
+
+impl CallSyntax {
+    /// The tags the syntax writes inside a call besides the table's terminals: the markers a
+    /// grammar writes inside a call's region, which free text before a call may not write (the
+    /// named-arguments marker excepted: it stands only after the call's opener, a terminal the
+    /// text cannot write, and in one table it is ordinary text a thought may hold, so the
+    /// grammar's `excluded_but` leaves it writable), and which a client that shows a call as
+    /// text has to strip. JSON, Python and xLAM's list have
+    /// none, their calls being their own text, and neither has MiniMax M3's XML tree, whose
+    /// element tags are the arguments' keys. A call given as data has its parameters' (see
+    /// [`CallShape::tag_texts`]).
+    pub fn tag_texts(&self) -> Vec<&'static str> {
+        match self {
+            Self::Tagged(..) => tagged::assembler::TAGS.to_vec(),
+            Self::Keyed(tags) => vec![
+                tags.key_open,
+                tags.key_close,
+                tags.value_open,
+                tags.value_close,
+            ],
+            // XTML's `<|sep|>` ends a tag's tail and is a marker of its own.
+            Self::Attributed(tags) => match tags.tag_end {
+                TagEnd::Marker(marker) => vec![tags.parameter_open, tags.parameter_close, marker],
+                TagEnd::Angle => vec![tags.parameter_open, tags.parameter_close],
+            },
+            Self::NamedJson(marker) | Self::NamedArguments { marker, .. } => vec![*marker],
+            Self::Gemma(spelling) => vec![spelling.string],
+            Self::Shaped(shape) => shape.tag_texts(),
+            Self::Json
+            | Self::Pythonic(_)
+            | Self::JsonList
+            | Self::JsonAlone(_)
+            | Self::ForcedArguments
+            | Self::Xml => Vec::new(),
+        }
+    }
 }
 
 /// What the text inside a state is.
@@ -89,34 +262,133 @@ pub enum Emits {
     Wrapper,
 }
 
+/// How much whitespace a JSON answer may hold between its tokens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Whitespace {
+    /// As much as JSON allows, which is without end.
+    #[default]
+    Free,
+    /// Runs of at most so many characters: xgrammar's `max_whitespace_cnt` on the answer's schema
+    /// node, which it enforces from 0.2.7 on and an older xgrammar ignores.
+    Bounded(u32),
+}
+
+/// Where a call's id comes from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum CallId {
+    /// The engine's: the request's nonce the call's index steps on (`ids.rs`), the shape the
+    /// gateway's older parsers mint.
+    #[default]
+    Minted,
+    /// The call's header as the model wrote it, its surrounding whitespace and the literal that
+    /// ends the header left out (`functions.get_weather:0` for the Kimi K2 line): a family whose
+    /// templates render a turn's ids back into the prompt keeps the id the model will see again,
+    /// and a tool result pairs with its call by the id the model gave. A header whose id repeats
+    /// one already given in the response takes the minted id instead, so a response's ids stay
+    /// distinct. Only a call given as data whose header names the call has one.
+    Header,
+}
+
 /// One format's table. Built with [`Format::new`] and the methods that add a row each; the
 /// first state added is the initial one.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Format {
     name: String,
     terminals: Vec<Terminal>,
     states: Vec<State>,
     transitions: Vec<Transition>,
     calls: Option<CallSyntax>,
+    /// Where a call's id comes from.
+    call_id: CallId,
     turn_opener: Option<String>,
+    /// The turn anchors, in the order a match at one place prefers them.
+    anchors: Vec<Anchor>,
+    /// The state a turn starts in when it does not start with a terminal.
+    start: Option<usize>,
+    /// The state a turn starts in when the prompt opens no turn for the model, and the text that
+    /// ends a turn the model wrote in the prompt.
+    unopened: Option<Unopened>,
     structural_tokens: Vec<String>,
+    /// The texts of the tokens the engine stops on that are terminals.
+    stop_tokens: Vec<String>,
+    /// How a shaped call's values read.
+    values: Values,
+    thinks_first: bool,
+    marker_tokens: Vec<String>,
+    /// How the model's chat template writes a turn, where the table holds one.
+    layout: Option<Box<Layout>>,
+    /// How much whitespace the answer's JSON may hold between its tokens.
+    answer_whitespace: Whitespace,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Terminal {
     name: String,
     text: String,
     /// Dropped wherever it stands, never a move.
     ignored: bool,
+    /// Read as content text where it moves the engine, in place of being dropped: a table's
+    /// variant shows the markers of the channel a request does not separate.
+    shown: bool,
+    /// Frames the turn's messages where the table starts in a message header
+    /// ([`Format::message_framing`]): the template's protocol in every variant, never shown.
+    /// Set by [`Format::without_calls`], which reads the header before it becomes content, so
+    /// that a variant made after it keeps the framing dropped.
+    frames_messages: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct State {
     name: String,
     emits: Emits,
+    /// The template discards the state's text (the framing row).
+    framing: bool,
+    /// The state's text is trimmed stay by stay (the trim row).
+    trimmed: bool,
+    /// The state's text stands as written, whitespace alone included (the kept row).
+    kept: bool,
+    /// The stream's stop closes the call open in the state (the stop row).
+    closes_at_stop: bool,
+    /// A request's variant made the state content ([`Format::without_reasoning`],
+    /// [`Format::without_calls`]): a marker with no row out of it is its text and adds no
+    /// malformed run of its own, as the table the variant was made of added none there (a
+    /// thought's marker is the thought's text; a call's header is the call's to judge).
+    remade: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+/// What the replay of a prompt leaves ([`Format::replayed`]): the state the output starts in,
+/// whether the turn's first piece is still to come, and the stay the output continues.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Replay {
+    /// The state the walk ends in; where the prompt left a call open, the state the turn started
+    /// in.
+    pub(crate) state: usize,
+    /// Whether the turn's first piece is still to come, for a table with a start row.
+    pub(crate) at_turn_start: bool,
+    /// Whether the prompt wrote text other than whitespace in the stay the output continues: a
+    /// prefill the output goes on with. The turn opener and the table's markers are the
+    /// template's framing, not the stay's text.
+    pub(crate) begun: bool,
+}
+
+/// A literal that starts the model's turn in the prompt, and the state the output starts in after
+/// it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Anchor {
+    text: String,
+    state: usize,
+}
+
+/// The unopened row: the state the output starts in when the prompt opens no turn for the model,
+/// and the text that ends a turn the model wrote in the prompt, after which the turn opener would
+/// have to be written again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Unopened {
+    state: usize,
+    end: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Transition {
     from: usize,
     on: usize,
@@ -142,8 +414,18 @@ impl Format {
             states: Vec::new(),
             transitions: Vec::new(),
             calls: None,
+            call_id: CallId::Minted,
             turn_opener: None,
+            anchors: Vec::new(),
+            start: None,
+            unopened: None,
             structural_tokens: Vec::new(),
+            stop_tokens: Vec::new(),
+            values: Values::Inferred,
+            thinks_first: false,
+            marker_tokens: Vec::new(),
+            layout: None,
+            answer_whitespace: Whitespace::Free,
         }
     }
 
@@ -154,6 +436,8 @@ impl Format {
             name: name.to_string(),
             text: text.to_string(),
             ignored: false,
+            shown: false,
+            frames_messages: false,
         });
         self
     }
@@ -166,6 +450,8 @@ impl Format {
             name: name.to_string(),
             text: text.to_string(),
             ignored: true,
+            shown: false,
+            frames_messages: false,
         });
         self
     }
@@ -189,6 +475,11 @@ impl Format {
         self.states.push(State {
             name: name.to_string(),
             emits,
+            framing: false,
+            trimmed: false,
+            kept: false,
+            closes_at_stop: false,
+            remade: false,
         });
         self
     }
@@ -213,6 +504,100 @@ impl Format {
         self
     }
 
+    /// Where a call's id comes from: the engine's nonce, or the call's header as the model wrote
+    /// it ([`CallId::Header`]).
+    #[must_use]
+    pub fn call_id(mut self, source: CallId) -> Self {
+        self.call_id = source;
+        self
+    }
+
+    /// The arguments state `state` closes its call when the stream stops in it: the family ends
+    /// its last call with a stop token, which the stop decoder hides, or a response template's
+    /// reader closes the call's region at the end of its text. A stream cut for length,
+    /// aborted, or ended with any finish but `Stop` is still cut; a driver hands a stop sequence of
+    /// the request's over as such a finish (see the stop row in [`crate::format`]). The state must
+    /// already be in the table.
+    #[must_use]
+    pub fn closes_at_stop(mut self, state: &str) -> Self {
+        let state = self.state_named(state);
+        self.states[state].closes_at_stop = true;
+        self
+    }
+
+    /// The template discards the text in `state`, a content or wrapper state: every byte of it is
+    /// `Dropped { Wrapper }`, held bytes included, at every finish (see the framing row in
+    /// [`crate::format`]). The state must already be in the table.
+    #[must_use]
+    pub fn framing(mut self, state: &str) -> Self {
+        let state = self.state_named(state);
+        self.states[state].framing = true;
+        self
+    }
+
+    /// The text of `state`, a content or reasoning state, is trimmed stay by stay: whitespace at
+    /// a stay's edges is `Dropped { Whitespace }` (see the trim row in [`crate::format`]). The
+    /// state must already be in the table.
+    #[must_use]
+    pub fn trims(mut self, state: &str) -> Self {
+        let state = self.state_named(state);
+        self.states[state].trimmed = true;
+        self
+    }
+
+    /// The text of `state`, a content state, stands as written: whitespace alone in a stay is
+    /// content (see the kept row in [`crate::format`]). The state must already be in the table.
+    #[must_use]
+    pub fn keeps(mut self, state: &str) -> Self {
+        let state = self.state_named(state);
+        self.states[state].kept = true;
+        self
+    }
+
+    /// The texts among `stops` (the model's end-of-sequence and stop tokens) that are terminals of
+    /// the table, each kept once in the order given; other texts are not kept. The terminals must
+    /// already be in the table. Parsing does not change, since the stop decoder hides these
+    /// tokens; [`Self::is_stop_token`] tells a constraint derived from the table which closing
+    /// terminals the model's stop writes.
+    #[must_use]
+    pub fn stop_tokens<'t>(mut self, stops: impl IntoIterator<Item = &'t str>) -> Self {
+        for stop in stops {
+            let terminal = self.terminals.iter().any(|terminal| terminal.text == stop);
+            if terminal && !self.stop_tokens.iter().any(|known| known == stop) {
+                self.stop_tokens.push(stop.to_string());
+            }
+        }
+        self
+    }
+
+    /// Whether `text` is a terminal of the table that is a token the engine stops on
+    /// ([`Self::stop_tokens`]): a region it closes ends at the model's stop, so a constraint can
+    /// end that region with no text of its own.
+    pub fn is_stop_token(&self, text: &str) -> bool {
+        self.stop_tokens.iter().any(|stop| stop == text)
+    }
+
+    /// The stop tokens the table keeps ([`Self::stop_tokens`]), in the order given.
+    pub(crate) fn stop_token_texts(&self) -> &[String] {
+        &self.stop_tokens
+    }
+
+    /// The table's shaped calls read their values with `reader`: a tagged value's text by the
+    /// shape's parser, typed by the parameter's schema; a member of JSON arguments held and typed
+    /// where the reader says; a key written twice as it says. Without the row they read as the
+    /// tagged tables read theirs ([`Inferred`](crate::shape::Inferred)). No other call syntax
+    /// reads it.
+    #[must_use]
+    pub fn reads_values_with(mut self, reader: Arc<dyn ValueRead>) -> Self {
+        self.values = Values::Reader(reader);
+        self
+    }
+
+    /// The reader a shaped call's values read with.
+    pub(crate) fn value_reader(&self) -> Values {
+        self.values.clone()
+    }
+
     /// The text that opens the turn the model writes, `<|im_start|>assistant` for ChatML: the
     /// prompt's replay starts at its last occurrence.
     #[must_use]
@@ -221,14 +606,603 @@ impl Format {
         self
     }
 
+    /// A literal that starts the model's turn in the prompt, as a response template's
+    /// `start_anchor`: the prompt's replay starts after the end of the last anchor found (see the
+    /// turn anchors in [`crate::format`]), in the first state. Anchors added earlier are preferred
+    /// where several match at one place.
+    #[must_use]
+    pub fn turn_anchor(mut self, text: &str) -> Self {
+        self.anchors.push(Anchor {
+            text: text.to_string(),
+            state: 0,
+        });
+        self
+    }
+
+    /// A turn anchor after which the output starts in `state`: an anchor that already opened the
+    /// thought, or closed it. The state must already be in the table.
+    #[must_use]
+    pub fn turn_anchor_starting_in(mut self, text: &str, state: &str) -> Self {
+        let state = self.state_named(state);
+        self.anchors.push(Anchor {
+            text: text.to_string(),
+            state,
+        });
+        self
+    }
+
+    /// The state a turn starts in when its first piece is not a terminal whose row leads into
+    /// another state, as a response template's `^` alternative of the state's open (see the start
+    /// row in [`crate::format`]). The state must already be in the table.
+    #[must_use]
+    pub fn starts_in(mut self, state: &str) -> Self {
+        self.start = Some(self.state_named(state));
+        self
+    }
+
+    /// The state the start row names, if the table has one.
+    pub(crate) fn start(&self) -> Option<usize> {
+        self.start
+    }
+
+    /// The state a turn starts in when the prompt opens no turn for the model (see the unopened
+    /// row in [`crate::format`]): the prompt holds no turn opener, or `turn_end`, the text that
+    /// ends a turn the model wrote in the prompt (`<｜end▁of▁sentence｜>`), follows the last one.
+    /// DeepSeek's template writes the turn opener after a user message only, so a conversation
+    /// that ends with a system message rendered in place leaves the turn unopened, and the model,
+    /// which thinks unless told not to, starts inside its thought. Nothing of such a prompt is
+    /// replayed. The state must already be in the table; the table must name a turn opener.
+    #[must_use]
+    pub fn unopened_turn_starts_in(mut self, state: &str, turn_end: &str) -> Self {
+        let state = self.state_named(state);
+        self.unopened = Some(Unopened {
+            state,
+            end: turn_end.to_string(),
+        });
+        self
+    }
+
+    /// The template writes the thought before every call and answer it renders: a property of the
+    /// template and its rendering, not of the call syntax. The structural tags write the thought
+    /// first where the prompt has not opened it ([`Format::grammar`], [`Format::answer_grammar`]);
+    /// parsing does not change. The table must have a thought; the tags write it where it opens
+    /// from the turn's own state and closes back there, and give `None` otherwise.
+    #[must_use]
+    pub fn thinks_first(mut self) -> Self {
+        self.thinks_first = true;
+        self
+    }
+
+    /// Whether the template writes the thought before every call and answer.
+    pub(crate) fn writes_thought_first(&self) -> bool {
+        self.thinks_first
+    }
+
+    /// The answer's JSON holds runs of whitespace of at most `run` characters between its tokens
+    /// ([`Whitespace::Bounded`]): the structural tags write the bound into the answer's schema
+    /// node ([`Format::answer_grammar`], the whole turn's grammar), where JSON otherwise admits
+    /// whitespace without end. For a model that, held to its answer's JSON after a long thought by
+    /// an engine starting the grammar at the first token, drifts into runs of tabs and newlines
+    /// until the budget ends; its arrays and strings stay the schema's, and the calls' values are
+    /// not bounded. Parsing does not change.
+    #[must_use]
+    pub fn bounds_answer_whitespace(mut self, run: u32) -> Self {
+        self.answer_whitespace = Whitespace::Bounded(run);
+        self
+    }
+
+    /// How much whitespace the answer's JSON may hold between its tokens.
+    pub(crate) fn answer_whitespace(&self) -> Whitespace {
+        self.answer_whitespace
+    }
+
+    /// The texts among `tokens` (the model's vocabulary's added tokens, by their text) that the
+    /// table's markers are made of: a terminal, a structural token or one of the call syntax's
+    /// tags that is one token, or a token inside one (`<|open|>` in Kimi K3's tags). The
+    /// structural tags write each as that token wherever they write it inside a tag or between
+    /// tags, so the model cannot spell it in ordinary tokens there; a tag's own begin and end and
+    /// its triggers stay text. Parsing does not change. It reads the markers the table has when
+    /// it is called, so it comes after the rows, and called again it replaces the set.
+    #[must_use]
+    pub fn marker_tokens<T: AsRef<str>>(mut self, tokens: impl IntoIterator<Item = T>) -> Self {
+        let mut markers: Vec<&str> = self
+            .terminals
+            .iter()
+            .map(|terminal| &*terminal.text)
+            .chain(self.structural_tokens.iter().map(String::as_str))
+            .collect();
+        let tags = self
+            .calls
+            .map(|syntax| syntax.tag_texts())
+            .unwrap_or_default();
+        markers.extend(tags);
+        let mut kept: Vec<String> = tokens
+            .into_iter()
+            .map(|token| token.as_ref().to_string())
+            .filter(|token| {
+                !token.is_empty() && markers.iter().any(|marker| marker.contains(token.as_str()))
+            })
+            .collect();
+        // The longest first, so a token inside a longer one is never taken for part of it.
+        kept.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        kept.dedup();
+        self.marker_tokens = kept;
+        self
+    }
+
+    /// The marker texts that are one token each, the longest first.
+    pub(crate) fn marker_token_texts(&self) -> &[String] {
+        &self.marker_tokens
+    }
+
+    /// How the model's chat template writes a turn of this table where the response template's
+    /// patterns leave the text open ([`Layout`]), as whoever compiled the table learned it from a
+    /// rendering. Parsing does not read it. The structural tags of a shaped call are written from
+    /// it, and every table's tags write a thought and an answer as it does
+    /// ([`Format::grammar_for`], [`Format::answer_grammar`]). [`Layout::check`] says whether it
+    /// fits the table; a shaped call whose layout does not fit has no tag. Given again, it
+    /// replaces the one before.
+    #[must_use]
+    pub fn with_layout(mut self, layout: Layout) -> Self {
+        self.layout = Some(Box::new(layout));
+        self
+    }
+
+    /// The layout's text after the thought's close replaced by `after`, the close kept: a
+    /// checkpoint group whose template writes other text there than its table's (the registry's
+    /// `after`: the NVIDIA Nemotron 3 groups and Step 3.5 Flash write one newline before a call
+    /// where the Qwen 3.5 template writes two). A table without a thought layout is left as it is.
+    #[must_use]
+    pub fn with_thought_after(mut self, after: &str) -> Self {
+        if let Some(thought) = self
+            .layout
+            .as_mut()
+            .and_then(|layout| layout.thought.as_mut())
+        {
+            thought.after = after.into();
+        }
+        self
+    }
+
+    /// The table's layout, if it has one.
+    pub fn layout(&self) -> Option<&Layout> {
+        self.layout.as_deref()
+    }
+
+    /// The table for a request that does not separate reasoning (`separate_reasoning: false`), as
+    /// the legacy path runs no reasoning parser then: the thought's text is content, and every
+    /// marker that is not a call's is shown, read as content text where it moves the engine, so
+    /// the bytes stay in the content as the model wrote them. The rows stay, so a call inside or
+    /// after the thought reads as before, from wherever a start row, an anchor or the prompt's
+    /// replay puts the turn. A call's markers are the terminals on the rows into or out of an
+    /// arguments state or a calls wrapper, and the message frame's are the terminals with a row
+    /// into or out of the frame ([`Self::message_framing`]): a table whose thought is framed by
+    /// them alone (Inkling's, whose kind markers also move between the bodies) shows none, and
+    /// neither does the variant [`Self::without_calls`] made of it. A state's own text rows
+    /// stay with it: a trimmed stay is still trimmed, a framing state's text still dropped; and a
+    /// tag the end cut short is still dropped, as the legacy parsers drop it on both their paths.
+    /// A table without a thought changes only in what it shows; the thought-first mark and the
+    /// layout, which serve the tags alone, go. A marker with no row out of the thought's state is
+    /// its text and counts no malformed run, as in the table ([`Self::is_remade`]), so an output
+    /// counts the same whether the request separates reasoning or not.
+    #[must_use]
+    pub fn without_reasoning(mut self) -> Self {
+        let calls = self.terminals_of_calls();
+        let framing = self.message_framing();
+        for (index, terminal) in self.terminals.iter_mut().enumerate() {
+            if !terminal.ignored
+                && !calls.contains(&index)
+                && !framing.contains(&index)
+                && !terminal.frames_messages
+            {
+                terminal.shown = true;
+            }
+        }
+        for state in &mut self.states {
+            if state.emits == Emits::Reasoning {
+                state.emits = Emits::Content;
+                state.remade = true;
+            }
+        }
+        self.thinks_first = false;
+        self.layout = None;
+        self
+    }
+
+    /// The table for a request that declares no tools or whose `tool_choice` is `none`, as the
+    /// legacy path runs no tool parser then: the arguments states and the calls wrappers are
+    /// content, with no call syntax to read them, and a call's markers are shown, read as content
+    /// text where they move the engine, so a call's bytes stay in the content as the model wrote
+    /// them. The markers that frame the thought and the answer are not shown: a marker that also
+    /// opens the thought, and, where the turn starts in a message header
+    /// ([`Self::message_framing`]: Inkling's arguments state, which the message opener returns
+    /// to and the thought and the answer open from), every marker of the message frame, which
+    /// stays dropped in a variant made of this one too; so the thought and the answer read as
+    /// before, their markers dropped, and a call the model writes anyway is content between
+    /// dropped framing, as the legacy reasoning parser leaves it. The turn's own wrapper, where
+    /// a table starts in one (Kimi K3's message), is the turn's frame, not a calls region: it
+    /// and its markers stay; so does the space between two messages of a message header's table
+    /// (Inkling's ended message), whose whitespace is the template's with or without tools. A
+    /// table whose output starts in its calls (`json`, `xlam`, `forced`) becomes content from
+    /// its first byte. A state's own text rows stay with it, as in [`Self::without_reasoning`].
+    /// A stop that closed a call closes nothing; the layout goes. A marker with no row out of a
+    /// state made content here is its text and adds no malformed run of its own
+    /// ([`Self::is_remade`]): in the table the call's syntax reads it and says what it is.
+    #[must_use]
+    pub fn without_calls(mut self) -> Self {
+        let frame = self.message_frame();
+        let framing = self.message_framing();
+        let demoted: Vec<bool> = self
+            .calls_regions()
+            .iter()
+            .zip(&self.states)
+            .zip(&frame)
+            .map(|((&region, state), &frame)| region && !(frame && state.emits == Emits::Wrapper))
+            .collect();
+        let calls = self.terminals_of_calls();
+        let opens_thought: Vec<usize> = self
+            .transitions
+            .iter()
+            .filter(|row| self.states[row.to].emits == Emits::Reasoning)
+            .map(|row| row.on)
+            .collect();
+        for (index, terminal) in self.terminals.iter_mut().enumerate() {
+            if framing.contains(&index) {
+                terminal.frames_messages = true;
+            }
+            if calls.contains(&index)
+                && !opens_thought.contains(&index)
+                && !terminal.frames_messages
+            {
+                terminal.shown = true;
+            }
+        }
+        for (index, state) in self.states.iter_mut().enumerate() {
+            if demoted[index] {
+                state.emits = Emits::Content;
+                state.closes_at_stop = false;
+                state.remade = true;
+            }
+        }
+        self.calls = None;
+        self.layout = None;
+        self
+    }
+
+    /// The states of the turn's frame where the table starts in a message header: an arguments
+    /// state a row returns to (Inkling's, where the call's name follows the message's opener, so
+    /// the state reads the call, and the thought and the answer open from it too), and the
+    /// wrappers whose every row leads back into the frame (the space between two messages, where
+    /// the thought, the answer and a call all close). All false for a table that starts anywhere
+    /// else, or in its calls, which no row enters (`json`, `xlam`, `forced`).
+    pub(crate) fn message_frame(&self) -> Vec<bool> {
+        let mut frame = vec![false; self.states.len()];
+        let header = self
+            .states
+            .first()
+            .is_some_and(|state| state.emits == Emits::Arguments)
+            && self.transitions.iter().any(|row| row.to == 0);
+        if !header {
+            return frame;
+        }
+        frame[0] = true;
+        loop {
+            let joined = (1..self.states.len()).find(|&index| {
+                let mut rows = self.transitions.iter().filter(|row| row.from == index);
+                !frame[index]
+                    && self.states[index].emits == Emits::Wrapper
+                    && rows.clone().next().is_some()
+                    && rows.all(|row| frame[row.to])
+            });
+            match joined {
+                Some(index) => frame[index] = true,
+                None => return frame,
+            }
+        }
+    }
+
+    /// The terminals that frame the turn's messages ([`Self::message_frame`]): those with a row
+    /// into or out of a state of the frame, which frame the thought and the answer as much as a
+    /// call, and no variant shows. Empty for a table without the frame.
+    fn message_framing(&self) -> Vec<usize> {
+        let frame = self.message_frame();
+        self.transitions
+            .iter()
+            .filter(|row| frame[row.from] || frame[row.to])
+            .map(|row| row.on)
+            .collect()
+    }
+
+    /// Which states are a call's region: the arguments states, and the wrapper states other than
+    /// the first, since a table that starts in a wrapper (Kimi K3's message) starts in the turn's
+    /// frame.
+    fn calls_regions(&self) -> Vec<bool> {
+        self.states
+            .iter()
+            .enumerate()
+            .map(|(index, state)| match state.emits {
+                Emits::Arguments => true,
+                Emits::Wrapper => index != 0,
+                Emits::Content | Emits::Reasoning => false,
+            })
+            .collect()
+    }
+
+    /// The terminals that are a call's markers: those whose every row enters or leaves a call's
+    /// region ([`Self::calls_regions`]). A terminal with a row between two other states as well
+    /// (Kimi K3's message close) frames the turn, not a call.
+    fn terminals_of_calls(&self) -> Vec<usize> {
+        let regions = self.calls_regions();
+        (0..self.terminals.len())
+            .filter(|&on| {
+                let mut rows = self.transitions.iter().filter(|row| row.on == on);
+                let mut any = false;
+                let all = rows.all(|row| {
+                    any = true;
+                    regions[row.from] || regions[row.to]
+                });
+                any && all
+            })
+            .collect()
+    }
+
     /// The turn opener, if the table names one.
     pub(crate) fn turn_opener(&self) -> Option<&str> {
         self.turn_opener.as_deref()
     }
 
+    /// The texts that start the model's turn: the turn opener, or the turn anchors in the table's
+    /// order; none for a table that names neither.
+    pub(crate) fn turn_texts(&self) -> Vec<&str> {
+        match self.turn_opener() {
+            Some(opener) => vec![opener],
+            None => self.anchors.iter().map(|anchor| &*anchor.text).collect(),
+        }
+    }
+
+    /// Where the model's turn starts in `prompt`: where the last turn anchor found
+    /// ([`Self::last_anchor`]), or else the last turn opener, starts, the text after it, and the
+    /// state the output starts in after it. `None` when the prompt holds neither.
+    pub(crate) fn turn_start<'p>(&self, prompt: &'p str) -> Option<(usize, &'p str, usize)> {
+        if !self.anchors.is_empty() {
+            let (at, anchor) = self.last_anchor(prompt)?;
+            return Some((at, &prompt[at + anchor.text.len()..], anchor.state));
+        }
+        let opener = self.turn_opener()?;
+        let at = prompt.rfind(opener)?;
+        Some((at, &prompt[at + opener.len()..], 0))
+    }
+
+    /// The part of `prompt` the engine replays to find the state the generation starts in: from
+    /// the last occurrence of the turn opener, or the whole prompt when the table names none or
+    /// the prompt does not hold it; for a table with turn anchors, from the start of the last
+    /// anchor found, or nothing when the prompt holds none. A caller that keeps the prompt for a
+    /// later `Input::Prompt` need keep only this: replayed again, it gives itself.
+    pub fn replay<'p>(&self, prompt: &'p str) -> &'p str {
+        if !self.anchors.is_empty() {
+            let from = self.last_anchor(prompt).map_or(prompt.len(), |(at, _)| at);
+            return &prompt[from..];
+        }
+        match self.turn_opener().and_then(|opener| prompt.rfind(opener)) {
+            Some(at) => &prompt[at..],
+            None => prompt,
+        }
+    }
+
+    /// The bytes a piece of the replay stands for.
+    fn piece_len(&self, piece: &Piece<'_>) -> usize {
+        match piece {
+            Piece::Text(text) => text.len(),
+            Piece::Marker(index) => self.terminal_text(*index).len(),
+        }
+    }
+
+    /// The text of `prompt` the engine replays, and the state the replay starts in: after the
+    /// last turn anchor, in the state it names; otherwise [`Self::replay`]'s part, from the first
+    /// state.
+    pub(crate) fn turn<'p>(&self, prompt: &'p str) -> (&'p str, usize) {
+        if self.anchors.is_empty() {
+            return (self.replay(prompt), 0);
+        }
+        match self.last_anchor(prompt) {
+            Some((at, anchor)) => (&prompt[at + anchor.text.len()..], anchor.state),
+            None => ("", 0),
+        }
+    }
+
+    /// The last turn anchor in `prompt` and where it starts, found as `finditer` finds the
+    /// alternation of the anchors: the earliest match, the first anchor in the table's order
+    /// where several match there, then on from that match's end. Each anchor's next occurrence is
+    /// searched for again only once the matches have passed it, so a prompt costs one pass per
+    /// anchor. An anchor with no text never matches.
+    fn last_anchor(&self, prompt: &str) -> Option<(usize, &Anchor)> {
+        let find = |anchor: &Anchor, from: usize| {
+            if anchor.text.is_empty() {
+                return None;
+            }
+            prompt[from..].find(&*anchor.text).map(|at| from + at)
+        };
+        let mut next: Vec<Option<usize>> =
+            self.anchors.iter().map(|anchor| find(anchor, 0)).collect();
+        let mut from = 0;
+        let mut last = None;
+        loop {
+            for (anchor, at) in self.anchors.iter().zip(next.iter_mut()) {
+                if at.is_some_and(|at| at < from) {
+                    *at = find(anchor, from);
+                }
+            }
+            let Some((at, index)) = next
+                .iter()
+                .enumerate()
+                .filter_map(|(index, at)| at.map(|at| (at, index)))
+                .min()
+            else {
+                return last;
+            };
+            let anchor = &self.anchors[index];
+            last = Some((at, anchor));
+            from = at + anchor.text.len();
+        }
+    }
+
+    /// The state the turn starts in once its first piece decides it, for a table with a start row:
+    /// the start row's state, unless the piece is a terminal whose row from `state` leads into
+    /// another one, which wins as the longer match; then `state`. A terminal the table ignores
+    /// decides nothing, and gives `None`. A table without a start row starts where it stands.
+    pub(crate) fn opening(&self, state: usize, piece: &Piece<'_>) -> Option<usize> {
+        let Some(start) = self.start else {
+            return Some(state);
+        };
+        match *piece {
+            Piece::Marker(index) if self.ignored(index) => None,
+            Piece::Marker(index) if self.next(state, index).is_some_and(|to| to != start) => {
+                Some(state)
+            }
+            _ => Some(start),
+        }
+    }
+
+    /// Where `prompt` leaves the table: [`Self::turn`]'s text replayed over the rows from the state
+    /// the turn starts in, the turn's first piece deciding its start where the table has a start
+    /// row ([`Self::opening`]), a terminal the table ignores, or one with no row from where the
+    /// walk stands, moving nothing; and the stay the output continues. A call the prompt left
+    /// open is not entered: the walk rests where the turn started. A prompt that opens no turn
+    /// for the model, where the table has an unopened row ([`Self::unopened_turn`]), is not
+    /// replayed: the output starts in the row's state, with nothing begun. The engine starts the
+    /// output where this leaves it, and [`Self::reasoning_open`] reads the same walk.
+    pub(crate) fn replayed(&self, prompt: &str) -> Replay {
+        if let Some(state) = self.unopened_turn(prompt) {
+            return Replay {
+                state,
+                at_turn_start: false,
+                begun: false,
+            };
+        }
+        let (turn, start) = self.turn(prompt);
+        // The turn opener's own bytes, where the replay begins with them: the template's framing,
+        // not text of the stay.
+        let framing = self
+            .turn_opener()
+            .filter(|opener| self.anchors.is_empty() && turn.starts_with(opener))
+            .map_or(0, str::len);
+        let mut scanner = Scanner::new(self.terminal_texts());
+        let (mut state, mut rest) = (start, start);
+        // Whether the prompt wrote text other than whitespace in the stay the output continues;
+        // a marker is the template's, whether or not a row reads it here.
+        let mut begun = false;
+        let mut at = 0;
+        // An anchor that names its own state leaves no start to choose.
+        let mut at_turn_start = self.start.is_some() && start == 0;
+        let fed = scanner.feed(turn);
+        let end = scanner.finish();
+        for piece in fed.pieces().chain(end.pieces()) {
+            if at_turn_start {
+                if let Some(opened) = self.opening(state, &piece) {
+                    at_turn_start = false;
+                    if opened != state {
+                        begun = false;
+                    }
+                    (state, rest) = (opened, opened);
+                }
+            }
+            let from = at;
+            at += self.piece_len(&piece);
+            match piece {
+                Piece::Marker(index) if self.ignored(index) => {}
+                Piece::Marker(index) => {
+                    if let Some(to) = self.next(state, index) {
+                        (state, begun) = (to, false);
+                    }
+                }
+                Piece::Text(text) => {
+                    let written = &text[framing.saturating_sub(from).min(text.len())..];
+                    begun |= !written.chars().all(is_strip_space);
+                }
+            }
+        }
+        if self.emits(state) == Emits::Arguments {
+            (state, begun) = (rest, false);
+        }
+        Replay {
+            state,
+            at_turn_start,
+            begun,
+        }
+    }
+
+    /// The state the unopened row names where `prompt` opens no turn for the model: the prompt is
+    /// not empty and holds no turn opener, or the turn's end follows its last opener. `None` for a
+    /// table without the row, and for a prompt that opens the turn, whose last opener is followed
+    /// by the template's framing or the model's own text and no turn end.
+    fn unopened_turn(&self, prompt: &str) -> Option<usize> {
+        let unopened = self.unopened.as_ref()?;
+        if prompt.is_empty() {
+            return None;
+        }
+        let opener = self.turn_opener()?;
+        let opened = prompt
+            .rfind(opener)
+            .is_some_and(|at| !prompt[at + opener.len()..].contains(unopened.end.as_str()));
+        (!opened).then_some(unopened.state)
+    }
+
+    /// The state `prompt` leaves the table in ([`Self::replayed`]): where the engine starts the
+    /// output.
+    pub(crate) fn prompt_state(&self, prompt: &str) -> usize {
+        self.replayed(prompt).state
+    }
+
+    /// Whether `prompt` leaves the model inside its thought: its terminals replayed over the table
+    /// from the turn's opener or its last anchor, as the engine replays them before the output.
+    /// The value the structural tags take as `reasoning_open` ([`Format::grammar`],
+    /// [`Format::answer_grammar`]), read where the prompt ends, whatever it writes after the
+    /// opener: Qwen 3.5's and DeepSeek's templates open the thought there, and a template with
+    /// thinking turned off opens and closes it there.
+    pub fn reasoning_open(&self, prompt: &str) -> bool {
+        self.emits(self.prompt_state(prompt)) == Emits::Reasoning
+    }
+
+    /// Whether `prompt` closed the thought itself and wrote what the template writes after the
+    /// close (a request with thinking switched off: Qwen3's `<think>\n\n</think>\n\n`), so the
+    /// structural tags owe none of it before their first text
+    /// ([`Options::thought_closed`](crate::grammar::Options::thought_closed)). `false` for a table
+    /// whose layout has no thought, a prompt that leaves the thought open or to the model, and
+    /// one that ends with the bare close (GLM 4.6's `<think></think>`, whose newline the tag still
+    /// writes).
+    pub fn thought_closed(&self, prompt: &str) -> bool {
+        let Some(thought) = self.layout().and_then(|layout| layout.thought.as_ref()) else {
+            return false;
+        };
+        let Some(close) = thought.close.as_deref() else {
+            return false;
+        };
+        !thought.after.is_empty()
+            && prompt
+                .strip_suffix(&*thought.after)
+                .is_some_and(|before| before.ends_with(close))
+    }
+
     /// The format's name.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Whether the table reads calls from the output's first byte, with no marker before them:
+    /// the output starts in an arguments state that no row enters, as xLAM's list and the `json`
+    /// table do. Such a table reads a bare JSON answer as a call. Inkling starts in an arguments
+    /// state too, but a row enters it, and its call has a marker after the tool's name; Llama
+    /// Nemotron writes xLAM's list, but between markers: neither reads a bare answer as a call.
+    pub fn starts_in_calls(&self) -> bool {
+        let starts_in_arguments = self
+            .states
+            .first()
+            .is_some_and(|state| state.emits == Emits::Arguments);
+        starts_in_arguments
+            && !self
+                .transitions
+                .iter()
+                .any(|row| self.states[row.to].emits == Emits::Arguments)
     }
 
     fn state_named(&self, name: &str) -> usize {
@@ -245,9 +1219,11 @@ impl Format {
             .unwrap_or_else(|| unknown("terminal", name, &self.name))
     }
 
-    /// The terminals' texts, in the order the engine's scanner numbers them.
-    pub(crate) fn terminal_texts(&self) -> impl Iterator<Item = &str> {
-        self.terminals.iter().map(|terminal| terminal.text.as_str())
+    /// The terminals' texts, in the order the engine's scanner numbers them: the markers the
+    /// table's rows move on, and those it ignores. Whoever learns the table's [`Layout`] from a
+    /// rendering reads them to tell a marker from the text the layout writes around it.
+    pub fn terminal_texts(&self) -> impl Iterator<Item = &str> {
+        self.terminals.iter().map(|terminal| &*terminal.text)
     }
 
     /// Whether `tail`, at the end of the output in `state`, is a tag the end cut short: it begins
@@ -275,6 +1251,11 @@ impl Format {
         self.terminals[index].ignored
     }
 
+    /// Whether terminal `index` is read as content text where it moves the engine.
+    pub(crate) fn shown(&self, index: usize) -> bool {
+        self.terminals[index].shown
+    }
+
     /// What the text in state `index` is.
     pub(crate) fn emits(&self, index: usize) -> Emits {
         self.states[index].emits
@@ -300,17 +1281,61 @@ impl Format {
             .map(|transition| (transition.from, transition.on, transition.to))
     }
 
-    /// The call syntax, for a format with an arguments state.
-    pub(crate) fn call_syntax(&self) -> Option<&CallSyntax> {
+    /// The call syntax, for a format with an arguments state: how the model writes a call there.
+    /// For a call given as data it is the shape's patterns, which whoever compiled the table reads
+    /// again to learn the table's [`Layout`] from a rendering of the model's chat template.
+    pub fn call_syntax(&self) -> Option<&CallSyntax> {
         self.calls.as_ref()
     }
 
+    /// Where a call's id comes from.
+    pub fn call_id_source(&self) -> CallId {
+        self.call_id
+    }
+
+    /// Whether the stream's stop closes the call in state `index`.
+    pub(crate) fn stop_closes(&self, index: usize) -> bool {
+        self.states[index].closes_at_stop
+    }
+
+    /// Whether the template discards the text in state `index`.
+    pub(crate) fn is_framing(&self, index: usize) -> bool {
+        self.states[index].framing
+    }
+
+    /// Whether the text of state `index` is trimmed stay by stay.
+    pub(crate) fn is_trimmed(&self, index: usize) -> bool {
+        self.states[index].trimmed
+    }
+
+    /// Whether the text of state `index` stands as written, whitespace alone included.
+    pub(crate) fn is_kept(&self, index: usize) -> bool {
+        self.states[index].kept
+    }
+
+    /// Whether a request's variant made state `index` content: the thought of a request that
+    /// does not separate reasoning ([`Self::without_reasoning`]), the calls of one without tools
+    /// ([`Self::without_calls`]). The engine counts no marker out of place there, as the table
+    /// counted none: a thought's marker is the thought's text, a call's header the call's.
+    pub(crate) fn is_remade(&self, index: usize) -> bool {
+        self.states[index].remade
+    }
+
     /// What every table must hold before an engine runs it: a state to start in, which does not
-    /// emit reasoning (a thought the output starts inside is entered by the prompt's replay, which
-    /// pushes `ReasoningStart`; an arguments state at the start has its call opened by the
-    /// engine), a call syntax when a state emits arguments, a text for every terminal and a turn
-    /// opener that is not empty. The builder keeps a row from naming what the table lacks; this
-    /// checks the rest.
+    /// emit reasoning (a thought the output starts inside is entered by the prompt's replay or by
+    /// the start row, either of which pushes `ReasoningStart`; an arguments state at the start has
+    /// its call opened by the engine), a call syntax when a state emits arguments, a text for
+    /// every terminal, a turn opener and turn anchors that are not empty and not both named, a
+    /// start row only where a turn's first byte is read from the first state and no opener replays
+    /// it, an unopened row only with a turn opener, a turn end that is not empty and a state that
+    /// holds no call, a stop row only for an arguments state, a framing row only for a state of
+    /// content or wrapping, a trim row only for a state of content or reasoning that is not
+    /// framing, a kept row only for a content state that is neither framing nor trimmed, a thought
+    /// when the table thinks first, and, for a shaped call, a shape a stream can run,
+    /// opened only through its terminal (the turn does not start in its state), no terminal the
+    /// table ignores, and, when its header is not empty, no row into its state from a state that
+    /// holds a call. The builder keeps a row from naming what the table lacks; this checks the
+    /// rest.
     pub fn validate(&self) -> Result<(), String> {
         let Some(first) = self.states.first() else {
             return Err(format!("format {}: a table with no state", self.name));
@@ -346,7 +1371,194 @@ impl Format {
         if self.turn_opener.as_deref() == Some("") {
             return Err(format!("format {}: an empty turn opener", self.name));
         }
+        if self.anchors.iter().any(|anchor| anchor.text.is_empty()) {
+            return Err(format!("format {}: an empty turn anchor", self.name));
+        }
+        if self.turn_opener.is_some() && !self.anchors.is_empty() {
+            return Err(format!(
+                "format {}: a turn opener and turn anchors; a table names one",
+                self.name
+            ));
+        }
+        if self.start.is_some() {
+            if first.emits == Emits::Arguments {
+                return Err(format!(
+                    "format {}: a start row, but the first state {:?} holds a call",
+                    self.name, first.name
+                ));
+            }
+            if self.turn_opener.is_some() {
+                return Err(format!(
+                    "format {}: a start row needs the turn's start, which a turn opener replays",
+                    self.name
+                ));
+            }
+        }
+        if let Some(unopened) = &self.unopened {
+            if self.turn_opener.is_none() {
+                return Err(format!(
+                    "format {}: an unopened row needs a turn opener, whose absence leaves the \
+                     turn unopened",
+                    self.name
+                ));
+            }
+            if unopened.end.is_empty() {
+                return Err(format!(
+                    "format {}: an unopened row with an empty turn end",
+                    self.name
+                ));
+            }
+            if self.states[unopened.state].emits == Emits::Arguments {
+                return Err(format!(
+                    "format {}: an unopened turn starts in {:?}, which holds a call",
+                    self.name, self.states[unopened.state].name
+                ));
+            }
+        }
+        if let Some(state) = self
+            .states
+            .iter()
+            .find(|state| state.closes_at_stop && state.emits != Emits::Arguments)
+        {
+            return Err(format!(
+                "format {}: a stop closes state {:?}, which holds no call",
+                self.name, state.name
+            ));
+        }
+        if let Some(state) = self.states.iter().find(|state| {
+            state.framing && matches!(state.emits, Emits::Reasoning | Emits::Arguments)
+        }) {
+            return Err(format!(
+                "format {}: state {:?} is framing, but it emits {:?}",
+                self.name, state.name, state.emits
+            ));
+        }
+        let misfit = self
+            .states
+            .iter()
+            .filter(|state| state.trimmed)
+            .find_map(|state| {
+                if matches!(state.emits, Emits::Arguments | Emits::Wrapper) {
+                    Some(format!(
+                        "format {}: state {:?} is trimmed, but it emits {:?}",
+                        self.name, state.name, state.emits
+                    ))
+                } else if state.framing {
+                    Some(format!(
+                        "format {}: state {:?} is trimmed, but its text is framing",
+                        self.name, state.name
+                    ))
+                } else {
+                    None
+                }
+            });
+        if let Some(why) = misfit {
+            return Err(why);
+        }
+        let misfit = self
+            .states
+            .iter()
+            .filter(|state| state.kept)
+            .find_map(|state| {
+                if state.emits != Emits::Content {
+                    Some(format!(
+                        "format {}: state {:?} is kept, but it emits {:?}",
+                        self.name, state.name, state.emits
+                    ))
+                } else if state.framing {
+                    Some(format!(
+                        "format {}: state {:?} is kept, but its text is framing",
+                        self.name, state.name
+                    ))
+                } else if state.trimmed {
+                    Some(format!(
+                        "format {}: state {:?} is kept, but it is trimmed",
+                        self.name, state.name
+                    ))
+                } else {
+                    None
+                }
+            });
+        if let Some(why) = misfit {
+            return Err(why);
+        }
+        if self.thinks_first
+            && !self
+                .states
+                .iter()
+                .any(|state| state.emits == Emits::Reasoning)
+        {
+            return Err(format!(
+                "format {}: a table that thinks first has no thought",
+                self.name
+            ));
+        }
+        if self.call_id == CallId::Header
+            && self
+                .calls
+                .as_ref()
+                .is_some_and(|syntax| !matches!(syntax, CallSyntax::Shaped(_)))
+        {
+            return Err(format!(
+                "format {}: the call's id comes from its header, which only a call given as data \
+                 has",
+                self.name
+            ));
+        }
+        if let Some(CallSyntax::Shaped(shape)) = self.calls {
+            self.validate_shaped(shape)?;
+        }
         Ok(())
+    }
+
+    /// What a table with a shaped call must hold besides: a shape a stream can run, every call
+    /// opened by a terminal (a shaped call opens through its terminal and its header, so the
+    /// output does not start in one, nor does a start row lead into one), no terminal the table
+    /// ignores (a shaped call has no place to keep one among the bytes it holds), and, when the
+    /// header is not empty, no row from a state that holds a call into one: a terminal whose
+    /// header does not match is the text of the state it came in, which a closed call cannot take.
+    fn validate_shaped(&self, shape: &CallShape) -> Result<(), String> {
+        if let Err(why) = shape.check() {
+            return Err(format!("format {}: the call's shape: {why}", self.name));
+        }
+        if self.call_id == CallId::Header
+            && (shape.header.0.is_empty() || shape.name != NameSource::Header)
+        {
+            return Err(format!(
+                "format {}: the call's id comes from its header, but the header names no call",
+                self.name
+            ));
+        }
+        let calls = |index: usize| self.states[index].emits == Emits::Arguments;
+        let anchored = self.anchors.iter().any(|anchor| calls(anchor.state));
+        if calls(0) || self.start.is_some_and(calls) || anchored {
+            return Err(format!(
+                "format {}: a shaped call opens through its terminal, but the turn may start in \
+                 one",
+                self.name
+            ));
+        }
+        if let Some(terminal) = self.terminals.iter().find(|terminal| terminal.ignored) {
+            return Err(format!(
+                "format {}: terminal {:?} is ignored, which a shaped call cannot keep in place",
+                self.name, terminal.name
+            ));
+        }
+        if shape.header.0.is_empty() {
+            return Ok(());
+        }
+        match self
+            .transitions
+            .iter()
+            .find(|row| calls(row.from) && calls(row.to))
+        {
+            Some(row) => Err(format!(
+                "format {}: a row from {:?} into {:?}, both holding calls, but the call's header \
+                 may not match, and then its terminal is the text of a state that holds none",
+                self.name, self.states[row.from].name, self.states[row.to].name
+            )),
+            None => Ok(()),
+        }
     }
 }
 
@@ -403,6 +1615,14 @@ mod tests {
             Err("format opener: an empty turn opener".to_string())
         );
         assert_eq!(
+            Format::new("first")
+                .state("c", Emits::Content)
+                .thinks_first()
+                .validate(),
+            Err("format first: a table that thinks first has no thought".to_string())
+        );
+        assert!(two_states().thinks_first().validate().is_ok());
+        assert_eq!(
             Format::new("thought")
                 .state("r", Emits::Reasoning)
                 .validate(),
@@ -412,6 +1632,992 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    /// A thought and calls, the calls' opener read inside the thought too, as Gemma 4 and dots3
+    /// have it.
+    fn with_calls() -> Format {
+        Format::new("q")
+            .terminal("think_open", "<think>")
+            .terminal("think_close", "</think>")
+            .terminal("call_open", "<tool_call>")
+            .terminal("call_close", "</tool_call>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("calls", Emits::Arguments)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "content")
+            .transition("content", "call_open", "calls")
+            .transition("calls", "call_close", "content")
+            .transition("reasoning", "call_open", "calls")
+            .calls(CallSyntax::Json)
+            .opens_turn("<|im_start|>assistant")
+    }
+
+    fn events(format: Format, prompt: &str, output: &str) -> Vec<crate::event::Event<'static>> {
+        use crate::{
+            engine::Engine,
+            event::Events,
+            input::{EngineFinish, Input},
+            parser::Parser,
+            Declared,
+        };
+        let mut parser = Engine::new(format, Declared::default());
+        let mut out = Events::new();
+        parser
+            .feed(
+                Input::Prompt {
+                    token_ids: &[],
+                    text: prompt,
+                },
+                &mut out,
+            )
+            .expect("prompt");
+        parser
+            .feed(
+                Input::Delta {
+                    token_ids: &[],
+                    text: output,
+                    spans: &[],
+                },
+                &mut out,
+            )
+            .expect("delta");
+        parser
+            .feed(
+                Input::End {
+                    finish: EngineFinish::Stop,
+                },
+                &mut out,
+            )
+            .expect("end");
+        out.into_owned().drain()
+    }
+
+    fn said(events: &[crate::event::Event]) -> (String, String, usize) {
+        use crate::event::Event;
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        let mut calls = 0;
+        for event in events {
+            match event {
+                Event::Content(text) => content.push_str(&text.text),
+                Event::Reasoning(text) => reasoning.push_str(&text.text),
+                Event::ToolCallStart { .. } => calls += 1,
+                _ => {}
+            }
+        }
+        (content, reasoning, calls)
+    }
+
+    #[test]
+    fn without_reasoning_shows_the_thoughts_markers_and_reads_the_calls() {
+        let format = with_calls().without_reasoning();
+        assert!(format.validate().is_ok());
+        assert_eq!(
+            format.emits(1),
+            Emits::Content,
+            "the thought is content now"
+        );
+        assert_eq!(
+            format.next(0, 0),
+            Some(1),
+            "its opener still moves the engine"
+        );
+        assert!(
+            format.shown(0) && format.shown(1),
+            "and is shown, as its closer is"
+        );
+        assert!(
+            !format.shown(2) && !format.shown(3),
+            "the call's markers are not"
+        );
+        let output = "<think>a thought</think>an answer<tool_call>\n{\"name\": \"f\", \
+                      \"arguments\": {}}\n</tool_call>";
+        let (content, reasoning, calls) = said(&events(format.clone(), "", output));
+        assert_eq!(content, "<think>a thought</think>an answer");
+        assert_eq!(reasoning, "");
+        assert_eq!(calls, 1);
+        // A prompt that opened the thought leaves the output in it: its text and its closer are
+        // content, and the call after it reads.
+        let (content, reasoning, calls) = said(&events(
+            format,
+            "<|im_start|>assistant\n<think>\n",
+            "still a thought</think><tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n\
+             </tool_call>",
+        ));
+        assert_eq!(
+            (content.as_str(), reasoning.as_str(), calls),
+            ("still a thought</think>", "", 1)
+        );
+        // A table without a thought or a marker is itself.
+        let plain = Format::new("p").state("c", Emits::Content);
+        assert_eq!(plain.clone().without_reasoning(), plain);
+    }
+
+    #[test]
+    fn without_calls_shows_the_calls_markers_and_reads_the_thought() {
+        let format = with_calls().without_calls();
+        assert!(format.validate().is_ok());
+        assert_eq!(
+            format.emits(2),
+            Emits::Content,
+            "the calls state is content now"
+        );
+        assert_eq!(format.call_syntax(), None);
+        assert!(
+            format.shown(2) && format.shown(3),
+            "the call's markers are shown"
+        );
+        assert!(
+            !format.shown(0) && !format.shown(1),
+            "the thought's are not"
+        );
+        let output = "<think>a thought</think><tool_call>\n{\"name\": \"f\", \
+                      \"arguments\": {}}\n</tool_call>";
+        let (content, reasoning, calls) = said(&events(format, "", output));
+        assert_eq!(
+            content,
+            "<tool_call>\n{\"name\": \"f\", \"arguments\": {}}\n</tool_call>"
+        );
+        assert_eq!(reasoning, "a thought");
+        assert_eq!(calls, 0);
+        // A trimmed stay is still trimmed up to the shown marker; the call's own text is not.
+        let trimmed = with_calls().trims("content").without_calls();
+        let (content, _, _) = said(&events(
+            trimmed,
+            "",
+            "an answer \n<tool_call>\n{}\n</tool_call>",
+        ));
+        assert_eq!(content, "an answer<tool_call>\n{}\n</tool_call>");
+        // A stop that closed the call closes nothing once the call is content.
+        let stopped = with_calls().closes_at_stop("calls").without_calls();
+        assert!(stopped.validate().is_ok());
+        assert!(!stopped.stop_closes(2));
+        // A table whose output starts in its calls is content from its first byte.
+        let alone = Format::new("j")
+            .state("calls", Emits::Arguments)
+            .calls(CallSyntax::JsonList)
+            .opens_turn("<|a|>")
+            .without_calls();
+        assert!(alone.validate().is_ok());
+        assert_eq!(alone.turn_opener(), Some("<|a|>"));
+        assert_eq!(alone.emits(0), Emits::Content);
+        let (content, _, calls) =
+            said(&events(alone, "", "[{\"name\": \"f\", \"arguments\": {}}]"));
+        assert_eq!(content, "[{\"name\": \"f\", \"arguments\": {}}]");
+        assert_eq!(calls, 0);
+    }
+
+    /// Kimi K3's turn after its opener: a thought, an answer and one call.
+    const KIMI_TURN: &str = concat!(
+        "<|open|>think<|sep|>a thought<|close|>think<|sep|>",
+        "<|open|>response<|sep|>an answer<|close|>response<|sep|>",
+        "<|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>",
+        "<|open|>argument key=\"q\" type=\"string\"<|sep|>x<|close|>argument<|sep|>",
+        "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+    );
+    const KIMI_OPENER: &str = "<|open|>message role=\"assistant\"<|sep|>";
+
+    #[test]
+    fn without_reasoning_shows_kimi_k3s_frame_and_still_reads_its_call() {
+        // The legacy reasoning parser removes the think, response and message tags and leaves the
+        // tools channel to the tool parser; without it those tags are text, and the call reads.
+        let format = crate::formats::kimi_k3().without_reasoning();
+        assert!(format.validate().is_ok());
+        let (content, reasoning, calls) = said(&events(format, KIMI_OPENER, KIMI_TURN));
+        assert_eq!(
+            content,
+            "<|open|>think<|sep|>a thought<|close|>think<|sep|><|open|>response<|sep|>an answer\
+             <|close|>response<|sep|><|close|>message<|sep|>"
+        );
+        assert_eq!(reasoning, "");
+        assert_eq!(calls, 1);
+        // A tag the end cut short is dropped, shown or not: the legacy parsers drop it on both
+        // paths, so a response the length cut inside its closing tag ends the same way.
+        let cut = "<|open|>response<|sep|>an answer<|close|>response";
+        let out = events(
+            crate::formats::kimi_k3().without_reasoning(),
+            KIMI_OPENER,
+            cut,
+        );
+        assert_eq!(said(&out).0, "<|open|>response<|sep|>an answer");
+        let dropped = out.iter().rev().nth(1);
+        assert!(
+            matches!(dropped, Some(crate::event::Event::Dropped { text, .. })
+                if text.text == "<|close|>response"),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn without_calls_keeps_kimi_k3s_frame_and_reads_its_thought_and_answer() {
+        let format = crate::formats::kimi_k3().without_calls();
+        assert!(format.validate().is_ok());
+        assert_eq!(
+            format.emits(0),
+            Emits::Wrapper,
+            "the message is the turn's frame"
+        );
+        let out = events(format, KIMI_OPENER, KIMI_TURN);
+        let (content, reasoning, calls) = said(&out);
+        assert_eq!(reasoning, "a thought");
+        assert_eq!(
+            content,
+            "an answer<|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>\
+             <|open|>argument key=\"q\" type=\"string\"<|sep|>x<|close|>argument<|sep|>\
+             <|close|>call<|sep|><|close|>tools<|sep|>"
+        );
+        assert_eq!(calls, 0);
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, crate::event::Event::Malformed { .. })),
+            "{out:?}"
+        );
+    }
+
+    /// Inkling's turn after its opener: a thought, an answer and one call, then the sampling end.
+    const INKLING_TURN: &str = concat!(
+        "<|content_thinking|>check sources<|end_message|>",
+        "<|message_model|><|content_text|>Here is the answer.<|end_message|>",
+        "<|message_model|>search<|content_invoke_tool_json|>",
+        "{\"name\": \"search\", \"args\": {\"q\": \"rust\"}}<|end_message|>",
+        "<|content_model_end_sampling|>"
+    );
+
+    #[test]
+    fn without_calls_keeps_inklings_framing_dropped_and_reads_its_call_message_as_text() {
+        // The message header is Inkling's arguments state, which every message opens from: its
+        // markers frame the thought and the answer as much as a call, so none is shown, as the
+        // legacy reasoning parser removes them; the thought reads, the answer is bare, the call's
+        // message is text between dropped framing, and the ignored terminal is still dropped.
+        let format = crate::formats::inkling().without_calls();
+        assert!(format.validate().is_ok());
+        assert!(
+            (0..4).all(|terminal| !format.shown(terminal)),
+            "no marker of the message framing is shown"
+        );
+        assert_eq!(format.emits(0), Emits::Content, "the header is content");
+        assert_eq!(
+            format.emits(3),
+            Emits::Wrapper,
+            "the ended message is the frame between two messages, not a call's wrapper"
+        );
+        let out = events(format, "<|message_model|>", INKLING_TURN);
+        let (content, reasoning, calls) = said(&out);
+        assert_eq!(reasoning, "check sources");
+        assert_eq!(calls, 0);
+        assert_eq!(
+            content,
+            "Here is the answer.search<|content_invoke_tool_json|>{\"name\": \"search\", \
+             \"args\": {\"q\": \"rust\"}}"
+        );
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, crate::event::Event::Malformed { .. })),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn without_calls_inklings_space_between_messages_is_the_templates_with_or_without_tools() {
+        // Whitespace after a message's close and before the next opener, or after the last close,
+        // is dropped by the full table; the variant keeps the ended message a wrapper, so it
+        // drops it too, and the content reads the same.
+        let output = "<|content_text|>Hi<|end_message|>\n<|message_model|><|content_text|>there\
+                      <|end_message|>\n";
+        for format in [
+            crate::formats::inkling(),
+            crate::formats::inkling().without_calls(),
+        ] {
+            let out = events(format, "<|message_model|>", output);
+            let (content, reasoning, calls) = said(&out);
+            assert_eq!(
+                (content.as_str(), reasoning.as_str(), calls),
+                ("Hithere", "", 0)
+            );
+            assert!(
+                !out.iter()
+                    .any(|e| matches!(e, crate::event::Event::Malformed { .. })),
+                "{out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inklings_message_framing_stays_dropped_in_the_variants_composed_in_either_order() {
+        // A request that declares no tools and keeps the reasoning in the content reads with
+        // both variants; the framing is the template's in that reading too, as it is for the
+        // same request with tools, whichever variant is made first.
+        for format in [
+            crate::formats::inkling()
+                .without_calls()
+                .without_reasoning(),
+            crate::formats::inkling()
+                .without_reasoning()
+                .without_calls(),
+        ] {
+            assert!(format.validate().is_ok());
+            assert!(
+                (0..4).all(|terminal| !format.shown(terminal)),
+                "no marker of the message framing is shown"
+            );
+            let (content, reasoning, calls) =
+                said(&events(format, "<|message_model|>", INKLING_TURN));
+            assert_eq!(
+                content,
+                "check sourcesHere is the answer.search<|content_invoke_tool_json|>{\"name\": \
+                 \"search\", \"args\": {\"q\": \"rust\"}}"
+            );
+            assert_eq!((reasoning.as_str(), calls), ("", 0));
+        }
+        // With tools and the reasoning kept, the same bytes read the same way, the call apart.
+        let (content, reasoning, calls) = said(&events(
+            crate::formats::inkling().without_reasoning(),
+            "<|message_model|>",
+            INKLING_TURN,
+        ));
+        assert_eq!(
+            (content.as_str(), reasoning.as_str(), calls),
+            ("check sourcesHere is the answer.", "", 1)
+        );
+    }
+
+    #[test]
+    fn without_reasoning_reads_inklings_call_after_a_thinking_message() {
+        let format = crate::formats::inkling().without_reasoning();
+        assert!(format.validate().is_ok());
+        let (content, reasoning, calls) = said(&events(format, "<|message_model|>", INKLING_TURN));
+        assert_eq!(reasoning, "");
+        assert_eq!(calls, 1);
+        assert_eq!(content, "check sourcesHere is the answer.");
+    }
+
+    #[test]
+    fn without_reasoning_keeps_both_of_minimax_m3s_thought_markers() {
+        let format = crate::formats::minimax_m3().without_reasoning();
+        let output = "<mm:think>a thought</mm:think>an answer";
+        let (content, reasoning, calls) = said(&events(format, "]~b]ai\n", output));
+        assert_eq!(content, output);
+        assert_eq!((reasoning.as_str(), calls), ("", 0));
+    }
+
+    #[test]
+    fn without_reasoning_reads_a_call_after_a_thought_the_turn_starts_in() {
+        // ERNIE-style: the turn starts inside the thought, with no opener to read.
+        let format = Format::new("e")
+            .terminal("think_close", "</think>")
+            .terminal("call_open", "<tool_call>")
+            .terminal("call_close", "</tool_call>")
+            .state("outside", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .state("call", Emits::Arguments)
+            .transition("reasoning", "think_close", "outside")
+            .transition("outside", "call_open", "call")
+            .transition("call", "call_close", "outside")
+            .calls(CallSyntax::Json)
+            .turn_anchor("Assistant:")
+            .starts_in("reasoning")
+            .without_reasoning();
+        assert!(format.validate().is_ok());
+        let output =
+            "a thought</think>\n<tool_call>{\"name\": \"f\", \"arguments\": {}}</tool_call>";
+        let (content, reasoning, calls) = said(&events(format, "User: hi\nAssistant:", output));
+        assert_eq!(
+            (content.as_str(), reasoning.as_str(), calls),
+            ("a thought</think>\n", "", 1)
+        );
+    }
+
+    #[test]
+    fn without_reasoning_drops_the_thought_first_mark_with_the_thought() {
+        let format = with_calls().thinks_first();
+        assert!(format.validate().is_ok());
+        assert!(format.without_reasoning().validate().is_ok());
+    }
+
+    #[test]
+    fn a_stop_row_names_an_arguments_state() {
+        let format = Format::new("stop")
+            .terminal("open", "<call>")
+            .state("content", Emits::Content)
+            .state("call", Emits::Arguments)
+            .transition("content", "open", "call")
+            .calls(CallSyntax::Json)
+            .closes_at_stop("call");
+        assert!(format.stop_closes(1));
+        assert!(!format.stop_closes(0));
+        assert!(format.validate().is_ok());
+        assert_eq!(
+            format.closes_at_stop("content").validate(),
+            Err("format stop: a stop closes state \"content\", which holds no call".to_string())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no state named \"call\"")]
+    fn a_stop_row_for_a_state_the_table_lacks_is_a_programming_error() {
+        let _ = two_states().closes_at_stop("call");
+    }
+
+    /// Gemma 4's two anchors, spelled from the response template of `google/gemma-4-31B-it` (its
+    /// `tokenizer_config.json`), around a thought and the content.
+    fn gemma_anchors() -> Format {
+        Format::new("anchors")
+            .terminal("think_open", "<|channel>thought\n")
+            .terminal("think_close", "<channel|>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .transition("content", "think_open", "reasoning")
+            .transition("reasoning", "think_close", "content")
+            .turn_anchor("<|turn>model\n")
+            .turn_anchor("<tool_response|>")
+    }
+
+    #[test]
+    fn the_last_anchor_of_either_kind_starts_the_turn_after_its_end() {
+        let format = gemma_anchors();
+        let turn = "<|turn>user\nWeather?<turn|>\n<|turn>model\n";
+        assert_eq!(format.replay(turn), "<|turn>model\n");
+        assert_eq!(format.turn(turn), ("", 0));
+        let after_a_tool = "<|turn>model\n<|tool_call>call:f{}<tool_call|><|tool_response>\
+                            response:f{}<tool_response|><|channel>thought\n";
+        assert_eq!(
+            format.replay(after_a_tool),
+            "<tool_response|><|channel>thought\n"
+        );
+        assert_eq!(format.turn(after_a_tool), ("<|channel>thought\n", 0));
+        let later_turn = "<|turn>model\n<tool_response|>Done.<turn|>\n<|turn>user\nThanks<turn|>\n\
+                          <|turn>model\n";
+        assert_eq!(format.turn(later_turn), ("", 0));
+    }
+
+    #[test]
+    fn anchors_are_found_as_finditer_finds_them() {
+        let doubled = Format::new("doubled")
+            .state("content", Emits::Content)
+            .turn_anchor("aa");
+        // `finditer` takes `aa` at 0 and goes on from 2: the turn starts after the first two.
+        assert_eq!(doubled.turn("aaa"), ("a", 0));
+        assert_eq!(doubled.turn("aaaa"), ("", 0));
+        let longest_first = Format::new("longest first")
+            .state("content", Emits::Content)
+            .turn_anchor("ab")
+            .turn_anchor("a");
+        assert_eq!(longest_first.turn("xab"), ("", 0));
+        let shortest_first = Format::new("shortest first")
+            .state("content", Emits::Content)
+            .turn_anchor("a")
+            .turn_anchor("ab");
+        assert_eq!(shortest_first.turn("xab"), ("b", 0));
+        // A later anchor that starts inside the last match is not one.
+        let overlapping = Format::new("overlapping")
+            .state("content", Emits::Content)
+            .turn_anchor("<a><b>")
+            .turn_anchor("<b>c");
+        assert_eq!(overlapping.turn("<a><b>c"), ("c", 0));
+        assert_eq!(overlapping.turn("<b>c<a><b>c"), ("c", 0));
+    }
+
+    #[test]
+    fn a_prompt_without_an_anchor_replays_nothing_and_a_replay_gives_itself() {
+        let format = gemma_anchors();
+        assert_eq!(format.replay("hello "), "");
+        assert_eq!(format.turn("hello "), ("", 0));
+        assert_eq!(format.turn(""), ("", 0));
+        for prompt in [
+            "<|turn>model\n",
+            "<|turn>model\n<|channel>thought\nPlan",
+            "a<tool_response|>b<|turn>model\nc<tool_response|>d",
+            "no anchor at all",
+        ] {
+            let kept = format.replay(prompt);
+            assert_eq!(format.replay(kept), kept, "{prompt:?}");
+            assert_eq!(format.turn(kept), format.turn(prompt), "{prompt:?}");
+        }
+    }
+
+    #[test]
+    fn an_anchor_names_the_state_the_output_starts_in() {
+        // TRL's Nemotron 3 template: the anchor pattern `<\|im_start\|>assistant\n<think>(?:\n|
+        // </think>)?` is three literals, the longer ones first as the greedy `?` tries them.
+        let format = Format::new("nemotron 3")
+            .terminal("think_close", "</think>")
+            .state("content", Emits::Content)
+            .state("reasoning", Emits::Reasoning)
+            .transition("reasoning", "think_close", "content")
+            .turn_anchor_starting_in("<|im_start|>assistant\n<think>\n", "reasoning")
+            .turn_anchor_starting_in("<|im_start|>assistant\n<think></think>", "content")
+            .turn_anchor_starting_in("<|im_start|>assistant\n<think>", "reasoning");
+        assert!(format.validate().is_ok());
+        assert_eq!(
+            format.turn("<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think>\n"),
+            ("", 1)
+        );
+        assert_eq!(
+            format.turn("<|im_start|>assistant\n<think></think>"),
+            ("", 0)
+        );
+        assert_eq!(format.turn("<|im_start|>assistant\n<think>"), ("", 1));
+        assert_eq!(format.turn("<|im_start|>assistant\n<think>x"), ("x", 1));
+    }
+
+    /// A table whose template writes the turn opener after a user message only: the thought is
+    /// where an unopened turn starts, and `<|end|>` ends a turn the model wrote.
+    fn opened_after_a_user_only() -> Format {
+        two_states()
+            .opens_turn("<|assistant|>")
+            .unopened_turn_starts_in("inside", "<|end|>")
+    }
+
+    #[test]
+    fn a_prompt_that_opens_no_turn_starts_the_output_where_the_unopened_row_says() {
+        let format = opened_after_a_user_only();
+        assert!(format.validate().is_ok());
+        let unopened = Replay {
+            state: 1,
+            at_turn_start: false,
+            begun: false,
+        };
+        // No turn opener at all: the row's state, nothing replayed, a marker in the text included.
+        assert_eq!(format.replayed("User: hi\nSystem: notes"), unopened);
+        assert_eq!(format.replayed("User: why </a> there?"), unopened);
+        // The last opener's turn ended and other roles' text followed: the same.
+        assert_eq!(
+            format.replayed("<|assistant|><a>t</a>answer<|end|>User: more</a>"),
+            unopened
+        );
+        assert!(format.reasoning_open("User: hi"));
+        // An opener last opens the turn: the template's framing after it is replayed as before.
+        let opened = |state, begun| Replay {
+            state,
+            at_turn_start: false,
+            begun,
+        };
+        assert_eq!(format.replayed("User: hi<|assistant|>"), opened(0, false));
+        assert_eq!(
+            format.replayed("User: hi<|assistant|><a>"),
+            opened(1, false)
+        );
+        assert_eq!(
+            format.replayed("User: hi<|assistant|><a></a>"),
+            opened(0, false)
+        );
+        // A turn continued without its end is the model's own text: a prefill, as before.
+        assert_eq!(
+            format.replayed("<|assistant|><a></a>Sure,"),
+            opened(0, true)
+        );
+        // An empty prompt is no prompt.
+        assert_eq!(format.replayed(""), opened(0, false));
+        // Without the row, a prompt without an opener replays whole, as before.
+        assert_eq!(
+            two_states()
+                .opens_turn("<|assistant|>")
+                .replayed("User: hi"),
+            opened(0, true)
+        );
+    }
+
+    #[test]
+    fn an_unopened_turn_starts_in_the_thought_and_the_close_leaves_it() {
+        let format = opened_after_a_user_only();
+        let output = "a thought</a>an answer";
+        for prompt in [
+            "User: hi\nSystem: notes",
+            "User: a</a>b<|assistant|><a>t</a>x<|end|>User: more\nSystem: notes",
+        ] {
+            let events = events(format.clone(), prompt, output);
+            assert_eq!(events[0], crate::event::Event::ReasoningStart, "{prompt:?}");
+            assert_eq!(
+                said(&events),
+                ("an answer".to_string(), "a thought".to_string(), 0),
+                "{prompt:?}"
+            );
+        }
+        // The replay a caller keeps gives itself.
+        for prompt in [
+            "User: hi",
+            "<|assistant|><a>t</a>x<|end|>User: more",
+            "<|assistant|><a>",
+        ] {
+            let kept = format.replay(prompt);
+            assert_eq!(format.replayed(kept), format.replayed(prompt), "{prompt:?}");
+        }
+        // Without its thought, as a request that keeps the reasoning in the content asks, the row
+        // stays and the thought's close is content.
+        let shown = events(format.without_reasoning(), "User: hi", output);
+        assert_eq!(
+            said(&shown),
+            ("a thought</a>an answer".to_string(), String::new(), 0)
+        );
+    }
+
+    #[test]
+    fn an_unopened_row_needs_a_turn_opener_a_turn_end_and_a_state_without_a_call() {
+        assert_eq!(
+            two_states()
+                .unopened_turn_starts_in("inside", "<|end|>")
+                .validate(),
+            Err(
+                "format t: an unopened row needs a turn opener, whose absence leaves the turn \
+                 unopened"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            two_states()
+                .opens_turn("<|assistant|>")
+                .unopened_turn_starts_in("inside", "")
+                .validate(),
+            Err("format t: an unopened row with an empty turn end".to_string())
+        );
+        assert_eq!(
+            Format::new("list")
+                .terminal("open", "<call>")
+                .state("content", Emits::Content)
+                .state("call", Emits::Arguments)
+                .transition("content", "open", "call")
+                .calls(CallSyntax::Json)
+                .opens_turn("<|assistant|>")
+                .unopened_turn_starts_in("call", "<|end|>")
+                .validate(),
+            Err("format list: an unopened turn starts in \"call\", which holds a call".to_string())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no state named \"thought\"")]
+    fn an_unopened_row_for_a_state_the_table_lacks_is_a_programming_error() {
+        let _ = two_states()
+            .opens_turn("<|assistant|>")
+            .unopened_turn_starts_in("thought", "<|end|>");
+    }
+
+    #[test]
+    fn an_anchor_is_not_empty_and_a_table_names_an_opener_or_anchors() {
+        assert_eq!(
+            Format::new("empty")
+                .state("c", Emits::Content)
+                .turn_anchor("")
+                .validate(),
+            Err("format empty: an empty turn anchor".to_string())
+        );
+        assert_eq!(
+            Format::new("both")
+                .state("c", Emits::Content)
+                .opens_turn("<|assistant|>")
+                .turn_anchor("<|assistant|>")
+                .validate(),
+            Err("format both: a turn opener and turn anchors; a table names one".to_string())
+        );
+        // An empty anchor never matches, even in a table nobody validated.
+        let unchecked = Format::new("unchecked")
+            .state("c", Emits::Content)
+            .turn_anchor("")
+            .turn_anchor("x");
+        assert_eq!(unchecked.turn("axb"), ("b", 0));
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no state named \"thought\"")]
+    fn an_anchor_starting_in_a_state_the_table_lacks_is_a_programming_error() {
+        let _ = two_states().turn_anchor_starting_in("<turn>", "thought");
+    }
+
+    #[test]
+    fn a_start_row_needs_a_first_state_without_a_call_and_no_opener() {
+        let format = two_states().starts_in("inside");
+        assert_eq!(format.start(), Some(1));
+        assert!(format.validate().is_ok());
+        assert_eq!(two_states().start(), None);
+        assert_eq!(
+            Format::new("list")
+                .state("calls", Emits::Arguments)
+                .state("content", Emits::Content)
+                .calls(CallSyntax::JsonList)
+                .starts_in("content")
+                .validate(),
+            Err("format list: a start row, but the first state \"calls\" holds a call".to_string())
+        );
+        assert_eq!(
+            format.opens_turn("<turn>").validate(),
+            Err(
+                "format t: a start row needs the turn's start, which a turn opener replays"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no state named \"thought\"")]
+    fn a_start_row_for_a_state_the_table_lacks_is_a_programming_error() {
+        let _ = two_states().starts_in("thought");
+    }
+
+    #[test]
+    fn a_framing_row_names_a_state_of_content_or_wrapping() {
+        let format = Format::new("framing")
+            .terminal("open", "<call>")
+            .state("outside", Emits::Content)
+            .state("between", Emits::Wrapper)
+            .state("thought", Emits::Reasoning)
+            .state("call", Emits::Arguments)
+            .transition("outside", "open", "call")
+            .calls(CallSyntax::Json)
+            .framing("outside")
+            .framing("between")
+            .framing("outside");
+        let framed: Vec<usize> = (0..format.states())
+            .filter(|&s| format.is_framing(s))
+            .collect();
+        assert_eq!(framed, [0, 1], "a state named twice is kept once");
+        assert!(format.is_framing(0));
+        assert!(format.is_framing(1));
+        assert!(!format.is_framing(2));
+        assert!(!format.is_framing(3));
+        assert!(format.validate().is_ok());
+        assert_eq!(
+            format.clone().framing("thought").validate(),
+            Err("format framing: state \"thought\" is framing, but it emits Reasoning".to_string())
+        );
+        assert_eq!(
+            format.framing("call").validate(),
+            Err("format framing: state \"call\" is framing, but it emits Arguments".to_string())
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no state named \"outside\"")]
+    fn a_framing_row_for_a_state_the_table_lacks_is_a_programming_error() {
+        let _ = two_states().framing("outside");
+    }
+
+    #[test]
+    fn a_trim_row_names_a_state_of_content_or_reasoning_that_is_not_framing() {
+        let format = Format::new("trimmed")
+            .terminal("open", "<call>")
+            .state("content", Emits::Content)
+            .state("thought", Emits::Reasoning)
+            .state("between", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .state("outside", Emits::Content)
+            .transition("content", "open", "call")
+            .calls(CallSyntax::Json)
+            .framing("outside")
+            .trims("content")
+            .trims("thought")
+            .trims("content");
+        let trimmed: Vec<usize> = (0..format.states())
+            .filter(|&s| format.is_trimmed(s))
+            .collect();
+        assert_eq!(trimmed, [0, 1], "a state named twice is kept once");
+        assert!(format.is_trimmed(0) && format.is_trimmed(1) && !format.is_trimmed(2));
+        assert!(format.validate().is_ok());
+        assert_eq!(
+            format.clone().trims("between").validate(),
+            Err("format trimmed: state \"between\" is trimmed, but it emits Wrapper".to_string())
+        );
+        assert_eq!(
+            format.clone().trims("call").validate(),
+            Err("format trimmed: state \"call\" is trimmed, but it emits Arguments".to_string())
+        );
+        assert_eq!(
+            format.trims("outside").validate(),
+            Err(
+                "format trimmed: state \"outside\" is trimmed, but its text is framing".to_string()
+            )
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no state named \"answer\"")]
+    fn a_trim_row_for_a_state_the_table_lacks_is_a_programming_error() {
+        let _ = two_states().trims("answer");
+    }
+
+    #[test]
+    fn a_kept_row_names_a_content_state_that_is_neither_framing_nor_trimmed() {
+        let format = Format::new("kept")
+            .terminal("open", "<c>")
+            .state("content", Emits::Content)
+            .state("thought", Emits::Reasoning)
+            .state("between", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .state("outside", Emits::Content)
+            .state("trimmed", Emits::Content)
+            .transition("content", "open", "call")
+            .calls(CallSyntax::Json)
+            .framing("outside")
+            .trims("trimmed")
+            .keeps("content");
+        assert!(format.is_kept(0) && !format.is_kept(5));
+        assert!(format.validate().is_ok());
+        for (state, why) in [
+            ("thought", "it emits Reasoning"),
+            ("between", "it emits Wrapper"),
+            ("call", "it emits Arguments"),
+            ("outside", "its text is framing"),
+            ("trimmed", "it is trimmed"),
+        ] {
+            assert_eq!(
+                format.clone().keeps(state).validate(),
+                Err(format!("format kept: state {state:?} is kept, but {why}"))
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "format t: no state named \"answer\"")]
+    fn a_kept_row_for_a_state_the_table_lacks_is_a_programming_error() {
+        let _ = two_states().keeps("answer");
+    }
+
+    #[test]
+    fn the_stop_tokens_kept_are_the_terminals_among_the_stops_each_once() {
+        let format = two_states().terminal("call", "<|call|>").stop_tokens([
+            "<|return|>",
+            "<|call|>",
+            "</a>",
+            "<|call|>",
+        ]);
+        assert!(format.is_stop_token("<|call|>"));
+        assert!(format.is_stop_token("</a>"));
+        assert!(
+            !format.is_stop_token("<|return|>"),
+            "a stop the table has no terminal for is not kept"
+        );
+        assert!(!format.is_stop_token("<a>"));
+        assert_eq!(format.stop_tokens, ["<|call|>", "</a>"]);
+        assert!(
+            !two_states()
+                .stop_tokens(["<|call|>"])
+                .is_stop_token("<|call|>"),
+            "a stop named before its terminal is not one yet"
+        );
+        assert!(format.validate().is_ok());
+    }
+
+    /// A shape on abstract tags, its header `<n=NAME>` when `header`, empty otherwise.
+    fn shape(header: bool) -> CallShape {
+        use crate::shape::{Arguments, Atom, Class, Dialect, NameSource, Pattern, Slot};
+        let word = Class::new([('a', 'z')], false);
+        let (header, name) = if header {
+            let atoms = [
+                Atom::Lit("<n=".into()),
+                Atom::Run {
+                    class: word.clone(),
+                    min: 1,
+                    max: None,
+                    greedy: true,
+                    capture: Some(Slot::Name),
+                },
+                Atom::Lit(">".into()),
+            ];
+            (Pattern(atoms.into()), NameSource::Header)
+        } else {
+            (Pattern::default(), NameSource::Literal("f".into()))
+        };
+        CallShape {
+            header,
+            name,
+            arguments: Arguments::Json(Dialect::default()),
+            trailer: Pattern::default(),
+            word,
+            hold_cap: 64,
+        }
+    }
+
+    fn shaped(header: bool) -> CallSyntax {
+        CallSyntax::Shaped(crate::shape::intern(shape(header)))
+    }
+
+    #[test]
+    fn a_shaped_call_opens_from_a_state_that_holds_none() {
+        let table = |syntax: CallSyntax| {
+            Format::new("shaped")
+                .terminal("open", "<c>")
+                .terminal("close", "</c>")
+                .state("content", Emits::Content)
+                .state("call", Emits::Arguments)
+                .transition("content", "open", "call")
+                .transition("call", "close", "content")
+                .calls(syntax)
+        };
+        assert!(table(shaped(true)).validate().is_ok());
+        assert_eq!(
+            table(shaped(true))
+                .transition("call", "open", "call")
+                .validate(),
+            Err(
+                "format shaped: a row from \"call\" into \"call\", both holding calls, but the \
+                 call's header may not match, and then its terminal is the text of a state that \
+                 holds none"
+                    .to_string()
+            )
+        );
+        assert!(
+            table(shaped(false))
+                .transition("call", "open", "call")
+                .validate()
+                .is_ok(),
+            "a call with no header always opens at its terminal"
+        );
+        assert_eq!(
+            table(shaped(true)).ignores("sep", "|").validate(),
+            Err(
+                "format shaped: terminal \"sep\" is ignored, which a shaped call cannot keep in \
+                 place"
+                    .to_string()
+            )
+        );
+        for starts_in_a_call in [
+            table(shaped(true)).starts_in("call"),
+            table(shaped(true)).turn_anchor_starting_in("<turn>", "call"),
+        ] {
+            assert_eq!(
+                starts_in_a_call.validate(),
+                Err(
+                    "format shaped: a shaped call opens through its terminal, but the turn may \
+                     start in one"
+                        .to_string()
+                )
+            );
+        }
+        let unnamed = CallSyntax::Shaped(crate::shape::intern(CallShape {
+            name: NameSource::Body,
+            ..shape(true)
+        }));
+        assert_eq!(
+            table(unnamed).validate(),
+            Err(
+                "format shaped: the call's shape: the name comes from the arguments, which are \
+                 no envelope"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn the_prompts_replay_walks_the_rows_from_the_last_opener() {
+        // Terminals before the last opener move nothing; after it, each moves the walk where its
+        // row says, a terminal with no row from where the walk stands moving nothing; a terminal
+        // the prompt cut short is text.
+        let format = two_states().opens_turn("<turn>");
+        assert_eq!(format.prompt_state("<turn>"), 0);
+        assert_eq!(format.prompt_state("<turn><a>"), 1);
+        assert!(format.reasoning_open("<turn><a>"));
+        assert!(!format.reasoning_open("<a><turn>"));
+        assert!(!format.reasoning_open("<turn><a>x</a>"));
+        assert!(
+            format.reasoning_open("<turn></a><a>"),
+            "a close in content is text"
+        );
+        assert!(
+            format.reasoning_open("<turn><a></a"),
+            "a cut close moves nothing"
+        );
+        assert!(format.reasoning_open("<a>"), "no opener: the whole prompt");
     }
 
     #[test]

@@ -1,16 +1,16 @@
 // Integration test for Responses API
 
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode};
 use openai_protocol::{
     common::{GenerationRequest, UsageInfo},
     responses::{
         CodeInterpreterTool, McpTool, ReasoningEffort, RequireApproval, RequireApprovalMode,
-        ResponseInput, ResponseReasoningParam, ResponseTool, ResponsesRequest, ResponsesToolChoice,
-        ServiceTier, ToolChoiceOptions, Truncation, WebSearchPreviewTool,
+        ResponseContentPart, ResponseInput, ResponseReasoningParam, ResponseTool, ResponsesRequest,
+        ResponsesToolChoice, ServiceTier, ToolChoiceOptions, Truncation, WebSearchPreviewTool,
     },
 };
 use smg::{
-    config::RouterConfig,
+    config::{RouterConfig, RouterConfigBuilder},
     endpoints::conversations,
     routers::RouterFactory,
     tenant::{RouteRequestMeta, TenantKey},
@@ -26,6 +26,41 @@ const TEST_INTERNAL_MCP_ERROR_MARKER: &str = "internal-mcp-failure-marker";
 
 fn test_tenant_meta() -> smg::middleware::TenantRequestMeta {
     RouteRequestMeta::new(TenantKey::from("test-tenant"))
+}
+
+/// What every router of these tests shares: OpenAI mode over `worker_urls`,
+/// the random policy, the loopback host on an ephemeral port, an 8 MiB
+/// payload cap, a one-minute request timeout, a one-second startup check
+/// interval and a five-second queue timeout.
+fn router_builder(worker_urls: Vec<String>) -> RouterConfigBuilder {
+    RouterConfig::builder()
+        .openai_mode(worker_urls)
+        .random_policy()
+        .host("127.0.0.1")
+        .port(0)
+        .max_payload_size(8 * 1024 * 1024)
+        .request_timeout_secs(60)
+        .worker_startup_check_interval_secs(1)
+        .log_level("warn")
+        .queue_timeout_secs(5)
+}
+
+/// The router of a test that drives a mock worker at `worker_url`: five
+/// seconds for the worker to come up, 32 requests in flight.
+fn worker_router_config(worker_url: String) -> RouterConfig {
+    router_builder(vec![worker_url])
+        .worker_startup_timeout_secs(5)
+        .max_concurrent_requests(32)
+        .build_unchecked()
+}
+
+/// The router of the conversation tests: a worker address nothing calls, one
+/// second for it to come up, 8 requests in flight.
+fn conversation_router_config() -> RouterConfig {
+    router_builder(vec!["http://localhost".to_string()])
+        .worker_startup_timeout_secs(1)
+        .max_concurrent_requests(8)
+        .build_unchecked()
 }
 
 #[tokio::test]
@@ -52,20 +87,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    // Build router config (HTTP OpenAI mode)
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     // Create router and context with MCP config from file
     let ctx =
@@ -118,6 +140,7 @@ async fn test_non_streaming_mcp_minimal_e2e_with_persistence() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        client_metadata: None,
         top_k: -1,
         min_p: 0.0,
         repetition_penalty: 1.0,
@@ -258,19 +281,7 @@ async fn test_non_streaming_mcp_e2e_accepts_forwardable_request_headers() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -321,6 +332,7 @@ async fn test_non_streaming_mcp_e2e_accepts_forwardable_request_headers() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        client_metadata: None,
         top_k: -1,
         min_p: 0.0,
         repetition_penalty: 1.0,
@@ -407,19 +419,7 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -470,6 +470,7 @@ async fn test_non_streaming_mcp_returns_approval_request_when_required() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        client_metadata: None,
         top_k: -1,
         min_p: 0.0,
         repetition_penalty: 1.0,
@@ -542,19 +543,7 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -605,6 +594,7 @@ async fn test_final_response_hides_internal_mcp_trace_items() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        client_metadata: None,
         top_k: -1,
         min_p: 0.0,
         repetition_penalty: 1.0,
@@ -676,19 +666,7 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -741,6 +719,7 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        client_metadata: None,
         top_k: -1,
         min_p: 0.0,
         repetition_penalty: 1.0,
@@ -797,6 +776,7 @@ async fn test_previous_response_id_does_not_repeat_mcp_list_tools_for_existing_b
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        client_metadata: None,
         top_k: -1,
         min_p: 0.0,
         repetition_penalty: 1.0,
@@ -859,19 +839,7 @@ async fn test_final_response_hides_internal_mcp_error_details() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -922,6 +890,7 @@ async fn test_final_response_hides_internal_mcp_error_details() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        client_metadata: None,
         top_k: -1,
         min_p: 0.0,
         repetition_penalty: 1.0,
@@ -959,19 +928,7 @@ async fn test_final_response_hides_internal_mcp_error_details() {
 #[tokio::test]
 async fn test_conversations_crud_basic() {
     // Router in OpenAI mode (no actual upstream calls in these tests)
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -979,7 +936,8 @@ async fn test_conversations_crud_basic() {
     // Create
     let create_body = serde_json::json!({ "metadata": { "project": "alpha" } });
     let create_resp =
-        conversations::create_conversation(&ctx.conversation_storage, create_body.clone()).await;
+        conversations::create_conversation(&ctx.conversation_storage, None, create_body.clone())
+            .await;
     assert_eq!(create_resp.status(), StatusCode::OK);
     let create_bytes = axum::body::to_bytes(create_resp.into_body(), usize::MAX)
         .await
@@ -990,7 +948,7 @@ async fn test_conversations_crud_basic() {
     assert_eq!(create_json["object"], "conversation");
 
     // Get
-    let get_resp = conversations::get_conversation(&ctx.conversation_storage, conv_id).await;
+    let get_resp = conversations::get_conversation(&ctx.conversation_storage, None, conv_id).await;
     assert_eq!(get_resp.status(), StatusCode::OK);
     let get_bytes = axum::body::to_bytes(get_resp.into_body(), usize::MAX)
         .await
@@ -1000,9 +958,13 @@ async fn test_conversations_crud_basic() {
 
     // Update (merge)
     let update_body = serde_json::json!({ "metadata": { "owner": "alice" } });
-    let upd_resp =
-        conversations::update_conversation(&ctx.conversation_storage, conv_id, update_body.clone())
-            .await;
+    let upd_resp = conversations::update_conversation(
+        &ctx.conversation_storage,
+        None,
+        conv_id,
+        update_body.clone(),
+    )
+    .await;
     assert_eq!(upd_resp.status(), StatusCode::OK);
     let upd_bytes = axum::body::to_bytes(upd_resp.into_body(), usize::MAX)
         .await
@@ -1012,7 +974,8 @@ async fn test_conversations_crud_basic() {
     assert_eq!(upd_json["metadata"]["owner"], serde_json::json!("alice"));
 
     // Delete
-    let del_resp = conversations::delete_conversation(&ctx.conversation_storage, conv_id).await;
+    let del_resp =
+        conversations::delete_conversation(&ctx.conversation_storage, None, conv_id).await;
     assert_eq!(del_resp.status(), StatusCode::OK);
     let del_bytes = axum::body::to_bytes(del_resp.into_body(), usize::MAX)
         .await
@@ -1021,8 +984,222 @@ async fn test_conversations_crud_basic() {
     assert_eq!(del_json["deleted"], serde_json::json!(true));
 
     // Get again -> 404
-    let not_found = conversations::get_conversation(&ctx.conversation_storage, conv_id).await;
+    let not_found = conversations::get_conversation(&ctx.conversation_storage, None, conv_id).await;
     assert_eq!(not_found.status(), StatusCode::NOT_FOUND);
+}
+
+/// The JSON body of a response that must be a 200.
+async fn ok_json(
+    response: axum::response::Response,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// The public API answers a conversation created without metadata with
+/// `"metadata": {}` on creation and on retrieval; the field is never omitted.
+#[tokio::test]
+async fn a_conversation_without_metadata_answers_an_empty_metadata_object(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = crate::common::create_test_context(conversation_router_config()).await;
+
+    let created = ok_json(
+        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
+            .await,
+    )
+    .await?;
+    assert_eq!(created["metadata"], serde_json::json!({}), "{created}");
+
+    let conv_id = created["id"].as_str().expect("id missing");
+    let fetched =
+        ok_json(conversations::get_conversation(&ctx.conversation_storage, None, conv_id).await)
+            .await?;
+    assert_eq!(fetched["metadata"], serde_json::json!({}), "{fetched}");
+    Ok(())
+}
+
+/// A message added with a plain string content is stored, answered and
+/// listed with the typed `input_text` part the public API makes of it, the
+/// same shape a message added with typed parts has; the list carries the item
+/// objects alone, without a gateway-only `created_at` on them.
+#[tokio::test]
+async fn items_added_with_string_content_are_listed_as_typed_parts(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = crate::common::create_test_context(conversation_router_config()).await;
+
+    let created = ok_json(
+        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
+            .await,
+    )
+    .await?;
+    let conv_id = created["id"].as_str().expect("id missing");
+    let typed_first = serde_json::json!([{"type": "input_text", "text": "first"}]);
+    let typed_second = serde_json::json!([{"type": "input_text", "text": "second"}]);
+
+    let added = ok_json(
+        conversations::create_conversation_items(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            conv_id,
+            serde_json::json!({"items": [
+                {"type": "message", "role": "user", "content": "first"},
+                {"type": "message", "role": "user", "content": typed_second},
+            ]}),
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(added["data"][0]["content"], typed_first, "{added}");
+    assert_eq!(added["data"][1]["content"], typed_second, "{added}");
+
+    let first_id = added["data"][0]["id"].as_str().expect("item id missing");
+    let second_id = added["data"][1]["id"].as_str().expect("item id missing");
+
+    let listed = ok_json(
+        conversations::list_conversation_items(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            conv_id,
+            None,
+            Some("asc"),
+            None,
+        )
+        .await,
+    )
+    .await?;
+    let listed_items = listed["data"].as_array().expect("data");
+    assert_eq!(listed_items.len(), 2, "{listed}");
+    // The two items of one add call share their `added_at`, and the stores
+    // order such ties by the item id, so the list may answer them in either
+    // order: each item is looked up by its id.
+    let listed_content = |id: &str| {
+        listed_items
+            .iter()
+            .find(|item| item["id"] == id)
+            .map(|item| item["content"].clone())
+    };
+    assert_eq!(
+        listed_content(first_id).as_ref(),
+        Some(&typed_first),
+        "{listed}"
+    );
+    assert_eq!(
+        listed_content(second_id).as_ref(),
+        Some(&typed_second),
+        "{listed}"
+    );
+    for item in listed_items {
+        assert!(
+            item.get("created_at").is_none(),
+            "a listed item carries a field the public API's items do not: {item}"
+        );
+        assert_eq!(item["status"], "completed", "{item}");
+    }
+
+    let fetched = ok_json(
+        conversations::get_conversation_item(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            conv_id,
+            first_id,
+            None,
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(fetched["content"], typed_first, "{fetched}");
+    Ok(())
+}
+
+/// An assistant message added with a plain string content becomes the one
+/// `output_text` part (empty `annotations`) the public API makes of it, not
+/// an `input_text` part, which the public API refuses on an assistant message
+/// when the conversation's history is replayed; the add, the item GET and the
+/// list answer that part, and it deserializes as the typed content parts the
+/// history loaders replay upstream.
+#[tokio::test]
+async fn an_assistant_message_added_as_a_string_is_stored_as_an_output_text_part(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let ctx = crate::common::create_test_context(conversation_router_config()).await;
+
+    let created = ok_json(
+        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
+            .await,
+    )
+    .await?;
+    let conv_id = created["id"].as_str().expect("id missing");
+    let output_part =
+        serde_json::json!([{"type": "output_text", "text": "Hi there!", "annotations": []}]);
+
+    let added = ok_json(
+        conversations::create_conversation_items(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            conv_id,
+            serde_json::json!({"items": [
+                {"type": "message", "role": "assistant", "content": "Hi there!"},
+            ]}),
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(added["data"][0]["role"], "assistant", "{added}");
+    assert_eq!(added["data"][0]["content"], output_part, "{added}");
+    let item_id = added["data"][0]["id"].as_str().expect("item id missing");
+
+    let fetched = ok_json(
+        conversations::get_conversation_item(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            conv_id,
+            item_id,
+            None,
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(fetched["content"], output_part, "{fetched}");
+
+    let listed = ok_json(
+        conversations::list_conversation_items(
+            &ctx.conversation_storage,
+            &ctx.conversation_item_storage,
+            None,
+            conv_id,
+            None,
+            Some("asc"),
+            None,
+        )
+        .await,
+    )
+    .await?;
+    assert_eq!(listed["data"].as_array().map(Vec::len), Some(1), "{listed}");
+    assert_eq!(listed["data"][0]["content"], output_part, "{listed}");
+
+    // The parse both history loaders apply to a stored message before they
+    // replay it upstream: the typed parts, an `output_text` one here.
+    let parts: Vec<ResponseContentPart> = serde_json::from_value(fetched["content"].clone())?;
+    assert!(
+        matches!(
+            parts.as_slice(),
+            [ResponseContentPart::OutputText { text, annotations, .. }]
+                if text == "Hi there!" && annotations.is_empty()
+        ),
+        "{parts:?}"
+    );
+    Ok(())
 }
 
 #[test]
@@ -1066,6 +1243,7 @@ fn test_responses_request_creation() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        client_metadata: None,
         top_k: -1,
         min_p: 0.0,
         repetition_penalty: 1.0,
@@ -1115,6 +1293,7 @@ fn test_responses_request_sglang_extensions() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        client_metadata: None,
         // SGLang-specific extensions:
         top_k: 10,
         min_p: 0.05,
@@ -1261,6 +1440,7 @@ fn test_json_serialization() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        client_metadata: None,
         top_k: 50,
         min_p: 0.1,
         repetition_penalty: 1.2,
@@ -1313,20 +1493,7 @@ async fn test_multi_turn_loop_with_mcp() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    // Build router config
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("info")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -1376,6 +1543,7 @@ async fn test_multi_turn_loop_with_mcp() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        client_metadata: None,
         top_k: 50,
         min_p: 0.0,
         repetition_penalty: 1.0,
@@ -1479,19 +1647,7 @@ async fn test_max_tool_calls_limit() {
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("info")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -1540,6 +1696,7 @@ async fn test_max_tool_calls_limit() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        client_metadata: None,
         top_k: 50,
         min_p: 0.0,
         repetition_penalty: 1.0,
@@ -1616,19 +1773,7 @@ async fn setup_streaming_mcp_test() -> (
     });
     let worker_url = worker.start().await.expect("start worker");
 
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec![worker_url])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(5)
-        .worker_startup_check_interval_secs(1)
-        .log_level("info")
-        .max_concurrent_requests(32)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = worker_router_config(worker_url);
 
     let ctx =
         crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path.to_str().unwrap())
@@ -1731,6 +1876,7 @@ async fn test_streaming_with_mcp_tool_calls() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        client_metadata: None,
         top_k: 50,
         min_p: 0.0,
         repetition_penalty: 1.0,
@@ -2020,6 +2166,7 @@ async fn test_streaming_multi_turn_with_mcp() {
         safety_identifier: None,
         stream_options: None,
         context_management: None,
+        client_metadata: None,
         top_k: 50,
         min_p: 0.0,
         repetition_penalty: 1.0,
@@ -2058,19 +2205,7 @@ async fn test_streaming_multi_turn_with_mcp() {
 #[tokio::test]
 async fn test_conversation_items_create_and_get() {
     // Test creating items and getting a specific item
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -2078,7 +2213,7 @@ async fn test_conversation_items_create_and_get() {
     // Create conversation
     let create_conv = serde_json::json!({});
     let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, create_conv).await;
+        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
     assert_eq!(conv_resp.status(), StatusCode::OK);
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
@@ -2105,6 +2240,7 @@ async fn test_conversation_items_create_and_get() {
     let items_resp = conversations::create_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         create_items,
     )
@@ -2124,6 +2260,7 @@ async fn test_conversation_items_create_and_get() {
     let get_resp = conversations::get_conversation_item(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         item_id,
         None,
@@ -2141,22 +2278,269 @@ async fn test_conversation_items_create_and_get() {
     assert_eq!(get_json["role"], "user");
 }
 
+/// The JSON body of a handler's 200 response.
+async fn conversation_json(
+    resp: axum::response::Response,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// The ids of a list response's `data[]`, in the order answered.
+fn conversation_item_ids(list: &serde_json::Value) -> Vec<String> {
+    list["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["id"].as_str().map(String::from))
+        .collect()
+}
+
+fn user_message(text: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "message",
+        "role": "user",
+        "content": [{"type": "input_text", "text": text}]
+    })
+}
+
+#[tokio::test]
+async fn items_of_one_add_call_are_listed_in_request_order(
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Items that share a stamp are listed by their random ids, which is request order about
+    // half of the time: twenty rounds, each with two items in one call and a third in the next.
+    let router_cfg = conversation_router_config();
+    let ctx = crate::common::create_test_context(router_cfg).await;
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    for round in 0..20 {
+        let conv = conversation_json(
+            conversations::create_conversation(
+                &ctx.conversation_storage,
+                None,
+                serde_json::json!({}),
+            )
+            .await,
+        )
+        .await?;
+        let conv_id = conv["id"].as_str().ok_or("conversation id")?;
+
+        let added = conversation_json(
+            conversations::create_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                None,
+                conv_id,
+                serde_json::json!({"items": [user_message("first"), user_message("second")]}),
+            )
+            .await,
+        )
+        .await?;
+        let mut expected = conversation_item_ids(&added);
+        assert_eq!(
+            expected.len(),
+            2,
+            "round {round}: the add answers both items"
+        );
+
+        // A second call right after the first: its item follows the first call's items.
+        let third = conversation_json(
+            conversations::create_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                None,
+                conv_id,
+                serde_json::json!({"items": [user_message("third")]}),
+            )
+            .await,
+        )
+        .await?;
+        expected.extend(conversation_item_ids(&third));
+        assert_eq!(
+            expected.len(),
+            3,
+            "round {round}: the second add answers its item"
+        );
+
+        let asc = conversation_json(
+            conversations::list_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                None,
+                conv_id,
+                None,
+                Some("asc"),
+                None,
+            )
+            .await,
+        )
+        .await?;
+        assert_eq!(
+            conversation_item_ids(&asc),
+            expected,
+            "round {round}: order=asc lists the items as they were added"
+        );
+
+        let desc = conversation_json(
+            conversations::list_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                None,
+                conv_id,
+                None,
+                Some("desc"),
+                None,
+            )
+            .await,
+        )
+        .await?;
+        let mut reversed = expected.clone();
+        reversed.reverse();
+        assert_eq!(
+            conversation_item_ids(&desc),
+            reversed,
+            "round {round}: order=desc is the reverse"
+        );
+
+        let after_first = conversation_json(
+            conversations::list_conversation_items(
+                &ctx.conversation_storage,
+                &ctx.conversation_item_storage,
+                None,
+                conv_id,
+                None,
+                Some("asc"),
+                Some(&expected[0]),
+            )
+            .await,
+        )
+        .await?;
+        assert_eq!(
+            conversation_item_ids(&after_first),
+            expected[1..],
+            "round {round}: after the first item come the others, in order"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_reference_to_an_item_already_in_the_conversation_is_refused(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let router_cfg = conversation_router_config();
+    let ctx = crate::common::create_test_context(router_cfg).await;
+    let _router = RouterFactory::create_router(&ctx).await.expect("router");
+
+    let add_items = |conv_id: String, items: serde_json::Value| {
+        let conversation_storage = ctx.conversation_storage.clone();
+        let item_storage = ctx.conversation_item_storage.clone();
+        async move {
+            conversations::create_conversation_items(
+                &conversation_storage,
+                &item_storage,
+                None,
+                &conv_id,
+                serde_json::json!({ "items": items }),
+            )
+            .await
+        }
+    };
+    let list_asc = |conv_id: String| {
+        let conversation_storage = ctx.conversation_storage.clone();
+        let item_storage = ctx.conversation_item_storage.clone();
+        async move {
+            let listed = conversations::list_conversation_items(
+                &conversation_storage,
+                &item_storage,
+                None,
+                &conv_id,
+                None,
+                Some("asc"),
+                None,
+            )
+            .await;
+            conversation_json(listed)
+                .await
+                .map(|list| conversation_item_ids(&list))
+        }
+    };
+
+    let conv = conversation_json(
+        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
+            .await,
+    )
+    .await?;
+    let conv_id = conv["id"].as_str().ok_or("conversation id")?.to_string();
+    let added = conversation_json(
+        add_items(
+            conv_id.clone(),
+            serde_json::json!([user_message("first"), user_message("second")]),
+        )
+        .await,
+    )
+    .await?;
+    let ids = conversation_item_ids(&added);
+    assert_eq!(ids.len(), 2, "the add answers both items");
+    let reference = serde_json::json!([{ "type": "item_reference", "id": ids[0] }]);
+
+    // A reference to an item the conversation already has is refused, like an item arriving
+    // under an id the conversation already has, and the conversation is left as it was.
+    let refused = add_items(conv_id.clone(), reference.clone()).await;
+    assert_eq!(
+        refused.status(),
+        StatusCode::BAD_REQUEST,
+        "a reference to an item already in the conversation is refused"
+    );
+    let body = axum::body::to_bytes(refused.into_body(), usize::MAX).await?;
+    let error: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(error["error"]["code"], "item_already_in_conversation");
+    assert_eq!(error["error"]["param"], "items");
+    assert_eq!(
+        list_asc(conv_id.clone()).await?,
+        ids,
+        "the refused reference changes nothing: each item once, in order"
+    );
+
+    // The same reference into another conversation links the item there, once.
+    let other = conversation_json(
+        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
+            .await,
+    )
+    .await?;
+    let other_id = other["id"].as_str().ok_or("conversation id")?.to_string();
+    let linked = conversation_json(add_items(other_id.clone(), reference.clone()).await).await?;
+    assert_eq!(conversation_item_ids(&linked), ids[..1]);
+    assert_eq!(list_asc(other_id.clone()).await?, ids[..1]);
+    assert_eq!(
+        add_items(other_id.clone(), reference).await.status(),
+        StatusCode::BAD_REQUEST,
+        "the second reference into the other conversation is refused too"
+    );
+
+    // One link per item: deleting the item takes it out of the conversation.
+    let deleted = conversations::delete_conversation_item(
+        &ctx.conversation_storage,
+        &ctx.conversation_item_storage,
+        None,
+        &conv_id,
+        &ids[0],
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::OK);
+    assert_eq!(list_asc(conv_id).await?, ids[1..]);
+    assert_eq!(
+        list_asc(other_id).await?,
+        ids[..1],
+        "the other conversation keeps its link"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_conversation_items_delete() {
     // Test deleting an item from a conversation
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -2164,7 +2548,7 @@ async fn test_conversation_items_delete() {
     // Create conversation
     let create_conv = serde_json::json!({});
     let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, create_conv).await;
+        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2185,6 +2569,7 @@ async fn test_conversation_items_delete() {
     let items_resp = conversations::create_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         create_items,
     )
@@ -2199,6 +2584,7 @@ async fn test_conversation_items_delete() {
     let list_resp = conversations::list_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         None,
         None,
@@ -2215,6 +2601,7 @@ async fn test_conversation_items_delete() {
     let del_resp = conversations::delete_conversation_item(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         item_id,
     )
@@ -2225,6 +2612,7 @@ async fn test_conversation_items_delete() {
     let list_resp2 = conversations::list_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         None,
         None,
@@ -2241,6 +2629,7 @@ async fn test_conversation_items_delete() {
     let get_resp = conversations::get_conversation_item(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         item_id,
         None,
@@ -2252,19 +2641,7 @@ async fn test_conversation_items_delete() {
 #[tokio::test]
 async fn test_conversation_items_max_limit() {
     // Test that creating > 20 items returns error
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -2272,7 +2649,7 @@ async fn test_conversation_items_max_limit() {
     // Create conversation
     let create_conv = serde_json::json!({});
     let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, create_conv).await;
+        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2293,6 +2670,7 @@ async fn test_conversation_items_max_limit() {
     let items_resp = conversations::create_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         create_items,
     )
@@ -2309,19 +2687,7 @@ async fn test_conversation_items_max_limit() {
 #[tokio::test]
 async fn test_conversation_items_unsupported_type() {
     // Test that unsupported item types return error
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
@@ -2329,7 +2695,7 @@ async fn test_conversation_items_unsupported_type() {
     // Create conversation
     let create_conv = serde_json::json!({});
     let conv_resp =
-        conversations::create_conversation(&ctx.conversation_storage, create_conv).await;
+        conversations::create_conversation(&ctx.conversation_storage, None, create_conv).await;
     let conv_bytes = axum::body::to_bytes(conv_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2349,6 +2715,7 @@ async fn test_conversation_items_unsupported_type() {
     let items_resp = conversations::create_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_id,
         create_items,
     )
@@ -2365,26 +2732,15 @@ async fn test_conversation_items_unsupported_type() {
 #[tokio::test]
 async fn test_conversation_items_multi_conversation_sharing() {
     // Test that items can be shared across conversations via soft delete
-    let router_cfg = RouterConfig::builder()
-        .openai_mode(vec!["http://localhost".to_string()])
-        .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(8 * 1024 * 1024)
-        .request_timeout_secs(60)
-        .worker_startup_timeout_secs(1)
-        .worker_startup_check_interval_secs(1)
-        .log_level("warn")
-        .max_concurrent_requests(8)
-        .queue_timeout_secs(5)
-        .build_unchecked();
+    let router_cfg = conversation_router_config();
 
     let ctx = crate::common::create_test_context(router_cfg).await;
     let _router = RouterFactory::create_router(&ctx).await.expect("router");
 
     // Create two conversations
     let conv_a_resp =
-        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await;
+        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
+            .await;
     let conv_a_bytes = axum::body::to_bytes(conv_a_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2392,7 +2748,8 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let conv_a_id = conv_a_json["id"].as_str().unwrap();
 
     let conv_b_resp =
-        conversations::create_conversation(&ctx.conversation_storage, serde_json::json!({})).await;
+        conversations::create_conversation(&ctx.conversation_storage, None, serde_json::json!({}))
+            .await;
     let conv_b_bytes = axum::body::to_bytes(conv_b_resp.into_body(), usize::MAX)
         .await
         .unwrap();
@@ -2413,6 +2770,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let items_a_resp = conversations::create_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_a_id,
         create_items,
     )
@@ -2436,6 +2794,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let items_b_resp = conversations::create_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_b_id,
         reference_items,
     )
@@ -2446,6 +2805,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let list_a = conversations::list_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_a_id,
         None,
         None,
@@ -2461,6 +2821,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let list_b = conversations::list_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_b_id,
         None,
         None,
@@ -2477,6 +2838,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
     conversations::delete_conversation_item(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_a_id,
         item_id,
     )
@@ -2486,6 +2848,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let list_a2 = conversations::list_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_a_id,
         None,
         None,
@@ -2502,6 +2865,7 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let list_b2 = conversations::list_conversation_items(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_b_id,
         None,
         None,
@@ -2518,10 +2882,720 @@ async fn test_conversation_items_multi_conversation_sharing() {
     let get_resp = conversations::get_conversation_item(
         &ctx.conversation_storage,
         &ctx.conversation_item_storage,
+        None,
         conv_b_id,
         item_id,
         None,
     )
     .await;
     assert_eq!(get_resp.status(), StatusCode::OK);
+}
+
+// ============================================================================
+// A failed Responses stream on the external router ends with the one error
+// event every router writes: the API's typed event on a data line alone.
+// ============================================================================
+
+/// The frames of an SSE body, each with its trailing blank line removed.
+fn sse_frames(body: &str) -> Vec<&str> {
+    body.split("\n\n").filter(|f| !f.is_empty()).collect()
+}
+
+/// A streaming request through the tool loop, its response not stored.
+fn streaming_mcp_request(mcp_url: &str, max_tool_calls: Option<u32>) -> ResponsesRequest {
+    mcp_request(mcp_url, max_tool_calls, true, false)
+}
+
+/// A request that routes through the tool loop: one MCP tool at `mcp_url`,
+/// the mock server's `brave_web_search` behind it.
+fn mcp_request(
+    mcp_url: &str,
+    max_tool_calls: Option<u32>,
+    stream: bool,
+    store: bool,
+) -> ResponsesRequest {
+    ResponsesRequest {
+        input: ResponseInput::Text("search for something".to_string()),
+        model: "mock-model".to_string(),
+        max_tool_calls,
+        store: Some(store),
+        stream: Some(stream),
+        tools: Some(vec![ResponseTool::Mcp(McpTool {
+            server_url: Some(mcp_url.to_string()),
+            authorization: None,
+            headers: None,
+            server_label: "mock".to_string(),
+            server_description: None,
+            require_approval: Some(RequireApproval::Mode(RequireApprovalMode::Never)),
+            allowed_tools: None,
+            connector_id: None,
+            defer_loading: None,
+        })]),
+        ..Default::default()
+    }
+}
+
+/// An upstream that answers `/v1/responses` with `responses`, and the model
+/// list and health probes a worker needs; returns its base URL.
+#[expect(
+    clippy::disallowed_methods,
+    clippy::expect_used,
+    reason = "test infrastructure"
+)]
+async fn stub_upstream(
+    responses: axum::routing::MethodRouter,
+) -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{routing::get, Json, Router};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let models = || async {
+        Json(
+            serde_json::json!({"object": "list", "data": [{"id": "mock-model", "object": "model"}]}),
+        )
+    };
+    let app = Router::new()
+        .route("/v1/responses", responses)
+        .route("/v1/models", get(models))
+        .route(
+            "/health",
+            get(|| async { Json(serde_json::json!({"status": "ok"})) }),
+        );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    (format!("http://{addr}"), server)
+}
+
+/// The `function_call` item of turn `turn`: the model asks for
+/// `brave_web_search`; the ids carry the turn's number.
+fn function_call_turn_item(turn: usize) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("fc_stub_{turn}"), "type": "function_call",
+        "call_id": format!("call_stub_{turn}"), "name": "brave_web_search",
+        "arguments": "{\"query\":\"smg\"}", "status": "completed"
+    })
+}
+
+/// The response object of function-call turn `turn`, as an upstream of the
+/// Responses API answers it unstreamed. An upstream that answers every turn
+/// with it asks again after the call's output comes back, so with
+/// `max_tool_calls` 1 the second turn's call is one over the limit.
+fn function_call_turn_response(turn: usize) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("resp_stub_{turn}"), "object": "response", "created_at": 1_700_000_000,
+        "model": "mock-model", "status": "completed", "output": [function_call_turn_item(turn)]
+    })
+}
+
+/// The SSE body of function-call turn `turn`, as an upstream of the
+/// Responses API streams it.
+fn function_call_turn_events(turn: usize) -> String {
+    let response = serde_json::json!({
+        "id": format!("resp_stub_{turn}"), "object": "response", "created_at": 1_700_000_000,
+        "model": "mock-model", "status": "in_progress", "output": []
+    });
+    let call = function_call_turn_item(turn);
+    let item_id = format!("fc_stub_{turn}");
+    let events = [
+        (
+            "response.created",
+            serde_json::json!({"type": "response.created", "sequence_number": 0, "response": response}),
+        ),
+        (
+            "response.in_progress",
+            serde_json::json!({"type": "response.in_progress", "sequence_number": 1, "response": response}),
+        ),
+        (
+            "response.output_item.added",
+            serde_json::json!({"type": "response.output_item.added", "sequence_number": 2, "output_index": 0, "item": call}),
+        ),
+        (
+            "response.function_call_arguments.delta",
+            serde_json::json!({"type": "response.function_call_arguments.delta", "sequence_number": 3, "output_index": 0, "item_id": item_id, "delta": "{\"query\":\"smg\"}"}),
+        ),
+        (
+            "response.function_call_arguments.done",
+            serde_json::json!({"type": "response.function_call_arguments.done", "sequence_number": 4, "output_index": 0, "item_id": item_id, "arguments": "{\"query\":\"smg\"}"}),
+        ),
+        (
+            "response.output_item.done",
+            serde_json::json!({"type": "response.output_item.done", "sequence_number": 5, "output_index": 0, "item": call}),
+        ),
+        (
+            "response.completed",
+            serde_json::json!({"type": "response.completed", "sequence_number": 6, "response": function_call_turn_response(turn)}),
+        ),
+    ];
+    events
+        .iter()
+        .map(|(name, data)| format!("event: {name}\ndata: {data}\n\n"))
+        .collect()
+}
+
+/// An upstream that asks for the tool on every turn, streamed or not: the
+/// turn's SSE body for a streaming request, its response object otherwise,
+/// the turns numbered in order.
+fn always_calling_upstream() -> axum::routing::MethodRouter {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use axum::response::IntoResponse;
+    let turns = Arc::new(AtomicUsize::new(0));
+    axum::routing::post(move |body: String| {
+        let turns = Arc::clone(&turns);
+        async move {
+            let turn = turns.fetch_add(1, Ordering::SeqCst) + 1;
+            let streaming = serde_json::from_str::<serde_json::Value>(&body)
+                .is_ok_and(|request| request["stream"] == true);
+            if streaming {
+                (
+                    [(CONTENT_TYPE, "text/event-stream")],
+                    function_call_turn_events(turn),
+                )
+                    .into_response()
+            } else {
+                axum::Json(function_call_turn_response(turn)).into_response()
+            }
+        }
+    })
+}
+
+/// An upstream that asks for two calls in one turn, unstreamed: the two
+/// `function_call` items in one response object.
+fn two_call_turn_upstream() -> axum::routing::MethodRouter {
+    axum::routing::post(|| async {
+        axum::Json(serde_json::json!({
+            "id": "resp_stub_two", "object": "response", "created_at": 1_700_000_000,
+            "model": "mock-model", "status": "completed",
+            "output": [
+                {"id": "fc_stub_a", "type": "function_call", "call_id": "call_stub_a",
+                 "name": "brave_web_search", "arguments": "{\"query\":\"smg a\"}", "status": "completed"},
+                {"id": "fc_stub_b", "type": "function_call", "call_id": "call_stub_b",
+                 "name": "brave_web_search", "arguments": "{\"query\":\"smg b\"}", "status": "completed"}
+            ]
+        }))
+    })
+}
+
+/// The frames' data as JSON, in order; the sentinel is no JSON and is left
+/// out.
+fn frame_events(body: &str) -> Vec<serde_json::Value> {
+    sse_frames(body)
+        .iter()
+        .filter_map(|frame| frame.lines().find_map(|line| line.strip_prefix("data: ")))
+        .filter_map(|data| serde_json::from_str(data).ok())
+        .collect()
+}
+
+/// What a response's items say: type, status and name, in order.
+fn item_shapes(response: &serde_json::Value) -> Vec<(String, String, String)> {
+    let field =
+        |item: &serde_json::Value, name: &str| item[name].as_str().unwrap_or_default().to_string();
+    response["output"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|item| {
+            (
+                field(item, "type"),
+                field(item, "status"),
+                field(item, "name"),
+            )
+        })
+        .collect()
+}
+
+/// The items' errors, in order.
+fn item_errors(response: &serde_json::Value) -> Vec<serde_json::Value> {
+    response["output"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|item| item["error"].clone())
+        .collect()
+}
+
+/// The router of an OpenAI-mode gateway over `upstream`, with the mock MCP
+/// server in its MCP configuration, and the context it was built from (its
+/// storage, for the records a request leaves).
+async fn external_router_with_mcp(
+    upstream: &str,
+    mcp: &MockMCPServer,
+    startup_timeout_secs: u64,
+) -> (
+    Box<dyn smg::routers::RouterTrait>,
+    std::sync::Arc<smg::app_context::AppContext>,
+    tempfile::TempDir,
+) {
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n",
+        mcp.url()
+    );
+    external_router_with_mcp_yaml(upstream, &mcp_yaml, startup_timeout_secs).await
+}
+
+/// The router of an OpenAI-mode gateway over `upstream`, with `mcp_yaml` as
+/// its MCP configuration, and the context it was built from.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+async fn external_router_with_mcp_yaml(
+    upstream: &str,
+    mcp_yaml: &str,
+    startup_timeout_secs: u64,
+) -> (
+    Box<dyn smg::routers::RouterTrait>,
+    std::sync::Arc<smg::app_context::AppContext>,
+    tempfile::TempDir,
+) {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let cfg_path = dir.path().join("mcp.yaml");
+    std::fs::write(&cfg_path, mcp_yaml).expect("write mcp cfg");
+    let router_cfg = router_builder(vec![upstream.to_string()])
+        .worker_startup_timeout_secs(startup_timeout_secs)
+        .max_concurrent_requests(8)
+        .build_unchecked();
+    let cfg_path = cfg_path.to_str().expect("a utf-8 path");
+    let ctx = crate::common::create_test_context_with_mcp_config(router_cfg, cfg_path).await;
+    // A running gateway's registration job populates the format registry as
+    // it connects each configured server; the test context connects them
+    // itself, so the registry is populated here the same way.
+    let mcp_config = smg_mcp::McpConfig::from_file(cfg_path)
+        .await
+        .expect("the mcp config");
+    for server in &mcp_config.servers {
+        ctx.mcp_format_registry.populate_from_server_config(server);
+    }
+    let router = RouterFactory::create_router(&ctx).await.expect("router");
+    (router, ctx, dir)
+}
+
+/// The body of a streaming request through `router`, as the client reads it.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+async fn stream_body(router: &dyn smg::routers::RouterTrait, req: ResponsesRequest) -> String {
+    let response = router
+        .route_responses(None, &test_tenant_meta(), req.clone(), &req.model)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    String::from_utf8(bytes.to_vec()).expect("utf-8")
+}
+
+/// An upstream status answered before the first byte of the first turn: the
+/// stream is the one typed error event, the upstream's own code and message,
+/// at sequence number 0; no event name, no sentinel.
+#[tokio::test]
+async fn a_failed_upstream_status_ends_the_stream_with_the_typed_error_event() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(axum::routing::post(|| async {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": {
+                "code": "overloaded", "type": "server_error", "message": "busy, try again"
+            }})),
+        )
+    }))
+    .await;
+    let (router, _ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+
+    let body = stream_body(router.as_ref(), streaming_mcp_request(&mcp.url(), None)).await;
+
+    assert_eq!(
+        body,
+        "data: {\"type\":\"error\",\"code\":\"overloaded\",\"message\":\"busy, try again\",\
+         \"param\":null,\"sequence_number\":0}\n\n"
+    );
+    server.abort();
+    mcp.stop().await;
+}
+
+/// The tool-call limit reached mid-stream (an upstream that asks for the
+/// tool on every turn, a limit of one, the response stored): the stream
+/// ends the way the non-streamed loop ends the same stop. The call that fit
+/// ran; the one over the limit is closed as not executed
+/// (`response.mcp_call.failed`, then its `response.output_item.done`, so no
+/// item the stream announced stays open); then `response.completed`, the
+/// response `completed` with `incomplete_details.reason` `max_tool_calls`
+/// and both calls among its items; no error event, no `response.failed`;
+/// and the record says what the terminal said.
+#[tokio::test]
+async fn the_tool_call_limit_ends_the_stream_as_the_non_streamed_loop_ends_its_response() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(always_calling_upstream()).await;
+    let (router, ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+
+    let body = stream_body(
+        router.as_ref(),
+        mcp_request(&mcp.url(), Some(1), true, true),
+    )
+    .await;
+
+    assert!(!body.contains("event: error\n"), "{body}");
+    let events = frame_events(&body);
+    let types: Vec<&str> = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap_or_default())
+        .collect();
+    assert!(
+        !types
+            .iter()
+            .any(|kind| matches!(*kind, "error" | "response.failed")),
+        "{body}"
+    );
+    let failed_at = types
+        .iter()
+        .position(|kind| *kind == "response.mcp_call.failed")
+        .expect("the skipped call's failed event");
+    assert_eq!(
+        &types[failed_at..],
+        [
+            "response.mcp_call.failed",
+            "response.output_item.done",
+            "response.completed"
+        ],
+        "the skipped call is closed, then the terminal, then nothing but the sentinel: {body}"
+    );
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+    assert!(
+        events.windows(2).all(|pair| {
+            pair[0]["sequence_number"].as_u64() < pair[1]["sequence_number"].as_u64()
+        }),
+        "{body}"
+    );
+    let announced: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_item.added")
+        .map(|event| &event["output_index"])
+        .collect();
+    let closed: Vec<&serde_json::Value> = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_item.done")
+        .map(|event| &event["output_index"])
+        .collect();
+    assert_eq!(announced, closed, "every item announced is closed: {body}");
+
+    let skipped = &events[failed_at + 1]["item"];
+    assert_eq!(skipped["type"], "mcp_call", "{skipped}");
+    assert_eq!(skipped["status"], "failed", "{skipped}");
+    assert!(
+        skipped["error"]
+            .to_string()
+            .contains("Not executed - response stopped due to limit"),
+        "{skipped}"
+    );
+    assert_eq!(skipped["id"], events[failed_at]["item_id"], "{body}");
+
+    let response = &events[failed_at + 2]["response"];
+    assert_eq!(response["status"], "completed", "{response}");
+    assert_eq!(
+        response["incomplete_details"],
+        serde_json::json!({ "reason": "max_tool_calls" }),
+        "{response}"
+    );
+    assert!(response["error"].is_null(), "{response}");
+    let shape = |kind: &str, status: &str, name: &str| {
+        (kind.to_string(), status.to_string(), name.to_string())
+    };
+    assert_eq!(
+        item_shapes(response),
+        vec![
+            shape("mcp_list_tools", "", ""),
+            shape("mcp_call", "completed", "brave_web_search"),
+            shape("mcp_call", "failed", "brave_web_search"),
+        ],
+        "{response}"
+    );
+
+    let stored = ctx
+        .response_storage
+        .get_response(&smg_data_connector::ResponseId::from(
+            response["id"].as_str().expect("an id"),
+        ))
+        .await
+        .expect("storage")
+        .expect("the record is stored")
+        .raw_response;
+    assert_eq!(stored["status"], response["status"], "{stored}");
+    assert_eq!(
+        stored["incomplete_details"], response["incomplete_details"],
+        "{stored}"
+    );
+    assert_eq!(item_shapes(&stored), item_shapes(response), "{stored}");
+    assert_eq!(item_errors(&stored), item_errors(response), "{stored}");
+    server.abort();
+    mcp.stop().await;
+}
+
+/// The same stop, streamed and not (the same upstream, the same limit, both
+/// stored): the terminal's response and the non-streamed response say the
+/// same thing (status, `incomplete_details`, the items in order with their
+/// statuses and errors), and so do their records.
+#[tokio::test]
+async fn a_streamed_and_a_non_streamed_tool_call_limit_leave_the_same_record() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(always_calling_upstream()).await;
+    let (router, ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+
+    let body = stream_body(
+        router.as_ref(),
+        mcp_request(&mcp.url(), Some(1), true, true),
+    )
+    .await;
+    let streamed = frame_events(&body)
+        .last()
+        .map(|terminal| terminal["response"].clone())
+        .expect("a terminal");
+
+    let request = mcp_request(&mcp.url(), Some(1), false, true);
+    let plain = router
+        .route_responses(None, &test_tenant_meta(), request.clone(), &request.model)
+        .await;
+    assert_eq!(plain.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(plain.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let plain: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+    let stored = |response: &serde_json::Value| {
+        let id = response["id"].as_str().expect("an id").to_string();
+        let storage = ctx.response_storage.clone();
+        async move {
+            storage
+                .get_response(&smg_data_connector::ResponseId::from(id.as_str()))
+                .await
+                .expect("storage")
+                .expect("the record is stored")
+                .raw_response
+        }
+    };
+    let (streamed_record, plain_record) = (stored(&streamed).await, stored(&plain).await);
+
+    for (streamed, plain) in [(&streamed, &plain), (&streamed_record, &plain_record)] {
+        assert_eq!(streamed["status"], "completed", "{streamed}");
+        assert_eq!(streamed["status"], plain["status"], "{streamed}\n{plain}");
+        assert_eq!(
+            streamed["incomplete_details"], plain["incomplete_details"],
+            "{streamed}\n{plain}"
+        );
+        assert_eq!(
+            item_shapes(streamed),
+            item_shapes(plain),
+            "{streamed}\n{plain}"
+        );
+        assert_eq!(
+            item_errors(streamed),
+            item_errors(plain),
+            "{streamed}\n{plain}"
+        );
+    }
+    server.abort();
+    mcp.stop().await;
+}
+
+/// The same stop for a tool answered in a hosted format (the request's
+/// `web_search_preview` tool, routed to the mock server's `brave_web_search`
+/// by its `builtin_type`): the stream announces the call as a
+/// `web_search_call`, so the call over the limit closes as one too: its
+/// `response.output_item.done` carries a `web_search_call` with the status
+/// `failed`, no `mcp_call` event names its index, and every item announced
+/// is closed under the type it was announced with; the terminal's items and
+/// the record say the same.
+#[tokio::test]
+async fn a_hosted_format_call_over_the_limit_closes_as_the_item_the_stream_announced() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(always_calling_upstream()).await;
+    let mcp_yaml = format!(
+        "servers:\n  - name: mock\n    protocol: streamable\n    url: {}\n    \
+         builtin_type: web_search_preview\n    builtin_tool_name: brave_web_search\n",
+        mcp.url()
+    );
+    let (router, ctx, _dir) = external_router_with_mcp_yaml(&upstream, &mcp_yaml, 5).await;
+    let request = ResponsesRequest {
+        tools: Some(vec![ResponseTool::WebSearchPreview(
+            WebSearchPreviewTool::default(),
+        )]),
+        ..mcp_request(&mcp.url(), Some(1), true, true)
+    };
+
+    let body = stream_body(router.as_ref(), request).await;
+
+    let events = frame_events(&body);
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event["type"].as_str(), Some("error" | "response.failed"))),
+        "{body}"
+    );
+    assert!(body.ends_with("data: [DONE]\n\n"), "{body}");
+    let items_by_type = |kind: &str| -> Vec<(u64, String)> {
+        events
+            .iter()
+            .filter(|event| event["type"] == kind)
+            .map(|event| {
+                (
+                    event["output_index"].as_u64().unwrap_or_default(),
+                    event["item"]["type"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                )
+            })
+            .collect()
+    };
+    let announced = items_by_type("response.output_item.added");
+    let closed = items_by_type("response.output_item.done");
+    assert_eq!(
+        announced, closed,
+        "every item is closed under the type it was announced with: {body}"
+    );
+    assert!(
+        announced.iter().any(|(_, kind)| kind == "web_search_call"),
+        "{body}"
+    );
+
+    let skipped = events
+        .iter()
+        .rev()
+        .find(|event| event["type"] == "response.output_item.done")
+        .expect("the last item closed");
+    assert_eq!(skipped["item"]["type"], "web_search_call", "{skipped}");
+    assert_eq!(skipped["item"]["status"], "failed", "{skipped}");
+    let skipped_index = &skipped["output_index"];
+    assert!(
+        !events.iter().any(|event| {
+            event["type"]
+                .as_str()
+                .is_some_and(|kind| kind.starts_with("response.mcp_call."))
+                && &event["output_index"] == skipped_index
+        }),
+        "no mcp_call sub-event closes the hosted item: {body}"
+    );
+
+    let response = &events.last().expect("the terminal")["response"];
+    assert_eq!(response["status"], "completed", "{response}");
+    assert_eq!(
+        response["incomplete_details"],
+        serde_json::json!({ "reason": "max_tool_calls" }),
+        "{response}"
+    );
+    let shape = |kind: &str, status: &str| (kind.to_string(), status.to_string(), String::new());
+    assert_eq!(
+        item_shapes(response),
+        vec![
+            shape("web_search_call", "completed"),
+            shape("web_search_call", "failed"),
+        ],
+        "{response}"
+    );
+    let stored = ctx
+        .response_storage
+        .get_response(&smg_data_connector::ResponseId::from(
+            response["id"].as_str().expect("an id"),
+        ))
+        .await
+        .expect("storage")
+        .expect("the record is stored")
+        .raw_response;
+    assert_eq!(item_shapes(&stored), item_shapes(response), "{stored}");
+    server.abort();
+    mcp.stop().await;
+}
+
+/// An unstreamed turn of two calls over an allowance of one: the first call
+/// runs, the second is the stop. Each call is rendered once, under its own
+/// id: the one that ran `completed`, the other not executed.
+#[tokio::test]
+async fn an_unstreamed_turn_the_allowance_cuts_renders_each_call_once() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let (upstream, server) = stub_upstream(two_call_turn_upstream()).await;
+    let (router, _ctx, _dir) = external_router_with_mcp(&upstream, &mcp, 5).await;
+
+    let request = mcp_request(&mcp.url(), Some(1), false, false);
+    let response = router
+        .route_responses(None, &test_tenant_meta(), request.clone(), &request.model)
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let response: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+
+    assert_eq!(
+        response["incomplete_details"],
+        serde_json::json!({ "reason": "max_tool_calls" }),
+        "{response}"
+    );
+    let shape = |kind: &str, status: &str, name: &str| {
+        (kind.to_string(), status.to_string(), name.to_string())
+    };
+    assert_eq!(
+        item_shapes(&response),
+        vec![
+            shape("mcp_list_tools", "", ""),
+            shape("mcp_call", "completed", "brave_web_search"),
+            shape("mcp_call", "failed", "brave_web_search"),
+        ],
+        "{response}"
+    );
+    let ids: Vec<&str> = response["output"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["id"].as_str())
+        .collect();
+    let unique: std::collections::HashSet<&str> = ids.iter().copied().collect();
+    assert_eq!(
+        ids.len(),
+        unique.len(),
+        "every item under its own id: {response}"
+    );
+    server.abort();
+    mcp.stop().await;
+}
+
+/// An upstream nothing listens on: the stream is the one typed error event
+/// with the request's failure, at sequence number 0.
+#[tokio::test]
+async fn an_unreachable_upstream_ends_the_stream_with_the_typed_error_event() {
+    let mut mcp = MockMCPServer::start().await.expect("start mcp");
+    let closed = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        format!("http://{}", listener.local_addr().expect("addr"))
+    };
+    let (router, _ctx, _dir) = external_router_with_mcp(&closed, &mcp, 1).await;
+
+    let body = stream_body(router.as_ref(), streaming_mcp_request(&mcp.url(), None)).await;
+
+    let frames = sse_frames(&body);
+    assert_eq!(frames.len(), 1, "{body}");
+    let event: serde_json::Value =
+        serde_json::from_str(frames[0].strip_prefix("data: ").expect("a data line")).expect("json");
+    assert_eq!(event["type"], "error", "{body}");
+    assert_eq!(event["code"], "upstream_request_failed", "{body}");
+    assert_eq!(event["sequence_number"], 0, "{body}");
+    assert!(
+        event["message"]
+            .as_str()
+            .is_some_and(|m| m.starts_with("Upstream request failed: ")),
+        "{body}"
+    );
+    assert!(event["param"].is_null(), "{body}");
+    mcp.stop().await;
 }

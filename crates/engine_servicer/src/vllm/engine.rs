@@ -78,9 +78,15 @@ pub(super) async fn connect_engine(
     {
         Ok(client) => {
             client.adopt_tokenizer_eos(state.tokenizer());
-            client.set_structured_outputs_backend(structured_outputs_backend_from_config(
-                &state.model.structured_outputs_backend,
-            ));
+            client.set_structured_outputs_support(
+                structured_outputs_backend_from_config(&state.model.structured_outputs_backend)
+                    .into(),
+            );
+            // Known at start: the wire reports every scheduler step while the
+            // engine's statistics are on, before its first batch shows it.
+            if state.model.log_stats == Some(true) {
+                client.note_reports_steps();
+            }
             info!(
                 handshake = %handshake_address,
                 engines = engine_count,

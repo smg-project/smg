@@ -1,0 +1,113 @@
+{
+ "description": "Prompts a MiniMax chat template WITHOUT a root branch renders (MiniMaxAI/MiniMax-M2.7 at revision d494266a4affc0d2995ba1fa35c8481cbd84294b: chat_template.jinja, the copy beside this file; its role mapping reads messages[0] only when it is a system message and its message loop has user/assistant/tool branches, so a root message handed to it as is would be dropped). The renderer hands such a template every root message as a system message and merges the system messages at the front, as it does for developer messages: `messages` is the request as a client sends it, `rendered_from` the list the renderer gives the template, `text` the reference implementation's rendering of that list (add_generation_prompt, string content as one-item text part lists; the plain-string rendering is identical); the text only, no ids: the slot is what these cases pin.",
+ "cases": [
+  {
+   "name": "system_then_user",
+   "messages": [
+    {
+     "role": "system",
+     "content": "You are a terse assistant. Answer in one sentence."
+    },
+    {
+     "role": "user",
+     "content": "Say hello in one short sentence, then stop."
+    }
+   ],
+   "rendered_from": [
+    {
+     "role": "system",
+     "content": "You are a terse assistant. Answer in one sentence."
+    },
+    {
+     "role": "user",
+     "content": "Say hello in one short sentence, then stop."
+    }
+   ],
+   "text": "]~!b[]~b]system\nYou are a terse assistant. Answer in one sentence.[e~[\n]~b]user\nSay hello in one short sentence, then stop.[e~[\n]~b]ai\n<think>\n"
+  },
+  {
+   "name": "root_then_user",
+   "messages": [
+    {
+     "role": "root",
+     "content": "Top priority: always answer in French."
+    },
+    {
+     "role": "user",
+     "content": "Say hello in one short sentence, then stop."
+    }
+   ],
+   "rendered_from": [
+    {
+     "role": "system",
+     "content": "Top priority: always answer in French."
+    },
+    {
+     "role": "user",
+     "content": "Say hello in one short sentence, then stop."
+    }
+   ],
+   "text": "]~!b[]~b]system\nTop priority: always answer in French.[e~[\n]~b]user\nSay hello in one short sentence, then stop.[e~[\n]~b]ai\n<think>\n"
+  },
+  {
+   "name": "root_then_system_then_user",
+   "messages": [
+    {
+     "role": "root",
+     "content": "Top priority: always answer in French."
+    },
+    {
+     "role": "system",
+     "content": "You are a terse assistant. Answer in one sentence."
+    },
+    {
+     "role": "user",
+     "content": "Say hello in one short sentence, then stop."
+    }
+   ],
+   "rendered_from": [
+    {
+     "role": "system",
+     "content": "Top priority: always answer in French.\n\nYou are a terse assistant. Answer in one sentence."
+    },
+    {
+     "role": "user",
+     "content": "Say hello in one short sentence, then stop."
+    }
+   ],
+   "text": "]~!b[]~b]system\nTop priority: always answer in French.\n\nYou are a terse assistant. Answer in one sentence.[e~[\n]~b]user\nSay hello in one short sentence, then stop.[e~[\n]~b]ai\n<think>\n"
+  },
+  {
+   "name": "two_roots_then_system_then_user",
+   "messages": [
+    {
+     "role": "root",
+     "content": "Top priority: always answer in French."
+    },
+    {
+     "role": "root",
+     "content": "Second priority: keep every answer under twenty words."
+    },
+    {
+     "role": "system",
+     "content": "You are a terse assistant. Answer in one sentence."
+    },
+    {
+     "role": "user",
+     "content": "Say hello in one short sentence, then stop."
+    }
+   ],
+   "rendered_from": [
+    {
+     "role": "system",
+     "content": "Top priority: always answer in French.\n\nSecond priority: keep every answer under twenty words.\n\nYou are a terse assistant. Answer in one sentence."
+    },
+    {
+     "role": "user",
+     "content": "Say hello in one short sentence, then stop."
+    }
+   ],
+   "text": "]~!b[]~b]system\nTop priority: always answer in French.\n\nSecond priority: keep every answer under twenty words.\n\nYou are a terse assistant. Answer in one sentence.[e~[\n]~b]user\nSay hello in one short sentence, then stop.[e~[\n]~b]ai\n<think>\n"
+  }
+ ]
+}

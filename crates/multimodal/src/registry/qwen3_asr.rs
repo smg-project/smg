@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
     audio::{AudioPreProcessor, Qwen3AudioProcessor},
@@ -278,6 +278,13 @@ impl ModelProcessorSpec for Qwen3AsrSpec {
         "qwen3_asr"
     }
 
+    /// `<|audio_pad|>` (the thinker config's `audio_token_id`) is the single
+    /// token the serving engine's prompt updates target, so a worker can
+    /// expand it itself.
+    fn worker_expandable(&self, modality: Modality) -> bool {
+        matches!(modality, Modality::Audio)
+    }
+
     fn matches(&self, metadata: &ModelMetadata) -> bool {
         transcription::is_qwen3_asr_identifier(metadata.model_id)
             || metadata
@@ -341,19 +348,15 @@ impl ModelProcessorSpec for Qwen3AsrSpec {
         Ok(HashMap::from([(Modality::Audio, 10)]))
     }
 
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
-    }
-
     fn audio_processor(
         &self,
         model_config: &Value,
         preprocessor_config: &PreProcessorConfig,
-    ) -> Option<Box<dyn AudioPreProcessor>> {
-        Some(Box::new(Qwen3AudioProcessor::from_configs(
+    ) -> RegistryResult<Option<Box<dyn AudioPreProcessor>>> {
+        Ok(Some(Box::new(Qwen3AudioProcessor::from_configs(
             model_config,
             preprocessor_config,
-        )))
+        ))))
     }
 
     fn prompt_replacements(
@@ -374,13 +377,12 @@ impl ModelProcessorSpec for Qwen3AsrSpec {
             Modality::Audio => {
                 let token_id = Self::audio_token_id(metadata)?;
                 let token = self.placeholder_token_for(metadata, Modality::Audio)?;
-                Ok(preprocessed
-                    .feature_token_counts
-                    .iter()
-                    .map(|&count| {
-                        PromptReplacement::repeated(Modality::Audio, &token, token_id, count)
-                    })
-                    .collect())
+                Ok(PromptReplacement::repeated_per_item(
+                    Modality::Audio,
+                    &token,
+                    token_id,
+                    &preprocessed.feature_token_counts,
+                ))
             }
             Modality::Image | Modality::Video | Modality::ImageEmbeds => {
                 Err(ModelRegistryError::UnsupportedModality {
@@ -462,6 +464,17 @@ mod tests {
         );
     }
 
+    /// The audio anchor is the one token the serving engine expands, so audio
+    /// may be forwarded to a worker that processes media itself; the spec
+    /// serves no other modality.
+    #[test]
+    fn asr_audio_can_be_expanded_by_a_worker() {
+        assert!(Qwen3AsrSpec.worker_expandable(Modality::Audio));
+        for modality in [Modality::Image, Modality::Video, Modality::ImageEmbeds] {
+            assert!(!Qwen3AsrSpec.worker_expandable(modality), "{modality}");
+        }
+    }
+
     #[test]
     fn asr_spec_builds_qwen_audio_processor() {
         use std::sync::Arc;
@@ -489,6 +502,7 @@ mod tests {
         .unwrap();
         let processor = spec
             .audio_processor(&config, &preprocessor_config)
+            .unwrap()
             .expect("qwen3_asr spec must provide an audio processor");
 
         let clip = Arc::new(AudioClip::new(

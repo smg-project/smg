@@ -49,6 +49,8 @@ fn pythonic_block_regex() -> &'static Regex {
 pub struct PythonicParser {
     /// Buffer for accumulating chunks
     buffer: String,
+    /// Calls handed out so far: the next accepted call's index.
+    emitted: usize,
 }
 
 impl Default for PythonicParser {
@@ -62,6 +64,7 @@ impl PythonicParser {
     pub fn new() -> Self {
         Self {
             buffer: String::new(),
+            emitted: 0,
         }
     }
 
@@ -151,27 +154,26 @@ impl ToolParser for PythonicParser {
                         let remaining_text = &cleaned[end + 1..];
                         self.buffer = remaining_text.to_string();
 
-                        // Validate tool names and convert ToolCall to ToolCallItem
+                        // Validate tool names and convert ToolCall to ToolCallItem.
+                        // Indices count the accepted calls across the stream, so an
+                        // unknown name shifts nothing and a later batch continues.
                         let tool_indices = helpers::get_tool_indices(tools);
-                        let items: Vec<ToolCallItem> = calls
-                            .into_iter()
-                            .enumerate()
-                            .filter_map(|(idx, tool)| {
-                                if !tool_indices.contains_key(&tool.function.name) {
-                                    tracing::debug!(
-                                        "Invalid tool name '{}' - skipping",
-                                        tool.function.name
-                                    );
-                                    return None;
-                                }
-
-                                Some(ToolCallItem {
-                                    tool_index: idx,
-                                    name: Some(tool.function.name),
-                                    parameters: tool.function.arguments,
-                                })
-                            })
-                            .collect();
+                        let mut items: Vec<ToolCallItem> = Vec::with_capacity(calls.len());
+                        for tool in calls {
+                            if !tool_indices.contains_key(&tool.function.name) {
+                                tracing::debug!(
+                                    "Invalid tool name '{}' - skipping",
+                                    tool.function.name
+                                );
+                                continue;
+                            }
+                            items.push(ToolCallItem {
+                                tool_index: self.emitted + items.len(),
+                                name: Some(tool.function.name),
+                                parameters: tool.function.arguments,
+                            });
+                        }
+                        self.emitted += items.len();
 
                         return Ok(StreamingParseResult {
                             normal_text,

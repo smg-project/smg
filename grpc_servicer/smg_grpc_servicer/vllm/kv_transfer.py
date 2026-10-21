@@ -5,6 +5,8 @@ import logging
 
 from smg_grpc_proto import vllm_engine_pb2
 
+from smg_grpc_servicer.vllm.config_view import EngineConfigView
+
 logger = logging.getLogger(__name__)
 
 _MULTI_CONNECTOR = "MultiConnector"
@@ -21,23 +23,16 @@ def pairing_fields(vllm_config: object) -> dict:
     absent and the router treats it as unknown rather than as a match. Every
     field degrades to its proto default when the config does not carry it.
     """
+    view = EngineConfigView(vllm_config)
     fields: dict = {}
-    cache = getattr(vllm_config, "cache_config", None)
-    if cache is not None:
-        dtype = getattr(cache, "cache_dtype", None)
-        if dtype:
-            fields["kv_cache_dtype"] = str(dtype)
-        block_size = getattr(cache, "block_size", None)
-        if isinstance(block_size, int) and block_size > 0:
-            fields["block_size"] = block_size
-    attention = getattr(vllm_config, "attention_config", None)
-    backend = getattr(attention, "backend", None) if attention is not None else None
-    if backend is not None:
-        fields["attention_backend"] = str(getattr(backend, "name", backend))
-    model = getattr(vllm_config, "model_config", None)
-    dtype = getattr(model, "dtype", None) if model is not None else None
-    if dtype is not None:
-        fields["model_dtype"] = str(dtype)
+    if view.cache.cache_dtype is not None:
+        fields["kv_cache_dtype"] = view.cache.cache_dtype
+    if view.cache.block_size is not None:
+        fields["block_size"] = view.cache.block_size
+    if view.attention_backend is not None:
+        fields["attention_backend"] = view.attention_backend
+    if view.model_dtype is not None:
+        fields["model_dtype"] = view.model_dtype
     return fields
 
 

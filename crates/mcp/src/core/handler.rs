@@ -22,7 +22,6 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     approval::{ApprovalManager, ApprovalMode, ApprovalOutcome, ApprovalParams},
-    inventory::ToolInventory,
     tenant::TenantContext,
 };
 
@@ -61,19 +60,13 @@ impl HandlerRequestContext {
 pub struct SmgClientHandler {
     server_key: Arc<str>,
     approval_manager: Arc<ApprovalManager>,
-    #[expect(dead_code)]
-    tool_inventory: Arc<ToolInventory>,
     client_info: ClientInfo,
     request_ctx: Arc<RwLock<Option<HandlerRequestContext>>>,
     refresh_tx: Option<mpsc::Sender<RefreshRequest>>,
 }
 
 impl SmgClientHandler {
-    pub fn new(
-        server_key: impl AsRef<str>,
-        approval_manager: Arc<ApprovalManager>,
-        tool_inventory: Arc<ToolInventory>,
-    ) -> Self {
+    pub fn new(server_key: impl AsRef<str>, approval_manager: Arc<ApprovalManager>) -> Self {
         let mut client_info = ClientInfo::default();
         client_info.client_info.name = "smg".to_string();
         client_info.client_info.version = env!("CARGO_PKG_VERSION").to_string();
@@ -81,7 +74,6 @@ impl SmgClientHandler {
         Self {
             server_key: Arc::from(server_key.as_ref()),
             approval_manager,
-            tool_inventory,
             client_info,
             request_ctx: Arc::new(RwLock::new(None)),
             refresh_tx: None,
@@ -322,9 +314,8 @@ mod tests {
         let audit_log = Arc::new(AuditLog::new());
         let policy_engine = Arc::new(PolicyEngine::new(audit_log.clone()));
         let approval_manager = Arc::new(ApprovalManager::new(policy_engine, audit_log));
-        let tool_inventory = Arc::new(ToolInventory::new());
 
-        SmgClientHandler::new("test-server", approval_manager, tool_inventory)
+        SmgClientHandler::new("test-server", approval_manager)
     }
 
     #[test]

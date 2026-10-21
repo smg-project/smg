@@ -2,7 +2,8 @@
 //! tokenizes and sends token ids; this service streams back canned token ids.
 
 use std::{
-    pin::Pin,
+    future::{pending, Future},
+    pin::{pin, Pin},
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -14,7 +15,7 @@ use futures::{stream, Stream, StreamExt};
 use smg_grpc_client::{common_proto as common, tokenspeed_scheduler::tokenspeed_proto as ts};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::mpsc,
+    sync::{mpsc, watch},
 };
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{transport::Server, Request, Response, Status};
@@ -25,12 +26,25 @@ use ts::{
 
 use crate::{
     config::Config,
+    drain::InFlight,
     engine::{self, Engine, KvEventStream, LoadsLike, NewRequest},
     replay::Capture,
+    script::{self, Answer, MatchedStop},
 };
 
 /// Serve the mock TokenSpeed gRPC service on `port` until the process exits.
 pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
+    serve_until(cfg, host, port, pending()).await;
+}
+
+/// Serve on `port` until `shutdown` resolves, then stop accepting connections
+/// and let the requests in flight finish (the drain of a termination signal).
+pub async fn serve_until(
+    cfg: Arc<Config>,
+    host: String,
+    port: u16,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
     // What the HTTP listener accepts: a bare IP of either family or a name.
     let listener = match TcpListener::bind((host.as_str(), port)).await {
         Ok(listener) => listener,
@@ -39,12 +53,21 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
             return;
         }
     };
-    serve_with_listener(cfg, listener).await;
+    serve_with_listener_until(cfg, listener, shutdown).await;
 }
 
 /// Serve on an already-bound listener. Callers that need a free port bind
 /// port 0 and read it back instead of picking one and binding it later.
 pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
+    serve_with_listener_until(cfg, listener, pending()).await;
+}
+
+/// [`serve_with_listener`] with the shutdown of [`serve_until`].
+pub async fn serve_with_listener_until(
+    cfg: Arc<Config>,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
     let addr = listener.local_addr().ok();
     let capture = match &cfg.replay.capture {
         Some(path) => match Capture::open(path) {
@@ -59,12 +82,17 @@ pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
         },
         None => None,
     };
+    if let Err(e) = script::ensure_loaded(&cfg) {
+        tracing::error!("grpc worker {addr:?} cannot load script: {e}");
+        return;
+    }
     // One simulated engine per listener (i.e. per virtual worker), registered
     // in the process fleet under `grpc:<port>` for the oracle and admin API.
     let name = format!("grpc:{}", addr.map(|a| a.port()).unwrap_or(0));
+    script::register(&name);
     let engine = cfg
         .realistic
-        .then(|| Engine::spawn_named(cfg.engine.clone(), name, true));
+        .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
     // The worker's vLLM-wire KV-event publisher, numbered by its port offset.
     let publisher = engine.as_ref().and_then(|engine| {
         let port = addr.map(|a| a.port())?;
@@ -74,12 +102,36 @@ pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
             .map(|kv| crate::kv_zmq::serve(engine.clone(), kv))
     });
     let max_message_bytes = cfg.grpc_max_message_bytes;
+    // The stop reaches the service's streams that have no end of their own
+    // (a KV-event subscription) before the server's graceful shutdown
+    // begins, which waits for every open stream.
+    let (stop, stopped) = watch::channel(false);
+    let shutdown = async move {
+        shutdown.await;
+        let _ = stop.send(true);
+    };
     let service = MockScheduler {
         cfg,
+        name,
         engine,
         capture,
+        stopped,
+        prefill_pending: Arc::new(AtomicU64::new(0)),
+        overrides: crate::overrides::for_port(addr.map(|a| a.port()).unwrap_or(0)),
     };
     let server = async {
+        // tonic drains on incoming EOF when graceful shutdown is enabled,
+        // but retains the stream while waiting for existing connections.
+        // Drop the listener at EOF so the port closes before that wait.
+        let incoming = stream::unfold(
+            Box::pin(connections(listener).take_until(shutdown)),
+            |mut incoming| async move {
+                incoming
+                    .next()
+                    .await
+                    .map(|connection| (connection, incoming))
+            },
+        );
         // tonic's 4 MiB default would refuse the Generate of a long prompt (a
         // million token ids are a few megabytes as varints, more with the
         // prompt text alongside); the limit follows the config: none by
@@ -90,7 +142,7 @@ pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
                     .max_decoding_message_size(max_message_bytes)
                     .max_encoding_message_size(max_message_bytes),
             )
-            .serve_with_incoming(connections(listener))
+            .serve_with_incoming_shutdown(incoming, pending())
             .await
         {
             tracing::error!("grpc worker {addr:?} stopped: {e}");
@@ -98,7 +150,15 @@ pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
     };
     match publisher {
         Some(publisher) => {
-            tokio::join!(server, publisher);
+            // When the server stops (the shutdown, or an error) the publisher
+            // goes with it; a publisher that stops on its own leaves the
+            // server serving, as before.
+            let mut server = pin!(server);
+            let mut publisher = pin!(publisher);
+            tokio::select! {
+                () = &mut server => {}
+                () = &mut publisher => server.await,
+            }
         }
         None => server.await,
     }
@@ -124,10 +184,22 @@ fn connections(listener: TcpListener) -> impl Stream<Item = std::io::Result<TcpS
 #[derive(Clone)]
 struct MockScheduler {
     cfg: Arc<Config>,
+    /// The worker's name in the process (`grpc:<port>`): what the admin API
+    /// and the script store address it by.
+    name: String,
     /// Present iff the worker runs the realistic engine simulator.
     engine: Option<Engine>,
     /// Present iff `--capture` is set: every `Generate` request is recorded.
     capture: Option<Arc<Capture>>,
+    /// Flips when the worker stops: ends the streams that have no end of
+    /// their own.
+    stopped: watch::Receiver<bool>,
+    /// Prompt tokens of the requests handed to the engine with no token yet:
+    /// the prefill work in hand, as a servicer reports it on its load record.
+    prefill_pending: Arc<AtomicU64>,
+    /// What the admin API made this worker report about itself (serving,
+    /// server args, model capabilities).
+    overrides: Arc<crate::overrides::WorkerOverrides>,
 }
 
 type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
@@ -144,6 +216,9 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         request: Request<ts::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
+        // In flight from here until the stream is done (or dropped by the
+        // gateway), so a shutdown knows what it waits for.
+        let in_flight = InFlight::enter();
         let req = request.into_inner();
         // Record before anything else: the line is in the file before the
         // stream is returned, so before the gateway can read any frame.
@@ -152,6 +227,28 @@ impl TokenSpeedScheduler for MockScheduler {
                 tracing::error!("capturing request {} failed: {e}", req.request_id);
                 return Err(Status::internal(format!("mock-worker capture failed: {e}")));
             }
+        }
+
+        // A scripted answer, ahead of either engine mode: the worker's queue
+        // or the prompt's key decides ([`crate::script`]).
+        let prompt_ids: &[u32] = req
+            .tokenized
+            .as_ref()
+            .map(|tokenized| tokenized.input_ids.as_slice())
+            .unwrap_or(&[]);
+        let scripted = script::take_ids(&self.cfg, &self.name, prompt_ids)
+            .map_err(Status::failed_precondition)?;
+        if let Some(answer) = scripted {
+            let prompt_tokens = answer.prompt_tokens(prompt_ids.len());
+            let stream = scripted_stream(
+                answer,
+                req.request_id.clone(),
+                prompt_tokens,
+                req.stream,
+                req.return_logprob,
+                self.cfg.weight_version.clone(),
+            );
+            return Ok(Response::new(Box::pin(in_flight.until_done(stream))));
         }
 
         // Realistic mode: submit to the engine simulator and stream its output.
@@ -169,9 +266,14 @@ impl TokenSpeedScheduler for MockScheduler {
                 }
             }
             let cut = injected.and_then(|fault| {
+                let end = if fault.finish_error {
+                    CutEnd::EngineError
+                } else {
+                    CutEnd::Status(injected_status(fault.status))
+                };
                 fault
                     .after_tokens
-                    .map(|after| (after, injected_status(fault.status), engine.cut_counter()))
+                    .map(|after| (after, end, engine.cut_counter()))
             });
             let request_id = req.request_id;
             let prompt_token_ids = req.tokenized.map(|t| t.input_ids).unwrap_or_default();
@@ -187,19 +289,28 @@ impl TokenSpeedScheduler for MockScheduler {
             // gateway and the engine, as a backlog in transit would hold it;
             // the load record does not see it until it lands.
             engine.admit().await;
+            let weight_version = self.cfg.weight_version.clone();
             let (tx, rx) = mpsc::unbounded_channel();
+            let pending = (
+                Arc::clone(&self.prefill_pending),
+                prompt_token_ids.len() as u64,
+            );
+            pending.0.fetch_add(pending.1, Ordering::Relaxed);
             engine.submit(NewRequest {
                 request_id: request_id.clone(),
                 prompt_token_ids,
                 max_new,
                 events: tx,
             });
-            return Ok(Response::new(generate_stream(
+            let stream = generate_stream(
                 rx,
                 stream_chunks,
                 request_id,
+                Some(pending),
                 cut,
-            )));
+                weight_version,
+            );
+            return Ok(Response::new(Box::pin(in_flight.until_done(stream))));
         }
 
         // Canned mode: a single up-front delay, then synthetic token ids.
@@ -220,7 +331,7 @@ impl TokenSpeedScheduler for MockScheduler {
                     cached_tokens: 0,
                     output_logprobs: None,
                     index: 0,
-                    weight_version: None,
+                    weight_version: self.cfg.weight_version.clone(),
                 })),
             }));
         }
@@ -235,27 +346,34 @@ impl TokenSpeedScheduler for MockScheduler {
                 output_logprobs: None,
                 matched_stop: None,
                 index: 0,
+                weight_version: self.cfg.weight_version.clone(),
                 ..Default::default()
             })),
         }));
 
-        Ok(Response::new(Box::pin(stream::iter(items))))
+        Ok(Response::new(Box::pin(
+            in_flight.until_done(stream::iter(items)),
+        )))
     }
 
     async fn health_check(
         &self,
         _request: Request<ts::HealthCheckRequest>,
     ) -> Result<Response<ts::HealthCheckResponse>, Status> {
+        let serving = self.overrides.serving();
         Ok(Response::new(ts::HealthCheckResponse {
-            healthy: true,
-            message: "ok".to_string(),
+            healthy: serving,
+            message: if serving { "ok" } else { "not serving" }.to_string(),
         }))
     }
 
     async fn abort(
         &self,
-        _request: Request<ts::AbortRequest>,
+        request: Request<ts::AbortRequest>,
     ) -> Result<Response<ts::AbortResponse>, Status> {
+        if let Some(engine) = &self.engine {
+            engine.abort(request.into_inner().request_id);
+        }
         Ok(Response::new(ts::AbortResponse {
             success: true,
             message: String::new(),
@@ -280,7 +398,7 @@ impl TokenSpeedScheduler for MockScheduler {
             bos_token_id: 1,
             weight_version: "mock".to_string(),
             default_sampling_params_json: String::new(),
-            supports_vision: false,
+            supports_vision: self.overrides.info_bool("supports_vision").unwrap_or(false),
             ..Default::default()
         }))
     }
@@ -289,8 +407,25 @@ impl TokenSpeedScheduler for MockScheduler {
         &self,
         _request: Request<ts::GetServerInfoRequest>,
     ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
+        // The configured server args, with the admin API's overrides on top:
+        // what the gateway flattens into this worker's labels.
+        let mut fields: std::collections::BTreeMap<String, prost_types::Value> = self
+            .cfg
+            .server_args
+            .iter()
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    prost_types::Value {
+                        kind: Some(prost_types::value::Kind::StringValue(v.clone())),
+                    },
+                )
+            })
+            .collect();
+        fields.extend(crate::overrides::server_args(&self.overrides.info()).fields);
+        let server_args = (!fields.is_empty()).then_some(prost_types::Struct { fields });
         Ok(Response::new(ts::GetServerInfoResponse {
-            server_args: None,
+            server_args,
             scheduler_info: None,
             active_requests: 0,
             is_paused: false,
@@ -298,6 +433,7 @@ impl TokenSpeedScheduler for MockScheduler {
             max_total_num_tokens: 1_000_000,
             tokenspeed_version: "mock".to_string(),
             start_time: None,
+            constrained_decoding: String::new(),
         }))
     }
 
@@ -344,12 +480,23 @@ impl TokenSpeedScheduler for MockScheduler {
             // Realistic mode with prefix caching: stream the engine's KV events,
             // each carrying the load record a servicer attaches.
             Some(engine) if engine.kv_enabled() => {
-                let start = request.into_inner().start_sequence_number;
-                Ok(Response::new(with_load_records(
+                let request = request.into_inner();
+                let events = with_load_records(
                     engine.clone(),
                     self.cfg.loads_like,
-                    engine.subscribe_kv(start),
-                )))
+                    self.cfg.step_reports,
+                    Arc::clone(&self.prefill_pending),
+                    request.load_records_before_first_batch,
+                    engine.subscribe_kv(request.start_sequence_number),
+                );
+                // A subscription ends with the worker's stop, as a serving
+                // engine's ends with its process; nothing else ends it, and
+                // the server's shutdown waits for it.
+                let mut stopped = self.stopped.clone();
+                let stop = async move {
+                    let _ = stopped.wait_for(|stop| *stop).await;
+                };
+                Ok(Response::new(Box::pin(events.take_until(stop))))
             }
             // Otherwise Unimplemented, on which the gateway's KvEventMonitor gives
             // up cleanly instead of keeping an idle per-worker task.
@@ -393,8 +540,9 @@ impl TokenSpeedScheduler for MockScheduler {
 /// The gRPC status code closest to the HTTP status a request fault answers,
 /// chosen so the gateway's mapping of codes to HTTP statuses gives that status
 /// back where it can: 408 reads back as 504 and 502 as 503 (both still
-/// retryable), any other 4xx as 400 (not retryable, as on the HTTP worker),
-/// any other 5xx as 500.
+/// retryable), 499 as 502 (`cancelled`: the worker's side ending the call,
+/// retryable and charged to the worker), any other 4xx as 400 (not
+/// retryable, as on the HTTP worker), any other 5xx as 500.
 fn injected_status(status: u16) -> Status {
     const MESSAGE: &str = "injected";
     match status {
@@ -405,11 +553,24 @@ fn injected_status(status: u16) -> Status {
         408 | 504 => Status::deadline_exceeded(MESSAGE),
         409 => Status::aborted(MESSAGE),
         429 => Status::resource_exhausted(MESSAGE),
+        // The call the worker's side ended: what a connection that closed
+        // under it produces at the gateway.
+        499 => Status::cancelled(MESSAGE),
         501 => Status::unimplemented(MESSAGE),
         502 | 503 => Status::unavailable(MESSAGE),
         other if (400..=499).contains(&other) => Status::invalid_argument(MESSAGE),
         _ => Status::internal(MESSAGE),
     }
+}
+
+/// How the fault hook's cut ends a stream.
+#[derive(Clone, Debug)]
+enum CutEnd {
+    /// The gRPC status the stream ends with.
+    Status(Status),
+    /// A `Complete` whose finish reason is `error`, as an engine that failed
+    /// the request sends it: the output so far, no status.
+    EngineError,
 }
 
 /// The generate stream's state between items.
@@ -418,31 +579,60 @@ struct Generating {
     output_ids: Vec<u32>,
     stream_chunks: bool,
     request_id: String,
-    /// The fault hook's cut: the stream ends with the status once the engine
-    /// has produced more than this many tokens; the counter records the cut.
-    cut: Option<(u32, Status, Arc<AtomicU64>)>,
+    /// The fault hook's cut: the stream ends with the given end once the
+    /// engine has produced more than this many tokens; the counter records
+    /// the cut.
+    cut: Option<(u32, CutEnd, Arc<AtomicU64>)>,
+    /// The worker's pending-prefill counter and this request's share of it,
+    /// settled at the first token (or at the end, if none came).
+    pending: Option<(Arc<AtomicU64>, u64)>,
+    /// Stamped on every chunk and the completion; `None` leaves the field
+    /// unset, like an engine that predates it.
+    weight_version: Option<String>,
     ended: bool,
+}
+
+impl Generating {
+    /// The prompt is prefilled (a first token, or the stream's end): it no
+    /// longer counts as pending prefill.
+    fn settle_prefill(&mut self) {
+        if let Some((counter, tokens)) = self.pending.take() {
+            counter.fetch_sub(tokens, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for Generating {
+    fn drop(&mut self) {
+        self.settle_prefill();
+    }
 }
 
 /// Map the engine's [`engine::GenEvent`] channel to the gRPC generate stream.
 /// In streaming mode each token becomes a `Chunk`; otherwise tokens are
 /// accumulated and only the final `Complete` is sent. After `Complete` the
 /// engine has dropped the sender, so the next `recv()` yields `None` and the
-/// stream ends. With `cut`, the stream ends with that status instead once the
-/// engine has produced more than the given number of tokens (the fault hook's
-/// `after_tokens`); an output no longer than that completes as usual.
+/// stream ends. With `cut`, the stream ends with the given status or
+/// engine-failure `Complete` instead once the engine has produced more than
+/// the given number of tokens (the fault hook's `after_tokens`); an output no
+/// longer than that completes as usual. Every chunk and completion carries
+/// `weight_version`, as an engine stamps them.
 fn generate_stream(
     rx: mpsc::UnboundedReceiver<engine::GenEvent>,
     stream_chunks: bool,
     request_id: String,
-    cut: Option<(u32, Status, Arc<AtomicU64>)>,
+    pending: Option<(Arc<AtomicU64>, u64)>,
+    cut: Option<(u32, CutEnd, Arc<AtomicU64>)>,
+    weight_version: Option<String>,
 ) -> GenStream {
     let init = Generating {
         rx,
         output_ids: Vec::new(),
         stream_chunks,
         request_id,
+        pending,
         cut,
+        weight_version,
         ended: false,
     };
     Box::pin(stream::unfold(init, |mut st| async move {
@@ -456,13 +646,36 @@ fn generate_stream(
                     prompt_tokens,
                     cached_tokens,
                 }) => {
+                    st.settle_prefill();
                     st.output_ids.push(token_id);
-                    if let Some((after, status, cut_total)) = &st.cut {
+                    if let Some((after, end, cut_total)) = &st.cut {
                         if st.output_ids.len() > *after as usize {
-                            let status = status.clone();
+                            let item = match end {
+                                CutEnd::Status(status) => Err(status.clone()),
+                                CutEnd::EngineError => {
+                                    // The output the engine had produced
+                                    // before it failed: the tokens it sent.
+                                    st.output_ids.truncate(*after as usize);
+                                    Ok(ts::GenerateResponse {
+                                        request_id: st.request_id.clone(),
+                                        response: Some(GenResp::Complete(ts::GenerateComplete {
+                                            output_ids: std::mem::take(&mut st.output_ids),
+                                            finish_reason: "error".to_string(),
+                                            prompt_tokens,
+                                            completion_tokens: *after,
+                                            cached_tokens,
+                                            output_logprobs: None,
+                                            matched_stop: None,
+                                            index: 0,
+                                            weight_version: st.weight_version.clone(),
+                                            ..Default::default()
+                                        })),
+                                    })
+                                }
+                            };
                             cut_total.fetch_add(1, Ordering::Relaxed);
                             st.ended = true;
-                            return Some((Err(status), st));
+                            return Some((item, st));
                         }
                     }
                     if st.stream_chunks {
@@ -475,7 +688,7 @@ fn generate_stream(
                                 cached_tokens,
                                 output_logprobs: None,
                                 index: 0,
-                                weight_version: None,
+                                weight_version: st.weight_version.clone(),
                             })),
                         };
                         return Some((Ok(resp), st));
@@ -499,6 +712,7 @@ fn generate_stream(
                             output_logprobs: None,
                             matched_stop: None,
                             index: 0,
+                            weight_version: st.weight_version.clone(),
                             ..Default::default()
                         })),
                     };
@@ -506,6 +720,120 @@ fn generate_stream(
                 }
                 None => return None,
             }
+        }
+    }))
+}
+
+/// The generate stream of a scripted answer: a `Chunk` per frame when the
+/// request streams, then the `Complete`, with the answer's pause before every
+/// frame but the first; the logprobs ride along when the request asked for
+/// them. A `Complete` that follows no chunk is what a non-streaming request
+/// reads, as it reads the engine's.
+fn scripted_stream(
+    answer: Answer,
+    request_id: String,
+    prompt_tokens: u32,
+    stream_chunks: bool,
+    return_logprob: bool,
+    weight_version: Option<String>,
+) -> GenStream {
+    struct Scripted {
+        answer: Answer,
+        frames: std::collections::VecDeque<script::Frame>,
+        request_id: String,
+        prompt_tokens: u32,
+        stream_chunks: bool,
+        return_logprob: bool,
+        weight_version: Option<String>,
+        /// Output tokens sent so far (the chunks' running `completion_tokens`).
+        sent: u32,
+        started: bool,
+        done: bool,
+    }
+    let frames = answer.token_frames().into();
+    let init = Scripted {
+        answer,
+        frames,
+        request_id,
+        prompt_tokens,
+        stream_chunks,
+        return_logprob,
+        weight_version,
+        sent: 0,
+        started: false,
+        done: false,
+    };
+    Box::pin(stream::unfold(init, |mut st| async move {
+        loop {
+            if st.done {
+                return None;
+            }
+            let Some(frame) = st.frames.pop_front() else {
+                st.done = true;
+                let answer = &st.answer;
+                let output_logprobs = answer
+                    .logprobs
+                    .as_ref()
+                    .filter(|logprobs| {
+                        st.return_logprob && logprobs.len() == answer.output_ids.len()
+                    })
+                    .map(|logprobs| ts::OutputLogProbs {
+                        token_logprobs: logprobs.clone(),
+                        token_ids: answer.output_ids.clone(),
+                        top_logprobs: Vec::new(),
+                    });
+                let matched_stop = answer.matched_stop.as_ref().map(|stop| match stop {
+                    MatchedStop::Token(id) => {
+                        ts::generate_complete::MatchedStop::MatchedTokenId(*id)
+                    }
+                    MatchedStop::Text(text) => {
+                        ts::generate_complete::MatchedStop::MatchedStopStr(text.clone())
+                    }
+                });
+                let complete = ts::GenerateResponse {
+                    request_id: st.request_id.clone(),
+                    response: Some(GenResp::Complete(ts::GenerateComplete {
+                        output_ids: answer.output_ids.clone(),
+                        finish_reason: answer.finish_reason.clone(),
+                        prompt_tokens: st.prompt_tokens,
+                        completion_tokens: answer.completion_tokens(),
+                        cached_tokens: answer.cached_tokens,
+                        output_logprobs,
+                        matched_stop,
+                        index: 0,
+                        weight_version: st.weight_version.clone(),
+                        ..Default::default()
+                    })),
+                };
+                return Some((Ok(complete), st));
+            };
+            if st.started && !st.answer.delay.is_zero() {
+                tokio::time::sleep(st.answer.delay).await;
+            }
+            st.started = true;
+            st.sent += u32::try_from(frame.ids.len()).unwrap_or(u32::MAX);
+            if !st.stream_chunks {
+                continue;
+            }
+            let output_logprobs = (st.return_logprob && frame.logprobs.len() == frame.ids.len())
+                .then(|| ts::OutputLogProbs {
+                    token_logprobs: frame.logprobs.clone(),
+                    token_ids: frame.ids.clone(),
+                    top_logprobs: Vec::new(),
+                });
+            let chunk = ts::GenerateResponse {
+                request_id: st.request_id.clone(),
+                response: Some(GenResp::Chunk(ts::GenerateStreamChunk {
+                    token_ids: frame.ids,
+                    prompt_tokens: st.prompt_tokens,
+                    completion_tokens: st.sent,
+                    cached_tokens: st.answer.cached_tokens,
+                    output_logprobs,
+                    index: 0,
+                    weight_version: st.weight_version.clone(),
+                })),
+            };
+            return Some((Ok(chunk), st));
         }
     }))
 }
@@ -539,9 +867,23 @@ fn load_record(
     }
 }
 
+/// The worker's pending prefill as the record carries it.
+fn pending_u32(counter: &AtomicU64) -> u32 {
+    u32::try_from(counter.load(Ordering::Relaxed)).unwrap_or(u32::MAX)
+}
+
+/// The engine's silence on its in-flight requests, as the Rust servicer's
+/// record carries it (`EngineLoad.engine_silence_ms`).
+fn silence_ms(engine: &engine::Engine) -> Option<u32> {
+    engine
+        .output_silence()
+        .map(|silence| u32::try_from(silence.as_millis()).unwrap_or(u32::MAX))
+}
+
 /// Whether a record moved enough from `last` to be worth a `load_only`
 /// batch: the Rust relay's rule (any queue, running or window change, KV
-/// usage by half a percent, the rate by 5 % or 50 tokens per second).
+/// usage by half a percent, the rate by 5 % or 50 tokens per second, the
+/// engine's silence by a whole second).
 fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool {
     last.running_requests != current.running_requests
         || last.waiting_requests != current.waiting_requests
@@ -552,6 +894,9 @@ fn load_changed(last: &common::EngineLoad, current: &common::EngineLoad) -> bool
             let delta = (last.gen_throughput - current.gen_throughput).abs();
             delta > 50.0 || delta > 0.05 * last.gen_throughput.max(current.gen_throughput)
         }
+        || last.engine_silence_ms.map(|ms| ms / 1000)
+            != current.engine_silence_ms.map(|ms| ms / 1000)
+        || last.prefill_pending_tokens != current.prefill_pending_tokens
 }
 
 /// How often the stream checks the record while no batch flows, the silence
@@ -565,7 +910,17 @@ struct LoadRecords {
     stream: KvEventStream,
     engine: engine::Engine,
     like: LoadsLike,
-    last_seq: u64,
+    /// What the record says of the wire (`--step-reports`).
+    step_reports: bool,
+    /// The worker's prompt tokens handed to the engine with no token yet.
+    prefill_pending: Arc<AtomicU64>,
+    /// The subscriber takes `load_only` batches before the stream's first
+    /// batch, numbered 0 (`SubscribeKvEventsRequest.
+    /// load_records_before_first_batch`); unset, it waits for that batch.
+    records_before_first_batch: bool,
+    /// The last sequence sent, which a `load_only` batch repeats; `None`
+    /// before the stream's first batch.
+    last_seq: Option<u64>,
     last_rank: Option<i32>,
     last_record: Option<common::EngineLoad>,
     last_sent_at: Instant,
@@ -587,6 +942,9 @@ impl LoadRecords {
         self.sample += 1;
         let snapshot = self.engine.load().as_reported_by(self.like);
         let mut record = load_record(&snapshot, self.like, self.sample);
+        record.engine_silence_ms = silence_ms(&self.engine);
+        record.engine_reports_steps = Some(self.step_reports);
+        record.prefill_pending_tokens = Some(pending_u32(&self.prefill_pending));
         record.load_only = load_only;
         // As the Rust relay: telemetry on heartbeats and the first record.
         if !load_only && self.sample > 1 {
@@ -599,9 +957,20 @@ impl LoadRecords {
     /// A `load_only` batch when the record moved since the last one sent, or
     /// after the heartbeat interval of silence (the backoff interval after two
     /// unchanged heartbeats); it repeats the last sequence sent, as the
-    /// gateway expects.
+    /// gateway expects. Before the stream's first batch there is none to
+    /// repeat: as the Rust relay, the mock sends one numbered 0 only to a
+    /// subscriber that asked for records before the first batch, and keeps
+    /// an older subscriber waiting for that batch.
     fn load_only_batch(&mut self) -> Option<common::KvEventBatch> {
-        let current = load_record(&self.engine.load().as_reported_by(self.like), self.like, 0);
+        let sequence_number = match self.last_seq {
+            Some(sequence) => sequence,
+            None if self.records_before_first_batch => 0,
+            None => return None,
+        };
+        let mut current = load_record(&self.engine.load().as_reported_by(self.like), self.like, 0);
+        current.engine_silence_ms = silence_ms(&self.engine);
+        current.engine_reports_steps = Some(self.step_reports);
+        current.prefill_pending_tokens = Some(pending_u32(&self.prefill_pending));
         let changed = self
             .last_record
             .as_ref()
@@ -622,7 +991,7 @@ impl LoadRecords {
             self.idle_heartbeats.saturating_add(1)
         };
         Some(common::KvEventBatch {
-            sequence_number: self.last_seq,
+            sequence_number,
             timestamp: engine::unix_seconds(),
             events: Vec::new(),
             dp_rank: self.last_rank,
@@ -634,17 +1003,25 @@ impl LoadRecords {
 
 /// `stream` with the engine's load record on every batch and `load_only`
 /// batches while the engine is quiet, as the Rust servicer's relay sends
-/// them (`crates/engine_servicer/src/kv_events.rs`).
+/// them (`crates/engine_servicer/src/kv_events.rs`): from the subscription
+/// on for a subscriber that takes records before the first batch
+/// (`records_before_first_batch`), from the stream's first batch otherwise.
 fn with_load_records(
     engine: engine::Engine,
     like: LoadsLike,
+    step_reports: bool,
+    prefill_pending: Arc<AtomicU64>,
+    records_before_first_batch: bool,
     stream: KvEventStream,
 ) -> KvEventStream {
     let records = LoadRecords {
         stream,
         engine,
         like,
-        last_seq: 0,
+        step_reports,
+        prefill_pending,
+        records_before_first_batch,
+        last_seq: None,
         last_rank: Some(0),
         last_record: None,
         last_sent_at: Instant::now(),
@@ -661,7 +1038,7 @@ fn with_load_records(
                 Waited::Item(None) => return None,
                 Waited::Item(Some(Err(status))) => return Some((Err(status), records)),
                 Waited::Item(Some(Ok(mut batch))) => {
-                    records.last_seq = batch.sequence_number;
+                    records.last_seq = Some(batch.sequence_number);
                     records.last_rank = batch.dp_rank;
                     records.last_sent_at = Instant::now();
                     records.idle_heartbeats = 0;
@@ -746,6 +1123,71 @@ mod tests {
         }
     }
 
+    /// As the Rust relay: a subscriber that asks for records before the
+    /// stream's first batch gets a `load_only` one numbered 0 within a tick;
+    /// one that does not waits for the first batch, whose sequence the
+    /// heartbeats repeat from there.
+    #[tokio::test]
+    async fn load_records_before_the_first_batch_go_to_the_subscriber_that_asked() {
+        let engine = Engine::spawn(engine::EngineParams::default());
+        let records = |asked: bool, kv: KvEventStream| {
+            with_load_records(
+                engine.clone(),
+                LoadsLike::Mock,
+                false,
+                Arc::new(AtomicU64::new(0)),
+                asked,
+                kv,
+            )
+        };
+        let quiet = || Box::pin(stream::pending()) as KvEventStream;
+        let load_only =
+            |batch: &common::KvEventBatch| batch.load.as_ref().is_some_and(|load| load.load_only);
+
+        let mut asked = records(true, quiet());
+        let first = tokio::time::timeout(Duration::from_millis(500), asked.next())
+            .await
+            .expect("a record before the stream's first batch")
+            .expect("an item")
+            .expect("a batch");
+        assert!(load_only(&first), "{first:?}");
+        assert_eq!((first.sequence_number, first.events.len()), (0, 0));
+
+        let mut waiting = records(false, quiet());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(400), waiting.next())
+                .await
+                .is_err(),
+            "no batch may precede the stream's first for a subscriber that did not ask"
+        );
+
+        let seventh = common::KvEventBatch {
+            sequence_number: 7,
+            ..Default::default()
+        };
+        let mut after = records(
+            false,
+            Box::pin(stream::iter([Ok::<_, Status>(seventh)]).chain(stream::pending())),
+        );
+        let live = after
+            .next()
+            .await
+            .expect("the first batch")
+            .expect("a batch");
+        assert_eq!(live.sequence_number, 7);
+        assert!(!load_only(&live));
+        let beat = tokio::time::timeout(
+            HEARTBEAT_INTERVAL + Duration::from_millis(500),
+            after.next(),
+        )
+        .await
+        .expect("a heartbeat after the interval")
+        .expect("an item")
+        .expect("a batch");
+        assert!(load_only(&beat));
+        assert_eq!(beat.sequence_number, 7, "repeats the last sequence sent");
+    }
+
     #[tokio::test]
     async fn a_cut_stream_ends_with_the_status_after_the_given_tokens() {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -755,12 +1197,50 @@ mod tests {
         tx.send(done(4)).unwrap();
         drop(tx);
         let cuts = Arc::new(AtomicU64::new(0));
-        let cut = Some((2, Status::unavailable("injected"), Arc::clone(&cuts)));
-        let mut stream = generate_stream(rx, true, "r".to_string(), cut);
+        let cut = Some((
+            2,
+            CutEnd::Status(Status::unavailable("injected")),
+            Arc::clone(&cuts),
+        ));
+        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut, None);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         assert_eq!(chunk_ids(stream.next().await), vec![2]);
         let cut = stream.next().await.expect("the cut");
         assert!(matches!(cut, Err(ref status) if status.code() == tonic::Code::Unavailable));
+        assert!(stream.next().await.is_none(), "nothing after the cut");
+        assert_eq!(cuts.load(Ordering::Relaxed), 1, "the cut is counted once");
+    }
+
+    #[tokio::test]
+    async fn an_engine_failure_cut_ends_with_an_error_complete_after_the_given_tokens() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for id in 1..=4 {
+            tx.send(token(id)).unwrap();
+        }
+        tx.send(done(4)).unwrap();
+        drop(tx);
+        let cuts = Arc::new(AtomicU64::new(0));
+        let cut = Some((2, CutEnd::EngineError, Arc::clone(&cuts)));
+        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut, None);
+        assert_eq!(chunk_ids(stream.next().await), vec![1]);
+        assert_eq!(chunk_ids(stream.next().await), vec![2]);
+        let item = stream
+            .next()
+            .await
+            .expect("the cut")
+            .expect("a response, not a status");
+        match item.response {
+            Some(GenResp::Complete(complete)) => {
+                assert_eq!(complete.finish_reason, "error");
+                assert_eq!(
+                    complete.output_ids,
+                    vec![1, 2],
+                    "the output the engine had sent"
+                );
+                assert_eq!(complete.completion_tokens, 2);
+            }
+            other => panic!("not an error completion: {other:?}"),
+        }
         assert!(stream.next().await.is_none(), "nothing after the cut");
         assert_eq!(cuts.load(Ordering::Relaxed), 1, "the cut is counted once");
     }
@@ -772,8 +1252,12 @@ mod tests {
         tx.send(done(1)).unwrap();
         drop(tx);
         let cuts = Arc::new(AtomicU64::new(0));
-        let cut = Some((1, Status::internal("injected"), Arc::clone(&cuts)));
-        let mut stream = generate_stream(rx, true, "r".to_string(), cut);
+        let cut = Some((
+            1,
+            CutEnd::Status(Status::internal("injected")),
+            Arc::clone(&cuts),
+        ));
+        let mut stream = generate_stream(rx, true, "r".to_string(), None, cut, None);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         let complete = stream.next().await.expect("complete").expect("ok");
         assert!(matches!(complete.response, Some(GenResp::Complete(_))));
@@ -793,8 +1277,9 @@ mod tests {
         assert_eq!(injected_status(429).code(), tonic::Code::ResourceExhausted);
         assert_eq!(injected_status(504).code(), tonic::Code::DeadlineExceeded);
         assert_eq!(injected_status(400).code(), tonic::Code::InvalidArgument);
-        // The two non-inverse cases (read back as 504 and 503) and a 4xx
-        // without its own code (read back as 400).
+        assert_eq!(injected_status(499).code(), tonic::Code::Cancelled);
+        // The three non-inverse cases (408 and 502 read back as 504 and 503,
+        // 499 as 502) and a 4xx without its own code (read back as 400).
         assert_eq!(injected_status(408).code(), tonic::Code::DeadlineExceeded);
         assert_eq!(injected_status(502).code(), tonic::Code::Unavailable);
         assert_eq!(injected_status(422).code(), tonic::Code::InvalidArgument);

@@ -17,6 +17,8 @@ struct MetricsState {
 
 async fn prometheus_handler(State(state): State<MetricsState>) -> impl IntoResponse {
     super::metrics::record_tokenizer_cache_activity();
+    super::metrics::record_detokenize_activity();
+    super::metrics::record_tokenizer_encode_activity();
     let mut body = state.handle.render();
     super::worker_metrics::render_into(&mut body);
     (
@@ -106,7 +108,9 @@ mod tests {
                 .await
                 .unwrap();
             assert!(addr.ip().is_ipv6(), "host {host} bound {addr}");
-            let resp = reqwest::get(format!("http://{addr}/metrics"))
+            let resp = crate::clients::http_client()
+                .get(format!("http://{addr}/metrics"))
+                .send()
                 .await
                 .unwrap();
             assert!(resp.status().is_success(), "host {host}");
@@ -149,7 +153,9 @@ mod tests {
             .unwrap();
         assert_ne!(addr.port(), 0);
 
-        let resp = reqwest::get(format!("http://{addr}/metrics"))
+        let resp = crate::clients::http_client()
+            .get(format!("http://{addr}/metrics"))
+            .send()
             .await
             .unwrap();
         assert!(resp.status().is_success());

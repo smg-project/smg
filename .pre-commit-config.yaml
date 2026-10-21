@@ -8,7 +8,8 @@ repos:
       - id: destroyed-symlinks
       - id: trailing-whitespace
         # Patch files keep their whitespace: a blank context line is a single space.
-        exclude: \.patch$
+        # Chat-template fixtures are kept as published; their whitespace is part of the template.
+        exclude: \.patch$|tests/fixtures/.*\.jinja$
       - id: end-of-file-fixer
         # Recorded SSE streams end with the protocol's blank line, and the
         # streaming tests compare them byte for byte.
@@ -24,6 +25,9 @@ repos:
       - id: detect-private-key
         exclude: .*tests/.*_test\.rs$
       - id: mixed-line-ending
+        # Recorded SSE streams carry a CRLF-terminated frame on purpose, and
+        # the relay tests compare them with the relayed bytes byte for byte.
+        exclude: \.sse$
       - id: no-commit-to-branch
 
   - repo: https://github.com/codespell-project/codespell
@@ -31,7 +35,7 @@ repos:
     hooks:
       - id: codespell
         additional_dependencies: ['tomli']
-        args: ['-L', 'cann,thi,makro,wil,rouge,PRIS,hel,te,ans,ser,wit,WIT,implementors,caf,nin,Nin,doubleclick,allocatedp,notin,NotIn']
+        args: ['-L', 'cann,thi,makro,wil,rouge,PRIS,hel,te,ans,ser,wit,WIT,implementors,caf,nin,Nin,doubleclick,allocatedp,notin,NotIn,ure']
         exclude: |
           (?x)^(
             Cargo\.lock|
@@ -39,6 +43,7 @@ repos:
             src/mesh/proto/.*\.proto$|
             src/tokenizer/chat_template\.rs|
             crates/multimodal/tests/fixtures/.*|
+            crates/response_template/tests/fixtures/.*|
             target/.*
           )$
 
@@ -50,6 +55,15 @@ repos:
         entry: cargo +nightly fmt --all --
         language: system
         types: [rust]
+        pass_filenames: false
+
+      - id: rustfmt-symphony-fuzz
+        name: rustfmt (symphony fuzz workspace)
+        description: Format the Symphony fuzz crate, a workspace of its own that `cargo fmt --all` from the root does not reach
+        entry: cargo +nightly fmt --manifest-path crates/symphony/fuzz/Cargo.toml --all --
+        language: system
+        types: [rust]
+        files: ^crates/symphony/fuzz/
         pass_filenames: false
 
       - id: clippy

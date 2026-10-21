@@ -3,11 +3,11 @@
 //! Adapted from ai-dynamo/dynamo `lib/runtime/src/metrics/tokio_perf.rs`
 //! (Apache-2.0); see "Ported vs dropped" below for how this differs.
 //!
-//! A single background task ([`spawn_observer`]) gives the runtime two cheap,
+//! A single background task (`spawn_observer`) gives the runtime two cheap,
 //! always-on probes so starvation is visible on the `/metrics` endpoint:
 //!
 //! - **Event-loop canary**: sleeps 10ms in a loop and measures wake drift.
-//!   Drift is recorded into [`EVENT_LOOP_DELAY_SECONDS`]; drift above 5ms
+//!   Drift is recorded into `EVENT_LOOP_DELAY_SECONDS`; drift above 5ms
 //!   increments `smg_tokio_event_loop_stalls_total`. Any stall means every
 //!   task on the runtime (accept loops, health checks, streaming responses)
 //!   was delayed by at least that long — it distinguishes "runtime starved"
@@ -16,7 +16,7 @@
 //!   exports queue depth, alive tasks, worker count, and per-worker busy
 //!   ratio / park counts.
 //!
-//! [`spawn_observer`] must be called from within the runtime being measured.
+//! `spawn_observer` must be called from within the runtime being measured.
 //!
 //! # Ported vs dropped (donor: dynamo `tokio_perf.rs`)
 //!

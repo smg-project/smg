@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
-
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
@@ -38,10 +36,6 @@ impl ModelProcessorSpec for Phi3VisionSpec {
         Ok(HashMap::from([(Modality::Image, 4)]))
     }
 
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
-    }
-
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
         HashMap::from([
             ("pixel_values".to_string(), FieldLayout::Batched),
@@ -56,11 +50,12 @@ impl ModelProcessorSpec for Phi3VisionSpec {
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let token_id = self.placeholder_token_id(metadata)?;
         let token = self.placeholder_token(metadata)?;
-        Ok(preprocessed
-            .feature_token_counts
-            .iter()
-            .map(|&count| PromptReplacement::repeated(Modality::Image, &token, token_id, count))
-            .collect())
+        Ok(PromptReplacement::repeated_per_item(
+            Modality::Image,
+            &token,
+            token_id,
+            &preprocessed.feature_token_counts,
+        ))
     }
 }
 

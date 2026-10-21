@@ -21,7 +21,7 @@ static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemall
     reason = "jemalloc reads its options from this exported symbol; a NUL-terminated byte string nothing in Rust dereferences"
 )]
 #[export_name = "_rjem_malloc_conf"]
-pub static MALLOC_CONF: &[u8; 61] = observability::metrics::SERVER_MALLOC_CONF;
+pub static MALLOC_CONF: &[u8; 72] = observability::metrics::SERVER_MALLOC_CONF;
 use smg::*;
 use smg_auth as auth;
 
@@ -131,6 +131,10 @@ pub struct PyJwtConfig {
     pub jwks_uri: Option<String>,
     #[pyo3(get, set)]
     pub role_mapping: HashMap<String, String>,
+    /// The claim that carries the role (the CLI's `--jwt-role-claim`, default
+    /// `roles`); appended last so positional callers keep their binding.
+    #[pyo3(get, set)]
+    pub role_claim: String,
 }
 
 #[pymethods]
@@ -141,18 +145,21 @@ impl PyJwtConfig {
         audience,
         jwks_uri = None,
         role_mapping = HashMap::new(),
+        role_claim = String::from("roles"),
     ))]
     fn new(
         issuer: String,
         audience: String,
         jwks_uri: Option<String>,
         role_mapping: HashMap<String, String>,
+        role_claim: String,
     ) -> Self {
         PyJwtConfig {
             issuer,
             audience,
             jwks_uri,
             role_mapping,
+            role_claim,
         }
     }
 }
@@ -160,6 +167,7 @@ impl PyJwtConfig {
 impl PyJwtConfig {
     pub fn to_auth_jwt_config(&self) -> auth::JwtConfig {
         let mut config = auth::JwtConfig::new(&self.issuer, &self.audience);
+        config.role_claim.clone_from(&self.role_claim);
 
         // Conditionally set JWKS URI
         if let Some(ref uri) = self.jwks_uri {
@@ -330,21 +338,30 @@ pub struct PyRedisConfig {
     pub pool_max: usize,
     #[pyo3(get, set)]
     pub retention_days: Option<u64>,
+    /// Bound in seconds on each call to the store (default 5).
+    #[pyo3(get, set)]
+    pub op_timeout_secs: u64,
 }
 
 #[pymethods]
 impl PyRedisConfig {
     #[new]
-    #[pyo3(signature = (url, pool_max = 16, retention_days = Some(30)))]
+    #[pyo3(signature = (url, pool_max = 16, retention_days = Some(30), op_timeout_secs = 5))]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "PyO3 #[new] method signature requires PyResult"
     )]
-    fn new(url: String, pool_max: usize, retention_days: Option<u64>) -> PyResult<Self> {
+    fn new(
+        url: String,
+        pool_max: usize,
+        retention_days: Option<u64>,
+        op_timeout_secs: u64,
+    ) -> PyResult<Self> {
         Ok(PyRedisConfig {
             url,
             pool_max,
             retention_days,
+            op_timeout_secs,
         })
     }
 }
@@ -354,6 +371,7 @@ impl PyRedisConfig {
         config::RedisConfig {
             url: self.url.clone(),
             pool_max: self.pool_max,
+            op_timeout_secs: self.op_timeout_secs,
             retention_days: self.retention_days,
             schema: None,
         }
@@ -368,18 +386,26 @@ pub struct PyPostgresConfig {
 
     #[pyo3(get, set)]
     pub pool_max: usize,
+
+    /// Bound in seconds on each call to the store (default 5).
+    #[pyo3(get, set)]
+    pub op_timeout_secs: u64,
 }
 
 #[pymethods]
 impl PyPostgresConfig {
     #[new]
-    #[pyo3(signature = (db_url = None,pool_max = 16,))]
+    #[pyo3(signature = (db_url = None, pool_max = 16, op_timeout_secs = 5))]
     #[expect(
         clippy::unnecessary_wraps,
         reason = "PyO3 #[new] method signature requires PyResult"
     )]
-    fn new(db_url: Option<String>, pool_max: usize) -> PyResult<Self> {
-        Ok(PyPostgresConfig { db_url, pool_max })
+    fn new(db_url: Option<String>, pool_max: usize, op_timeout_secs: u64) -> PyResult<Self> {
+        Ok(PyPostgresConfig {
+            db_url,
+            pool_max,
+            op_timeout_secs,
+        })
     }
 }
 
@@ -388,6 +414,7 @@ impl PyPostgresConfig {
         config::PostgresConfig {
             db_url: self.db_url.clone().unwrap_or_default(),
             pool_max: self.pool_max,
+            op_timeout_secs: self.op_timeout_secs,
             schema: None,
         }
     }
@@ -396,203 +423,234 @@ impl PyPostgresConfig {
 #[pyclass(from_py_object)]
 #[derive(Debug, Clone, PartialEq)]
 struct Router {
-    host: String,
-    port: u16,
-    health_check_port: Option<u16>,
-    routing_key_override: bool,
+    // The constructor's positional parameters, in their order.
     worker_urls: Vec<String>,
     policy: PolicyType,
-    worker_startup_timeout_secs: u64,
-    worker_startup_check_interval: u64,
-    load_monitor_interval: u64,
-    cache_threshold: f32,
-    balance_abs_threshold: usize,
-    balance_rel_threshold: f32,
-    eviction_interval_secs: u64,
-    max_tree_size: usize,
-    block_size: usize,
-    balance_token_usage_threshold: f32,
-    overload_token_usage_threshold: f32,
-    prefix_token_count: usize,
-    prefix_hash_load_factor: f64,
-    prefix_hash_balance_abs_threshold: usize,
-    least_load_kv_pressure_weight: f64,
-    least_load_default_throughput: f64,
-    least_load_mean_prefill_tokens: u32,
-    max_idle_secs: u64,
-    assignment_mode: Option<String>,
-    max_payload_size: usize,
-    dp_aware: bool,
-    dp_minimum_tokens_scheduler: bool,
-    upstream_http2: bool,
+    host: String,
+    port: u16,
+    // The keyword-only parameters, in alphabetical order, as the `#[pyo3(signature)]`
+    // below lists them: a new one goes at its place in each of the four lists (this
+    // struct, the signature, the parameters of `new`, the literal in `new`), never at
+    // the tail, so two additions do not touch the same lines.
+    /// The optional fields of the access-log record.
+    access_log_fields: Vec<String>,
+    admin_host: Option<String>,
+    admin_port: Option<u16>,
     api_key: Option<String>,
-    log_dir: Option<String>,
-    log_level: Option<String>,
-    log_json: bool,
-    service_discovery: bool,
-    selector: HashMap<String, String>,
-    service_discovery_port: u16,
-    service_discovery_namespace: Option<String>,
-    prefill_selector: HashMap<String, String>,
-    decode_selector: HashMap<String, String>,
-    router_selector: HashMap<String, String>,
+    assignment_mode: Option<String>,
+    backend: BackendType,
+    balance_abs_threshold: usize,
+    balance_prefix_margin_tokens: u32,
+    balance_rel_threshold: f32,
+    balance_token_usage_threshold: f32,
+    balance_uncached_credit: bool,
+    block_size: usize,
     bootstrap_port_annotation: String,
-    model_id_from: Option<String>,
-    prometheus_port: Option<u16>,
-    prometheus_host: Option<String>,
-    prometheus_duration_buckets: Option<Vec<f64>>,
-    jemalloc_prof_dir: Option<String>,
-    request_timeout_secs: u64,
-    shutdown_grace_period_secs: u64,
-    request_id_headers: Option<Vec<String>>,
-    trust_tenant_header: bool,
-    tenant_header_name: String,
-    storage_context_headers: HashMap<String, String>,
-    pd_disaggregation: bool,
     bucket_adjust_interval_secs: usize,
-    prefill_urls: Option<Vec<(String, Option<u16>)>>,
-    decode_urls: Option<Vec<String>>,
-    prefill_policy: Option<PolicyType>,
-    decode_policy: Option<PolicyType>,
-    max_concurrent_requests: i32,
-    cors_allowed_origins: Vec<String>,
-    retry_max_retries: u32,
-    retry_initial_backoff_ms: u64,
-    retry_max_backoff_ms: u64,
-    retry_backoff_multiplier: f32,
-    retry_jitter_factor: f32,
-    disable_retries: bool,
+    ca_cert_paths: Vec<String>,
+    cache_boundaries: Vec<usize>,
+    cache_index: String,
+    cache_threshold: f32,
+    cache_ttl_secs: u64,
     cb_failure_threshold: u32,
     cb_success_threshold: u32,
     cb_timeout_duration_secs: u64,
     cb_window_duration_secs: u64,
-    disable_circuit_breaker: bool,
-    health_failure_threshold: u32,
-    health_success_threshold: u32,
-    health_check_timeout_secs: u64,
-    health_check_interval_secs: u64,
-    health_check_endpoint: String,
-    disable_health_check: bool,
-    remove_unhealthy_workers: Option<bool>,
-    enable_igw: bool,
-    queue_size: usize,
-    queue_timeout_secs: u64,
-    rate_limit_tokens_per_second: Option<i32>,
-    connection_mode: worker::ConnectionMode,
-    model_path: Option<String>,
-    tokenizer_path: Option<String>,
     chat_template: Option<String>,
-    disable_tokenizer_autoload: bool,
-    tokenizer_cache_enable_l0: bool,
-    tokenizer_cache_l0_max_entries: usize,
-    tokenizer_cache_l0_max_memory: usize,
-    tokenizer_cache_enable_l1: bool,
-    tokenizer_cache_l1_max_memory: usize,
-    reasoning_parser: Option<String>,
-    tool_call_parser: Option<String>,
-    mcp_config_path: Option<String>,
-    storage_hook_wasm_path: Option<String>,
-    backend: BackendType,
-    history_backend: HistoryBackendType,
-    oracle_config: Option<PyOracleConfig>,
-    postgres_config: Option<PyPostgresConfig>,
-    redis_config: Option<PyRedisConfig>,
     client_cert_path: Option<String>,
     client_key_path: Option<String>,
-    ca_cert_paths: Vec<String>,
-    server_cert_path: Option<String>,
-    server_key_path: Option<String>,
-    enable_trace: bool,
-    otlp_traces_endpoint: String,
     control_plane_auth: Option<PyControlPlaneAuthConfig>,
-    schema_config: Option<String>,
-    // Mesh server
-    enable_mesh: bool,
-    mesh_server_name: Option<String>,
-    mesh_host: String,
-    mesh_advertise_host: Option<String>,
-    mesh_port: u16,
-    mesh_peer_urls: Vec<String>,
-    /// New parameters MUST be appended here (not inserted mid-list) to avoid
-    /// breaking external Python callers that pass `_Router(...)` positionally.
-    drain_settle_secs: u64,
-    enable_wasm: bool,
-    encode_selector: HashMap<String, String>,
-    epd_disaggregation: bool,
-    encode_urls: Option<Vec<(String, Option<u16>)>>,
-    encode_policy: Option<PolicyType>,
-    multimodal_tensor_transport: Option<String>,
-    multimodal_shm_min_bytes: Option<usize>,
-    model_aliases: HashMap<String, String>,
-    worker_startup_delay: u64,
-    worker_ports_annotation: String,
-    /// DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped).
-    /// Positional slot preserved; new constructor arguments belong at the signature tail.
-    zmq_engine_count: Option<usize>,
-    overlap_decay: f32,
-    selection_temperature: f32,
-    upstream_pool_idle_timeout_secs: u64,
-    least_load_max_waiting_requests: u32,
-    stream_body_stall_timeout_secs: u64,
-    routing_key_headers: Vec<String>,
-    cache_boundaries: Vec<usize>,
-    cache_index: String,
-    cache_ttl_secs: u64,
-    job_queue_capacity: usize,
-    job_queue_concurrency: usize,
-    worker_overload_waiting_requests: Option<usize>,
-    worker_overload_token_usage: Option<f64>,
-    worker_overload_protection: bool,
+    cors_allowed_origins: Vec<String>,
+    decode_policy: Option<PolicyType>,
+    decode_selector: HashMap<String, String>,
+    decode_urls: Option<Vec<String>>,
+    disable_circuit_breaker: bool,
+    disable_health_check: bool,
     disable_load_monitoring: bool,
-    max_buffered_request_bytes: u64,
-    kv_connector_annotation: String,
-    kv_engine_id_annotation: String,
-    mm_per_request_image_limit: Option<usize>,
-    pd_admission_wait_secs: u64,
-    /// New parameters MUST be appended here (not inserted mid-list) to avoid
-    /// breaking external Python callers that pass `_Router(...)` positionally.
-    enable_rl: bool,
-    rl_control_timeout_secs: u64,
-    rl_fanout_concurrency: usize,
-    multimodal_max_inflight_bytes: Option<usize>,
-    mm_processing: Option<String>,
-    mm_pixel_cache_mb: Option<usize>,
-    mm_pixel_rdma: bool,
-    rdma_listen_ip: Option<String>,
-    rdma_slot_ttl_s: Option<u64>,
-    log_mm_timing: bool,
-    prefill_max_inflight_requests_per_worker: i32,
-    prefill_queue_size: Option<usize>,
-    prefill_queue_timeout_secs: Option<u64>,
-    worker_overload_shed: bool,
-    kv_index: String,
-    worker_stall_secs: u64,
-    worker_wedge_secs: u64,
-    worker_stale_secs: u64,
-    worker_warmup_secs: u64,
-    worker_warmup_share: f32,
-    worker_warmup_blocks: usize,
-    worker_warmup_thin_ratio: f32,
-    worker_warmup_divert_every: u64,
-    selection_policy: String,
-    selection_accounting_ttl_ms: u64,
-    /// Per-tenant data-plane keys as `(tenant_id, key)` pairs; each resolves
-    /// to its own tenant identity (`auth:<tenant_id>`) on top of `api_key`.
-    tenant_api_keys: Vec<(String, String)>,
-    priority_scheduler_enabled: bool,
-    priority_scheduler_default_max_class: String,
-    priority_scheduler_config: Option<String>,
-    priority_scheduler_tenant_metric_top_n: u32,
-    tenant_rate_limit_enabled: bool,
-    tenant_rate_limit_config: Option<String>,
-    /// The keyword-only `discovery` mapping, read by the same rules as
+    disable_retries: bool,
+    disable_tokenizer_autoload: bool,
+    /// The `discovery` mapping, read by the same rules as
     /// `RouterConfig.discovery`.
     discovery: Option<config::DiscoveryConfig>,
-    /// Keyword-only: the mesh CA, this node's certificate and key (PEM
+    /// The interval of `service_discovery=True` Kubernetes discovery
+    /// (`None`: the default every provider has, 30s).
+    discovery_check_interval_secs: Option<u64>,
+    dp_aware: bool,
+    dp_minimum_tokens_scheduler: bool,
+    drain_settle_secs: u64,
+    enable_igw: bool,
+    enable_mesh: bool,
+    enable_rl: bool,
+    enable_trace: bool,
+    enable_wasm: bool,
+    encode_policy: Option<PolicyType>,
+    encode_selector: HashMap<String, String>,
+    encode_urls: Option<Vec<(String, Option<u16>)>>,
+    engine_metrics: bool,
+    epd_disaggregation: bool,
+    eviction_interval_secs: u64,
+    header_read_timeout_secs: u64,
+    health_check_endpoint: String,
+    health_check_interval_secs: u64,
+    health_check_port: Option<u16>,
+    health_check_timeout_secs: u64,
+    health_failure_threshold: u32,
+    health_success_threshold: u32,
+    history_backend: HistoryBackendType,
+    history_memory_max_items: usize,
+    history_memory_max_responses: usize,
+    history_memory_retention_secs: u64,
+    idle_connection_timeout_secs: u64,
+    jemalloc_prof_dir: Option<String>,
+    job_queue_capacity: usize,
+    job_queue_concurrency: usize,
+    kv_connector_annotation: String,
+    kv_engine_id_annotation: String,
+    kv_index: Option<String>,
+    least_load_default_throughput: f64,
+    least_load_kv_pressure_weight: f64,
+    least_load_max_waiting_requests: u32,
+    least_load_mean_prefill_tokens: u32,
+    load_monitor_interval: u64,
+    log_dir: Option<String>,
+    log_json: bool,
+    log_level: Option<String>,
+    log_mm_timing: bool,
+    max_background_responses: usize,
+    max_buffered_request_bytes: u64,
+    max_concurrent_requests: i32,
+    max_connections: usize,
+    max_idle_secs: u64,
+    max_payload_size: usize,
+    max_tree_size: usize,
+    mcp_config_path: Option<String>,
+    mesh_advertise_host: Option<String>,
+    mesh_host: String,
+    mesh_peer_urls: Vec<String>,
+    mesh_port: u16,
+    mesh_server_name: Option<String>,
+    /// The mesh CA, this node's certificate and key (PEM
     /// paths); all three or none.
     mesh_tls_ca_cert: Option<String>,
     mesh_tls_cert: Option<String>,
     mesh_tls_key: Option<String>,
+    mm_allow_private_media_hosts: bool,
+    mm_allowed_media_domains: Option<Vec<String>>,
+    mm_per_request_image_limit: Option<usize>,
+    mm_pixel_cache_mb: Option<usize>,
+    mm_pixel_rdma: bool,
+    mm_processing: Option<String>,
+    mm_turbojpeg: Option<String>,
+    model_aliases: HashMap<String, String>,
+    model_id_from: Option<String>,
+    model_path: Option<String>,
+    multimodal_max_inflight_bytes: Option<usize>,
+    multimodal_shm_min_bytes: Option<usize>,
+    multimodal_tensor_transport: Option<String>,
+    oracle_config: Option<PyOracleConfig>,
+    otlp_traces_endpoint: String,
+    overlap_decay: f32,
+    overload_token_usage_threshold: f32,
+    /// `legacy` or `symphony`: which parser reads a chat completion's output.
+    parser: String,
+    pd_admission_wait_secs: u64,
+    pd_disaggregation: bool,
+    pd_pairing_mode: String,
+    postgres_config: Option<PyPostgresConfig>,
+    power_of_two_load_metric: String,
+    prefill_max_inflight_requests_per_worker: i32,
+    prefill_policy: Option<PolicyType>,
+    prefill_queue_size: Option<usize>,
+    prefill_queue_timeout_secs: Option<u64>,
+    prefill_selector: HashMap<String, String>,
+    prefill_urls: Option<Vec<(String, Option<u16>)>>,
+    prefix_hash_balance_abs_threshold: usize,
+    prefix_hash_load_factor: f64,
+    prefix_token_count: usize,
+    priority_scheduler_config: Option<String>,
+    priority_scheduler_default_max_class: String,
+    priority_scheduler_enabled: bool,
+    priority_scheduler_tenant_metric_top_n: u32,
+    prometheus_duration_buckets: Option<Vec<f64>>,
+    prometheus_host: Option<String>,
+    prometheus_port: Option<u16>,
+    queue_size: usize,
+    queue_timeout_secs: u64,
+    rate_limit_tokens_per_second: Option<i32>,
+    rdma_listen_ip: Option<String>,
+    rdma_slot_ttl_s: Option<u64>,
+    reasoning_parser: Option<String>,
+    redis_config: Option<PyRedisConfig>,
+    remove_unhealthy_workers: Option<bool>,
+    request_id_headers: Option<Vec<String>>,
+    request_timeout_secs: u64,
+    retry_backoff_multiplier: f32,
+    retry_initial_backoff_ms: u64,
+    retry_jitter_factor: f32,
+    retry_max_backoff_ms: u64,
+    retry_max_retries: u32,
+    rl_control_timeout_secs: u64,
+    rl_fanout_concurrency: usize,
+    router_selector: HashMap<String, String>,
+    routing_key_headers: Vec<String>,
+    routing_key_override: bool,
+    runtime_worker_threads: Option<usize>,
+    schema_config: Option<String>,
+    selection_accounting_ttl_ms: u64,
+    selection_policy: String,
+    selection_temperature: f32,
+    selector: HashMap<String, String>,
+    server_cert_path: Option<String>,
+    server_key_path: Option<String>,
+    service_discovery: bool,
+    service_discovery_namespace: Option<String>,
+    service_discovery_port: u16,
+    shutdown_grace_period_secs: u64,
+    sse_keepalive_secs: u64,
+    storage_context_headers: HashMap<String, String>,
+    storage_hook_wasm_path: Option<String>,
+    stream_body_stall_timeout_secs: u64,
+    /// Per-tenant data-plane keys as `(tenant_id, key)` pairs; each resolves
+    /// to its own tenant identity (`auth:<tenant_id>`) on top of `api_key`.
+    tenant_api_keys: Vec<(String, String)>,
+    tenant_header_name: String,
+    tenant_rate_limit_config: Option<String>,
+    tenant_rate_limit_enabled: bool,
+    tokenizer_cache_enable_l0: bool,
+    tokenizer_cache_enable_l1: bool,
+    tokenizer_cache_l0_max_entries: usize,
+    tokenizer_cache_l0_max_memory: usize,
+    tokenizer_cache_l1_max_memory: usize,
+    tokenizer_path: Option<String>,
+    tool_call_parser: Option<String>,
+    trust_tenant_header: bool,
+    upstream_http2: bool,
+    upstream_pool_idle_timeout_secs: u64,
+    webrtc_bind_addr: Option<String>,
+    webrtc_stun_server: Option<String>,
+    worker_overload_protection: bool,
+    worker_overload_shed: bool,
+    worker_overload_token_usage: Option<f64>,
+    worker_overload_waiting_requests: Option<usize>,
+    worker_ports_annotation: String,
+    worker_stale_secs: u64,
+    worker_stall_secs: u64,
+    worker_startup_check_interval: u64,
+    worker_startup_delay: u64,
+    worker_startup_timeout_secs: u64,
+    worker_warmup_blocks: usize,
+    worker_warmup_divert_every: u64,
+    worker_warmup_secs: u64,
+    worker_warmup_share: f32,
+    worker_warmup_thin_ratio: f32,
+    worker_wedge_secs: u64,
+    /// DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped).
+    zmq_engine_count: Option<usize>,
+    /// Seconds any one stage of a ZMQ engine's startup handshake may stay
+    /// silent; it alone covers the engine's init between HELLO and READY.
+    zmq_startup_timeout_secs: u64,
+    // Derived from the URL lists; not a parameter.
+    connection_mode: worker::ConnectionMode,
 }
 
 /// Read the keyword-only `discovery` mapping by the same rules as
@@ -691,6 +749,19 @@ impl Router {
         }
     }
 
+    /// The pairing rule by its CLI spelling (`off`, `lenient`, `strict`; any
+    /// case, trimmed); anything else is refused by name, as the CLI's choices
+    /// refuse it.
+    fn parse_pd_pairing_mode(&self) -> Result<config::PdPairingMode, config::ConfigError> {
+        config::PdPairingMode::parse(&self.pd_pairing_mode).ok_or_else(|| {
+            config::ConfigError::InvalidValue {
+                field: "pd_pairing_mode".to_string(),
+                value: self.pd_pairing_mode.clone(),
+                reason: "expected 'off', 'lenient', or 'strict'".to_string(),
+            }
+        })
+    }
+
     fn parse_assignment_mode(
         &self,
         default: config::ManualAssignmentMode,
@@ -746,13 +817,42 @@ impl Router {
                 })
             })
             .transpose()?;
+        let mm_turbojpeg = self
+            .mm_turbojpeg
+            .as_deref()
+            .map(|value| {
+                config::TurboJpegPolicy::parse(value).ok_or_else(|| {
+                    config::ConfigError::InvalidValue {
+                        field: "mm_turbojpeg".to_string(),
+                        value: value.to_string(),
+                        reason: "expected 'prefer' or 'require'".to_string(),
+                    }
+                })
+            })
+            .transpose()?;
 
-        let kv_index = config::KvIndexKind::parse(&self.kv_index).ok_or_else(|| {
-            config::ConfigError::InvalidValue {
-                field: "kv_index".to_string(),
-                value: self.kv_index.clone(),
-                reason: "expected 'positional' or 'chain'".to_string(),
-            }
+        // The access-log fields by name, each spelled as the record keys it.
+        let access_log_fields = self
+            .access_log_fields
+            .iter()
+            .map(|name| {
+                name.parse::<config::AccessLogField>().map_err(|reason| {
+                    config::ConfigError::InvalidValue {
+                        field: "access_log_fields".to_string(),
+                        value: name.clone(),
+                        reason,
+                    }
+                })
+            })
+            .collect::<config::ConfigResult<Vec<_>>>()?;
+
+        let power_of_two_load_metric = config::PowerOfTwoLoadMetric::parse(
+            &self.power_of_two_load_metric,
+        )
+        .ok_or_else(|| config::ConfigError::InvalidValue {
+            field: "power_of_two_load_metric".to_string(),
+            value: self.power_of_two_load_metric.clone(),
+            reason: "expected expected_wait, requests or least_requests".to_string(),
         })?;
 
         let convert_policy = |policy: &PolicyType| -> config::ConfigResult<ConfigPolicyConfig> {
@@ -777,12 +877,13 @@ impl Router {
                     selection_policy: (self.selection_policy != policies::cost::DEFAULT_POLICY)
                         .then(|| self.selection_policy.clone()),
                     selection_accounting_ttl_ms: self.selection_accounting_ttl_ms,
+                    balance_prefix_margin_tokens: self.balance_prefix_margin_tokens,
+                    balance_uncached_credit: self.balance_uncached_credit,
                 },
                 PolicyType::PowerOfTwo => ConfigPolicyConfig::PowerOfTwo {
-                    load_check_interval_secs: self.load_monitor_interval,
+                    load_metric: power_of_two_load_metric,
                 },
                 PolicyType::LeastLoad => ConfigPolicyConfig::LeastLoad {
-                    load_check_interval_secs: self.load_monitor_interval,
                     kv_pressure_weight: self.least_load_kv_pressure_weight,
                     mean_prefill_tokens: self.least_load_mean_prefill_tokens,
                     default_throughput: self.least_load_default_throughput,
@@ -871,7 +972,9 @@ impl Router {
             Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
                 namespace: self.service_discovery_namespace.clone(),
                 port: self.service_discovery_port,
-                check_interval_secs: 60,
+                check_interval_secs: self
+                    .discovery_check_interval_secs
+                    .unwrap_or(config::DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS),
                 selector: self.selector.clone(),
                 encode_selector: self.encode_selector.clone(),
                 prefill_selector: self.prefill_selector.clone(),
@@ -889,8 +992,11 @@ impl Router {
         };
         let has_discovery = discovery.is_some();
 
-        let metrics = self.prometheus_port.map(|port| MetricsConfig {
-            port,
+        // The metrics listener `start` creates: its port when unset is the
+        // exporter's default, so the validator's port checks (the admin,
+        // probe and data ports against it) see the listener that will bind.
+        let metrics = Some(MetricsConfig {
+            port: self.prometheus_port.unwrap_or(29000),
             host: self.metrics_host(),
         });
 
@@ -899,6 +1005,13 @@ impl Router {
             otlp_traces_endpoint: self.otlp_traces_endpoint.clone(),
         });
 
+        let parser = config::ParserChoice::parse(&self.parser).ok_or_else(|| {
+            config::ConfigError::InvalidValue {
+                field: "parser".to_string(),
+                value: self.parser.clone(),
+                reason: "expected legacy or symphony".to_string(),
+            }
+        })?;
         let history_backend = match self.history_backend {
             HistoryBackendType::Memory => config::HistoryBackend::Memory,
             HistoryBackendType::None => config::HistoryBackend::None,
@@ -971,6 +1084,8 @@ impl Router {
                 None
             };
 
+        let pd_pairing_mode = self.parse_pd_pairing_mode()?;
+
         config::RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -978,9 +1093,12 @@ impl Router {
             .host(&self.host)
             .port(self.port)
             .health_check_port(self.health_check_port)
+            .admin_port(self.admin_port)
+            .admin_host(self.admin_host.clone())
             .connection_mode(self.connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
             .zmq_engine_count(self.zmq_engine_count)
+            .zmq_startup_timeout_secs(self.zmq_startup_timeout_secs)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
@@ -1002,7 +1120,8 @@ impl Router {
                 self.worker_warmup_thin_ratio,
                 self.worker_warmup_divert_every,
             )
-            .kv_index(kv_index)
+            // Deprecated: unset by default; `chain` is the only value, `positional` fails validation.
+            .kv_index(self.kv_index.clone())
             .disable_load_monitoring(self.disable_load_monitoring)
             .load_monitor_interval_secs(self.load_monitor_interval)
             .pd_admission_wait_secs(self.pd_admission_wait_secs)
@@ -1055,7 +1174,14 @@ impl Router {
                 l1_max_memory: self.tokenizer_cache_l1_max_memory,
             })
             .disable_tokenizer_autoload(self.disable_tokenizer_autoload)
+            .parser(parser)
             .history_backend(history_backend)
+            .memory_config(config::MemoryConfig {
+                max_responses: self.history_memory_max_responses,
+                max_items: self.history_memory_max_items,
+                retention_secs: (self.history_memory_retention_secs > 0)
+                    .then_some(self.history_memory_retention_secs),
+            })
             .maybe_api_key(self.api_key.as_ref())
             .tenant_api_keys(
                 self.tenant_api_keys
@@ -1080,6 +1206,8 @@ impl Router {
                     .then(|| self.storage_context_headers.clone()),
             )
             .maybe_rate_limit_tokens_per_second(self.rate_limit_tokens_per_second)
+            .max_background_responses(self.max_background_responses)
+            .sse_keepalive_secs(self.sse_keepalive_secs)
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
@@ -1093,10 +1221,16 @@ impl Router {
             .maybe_storage_hook_wasm_path(self.storage_hook_wasm_path.as_deref())
             .enable_wasm(self.enable_wasm)
             .dp_aware(self.dp_aware)
+            .engine_metrics(self.engine_metrics)
+            .pd_pairing_mode(pd_pairing_mode)
+            .runtime_worker_threads(self.runtime_worker_threads)
             .upstream_http2(self.upstream_http2)
             .upstream_pool_idle_timeout_secs(self.upstream_pool_idle_timeout_secs)
             .max_buffered_request_bytes(self.max_buffered_request_bytes)
             .stream_body_stall_timeout_secs(self.stream_body_stall_timeout_secs)
+            .header_read_timeout_secs(self.header_read_timeout_secs)
+            .idle_connection_timeout_secs(self.idle_connection_timeout_secs)
+            .max_connections(self.max_connections)
             .multimodal_tensor_transport(multimodal_tensor_transport)
             .multimodal_shm_min_bytes(self.multimodal_shm_min_bytes)
             .multimodal_max_inflight_bytes(self.multimodal_max_inflight_bytes)
@@ -1104,9 +1238,13 @@ impl Router {
             .mm_processing(mm_processing)
             .mm_pixel_cache_mb(self.mm_pixel_cache_mb)
             .mm_pixel_rdma(self.mm_pixel_rdma)
+            .mm_allowed_media_domains(self.mm_allowed_media_domains.clone())
+            .mm_allow_private_media_hosts(self.mm_allow_private_media_hosts)
+            .mm_turbojpeg(mm_turbojpeg)
             .rdma_listen_ip(self.rdma_listen_ip.clone())
             .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
             .log_mm_timing(self.log_mm_timing)
+            .access_log_fields(access_log_fields)
             .routing_key_override(config::RoutingKeyOverrideConfig {
                 enabled: self.routing_key_override,
                 eviction_interval_secs: self.eviction_interval_secs,
@@ -1145,193 +1283,213 @@ impl Router {
         policy = PolicyType::RoundRobin,
         host = String::from("0.0.0.0"),
         port = 3001,
-        worker_startup_timeout_secs = 600,
-        worker_startup_check_interval = 30,
-        load_monitor_interval = 10,
-        cache_threshold = 0.3,
-        balance_abs_threshold = 64,
-        balance_rel_threshold = 1.5,
-        eviction_interval_secs = 120,
-        max_tree_size = 2usize.pow(26),
-        block_size = 16,
-        balance_token_usage_threshold = 1.0,
-        overload_token_usage_threshold = 1.0,
-        least_load_kv_pressure_weight = 0.15,
-        least_load_default_throughput = 2000.0,
-        least_load_mean_prefill_tokens = 1024,
-        max_idle_secs = 14400,
-        assignment_mode = None,
-        max_payload_size = 512 * 1024 * 1024,
-        dp_aware = false,
-        dp_minimum_tokens_scheduler = false,
+        // Every other parameter is keyword-only, in alphabetical order (the struct's
+        // note says where a new one goes).
+        *,
+        access_log_fields = vec![],
+        admin_host = None,
+        admin_port = None,
         api_key = None,
-        log_dir = None,
-        log_level = None,
-        log_json = false,
-        service_discovery = false,
-        selector = HashMap::new(),
-        service_discovery_port = 80,
-        service_discovery_namespace = None,
-        prefill_selector = HashMap::new(),
-        decode_selector = HashMap::new(),
-        router_selector = HashMap::new(),
+        assignment_mode = None,
+        backend = BackendType::Sglang,
+        balance_abs_threshold = 64,
+        balance_prefix_margin_tokens = 0,
+        balance_rel_threshold = 1.5,
+        balance_token_usage_threshold = 1.0,
+        balance_uncached_credit = false,
+        block_size = 16,
         bootstrap_port_annotation = String::from("sglang.ai/bootstrap-port"),
-        model_id_from = None,
-        prometheus_port = None,
-        prometheus_host = None,
-        prometheus_duration_buckets = None,
-        request_timeout_secs = 1800,
-        shutdown_grace_period_secs = 180,
-        request_id_headers = None,
-        trust_tenant_header = false,
-        tenant_header_name = String::from("x-smg-tenant-id"),
-        storage_context_headers = HashMap::new(),
-        pd_disaggregation = false,
         bucket_adjust_interval_secs = 5,
-        prefill_urls = None,
-        decode_urls = None,
-        prefill_policy = None,
-        decode_policy = None,
-        max_concurrent_requests = -1,
-        cors_allowed_origins = vec![],
-        retry_max_retries = 5,
-        retry_initial_backoff_ms = 50,
-        retry_max_backoff_ms = 30_000,
-        retry_backoff_multiplier = 1.5,
-        retry_jitter_factor = 0.2,
-        disable_retries = false,
+        ca_cert_paths = vec![],
+        cache_boundaries = vec![],
+        cache_index = String::from("tree"),
+        cache_threshold = 0.3,
+        cache_ttl_secs = 180,
         cb_failure_threshold = 10,
         cb_success_threshold = 3,
         cb_timeout_duration_secs = 60,
         cb_window_duration_secs = 120,
-        disable_circuit_breaker = false,
-        health_failure_threshold = 3,
-        health_success_threshold = 2,
-        health_check_timeout_secs = 5,
-        health_check_interval_secs = 60,
-        health_check_endpoint = String::from("/health"),
-        disable_health_check = false,
-        remove_unhealthy_workers = None,
-        enable_igw = false,
-        queue_size = 100,
-        queue_timeout_secs = 60,
-        rate_limit_tokens_per_second = None,
-        model_path = None,
-        tokenizer_path = None,
         chat_template = None,
-        tokenizer_cache_enable_l0 = false,
-        tokenizer_cache_l0_max_entries = 10000,
-        tokenizer_cache_enable_l1 = false,
-        tokenizer_cache_l1_max_memory = 52428800,
-        reasoning_parser = None,
-        tool_call_parser = None,
-        mcp_config_path = None,
-        storage_hook_wasm_path = None,
-        backend = BackendType::Sglang,
-        history_backend = HistoryBackendType::Memory,
-        oracle_config = None,
-        postgres_config = None,
-        redis_config = None,
         client_cert_path = None,
         client_key_path = None,
-        ca_cert_paths = vec![],
-        server_cert_path = None,
-        server_key_path = None,
-        enable_trace = false,
-        otlp_traces_endpoint = String::from("localhost:4317"),
         control_plane_auth = None,
-        schema_config = None,
+        cors_allowed_origins = vec![],
+        decode_policy = None,
+        decode_selector = HashMap::new(),
+        decode_urls = None,
+        disable_circuit_breaker = false,
+        disable_health_check = false,
+        disable_load_monitoring = false,
+        disable_retries = false,
         disable_tokenizer_autoload = false,
-        enable_mesh = false,
-        mesh_server_name = None,
-        mesh_host = String::from("0.0.0.0"),
-        mesh_port = 39527u16,
-        mesh_peer_urls = vec![],
-        mesh_advertise_host = None,
+        discovery = None,
+        discovery_check_interval_secs = None,
+        dp_aware = false,
+        dp_minimum_tokens_scheduler = false,
         drain_settle_secs = 5,
+        enable_igw = false,
+        enable_mesh = false,
+        enable_rl = false,
+        enable_trace = false,
         enable_wasm = false,
-        // Appended last (not inserted mid-list) so every pre-existing
-        // positional argument keeps its index for callers that construct
-        // `_Router(...)` positionally. See the struct-field note above.
-        health_check_port = None,
-        routing_key_override = false,
-        encode_selector = HashMap::new(),
-        epd_disaggregation = false,
-        encode_urls = None,
         encode_policy = None,
-        multimodal_tensor_transport = None,
-        multimodal_shm_min_bytes = None,
-        model_aliases = HashMap::new(),
-        worker_startup_delay = 0,
-        worker_ports_annotation = String::from("smg.ai/worker-ports"),
-        zmq_engine_count = None,
-        prefix_token_count = 256,
-        prefix_hash_load_factor = 1.25,
-        prefix_hash_balance_abs_threshold = 10,
-        upstream_http2 = false,
-        overlap_decay = 0.0,
-        selection_temperature = 0.0,
-        upstream_pool_idle_timeout_secs = 3,
-        least_load_max_waiting_requests = 0,
-        stream_body_stall_timeout_secs = 300,
-        routing_key_headers = vec![String::from("x-smg-routing-key")],
-        cache_boundaries = vec![],
-        cache_index = String::from("tree"),
-        cache_ttl_secs = 180,
+        encode_selector = HashMap::new(),
+        encode_urls = None,
+        engine_metrics = false,
+        epd_disaggregation = false,
+        eviction_interval_secs = 120,
+        header_read_timeout_secs = 30,
+        health_check_endpoint = String::from("/health"),
+        health_check_interval_secs = 60,
+        health_check_port = None,
+        health_check_timeout_secs = 5,
+        health_failure_threshold = 3,
+        health_success_threshold = 2,
+        history_backend = HistoryBackendType::Memory,
+        history_memory_max_items = 100000,
+        history_memory_max_responses = 10000,
+        history_memory_retention_secs = 86400,
+        idle_connection_timeout_secs = 90,
+        jemalloc_prof_dir = None,
         job_queue_capacity = 1000,
         job_queue_concurrency = 200,
-        worker_overload_waiting_requests = Some(8),
-        worker_overload_token_usage = Some(0.8),
-        worker_overload_protection = true,
-        disable_load_monitoring = false,
-        max_buffered_request_bytes = 1_048_576,
         kv_connector_annotation = String::from("smg.ai/kv-connector"),
         kv_engine_id_annotation = String::from("smg.ai/kv-engine-id"),
-        mm_per_request_image_limit = None,
-        pd_admission_wait_secs = 30,
-        // Appended last (not inserted mid-list) so every pre-existing
-        // positional argument keeps its index for callers that construct
-        // `_Router(...)` positionally. See the struct-field note above.
-        enable_rl = false,
-        rl_control_timeout_secs = 600,
-        rl_fanout_concurrency = 32,
-        multimodal_max_inflight_bytes = None,
-        mm_processing = None,
-        mm_pixel_cache_mb = None,
-        mm_pixel_rdma = false,
-        rdma_listen_ip = None,
-        rdma_slot_ttl_s = None,
+        kv_index = None,
+        least_load_default_throughput = 2000.0,
+        least_load_kv_pressure_weight = 0.15,
+        least_load_max_waiting_requests = 0,
+        least_load_mean_prefill_tokens = 1024,
+        load_monitor_interval = 10,
+        log_dir = None,
+        log_json = false,
+        log_level = None,
         log_mm_timing = false,
-        prefill_max_inflight_requests_per_worker = -1,
-        prefill_queue_size = None,
-        prefill_queue_timeout_secs = None,
-        worker_overload_shed = false,
-        kv_index = String::from("positional"),
-        worker_stall_secs = 2,
-        worker_wedge_secs = 3,
-        worker_stale_secs = 15,
-        worker_warmup_secs = 60,
-        worker_warmup_share = 0.25,
-        worker_warmup_blocks = 1024,
-        worker_warmup_thin_ratio = 0.5,
-        worker_warmup_divert_every = 8,
-        selection_policy = String::from("cache-aware-default"),
-        selection_accounting_ttl_ms = 0,
-        tenant_api_keys = vec![],
-        priority_scheduler_enabled = false,
-        priority_scheduler_default_max_class = String::from("default"),
-        priority_scheduler_config = None,
-        priority_scheduler_tenant_metric_top_n = 32,
-        tenant_rate_limit_enabled = false,
-        tenant_rate_limit_config = None,
-        jemalloc_prof_dir = None,
-        tokenizer_cache_l0_max_memory = 268435456,
-        // Keyword-only, so it never takes a positional slot.
-        *,
+        max_background_responses = 1024,
+        max_buffered_request_bytes = 1_048_576,
+        max_concurrent_requests = -1,
+        max_connections = 0,
+        max_idle_secs = 14400,
+        max_payload_size = 512 * 1024 * 1024,
+        max_tree_size = 2usize.pow(26),
+        mcp_config_path = None,
+        mesh_advertise_host = None,
+        mesh_host = String::from("0.0.0.0"),
+        mesh_peer_urls = vec![],
+        mesh_port = 39527u16,
+        mesh_server_name = None,
         mesh_tls_ca_cert = None,
         mesh_tls_cert = None,
         mesh_tls_key = None,
-        discovery = None,
+        mm_allow_private_media_hosts = false,
+        mm_allowed_media_domains = None,
+        mm_per_request_image_limit = None,
+        mm_pixel_cache_mb = None,
+        mm_pixel_rdma = false,
+        mm_processing = None,
+        mm_turbojpeg = None,
+        model_aliases = HashMap::new(),
+        model_id_from = None,
+        model_path = None,
+        multimodal_max_inflight_bytes = None,
+        multimodal_shm_min_bytes = None,
+        multimodal_tensor_transport = None,
+        oracle_config = None,
+        otlp_traces_endpoint = String::from("localhost:4317"),
+        overlap_decay = 0.0,
+        overload_token_usage_threshold = 1.0,
+        parser = String::from("legacy"),
+        pd_admission_wait_secs = 30,
+        pd_disaggregation = false,
+        pd_pairing_mode = String::from("lenient"),
+        postgres_config = None,
+        power_of_two_load_metric = String::from("expected_wait"),
+        prefill_max_inflight_requests_per_worker = -1,
+        prefill_policy = None,
+        prefill_queue_size = None,
+        prefill_queue_timeout_secs = None,
+        prefill_selector = HashMap::new(),
+        prefill_urls = None,
+        prefix_hash_balance_abs_threshold = 10,
+        prefix_hash_load_factor = 1.25,
+        prefix_token_count = 256,
+        priority_scheduler_config = None,
+        priority_scheduler_default_max_class = String::from("default"),
+        priority_scheduler_enabled = false,
+        priority_scheduler_tenant_metric_top_n = 32,
+        prometheus_duration_buckets = None,
+        prometheus_host = None,
+        prometheus_port = None,
+        queue_size = 100,
+        queue_timeout_secs = 60,
+        rate_limit_tokens_per_second = None,
+        rdma_listen_ip = None,
+        rdma_slot_ttl_s = None,
+        reasoning_parser = None,
+        redis_config = None,
+        remove_unhealthy_workers = None,
+        request_id_headers = None,
+        request_timeout_secs = 1800,
+        retry_backoff_multiplier = 1.5,
+        retry_initial_backoff_ms = 50,
+        retry_jitter_factor = 0.2,
+        retry_max_backoff_ms = 30_000,
+        retry_max_retries = 5,
+        rl_control_timeout_secs = 600,
+        rl_fanout_concurrency = 32,
+        router_selector = HashMap::new(),
+        routing_key_headers = vec![String::from("x-smg-routing-key")],
+        routing_key_override = false,
+        runtime_worker_threads = None,
+        schema_config = None,
+        selection_accounting_ttl_ms = 0,
+        selection_policy = String::from("cache-aware-default"),
+        selection_temperature = 0.0,
+        selector = HashMap::new(),
+        server_cert_path = None,
+        server_key_path = None,
+        service_discovery = false,
+        service_discovery_namespace = None,
+        service_discovery_port = 80,
+        shutdown_grace_period_secs = 180,
+        sse_keepalive_secs = 15,
+        storage_context_headers = HashMap::new(),
+        storage_hook_wasm_path = None,
+        stream_body_stall_timeout_secs = 300,
+        tenant_api_keys = vec![],
+        tenant_header_name = String::from("x-smg-tenant-id"),
+        tenant_rate_limit_config = None,
+        tenant_rate_limit_enabled = false,
+        tokenizer_cache_enable_l0 = false,
+        tokenizer_cache_enable_l1 = false,
+        tokenizer_cache_l0_max_entries = 10000,
+        tokenizer_cache_l0_max_memory = 268435456,
+        tokenizer_cache_l1_max_memory = 52428800,
+        tokenizer_path = None,
+        tool_call_parser = None,
+        trust_tenant_header = false,
+        upstream_http2 = false,
+        upstream_pool_idle_timeout_secs = 3,
+        webrtc_bind_addr = None,
+        webrtc_stun_server = None,
+        worker_overload_protection = true,
+        worker_overload_shed = false,
+        worker_overload_token_usage = Some(0.8),
+        worker_overload_waiting_requests = Some(8),
+        worker_ports_annotation = String::from("smg.ai/worker-ports"),
+        worker_stale_secs = 15,
+        worker_stall_secs = 2,
+        worker_startup_check_interval = 30,
+        worker_startup_delay = 0,
+        worker_startup_timeout_secs = 600,
+        worker_warmup_blocks = 1024,
+        worker_warmup_divert_every = 8,
+        worker_warmup_secs = 60,
+        worker_warmup_share = 0.25,
+        worker_warmup_thin_ratio = 0.5,
+        worker_wedge_secs = 3,
+        zmq_engine_count = None,
+        zmq_startup_timeout_secs = 3600,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1339,194 +1497,223 @@ impl Router {
         policy: PolicyType,
         host: String,
         port: u16,
-        worker_startup_timeout_secs: u64,
-        worker_startup_check_interval: u64,
-        load_monitor_interval: u64,
-        cache_threshold: f32,
-        balance_abs_threshold: usize,
-        balance_rel_threshold: f32,
-        eviction_interval_secs: u64,
-        max_tree_size: usize,
-        block_size: usize,
-        balance_token_usage_threshold: f32,
-        overload_token_usage_threshold: f32,
-        least_load_kv_pressure_weight: f64,
-        least_load_default_throughput: f64,
-        least_load_mean_prefill_tokens: u32,
-        max_idle_secs: u64,
-        assignment_mode: Option<String>,
-        max_payload_size: usize,
-        dp_aware: bool,
-        dp_minimum_tokens_scheduler: bool,
+        // Keyword-only, in the signature's order (pyo3 wants the two orders to agree).
+        access_log_fields: Vec<String>,
+        admin_host: Option<String>,
+        admin_port: Option<u16>,
         api_key: Option<String>,
-        log_dir: Option<String>,
-        log_level: Option<String>,
-        log_json: bool,
-        service_discovery: bool,
-        selector: HashMap<String, String>,
-        service_discovery_port: u16,
-        service_discovery_namespace: Option<String>,
-        prefill_selector: HashMap<String, String>,
-        decode_selector: HashMap<String, String>,
-        router_selector: HashMap<String, String>,
+        assignment_mode: Option<String>,
+        backend: BackendType,
+        balance_abs_threshold: usize,
+        balance_prefix_margin_tokens: u32,
+        balance_rel_threshold: f32,
+        balance_token_usage_threshold: f32,
+        balance_uncached_credit: bool,
+        block_size: usize,
         bootstrap_port_annotation: String,
-        model_id_from: Option<String>,
-        prometheus_port: Option<u16>,
-        prometheus_host: Option<String>,
-        prometheus_duration_buckets: Option<Vec<f64>>,
-        request_timeout_secs: u64,
-        shutdown_grace_period_secs: u64,
-        request_id_headers: Option<Vec<String>>,
-        trust_tenant_header: bool,
-        tenant_header_name: String,
-        storage_context_headers: HashMap<String, String>,
-        pd_disaggregation: bool,
         bucket_adjust_interval_secs: usize,
-        prefill_urls: Option<Vec<(String, Option<u16>)>>,
-        decode_urls: Option<Vec<String>>,
-        prefill_policy: Option<PolicyType>,
-        decode_policy: Option<PolicyType>,
-        max_concurrent_requests: i32,
-        cors_allowed_origins: Vec<String>,
-        retry_max_retries: u32,
-        retry_initial_backoff_ms: u64,
-        retry_max_backoff_ms: u64,
-        retry_backoff_multiplier: f32,
-        retry_jitter_factor: f32,
-        disable_retries: bool,
+        ca_cert_paths: Vec<String>,
+        cache_boundaries: Vec<usize>,
+        cache_index: String,
+        cache_threshold: f32,
+        cache_ttl_secs: u64,
         cb_failure_threshold: u32,
         cb_success_threshold: u32,
         cb_timeout_duration_secs: u64,
         cb_window_duration_secs: u64,
-        disable_circuit_breaker: bool,
-        health_failure_threshold: u32,
-        health_success_threshold: u32,
-        health_check_timeout_secs: u64,
-        health_check_interval_secs: u64,
-        health_check_endpoint: String,
-        disable_health_check: bool,
-        remove_unhealthy_workers: Option<bool>,
-        enable_igw: bool,
-        queue_size: usize,
-        queue_timeout_secs: u64,
-        rate_limit_tokens_per_second: Option<i32>,
-        model_path: Option<String>,
-        tokenizer_path: Option<String>,
         chat_template: Option<String>,
-        tokenizer_cache_enable_l0: bool,
-        tokenizer_cache_l0_max_entries: usize,
-        tokenizer_cache_enable_l1: bool,
-        tokenizer_cache_l1_max_memory: usize,
-        reasoning_parser: Option<String>,
-        tool_call_parser: Option<String>,
-        mcp_config_path: Option<String>,
-        storage_hook_wasm_path: Option<String>,
-        backend: BackendType,
-        history_backend: HistoryBackendType,
-        oracle_config: Option<PyOracleConfig>,
-        postgres_config: Option<PyPostgresConfig>,
-        redis_config: Option<PyRedisConfig>,
         client_cert_path: Option<String>,
         client_key_path: Option<String>,
-        ca_cert_paths: Vec<String>,
-        server_cert_path: Option<String>,
-        server_key_path: Option<String>,
-        enable_trace: bool,
-        otlp_traces_endpoint: String,
         control_plane_auth: Option<PyControlPlaneAuthConfig>,
-        schema_config: Option<String>,
+        cors_allowed_origins: Vec<String>,
+        decode_policy: Option<PolicyType>,
+        decode_selector: HashMap<String, String>,
+        decode_urls: Option<Vec<String>>,
+        disable_circuit_breaker: bool,
+        disable_health_check: bool,
+        disable_load_monitoring: bool,
+        disable_retries: bool,
         disable_tokenizer_autoload: bool,
-        enable_mesh: bool,
-        mesh_server_name: Option<String>,
-        mesh_host: String,
-        mesh_port: u16,
-        mesh_peer_urls: Vec<String>,
-        mesh_advertise_host: Option<String>,
+        discovery: Option<Bound<'_, PyAny>>,
+        discovery_check_interval_secs: Option<u64>,
+        dp_aware: bool,
+        dp_minimum_tokens_scheduler: bool,
         drain_settle_secs: u64,
+        enable_igw: bool,
+        enable_mesh: bool,
+        enable_rl: bool,
+        enable_trace: bool,
         enable_wasm: bool,
-        // Appended last to match the `#[pyo3(signature)]` order above and
-        // preserve positional-argument compatibility.
-        health_check_port: Option<u16>,
-        routing_key_override: bool,
-        encode_selector: HashMap<String, String>,
-        epd_disaggregation: bool,
-        encode_urls: Option<Vec<(String, Option<u16>)>>,
         encode_policy: Option<PolicyType>,
-        multimodal_tensor_transport: Option<String>,
-        multimodal_shm_min_bytes: Option<usize>,
-        model_aliases: HashMap<String, String>,
-        worker_startup_delay: u64,
-        worker_ports_annotation: String,
-        zmq_engine_count: Option<usize>,
-        prefix_token_count: usize,
-        prefix_hash_load_factor: f64,
-        prefix_hash_balance_abs_threshold: usize,
-        upstream_http2: bool,
-        overlap_decay: f32,
-        selection_temperature: f32,
-        upstream_pool_idle_timeout_secs: u64,
-        least_load_max_waiting_requests: u32,
-        stream_body_stall_timeout_secs: u64,
-        routing_key_headers: Vec<String>,
-        cache_boundaries: Vec<usize>,
-        cache_index: String,
-        cache_ttl_secs: u64,
+        encode_selector: HashMap<String, String>,
+        encode_urls: Option<Vec<(String, Option<u16>)>>,
+        engine_metrics: bool,
+        epd_disaggregation: bool,
+        eviction_interval_secs: u64,
+        header_read_timeout_secs: u64,
+        health_check_endpoint: String,
+        health_check_interval_secs: u64,
+        health_check_port: Option<u16>,
+        health_check_timeout_secs: u64,
+        health_failure_threshold: u32,
+        health_success_threshold: u32,
+        history_backend: HistoryBackendType,
+        history_memory_max_items: usize,
+        history_memory_max_responses: usize,
+        history_memory_retention_secs: u64,
+        idle_connection_timeout_secs: u64,
+        jemalloc_prof_dir: Option<String>,
         job_queue_capacity: usize,
         job_queue_concurrency: usize,
-        worker_overload_waiting_requests: Option<usize>,
-        worker_overload_token_usage: Option<f64>,
-        worker_overload_protection: bool,
-        disable_load_monitoring: bool,
-        max_buffered_request_bytes: u64,
         kv_connector_annotation: String,
         kv_engine_id_annotation: String,
-        mm_per_request_image_limit: Option<usize>,
-        pd_admission_wait_secs: u64,
-        // Appended last to match the `#[pyo3(signature)]` order above and
-        // preserve positional-argument compatibility.
-        enable_rl: bool,
-        rl_control_timeout_secs: u64,
-        rl_fanout_concurrency: usize,
-        multimodal_max_inflight_bytes: Option<usize>,
-        mm_processing: Option<String>,
-        mm_pixel_cache_mb: Option<usize>,
-        mm_pixel_rdma: bool,
-        rdma_listen_ip: Option<String>,
-        rdma_slot_ttl_s: Option<u64>,
+        kv_index: Option<String>,
+        least_load_default_throughput: f64,
+        least_load_kv_pressure_weight: f64,
+        least_load_max_waiting_requests: u32,
+        least_load_mean_prefill_tokens: u32,
+        load_monitor_interval: u64,
+        log_dir: Option<String>,
+        log_json: bool,
+        log_level: Option<String>,
         log_mm_timing: bool,
-        prefill_max_inflight_requests_per_worker: i32,
-        prefill_queue_size: Option<usize>,
-        prefill_queue_timeout_secs: Option<u64>,
-        worker_overload_shed: bool,
-        kv_index: String,
-        worker_stall_secs: u64,
-        worker_wedge_secs: u64,
-        worker_stale_secs: u64,
-        worker_warmup_secs: u64,
-        worker_warmup_share: f32,
-        worker_warmup_blocks: usize,
-        worker_warmup_thin_ratio: f32,
-        worker_warmup_divert_every: u64,
-        selection_policy: String,
-        selection_accounting_ttl_ms: u64,
-        tenant_api_keys: Vec<(String, String)>,
-        priority_scheduler_enabled: bool,
-        priority_scheduler_default_max_class: String,
-        priority_scheduler_config: Option<String>,
-        priority_scheduler_tenant_metric_top_n: u32,
-        tenant_rate_limit_enabled: bool,
-        tenant_rate_limit_config: Option<String>,
-        jemalloc_prof_dir: Option<String>,
-        tokenizer_cache_l0_max_memory: usize,
+        max_background_responses: usize,
+        max_buffered_request_bytes: u64,
+        max_concurrent_requests: i32,
+        max_connections: usize,
+        max_idle_secs: u64,
+        max_payload_size: usize,
+        max_tree_size: usize,
+        mcp_config_path: Option<String>,
+        mesh_advertise_host: Option<String>,
+        mesh_host: String,
+        mesh_peer_urls: Vec<String>,
+        mesh_port: u16,
+        mesh_server_name: Option<String>,
         mesh_tls_ca_cert: Option<String>,
         mesh_tls_cert: Option<String>,
         mesh_tls_key: Option<String>,
-        discovery: Option<Bound<'_, PyAny>>,
+        mm_allow_private_media_hosts: bool,
+        mm_allowed_media_domains: Option<Vec<String>>,
+        mm_per_request_image_limit: Option<usize>,
+        mm_pixel_cache_mb: Option<usize>,
+        mm_pixel_rdma: bool,
+        mm_processing: Option<String>,
+        mm_turbojpeg: Option<String>,
+        model_aliases: HashMap<String, String>,
+        model_id_from: Option<String>,
+        model_path: Option<String>,
+        multimodal_max_inflight_bytes: Option<usize>,
+        multimodal_shm_min_bytes: Option<usize>,
+        multimodal_tensor_transport: Option<String>,
+        oracle_config: Option<PyOracleConfig>,
+        otlp_traces_endpoint: String,
+        overlap_decay: f32,
+        overload_token_usage_threshold: f32,
+        parser: String,
+        pd_admission_wait_secs: u64,
+        pd_disaggregation: bool,
+        pd_pairing_mode: String,
+        postgres_config: Option<PyPostgresConfig>,
+        power_of_two_load_metric: String,
+        prefill_max_inflight_requests_per_worker: i32,
+        prefill_policy: Option<PolicyType>,
+        prefill_queue_size: Option<usize>,
+        prefill_queue_timeout_secs: Option<u64>,
+        prefill_selector: HashMap<String, String>,
+        prefill_urls: Option<Vec<(String, Option<u16>)>>,
+        prefix_hash_balance_abs_threshold: usize,
+        prefix_hash_load_factor: f64,
+        prefix_token_count: usize,
+        priority_scheduler_config: Option<String>,
+        priority_scheduler_default_max_class: String,
+        priority_scheduler_enabled: bool,
+        priority_scheduler_tenant_metric_top_n: u32,
+        prometheus_duration_buckets: Option<Vec<f64>>,
+        prometheus_host: Option<String>,
+        prometheus_port: Option<u16>,
+        queue_size: usize,
+        queue_timeout_secs: u64,
+        rate_limit_tokens_per_second: Option<i32>,
+        rdma_listen_ip: Option<String>,
+        rdma_slot_ttl_s: Option<u64>,
+        reasoning_parser: Option<String>,
+        redis_config: Option<PyRedisConfig>,
+        remove_unhealthy_workers: Option<bool>,
+        request_id_headers: Option<Vec<String>>,
+        request_timeout_secs: u64,
+        retry_backoff_multiplier: f32,
+        retry_initial_backoff_ms: u64,
+        retry_jitter_factor: f32,
+        retry_max_backoff_ms: u64,
+        retry_max_retries: u32,
+        rl_control_timeout_secs: u64,
+        rl_fanout_concurrency: usize,
+        router_selector: HashMap<String, String>,
+        routing_key_headers: Vec<String>,
+        routing_key_override: bool,
+        runtime_worker_threads: Option<usize>,
+        schema_config: Option<String>,
+        selection_accounting_ttl_ms: u64,
+        selection_policy: String,
+        selection_temperature: f32,
+        selector: HashMap<String, String>,
+        server_cert_path: Option<String>,
+        server_key_path: Option<String>,
+        service_discovery: bool,
+        service_discovery_namespace: Option<String>,
+        service_discovery_port: u16,
+        shutdown_grace_period_secs: u64,
+        sse_keepalive_secs: u64,
+        storage_context_headers: HashMap<String, String>,
+        storage_hook_wasm_path: Option<String>,
+        stream_body_stall_timeout_secs: u64,
+        tenant_api_keys: Vec<(String, String)>,
+        tenant_header_name: String,
+        tenant_rate_limit_config: Option<String>,
+        tenant_rate_limit_enabled: bool,
+        tokenizer_cache_enable_l0: bool,
+        tokenizer_cache_enable_l1: bool,
+        tokenizer_cache_l0_max_entries: usize,
+        tokenizer_cache_l0_max_memory: usize,
+        tokenizer_cache_l1_max_memory: usize,
+        tokenizer_path: Option<String>,
+        tool_call_parser: Option<String>,
+        trust_tenant_header: bool,
+        upstream_http2: bool,
+        upstream_pool_idle_timeout_secs: u64,
+        webrtc_bind_addr: Option<String>,
+        webrtc_stun_server: Option<String>,
+        worker_overload_protection: bool,
+        worker_overload_shed: bool,
+        worker_overload_token_usage: Option<f64>,
+        worker_overload_waiting_requests: Option<usize>,
+        worker_ports_annotation: String,
+        worker_stale_secs: u64,
+        worker_stall_secs: u64,
+        worker_startup_check_interval: u64,
+        worker_startup_delay: u64,
+        worker_startup_timeout_secs: u64,
+        worker_warmup_blocks: usize,
+        worker_warmup_divert_every: u64,
+        worker_warmup_secs: u64,
+        worker_warmup_share: f32,
+        worker_warmup_thin_ratio: f32,
+        worker_wedge_secs: u64,
+        zmq_engine_count: Option<usize>,
+        zmq_startup_timeout_secs: u64,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.
         if service_discovery && discovery.is_some() {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "Pass service_discovery=True or a discovery mapping, not both",
+            ));
+        }
+        // A `discovery` mapping carries its own `check_interval_secs`.
+        if discovery_check_interval_secs.is_some() && !service_discovery {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "discovery_check_interval_secs applies to service_discovery=True; \
+                 a discovery mapping takes check_interval_secs",
             ));
         }
         let discovery = discovery
@@ -1556,190 +1743,215 @@ impl Router {
         let connection_mode = Self::determine_connection_mode(&all_urls);
 
         Ok(Router {
-            host,
-            port,
-            health_check_port,
-            routing_key_override,
             worker_urls,
             policy,
-            worker_startup_timeout_secs,
-            worker_startup_check_interval,
-            load_monitor_interval,
-            cache_threshold,
-            balance_abs_threshold,
-            balance_rel_threshold,
-            eviction_interval_secs,
-            max_tree_size,
-            block_size,
-            balance_token_usage_threshold,
-            overload_token_usage_threshold,
-            prefix_token_count,
-            prefix_hash_load_factor,
-            prefix_hash_balance_abs_threshold,
-            least_load_kv_pressure_weight,
-            least_load_default_throughput,
-            least_load_mean_prefill_tokens,
-            max_idle_secs,
-            assignment_mode,
-            max_payload_size,
-            dp_aware,
-            dp_minimum_tokens_scheduler,
-            upstream_http2,
+            host,
+            port,
+            access_log_fields,
+            admin_host,
+            admin_port,
             api_key,
-            log_dir,
-            log_level,
-            log_json,
-            service_discovery,
-            selector,
-            service_discovery_port,
-            service_discovery_namespace,
-            prefill_selector,
-            decode_selector,
-            router_selector,
+            assignment_mode,
+            backend,
+            balance_abs_threshold,
+            balance_prefix_margin_tokens,
+            balance_rel_threshold,
+            balance_token_usage_threshold,
+            balance_uncached_credit,
+            block_size,
             bootstrap_port_annotation,
-            model_id_from,
-            prometheus_port,
-            prometheus_host,
-            prometheus_duration_buckets,
-            jemalloc_prof_dir,
-            request_timeout_secs,
-            shutdown_grace_period_secs,
-            request_id_headers,
-            trust_tenant_header,
-            tenant_header_name,
-            storage_context_headers,
-            pd_disaggregation,
             bucket_adjust_interval_secs,
-            prefill_urls,
-            decode_urls,
-            prefill_policy,
-            decode_policy,
-            max_concurrent_requests,
-            cors_allowed_origins,
-            retry_max_retries,
-            retry_initial_backoff_ms,
-            retry_max_backoff_ms,
-            retry_backoff_multiplier,
-            retry_jitter_factor,
-            disable_retries,
+            ca_cert_paths,
+            cache_boundaries,
+            cache_index,
+            cache_threshold,
+            cache_ttl_secs,
             cb_failure_threshold,
             cb_success_threshold,
             cb_timeout_duration_secs,
             cb_window_duration_secs,
-            disable_circuit_breaker,
-            health_failure_threshold,
-            health_success_threshold,
-            health_check_timeout_secs,
-            health_check_interval_secs,
-            health_check_endpoint,
-            disable_health_check,
-            remove_unhealthy_workers,
-            enable_igw,
-            queue_size,
-            queue_timeout_secs,
-            rate_limit_tokens_per_second,
-            connection_mode,
-            model_path,
-            tokenizer_path,
             chat_template,
-            disable_tokenizer_autoload,
-            tokenizer_cache_enable_l0,
-            tokenizer_cache_l0_max_entries,
-            tokenizer_cache_l0_max_memory,
-            tokenizer_cache_enable_l1,
-            tokenizer_cache_l1_max_memory,
-            reasoning_parser,
-            tool_call_parser,
-            mcp_config_path,
-            storage_hook_wasm_path,
-            backend,
-            history_backend,
-            oracle_config,
-            postgres_config,
-            redis_config,
             client_cert_path,
             client_key_path,
-            ca_cert_paths,
-            server_cert_path,
-            server_key_path,
-            enable_trace,
-            otlp_traces_endpoint,
             control_plane_auth,
-            schema_config,
-            enable_mesh,
-            mesh_server_name,
-            mesh_host,
-            mesh_advertise_host,
-            mesh_port,
-            mesh_peer_urls,
+            cors_allowed_origins,
+            decode_policy,
+            decode_selector,
+            decode_urls,
+            disable_circuit_breaker,
+            disable_health_check,
+            disable_load_monitoring,
+            disable_retries,
+            disable_tokenizer_autoload,
+            discovery,
+            discovery_check_interval_secs,
+            dp_aware,
+            dp_minimum_tokens_scheduler,
             drain_settle_secs,
+            enable_igw,
+            enable_mesh,
+            enable_rl,
+            enable_trace,
             enable_wasm,
-            encode_selector,
-            epd_disaggregation,
-            encode_urls,
             encode_policy,
-            multimodal_tensor_transport,
-            multimodal_shm_min_bytes,
-            model_aliases,
-            worker_startup_delay,
-            worker_ports_annotation,
-            zmq_engine_count,
-            overlap_decay,
-            selection_temperature,
-            upstream_pool_idle_timeout_secs,
-            least_load_max_waiting_requests,
-            stream_body_stall_timeout_secs,
-            routing_key_headers,
-            cache_boundaries,
-            cache_index,
-            cache_ttl_secs,
+            encode_selector,
+            encode_urls,
+            engine_metrics,
+            epd_disaggregation,
+            eviction_interval_secs,
+            header_read_timeout_secs,
+            health_check_endpoint,
+            health_check_interval_secs,
+            health_check_port,
+            health_check_timeout_secs,
+            health_failure_threshold,
+            health_success_threshold,
+            history_backend,
+            history_memory_max_items,
+            history_memory_max_responses,
+            history_memory_retention_secs,
+            idle_connection_timeout_secs,
+            jemalloc_prof_dir,
             job_queue_capacity,
             job_queue_concurrency,
-            worker_overload_waiting_requests,
-            worker_overload_token_usage,
-            worker_overload_protection,
-            disable_load_monitoring,
-            max_buffered_request_bytes,
             kv_connector_annotation,
             kv_engine_id_annotation,
-            mm_per_request_image_limit,
-            pd_admission_wait_secs,
-            enable_rl,
-            rl_control_timeout_secs,
-            rl_fanout_concurrency,
-            multimodal_max_inflight_bytes,
-            mm_processing,
-            mm_pixel_cache_mb,
-            mm_pixel_rdma,
-            rdma_listen_ip,
-            rdma_slot_ttl_s,
-            log_mm_timing,
-            prefill_max_inflight_requests_per_worker,
-            prefill_queue_size,
-            prefill_queue_timeout_secs,
-            worker_overload_shed,
             kv_index,
-            worker_stall_secs,
-            worker_wedge_secs,
-            worker_stale_secs,
-            worker_warmup_secs,
-            worker_warmup_share,
-            worker_warmup_blocks,
-            worker_warmup_thin_ratio,
-            worker_warmup_divert_every,
-            selection_policy,
-            selection_accounting_ttl_ms,
-            tenant_api_keys,
-            priority_scheduler_enabled,
-            priority_scheduler_default_max_class,
-            priority_scheduler_config,
-            priority_scheduler_tenant_metric_top_n,
-            tenant_rate_limit_enabled,
-            tenant_rate_limit_config,
-            discovery,
+            least_load_default_throughput,
+            least_load_kv_pressure_weight,
+            least_load_max_waiting_requests,
+            least_load_mean_prefill_tokens,
+            load_monitor_interval,
+            log_dir,
+            log_json,
+            log_level,
+            log_mm_timing,
+            max_background_responses,
+            max_buffered_request_bytes,
+            max_concurrent_requests,
+            max_connections,
+            max_idle_secs,
+            max_payload_size,
+            max_tree_size,
+            mcp_config_path,
+            mesh_advertise_host,
+            mesh_host,
+            mesh_peer_urls,
+            mesh_port,
+            mesh_server_name,
             mesh_tls_ca_cert,
             mesh_tls_cert,
             mesh_tls_key,
+            mm_allow_private_media_hosts,
+            mm_allowed_media_domains,
+            mm_per_request_image_limit,
+            mm_pixel_cache_mb,
+            mm_pixel_rdma,
+            mm_processing,
+            mm_turbojpeg,
+            model_aliases,
+            model_id_from,
+            model_path,
+            multimodal_max_inflight_bytes,
+            multimodal_shm_min_bytes,
+            multimodal_tensor_transport,
+            oracle_config,
+            otlp_traces_endpoint,
+            overlap_decay,
+            overload_token_usage_threshold,
+            parser,
+            pd_admission_wait_secs,
+            pd_disaggregation,
+            pd_pairing_mode,
+            postgres_config,
+            power_of_two_load_metric,
+            prefill_max_inflight_requests_per_worker,
+            prefill_policy,
+            prefill_queue_size,
+            prefill_queue_timeout_secs,
+            prefill_selector,
+            prefill_urls,
+            prefix_hash_balance_abs_threshold,
+            prefix_hash_load_factor,
+            prefix_token_count,
+            priority_scheduler_config,
+            priority_scheduler_default_max_class,
+            priority_scheduler_enabled,
+            priority_scheduler_tenant_metric_top_n,
+            prometheus_duration_buckets,
+            prometheus_host,
+            prometheus_port,
+            queue_size,
+            queue_timeout_secs,
+            rate_limit_tokens_per_second,
+            rdma_listen_ip,
+            rdma_slot_ttl_s,
+            reasoning_parser,
+            redis_config,
+            remove_unhealthy_workers,
+            request_id_headers,
+            request_timeout_secs,
+            retry_backoff_multiplier,
+            retry_initial_backoff_ms,
+            retry_jitter_factor,
+            retry_max_backoff_ms,
+            retry_max_retries,
+            rl_control_timeout_secs,
+            rl_fanout_concurrency,
+            router_selector,
+            routing_key_headers,
+            routing_key_override,
+            runtime_worker_threads,
+            schema_config,
+            selection_accounting_ttl_ms,
+            selection_policy,
+            selection_temperature,
+            selector,
+            server_cert_path,
+            server_key_path,
+            service_discovery,
+            service_discovery_namespace,
+            service_discovery_port,
+            shutdown_grace_period_secs,
+            sse_keepalive_secs,
+            storage_context_headers,
+            storage_hook_wasm_path,
+            stream_body_stall_timeout_secs,
+            tenant_api_keys,
+            tenant_header_name,
+            tenant_rate_limit_config,
+            tenant_rate_limit_enabled,
+            tokenizer_cache_enable_l0,
+            tokenizer_cache_enable_l1,
+            tokenizer_cache_l0_max_entries,
+            tokenizer_cache_l0_max_memory,
+            tokenizer_cache_l1_max_memory,
+            tokenizer_path,
+            tool_call_parser,
+            trust_tenant_header,
+            upstream_http2,
+            upstream_pool_idle_timeout_secs,
+            webrtc_bind_addr,
+            webrtc_stun_server,
+            worker_overload_protection,
+            worker_overload_shed,
+            worker_overload_token_usage,
+            worker_overload_waiting_requests,
+            worker_ports_annotation,
+            worker_stale_secs,
+            worker_stall_secs,
+            worker_startup_check_interval,
+            worker_startup_delay,
+            worker_startup_timeout_secs,
+            worker_warmup_blocks,
+            worker_warmup_divert_every,
+            worker_warmup_secs,
+            worker_warmup_share,
+            worker_warmup_thin_ratio,
+            worker_wedge_secs,
+            zmq_engine_count,
+            zmq_startup_timeout_secs,
+            connection_mode,
         })
     }
 
@@ -1778,8 +1990,29 @@ impl Router {
             duration_buckets: self.prometheus_duration_buckets.clone(),
         });
 
-        let runtime = tokio::runtime::Runtime::new()
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        // Refused before the runtime exists, as the CLI refuses it at parse time.
+        let webrtc_bind_addr = self
+            .webrtc_bind_addr
+            .as_deref()
+            .map(|addr| {
+                addr.parse::<std::net::IpAddr>().map_err(|e| {
+                    pyo3::exceptions::PyValueError::new_err(format!(
+                        "Invalid value for webrtc_bind_addr='{addr}': {e}"
+                    ))
+                })
+            })
+            .transpose()?;
+
+        // The runtime's default size unless a thread count is given (the
+        // validation above refused 0), as the CLI's `serve` builds it.
+        let runtime = match self.runtime_worker_threads {
+            Some(threads) => tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(threads)
+                .enable_all()
+                .build(),
+            None => tokio::runtime::Runtime::new(),
+        }
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         // Release the GIL while the server runs so Python threads can make progress.
         py.detach(|| {
@@ -1788,7 +2021,7 @@ impl Router {
                 host: self.host.clone(),
                 port: self.port,
                 health_check_port: self.health_check_port,
-                runtime_worker_threads: None,
+                runtime_worker_threads: self.runtime_worker_threads,
                 router_config,
                 max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),
@@ -1861,8 +2094,11 @@ impl Router {
                 } else {
                     None
                 },
-                webrtc_bind_addr: None,
-                webrtc_stun_server: None,
+                webrtc_bind_addr,
+                webrtc_stun_server: self.webrtc_stun_server.clone(),
+                // The launcher resolved the secrets' sources in Python; the
+                // record is the CLI's.
+                secret_sources: Default::default(),
             }))
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
@@ -1894,11 +2130,39 @@ fn print_banner(host: &str, port: u16, mode: &str) {
 fn get_available_tool_call_parsers() -> Vec<String> {
     static PARSERS: OnceCell<Vec<String>> = OnceCell::new();
     PARSERS
-        .get_or_init(|| {
-            let factory = tool_parser::ParserFactory::new();
-            factory.list_parsers()
-        })
+        .get_or_init(|| parser_choices(|tools, _| tools.list_parsers()))
         .clone()
+}
+
+/// The choices of one parser flag: the names `legacy` picks from the two legacy registries (the
+/// flag's own kind), Symphony's tables' (`symphony::formats::Table::name`), which `--parser
+/// symphony` reads with when both flags name one, the names a table answers to that no legacy
+/// parser of either kind has (the gateway's `utils::ALIASES`: an engine's exact parser name for a
+/// family, or a launcher's name for one whose table has no older parser, which the gateway takes
+/// in either flag), and `hf`,
+/// the table a model's response template compiles into, sorted, each once.
+fn parser_choices(
+    legacy: impl FnOnce(&tool_parser::ParserFactory, &reasoning_parser::ParserFactory) -> Vec<String>,
+) -> Vec<String> {
+    let tools = tool_parser::ParserFactory::new();
+    let reasoning = reasoning_parser::ParserFactory::new();
+    let mut names = legacy(&tools, &reasoning);
+    names.extend(
+        symphony::formats::Table::ALL
+            .iter()
+            .map(|table| table.name().to_string()),
+    );
+    names.extend(
+        routers::grpc::utils::ALIASES
+            .iter()
+            .map(|(alias, _)| *alias)
+            .filter(|alias| !tools.has_parser(alias) && !reasoning.registry().has_parser(alias))
+            .map(str::to_string),
+    );
+    names.push(config::TEMPLATE_PARSER.to_string());
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Get the list of available reasoning parsers from the Rust factory.
@@ -1906,16 +2170,17 @@ fn get_available_tool_call_parsers() -> Vec<String> {
 fn get_available_reasoning_parsers() -> Vec<String> {
     static PARSERS: OnceCell<Vec<String>> = OnceCell::new();
     PARSERS
-        .get_or_init(|| {
-            let factory = reasoning_parser::ParserFactory::new();
-            factory.list_parsers()
-        })
+        .get_or_init(|| parser_choices(|_, reasoning| reasoning.list_parsers()))
         .clone()
 }
 
 #[pymodule]
 fn smg_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     observability::metrics::register_jemalloc_as_global_allocator();
+    // The process-level TLS crypto provider, installed once when the module
+    // is imported: every HTTP client a binding builds takes it, whether or
+    // not a router is started in this process.
+    tls::install_crypto_provider();
 
     m.add_class::<PolicyType>()?;
     m.add_class::<BackendType>()?;

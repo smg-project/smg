@@ -25,7 +25,7 @@ use crate::{BoxedTraceInjector, NoopTraceInjector};
 /// without pooling every call paid a fresh TCP + HTTP/2 (+ TLS) handshake on the
 /// request's critical path. A `tonic::Channel` is cheap to clone and multiplexes
 /// concurrent RPCs over a single HTTP/2 connection, so we reuse one channel per
-/// endpoint — the same connection reuse the prefill/decode legs already get from
+/// endpoint — the same connection reuse the prefill/decode sides already get from
 /// their cached per-worker client.
 /// A single body is large; several concurrent images to the SAME worker would
 /// head-of-line-block on one HTTP/2 connection's write buffer + flow-control

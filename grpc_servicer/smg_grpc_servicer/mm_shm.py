@@ -7,6 +7,7 @@ gRPC servicers; their ``TensorData``/``ShmHandle`` messages share the ``payload`
 oneof shape (``inline`` | ``shm`` | ``remote``) via ``common.proto``.
 """
 
+import errno
 import os
 import stat
 
@@ -39,18 +40,26 @@ def tensor_payload_bytes_from_shm(shm_handle) -> bytes:
 
     path = os.path.join("/dev/shm", name)
     fd = None
+    unlink = False
     try:
         # O_NOFOLLOW: never follow a symlink at the final path component, so a
         # crafted name that resolves to a pre-existing symlink in /dev/shm can't
-        # redirect the read. Then require a regular file (fail closed otherwise).
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        # redirect the read; the refusal names it. Then require a regular file
+        # (fail closed otherwise). Only a segment that was read is unlinked.
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError as error:
+            if error.errno == errno.ELOOP:
+                raise ValueError(f"TensorData.shm is a symlink: {shm_handle.name!r}") from None
+            raise
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             raise ValueError(f"TensorData.shm is not a regular file: {shm_handle.name!r}")
+        unlink = UNLINK_MM_SHM_AFTER_READ
         raw = os.pread(fd, int(shm_handle.nbytes), int(shm_handle.offset))
     finally:
         if fd is not None:
             os.close(fd)
-        if fd is not None and UNLINK_MM_SHM_AFTER_READ:
+        if unlink:
             try:
                 os.unlink(path)
             except FileNotFoundError:

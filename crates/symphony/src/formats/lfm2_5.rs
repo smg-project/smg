@@ -3,8 +3,20 @@
 //! everything else content. The model writes its own `<think>`, and a turn opens with
 //! `<|im_start|>assistant`, so the prompt's replay starts there. Recorded as
 //! `lfm2.5-1.2b-instruct` (LiquidAI/LFM2.5-1.2B-Instruct).
+//!
+//! A JSON answer's whitespace is bounded: held to a schema's JSON after a long thought by an
+//! engine that starts the grammar at the first token, the model drifted into runs of tabs and
+//! newlines inside the object until the budget ended, where its own server, which lets no thought
+//! precede the answer, stopped every time. A run of at most thirty-two characters ends a drift of
+//! thousands and leaves pretty-printing its room: a newline and four-space indentation to a depth
+//! of seven, two-space to fifteen; past that the model writes the next token early, the JSON
+//! still valid. The bound goes with the table to every model that reads with it (the d1 family's
+//! checkpoints too, on which the drift was not measured).
 
-use crate::format::{CallSyntax, Emits, Format};
+use crate::{
+    format::{CallSyntax, Emits, Format},
+    pythonic::Dialect,
+};
 
 /// The LFM2.5 table.
 pub fn lfm2_5() -> Format {
@@ -20,60 +32,30 @@ pub fn lfm2_5() -> Format {
         .transition("reasoning", "think_close", "content")
         .transition("content", "calls_open", "calls")
         .transition("calls", "calls_close", "content")
-        .calls(CallSyntax::Pythonic)
+        .calls(CallSyntax::Pythonic(Dialect::LFM2_5))
         .opens_turn("<|im_start|>assistant")
+        .bounds_answer_whitespace(32)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        engine::Engine,
-        event::{Event, Events},
-        input::{EngineFinish, Input},
-        parser::Parser,
-        tagged::Declared,
-    };
+    use crate::{engine::Engine, event::Event, testing::drive, Declared};
 
-    fn run(prompt: &str, output: &str) -> Vec<Event> {
-        let mut parser = Engine::new(lfm2_5(), Declared::default());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        parser
-            .feed(
-                Input::Delta {
-                    token_ids: &[],
-                    text: output,
-                    spans: &[],
-                },
-                &mut out,
-            )
-            .expect("delta");
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
+    fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
+        drive(
+            &mut Engine::new(lfm2_5(), Declared::default()),
+            prompt,
+            &[output],
+        )
     }
 
     fn text_of(events: &[Event], reasoning: bool) -> String {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(text) if reasoning => Some(text.text.as_str()),
-                Event::Content(text) if !reasoning => Some(text.text.as_str()),
+                Event::Reasoning(text) if reasoning => Some(&*text.text),
+                Event::Content(text) if !reasoning => Some(&*text.text),
                 _ => None,
             })
             .collect()

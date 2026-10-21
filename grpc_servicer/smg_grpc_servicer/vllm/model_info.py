@@ -1,12 +1,12 @@
 """The engine facts both vLLM servicers advertise, read once off vLLM's config.
 
 `GetModelInfo` and `GetServerInfo` answer from vLLM's `ModelConfig` and
-`VllmConfig`. vLLM offers no API for these facts beyond the config attributes
-themselves, so the reads live here, in one place, for the Python servicer
-(which answers at request time from its AsyncLLM's config) and the Rust
-servicer (whose launcher computes them before the headless engine starts,
-since no Python runs on its request path). A vLLM change to any of these
-attributes is then one fix, and the Python servicer's live lane catches it.
+`VllmConfig`, through :mod:`.config_view` (the one reader of the config's
+attribute names), for the Python servicer (which answers at request time from
+its AsyncLLM's config) and the Rust servicer (whose launcher computes them
+before the headless engine starts, since no Python runs on its request path).
+What is a fact of the proto, as opposed to an attribute of the config, is
+decided here.
 
 Engine-free at import: this module takes the config objects and imports
 nothing from vLLM.
@@ -16,10 +16,17 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from typing import Any
 
 from smg_grpc_servicer import mm_shm
+from smg_grpc_servicer.constrained_decoding import (
+    CONSTRAINED_DECODING_AFTER_REASONING,
+    CONSTRAINED_DECODING_FIRST_TOKEN,
+)
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
+from smg_grpc_servicer.vllm.config_view import EngineConfigView, ModelSection, token_ids
+from smg_grpc_servicer.vllm.config_view import hf_eos_token_ids as _hf_eos_token_ids
 from smg_grpc_servicer.vllm.kv_transfer import pairing_fields, resolve_pd_connector
 from smg_grpc_servicer.vllm.mm_salt import engine_accepts_mm_inputs
 
@@ -51,19 +58,9 @@ def default_sampling_params_json(model_config: Any) -> str:
     return json.dumps(filtered, separators=(",", ":")) if filtered else ""
 
 
-def _ids(value: Any) -> list[int]:
-    if isinstance(value, bool) or value is None:
-        return []
-    if isinstance(value, int):
-        return [value] if value >= 0 else []
-    if isinstance(value, (list, tuple)):
-        return [v for v in value if isinstance(v, int) and not isinstance(v, bool) and v >= 0]
-    return []
-
-
 def hf_eos_token_ids(model_config: Any) -> list[int]:
     """The EOS ids the model's HF config declares: what `GetModelInfo` advertises."""
-    return _ids(getattr(getattr(model_config, "hf_config", None), "eos_token_id", None))
+    return _hf_eos_token_ids(model_config)
 
 
 def eos_token_ids_with_generation_config(model_config: Any) -> list[int]:
@@ -77,7 +74,7 @@ def eos_token_ids_with_generation_config(model_config: Any) -> list[int]:
             generation = try_get() or {}
         except Exception:  # a missing or malformed generation config is not fatal
             generation = {}
-        for extra in _ids(generation.get("eos_token_id")):
+        for extra in token_ids(generation.get("eos_token_id")):
             if extra not in ids:
                 ids.append(extra)
     return ids
@@ -97,23 +94,20 @@ def supports_vision(model_config: Any) -> bool:
 
 def model_facts(model_config: Any) -> dict[str, Any]:
     """`GetModelInfo`'s fields, keyed as the proto names them."""
-    hf_config = getattr(model_config, "hf_config", None)
-    served = getattr(model_config, "served_model_name", None) or model_config.model
-    if isinstance(served, (list, tuple)):
-        served = served[0] if served else model_config.model
+    model = ModelSection.read(model_config)
     return {
-        "model_path": str(model_config.model),
-        "is_generation": getattr(model_config, "runner_type", "generate") == "generate",
-        "max_context_length": int(model_config.max_model_len),
-        "vocab_size": int(model_config.get_vocab_size()),
+        "model_path": model.model,
+        "is_generation": model.runner_type == "generate",
+        "max_context_length": model.max_model_len,
+        "vocab_size": model.vocab_size,
         "supports_vision": supports_vision(model_config),
-        "served_model_name": str(served),
-        "tokenizer_path": str(getattr(model_config, "tokenizer", None) or model_config.model),
-        "model_type": str(getattr(hf_config, "model_type", None) or ""),
-        "architectures": [str(a) for a in (getattr(model_config, "architectures", None) or [])],
-        "eos_token_ids": hf_eos_token_ids(model_config),
-        "pad_token_id": int(getattr(hf_config, "pad_token_id", None) or 0),
-        "bos_token_id": int(getattr(hf_config, "bos_token_id", None) or 0),
+        "served_model_name": model.served_model_name,
+        "tokenizer_path": model.tokenizer,
+        "model_type": model.model_type,
+        "architectures": model.architectures,
+        "eos_token_ids": model.hf_eos_token_ids,
+        "pad_token_id": model.pad_token_id,
+        "bos_token_id": model.bos_token_id,
         "default_sampling_params_json": default_sampling_params_json(model_config),
     }
 
@@ -124,11 +118,7 @@ def mm_device_do_normalize(vllm_config: Any) -> bool:
     model class does not support it). Such an engine takes the pixels' own
     ``uint8`` bytes and would normalize anything else twice, so both servicers
     advertise it and whoever preprocesses sends raw pixels."""
-    model_config = vllm_config.model_config
-    if not getattr(model_config, "is_multimodal_model", False):
-        return False
-    mm_config = getattr(model_config, "multimodal_config", None)
-    return bool(getattr(mm_config, "mm_device_do_normalize", False))
+    return EngineConfigView(vllm_config).multimodal.device_do_normalize
 
 
 # The modalities a router request can carry to a vLLM worker, whose per-prompt
@@ -142,12 +132,8 @@ def mm_item_limits(vllm_config: Any) -> str:
     vLLM's resolved ``--limit-mm-per-prompt``, whose own server refuses a prompt
     above them. Empty on a text model or a config that does not carry them,
     which leaves the Router to its own caps."""
-    model_config = vllm_config.model_config
-    if not getattr(model_config, "is_multimodal_model", False):
-        return ""
-    mm_config = getattr(model_config, "multimodal_config", None)
-    get_limit = getattr(mm_config, "get_limit_per_prompt", None)
-    if not callable(get_limit):
+    get_limit = EngineConfigView(vllm_config).multimodal.limit_per_prompt
+    if get_limit is None:
         return ""
     pairs = []
     for modality in sorted(MM_ITEM_LIMIT_MODALITIES):
@@ -160,42 +146,109 @@ def mm_item_limits(vllm_config: Any) -> str:
     return ",".join(pairs)
 
 
+def mm_encoder_budget(vllm_config: Any, budget_factory: Callable[[Any], Any] | None = None) -> int:
+    """The engine's encoder budget as the ``mm_encoder_budget`` fact both
+    servicers advertise: the most feature (embedding) tokens one media item may
+    carry and still be scheduled, in the units of the engine's "Encoder cache
+    will be initialized with a budget of N tokens" start-up line. Derived as
+    vLLM derives it, with the ``MultiModalBudget`` helper its own front end and
+    model runner share (the lesser of the encoder compute budget and the
+    encoder cache size: the front end refuses an item above the latter, the
+    scheduler never places one above either). ``0`` on a text model, and when
+    the installed vLLM cannot tell, which leaves an item's size to the engine
+    as before. ``budget_factory`` builds the helper from the config (the
+    default imports vLLM's; tests pass their own)."""
+    model_config = getattr(vllm_config, "model_config", None)
+    if not getattr(model_config, "is_multimodal_model", False):
+        return 0
+    try:
+        factory = budget_factory or _vllm_multimodal_budget
+        budget = int(factory(vllm_config).get_encoder_budget())
+    except Exception:  # an unexpected helper or config shape must not take the servicer down
+        logger.warning(
+            "Could not derive the engine's encoder budget; a media item larger than the engine "
+            "can place is not refused before it reaches the engine",
+            exc_info=True,
+        )
+        return 0
+    return max(budget, 0)
+
+
+def _vllm_multimodal_budget(vllm_config: Any) -> Any:
+    """vLLM's own budget helper over the engine's config, without a processor
+    cache (the number is all a servicer keeps of it)."""
+    from vllm.multimodal import MULTIMODAL_REGISTRY
+    from vllm.multimodal.encoder_budget import MultiModalBudget
+
+    try:
+        return MultiModalBudget(vllm_config, MULTIMODAL_REGISTRY, enable_cache=False)
+    except TypeError:  # a release before the helper took the cache switch
+        return MultiModalBudget(vllm_config, MULTIMODAL_REGISTRY)
+
+
 def running_window(vllm_config: Any) -> int:
     """The scheduler's running window (``--max-num-seqs``): how many requests
     the engine runs at once, which ``GetServerInfo`` advertises as
     ``max_num_seqs`` for the Router's PD admission gate and its fleet capacity
     accounting; 0 when the config does not carry it, which leaves both as
     they were."""
-    scheduler = getattr(vllm_config, "scheduler_config", None)
-    window = getattr(scheduler, "max_num_seqs", None)
-    if isinstance(window, bool) or not isinstance(window, int) or window <= 0:
-        return 0
-    return int(window)
+    return EngineConfigView(vllm_config).max_num_seqs
+
+
+def engine_reasoning_parser(vllm_config: Any) -> str:
+    """The engine's reasoning parser (``--reasoning-parser``), as its
+    structured-outputs config carries it, for the ``engine_reasoning_parser``
+    label (a name of its own: ``reasoning_parser`` is the per-model parser
+    override the Router reads off a worker's labels); "" when the engine runs
+    none or the config has no such section."""
+    return EngineConfigView(vllm_config).structured_outputs.reasoning_parser
+
+
+# The `constrained_decoding_start` label's values (where the engine starts a
+# request's grammar on a prompt that ends inside the model's thinking block)
+# are `smg_grpc_servicer.constrained_decoding`', shared with the servicers of
+# the engines that carry them as server args.
+def constrained_decoding_start(vllm_config: Any) -> str:
+    """Where the engine starts a request's grammar on a thinking prompt, as the
+    ``constrained_decoding_start`` label the Router shapes a forced tool call's
+    grammar by. vLLM's structured-output manager holds a grammar back until
+    its reasoning parser has seen the thought's end when a reasoning parser is
+    set and ``enable_in_reasoning`` is off (``after_reasoning``); otherwise the
+    grammar runs from the first generated token (``first_token``). "" when
+    the config has no structured-outputs section, or one without the reasoning
+    parser attribute, which leaves the Router to the shape that fits either
+    kind of engine."""
+    structured = EngineConfigView(vllm_config).structured_outputs
+    if not structured.reasoning_parser_known:
+        # No section, or one that predates the reasoning parser: unknown.
+        return ""
+    if structured.reasoning_parser and not structured.enable_in_reasoning:
+        return CONSTRAINED_DECODING_AFTER_REASONING
+    return CONSTRAINED_DECODING_FIRST_TOKEN
 
 
 def server_facts(vllm_config: Any) -> dict[str, Any]:
     """`GetServerInfo`'s config-derived fields, keyed as the proto names them:
     the PD identity and pairing facts, the data-parallel size, the running
     window, this host's `/dev/shm` identity."""
-    kv_config = getattr(vllm_config, "kv_transfer_config", None)
-    kv_connector, kv_engine_id, kv_role = "", "", ""
-    if kv_config is not None:
+    view = EngineConfigView(vllm_config)
+    kv_connector, kv_engine_id = "", ""
+    if view.kv_transfer.config is not None:
         # The effective PD engine_id; with DP the engine cores serve
         # `{id}_dp{rank}` and the router derives the suffix from the rank it
         # pins per request.
-        kv_connector, kv_engine_id = resolve_pd_connector(kv_config)
-        kv_role = getattr(kv_config, "kv_role", None) or ""
+        kv_connector, kv_engine_id = resolve_pd_connector(view.kv_transfer.config)
     pairing = pairing_fields(vllm_config)
     encoder_dtype = pairing.get("model_dtype", "").removeprefix("torch.")
     if encoder_dtype not in {"float32", "float16", "bfloat16"}:
         encoder_dtype = ""
     return {
         "kv_connector": str(kv_connector or ""),
-        "kv_role": str(kv_role),
+        "kv_role": view.kv_transfer.role,
         "kv_engine_id": str(kv_engine_id or ""),
-        "data_parallel_size": int(vllm_config.parallel_config.data_parallel_size),
+        "data_parallel_size": view.data_parallel_size,
         "multimodal_encoder_dtype": encoder_dtype,
-        "max_num_seqs": running_window(vllm_config),
+        "max_num_seqs": view.max_num_seqs,
         "shm_namespace_id": mm_shm.shm_namespace_id(),
         "pairing_protocol": pairing_protocol_from_env(),
         **pairing,

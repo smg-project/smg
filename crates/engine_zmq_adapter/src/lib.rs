@@ -29,6 +29,7 @@ mod sglang;
 mod sockets;
 pub mod stops;
 mod stream;
+mod structured_outputs;
 mod tokenspeed;
 mod vllm;
 
@@ -37,13 +38,17 @@ pub use client::{
     ZmqEngineClient, ZmqModelInfo, ZmqServerInfo,
 };
 pub use embed::translate_embed_request;
-pub use engine_zmq_client::protocol::vllm::pooling::{PoolerDefaults, PoolingParams};
+pub use engine_zmq_client::protocol::vllm::{
+    pooling::{PoolerDefaults, PoolingParams},
+    structured_outputs::StructuredOutputBackend,
+};
 pub use eos::{fold_tokenizer_eos_backstop, EosTokenIds};
 pub use sglang::{to_sglang_response, SglangGenerateStream, SglangProfileStart};
 pub use sockets::{zmq_handshake_address, Handshake};
 pub use stream::ZmqGenerateStream;
-pub use tokenspeed::{to_tokenspeed_response, TokenSpeedGenerateStream};
-pub use vllm::{
-    structured_outputs_backend_from_config, ProcessedMedia, StructuredOutputsBackendConfig,
-    VllmGenerateStream,
+pub use structured_outputs::{
+    refuse_unenforceable_constraint, ConstraintKinds, ConstraintRef,
+    StructuredOutputsBackendConfig, StructuredOutputsSupport,
 };
+pub use tokenspeed::{to_tokenspeed_response, GridTensors, TokenSpeedGenerateStream};
+pub use vllm::{structured_outputs_backend_from_config, ProcessedMedia, VllmGenerateStream};

@@ -7,6 +7,7 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -37,32 +38,33 @@ use uuid::Uuid;
 
 use super::{
     common::{
-        apply_mcp_tool_call_limit, build_next_request, convert_mcp_tools_to_chat_tools,
-        extract_all_tool_calls_from_chat, has_unfinished_mcp_call, prepare_chat_tools_and_choice,
-        ExtractedToolCall, McpToolCallLimit, ResponsesCallContext, ToolLoopState,
+        build_next_request, convert_mcp_tools_to_chat_tools, dispatch_arguments,
+        extract_all_tool_calls_from_chat, has_unfinished_mcp_call, partition_tool_calls,
+        prepare_tool_choice, record_mcp_call, ExtractedToolCall, McpToolCallLimit,
+        ResponsesCallContext, ToolLoopState,
     },
     conversions,
 };
 use crate::{
-    observability::metrics::{metrics_labels, Metrics},
+    observability::metrics::Metrics,
     routers::{
         common::{
-            mcp_utils::{prepare_hosted_dispatch_args, DEFAULT_MAX_ITERATIONS},
-            openai_bridge::{self, ResponseFormat},
+            mcp_utils::DEFAULT_MAX_ITERATIONS,
+            openai_bridge::{self, FormatRegistry, ResponseFormat},
             sse::{sse_channel, SseSender},
         },
         error,
         grpc::{
             common::responses::{
                 await_stream_startup, build_sse_response, persist_response_if_needed,
-                signal_stream_startup, stream_startup_channel,
+                signal_stream_startup, stored_foreground, stream_startup_channel,
                 streaming::{
                     attach_mcp_server_label, ResponseStreamEventEmitter, StreamStartupSender,
                 },
                 utils::{
                     function_call_status, generation_failure_error, resolve_function_identity,
                 },
-                ResponsesContext,
+                BackgroundStream, ResponsesContext,
             },
             utils,
         },
@@ -86,8 +88,11 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     chat_request: Arc<ChatCompletionRequest>,
     params: ResponsesCallContext,
     original_request: &ResponsesRequest,
+    background: Option<BackgroundStream>,
 ) -> Response {
     debug!("Converting chat SSE stream to responses SSE format");
+    let response_id = params.response_id;
+    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
 
     // Get chat streaming response
     let chat_response = ctx
@@ -126,27 +131,51 @@ pub(super) async fn convert_chat_stream_to_responses_stream(
     let conversation_storage = ctx.conversation_storage.clone();
     let conversation_item_storage = ctx.conversation_item_storage.clone();
     let request_context = ctx.request_context.clone();
+    // A background stream's events go through a relay, so the work and its
+    // terminal record outlive a client that leaves.
+    let tx = match &background {
+        Some(_) => BackgroundStream::detach(tx),
+        None => tx,
+    };
 
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "streaming task is fire-and-forget; client disconnect terminates it"
-    )]
-    tokio::spawn(async move {
-        if let Err(e) = process_and_transform_sse_stream(
+    // The transform answers the error it ended with (after the error frame
+    // went to the client), so the runner of a background stream can store it.
+    let transform = async move {
+        match process_and_transform_sse_stream(
             body,
             original_request_clone,
+            response_id,
             response_storage,
             conversation_storage,
             conversation_item_storage,
+            tenant,
             request_context,
             tx.clone(),
         )
         .await
         {
-            warn!("Error transforming SSE stream: {}", e);
-            utils::send_error_sse(&tx, &e, "stream_error").await;
+            Ok(()) => Ok(()),
+            Err(e) => {
+                warn!("Error transforming SSE stream: {}", e);
+                utils::send_error_sse(&tx, &e, "stream_error").await;
+                Err(json!({ "code": "stream_error", "message": e }))
+            }
         }
-    });
+    };
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "streaming task is fire-and-forget; client disconnect terminates it unless it runs a background response, whose slot bounds it"
+    )]
+    match background {
+        Some(run) => {
+            let storage = ctx.response_storage.clone();
+            let request_context = ctx.request_context.clone();
+            tokio::spawn(run.run(storage, request_context, transform));
+        }
+        None => {
+            tokio::spawn(transform);
+        }
+    }
 
     // Build SSE response with transformed stream
     build_sse_response(rx)
@@ -165,32 +194,98 @@ fn sse_events(frame: &str) -> impl Iterator<Item = &str> {
         .filter(|event| !event.is_empty())
 }
 
+/// One `data:` event of the chat stream's body, as the Responses conversions
+/// read it: the chat chunk it carries, the chat stream's error event as the
+/// error object a Responses terminal carries, the `[DONE]` terminator, or any
+/// other data event, left to the reader. Lines that are not data events (a
+/// comment, a keep-alive) are nobody's and are not yielded.
+enum ChatSseEvent<'a> {
+    Chunk(ChatCompletionStreamResponse),
+    UpstreamError(Value),
+    Done,
+    Other(&'a str),
+}
+
+/// The data events of one frame of the chat stream's body, in order; the
+/// reader stops at [`ChatSseEvent::Done`].
+fn chat_sse_events(frame: &str) -> impl Iterator<Item = ChatSseEvent<'_>> {
+    sse_events(frame).filter_map(|event| {
+        if event == "data: [DONE]" {
+            return Some(ChatSseEvent::Done);
+        }
+        let data = event.strip_prefix("data: ")?.trim();
+        if let Ok(chunk) = serde_json::from_str::<ChatCompletionStreamResponse>(data) {
+            return Some(ChatSseEvent::Chunk(chunk));
+        }
+        let error = serde_json::from_str::<Value>(data)
+            .ok()
+            .and_then(|value| value.get("error").map(upstream_error_object));
+        Some(match error {
+            Some(error) => ChatSseEvent::UpstreamError(error),
+            None => ChatSseEvent::Other(event),
+        })
+    })
+}
+
+/// The error object of a Responses terminal for the chat stream's error
+/// event: its `code`, else its `type`, else `server_error`; its `message`,
+/// else the generic wording.
+fn upstream_error_object(error: &Value) -> Value {
+    json!({
+        "code": error.get("code").and_then(Value::as_str)
+            .or_else(|| error.get("type").and_then(Value::as_str)).unwrap_or("server_error"),
+        "message": error.get("message").and_then(Value::as_str).unwrap_or("Upstream generation failed"),
+    })
+}
+
+/// The error object of a Responses terminal for a chat body the gateway
+/// could not read.
+fn stream_read_error(error: &impl fmt::Display) -> Value {
+    json!({"code": "stream_error", "message": format!("Stream read error: {error}")})
+}
+
 /// Process chat SSE stream and transform to responses format
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the stream transform takes the storage handles and the pre-stored id of a background response"
+)]
 async fn process_and_transform_sse_stream(
     body: Body,
     original_request: ResponsesRequest,
+    response_id: Option<String>,
     response_storage: Arc<dyn ResponseStorage>,
     conversation_storage: Arc<dyn ConversationStorage>,
     conversation_item_storage: Arc<dyn ConversationItemStorage>,
+    tenant: Option<String>,
     request_context: Option<StorageRequestContext>,
     tx: SseSender,
 ) -> Result<(), String> {
     // Create accumulator for final response
     let mut accumulator = StreamingResponseAccumulator::new(&original_request);
 
-    // Create event emitter for OpenAI-compatible streaming
-    let response_id = format!("resp_{}", Uuid::now_v7());
+    // Create event emitter for OpenAI-compatible streaming; a background
+    // response streams under the id its queued record was stored under.
+    let response_id = response_id.unwrap_or_else(|| format!("resp_{}", Uuid::now_v7()));
     let model = original_request.model.clone();
     let created_at = chrono::Utc::now().timestamp() as u64;
     let mut event_emitter = ResponseStreamEventEmitter::new(response_id.clone(), model, created_at);
     event_emitter.set_original_request(original_request.clone());
 
-    // Emit initial response.created and response.in_progress events
+    // Emit initial response.created and response.in_progress events (a
+    // background stream reports response.queued between the two)
     let event = event_emitter.emit_created();
     event_emitter
         .send_event(&event, &tx)
         .await
         .map_err(|_| "Failed to send response.created event".to_string())?;
+
+    if original_request.background.unwrap_or(false) {
+        let event = event_emitter.emit_queued();
+        event_emitter
+            .send_event(&event, &tx)
+            .await
+            .map_err(|_| "Failed to send response.queued event".to_string())?;
+    }
 
     let event = event_emitter.emit_in_progress();
     event_emitter
@@ -207,46 +302,25 @@ async fn process_and_transform_sse_stream(
         let chunk = match chunk_result {
             Ok(chunk) => chunk,
             Err(error) => {
-                terminal_error = Some(
-                    json!({"code": "stream_error", "message": format!("Stream read error: {error}")}),
-                );
+                terminal_error = Some(stream_read_error(&error));
                 break;
             }
         };
 
         let frame = String::from_utf8_lossy(&chunk);
-        for event in sse_events(&frame) {
-            // Check for end of stream
-            if event == "data: [DONE]" {
-                break 'frames;
-            }
-
-            // Parse SSE event (format: "data: {...}")
-            let Some(json_str) = event.strip_prefix("data: ") else {
-                continue;
-            };
-            let json_str = json_str.trim();
-
-            // Try to parse as ChatCompletionStreamResponse
-            match serde_json::from_str::<ChatCompletionStreamResponse>(json_str) {
-                Ok(chat_chunk) => {
-                    // Update accumulator
+        for event in chat_sse_events(&frame) {
+            match event {
+                ChatSseEvent::Done => break 'frames,
+                ChatSseEvent::Chunk(chat_chunk) => {
                     accumulator.process_chunk(&chat_chunk);
-
-                    // Process chunk through event emitter (emits proper OpenAI events)
                     event_emitter.process_chunk(&chat_chunk, &tx).await?;
                 }
-                Err(_) => {
-                    if let Ok(value) = serde_json::from_str::<Value>(json_str) {
-                        if let Some(error) = value.get("error") {
-                            terminal_error = Some(json!({
-                                "code": error.get("code").and_then(Value::as_str).or_else(|| error.get("type").and_then(Value::as_str)).unwrap_or("server_error"),
-                                "message": error.get("message").and_then(Value::as_str).unwrap_or("Upstream generation failed"),
-                            }));
-                            break 'frames;
-                        }
-                    }
-                    // Pass through unrecognized non-error events.
+                ChatSseEvent::UpstreamError(error) => {
+                    terminal_error = Some(error);
+                    break 'frames;
+                }
+                // Pass through unrecognized non-error events.
+                ChatSseEvent::Other(event) => {
                     debug!("Non-chunk SSE event, passing through: {}", event);
                     if tx
                         .send(Ok(Bytes::from(format!("{event}\n\n"))))
@@ -260,48 +334,47 @@ async fn process_and_transform_sse_stream(
         }
     }
 
-    // Emit final response.completed event with accumulated usage
-    let usage_json = accumulator.usage.as_ref().map(|u| {
-        let mut usage_obj = json!({
-            "input_tokens": u.prompt_tokens,
-            "output_tokens": u.completion_tokens,
-            "total_tokens": u.total_tokens
-        });
-
-        // Include reasoning_tokens if present
-        if let Some(details) = &u.completion_tokens_details {
-            if let Some(reasoning_tokens) = details.reasoning_tokens {
-                usage_obj["output_tokens_details"] =
-                    json!({ "reasoning_tokens": reasoning_tokens });
-            }
-        }
-
-        usage_obj
-    });
-
-    event_emitter
-        .emit_terminal(usage_json.as_ref(), terminal_error.as_ref(), &tx)
-        .await?;
-
-    // Finalize and persist accumulated response
+    // Use the same complete usage representation for the terminal event and storage.
     if terminal_error.is_some() {
         accumulator.finish_reason = Some("failed".into());
     }
     let mut final_response = accumulator.finalize();
     // Persist under the public Responses ID, not the upstream Chat ID.
     final_response.id = response_id;
-    if let Some(error) = terminal_error {
-        final_response.error = Some(error);
+    if let Some(error) = terminal_error.as_ref() {
+        final_response.error = Some(error.clone());
     }
-    persist_response_if_needed(
+    let usage_json = final_response.usage.as_ref().map(|usage| json!(usage));
+    let persist = persist_response_if_needed(
         conversation_storage,
         conversation_item_storage,
         response_storage,
         &final_response,
         &original_request,
+        tenant.as_deref(),
         request_context,
-    )
-    .await;
+    );
+    if stored_foreground(&original_request) {
+        // A foreground response the client expects stored is written before
+        // its terminal event: a record that could not be written ends the
+        // stream with response.failed, not with a completed response that
+        // can be neither retrieved nor continued.
+        let not_stored = persist.await.err().map(|e| e.error_object());
+        let error = terminal_error.as_ref().or(not_stored.as_ref());
+        event_emitter
+            .emit_terminal(usage_json.as_ref(), error, &tx)
+            .await?;
+    } else {
+        // A background response's terminal write is retried behind the event
+        // (its client polls the record); an unstored response stores
+        // nothing. Neither fails the stream.
+        event_emitter
+            .emit_terminal(usage_json.as_ref(), terminal_error.as_ref(), &tx)
+            .await?;
+        if let Err(e) = persist.await {
+            debug!(response_id = %final_response.id, error = %e.message, "Response not stored");
+        }
+    }
 
     Ok(())
 }
@@ -533,6 +606,7 @@ pub(super) async fn execute_tool_loop_streaming(
     original_request: &ResponsesRequest,
     params: ResponsesCallContext,
     mcp_servers: Vec<McpServerBinding>,
+    background: Option<BackgroundStream>,
 ) -> Response {
     // Create SSE channel for client
     let (tx, rx) = sse_channel();
@@ -541,14 +615,17 @@ pub(super) async fn execute_tool_loop_streaming(
     // Clone data for background task
     let ctx_clone = ctx.clone();
     let original_request_clone = original_request.clone();
+    // A background stream's events go through a relay, so the work and its
+    // terminal record outlive a client that leaves.
+    let tx = match &background {
+        Some(_) => BackgroundStream::detach(tx),
+        None => tx,
+    };
 
-    // Spawn background task for tool loop
-    #[expect(
-        clippy::disallowed_methods,
-        reason = "streaming task is fire-and-forget; client disconnect terminates it"
-    )]
-    tokio::spawn(async move {
-        let result = execute_tool_loop_streaming_internal(
+    // The loop answers the error it ended with (after the error frame went
+    // to the client), so the runner of a background stream can store it.
+    let tool_loop = async move {
+        match execute_tool_loop_streaming_internal(
             &ctx_clone,
             current_request,
             &original_request_clone,
@@ -557,15 +634,190 @@ pub(super) async fn execute_tool_loop_streaming(
             tx.clone(),
             Some(startup_tx),
         )
-        .await;
-
-        if let Err(e) = result {
-            warn!("Streaming tool loop error: {}", e);
-            utils::send_error_sse(&tx, &e, "tool_loop_error").await;
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                warn!("Streaming tool loop error: {}", e);
+                utils::send_error_sse(&tx, &e, "tool_loop_error").await;
+                Err(json!({ "code": "tool_loop_error", "message": e }))
+            }
         }
-    });
+    };
+    // Spawn background task for tool loop
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "streaming task is fire-and-forget; client disconnect terminates it unless it runs a background response, whose slot bounds it"
+    )]
+    match background {
+        Some(run) => {
+            let storage = ctx.response_storage.clone();
+            let request_context = ctx.request_context.clone();
+            tokio::spawn(run.run(storage, request_context, tool_loop));
+        }
+        None => {
+            tokio::spawn(tool_loop);
+        }
+    }
 
     await_stream_startup(startup_rx, rx).await
+}
+
+/// What every MCP call of one turn shares.
+struct CallSite<'a> {
+    session: &'a McpToolSession<'a>,
+    format_registry: &'a FormatRegistry,
+    original_request: &'a ResponsesRequest,
+    model: &'a str,
+}
+
+/// One MCP call's whole life on the stream: announced with its progress
+/// events, run, closed with its completion or failure, done, and recorded.
+async fn stream_mcp_call(
+    site: &CallSite<'_>,
+    state: &mut ToolLoopState,
+    emitter: &mut ResponseStreamEventEmitter,
+    tx: &SseSender,
+    tool_call: ExtractedToolCall,
+) -> Result<(), String> {
+    state.total_calls += 1;
+
+    trace!(
+        "Executing tool call {}/{}: {} (call_id: {})",
+        state.total_calls,
+        state.total_calls,
+        tool_call.name,
+        tool_call.call_id
+    );
+
+    let response_format =
+        openai_bridge::lookup_tool_format(site.session, site.format_registry, &tool_call.name);
+
+    // Use emitter helpers to determine correct type and allocate index
+    let item_type = ResponseStreamEventEmitter::type_str_for_format(Some(&response_format));
+    let resolved_label = site.session.resolve_tool_server_label(&tool_call.name);
+
+    // Allocate output_index with the format's id-prefix discriminator
+    // (e.g. `ws_…` for web_search_call); see FormatDescriptor.
+    let (output_index, item_id) = emitter.allocate_output_index_for_format(Some(response_format));
+
+    // Build initial tool call item
+    let mut item = json!({
+        "id": item_id,
+        "type": item_type,
+        "name": tool_call.name,
+        "status": "in_progress",
+        "arguments": ""
+    });
+    attach_mcp_server_label(
+        &mut item,
+        Some(resolved_label.as_str()),
+        Some(&response_format),
+    );
+
+    // Emit output_item.added
+    let event = emitter.emit_output_item_added(output_index, &item);
+    emitter.send_event(&event, tx).await?;
+
+    // Emit tool_call.in_progress
+    let event = emitter.emit_tool_call_in_progress(output_index, &item_id, response_format);
+    emitter.send_event(&event, tx).await?;
+
+    // Emit arguments events for mcp_call only (skip for builtin tools)
+    if matches!(response_format, ResponseFormat::Passthrough) {
+        // Emit mcp_call_arguments.delta (simulate streaming by sending full arguments)
+        let event =
+            emitter.emit_mcp_call_arguments_delta(output_index, &item_id, &tool_call.arguments);
+        emitter.send_event(&event, tx).await?;
+
+        // Emit mcp_call_arguments.done
+        let event =
+            emitter.emit_mcp_call_arguments_done(output_index, &item_id, &tool_call.arguments);
+        emitter.send_event(&event, tx).await?;
+    }
+
+    // Emit searching/interpreting event for builtin tools
+    if let Some(event) = emitter.emit_tool_call_searching(output_index, &item_id, response_format) {
+        emitter.send_event(&event, tx).await?;
+    }
+
+    // Execute the MCP tool
+    trace!(
+        "Calling MCP tool '{}' with args: {}",
+        tool_call.name,
+        tool_call.arguments
+    );
+    let arguments =
+        dispatch_arguments(response_format, site.original_request, &tool_call.arguments);
+
+    // Execute the single tool via the normalized MCP execution API.
+    // This avoids custom serialization and manual re-transformation in streaming paths.
+    let tool_output = site
+        .session
+        .execute_tool(ToolExecutionInput {
+            call_id: tool_call.call_id,
+            tool_name: tool_call.name,
+            arguments,
+        })
+        .await;
+
+    let success = !tool_output.is_error;
+    let output_str = tool_output.output.to_string();
+
+    let output_item = openai_bridge::transform_tool_output(&tool_output, response_format);
+    let mut item_done = serde_json::to_value(&output_item).unwrap_or_else(|e| {
+        warn!(
+            tool = %tool_output.tool_name,
+            error = %e,
+            "Failed to serialize transformed output item; falling back to a minimal stub",
+        );
+        json!({
+            "id": item_id,
+            "type": item_type,
+            "status": if success { "completed" } else { "failed" },
+        })
+    });
+    // Override the typed item's id so output_item.done matches the
+    // streaming-allocated id used by the earlier output_item.added.
+    if let Some(obj) = item_done.as_object_mut() {
+        obj.insert("id".to_string(), json!(&item_id));
+    }
+    attach_mcp_server_label(
+        &mut item_done,
+        Some(tool_output.server_label.as_str()),
+        Some(&response_format),
+    );
+
+    if success {
+        let event = emitter.emit_tool_call_completed(output_index, &item_id, response_format);
+        emitter.send_event(&event, tx).await?;
+    } else {
+        let err_text = tool_output
+            .error_message
+            .clone()
+            .unwrap_or_else(|| output_str.clone());
+        warn!("Tool execution returned error: {}", err_text);
+
+        // `response.mcp_call.failed` is the only `*.failed` event
+        // in the Responses API. Hosted-builtin families close via
+        // `*.completed` to mirror OpenAI cloud's wire shape;
+        // the failure context (when present) lives in the item
+        // content.
+        if matches!(response_format, ResponseFormat::Passthrough) {
+            let event = emitter.emit_mcp_call_failed(output_index, &item_id, &err_text);
+            emitter.send_event(&event, tx).await?;
+        } else {
+            let event = emitter.emit_tool_call_completed(output_index, &item_id, response_format);
+            emitter.send_event(&event, tx).await?;
+        }
+    }
+
+    let event = emitter.emit_output_item_done(output_index, &item_done);
+    emitter.send_event(&event, tx).await?;
+    emitter.complete_output_item(output_index);
+
+    record_mcp_call(state, site.model, tool_output, output_str, output_item);
+    Ok(())
 }
 
 /// Internal streaming tool loop implementation
@@ -578,11 +830,17 @@ async fn execute_tool_loop_streaming_internal(
     tx: SseSender,
     mut startup: Option<StreamStartupSender>,
 ) -> Result<(), String> {
-    let mut state = ToolLoopState::new(original_request);
+    // The loop is rebuilt on the loaded request: a stored turn's tool calls
+    // and outputs stay in front of the calls this loop executes.
+    let mut state = ToolLoopState::new(&current_request);
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
 
     // Generate response ID first so we can use it for both emitter and session
-    let response_id = format!("resp_{}", Uuid::now_v7());
+    // (a background response streams under the id its queued record holds)
+    let response_id = params
+        .response_id
+        .clone()
+        .unwrap_or_else(|| format!("resp_{}", Uuid::now_v7()));
 
     // Create session once — bundles orchestrator, request_ctx, server_keys, mcp_tools
     let session = McpToolSession::new(&ctx.mcp_orchestrator, mcp_servers, &response_id);
@@ -596,9 +854,14 @@ async fn execute_tool_loop_streaming_internal(
         ResponseStreamEventEmitter::new(response_id, current_request.model.clone(), created_at);
     emitter.set_original_request(original_request.clone());
 
-    // Emit initial response.created and response.in_progress events
+    // Emit initial response.created and response.in_progress events (a
+    // background stream reports response.queued between the two)
     let event = emitter.emit_created();
     emitter.send_event(&event, &tx).await?;
+    if original_request.background.unwrap_or(false) {
+        let event = emitter.emit_queued();
+        emitter.send_event(&event, &tx).await?;
+    }
     let event = emitter.emit_in_progress();
     emitter.send_event(&event, &tx).await?;
 
@@ -627,8 +890,11 @@ async fn execute_tool_loop_streaming_internal(
             mcp_list_tools_emitted = true;
         }
 
-        // Convert to chat request
-        let mut chat_request = match conversions::responses_to_chat(&current_request) {
+        // Convert to chat request, the MCP tools in its tool list
+        let mut chat_request = match conversions::responses_to_chat_with_mcp_tools(
+            &current_request,
+            &mcp_chat_tools,
+        ) {
             Ok(request) => request,
             Err(e) => {
                 let message = format!("Failed to convert request: {e}");
@@ -641,8 +907,8 @@ async fn execute_tool_loop_streaming_internal(
             }
         };
 
-        // Prepare tools and tool_choice for this iteration (same logic as non-streaming)
-        prepare_chat_tools_and_choice(&mut chat_request, &mcp_chat_tools, state.iteration);
+        // Prepare tool_choice for this iteration (same logic as non-streaming)
+        prepare_tool_choice(&mut chat_request, state.iteration);
         state.iteration += 1;
         Metrics::record_mcp_tool_iteration(&current_request.model);
 
@@ -704,219 +970,18 @@ async fn execute_tool_loop_streaming_internal(
         }
 
         if !tool_calls.is_empty() {
-            trace!(
-                "Tool loop iteration {}: found {} tool call(s)",
-                state.iteration,
-                tool_calls.len()
-            );
-
-            // Separate MCP and function tool calls using session-exposed names.
-            let (mut mcp_tool_calls, function_tool_calls): (Vec<ExtractedToolCall>, Vec<_>) =
-                tool_calls
-                    .into_iter()
-                    .partition(|tc| session.has_exposed_tool(tc.name.as_str()));
-
-            trace!(
-                "Separated tool calls: {} MCP, {} function",
-                mcp_tool_calls.len(),
-                function_tool_calls.len()
-            );
-
-            let tool_call_limit =
-                apply_mcp_tool_call_limit(&mut mcp_tool_calls, state.total_calls, max_tool_calls);
+            let (mcp_tool_calls, function_tool_calls, tool_call_limit) =
+                partition_tool_calls(tool_calls, &session, &state, max_tool_calls, true);
 
             // Process each MCP tool call
+            let site = CallSite {
+                session: &session,
+                format_registry: &ctx.mcp_format_registry,
+                original_request,
+                model: &current_request.model,
+            };
             for tool_call in mcp_tool_calls {
-                state.total_calls += 1;
-
-                trace!(
-                    "Executing tool call {}/{}: {} (call_id: {})",
-                    state.total_calls,
-                    state.total_calls,
-                    tool_call.name,
-                    tool_call.call_id
-                );
-
-                let response_format = openai_bridge::lookup_tool_format(
-                    &session,
-                    &ctx.mcp_format_registry,
-                    &tool_call.name,
-                );
-
-                // Use emitter helpers to determine correct type and allocate index
-                let item_type =
-                    ResponseStreamEventEmitter::type_str_for_format(Some(&response_format));
-                let resolved_label = session.resolve_tool_server_label(&tool_call.name);
-
-                // Allocate output_index with the format's id-prefix discriminator
-                // (e.g. `ws_…` for web_search_call); see FormatDescriptor.
-                let (output_index, item_id) =
-                    emitter.allocate_output_index_for_format(Some(response_format));
-
-                // Build initial tool call item
-                let mut item = json!({
-                    "id": item_id,
-                    "type": item_type,
-                    "name": tool_call.name,
-                    "status": "in_progress",
-                    "arguments": ""
-                });
-                attach_mcp_server_label(
-                    &mut item,
-                    Some(resolved_label.as_str()),
-                    Some(&response_format),
-                );
-
-                // Emit output_item.added
-                let event = emitter.emit_output_item_added(output_index, &item);
-                emitter.send_event(&event, &tx).await?;
-
-                // Emit tool_call.in_progress
-                let event =
-                    emitter.emit_tool_call_in_progress(output_index, &item_id, response_format);
-                emitter.send_event(&event, &tx).await?;
-
-                // Emit arguments events for mcp_call only (skip for builtin tools)
-                if matches!(response_format, ResponseFormat::Passthrough) {
-                    // Emit mcp_call_arguments.delta (simulate streaming by sending full arguments)
-                    let event = emitter.emit_mcp_call_arguments_delta(
-                        output_index,
-                        &item_id,
-                        &tool_call.arguments,
-                    );
-                    emitter.send_event(&event, &tx).await?;
-
-                    // Emit mcp_call_arguments.done
-                    let event = emitter.emit_mcp_call_arguments_done(
-                        output_index,
-                        &item_id,
-                        &tool_call.arguments,
-                    );
-                    emitter.send_event(&event, &tx).await?;
-                }
-
-                // Emit searching/interpreting event for builtin tools
-                if let Some(event) =
-                    emitter.emit_tool_call_searching(output_index, &item_id, response_format)
-                {
-                    emitter.send_event(&event, &tx).await?;
-                }
-
-                // Execute the MCP tool
-                trace!(
-                    "Calling MCP tool '{}' with args: {}",
-                    tool_call.name,
-                    tool_call.arguments
-                );
-                // Parse arguments to Value, coercing scalar/array/null payloads
-                // to an empty object so hosted-tool override merge can actually
-                // apply. `apply_hosted_tool_overrides` is a no-op on non-objects;
-                // silently dropping caller-declared config would be surprising.
-                let mut arguments = match serde_json::from_str::<Value>(&tool_call.arguments) {
-                    Ok(Value::Object(map)) => Value::Object(map),
-                    _ => json!({}),
-                };
-                prepare_hosted_dispatch_args(
-                    &mut arguments,
-                    response_format,
-                    original_request.tools.as_deref().unwrap_or(&[]),
-                    original_request.user.as_deref(),
-                );
-
-                // Execute the single tool via the normalized MCP execution API.
-                // This avoids custom serialization and manual re-transformation in streaming paths.
-                let tool_output = session
-                    .execute_tool(ToolExecutionInput {
-                        call_id: tool_call.call_id.clone(),
-                        tool_name: tool_call.name.clone(),
-                        arguments,
-                    })
-                    .await;
-
-                let success = !tool_output.is_error;
-                let output_str = tool_output.output.to_string();
-
-                let output_item =
-                    openai_bridge::transform_tool_output(&tool_output, response_format);
-                let mut item_done = serde_json::to_value(&output_item).unwrap_or_else(|e| {
-                    warn!(
-                        tool = %tool_output.tool_name,
-                        error = %e,
-                        "Failed to serialize transformed output item; falling back to a minimal stub",
-                    );
-                    json!({
-                        "id": item_id,
-                        "type": item_type,
-                        "status": if success { "completed" } else { "failed" },
-                    })
-                });
-                // Override the typed item's id so output_item.done matches the
-                // streaming-allocated id used by the earlier output_item.added.
-                if let Some(obj) = item_done.as_object_mut() {
-                    obj.insert("id".to_string(), json!(&item_id));
-                }
-                attach_mcp_server_label(
-                    &mut item_done,
-                    Some(tool_output.server_label.as_str()),
-                    Some(&response_format),
-                );
-
-                if success {
-                    let event =
-                        emitter.emit_tool_call_completed(output_index, &item_id, response_format);
-                    emitter.send_event(&event, &tx).await?;
-                } else {
-                    let err_text = tool_output
-                        .error_message
-                        .clone()
-                        .unwrap_or_else(|| output_str.clone());
-                    warn!("Tool execution returned error: {}", err_text);
-
-                    // `response.mcp_call.failed` is the only `*.failed` event
-                    // in the Responses API. Hosted-builtin families close via
-                    // `*.completed` to mirror OpenAI cloud's wire shape;
-                    // the failure context (when present) lives in the item
-                    // content.
-                    if matches!(response_format, ResponseFormat::Passthrough) {
-                        let event = emitter.emit_mcp_call_failed(output_index, &item_id, &err_text);
-                        emitter.send_event(&event, &tx).await?;
-                    } else {
-                        let event = emitter.emit_tool_call_completed(
-                            output_index,
-                            &item_id,
-                            response_format,
-                        );
-                        emitter.send_event(&event, &tx).await?;
-                    }
-                }
-
-                let event = emitter.emit_output_item_done(output_index, &item_done);
-                emitter.send_event(&event, &tx).await?;
-                emitter.complete_output_item(output_index);
-
-                Metrics::record_mcp_tool_duration(
-                    &current_request.model,
-                    &tool_output.tool_name,
-                    tool_output.duration,
-                );
-                Metrics::record_mcp_tool_call(
-                    &current_request.model,
-                    &tool_output.tool_name,
-                    if success {
-                        metrics_labels::RESULT_SUCCESS
-                    } else {
-                        metrics_labels::RESULT_ERROR
-                    },
-                );
-
-                state.record_call(
-                    tool_output.call_id,
-                    tool_output.tool_name,
-                    tool_output.arguments_str,
-                    output_str,
-                    output_item,
-                    success,
-                );
+                stream_mcp_call(&site, &mut state, &mut emitter, &tx, tool_call).await?;
             }
 
             if let Some(limit) = tool_call_limit {
@@ -964,9 +1029,45 @@ async fn execute_tool_loop_streaming_internal(
     };
 
     let terminal_usage = state.usage.as_ref().map(|usage| json!(usage));
-    emitter
-        .emit_terminal(terminal_usage.as_ref(), terminal_error.as_ref(), &tx)
-        .await
+    // The final object, read before the terminal event drains the emitter's
+    // items; a background response needs its terminal record under the id
+    // the client polls.
+    let mut final_response = emitter.finalize(None);
+    final_response.usage = state.usage.clone().map(ResponsesUsage::Modern);
+    if let Some(error) = terminal_error.clone() {
+        // The emitter learns of the failure from the terminal event, which
+        // now follows the final object: the stored record says failed itself.
+        final_response.status = ResponseStatus::Failed;
+        final_response.incomplete_details = None;
+        final_response.error = Some(error);
+    }
+    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
+    let persist = persist_response_if_needed(
+        ctx.conversation_storage.clone(),
+        ctx.conversation_item_storage.clone(),
+        ctx.response_storage.clone(),
+        &final_response,
+        original_request,
+        tenant.as_deref(),
+        ctx.request_context.clone(),
+    );
+    if stored_foreground(original_request) {
+        // Written before its terminal event: a record that could not be
+        // written ends the stream with response.failed.
+        let not_stored = persist.await.err().map(|e| e.error_object());
+        let error = terminal_error.as_ref().or(not_stored.as_ref());
+        emitter
+            .emit_terminal(terminal_usage.as_ref(), error, &tx)
+            .await?;
+    } else {
+        emitter
+            .emit_terminal(terminal_usage.as_ref(), terminal_error.as_ref(), &tx)
+            .await?;
+        if let Err(e) = persist.await {
+            debug!(response_id = %final_response.id, error = %e.message, "Response not stored");
+        }
+    }
+    Ok(())
 }
 
 /// Convert chat stream to Responses API events while accumulating for tool call detection
@@ -985,70 +1086,53 @@ async fn convert_and_accumulate_stream(
 
     // A frame holds one or more SSE events; every one of them counts.
     'frames: while let Some(chunk_result) = stream.next().await {
-        let chunk = chunk_result.map_err(|error| {
-            json!({
-                "code": "stream_error", "message": format!("Stream read error: {error}"),
-            })
-        })?;
+        let chunk = chunk_result.map_err(|error| stream_read_error(&error))?;
         let frame = String::from_utf8_lossy(&chunk);
-        for event in sse_events(&frame) {
-            if event == "data: [DONE]" {
-                break 'frames;
-            }
-            let Some(json_str) = event.strip_prefix("data: ") else {
-                continue;
+        for event in chat_sse_events(&frame) {
+            let mut chat_chunk = match event {
+                ChatSseEvent::Done => break 'frames,
+                ChatSseEvent::Chunk(chunk) => chunk,
+                ChatSseEvent::UpstreamError(error) => return Err(error),
+                ChatSseEvent::Other(_) => continue,
             };
-            let json_str = json_str.trim();
-            if let Ok(mut chat_chunk) =
-                serde_json::from_str::<ChatCompletionStreamResponse>(json_str)
-            {
-                // Keep all calls for server execution; only client-owned calls
-                // may be exposed as Responses function_call items and events.
-                accumulator.process_chunk(&chat_chunk);
-                if let Some(choice) = chat_chunk.choices.first_mut() {
-                    if let Some(calls) = choice.delta.tool_calls.take() {
-                        let mut visible = Vec::new();
-                        for call in calls {
-                            let index = call.index;
-                            if let Some(name) = call
-                                .function
-                                .as_ref()
-                                .and_then(|f| f.name.as_deref())
-                                .filter(|name| !name.is_empty())
-                            {
-                                mcp_indices
-                                    .entry(index)
-                                    .or_insert_with(|| is_mcp_tool(name));
-                            }
-                            pending.entry(index).or_default().push(call);
-                            if let Some(is_mcp) = mcp_indices.get(&index) {
-                                if let Some(deltas) = pending.remove(&index) {
-                                    if !is_mcp {
-                                        visible.extend(deltas);
-                                    }
+            // Keep all calls for server execution; only client-owned calls
+            // may be exposed as Responses function_call items and events.
+            accumulator.process_chunk(&chat_chunk);
+            if let Some(choice) = chat_chunk.choices.first_mut() {
+                if let Some(calls) = choice.delta.tool_calls.take() {
+                    let mut visible = Vec::new();
+                    for call in calls {
+                        let index = call.index;
+                        if let Some(name) = call
+                            .function
+                            .as_ref()
+                            .and_then(|f| f.name.as_deref())
+                            .filter(|name| !name.is_empty())
+                        {
+                            mcp_indices
+                                .entry(index)
+                                .or_insert_with(|| is_mcp_tool(name));
+                        }
+                        pending.entry(index).or_default().push(call);
+                        if let Some(is_mcp) = mcp_indices.get(&index) {
+                            if let Some(deltas) = pending.remove(&index) {
+                                if !is_mcp {
+                                    visible.extend(deltas);
                                 }
                             }
                         }
-                        choice.delta.tool_calls = (!visible.is_empty()).then_some(visible);
                     }
-                }
-                emitter
-                    .process_chunk(&chat_chunk, tx)
-                    .await
-                    .map_err(|message| {
-                        json!({
-                            "code": "stream_error", "message": message,
-                        })
-                    })?;
-            } else if let Ok(value) = serde_json::from_str::<Value>(json_str) {
-                if let Some(error) = value.get("error") {
-                    return Err(json!({
-                        "code": error.get("code").and_then(Value::as_str)
-                            .or_else(|| error.get("type").and_then(Value::as_str)).unwrap_or("server_error"),
-                        "message": error.get("message").and_then(Value::as_str).unwrap_or("Upstream generation failed"),
-                    }));
+                    choice.delta.tool_calls = (!visible.is_empty()).then_some(visible);
                 }
             }
+            emitter
+                .process_chunk(&chat_chunk, tx)
+                .await
+                .map_err(|message| {
+                    json!({
+                        "code": "stream_error", "message": message,
+                    })
+                })?;
         }
     }
     Ok(accumulator.finalize())
@@ -1156,6 +1240,7 @@ impl ChatResponseAccumulator {
                         Some(self.content)
                     },
                     refusal: None,
+                    annotations: Vec::new(),
                     tool_calls: if tool_calls.is_empty() {
                         None
                     } else {
@@ -1207,6 +1292,65 @@ mod tests {
         );
         assert!(usage.get("prompt_tokens").is_none());
         assert!(usage.get("completion_tokens").is_none());
+    }
+
+    #[tokio::test]
+    async fn terminal_stream_preserves_cache_and_reasoning_usage() {
+        for cached in [Some(0), Some(6), None] {
+            let mut usage = Usage::from_counts(12, 7).with_reasoning_tokens(2);
+            if let Some(cached) = cached {
+                usage = usage.with_cached_tokens(cached);
+            }
+            let chunk = ChatCompletionStreamResponse::builder("chat_test", "test-model")
+                .usage(usage)
+                .build();
+            let frames = vec![
+                format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap()),
+                "data: [DONE]\n\n".into(),
+            ];
+            let body = Body::from_stream(futures_util::stream::iter(
+                frames.into_iter().map(Ok::<_, std::convert::Infallible>),
+            ));
+            let (tx, mut rx) = mpsc::channel(64);
+            process_and_transform_sse_stream(
+                body,
+                ResponsesRequest {
+                    store: Some(false),
+                    ..Default::default()
+                },
+                None,
+                Arc::new(smg_data_connector::MemoryResponseStorage::new()),
+                Arc::new(smg_data_connector::MemoryConversationStorage::new()),
+                Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+                None,
+                None,
+                tx,
+            )
+            .await
+            .unwrap();
+            let mut terminal = None;
+            while let Some(Ok(bytes)) = rx.recv().await {
+                let text = std::str::from_utf8(&bytes).unwrap();
+                let data = text
+                    .lines()
+                    .find_map(|line| line.strip_prefix("data: "))
+                    .unwrap();
+                let event: Value = serde_json::from_str(data).unwrap();
+                if event["type"] == "response.completed" {
+                    terminal = Some(event);
+                }
+            }
+            let terminal = terminal.expect("completed event must be emitted");
+            let usage = &terminal["response"]["usage"];
+            assert_eq!(usage["input_tokens"], 12);
+            assert_eq!(usage["output_tokens"], 7);
+            assert_eq!(usage["total_tokens"], 19);
+            assert_eq!(usage["output_tokens_details"]["reasoning_tokens"], 2);
+            assert_eq!(
+                usage["input_tokens_details"]["cached_tokens"],
+                cached.unwrap_or(0)
+            );
+        }
     }
 
     #[test]
@@ -1355,9 +1499,11 @@ mod tests {
                 store: Some(false),
                 ..Default::default()
             },
+            None,
             Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
             None,
             tx,
         )
@@ -1619,6 +1765,48 @@ mod tests {
             .contains("connection reset"));
     }
 
+    /// One reader for the chat stream's events: chunks, the error event as
+    /// the terminal's error object (`code`, else `type`, else `server_error`;
+    /// `message`, else the generic wording), the terminator, and every other
+    /// data event left to the caller; lines that are not data events are
+    /// nobody's.
+    #[test]
+    fn the_chat_sse_reader_sorts_a_frames_events() {
+        let frame = concat!(
+            ": keep-alive\n\n",
+            "data: {\"id\":\"chat_test\",\"object\":\"chat.completion.chunk\",\"created\":0,\
+             \"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\
+             \"finish_reason\":null}]}\n\n",
+            "data: {\"unexpected\":true}\n\n",
+            "data: {\"error\":{\"type\":\"internal_error\",\"message\":\"engine unavailable\"}}\n\n",
+            "data: {\"error\":{\"code\":\"rate_limited\"}}\n\n",
+            "data: [DONE]\n\n",
+            "data: {\"after\":\"done\"}\n\n",
+        );
+        let read: Vec<String> = chat_sse_events(frame)
+            .map(|event| match event {
+                ChatSseEvent::Chunk(chunk) => format!(
+                    "chunk:{}",
+                    chunk.choices[0].delta.content.as_deref().unwrap_or("")
+                ),
+                ChatSseEvent::UpstreamError(error) => format!("error:{error}"),
+                ChatSseEvent::Done => "done".to_string(),
+                ChatSseEvent::Other(event) => format!("other:{event}"),
+            })
+            .collect();
+        assert_eq!(
+            read,
+            [
+                "chunk:hi",
+                "other:data: {\"unexpected\":true}",
+                "error:{\"code\":\"internal_error\",\"message\":\"engine unavailable\"}",
+                "error:{\"code\":\"rate_limited\",\"message\":\"Upstream generation failed\"}",
+                "done",
+                "other:data: {\"after\":\"done\"}",
+            ]
+        );
+    }
+
     /// One chat chunk as the SSE event the chat stream writes for it.
     fn chat_event(delta: Value, finish_reason: Option<&str>) -> String {
         format!(
@@ -1658,9 +1846,11 @@ mod tests {
                 store: Some(false),
                 ..Default::default()
             },
+            None,
             Arc::new(smg_data_connector::MemoryResponseStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationStorage::new()),
             Arc::new(smg_data_connector::MemoryConversationItemStorage::new()),
+            None,
             None,
             tx,
         )

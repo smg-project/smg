@@ -1,6 +1,9 @@
 // Ported from the Apache-2.0 reference `vllm-engine-core-client`
 // (vllm-project/vllm): protocol/structured_outputs.rs.
 
+use std::{borrow::Cow, fmt::Write as _, sync::OnceLock};
+
+use memchr::memmem;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
@@ -9,16 +12,24 @@ use crate::error::{Error, Result};
 /// Structured-output backend selected for EngineCore grammar compilation.
 ///
 /// Python stores this in `StructuredOutputsParams._backend` after request
-/// validation and the engine uses it as is. A sender that knows the engine's
-/// configured backend pins it on every request; otherwise this client picks
-/// one per constraint: structural tags require xgrammar (the triggered-tags
-/// format is not understood by guidance's legacy structures/triggers parser);
-/// everything else lowers to guidance.
+/// validation and the engine uses it as is. The engine's structured-output
+/// manager builds one backend per process, from the first structured request
+/// it sees, and compiles every later request on that one whatever its own
+/// `_backend` says. A sender that knows the engine's configured backend pins
+/// it on every request; otherwise this client stamps the default, xgrammar,
+/// on every constraint: a structural tag in the triggered-tags format
+/// compiles on xgrammar alone (guidance's parser knows only the legacy
+/// structures/triggers shape), so an engine that may receive one must settle
+/// on xgrammar whichever constraint reaches it first. xgrammar compiles a
+/// JSON schema with features it lacks with those keywords dropped (an answer
+/// off the schema, not an error), so a sender that stamps it refuses such a
+/// schema before it reaches the engine, as vLLM's frontend does under
+/// `backend=xgrammar` ([`has_xgrammar_unsupported_json_features`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StructuredOutputBackend {
-    Xgrammar,
     #[default]
+    Xgrammar,
     Guidance,
     Outlines,
     LmFormatEnforcer,
@@ -62,7 +73,7 @@ pub struct StructuredOutputsParams {
     pub constraint: StructuredOutputConstraint,
     pub options: StructuredOutputOptions,
     /// Structured-output backend, mirroring Python's internal `_backend`: the
-    /// one the sender pinned, else the per-constraint default.
+    /// one the sender pinned, else the default ([`StructuredOutputBackend`]).
     pub backend: StructuredOutputBackend,
 }
 
@@ -93,12 +104,17 @@ impl StructuredOutputsParams {
         ))
     }
 
+    /// The constraint under the default backend. A choice stays a choice
+    /// here: the sender pins the engine's backend through
+    /// [`with_backend`](Self::with_backend) before it sends, which lowers a
+    /// choice to the grammar xgrammar compiles and keeps it for a backend
+    /// that serves choices itself (guidance); lowering here would hand that
+    /// backend a grammar it does not parse.
     fn from_constraint(constraint: StructuredOutputConstraint) -> Self {
-        let backend = default_backend(&constraint);
         Self {
             constraint,
             options: StructuredOutputOptions::default(),
-            backend,
+            backend: StructuredOutputBackend::default(),
         }
     }
 
@@ -114,47 +130,6 @@ impl StructuredOutputsParams {
         }
         self.backend = backend;
         self
-    }
-
-    /// [`with_backend`](Self::with_backend) with the backend vLLM's `auto`
-    /// resolves to for this constraint ([`auto_backend`]).
-    pub fn with_auto_backend(self) -> Self {
-        let backend = auto_backend(&self.constraint);
-        self.with_backend(backend)
-    }
-}
-
-/// The backend vLLM's frontend settles on under `--structured-outputs-config
-/// backend=auto` (`SamplingParams.update_from_tokenizer`, the `auto` branch):
-/// xgrammar, unless the constraint is a JSON schema with features xgrammar
-/// does not compile, which falls back to guidance, or to outlines when
-/// guidance cannot compile it either. These are the frontend's static checks;
-/// the xgrammar parse it also runs needs xgrammar itself, so a regex or
-/// grammar xgrammar rejects fails at the engine's grammar compile (that
-/// request only) instead of falling back.
-pub fn auto_backend(constraint: &StructuredOutputConstraint) -> StructuredOutputBackend {
-    let StructuredOutputConstraint::Json(schema) = constraint else {
-        return StructuredOutputBackend::Xgrammar;
-    };
-    // A schema string is parsed as the frontend parses it; one that is not
-    // JSON is left to xgrammar, which refuses it at compile.
-    let parsed: Value;
-    let schema = match schema {
-        Value::String(text) => match serde_json::from_str::<Value>(text) {
-            Ok(value) => {
-                parsed = value;
-                &parsed
-            }
-            Err(_) => return StructuredOutputBackend::Xgrammar,
-        },
-        other => other,
-    };
-    if !has_xgrammar_unsupported_json_features(schema) {
-        StructuredOutputBackend::Xgrammar
-    } else if has_guidance_unsupported_json_features(schema) {
-        StructuredOutputBackend::Outlines
-    } else {
-        StructuredOutputBackend::Guidance
     }
 }
 
@@ -186,86 +161,202 @@ pub fn choice_as_grammar(choices: &[String]) -> String {
     format!("root ::= {}", alternatives.join(" | "))
 }
 
-/// Whether a nested schema value (an object, or an array of objects) fails
-/// `check`, the recursion both feature checks share.
-fn any_nested(obj: &serde_json::Map<String, Value>, check: fn(&Value) -> bool) -> bool {
-    obj.values().any(|value| match value {
-        Value::Object(_) => check(value),
-        Value::Array(items) => items.iter().any(|item| item.is_object() && check(item)),
-        _ => false,
-    })
+/// A JSON-schema feature xgrammar's converter drops instead of refusing, as
+/// [`xgrammar_unsupported_json_feature`] finds it: the keyword (or the
+/// keywords that conflict; a `format` with its value), and the JSON pointer
+/// (RFC 6901) of the schema object that carries it, from the schema the check
+/// was given (empty at its root). For a feature inside a structural tag the
+/// pointer runs from the tag's root, and `openers` holds the `begin` text of
+/// each tag around the schema, outermost first: a call's tag opens with the
+/// tool's name in the template's syntax, so they name the tool; empty for a
+/// schema outside any tag (a JSON answer's)
+/// ([`xgrammar_unsupported_feature_in_structural_tag`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XgrammarUnsupportedFeature {
+    pub keyword: Cow<'static, str>,
+    pub pointer: String,
+    pub openers: Vec<String>,
 }
 
 /// vLLM's `has_xgrammar_unsupported_json_features`
-/// (`v1/structured_output/backend_xgrammar.py`), keyword for keyword.
-fn has_xgrammar_unsupported_json_features(schema: &Value) -> bool {
-    const STRING_SUPPORTED_FORMATS: [&str; 14] = [
-        "email",
-        "date",
-        "time",
-        "date-time",
-        "duration",
-        "ipv4",
-        "ipv6",
-        "hostname",
-        "uuid",
-        "uri",
-        "uri-reference",
-        "uri-template",
-        "json-pointer",
-        "relative-json-pointer",
-    ];
-    fn schema_types(obj: &serde_json::Map<String, Value>) -> Vec<&str> {
-        match obj.get("type") {
-            Some(Value::String(one)) => vec![one.as_str()],
-            Some(Value::Array(items)) => items.iter().filter_map(Value::as_str).collect(),
-            _ => Vec::new(),
+/// (`v1/structured_output/backend_xgrammar.py`), keyword for keyword: the
+/// schema features xgrammar's converter drops instead of refusing. vLLM's
+/// frontend refuses such a schema with a 400 under `backend=xgrammar`
+/// (`validate_xgrammar_grammar`); a sender stamping xgrammar does the same. A
+/// schema given as a string is parsed as the frontend parses it; one that is
+/// not JSON is left to xgrammar, which refuses it at compile.
+pub fn has_xgrammar_unsupported_json_features(schema: &Value) -> bool {
+    xgrammar_unsupported_json_feature(schema).is_some()
+}
+
+/// The first feature of `schema` xgrammar cannot enforce, in the order of
+/// vLLM's rules ([`has_xgrammar_unsupported_json_features`]), with where it
+/// stands; `None` for a schema xgrammar compiles whole.
+pub fn xgrammar_unsupported_json_feature(schema: &Value) -> Option<XgrammarUnsupportedFeature> {
+    let parsed: Value;
+    let schema = match schema {
+        Value::String(text) => match serde_json::from_str::<Value>(text) {
+            Ok(value) => {
+                parsed = value;
+                &parsed
+            }
+            Err(_) => return None,
+        },
+        other => other,
+    };
+    let mut pointer = String::new();
+    let keyword = unsupported_in(schema, &mut pointer)?;
+    Some(XgrammarUnsupportedFeature {
+        keyword,
+        pointer,
+        openers: Vec::new(),
+    })
+}
+
+/// [`xgrammar_unsupported_json_feature`] for a schema as its text: the text
+/// is scanned for the rules' keywords first
+/// ([`text_names_an_xgrammar_unsupported_keyword`]) and parsed only when it
+/// names one, so the common schema costs the scan alone.
+pub fn xgrammar_unsupported_feature_in_schema_text(
+    schema: &str,
+) -> Option<XgrammarUnsupportedFeature> {
+    if !text_names_an_xgrammar_unsupported_keyword(schema) {
+        return None;
+    }
+    let schema: Value = serde_json::from_str(schema).ok()?;
+    xgrammar_unsupported_json_feature(&schema)
+}
+
+/// The first feature xgrammar cannot enforce among the `json_schema` elements
+/// of a structural tag (xgrammar compiles each with the converter a
+/// JSON-schema constraint goes through, the same keywords dropped), with the
+/// pointer from the tag's root
+/// (`/format/tags/1/content/json_schema/properties/tags`) and the tags around
+/// it by their `begin`; `None` for a tag that carries none, and for one that
+/// is not JSON, which xgrammar refuses at compile. The tag's text is scanned
+/// for the rules' keywords first
+/// ([`text_names_an_xgrammar_unsupported_keyword`]): a tag that names none
+/// carries none and is not parsed, so a forced call pays the scan alone for
+/// the common tag.
+pub fn xgrammar_unsupported_feature_in_structural_tag(
+    tag: &str,
+) -> Option<XgrammarUnsupportedFeature> {
+    if !text_names_an_xgrammar_unsupported_keyword(tag) {
+        return None;
+    }
+    let tag: Value = serde_json::from_str(tag).ok()?;
+    let mut pointer = String::new();
+    let mut openers = Vec::new();
+    let keyword = unsupported_in_tag(&tag, &mut pointer, &mut openers)?;
+    Some(XgrammarUnsupportedFeature {
+        keyword,
+        pointer,
+        openers,
+    })
+}
+
+/// The string formats xgrammar's converter knows; any other is dropped.
+const STRING_SUPPORTED_FORMATS: [&str; 14] = [
+    "email",
+    "date",
+    "time",
+    "date-time",
+    "duration",
+    "ipv4",
+    "ipv6",
+    "hostname",
+    "uuid",
+    "uri",
+    "uri-reference",
+    "uri-template",
+    "json-pointer",
+    "relative-json-pointer",
+];
+
+/// The rules on one schema object, then on its nested schemas (an object
+/// value, or the objects of an array value), as vLLM's check recurses.
+/// `pointer` holds the path down to `value` and is cut back on the way up, so
+/// it reads the hit's path when one returns.
+fn unsupported_in(value: &Value, pointer: &mut String) -> Option<Cow<'static, str>> {
+    let Value::Object(obj) = value else {
+        return None;
+    };
+    if let Some(keyword) = unsupported_keyword_of(obj) {
+        return Some(keyword);
+    }
+    for (key, nested) in obj {
+        match nested {
+            Value::Object(_) => {
+                let len = pointer.len();
+                push_segment(pointer, key);
+                if let Some(keyword) = unsupported_in(nested, pointer) {
+                    return Some(keyword);
+                }
+                pointer.truncate(len);
+            }
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    if !item.is_object() {
+                        continue;
+                    }
+                    let len = pointer.len();
+                    push_segment(pointer, key);
+                    let _ = write!(pointer, "/{index}");
+                    if let Some(keyword) = unsupported_in(item, pointer) {
+                        return Some(keyword);
+                    }
+                    pointer.truncate(len);
+                }
+            }
+            _ => {}
         }
     }
-    fn has_pattern_and_length_bounds(obj: &serde_json::Map<String, Value>) -> bool {
-        (obj.contains_key("pattern") || obj.contains_key("format"))
-            && (obj.contains_key("minLength") || obj.contains_key("maxLength"))
+    None
+}
+
+/// The rule one schema object breaks, as its keyword (a `format` with the
+/// value xgrammar does not know): vLLM's checks in their order, or `None`.
+fn unsupported_keyword_of(obj: &serde_json::Map<String, Value>) -> Option<Cow<'static, str>> {
+    let kind = obj.get("type");
+    let has = |wanted: &str| match kind {
+        Some(Value::String(one)) => one == wanted,
+        Some(Value::Array(items)) => items.iter().any(|item| item.as_str() == Some(wanted)),
+        _ => false,
+    };
+    if (has("integer") || has("number")) && obj.contains_key("multipleOf") {
+        return Some("multipleOf".into());
     }
-    fn check(value: &Value) -> bool {
-        let Value::Object(obj) = value else {
-            return false;
-        };
-        let types = schema_types(obj);
-        let has = |kind: &str| types.contains(&kind);
-        if (has("integer") || has("number")) && obj.contains_key("multipleOf") {
-            return true;
+    if has("array") {
+        for key in ["uniqueItems", "contains", "minContains", "maxContains"] {
+            if obj.contains_key(key) {
+                return Some(key.into());
+            }
         }
-        if has("array")
-            && ["uniqueItems", "contains", "minContains", "maxContains"]
-                .iter()
-                .any(|key| obj.contains_key(*key))
-        {
-            return true;
-        }
-        if has("string")
-            && obj.get("format").is_some_and(|format| {
-                !format
-                    .as_str()
-                    .is_some_and(|format| STRING_SUPPORTED_FORMATS.contains(&format))
-            })
-        {
-            return true;
+    }
+    if has("string") {
+        if let Some(format) = obj.get("format") {
+            if !format
+                .as_str()
+                .is_some_and(|format| STRING_SUPPORTED_FORMATS.contains(&format))
+            {
+                return Some(format!("format: {format}").into());
+            }
         }
         // xgrammar drops minLength/maxLength next to a pattern or format.
-        if has("string") && has_pattern_and_length_bounds(obj) {
-            return true;
+        if has_pattern_and_length_bounds(obj) {
+            return Some("minLength/maxLength beside pattern or format".into());
         }
-        if has("object")
-            && obj
-                .get("propertyNames")
-                .and_then(Value::as_object)
-                .is_some_and(has_pattern_and_length_bounds)
+    }
+    if has("object") {
+        if obj
+            .get("propertyNames")
+            .and_then(Value::as_object)
+            .is_some_and(has_pattern_and_length_bounds)
         {
-            return true;
+            return Some("propertyNames with minLength/maxLength beside pattern or format".into());
         }
         // propertyNames conflicts with the other property keywords.
-        if has("object")
-            && obj.contains_key("propertyNames")
+        if obj.contains_key("propertyNames")
             && (obj.contains_key("properties")
                 || obj.contains_key("patternProperties")
                 || obj
@@ -275,44 +366,147 @@ fn has_xgrammar_unsupported_json_features(schema: &Value) -> bool {
                     .get("unevaluatedProperties")
                     .is_some_and(|value| *value != Value::Bool(true)))
         {
-            return true;
+            return Some("propertyNames beside other property keywords".into());
         }
         // Several patternProperties, or one next to properties, conflict.
-        if has("object")
-            && obj
-                .get("patternProperties")
-                .and_then(Value::as_object)
-                .is_some_and(|patterns| obj.contains_key("properties") || patterns.len() > 1)
+        if obj
+            .get("patternProperties")
+            .and_then(Value::as_object)
+            .is_some_and(|patterns| obj.contains_key("properties") || patterns.len() > 1)
         {
+            return Some("patternProperties beside properties, or more than one".into());
+        }
+    }
+    None
+}
+
+fn has_pattern_and_length_bounds(obj: &serde_json::Map<String, Value>) -> bool {
+    (obj.contains_key("pattern") || obj.contains_key("format"))
+        && (obj.contains_key("minLength") || obj.contains_key("maxLength"))
+}
+
+/// [`unsupported_in`] at every `json_schema` element under `value` (an object
+/// with `"type": "json_schema"`, its schema under `json_schema`), the tag's
+/// other objects and arrays walked for them; `pointer` as there, and
+/// `openers` the `begin` of each tag on the way down (an object with one),
+/// taken back on the way up, so it reads the tags around the hit when one
+/// returns.
+fn unsupported_in_tag(
+    value: &Value,
+    pointer: &mut String,
+    openers: &mut Vec<String>,
+) -> Option<Cow<'static, str>> {
+    match value {
+        Value::Object(obj) => {
+            if obj.get("type").and_then(Value::as_str) == Some("json_schema") {
+                let schema = obj.get("json_schema")?;
+                push_segment(pointer, "json_schema");
+                return unsupported_in(schema, pointer);
+            }
+            let opens = obj.get("begin").and_then(Value::as_str);
+            if let Some(begin) = opens {
+                openers.push(begin.to_string());
+            }
+            for (key, nested) in obj {
+                let len = pointer.len();
+                push_segment(pointer, key);
+                if let Some(keyword) = unsupported_in_tag(nested, pointer, openers) {
+                    return Some(keyword);
+                }
+                pointer.truncate(len);
+            }
+            if opens.is_some() {
+                openers.pop();
+            }
+            None
+        }
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                let len = pointer.len();
+                let _ = write!(pointer, "/{index}");
+                if let Some(keyword) = unsupported_in_tag(item, pointer, openers) {
+                    return Some(keyword);
+                }
+                pointer.truncate(len);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// `key` behind `/` as a JSON pointer segment, `~` and `/` escaped as RFC
+/// 6901 has them.
+fn push_segment(pointer: &mut String, key: &str) {
+    pointer.push('/');
+    if !key.contains(['~', '/']) {
+        pointer.push_str(key);
+        return;
+    }
+    for ch in key.chars() {
+        match ch {
+            '~' => pointer.push_str("~0"),
+            '/' => pointer.push_str("~1"),
+            other => pointer.push(other),
+        }
+    }
+}
+
+/// Whether `text`, a JSON schema or a structural tag as a JSON serializer
+/// writes it, names a keyword one of the rules reads: `multipleOf`,
+/// `uniqueItems`, `contains` (`minContains`, `maxContains` with it),
+/// `minLength`/`maxLength` (a `pattern` matters only beside them),
+/// `propertyNames`, `patternProperties`, or a `format` whose value is not an
+/// object. A text that names none breaks no rule, so its caller skips the
+/// parse; one that does is parsed and checked, a string that ends in
+/// `Length` or `Contains` costing the parse and no more. The one exception: a
+/// `format` with an object for its value is not looked for, since a
+/// structural tag's own `format` key and a property named `format` hold
+/// objects, so a string schema with an object for its `format` (no schema
+/// writes one; the rule would flag it, as vLLM's does) is left to the engine.
+fn text_names_an_xgrammar_unsupported_keyword(text: &str) -> bool {
+    static KEYWORDS: OnceLock<Vec<memmem::Finder<'static>>> = OnceLock::new();
+    static FORMAT: OnceLock<memmem::Finder<'static>> = OnceLock::new();
+    let bytes = text.as_bytes();
+    const NAMED: [&[u8]; 7] = [
+        b"\"multipleOf\"",
+        b"\"uniqueItems\"",
+        b"\"contains\"",
+        b"Contains\"",
+        b"Length\"",
+        b"\"propertyNames\"",
+        b"\"patternProperties\"",
+    ];
+    let keywords = KEYWORDS.get_or_init(|| {
+        NAMED
+            .iter()
+            .map(|name| memmem::Finder::new(*name))
+            .collect()
+    });
+    if keywords.iter().any(|keyword| keyword.find(bytes).is_some()) {
+        return true;
+    }
+    let format = FORMAT.get_or_init(|| memmem::Finder::new(b"\"format\""));
+    let mut rest = bytes;
+    while let Some(at) = format.find(rest) {
+        rest = &rest[at + b"\"format\"".len()..];
+        let Some(value) = json_whitespace_trimmed(rest).strip_prefix(b":") else {
+            continue;
+        };
+        if !matches!(json_whitespace_trimmed(value).first(), None | Some(b'{')) {
             return true;
         }
-        any_nested(obj, check)
     }
-    check(schema)
+    false
 }
 
-/// vLLM's `has_guidance_unsupported_json_features`
-/// (`v1/structured_output/backend_guidance.py`): llguidance has no
-/// `patternProperties`.
-fn has_guidance_unsupported_json_features(schema: &Value) -> bool {
-    fn check(value: &Value) -> bool {
-        let Value::Object(obj) = value else {
-            return false;
-        };
-        obj.contains_key("patternProperties") || any_nested(obj, check)
-    }
-    check(schema)
-}
-
-/// The backend a constraint gets when the sender pinned none. Structural tags
-/// use the triggered-tags format that only xgrammar compiles; guidance's
-/// parser expects the legacy structures/triggers shape and fails the request
-/// at grammar build.
-fn default_backend(constraint: &StructuredOutputConstraint) -> StructuredOutputBackend {
-    match constraint {
-        StructuredOutputConstraint::StructuralTag(_) => StructuredOutputBackend::Xgrammar,
-        _ => StructuredOutputBackend::default(),
-    }
+/// `bytes` past its leading JSON whitespace.
+fn json_whitespace_trimmed(bytes: &[u8]) -> &[u8] {
+    let blank = bytes
+        .iter()
+        .take_while(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\r'))
+        .count();
+    &bytes[blank..]
 }
 
 /// `true` when a boolean is `false`; used to drop default-`false` flags from the
@@ -344,7 +538,7 @@ struct WireStructuredOutputsParams {
     structural_tag: Option<String>,
     /// The backend the sender pinned (vLLM's frontend sets it after
     /// validation; the engine reads it as is). Absent falls back to the
-    /// per-constraint default.
+    /// default.
     #[serde(default, rename = "_backend")]
     backend: Option<StructuredOutputBackend>,
 }
@@ -422,9 +616,7 @@ impl TryFrom<WireStructuredOutputsParams> for StructuredOutputsParams {
                 disable_additional_properties: raw.disable_additional_properties,
                 whitespace_pattern: raw.whitespace_pattern,
             },
-            backend: raw
-                .backend
-                .unwrap_or_else(|| default_backend(&constraint_ref)),
+            backend: raw.backend.unwrap_or_default(),
             constraint: constraint_ref,
         })
     }
@@ -490,87 +682,18 @@ mod tests {
         // `_backend` as is, so decoding keeps it and re-encoding repeats it.
         let raw = serde_json::json!({
             "json_object": true,
-            "_backend": "xgrammar",
+            "_backend": "guidance",
         });
         let params: StructuredOutputsParams = serde_json::from_value(raw).unwrap();
-        assert_eq!(params.backend, StructuredOutputBackend::Xgrammar);
+        assert_eq!(params.backend, StructuredOutputBackend::Guidance);
         assert_eq!(params.constraint, StructuredOutputConstraint::JsonObject);
         let value = serde_json::to_value(&params).unwrap();
-        assert_eq!(value["_backend"], "xgrammar");
+        assert_eq!(value["_backend"], "guidance");
 
-        // Unpinned, the per-constraint default applies.
+        // Unpinned, the default applies.
         let raw = serde_json::json!({ "json_object": true });
         let params: StructuredOutputsParams = serde_json::from_value(raw).unwrap();
-        assert_eq!(params.backend, StructuredOutputBackend::Guidance);
-    }
-
-    /// vLLM's `auto`: xgrammar unless the JSON schema uses a feature it
-    /// does not compile (then guidance, or outlines when guidance has no
-    /// `patternProperties` either); non-JSON constraints go to xgrammar.
-    #[test]
-    fn auto_backend_follows_vllms_static_checks() {
-        let json = |schema: Value| auto_backend(&StructuredOutputConstraint::Json(schema));
-        assert_eq!(
-            json(serde_json::json!({"type": "object", "properties": {"a": {"type": "integer"}}})),
-            StructuredOutputBackend::Xgrammar
-        );
-        assert_eq!(
-            json(serde_json::json!({"type": "integer", "multipleOf": 5})),
-            StructuredOutputBackend::Guidance
-        );
-        // Nested, and under a list-valued type.
-        assert_eq!(
-            json(
-                serde_json::json!({"type": "object", "properties": {"tags": {
-                "type": ["array", "null"], "uniqueItems": true}}})
-            ),
-            StructuredOutputBackend::Guidance
-        );
-        assert_eq!(
-            json(serde_json::json!({"type": "string", "format": "email"})),
-            StructuredOutputBackend::Xgrammar
-        );
-        assert_eq!(
-            json(serde_json::json!({"type": "string", "format": "iri"})),
-            StructuredOutputBackend::Guidance
-        );
-        assert_eq!(
-            json(serde_json::json!({"type": "string", "pattern": "^a", "maxLength": 3})),
-            StructuredOutputBackend::Guidance
-        );
-        assert_eq!(
-            json(
-                serde_json::json!({"type": "object", "propertyNames": {"pattern": "^x"},
-                "properties": {"x": {}}})
-            ),
-            StructuredOutputBackend::Guidance
-        );
-        // Two patternProperties fail xgrammar, and guidance has none at all.
-        assert_eq!(
-            json(serde_json::json!({"type": "object",
-                "patternProperties": {"^a": {}, "^b": {}}})),
-            StructuredOutputBackend::Outlines
-        );
-        // A schema string is parsed like the frontend parses it.
-        assert_eq!(
-            json(Value::String(
-                r#"{"type":"number","multipleOf":0.5}"#.into()
-            )),
-            StructuredOutputBackend::Guidance
-        );
-        assert_eq!(
-            json(Value::String("not json".into())),
-            StructuredOutputBackend::Xgrammar
-        );
-        for constraint in [
-            StructuredOutputConstraint::Regex("[a-z]+".into()),
-            StructuredOutputConstraint::Grammar("start: \"a\"".into()),
-            StructuredOutputConstraint::Choice(vec!["a".into()]),
-            StructuredOutputConstraint::JsonObject,
-            StructuredOutputConstraint::StructuralTag("{}".into()),
-        ] {
-            assert_eq!(auto_backend(&constraint), StructuredOutputBackend::Xgrammar);
-        }
+        assert_eq!(params.backend, StructuredOutputBackend::Xgrammar);
     }
 
     /// Pinning xgrammar rewrites a choice into the grammar vLLM's frontend
@@ -600,18 +723,13 @@ mod tests {
             .with_backend(StructuredOutputBackend::Guidance);
         assert_eq!(
             params.constraint,
-            StructuredOutputConstraint::Choice(choices.clone())
+            StructuredOutputConstraint::Choice(choices)
         );
         assert_eq!(params.backend, StructuredOutputBackend::Guidance);
 
-        // `auto` resolves to xgrammar for a choice, so it lowers too.
-        let params = StructuredOutputsParams::choice(choices).with_auto_backend();
-        assert!(matches!(
-            params.constraint,
-            StructuredOutputConstraint::Grammar(_)
-        ));
         // A Lark grammar passes to xgrammar unchanged (it parses Lark itself).
-        let params = StructuredOutputsParams::grammar("start: \"a\" | \"b\"").with_auto_backend();
+        let params = StructuredOutputsParams::grammar("start: \"a\" | \"b\"")
+            .with_backend(StructuredOutputBackend::Xgrammar);
         assert_eq!(params.backend, StructuredOutputBackend::Xgrammar);
         assert_eq!(
             params.constraint,
@@ -619,16 +737,73 @@ mod tests {
         );
     }
 
+    /// The engine keeps the backend of its first structured request for its
+    /// life, and the triggered-tags format compiles on xgrammar alone: every
+    /// constraint is stamped xgrammar unless the sender pins another, so the
+    /// kind that reaches a fresh engine first never decides whether a later
+    /// structural tag compiles.
     #[test]
-    fn structural_tag_selects_xgrammar_backend() {
-        // The triggered-tags format only compiles under xgrammar; guidance's
-        // legacy parser fails the request at grammar build.
-        let params = StructuredOutputsParams::structural_tag(r#"{"format":{}}"#);
-        assert_eq!(params.backend, StructuredOutputBackend::Xgrammar);
-
-        let value = serde_json::to_value(params).unwrap();
-        assert_eq!(value["_backend"], "xgrammar");
+    fn every_constraint_defaults_to_xgrammar() {
+        for params in [
+            StructuredOutputsParams::json(serde_json::json!({"type": "object"})),
+            StructuredOutputsParams::json(serde_json::json!({"type": "integer", "multipleOf": 3})),
+            StructuredOutputsParams::json_object(),
+            StructuredOutputsParams::regex("[a-z]+"),
+            StructuredOutputsParams::grammar("root ::= \"a\""),
+            StructuredOutputsParams::choice(vec!["a".into()]),
+            StructuredOutputsParams::structural_tag(r#"{"format":{}}"#),
+        ] {
+            assert_eq!(
+                params.backend,
+                StructuredOutputBackend::Xgrammar,
+                "{params:?}"
+            );
+            let value = serde_json::to_value(&params).unwrap();
+            assert_eq!(value["_backend"], "xgrammar", "{params:?}");
+        }
+        let value =
+            serde_json::to_value(StructuredOutputsParams::structural_tag(r#"{"format":{}}"#))
+                .unwrap();
         assert_eq!(value["structural_tag"], r#"{"format":{}}"#);
+    }
+
+    /// vLLM's static xgrammar feature check, the one a sender stamping
+    /// xgrammar refuses a schema by: the keywords xgrammar would drop, nested
+    /// and under a list-valued type as well; a plain object passes, and a
+    /// schema string is parsed as the frontend parses it.
+    #[test]
+    fn xgrammar_unsupported_features_are_detected() {
+        let lacks = |schema: Value| has_xgrammar_unsupported_json_features(&schema);
+        assert!(!lacks(
+            serde_json::json!({"type": "object", "properties": {"a": {"type": "integer"}}})
+        ));
+        assert!(lacks(
+            serde_json::json!({"type": "integer", "multipleOf": 5})
+        ));
+        // Nested, and under a list-valued type.
+        assert!(lacks(
+            serde_json::json!({"type": "object", "properties": {"tags": {
+            "type": ["array", "null"], "uniqueItems": true}}})
+        ));
+        assert!(!lacks(
+            serde_json::json!({"type": "string", "format": "email"})
+        ));
+        assert!(lacks(
+            serde_json::json!({"type": "string", "format": "iri"})
+        ));
+        assert!(lacks(
+            serde_json::json!({"type": "string", "pattern": "^a", "maxLength": 3})
+        ));
+        assert!(lacks(serde_json::json!({"type": "object",
+            "propertyNames": {"pattern": "^x"}, "properties": {"x": {}}})));
+        assert!(lacks(serde_json::json!({"type": "object",
+            "patternProperties": {"^a": {}, "^b": {}}})));
+        // A schema string is parsed like the frontend parses it; one that is
+        // not JSON is left to xgrammar.
+        assert!(lacks(Value::String(
+            r#"{"type":"number","multipleOf":0.5}"#.into()
+        )));
+        assert!(!lacks(Value::String("not json".into())));
     }
 
     #[test]
@@ -696,5 +871,279 @@ mod tests {
         assert_eq!(value["structural_tag"], r#"{"type":"structural_tag"}"#);
         assert_eq!(value["_backend"], "xgrammar");
         assert!(value.get("json").is_none());
+    }
+
+    /// Every rule names its keyword and the place of the schema object that
+    /// breaks it, as a JSON pointer from the schema's root: the shapes the
+    /// tool corpora carry (an array parameter under `uniqueItems`, a string
+    /// with length bounds beside a pattern), nested under an array of
+    /// objects, under a list-valued type, a key the pointer escapes, and a
+    /// schema given as text.
+    #[test]
+    fn an_unsupported_feature_is_named_with_its_place() {
+        let feature = |schema: Value| xgrammar_unsupported_json_feature(&schema);
+        let found = |keyword: &str, pointer: &str| {
+            Some(XgrammarUnsupportedFeature {
+                keyword: keyword.to_string().into(),
+                pointer: pointer.to_string(),
+                openers: Vec::new(),
+            })
+        };
+        assert_eq!(
+            feature(serde_json::json!({"type": "object", "properties": {
+                "days": {"type": "array", "items": {"type": "string", "enum": ["mon", "tue"]},
+                         "uniqueItems": true}}, "required": ["days"]})),
+            found("uniqueItems", "/properties/days")
+        );
+        assert_eq!(
+            feature(
+                serde_json::json!({"type": "object", "properties": {"listings": {
+                "type": "array", "items": {"type": "object", "properties": {
+                    "amenities": {"type": "array", "items": {"type": "string"},
+                                  "uniqueItems": true}}}}}})
+            ),
+            found(
+                "uniqueItems",
+                "/properties/listings/items/properties/amenities"
+            )
+        );
+        assert_eq!(
+            feature(
+                serde_json::json!({"type": "string", "minLength": 1, "maxLength": 100,
+                "pattern": "^[a-z]+$", "default": "hello"})
+            ),
+            found("minLength/maxLength beside pattern or format", "")
+        );
+        assert_eq!(
+            feature(serde_json::json!({"type": "object", "properties": {
+                "n": {"type": "integer", "multipleOf": 3}}})),
+            found("multipleOf", "/properties/n")
+        );
+        for key in ["contains", "minContains", "maxContains"] {
+            assert_eq!(
+                feature(serde_json::json!({"type": "object", "properties": {
+                    "xs": {"type": ["array", "null"], key: {"type": "string"}}}})),
+                found(key, "/properties/xs"),
+                "{key}"
+            );
+        }
+        assert_eq!(
+            feature(serde_json::json!({"type": "object", "properties": {
+                "data": {"type": "string", "format": "binary"}}})),
+            found("format: \"binary\"", "/properties/data")
+        );
+        assert_eq!(
+            feature(serde_json::json!({"type": "object", "properties": {
+                "when": {"type": "string", "format": "date-time"}}})),
+            None
+        );
+        assert_eq!(
+            feature(serde_json::json!({"type": "object", "propertyNames": {
+                "pattern": "^x", "maxLength": 3}})),
+            found(
+                "propertyNames with minLength/maxLength beside pattern or format",
+                ""
+            )
+        );
+        assert_eq!(
+            feature(
+                serde_json::json!({"type": "object", "propertyNames": {"pattern": "^x"},
+                "properties": {"x": {}}})
+            ),
+            found("propertyNames beside other property keywords", "")
+        );
+        assert_eq!(
+            feature(
+                serde_json::json!({"type": "object", "properties": {"m": {"type": "object",
+                "patternProperties": {"^a": {}, "^b": {}}}}})
+            ),
+            found(
+                "patternProperties beside properties, or more than one",
+                "/properties/m"
+            )
+        );
+        // Objects in an array value are walked with their index; a key with
+        // `/` or `~` is escaped in the pointer.
+        assert_eq!(
+            feature(serde_json::json!({"anyOf": [{"type": "string"},
+                {"type": "object", "properties": {"a/b~c": {"type": "integer", "multipleOf": 2}}}]})),
+            found("multipleOf", "/anyOf/1/properties/a~1b~0c")
+        );
+        assert_eq!(
+            feature(Value::String(
+                r#"{"type":"number","multipleOf":0.5}"#.into()
+            )),
+            found("multipleOf", "")
+        );
+        assert_eq!(feature(Value::String("not json".into())), None);
+        assert_eq!(
+            xgrammar_unsupported_feature_in_schema_text(
+                r#"{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string"},"uniqueItems":true}}}"#
+            ),
+            found("uniqueItems", "/properties/tags")
+        );
+        assert_eq!(
+            xgrammar_unsupported_feature_in_schema_text(
+                r#"{"type":"object","properties":{"city":{"type":"string"}}}"#
+            ),
+            None
+        );
+    }
+
+    /// A structural tag is checked at its `json_schema` elements, wherever
+    /// the format nests them, and nowhere else: the tag's own `format`,
+    /// `pattern` (a regex element) and `excludes` keys trip no rule; the
+    /// pointer runs from the tag's root, and the tags around the schema are
+    /// named by their `begin` (the call's, which carries the tool's name, and
+    /// a parameter tag's under it); a tag that is not JSON is left to the
+    /// engine.
+    #[test]
+    fn a_structural_tag_is_checked_at_its_json_schema_elements() {
+        let found = |keyword: &str, pointer: &str, openers: &[&str]| {
+            Some(XgrammarUnsupportedFeature {
+                keyword: keyword.to_string().into(),
+                pointer: pointer.to_string(),
+                openers: openers.iter().map(|begin| begin.to_string()).collect(),
+            })
+        };
+        let call = |name: &str, parameters: Value| {
+            serde_json::json!({
+                "begin": format!("<tool_call>\n{{\"name\": \"{name}\", \"arguments\": "),
+                "content": {"type": "json_schema", "json_schema": parameters,
+                            "excludes": ["</tool_call>"], "max_whitespace_cnt": 8},
+                "end": "}\n</tool_call>",
+            })
+        };
+        let plain =
+            serde_json::json!({"type": "object", "properties": {"city": {"type": "string"}}});
+        let unique = serde_json::json!({"type": "object", "properties": {
+            "tags": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}}});
+        let calls = |tags: Vec<Value>| {
+            serde_json::json!({"format": {"type": "triggered_tags", "triggers": ["<tool_call>"],
+                "tags": tags, "at_least_one": true}})
+            .to_string()
+        };
+        let opens_tagged = "<tool_call>\n{\"name\": \"tagged\", \"arguments\": ";
+        assert_eq!(
+            xgrammar_unsupported_feature_in_structural_tag(&calls(vec![
+                call("plain", plain.clone()),
+                call("tagged", unique.clone()),
+            ])),
+            found(
+                "uniqueItems",
+                "/format/tags/1/content/json_schema/properties/tags",
+                &[opens_tagged]
+            )
+        );
+        assert_eq!(
+            xgrammar_unsupported_feature_in_structural_tag(&calls(vec![call(
+                "plain",
+                plain.clone()
+            )])),
+            None
+        );
+        // Behind a reasoning prefix (a sequence), and a regex element whose
+        // `pattern` and a const string are not schemas.
+        let wrapped = serde_json::json!({"format": {"type": "sequence", "elements": [
+            {"type": "any_text", "excludes": ["<tool_call>"]},
+            {"type": "const_string", "value": "</think>"},
+            {"type": "regex", "pattern": "[ \n]{0,8}"},
+            {"type": "triggered_tags", "triggers": ["<tool_call>"],
+             "tags": [call("tagged", unique.clone())], "at_least_one": true},
+        ]}})
+        .to_string();
+        assert_eq!(
+            xgrammar_unsupported_feature_in_structural_tag(&wrapped),
+            found(
+                "uniqueItems",
+                "/format/elements/3/tags/0/content/json_schema/properties/tags",
+                &[opens_tagged]
+            )
+        );
+        // A call written as a tag per parameter: the call's tag and the
+        // parameter's are both named, the call's first; the first tag's
+        // schema, which passes, leaves no opener behind.
+        let parameter = |name: &str, schema: Value| {
+            serde_json::json!({"type": "tag", "begin": format!("<param name=\"{name}\">"),
+                "content": {"type": "json_schema", "json_schema": schema}, "end": "</param>\n"})
+        };
+        let per_parameter = serde_json::json!({"format": {"type": "tags_with_separator",
+            "tags": [{"type": "tag", "begin": "<invoke name=\"plan\">\n",
+                      "content": {"type": "sequence", "elements": [
+                          parameter("city", serde_json::json!({"type": "string"})),
+                          parameter("days", serde_json::json!({"type": "array",
+                              "items": {"type": "string"}, "uniqueItems": true}))]},
+                      "end": "</invoke>\n"}],
+            "separator": "", "at_least_one": true}})
+        .to_string();
+        assert_eq!(
+            xgrammar_unsupported_feature_in_structural_tag(&per_parameter),
+            found(
+                "uniqueItems",
+                "/format/tags/0/content/elements/1/content/json_schema",
+                &["<invoke name=\"plan\">\n", "<param name=\"days\">"]
+            )
+        );
+        // A JSON answer's schema alone: no tag around it.
+        assert_eq!(
+            xgrammar_unsupported_feature_in_structural_tag(
+                &serde_json::json!({"format": {"type": "json_schema",
+                    "json_schema": {"type": "integer", "multipleOf": 3}}})
+                .to_string()
+            ),
+            found("multipleOf", "/format/json_schema", &[])
+        );
+        assert_eq!(
+            xgrammar_unsupported_feature_in_structural_tag("<not json>"),
+            None
+        );
+    }
+
+    /// The keyword scan a constraint's text goes through before its parse:
+    /// a text that names none of the rules' keywords is not parsed; one that
+    /// does is, a `format` with any value but an object included and the
+    /// tag's own `format` object excluded, whatever the spacing; a string
+    /// schema with an object for its `format` is the documented exception
+    /// the scan does not see.
+    #[test]
+    fn the_keyword_scan_spares_the_parse_of_a_text_that_names_none() {
+        let names = text_names_an_xgrammar_unsupported_keyword;
+        assert!(!names(
+            r#"{"format":{"type":"triggered_tags","triggers":["<tool_call>"],"tags":[{"begin":"<tool_call>","content":{"type":"json_schema","json_schema":{"type":"object","properties":{"q":{"type":"string","pattern":"^a"}}}},"end":"</tool_call>"}]}}"#
+        ));
+        assert!(!names(
+            r#"{"type":"object","properties":{"city":{"type":"string","description":"the city"}}}"#
+        ));
+        for text in [
+            r#"{"type":"integer","multipleOf":3}"#,
+            r#"{"type":"array","uniqueItems":true}"#,
+            r#"{"type":"array","contains":{}}"#,
+            r#"{"type":"array","maxContains":1}"#,
+            r#"{"type":"string","pattern":"^a","maxLength":3}"#,
+            r#"{"type":"string","minLength":1,"format":"email"}"#,
+            r#"{"type":"object","propertyNames":{}}"#,
+            r#"{"type":"object","patternProperties":{}}"#,
+            r#"{"type":"string","format":"binary"}"#,
+            r#"{"type": "string", "format" : "binary"}"#,
+            r#"{"format":{"type":"json_schema","json_schema":{"type":"string","format":"iri"}}}"#,
+            // A description that ends in a keyword costs the parse, no more.
+            r#"{"type":"string","description":"the given maxLength"}"#,
+        ] {
+            assert!(names(text), "{text}");
+        }
+        assert!(!names(
+            r#"{"format":{"type":"json_schema","json_schema":{"type":"string"}}}"#
+        ));
+        assert!(!names(
+            r#"{"type":"object","properties":{"format":{"type":"string"}}}"#
+        ));
+        // A keyword is looked for as a quoted key; a word in a description is not one.
+        assert!(!names(
+            r#"{"type":"string","description":"what the box contains"}"#
+        ));
+        assert!(names(r#"{"type":"string","format":["email"]}"#));
+        assert!(names(r#"{"type":"string","format":null}"#));
+        // The exception: an object for a `format` is not seen by the scan.
+        assert!(!names(r#"{"type":"string","format":{}}"#));
     }
 }

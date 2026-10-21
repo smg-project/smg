@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from infra import BRAVE_MCP_URL
+from infra.streams import collect_streamed_response
 
 logger = logging.getLogger(__name__)
 
@@ -505,10 +506,11 @@ class TestToolCallingCloud:
             reasoning={"effort": "low"},
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
-        event_types = [event.type for event in events]
+        event_types = streamed.event_types
         assert "response.created" in event_types, "Should have response.created event"
         assert "response.completed" in event_types, "Should have response.completed event"
         assert "response.output_item.added" in event_types, "Should have output_item.added events"
@@ -530,10 +532,9 @@ class TestToolCallingCloud:
         assert "response.mcp_call.completed" in event_types, "Should have mcp_call.completed event"
         assert_streaming_mcp_call_ids_match(events)
 
-        completed_events = [e for e in events if e.type == "response.completed"]
-        assert len(completed_events) == 1
+        assert len(streamed.completed_events) == 1
 
-        final_response = completed_events[0].response
+        final_response = streamed.final_response
         assert final_response.id is not None
         assert final_response.status == "completed"
         assert final_response.output is not None
@@ -640,7 +641,8 @@ class TestToolCallingCloud:
             reasoning={"effort": "low"},
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
         list_tools_events = [
@@ -654,9 +656,8 @@ class TestToolCallingCloud:
         list_tool_labels = {event.item.server_label for event in list_tools_events}
         assert list_tool_labels == {"brave", "deepwiki"}
 
-        completed_events = [e for e in events if e.type == "response.completed"]
-        assert len(completed_events) == 1
-        final_response = completed_events[0].response
+        assert len(streamed.completed_events) == 1
+        final_response = streamed.final_response
         assert final_response.output is not None
 
         final_list_tools = [item for item in final_response.output if item.type == "mcp_list_tools"]
@@ -872,16 +873,16 @@ class TestToolChoiceGptOss:
             stream=True,
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
-        event_types = [e.type for e in events]
+        event_types = streamed.event_types
         assert "response.function_call_arguments.delta" in event_types
 
-        completed_events = [e for e in events if e.type == "response.completed"]
-        assert len(completed_events) == 1
+        assert len(streamed.completed_events) == 1
 
-        output = completed_events[0].response.output
+        output = streamed.final_response.output
         function_calls = [item for item in output if item.type == "function_call"]
         assert len(function_calls) > 0
 
@@ -1023,10 +1024,11 @@ class TestToolChoiceGptOss:
             reasoning={"effort": "low"},
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
-        event_types = [event.type for event in events]
+        event_types = streamed.event_types
         assert "response.created" in event_types
         assert "response.completed" in event_types
         assert "response.mcp_list_tools.completed" in event_types
@@ -1070,10 +1072,11 @@ class TestToolChoiceGptOss:
             tool_choice="auto",
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
-        event_types = [e.type for e in events]
+        event_types = streamed.event_types
         assert "response.created" in event_types
         assert "response.mcp_list_tools.completed" in event_types
         assert "response.function_call_arguments.delta" in event_types
@@ -1126,7 +1129,8 @@ class TestToolChoiceGptOss:
             reasoning={"effort": "low"},
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
         list_tools_events = [
@@ -1140,9 +1144,8 @@ class TestToolChoiceGptOss:
         list_tool_labels = {event.item.server_label for event in list_tools_events}
         assert list_tool_labels == {"brave", "deepwiki"}
 
-        completed_events = [e for e in events if e.type == "response.completed"]
-        assert len(completed_events) == 1
-        final_response = completed_events[0].response
+        assert len(streamed.completed_events) == 1
+        final_response = streamed.final_response
         assert final_response.output is not None
 
         final_list_tools = [item for item in final_response.output if item.type == "mcp_list_tools"]
@@ -1268,10 +1271,11 @@ class TestToolChoiceLocal:
             reasoning={"effort": "low"},
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
-        event_types = [event.type for event in events]
+        event_types = streamed.event_types
         assert "response.created" in event_types
         assert "response.completed" in event_types
 
@@ -1376,10 +1380,11 @@ class TestToolChoiceLocal:
             tool_choice="auto",
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
-        event_types = [e.type for e in events]
+        event_types = streamed.event_types
         assert "response.created" in event_types
         assert "response.mcp_list_tools.completed" in event_types
         assert "response.function_call_arguments.delta" in event_types
@@ -1432,7 +1437,8 @@ class TestToolChoiceLocal:
             reasoning={"effort": "low"},
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
         list_tools_events = [
@@ -1446,9 +1452,8 @@ class TestToolChoiceLocal:
         list_tool_labels = {event.item.server_label for event in list_tools_events}
         assert list_tool_labels == {"brave", "deepwiki"}
 
-        completed_events = [e for e in events if e.type == "response.completed"]
-        assert len(completed_events) == 1
-        final_response = completed_events[0].response
+        assert len(streamed.completed_events) == 1
+        final_response = streamed.final_response
         assert final_response.output is not None
 
         final_list_tools = [item for item in final_response.output if item.type == "mcp_list_tools"]

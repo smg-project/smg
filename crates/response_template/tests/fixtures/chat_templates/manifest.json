@@ -1,0 +1,61 @@
+{
+ "transformers": "5.18.0",
+ "jinja2": "3.1.6",
+ "python": "3.12",
+ "generator": "zyhjxmpngwwhsrrr",
+ "now": 0,
+ "sources": [
+  {
+   "id": "Qwen/Qwen3.5-9B",
+   "revision": "c20223623576",
+   "license": "apache-2.0",
+   "copied": true,
+   "settings": [
+    "default",
+    "disable_thinking"
+   ],
+   "files": {
+    "tokenizer_config.json": "khpjkgxptrgsqghz",
+    "chat_template.jinja": "tmtyyrtzwzjygqhh"
+   }
+  },
+  {
+   "id": "meta-models/Muse-Glimmer-30B",
+   "revision": "a4e59da52a7b",
+   "license": "apache-2.0",
+   "copied": true,
+   "settings": [
+    "default"
+   ],
+   "files": {
+    "tokenizer_config.json": "qrhypwqmznqhpmjw",
+    "chat_template.jinja": "wzwpqynzkmszkqps"
+   }
+  }
+ ],
+ "pairs": [
+  {
+   "response_template": "serve/qwen3_5",
+   "chat_template": "Qwen/Qwen3.5-9B",
+   "layout": true
+  },
+  {
+   "response_template": "trl/qwen3_5",
+   "chat_template": "Qwen/Qwen3.5-9B",
+   "layout": true
+  },
+  {
+   "response_template": "hub/muse-glimmer",
+   "chat_template": "meta-models/Muse-Glimmer-30B",
+   "layout": true
+  }
+ ],
+ "counts": {
+  "templates": 2,
+  "copied": 2,
+  "renders": 42,
+  "render_errors": 0
+ },
+ "digest": "sha256 of the file bytes (of the canonical JSON for a response template), first 8 bytes, nibbles as ghjkmnpqrstvwxyz",
+ "license": "The chat templates and their renders come from the Hugging Face repositories named in sources, under the licenses their model cards declare."
+}

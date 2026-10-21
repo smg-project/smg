@@ -88,6 +88,16 @@ Signed-off-by: Your Name <your.email@example.com>
 
 ---
 
+## Words for disaggregated serving
+
+The gateway's prefill-decode code uses one word per thing, so a reader never has to guess which of three meanings is meant:
+
+- the two halves of one disaggregated dispatch are its **sides** (the prefill side, the decode side; `PdSide`, `PrefillBound`, `DecodeBound`);
+- a worker's prefill-decode function is its **role** (`WorkerRole::{Single, Prefill, Decode}`), and the set of workers of one role is a **pool**;
+- a single worker, a stream or a call is called what it is (`worker`, `UpstreamStream`).
+
+"Leg" is not used for any of these: it meant all three at once, and it does not come back in code, comments, test names or log lines. Metric names and labels keep their published spelling.
+
 ## Pull requests
 
 - **Fill in the [PR template](./.github/PULL_REQUEST_TEMPLATE.md)** — especially
@@ -147,9 +157,12 @@ edits, so upstream syncs stay conflict-free.
 | `SMG_RUNNER_DOCKER` | `cpu-e5` | docker / engine image build and push |
 | `SMG_RUNNER_GPU` | `k8s-runner-gpu` | GPU jobs with no fixed GPU count |
 | `SMG_RUNNER_GPU_1` | `1-gpu-h100` | 1-GPU e2e jobs |
+| `SMG_RUNNER_AMD_GPU_1` | `1-gpu-mi300x` | AMD row of the 1-GPU chat e2e job (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 | `SMG_RUNNER_GPU_2` | `2-gpu-h100` | 2-GPU e2e jobs |
 | `SMG_RUNNER_GPU_4` | `4-gpu-h100` | 4-GPU e2e and benchmark jobs |
+| `SMG_RUNNER_AMD_GPU_4` | `4-gpu-mi300x` | AMD nightly benchmark (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 | `SMG_RUNNER_GPU_8` | `8-gpu-h200` | 8-GPU benchmark jobs |
+| `SMG_RUNNER_AMD_GPU_8` | `8-gpu-mi300x` | AMD legs of the BFCL A/B and AMD rows of the nightly PD sweep (off unless `SMG_RUN_AMD_LEGS` is `true`) |
 
 GitHub-hosted labels (`ubuntu-latest`, `macos-latest`) are left as-is — every
 fork already has those.

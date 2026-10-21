@@ -1,22 +1,29 @@
 #!/usr/bin/env python3
-"""Generate compact HuggingFace reference fingerprints for Qwen preprocessing.
+"""Generate compact reference fingerprints for Qwen preprocessing.
 
-The processor classes are constructed locally, so this script does not download
+The reference processors are the torchvision-backed image and video processors
+the serving engines run, constructed locally, so this script does not download
 model weights or configuration. Its output is checked into the Rust integration
 test as an external correctness oracle for resize, normalization, and patchify.
+The resize oracle is torch's antialiased `uint8` bicubic reached through
+torchvision; the document records the torch and torchvision versions it was
+generated with, since that kernel's dispatch has changed across releases.
 """
 
 import json
 
 import numpy as np
+import torch
+import torchvision
 from PIL import Image
 from PIL import __version__ as pillow_version
-from transformers import Qwen2VLImageProcessor
 from transformers import __version__ as transformers_version
-from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
-    Qwen3VLVideoProcessor,
-    smart_resize,
-)
+from transformers.models.qwen3_vl.video_processing_qwen3_vl import Qwen3VLVideoProcessor
+
+if int(transformers_version.split(".")[0]) >= 5:
+    from transformers import Qwen2VLImageProcessor
+else:
+    from transformers import Qwen2VLImageProcessorFast as Qwen2VLImageProcessor
 
 CASES = ((37, 23), (259, 194))
 
@@ -69,28 +76,11 @@ def processor_cases(name: str, processor: Qwen2VLImageProcessor) -> list[dict]:
 def qwen3_video_case(processor: Qwen3VLVideoProcessor) -> dict:
     width, height = 37, 35
     seeds = (3, 101, 177)
-    temporal_patch_size = 2
-    target_height, target_width = smart_resize(
-        len(seeds),
-        height,
-        width,
-        temporal_factor=temporal_patch_size,
-        factor=32,
-        min_pixels=4096,
-        max_pixels=25165824,
-    )
-    # Keep PIL as the resize oracle for SMG's PIL-compatible kernel, then use
-    # the real HF video processor for temporal padding and patchification.
-    frames = [
-        make_image(width, height, seed).resize(
-            (target_width, target_height),
-            Image.Resampling.BICUBIC,
-        )
-        for seed in seeds
-    ]
+    # The reference video processor resizes the frames itself (its torchvision
+    # kernel), then pads temporally and patchifies.
+    frames = [make_image(width, height, seed) for seed in seeds]
     output = processor(
         videos=[frames],
-        do_resize=False,
         do_normalize=False,
         do_sample_frames=False,
         return_tensors="pt",
@@ -142,6 +132,8 @@ def main() -> None:
     document = {
         "generator": "generate_qwen_preprocess_fingerprints.py",
         "transformers": transformers_version,
+        "torch": torch.__version__,
+        "torchvision": torchvision.__version__,
         "pillow": pillow_version,
         "cases": processor_cases("qwen2_vl", qwen2) + processor_cases("qwen3_vl", qwen3),
         "video_cases": [qwen3_video_case(qwen3_video)],

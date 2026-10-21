@@ -92,7 +92,7 @@ fn payload_bytes(
     payload: Option<vllm::tensor_data::Payload>,
 ) -> Result<Vec<u8>, String> {
     match payload {
-        Some(vllm::tensor_data::Payload::Inline(data)) => Ok(data),
+        Some(vllm::tensor_data::Payload::Inline(data)) => Ok(Vec::from(data)),
         Some(vllm::tensor_data::Payload::Shm(handle)) => read_shm_payload(name, &handle),
         Some(vllm::tensor_data::Payload::Remote(_)) => Err(format!(
             "multimodal tensor {name:?}: TensorData.remote payload is not implemented yet"
@@ -302,7 +302,7 @@ fn mm_key(key: &str, is_video: bool) -> String {
 }
 
 /// Whether a batch carries tensors the preprocessed path can use: pixels, or
-/// the grid-only form of a PD decode leg. A bare identity payload (hashes
+/// the grid-only form of a PD decode side. A bare identity payload (hashes
 /// only) is not, and rides `cache_salt` instead.
 fn has_preprocessed_payload(mm: &vllm::MultimodalInputs) -> bool {
     mm.pixel_values.is_some() || !mm.model_specific_tensors.is_empty()
@@ -324,7 +324,7 @@ fn identity_cache_salt(batches: &[vllm::MultimodalInputs]) -> Option<String> {
 /// become on the wire: per-item `mm_features` in prompt order, or, for a
 /// tensor-less identity payload, the `cache_salt` carrying the hashes. The
 /// rules are the Python servicer's: a pixel-less (grid-only) batch is a PD
-/// decode leg and needs remote KV, or the engine would run the encoder with
+/// decode side and needs remote KV, or the engine would run the encoder with
 /// nothing to encode.
 pub(crate) fn translate_batches(
     batches: Vec<vllm::MultimodalInputs>,
@@ -582,7 +582,7 @@ mod tests {
         vllm::TensorData {
             shape,
             dtype: dtype.to_string(),
-            payload: Some(vllm::tensor_data::Payload::Inline(data)),
+            payload: Some(vllm::tensor_data::Payload::Inline(data.into())),
         }
     }
 
@@ -953,7 +953,7 @@ mod tests {
     /// batches merge in prompt order, a tensor-less identity payload becomes a
     /// cache salt, and a grid-only (pixel-less) batch needs remote KV.
     #[test]
-    fn translate_batches_merges_salts_and_gates_pixel_less_legs() {
+    fn translate_batches_merges_salts_and_gates_pixel_less_sides() {
         // Two batches: the second one's placeholders sit before the first's.
         let mut second = base_inputs();
         second.mm_placeholders = placeholders(&[(0, 1), (12, 1)]);
@@ -993,7 +993,7 @@ mod tests {
         assert!(features.is_none());
         assert_eq!(salt.as_deref(), Some("mm:h0,h1"));
 
-        // Grid only (a PD decode leg): refused without remote KV, built with it.
+        // Grid only (a PD decode side): refused without remote KV, built with it.
         let grid_only = || {
             let mut mm = base_inputs();
             mm.pixel_values = None;
@@ -1009,7 +1009,7 @@ mod tests {
         assert!(err.contains("requires remote KV"), "{err}");
         let (features, _) =
             translate_batches(vec![grid_only()], &[0; 9], ModelDtype::BFloat16, true)
-                .expect("decode leg");
+                .expect("decode side");
         let features = features.expect("grid features");
         assert_eq!(features.len(), 2);
         let item = features[0].data.as_ref().expect("item");

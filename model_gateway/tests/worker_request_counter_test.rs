@@ -21,7 +21,7 @@
 #[path = "common/mod.rs"]
 mod common;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     body::Body,
@@ -30,22 +30,22 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use common::test_app::{create_test_app_context, create_test_app_with_context};
-use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
-use openai_protocol::{
-    completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
+use common::{
+    grpc_harness::{
+        build_grpc_router, grpc_router_config, health_checks_off, serve_canned_worker, Canned,
+    },
+    test_app::{create_test_app_context, create_test_app_with_context},
 };
+use openai_protocol::{completion::CompletionRequest, model_card::ModelCard};
 use serde_json::json;
 use smg::{
-    config::{RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
     observability::{
         metrics::{start_prometheus, PrometheusConfig},
         metrics_server::start_metrics_server,
     },
     routers::{
-        factory::router_ids, gateway::Gateway, http::router::Router as HttpRouter, RouterFactory,
-        RouterTrait,
+        factory::router_ids, gateway::Gateway, http::router::Router as HttpRouter, RouterTrait,
     },
     tenant::TenantKey,
     worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType},
@@ -56,7 +56,9 @@ use tower::ServiceExt;
 const MODEL: &str = "counter-test-model";
 
 async fn scrape(addr: SocketAddr) -> String {
-    reqwest::get(format!("http://{addr}/metrics"))
+    smg::clients::http_client()
+        .get(format!("http://{addr}/metrics"))
+        .send()
         .await
         .expect("metrics endpoint reachable")
         .text()
@@ -76,13 +78,6 @@ fn requests_total(body: &str, worker_url: &str) -> Option<u64> {
             );
             line.rsplit(' ').next().unwrap().parse().unwrap()
         })
-}
-
-fn health_checks_off() -> HealthCheckConfig {
-    HealthCheckConfig {
-        disable_health_check: true,
-        ..Default::default()
-    }
 }
 
 /// An HTTP upstream that answers every `/generate` with a completion.
@@ -127,50 +122,21 @@ fn generate_request() -> Request {
 
 /// An in-process mock gRPC engine that answers any prompt.
 async fn start_grpc_upstream() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let cfg = Arc::new(mock_worker::config::Config {
-        admin_port: None,
-        http_count: 0,
-        grpc_base_port: port,
-        grpc_count: 1,
-        zmq_count: 0,
-        model_id: MODEL.to_string(),
-        tokenizer_path: MODEL.to_string(),
+    let port = serve_canned_worker(Canned {
+        model: MODEL,
+        gen_delay: Duration::ZERO,
         output_tokens: 2,
-        realistic: false,
-        ..mock_worker::config::Config::default()
-    });
-    tokio::spawn(mock_worker::grpc::serve_with_listener(cfg, listener));
+    })
+    .await;
     format!("grpc://127.0.0.1:{port}")
 }
 
 /// The production gRPC router with one regular worker at `upstream`.
 async fn grpc_router(upstream: &str) -> Box<dyn RouterTrait> {
-    let mut config = RouterConfig::builder()
-        .mode(RoutingMode::Regular {
-            worker_urls: vec![],
-        })
-        .grpc_connection()
+    let config = grpc_router_config()
+        .regular_mode(vec![])
         .random_policy()
-        .host("127.0.0.1")
-        .port(0)
-        .max_payload_size(1024 * 1024)
         .build_unchecked();
-    config.health_check.disable_health_check = true;
-
-    let tokenizer_registry = Arc::new(TokenizerRegistry::new());
-    let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
-    tokenizer_registry
-        .load(
-            "tokenizer-id",
-            MODEL,
-            "test",
-            || async move { Ok(tokenizer) },
-        )
-        .await
-        .unwrap();
-    let ctx = common::create_test_context_with_tokenizer_registry(config, tokenizer_registry).await;
     let worker: Arc<dyn Worker> = Arc::new(
         BasicWorkerBuilder::new(upstream)
             .worker_type(WorkerType::Regular)
@@ -180,10 +146,7 @@ async fn grpc_router(upstream: &str) -> Box<dyn RouterTrait> {
             .health_config(health_checks_off())
             .build(),
     );
-    ctx.worker_registry.register(worker).unwrap();
-    RouterFactory::create_router(&ctx)
-        .await
-        .expect("gRPC router should build")
+    build_grpc_router(config, MODEL, vec![worker]).await
 }
 
 fn completion() -> CompletionRequest {

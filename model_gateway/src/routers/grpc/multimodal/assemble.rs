@@ -11,8 +11,8 @@ use std::{
 
 use anyhow::{Context, Result};
 use llm_multimodal::{
-    EncoderFieldLayouts, EncoderInputView, FieldLayout, Modality, ModelSpecificValue,
-    PlaceholderRange, PreprocessedEncoderInputs,
+    EncoderDtype, EncoderFieldLayouts, EncoderInput, EncoderInputView, FieldLayout, Modality,
+    ModelSpecificValue, PlaceholderRange, PreprocessedEncoderInputs,
 };
 use smg_grpc_client::common_proto as common;
 use tracing::{info, warn};
@@ -21,8 +21,8 @@ use super::{
     capability::ensure_backend_supports_modalities,
     log_mm_timing_enabled,
     serialize::{
-        model_specific_to_tensor_bytes, serialize_encoder_input, serialize_model_specific,
-        serialize_tokenspeed_encoder_input,
+        model_specific_to_tensor_bytes, serialize_encoder_input_owned, serialize_model_specific,
+        serialize_tokenspeed_encoder_input, serialize_tokenspeed_encoder_input_owned, wire_dtype,
     },
     transport::{
         mm_encoder_input_dtype, mm_vllm_device_normalizes, mm_vllm_encoder_input_dtype,
@@ -164,7 +164,7 @@ async fn spawn_tokenspeed_assembly(
 ) -> Result<TokenSpeedMultimodalData> {
     let batches = intermediate.into_batches();
     let pending = tokio::task::spawn_blocking(move || {
-        assemble_tokenspeed_batches(&batches, options).map(PendingTokenSpeedAssembly::new)
+        assemble_tokenspeed_batches_owned(batches, options).map(PendingTokenSpeedAssembly::new)
     })
     .await
     .context("TokenSpeed multimodal assembly task failed")??;
@@ -233,6 +233,17 @@ impl VllmAssembly {
             shm_min_bytes: resolve_mm_shm_min_bytes(workers),
         }
     }
+
+    /// The dtype this assembly writes an image encoder input in, known
+    /// before the images are preprocessed; `None` when the engine takes the
+    /// pixels' own bytes.
+    pub(super) fn image_wire_dtype(&self) -> Option<EncoderDtype> {
+        if self.device_normalizes {
+            return None;
+        }
+        let dtype = wire_dtype(&self.encoder_dtype, true);
+        (dtype != EncoderDtype::Uint8).then_some(dtype)
+    }
 }
 
 /// [`assemble_vllm_batches`] with the wire choices given.
@@ -286,7 +297,7 @@ fn assemble_sglang(
     // Pinned to float32: nothing on this wire reports which widths the worker
     // accepts, and the three names it does document are all four bytes or wider.
     let (pixel_values, pixel_values_shape, pixel_values_dtype) =
-        serialize_encoder_input(&intermediate.preprocessed, "float32");
+        serialize_encoder_input_owned(intermediate.preprocessed.encoder_input, "float32")?;
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);
     let MediaBatch::Images(images) = &intermediate.media else {
         anyhow::bail!("SGLang assembly requires an image batch");
@@ -338,7 +349,7 @@ fn assemble_vllm(
 ) -> Result<VllmMultimodalData> {
     let dtype = vllm_pixel_dtype(&intermediate.preprocessed, assembly);
     let (pixel_values, pixel_values_shape, pixel_values_dtype) =
-        serialize_encoder_input(&intermediate.preprocessed, dtype);
+        serialize_encoder_input_owned(intermediate.preprocessed.encoder_input, dtype)?;
     let model_specific_tensors = serialize_model_specific(intermediate.preprocessed.model_specific);
     let (modality, mm_hashes) = match &intermediate.media {
         MediaBatch::Images(images) => (
@@ -420,7 +431,7 @@ fn assemble_tokenspeed(
     validate_precomputed_batch(intermediate)?;
     let options =
         tokenspeed_assembly_options(intermediate.media.modality(), workers, skip_pixel_values);
-    assemble_tokenspeed_with_options(intermediate, options)
+    assemble_tokenspeed_with_options(intermediate, options, None)
 }
 
 pub(crate) fn assemble_tokenspeed_for_encode(
@@ -456,9 +467,13 @@ fn tokenspeed_assembly_options(
     }
 }
 
+/// `owned_input` is the batch's encoder input when the caller handed it over
+/// whole (see [`take_whole_encoder_input`]); its one item then moves those
+/// bytes into its payload instead of writing a copy of its view.
 fn assemble_tokenspeed_with_options(
     intermediate: &PrecomputedMultimodalIntermediate,
     options: TokenSpeedAssemblyOptions,
+    mut owned_input: Option<EncoderInput>,
 ) -> Result<TokenSpeedMultimodalData> {
     let log_timing = log_mm_timing_enabled();
     let total_started = Instant::now();
@@ -511,6 +526,19 @@ fn assemble_tokenspeed_with_options(
         // the per-item slice + serialize entirely when skip_pixel_values is set.
         let encoder_input = if skip_pixel_values {
             TokenSpeedTensor::inline(Vec::new(), Vec::new(), encoder_input_dtype.clone())
+        } else if let Some(input) = owned_input.take() {
+            match serialize_tokenspeed_encoder_input_owned(
+                input,
+                &encoder_input_dtype,
+                shm_enabled,
+                shm_min_bytes,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    cleanup_tokenspeed_items_encoder_shm(&items, None);
+                    return Err(error);
+                }
+            }
         } else {
             let item_encoder_input = match encoder_input_for_item(
                 &intermediate.preprocessed,
@@ -523,12 +551,18 @@ fn assemble_tokenspeed_with_options(
                     return Err(error);
                 }
             };
-            serialize_tokenspeed_encoder_input(
+            match serialize_tokenspeed_encoder_input(
                 &item_encoder_input,
                 &encoder_input_dtype,
                 shm_enabled,
                 shm_min_bytes,
-            )
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    cleanup_tokenspeed_items_encoder_shm(&items, None);
+                    return Err(error);
+                }
+            }
         };
         let encoder_input_serialize_ms = encoder_input_started.elapsed().as_secs_f64() * 1000.0;
         let model_specific_started = Instant::now();
@@ -586,12 +620,60 @@ fn assemble_tokenspeed_with_options(
     })
 }
 
+/// Batches the caller keeps: every item's encoder input is written from its
+/// view.
 fn assemble_tokenspeed_batches(
     batches: &[PrecomputedMultimodalIntermediate],
     options: Vec<TokenSpeedAssemblyOptions>,
 ) -> Result<TokenSpeedMultimodalData> {
+    let none = batches.iter().map(|_| None).collect();
+    assemble_tokenspeed_batches_with(batches, options, none)
+}
+
+/// Batches the caller hands over: a batch whose one item is the whole encoder
+/// input moves that input into the item's payload instead of writing a copy.
+fn assemble_tokenspeed_batches_owned(
+    mut batches: Vec<PrecomputedMultimodalIntermediate>,
+    options: Vec<TokenSpeedAssemblyOptions>,
+) -> Result<TokenSpeedMultimodalData> {
+    let owned = batches.iter_mut().map(take_whole_encoder_input).collect();
+    assemble_tokenspeed_batches_with(&batches, options, owned)
+}
+
+/// The encoder input of a batch whose single item spans all of it, taken out
+/// of the batch; an empty tensor stays in its place, which no per-item step
+/// reads. `None` for every other batch, whose items are written from views.
+fn take_whole_encoder_input(batch: &mut PrecomputedMultimodalIntermediate) -> Option<EncoderInput> {
+    let [binding] = batch.bindings.as_slice() else {
+        return None;
+    };
+    let item_index = binding.item_index;
+    if batch.media.len() != 1 {
+        return None;
+    }
+    let whole = batch.preprocessed.encoder_input.view();
+    let item = encoder_input_for_item(
+        &batch.preprocessed,
+        &batch.field_layouts.encoder_input,
+        item_index,
+    )
+    .ok()?;
+    if whole.is_empty() || item.len() != whole.len() {
+        return None;
+    }
+    Some(std::mem::replace(
+        &mut batch.preprocessed.encoder_input,
+        EncoderInput::F32(ndarray::ArrayD::zeros(ndarray::IxDyn(&[0]))),
+    ))
+}
+
+fn assemble_tokenspeed_batches_with(
+    batches: &[PrecomputedMultimodalIntermediate],
+    options: Vec<TokenSpeedAssemblyOptions>,
+    owned_inputs: Vec<Option<EncoderInput>>,
+) -> Result<TokenSpeedMultimodalData> {
     anyhow::ensure!(
-        batches.len() == options.len(),
+        batches.len() == options.len() && batches.len() == owned_inputs.len(),
         "multimodal batch/assembly option count mismatch"
     );
 
@@ -602,8 +684,8 @@ fn assemble_tokenspeed_batches(
     let shm_min_bytes = options.first().map(|opts| opts.shm_min_bytes).unwrap_or(0);
     let mut ordered_items: Vec<(usize, TokenSpeedMultimodalItem)> = Vec::new();
 
-    for (batch, options) in batches.iter().zip(options) {
-        match assemble_tokenspeed_with_options(batch, options) {
+    for ((batch, options), owned_input) in batches.iter().zip(options).zip(owned_inputs) {
+        match assemble_tokenspeed_with_options(batch, options, owned_input) {
             Ok(data) => {
                 let mut ordinals = batch
                     .bindings
@@ -1044,8 +1126,163 @@ mod tests {
         assert!(!path.exists());
     }
 
+    /// One image whose flat span is the whole encoder input: the tensor
+    /// handed over by value moves into the item's payload, and the item is
+    /// the same as the one written from a view of it.
+    fn single_image_intermediate() -> PrecomputedMultimodalIntermediate {
+        let mut model_specific = HashMap::new();
+        model_specific.insert(
+            "patches_per_image".to_string(),
+            ModelSpecificValue::UintTensor {
+                data: vec![4],
+                shape: vec![1],
+            },
+        );
+        let preprocessed = PreprocessedEncoderInputs {
+            encoder_input: ArrayD::from_shape_vec(
+                IxDyn(&[4, 2]),
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            )
+            .unwrap()
+            .into(),
+            feature_token_counts: vec![4],
+            item_sizes: vec![(1, 1)],
+            model_specific,
+        };
+        PrecomputedMultimodalIntermediate {
+            preprocessed,
+            media: MediaBatch::Images(vec![Arc::new(ImageFrame::new(
+                image::DynamicImage::new_rgb8(1, 1),
+                bytes::Bytes::from_static(b"a"),
+                ImageDetail::Auto,
+                llm_multimodal::ImageSource::InlineBytes,
+                "hash-a".to_string(),
+            ))]),
+            bindings: vec![PromptBinding {
+                item_index: 0,
+                prompt_ordinal: 0,
+                structural: PlaceholderRange {
+                    offset: 10,
+                    length: 4,
+                },
+                patches: vec![PlaceholderRange {
+                    offset: 10,
+                    length: 4,
+                }],
+            }],
+            placeholder_token_id: Some(151655),
+            field_layouts: EncoderFieldLayouts::new(
+                FieldLayout::flat("patches_per_image"),
+                HashMap::from([("patches_per_image".to_string(), FieldLayout::Batched)]),
+            ),
+            keep_on_cpu_keys: vec![],
+            encoder_input_key: None,
+        }
+    }
+
     #[test]
-    fn assemble_tokenspeed_splits_image_items() {
+    fn a_single_whole_item_moves_its_encoder_input_into_the_same_payload() {
+        use crate::routers::grpc::proto_wrapper::TokenSpeedTensorStorage;
+
+        let borrowed = assemble_tokenspeed(&single_image_intermediate(), None, false).unwrap();
+        let mut taken = single_image_intermediate();
+        assert!(take_whole_encoder_input(&mut taken).is_some());
+        assert_eq!(taken.preprocessed.encoder_input.view().len(), 0);
+
+        let options = vec![tokenspeed_assembly_options(Modality::Image, None, false)];
+        let owned =
+            assemble_tokenspeed_batches_owned(vec![single_image_intermediate()], options).unwrap();
+        assert_eq!(owned.items.len(), 1);
+        let (a, b) = (
+            &borrowed.items[0].encoder_input,
+            &owned.items[0].encoder_input,
+        );
+        assert_eq!(a.shape, b.shape);
+        assert_eq!(a.dtype, b.dtype);
+        match (&a.storage, &b.storage) {
+            (TokenSpeedTensorStorage::Inline(x), TokenSpeedTensorStorage::Inline(y)) => {
+                assert_eq!(x, y);
+                // Eight bfloat16 values, two bytes each.
+                assert_eq!(x.len(), 16);
+            }
+            other => panic!("inline payloads expected, got {other:?}"),
+        }
+        assert_eq!(
+            owned.items[0].mm_placeholders,
+            borrowed.items[0].mm_placeholders
+        );
+        assert_eq!(owned.items[0].content_hash, borrowed.items[0].content_hash);
+    }
+
+    /// The production case of the move: the one-pass wire buffer, already
+    /// in the dtype the worker reads, handed over whole.
+    fn single_image_wire_intermediate() -> PrecomputedMultimodalIntermediate {
+        use llm_multimodal::PixelNorm;
+        let mut intermediate = single_image_intermediate();
+        // Eight bfloat16 values with the shape [4, 2]: 1.0, 2.0, ... 8.0.
+        let bytes: Vec<u8> = [
+            0x3f80u16, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0, 0x40e0, 0x4100,
+        ]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+        intermediate.preprocessed.encoder_input = EncoderInput::wire(
+            bytes,
+            EncoderDtype::BFloat16,
+            vec![4, 2],
+            PixelNorm {
+                scale: 1.0,
+                offset: [0.0; 3],
+                divisor: [1.0; 3],
+                channel_block: 512,
+            },
+        )
+        .expect("a wire of the shape's length");
+        intermediate
+    }
+
+    #[test]
+    fn a_single_whole_wire_item_moves_its_own_bytes_into_the_payload() {
+        use crate::routers::grpc::proto_wrapper::TokenSpeedTensorStorage;
+
+        let wire_bytes = match &single_image_wire_intermediate().preprocessed.encoder_input {
+            EncoderInput::Wire { bytes, .. } => bytes.clone(),
+            other => panic!("a wire input expected, got {other:?}"),
+        };
+        let borrowed = assemble_tokenspeed(&single_image_wire_intermediate(), None, false).unwrap();
+        let options = vec![tokenspeed_assembly_options(Modality::Image, None, false)];
+        let owned =
+            assemble_tokenspeed_batches_owned(vec![single_image_wire_intermediate()], options)
+                .unwrap();
+        let (a, b) = (
+            &borrowed.items[0].encoder_input,
+            &owned.items[0].encoder_input,
+        );
+        assert_eq!(a.shape, vec![4, 2]);
+        assert_eq!(a.shape, b.shape);
+        assert_eq!(a.dtype, "bfloat16");
+        assert_eq!(a.dtype, b.dtype);
+        match (&a.storage, &b.storage) {
+            (TokenSpeedTensorStorage::Inline(x), TokenSpeedTensorStorage::Inline(y)) => {
+                assert_eq!(
+                    x, &wire_bytes,
+                    "the view-written item carries the wire's bytes"
+                );
+                assert_eq!(y, &wire_bytes, "the moved item carries the wire's bytes");
+            }
+            other => panic!("inline payloads expected, got {other:?}"),
+        }
+    }
+
+    /// Two items share one tensor: both are written from views, nothing moves.
+    #[test]
+    fn a_batch_of_two_items_keeps_its_encoder_input() {
+        let mut two = two_image_intermediate();
+        assert!(take_whole_encoder_input(&mut two).is_none());
+        assert_eq!(two.preprocessed.encoder_input.view().len(), 8);
+    }
+
+    fn two_image_intermediate() -> PrecomputedMultimodalIntermediate {
         let mut model_specific = HashMap::new();
         model_specific.insert(
             "patches_per_image".to_string(),
@@ -1091,7 +1328,7 @@ mod tests {
             )),
         ];
 
-        let intermediate = PrecomputedMultimodalIntermediate {
+        PrecomputedMultimodalIntermediate {
             preprocessed,
             media: MediaBatch::Images(images),
             bindings: vec![
@@ -1130,8 +1367,12 @@ mod tests {
             ),
             keep_on_cpu_keys: vec![],
             encoder_input_key: None,
-        };
+        }
+    }
 
+    #[test]
+    fn assemble_tokenspeed_splits_image_items() {
+        let intermediate = two_image_intermediate();
         let assembled = assemble_tokenspeed(&intermediate, None, false).unwrap();
         assert_eq!(assembled.items.len(), 2);
 
@@ -1379,6 +1620,7 @@ mod tests {
                 encoder_input_dtype: "bfloat16".to_string(),
                 skip_pixel_values: false,
             },
+            None,
         )
         .unwrap();
 
@@ -1401,6 +1643,142 @@ mod tests {
                 assert_eq!(item.model_specific_tensors[key].dtype, "uint32", "{key}");
             }
         }
+    }
+
+    /// A video batch of the Qwen3-VL family, from the family's processor to the
+    /// vLLM wire with the layout its spec declares for video: validation must
+    /// find the batch's own sizes tensor (`patches_per_video`), and the wire
+    /// must name it, not the image one. The spec once answered every modality
+    /// with the image layout, and every video failed here with
+    /// "missing flat sizes tensor patches_per_image".
+    #[test]
+    fn a_qwen3_vl_video_batch_assembles_with_its_own_sizes_key() {
+        use llm_multimodal::{
+            vision::Qwen3VLProcessor, ModelMetadata, ModelRegistry, PreProcessorConfig, Tokenizer,
+            VideoSource, VisionPreProcessor,
+        };
+
+        struct NoTokenizer;
+        impl Tokenizer for NoTokenizer {
+            fn token_to_id(&self, _token: &str) -> Option<u32> {
+                None
+            }
+            fn id_to_token(&self, _id: u32) -> Option<String> {
+                None
+            }
+            fn encode_text(&self, _text: &str) -> Option<Vec<u32>> {
+                None
+            }
+        }
+
+        let model_config = serde_json::json!({
+            "model_type": "qwen3_vl",
+            "image_token_id": 151655,
+            "video_token_id": 151656,
+        });
+        let registry = ModelRegistry::new();
+        let spec = registry
+            .lookup(&ModelMetadata {
+                model_id: "qwen3-vl",
+                tokenizer: &NoTokenizer,
+                config: &model_config,
+            })
+            .expect("the family's spec");
+
+        let config = PreProcessorConfig::from_json(
+            r#"{"patch_size": 16, "temporal_patch_size": 2, "merge_size": 2,
+                "image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.5, 0.5],
+                "size": {"shortest_edge": 4096, "longest_edge": 25165824}}"#,
+        )
+        .expect("preprocessor config");
+        let processor = Qwen3VLProcessor::from_preprocessor_config(&config);
+        let frames: Vec<image::DynamicImage> = (0..4u8)
+            .map(|t| {
+                image::DynamicImage::ImageRgb8(image::RgbImage::from_fn(64, 64, |x, y| {
+                    image::Rgb([x as u8 * 4, y as u8 * 4, t * 60])
+                }))
+            })
+            .collect();
+        let preprocessed = processor
+            .preprocess_video(&frames, &config)
+            .expect("video preprocess");
+        let rows = preprocessed.encoder_input.shape()[0];
+        let features = preprocessed.encoder_input.shape()[1];
+        let tokens = preprocessed.feature_token_counts[0];
+        assert_eq!(
+            (rows, tokens),
+            (32, 8),
+            "4 frames of 64x64: 2 x 4 x 4 patches, merged 2x2"
+        );
+
+        let intermediate = PrecomputedMultimodalIntermediate {
+            preprocessed,
+            media: MediaBatch::Videos(vec![Arc::new(VideoClip::new(
+                frames,
+                bytes::Bytes::from_static(b"clip"),
+                VideoSource::InlineBytes,
+                "video-hash".to_string(),
+            ))]),
+            bindings: vec![PromptBinding {
+                item_index: 0,
+                prompt_ordinal: 0,
+                structural: PlaceholderRange {
+                    offset: 10,
+                    length: tokens,
+                },
+                patches: vec![],
+            }],
+            placeholder_token_id: Some(151656),
+            field_layouts: spec.encoder_field_layouts_for(Modality::Video),
+            keep_on_cpu_keys: spec.keep_on_cpu_keys_for(Modality::Video),
+            encoder_input_key: spec.encoder_input_key_for(Modality::Video),
+        };
+
+        validate_precomputed_batch(&intermediate)
+            .expect("a video batch validates against the spec's video layout");
+        let assembled = assemble_vllm(
+            intermediate,
+            &VllmAssembly {
+                encoder_dtype: "bfloat16".to_string(),
+                device_normalizes: false,
+                shm_enabled: false,
+                shm_min_bytes: 0,
+            },
+        )
+        .expect("vLLM assembly of a video batch");
+
+        assert_eq!(assembled.modality, common::Modality::Video);
+        assert_eq!(
+            assembled.flat_keys,
+            HashMap::from([("pixel_values".to_string(), "patches_per_video".to_string())])
+        );
+        for key in [
+            "video_grid_thw",
+            "patches_per_video",
+            "video_second_per_grid",
+        ] {
+            assert!(
+                assembled.batched_keys.iter().any(|k| k == key),
+                "{key} is batched"
+            );
+            assert!(
+                assembled.model_specific_tensors.contains_key(key),
+                "{key} is sent"
+            );
+        }
+        assert!(
+            !assembled
+                .batched_keys
+                .iter()
+                .any(|k| k.starts_with("image_")),
+            "no image tensor is announced for a video batch: {:?}",
+            assembled.batched_keys
+        );
+        assert_eq!(
+            assembled.pixel_values_shape,
+            vec![rows as u32, features as u32]
+        );
+        assert_eq!(assembled.mm_placeholders, vec![(10, tokens as u32)]);
     }
 
     #[test]

@@ -49,6 +49,15 @@ pub enum StorageOperation {
     DeleteItem,
 
     // ── ResponseStorage ──────────────────────────────────────────────────
+    /// A response stored under its id; the after-hook's `result` is the id.
+    /// A conditional store (`ResponseStorage::store_response_if_open`) runs
+    /// the before-hook for every attempt and the after-hook only when the
+    /// record was written, with the id as its result. A status transition
+    /// (`ResponseStorage::update_response_object_if_open`) sends this same
+    /// operation with a payload of the record's id and its stored object
+    /// alone (`{id, raw_response}`), not the serialized `StoredResponse` a
+    /// store of the whole row sends: a hook that reads the row's other
+    /// fields from the payload finds them absent on a transition.
     StoreResponse,
     GetResponse,
     DeleteResponse,

@@ -3,26 +3,7 @@
 //! XML tree of arguments, everything else content, and the separator token `]<]minimax[>[` before
 //! every tag, dropped wherever it stands. As recorded for `MiniMaxAI/MiniMax-M3`.
 //!
-//! What this table says beyond the DSML one:
-//!
-//! - **An ignored terminal.** The template writes `]<]minimax[>[` before `<tool_call>`, before
-//!   every tag inside an invoke and before `</tool_call>`; it is one token, and it never stands
-//!   inside prose. The table ignores it: the engine drops it in every state and moves nowhere,
-//!   and inside an invoke the assembler keeps its bytes in place.
-//! - **The model writes the thought, or closes an empty one.** The template renders an assistant
-//!   turn as `<mm:think>…</mm:think>` when it has reasoning and as `</mm:think>` alone when it has
-//!   none, and its generation prompt adds nothing in its default mode (`thinking_mode` unset or
-//!   `adaptive`), so an output starts with one or the other. The table starts in a `start` state
-//!   whose text is content: `<mm:think>` there opens the thought and `</mm:think>` there closes
-//!   the empty one, both dropped; later in the content both are text. With `thinking_mode` set,
-//!   the generation prompt ends with `<mm:think>` (`enabled`) or `</mm:think>` (`disabled`) after
-//!   the turn opener `]~b]ai\n`, and the replay puts the output inside the thought or in content.
-//! - **A calls block ends the thought** (`reasoning + calls_open = calls`), as the design's table
-//!   has it; the recorded outputs close the thought first.
-//! - **Two states for the calls, as for DSML:** `calls` is the template's wrapping (a newline after
-//!   `<tool_call>` and after `</invoke>`), `invoke` one call's arguments, read by the XML assembler
-//!   ([`tagged::xml`](crate::tagged::xml)); a second invoke before the first closed ends the first,
-//!   and the block's close ends an invoke still open.
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::{
     format::{CallSyntax, Emits, Format},
@@ -67,10 +48,9 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, Text},
-        input::{EngineFinish, Input},
-        parser::Parser,
-        tagged::Declared,
+        event::{DropReason, Event, MalformedReason, Text},
+        testing::{arguments_of, bytes, content, drive, names, reasoning},
+        Declared,
     };
 
     const SEP: &str = "]<]minimax[>[";
@@ -114,39 +94,8 @@ mod tests {
         }])
     }
 
-    fn run_with(declared: Declared, prompt: &str, pieces: &[&str]) -> Vec<Event> {
-        let mut parser = Engine::new(minimax_m3(), declared);
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        for piece in pieces {
-            parser
-                .feed(
-                    Input::Delta {
-                        token_ids: &[],
-                        text: piece,
-                        spans: &[],
-                    },
-                    &mut out,
-                )
-                .expect("delta");
-        }
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
+    fn run_with(declared: Declared, prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
+        drive(&mut Engine::new(minimax_m3(), declared), prompt, pieces)
     }
 
     /// One function with `parameters`, as a request declares it.
@@ -173,73 +122,17 @@ mod tests {
         body.replace('<', "]<]minimax[>[<")
     }
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
         run_with(Declared::default(), prompt, pieces)
     }
 
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
-    fn arguments_of(events: &[Event], call: u32) -> String {
+    fn fragments_of<'a>(events: &'a [Event<'_>], call: u32) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
                 Event::ToolCallArguments { index, json, .. } if *index == call => {
                     Some(json.as_str())
                 }
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn fragments_of(events: &[Event], call: u32) -> Vec<&str> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallArguments { index, json, .. } if *index == call => {
-                    Some(json.as_str())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn names(events: &[Event]) -> Vec<&str> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallStart { name, .. } => Some(name.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
                 _ => None,
             })
             .collect()
@@ -252,9 +145,9 @@ mod tests {
             .count()
     }
 
-    fn dropped(text: &str) -> Event {
+    fn dropped(text: &str) -> Event<'static> {
         Event::Dropped {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
         }
     }
@@ -446,6 +339,27 @@ mod tests {
         assert_eq!(bytes(&events), output);
         assert_eq!(fragments_of(&events, 0), [r#"{"name": ""#, "Par"]);
         assert_eq!(ends(&events), 1);
+        // The arguments are no whole value and nothing is made up: one `Malformed` event of no
+        // bytes says so, right before the call's end.
+        let ended = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+            .expect("the call ends");
+        assert!(
+            matches!(
+                &events[ended - 1],
+                Event::Malformed { text, why: MalformedReason::UnterminatedRegion }
+                    if text.text.is_empty()
+            ),
+            "{events:#?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::Malformed { .. }))
+                .count(),
+            1
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             Event::ToolCallEnd { source, .. } if source.text.is_empty()
@@ -487,7 +401,8 @@ mod tests {
     #[test]
     fn a_separator_inside_the_invoke_tag_is_carried_and_never_splits_a_character() {
         // The separator arriving between the name's quote and the `>`, after a multi-byte
-        // character: the tail is reported whole, and the call starts (smg #2850, claude[bot]).
+        // character: the tail is reported around it, in order, the separator in an event of its
+        // own, and the call starts (smg #2850, claude[bot]).
         let output = concat!(
             "</mm:think><tool_call>\n<invoke name=\"add\" ñ]<]minimax[>[x><a>1</a></invoke>\n",
             "</tool_call>"
@@ -496,9 +411,17 @@ mod tests {
         assert_eq!(bytes(&events), output);
         assert_eq!(names(&events), ["add"]);
         assert_eq!(arguments_of(&events, 0), r#"{"a": 1}"#);
+        let malformed: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, .. } => Some(&*text.text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(malformed, [" ñ", "x"]);
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::Malformed { text, .. } if text.text == " ñ]<]minimax[>[x"
+            Event::Dropped { text, .. } if text.text == "]<]minimax[>["
         )));
     }
 
@@ -513,7 +436,7 @@ mod tests {
         let ends: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallEnd { source, .. } => Some(source.text.as_str()),
+                Event::ToolCallEnd { source, .. } => Some(&*source.text),
                 _ => None,
             })
             .collect();
@@ -540,19 +463,48 @@ mod tests {
         ));
     }
 
+    /// The invoke's close inside a streamed string, by its own closing tag, the block's close or
+    /// the next invoke: nothing is closed for a value the model never closed; the fragments
+    /// stand, and the one `Malformed` event before the end carries the start of a tag held there
+    /// or no bytes and says that the arguments are no whole value, under the engine's name for a
+    /// region a marker closed.
     #[test]
-    fn a_tag_the_invokes_close_cut_short_inside_a_string_is_reported() {
-        let output = concat!(
-            "</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par</na</invoke>\n",
-            "</tool_call>"
-        );
-        let events = run_with(tools(), "", &[output]);
-        assert_eq!(bytes(&events), output);
-        assert_eq!(arguments_of(&events, 0), r#"{"name": "Par"}"#);
-        assert!(events.iter().any(|event| matches!(
-            event,
-            Event::Malformed { text, .. } if text.text == "</na"
-        )));
+    fn the_invokes_close_inside_a_string_leaves_it_open_and_reports_what_was_held() {
+        for (output, held) in [
+            (
+                "</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par</na</invoke>\n</tool_call>",
+                "</na",
+            ),
+            ("</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par</tool_call>", ""),
+            (
+                "</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par<invoke name=\"alert\">\
+                 </invoke>\n</tool_call>",
+                "",
+            ),
+        ] {
+            let events = run_with(tools(), "", &[output]);
+            assert_eq!(bytes(&events), output, "{output:?}");
+            assert_eq!(arguments_of(&events, 0), r#"{"name": "Par"#, "{output:?}");
+            let ended = events
+                .iter()
+                .position(|event| matches!(event, Event::ToolCallEnd { index: 0, .. }))
+                .expect("the call ends");
+            assert!(
+                matches!(
+                    &events[ended - 1],
+                    Event::Malformed { text, why: MalformedReason::BlockWithoutACompleteCall } if text.text == held
+                ),
+                "{output:?}: {events:#?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, Event::Malformed { .. }))
+                    .count(),
+                1,
+                "{output:?}"
+            );
+        }
     }
 
     #[test]

@@ -3,9 +3,9 @@
 //! These are regression/wiring guards: they boot the real `build_app` via the
 //! test harness with `--priority-scheduler-enabled` on and off and assert the
 //! gateway still serves requests through the admission middleware, the
-//! `SchedulerGuardBody` wrapper, and the handler `PreemptionGuard` — and that
-//! a scheduler that can't start (reservations exceed capacity) degrades to
-//! legacy admission rather than failing requests.
+//! permit on the edge's body wrapper, and the handler `PreemptionGuard` — and
+//! that a scheduler that can't start (reservations exceed capacity) degrades
+//! to legacy admission rather than failing requests.
 //!
 //! The scheduler's behavioral logic (admit / queue / preempt / starvation /
 //! capacity) is covered deterministically by the engine unit tests in

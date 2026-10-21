@@ -274,6 +274,7 @@ func (c *Client) CreateChatCompletionStream(ctx context.Context, req ChatComplet
   - Same structure as above but for incremental updates
 - `Message`: Complete message with content and tool calls
 - `ToolCall`: Tool call information with function and arguments
+- `ToolCallDelta`: One piece of a tool call in a streaming delta, with the call's index
 - `Usage`: Token usage statistics
   - PromptTokens, CompletionTokens, TotalTokens
 
@@ -369,7 +370,7 @@ All public types and functions include comprehensive documentation with usage ex
 - `ChatCompletionResponse` - Response structure and usage
 - `ChatCompletionStreamResponse` - Streaming response format
 - `Usage` - Token usage information structure
-- `Tool`, `Function`, `ToolCall` - Tool call structures
+- `Tool`, `Function`, `ToolCall`, `ToolCallDelta` - Tool call structures
 
 ### Viewing Documentation
 

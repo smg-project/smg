@@ -1,0 +1,6 @@
+# Wraps the workspace mock-worker binary (built on the runner) for kind.
+# Base must glibc-match the build host (ubuntu-24.04); build context is
+# target/debug.
+FROM ubuntu:24.04
+COPY mock-worker /usr/local/bin/mock-worker
+ENTRYPOINT ["/usr/local/bin/mock-worker"]

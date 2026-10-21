@@ -100,6 +100,12 @@ pub(crate) struct HarmonyChannelOutput {
 
     /// Number of reasoning tokens (from analysis and commentary channels)
     pub reasoning_token_count: u32,
+
+    /// For each output token, the bytes of `final_text` it carries, or `None`
+    /// for a token outside it (a header, a stop token, the analysis or a tool
+    /// call). A token held for an incomplete UTF-8 character carries 0. Only
+    /// `parse_complete` fills it.
+    pub final_text_tokens: Vec<Option<usize>>,
 }
 
 /// Streaming delta for SSE responses

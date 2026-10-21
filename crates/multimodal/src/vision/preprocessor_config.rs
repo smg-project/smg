@@ -481,6 +481,30 @@ impl PreProcessorConfig {
             .and_then(|v| serde_json::from_value(v.clone()).ok())
     }
 
+    /// A `usize` extra key, read strictly: `None` when the key is absent, the value when it is a
+    /// non-negative integer (an integral JSON float such as `2.0` included, for toolchains that
+    /// serialize integers as floats), else the value that could not be read, for the caller to
+    /// name in its error. The two forms are not interchangeable at the top: an integer is taken
+    /// as far as `u64` reaches, a float only up to `u32::MAX` (the rule the two processors
+    /// applied before it lived here). [`get_extra`](Self::get_extra) cannot serve here: it
+    /// swallows a type mismatch into `None`, and a silent default would change an alignment
+    /// factor or the token geometry, so the gateway's placeholder count would disagree with the
+    /// serving engine's with no trace.
+    pub fn extra_usize(&self, key: &str) -> Result<Option<usize>, &serde_json::Value> {
+        let Some(value) = self.extra.get(key) else {
+            return Ok(None);
+        };
+        if let Some(n) = value.as_u64() {
+            return Ok(Some(n as usize));
+        }
+        if let Some(f) = value.as_f64() {
+            if f >= 0.0 && f.fract() == 0.0 && f <= f64::from(u32::MAX) {
+                return Ok(Some(f as usize));
+            }
+        }
+        Err(value)
+    }
+
     // Common default values
     pub const CLIP_MEAN: [f64; 3] = [0.48145466, 0.4578275, 0.40821073];
     pub const CLIP_STD: [f64; 3] = [0.26862954, 0.26130258, 0.27577711];
@@ -620,6 +644,46 @@ mod tests {
             nested.as_ref().unwrap().get("foo"),
             Some(&"bar".to_string())
         );
+    }
+
+    #[test]
+    fn extra_usize_reads_a_present_key_strictly_and_an_absent_one_as_none() {
+        let config: PreProcessorConfig = serde_json::from_value(serde_json::json!({
+            "integer": 3,
+            "integral_float": 2.0,
+            "fractional": 2.5,
+            "negative": -1,
+            "text": "3",
+            "flag": true,
+            "huge_integer": 4_294_967_296_u64,
+            "huge_float": 4_294_967_296.0,
+            "largest_float": 4_294_967_295.0,
+        }))
+        .unwrap();
+        assert_eq!(config.extra_usize("absent"), Ok(None));
+        assert_eq!(config.extra_usize("integer"), Ok(Some(3)));
+        assert_eq!(
+            config.extra_usize("integral_float"),
+            Ok(Some(2)),
+            "an integral float is the integer it spells"
+        );
+        assert_eq!(
+            config.extra_usize("huge_integer"),
+            Ok(Some(4_294_967_296)),
+            "an integer is taken as far as u64 reaches"
+        );
+        assert_eq!(
+            config.extra_usize("largest_float"),
+            Ok(Some(4_294_967_295)),
+            "a float is taken up to u32::MAX"
+        );
+        for key in ["fractional", "negative", "text", "flag", "huge_float"] {
+            assert_eq!(
+                config.extra_usize(key),
+                Err(&config.extra[key]),
+                "{key}: a present value that is no non-negative integer is handed back"
+            );
+        }
     }
 
     #[test]

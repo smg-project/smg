@@ -12,7 +12,7 @@ use bytes::Bytes;
 use engine_zmq_client::{
     codec::{decode_msgpack, encode_msgpack},
     mock_engine::{
-        connect_to_frontend, default_ready_response, MockEngineInput, MockEngineOutput,
+        connect_to_frontend, default_ready_response, hello, MockEngineInput, MockEngineOutput,
         MOCK_DEADLINE,
     },
     protocol::{
@@ -24,6 +24,7 @@ use engine_zmq_client::{
     },
     EngineId,
 };
+use futures::StreamExt;
 use llm_tokenizer::{mock::MockTokenizer, traits::Tokenizer};
 use prost_types::value::Kind;
 use smg_grpc_client::{
@@ -36,7 +37,11 @@ use tonic_health::pb::{
 };
 
 use super::*;
-use crate::{kv_events, testing::Bounded, ServicerError};
+use crate::{
+    kv_events,
+    testing::{servicer_config, Bounded},
+    ServicerError,
+};
 
 fn model_info() -> TokenSpeedModelInfo {
     TokenSpeedModelInfo {
@@ -52,7 +57,7 @@ fn model_info() -> TokenSpeedModelInfo {
         bos_token_id: 1,
         default_sampling_params_json: "{\"temperature\":0.7}".to_string(),
         server_args_json:
-            r#"{"model":"org/model","max_num_seqs":64,"dp_size":2,"pairing_protocol":"p1"}"#
+            r#"{"model":"org/model","max_num_seqs":64,"dp_size":2,"pairing_protocol":"p1","engine_reasoning_parser":"kimi_k25","constrained_decoding_start":"first_token"}"#
                 .to_string(),
         scheduler_info_json: r#"{"shm_namespace_id":"boot:1"}"#.to_string(),
         tokenspeed_version: "0.1.0.post20261003".to_string(),
@@ -68,13 +73,8 @@ fn config(
     model: TokenSpeedModelInfo,
 ) -> TokenSpeedServicerConfig {
     TokenSpeedServicerConfig {
-        bind_address: "127.0.0.1:0".to_string(),
-        ipc_base_url: format!("ipc://{}", dir.join("engine").display()),
-        handshake_address: handshake.to_string(),
-        engine_count: 1,
-        tokenizer_dir: None,
+        servicer: servicer_config(dir, handshake),
         model,
-        engine_startup_timeout: Duration::from_secs(10),
     }
 }
 
@@ -251,38 +251,152 @@ fn complete(response: ts::GenerateResponse) -> ts::GenerateComplete {
     }
 }
 
+/// Nothing reaches a mock scheduler that was only handshaken.
+async fn assert_scheduler_idle(engine_in: &mut MockEngineInput) {
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), engine_in.recv())
+            .await
+            .is_err(),
+        "nothing should have reached the scheduler"
+    );
+}
+
+/// Between HELLO and READY a real scheduler loads its model, and nothing
+/// crosses the wire meanwhile. The lifecycle owner's reports that the
+/// scheduler process is alive keep the link waiting well past the silence
+/// bound, and the start then completes.
+#[tokio::test]
+async fn a_slow_scheduler_stays_linked_while_the_launcher_reports_it_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let silence = Duration::from_millis(300);
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = silence;
+    let server = TokenSpeedServicerServer::start(config).unwrap();
+    // The scheduler dials in at once, then "loads" for four silences.
+    let loading = hello(&handshake, EngineId::from_engine_index(0))
+        .bounded()
+        .await
+        .expect("HELLO answered with INIT");
+    let load_time = Instant::now() + 4 * silence;
+    while Instant::now() < load_time {
+        server.note_engine_alive();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        server.last_error().unwrap(),
+        None,
+        "the link gave up on a living scheduler"
+    );
+    assert!(!server.engine_ready());
+
+    let engine = loading
+        .ready(default_ready_response())
+        .bounded()
+        .await
+        .expect("READY and registration accepted");
+    wait_until(|| server.engine_ready()).await;
+    let (mut engine_in, _engine_out) = engine.split();
+    assert_scheduler_idle(&mut engine_in).await;
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
+/// A scheduler that dials in and then falls silent, with nobody reporting it
+/// alive, fails the link at the silence bound as before.
+#[tokio::test]
+async fn a_scheduler_that_falls_silent_after_hello_fails_the_link_at_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let silence = Duration::from_millis(300);
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = silence;
+    let server = TokenSpeedServicerServer::start(config).unwrap();
+    let _loading = hello(&handshake, EngineId::from_engine_index(0))
+        .bounded()
+        .await
+        .expect("HELLO answered with INIT");
+    let since_hello = Instant::now();
+    let deadline = since_hello + Duration::from_secs(10);
+    let error = loop {
+        if let Some(error) = server.last_error().unwrap() {
+            break error;
+        }
+        assert!(Instant::now() < deadline, "no link failure reported");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(since_hello.elapsed() >= silence);
+    assert!(
+        error.contains("timed out while waiting for READY"),
+        "{error}"
+    );
+    assert!(error.contains("without a sign of life"), "{error}");
+    assert!(!server.engine_ready());
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
+/// The ceiling bounds a start however alive the scheduler is reported.
+#[tokio::test]
+async fn the_startup_ceiling_bounds_a_start_the_launcher_keeps_reporting_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let silence = Duration::from_millis(300);
+    let ceiling = Duration::from_millis(900);
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = silence;
+    config.servicer.engine_startup_ceiling = Some(ceiling);
+    let server = TokenSpeedServicerServer::start(config).unwrap();
+    let started = Instant::now();
+    let _loading = hello(&handshake, EngineId::from_engine_index(0))
+        .bounded()
+        .await
+        .expect("HELLO answered with INIT");
+    let deadline = started + Duration::from_secs(10);
+    let error = loop {
+        server.note_engine_alive();
+        if let Some(error) = server.last_error().unwrap() {
+            break error;
+        }
+        assert!(Instant::now() < deadline, "no link failure reported");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(started.elapsed() >= ceiling);
+    assert!(error.contains("reached its ceiling"), "{error}");
+    assert!(!server.engine_ready());
+    server.stop(Duration::from_secs(5)).unwrap();
+}
+
 #[test]
 fn config_is_validated_before_binding() {
     let dir = tempfile::tempdir().unwrap();
     let good = config(dir.path(), "tcp://127.0.0.1:1", model_info());
+    let with = |edit: fn(&mut ServicerConfig)| {
+        let mut config = good.clone();
+        edit(&mut config.servicer);
+        config
+    };
     for (name, bad) in [
         (
             "bind",
-            TokenSpeedServicerConfig {
-                bind_address: "nope".into(),
-                ..good.clone()
-            },
+            with(|servicer| servicer.bind_address = "nope".into()),
         ),
         (
             "ipc",
-            TokenSpeedServicerConfig {
-                ipc_base_url: "tcp://x".into(),
-                ..good.clone()
-            },
+            with(|servicer| servicer.ipc_base_url = "tcp://x".into()),
         ),
         (
             "handshake",
-            TokenSpeedServicerConfig {
-                handshake_address: "udp://x".into(),
-                ..good.clone()
-            },
+            with(|servicer| servicer.handshake_address = "udp://x".into()),
+        ),
+        ("engines", with(|servicer| servicer.engine_count = 0)),
+        (
+            "timeout",
+            with(|servicer| servicer.engine_startup_timeout = Duration::ZERO),
         ),
         (
-            "engines",
-            TokenSpeedServicerConfig {
-                engine_count: 0,
-                ..good.clone()
-            },
+            "ceiling",
+            with(|servicer| {
+                servicer.engine_startup_ceiling = Some(Duration::ZERO);
+            }),
         ),
         (
             "model",
@@ -293,10 +407,7 @@ fn config_is_validated_before_binding() {
         ),
         (
             "startup timeout",
-            TokenSpeedServicerConfig {
-                engine_startup_timeout: Duration::ZERO,
-                ..good.clone()
-            },
+            with(|servicer| servicer.engine_startup_timeout = Duration::ZERO),
         ),
     ] {
         assert!(
@@ -537,6 +648,10 @@ async fn string_stops_without_a_tokenizer_are_refused() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// `Abort` ends the stream with an `abort` Complete and reaches the
+/// scheduler. The caller's own abort stays a completion; only a shutdown
+/// under an open request is a status
+/// (`a_shutdown_ends_an_open_stream_with_unavailable_not_an_abort_completion`).
 #[tokio::test]
 async fn abort_rpc_cancels_an_in_flight_stream() {
     let mut h = harness(model_info(), None).await;
@@ -712,6 +827,29 @@ async fn requests_without_token_ids_are_refused() {
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
+/// The launcher's constrained-decoding policy (the engine's declaration that
+/// it takes a grammar on every turn) reaches `GetServerInfo` as a field of its
+/// own, for the Router's `constrained_decoding` label.
+#[tokio::test]
+async fn server_info_reports_the_engines_constrained_decoding_policy() {
+    let mut h = harness(
+        TokenSpeedModelInfo {
+            constrained_decoding: "always".to_string(),
+            ..model_info()
+        },
+        None,
+    )
+    .await;
+    let info = h
+        .client
+        .get_server_info(ts::GetServerInfoRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(info.constrained_decoding, "always");
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
 /// The info RPCs report the launcher's facts, with the handshake's capacity
 /// figures under `scheduler_info`, and the loads the scheduler piggybacks on
 /// its output (zero-filled per rank before any step).
@@ -739,6 +877,9 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
         .await
         .unwrap()
         .into_inner();
+    // A launcher that reports no constrained-decoding policy leaves the field
+    // at its default; the Router then sets no `constrained_decoding` label.
+    assert_eq!(info.constrained_decoding, "");
     let server_args = info.server_args.expect("server_args");
     assert_eq!(
         server_args.fields["dp_size"].kind,
@@ -747,6 +888,17 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
     assert_eq!(
         server_args.fields["pairing_protocol"].kind,
         Some(Kind::StringValue("p1".to_string()))
+    );
+    // The launcher's grammar-start facts (the engine's reasoning parser and
+    // where its grammar starts on a thinking prompt) reach the Router's label
+    // source as the launcher wrote them.
+    assert_eq!(
+        server_args.fields["engine_reasoning_parser"].kind,
+        Some(Kind::StringValue("kimi_k25".to_string()))
+    );
+    assert_eq!(
+        server_args.fields["constrained_decoding_start"].kind,
+        Some(Kind::StringValue("first_token".to_string()))
     );
     let scheduler_info = info.scheduler_info.expect("scheduler_info");
     assert_eq!(
@@ -1077,11 +1229,9 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
 async fn a_scheduler_that_never_dials_in_fails_the_link_at_the_startup_bound() {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
-    let server = TokenSpeedServicerServer::start(TokenSpeedServicerConfig {
-        engine_startup_timeout: Duration::from_millis(300),
-        ..config(dir.path(), &handshake, model_info())
-    })
-    .unwrap();
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.engine_startup_timeout = Duration::from_millis(300);
+    let server = TokenSpeedServicerServer::start(config).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let error = loop {
         if let Some(error) = server.last_error().unwrap() {
@@ -1099,4 +1249,347 @@ async fn a_scheduler_that_never_dials_in_fails_the_link_at_the_startup_bound() {
 
     server.stop(Duration::from_secs(5)).unwrap();
     assert_handshake_released(&handshake).await;
+}
+
+/// A shutdown with a stream still open is the engine side going away under
+/// the request, not an abort the caller asked for: the stream ends with
+/// `UNAVAILABLE` (the status the Router counts and logs as the worker's
+/// failure), never with a `Complete` whose finish reason is `abort`.
+#[tokio::test]
+async fn a_shutdown_ends_an_open_stream_with_unavailable_not_an_abort_completion() {
+    let mut h = harness(model_info(), None).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("r8", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(&mut h.engine_out, &batch("r8", vec![10], 1, None, None)).await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![10]
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    let status = stream
+        .message()
+        .bounded()
+        .await
+        .expect_err("a shutdown ends the stream with a status, not a completion");
+    assert_eq!(status.code(), Code::Unavailable);
+    assert!(
+        status.message().contains("shutting down"),
+        "{}",
+        status.message()
+    );
+    assert!(!h.server.running());
+}
+
+/// A request the engine finished on the tick before the shutdown keeps its
+/// completion: the finish tick's chunk went out and its `Complete` was
+/// parked for the next poll when `stop()` landed, so the stream ends with
+/// that `Complete` and no status (nothing was cut), never with `UNAVAILABLE`.
+#[tokio::test]
+async fn a_shutdown_keeps_the_completion_of_a_choice_the_engine_had_finished() {
+    let mut h = harness(model_info(), None).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("r11", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r11", vec![10], 1, Some("length"), None),
+    )
+    .await;
+    assert_eq!(
+        chunk_tokens(stream.message().bounded().await.unwrap().unwrap()),
+        vec![10]
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    let done = complete(
+        stream
+            .message()
+            .bounded()
+            .await
+            .expect("the completion the engine had already produced, not a status")
+            .expect("a completion, not the end of the stream"),
+    );
+    assert_eq!(done.finish_reason, "length");
+    assert_eq!(done.output_ids, vec![10]);
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert!(!h.server.running());
+}
+
+/// The engine's own `Complete` went out and the shutdown lands before the
+/// poll that would have ended the stream (the gap h2 backpressure opens):
+/// the choice has ended and is not open, so the stream ends cleanly, never
+/// with `UNAVAILABLE` after a completion. Driven poll by poll with no
+/// transport in between, so nothing races; without the choice dropping its
+/// engine stream as the `Complete` goes out, this ends with a status.
+#[tokio::test]
+async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
+    let mut h = harness(model_info(), None).await;
+    let mut stream = generate::generate(&h.server.state, generate_request("r12", true, Vec::new()))
+        .await
+        .expect("generate");
+    recv_add(&mut h.engine_in).await;
+    send(
+        &mut h.engine_out,
+        &batch("r12", vec![10], 1, Some("length"), None),
+    )
+    .await;
+    assert_eq!(
+        chunk_tokens(stream.next().bounded().await.unwrap().unwrap()),
+        vec![10]
+    );
+    let done = complete(stream.next().bounded().await.unwrap().unwrap());
+    assert_eq!(done.finish_reason, "length");
+    assert_eq!(done.output_ids, vec![10]);
+    // The shutdown lands between the completion and the poll that ends the
+    // stream: `cancel_all` is what `stop()` fires first.
+    h.server.state.registry.cancel_all().expect("cancel_all");
+    assert!(
+        stream.next().bounded().await.is_none(),
+        "a clean end after the completion, not a status"
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A worker with two attention-DP ranks publishes on `port` and `port + 1`,
+/// each under its own sequence counter. The launcher's width
+/// (`data_parallel_size`) tells the relay how many publishers to follow: a
+/// gateway's stream carries both ranks' batches, each under its rank's own
+/// numbers and stamped with its socket's rank, which is what the gateway's
+/// per-rank admission cursors expect.
+#[tokio::test]
+async fn every_rank_of_a_data_parallel_publisher_reaches_the_gateway() {
+    use zeromq::prelude::*;
+
+    use crate::{kv_events::golden, testing::consecutive_publishers};
+
+    let (base, mut publishers) = consecutive_publishers(2).await;
+    let mut model = model_info();
+    model.kv_events_endpoint = format!("tcp://*:{base}");
+    model.kv_events_topic = "kv".to_string();
+    model.data_parallel_size = 2;
+    let mut h = harness(model, None).await;
+    let relay = h
+        .server
+        .state
+        .kv_relay
+        .clone()
+        .expect("a relay for the publishers");
+    // Each SUB connect is asynchronous: publish sequence 0 on both ranks
+    // until the relay has taken both (repeats are duplicates).
+    let batch2 = golden::bytes(golden::BATCH2);
+    for _ in 0..250 {
+        for publisher in &mut publishers {
+            publisher
+                .send(golden::frame(b"kv", 0, &batch2))
+                .await
+                .expect("publish");
+        }
+        if relay.counts().relayed >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        relay.counts().relayed,
+        2,
+        "both ranks' sequence 0 reached the relay"
+    );
+
+    let mut stream = h
+        .client
+        .subscribe_kv_events(common::SubscribeKvEventsRequest::default())
+        .await
+        .expect("subscribe")
+        .into_inner();
+    let mut seen = Vec::new();
+    for _ in 0..2 {
+        let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("a batch in time")
+            .expect("stream open")
+            .expect("a batch");
+        seen.push((batch.dp_rank, batch.sequence_number));
+    }
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        vec![(Some(0), 0), (Some(1), 0)],
+        "each rank under its own sequence, stamped with its socket's rank"
+    );
+    // Each rank continues its own count.
+    publishers[1]
+        .send(golden::frame(b"kv", 1, &batch2))
+        .await
+        .expect("publish");
+    let batch = tokio::time::timeout(Duration::from_secs(5), stream.message())
+        .await
+        .expect("a batch in time")
+        .expect("stream open")
+        .expect("a batch");
+    assert_eq!((batch.dp_rank, batch.sequence_number), (Some(1), 1));
+    drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// What the scheduler enforces of a structured request, as the launcher's
+/// `server_args` say: the grammar backend it resolved; nothing is judged
+/// when the launcher could not tell.
+#[test]
+fn structured_outputs_support_follows_the_launcher_args() {
+    use engine_zmq_adapter::{
+        StructuredOutputBackend,
+        StructuredOutputsBackendConfig::{Other, Pinned},
+        StructuredOutputsSupport,
+    };
+    let support = |server_args_json: &str| {
+        structured_outputs_support(&TokenSpeedModelInfo {
+            server_args_json: server_args_json.to_string(),
+            ..model_info()
+        })
+    };
+    assert_eq!(
+        support(r#"{"grammar_backend":"xgrammar"}"#),
+        Pinned(StructuredOutputBackend::Xgrammar).into()
+    );
+    assert_eq!(
+        support(r#"{"grammar_backend":"none"}"#),
+        StructuredOutputsSupport::DISABLED
+    );
+    // A launcher that wrote no backend could not tell (a checkpoint default
+    // not resolved yet, or an older launcher): nothing is judged here.
+    assert_eq!(support(r#"{"model":"org/model"}"#), Other.into());
+    assert_eq!(support(""), Other.into());
+    assert_eq!(support(r#"{"grammar_backend":"other"}"#), Other.into());
+}
+
+/// A constraint the scheduler's grammar backend cannot enforce is refused
+/// before the scheduler, as the caller's error, on this wire as on the
+/// others: every kind under `--grammar-backend none` (the scheduler would
+/// admit the request and abort it, which this wire reports as a bare
+/// `abort`, an empty answer), and a schema with a feature xgrammar drops;
+/// what the backend compiles reaches the scheduler with its constraint, an
+/// unconstrained request is served as before, and nothing is judged when
+/// the launcher wrote no backend.
+#[tokio::test]
+async fn a_constraint_the_grammar_backend_cannot_enforce_is_refused_before_the_scheduler() {
+    use ts::sampling_params::Constraint;
+
+    let with_backend = |server_args_json: &str| TokenSpeedModelInfo {
+        server_args_json: server_args_json.to_string(),
+        ..model_info()
+    };
+    let constrained = |id: &str, constraint: Constraint| {
+        let mut request = generate_request(id, false, Vec::new());
+        request.sampling_params.as_mut().unwrap().constraint = Some(constraint);
+        request
+    };
+    const SCHEMA: &str = r#"{"type":"object","properties":{"city":{"type":"string"}}}"#;
+    const MULTIPLE_OF: &str = r#"{"type":"integer","multipleOf":3}"#;
+    let schema = || Constraint::JsonSchema(SCHEMA.to_string());
+    let regex = || Constraint::Regex("[0-9]+".to_string());
+
+    // No backend: every kind is refused up front; nothing reaches the
+    // scheduler but the unconstrained request.
+    {
+        let mut h = harness(with_backend(r#"{"grammar_backend":"none"}"#), None).await;
+        for (id, constraint) in [
+            ("n1", schema()),
+            ("n2", regex()),
+            ("n3", Constraint::EbnfGrammar("root ::= \"a\"".to_string())),
+            (
+                "n4",
+                Constraint::StructuralTag(r#"{"format":{}}"#.to_string()),
+            ),
+        ] {
+            let status = h
+                .client
+                .generate(constrained(id, constraint))
+                .await
+                .expect_err("refused");
+            assert_eq!(status.code(), Code::InvalidArgument, "{id}");
+            assert!(
+                status
+                    .message()
+                    .contains("grammar backend disabled (`none`)"),
+                "{id}: {}",
+                status.message()
+            );
+        }
+        assert_scheduler_idle(&mut h.engine_in).await;
+        let _stream = h
+            .client
+            .generate(generate_request("n5", false, Vec::new()))
+            .await
+            .expect("generate")
+            .into_inner();
+        assert_eq!(recv_add(&mut h.engine_in).await.rid, "n5");
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+
+    // xgrammar: a schema and a regex reach the scheduler with their
+    // constraint; a schema with a feature xgrammar drops is refused.
+    {
+        let mut h = harness(with_backend(r#"{"grammar_backend":"xgrammar"}"#), None).await;
+        let _schema_stream = h
+            .client
+            .generate(constrained("x1", schema()))
+            .await
+            .expect("generate")
+            .into_inner();
+        let sent = recv_add(&mut h.engine_in).await;
+        assert_eq!(sent.sampling_params.json_schema.as_deref(), Some(SCHEMA));
+        let _regex_stream = h
+            .client
+            .generate(constrained("x2", regex()))
+            .await
+            .expect("generate")
+            .into_inner();
+        let sent = recv_add(&mut h.engine_in).await;
+        assert_eq!(sent.sampling_params.regex.as_deref(), Some("[0-9]+"));
+        let status = h
+            .client
+            .generate(constrained(
+                "x3",
+                Constraint::JsonSchema(MULTIPLE_OF.to_string()),
+            ))
+            .await
+            .expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status.message().contains("`multipleOf` at its root")
+                && status.message().contains("not supported by xgrammar"),
+            "{}",
+            status.message()
+        );
+        assert_scheduler_idle(&mut h.engine_in).await;
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+
+    // No backend written: nothing is judged ahead of the engine.
+    {
+        let mut h = harness(with_backend(r#"{"model":"org/model"}"#), None).await;
+        let _stream = h
+            .client
+            .generate(constrained(
+                "u1",
+                Constraint::JsonSchema(MULTIPLE_OF.to_string()),
+            ))
+            .await
+            .expect("generate")
+            .into_inner();
+        let sent = recv_add(&mut h.engine_in).await;
+        assert_eq!(
+            sent.sampling_params.json_schema.as_deref(),
+            Some(MULTIPLE_OF)
+        );
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
 }

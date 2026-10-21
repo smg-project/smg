@@ -284,12 +284,6 @@ impl CrdtOrMap {
         }
         changes
     }
-
-    /// Convenience: merge another replica's full log.
-    pub fn merge_replica(&self, other: &CrdtOrMap) {
-        let other_log = other.get_operation_log();
-        self.merge(&other_log);
-    }
 }
 
 impl Default for CrdtOrMap {

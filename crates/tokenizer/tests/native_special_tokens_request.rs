@@ -130,9 +130,10 @@ fn a_tokenizer_whose_post_processor_adds_a_token_keeps_the_tokenizers_path() {
             Some(&eot),
             "{text:?}: the added token leads the ids"
         );
-        assert!(
-            !matches!(with, Encoding::Plain(_)),
-            "{text:?}: a token-adding post-processor keeps the request off the direct path"
+        assert_eq!(
+            matches!(with, Encoding::Plain(_)),
+            ours.uses_v1_encoder(),
+            "{text:?}: only v1 returns plain ids for a token-adding post-processor"
         );
         let without = ours.encode(text, false).expect("an encode");
         assert_eq!(

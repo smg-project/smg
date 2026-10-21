@@ -307,10 +307,7 @@ impl VisionPreProcessor for Phi3VisionProcessor {
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
-            return Err(TransformError::InvalidShape {
-                expected: "at least one image".to_string(),
-                actual: vec![0],
-            });
+            return Err(TransformError::EmptyBatch);
         }
 
         let mut all_pixel_values = Vec::with_capacity(images.len());
@@ -381,14 +378,19 @@ impl VisionPreProcessor for Phi3VisionProcessor {
         })
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, _config: &PreProcessorConfig) -> usize {
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        _config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
         // First apply HD transform to get the actual size
         let image = DynamicImage::new_rgb8(width, height);
         let hd_image = self.hd_transform(&image);
         let (_, hd_h) = hd_image.dimensions();
         let hd_w = hd_image.width();
 
-        self.calculate_num_tokens(hd_h as usize, hd_w as usize)
+        Ok(self.calculate_num_tokens(hd_h as usize, hd_w as usize))
     }
 
     fn model_name(&self) -> &'static str {
@@ -559,5 +561,12 @@ mod tests {
         assert_eq!(transposed.get_pixel(0, 99).0[0..3], [0, 255, 0]); // (99,0) -> (0,99)
         assert_eq!(transposed.get_pixel(199, 0).0[0..3], [0, 0, 255]); // (0,199) -> (199,0)
         assert_eq!(transposed.get_pixel(199, 99).0[0..3], [255, 255, 0]); // (99,199) -> (199,99)
+    }
+
+    #[test]
+    fn an_empty_batch_is_refused_as_empty_batch() {
+        let processor = Phi3VisionProcessor::new();
+        let result = processor.preprocess(&[], &PreProcessorConfig::default());
+        assert!(matches!(result, Err(TransformError::EmptyBatch)));
     }
 }

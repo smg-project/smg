@@ -19,17 +19,19 @@ use futures::{stream::SelectAll, Stream};
 use llm_tokenizer::stop::StopSequenceDecoder;
 use smg_grpc_client::vllm_proto as vllm;
 use tokio::sync::oneshot;
-use tonic::{metadata::MetadataMap, Status};
+use tonic::Status;
 
 use super::{media::process_media_refs, State};
 use crate::{
-    requests::Registration,
+    requests::{settle_shutdown, CancelReason, HeldTerminal, Registration},
     stop_match::{stop_decoder, StopMatcher},
     BoxStream,
 };
 
 /// Handle one `Generate` request against the connected engine.
-/// `trace_headers` is the caller's W3C trace context (see [`trace_headers`]).
+/// `trace_headers` is the caller's W3C trace context (see
+/// [`crate::trace_context::trace_headers`]), handed to the engine request in
+/// the shape vLLM's own frontend hands its tracer.
 pub(super) async fn generate(
     state: &Arc<State>,
     req: vllm::GenerateRequest,
@@ -42,21 +44,7 @@ pub(super) async fn generate(
     submit(state, client, req, trace_headers).await
 }
 
-/// The W3C trace context the Router sent in the call's metadata, in the
-/// shape vLLM's own frontend hands its tracer: the `trace_headers` of the
-/// engine request. `None` when the call carries no context.
-pub(super) fn trace_headers(metadata: &MetadataMap) -> Option<BTreeMap<String, String>> {
-    let headers: BTreeMap<String, String> = ["traceparent", "tracestate"]
-        .into_iter()
-        .filter_map(|name| {
-            let value = metadata.get(name)?.to_str().ok()?;
-            Some((name.to_string(), value.to_string()))
-        })
-        .collect();
-    (!headers.is_empty()).then_some(headers)
-}
-
-/// The rejection notice a refused PD decode leg owes its prefill side, so the
+/// The rejection notice a refused PD decode side owes its prefill side, so the
 /// connector releases the blocks that side pinned: what vLLM's own frontend
 /// sends, an immediately aborted one-token request under the refused id.
 struct RejectionNotice {
@@ -126,7 +114,7 @@ async fn submit(
     mut req: vllm::GenerateRequest,
     trace_headers: Option<BTreeMap<String, String>>,
 ) -> Result<BoxStream<vllm::GenerateResponse>, Status> {
-    // A PD decode leg refused before admission still owes its prefill side
+    // A PD decode side refused before admission still owes its prefill side
     // the notice: armed from the first refusal below until the engine can
     // hold the request.
     let mut notice = ArmedNotice(RejectionNotice::owed_by(client, &req));
@@ -143,7 +131,7 @@ async fn submit(
     let (registration, cancel) = state.registry.register(&request_id).inspect_err(|_| {
         // The id names a request that is still live; a notice under it would
         // reuse it (and, past an `n > 1` fan-out, get in and free the live
-        // leg's blocks).
+        // side's blocks).
         notice.disarm();
     })?;
     // Worker-side media: the request's references become engine features
@@ -198,8 +186,14 @@ async fn submit(
         }
     };
     // Queued token-work for `GetLoads`: in flight from here until the
-    // engine's first output (or the stream's end).
-    state.loads.submitted(&request_id, prompt_tokens);
+    // engine's first output (or the stream's end), on the rank the first
+    // choice went to (the choice whose first output reports the prompt).
+    let rank = subs
+        .iter()
+        .find(|sub| sub.index() == 0)
+        .or_else(|| subs.first())
+        .map_or(0, rank_of);
+    state.loads.submitted(rank, &request_id, prompt_tokens);
     let loads = LoadsGuard {
         state: Arc::clone(state),
         request_id: request_id.clone(),
@@ -225,9 +219,19 @@ async fn submit(
         choices,
         cancel,
         aborted: None,
+        cut: None,
         _registration: registration,
         _loads: loads,
     }))
+}
+
+/// The data-parallel rank a choice's engine request went to, as the load
+/// tracker and `GetLoads` name it (an engine whose identity names no index
+/// counts as the first).
+fn rank_of(sub: &VllmGenerateStream) -> i32 {
+    sub.engine_index()
+        .and_then(|index| i32::try_from(index).ok())
+        .unwrap_or(0)
 }
 
 /// Takes the request out of the load tracker's queue when the stream ends,
@@ -262,11 +266,14 @@ struct ChoiceStream {
     pending: Option<vllm::GenerateResponse>,
     /// Whether this request's prompt tokens went into the stats counters.
     prompt_counted: bool,
-    /// A PD prefill leg's account of the media it processed, stamped on
-    /// every `Complete` of the request for the decode leg.
+    /// A PD prefill side's account of the media it processed, stamped on
+    /// every `Complete` of the request for the decode side.
     media_identity: Option<Arc<vllm::MediaIdentity>>,
     /// The request this choice belongs to, for the load tracker.
     request_id: String,
+    /// The rank this choice's engine request went to, whose figures the
+    /// load tracker credits its prompt and tokens to.
+    rank: i32,
 }
 
 impl ChoiceStream {
@@ -282,6 +289,7 @@ impl ChoiceStream {
         Self {
             media_identity,
             request_id,
+            rank: rank_of(&inner),
             state,
             inner: Some(inner),
             stops: StopMatcher::new(decoder, min_tokens),
@@ -303,9 +311,12 @@ impl ChoiceStream {
                 .stats
                 .prompt_tokens
                 .fetch_add(u64::from(prompt_tokens), Ordering::Relaxed);
-            self.state
-                .loads
-                .first_output(&self.request_id, prompt_tokens, cached_tokens);
+            self.state.loads.first_output(
+                self.rank,
+                &self.request_id,
+                prompt_tokens,
+                cached_tokens,
+            );
         }
         self.prompt_counted = true;
     }
@@ -332,6 +343,35 @@ impl ChoiceStream {
             complete.media_identity = Some(identity.clone());
         }
         response
+    }
+}
+
+impl HeldTerminal for ChoiceStream {
+    type Response = vllm::GenerateResponse;
+
+    /// The terminal this choice already holds, when the engine (or a stop
+    /// string) finished it before the poll that would have yielded it: the
+    /// `Complete` it was about to yield, or the engine's parked one. `None`
+    /// for a choice still open, which is left as it is.
+    fn finished(&mut self) -> Option<vllm::GenerateResponse> {
+        if let Some(complete) = self.pending.take() {
+            self.inner = None;
+            return Some(self.stamped(complete));
+        }
+        let inner = self.inner.as_mut()?;
+        if !inner.has_parked_complete() {
+            return None;
+        }
+        // `complete_aborted` yields the parked `Complete` when there is one.
+        let complete = inner.complete_aborted();
+        self.inner = None;
+        Some(self.stamped(complete))
+    }
+
+    /// Whether this choice is still open: neither ended nor holding its
+    /// terminal.
+    fn is_open(&self) -> bool {
+        self.pending.is_none() && self.inner.is_some()
     }
 }
 
@@ -367,22 +407,33 @@ impl Stream for ChoiceStream {
             let Some(vllm::generate_response::Response::Chunk(chunk)) = item.response.as_ref()
             else {
                 // The engine's own terminal `Complete` (or an empty response)
-                // passes through as-is; the engine stream ends after it.
+                // passes through as-is; the engine stream ends after it, and
+                // the choice is no longer open once the `Complete` is out (a
+                // shutdown landing before the next poll must not cut it; the
+                // engine stream has already seen the finish, so dropping it
+                // sends no abort).
+                let mut ended = false;
                 if let Some(vllm::generate_response::Response::Complete(complete)) =
                     item.response.as_ref()
                 {
                     this.count_prompt(complete.prompt_tokens, complete.cached_tokens);
+                    ended = true;
                 }
-                return Poll::Ready(Some(Ok(this.stamped(item))));
+                let response = this.stamped(item);
+                if ended {
+                    this.inner = None;
+                }
+                return Poll::Ready(Some(Ok(response)));
             };
             this.count_prompt(chunk.prompt_tokens, chunk.cached_tokens);
             this.state
                 .stats
                 .generation_tokens
                 .fetch_add(chunk.token_ids.len() as u64, Ordering::Relaxed);
-            this.state
-                .loads
-                .generated(u32::try_from(chunk.token_ids.len()).unwrap_or(u32::MAX));
+            this.state.loads.generated(
+                this.rank,
+                u32::try_from(chunk.token_ids.len()).unwrap_or(u32::MAX),
+            );
             let matched = match this.stops.feed(&chunk.token_ids) {
                 Ok(matched) => matched,
                 Err(status) => {
@@ -423,10 +474,13 @@ impl Stream for ChoiceStream {
 /// `Abort` RPC.
 struct GenerateStream {
     choices: SelectAll<ChoiceStream>,
-    cancel: oneshot::Receiver<()>,
+    cancel: oneshot::Receiver<CancelReason>,
     /// Set once aborted: the terminal `Complete` of every choice still open
     /// at that point, yielded before the stream ends.
     aborted: Option<VecDeque<vllm::GenerateResponse>>,
+    /// The status a shutdown ends the stream with once `aborted` is drained,
+    /// when it cut a choice still open; `None` ends it plainly.
+    cut: Option<Status>,
     _registration: Registration,
     _loads: LoadsGuard,
 }
@@ -438,13 +492,36 @@ impl Stream for GenerateStream {
         let this = self.get_mut();
         loop {
             if let Some(aborted) = this.aborted.as_mut() {
-                return Poll::Ready(aborted.pop_front().map(Ok));
+                if let Some(response) = aborted.pop_front() {
+                    return Poll::Ready(Some(Ok(response)));
+                }
+                // The completions the choices already held went out; a
+                // shutdown that cut a choice still open ends the stream with
+                // its status, a plain abort just ends it.
+                return Poll::Ready(this.cut.take().map(Err));
             }
-            // Either an `Abort` fired the sender or shutdown dropped the
-            // registry: both end the request as the Python servicer does, with
-            // each open choice's `Complete(finish_reason = "abort")`. Dropping
-            // the choices aborts the engine side.
-            if Pin::new(&mut this.cancel).poll(cx).is_ready() {
+            // The cancellation names its cause. An `Abort` RPC is the caller's
+            // own abort: the request ends as the Python servicer ends it, with
+            // each open choice's `Complete(finish_reason = "abort")`. A
+            // shutdown with the request still open is its engine side going
+            // away under it (the lifecycle owner stopping the pair after the
+            // engine exited, a drain whose grace ran out): no completion the
+            // caller could read as a short answer, so the stream ends with
+            // UNAVAILABLE, which the Router classes as the worker's failure.
+            // Either way dropping the choices aborts the engine side.
+            if let Poll::Ready(reason) = Pin::new(&mut this.cancel).poll(cx) {
+                if reason == Ok(CancelReason::Shutdown) {
+                    // A choice the engine (or a stop string) finished before
+                    // this poll keeps its completion; only a choice still
+                    // open is cut, and only then does the stream end with the
+                    // status (see `settle_shutdown`).
+                    let (finished, cut) = settle_shutdown(&mut this.choices);
+                    this.aborted = Some(finished);
+                    this.cut = cut.then(|| Status::unavailable(crate::requests::SHUTDOWN_MESSAGE));
+                    continue;
+                }
+                // The abort, or a sender dropped without a word (the registry
+                // entry went away): the completion it always was.
                 let aborted = this
                     .choices
                     .iter_mut()

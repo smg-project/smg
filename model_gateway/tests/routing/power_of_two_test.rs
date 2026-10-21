@@ -143,7 +143,7 @@ mod power_of_two_tests {
 
         let mut config = RouterConfig::builder()
             .regular_mode(vec![])
-            .power_of_two_policy(1)
+            .power_of_two_policy()
             .host("127.0.0.1")
             .port(3602)
             .max_payload_size(256 * 1024 * 1024)

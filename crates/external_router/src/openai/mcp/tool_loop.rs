@@ -10,11 +10,11 @@
 
 use std::collections::HashSet;
 
-use axum::http::HeaderMap;
+use axum::http::{HeaderMap, HeaderValue};
 use bytes::Bytes;
 use openai_protocol::{
     event_types::{is_function_call_type, ItemType, McpEvent, OutputItemEvent},
-    responses::{generate_id, McpToolCallError, ResponseInput, ResponseTool, ResponsesRequest},
+    responses::{generate_id, McpToolCallError, ResponseTool, ResponsesRequest},
 };
 use serde_json::{json, to_value, Value};
 use smg_mcp::{McpServerBinding, McpToolSession, ToolExecutionInput, ToolExecutionResult};
@@ -41,10 +41,8 @@ pub(crate) struct ToolLoopState {
     pub iteration: usize,
     /// Total number of tool calls executed
     pub total_calls: usize,
-    /// Conversation history (function_call and function_call_output items)
+    /// The calls this loop executed, each with its output, in order
     pub conversation_history: Vec<Value>,
-    /// Original user input (preserved for building resume payloads)
-    pub original_input: ResponseInput,
     /// MCP bindings already represented by historical `mcp_list_tools` items.
     pub existing_mcp_list_tools_labels: HashSet<String>,
     /// Transformed output items (mcp_call, web_search_call, etc.) - stored to avoid reconstruction
@@ -52,7 +50,7 @@ pub(crate) struct ToolLoopState {
 }
 
 impl ToolLoopState {
-    pub fn new(original_input: ResponseInput, prior_mcp_list_tools_labels: Vec<String>) -> Self {
+    pub fn new(prior_mcp_list_tools_labels: Vec<String>) -> Self {
         let known_labels = prior_mcp_list_tools_labels
             .into_iter()
             .collect::<HashSet<_>>();
@@ -61,7 +59,6 @@ impl ToolLoopState {
             iteration: 0,
             total_calls: 0,
             conversation_history: Vec::new(),
-            original_input,
             existing_mcp_list_tools_labels: known_labels,
             mcp_call_items: Vec::new(),
         }
@@ -199,64 +196,53 @@ pub(crate) async fn execute_streaming_tool_calls(
             openai_bridge::lookup_tool_format(session, format_registry, &call.name);
         let server_label = session.resolve_tool_server_label(&call.name);
 
-        let mut arguments: Value = match serde_json::from_str(args_str) {
-            Ok(v) => v,
-            Err(e) => {
-                let err_str = format!("Failed to parse tool arguments: {e}");
-                warn!("{}", err_str);
-                let error_output = json!({ "error": &err_str });
-                let mut mcp_call_item = build_transformed_mcp_call_item(
-                    &error_output,
-                    response_format,
-                    &call.call_id,
-                    &server_label,
-                    &call.name,
-                    &call.arguments_buffer,
-                );
-                if let Some(obj) = mcp_call_item.as_object_mut() {
-                    obj.insert(
-                        "id".to_string(),
-                        Value::String(stable_streaming_tool_item_id(&call, response_format)),
+        let arguments =
+            match prepared_arguments(args_str, response_format, request_tools, request_user) {
+                Ok(v) => v,
+                Err(e) => {
+                    let err_str = format!("Failed to parse tool arguments: {e}");
+                    warn!("{}", err_str);
+                    let error_output = json!({ "error": &err_str });
+                    let mut mcp_call_item = build_transformed_mcp_call_item(
+                        &error_output,
+                        response_format,
+                        &call.call_id,
+                        &server_label,
+                        &call.name,
+                        &call.arguments_buffer,
                     );
+                    if let Some(obj) = mcp_call_item.as_object_mut() {
+                        obj.insert(
+                            "id".to_string(),
+                            Value::String(stable_streaming_tool_item_id(&call, response_format)),
+                        );
+                    }
+                    if !send_tool_call_completion_events(
+                        tx,
+                        &call,
+                        &mcp_call_item,
+                        response_format,
+                        sequence_number,
+                    )
+                    .await
+                    {
+                        return false;
+                    }
+                    state.record_call(
+                        session.is_builtin_tool(&call.name),
+                        call.call_id,
+                        call.name,
+                        call.arguments_buffer,
+                        error_output.to_string(),
+                        mcp_call_item,
+                    );
+                    continue;
                 }
-                if !send_tool_call_completion_events(
-                    tx,
-                    &call,
-                    &mcp_call_item,
-                    response_format,
-                    sequence_number,
-                )
-                .await
-                {
-                    return false;
-                }
-                state.record_call(
-                    session.is_builtin_tool(&call.name),
-                    call.call_id,
-                    call.name,
-                    call.arguments_buffer,
-                    error_output.to_string(),
-                    mcp_call_item,
-                );
-                continue;
-            }
-        };
+            };
 
         if !send_tool_call_intermediate_event(tx, &call, response_format, sequence_number).await {
             return false;
         }
-
-        // Coerce non-object payloads to `{}` before merging overrides — the
-        // merge is a no-op on scalars/arrays and we don't want to silently
-        // drop caller-declared hosted-tool config.
-        if !matches!(arguments, Value::Object(_)) {
-            arguments = json!({});
-        }
-        // Merge caller-declared hosted-tool configuration (e.g. `size`, `quality`
-        // on image_generation) into dispatch args, then forward the request-
-        // level `user` so a downstream MCP server can attribute per-user usage.
-        // Both steps are no-ops for plain MCP function tools.
-        prepare_hosted_dispatch_args(&mut arguments, response_format, request_tools, request_user);
 
         // Log the effective (post-merge) args so the log reflects what the
         // MCP server actually receives, not the pre-merge string from the model.
@@ -269,16 +255,7 @@ pub(crate) async fn execute_streaming_tool_calls(
             })
             .await;
 
-        Metrics::record_mcp_tool_duration(model_id, &tool_output.tool_name, tool_output.duration);
-        Metrics::record_mcp_tool_call(
-            model_id,
-            &tool_output.tool_name,
-            if tool_output.is_error {
-                metrics_labels::RESULT_ERROR
-            } else {
-                metrics_labels::RESULT_SUCCESS
-            },
-        );
+        record_tool_metrics(model_id, &tool_output);
 
         let output_str = tool_output.output.to_string();
         let mut mcp_call_item = to_value(openai_bridge::transform_tool_output(
@@ -316,6 +293,85 @@ pub(crate) async fn execute_streaming_tool_calls(
             output_str,
             mcp_call_item,
         );
+    }
+    true
+}
+
+/// The calls of a batch beyond the request's tool-call allowance: none runs.
+/// Each is closed on the wire under the type the stream announced for it,
+/// with the item the non-streamed loop renders for the same call
+/// ([`not_executed_tool_call_item`]): an `mcp_call` gets
+/// `response.mcp_call.failed` and then its `response.output_item.done`; a
+/// call in a hosted format gets its `response.output_item.done` alone (the
+/// API has no failed sub-event for those item types; the item's status says
+/// it). So no item the stream announced stays open, and each takes its place
+/// among the final response's items after the calls that ran. Returns false
+/// when the client left.
+pub(crate) async fn skip_streaming_tool_calls(
+    skipped: Vec<FunctionCallInProgress>,
+    session: &McpToolSession<'_>,
+    format_registry: &FormatRegistry,
+    tx: &SseSender,
+    state: &mut ToolLoopState,
+    sequence_number: &mut u64,
+) -> bool {
+    for call in skipped {
+        let response_format =
+            openai_bridge::lookup_tool_format(session, format_registry, &call.name);
+        let server_label = session.resolve_tool_server_label(&call.name);
+        let arguments = if call.arguments_buffer.is_empty() {
+            "{}"
+        } else {
+            &call.arguments_buffer
+        };
+        let item_id = stable_streaming_tool_item_id(&call, response_format);
+        let mut item = not_executed_tool_call_item(
+            response_format,
+            call.item_id.as_deref().unwrap_or(call.call_id.as_str()),
+            &server_label,
+            &call.name,
+            arguments,
+        );
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert("id".to_string(), Value::String(item_id.clone()));
+        }
+        let output_index = call.effective_output_index();
+
+        if response_format == ResponseFormat::Passthrough {
+            let failed_payload = json!({
+                "type": McpEvent::CALL_FAILED,
+                "sequence_number": *sequence_number,
+                "output_index": output_index,
+                "item_id": item_id
+            });
+            *sequence_number += 1;
+            let failed_event = format!(
+                "event: {}\ndata: {}\n\n",
+                McpEvent::CALL_FAILED,
+                failed_payload
+            );
+            if tx.send(Ok(Bytes::from(failed_event))).await.is_err() {
+                return false;
+            }
+        }
+
+        let done_payload = json!({
+            "type": OutputItemEvent::DONE,
+            "sequence_number": *sequence_number,
+            "output_index": output_index,
+            "item": item
+        });
+        *sequence_number += 1;
+        let done_event = format!(
+            "event: {}\ndata: {}\n\n",
+            OutputItemEvent::DONE,
+            done_payload
+        );
+        if tx.send(Ok(Bytes::from(done_event))).await.is_err() {
+            return false;
+        }
+
+        state.mcp_call_items.push(item);
     }
     true
 }
@@ -389,11 +445,12 @@ fn remap_tool_choice_for_functions(tool_choice: Option<&Value>, tools: &[Value])
     }
 }
 
-/// Build a resume payload with conversation history
+/// Build a resume payload: the payload the loop started from, its input (the
+/// request's own, with the history it continues loaded in front) followed by
+/// every call this loop executed with its output.
 pub(crate) fn build_resume_payload(
     base_payload: &Value,
     conversation_history: &[Value],
-    original_input: &ResponseInput,
     tools_json: &Value,
     is_streaming: bool,
 ) -> Result<Value, String> {
@@ -403,25 +460,15 @@ pub(crate) fn build_resume_payload(
         .as_object_mut()
         .ok_or_else(|| "payload not an object".to_string())?;
 
-    let mut input_array = Vec::with_capacity(1 + conversation_history.len());
-
-    match original_input {
-        ResponseInput::Text(text) => {
-            let user_item = json!({
-                "type": "message",
-                "role": "user",
-                "content": [{ "type": "input_text", "text": text }]
-            });
-            input_array.push(user_item);
-        }
-        ResponseInput::Items(items) => {
-            let items_value =
-                to_value(items).map_err(|e| format!("Failed to serialize input items: {e}"))?;
-            if let Some(items_arr) = items_value.as_array() {
-                input_array.extend_from_slice(items_arr);
-            }
-        }
-    }
+    let mut input_array = match obj.get("input") {
+        Some(Value::Array(items)) => items.clone(),
+        Some(Value::String(text)) => vec![json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": text }]
+        })],
+        _ => return Err("payload input is neither a string nor an item list".to_string()),
+    };
 
     input_array.extend_from_slice(conversation_history);
     obj.insert("input".to_string(), Value::Array(input_array));
@@ -767,7 +814,14 @@ fn build_approval_response(
     Ok(response)
 }
 
-fn retained_output_items(output_array: &[Value], original_body: &ResponsesRequest) -> Vec<Value> {
+/// The upstream's output items a response keeps when the loop ends short of
+/// an answer: everything but the model's asks for server calls (the
+/// `function_call` items bound to the session's tools), which the loop
+/// renders as its own `mcp_call` items; a client function's call stays.
+pub(crate) fn retained_output_items(
+    output_array: &[Value],
+    original_body: &ResponsesRequest,
+) -> Vec<Value> {
     let user_function_names: HashSet<&str> = original_body
         .tools
         .as_deref()
@@ -852,10 +906,7 @@ pub(crate) async fn execute_tool_loop(
         format_registry,
     } = tool_loop_ctx;
 
-    let mut state = ToolLoopState::new(
-        original_body.input.clone(),
-        existing_mcp_list_tools_labels.to_vec(),
-    );
+    let mut state = ToolLoopState::new(existing_mcp_list_tools_labels.to_vec());
     let max_tool_calls = original_body.max_tool_calls.map(|n| n as usize);
     let base_payload = initial_payload.clone();
     let tools_json = base_payload.get("tools").cloned().unwrap_or(json!([]));
@@ -869,37 +920,27 @@ pub(crate) async fn execute_tool_loop(
     let auth_header = provider.extract_auth_header(headers, worker_api_key);
 
     loop {
-        let request_builder = client.post(url).json(&current_payload);
-        let request_builder = provider.apply_headers(request_builder, auth_header.as_ref());
-
-        let response = request_builder
-            .send()
-            .await
-            .map_err(|e| format!("upstream request failed: {e}"))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            let body = error::sanitize_error_body(&body);
-            return Err(format!("upstream error {status}: {body}"));
-        }
-
-        let mut response_json = response
-            .json::<Value>()
-            .await
-            .map_err(|e| format!("parse response: {e}"))?;
-
-        let function_calls = extract_function_calls(&response_json);
-        if function_calls.is_empty() {
-            info!(
-                "Tool loop completed: {} iterations, {} total calls",
-                state.iteration, state.total_calls
-            );
-            if state.total_calls > 0 {
-                inject_mcp_metadata_streaming(&mut response_json, &state, session);
+        let (response_json, function_calls) = match upstream_round(
+            client,
+            url,
+            &provider,
+            auth_header.as_ref(),
+            &current_payload,
+        )
+        .await?
+        {
+            Round::Done(mut response_json) => {
+                info!(
+                    "Tool loop completed: {} iterations, {} total calls",
+                    state.iteration, state.total_calls
+                );
+                if state.total_calls > 0 {
+                    inject_mcp_metadata_streaming(&mut response_json, &state, session);
+                }
+                return Ok(response_json);
             }
-            return Ok(response_json);
-        }
+            Round::Calls(response_json, function_calls) => (response_json, function_calls),
+        };
 
         state.iteration += 1;
         Metrics::record_mcp_tool_iteration(&original_body.model);
@@ -926,136 +967,169 @@ pub(crate) async fn execute_tool_loop(
                 return build_incomplete_response(
                     response_json,
                     state,
-                    "max_tool_calls",
+                    TOOL_CALL_LIMIT_REASON,
                     session,
+                    format_registry,
                     original_body,
                 );
             }
-            let mut arguments: Value = match serde_json::from_str(&call.arguments) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(tool = %call.name, error = %e, "Failed to parse tool arguments as JSON");
-                    let error_output = format!("Invalid tool arguments: {e}");
-                    let response_format =
-                        openai_bridge::lookup_tool_format(session, format_registry, &call.name);
-                    let server_label = session.resolve_tool_server_label(&call.name);
-                    let tool_item_id =
-                        non_streaming_tool_item_id_source(&call.item_id, response_format);
-                    let error_json = json!({ "error": &error_output });
-                    let transformed_item = build_transformed_mcp_call_item(
-                        &error_json,
-                        response_format,
-                        &tool_item_id,
-                        &server_label,
-                        &call.name,
-                        &call.arguments,
-                    );
-
-                    Metrics::record_mcp_tool_call(
-                        &original_body.model,
-                        &call.name,
-                        metrics_labels::RESULT_ERROR,
-                    );
-
-                    state.record_call(
-                        session.is_builtin_tool(&call.name),
-                        call.call_id,
-                        call.name,
-                        call.arguments,
-                        error_output,
-                        transformed_item,
-                    );
-                    continue;
-                }
-            };
-
-            // Coerce non-object payloads to `{}` before merging overrides —
-            // the merge is a no-op on scalars/arrays and we don't want to
-            // silently drop caller-declared hosted-tool config.
-            if !matches!(arguments, Value::Object(_)) {
-                arguments = json!({});
+            if let Some(approval_item) =
+                dispatch_call(call, &mut state, session, format_registry, original_body).await
+            {
+                return build_approval_response(
+                    response_json,
+                    state,
+                    session,
+                    original_body,
+                    approval_item,
+                );
             }
-            // Merge caller-declared hosted-tool configuration into dispatch args
-            // and forward the request-level `user` so a downstream MCP server
-            // can attribute per-user usage. Both steps are no-ops for plain
-            // MCP function tools (Passthrough format).
-            let response_format =
-                openai_bridge::lookup_tool_format(session, format_registry, &call.name);
-            prepare_hosted_dispatch_args(
-                &mut arguments,
-                response_format,
-                original_body.tools.as_deref().unwrap_or(&[]),
-                original_body.user.as_deref(),
+        }
+
+        current_payload = build_resume_payload(
+            &base_payload,
+            &state.conversation_history,
+            &tools_json,
+            false,
+        )?;
+    }
+}
+
+/// The `incomplete_details.reason` of a tool loop stopped at the request's
+/// `max_tool_calls` before the model's final answer, in both modes.
+pub(crate) const TOOL_CALL_LIMIT_REASON: &str = "max_tool_calls";
+/// The error of a call the loop did not run because the request's tool-call
+/// allowance was spent before it, in both modes.
+pub(crate) const NOT_EXECUTED_AT_TOOL_CALL_LIMIT: &str =
+    "Not executed - response stopped due to limit";
+
+/// The item of a call the loop did not run because the request's tool-call
+/// allowance was spent before it, in the call's own format, in both modes:
+/// an `mcp_call` that `failed` with [`NOT_EXECUTED_AT_TOOL_CALL_LIMIT`], or,
+/// for a tool answered in a hosted format, the item type the stream announces
+/// for the call (`web_search_call`, ...) with the status `failed`. The id is
+/// derived from the call's, as an executed call's is.
+fn not_executed_tool_call_item(
+    response_format: ResponseFormat,
+    item_id_source: &str,
+    server_label: &str,
+    tool_name: &str,
+    arguments: &str,
+) -> Value {
+    if response_format == ResponseFormat::Passthrough {
+        let mut item = build_mcp_call_item(
+            tool_name,
+            arguments,
+            "",
+            server_label,
+            false,
+            Some(NOT_EXECUTED_AT_TOOL_CALL_LIMIT),
+        );
+        if let Some(obj) = item.as_object_mut() {
+            obj.insert(
+                "id".to_string(),
+                Value::String(mcp_response_item_id(item_id_source)),
             );
+        }
+        return item;
+    }
+    let mut item = build_transformed_mcp_call_item(
+        &json!({ "error": NOT_EXECUTED_AT_TOOL_CALL_LIMIT }),
+        response_format,
+        item_id_source,
+        server_label,
+        tool_name,
+        arguments,
+    );
+    if let Some(obj) = item.as_object_mut() {
+        obj.insert("status".to_string(), Value::String("failed".to_string()));
+    }
+    item
+}
 
-            // Serialize the post-merge args once so downstream logging + the
-            // approval payload show the effective (dispatched) payload rather
-            // than the pre-merge string the model emitted.
-            let effective_arguments =
-                serde_json::to_string(&arguments).unwrap_or_else(|_| call.arguments.clone());
+/// What one upstream round of the loop answered: the final response, or the
+/// response with the function calls the model asked for.
+enum Round {
+    Done(Value),
+    Calls(Value, Vec<ExtractedFunctionCall>),
+}
 
-            debug!(
-                "Calling MCP tool '{}' with args: {}",
-                call.name, effective_arguments
-            );
-            let tool_result = session
-                .execute_tool_result(ToolExecutionInput {
-                    call_id: call.call_id.clone(),
-                    tool_name: call.name.clone(),
-                    arguments,
-                })
-                .await;
+/// One upstream round: the payload posted under the provider's headers, an
+/// error status answered as the loop's failure with its body sanitized, the
+/// JSON read and its function calls extracted.
+async fn upstream_round(
+    client: &reqwest::Client,
+    url: &str,
+    provider: &ApiProvider,
+    auth_header: Option<&HeaderValue>,
+    payload: &Value,
+) -> Result<Round, String> {
+    let request_builder = client.post(url).json(payload);
+    let request_builder = provider.apply_headers(request_builder, auth_header);
 
-            let server_label = session.resolve_tool_server_label(&call.name);
-            let tool_item_id = non_streaming_tool_item_id_source(&call.item_id, response_format);
-            let approval_request_id = approval_request_item_id_source(&call.item_id);
+    let response = request_builder
+        .send()
+        .await
+        .map_err(|e| format!("upstream request failed: {e}"))?;
 
-            let tool_output = match tool_result {
-                ToolExecutionResult::Executed(tool_output) => tool_output,
-                ToolExecutionResult::PendingApproval(pending) => {
-                    let approval_item = build_mcp_approval_request_item(
-                        &approval_request_id,
-                        &pending.tool_name,
-                        &effective_arguments,
-                        &server_label,
-                    );
-                    return build_approval_response(
-                        response_json,
-                        state,
-                        session,
-                        original_body,
-                        approval_item,
-                    );
-                }
-            };
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        let body = error::sanitize_error_body(&body);
+        return Err(format!("upstream error {status}: {body}"));
+    }
 
-            Metrics::record_mcp_tool_duration(
-                &original_body.model,
-                &tool_output.tool_name,
-                tool_output.duration,
-            );
-            Metrics::record_mcp_tool_call(
-                &original_body.model,
-                &tool_output.tool_name,
-                if tool_output.is_error {
-                    metrics_labels::RESULT_ERROR
-                } else {
-                    metrics_labels::RESULT_SUCCESS
-                },
-            );
+    let response_json = response
+        .json::<Value>()
+        .await
+        .map_err(|e| format!("parse response: {e}"))?;
 
-            let output_str = tool_output.output.to_string();
+    let function_calls = extract_function_calls(&response_json);
+    if function_calls.is_empty() {
+        return Ok(Round::Done(response_json));
+    }
+    Ok(Round::Calls(response_json, function_calls))
+}
+
+/// One call of a round dispatched and recorded: arguments the model wrote
+/// that are not JSON record an error item; otherwise the prepared arguments
+/// go to the session, and the result is recorded with its metrics. A call the
+/// session holds for approval returns the approval item, which ends the
+/// loop with the approval response.
+async fn dispatch_call(
+    call: ExtractedFunctionCall,
+    state: &mut ToolLoopState,
+    session: &McpToolSession<'_>,
+    format_registry: &FormatRegistry,
+    original_body: &ResponsesRequest,
+) -> Option<Value> {
+    let response_format = openai_bridge::lookup_tool_format(session, format_registry, &call.name);
+    let server_label = session.resolve_tool_server_label(&call.name);
+    let tool_item_id = non_streaming_tool_item_id_source(&call.item_id, response_format);
+    let arguments = match prepared_arguments(
+        &call.arguments,
+        response_format,
+        original_body.tools.as_deref().unwrap_or(&[]),
+        original_body.user.as_deref(),
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(tool = %call.name, error = %e, "Failed to parse tool arguments as JSON");
+            let error_output = format!("Invalid tool arguments: {e}");
+            let error_json = json!({ "error": &error_output });
             let transformed_item = build_transformed_mcp_call_item(
-                &tool_output.output,
+                &error_json,
                 response_format,
                 &tool_item_id,
                 &server_label,
                 &call.name,
-                // Use the post-merge string so the client-visible item describes
-                // what the router actually dispatched (e.g. hosted-tool overrides
-                // like image-generation `size`/`quality` merged in above), not
-                // the pre-merge arguments the model emitted.
-                &effective_arguments,
+                &call.arguments,
+            );
+
+            Metrics::record_mcp_tool_call(
+                &original_body.model,
+                &call.name,
+                metrics_labels::RESULT_ERROR,
             );
 
             state.record_call(
@@ -1063,19 +1137,106 @@ pub(crate) async fn execute_tool_loop(
                 call.call_id,
                 call.name,
                 call.arguments,
-                output_str,
+                error_output,
                 transformed_item,
             );
+            return None;
         }
+    };
 
-        current_payload = build_resume_payload(
-            &base_payload,
-            &state.conversation_history,
-            &state.original_input,
-            &tools_json,
-            false,
-        )?;
+    // Serialize the post-merge args once so downstream logging + the
+    // approval payload show the effective (dispatched) payload rather
+    // than the pre-merge string the model emitted.
+    let effective_arguments =
+        serde_json::to_string(&arguments).unwrap_or_else(|_| call.arguments.clone());
+
+    debug!(
+        "Calling MCP tool '{}' with args: {}",
+        call.name, effective_arguments
+    );
+    let tool_result = session
+        .execute_tool_result(ToolExecutionInput {
+            call_id: call.call_id.clone(),
+            tool_name: call.name.clone(),
+            arguments,
+        })
+        .await;
+
+    let approval_request_id = approval_request_item_id_source(&call.item_id);
+
+    let tool_output = match tool_result {
+        ToolExecutionResult::Executed(tool_output) => tool_output,
+        ToolExecutionResult::PendingApproval(pending) => {
+            return Some(build_mcp_approval_request_item(
+                &approval_request_id,
+                &pending.tool_name,
+                &effective_arguments,
+                &server_label,
+            ));
+        }
+    };
+
+    record_tool_metrics(&original_body.model, &tool_output);
+
+    let output_str = tool_output.output.to_string();
+    let transformed_item = build_transformed_mcp_call_item(
+        &tool_output.output,
+        response_format,
+        &tool_item_id,
+        &server_label,
+        &call.name,
+        // Use the post-merge string so the client-visible item describes
+        // what the router actually dispatched (e.g. hosted-tool overrides
+        // like image-generation `size`/`quality` merged in above), not
+        // the pre-merge arguments the model emitted.
+        &effective_arguments,
+    );
+
+    state.record_call(
+        session.is_builtin_tool(&call.name),
+        call.call_id,
+        call.name,
+        call.arguments,
+        output_str,
+        transformed_item,
+    );
+    None
+}
+
+/// The arguments a call dispatches with: the model's string parsed as JSON,
+/// a payload that is not an object coerced to `{}` before the merge (the
+/// merge is a no-op on scalars and arrays, and caller-declared hosted-tool
+/// config must not be dropped silently), the caller-declared hosted-tool
+/// configuration (e.g. `size`, `quality` on image_generation) merged in, and
+/// the request-level `user` forwarded so a downstream MCP server can
+/// attribute per-user usage. The merge and the forwarding are no-ops for
+/// plain MCP function tools (Passthrough format).
+fn prepared_arguments(
+    raw: &str,
+    response_format: ResponseFormat,
+    request_tools: &[ResponseTool],
+    request_user: Option<&str>,
+) -> Result<Value, serde_json::Error> {
+    let mut arguments: Value = serde_json::from_str(raw)?;
+    if !matches!(arguments, Value::Object(_)) {
+        arguments = json!({});
     }
+    prepare_hosted_dispatch_args(&mut arguments, response_format, request_tools, request_user);
+    Ok(arguments)
+}
+
+/// A dispatched call's duration and result, by model and tool.
+fn record_tool_metrics(model_id: &str, tool_output: &smg_mcp::ToolExecutionOutput) {
+    Metrics::record_mcp_tool_duration(model_id, &tool_output.tool_name, tool_output.duration);
+    Metrics::record_mcp_tool_call(
+        model_id,
+        &tool_output.tool_name,
+        if tool_output.is_error {
+            metrics_labels::RESULT_ERROR
+        } else {
+            metrics_labels::RESULT_SUCCESS
+        },
+    );
 }
 
 /// Build an incomplete response when limits are exceeded
@@ -1084,6 +1245,7 @@ fn build_incomplete_response(
     state: ToolLoopState,
     reason: &str,
     session: &McpToolSession<'_>,
+    format_registry: &FormatRegistry,
     original_body: &ResponsesRequest,
 ) -> Result<Value, String> {
     let obj = response
@@ -1119,6 +1281,17 @@ fn build_incomplete_response(
         })
         .unwrap_or_default();
 
+    // The calls this loop ran, each already among the executed items: a turn
+    // the allowance cut in two renders them once.
+    let executed_call_ids: HashSet<&str> = state
+        .conversation_history
+        .iter()
+        .filter(|item| {
+            item.get("type").and_then(Value::as_str) == Some(ItemType::FUNCTION_CALL_OUTPUT)
+        })
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+        .collect();
+
     // Convert MCP function_call items in output to mcp_call format.
     if let Some(output_array) = obj.get_mut("output").and_then(|v| v.as_array_mut()) {
         // Find any function_call items and convert them to mcp_call (incomplete)
@@ -1131,24 +1304,43 @@ fn build_incomplete_response(
                     // User function calls must remain as function_call output items.
                     continue;
                 }
+                let call_id = item.get("call_id").and_then(|v| v.as_str()).unwrap_or("");
+                if executed_call_ids.contains(call_id) {
+                    // The call ran before the allowance was spent: its item
+                    // is among the executed ones.
+                    continue;
+                }
                 let args = item
                     .get("arguments")
                     .and_then(|v| v.as_str())
                     .unwrap_or("{}");
 
-                // Mark as incomplete - not executed
+                // Not executed: the item in the call's own format, as the
+                // streamed loop closes the same call.
+                let response_format =
+                    openai_bridge::lookup_tool_format(session, format_registry, tool_name);
+                let item_id = item
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| item.get("call_id").and_then(|v| v.as_str()))
+                    .unwrap_or("");
                 let resolved_label = session.resolve_tool_server_label(tool_name);
-                let mcp_call_item = build_mcp_call_item(
+                incomplete_items.push(not_executed_tool_call_item(
+                    response_format,
+                    &non_streaming_tool_item_id_source(item_id, response_format),
+                    &resolved_label,
                     tool_name,
                     args,
-                    "", // No output - wasn't executed
-                    &resolved_label,
-                    false, // Not successful
-                    Some("Not executed - response stopped due to limit"),
-                );
-                incomplete_items.push(mcp_call_item);
+                ));
             }
         }
+
+        // The asks themselves leave: each is rendered by its call's item (the
+        // executed one, or the not-executed one in the call's own format), as
+        // the approval exit keeps only the client's own function calls.
+        let retained = retained_output_items(output_array, original_body);
+        output_array.clear();
+        output_array.extend(retained);
 
         // Add mcp_list_tools and executed mcp_call items at the beginning
         if state.total_calls > 0 || !incomplete_items.is_empty() {
@@ -1335,8 +1527,8 @@ mod tests {
 
     use super::{
         build_transformed_mcp_call_item, extract_openai_response_output_items,
-        is_internal_mcp_response_item, mcp_list_tools_bindings_to_emit, ResponseInput,
-        ToolLoopState,
+        is_internal_mcp_response_item, mcp_list_tools_bindings_to_emit,
+        not_executed_tool_call_item, ToolLoopState, NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
     };
     use crate::openai_bridge::ResponseFormat;
 
@@ -1346,6 +1538,43 @@ mod tests {
         schema.insert("properties".to_string(), json!({}));
 
         Tool::new(name.to_string(), "internal", schema)
+    }
+
+    /// A call left over the tool-call allowance is rendered in its own
+    /// format: an `mcp_call` that failed with the not-executed error and the
+    /// id an executed call would have had, or the hosted item type the stream
+    /// announces for the tool, `failed`, with that format's id.
+    #[test]
+    fn a_not_executed_call_item_keeps_the_format_the_stream_announced() {
+        let plain = not_executed_tool_call_item(
+            ResponseFormat::Passthrough,
+            "fc_1",
+            "mock",
+            "brave_web_search",
+            "{}",
+        );
+        assert_eq!(plain["type"], "mcp_call");
+        assert_eq!(plain["status"], "failed");
+        assert_eq!(plain["id"], "mcp_1");
+        assert_eq!(plain["server_label"], "mock");
+        assert!(
+            plain["error"]
+                .to_string()
+                .contains(NOT_EXECUTED_AT_TOOL_CALL_LIMIT),
+            "{plain}"
+        );
+
+        let hosted = not_executed_tool_call_item(
+            ResponseFormat::WebSearchCall,
+            "1",
+            "mock",
+            "brave_web_search",
+            r#"{"query":"q"}"#,
+        );
+        assert_eq!(hosted["type"], "web_search_call");
+        assert_eq!(hosted["status"], "failed");
+        assert_eq!(hosted["id"], "ws_1");
+        assert!(hosted.get("server_label").is_none());
     }
 
     #[test]
@@ -1557,7 +1786,7 @@ mod tests {
 
     #[test]
     fn record_call_appends_openai_response_output_after_tool_item() {
-        let mut state = ToolLoopState::new(ResponseInput::Text("hello".to_string()), Vec::new());
+        let mut state = ToolLoopState::new(Vec::new());
         let transformed = json!({
             "type": "web_search_call",
             "id": "ws_test",
@@ -1606,7 +1835,7 @@ mod tests {
 
     #[test]
     fn record_call_does_not_append_openai_response_output_for_non_builtin_tools() {
-        let mut state = ToolLoopState::new(ResponseInput::Text("hello".to_string()), Vec::new());
+        let mut state = ToolLoopState::new(Vec::new());
         let transformed = json!({
             "type": "web_search_call",
             "id": "ws_test",
@@ -2059,12 +2288,101 @@ mod tests {
         let resumed = super::build_resume_payload(
             &base,
             &[],
-            &ResponseInput::Text("q".to_string()),
             &json!([{"type": "function", "name": "ask_wiki"}]),
             false,
         )
         .expect("resume payload");
 
         assert_eq!(resumed["tool_choice"], json!("auto"));
+        assert_eq!(
+            resumed["input"],
+            json!([{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "q"}]}])
+        );
+    }
+
+    /// The payload the loop started from carries the history the request
+    /// continues (a stored turn's function call and the client's answer to
+    /// it); the resume payload keeps it in front of the calls this loop ran.
+    #[test]
+    fn resume_payload_keeps_the_loaded_history_in_front_of_the_loops_calls() {
+        let loaded_input = json!([
+            {"type": "message", "id": "msg_1", "role": "user", "content": [{"type": "input_text", "text": "What is 6*7?"}]},
+            {"type": "function_call", "id": "fc_1", "call_id": "call_A", "name": "calc", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_A", "output": "42"}
+        ]);
+        let base = json!({
+            "model": "m",
+            "input": loaded_input,
+            "tools": [{"type": "function", "name": "search"}]
+        });
+        let executed = [
+            json!({"type": "function_call", "call_id": "call_B", "name": "search", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "call_B", "output": "found"}),
+        ];
+
+        let resumed = super::build_resume_payload(
+            &base,
+            &executed,
+            &json!([{"type": "function", "name": "search"}]),
+            false,
+        )
+        .expect("resume payload");
+
+        let kinds: Vec<(&str, &str)> = resumed["input"]
+            .as_array()
+            .expect("an item list")
+            .iter()
+            .map(|item| {
+                (
+                    item["type"].as_str().unwrap_or("?"),
+                    item["call_id"].as_str().unwrap_or(""),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("message", ""),
+                ("function_call", "call_A"),
+                ("function_call_output", "call_A"),
+                ("function_call", "call_B"),
+                ("function_call_output", "call_B"),
+            ]
+        );
+        assert_eq!(resumed["store"], json!(false));
+    }
+
+    /// The argument preparation both loops share: a payload that is not an
+    /// object becomes `{}` before the hosted-tool merge, the request's `user`
+    /// is forwarded for a hosted format and left out for a plain MCP tool,
+    /// and an object payload under a plain MCP tool goes through untouched.
+    #[test]
+    fn prepared_arguments_coerce_merge_and_forward_the_user() {
+        let hosted =
+            super::prepared_arguments("42", ResponseFormat::WebSearchCall, &[], Some("u-1"))
+                .expect("a scalar payload parses");
+        assert_eq!(hosted, json!({ "user": "u-1" }));
+        let plain = super::prepared_arguments("42", ResponseFormat::Passthrough, &[], Some("u-1"))
+            .expect("a scalar payload parses");
+        assert_eq!(plain, json!({}));
+        let object = super::prepared_arguments(
+            r#"{"query": "weather", "user": null}"#,
+            ResponseFormat::Passthrough,
+            &[],
+            Some("u-1"),
+        )
+        .expect("an object payload parses");
+        assert_eq!(object, json!({ "query": "weather", "user": null }));
+        let overwritten = super::prepared_arguments(
+            r#"{"query": "weather", "user": null}"#,
+            ResponseFormat::WebSearchCall,
+            &[],
+            Some("u-1"),
+        )
+        .expect("an object payload parses");
+        assert_eq!(overwritten, json!({ "query": "weather", "user": "u-1" }));
+        assert!(
+            super::prepared_arguments("not json", ResponseFormat::Passthrough, &[], None).is_err()
+        );
     }
 }

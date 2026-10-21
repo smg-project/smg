@@ -19,19 +19,21 @@ use axum::response::{IntoResponse, Response};
 use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::ClassifyRequest,
+    common::{InputIds, Usage},
     completion::CompletionRequest,
-    decisions::DecisionsRequest,
+    decisions::{DecisionUsage, DecisionsRequest},
     embedding::EmbeddingRequest,
-    generate::GenerateRequest,
+    generate::{GenerateRequest, GenerateResponse},
     messages::CreateMessageRequest,
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_external_router::header_utils::insert_routed_worker_id;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::error;
+use tracing::{debug, error};
 
 use super::{
     common::{
+        response_formatting::TokenCounts,
         responses::{ResponsesContext, StreamStartupSender},
         stages::*,
     },
@@ -67,11 +69,11 @@ use super::{
     },
     spec::ResponseSpec,
     utils,
-    utils::error_type_from_status,
+    utils::error_type_for_response,
 };
 use crate::{
     config::types::RetryConfig,
-    middleware::TenantRequestMeta,
+    middleware::{ReportedRefusal, TenantRequestMeta},
     observability::{
         cache_trace,
         metrics::{bool_to_static_str, metrics_labels, Metrics},
@@ -191,6 +193,8 @@ impl PipelineDeps {
             self.worker_registry.clone(),
             self.configured_tool_parser.clone(),
             self.configured_reasoning_parser.clone(),
+            &self.tool_parser_factory,
+            &self.reasoning_parser_factory,
         );
         let processor = processor::ResponseProcessor::new(
             self.tool_parser_factory.clone(),
@@ -266,10 +270,12 @@ pub(crate) struct RequestPipeline {
     stages: Arc<PipelineStages>,
     /// Backend type for metrics labeling
     backend_type: &'static str,
-    /// Disaggregation mode, for per-leg retry metric labels.
+    /// Disaggregation mode, for per-side retry metric labels.
     mode: Mode,
     /// The registry, read at dispatch for `--worker-overload-shed`.
     worker_registry: Arc<WorkerRegistry>,
+    /// Shapes a forced tool call's constraint for each attempt's worker.
+    tool_parser_factory: ToolParserFactory,
 }
 
 /// Outcome of one full pipeline run.
@@ -324,7 +330,9 @@ impl RequestPipeline {
             Endpoint::Chat => {
                 let (processor, streaming_processor) = deps.configured_processors(backend);
                 PipelineStages {
-                    preparation: Box::new(ChatGeneratePreparationStage::new()),
+                    preparation: Box::new(ChatGeneratePreparationStage::new(
+                        mode.multimodal_wire_pools(),
+                    )),
                     rate_limit: Some(rate_limit()),
                     worker_selection,
                     encode,
@@ -341,7 +349,9 @@ impl RequestPipeline {
             Endpoint::Messages => {
                 let (processor, streaming_processor) = deps.configured_processors(backend);
                 PipelineStages {
-                    preparation: Box::new(MessagePreparationStage),
+                    preparation: Box::new(MessagePreparationStage::new(
+                        mode.multimodal_wire_pools(),
+                    )),
                     rate_limit: Some(rate_limit()),
                     worker_selection,
                     encode,
@@ -448,6 +458,7 @@ impl RequestPipeline {
             backend_type: backend,
             mode,
             worker_registry: deps.worker_registry.clone(),
+            tool_parser_factory: deps.tool_parser_factory.clone(),
         })
     }
 
@@ -455,8 +466,29 @@ impl RequestPipeline {
     async fn run_ingress(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
         macro_rules! step {
             ($stage:expr, $result:expr) => {
-                $result.inspect_err(|response: &Response| {
-                    error!("Stage {} failed with status {}", $stage, response.status());
+                $result.map_err(|response: Response| {
+                    // A refusal the failing stage did not report itself (the
+                    // preparation stage's 404 for a model nobody serves)
+                    // gets its one rate-limited line here; a reported one,
+                    // and every other failure, passes through.
+                    let response = self.stages.worker_selection.report_refusal(
+                        "RequestPipeline::run_ingress",
+                        helpers::middleware_request_id(ctx.input.tenant_request_meta.as_ref()),
+                        &ctx.input.model_id,
+                        response,
+                    );
+                    if response.extensions().get::<ReportedRefusal>().is_some() {
+                        // The one line this refusal gets was written
+                        // (rate-limited, with the pool's state).
+                        debug!(
+                            "Stage {} refused the request with status {}",
+                            $stage,
+                            response.status()
+                        );
+                    } else {
+                        error!("Stage {} failed with status {}", $stage, response.status());
+                    }
+                    response
                 })
             };
         }
@@ -473,23 +505,11 @@ impl RequestPipeline {
             stages.worker_selection.name(),
             stages.worker_selection.execute(ctx).await
         )?;
-        let workers = ctx.state.workers.as_ref().ok_or_else(|| {
-            error!(function = "run_ingress", "Worker selection not completed");
-            error::internal_error(
-                "worker_selection_not_completed",
-                "Worker selection not completed",
-            )
-        })?;
-        // The window is a property of the selected worker's model card, so
-        // this has to follow selection; it precedes client acquisition so a
-        // request no engine could accept never reaches one (#2380).
-        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
-            error!(function = "run_ingress", "Preparation stage not completed");
-            error::internal_error(
-                "preparation_stage_not_completed",
-                "Preparation stage not completed",
-            )
-        })?;
+        let workers = stage_output(ctx.state.workers.as_ref(), "run_ingress")?;
+        // Keep the post-selection guard for paths without pre-filtering
+        // (EPD and direct ZMQ), and for a model card updated during selection.
+        // No rejected request acquires a client or reaches an engine (#2380).
+        let prep = stage_output(ctx.state.preparation.as_ref(), "run_ingress")?;
         step!(
             "ContextLength",
             enforce_context_length(prep, workers, &ctx.input.model_id)
@@ -522,28 +542,23 @@ impl RequestPipeline {
         &self,
         dctx: &mut DispatchContext,
         plan: &mut Option<ExecutionPlan>,
-        spec: &ResponseSpec,
+        spec: &mut Option<ResponseSpec>,
         stamp: &AttemptStamp,
         attempt: u32,
         last_attempt: bool,
     ) -> Result<Option<Response>, Response> {
         dctx.attempt = attempt;
+        let consumed = || {
+            error!(function = "run_attempt", "Execution plan already consumed");
+            error::internal_error("execution_plan_consumed", "Execution plan already consumed")
+        };
         if attempt > 0 {
             // Fresh worker selection per attempt; the retained plan is
-            // re-stamped (engine ids, sampling defaults, PD rooms) for the
-            // new workers. Buffered decode state from the failed attempt is
-            // reset.
+            // re-stamped (engine ids, sampling defaults, the forced tool
+            // call's shape, PD rooms) for the new workers. Buffered decode
+            // state from the failed attempt is reset.
             self.stages.worker_selection.reselect(dctx).await?;
-            let workers = dctx.workers.as_ref().ok_or_else(|| {
-                error!(
-                    function = "run_attempt",
-                    "Worker re-selection not completed"
-                );
-                error::internal_error(
-                    "worker_selection_not_completed",
-                    "Worker selection not completed",
-                )
-            })?;
+            let workers = stage_output(dctx.workers.as_ref(), "run_attempt")?;
             dctx.clients = Some(
                 acquire_clients(
                     workers,
@@ -552,34 +567,28 @@ impl RequestPipeline {
                 )
                 .await?,
             );
-            let retained = plan.as_mut().ok_or_else(|| {
-                error!(function = "run_attempt", "Execution plan already consumed");
-                error::internal_error("execution_plan_consumed", "Execution plan already consumed")
-            })?;
-            helpers::restamp_plan_for_attempt(retained, stamp, workers)?;
+            let retained = plan.as_mut().ok_or_else(consumed)?;
+            helpers::restamp_plan_for_attempt(retained, stamp, workers, &self.tool_parser_factory)?;
             if let Some(decoder) = dctx.response.stop_decoder.as_mut() {
                 decoder.reset();
             }
             dctx.response.execution_result = None;
         }
 
-        if let ResponseSpec::Decisions(spec) = spec {
+        if let Some(ResponseSpec::Decisions(spec)) = spec {
             if let Some(workers) = dctx.workers.as_ref() {
                 enforce_decisions_context_length(spec.max_input_tokens, workers, &dctx.model_id)?;
             }
         }
 
-        // The last allowed attempt moves the plan (no clone); earlier
-        // attempts dispatch a clone and retain the original for replay.
-        let attempt_plan = if last_attempt {
-            plan.take()
+        // The last allowed attempt moves the plan and the spec (no clone);
+        // earlier attempts dispatch a clone and retain the originals for replay.
+        let (attempt_plan, attempt_spec) = if last_attempt {
+            plan.take().zip(spec.take())
         } else {
-            plan.clone()
+            plan.clone().zip(spec.clone())
         }
-        .ok_or_else(|| {
-            error!(function = "run_attempt", "Execution plan already consumed");
-            error::internal_error("execution_plan_consumed", "Execution plan already consumed")
-        })?;
+        .ok_or_else(consumed)?;
 
         dctx.dispatch = Some(prepare_dispatch_metadata(
             &attempt_plan,
@@ -590,7 +599,7 @@ impl RequestPipeline {
         execute_plan(dctx, attempt_plan, last_attempt).await?;
         self.stages
             .response_processing
-            .process(dctx, spec.clone())
+            .process(dctx, attempt_spec)
             .await
             .inspect_err(|response| {
                 error!(
@@ -636,14 +645,7 @@ impl RequestPipeline {
     ) -> Result<RunOutcome, Response> {
         let mut attempt_start = Instant::now();
         if let Some(endpoint) = metrics_endpoint {
-            Metrics::record_router_request(
-                metrics_labels::ROUTER_GRPC,
-                self.backend_type,
-                metrics_labels::CONNECTION_GRPC,
-                &ctx.input.model_id,
-                endpoint,
-                bool_to_static_str(ctx.is_streaming()),
-            );
+            self.record_request(endpoint, &ctx.input.model_id, ctx.is_streaming());
         }
 
         let build = match self.run_ingress(&mut ctx).await {
@@ -670,37 +672,31 @@ impl RequestPipeline {
 
         let max_attempts = retry_config.map_or(1, |config| config.max_retries.max(1));
         let mut plan = Some(plan);
+        let mut spec = Some(spec);
         let mut attempt: u32 = 0;
         loop {
             if attempt > 0 {
                 attempt_start = Instant::now();
                 if let Some(endpoint) = metrics_endpoint {
-                    Metrics::record_router_request(
-                        metrics_labels::ROUTER_GRPC,
-                        self.backend_type,
-                        metrics_labels::CONNECTION_GRPC,
-                        &dctx.model_id,
-                        endpoint,
-                        bool_to_static_str(dctx.streaming),
-                    );
+                    self.record_request(endpoint, &dctx.model_id, dctx.streaming);
                 }
             }
 
             let last_attempt = attempt + 1 >= max_attempts;
             let mut failure = match self
-                .run_attempt(&mut dctx, &mut plan, &spec, &stamp, attempt, last_attempt)
+                .run_attempt(
+                    &mut dctx,
+                    &mut plan,
+                    &mut spec,
+                    &stamp,
+                    attempt,
+                    last_attempt,
+                )
                 .await
             {
                 Ok(Some(response)) => {
                     if let Some(endpoint) = metrics_endpoint {
-                        Metrics::record_router_duration(
-                            metrics_labels::ROUTER_GRPC,
-                            self.backend_type,
-                            metrics_labels::CONNECTION_GRPC,
-                            &dctx.model_id,
-                            endpoint,
-                            attempt_start.elapsed(),
-                        );
+                        self.record_duration(endpoint, &dctx.model_id, attempt_start);
                     }
                     return Ok(RunOutcome::Early(Self::routed_response(&dctx, response)));
                 }
@@ -709,11 +705,21 @@ impl RequestPipeline {
             };
 
             self.record_error(metrics_endpoint, &dctx.model_id, &failure);
-            error!(
-                attempt,
-                status = %failure.status(),
-                "pipeline attempt failed"
-            );
+            if failure.extensions().get::<ReportedRefusal>().is_some() {
+                // The re-selection wrote this refusal's line (rate-limited,
+                // with the pool's state), as for the first selection.
+                debug!(
+                    attempt,
+                    status = %failure.status(),
+                    "pipeline attempt refused"
+                );
+            } else {
+                error!(
+                    attempt,
+                    status = %failure.status(),
+                    "pipeline attempt failed"
+                );
+            }
             // The failed attempt's worker load must not stay elevated through
             // the backoff window (a fresh context dropped them here before).
             // This releases its PD admission claim too, so the retry is not
@@ -724,11 +730,24 @@ impl RequestPipeline {
             // worker: the next attempt goes to another available worker, or
             // the answer stands as the client's response.
             if let Some(workers) = dctx.workers.as_ref() {
+                // The alternative is sought where the retry would re-select,
+                // among the workers that decide the constraint alike too.
                 let pools = self.retry_pools(&dctx.model_id, dctx.wire);
+                let decided_on = dctx.constraint_decided_on;
                 dctx.ledger.settle(
                     &mut failure,
                     workers.workers(),
-                    pools.iter().flat_map(|pool| pool.as_slice().iter()),
+                    pools
+                        .iter()
+                        .flat_map(|pool| pool.as_slice().iter())
+                        .filter(|worker| {
+                            decided_on
+                                .is_none_or(|decoding| decoding.decides_alike(worker.as_ref()))
+                                && dctx
+                                    .routing
+                                    .context_requirements
+                                    .admits(worker.as_ref(), &dctx.model_id)
+                        }),
                 );
             }
 
@@ -792,6 +811,13 @@ impl RequestPipeline {
                 response.headers_mut().insert("x-smg-cache-trace", value);
             }
         }
+        // Which parser read a chat completion, so a client comparing the two can tell.
+        if let Some(parser) = ctx.parser {
+            response.headers_mut().insert(
+                "x-smg-parser",
+                http::HeaderValue::from_static(parser.name()),
+            );
+        }
         if let Some(workers) = ctx.workers.as_ref() {
             let worker = match workers {
                 WorkerSelection::Single { worker } => worker,
@@ -802,15 +828,39 @@ impl RequestPipeline {
         response
     }
 
-    fn record_error(&self, endpoint: Option<&'static str>, model: &str, response: &Response) {
+    /// One router request under this pipeline's labels, the count the
+    /// dashboards read: recorded per attempt here, and by the router for an
+    /// answer it gives without the pipeline, so that traffic stays visible.
+    /// The `model` label is the served model's id, or `other` for a model no
+    /// worker serves ([`WorkerRegistry::metric_model_label`]), here and in
+    /// the error and duration records below.
+    pub(crate) fn record_request(&self, endpoint: &'static str, model: &str, streaming: bool) {
+        Metrics::record_router_request(
+            metrics_labels::ROUTER_GRPC,
+            self.backend_type,
+            metrics_labels::CONNECTION_GRPC,
+            self.worker_registry.metric_model_label(model),
+            endpoint,
+            bool_to_static_str(streaming),
+        );
+    }
+
+    /// A refused request under this pipeline's labels, by its class: one of
+    /// the gateway's own refusals, or the response's status.
+    pub(crate) fn record_error(
+        &self,
+        endpoint: Option<&'static str>,
+        model: &str,
+        response: &Response,
+    ) {
         if let Some(endpoint) = endpoint {
             Metrics::record_router_error(
                 metrics_labels::ROUTER_GRPC,
                 self.backend_type,
                 metrics_labels::CONNECTION_GRPC,
-                model,
+                self.worker_registry.metric_model_label(model),
                 endpoint,
-                error_type_from_status(response.status()),
+                error_type_for_response(response),
             );
         }
     }
@@ -848,7 +898,7 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model,
+            self.worker_registry.metric_model_label(model),
             endpoint,
             start.elapsed(),
         );
@@ -871,7 +921,7 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model,
+            self.worker_registry.metric_model_label(model),
             endpoint,
             metrics_labels::ERROR_INTERNAL,
         );
@@ -889,7 +939,7 @@ impl RequestPipeline {
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            model,
+            self.worker_registry.metric_model_label(model),
             endpoint,
             metrics_labels::ERROR_INTERNAL,
         );
@@ -901,20 +951,86 @@ impl RequestPipeline {
     /// disabled or endpoint opted out) or was never admitted (e.g. prep
     /// failed before the reserve stage ran). Idempotent -- `settle_success`
     /// is a no-op if the handle was already resolved.
-    async fn settle_reservation(
-        cell: Option<&RateLimitCell>,
-        actual_input_tokens: u32,
-        completion_tokens: u32,
-    ) {
+    async fn settle_reservation(cell: Option<&RateLimitCell>, usage: UsageSettlement) {
         let Some(RateLimitOutcome::Admitted(handle)) = cell.and_then(RateLimitCell::peek) else {
             return;
         };
-        handle
-            .settle_success(UsageSettlement {
-                actual_input_tokens,
-                completion_tokens,
-            })
-            .await;
+        handle.settle_success(usage).await;
+    }
+
+    /// The settlement of a non-streamed chat or messages answer: the engine's
+    /// counters the response stage recorded (see `ResponseState::engine_counts`);
+    /// all zeros, a full refund, when none were (the stage always records
+    /// them with a response).
+    fn recorded_settlement(response: &ResponseState) -> UsageSettlement {
+        response
+            .engine_counts
+            .map_or_else(UsageSettlement::default, TokenCounts::settlement)
+    }
+
+    /// The settlement of a non-streamed legacy completion: its usage object
+    /// is the engine's counters unchanged (no unbilled prompt tokens, no
+    /// parser), summed over the prompts of a batch.
+    pub(in crate::routers::grpc) fn completion_settlement(
+        usage: Option<&Usage>,
+    ) -> UsageSettlement {
+        usage.map_or_else(UsageSettlement::default, |usage| UsageSettlement {
+            actual_input_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            cached_input_tokens: usage
+                .prompt_tokens_details
+                .as_ref()
+                .map_or(0, |details| details.cached_tokens),
+            reasoning_tokens: usage
+                .completion_tokens_details
+                .as_ref()
+                .and_then(|details| details.reasoning_tokens)
+                .unwrap_or(0),
+        })
+    }
+
+    /// The settlement of a non-streamed generate answer, one entry per
+    /// choice: the choices share one prompt, so its count and its cache hit
+    /// are taken once, the greatest any choice reports, as `TokenCounts::of`
+    /// and the streamed paths take them (the choice that prefilled the
+    /// shared prefix may report fewer hits than its siblings), and each
+    /// choice's own completion and reasoning counts sum.
+    pub(in crate::routers::grpc) fn generate_settlement(
+        responses: &[GenerateResponse],
+    ) -> UsageSettlement {
+        UsageSettlement {
+            actual_input_tokens: responses
+                .iter()
+                .map(|r| r.meta_info.prompt_tokens)
+                .max()
+                .unwrap_or(0),
+            completion_tokens: responses
+                .iter()
+                .map(|r| r.meta_info.completion_tokens)
+                .sum(),
+            cached_input_tokens: responses
+                .iter()
+                .map(|r| r.meta_info.cached_tokens)
+                .max()
+                .unwrap_or(0),
+            reasoning_tokens: responses
+                .iter()
+                .map(|r| r.meta_info.reasoning_tokens.unwrap_or(0))
+                .sum(),
+        }
+    }
+
+    /// The settlement of a decision batch: its input tokens, no completion
+    /// (label scoring generates none, as today), and the cache and reasoning
+    /// counters its usage reports, zero while the backend reports none.
+    pub(in crate::routers::grpc) fn decisions_settlement(usage: &DecisionUsage) -> UsageSettlement {
+        let count = |tokens: u64| u32::try_from(tokens).unwrap_or(u32::MAX);
+        UsageSettlement {
+            actual_input_tokens: count(usage.input_tokens),
+            completion_tokens: 0,
+            cached_input_tokens: count(usage.input_tokens_details.cached_tokens),
+            reasoning_tokens: count(usage.output_tokens_details.reasoning_tokens),
+        }
     }
 
     /// [`Self::run`], reporting to a Responses stream's startup barrier
@@ -974,14 +1090,11 @@ impl RequestPipeline {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Chat(response)) => {
-                    let usage = response.usage.as_ref();
+                    // The engine's counts: the usage shown excludes the unbilled
+                    // stub and may carry the parser's reasoning split.
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        // The engine's count: the usage shown excludes the unbilled stub.
-                        usage.map_or(0, |u| {
-                            u.prompt_tokens + dctx.response.unbilled_prompt_tokens
-                        }),
-                        usage.map_or(0, |u| u.completion_tokens),
+                        Self::recorded_settlement(&dctx.response),
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
@@ -1012,6 +1125,22 @@ impl RequestPipeline {
         rate_limit_cell: Option<Arc<RateLimitCell>>,
         retry_config: Option<&RetryConfig>,
     ) -> Response {
+        // The response needs to know the request's shape (single prompt vs.
+        // batch, and `n`) to answer like SGLang, but `into_dispatch` drops
+        // the request by construction (see the module doc) -- the dispatch
+        // phase runs with no request, on purpose. Read the two scalars off
+        // the request now, before it moves into the context, instead of
+        // retaining a handle across dispatch.
+        //
+        // `single_prompt` is false for `InputIds::Batch`, but that shape
+        // never reaches here: the preparation stage 400s it first.
+        let single_prompt =
+            request.text.is_some() || matches!(request.input_ids, Some(InputIds::Single(_)));
+        let n = request
+            .sampling_params
+            .as_ref()
+            .and_then(|sp| sp.n)
+            .unwrap_or(1);
         let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
         ctx.input.tenant_request_meta = tenant_request_meta;
         ctx.input.rate_limit_cell = rate_limit_cell;
@@ -1021,18 +1150,14 @@ impl RequestPipeline {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Generate(response)) => {
-                    let actual_input_tokens =
-                        response.first().map_or(0, |r| r.meta_info.prompt_tokens);
-                    let completion_tokens =
-                        response.iter().map(|r| r.meta_info.completion_tokens).sum();
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        actual_input_tokens,
-                        completion_tokens,
+                        Self::generate_settlement(&response),
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
-                    Self::routed_response(&dctx, axum::Json(response).into_response())
+                    let body = generate_response_body(single_prompt, n, response);
+                    Self::routed_response(&dctx, axum::Json(body).into_response())
                 }
                 Some(other) => self.wrong_response_type(
                     "execute_generate",
@@ -1068,11 +1193,9 @@ impl RequestPipeline {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Completion(response)) => {
-                    let usage = response.usage.as_ref();
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        usage.map_or(0, |u| u.prompt_tokens),
-                        usage.map_or(0, |u| u.completion_tokens),
+                        Self::completion_settlement(response.usage.as_ref()),
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
@@ -1112,10 +1235,12 @@ impl RequestPipeline {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Messages(response)) => {
+                    // The engine's counts: the Messages usage reports no cache
+                    // hits and the greater of the engine's and the parser's
+                    // thinking count.
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        response.usage.input_tokens,
-                        response.usage.output_tokens,
+                        Self::recorded_settlement(&dctx.response),
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
@@ -1159,8 +1284,7 @@ impl RequestPipeline {
                 Some(FinalResponse::Decisions(response)) => {
                     Self::settle_reservation(
                         dctx.rate_limit_cell.as_deref(),
-                        u32::try_from(response.usage.input_tokens).unwrap_or(u32::MAX),
-                        0,
+                        Self::decisions_settlement(&response.usage),
                     )
                     .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
@@ -1438,6 +1562,116 @@ impl RequestPipeline {
     }
 }
 
+/// A `/generate` response body: a bare object for a single prompt, a list
+/// otherwise. `#[serde(untagged)]` makes `One` serialize as its inner
+/// object with no wrapper, matching SGLang's shape -- see the doc comment
+/// on [`GenerateResponse`].
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum GenerateBody {
+    One(Box<GenerateResponse>),
+    Many(Vec<GenerateResponse>),
+}
+
+/// SGLang answers a single prompt with one object and a batch (or `n > 1`)
+/// with a list. Mirror that shape here so native clients that never batch
+/// (slime, verl) can index `meta_info` directly instead of unwrapping a
+/// one-element list.
+///
+/// `single_prompt` and `n` are read off the request in `execute_generate`
+/// (the only caller) before it moves into the dispatch context, which is
+/// request-free by construction -- see the module doc.
+fn generate_response_body(
+    single_prompt: bool,
+    n: u32,
+    responses: Vec<GenerateResponse>,
+) -> GenerateBody {
+    if single_prompt && n <= 1 && responses.len() == 1 {
+        let mut responses = responses;
+        return GenerateBody::One(Box::new(responses.remove(0)));
+    }
+    GenerateBody::Many(responses)
+}
+
+#[cfg(test)]
+mod generate_response_body_tests {
+    use openai_protocol::generate::{GenerateFinishReason, GenerateFinishType, GenerateMetaInfo};
+
+    use super::*;
+
+    fn response(weight_version: &str) -> GenerateResponse {
+        GenerateResponse {
+            text: "hi".to_string(),
+            output_ids: vec![1, 2, 3],
+            meta_info: GenerateMetaInfo {
+                id: "req-1".to_string(),
+                finish_reason: GenerateFinishReason::Stop {
+                    finish_type: GenerateFinishType::Stop,
+                },
+                prompt_tokens: 3,
+                weight_version: weight_version.to_string(),
+                input_token_logprobs: None,
+                output_token_logprobs: None,
+                completion_tokens: 3,
+                cached_tokens: 0,
+                reasoning_tokens: None,
+                e2e_latency: 0.1,
+                matched_stop: None,
+            },
+        }
+    }
+
+    fn to_value(body: GenerateBody) -> serde_json::Value {
+        serde_json::to_value(body).expect("GenerateBody always serializes")
+    }
+
+    #[test]
+    fn single_prompt_with_one_response_is_an_object() {
+        let value = to_value(generate_response_body(true, 1, vec![response("v1")]));
+        assert!(value.is_object(), "expected an object, got {value}");
+        assert_eq!(value["meta_info"]["weight_version"], "v1");
+    }
+
+    #[test]
+    fn n_greater_than_one_stays_a_list_even_for_a_single_prompt() {
+        let value = to_value(generate_response_body(
+            true,
+            2,
+            vec![response("v1"), response("v1")],
+        ));
+        assert!(value.is_array(), "expected a list, got {value}");
+        assert_eq!(value.as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn a_batch_request_stays_a_list() {
+        // `single_prompt = false` here stands in for a batch `input_ids`
+        // request. That shape is unreachable over gRPC today --
+        // `GeneratePreparationStage::resolve_generate_input` rejects
+        // `InputIds::Batch` with 400 before any response exists -- but the
+        // helper still needs to answer it correctly if that ever changes.
+        let value = to_value(generate_response_body(
+            false,
+            1,
+            vec![response("v1"), response("v1")],
+        ));
+        assert!(value.is_array(), "expected a list, got {value}");
+    }
+
+    #[test]
+    fn single_prompt_with_more_than_one_response_stays_a_list() {
+        // Shouldn't happen in practice (a single prompt dispatches once),
+        // but the helper must not silently drop a response if it did.
+        let value = to_value(generate_response_body(
+            true,
+            1,
+            vec![response("v1"), response("v2")],
+        ));
+        assert!(value.is_array(), "expected a list, got {value}");
+        assert_eq!(value.as_array().map(Vec::len), Some(2));
+    }
+}
+
 #[cfg(test)]
 impl RequestPipeline {
     /// Mode-bearing construction descriptor for the parity test. Stage
@@ -1576,6 +1810,7 @@ mod alias_pipeline_tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
+        routers::grpc::regular::symphony::template::Templates,
         worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
     };
 
@@ -1625,12 +1860,16 @@ mod alias_pipeline_tests {
         );
         let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::PrefillDecode, &deps).unwrap();
         let components = Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
             tokenizer_registry,
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal: None,
+            tokenizer_autoload: true,
+            tokenizer_load_failures: Arc::default(),
+            parser: crate::config::ParserChoice::Legacy,
         });
         let request: GenerateRequest = serde_json::from_value(json!({
             "model": MODEL_ALIAS,
@@ -1689,11 +1928,12 @@ mod request_release_tests {
     use llm_tokenizer::{
         traits::Tokenizer, HuggingFaceTokenizer, MockTokenizer, TokenizerRegistry,
     };
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::{
         completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
     };
     use portpicker::pick_unused_port;
-    use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts};
+    use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts, vllm_proto};
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
@@ -1704,8 +1944,15 @@ mod request_release_tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        routers::grpc::multimodal::{
-            MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
+        routers::grpc::{
+            client::ModelInfo,
+            multimodal::{
+                MultimodalComponents, MultimodalConfigRegistry, MultimodalSettings,
+                SUPPORTS_VISION_LABEL,
+            },
+            proto_wrapper::ENGINE_ERROR_MESSAGE,
+            regular::symphony::template::Templates,
+            utils::tonic_ext::TonicStatusExt,
         },
         worker::{
             circuit_breaker::{CircuitBreakerConfig, CircuitState},
@@ -1715,6 +1962,26 @@ mod request_release_tests {
     };
 
     const MODEL: &str = "request-release-test-model";
+    /// A valid 1x1 PNG, as a client sends an inline image.
+    const ONE_PIXEL_PNG_DATA_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+    /// The worker label of an engine without a vision encoder (vLLM
+    /// `--language-model-only`, or a text-only model).
+    const LANGUAGE_MODEL_ONLY: &[(&str, &str)] = &[(SUPPORTS_VISION_LABEL, "false")];
+
+    /// The labels discovery derives from a servicer's `GetModelInfo`, as
+    /// `(key, value)` pairs for the worker builders of these tests.
+    fn labels_of(info: &ModelInfo) -> Vec<(String, String)> {
+        let mut labels: Vec<(String, String)> = info.to_labels().into_iter().collect();
+        labels.sort();
+        labels
+    }
+
+    fn label_pairs(labels: &[(String, String)]) -> Vec<(&str, &str)> {
+        labels
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str()))
+            .collect()
+    }
 
     /// The `(offset, length)` placeholder ranges of one generate call.
     type PlaceholderRanges = Vec<(u32, u32)>;
@@ -1727,10 +1994,12 @@ mod request_release_tests {
     /// its tokens (or, with `gate_rpc`, the generate RPC itself) until the
     /// probe reaches zero strong references or a deadline passes, recording
     /// the outcome in `released`. An ungated stub (no probe) answers
-    /// immediately -- used for the PD prefill leg. `fail_first` makes the
+    /// immediately -- used for the PD prefill side. `fail_first` makes the
     /// first generate call return UNAVAILABLE, for retry-replay tests;
     /// `fail_always` fails every call, `fail_internal` answers every call with
-    /// INTERNAL (an engine that took the request and failed on it), and
+    /// INTERNAL (an engine that took the request and failed on it),
+    /// `fail_mid_stream` ends the stream with the engine's own error after
+    /// its first frame, and
     /// `answer_after` stalls the generate RPC, standing in for an engine that
     /// answers only at its own deadline; `frame_gap` paces the response frames,
     /// for a stream that outlasts its dispatch. Every call's input token ids,
@@ -1744,6 +2013,7 @@ mod request_release_tests {
         fail_first: bool,
         fail_always: bool,
         fail_internal: bool,
+        fail_mid_stream: bool,
         answer_after: Option<Duration>,
         frame_gap: Option<Duration>,
         calls: Arc<AtomicUsize>,
@@ -1867,14 +2137,20 @@ mod request_release_tests {
             let probe = (!self.gate_rpc).then(|| self.probe.clone()).flatten();
             let released = Arc::clone(&self.released);
             let frame_gap = self.frame_gap;
+            let fail_mid_stream = self.fail_mid_stream;
             tokio::spawn(async move {
                 if let Some(probe) = probe {
                     Self::await_probe(&probe, &released).await;
                 }
-                for frame in generate_frames(&request_id) {
+                for (index, frame) in generate_frames(&request_id).into_iter().enumerate() {
                     if let Some(gap) = frame_gap {
                         tokio::time::sleep(gap).await;
                     }
+                    let frame = if fail_mid_stream && index == 1 {
+                        Err(Status::internal(ENGINE_ERROR_MESSAGE))
+                    } else {
+                        frame
+                    };
                     if tx.send(frame).await.is_err() {
                         return;
                     }
@@ -2015,18 +2291,41 @@ mod request_release_tests {
         port: u16,
         worker_type: WorkerType,
     ) -> Arc<dyn Worker> {
-        let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
-                .worker_type(worker_type)
-                .connection_mode(ConnectionMode::Grpc)
-                .runtime_type(RuntimeType::TokenSpeed)
-                .model(ModelCard::new(MODEL))
-                .health_config(HealthCheckConfig {
-                    disable_health_check: true,
-                    ..Default::default()
-                })
-                .build(),
-        );
+        register_worker_with_labels(registry, port, worker_type, &[])
+    }
+
+    fn register_worker_with_labels(
+        registry: &WorkerRegistry,
+        port: u16,
+        worker_type: WorkerType,
+        labels: &[(&str, &str)],
+    ) -> Arc<dyn Worker> {
+        register_worker_of_runtime(registry, port, worker_type, RuntimeType::TokenSpeed, labels)
+    }
+
+    /// [`register_worker_with_labels`] for a worker typed as another engine:
+    /// the capability matrix reads the runtime, and a request refused before
+    /// dispatch never speaks to the stub.
+    fn register_worker_of_runtime(
+        registry: &WorkerRegistry,
+        port: u16,
+        worker_type: WorkerType,
+        runtime: RuntimeType,
+        labels: &[(&str, &str)],
+    ) -> Arc<dyn Worker> {
+        let mut builder = BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+            .worker_type(worker_type)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(runtime)
+            .model(ModelCard::new(MODEL))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            });
+        for (key, value) in labels {
+            builder = builder.label(*key, *value);
+        }
+        let worker: Arc<dyn Worker> = Arc::new(builder.build());
         registry
             .register(Arc::clone(&worker))
             .expect("register release-test worker");
@@ -2064,6 +2363,16 @@ mod request_release_tests {
     }
 
     async fn components(worker_registry: Arc<WorkerRegistry>) -> Arc<SharedComponents> {
+        components_with_multimodal(worker_registry, false).await
+    }
+
+    /// Components over the mock tokenizer; `with_multimodal` adds the
+    /// multimodal bundle (default settings, no model directory) so media
+    /// reaches the multimodal path instead of the "not available" refusal.
+    async fn components_with_multimodal(
+        worker_registry: Arc<WorkerRegistry>,
+        with_multimodal: bool,
+    ) -> Arc<SharedComponents> {
         let tokenizer_registry = Arc::new(TokenizerRegistry::new());
         let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
         tokenizer_registry
@@ -2075,14 +2384,531 @@ mod request_release_tests {
             )
             .await
             .expect("load mock tokenizer");
+        let multimodal = with_multimodal.then(|| {
+            Arc::new(
+                MultimodalComponents::new(
+                    Arc::new(MultimodalConfigRegistry::new()),
+                    None,
+                    None,
+                    &MultimodalSettings::default(),
+                )
+                .expect("multimodal components"),
+            )
+        });
         Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
             tokenizer_registry,
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
             parser_resolver: utils::ParserResolver::disabled(),
-            multimodal: None,
+            multimodal,
+            tokenizer_autoload: true,
+            tokenizer_load_failures: Arc::default(),
+            parser: crate::config::ParserChoice::Legacy,
         })
+    }
+
+    mod glm53;
+
+    /// A worker whose servicer left `supports_vision` unset (the SGLang and
+    /// TokenSpeed protos carry the field; only vLLM's servicer sets it on
+    /// purpose) is not a language-model-only worker: its labels carry no
+    /// vision verdict, and an image request goes on past the refusal into
+    /// multimodal processing (here, to the config lookup the mock tokenizer
+    /// cannot satisfy) instead of a `multimodal_not_supported`.
+    #[tokio::test]
+    async fn image_to_a_worker_without_a_vision_verdict_is_not_refused() {
+        let labels = labels_of(&ModelInfo::Sglang(Box::default()));
+        assert!(
+            labels.iter().all(|(key, _)| key != SUPPORTS_VISION_LABEL),
+            "{labels:?}"
+        );
+        let seen_ids = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            seen_input_ids: Arc::clone(&seen_ids),
+            ..Default::default()
+        })
+        .await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker_with_labels(
+            &worker_registry,
+            port,
+            WorkerType::Regular,
+            &label_pairs(&labels),
+        );
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+            Duration::from_secs(60),
+        );
+        let pipeline =
+            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
+        let components = components_with_multimodal(worker_registry, true).await;
+        let request: Arc<ChatCompletionRequest> = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What colour is this pixel?"},
+                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
+                    ]
+                }],
+                "max_completion_tokens": 32,
+            }))
+            .expect("chat request"),
+        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.execute_chat(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the mock path answers");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
+        assert_eq!(
+            body["error"]["code"], "invalid_multimodal_request",
+            "{body}"
+        );
+    }
+
+    /// An SGLang servicer that carries no media to its engine says so with a
+    /// deliberate `supports_vision=false` in its `server_args` (its
+    /// `GetModelInfo` bool is no verdict for this runtime): with the labels
+    /// discovery merges from both, the worker reads as language model only,
+    /// and an image is refused at the gate before anything is decoded or
+    /// dispatched, instead of after the media was fetched.
+    #[tokio::test]
+    async fn image_to_an_sglang_worker_that_carries_no_media_is_refused_before_dispatch() {
+        use std::collections::BTreeMap;
+
+        use smg_grpc_client::sglang_proto;
+
+        use crate::routers::grpc::client::ServerInfo;
+
+        let mut merged = ModelInfo::Sglang(Box::default()).to_labels();
+        merged.extend(
+            ServerInfo::Sglang(Box::new(sglang_proto::GetServerInfoResponse {
+                server_args: Some(prost_types::Struct {
+                    fields: BTreeMap::from([(
+                        "supports_vision".to_string(),
+                        prost_types::Value {
+                            kind: Some(prost_types::value::Kind::BoolValue(false)),
+                        },
+                    )]),
+                }),
+                ..Default::default()
+            }))
+            .to_labels(),
+        );
+        let mut labels: Vec<(String, String)> = merged.into_iter().collect();
+        labels.sort();
+        assert!(
+            labels
+                .iter()
+                .any(|(key, value)| key == SUPPORTS_VISION_LABEL && value == "false"),
+            "{labels:?}"
+        );
+        let seen_ids = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            seen_input_ids: Arc::clone(&seen_ids),
+            ..Default::default()
+        })
+        .await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker_with_labels(
+            &worker_registry,
+            port,
+            WorkerType::Regular,
+            &label_pairs(&labels),
+        );
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+            Duration::from_secs(60),
+        );
+        let pipeline =
+            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
+        let components = components_with_multimodal(worker_registry, true).await;
+        let request: Arc<ChatCompletionRequest> = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What colour is this pixel?"},
+                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
+                    ]
+                }],
+                "max_completion_tokens": 32,
+            }))
+            .expect("chat request"),
+        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.execute_chat(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the refusal must not wait on anything");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
+        assert!(
+            seen_ids.lock().expect("seen ids").is_empty(),
+            "nothing must reach the worker"
+        );
+    }
+
+    /// An image to a model whose only worker runs without a vision encoder
+    /// is refused with a prompt 400 that names the modality and the model,
+    /// before any media is decoded and before anything reaches the worker
+    /// (an engine without an encoder admits such a request and never
+    /// schedules it, which the client saw as a hang).
+    #[tokio::test]
+    async fn image_to_a_language_model_only_pool_is_refused_before_dispatch() {
+        let seen_ids = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            seen_input_ids: Arc::clone(&seen_ids),
+            ..Default::default()
+        })
+        .await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker_with_labels(
+            &worker_registry,
+            port,
+            WorkerType::Regular,
+            LANGUAGE_MODEL_ONLY,
+        );
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+            Duration::from_secs(60),
+        );
+        let pipeline =
+            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
+        let components = components_with_multimodal(worker_registry, true).await;
+        let request: Arc<ChatCompletionRequest> = Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What colour is this pixel?"},
+                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
+                    ]
+                }],
+                "max_completion_tokens": 32,
+            }))
+            .expect("chat request"),
+        );
+
+        let started = Instant::now();
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.execute_chat(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the refusal must not wait on anything");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
+        let message = body["error"]["message"].as_str().expect("message");
+        assert!(
+            message.starts_with("image input is not supported by model"),
+            "{message}"
+        );
+        assert!(message.contains("language model only"), "{message}");
+        assert!(
+            seen_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "nothing must reach the worker"
+        );
+    }
+
+    /// The chat pipeline over one stub worker typed as `runtime`, and the
+    /// ids the stub saw.
+    async fn chat_pipeline_of_runtime(
+        runtime: RuntimeType,
+    ) -> (
+        RequestPipeline,
+        Arc<SharedComponents>,
+        Arc<Mutex<Vec<Vec<u32>>>>,
+    ) {
+        let seen_ids = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            seen_input_ids: Arc::clone(&seen_ids),
+            ..Default::default()
+        })
+        .await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker_of_runtime(&worker_registry, port, WorkerType::Regular, runtime, &[]);
+        let deps = PipelineDeps::pair(
+            worker_registry.clone(),
+            Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+            None,
+            None,
+            Duration::from_secs(60),
+        );
+        let pipeline =
+            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
+        let components = components_with_multimodal(worker_registry, true).await;
+        (pipeline, components, seen_ids)
+    }
+
+    /// The error body of a chat request the pipeline answered within its
+    /// budget.
+    async fn chat_error_body(
+        pipeline: &RequestPipeline,
+        components: Arc<SharedComponents>,
+        request: serde_json::Value,
+    ) -> (http::StatusCode, serde_json::Value) {
+        let request: Arc<ChatCompletionRequest> =
+            Arc::new(serde_json::from_value(request).expect("chat request"));
+        let response = tokio::time::timeout(
+            Duration::from_secs(10),
+            pipeline.execute_chat(
+                request,
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the refusal must not wait on anything");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        (
+            status,
+            serde_json::from_slice(&body).expect("json error body"),
+        )
+    }
+
+    /// A video to a model whose only worker runs an engine without video in
+    /// the capability matrix is refused in preparation, before the model's
+    /// media config is read and before any byte of the clip is fetched or
+    /// decoded, with the code and the sentence the selection-time check gave
+    /// after the decode; with and without a sampling hint on the part (the
+    /// hint decides between router-side and worker-side processing, both
+    /// after this refusal). The clip is deliberately undecodable: a request
+    /// that reached the decoder would be answered differently.
+    #[tokio::test]
+    async fn video_to_a_pool_whose_engine_takes_no_video_is_refused_before_any_media_is_touched() {
+        for video_url in [
+            serde_json::json!({"url": "data:video/mp4;base64,invalid", "fps": 0.5}),
+            serde_json::json!({"url": "data:video/mp4;base64,invalid"}),
+        ] {
+            let (pipeline, components, seen_ids) =
+                chat_pipeline_of_runtime(RuntimeType::Sglang).await;
+            let started = Instant::now();
+            let (status, body) = chat_error_body(
+                &pipeline,
+                components,
+                serde_json::json!({
+                    "model": MODEL,
+                    "messages": [{
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe this video briefly."},
+                            {"type": "video_url", "video_url": video_url}
+                        ]
+                    }],
+                    "max_completion_tokens": 32,
+                }),
+            )
+            .await;
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{:?}",
+                started.elapsed()
+            );
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
+            assert_eq!(
+                body["error"]["message"], "backend sglang does not support video inputs",
+                "{body}"
+            );
+            assert!(
+                seen_ids
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty(),
+                "nothing must reach the worker"
+            );
+        }
+    }
+
+    /// An image to the same worker is not the matrix's refusal: it goes on
+    /// into multimodal processing (here, to the config lookup the mock
+    /// tokenizer cannot satisfy, as for the worker without a vision verdict).
+    #[tokio::test]
+    async fn image_to_a_pool_whose_engine_takes_images_goes_on_into_media_processing() {
+        let (pipeline, components, _) = chat_pipeline_of_runtime(RuntimeType::Sglang).await;
+        let (status, body) = chat_error_body(
+            &pipeline,
+            components,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What colour is this pixel?"},
+                        {"type": "image_url", "image_url": {"url": ONE_PIXEL_PNG_DATA_URL}}
+                    ]
+                }],
+                "max_completion_tokens": 32,
+            }),
+        )
+        .await;
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
+        assert_eq!(
+            body["error"]["code"], "invalid_multimodal_request",
+            "{body}"
+        );
+    }
+
+    /// The Messages route shares the refusal: an image block to a model
+    /// whose only worker runs an engine without image input in the matrix
+    /// is refused before any media is touched, with the same sentence; the
+    /// same block to an engine that takes images goes on.
+    #[tokio::test]
+    async fn messages_image_to_a_pool_whose_engine_takes_no_image_is_refused_before_any_media_is_touched(
+    ) {
+        let (_, png) = ONE_PIXEL_PNG_DATA_URL
+            .split_once("base64,")
+            .expect("data url");
+        let request = serde_json::json!({
+            "model": MODEL,
+            "max_tokens": 32,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What colour is this pixel?"},
+                    {"type": "image", "source": {
+                        "type": "base64", "media_type": "image/png", "data": png
+                    }}
+                ]
+            }],
+        });
+        for (runtime, refused) in [(RuntimeType::Mlx, true), (RuntimeType::Sglang, false)] {
+            let seen_ids = Arc::new(Mutex::new(Vec::new()));
+            let port = spawn_stub(GatedScheduler {
+                seen_input_ids: Arc::clone(&seen_ids),
+                ..Default::default()
+            })
+            .await;
+            let worker_registry = Arc::new(WorkerRegistry::new());
+            register_worker_of_runtime(&worker_registry, port, WorkerType::Regular, runtime, &[]);
+            let deps = PipelineDeps::pair(
+                worker_registry.clone(),
+                Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
+                None,
+                None,
+                Duration::from_secs(60),
+            );
+            let pipeline = RequestPipeline::build(Endpoint::Messages, Mode::Regular, &deps)
+                .expect("messages pipeline");
+            let components = components_with_multimodal(worker_registry, true).await;
+            let request: Arc<CreateMessageRequest> =
+                Arc::new(serde_json::from_value(request.clone()).expect("messages request"));
+            let response = tokio::time::timeout(
+                Duration::from_secs(10),
+                pipeline.execute_messages(
+                    request,
+                    None,
+                    MODEL.to_string(),
+                    components,
+                    None,
+                    None,
+                    None,
+                ),
+            )
+            .await
+            .expect("the refusal must not wait on anything");
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("drain body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+            assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+            if refused {
+                assert_eq!(body["error"]["code"], "multimodal_not_supported", "{body}");
+                assert_eq!(
+                    body["error"]["message"], "backend mlx does not support image inputs",
+                    "{body}"
+                );
+            } else {
+                assert_ne!(body["error"]["code"], "multimodal_not_supported", "{body}");
+            }
+            assert!(
+                seen_ids
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_empty(),
+                "nothing must reach the worker"
+            );
+        }
     }
 
     fn completion_request(stream: bool) -> Arc<CompletionRequest> {
@@ -2418,7 +3244,7 @@ mod request_release_tests {
         );
     }
 
-    /// grpc_pd twin: the decode leg's stream task must not pin the parsed
+    /// grpc_pd twin: the decode side's stream task must not pin the parsed
     /// request either (the prefill stub answers immediately).
     #[tokio::test]
     async fn pd_streaming_releases_parsed_request_before_first_token() {
@@ -2498,7 +3324,7 @@ mod request_release_tests {
         );
     }
 
-    /// grpc_pd twin of the dispatch-release probe: the gated decode leg
+    /// grpc_pd twin of the dispatch-release probe: the gated decode side
     /// answers only after the parsed request is freed.
     #[tokio::test]
     async fn pd_buffered_dispatch_releases_parsed_request_before_upstream_responds() {
@@ -2538,8 +3364,164 @@ mod request_release_tests {
         );
         assert!(
             released.load(Ordering::SeqCst),
-            "the parsed request must be freed before the decode leg answers"
+            "the parsed request must be freed before the decode side answers"
         );
+    }
+
+    /// The one `smg_worker_errors_total` sample of the gRPC workers of
+    /// `worker_type`, if any.
+    fn side_worker_error_line<'a>(rendered: &'a str, worker_type: &str) -> Option<&'a str> {
+        let worker_label = format!("worker_type=\"{worker_type}\"");
+        rendered.lines().find(|line| {
+            line.starts_with("smg_worker_errors_total{")
+                && line.contains(&worker_label)
+                && line.contains("connection_mode=\"grpc\"")
+        })
+    }
+
+    /// A decode side's stream that fails after its first frame while a
+    /// non-streamed disaggregated answer is collected is the decode worker's
+    /// failure, as it is for a streamed answer: one sample of
+    /// `smg_worker_errors_total` under the side's labels per attempt
+    /// (`engine_error` for the engine's own report), none for the prefill side
+    /// that completed.
+    #[test]
+    fn a_decode_side_that_fails_mid_way_counts_against_its_worker_for_a_non_streamed_answer() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let attempts = metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let decode_calls = Arc::new(Mutex::new(Vec::new()));
+                let prefill_port = spawn_stub(GatedScheduler::default()).await;
+                let decode_port = spawn_stub(GatedScheduler {
+                    fail_mid_stream: true,
+                    seen_request_ids: Arc::clone(&decode_calls),
+                    ..Default::default()
+                })
+                .await;
+                let worker_registry = Arc::new(WorkerRegistry::new());
+                register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+                register_worker(&worker_registry, decode_port, WorkerType::Decode);
+                let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
+                let components = components(worker_registry).await;
+
+                let response = run_completion(pipeline, components, &fast_retry_config(3)).await;
+
+                assert_eq!(
+                    response.status(),
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "the engine's error ends a non-streamed answer with a 500"
+                );
+                let attempts = calls_seen(&decode_calls);
+                assert!(attempts >= 1, "the decode side was dispatched");
+                attempts
+            })
+        });
+        let rendered = handle.render();
+        let line = side_worker_error_line(&rendered, "decode")
+            .unwrap_or_else(|| panic!("the decode worker's failure is counted:\n{rendered}"));
+        assert!(line.contains("error_type=\"engine_error\""), "{line}");
+        assert!(
+            line.ends_with(&format!(" {attempts}")),
+            "one sample per attempt ({attempts}): {line}"
+        );
+        assert!(
+            side_worker_error_line(&rendered, "prefill").is_none(),
+            "the prefill side completed:\n{rendered}"
+        );
+    }
+
+    /// The prefill side's stream, drained before the answer, counts the same
+    /// way under its own labels when it fails after its first frame; the
+    /// decode side, dropped unread, is not charged.
+    #[test]
+    fn a_prefill_side_that_fails_mid_way_counts_against_its_worker_for_a_non_streamed_answer() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let prefill_port = spawn_stub(GatedScheduler {
+                    fail_mid_stream: true,
+                    ..Default::default()
+                })
+                .await;
+                let decode_port = spawn_stub(GatedScheduler::default()).await;
+                let worker_registry = Arc::new(WorkerRegistry::new());
+                register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+                register_worker(&worker_registry, decode_port, WorkerType::Decode);
+                let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
+                let components = components(worker_registry).await;
+
+                let response = run_completion(pipeline, components, &fast_retry_config(1)).await;
+
+                assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+            });
+        });
+        let rendered = handle.render();
+        let line = side_worker_error_line(&rendered, "prefill")
+            .unwrap_or_else(|| panic!("the prefill worker's failure is counted:\n{rendered}"));
+        assert!(line.contains("error_type=\"engine_error\""), "{line}");
+        assert!(line.ends_with(" 1"), "{line}");
+        assert!(
+            side_worker_error_line(&rendered, "decode").is_none(),
+            "the decode side did not fail:\n{rendered}"
+        );
+    }
+
+    /// The streamed answer's accounting is unchanged by the sides' attribution:
+    /// a decode side that fails mid-way is one sample, counted where the stream
+    /// is written, not a second time where it is read.
+    #[test]
+    fn a_decode_side_that_fails_mid_way_is_counted_once_for_a_streamed_answer() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let prefill_port = spawn_stub(GatedScheduler::default()).await;
+                let decode_port = spawn_stub(GatedScheduler {
+                    fail_mid_stream: true,
+                    ..Default::default()
+                })
+                .await;
+                let worker_registry = Arc::new(WorkerRegistry::new());
+                register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+                register_worker(&worker_registry, decode_port, WorkerType::Decode);
+                let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
+                let components = components(worker_registry).await;
+
+                let body = run_and_drain(
+                    pipeline,
+                    components,
+                    completion_request(true),
+                    &format!("grpc://127.0.0.1:{decode_port}"),
+                )
+                .await;
+
+                let body = String::from_utf8_lossy(&body);
+                assert!(
+                    body.contains("\"error\""),
+                    "the stream ends with the error event: {body}"
+                );
+                assert!(body.contains("data: [DONE]"), "{body}");
+            });
+        });
+        let rendered = handle.render();
+        let line = side_worker_error_line(&rendered, "decode")
+            .unwrap_or_else(|| panic!("the decode worker's failure is counted:\n{rendered}"));
+        assert!(line.contains("error_type=\"engine_error\""), "{line}");
+        assert!(line.ends_with(" 1"), "counted once: {line}");
     }
 
     /// A failed first dispatch retries from the retained plan: the second
@@ -2754,6 +3736,49 @@ mod request_release_tests {
         assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
     }
 
+    /// A smaller engine is not an alternative to the engine that returned a
+    /// definitive error: keep its 500, without a futile retry or a false 400.
+    #[tokio::test]
+    async fn context_ineligible_worker_does_not_extend_the_retry_window() {
+        let seen_small = Arc::new(Mutex::new(Vec::new()));
+        let seen_large = Arc::new(Mutex::new(Vec::new()));
+        let small_port = spawn_stub(GatedScheduler {
+            seen_request_ids: Arc::clone(&seen_small),
+            ..Default::default()
+        })
+        .await;
+        let large_port = spawn_stub(GatedScheduler {
+            fail_internal: true,
+            seen_request_ids: Arc::clone(&seen_large),
+            ..Default::default()
+        })
+        .await;
+        let registry = Arc::new(WorkerRegistry::new());
+        for (port, window) in [(small_port, 1), (large_port, 64)] {
+            registry
+                .register(Arc::new(
+                    BasicWorkerBuilder::new(format!("grpc://127.0.0.1:{port}"))
+                        .worker_type(WorkerType::Regular)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .runtime_type(RuntimeType::TokenSpeed)
+                        .model(ModelCard::new(MODEL).with_context_length(window))
+                        .health_config(HealthCheckConfig {
+                            disable_health_check: true,
+                            ..Default::default()
+                        })
+                        .build(),
+                ))
+                .expect("register context-bound worker");
+        }
+        let pipeline = completion_pipeline(&registry, Mode::Regular);
+        let response =
+            run_completion(pipeline, components(registry).await, &fast_retry_config(5)).await;
+        assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!is_retryable_response(&response));
+        assert_eq!(calls_seen(&seen_small), 0);
+        assert_eq!(calls_seen(&seen_large), 1);
+    }
+
     /// With two workers the request moves to the other one once; a second
     /// INTERNAL answer stands.
     #[tokio::test]
@@ -2818,8 +3843,8 @@ mod request_release_tests {
         assert!(!is_retryable_response(&response));
     }
 
-    /// A prefill leg that cannot start must answer the client immediately
-    /// rather than waiting out the decode leg's own deadline, and the decode
+    /// A prefill side that cannot start must answer the client immediately
+    /// rather than waiting out the decode side's own deadline, and the decode
     /// room it stranded must be aborted rather than left for the engine to
     /// time out. The decode stub here answers only after `DECODE_DELAY`,
     /// standing in for an engine whose transfer deadline is what the client
@@ -2870,10 +3895,10 @@ mod request_release_tests {
         );
         assert!(
             answered_in < DECODE_DELAY,
-            "the prefill failure must not wait for the decode leg, took {answered_in:?}"
+            "the prefill failure must not wait for the decode side, took {answered_in:?}"
         );
 
-        // The decode leg is retired off the request path: once its dispatch
+        // The decode side is retired off the request path: once its dispatch
         // lands, its stream drops and that is what sends the abort.
         let deadline = Instant::now() + DECODE_DELAY + Duration::from_secs(8);
         loop {
@@ -2897,7 +3922,7 @@ mod request_release_tests {
         assert_eq!(
             aborted.as_slice(),
             dispatched.as_slice(),
-            "the abort must name the decode leg's own request id"
+            "the abort must name the decode side's own request id"
         );
     }
 
@@ -3016,9 +4041,9 @@ mod request_release_tests {
         drop(hold);
     }
 
-    /// gRPC PD path: the prefill leg answers on its own and reports when its
-    /// phase ends; the decode leg is still owed its first token when the
-    /// client leaves, and reports with the dropped body. Both legs end with
+    /// gRPC PD path: the prefill side answers on its own and reports when its
+    /// phase ends; the decode side is still owed its first token when the
+    /// client leaves, and reports with the dropped body. Both sides end with
     /// their load released, exactly once each.
     #[tokio::test]
     async fn cancelled_pd_stream_reports_the_prefill_and_decode_completions() {
@@ -3036,7 +4061,7 @@ mod request_release_tests {
         assert_eq!(
             decode.load(),
             1,
-            "the decode leg holds its load until the stream ends"
+            "the decode side holds its load until the stream ends"
         );
 
         drop(response);
@@ -3045,13 +4070,13 @@ mod request_release_tests {
         urls.sort();
         let mut expected = vec![prefill.url().to_string(), decode.url().to_string()];
         expected.sort();
-        assert_eq!(urls, expected, "each leg reports exactly once");
+        assert_eq!(urls, expected, "each side reports exactly once");
         assert_eq!(prefill.load(), 0);
         assert_eq!(decode.load(), 0);
         drop(hold);
     }
 
-    /// gRPC PD path under prefill admission: the prefill leg's load is a
+    /// gRPC PD path under prefill admission: the prefill side's load is a
     /// reservation in the admission gate rather than a bare guard, and it
     /// still reports the completion when the phase ends, so a cancelled
     /// request frees its slot for the next one.
@@ -3079,7 +4104,7 @@ mod request_release_tests {
         urls.sort();
         let mut expected = vec![prefill.url().to_string(), decode.url().to_string()];
         expected.sort();
-        assert_eq!(urls, expected, "each leg reports exactly once");
+        assert_eq!(urls, expected, "each side reports exactly once");
         assert_eq!(
             prefill.load(),
             0,
@@ -3197,12 +4222,16 @@ mod request_release_tests {
             )
         });
         Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
             tokenizer_registry,
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal,
+            tokenizer_autoload: true,
+            tokenizer_load_failures: Arc::default(),
+            parser: crate::config::ParserChoice::Legacy,
         })
     }
 
@@ -3221,6 +4250,16 @@ mod request_release_tests {
         request: serde_json::Value,
         with_multimodal: bool,
     ) -> ChatRun {
+        v41_run_chat_on(dir, request, with_multimodal, &[]).await
+    }
+
+    /// [`v41_run_chat`] with `worker_labels` on the stub's worker.
+    async fn v41_run_chat_on(
+        dir: &Path,
+        request: serde_json::Value,
+        with_multimodal: bool,
+        worker_labels: &[(&str, &str)],
+    ) -> ChatRun {
         let seen_ids = Arc::new(Mutex::new(Vec::new()));
         let seen_mm = Arc::new(Mutex::new(Vec::new()));
         let port = spawn_stub(GatedScheduler {
@@ -3230,7 +4269,7 @@ mod request_release_tests {
         })
         .await;
         let worker_registry = Arc::new(WorkerRegistry::new());
-        register_worker(&worker_registry, port, WorkerType::Regular);
+        register_worker_with_labels(&worker_registry, port, WorkerType::Regular, worker_labels);
         let deps = PipelineDeps::pair(
             worker_registry.clone(),
             Arc::new(PolicyRegistry::new(PolicyConfig::Random)),
@@ -3274,6 +4313,9 @@ mod request_release_tests {
     /// for a recorded multi-turn chat-mode case, and a `continue_final_message`
     /// request keeps its trailing assistant message and renders it the
     /// reference way (no EOS, no generation header) instead of as a prefix.
+    /// The thinking-mode case is the one recorded at the checkpoint's current
+    /// revision: the tokenizer directory here carries no encoder, so the
+    /// renderer writes that revision's effort budget.
     #[tokio::test]
     async fn deepseek_v41_prompt_ids_match_the_reference_through_the_pipeline() {
         let Some(dir) = deepseek_v41_model_dir() else {
@@ -3305,7 +4347,7 @@ mod request_release_tests {
             "hf_2: prompt ids differ from the reference"
         );
 
-        let (case, expected) = v41_fixture("continue_final_message");
+        let (case, expected) = v41_fixture("continue_final_message_current");
         let (status, body, ids, _) = v41_run_chat(
             &dir,
             serde_json::json!({
@@ -3409,18 +4451,344 @@ mod request_release_tests {
         );
         assert_eq!(mm, vec![vec![(first as u32, V41_CORN_TOKENS as u32)]]);
     }
+
+    /// A dispatch the engine answered with RESOURCE_EXHAUSTED is counted as
+    /// the rate-limit error the client reads in the 429 body, not as an
+    /// internal error of the router.
+    #[test]
+    fn a_dispatch_the_engine_throttled_is_counted_as_a_rate_limit_error() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        // The model is served: its errors are counted under its own id (an
+        // unserved name is counted under `other`).
+        register_worker(&worker_registry, 1, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let failure = Status::resource_exhausted("kv cache full")
+            .to_http_error("engine_busy", "kv cache full".to_string());
+        assert_eq!(failure.status(), http::StatusCode::TOO_MANY_REQUESTS);
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            pipeline.record_error(Some(metrics_labels::ENDPOINT_COMPLETIONS), MODEL, &failure);
+        });
+        let rendered = handle.render();
+        let line = rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("smg_router_request_errors_total{")
+                    && line.contains(&format!("model=\"{MODEL}\""))
+                    && line.contains(&format!(
+                        "endpoint=\"{}\"",
+                        metrics_labels::ENDPOINT_COMPLETIONS
+                    ))
+            })
+            .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
+        assert!(line.contains("error_type=\"rate_limit_error\""), "{line}");
+        assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// The same image to the same model served by a worker without a vision
+    /// encoder: refused with a 400 in preparation, nothing preprocessed or
+    /// dispatched (the engine would admit the request and never schedule it).
+    #[tokio::test]
+    async fn deepseek_v41_image_to_a_language_model_only_worker_is_refused() {
+        let Some(dir) = deepseek_v41_model_dir() else {
+            skip_no_tokenizer();
+            return;
+        };
+        let data_url = format!("data:image/png;base64,{}", BASE64.encode(V41_CORN_PNG));
+        let (status, body, ids, mm) = v41_run_chat_on(
+            &dir,
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is in this picture?"},
+                        {"type": "image_url", "image_url": {"url": data_url}}
+                    ]
+                }],
+                "chat_template_kwargs": {"thinking": false},
+                "max_tokens": 1,
+            }),
+            true,
+            LANGUAGE_MODEL_ONLY,
+        )
+        .await;
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("multimodal_not_supported"), "{body}");
+        assert!(body.contains("language model only"), "{body}");
+        assert!(ids.is_empty(), "nothing must reach the worker");
+        assert!(mm.is_empty(), "nothing must be preprocessed");
+    }
+
+    /// The same image with the worker labels discovery derives from each
+    /// servicer's `GetModelInfo`: a servicer that left `supports_vision`
+    /// unset (SGLang, TokenSpeed) gives no verdict, so the image is
+    /// preprocessed and dispatched as to any vision worker; vLLM's deliberate
+    /// `false` refuses it.
+    #[tokio::test]
+    async fn deepseek_v41_image_follows_the_servicer_vision_verdict() {
+        let Some(dir) = deepseek_v41_model_dir() else {
+            skip_no_tokenizer();
+            return;
+        };
+        let request = || {
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What is in this picture?"},
+                        {"type": "image_url", "image_url": {"url": format!(
+                            "data:image/png;base64,{}", BASE64.encode(V41_CORN_PNG))}}
+                    ]
+                }],
+                "chat_template_kwargs": {"thinking": false},
+                "max_tokens": 1,
+            })
+        };
+        for (name, info) in [
+            ("sglang", ModelInfo::Sglang(Box::default())),
+            ("tokenspeed", ModelInfo::TokenSpeed(Box::default())),
+        ] {
+            let labels = labels_of(&info);
+            let (status, body, ids, mm) =
+                v41_run_chat_on(&dir, request(), true, &label_pairs(&labels)).await;
+            assert_eq!(
+                status,
+                http::StatusCode::OK,
+                "{name}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert_eq!(ids.len(), 1, "{name}: dispatched once");
+            assert_eq!(
+                mm.iter().map(Vec::len).sum::<usize>(),
+                1,
+                "{name}: the image span reached the worker"
+            );
+        }
+
+        let labels = labels_of(&ModelInfo::Vllm(vllm_proto::GetModelInfoResponse {
+            supports_vision: false,
+            ..Default::default()
+        }));
+        let (status, body, ids, _) =
+            v41_run_chat_on(&dir, request(), true, &label_pairs(&labels)).await;
+        let body = String::from_utf8_lossy(&body);
+        assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.contains("multimodal_not_supported"), "{body}");
+        assert!(ids.is_empty(), "nothing must reach the worker");
+    }
+
+    /// The one `smg_worker_errors_total` sample of the regular gRPC workers.
+    fn regular_worker_error_line(rendered: &str) -> &str {
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with("smg_worker_errors_total{")
+                    && line.contains("worker_type=\"regular\"")
+                    && line.contains("connection_mode=\"grpc\"")
+            })
+            .unwrap_or_else(|| panic!("a worker error is counted:\n{rendered}"))
+    }
+
+    /// Every attempt a worker refuses before the first token is one sample of
+    /// `smg_worker_errors_total` under the worker's labels, however the
+    /// breaker is charged (once per request): three UNAVAILABLE starts of one
+    /// request are three worker errors and one breaker failure.
+    #[test]
+    fn a_refusal_before_the_first_token_counts_against_the_worker_once_per_attempt() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let seen = Arc::new(Mutex::new(Vec::new()));
+                let port = spawn_stub(GatedScheduler {
+                    fail_always: true,
+                    seen_request_ids: Arc::clone(&seen),
+                    ..Default::default()
+                })
+                .await;
+                let worker_registry = Arc::new(WorkerRegistry::new());
+                let worker = register_worker_with_breaker(&worker_registry, port, 5);
+                let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+                let components = components(worker_registry).await;
+
+                let response = run_completion(pipeline, components, &fast_retry_config(3)).await;
+
+                assert_eq!(response.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(calls_seen(&seen), 3, "three attempts on the one worker");
+                assert_eq!(
+                    worker.circuit_breaker_state(),
+                    CircuitState::Closed,
+                    "one failed request is one breaker failure"
+                );
+            });
+        });
+        let rendered = handle.render();
+        let line = regular_worker_error_line(&rendered);
+        assert!(line.contains("error_type=\"backend_error\""), "{line}");
+        assert!(line.ends_with(" 3"), "one sample per attempt: {line}");
+    }
+
+    /// A worker stream that fails after its first frame, read into a
+    /// non-streamed answer, is the worker's failure as it is for a streamed
+    /// one: one sample of `smg_worker_errors_total`, `engine_error` for the
+    /// engine's own report.
+    #[test]
+    fn a_worker_stream_that_fails_mid_way_counts_against_the_worker_for_a_non_streamed_answer() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let port = spawn_stub(GatedScheduler {
+                    fail_mid_stream: true,
+                    ..Default::default()
+                })
+                .await;
+                let worker_registry = Arc::new(WorkerRegistry::new());
+                register_worker(&worker_registry, port, WorkerType::Regular);
+                let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+                let components = components(worker_registry).await;
+
+                let response = run_completion(pipeline, components, &fast_retry_config(1)).await;
+
+                assert_eq!(
+                    response.status(),
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "the engine's error ends a non-streamed answer with a 500"
+                );
+            });
+        });
+        let rendered = handle.render();
+        let line = regular_worker_error_line(&rendered);
+        assert!(line.contains("error_type=\"engine_error\""), "{line}");
+        assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// A completion for a model nobody serves and no tokenizer knows is
+    /// refused by the preparation stage with the 404, before selection: the
+    /// pipeline reports it once (the response marked, so the stage line and
+    /// the access log keep quiet) and writes no ERROR event. The one refusal
+    /// path a stage-level test cannot reach.
+    #[tokio::test]
+    async fn a_404_from_the_preparation_stage_is_reported_once_and_marked() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct ErrorCounter(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for ErrorCounter {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() == tracing::Level::ERROR {
+                    self.0.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let errors = Arc::new(AtomicUsize::new(0));
+        let _guard = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(ErrorCounter(Arc::clone(&errors))),
+        );
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(Arc::new(TokenizerRegistry::new()))),
+            tokenizer_registry: Arc::new(TokenizerRegistry::new()),
+            worker_registry,
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            parser_resolver: utils::ParserResolver::disabled(),
+            multimodal: None,
+            tokenizer_autoload: true,
+            tokenizer_load_failures: Arc::default(),
+            parser: crate::config::ParserChoice::Legacy,
+        });
+
+        let response = pipeline
+            .execute_completion(
+                completion_request(false),
+                None,
+                "nobody-serves-this".to_string(),
+                components,
+                None,
+                None,
+                Some(&fast_retry_config(1)),
+            )
+            .await;
+
+        assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            placement::MODEL_NOT_FOUND_CODE
+        );
+        assert!(
+            response.extensions().get::<ReportedRefusal>().is_some(),
+            "the pipeline reported the 404, so the stage line and the access log keep quiet"
+        );
+        assert_eq!(
+            errors.load(Ordering::Relaxed),
+            0,
+            "a model nobody serves is the client's mistake, not an error of the gateway"
+        );
+    }
+
+    /// A refusal the gateway answers on its own (every worker of the model
+    /// unavailable) is counted as `unavailable`, not as a backend's error: no
+    /// worker was contacted.
+    #[test]
+    fn a_refusal_for_a_drained_pool_is_counted_as_unavailable_not_as_a_backend_error() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let refusal = placement::no_available_workers("every worker is down");
+        assert_eq!(refusal.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            pipeline.record_error(Some(metrics_labels::ENDPOINT_COMPLETIONS), MODEL, &refusal);
+        });
+        let rendered = handle.render();
+        let line = rendered
+            .lines()
+            .find(|line| {
+                // The model label is bounded to the served models (an
+                // unregistered one reads "other"), so the line is found by
+                // its router, as the HTTP and PD tests find theirs.
+                line.starts_with("smg_router_request_errors_total{")
+                    && line.contains(&format!("router_type=\"{}\"", metrics_labels::ROUTER_GRPC))
+            })
+            .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
+        assert!(line.contains("error_type=\"unavailable\""), "{line}");
+        assert!(line.ends_with(" 1"), "{line}");
+    }
 }
 
 #[cfg(test)]
 mod rate_limit_reserve_tests {
     use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
-    use openai_protocol::generate::GenerateRequest;
+    use openai_protocol::{
+        decisions::{DecisionInputTokensDetails, DecisionOutputTokensDetails},
+        generate::{GenerateFinishReason, GenerateFinishType, GenerateMetaInfo, GenerateRequest},
+    };
     use serde_json::json;
 
     use super::*;
     use crate::{
         config::types::RouterConfig,
         rate_limit::{RateLimitManager, Reservation, ReserveRequest},
+        routers::grpc::regular::symphony::template::Templates,
         tenant::TenantKey,
     };
 
@@ -3440,12 +4808,16 @@ mod rate_limit_reserve_tests {
             .await
             .unwrap();
         Arc::new(SharedComponents {
+            templates: Arc::new(Templates::new(tokenizer_registry.clone())),
             tokenizer_registry,
             worker_registry,
             tool_parser_factory: ToolParserFactory::default(),
             reasoning_parser_factory: ReasoningParserFactory::default(),
             parser_resolver: utils::ParserResolver::disabled(),
             multimodal: None,
+            tokenizer_autoload: true,
+            tokenizer_load_failures: Arc::default(),
+            parser: crate::config::ParserChoice::Legacy,
         })
     }
 
@@ -3550,11 +4922,11 @@ mod rate_limit_reserve_tests {
 
     #[tokio::test]
     async fn settle_reservation_with_zero_usage_refunds_the_full_estimate() {
-        // Budget 6; reserve 5 leaves 1. A response with no `usage` settles
-        // with 0/0 (see the `usage.map_or(0, ...)` call sites in
-        // execute_chat/execute_generate/etc.) -- that must refund the full
-        // 5-token debit back to the tenant, not silently keep it (nothing
-        // was actually consumed) and not leave the reservation stuck open
+        // Budget 6; reserve 5 leaves 1. A response without usage settles
+        // with all zeros (see `recorded_settlement`, `completion_settlement`
+        // and `generate_settlement`) -- that must refund the full 5-token
+        // debit back to the tenant, not silently keep it (nothing was
+        // actually consumed) and not leave the reservation stuck open
         // (which would leak budget forever).
         let manager = manager_with_tokens_per_minute(6);
         let components = test_components().await;
@@ -3564,7 +4936,11 @@ mod rate_limit_reserve_tests {
         let stage = RateLimitReserveStage::new(Some(manager.clone()));
         assert!(stage.execute(&mut ctx).await.is_ok());
 
-        RequestPipeline::settle_reservation(ctx.input.rate_limit_cell.as_deref(), 0, 0).await;
+        RequestPipeline::settle_reservation(
+            ctx.input.rate_limit_cell.as_deref(),
+            UsageSettlement::default(),
+        )
+        .await;
 
         // The full 6-token budget must be available again -- would be
         // denied if settle had kept the original 5-token debit instead of
@@ -3579,5 +4955,226 @@ mod rate_limit_reserve_tests {
             manager.reserve(check).await,
             Reservation::Admitted(_)
         ));
+    }
+
+    /// The cached and reasoning split of a settlement is carried for the
+    /// consumers that price or report it; the true-up charges the counts.
+    #[tokio::test]
+    async fn settle_reservation_charges_the_counts_and_not_their_split() {
+        let manager = manager_with_tokens_per_minute(100);
+        let components = test_components().await;
+        let mut ctx = ctx_with_tokens(components, 5);
+        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
+
+        let stage = RateLimitReserveStage::new(Some(manager.clone()));
+        assert!(stage.execute(&mut ctx).await.is_ok());
+
+        RequestPipeline::settle_reservation(
+            ctx.input.rate_limit_cell.as_deref(),
+            UsageSettlement {
+                actual_input_tokens: 5,
+                completion_tokens: 10,
+                cached_input_tokens: 4,
+                reasoning_tokens: 3,
+            },
+        )
+        .await;
+
+        // 100 - 15 = 85 remain: the split neither charges twice nor refunds.
+        let check = |tokens: u32| ReserveRequest {
+            request_charge_id: uuid::Uuid::now_v7(),
+            tenant_key: TenantKey::new("test-tenant"),
+            model_id: Some(MODEL.to_string()),
+            estimated_input_tokens: tokens,
+        };
+        assert!(matches!(
+            manager.reserve(check(85)).await,
+            Reservation::Admitted(_)
+        ));
+        assert!(matches!(
+            manager.reserve(check(1)).await,
+            Reservation::Denied { .. }
+        ));
+    }
+
+    /// The non-streamed completion settles from its usage object: the
+    /// engine's counters, their details included; zeros without one.
+    #[test]
+    fn completion_settlement_carries_the_usage_details() {
+        let usage = Usage::from_counts(7, 5)
+            .with_cached_tokens(3)
+            .with_reasoning_tokens(2);
+        assert_eq!(
+            RequestPipeline::completion_settlement(Some(&usage)),
+            UsageSettlement {
+                actual_input_tokens: 7,
+                completion_tokens: 5,
+                cached_input_tokens: 3,
+                reasoning_tokens: 2,
+            }
+        );
+        assert_eq!(
+            RequestPipeline::completion_settlement(Some(&Usage::from_counts(7, 5))),
+            UsageSettlement {
+                actual_input_tokens: 7,
+                completion_tokens: 5,
+                cached_input_tokens: 0,
+                reasoning_tokens: 0,
+            }
+        );
+        assert_eq!(
+            RequestPipeline::completion_settlement(None),
+            UsageSettlement::default()
+        );
+    }
+
+    /// The non-streamed generate answer settles its shared prompt and cache
+    /// hit once, the greatest any choice reports, and sums each choice's
+    /// completion and reasoning counts; an empty answer settles zeros.
+    #[test]
+    fn generate_settlement_takes_the_shared_prompt_once_and_sums_the_choices() {
+        let choice = |completion_tokens: u32, reasoning_tokens: Option<u32>, cached_tokens: u32| {
+            GenerateResponse {
+                text: String::new(),
+                output_ids: Vec::new(),
+                meta_info: GenerateMetaInfo {
+                    id: "gen".to_string(),
+                    finish_reason: GenerateFinishReason::Stop {
+                        finish_type: GenerateFinishType::Stop,
+                    },
+                    prompt_tokens: 9,
+                    weight_version: "default".to_string(),
+                    input_token_logprobs: None,
+                    output_token_logprobs: None,
+                    completion_tokens,
+                    cached_tokens,
+                    reasoning_tokens,
+                    e2e_latency: 0.0,
+                    matched_stop: None,
+                },
+            }
+        };
+        assert_eq!(
+            RequestPipeline::generate_settlement(&[choice(3, Some(1), 4), choice(5, None, 4)]),
+            UsageSettlement {
+                actual_input_tokens: 9,
+                completion_tokens: 8,
+                cached_input_tokens: 4,
+                reasoning_tokens: 1,
+            }
+        );
+        // The choices report different cache hits: the settlement takes the
+        // greatest, as the streamed answer settles.
+        assert_eq!(
+            RequestPipeline::generate_settlement(&[choice(3, Some(1), 2), choice(5, None, 6)])
+                .cached_input_tokens,
+            6
+        );
+        assert_eq!(
+            RequestPipeline::generate_settlement(&[]),
+            UsageSettlement::default()
+        );
+    }
+
+    /// A decision batch settles its input tokens and the cache and reasoning
+    /// counters its usage carries, no completion; a count past `u32` saturates.
+    #[test]
+    fn decisions_settlement_carries_the_usage_counters() {
+        let usage = DecisionUsage {
+            input_tokens: 11,
+            output_tokens: 0,
+            total_tokens: 11,
+            input_tokens_details: DecisionInputTokensDetails {
+                cached_tokens: 2,
+                cache_write_tokens: 0,
+            },
+            output_tokens_details: DecisionOutputTokensDetails {
+                reasoning_tokens: 1,
+            },
+        };
+        assert_eq!(
+            RequestPipeline::decisions_settlement(&usage),
+            UsageSettlement {
+                actual_input_tokens: 11,
+                completion_tokens: 0,
+                cached_input_tokens: 2,
+                reasoning_tokens: 1,
+            }
+        );
+        let beyond = DecisionUsage {
+            input_tokens: u64::from(u32::MAX) + 1,
+            ..usage
+        };
+        assert_eq!(
+            RequestPipeline::decisions_settlement(&beyond).actual_input_tokens,
+            u32::MAX
+        );
+    }
+}
+
+#[cfg(test)]
+mod model_label_tests {
+    use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+
+    use super::*;
+    use crate::{
+        config::types::PolicyConfig,
+        observability::metrics::test_support::render_with_recorder,
+        worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    };
+
+    /// smg-lab #288: the pipeline's request and error records carry the
+    /// served model's id, or `other` for a model no worker serves, so a
+    /// client cannot mint series with unknown names.
+    #[test]
+    fn the_pipeline_counts_an_unserved_model_under_other() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = BasicWorkerBuilder::new("grpc://worker:30000")
+            .worker_type(WorkerType::Regular)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::Sglang)
+            .model(ModelCard::new("m1"))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        worker_registry.register(Arc::new(worker)).unwrap();
+        let deps = PipelineDeps::pair(
+            worker_registry,
+            Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+            None,
+            None,
+            Duration::from_secs(60),
+        );
+        let pipeline =
+            RequestPipeline::build(Endpoint::Chat, Mode::Regular, &deps).expect("chat pipeline");
+        let rendered = render_with_recorder(|| {
+            pipeline.record_request(metrics_labels::ENDPOINT_CHAT, "ghost-1", false);
+            pipeline.record_request(metrics_labels::ENDPOINT_CHAT, "m1", false);
+            pipeline.record_error(
+                Some(metrics_labels::ENDPOINT_CHAT),
+                "ghost-1",
+                &error::model_not_found("ghost-1"),
+            );
+        });
+        assert!(!rendered.contains("ghost-"), "{rendered}");
+        let has = |family: &str, label: &str| {
+            rendered
+                .lines()
+                .any(|line| line.starts_with(&format!("{family}{{")) && line.contains(label))
+        };
+        assert!(
+            has("smg_router_requests_total", r#"model="other""#),
+            "{rendered}"
+        );
+        assert!(
+            has("smg_router_requests_total", r#"model="m1""#),
+            "{rendered}"
+        );
+        assert!(
+            has("smg_router_request_errors_total", r#"model="other""#),
+            "{rendered}"
+        );
     }
 }

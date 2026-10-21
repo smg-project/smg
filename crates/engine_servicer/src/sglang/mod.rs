@@ -22,7 +22,10 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use engine_zmq_adapter::ZmqEngineClient;
+use engine_zmq_adapter::{
+    ConstraintKinds, StructuredOutputBackend, StructuredOutputsBackendConfig,
+    StructuredOutputsSupport, ZmqEngineClient,
+};
 use futures::FutureExt;
 use smg_grpc_client::sglang_proto::sglang_scheduler_server::SglangSchedulerServer;
 use tokio::net::TcpListener;
@@ -33,7 +36,7 @@ use tracing::{info, warn};
 
 use crate::{
     engine_link::EngineLink, health::HealthReporter, proto_json, requests::RequestRegistry,
-    ServerThread, ServicerError, Shutdown,
+    ServerThread, ServicerConfig, ServicerError, Shutdown,
 };
 
 /// The gRPC service name, as the health service reports it.
@@ -65,6 +68,9 @@ pub struct SglangModelInfo {
     /// The model's generation-config sampling defaults merged with the
     /// preferred ones, as JSON text, or empty.
     pub default_sampling_params_json: String,
+    /// Whether the model takes multimodal input, as the launcher reports it.
+    /// Not advertised until this servicer carries media to the scheduler
+    /// (see `info`): the wire refuses `mm_inputs` today.
     pub supports_vision: bool,
     /// Classification heads: `id2label` as JSON text and the label count.
     pub id2label_json: String,
@@ -95,28 +101,64 @@ pub struct SglangModelInfo {
     pub kv_events_topic: String,
 }
 
+/// What the scheduler enforces of a structured request, read off the
+/// launcher's `server_args`: the `grammar_backend` the launcher resolved
+/// (SGLang's `--grammar-backend`: `xgrammar` unless set, `outlines`,
+/// `llguidance` or `none`) and whether the scheduler keeps its tokenizer,
+/// without which (`--skip-tokenizer-init`) its grammar manager builds no
+/// backend at all. `none` enforces nothing: the scheduler admits such a
+/// request and aborts it with a 400. `outlines` compiles JSON schemas and
+/// regular expressions and fails the other kinds at compile; `xgrammar` and
+/// `llguidance` compile all four, xgrammar with the schema features it lacks
+/// dropped. A name this servicer does not know is a plugin backend of the
+/// scheduler's: nothing is judged ahead of it. A launcher that wrote no
+/// backend (an older one) leaves the engine's default, xgrammar. The adapter
+/// refuses a constraint outside this before the scheduler, as on every wire.
+pub(super) fn structured_outputs_support(model: &SglangModelInfo) -> StructuredOutputsSupport {
+    use StructuredOutputsBackendConfig::{Other, Pinned};
+
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    if args
+        .get("skip_tokenizer_init")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return StructuredOutputsSupport::DISABLED;
+    }
+    let backend = args
+        .get("grammar_backend")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    match backend {
+        "" => StructuredOutputsSupport::default(),
+        "xgrammar" => Pinned(StructuredOutputBackend::Xgrammar).into(),
+        "llguidance" => Pinned(StructuredOutputBackend::Guidance).into(),
+        "outlines" => StructuredOutputsSupport::new(
+            Pinned(StructuredOutputBackend::Outlines),
+            ConstraintKinds {
+                json_schema: true,
+                regex: true,
+                ebnf: false,
+                structural_tag: false,
+            },
+        ),
+        "none" => StructuredOutputsSupport::DISABLED,
+        _ => Other.into(),
+    }
+}
+
 /// How to bind, where the engines dial in, and what to advertise.
 #[derive(Debug, Clone)]
 pub struct SglangServicerConfig {
-    /// `host:port` for the gRPC listener.
-    pub bind_address: String,
-    /// `ipc://<path>` base for the data-plane sockets (`<path>-in.sock` and
-    /// `<path>-out.sock`), owned by this process's uid.
-    pub ipc_base_url: String,
-    /// `tcp://host:port` the headless scheduler dials for the handshake (the
-    /// launcher's `--zmq-handshake-address`).
-    /// An `ipc://<path>` endpoint is accepted too: one per test, so parallel
-    /// tests never share a probed TCP port.
-    pub handshake_address: String,
-    /// Engines that will dial in (the data-parallel size).
-    pub engine_count: usize,
-    /// Local directory holding the model's tokenizer files, bundled by
-    /// `GetTokenizer`; the scheduler keeps its own tokenizer for stop strings.
-    pub tokenizer_dir: Option<String>,
+    /// The listener, the scheduler's endpoints, the tokenizer directory and
+    /// the start-up bounds. `handshake_address` is what the headless
+    /// scheduler dials (the launcher's `--zmq-handshake-address`),
+    /// `engine_count` the data-parallel size; `tokenizer_dir` is bundled by
+    /// `GetTokenizer` only, the scheduler keeps its own tokenizer for stop
+    /// strings.
+    pub servicer: ServicerConfig,
     pub model: SglangModelInfo,
-    /// Bound on the scheduler's startup handshake; see
-    /// [`crate::DEFAULT_ENGINE_STARTUP_TIMEOUT`].
-    pub engine_startup_timeout: Duration,
 }
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
@@ -130,7 +172,11 @@ impl crate::kv_events::LoadSource for LoadFromState {
         let load = response.loads.first()?;
         // The engine reports no queued token-work on this wire yet: the
         // record's `waiting_uncached_tokens` stays unset.
-        Some(smg_grpc_client::common_proto::EngineLoad::from(load))
+        let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
+        record.engine_silence_ms = state.engine.output_silence_ms();
+        record.engine_reports_steps = state.engine.reports_steps();
+        record.prefill_pending_tokens = state.engine.prefill_pending_tokens();
+        Some(record)
     }
 }
 
@@ -197,25 +243,7 @@ impl SglangServicerServer {
     /// Validate, bind, and serve on a dedicated runtime thread.
     pub fn start(config: SglangServicerConfig) -> Result<Self, ServicerError> {
         let invalid = |message: &str| ServicerError::InvalidConfig(message.to_string());
-        if config.bind_address.rsplit_once(':').is_none() {
-            return Err(invalid("bind_address must be host:port"));
-        }
-        if !config.ipc_base_url.starts_with("ipc://") {
-            return Err(invalid("ipc_base_url must be ipc://<path>"));
-        }
-        if !config.handshake_address.starts_with("tcp://")
-            && !config.handshake_address.starts_with("ipc://")
-        {
-            return Err(invalid(
-                "handshake_address must be tcp://host:port or ipc://<path>",
-            ));
-        }
-        if config.engine_count == 0 {
-            return Err(invalid("engine_count must be positive"));
-        }
-        if config.engine_startup_timeout.is_zero() {
-            return Err(invalid("engine_startup_timeout must be positive"));
-        }
+        config.servicer.validate()?;
         if config.model.model_path.trim().is_empty() {
             return Err(invalid("model_path must not be empty"));
         }
@@ -229,13 +257,24 @@ impl SglangServicerServer {
                 return Err(invalid(&format!("{name} must be a JSON object")));
             }
         }
+        if config.model.supports_vision {
+            info!(
+                served_model_name = %config.model.served_model_name,
+                "the model takes multimodal input, but this servicer does not carry media to \
+                 the scheduler yet: it advertises supports_vision=false, so the gateway refuses \
+                 image and video input at its gate instead of after fetching it"
+            );
+        }
+        // One publisher per data-parallel rank: the launcher's width (the
+        // handshake's figure, which may differ, is not known yet).
         let kv_relay = crate::kv_events::KvEventRelay::for_publisher(
             &config.model.kv_events_endpoint,
             Some(&config.model.kv_events_replay_endpoint),
             &config.model.kv_events_topic,
+            u32::try_from(config.model.data_parallel_size).unwrap_or(1),
         );
         let state = Arc::new(State {
-            tokenizer_dir: config.tokenizer_dir.clone(),
+            tokenizer_dir: config.servicer.tokenizer_dir.clone(),
             model: config.model,
             kv_relay,
             engine: EngineLink::default(),
@@ -257,14 +296,15 @@ impl SglangServicerServer {
         );
         let connect_state = Arc::clone(&state);
         let kv_relay = state.kv_relay.clone();
-        let SglangServicerConfig {
+        let ServicerConfig {
             bind_address,
             ipc_base_url,
             handshake_address,
             engine_count,
             engine_startup_timeout,
+            engine_startup_ceiling,
             ..
-        } = config;
+        } = config.servicer;
         let thread = ServerThread::start(
             "smg-sglang-servicer",
             &bind_address,
@@ -285,6 +325,7 @@ impl SglangServicerServer {
                     handshake_address,
                     engine_count,
                     engine_startup_timeout,
+                    engine_startup_ceiling,
                     last_error,
                 ));
                 info!(address = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(), "SGLang gRPC servicer listening");
@@ -341,6 +382,18 @@ impl SglangServicerServer {
     /// Whether the engine handshake completed.
     pub fn engine_ready(&self) -> bool {
         self.state.engine.client.get().is_some()
+    }
+
+    /// Report a sign of life from the scheduler process while the handshake
+    /// runs: the lifecycle owner that launched it calls this each time it
+    /// polls the process and finds it alive. Each report resets the
+    /// handshake's silence bound (`engine_startup_timeout`); the ceiling
+    /// (`engine_startup_ceiling`) still holds. A no-op once the scheduler is
+    /// connected.
+    pub fn note_engine_alive(&self) {
+        if !self.engine_ready() {
+            self.state.engine.liveness.touch();
+        }
     }
 
     pub fn last_error(&self) -> Result<Option<String>, ServicerError> {

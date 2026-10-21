@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
-
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
@@ -13,10 +11,10 @@ pub(super) struct QwenVLVisionSpec;
 impl QwenVLVisionSpec {
     fn pad_token_id(metadata: &ModelMetadata) -> RegistryResult<TokenId> {
         metadata
-            .config_u32(&["vision_token_id"])
+            .config_u32(&["image_token_id"])
             .map(|v| v as TokenId)
             .ok_or_else(|| ModelRegistryError::MissingConfigField {
-                field: "vision_token_id".to_string(),
+                field: "image_token_id".to_string(),
             })
     }
 }
@@ -35,12 +33,13 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
     }
 
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
-        Ok("<image>".to_string())
+        Ok("<|image_pad|>".to_string())
     }
 
     fn placeholder_token_id(&self, metadata: &ModelMetadata) -> RegistryResult<TokenId> {
-        // Must match pad_token_id (vision_token_id) — this is the repeated token
-        // in the expanded sequence. image_token_id is a distinct token in Qwen2-VL.
+        // Must match pad_token_id (image_token_id) — this is the repeated token
+        // in the expanded sequence. vision_token_id (<|vision_pad|>) is a distinct
+        // token the chat template never emits.
         Self::pad_token_id(metadata)
     }
 
@@ -51,10 +50,6 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
         Ok(HashMap::from([(Modality::Image, 10)]))
     }
 
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
-    }
-
     fn prompt_replacements(
         &self,
         metadata: &ModelMetadata,
@@ -63,15 +58,13 @@ impl ModelProcessorSpec for QwenVLVisionSpec {
         let pad_token_id = Self::pad_token_id(metadata)?;
         let placeholder_token = self.placeholder_token(metadata)?;
         // The chat template already wraps each image with <|vision_start|> ... <|vision_end|>,
-        // so we only expand the single <image> placeholder to N pad tokens.
-        Ok(preprocessed
-            .feature_token_counts
-            .iter()
-            .map(|&num_tokens| {
-                let tokens = vec![pad_token_id; num_tokens];
-                PromptReplacement::sequence(Modality::Image, &placeholder_token, tokens)
-            })
-            .collect())
+        // so we only expand the single <|image_pad|> placeholder to N pad tokens.
+        Ok(PromptReplacement::repeated_per_item(
+            Modality::Image,
+            &placeholder_token,
+            pad_token_id,
+            &preprocessed.feature_token_counts,
+        ))
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
@@ -104,7 +97,8 @@ mod tests {
 
     #[test]
     fn qwen_vision_uses_config_token_ids() {
-        let tokenizer = TestTokenizer::new(&[("<image>", 999)]);
+        let tokenizer =
+            TestTokenizer::new(&[("<|vision_pad|>", 151654), ("<|image_pad|>", 151655)]);
         let config = json!({
             "model_type": "qwen2_vl",
             "vision_start_token_id": 151652,
@@ -119,6 +113,11 @@ mod tests {
         };
         let registry = ModelRegistry::new();
         let spec = registry.lookup(&metadata).expect("qwen spec");
+        // The chat template emits <|image_pad|>; it is the prompt anchor and the
+        // token the expansion repeats.
+        let placeholder_token = spec.placeholder_token(&metadata).unwrap();
+        assert_eq!(metadata.token_id(&placeholder_token).unwrap(), 151655);
+        assert_eq!(spec.placeholder_token_id(&metadata).unwrap(), 151655);
         // 448/14 = 32 grid, merge_size=2 => (32*32)/4 = 256 tokens
         let replacements = spec
             .prompt_replacements(
@@ -128,13 +127,13 @@ mod tests {
             .unwrap();
         // Only pad tokens — vision_start/vision_end are already in the chat template
         assert_eq!(replacements[0].tokens.len(), 256);
-        assert_eq!(replacements[0].tokens[0], 151654); // pad (vision_token_id)
-        assert_eq!(*replacements[0].tokens.last().unwrap(), 151654);
+        assert_eq!(replacements[0].tokens[0], 151655); // pad (image_token_id)
+        assert_eq!(*replacements[0].tokens.last().unwrap(), 151655);
     }
 
     #[test]
     fn qwen_vl_matches_alias_via_model_type() {
-        let tokenizer = TestTokenizer::new(&[("<image>", 999)]);
+        let tokenizer = TestTokenizer::new(&[("<|image_pad|>", 151655)]);
         let config = json!({
             "model_type": "qwen2_vl",
             "vision_start_token_id": 151652,

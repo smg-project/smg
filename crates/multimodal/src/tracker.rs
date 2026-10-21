@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc};
 
 use tokio::task::JoinHandle;
 
@@ -11,6 +11,7 @@ use super::{
         ImageDetail, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, TrackedMedia,
     },
 };
+use crate::types::TransparencyPolicy;
 
 type PendingTask = JoinHandle<MultiModalResult<TrackedMedia>>;
 
@@ -77,6 +78,10 @@ pub struct AsyncMultiModalTracker {
     /// keeps the connector default.
     default_video_sample_fps: Option<f32>,
     video_frame_sampling: FrameSampling,
+    /// The policy the fetched image frames decode an alpha channel under (see
+    /// [`TransparencyPolicy`]); `KeepAlpha` unless the request's processing
+    /// stage set the destination engine's.
+    image_transparency: TransparencyPolicy,
 }
 
 impl AsyncMultiModalTracker {
@@ -88,7 +93,15 @@ impl AsyncMultiModalTracker {
             first_slot: HashMap::new(),
             default_video_sample_fps: None,
             video_frame_sampling: FrameSampling::default(),
+            image_transparency: TransparencyPolicy::KeepAlpha,
         }
+    }
+
+    /// Decode the request's image frames under `policy` (the destination
+    /// engine's own transparency rule); it becomes part of each frame's hash.
+    pub fn with_image_transparency(mut self, policy: TransparencyPolicy) -> Self {
+        self.image_transparency = policy;
+        self
     }
 
     /// Sample videos that name no `fps` at this rate (the model's reference
@@ -247,36 +260,21 @@ impl AsyncMultiModalTracker {
         uuid: Option<String>,
         max_long_side_pixel: Option<u32>,
     ) {
-        let modality = Modality::Image;
-        self.uuids.entry(modality).or_default().push(uuid);
-
         let config = ImageFetchConfig {
             detail,
             max_long_side_pixel,
+            transparency: self.image_transparency,
         };
-        let source = Arc::new(FetchSource::from(source));
-        if let Some(first) = self.same_media_as(modality, format!("{config:?}"), &source) {
-            self.pending
-                .entry(modality)
-                .or_default()
-                .push(Slot::SameAs(first));
-            return;
-        }
-
-        let connector = Arc::clone(&self.media_connector);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
-        )]
-        let handle = tokio::spawn(async move {
-            let frame = connector.fetch_image_from(&source, config).await?;
-            Ok(TrackedMedia::Image(frame))
-        });
-
-        self.pending
-            .entry(modality)
-            .or_default()
-            .push(Slot::Fetch(handle));
+        self.enqueue(
+            Modality::Image,
+            uuid,
+            format!("{config:?}"),
+            source,
+            move |connector, source| async move {
+                let frame = connector.fetch_image_from(&source, config).await?;
+                Ok(TrackedMedia::Image(frame))
+            },
+        );
     }
 
     fn enqueue_video(
@@ -292,63 +290,61 @@ impl AsyncMultiModalTracker {
             self.default_video_sample_fps,
             self.video_frame_sampling,
         )?;
-
-        let modality = Modality::Video;
-        self.uuids.entry(modality).or_default().push(uuid);
-
-        let source = Arc::new(FetchSource::from(source));
-        if let Some(first) = self.same_media_as(modality, format!("{cfg:?}"), &source) {
-            self.pending
-                .entry(modality)
-                .or_default()
-                .push(Slot::SameAs(first));
-            return Ok(());
-        }
-
-        let connector = Arc::clone(&self.media_connector);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
-        )]
-        let handle = tokio::spawn(async move {
-            let clip = connector.fetch_video_from(&source, cfg).await?;
-            Ok(TrackedMedia::Video(clip))
-        });
-
-        self.pending
-            .entry(modality)
-            .or_default()
-            .push(Slot::Fetch(handle));
+        self.enqueue(
+            Modality::Video,
+            uuid,
+            format!("{cfg:?}"),
+            source,
+            move |connector, source| async move {
+                let clip = connector.fetch_video_from(&source, cfg).await?;
+                Ok(TrackedMedia::Video(clip))
+            },
+        );
         Ok(())
     }
 
     fn enqueue_audio(&mut self, source: MediaSource, uuid: Option<String>) {
-        let modality = Modality::Audio;
+        self.enqueue(
+            Modality::Audio,
+            uuid,
+            String::new(),
+            source,
+            |connector, source| async move {
+                let clip = connector.fetch_audio_from(&source).await?;
+                Ok(TrackedMedia::Audio(clip))
+            },
+        );
+    }
+
+    /// The slot of one media item: its uuid recorded, then either the fetch an
+    /// earlier item of the same modality, settings and bytes already runs, or
+    /// its own fetch spawned now and awaited in [`Self::finalize`].
+    fn enqueue<F, Fut>(
+        &mut self,
+        modality: Modality,
+        uuid: Option<String>,
+        settings: String,
+        source: MediaSource,
+        fetch: F,
+    ) where
+        F: FnOnce(Arc<MediaConnector>, Arc<FetchSource>) -> Fut,
+        Fut: Future<Output = MultiModalResult<TrackedMedia>> + Send + 'static,
+    {
         self.uuids.entry(modality).or_default().push(uuid);
 
         let source = Arc::new(FetchSource::from(source));
-        if let Some(first) = self.same_media_as(modality, String::new(), &source) {
-            self.pending
-                .entry(modality)
-                .or_default()
-                .push(Slot::SameAs(first));
-            return;
-        }
-
-        let connector = Arc::clone(&self.media_connector);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
-        )]
-        let handle = tokio::spawn(async move {
-            let clip = connector.fetch_audio_from(&source).await?;
-            Ok(TrackedMedia::Audio(clip))
-        });
-
-        self.pending
-            .entry(modality)
-            .or_default()
-            .push(Slot::Fetch(handle));
+        let slot = match self.same_media_as(modality, settings, &source) {
+            Some(first) => Slot::SameAs(first),
+            None => {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
+                )]
+                let handle = tokio::spawn(fetch(Arc::clone(&self.media_connector), source));
+                Slot::Fetch(handle)
+            }
+        };
+        self.pending.entry(modality).or_default().push(slot);
     }
 }
 
@@ -505,6 +501,7 @@ mod video_param_tests {
 
 #[cfg(test)]
 mod repeat_tests {
+
     use super::*;
     use crate::media::MediaConnectorConfig;
 
@@ -553,9 +550,11 @@ mod repeat_tests {
     }
 
     fn tracker() -> AsyncMultiModalTracker {
-        let connector =
-            MediaConnector::new(reqwest::Client::new(), MediaConnectorConfig::default())
-                .expect("default connector");
+        let connector = MediaConnector::new(
+            crate::test_support::http_client_builder(),
+            MediaConnectorConfig::default(),
+        )
+        .expect("default connector");
         AsyncMultiModalTracker::new(Arc::new(connector))
     }
 
@@ -576,6 +575,40 @@ mod repeat_tests {
             .data
             .remove(&Modality::Image)
             .expect("the request carries images")
+    }
+
+    #[tokio::test]
+    async fn the_tracker_s_transparency_policy_reaches_the_frame_and_its_hash() {
+        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+        let png = BASE64_STANDARD
+            .decode(TINY_PNG_URL.split_once(',').expect("data url").1)
+            .expect("base64");
+        for policy in [
+            TransparencyPolicy::KeepAlpha,
+            TransparencyPolicy::CompositeOverWhite,
+            TransparencyPolicy::DropAlpha,
+        ] {
+            let mut tracker = tracker().with_image_transparency(policy);
+            tracker.push_part(image_part(None)).expect("part");
+            let items = images(tracker).await;
+            let Some(TrackedMedia::Image(frame)) = items.first() else {
+                panic!("the slot must hold an image");
+            };
+            assert_eq!(frame.transparency(), policy);
+            assert_eq!(
+                frame.hash,
+                crate::hasher::hash_image_with_transparency(&png, None, policy),
+                "{policy:?}"
+            );
+        }
+        let mut tracker = tracker();
+        tracker.push_part(image_part(None)).expect("part");
+        let items = images(tracker).await;
+        let Some(TrackedMedia::Image(frame)) = items.first() else {
+            panic!("the slot must hold an image");
+        };
+        assert_eq!(frame.transparency(), TransparencyPolicy::KeepAlpha);
+        assert_eq!(frame.hash, crate::hasher::hash_image(&png));
     }
 
     #[tokio::test]

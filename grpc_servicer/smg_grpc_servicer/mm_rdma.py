@@ -19,6 +19,17 @@ _FRAME_BYTES = 2 * _GEN_BYTES
 DEFAULT_GATEWAY_AGENT_NAME = "smg-gateway-encode"
 _LOCAL_IP_CACHE: dict[str, bool] = {}
 
+# The spellings that turn an SMG env switch on, the same set the gateway
+# reads (``1``, ``true``, ``yes``, ``on``, in any case, surrounding blanks
+# ignored); anything else leaves the switch off.
+_SWITCH_ON = frozenset({"1", "true", "yes", "on"})
+
+
+def rdma_pixel_lane_enabled(environ) -> bool:
+    """Whether ``SMG_MM_PIXEL_RDMA`` asks for the RDMA pixel lane, read with
+    the gateway's spelling rule, so gateway and worker agree on one value."""
+    return (environ.get("SMG_MM_PIXEL_RDMA") or "").strip().lower() in _SWITCH_ON
+
 
 @dataclass(frozen=True)
 class _RemotePixelDescriptor:
@@ -121,7 +132,7 @@ class RdmaPixelPuller:
         self._landing_slot_bytes = 0
         self._landing_free = None
 
-        if os.environ.get("SMG_MM_PIXEL_RDMA") not in ("1", "true"):
+        if not rdma_pixel_lane_enabled(os.environ):
             return
 
         try:

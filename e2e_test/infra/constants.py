@@ -1,6 +1,7 @@
 """Constants and enums for E2E test infrastructure."""
 
 import os
+import socket
 from enum import StrEnum
 
 
@@ -29,6 +30,9 @@ class Runtime(StrEnum):
     TRTLLM = "trtllm"
     MLX = "mlx"
     TOKENSPEED = "tokenspeed"
+    # The scripted mock worker (`crates/mock_worker`): no model, the test
+    # states the answer before it sends the request. CPU only.
+    MOCK = "mock"
     OPENAI = "openai"
     XAI = "xai"
     GEMINI = "gemini"
@@ -38,7 +42,7 @@ class Runtime(StrEnum):
 # Convenience sets
 LOCAL_MODES = frozenset({ConnectionMode.HTTP, ConnectionMode.GRPC, ConnectionMode.ZMQ})
 LOCAL_RUNTIMES = frozenset(
-    {Runtime.SGLANG, Runtime.VLLM, Runtime.TRTLLM, Runtime.MLX, Runtime.TOKENSPEED}
+    {Runtime.SGLANG, Runtime.VLLM, Runtime.TRTLLM, Runtime.MLX, Runtime.TOKENSPEED, Runtime.MOCK}
 )
 CLOUD_RUNTIMES = frozenset({Runtime.OPENAI, Runtime.XAI, Runtime.GEMINI, Runtime.ANTHROPIC})
 
@@ -79,6 +83,7 @@ ENV_MM_PROCESSING = (
     "E2E_MM_PROCESSING"  # Per-lane multimodal processing location — see get_mm_processing
 )
 ENV_VLLM_MM_PROCESSOR = "E2E_VLLM_MM_PROCESSOR"  # Worker-lane processor — see get_vllm_mm_processor
+ENV_PARSER = "E2E_PARSER"  # The gateway's --parser for a lane — see get_parser
 ENV_STARTUP_TIMEOUT = (
     "E2E_STARTUP_TIMEOUT"  # Floor on every startup wait — see effective_startup_timeout
 )
@@ -201,6 +206,21 @@ VLLM_SERVICER_IMPLS = ("python", "rust")
 VLLM_MM_PROCESSORS = ("inprocess", "smg")
 
 
+def get_parser() -> str | None:
+    """The parser a lane starts the gateway with, its ``--parser`` flag.
+
+    Set ``E2E_PARSER=symphony`` to read every chat completion with Symphony for
+    the models its registry knows; ``legacy`` names the per-model parsers.
+    Unset or blank leaves the gateway on its default, legacy.
+    """
+    value = os.environ.get(ENV_PARSER, "").strip().lower()
+    if not value:
+        return None
+    if value not in ("legacy", "symphony"):
+        raise ValueError(f"{ENV_PARSER}={value!r} is not a parser; use legacy or symphony")
+    return value
+
+
 def get_vllm_mm_processor() -> str:
     """The processor the worker lane launches vLLM gRPC workers with
     (``SMG_VLLM_MM_PROCESSOR``): ``inprocess`` (vLLM's own, the default) or
@@ -303,7 +323,7 @@ def get_gpu_offset() -> int:
 
     Workers take GPUs sequentially from 0; on a multi-GPU host, set
     ``E2E_GPU_OFFSET`` to run several lanes side by side, each on its own
-    GPUs. Every worker of the lane (regular and PD legs) shifts by it.
+    GPUs. Every worker of the lane (regular and PD pools) shifts by it.
     Unset/blank means 0.
     """
     value = os.environ.get(ENV_GPU_OFFSET, "").strip()
@@ -331,7 +351,7 @@ def effective_startup_timeout(spec_timeout: int) -> int:
     raised to ``E2E_STARTUP_TIMEOUT`` when that is larger. The per-model bound
     assumes warm caches; on a fresh host an engine's first start JIT-compiles
     and autotunes kernels for minutes, which the env floor covers for every
-    wait that gates on a loaded model (worker health, ZMQ gateway readiness).
+    wait that gates on a loaded model (worker health, gateway readiness).
     An explicitly larger per-model bound is never shrunk.
     """
     return max(spec_timeout, get_startup_timeout() or 0)
@@ -345,7 +365,7 @@ ENV_SGLANG_TRANSFER_BACKEND = "E2E_SGLANG_TRANSFER_BACKEND"
 
 
 def vllm_kv_backend() -> str:
-    """KV transfer backend for vLLM PD workers: "nixl" (default) or "mooncake"."""
+    """KV transfer backend for vLLM PD workers: "nixl" (default), "mooncake" or "moriio"."""
     lane = os.environ.get(ENV_KV_BACKEND, "").strip().lower()
     return lane or os.environ.get(ENV_VLLM_KV_BACKEND, "nixl").lower()
 
@@ -356,6 +376,40 @@ def sglang_transfer_backend() -> str:
     return lane or os.environ.get(ENV_SGLANG_TRANSFER_BACKEND, "mooncake").lower()
 
 
+# MoRI-IO (the "moriio" vLLM KV backend): READ or WRITE transfers, its
+# transfer engine, and the address the workers advertise and SMG hands to
+# their peers.
+ENV_VLLM_MORIIO_MODE = "E2E_VLLM_MORIIO_MODE"
+ENV_VLLM_MORIIO_BACKEND = "E2E_VLLM_MORIIO_BACKEND"
+ENV_MORIIO_HOST = "E2E_MORIIO_HOST"
+
+
+def vllm_moriio_mode() -> str:
+    """MoRI-IO transfer mode for vLLM PD workers: "read" (default) or "write"."""
+    mode = os.environ.get(ENV_VLLM_MORIIO_MODE, "").strip().lower() or "read"
+    if mode not in ("read", "write"):
+        raise ValueError(f"{ENV_VLLM_MORIIO_MODE} must be 'read' or 'write', not {mode!r}")
+    return mode
+
+
+def vllm_moriio_backend() -> str:
+    """MoRI-IO transfer engine: "rdma" (default, through the NICs) or "xgmi" (GPU to GPU, one node)."""
+    backend = os.environ.get(ENV_VLLM_MORIIO_BACKEND, "").strip().lower() or "rdma"
+    if backend not in ("rdma", "xgmi"):
+        raise ValueError(f"{ENV_VLLM_MORIIO_BACKEND} must be 'rdma' or 'xgmi', not {backend!r}")
+    return backend
+
+
+def moriio_host() -> str:
+    """Address of this host for MoRI-IO: ``E2E_MORIIO_HOST``, else the default route's source."""
+    host = os.environ.get(ENV_MORIIO_HOST, "").strip()
+    if host:
+        return host
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect(("10.255.255.255", 1))  # sends nothing; only picks the route
+        return s.getsockname()[0]
+
+
 # Runtime display labels
 RUNTIME_LABELS = {
     "sglang": "SGLang",
@@ -363,6 +417,7 @@ RUNTIME_LABELS = {
     "trtllm": "TensorRT-LLM",
     "mlx": "MLX",
     "tokenspeed": "TokenSpeed",
+    "mock": "Mock",
 }
 
 ENV_SHOW_ROUTER_LOGS = "SHOW_ROUTER_LOGS"

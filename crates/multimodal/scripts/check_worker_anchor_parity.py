@@ -23,6 +23,7 @@ files; weights are not loaded.
 from __future__ import annotations
 
 import argparse
+import inspect
 import sys
 from dataclasses import dataclass
 
@@ -55,6 +56,35 @@ MODELS = {
         # Anchor = tokenizer token for the config's image_token_id. Video is
         # deliberately absent: vLLM targets a three-token block for it.
         "anchors": {"image": ("config_id", "image_token_id")},
+    },
+    "llava": {
+        "model_id": "llava-hf/llava-1.5-7b-hf",
+        # Anchor = the literal <image> token (config image_token_index when present).
+        "anchors": {"image": ("literal", "<image>")},
+    },
+    "llava_next": {
+        "model_id": "llava-hf/llava-v1.6-mistral-7b-hf",
+        "anchors": {"image": ("literal", "<image>")},
+    },
+    "qwen3_omni": {
+        "model_id": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        # Anchor = tokenizer token for the thinker config's <modality>_token_id
+        # (config_int reads one level into the sub-configs).
+        "anchors": {
+            "image": ("config_id", "image_token_id"),
+            "video": ("config_id", "video_token_id"),
+            "audio": ("config_id", "audio_token_id"),
+        },
+    },
+    "qwen3_asr": {
+        "model_id": "Qwen/Qwen3-ASR-1.7B",
+        "anchors": {"audio": ("config_id", "audio_token_id")},
+    },
+    "deepseek_v41": {
+        "model_id": "deepseek-ai/DeepSeek-V4.1-Flash",
+        # Anchor = the literal <｜deepseek_image｜> the registry renders; its
+        # tokenizer id must be the config's image_token_id vLLM targets.
+        "anchors": {"image": ("literal", "<｜deepseek_image｜>")},
     },
 }
 
@@ -106,9 +136,36 @@ def router_anchor(config, tokenizer, rule: tuple[str, str]) -> tuple[str, int]:
 
 
 def dummy_media(processor, modality: str) -> list:
-    data = processor.dummy_inputs.get_dummy_mm_data(seq_len=256, mm_counts={modality: 1})
+    kwargs = {"seq_len": 256, "mm_counts": {modality: 1}}
+    # Newer vLLM takes the per-modality dummy options as a third argument
+    # with no default; an empty mapping means the builder's defaults.
+    if "mm_options" in inspect.signature(processor.dummy_inputs.get_dummy_mm_data).parameters:
+        kwargs["mm_options"] = {}
+    data = processor.dummy_inputs.get_dummy_mm_data(**kwargs)
     items = data[modality]
     return list(items) if isinstance(items, (list, tuple)) else [items]
+
+
+def apply_processor(processor, prompt_ids: list[int], mm_data: dict):
+    """Run the processor over token ids plus media on either processing API.
+
+    Older vLLM took (prompt, mm_data, hf_processor_mm_kwargs); newer vLLM takes
+    a ProcessorInputs carrying the already-parsed media items and a
+    TimingContext. The result keeps the keys read below either way.
+    """
+    if "inputs" not in inspect.signature(processor.apply).parameters:
+        return processor.apply(prompt_ids, mm_data, {})
+    from vllm.multimodal.processing.context import TimingContext
+    from vllm.multimodal.processing.inputs import ProcessorInputs
+
+    # Only the two fields every version has: the kwargs fields default to empty
+    # mappings where they exist, and `media_io_kwargs` is newer than the
+    # `inputs` form of `apply` (absent on the versions in between).
+    inputs = ProcessorInputs(
+        prompt=prompt_ids,
+        mm_data_items=processor.data_parser.parse_mm_data(mm_data),
+    )
+    return processor.apply(inputs, TimingContext(enabled=False))
 
 
 def check(model_key: str, model_id: str, trust_remote_code: bool) -> list[Outcome]:
@@ -134,7 +191,9 @@ def check(model_key: str, model_id: str, trust_remote_code: bool) -> list[Outcom
             continue
         prompt_ids = prefix + [anchor_id] + suffix
         try:
-            result = processor.apply(prompt_ids, {modality: dummy_media(processor, modality)}, {})
+            result = apply_processor(
+                processor, prompt_ids, {modality: dummy_media(processor, modality)}
+            )
         except Exception as e:  # noqa: BLE001 - any processor failure is a parity failure
             outcomes.append(
                 Outcome(

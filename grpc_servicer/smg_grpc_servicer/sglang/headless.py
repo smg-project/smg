@@ -92,7 +92,9 @@ def launch(ours: argparse.Namespace, server_argv: list[str]) -> int:
 def run(server_args: Any, handshake_address: str, engine_index: int = 0) -> int:
     """Run the scheduler ranks headless on prepared server args until they
     exit or a signal arrives; returns the process exit code. The Rust servicer
-    calls this in a spawned child with the args SGLang's entrypoint parsed."""
+    starts the ranks the same way from its own process
+    (:func:`smg_grpc_servicer.sglang.rust.launch_scheduler_ranks`); this
+    standalone form keeps a supervisor of its own."""
     os.environ[HANDSHAKE_ENV] = handshake_address
     os.environ[ENGINE_INDEX_ENV] = str(engine_index)
 

@@ -18,34 +18,43 @@
 //!
 //! Status: the public types below are the contract, [`adapt`] renders them for the Chat
 //! Completions, Responses and Messages APIs, streamed and whole, and [`Engine`] runs a [`Format`]
-//! table: the tables in [`formats`] are the families recorded so far, and more follow.
+//! table: the tables in [`formats`] are the families recorded so far, [`formats::for_model`] picks
+//! the one for a model id, and more follow. The crate's surface is this root: the modules it
+//! declares public and the names it re-exports, which the gateway, the bindings and the tests
+//! build on (`tests/surface.rs` pins the list). The assemblers, the scanner and the token ledger
+//! are the engine's own.
 
 #![forbid(unsafe_code)]
 
 pub mod adapt;
+pub mod declared;
 pub mod engine;
 pub mod event;
 pub mod format;
 pub mod formats;
+pub mod gemma;
 pub mod grammar;
+mod ids;
 pub mod input;
 pub mod json;
-pub mod markers;
+mod markers;
 pub mod parser;
-pub mod pythonic;
+mod pythonic;
+pub mod shape;
 pub mod tagged;
-pub mod tokens;
+#[cfg(test)]
+pub(crate) mod testing;
+mod tokens;
 
+pub use declared::Declared;
 pub use engine::Engine;
 pub use event::{DropReason, Event, Events, FinishReason, MalformedReason, Text};
-pub use format::{CallSyntax, Emits, Format};
-pub use formats::{
-    deepseek_v4_1, glm, hy4, iquest, kimi_k3, lfm2_5, ling, minimax_m3, olmo3, plain, qwen2_5,
-    qwen3, seed_oss, xlam,
+pub use format::{CallId, CallSyntax, Emits, Format, Whitespace};
+pub use grammar::{
+    Bound, Grammar, GrammarStart, Output, OutputAnswer, OutputChoice, OutputPosition,
+    OutputSpelling, Tag, Turn,
 };
-pub use grammar::{Grammar, Tag};
+pub use ids::CallIds;
 pub use input::{EngineFinish, Input, TokenSpan};
-pub use markers::{Piece, Scanner};
 pub use parser::{ParseError, Parser};
-pub use tagged::Declared;
-pub use tokens::Ledger;
+pub use shape::{Inferred, ValueRead};

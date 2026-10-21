@@ -1,0 +1,520 @@
+{
+ "tools": [
+  {
+   "type": "function",
+   "function": {
+    "name": "fn_alpha",
+    "description": "A probe tool with one parameter of each JSON type.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "s": {
+       "type": "string"
+      },
+      "i": {
+       "type": "integer"
+      },
+      "n": {
+       "type": "number"
+      },
+      "b": {
+       "type": "boolean"
+      },
+      "a": {
+       "type": "array",
+       "items": {
+        "type": "integer"
+       }
+      },
+      "o": {
+       "type": "object"
+      },
+      "z": {
+       "type": "string",
+       "nullable": true
+      }
+     },
+     "required": [
+      "s",
+      "i",
+      "n",
+      "b",
+      "a",
+      "o",
+      "z"
+     ]
+    }
+   }
+  },
+  {
+   "type": "function",
+   "function": {
+    "name": "fn_beta",
+    "description": "A probe tool with one string parameter.",
+    "parameters": {
+     "type": "object",
+     "properties": {
+      "q": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "q"
+     ]
+    }
+   }
+  }
+ ],
+ "cases": {
+  "prompt": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Call the probe tools."
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "prompt_after_tool": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Call the probe tools."
+    },
+    {
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "id": "call_alpha",
+       "type": "function",
+       "function": {
+        "name": "fn_alpha",
+        "arguments": {
+         "s": "sigma",
+         "i": 42,
+         "n": 2.5,
+         "b": true,
+         "a": [
+          1,
+          2
+         ],
+         "o": {
+          "m": "mu"
+         },
+         "z": null
+        }
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "call_alpha",
+     "name": "fn_alpha",
+     "content": "{\"ok\": true}"
+    }
+   ],
+   "add_generation_prompt": true
+  },
+  "calls": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Call the probe tools."
+    },
+    {
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "id": "call_alpha",
+       "type": "function",
+       "function": {
+        "name": "fn_alpha",
+        "arguments": {
+         "s": "sigma",
+         "i": 42,
+         "n": 2.5,
+         "b": true,
+         "a": [
+          1,
+          2
+         ],
+         "o": {
+          "m": "mu"
+         },
+         "z": null
+        }
+       }
+      },
+      {
+       "id": "call_beta",
+       "type": "function",
+       "function": {
+        "name": "fn_beta",
+        "arguments": {
+         "q": "kappa"
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "add_generation_prompt": false
+  },
+  "one_call": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Call the probe tools."
+    },
+    {
+     "role": "assistant",
+     "tool_calls": [
+      {
+       "id": "call_alpha",
+       "type": "function",
+       "function": {
+        "name": "fn_alpha",
+        "arguments": {
+         "s": "sigma",
+         "i": 42,
+         "n": 2.5,
+         "b": true,
+         "a": [
+          1,
+          2
+         ],
+         "o": {
+          "m": "mu"
+         },
+         "z": null
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "add_generation_prompt": false
+  },
+  "answer": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Call the probe tools."
+    },
+    {
+     "role": "assistant",
+     "content": "{\"probe\": 1}"
+    }
+   ],
+   "add_generation_prompt": false
+  },
+  "calls+reasoning_content": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Call the probe tools."
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "Probe thought.",
+     "tool_calls": [
+      {
+       "id": "call_alpha",
+       "type": "function",
+       "function": {
+        "name": "fn_alpha",
+        "arguments": {
+         "s": "sigma",
+         "i": 42,
+         "n": 2.5,
+         "b": true,
+         "a": [
+          1,
+          2
+         ],
+         "o": {
+          "m": "mu"
+         },
+         "z": null
+        }
+       }
+      },
+      {
+       "id": "call_beta",
+       "type": "function",
+       "function": {
+        "name": "fn_beta",
+        "arguments": {
+         "q": "kappa"
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "add_generation_prompt": false
+  },
+  "calls+reasoning": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Call the probe tools."
+    },
+    {
+     "role": "assistant",
+     "reasoning": "Probe thought.",
+     "tool_calls": [
+      {
+       "id": "call_alpha",
+       "type": "function",
+       "function": {
+        "name": "fn_alpha",
+        "arguments": {
+         "s": "sigma",
+         "i": 42,
+         "n": 2.5,
+         "b": true,
+         "a": [
+          1,
+          2
+         ],
+         "o": {
+          "m": "mu"
+         },
+         "z": null
+        }
+       }
+      },
+      {
+       "id": "call_beta",
+       "type": "function",
+       "function": {
+        "name": "fn_beta",
+        "arguments": {
+         "q": "kappa"
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "add_generation_prompt": false
+  },
+  "calls+thinking": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Call the probe tools."
+    },
+    {
+     "role": "assistant",
+     "thinking": "Probe thought.",
+     "tool_calls": [
+      {
+       "id": "call_alpha",
+       "type": "function",
+       "function": {
+        "name": "fn_alpha",
+        "arguments": {
+         "s": "sigma",
+         "i": 42,
+         "n": 2.5,
+         "b": true,
+         "a": [
+          1,
+          2
+         ],
+         "o": {
+          "m": "mu"
+         },
+         "z": null
+        }
+       }
+      },
+      {
+       "id": "call_beta",
+       "type": "function",
+       "function": {
+        "name": "fn_beta",
+        "arguments": {
+         "q": "kappa"
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "add_generation_prompt": false
+  },
+  "one_call+reasoning_content": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Call the probe tools."
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "Probe thought.",
+     "tool_calls": [
+      {
+       "id": "call_alpha",
+       "type": "function",
+       "function": {
+        "name": "fn_alpha",
+        "arguments": {
+         "s": "sigma",
+         "i": 42,
+         "n": 2.5,
+         "b": true,
+         "a": [
+          1,
+          2
+         ],
+         "o": {
+          "m": "mu"
+         },
+         "z": null
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "add_generation_prompt": false
+  },
+  "one_call+reasoning": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Call the probe tools."
+    },
+    {
+     "role": "assistant",
+     "reasoning": "Probe thought.",
+     "tool_calls": [
+      {
+       "id": "call_alpha",
+       "type": "function",
+       "function": {
+        "name": "fn_alpha",
+        "arguments": {
+         "s": "sigma",
+         "i": 42,
+         "n": 2.5,
+         "b": true,
+         "a": [
+          1,
+          2
+         ],
+         "o": {
+          "m": "mu"
+         },
+         "z": null
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "add_generation_prompt": false
+  },
+  "one_call+thinking": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Call the probe tools."
+    },
+    {
+     "role": "assistant",
+     "thinking": "Probe thought.",
+     "tool_calls": [
+      {
+       "id": "call_alpha",
+       "type": "function",
+       "function": {
+        "name": "fn_alpha",
+        "arguments": {
+         "s": "sigma",
+         "i": 42,
+         "n": 2.5,
+         "b": true,
+         "a": [
+          1,
+          2
+         ],
+         "o": {
+          "m": "mu"
+         },
+         "z": null
+        }
+       }
+      }
+     ]
+    }
+   ],
+   "add_generation_prompt": false
+  },
+  "answer+reasoning_content": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Call the probe tools."
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "Probe thought.",
+     "content": "{\"probe\": 1}"
+    }
+   ],
+   "add_generation_prompt": false
+  },
+  "answer+reasoning": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Call the probe tools."
+    },
+    {
+     "role": "assistant",
+     "reasoning": "Probe thought.",
+     "content": "{\"probe\": 1}"
+    }
+   ],
+   "add_generation_prompt": false
+  },
+  "answer+thinking": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Call the probe tools."
+    },
+    {
+     "role": "assistant",
+     "thinking": "Probe thought.",
+     "content": "{\"probe\": 1}"
+    }
+   ],
+   "add_generation_prompt": false
+  }
+ },
+ "settings": {
+  "default": {},
+  "enable_thinking": {
+   "enable_thinking": true
+  },
+  "disable_thinking": {
+   "enable_thinking": false
+  }
+ },
+ "arguments": {
+  "object": "each tool call's arguments as a JSON object",
+  "string": "each tool call's arguments as compact JSON text (json.dumps with separators (',', ':')), tried when the object form raises"
+ },
+ "now": 0,
+ "notes": [
+  "strftime_now writes the instant `now`, in seconds since the Unix epoch, as UTC.",
+  "A setting missing from a chat template's settings in manifest.json renders every case as the default setting does.",
+  "Every render passes the tools; the chat template's special tokens come from templates.jsonl and the setting's keyword arguments are added to them."
+ ]
+}

@@ -22,7 +22,7 @@ def test_gate_accepts_pixel_payloads():
 
 
 def test_gate_accepts_grid_only_payloads():
-    # The PD decode leg's form: grid tensors without pixels.
+    # The PD decode side's form: grid tensors without pixels.
     mm = vllm_engine_pb2.MultimodalInputs(mm_hashes=["h1"])
     mm.model_specific_tensors["image_grid_thw"].CopyFrom(
         vllm_engine_pb2.TensorData(dtype="int64", shape=[1, 3])
@@ -31,7 +31,7 @@ def test_gate_accepts_grid_only_payloads():
 
 
 def test_gate_rejects_identity_only_payloads():
-    # Hashes alone cannot rebuild mm features; this leg takes the salt path.
+    # Hashes alone cannot rebuild mm features; this side takes the salt path.
     mm = vllm_engine_pb2.MultimodalInputs(mm_hashes=["h1"])
     assert not mm_salt.has_preprocessed_mm_payload(mm)
 

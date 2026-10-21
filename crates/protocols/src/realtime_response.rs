@@ -13,7 +13,7 @@ use validator::{Validate, ValidationError};
 
 use crate::{
     builders::RealtimeResponseBuilder,
-    common::ResponsePrompt,
+    common::{invalid, ResponsePrompt},
     realtime_conversation::{ConversationItemRole, RealtimeContentPart, RealtimeConversationItem},
     realtime_session::{
         MaxOutputTokens, OutputModality, RealtimeAudioFormats, RealtimeToolChoiceConfig,
@@ -255,17 +255,15 @@ fn validate_conversation_item(item: &RealtimeConversationItem) -> Result<(), Val
         };
 
         if !allowed {
-            let mut err = ValidationError::new("invalid_content_part");
-            err.message = Some(
+            return Err(invalid(
+                "invalid_content_part",
                 format!(
                     "content[{}]: {:?} role does not allow \"{}\" content parts",
                     i,
                     role,
                     part.type_name()
-                )
-                .into(),
-            );
-            return Err(err);
+                ),
+            ));
         }
     }
 

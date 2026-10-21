@@ -17,13 +17,23 @@
 //!
 //! Connect failures, timeouts and the "not served now" statuses (408, 502,
 //! 503, 504) stay transient: they are replayed as before, charged once.
+//!
+//! One side of a disaggregated pair can also be given up on alone: a prefill
+//! side that produced nothing within its silence bound has, for this request,
+//! told its worker's side of the story, and a replay there would wait out
+//! the same bound. The response names the side ([`FailedSide`]); the retry
+//! window closes on that worker only, its partner stays selectable, and
+//! when no other worker of the side's kind is available the answer stands.
 
 use std::sync::Arc;
 
 use axum::{http::StatusCode, response::Response};
 use parking_lot::Mutex;
 
-use crate::{routers::common::retry::mark_non_retryable, worker::Worker};
+use crate::{
+    routers::common::retry::mark_non_retryable,
+    worker::{Worker, WorkerType},
+};
 
 /// Response extension: the worker answered the request itself, so the status
 /// is the worker's verdict on this payload rather than a transport failure or
@@ -34,6 +44,23 @@ pub(crate) struct UpstreamAnswer;
 /// Mark `response` as answered by the worker (see [`UpstreamAnswer`]).
 pub(crate) fn mark_upstream_answer(response: &mut Response) {
     response.extensions_mut().insert(UpstreamAnswer);
+}
+
+/// Response extension: the attempt failed on one side of a disaggregated pair,
+/// named by its engine, and that side alone is what the request must not be
+/// replayed on (see [`AttemptLedger::settle`]).
+#[derive(Debug, Clone)]
+pub(crate) struct FailedSide {
+    engine: String,
+    worker_type: WorkerType,
+}
+
+/// Mark `response` as the failure of `worker`'s side alone (see [`FailedSide`]).
+pub(crate) fn mark_failed_side(response: &mut Response, worker: &dyn Worker) {
+    response.extensions_mut().insert(FailedSide {
+        engine: worker.base_url().to_string(),
+        worker_type: *worker.worker_type(),
+    });
 }
 
 /// Whether `response` is a failure the answering worker must not see again
@@ -89,28 +116,38 @@ impl AttemptLedger {
     /// Close the retry window on a definitive failure. The workers that gave
     /// the answer take no further attempt of this request; when no available
     /// worker in `pool` is left to take one, the answer is marked terminal and
-    /// goes back to the client as it is. Any other response passes untouched.
+    /// goes back to the client as it is. A failure of one side alone
+    /// ([`FailedSide`]) closes the window on that side's worker only, and the
+    /// alternative is sought among the workers of its kind. Any other
+    /// response passes untouched.
     pub(crate) fn settle<'a>(
         &self,
         response: &mut Response,
         answered_by: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
         pool: impl IntoIterator<Item = &'a Arc<dyn Worker>>,
     ) {
-        if !is_definitive_failure(response) {
+        let side = response.extensions().get::<FailedSide>().cloned();
+        if side.is_none() && !is_definitive_failure(response) {
             return;
         }
         {
             let mut ledger = self.inner.lock();
             for worker in answered_by {
                 let engine = worker.base_url();
+                if side.as_ref().is_some_and(|side| side.engine != engine) {
+                    continue;
+                }
                 if !ledger.answered.iter().any(|url| url == engine) {
                     ledger.answered.push(engine.to_string());
                 }
             }
         }
-        let alternative = pool
-            .into_iter()
-            .any(|worker| worker.is_available() && self.admits(worker.as_ref()));
+        let alternative = pool.into_iter().any(|worker| {
+            side.as_ref()
+                .is_none_or(|side| *worker.worker_type() == side.worker_type)
+                && worker.is_available()
+                && self.admits(worker.as_ref())
+        });
         if !alternative {
             mark_non_retryable(response);
         }
@@ -227,5 +264,51 @@ mod tests {
         ledger.settle(&mut transport, [&w1], pool.iter());
         assert!(ledger.admits(w1.as_ref()));
         assert!(is_retryable_response(&transport));
+    }
+
+    fn worker_of(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    #[test]
+    fn a_failed_side_excludes_its_worker_alone_and_ends_the_window_without_another_of_its_kind() {
+        // A silent prefill side: the pair's decode did nothing wrong and stays
+        // selectable; the retry goes to the other prefill worker, and once
+        // that one has failed too the 504 stands even though a decode worker
+        // is still available.
+        let p1 = worker_of("grpc://p1:8000", WorkerType::Prefill);
+        let p2 = worker_of("grpc://p2:8000", WorkerType::Prefill);
+        let d1 = worker_of("grpc://d1:8000", WorkerType::Decode);
+        let pool = [Arc::clone(&p1), Arc::clone(&p2), Arc::clone(&d1)];
+        let ledger = AttemptLedger::default();
+
+        let mut first = (StatusCode::GATEWAY_TIMEOUT, "silent").into_response();
+        mark_failed_side(&mut first, p1.as_ref());
+        ledger.settle(&mut first, [&p1, &d1], pool.iter());
+        assert!(!ledger.admits(p1.as_ref()), "the silent prefill is out");
+        assert!(ledger.admits(d1.as_ref()), "its decode partner is not");
+        assert!(ledger.admits(p2.as_ref()));
+        assert!(
+            is_retryable_response(&first),
+            "another prefill worker can take the request"
+        );
+
+        let mut second = (StatusCode::GATEWAY_TIMEOUT, "silent").into_response();
+        mark_failed_side(&mut second, p2.as_ref());
+        ledger.settle(&mut second, [&p2, &d1], pool.iter());
+        assert!(!ledger.admits(p2.as_ref()));
+        assert!(ledger.admits(d1.as_ref()));
+        assert!(
+            !is_retryable_response(&second),
+            "no prefill worker is left: the answer is terminal, whatever the decode pool holds"
+        );
     }
 }

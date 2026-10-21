@@ -48,8 +48,11 @@ fn fnv1a_f32(data: &[f32]) -> u64 {
 
 const CASES: &[(u32, u32)] = &[(560, 420), (840, 560), (1280, 960)];
 
-// Captured under serial normalize/patchify; PARALLELIZATION MUST NOT CHANGE THESE.
-const EXPECTED: &[u64] = &[0x391ca5deba1ff255, 0x5bde4728a72eba9d, 0x617d3e39f58f1c45];
+// Captured under serial normalize/patchify with the torchvision resize kernel of the
+// reference processors (`tests/qwen_preprocess_golden.rs` pins that kernel) and their
+// fused normalization (`tests/qwen_pixel_norm_golden.rs` pins that arithmetic);
+// PARALLELIZATION MUST NOT CHANGE THESE.
+const EXPECTED: &[u64] = &[0x776d46f52782791d, 0x12257fb9b357d2d1, 0xcfe5dc6b41292ea5];
 
 fn fingerprint(w: u32, h: u32) -> (u64, usize) {
     let proc = Qwen3VLProcessor::new();

@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::{
     chat::{ChatCompletionRequest, ChatMessage, MessageContent, ThinkingType},
-    common::ContentPart,
+    common::{invalid, ContentPart},
     profile::ModelProfile,
 };
 
@@ -144,9 +144,9 @@ fn validate_thinking_enabled(
         .as_ref()
         .is_some_and(|thinking| thinking.r#type == Some(ThinkingType::Disabled))
     {
-        return Err(error(
+        return Err(invalid(
             "thinking_disabled_not_supported",
-            "thinking cannot be disabled for this model".into(),
+            "thinking cannot be disabled for this model",
         ));
     }
     Ok(())
@@ -178,11 +178,12 @@ fn validate_efforts(
 fn validate_tools(req: &ChatCompletionRequest) -> Result<(), validator::ValidationError> {
     if let Some(tool) = req
         .tools
-        .iter()
+        .as_deref()
+        .into_iter()
         .flatten()
         .find(|tool| tool.tool_type != TOOL_TYPE)
     {
-        return Err(error(
+        return Err(invalid(
             "tool_type_not_supported",
             format!(
                 "invalid tools[].type '{}': only '{TOOL_TYPE}' is supported",
@@ -214,7 +215,7 @@ fn validate_content_parts(req: &ChatCompletionRequest) -> Result<(), validator::
                 if fields.get("type").and_then(|t| t.as_str()) == Some(FILE_URL))
         };
         if parts.iter().any(is_file_url) {
-            return Err(error(
+            return Err(invalid(
                 "content_part_not_supported",
                 format!("{FILE_URL} content blocks are not supported"),
             ));
@@ -223,14 +224,8 @@ fn validate_content_parts(req: &ChatCompletionRequest) -> Result<(), validator::
     Ok(())
 }
 
-fn error(code: &'static str, message: String) -> validator::ValidationError {
-    let mut e = validator::ValidationError::new(code);
-    e.message = Some(message.into());
-    e
-}
-
 fn pinned(code: &'static str, field: &str, allowed: &str) -> validator::ValidationError {
-    error(
+    invalid(
         code,
         format!("invalid {field}: only {allowed} is allowed for this model"),
     )

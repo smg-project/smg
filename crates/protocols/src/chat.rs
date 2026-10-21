@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -6,11 +6,11 @@ use validator::Validate;
 
 use super::{
     common::{
-        default_true, deserialize_null_as_false, deserialize_null_as_true, is_false, is_true,
-        validate_json_schema_shape, validate_stop, CachePartition, ChatLogProbs, ContentPart,
-        Function, FunctionCall, FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions,
-        StringOrArray, Tool, ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference,
-        Usage,
+        default_true, deserialize_null_as_empty_vec, deserialize_null_as_false,
+        deserialize_null_as_true, invalid, is_false, is_true, validate_json_schema_shape,
+        validate_stop, CachePartition, ChatLogProbs, ContentPart, Function, FunctionCall,
+        FunctionChoice, GenerationRequest, ResponseFormat, StreamOptions, StringOrArray, Tool,
+        ToolCall, ToolCallDelta, ToolChoice, ToolChoiceValue, ToolReference, Usage,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
@@ -74,7 +74,9 @@ pub enum ChatMessage {
         ext: KimiDeveloperExt,
     },
     /// MiniMax extension: top-priority instruction message, above system.
-    /// Normalized to a system message for dispatch; rejected by other profiles.
+    /// Hoisted to the front for dispatch (several merge into one), where the
+    /// chat template reads it; a template without a root branch gets it as
+    /// the leading system message. Rejected by other profiles.
     #[serde(rename = "root")]
     Root {
         content: MessageContent,
@@ -277,7 +279,10 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<ToolChoice>,
 
     /// A list of tools the model may call
-    pub tools: Option<Vec<Tool>>,
+    // Shared, not copied, with what reads the set on the serving path (the
+    // response spec, the readers that type the calls): the parser allocates
+    // the list once and hands it over (`Self::shared_tool_list`).
+    pub tools: Option<Arc<[Tool]>>,
 
     /// An integer between 0 and 20 specifying the number of most likely tokens to return
     #[validate(range(min = 0, max = 20))]
@@ -287,8 +292,9 @@ pub struct ChatCompletionRequest {
     #[validate(custom(function = "validate_top_p_value"))]
     pub top_p: Option<f32>,
 
-    /// Verbosity level for debugging
-    pub verbosity: Option<i32>,
+    /// How verbose the answer should be: `low`, `medium` or `high`
+    #[validate(custom(function = "validate_verbosity"))]
+    pub verbosity: Option<String>,
 
     // =============================================================================
     // Engine-Specific Sampling Parameters
@@ -446,9 +452,11 @@ impl ChatCompletionRequest {
     }
 
     /// The cap the client put on the completion: `max_completion_tokens`,
-    /// else the deprecated `max_tokens`. The request keeps whichever field
-    /// the client wrote, so a proxied body reaches its upstream unchanged;
-    /// everything that needs the number reads it here.
+    /// else the deprecated `max_tokens`; when the client wrote both, the
+    /// current name wins, as the serving engines resolve the pair. The
+    /// request keeps whichever fields the client wrote, so a proxied body
+    /// reaches its upstream unchanged; everything that needs the number
+    /// reads it here.
     pub fn output_token_cap(&self) -> Option<u32> {
         #[expect(deprecated, reason = "the one place the deprecated field is read")]
         let max_tokens = self.max_tokens;
@@ -458,6 +466,62 @@ impl ChatCompletionRequest {
     /// The thinking preference stated by `thinking.type`, if any.
     pub fn thinking_toggle(&self) -> Option<bool> {
         self.thinking.as_ref().and_then(ThinkingParam::toggle)
+    }
+
+    /// [`Self::thinking_toggle`] as the request's provider profile reads it:
+    /// a profile whose contract lets an explicit effort outrank
+    /// `thinking.type: disabled` ([`ProviderProfile::effort_outranks_thinking_disabled`])
+    /// drops that toggle from a request that carries an effort.
+    pub fn effective_thinking_toggle(&self) -> Option<bool> {
+        let toggle = self.thinking_toggle();
+        if toggle == Some(false)
+            && self.effective_reasoning_effort().is_some()
+            && self.provider_profile().effort_outranks_thinking_disabled()
+        {
+            return None;
+        }
+        toggle
+    }
+
+    /// The thinking preference the prompt is rendered with: the effective
+    /// typed toggle, else the provider profile's reading of the effective
+    /// `reasoning_effort` ([`ProviderProfile::thinking_from_reasoning_effort`]).
+    pub fn template_thinking(&self) -> Option<bool> {
+        self.effective_thinking_toggle().or_else(|| {
+            self.provider_profile()
+                .thinking_from_reasoning_effort(self.effective_reasoning_effort())
+        })
+    }
+
+    /// Whether `continue_final_message` applies: it is set and the request
+    /// ends with an assistant message.
+    pub fn continues_final_assistant(&self) -> bool {
+        self.continue_final_message
+            && matches!(self.messages.last(), Some(ChatMessage::Assistant { .. }))
+    }
+
+    /// Whether `parallel_tool_calls: false` asks for one tool call at most.
+    pub fn disables_parallel_tool_calls(&self) -> bool {
+        self.parallel_tool_calls == Some(false)
+    }
+
+    /// The choices the request asks for: `n`, one when absent or zero.
+    pub fn choices(&self) -> u32 {
+        self.n.filter(|&n| n > 0).unwrap_or(1)
+    }
+
+    /// The tool calls the history already holds, across the assistant
+    /// messages: the index the next call continues from.
+    pub fn history_tool_calls_count(&self) -> usize {
+        self.messages
+            .iter()
+            .filter_map(|message| match message {
+                ChatMessage::Assistant { tool_calls, .. } => {
+                    tool_calls.as_ref().map(|calls| calls.len())
+                }
+                _ => None,
+            })
+            .sum()
     }
 
     /// `thinking.effort` when present, else the top-level `reasoning_effort`.
@@ -481,6 +545,8 @@ impl ChatCompletionRequest {
 /// so the lowest OpenAI level is the closest available "do not reason".
 /// Level values return `None` — no opinion, defer to the template default or an
 /// explicit thinking kwarg.
+/// The default reading; a provider profile may read the field by its own
+/// contract ([`ProviderProfile::thinking_from_reasoning_effort`]).
 pub fn thinking_from_reasoning_effort(reasoning_effort: Option<&str>) -> Option<bool> {
     match reasoning_effort {
         Some("none") | Some("minimal") => Some(false),
@@ -488,7 +554,9 @@ pub fn thinking_from_reasoning_effort(reasoning_effort: Option<&str>) -> Option<
     }
 }
 
-fn deserialize_reasoning_effort<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+pub(crate) fn deserialize_reasoning_effort<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -509,10 +577,26 @@ where
 
 fn validate_messages(messages: &[ChatMessage]) -> Result<(), validator::ValidationError> {
     if messages.is_empty() {
-        return Err(validator::ValidationError::new("messages cannot be empty"));
+        return Err(invalid(
+            "empty_array",
+            "Invalid 'messages': empty array. Expected an array with minimum length 1, but got an empty array instead.".to_string(),
+        ));
     }
 
     Ok(())
+}
+
+fn validate_verbosity(verbosity: &str) -> Result<(), validator::ValidationError> {
+    match verbosity {
+        "low" | "medium" | "high" => Ok(()),
+        other => Err(invalid(
+            "unsupported_value",
+            format!(
+                "Invalid value: '{other}' for parameter 'verbosity'; supported values are 'low', \
+                 'medium' and 'high'"
+            ),
+        )),
+    }
 }
 
 /// Schema-level validation for cross-field dependencies
@@ -521,25 +605,27 @@ fn validate_chat_cross_parameters(
 ) -> Result<(), validator::ValidationError> {
     // 1. Validate logprobs dependency
     if req.top_logprobs.is_some() && !req.logprobs {
-        let mut e = validator::ValidationError::new("top_logprobs_requires_logprobs");
-        e.message = Some("top_logprobs is only allowed when logprobs is enabled".into());
-        return Err(e);
+        return Err(invalid(
+            "top_logprobs_requires_logprobs",
+            "top_logprobs is only allowed when logprobs is enabled",
+        ));
     }
 
     // 2. Validate stream_options dependency
     if req.stream_options.is_some() && !req.stream {
-        let mut e = validator::ValidationError::new("stream_options_requires_stream");
-        e.message =
-            Some("The 'stream_options' parameter is only allowed when 'stream' is enabled".into());
-        return Err(e);
+        return Err(invalid(
+            "stream_options_requires_stream",
+            "The 'stream_options' parameter is only allowed when 'stream' is enabled",
+        ));
     }
 
     // 3. Validate token limits - min <= max
     if let (Some(min), Some(max)) = (req.min_tokens, req.output_token_cap()) {
         if min > max {
-            let mut e = validator::ValidationError::new("min_tokens_exceeds_max");
-            e.message = Some("min_tokens cannot exceed max_tokens/max_completion_tokens".into());
-            return Err(e);
+            return Err(invalid(
+                "min_tokens_exceeds_max",
+                "min_tokens cannot exceed max_tokens/max_completion_tokens",
+            ));
         }
     }
 
@@ -550,15 +636,17 @@ fn validate_chat_cross_parameters(
     );
 
     if has_json_format && req.regex.is_some() {
-        let mut e = validator::ValidationError::new("regex_conflicts_with_json");
-        e.message = Some("cannot use regex constraint with JSON response format".into());
-        return Err(e);
+        return Err(invalid(
+            "regex_conflicts_with_json",
+            "cannot use regex constraint with JSON response format",
+        ));
     }
 
     if has_json_format && req.ebnf.is_some() {
-        let mut e = validator::ValidationError::new("ebnf_conflicts_with_json");
-        e.message = Some("cannot use EBNF constraint with JSON response format".into());
-        return Err(e);
+        return Err(invalid(
+            "ebnf_conflicts_with_json",
+            "cannot use EBNF constraint with JSON response format",
+        ));
     }
 
     // 5. Validate mutually exclusive structured output constraints
@@ -572,9 +660,10 @@ fn validate_chat_cross_parameters(
     .count();
 
     if constraint_count > 1 {
-        let mut e = validator::ValidationError::new("multiple_constraints");
-        e.message = Some("only one structured output constraint (regex, ebnf, or json_schema) can be active at a time".into());
-        return Err(e);
+        return Err(invalid(
+            "multiple_constraints",
+            "only one structured output constraint (regex, ebnf, or json_schema) can be active at a time",
+        ));
     }
 
     // 6. Validate response format JSON schema name and shape
@@ -582,111 +671,126 @@ fn validate_chat_cross_parameters(
         validate_json_schema_shape(&json_schema.name, &json_schema.schema)?;
     }
 
-    // 7. Validate tool_choice requires tools — except "none" and "auto", which are valid without tools
-    if let Some(ref tool_choice) = req.tool_choice {
-        // The effective tool set: request-level tools plus the dynamic tools
-        // declared on system and developer messages (Kimi K3). Both the
-        // "are there tools" decision and the named-choice checks below use
-        // it, so a name is resolved against everything the model will see.
-        // Lazy on purpose: most tool traffic only needs the emptiness check.
-        let effective_tools = || req.effective_tools();
-        let has_tools = effective_tools().next().is_some();
+    // 7. A tool_choice against the tools the model will see
+    if let Some(tool_choice) = &req.tool_choice {
+        validate_tool_choice(req, tool_choice)?;
+    }
 
-        let requires_tools = !matches!(
-            tool_choice,
-            ToolChoice::Value(ToolChoiceValue::None) | ToolChoice::Value(ToolChoiceValue::Auto)
-        );
-
-        if requires_tools && !has_tools {
-            let mut e = validator::ValidationError::new("tool_choice_requires_tools");
-            e.message = Some("Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.".into());
-            return Err(e);
-        }
-
-        // Additional validation when tools are present
-        if has_tools {
-            match tool_choice {
-                ToolChoice::Function { function, .. } => {
-                    // Validate that the specified function name exists in tools
-                    let function_exists = effective_tools().any(|tool| {
-                        tool.tool_type == "function" && tool.function.name == function.name
-                    });
-
-                    if !function_exists {
-                        let mut e =
-                            validator::ValidationError::new("tool_choice_function_not_found");
-                        e.message = Some(
-                            format!(
-                            "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
-                            function.name
-                        )
-                            .into(),
-                        );
-                        return Err(e);
-                    }
-                }
-                ToolChoice::AllowedTools {
-                    mode,
-                    tools: allowed_tools,
-                    ..
-                } => {
-                    // Validate mode is "auto" or "required"
-                    if mode != "auto" && mode != "required" {
-                        let mut e = validator::ValidationError::new("tool_choice_invalid_mode");
-                        e.message = Some(format!(
-                            "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{mode}'."
-                        ).into());
-                        return Err(e);
-                    }
-
-                    // Validate that all ToolReferences are Function type (Chat API only supports function tools)
-                    for tool_ref in allowed_tools {
-                        match tool_ref {
-                            ToolReference::Function { name } => {
-                                // Validate that the function exists in tools array
-                                let tool_exists = effective_tools().any(|tool| {
-                                    tool.tool_type == "function" && tool.function.name == *name
-                                });
-
-                                if !tool_exists {
-                                    let mut e = validator::ValidationError::new(
-                                        "tool_choice_tool_not_found",
-                                    );
-                                    e.message = Some(
-                                        format!(
-                                            "Invalid value for 'tool_choice.tools': tool '{name}' not found in 'tools'."
-                                        )
-                                        .into(),
-                                    );
-                                    return Err(e);
-                                }
-                            }
-                            _ => {
-                                // Chat Completion API only supports function tools in tool_choice
-                                let mut e = validator::ValidationError::new(
-                                    "tool_choice_invalid_tool_type",
-                                );
-                                e.message = Some(
-                                    format!(
-                                        "Invalid value for 'tool_choice.tools': Chat Completion API only supports function tools, got '{}'.",
-                                        tool_ref.identifier()
-                                    )
-                                    .into(),
-                                );
-                                return Err(e);
-                            }
-                        }
-                    }
-                }
-                ToolChoice::Value(_) => {}
-            }
+    // 8. A function's `parameters` is a JSON Schema object (null was already
+    //    read as the empty schema)
+    for (index, tool) in req.tools.as_deref().into_iter().flatten().enumerate() {
+        if !tool.function.parameters.is_object() {
+            return Err(invalid(
+                "invalid_type",
+                format!(
+                    "Invalid 'tools[{index}].function.parameters': expected an object, but got {} \
+                     instead",
+                    json_type_name(&tool.function.parameters)
+                ),
+            ));
         }
     }
 
-    // 8. Provider-profile contract rules, selected from the model id
+    // 9. `logit_bias` is keyed by token ids
+    if let Some(key) = req
+        .logit_bias
+        .iter()
+        .flatten()
+        .map(|(key, _)| key)
+        .find(|key| key.parse::<u64>().is_err())
+    {
+        return Err(invalid(
+            "logit_bias_invalid_key",
+            format!(
+                "Invalid key in 'logit_bias': '{key}'; keys must be non-negative integer token \
+                 ids"
+            ),
+        ));
+    }
+
+    // 10. Provider-profile contract rules, from the request's resolved
+    //     contract. Both token limits at once are judged there: the request
+    //     keeps whichever the client wrote and `output_token_cap` reads
+    //     `max_completion_tokens` first, the precedence the serving engines
+    //     apply themselves; only OpenAI's own contract refuses the pair.
     req.provider_profile().validate_chat(req)?;
 
     Ok(())
+}
+
+/// A `tool_choice` against the tools the model will see: the request's tools
+/// plus the dynamic tools its system and developer messages declare. Only
+/// `none` and `auto` are allowed without tools; a named function must be
+/// declared; an allowed-tools choice names a mode and function tools only,
+/// each declared.
+fn validate_tool_choice(
+    req: &ChatCompletionRequest,
+    tool_choice: &ToolChoice,
+) -> Result<(), validator::ValidationError> {
+    // Lazy on purpose: most tool traffic only needs the emptiness check.
+    let effective_tools = || req.effective_tools();
+    let has_tools = effective_tools().next().is_some();
+    let requires_tools = !matches!(
+        tool_choice,
+        ToolChoice::Value(ToolChoiceValue::None | ToolChoiceValue::Auto)
+    );
+    if requires_tools && !has_tools {
+        return Err(invalid(
+            "tool_choice_requires_tools",
+            "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
+        ));
+    }
+    if !has_tools {
+        return Ok(());
+    }
+    let declared = |name: &str| {
+        effective_tools().any(|tool| tool.tool_type == "function" && tool.function.name == name)
+    };
+    match tool_choice {
+        ToolChoice::Function { function, .. } if !declared(&function.name) => Err(invalid(
+            "tool_choice_function_not_found",
+            format!(
+                "Invalid value for 'tool_choice': function '{}' not found in 'tools'.",
+                function.name
+            ),
+        )),
+        ToolChoice::AllowedTools { mode, .. } if mode != "auto" && mode != "required" => {
+            Err(invalid(
+                "tool_choice_invalid_mode",
+                format!(
+                    "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{mode}'."
+                ),
+            ))
+        }
+        // The Chat Completions API takes function tools only in an allowed-tools choice.
+        ToolChoice::AllowedTools { tools, .. } => tools.iter().try_for_each(|tool_ref| match tool_ref {
+            ToolReference::Function { name } if !declared(name) => Err(invalid(
+                "tool_choice_tool_not_found",
+                format!("Invalid value for 'tool_choice.tools': tool '{name}' not found in 'tools'."),
+            )),
+            ToolReference::Function { .. } => Ok(()),
+            _ => Err(invalid(
+                "tool_choice_invalid_tool_type",
+                format!(
+                    "Invalid value for 'tool_choice.tools': Chat Completion API only supports function tools, got '{}'.",
+                    tool_ref.identifier()
+                ),
+            )),
+        }),
+        ToolChoice::Function { .. } | ToolChoice::Value(_) => Ok(()),
+    }
+}
+
+/// The JSON type of a value, for error messages (`a string`, `an array`, ...).
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 impl ChatCompletionRequest {
@@ -697,24 +801,90 @@ impl ChatCompletionRequest {
         self.provider_profile().dynamic_tools(self)
     }
 
+    /// Whether the request offers the model any tool: a request-level `tools`
+    /// field, an empty list included (the normalizer answers an empty list
+    /// with `tool_choice: none`, which switches the calls off), or a tool a
+    /// message declares. Every gate on the serving path that asks "does this
+    /// request have tools" (whether the response is scanned for calls, whether
+    /// the engine keeps the special tokens the call markers are made of,
+    /// whether a prompt opens its tool channel) reads this one answer: a gate
+    /// that read `tools` alone took a request whose tools are all declared on
+    /// messages for a request without tools, and its calls came back as text.
+    /// Whether a call can be forced is a question for the narrowed set,
+    /// [`Self::callable_tools`].
+    pub fn declares_tools(&self) -> bool {
+        self.tools.is_some() || self.dynamic_tools().next().is_some()
+    }
+
     /// Every tool the model will see: the request-level `tools` followed by
     /// the dynamic tools. Anything that resolves a tool name in the response,
     /// tool-call parsing first of all, must work from this set rather than
     /// from `tools` alone, or a call to a dynamic tool comes back as text.
     pub fn effective_tools(&self) -> impl Iterator<Item = &Tool> {
-        self.tools.iter().flatten().chain(self.dynamic_tools())
+        self.tools
+            .as_deref()
+            .into_iter()
+            .flatten()
+            .chain(self.dynamic_tools())
     }
 
-    /// The tools a `tool_choice` may force: [`Self::effective_tools`] narrowed
-    /// by the choice (see [`ToolChoice::narrow_tools`]). A `tool_choice`
-    /// grammar must be built from this set; built from `tools` alone, a
-    /// forced call could only ever land on a request-level tool.
-    pub fn callable_tools(&self) -> Vec<Tool> {
-        let tools: Vec<Tool> = self.effective_tools().cloned().collect();
-        self.tool_choice
+    /// [`Self::effective_tools`] as one list: the request's own `tools`,
+    /// borrowed as they are, when no message declares a tool; a list that
+    /// chains both otherwise. The serving path reads the set several times per
+    /// request (the constraint, the response spec, the table that reads the
+    /// calls), so where nothing narrows it, nothing copies it.
+    pub fn effective_tool_list(&self) -> Cow<'_, [Tool]> {
+        let mut dynamic = self.dynamic_tools().peekable();
+        if dynamic.peek().is_none() {
+            return Cow::Borrowed(self.tools.as_deref().unwrap_or(&[]));
+        }
+        Cow::Owned(
+            self.tools
+                .as_deref()
+                .into_iter()
+                .flatten()
+                .chain(dynamic)
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// [`Self::effective_tool_list`] for a holder that outlives the request's
+    /// borrow (the response spec, and through it every reader of the
+    /// response): the request's own `tools`, the one list the parser made,
+    /// shared, when no message declares a tool; a list that chains both
+    /// otherwise; an empty list when the request declares none.
+    pub fn shared_tool_list(&self) -> Arc<[Tool]> {
+        let mut dynamic = self.dynamic_tools().peekable();
+        match (&self.tools, dynamic.peek()) {
+            (Some(tools), None) => Arc::clone(tools),
+            (None, None) => Arc::default(),
+            (_, Some(_)) => self
+                .tools
+                .as_deref()
+                .into_iter()
+                .flatten()
+                .chain(dynamic)
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// The tools a `tool_choice` may force: [`Self::effective_tool_list`]
+    /// narrowed by the choice (see [`ToolChoice::narrow_tools`]). A
+    /// `tool_choice` grammar must be built from this set; built from `tools`
+    /// alone, a forced call could only ever land on a request-level tool. The
+    /// list is borrowed from the request where the choice narrows nothing.
+    pub fn callable_tools(&self) -> Cow<'_, [Tool]> {
+        let tools = self.effective_tool_list();
+        match self
+            .tool_choice
             .as_ref()
             .and_then(|choice| choice.narrow_tools(&tools))
-            .unwrap_or(tools)
+        {
+            Some(narrowed) => Cow::Owned(narrowed),
+            None => tools,
+        }
     }
 }
 
@@ -726,8 +896,8 @@ impl Normalizable for ChatCompletionRequest {
     /// Normalize the request:
     /// 1. Apply the profile's rewrites to the request as the client sent it,
     ///    before any migration: drop message extensions that belong to another
-    ///    provider's profile and fold MiniMax `root` into the leading system
-    ///    message (see [`ProviderProfile::normalize_chat`])
+    ///    provider's profile and merge MiniMax `root` messages into one
+    ///    leading root (see [`ProviderProfile::normalize_chat`])
     /// 2. Migrate deprecated fields to their replacements
     /// 3. Clear deprecated fields and log warnings
     /// 4. Apply OpenAI defaults for tool_choice
@@ -923,11 +1093,16 @@ pub struct ChatCompletionMessage {
     /// refusals, so it is `null`.
     #[serde(default)]
     pub refusal: Option<String>,
+    /// Always present, as the OpenAI API sends it; the gateway attaches no
+    /// annotations of its own, so the list is empty unless an upstream sent
+    /// some. An upstream's missing key or `null` reads as the empty list.
+    #[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]
+    pub annotations: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
     pub reasoning_content: Option<String>,
     // Note: function_call is deprecated and not included
-    // Note: annotations, audio are not added yet
+    // Note: audio is not added yet
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -1000,6 +1175,22 @@ mod tests {
         ThinkingType,
     };
 
+    /// `parallel_tool_calls: false` asks for one call; `true` and absent do not.
+    #[test]
+    fn a_chat_request_says_whether_it_disables_parallel_tool_calls() {
+        let request = |body: Value| -> ChatCompletionRequest {
+            serde_json::from_value(body).expect("a chat request")
+        };
+        let base = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        assert!(!request(base.clone()).disables_parallel_tool_calls());
+        let mut on = base.clone();
+        on["parallel_tool_calls"] = json!(true);
+        assert!(!request(on).disables_parallel_tool_calls());
+        let mut off = base;
+        off["parallel_tool_calls"] = json!(false);
+        assert!(request(off).disables_parallel_tool_calls());
+    }
+
     fn request_with_output_fields(fields: &[(&str, Value)]) -> ChatCompletionRequest {
         let mut value = json!({
             "model": "test-model",
@@ -1066,6 +1257,72 @@ mod tests {
         assert!(!back.skip_special_tokens);
         assert!(!back.separate_reasoning);
         assert!(!back.stream_reasoning);
+    }
+
+    /// The MiniMax contract reads `reasoning_effort` by its own rule: `none`
+    /// (the default depth) and `minimal` (`low`) keep thinking on, and an
+    /// explicit effort outranks `thinking.type: disabled`; every other
+    /// profile keeps the OpenAI reading and honours the toggle.
+    #[test]
+    fn minimax_profile_keeps_thinking_on_for_every_effort() {
+        let request = |model: &str, fields: Value| -> ChatCompletionRequest {
+            let mut value = json!({"model": model, "messages": []});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().cloned().unwrap_or_default());
+            serde_json::from_value(value).unwrap()
+        };
+        for effort in ["none", "minimal", "low", "high", "max"] {
+            assert_eq!(
+                request("MiniMax-M3", json!({"reasoning_effort": effort})).template_thinking(),
+                None,
+                "MiniMax {effort}: the template's default, thinking on"
+            );
+            assert_eq!(
+                request(
+                    "MiniMax-M3",
+                    json!({"reasoning_effort": effort, "thinking": {"type": "disabled"}})
+                )
+                .template_thinking(),
+                None,
+                "MiniMax {effort} outranks thinking.disabled"
+            );
+        }
+        assert_eq!(
+            request("MiniMax-M3", json!({"thinking": {"type": "disabled"}})).template_thinking(),
+            Some(false),
+            "thinking.disabled alone switches thinking off"
+        );
+        assert_eq!(
+            request(
+                "MiniMax-M3",
+                json!({"reasoning_effort": "none", "thinking": {"type": "enabled"}})
+            )
+            .template_thinking(),
+            Some(true)
+        );
+        for model in ["self-hosted-model", "kimi-k3", "deepseek-v4.1"] {
+            assert_eq!(
+                request(model, json!({"reasoning_effort": "none"})).template_thinking(),
+                Some(false),
+                "{model}: the OpenAI reading, none switches thinking off"
+            );
+            assert_eq!(
+                request(
+                    model,
+                    json!({"reasoning_effort": "high", "thinking": {"type": "disabled"}})
+                )
+                .template_thinking(),
+                Some(false),
+                "{model}: thinking.disabled wins"
+            );
+            assert_eq!(
+                request(model, json!({"reasoning_effort": "high"})).template_thinking(),
+                None,
+                "{model}"
+            );
+        }
     }
 
     #[test]
@@ -1323,6 +1580,7 @@ mod tests {
             role: "assistant".to_string(),
             content: None,
             refusal: None,
+            annotations: Vec::new(),
             tool_calls: Some(vec![crate::common::ToolCall {
                 id: "call_1".to_string(),
                 tool_type: "function".to_string(),
@@ -1336,5 +1594,269 @@ mod tests {
         let value = serde_json::to_value(&message).expect("serialize");
         assert_eq!(value.get("content"), Some(&Value::Null), "{value}");
         assert_eq!(value["tool_calls"][0]["function"]["name"], "get_weather");
+    }
+
+    #[test]
+    fn completion_message_carries_the_always_present_annotations() {
+        // Parsed without annotations (an engine's answer), the message leaves
+        // with the public API's empty list.
+        let message: super::ChatCompletionMessage = serde_json::from_value(json!({
+            "role": "assistant", "content": "Hello!", "refusal": null, "reasoning_content": null
+        }))
+        .expect("parse");
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(value["annotations"], json!([]), "{value}");
+    }
+
+    #[test]
+    fn an_upstreams_null_annotations_read_as_the_empty_list_and_a_list_is_kept() {
+        // An upstream that writes the key as `null` parses (the key was ignored
+        // before the field existed) and leaves as the empty list.
+        let message: super::ChatCompletionMessage = serde_json::from_value(json!({
+            "role": "assistant", "content": "Hello!", "refusal": null,
+            "annotations": null, "reasoning_content": null
+        }))
+        .expect("a null annotations list parses");
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(value["annotations"], json!([]), "{value}");
+        // A list an upstream sent is kept as it was.
+        let sent =
+            json!([{"type": "url_citation", "url_citation": {"url": "https://example.com"}}]);
+        let message: super::ChatCompletionMessage = serde_json::from_value(json!({
+            "role": "assistant", "content": "Hello!", "refusal": null,
+            "annotations": sent, "reasoning_content": null
+        }))
+        .expect("parse");
+        let value = serde_json::to_value(&message).expect("serialize");
+        assert_eq!(value["annotations"], sent, "{value}");
+    }
+
+    /// `n` is the number of choices; absent and zero both mean one.
+    #[test]
+    fn a_chat_request_asks_for_at_least_one_choice() {
+        let request = |body: Value| -> ChatCompletionRequest {
+            serde_json::from_value(body).expect("a chat request")
+        };
+        let base = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        assert_eq!(request(base.clone()).choices(), 1);
+        let mut zero = base.clone();
+        zero["n"] = json!(0);
+        assert_eq!(request(zero).choices(), 1);
+        let mut three = base;
+        three["n"] = json!(3);
+        assert_eq!(request(three).choices(), 3);
+    }
+
+    /// The history's tool calls are the assistant messages' `tool_calls`,
+    /// summed in order; user, system and tool messages do not count.
+    #[test]
+    fn the_history_counts_the_assistant_tool_calls() {
+        let request = |messages: Value| -> ChatCompletionRequest {
+            serde_json::from_value(json!({"model": "m", "messages": messages}))
+                .expect("a chat request")
+        };
+        assert_eq!(
+            request(json!([{"role": "user", "content": "hi"}])).history_tool_calls_count(),
+            0
+        );
+        let call = |id: &str| json!({"id": id, "type": "function", "function": {"name": "calc", "arguments": "{}"}});
+        let history = json!([
+            {"role": "system", "content": "be brief"},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": null, "tool_calls": [call("c1"), call("c2")]},
+            {"role": "tool", "tool_call_id": "c1", "content": "2"},
+            {"role": "assistant", "content": "done"},
+            {"role": "assistant", "content": null, "tool_calls": [call("c3")]}
+        ]);
+        assert_eq!(request(history).history_tool_calls_count(), 3);
+    }
+}
+
+#[cfg(test)]
+mod request_contract_tests {
+    use serde_json::{json, Value};
+    use validator::Validate;
+
+    use super::ChatCompletionRequest;
+
+    fn request(extra: Value) -> ChatCompletionRequest {
+        let mut value = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Say hi in one word."}],
+            "max_completion_tokens": 64
+        });
+        value
+            .as_object_mut()
+            .expect("object")
+            .extend(extra.as_object().expect("object").clone());
+        serde_json::from_value(value).expect("request deserializes")
+    }
+
+    /// The validation error codes and messages, joined, or `None` when valid.
+    fn rejection(req: &ChatCompletionRequest) -> Option<String> {
+        req.validate().err().map(|errors| {
+            errors
+                .field_errors()
+                .values()
+                .flat_map(|errors| errors.iter())
+                .map(|error| {
+                    format!(
+                        "{}: {}",
+                        error.code,
+                        error.message.as_deref().unwrap_or_default()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ")
+        })
+    }
+
+    #[test]
+    fn verbosity_is_the_public_enum() {
+        for level in ["low", "medium", "high"] {
+            let req = request(json!({"verbosity": level}));
+            assert_eq!(req.verbosity.as_deref(), Some(level));
+            assert_eq!(rejection(&req), None, "{level}");
+        }
+        let bogus = request(json!({"verbosity": "extreme"}));
+        assert!(rejection(&bogus).is_some_and(|e| e.contains("unsupported_value")));
+        assert!(serde_json::from_value::<ChatCompletionRequest>(json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}], "verbosity": 3
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn function_parameters_must_be_an_object() {
+        let bad = request(
+            json!({"tools": [{"type": "function", "function": {"name": "f", "parameters": "oops"}}]}),
+        );
+        let error = rejection(&bad).expect("rejected");
+        assert!(
+            error.contains("invalid_type") && error.contains("tools[0].function.parameters"),
+            "{error}"
+        );
+        let empty = request(json!({"tools": [{"type": "function", "function": {"name": "f"}}]}));
+        assert_eq!(rejection(&empty), None);
+    }
+
+    #[test]
+    fn logit_bias_is_keyed_by_token_ids() {
+        let bad = request(json!({"logit_bias": {"not-a-token": 1}}));
+        assert!(rejection(&bad).is_some_and(|e| e.contains("logit_bias_invalid_key")));
+        let good = request(json!({"logit_bias": {"50256": -100, "0": 1.5}}));
+        assert_eq!(rejection(&good), None);
+    }
+
+    /// Both token limits at once are accepted outside OpenAI's own contract
+    /// (a self-hosted model, a vendor profile), whatever the two values, and
+    /// `max_completion_tokens` is the cap; the deprecated name alone still
+    /// carries it.
+    #[test]
+    fn both_token_limits_are_accepted_and_max_completion_tokens_wins() {
+        for model in ["test-model", "MiniMax-M2"] {
+            for (legacy, current) in [(32, 64), (64, 32), (64, 64)] {
+                let both = request(
+                    json!({"model": model, "max_tokens": legacy, "max_completion_tokens": current}),
+                );
+                assert_eq!(rejection(&both), None, "{model}: {legacy} and {current}");
+                assert_eq!(both.output_token_cap(), Some(current), "{model}");
+            }
+        }
+        let legacy = request(json!({"max_tokens": 32, "max_completion_tokens": null}));
+        assert_eq!(rejection(&legacy), None);
+        assert_eq!(legacy.output_token_cap(), Some(32));
+    }
+}
+
+#[cfg(test)]
+mod tool_choice_tests {
+    use serde_json::{json, Value};
+
+    use super::{validate_tool_choice, ChatCompletionRequest};
+
+    fn request(tools: Value, tool_choice: Value) -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": tools,
+            "tool_choice": tool_choice,
+        }))
+        .expect("a chat request")
+    }
+
+    /// The code the choice is refused with, or `None` when it passes.
+    fn verdict(tools: Value, tool_choice: Value) -> Option<String> {
+        let req = request(tools, tool_choice);
+        let choice = req.tool_choice.as_ref().expect("a tool choice");
+        validate_tool_choice(&req, choice)
+            .err()
+            .map(|e| e.code.into_owned())
+    }
+
+    fn weather_tool() -> Value {
+        json!([{
+            "type": "function",
+            "function": {"name": "get_weather", "parameters": {"type": "object"}},
+        }])
+    }
+
+    #[test]
+    fn without_tools_only_none_and_auto_pass() {
+        assert_eq!(verdict(json!([]), json!("none")), None);
+        assert_eq!(verdict(json!([]), json!("auto")), None);
+        assert_eq!(
+            verdict(json!([]), json!("required")),
+            Some("tool_choice_requires_tools".to_string())
+        );
+        assert_eq!(
+            verdict(
+                json!([]),
+                json!({"type": "function", "function": {"name": "get_weather"}})
+            ),
+            Some("tool_choice_requires_tools".to_string())
+        );
+    }
+
+    #[test]
+    fn each_kind_of_choice_is_judged_against_the_declared_tools() {
+        let cases = [
+            (json!("required"), None),
+            (
+                json!({"type": "function", "function": {"name": "get_weather"}}),
+                None,
+            ),
+            (
+                json!({"type": "function", "function": {"name": "get_time"}}),
+                Some("tool_choice_function_not_found"),
+            ),
+            (
+                json!({"type": "allowed_tools", "mode": "auto",
+                       "tools": [{"type": "function", "name": "get_weather"}]}),
+                None,
+            ),
+            (
+                json!({"type": "allowed_tools", "mode": "sometimes",
+                       "tools": [{"type": "function", "name": "get_weather"}]}),
+                Some("tool_choice_invalid_mode"),
+            ),
+            (
+                json!({"type": "allowed_tools", "mode": "required",
+                       "tools": [{"type": "function", "name": "get_time"}]}),
+                Some("tool_choice_tool_not_found"),
+            ),
+            (
+                json!({"type": "allowed_tools", "mode": "required",
+                       "tools": [{"type": "mcp", "server_label": "docs"}]}),
+                Some("tool_choice_invalid_tool_type"),
+            ),
+        ];
+        for (tool_choice, code) in cases {
+            assert_eq!(
+                verdict(weather_tool(), tool_choice.clone()),
+                code.map(str::to_string),
+                "{tool_choice}"
+            );
+        }
     }
 }

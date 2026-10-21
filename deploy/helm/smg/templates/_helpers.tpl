@@ -178,6 +178,8 @@ Called from the router Deployment template.
 - {{ int .Values.router.maxPayloadSize | quote }}
 - "--request-timeout-secs"
 - {{ .Values.router.requestTimeoutSecs | quote }}
+- "--shutdown-grace-period-secs"
+- {{ .Values.router.shutdownGracePeriodSeconds | quote }}
 - "--max-concurrent-requests"
 - {{ .Values.router.maxConcurrentRequests | quote }}
 - "--queue-size"
@@ -245,36 +247,16 @@ Called from the router Deployment template.
 - {{ .Values.history.backend | quote }}
 {{- end }}
 {{- if eq .Values.history.backend "postgres" }}
-{{- if .Values.history.postgres.url }}
-- "--postgres-db-url"
-- {{ .Values.history.postgres.url | quote }}
-{{- end }}
 - "--postgres-pool-max"
 - {{ .Values.history.postgres.poolMax | quote }}
 {{- end }}
 {{- if eq .Values.history.backend "redis" }}
-{{- if .Values.history.redis.url }}
-- "--redis-url"
-- {{ .Values.history.redis.url | quote }}
-{{- end }}
 - "--redis-pool-max"
 - {{ .Values.history.redis.poolMax | quote }}
 {{- end }}
 {{- if eq .Values.history.backend "oracle" }}
-{{- if .Values.history.oracle.dsn }}
-- "--oracle-connect-descriptor"
-- {{ .Values.history.oracle.dsn | quote }}
-{{- end }}
 - "--oracle-pool-max"
 - {{ .Values.history.oracle.poolMax | quote }}
-{{- if .Values.history.oracle.user }}
-- "--oracle-username"
-- {{ .Values.history.oracle.user | quote }}
-{{- end }}
-{{- if .Values.history.oracle.password }}
-- "--oracle-password"
-- {{ .Values.history.oracle.password | quote }}
-{{- end }}
 {{- end }}
 {{- if ge (int .Values.auth.rateLimitTokensPerSecond) 0 }}
 - "--rate-limit-tokens-per-second"
@@ -299,13 +281,159 @@ Called from the router Deployment template.
 - "--tool-call-parser"
 - {{ .Values.router.toolCallParser | quote }}
 {{- end }}
-{{- if .Values.auth.apiKey }}
-- "--api-key"
-- {{ .Values.auth.apiKey | quote }}
+{{- if include "smg.authSecretName" . }}
+- "--api-key-file"
+- {{ printf "/etc/smg/auth/%s" (include "smg.authSecretKey" .) | quote }}
 {{- end }}
 {{- range .Values.router.extraArgs }}
 - {{ . | quote }}
 {{- end }}
+{{- end }}
+
+{{/*
+Auth secret -- the Secret holding the shared API key, mounted into the router
+pod as a file the gateway reads with --api-key-file; the key itself is never
+in the pod's arguments. `auth.existingSecret` names a Secret the operator
+manages; otherwise `auth.apiKey`, when set, is written into a chart-managed
+Secret. Empty when no key is configured.
+*/}}
+{{- define "smg.authSecretName" -}}
+{{- if .Values.auth.existingSecret -}}
+{{- .Values.auth.existingSecret -}}
+{{- else if .Values.auth.apiKey -}}
+{{- printf "%s-auth" (include "smg.fullname" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Auth secret key -- the key within the auth Secret that holds the API key.
+*/}}
+{{- define "smg.authSecretKey" -}}
+{{- .Values.auth.apiKeySecretKey | default "api-key" -}}
+{{- end }}
+
+{{/*
+History store -- the store the history backend uses, postgres or redis (its
+values are .Values.history.<store>); empty for the other backends.
+*/}}
+{{- define "smg.historyStore" -}}
+{{- if or (eq .Values.history.backend "postgres") (eq .Values.history.backend "redis") -}}
+{{- .Values.history.backend -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+History secret -- the Secret holding the history store's connection URL,
+which carries the database password. The URL reaches the router pod as the
+environment variable the gateway reads (SMG_POSTGRES_DB_URL or
+SMG_REDIS_URL); it is never in the pod's arguments. The store's
+`existingSecret` names a Secret the operator manages; otherwise its `url`,
+when set, is written into the chart-managed Secret <fullname>-history.
+Empty when no URL is configured or the backend has no store.
+*/}}
+{{- define "smg.historySecretName" -}}
+{{- with include "smg.historyStore" . -}}
+{{- $store := index $.Values.history . -}}
+{{- if $store.existingSecret -}}
+{{- $store.existingSecret -}}
+{{- else if $store.url -}}
+{{- printf "%s-history" (include "smg.fullname" $) -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+History secret key -- the key within the history Secret that holds the URL:
+the store's `secretKey`, else "<store>-url".
+*/}}
+{{- define "smg.historySecretKey" -}}
+{{- with include "smg.historyStore" . -}}
+{{- (index $.Values.history .).secretKey | default (printf "%s-url" .) -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+History URL variable -- the environment variable the gateway reads the
+history store's connection URL from.
+*/}}
+{{- define "smg.historyUrlEnv" -}}
+{{- with include "smg.historyStore" . -}}
+{{- if eq . "postgres" }}SMG_POSTGRES_DB_URL{{ else }}SMG_REDIS_URL{{ end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+History secret managed -- "true" when the chart writes the history Secret
+itself (the store's `url` is set and no `existingSecret` replaces it). The
+router pod template carries a checksum of that Secret, so a changed URL
+rolls the pods.
+*/}}
+{{- define "smg.historySecretManaged" -}}
+{{- with include "smg.historyStore" . -}}
+{{- $store := index $.Values.history . -}}
+{{- if and $store.url (not $store.existingSecret) -}}true{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Oracle secret -- the Secret holding the Oracle connect descriptor, database
+user and password. Each reaches the router pod as the environment variable
+the gateway reads (ATP_DSN, ATP_USER, ATP_PASSWORD); none is in the pod's
+arguments. `history.oracle.existingSecret` names a Secret the operator
+manages; otherwise the credentials set under history.oracle are written into
+the chart-managed Secret <fullname>-secrets, the Secret earlier chart
+versions wrote without reading it (same name, same keys). Empty when the
+backend is not oracle or no credential is configured.
+*/}}
+{{- define "smg.oracleSecretName" -}}
+{{- if eq .Values.history.backend "oracle" -}}
+{{- with .Values.history.oracle -}}
+{{- if .existingSecret -}}
+{{- .existingSecret -}}
+{{- else if or .dsn .user .password -}}
+{{- printf "%s-secrets" (include "smg.fullname" $) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Oracle secret managed -- "true" when the chart writes the Oracle Secret
+itself (a credential is set under history.oracle and no `existingSecret`
+replaces them). The router pod template carries a checksum of that Secret,
+so a changed credential rolls the pods.
+*/}}
+{{- define "smg.oracleSecretManaged" -}}
+{{- if eq .Values.history.backend "oracle" -}}
+{{- with .Values.history.oracle -}}
+{{- if and (not .existingSecret) (or .dsn .user .password) -}}true{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Oracle credentials -- the credentials the router pod is wired to, as a JSON
+list for fromJsonArray: each with the environment variable the gateway reads
+it from (env), its key within the Oracle Secret (key) and its value from the
+values (value, used by the chart-managed Secret alone). With `existingSecret`
+all three are wired and that Secret holds their keys; otherwise the ones set
+under history.oracle. Empty when there is no Oracle Secret.
+*/}}
+{{- define "smg.oracleCredentials" -}}
+{{- $credentials := list -}}
+{{- if include "smg.oracleSecretName" . -}}
+{{- $oracle := .Values.history.oracle -}}
+{{- $keys := $oracle.secretKeys | default dict -}}
+{{- $dsn := dict "env" "ATP_DSN" "key" ($keys.dsn | default "oracle-dsn") "value" $oracle.dsn -}}
+{{- $user := dict "env" "ATP_USER" "key" ($keys.user | default "oracle-user") "value" $oracle.user -}}
+{{- $password := dict "env" "ATP_PASSWORD" "key" ($keys.password | default "oracle-password") "value" $oracle.password -}}
+{{- range $credential := list $dsn $user $password -}}
+{{- if or $oracle.existingSecret $credential.value -}}
+{{- $credentials = append $credentials $credential -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- toJson $credentials -}}
 {{- end }}
 
 {{/*

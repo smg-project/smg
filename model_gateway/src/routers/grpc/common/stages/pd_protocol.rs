@@ -14,7 +14,7 @@ use crate::worker::RuntimeType;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PdDispatch {
     /// Prefill runs to completion first, then decode: the router relays the
-    /// KV handoff state between the legs (vLLM `kv_transfer_params`).
+    /// KV handoff state between the sides (vLLM `kv_transfer_params`).
     Sequential,
     /// Prefill and decode dispatch together and rendezvous on bootstrap info
     /// carried in the request itself.
@@ -31,18 +31,18 @@ pub(crate) enum PdRendezvous {
     /// (TokenSpeed), injected by `helpers::maybe_inject_pd_rendezvous`.
     KvBootstrapRoom,
     /// No in-request rendezvous: the sequential dispatch path relays the
-    /// handoff state between the legs instead.
+    /// handoff state between the sides instead.
     None,
 }
 
-/// How a disaggregated engine learns each leg's data-parallel placement.
+/// How a disaggregated engine learns each side's data-parallel placement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DpPlacement {
     /// The engine honors the per-request `data_parallel_rank` pin field, set
-    /// on each leg from its selected dp-aware virtual worker.
+    /// on each side from its selected dp-aware virtual worker.
     PinField,
-    /// The engine dispatches both legs by `bootstrap_room % dp_size` and
-    /// ignores the pin field (TokenSpeed — a mismatched decode-leg pin spams
+    /// The engine dispatches both sides by `bootstrap_room % dp_size` and
+    /// ignores the pin field (TokenSpeed — a mismatched decode-side pin spams
     /// conflict warnings there). The rendezvous room is minted congruent to
     /// the prefill worker's rank, so the room residue, not the pin, is the
     /// placement carrier.

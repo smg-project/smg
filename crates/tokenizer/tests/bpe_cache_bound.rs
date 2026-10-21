@@ -12,7 +12,10 @@
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex, PoisonError,
+    },
 };
 
 use llm_tokenizer::{traits::Encoder, HuggingFaceTokenizer};
@@ -82,9 +85,14 @@ fn word(mut i: usize) -> String {
     word
 }
 
-#[test]
-fn a_thread_that_encodes_many_distinct_words_keeps_a_bounded_cache() {
-    let tokenizer = HuggingFaceTokenizer::from_tokenizer(letters_bpe());
+/// The tests of this binary read one allocator count, so they run one at a
+/// time.
+static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+/// Encodes 20,000 distinct words on this thread and checks what the thread's
+/// BPE word cache kept of them.
+fn keeps_a_bounded_cache(tokenizer: &HuggingFaceTokenizer) {
+    let _one_at_a_time = ONE_AT_A_TIME.lock().unwrap_or_else(PoisonError::into_inner);
     // The first encode on a thread sets up its tables; measure from there.
     tokenizer
         .encode(&word(usize::MAX / 7), false)
@@ -100,4 +108,27 @@ fn a_thread_that_encodes_many_distinct_words_keeps_a_bounded_cache() {
         kept < 1 << 20,
         "the thread's BPE word cache kept {kept} bytes after 20,000 distinct words"
     );
+}
+
+#[test]
+fn a_thread_that_encodes_many_distinct_words_keeps_a_bounded_cache() {
+    keeps_a_bounded_cache(&HuggingFaceTokenizer::from_tokenizer(letters_bpe()));
+}
+
+/// The file loader sets the bound on the model it reads, in place: the same
+/// tokenizer written out as a `tokenizer.json` and read back.
+#[test]
+fn the_file_loader_bounds_the_cache_of_the_model_it_reads() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("tokenizer.json");
+    std::fs::write(
+        &path,
+        letters_bpe()
+            .to_string(false)
+            .expect("the tokenizer serializes"),
+    )
+    .expect("the tokenizer file");
+    let tokenizer = HuggingFaceTokenizer::from_file(path.to_str().expect("a utf-8 path"))
+        .expect("the tokenizer loads");
+    keeps_a_bounded_cache(&tokenizer);
 }

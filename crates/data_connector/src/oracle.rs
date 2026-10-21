@@ -1,22 +1,19 @@
 //! Oracle storage implementation using OracleStore helper.
 
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::Path, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use deadpool::managed::{Manager, Metrics, Pool, RecycleError, RecycleResult};
-use oracle::{
-    sql_type::{OracleType, ToSql},
-    Connection, Connector, Row,
-};
+use oracle::{sql_type::ToSql, Connection, Connector, Row};
 use serde_json::Value;
 
 use super::core::{
-    make_item_id, Conversation, ConversationId, ConversationItem, ConversationItemId,
-    ConversationItemStorage, ConversationItemStorageError, ConversationMetadata,
-    ConversationStorage, ConversationStorageError, ListParams, NewConversation,
-    NewConversationItem, ResponseId, ResponseStorage, ResponseStorageError, SortOrder,
-    StoredResponse,
+    make_item_id, sql_string_list, ConditionalStore, Conversation, ConversationId,
+    ConversationItem, ConversationItemId, ConversationItemStorage, ConversationItemStorageError,
+    ConversationMetadata, ConversationStorage, ConversationStorageError, Failure, ListParams,
+    NewConversation, NewConversationItem, ResponseId, ResponseStorage, ResponseStorageError,
+    SortOrder, StoredResponse, TERMINAL_RESPONSE_STATUSES,
 };
 use crate::{
     common::{
@@ -27,6 +24,10 @@ use crate::{
     context::current_extra_columns,
     oracle_migrations::ORACLE_HISTORY_MIGRATIONS,
     schema::SchemaConfig,
+    versioning::{
+        bootstrap_oracle_schema, oracle_recorded_version, run_oracle_migrations, Migration,
+        OracleSchemaSteps,
+    },
 };
 
 // ============================================================================
@@ -46,10 +47,14 @@ pub(crate) struct OracleStore {
 }
 
 impl OracleStore {
-    /// Create a connection pool and initialize all schemas.
+    /// Create a connection pool, with the schema brought to this build's
+    /// shape first.
     ///
     /// Accepts a list of schema initializers that run on a single connection
-    /// before the pool is created, ensuring all tables exist.
+    /// before the pool is created, ensuring all tables exist. The database's
+    /// recorded schema version is checked against this build's migrations
+    /// before any of them runs, so a database a newer build migrated forward
+    /// is refused untouched (see [`bootstrap_oracle_schema`]).
     pub fn new(config: &OracleConfig, init_schemas: &[SchemaInitFn]) -> Result<Self, String> {
         // Extract and validate schema config.
         // Oracle folds unquoted identifiers to uppercase, so existing tables
@@ -72,27 +77,18 @@ impl OracleStore {
         )
         .map_err(map_oracle_error)?;
 
-        for init_schema in init_schemas {
-            init_schema(&conn, &schema)?;
-        }
-
-        // Run versioned migrations after table creation
-        let applied = crate::versioning::run_oracle_migrations(
-            &conn,
-            &schema,
+        // The recorded schema version against this build's migrations before
+        // any history table is touched; then the tables, the migrations and
+        // the indexes on the columns they added.
+        bootstrap_oracle_schema(
+            &OracleSchemaSetup {
+                conn: &conn,
+                schema: schema.as_ref(),
+                init_schemas,
+            },
             &ORACLE_HISTORY_MIGRATIONS,
             schema.version,
-            schema.auto_migrate,
         )?;
-
-        // Re-run init_schemas when migrations were applied so that indexes
-        // on newly-added columns (e.g. safety_identifier added by v1) are
-        // created in this startup cycle rather than requiring a restart.
-        if !applied.is_empty() {
-            for init_schema in init_schemas {
-                init_schema(&conn, &schema)?;
-            }
-        }
 
         drop(conn);
 
@@ -118,16 +114,16 @@ impl OracleStore {
     }
 
     /// Execute function with a connection from the pool
-    pub async fn execute<F, T>(&self, func: F) -> Result<T, String>
+    /// Runs `func` on a pooled connection. A connection the pool cannot give
+    /// is the store being unavailable; what `func` answers is the store's
+    /// own failure (classifying the statement's errors further is left to
+    /// the caller's text).
+    pub async fn execute<F, T>(&self, func: F) -> Result<T, Failure>
     where
         F: FnOnce(&Connection) -> Result<T, String> + Send + 'static,
         T: Send + 'static,
     {
-        let connection = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| format!("Failed to get Oracle connection: {e}"))?;
+        let connection = self.pool.get().await.map_err(|e| Failure::pool(&e))?;
 
         tokio::task::spawn_blocking(move || {
             let result = func(&connection);
@@ -135,7 +131,43 @@ impl OracleStore {
             result
         })
         .await
-        .map_err(|e| format!("Task execution failed: {e}"))?
+        .map_err(|e| Failure::Storage(format!("Task execution failed: {e}")))?
+        .map_err(Failure::Storage)
+    }
+}
+
+/// The start-up steps of [`OracleStore::new`] on its connection, in the order
+/// [`bootstrap_oracle_schema`] runs them.
+struct OracleSchemaSetup<'a> {
+    conn: &'a Connection,
+    schema: &'a SchemaConfig,
+    init_schemas: &'a [SchemaInitFn],
+}
+
+impl OracleSchemaSteps for OracleSchemaSetup<'_> {
+    fn recorded_version(&self) -> Result<Option<u32>, String> {
+        oracle_recorded_version(self.conn, self.schema)
+    }
+
+    fn create_tables(&self) -> Result<(), String> {
+        for init_schema in self.init_schemas {
+            init_schema(self.conn, self.schema)?;
+        }
+        Ok(())
+    }
+
+    fn migrate(
+        &self,
+        migrations: &[Migration],
+        config_version: Option<u32>,
+    ) -> Result<Vec<u32>, String> {
+        run_oracle_migrations(
+            self.conn,
+            self.schema,
+            migrations,
+            config_version,
+            self.schema.auto_migrate,
+        )
     }
 }
 
@@ -320,6 +352,9 @@ impl OracleConversationStorage {
             if !s.is_skipped("metadata") {
                 col_defs.push(format!("{} CLOB", s.col("metadata")));
             }
+            if !s.is_skipped("tenant") {
+                col_defs.push(format!("{} VARCHAR2(255)", s.col("tenant")));
+            }
             col_defs.extend(extra_column_defs(s));
 
             conn.execute(
@@ -354,6 +389,7 @@ impl ConversationStorage for OracleConversationStorage {
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?;
+        let tenant = conversation.tenant.clone();
         let schema = self.store.schema.clone();
         // Capture extra columns before spawn_blocking (task-locals don't propagate)
         let hook_extra = current_extra_columns().unwrap_or_default();
@@ -372,6 +408,10 @@ impl ConversationStorage for OracleConversationStorage {
                 if !s.is_skipped("metadata") {
                     columns.push(s.col("metadata"));
                     params.push(&metadata_json);
+                }
+                if !s.is_skipped("tenant") {
+                    columns.push(s.col("tenant"));
+                    params.push(&tenant);
                 }
 
                 // Append extra columns from hooks or defaults
@@ -394,7 +434,7 @@ impl ConversationStorage for OracleConversationStorage {
                     .map_err(map_oracle_error)
             })
             .await
-            .map_err(ConversationStorageError::StorageError)?;
+            .map_err(ConversationStorageError::from_failure)?;
 
         Ok(conversation)
     }
@@ -419,6 +459,9 @@ impl ConversationStorage for OracleConversationStorage {
                 if !s.is_skipped("metadata") {
                     select_cols.push(s.col("metadata").to_string());
                 }
+                if !s.is_skipped("tenant") {
+                    select_cols.push(s.col("tenant").to_string());
+                }
 
                 let sql = format!(
                     "SELECT {} FROM {table} WHERE {col_id} = :1",
@@ -441,17 +484,23 @@ impl ConversationStorage for OracleConversationStorage {
                         row.get(s.col("metadata")).map_err(map_oracle_error)?
                     };
                     let metadata = Self::parse_metadata(metadata_raw).map_err(|e| e.to_string())?;
+                    let tenant: Option<String> = if s.is_skipped("tenant") {
+                        None
+                    } else {
+                        row.get(s.col("tenant")).map_err(map_oracle_error)?
+                    };
                     Ok(Some(Conversation::with_parts(
                         ConversationId(id),
                         created_at,
                         metadata,
+                        tenant,
                     )))
                 } else {
                     Ok(None)
                 }
             })
             .await
-            .map_err(ConversationStorageError::StorageError)
+            .map_err(ConversationStorageError::from_failure)
     }
 
     async fn update_conversation(
@@ -459,84 +508,43 @@ impl ConversationStorage for OracleConversationStorage {
         id: &ConversationId,
         metadata: Option<ConversationMetadata>,
     ) -> Result<Option<Conversation>, ConversationStorageError> {
+        // The row as stored (its creation time and its tenant come back as
+        // they are), then the one column the update moves.
+        let Some(current) = self.get_conversation(id).await? else {
+            return Ok(None);
+        };
+        if self.store.schema.conversations.is_skipped("metadata") {
+            return Ok(Some(Conversation {
+                metadata,
+                ..current
+            }));
+        }
         let id_str = id.0.clone();
         let metadata_json = metadata.as_ref().map(serde_json::to_string).transpose()?;
-        let conversation_id = id.clone();
         let schema = self.store.schema.clone();
 
-        self.store
+        let rows = self
+            .store
             .execute(move |conn| {
                 let s = &schema.conversations;
                 let table = s.qualified_table(schema.owner.as_deref());
                 let col_id = s.col("id");
-
-                if s.is_skipped("metadata") {
-                    // Nothing to update — just verify the row exists
-                    let sql = format!("SELECT COUNT(*) FROM {table} WHERE {col_id} = :1");
-                    let count: i64 = conn
-                        .query_row_as(&sql, &[&id_str])
-                        .map_err(map_oracle_error)?;
-                    return if count > 0 {
-                        Ok(Some(Conversation::with_parts(
-                            conversation_id,
-                            Utc::now(),
-                            metadata,
-                        )))
-                    } else {
-                        Ok(None)
-                    };
-                }
-
                 let col_meta = s.col("metadata");
-
-                if s.is_skipped("created_at") {
-                    let sql = format!("UPDATE {table} SET {col_meta} = :1 WHERE {col_id} = :2");
-                    let stmt = conn
-                        .execute(&sql, &[&metadata_json, &id_str])
-                        .map_err(map_oracle_error)?;
-                    let rows = stmt.row_count().map_err(map_oracle_error)?;
-                    return if rows == 0 {
-                        Ok(None)
-                    } else {
-                        Ok(Some(Conversation::with_parts(
-                            conversation_id,
-                            Utc::now(),
-                            metadata,
-                        )))
-                    };
-                }
-
-                let col_created = s.col("created_at");
-                let sql = format!(
-                    "UPDATE {table} SET {col_meta} = :1 \
-                     WHERE {col_id} = :2 \
-                     RETURNING {col_created} INTO :3"
-                );
-                let mut stmt = conn.statement(&sql).build().map_err(map_oracle_error)?;
-
-                stmt.bind(3, &OracleType::TimestampTZ(6))
+                let sql = format!("UPDATE {table} SET {col_meta} = :1 WHERE {col_id} = :2");
+                let stmt = conn
+                    .execute(&sql, &[&metadata_json, &id_str])
                     .map_err(map_oracle_error)?;
-                stmt.execute(&[&metadata_json, &id_str])
-                    .map_err(map_oracle_error)?;
-
-                if stmt.row_count().map_err(map_oracle_error)? == 0 {
-                    return Ok(None);
-                }
-
-                let mut created_at: Vec<DateTime<Utc>> =
-                    stmt.returned_values(3).map_err(map_oracle_error)?;
-                let created_at = created_at
-                    .pop()
-                    .ok_or_else(|| "Oracle update did not return created_at".to_string())?;
-
-                Ok(Some(Conversation::with_parts(
-                    conversation_id,
-                    created_at,
-                    metadata,
-                )))
+                stmt.row_count().map_err(map_oracle_error)
             })
             .await
-            .map_err(ConversationStorageError::StorageError)
+            .map_err(ConversationStorageError::from_failure)?;
+        if rows == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Conversation {
+            metadata,
+            ..current
+        }))
     }
 
     async fn delete_conversation(
@@ -560,7 +568,7 @@ impl ConversationStorage for OracleConversationStorage {
                 .map_err(map_oracle_error)
             })
             .await
-            .map_err(ConversationStorageError::StorageError)?;
+            .map_err(ConversationStorageError::from_failure)?;
 
         Ok(res
             .row_count()
@@ -600,13 +608,14 @@ impl OracleConversationItemStorage {
 
         if exists_items == 0 {
             let mut col_defs = vec![format!("{} VARCHAR2(64) PRIMARY KEY", si.col("id"))];
-            let item_core_cols: [(&str, &str); 6] = [
+            let item_core_cols: [(&str, &str); 7] = [
                 ("response_id", "VARCHAR2(64)"),
                 ("item_type", "VARCHAR2(32) NOT NULL"),
                 ("role", "VARCHAR2(32)"),
                 ("content", "CLOB"),
                 ("status", "VARCHAR2(32)"),
                 ("created_at", "TIMESTAMP WITH TIME ZONE"),
+                ("tenant", "VARCHAR2(255)"),
             ];
             for (logical, sql_type) in &item_core_cols {
                 if !si.is_skipped(logical) {
@@ -683,6 +692,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
             role,
             content,
             status,
+            tenant,
         } = item;
         let id = opt_id.unwrap_or_else(|| make_item_id(&item_type));
         let created_at = Utc::now();
@@ -693,6 +703,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
         let cl_item_type = item_type.clone();
         let cl_role = role.clone();
         let cl_status = status.clone();
+        let cl_tenant = tenant.clone();
         let schema = self.store.schema.clone();
         let hook_extra = current_extra_columns().unwrap_or_default();
 
@@ -727,6 +738,10 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                     columns.push(si.col("created_at"));
                     params.push(&created_at);
                 }
+                if !si.is_skipped("tenant") {
+                    columns.push(si.col("tenant"));
+                    params.push(&cl_tenant);
+                }
 
                 // Append extra columns from hooks or defaults
                 let extra_cols: Vec<(&str, Option<String>)> =
@@ -747,7 +762,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 Ok(())
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)?;
+            .map_err(ConversationItemStorageError::from_failure)?;
 
         Ok(ConversationItem {
             id,
@@ -757,6 +772,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
             content,
             status,
             created_at,
+            tenant,
         })
     }
 
@@ -790,18 +806,17 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                     params.push(val);
                 }
 
-                let placeholders: Vec<String> =
-                    (1..=params.len()).map(|i| format!(":{i}")).collect();
-                let sql = format!(
-                    "INSERT INTO {table} ({}) VALUES ({})",
-                    columns.join(", "),
-                    placeholders.join(", ")
-                );
-                conn.execute(&sql, &params[..]).map_err(map_oracle_error)?;
+                let (sql, binds) = link_sql(&table, &columns);
+                let named: Vec<(&str, &dyn ToSql)> = binds
+                    .iter()
+                    .map(String::as_str)
+                    .zip(params.iter().copied())
+                    .collect();
+                conn.execute_named(&sql, &named).map_err(map_oracle_error)?;
                 Ok(())
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 
     async fn link_items(
@@ -816,8 +831,11 @@ impl ConversationItemStorage for OracleConversationItemStorage {
         let cid = conversation_id.0.clone();
         let schema = self.store.schema.clone();
         let hook_extra = current_extra_columns().unwrap_or_default();
-        let owned_items: Vec<(String, DateTime<Utc>)> =
-            items.iter().map(|(id, ts)| (id.0.clone(), *ts)).collect();
+        // One source row per item: a repeated id keeps its last stamp, as the
+        // other backends' per-item links leave it (two rows under one key
+        // would fail the MERGE).
+        let owned_items =
+            last_stamp_per_item(items.iter().map(|(id, ts)| (id.0.clone(), *ts)).collect());
 
         self.store
             .execute(move |conn| {
@@ -836,25 +854,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                     columns.push(*name);
                 }
 
-                let col_list = columns.join(", ");
-
-                // Build INSERT ALL ... SELECT 1 FROM DUAL
-                let mut sql = String::from("INSERT ALL");
-                for (idx, _) in owned_items.iter().enumerate() {
-                    let mut placeholders = vec![
-                        ":cid".to_string(),
-                        format!(":iid{idx}"),
-                        format!(":ts{idx}"),
-                    ];
-                    for (ei, _) in extra_cols.iter().enumerate() {
-                        placeholders.push(format!(":ex{ei}"));
-                    }
-                    sql.push_str(&format!(
-                        " INTO {table} ({col_list}) VALUES ({})",
-                        placeholders.join(", ")
-                    ));
-                }
-                sql.push_str(" SELECT 1 FROM DUAL");
+                let sql = link_items_sql(&table, &columns, owned_items.len());
 
                 let mut params_vec: Vec<(&str, &dyn ToSql)> = vec![("cid", &cid)];
 
@@ -879,7 +879,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 Ok(())
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 
     async fn list_items(
@@ -915,6 +915,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                         "content",
                         "status",
                         "created_at",
+                        "tenant",
                     ] {
                         if !si.is_skipped(field) {
                             select_cols.push(format!("i.{}", si.col(field)));
@@ -984,7 +985,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 }
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 
     async fn get_item(
@@ -1008,6 +1009,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                     "content",
                     "status",
                     "created_at",
+                    "tenant",
                 ] {
                     if !si.is_skipped(field) {
                         select_cols.push(si.col(field).to_string());
@@ -1029,7 +1031,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 }
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 
     async fn is_item_linked(
@@ -1056,7 +1058,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 Ok(count > 0)
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 
     async fn delete_item(
@@ -1083,7 +1085,7 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                 Ok(())
             })
             .await
-            .map_err(ConversationItemStorageError::StorageError)
+            .map_err(ConversationItemStorageError::from_failure)
     }
 }
 
@@ -1132,6 +1134,11 @@ fn build_item_from_oracle_row(
     } else {
         row.get(si.col("created_at")).map_err(map_oracle_error)?
     };
+    let tenant: Option<String> = if si.is_skipped("tenant") {
+        None
+    } else {
+        row.get(si.col("tenant")).map_err(map_oracle_error)?
+    };
 
     Ok(ConversationItem {
         id: ConversationItemId(id),
@@ -1141,6 +1148,7 @@ fn build_item_from_oracle_row(
         content,
         status,
         created_at,
+        tenant,
     })
 }
 
@@ -1148,6 +1156,27 @@ fn build_item_from_oracle_row(
 pub(super) struct OracleResponseStorage {
     store: OracleStore,
     select_base: String,
+}
+
+/// The query behind `find_response_by_output_item`: `raw_response` holds the
+/// response as JSON text, so `JSON_EXISTS` asks whether its `output` array has
+/// an item whose id equals the bind variable `:1` (passed into the path as
+/// `$iid`, never spliced into it). `None` when the schema skips the column.
+fn find_by_output_item_sql(schema: &SchemaConfig, select_base: &str) -> Option<String> {
+    let s = &schema.responses;
+    if s.is_skipped("raw_response") {
+        return None;
+    }
+    let col_raw = s.col("raw_response");
+    let order = if s.is_skipped("created_at") {
+        String::new()
+    } else {
+        format!(" ORDER BY {} DESC", s.col("created_at"))
+    };
+    Some(format!(
+        "SELECT * FROM ({select_base} WHERE JSON_EXISTS({col_raw}, \
+         '$.output[*]?(@.id == $iid)' PASSING :1 AS \"iid\"){order}) WHERE ROWNUM <= 1"
+    ))
 }
 
 impl OracleResponseStorage {
@@ -1173,7 +1202,7 @@ impl OracleResponseStorage {
 
         if exists == 0 {
             let mut col_defs = vec![format!("{} VARCHAR2(64) PRIMARY KEY", s.col("id"))];
-            let core_cols: [(&str, &str); 7] = [
+            let core_cols: [(&str, &str); 8] = [
                 ("conversation_id", "VARCHAR2(64)"),
                 ("previous_response_id", "VARCHAR2(64)"),
                 ("input", "CLOB"),
@@ -1181,6 +1210,7 @@ impl OracleResponseStorage {
                 ("safety_identifier", "VARCHAR2(128)"),
                 ("model", "VARCHAR2(128)"),
                 ("raw_response", "CLOB"),
+                ("tenant", "VARCHAR2(255)"),
             ];
             for (logical, sql_type) in &core_cols {
                 if !s.is_skipped(logical) {
@@ -1194,6 +1224,31 @@ impl OracleResponseStorage {
                 &[],
             )
             .map_err(map_oracle_error)?;
+
+            // The index behind `delete_unstored_older_than`: the object's status
+            // over the unstored records only (NULL, hence absent, for the rest).
+            // Built with the table, while it is empty; an existing table gets it
+            // from its operator (see the release note), and a build that fails
+            // (a busy object, an identifier too long for the release, no
+            // temporary space) leaves the sweep a scan rather than failing the
+            // start, as on Postgres.
+            if !s.is_skipped("raw_response") {
+                let col_raw = s.col("raw_response");
+                let unstored_idx = format!("{}_UNSTORED_IDX", s.table);
+                if let Err(e) = create_index_if_missing(
+                    conn,
+                    &s.table,
+                    &unstored_idx,
+                    &format!(
+                        "CREATE INDEX {unstored_idx} ON {table}({})",
+                        unstored_status_expr(col_raw)
+                    ),
+                ) {
+                    tracing::warn!(
+                        "unstored response index not created (the sweep of unstored background records scans the table): {e}"
+                    );
+                }
+            }
         }
 
         if !s.is_skipped("previous_response_id") {
@@ -1266,6 +1321,11 @@ impl OracleResponseStorage {
         } else {
             row.get(s.col("raw_response")).map_err(map_oracle_error)?
         };
+        let tenant: Option<String> = if s.is_skipped("tenant") {
+            None
+        } else {
+            row.get(s.col("tenant")).map_err(map_oracle_error)?
+        };
 
         let previous_response_id = previous.map(ResponseId);
         let raw_response = parse_raw_response(raw_response_json)?;
@@ -1280,16 +1340,80 @@ impl OracleResponseStorage {
             model,
             conversation_id,
             raw_response,
+            tenant,
+        })
+    }
+
+    /// The outcome of a conditional write: `Stored` when a row changed, else
+    /// the row read back, `Closed` with it or `Missing`.
+    async fn conditional_store_outcome(
+        &self,
+        updated: u64,
+        read_back: &ResponseId,
+    ) -> Result<ConditionalStore, ResponseStorageError> {
+        if updated > 0 {
+            return Ok(ConditionalStore::Stored);
+        }
+        Ok(match self.get_response(read_back).await? {
+            Some(current) => ConditionalStore::Closed(Box::new(current)),
+            None => ConditionalStore::Missing,
         })
     }
 }
 
-#[async_trait]
-impl ResponseStorage for OracleResponseStorage {
-    async fn store_response(
-        &self,
-        response: StoredResponse,
-    ) -> Result<ResponseId, ResponseStorageError> {
+/// The condition of the tenant scope on the rows of a query, with the
+/// caller's tenant bound as `:bind`: the rows stored under no tenant and
+/// those stored under the caller's (see
+/// [`tenant_scope_allows`](crate::core::tenant_scope_allows)). `None` when
+/// the schema skips the column: every row is served then, as before.
+fn tenant_scope_sql(s: &crate::schema::TableConfig, bind: usize) -> Option<String> {
+    if s.is_skipped("tenant") {
+        return None;
+    }
+    let col = s.col("tenant");
+    Some(format!(" AND ({col} IS NULL OR {col} = :{bind})"))
+}
+
+/// A safety identifier and the tenant scope it is read within, as the
+/// identifier queries bind them; named fields, so the two cannot swap.
+struct IdentifierScope<'a> {
+    identifier: &'a String,
+    tenant: &'a Option<String>,
+}
+
+/// The responses filter on a safety identifier within the tenant scope, with
+/// its binds: the identifier as `:1`, the tenant (NULL when absent) as `:2`
+/// when the table keeps a tenant column.
+fn identifier_filter<'a>(
+    s: &crate::schema::TableConfig,
+    scope: IdentifierScope<'a>,
+) -> (String, Vec<&'a dyn ToSql>) {
+    let col_safety = s.col("safety_identifier");
+    let mut filter = format!("{col_safety} = :1");
+    let mut binds: Vec<&dyn ToSql> = vec![scope.identifier];
+    if let Some(tenant_scope) = tenant_scope_sql(s, binds.len() + 1) {
+        filter.push_str(&tenant_scope);
+        binds.push(scope.tenant);
+    }
+    (filter, binds)
+}
+
+/// The responses row of a stored response, its JSON fields serialized once:
+/// what both writers (the store and the conditional store) bind.
+struct ResponseRow {
+    id: String,
+    previous_response_id: Option<String>,
+    input: String,
+    created_at: DateTime<Utc>,
+    safety_identifier: Option<String>,
+    model: Option<String>,
+    conversation_id: Option<String>,
+    raw_response: String,
+    tenant: Option<String>,
+}
+
+impl ResponseRow {
+    fn new(response: StoredResponse) -> Result<Self, serde_json::Error> {
         let StoredResponse {
             id,
             previous_response_id,
@@ -1299,14 +1423,273 @@ impl ResponseStorage for OracleResponseStorage {
             model,
             conversation_id,
             raw_response,
+            tenant,
         } = response;
+        Ok(Self {
+            id: id.0,
+            previous_response_id: previous_response_id.map(|r| r.0),
+            input: serde_json::to_string(&input)?,
+            created_at,
+            safety_identifier,
+            model,
+            conversation_id,
+            raw_response: serde_json::to_string(&raw_response)?,
+            tenant,
+        })
+    }
 
-        let return_id = id.clone();
+    /// The row's columns and binds in one order: the id always, the other
+    /// logical fields unless the table skips them, then the hook's or the
+    /// defaults' extra columns.
+    fn columns_and_binds<'a>(
+        &'a self,
+        s: &'a crate::schema::TableConfig,
+        extra_cols: &'a [(&'a str, Option<String>)],
+    ) -> (Vec<&'a str>, Vec<&'a dyn ToSql>) {
+        let logical_fields: [(&str, &dyn ToSql); 9] = [
+            ("id", &self.id),
+            ("previous_response_id", &self.previous_response_id),
+            ("input", &self.input),
+            ("created_at", &self.created_at),
+            ("safety_identifier", &self.safety_identifier),
+            ("model", &self.model),
+            ("conversation_id", &self.conversation_id),
+            ("raw_response", &self.raw_response),
+            ("tenant", &self.tenant),
+        ];
+        let mut columns = Vec::new();
+        let mut binds: Vec<&dyn ToSql> = Vec::new();
+        for (logical, value) in logical_fields {
+            // Always include id (primary key), skip others if configured
+            if logical != "id" && s.is_skipped(logical) {
+                continue;
+            }
+            columns.push(s.col(logical));
+            binds.push(value);
+        }
+        for (name, value) in extra_cols {
+            columns.push(*name);
+            binds.push(value);
+        }
+        (columns, binds)
+    }
+}
 
-        let response_id_str = id.0;
-        let previous_id = previous_response_id.map(|r| r.0);
-        let json_input = serde_json::to_string(&input)?;
-        let json_raw_response = serde_json::to_string(&raw_response)?;
+/// The statement that stores a response, with the names of its binds in the
+/// columns' order: a merge on the id (the first column, the table's primary
+/// key) that inserts a new row or updates every other column of the
+/// existing one, so a record written as `queued` is replaced by its terminal
+/// object under the one id. Only the id is bound inside the USING source;
+/// the values are bound in UPDATE SET and INSERT VALUES, where a string
+/// above 4,000 bytes (the JSON of `input` or `raw_response`) is accepted
+/// for a CLOB column as it is in an INSERT, while the same bind in a
+/// subquery's select list fails with ORA-01461. Named binds, so the id's
+/// two occurrences are bound once. The MERGE needs no unique index on the
+/// id: its one-row source matches the target rows through the ON clause
+/// (every row under the id is updated, a row is inserted when none
+/// matches), so a configured table that pre-exists without the primary key
+/// the store would create works too.
+fn store_response_sql(table: &str, columns: &[&str]) -> (String, Vec<String>) {
+    let binds: Vec<String> = (1..=columns.len()).map(|i| format!("v{i}")).collect();
+    let id_col = columns.first().copied().unwrap_or("id");
+    let id_bind = binds.first().cloned().unwrap_or_else(|| "v1".to_string());
+    let updates: Vec<String> = columns
+        .iter()
+        .zip(&binds)
+        .skip(1)
+        .map(|(col, bind)| format!("t.{col} = :{bind}"))
+        .collect();
+    let values: Vec<String> = binds.iter().map(|bind| format!(":{bind}")).collect();
+    let matched = if updates.is_empty() {
+        String::new()
+    } else {
+        format!(" WHEN MATCHED THEN UPDATE SET {}", updates.join(", "))
+    };
+    let sql = format!(
+        "MERGE INTO {table} t USING (SELECT :{id_bind} AS {id_col} FROM dual) s \
+         ON (t.{id_col} = s.{id_col}){matched} \
+         WHEN NOT MATCHED THEN INSERT ({}) VALUES ({})",
+        columns.join(", "),
+        values.join(", ")
+    );
+    (sql, binds)
+}
+
+/// The statement of a link: a MERGE on the (conversation, item) key, the
+/// first two columns, so the row takes the new stamp and the new values of
+/// any extra column when it exists and is inserted when it does not. A second
+/// link of an item moves it, the contract of
+/// [`ConversationItemStorage::link_item`], where the key used to refuse the
+/// insert. Named binds, one per column, so an extra column's two occurrences
+/// (UPDATE SET and INSERT VALUES) are bound once.
+fn link_sql(table: &str, columns: &[&str]) -> (String, Vec<String>) {
+    let binds: Vec<String> = (1..=columns.len()).map(|i| format!("v{i}")).collect();
+    let placeholders: Vec<String> = binds.iter().map(|bind| format!(":{bind}")).collect();
+    let keyed = placeholders.len().min(LINK_KEY_COLUMNS);
+    let (key_binds, extra_binds) = placeholders.split_at(keyed);
+    (
+        merge_links_sql(table, columns, &[key_binds.to_vec()], extra_binds),
+        binds,
+    )
+}
+
+/// The statement of a batch link: one MERGE whose source is the batch's rows
+/// (ids and stamps, far under the source's size limit), keyed as [`link_sql`]
+/// is. The binds are `:cid` (the conversation, once), `:iid<n>` and `:ts<n>`
+/// per row, `:ex<n>` per extra column (one value for the whole batch, bound
+/// outside the source). The batch must hold distinct item ids: two source
+/// rows under one key are refused by the MERGE (ORA-30926, or ORA-00001 when
+/// both insert), so the caller keeps the last stamp of a repeated id.
+fn link_items_sql(table: &str, columns: &[&str], rows: usize) -> String {
+    let extra = columns.len().saturating_sub(LINK_KEY_COLUMNS);
+    let key_rows: Vec<Vec<String>> = (0..rows)
+        .map(|idx| {
+            vec![
+                ":cid".to_string(),
+                format!(":iid{idx}"),
+                format!(":ts{idx}"),
+            ]
+        })
+        .collect();
+    let extra_binds: Vec<String> = (0..extra).map(|ei| format!(":ex{ei}")).collect();
+    merge_links_sql(table, columns, &key_rows, &extra_binds)
+}
+
+/// The columns a link's source row carries: the key (conversation, item) and
+/// the stamp. Any further column is an extra column of the table.
+const LINK_KEY_COLUMNS: usize = 3;
+
+/// One MERGE into the links `table` with one source row per entry of
+/// `key_rows` (one bind per key column, in the columns' order), matched on
+/// the first two columns: the stamp and the extra columns of a matched row
+/// take the new values, an unmatched row is inserted. The extra columns'
+/// values (`extra_binds`, one per column after the first three) are bound in
+/// UPDATE SET and INSERT VALUES, outside the source: a string above 4,000
+/// bytes is accepted there for a CLOB column, as in an INSERT, while the same
+/// bind in a subquery's select list fails with ORA-01461 (the rule
+/// [`store_response_sql`] follows); an extra column is user-configured and
+/// may well be a CLOB.
+fn merge_links_sql(
+    table: &str,
+    columns: &[&str],
+    key_rows: &[Vec<String>],
+    extra_binds: &[String],
+) -> String {
+    let keyed = columns.len().min(LINK_KEY_COLUMNS);
+    let (key_columns, extra_columns) = columns.split_at(keyed);
+    let source: Vec<String> = key_rows
+        .iter()
+        .map(|binds| {
+            let selected: Vec<String> = key_columns
+                .iter()
+                .zip(binds)
+                .map(|(col, bind)| format!("{bind} AS {col}"))
+                .collect();
+            format!("SELECT {} FROM dual", selected.join(", "))
+        })
+        .collect();
+    let on: Vec<String> = key_columns
+        .iter()
+        .take(2)
+        .map(|col| format!("t.{col} = s.{col}"))
+        .collect();
+    let updates: Vec<String> = key_columns
+        .iter()
+        .skip(2)
+        .map(|col| format!("t.{col} = s.{col}"))
+        .chain(
+            extra_columns
+                .iter()
+                .zip(extra_binds)
+                .map(|(col, bind)| format!("t.{col} = {bind}")),
+        )
+        .collect();
+    let matched = if updates.is_empty() {
+        String::new()
+    } else {
+        format!(" WHEN MATCHED THEN UPDATE SET {}", updates.join(", "))
+    };
+    let values: Vec<String> = key_columns
+        .iter()
+        .map(|col| format!("s.{col}"))
+        .chain(extra_binds.iter().cloned())
+        .collect();
+    format!(
+        "MERGE INTO {table} t USING ({}) s ON ({}){matched} \
+         WHEN NOT MATCHED THEN INSERT ({}) VALUES ({})",
+        source.join(" UNION ALL "),
+        on.join(" AND "),
+        columns.join(", "),
+        values.join(", ")
+    )
+}
+
+/// The batch with one row per item id, the last stamp of a repeated id kept
+/// in the position of its first occurrence: the result of linking the items
+/// one by one, which the other backends give a repeated id.
+fn last_stamp_per_item(items: Vec<(String, DateTime<Utc>)>) -> Vec<(String, DateTime<Utc>)> {
+    let mut positions: HashMap<String, usize> = HashMap::new();
+    let mut rows: Vec<(String, DateTime<Utc>)> = Vec::with_capacity(items.len());
+    for (id, ts) in items {
+        match positions.get(&id) {
+            Some(&at) => rows[at].1 = ts,
+            None => {
+                positions.insert(id.clone(), rows.len());
+                rows.push((id, ts));
+            }
+        }
+    }
+    rows
+}
+
+/// The statement of `store_response_if_open`, with the names of its binds
+/// in the columns' order: an UPDATE of every column but the id of the row
+/// under the id, applied only while the stored object's status is not
+/// terminal (`open`; none when the schema skips the column, so the update
+/// is plain). The values are bound by name as in `store_response_sql`.
+fn update_if_open_sql(table: &str, columns: &[&str], open: Option<&str>) -> (String, Vec<String>) {
+    let binds: Vec<String> = (1..=columns.len()).map(|i| format!("v{i}")).collect();
+    let id_col = columns.first().copied().unwrap_or("id");
+    let id_bind = binds.first().cloned().unwrap_or_else(|| "v1".to_string());
+    let updates: Vec<String> = columns
+        .iter()
+        .zip(&binds)
+        .skip(1)
+        .map(|(col, bind)| format!("{col} = :{bind}"))
+        .collect();
+    let condition = open.map(|open| format!(" AND {open}")).unwrap_or_default();
+    let sql = format!(
+        "UPDATE {table} SET {} WHERE {id_col} = :{id_bind}{condition}",
+        updates.join(", ")
+    );
+    (sql, binds)
+}
+
+/// The condition of `update_if_open_sql` over the stored object's JSON text
+/// (a record without a status counts as open).
+fn oracle_open_predicate(col_raw: &str) -> String {
+    format!(
+        "COALESCE(JSON_VALUE({col_raw}, '$.status'), ' ') NOT IN ({})",
+        sql_string_list(&TERMINAL_RESPONSE_STATUSES)
+    )
+}
+
+/// [`oracle_open_predicate`] over the schema's object column; none when the
+/// schema skips it: there is no status to check, so the conditional store is
+/// a plain update of the row under the id (every backend of this crate
+/// agrees).
+fn oracle_open_predicate_for(s: &crate::schema::TableConfig) -> Option<String> {
+    (!s.is_skipped("raw_response")).then(|| oracle_open_predicate(s.col("raw_response")))
+}
+
+#[async_trait]
+impl ResponseStorage for OracleResponseStorage {
+    async fn store_response(
+        &self,
+        response: StoredResponse,
+    ) -> Result<ResponseId, ResponseStorageError> {
+        let return_id = response.id.clone();
+        let row = ResponseRow::new(response)?;
         let schema = self.store.schema.clone();
         // Capture extra columns before spawn_blocking (task-locals don't propagate)
         let hook_extra = current_extra_columns().unwrap_or_default();
@@ -1315,53 +1698,86 @@ impl ResponseStorage for OracleResponseStorage {
             .execute(move |conn| {
                 let s = &schema.responses;
                 let table = s.qualified_table(schema.owner.as_deref());
+                let extra_cols = resolve_extra_column_values(s, &hook_extra);
+                let (columns, params) = row.columns_and_binds(s, &extra_cols);
 
-                // Build column list and params dynamically, respecting skip_columns
-                let logical_fields: &[(&str, &dyn ToSql)] = &[
-                    ("id", &response_id_str),
-                    ("previous_response_id", &previous_id),
-                    ("input", &json_input),
-                    ("created_at", &created_at),
-                    ("safety_identifier", &safety_identifier),
-                    ("model", &model),
-                    ("conversation_id", &conversation_id),
-                    ("raw_response", &json_raw_response),
-                ];
-
-                let mut columns = Vec::new();
-                let mut params: Vec<&dyn ToSql> = Vec::new();
-                for &(logical, val) in logical_fields {
-                    // Always include id (primary key), skip others if configured
-                    if logical != "id" && s.is_skipped(logical) {
-                        continue;
-                    }
-                    columns.push(s.col(logical));
-                    params.push(val);
-                }
-
-                // Append extra columns from hooks or defaults
-                let extra_cols: Vec<(&str, Option<String>)> =
-                    resolve_extra_column_values(s, &hook_extra);
-                for (name, val) in &extra_cols {
-                    columns.push(*name);
-                    params.push(val);
-                }
-
-                let placeholders: Vec<String> =
-                    (1..=params.len()).map(|i| format!(":{i}")).collect();
-                let sql = format!(
-                    "INSERT INTO {table} ({}) VALUES ({})",
-                    columns.join(", "),
-                    placeholders.join(", ")
-                );
-                conn.execute(&sql, &params[..])
+                let (sql, binds) = store_response_sql(&table, &columns);
+                let named: Vec<(&str, &dyn ToSql)> = binds
+                    .iter()
+                    .map(String::as_str)
+                    .zip(params.iter().copied())
+                    .collect();
+                conn.execute_named(&sql, &named)
                     .map(|_| ())
                     .map_err(map_oracle_error)
             })
             .await
-            .map_err(ResponseStorageError::StorageError)?;
+            .map_err(ResponseStorageError::from_failure)?;
 
         Ok(return_id)
+    }
+
+    async fn store_response_if_open(
+        &self,
+        response: StoredResponse,
+    ) -> Result<ConditionalStore, ResponseStorageError> {
+        let read_back = response.id.clone();
+        let row = ResponseRow::new(response)?;
+        let schema = self.store.schema.clone();
+        let hook_extra = current_extra_columns().unwrap_or_default();
+
+        let updated = self
+            .store
+            .execute(move |conn| {
+                let s = &schema.responses;
+                let table = s.qualified_table(schema.owner.as_deref());
+                let extra_cols = resolve_extra_column_values(s, &hook_extra);
+                let (columns, params) = row.columns_and_binds(s, &extra_cols);
+                let open = oracle_open_predicate_for(s);
+                let (sql, binds) = update_if_open_sql(&table, &columns, open.as_deref());
+                let named: Vec<(&str, &dyn ToSql)> = binds
+                    .iter()
+                    .map(String::as_str)
+                    .zip(params.iter().copied())
+                    .collect();
+                let stmt = conn.execute_named(&sql, &named).map_err(map_oracle_error)?;
+                stmt.row_count().map_err(map_oracle_error)
+            })
+            .await
+            .map_err(ResponseStorageError::from_failure)?;
+        self.conditional_store_outcome(updated, &read_back).await
+    }
+
+    async fn update_response_object_if_open(
+        &self,
+        id: &ResponseId,
+        raw_response: Value,
+    ) -> Result<ConditionalStore, ResponseStorageError> {
+        let read_back = id.clone();
+        let id_str = id.0.clone();
+        let json_raw_response = serde_json::to_string(&raw_response)?;
+        let schema = self.store.schema.clone();
+        let updated = self
+            .store
+            .execute(move |conn| {
+                let s = &schema.responses;
+                if s.is_skipped("raw_response") {
+                    // No object column: nothing a transition could move.
+                    return Ok(1);
+                }
+                let table = s.qualified_table(schema.owner.as_deref());
+                let open = oracle_open_predicate(s.col("raw_response"));
+                let (sql, binds) =
+                    update_if_open_sql(&table, &[s.col("id"), s.col("raw_response")], Some(&open));
+                let params: Vec<&dyn ToSql> = vec![&id_str, &json_raw_response];
+                let named: Vec<(&str, &dyn ToSql)> =
+                    binds.iter().map(String::as_str).zip(params).collect();
+                let stmt = conn.execute_named(&sql, &named).map_err(map_oracle_error)?;
+                stmt.row_count().map_err(map_oracle_error)
+            })
+            .await
+            .map_err(ResponseStorageError::from_failure)?;
+        self.conditional_store_outcome(updated, &read_back).await
     }
 
     async fn get_response(
@@ -1387,7 +1803,33 @@ impl ResponseStorage for OracleResponseStorage {
                 }
             })
             .await
-            .map_err(ResponseStorageError::StorageError)
+            .map_err(ResponseStorageError::from_failure)
+    }
+
+    async fn find_response_by_output_item(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<StoredResponse>, ResponseStorageError> {
+        let schema = self.store.schema.clone();
+        let Some(sql) = find_by_output_item_sql(&schema, &self.select_base) else {
+            return Ok(None);
+        };
+        let item_id = item_id.to_string();
+
+        self.store
+            .execute(move |conn| {
+                let mut stmt = conn.statement(&sql).build().map_err(map_oracle_error)?;
+                let mut rows = stmt.query(&[&item_id]).map_err(map_oracle_error)?;
+                match rows.next() {
+                    Some(row) => {
+                        let row = row.map_err(map_oracle_error)?;
+                        Self::build_response_from_row(&row, &schema).map(Some)
+                    }
+                    None => Ok(None),
+                }
+            })
+            .await
+            .map_err(ResponseStorageError::from_failure)
     }
 
     async fn delete_response(&self, response_id: &ResponseId) -> Result<(), ResponseStorageError> {
@@ -1405,15 +1847,17 @@ impl ResponseStorage for OracleResponseStorage {
                     .map_err(map_oracle_error)
             })
             .await
-            .map_err(ResponseStorageError::StorageError)
+            .map_err(ResponseStorageError::from_failure)
     }
 
     async fn list_identifier_responses(
         &self,
         identifier: &str,
+        tenant: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
         let identifier = identifier.to_string();
+        let tenant = tenant.map(str::to_string);
         let select_base = self.select_base.clone();
         let schema = self.store.schema.clone();
 
@@ -1426,32 +1870,38 @@ impl ResponseStorage for OracleResponseStorage {
                     return Ok(Vec::new());
                 }
 
-                let col_safety = s.col("safety_identifier");
+                let (filter, binds) = identifier_filter(
+                    s,
+                    IdentifierScope {
+                        identifier: &identifier,
+                        tenant: &tenant,
+                    },
+                );
 
                 let sql = if s.is_skipped("created_at") {
                     // No created_at column — omit ORDER BY
                     if let Some(limit) = limit {
                         format!(
-                            "SELECT * FROM ({select_base} WHERE {col_safety} = :1) \
+                            "SELECT * FROM ({select_base} WHERE {filter}) \
                              WHERE ROWNUM <= {limit}"
                         )
                     } else {
-                        format!("{select_base} WHERE {col_safety} = :1")
+                        format!("{select_base} WHERE {filter}")
                     }
                 } else {
                     let col_created = s.col("created_at");
                     if let Some(limit) = limit {
                         format!(
-                            "SELECT * FROM ({select_base} WHERE {col_safety} = :1 \
+                            "SELECT * FROM ({select_base} WHERE {filter} \
                              ORDER BY {col_created} DESC) WHERE ROWNUM <= {limit}"
                         )
                     } else {
-                        format!("{select_base} WHERE {col_safety} = :1 ORDER BY {col_created} DESC")
+                        format!("{select_base} WHERE {filter} ORDER BY {col_created} DESC")
                     }
                 };
 
                 let mut stmt = conn.statement(&sql).build().map_err(map_oracle_error)?;
-                let mut rows = stmt.query(&[&identifier]).map_err(map_oracle_error)?;
+                let mut rows = stmt.query(&binds[..]).map_err(map_oracle_error)?;
                 let mut results = Vec::new();
 
                 for row in &mut rows {
@@ -1462,14 +1912,66 @@ impl ResponseStorage for OracleResponseStorage {
                 Ok(results)
             })
             .await
-            .map_err(ResponseStorageError::StorageError)
+            .map_err(ResponseStorageError::from_failure)
+    }
+
+    async fn delete_unstored_older_than(
+        &self,
+        cutoff: DateTime<Utc>,
+    ) -> Result<usize, ResponseStorageError> {
+        let schema = self.store.schema.clone();
+        // The object (its `store`, `status` and `completed_at`) is what the
+        // query reads; without the column there is nothing to read.
+        if schema.responses.is_skipped("raw_response") {
+            return Ok(0);
+        }
+        let cutoff_secs: i64 = cutoff.timestamp();
+
+        let affected = self
+            .store
+            .execute(move |conn| {
+                let s = &schema.responses;
+                let table = s.qualified_table(schema.owner.as_deref());
+                let col_raw = s.col("raw_response");
+                let ended = if s.is_skipped("created_at") {
+                    format!("TO_NUMBER(JSON_VALUE({col_raw}, '$.completed_at'))")
+                } else {
+                    format!(
+                        "COALESCE(TO_NUMBER(JSON_VALUE({col_raw}, '$.completed_at')), \
+                         ROUND((CAST({} AS DATE) - DATE '1970-01-01') * 86400))",
+                        s.col("created_at")
+                    )
+                };
+
+                // The predicate is the expression the table's unstored index
+                // holds (see the bootstrap), so the sweep reads those rows only.
+                conn.execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE {} IN ('completed', 'incomplete', 'failed', 'cancelled') \
+                         AND {ended} < :1",
+                        unstored_status_expr(col_raw)
+                    ),
+                    &[&cutoff_secs],
+                )
+                .map_err(map_oracle_error)
+            })
+            .await
+            .map_err(ResponseStorageError::from_failure)?;
+
+        let deleted = affected
+            .row_count()
+            .map_err(|e| ResponseStorageError::StorageError(map_oracle_error(e)))?
+            as usize;
+        Ok(deleted)
     }
 
     async fn delete_identifier_responses(
         &self,
         identifier: &str,
+        tenant: Option<&str>,
     ) -> Result<usize, ResponseStorageError> {
         let identifier = identifier.to_string();
+        let tenant = tenant.map(str::to_string);
         let schema = self.store.schema.clone();
 
         let schema_check = self.store.schema.clone();
@@ -1482,16 +1984,19 @@ impl ResponseStorage for OracleResponseStorage {
             .execute(move |conn| {
                 let s = &schema.responses;
                 let table = s.qualified_table(schema.owner.as_deref());
-                let col_safety = s.col("safety_identifier");
+                let (filter, binds) = identifier_filter(
+                    s,
+                    IdentifierScope {
+                        identifier: &identifier,
+                        tenant: &tenant,
+                    },
+                );
 
-                conn.execute(
-                    &format!("DELETE FROM {table} WHERE {col_safety} = :1"),
-                    &[&identifier],
-                )
-                .map_err(map_oracle_error)
+                conn.execute(&format!("DELETE FROM {table} WHERE {filter}"), &binds[..])
+                    .map_err(map_oracle_error)
             })
             .await
-            .map_err(ResponseStorageError::StorageError)?;
+            .map_err(ResponseStorageError::from_failure)?;
 
         let deleted = affected
             .row_count()
@@ -1499,6 +2004,14 @@ impl ResponseStorage for OracleResponseStorage {
             as usize;
         Ok(deleted)
     }
+}
+
+/// The status of an unstored response object, NULL for a stored one: the
+/// expression the unstored index holds and the sweep's predicate reads.
+fn unstored_status_expr(col_raw: &str) -> String {
+    format!(
+        "CASE WHEN JSON_VALUE({col_raw}, '$.store') = 'false' THEN JSON_VALUE({col_raw}, '$.status') END"
+    )
 }
 
 fn create_index_if_missing(
@@ -1533,4 +2046,240 @@ fn create_index_if_missing(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The identifier filter binds the identifier first and the tenant scope
+    /// second, and leaves the scope out when the table keeps no tenant.
+    #[test]
+    fn the_identifier_filter_scopes_by_tenant_only_when_the_table_keeps_one() {
+        let mut s = SchemaConfig::default().responses;
+        let identifier = "user-1".to_string();
+        let tenant = Some("t".to_string());
+        let scope = || IdentifierScope {
+            identifier: &identifier,
+            tenant: &tenant,
+        };
+        let (filter, binds) = identifier_filter(&s, scope());
+        assert_eq!(
+            filter,
+            "safety_identifier = :1 AND (tenant IS NULL OR tenant = :2)"
+        );
+        assert_eq!(binds.len(), 2);
+        assert!(
+            std::ptr::addr_eq(binds[0], &identifier),
+            "the identifier is :1"
+        );
+        assert!(std::ptr::addr_eq(binds[1], &tenant), "the tenant is :2");
+
+        s.skip_columns.insert("tenant".to_string());
+        let (filter, binds) = identifier_filter(&s, scope());
+        assert_eq!(filter, "safety_identifier = :1");
+        assert_eq!(binds.len(), 1);
+        assert!(std::ptr::addr_eq(binds[0], &identifier));
+    }
+
+    /// The responses row binds the id whatever the table skips, the other
+    /// logical fields unless skipped, then the extra columns, one bind per
+    /// column.
+    #[test]
+    fn the_responses_row_keeps_the_id_skips_the_skipped_and_appends_the_extras() {
+        let mut s = SchemaConfig::default().responses;
+        s.skip_columns.insert("id".to_string());
+        s.skip_columns.insert("model".to_string());
+        let row = ResponseRow::new(StoredResponse {
+            id: ResponseId("resp_1".to_string()),
+            previous_response_id: Some(ResponseId("resp_0".to_string())),
+            input: serde_json::json!([]),
+            created_at: Utc::now(),
+            safety_identifier: None,
+            model: Some("m".to_string()),
+            conversation_id: None,
+            raw_response: serde_json::json!({"id": "resp_1"}),
+            tenant: None,
+        })
+        .expect("the JSON fields serialize");
+        let extras = vec![("region", Some("eu".to_string()))];
+        let (columns, binds) = row.columns_and_binds(&s, &extras);
+        assert_eq!(
+            columns,
+            [
+                "id",
+                "previous_response_id",
+                "input",
+                "created_at",
+                "safety_identifier",
+                "conversation_id",
+                "raw_response",
+                "tenant",
+                "region",
+            ]
+        );
+        assert_eq!(binds.len(), columns.len());
+    }
+
+    #[test]
+    fn output_item_lookup_binds_the_id_into_the_json_path_and_takes_one_row() {
+        let schema = SchemaConfig::default();
+        let sql = find_by_output_item_sql(&schema, &build_response_select_base(&schema))
+            .expect("raw_response is stored by default");
+        assert!(
+            sql.contains(
+                "JSON_EXISTS(raw_response, '$.output[*]?(@.id == $iid)' PASSING :1 AS \"iid\")"
+            ),
+            "{sql}"
+        );
+        assert!(
+            sql.ends_with(" ORDER BY created_at DESC) WHERE ROWNUM <= 1"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn output_item_lookup_needs_the_raw_response_column() {
+        let mut schema = SchemaConfig::default();
+        schema
+            .responses
+            .skip_columns
+            .insert("raw_response".to_string());
+        assert!(find_by_output_item_sql(&schema, "SELECT 1 FROM dual").is_none());
+    }
+
+    #[test]
+    fn link_sql_merges_on_the_conversation_and_item_key() {
+        let (sql, binds) = link_sql(
+            "links",
+            &["conversation_id", "item_id", "added_at", "tenant"],
+        );
+        assert_eq!(
+            sql,
+            "MERGE INTO links t USING (SELECT :v1 AS conversation_id, :v2 AS item_id, \
+             :v3 AS added_at FROM dual) s \
+             ON (t.conversation_id = s.conversation_id AND t.item_id = s.item_id) \
+             WHEN MATCHED THEN UPDATE SET t.added_at = s.added_at, t.tenant = :v4 \
+             WHEN NOT MATCHED THEN INSERT (conversation_id, item_id, added_at, tenant) \
+             VALUES (s.conversation_id, s.item_id, s.added_at, :v4)"
+        );
+        assert_eq!(binds, ["v1", "v2", "v3", "v4"]);
+        // An extra column may be a CLOB: its value is never bound inside the
+        // source (ORA-01461 above 4,000 bytes there), as in `store_response_sql`.
+        let source = &sql[sql.find("USING (").unwrap()..sql.find(") s ON").unwrap()];
+        assert!(!source.contains(":v4"), "{source}");
+        // The key alone leaves nothing to move.
+        let (sql, _) = link_sql("l", &["conversation_id", "item_id"]);
+        assert!(!sql.contains("WHEN MATCHED"), "{sql}");
+        assert!(
+            sql.ends_with("VALUES (s.conversation_id, s.item_id)"),
+            "{sql}"
+        );
+    }
+
+    #[test]
+    fn link_items_sql_merges_the_batch_in_one_statement() {
+        let sql = link_items_sql(
+            "links",
+            &["conversation_id", "item_id", "added_at", "tenant"],
+            2,
+        );
+        assert_eq!(
+            sql,
+            "MERGE INTO links t USING (\
+             SELECT :cid AS conversation_id, :iid0 AS item_id, :ts0 AS added_at FROM dual \
+             UNION ALL \
+             SELECT :cid AS conversation_id, :iid1 AS item_id, :ts1 AS added_at FROM dual) s \
+             ON (t.conversation_id = s.conversation_id AND t.item_id = s.item_id) \
+             WHEN MATCHED THEN UPDATE SET t.added_at = s.added_at, t.tenant = :ex0 \
+             WHEN NOT MATCHED THEN INSERT (conversation_id, item_id, added_at, tenant) \
+             VALUES (s.conversation_id, s.item_id, s.added_at, :ex0)"
+        );
+        let source = &sql[sql.find("USING (").unwrap()..sql.find(") s ON").unwrap()];
+        assert!(!source.contains(":ex0"), "{source}");
+    }
+
+    #[test]
+    fn a_batch_keeps_the_last_stamp_of_a_repeated_item() {
+        let t = |secs: i64| DateTime::<Utc>::from_timestamp(secs, 0).unwrap();
+        let rows = last_stamp_per_item(vec![
+            ("a".to_string(), t(1)),
+            ("b".to_string(), t(2)),
+            ("a".to_string(), t(3)),
+            ("c".to_string(), t(4)),
+            ("b".to_string(), t(5)),
+        ]);
+        assert_eq!(
+            rows,
+            vec![
+                ("a".to_string(), t(3)),
+                ("b".to_string(), t(5)),
+                ("c".to_string(), t(4)),
+            ]
+        );
+    }
+
+    #[test]
+    fn update_if_open_sql_updates_the_row_under_its_id_only_while_its_status_is_open() {
+        let open = oracle_open_predicate("raw_response");
+        let (sql, binds) =
+            update_if_open_sql("responses", &["id", "input", "raw_response"], Some(&open));
+        assert_eq!(binds, ["v1", "v2", "v3"]);
+        assert_eq!(
+            sql,
+            "UPDATE responses SET input = :v2, raw_response = :v3 WHERE id = :v1 AND \
+             COALESCE(JSON_VALUE(raw_response, '$.status'), ' ') NOT IN ('completed', \
+             'incomplete', 'failed', 'cancelled')"
+        );
+        let (plain, _) = update_if_open_sql("r", &["response_key", "input"], None);
+        assert_eq!(plain, "UPDATE r SET input = :v2 WHERE response_key = :v1");
+    }
+
+    #[test]
+    fn store_response_sql_merges_on_the_id_and_binds_the_values_outside_the_source() {
+        let (sql, binds) = store_response_sql("responses", &["id", "input", "raw_response"]);
+        assert_eq!(
+            sql,
+            "MERGE INTO responses t USING (SELECT :v1 AS id FROM dual) s ON (t.id = s.id) \
+             WHEN MATCHED THEN UPDATE SET t.input = :v2, t.raw_response = :v3 \
+             WHEN NOT MATCHED THEN INSERT (id, input, raw_response) VALUES (:v1, :v2, :v3)"
+        );
+        assert_eq!(
+            binds,
+            ["v1", "v2", "v3"],
+            "one bind per column, in the columns' order"
+        );
+        // The CLOB-sized values never sit in the USING source (ORA-01461 above
+        // 4,000 bytes there); they are bound where an INSERT binds them.
+        let source = &sql[sql.find("USING (").unwrap()..sql.find(") s ON").unwrap()];
+        assert!(
+            !source.contains(":v2") && !source.contains(":v3"),
+            "{source}"
+        );
+        let (sql, binds) = store_response_sql("r", &["id"]);
+        assert_eq!(
+            sql,
+            "MERGE INTO r t USING (SELECT :v1 AS id FROM dual) s ON (t.id = s.id) \
+             WHEN NOT MATCHED THEN INSERT (id) VALUES (:v1)"
+        );
+        assert_eq!(binds, ["v1"]);
+    }
+
+    #[test]
+    fn a_schema_without_the_object_column_has_no_open_condition() {
+        let mut s = crate::schema::TableConfig::with_table("responses");
+        s.columns
+            .insert("raw_response".to_string(), "payload".to_string());
+        assert_eq!(
+            oracle_open_predicate_for(&s).as_deref(),
+            Some(oracle_open_predicate("payload").as_str()),
+            "the mapped column is checked"
+        );
+        s.skip_columns.insert("raw_response".to_string());
+        assert_eq!(
+            oracle_open_predicate_for(&s),
+            None,
+            "no object column: the conditional store is a plain update"
+        );
+    }
 }

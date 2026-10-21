@@ -55,6 +55,7 @@ fn factory_registers_and_maps_v41_model_names_before_v4() {
     assert!(factory.registry().has_parser("deepseek_v41"));
     for model in [
         "deepseek-ai/DeepSeek-V4.1-Flash",
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017",
         "deepseek-v4.1-flash",
         "deepseek_v41",
         "DeepSeek-V41",

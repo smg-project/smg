@@ -51,6 +51,23 @@ impl EngineProtocol for TokenSpeedProtocol {
         TokenSpeedRequestType::Abort.to_frame()
     }
 
+    fn prompt_tokens(request: &Self::Request) -> u64 {
+        request.input_ids.len() as u64
+    }
+
+    fn reported_every_step(request: &Self::Request) -> bool {
+        // A request that does not stream is reported at its end (and at the
+        // scheduler's forced interval), a streaming one every
+        // `stream_interval` tokens (its own, else the server's, 1 unless
+        // raised); only a streaming request at an interval of one is
+        // reported every step.
+        request.stream
+            && request
+                .sampling_params
+                .stream_interval
+                .is_none_or(|interval| interval <= 1)
+    }
+
     fn request_id(request: &Self::Request) -> &str {
         &request.rid
     }
@@ -147,6 +164,44 @@ mod tests {
             kv_active_pages: 100,
             kv_total_pages: 400,
         }
+    }
+
+    /// Which requests the engine reports every step, for the silence count:
+    /// a streaming request at an interval of one (the request's own, or the
+    /// server's default when unset); one that does not stream, or streams
+    /// every so many tokens, is reported at intervals. Every prompt counts
+    /// as pending prefill.
+    #[test]
+    fn a_streaming_request_at_interval_one_is_reported_every_step() {
+        use crate::protocol::tokenspeed::sampling::SamplingParams;
+        let request = |stream: bool, stream_interval: Option<u32>| TokenizedGenerateReqInput {
+            input_ids: vec![1, 2, 3],
+            stream,
+            sampling_params: SamplingParams {
+                stream_interval,
+                ..SamplingParams::default()
+            },
+            ..TokenizedGenerateReqInput::default()
+        };
+        assert!(TokenSpeedProtocol::reported_every_step(&request(
+            true, None
+        )));
+        assert!(TokenSpeedProtocol::reported_every_step(&request(
+            true,
+            Some(1)
+        )));
+        assert!(!TokenSpeedProtocol::reported_every_step(&request(
+            true,
+            Some(8)
+        )));
+        assert!(!TokenSpeedProtocol::reported_every_step(&request(
+            false, None
+        )));
+        assert!(!TokenSpeedProtocol::reported_every_step(&request(
+            false,
+            Some(1)
+        )));
+        assert_eq!(TokenSpeedProtocol::prompt_tokens(&request(false, None)), 3);
     }
 
     #[test]

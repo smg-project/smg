@@ -1,7 +1,8 @@
-//! The exact SSE bytes of chat streams, pinned per scenario.
+//! The exact SSE bytes of chat and completion streams, pinned per scenario.
 //!
-//! Each scenario drives `process_streaming_chunks` over scripted engine frames
-//! and compares the concatenated SSE events, byte for byte, with
+//! Each scenario drives `process_streaming_chunks` (chat) or
+//! `process_completion_streaming_chunks` (completions) over scripted engine
+//! frames and compares the concatenated SSE events, byte for byte, with
 //! `fixtures/<scenario>.sse`. The fixtures hold the bytes the plain
 //! serialization of whole chunk structs produced, so any change to the wire
 //! format of a streamed chunk, intended or not, fails here. Set
@@ -9,7 +10,9 @@
 
 use std::{fs, path::PathBuf};
 
-use openai_protocol::{chat::ChatCompletionRequest, common::StringOrArray};
+use openai_protocol::{
+    chat::ChatCompletionRequest, common::StringOrArray, completion::CompletionRequest,
+};
 use smg_grpc_client::vllm_engine::proto;
 
 use super::{
@@ -215,41 +218,145 @@ async fn stream_bytes(scenario: &Scenario) -> Vec<u8> {
     bytes
 }
 
-#[tokio::test]
-async fn chat_stream_bytes_match_the_recorded_fixtures() {
+/// Compare (or, under `SMG_RECORD_SSE_FIXTURES`, record) the bytes of one
+/// scenario against `fixtures/<name>.sse`.
+fn assert_recorded_bytes(name: &str, must_contain: &str, actual: &[u8]) {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("src/routers/grpc/regular/streaming/fixtures");
     let record = std::env::var_os("SMG_RECORD_SSE_FIXTURES").is_some();
+    let text = String::from_utf8_lossy(actual);
+    assert!(
+        text.contains(must_contain),
+        "{name}: {must_contain:?} missing from the stream:\n{text}"
+    );
+    let path = dir.join(format!("{name}.sse"));
+    if record {
+        fs::write(&path, actual).expect("write the fixture");
+        return;
+    }
+    let expected = fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert!(
+        actual == expected,
+        "{name}: the SSE bytes differ from {}\n--- recorded\n{}\n--- now\n{text}",
+        path.display(),
+        String::from_utf8_lossy(&expected)
+    );
+}
+
+#[tokio::test]
+async fn chat_stream_bytes_match_the_recorded_fixtures() {
     for scenario in scenarios() {
         let actual = stream_bytes(&scenario).await;
-        let text = String::from_utf8_lossy(&actual);
-        assert!(
-            text.contains(scenario.must_contain),
-            "{}: {:?} missing from the stream:\n{text}",
-            scenario.name,
-            scenario.must_contain
-        );
-        let path = dir.join(format!("{}.sse", scenario.name));
-        if record {
-            fs::write(&path, &actual).expect("write the fixture");
-            continue;
-        }
-        let expected = fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        assert!(
-            actual == expected,
-            "{}: the SSE bytes differ from {}\n--- recorded\n{}\n--- now\n{text}",
-            scenario.name,
-            path.display(),
-            String::from_utf8_lossy(&expected)
-        );
+        assert_recorded_bytes(scenario.name, scenario.must_contain, &actual);
     }
 }
 
-/// Chunks the engine has already delivered leave as one frame: the buffered
-/// stream here has every response ready at once, so the role and content
-/// chunks share a frame and only the finish chunk follows separately.
+struct CompletionScenario {
+    name: &'static str,
+    request: Value,
+    weight_version: Option<&'static str>,
+    stop: Option<&'static str>,
+    /// The prompt's text, echoed into the first chunk when the request asks.
+    prompt_text: &'static str,
+    frames: Vec<proto::GenerateResponse>,
+    must_contain: &'static str,
+}
+
+fn completion_scenarios() -> Vec<CompletionScenario> {
+    let request = |extra: Value| {
+        let mut request = json!({"model": "fixture-model", "prompt": "test", "stream": true});
+        if let (Some(base), Some(extra)) = (request.as_object_mut(), extra.as_object()) {
+            base.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
+        request
+    };
+    vec![
+        CompletionScenario {
+            name: "completion_text",
+            request: request(json!({})),
+            weight_version: None,
+            stop: None,
+            prompt_text: "",
+            frames: vec![chunk(0, "Hello"), chunk(0, ", world"), complete(0, "stop")],
+            must_contain: r#""text":", world""#,
+        },
+        CompletionScenario {
+            name: "completion_fingerprint_and_stop_sequence",
+            request: request(json!({})),
+            weight_version: Some("v7"),
+            stop: Some("END"),
+            prompt_text: "",
+            frames: vec![chunk(0, "keep this ENDnot this"), complete(0, "length")],
+            must_contain: r#""system_fingerprint":"v7""#,
+        },
+        CompletionScenario {
+            name: "completion_echo_and_suffix",
+            request: request(json!({"prompt": "prompt: ", "echo": true, "suffix": "tail"})),
+            weight_version: None,
+            stop: None,
+            prompt_text: "prompt: ",
+            frames: vec![chunk(0, "a"), complete(0, "stop")],
+            must_contain: r#""text":"tail""#,
+        },
+    ]
+}
+
+async fn completion_stream_bytes(scenario: &CompletionScenario) -> Vec<u8> {
+    let (stream, server) = scripted_stream(scenario.frames.clone(), "0").await;
+    let (tx, mut rx) = sse_channel();
+    let request: CompletionRequest =
+        serde_json::from_value(scenario.request.clone()).expect("completion request");
+    let spec = CompletionResponseSpec::from(&request);
+    let dispatch = context::DispatchMetadata {
+        request_id: "cmpl-fixture".to_string(),
+        model: request.model.clone(),
+        created: 1_700_000_000,
+        weight_version: scenario.weight_version.map(str::to_string),
+    };
+    let stop = scenario
+        .stop
+        .map(|sequence| StringOrArray::String(sequence.to_string()));
+    let result = processor(false)
+        .process_completion_streaming_chunks(
+            stream,
+            dispatch,
+            Arc::new(CharacterTokenizer::default()),
+            (stop, None, false, false, false),
+            &spec,
+            scenario.prompt_text,
+            0,
+            &tx,
+        )
+        .await;
+    drop(tx);
+    let mut bytes = Vec::new();
+    while let Some(frame) = rx.recv().await {
+        bytes.extend_from_slice(&frame.expect("successful SSE write"));
+    }
+    server.abort();
+    assert!(
+        result.is_ok(),
+        "{}: the completion stream failed",
+        scenario.name
+    );
+    bytes
+}
+
 #[tokio::test]
-async fn ready_chunks_share_one_frame() {
+async fn completion_stream_bytes_match_the_recorded_fixtures() {
+    for scenario in completion_scenarios() {
+        let actual = completion_stream_bytes(&scenario).await;
+        assert_recorded_bytes(scenario.name, scenario.must_contain, &actual);
+    }
+}
+
+/// Every engine message leaves as its own frame as soon as it is processed,
+/// even when the engine delivered them all at once: here the role chunk
+/// shares the first content chunk's frame (both are written before the
+/// stream is polled again), the two other content chunks and the finish
+/// chunk follow one frame each.
+#[tokio::test]
+async fn each_engine_message_leaves_as_its_own_frame() {
     let scenario = Scenario {
         name: "ready_chunks",
         with_tools: false,
@@ -296,8 +403,8 @@ async fn ready_chunks_share_one_frame() {
     server.abort();
     assert!(result.is_ok(), "{result:?}");
     assert_eq!(events, 5, "role, three content chunks and the finish chunk");
-    assert!(
-        frames <= 2,
-        "{events} ready events arrived in {frames} frames instead of one plus the finish chunk"
+    assert_eq!(
+        frames, 4,
+        "{events} events in {frames} frames: the role with the first content chunk, then one frame per message"
     );
 }

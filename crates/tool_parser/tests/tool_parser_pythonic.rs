@@ -515,3 +515,24 @@ async fn test_detect_and_parse_with_python_start_and_end_token() {
     assert_eq!(args["location"], "Mars");
     assert_eq!(args["unit"], "celsius");
 }
+
+/// Streamed indices count the accepted calls: an unknown tool before a valid
+/// one does not shift it, and a later batch continues the count.
+#[tokio::test]
+async fn test_pythonic_streaming_indices_count_accepted_calls() {
+    let mut parser = PythonicParser::new();
+    let tools = create_test_tools();
+    let first = parser
+        .parse_incremental("[unknown_tool(x=1), get_weather(city='Paris')]", &tools)
+        .await
+        .unwrap();
+    assert_eq!(first.calls.len(), 1);
+    assert_eq!(first.calls[0].tool_index, 0);
+    assert_eq!(first.calls[0].name.as_deref(), Some("get_weather"));
+    let second = parser
+        .parse_incremental("[search(query='x')]", &tools)
+        .await
+        .unwrap();
+    assert_eq!(second.calls.len(), 1);
+    assert_eq!(second.calls[0].tool_index, 1);
+}

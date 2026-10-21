@@ -4,6 +4,8 @@
 // with the class-name tag string as element 0. **Field order is the wire
 // contract** — do not reorder.
 
+use std::collections::BTreeMap;
+
 use bytes::Bytes;
 use serde::{
     de::{IgnoredAny, SeqAccess, Visitor},
@@ -20,6 +22,62 @@ use crate::protocol::{
 pub const TOKENIZED_GENERATE_REQ_INPUT_TAG: &str = "TokenizedGenerateReqInput";
 /// The msgspec tag for [`TokenizedEmbeddingReqInput`] (element 0 on the wire).
 pub const TOKENIZED_EMBEDDING_REQ_INPUT_TAG: &str = "TokenizedEmbeddingReqInput";
+
+/// The scheduler's field order of [`TokenizedGenerateReqInput`] this encoder
+/// relies on, through `require_reasoning` (the tag, element 0, is not a
+/// field): the slots the extended form fills, which the handshake check
+/// compares with the order the engine declares.
+pub const GENERATE_WIRE_FIELDS: [&str; 33] = [
+    "rid",
+    "http_worker_ipc",
+    "input_text",
+    "input_ids",
+    "input_embeds",
+    "mm_inputs",
+    "token_type_ids",
+    "sampling_params",
+    "return_logprob",
+    "logprob_start_len",
+    "top_logprobs_num",
+    "token_ids_logprob",
+    "stream",
+    "return_sampling_mask",
+    "return_flat_raw_top_logprobs",
+    "return_hidden_states",
+    "return_routed_experts",
+    "routed_experts_start_len",
+    "return_indexer_topk",
+    "session_id",
+    "session_params",
+    "lora_id",
+    "custom_logit_processor",
+    "positional_embed_overrides",
+    "bootstrap_host",
+    "bootstrap_port",
+    "bootstrap_room",
+    "bootstrap_pair_key",
+    "decode_tp_size",
+    "routed_dp_rank",
+    "disagg_prefill_dp_rank",
+    "routing_key",
+    "require_reasoning",
+];
+
+/// The same for [`TokenizedEmbeddingReqInput`], through `dimensions`.
+pub const EMBEDDING_WIRE_FIELDS: [&str; 12] = [
+    "rid",
+    "http_worker_ipc",
+    "input_text",
+    "input_ids",
+    "mm_inputs",
+    "token_type_ids",
+    "sampling_params",
+    "lora_id",
+    "positional_embed_overrides",
+    "routed_dp_rank",
+    "priority",
+    "dimensions",
+];
 
 /// Request types: a single raw byte sent as its own ZMQ frame ahead of the
 /// msgpack payload, so the plugin dispatches without decoding first.
@@ -95,6 +153,35 @@ pub struct TokenizedGenerateReqInput {
     /// Hybrid-reasoning request: the scheduler tracks the reasoning phase and
     /// accounts its tokens separately.
     pub require_reasoning: bool,
+    /// The caller's W3C trace context (`traceparent`, `tracestate`) for the
+    /// engine's tracer. Not a slot of the scheduler's struct (its own
+    /// `time_stats` slot is a pickled object no frontend outside Python can
+    /// fill): it rides in the request's metadata frame after the positional
+    /// array, see [`RequestMeta`]. Never serialized into the array.
+    pub trace_headers: Option<BTreeMap<String, String>>,
+}
+
+/// What rides beside an ADD's positional request, as one more msgpack frame
+/// (a map, every key optional): the request's metadata the scheduler's own
+/// struct has no slot for. The plugin in the scheduler reads it; a scheduler
+/// without the plugin's reader ignores the extra frame. Absent when empty.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct RequestMeta {
+    /// The caller's W3C trace context (`traceparent`, `tracestate`): the
+    /// plugin starts the request's trace from it, as SGLang's own frontend
+    /// starts it from an HTTP request's headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_headers: Option<BTreeMap<String, String>>,
+}
+
+impl RequestMeta {
+    /// The metadata frame for `request`, or `None` when there is nothing to
+    /// carry.
+    pub fn for_request(request: &TokenizedGenerateReqInput) -> Option<Self> {
+        request.trace_headers.as_ref().map(|headers| Self {
+            trace_headers: Some(headers.clone()),
+        })
+    }
 }
 
 impl TokenizedGenerateReqInput {
@@ -120,6 +207,7 @@ impl Default for TokenizedGenerateReqInput {
             lora_id: None,
             custom_logit_processor: None,
             require_reasoning: false,
+            trace_headers: None,
         }
     }
 }
@@ -130,7 +218,11 @@ impl Serialize for TokenizedGenerateReqInput {
         // The shortest valid prefix: through `stream` unless a later field
         // (`lora_id`, `custom_logit_processor`, `require_reasoning`) has to
         // reach its slot past the defaulted ones.
-        let len = if self.needs_extended_form() { 34 } else { 14 };
+        let len = if self.needs_extended_form() {
+            GENERATE_WIRE_FIELDS.len() + 1
+        } else {
+            14
+        };
         let mut tuple = serializer.serialize_tuple(len)?;
         tuple.serialize_element(TOKENIZED_GENERATE_REQ_INPUT_TAG)?;
         tuple.serialize_element(&self.rid)?;
@@ -242,6 +334,7 @@ impl<'de> Deserialize<'de> for TokenizedGenerateReqInput {
                     lora_id,
                     custom_logit_processor,
                     require_reasoning,
+                    trace_headers: None,
                 })
             }
         }
@@ -288,7 +381,7 @@ impl Default for TokenizedEmbeddingReqInput {
 impl Serialize for TokenizedEmbeddingReqInput {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         const NIL: Option<()> = None;
-        let mut tuple = serializer.serialize_tuple(13)?;
+        let mut tuple = serializer.serialize_tuple(EMBEDDING_WIRE_FIELDS.len() + 1)?;
         tuple.serialize_element(TOKENIZED_EMBEDDING_REQ_INPUT_TAG)?;
         tuple.serialize_element(&self.rid)?;
         tuple.serialize_element(&NIL)?; // http_worker_ipc
@@ -403,12 +496,117 @@ impl Serialize for SglangRequest {
     }
 }
 
+/// The field order of the scheduler's request structs in the releases the
+/// wire was recorded against (`__struct_fields__`, base classes first), for
+/// the tests of this module and of the handshake check.
+#[cfg(test)]
+pub(crate) mod recorded {
+    /// SGLang 0.5.21 and 0.5.22 declare the same generate request.
+    pub(crate) const GENERATE_FIELDS_0_5_21: [&str; 48] = [
+        "rid",
+        "http_worker_ipc",
+        "input_text",
+        "input_ids",
+        "input_embeds",
+        "mm_inputs",
+        "token_type_ids",
+        "sampling_params",
+        "return_logprob",
+        "logprob_start_len",
+        "top_logprobs_num",
+        "token_ids_logprob",
+        "stream",
+        "return_sampling_mask",
+        "return_flat_raw_top_logprobs",
+        "return_hidden_states",
+        "return_routed_experts",
+        "routed_experts_start_len",
+        "return_indexer_topk",
+        "session_id",
+        "session_params",
+        "lora_id",
+        "custom_logit_processor",
+        "positional_embed_overrides",
+        "bootstrap_host",
+        "bootstrap_port",
+        "bootstrap_room",
+        "bootstrap_pair_key",
+        "decode_tp_size",
+        "routed_dp_rank",
+        "disagg_prefill_dp_rank",
+        "routing_key",
+        "require_reasoning",
+        "priority",
+        "extra_key",
+        "no_logs",
+        "return_bytes",
+        "return_entropy",
+        "need_wait_for_mm_inputs",
+        "num_items_assigned",
+        "encoder_urls",
+        "multi_item_delimiter_indices",
+        "token_indices_to_pool",
+        "time_stats",
+        "cache_salt",
+        "kv_hints",
+        "pp_prefetch_ticketed",
+        "sampling_logprobs_mode",
+    ];
+    pub(crate) const GENERATE_FIELDS_0_5_22: [&str; 48] = GENERATE_FIELDS_0_5_21;
+
+    /// SGLang 0.5.21's embedding request.
+    pub(crate) const EMBEDDING_FIELDS_0_5_21: [&str; 16] = [
+        "rid",
+        "http_worker_ipc",
+        "input_text",
+        "input_ids",
+        "mm_inputs",
+        "token_type_ids",
+        "sampling_params",
+        "lora_id",
+        "positional_embed_overrides",
+        "routed_dp_rank",
+        "priority",
+        "dimensions",
+        "return_pooled_hidden_states",
+        "multi_item_delimiter_indices",
+        "token_indices_to_pool",
+        "time_stats",
+    ];
+    /// SGLang 0.5.22 appended `decision_layout` before `time_stats`, past
+    /// the prefix this side fills.
+    pub(crate) const EMBEDDING_FIELDS_0_5_22: [&str; 17] = [
+        "rid",
+        "http_worker_ipc",
+        "input_text",
+        "input_ids",
+        "mm_inputs",
+        "token_type_ids",
+        "sampling_params",
+        "lora_id",
+        "positional_embed_overrides",
+        "routed_dp_rank",
+        "priority",
+        "dimensions",
+        "return_pooled_hidden_states",
+        "multi_item_delimiter_indices",
+        "token_indices_to_pool",
+        "decision_layout",
+        "time_stats",
+    ];
+}
+
 #[cfg(test)]
 mod tests {
     use rmpv::Value;
 
-    use super::*;
-    use crate::codec::{decode_msgpack, encode_msgpack};
+    use super::{recorded::*, *};
+    use crate::{
+        codec::{decode_msgpack, encode_msgpack},
+        protocol::sglang::sampling::{
+            recorded::PYTHON_PINNED_0_5_22, WIRE_FIELDS as SAMPLING_WIRE_FIELDS,
+        },
+    };
 
     /// `msgspec.msgpack.encode` of the positional request the SMG plugin's
     /// tests build: rid `r1`, ids `[1, 2, 3]`, `SamplingParams(max_new_tokens=8,
@@ -447,7 +645,11 @@ mod tests {
         assert!(arr[3].is_nil(), "input_text at 3");
         assert_eq!(arr[4].as_array().unwrap().len(), 3, "input_ids at 4");
         assert!(arr[5].is_nil() && arr[6].is_nil() && arr[7].is_nil());
-        assert_eq!(arr[8].as_array().unwrap().len(), 32, "sampling_params at 8");
+        assert_eq!(
+            arr[8].as_array().unwrap().len(),
+            SAMPLING_WIRE_FIELDS.len(),
+            "sampling_params at 8, their API prefix"
+        );
         assert_eq!(arr[9].as_bool(), Some(false), "return_logprob at 9");
         assert_eq!(arr[10].as_i64(), Some(-1), "logprob_start_len at 10");
         assert_eq!(arr[11].as_u64(), Some(0), "top_logprobs_num at 11");
@@ -497,8 +699,53 @@ mod tests {
         assert_eq!(decoded.sampling_params.max_new_tokens, Some(8));
         assert_eq!(decoded.sampling_params.top_k, 1);
         assert!(decoded.stream && decoded.require_reasoning);
-        // Byte-for-byte: what SMG encodes is what the Python struct encodes.
-        assert_eq!(encode_msgpack(&decoded).unwrap(), hex(PYTHON_REQUEST));
+        // What SMG encodes is the Python struct's array with the sampling
+        // params cut to their API prefix: the same request on either release.
+        let encoded = encode_msgpack(&decoded).unwrap();
+        let again: TokenizedGenerateReqInput = decode_msgpack(&encoded).unwrap();
+        assert_eq!(again, decoded);
+        let python: Vec<Value> = rmp_serde::from_slice(&hex(PYTHON_REQUEST)).unwrap();
+        let ours: Vec<Value> = rmp_serde::from_slice(&encoded).unwrap();
+        assert_eq!(ours.len(), python.len());
+        for (index, (ours, python)) in ours.iter().zip(&python).enumerate() {
+            if index == 8 {
+                let prefix = &python.as_array().unwrap()[..SAMPLING_WIRE_FIELDS.len()];
+                assert_eq!(ours.as_array().unwrap(), prefix, "sampling_params at 8");
+            } else {
+                assert_eq!(ours, python, "element {index}");
+            }
+        }
+    }
+
+    /// The newer release's sampling array (one field longer) nested in the
+    /// same request decodes to the same request.
+    #[test]
+    fn a_request_with_the_newer_releases_sampling_array_decodes_the_same() {
+        let mut arr: Vec<Value> = rmp_serde::from_slice(&hex(PYTHON_REQUEST)).unwrap();
+        arr[8] = rmp_serde::from_slice(&hex(PYTHON_PINNED_0_5_22)).unwrap();
+        let bytes = rmp_serde::to_vec(&Value::Array(arr)).unwrap();
+        let newer: TokenizedGenerateReqInput = decode_msgpack(&bytes).unwrap();
+        let pinned: TokenizedGenerateReqInput = decode_msgpack(&hex(PYTHON_REQUEST)).unwrap();
+        assert_eq!(newer, pinned);
+    }
+
+    /// The wire field lists name the slots the encoders fill, and head the
+    /// field order of both recorded releases.
+    #[test]
+    fn the_wire_field_lists_name_the_slots_the_encoders_fill() {
+        assert_eq!(GENERATE_WIRE_FIELDS[7], "sampling_params");
+        assert_eq!(GENERATE_WIRE_FIELDS[12], "stream");
+        assert_eq!(GENERATE_WIRE_FIELDS[21], "lora_id");
+        assert_eq!(GENERATE_WIRE_FIELDS[22], "custom_logit_processor");
+        assert_eq!(GENERATE_WIRE_FIELDS[32], "require_reasoning");
+        assert_eq!(EMBEDDING_WIRE_FIELDS[6], "sampling_params");
+        assert_eq!(EMBEDDING_WIRE_FIELDS[11], "dimensions");
+        for release in [&GENERATE_FIELDS_0_5_21[..], &GENERATE_FIELDS_0_5_22[..]] {
+            assert!(release.starts_with(&GENERATE_WIRE_FIELDS));
+        }
+        for release in [&EMBEDDING_FIELDS_0_5_21[..], &EMBEDDING_FIELDS_0_5_22[..]] {
+            assert!(release.starts_with(&EMBEDDING_WIRE_FIELDS));
+        }
     }
 
     #[test]
@@ -527,8 +774,11 @@ mod tests {
         assert_eq!(array[1].as_str(), Some("e1"));
         assert_eq!(array[4], Value::Array(vec![1.into(), 2.into(), 3.into()]));
         assert_eq!(array[6], Value::Nil, "no token type ids");
-        // sampling_params is the 32-field array with max_new_tokens 0.
-        assert_eq!(array[7].as_array().map(Vec::len), Some(32));
+        // sampling_params is the API prefix with max_new_tokens 0.
+        assert_eq!(
+            array[7].as_array().map(Vec::len),
+            Some(SAMPLING_WIRE_FIELDS.len())
+        );
         assert_eq!(array[7].as_array().unwrap()[0], Value::from(0));
         assert_eq!(array[12], Value::Nil, "dimensions unset");
         let back: TokenizedEmbeddingReqInput = decode_msgpack(&encoded).unwrap();
@@ -587,6 +837,43 @@ mod tests {
         let back: TokenizedGenerateReqInput =
             decode_msgpack(&encode_msgpack(&request).unwrap()).unwrap();
         assert_eq!(back, request);
+    }
+
+    #[test]
+    fn trace_headers_ride_as_the_metadata_frame_not_the_positional_array() {
+        use crate::protocol::{sglang::SglangProtocol, EngineProtocol};
+
+        let headers = BTreeMap::from([
+            ("traceparent".to_string(), "00-aa-bb-01".to_string()),
+            ("tracestate".to_string(), "vendor=a".to_string()),
+        ]);
+        let plain = TokenizedGenerateReqInput {
+            rid: "t1".to_string(),
+            input_ids: vec![1, 2],
+            ..TokenizedGenerateReqInput::default()
+        };
+        let traced = TokenizedGenerateReqInput {
+            trace_headers: Some(headers.clone()),
+            ..plain.clone()
+        };
+        let (plain_payload, plain_aux) =
+            SglangProtocol::encode_add(&SglangRequest::Generate(plain)).unwrap();
+        let (payload, aux) = SglangProtocol::encode_add(&SglangRequest::Generate(traced)).unwrap();
+        // The scheduler's own array is byte-identical: the context never enters it.
+        assert_eq!(payload, plain_payload);
+        assert!(plain_aux.is_empty());
+        assert_eq!(aux.len(), 1, "one metadata frame");
+        let meta_frame = &aux[0];
+        let meta: RequestMeta = decode_msgpack(meta_frame.as_ref()).unwrap();
+        assert_eq!(meta.trace_headers, Some(headers));
+        // On the wire the frame is a map keyed by name, as the plugin reads it.
+        let raw: BTreeMap<String, BTreeMap<String, String>> =
+            decode_msgpack(meta_frame.as_ref()).unwrap();
+        assert_eq!(raw["trace_headers"]["traceparent"], "00-aa-bb-01");
+        // A decoded request never carries one: the array has no slot for it.
+        let decoded: TokenizedGenerateReqInput = decode_msgpack(&payload).unwrap();
+        assert_eq!(decoded.trace_headers, None);
+        assert!(RequestMeta::for_request(&decoded).is_none());
     }
 
     #[test]

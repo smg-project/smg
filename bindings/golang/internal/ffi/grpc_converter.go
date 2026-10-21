@@ -31,6 +31,7 @@ GrpcResponseConverterHandle* sgl_grpc_response_converter_create(
     const char* stop_token_ids,
     int skip_special_tokens,
     int initial_prompt_tokens,
+    const char* weight_version,
     char** error_out
 );
 
@@ -47,8 +48,20 @@ import "C"
 
 import (
 	"fmt"
+	"sync/atomic"
 	"unsafe"
 )
+
+// liveGrpcResponseConverters counts the converter handles created and not yet
+// freed. A stream path that forgets its free shows as a count that only grows;
+// the tests check it returns to where it started.
+var liveGrpcResponseConverters atomic.Int64
+
+// LiveGrpcResponseConverters reports how many converter handles are live:
+// created by this process and not yet freed.
+func LiveGrpcResponseConverters() int64 {
+	return liveGrpcResponseConverters.Load()
+}
 
 // CreateGrpcResponseConverter creates a gRPC response converter handle
 // This function creates a new tokenizer handle each time (for backward compatibility)
@@ -63,6 +76,7 @@ func CreateGrpcResponseConverter(
 	stopTokenIDs []uint32,
 	skipSpecialTokens bool,
 	initialPromptTokens int32,
+	weightVersion string,
 ) (*GrpcResponseConverterHandle, error) {
 	// Create tokenizer handle
 	tokenizerHandle, err := createTokenizerHandle(tokenizerPath)
@@ -81,6 +95,7 @@ func CreateGrpcResponseConverter(
 		stopTokenIDs,
 		skipSpecialTokens,
 		initialPromptTokens,
+		weightVersion,
 	)
 }
 
@@ -96,6 +111,7 @@ func CreateGrpcResponseConverterWithTokenizer(
 	stopTokenIDs []uint32,
 	skipSpecialTokens bool,
 	initialPromptTokens int32,
+	weightVersion string,
 ) (*GrpcResponseConverterHandle, error) {
 	if tokenizerHandle == nil || tokenizerHandle.handle == nil {
 		return nil, fmt.Errorf("invalid tokenizer handle")
@@ -111,6 +127,7 @@ func CreateGrpcResponseConverterWithTokenizer(
 		stopTokenIDs,
 		skipSpecialTokens,
 		initialPromptTokens,
+		weightVersion,
 	)
 }
 
@@ -125,6 +142,7 @@ func createGrpcResponseConverterWithTokenizerHandle(
 	stopTokenIDs []uint32,
 	skipSpecialTokens bool,
 	initialPromptTokens int32,
+	weightVersion string,
 ) (*GrpcResponseConverterHandle, error) {
 
 	// Convert strings to C strings
@@ -176,6 +194,14 @@ func createGrpcResponseConverterWithTokenizerHandle(
 
 	initialPromptTokensC := C.int(initialPromptTokens)
 
+	// The engine's weight version, the chunks' system_fingerprint; nil for
+	// the gateway's default.
+	var weightVersionC *C.char
+	if weightVersion != "" {
+		weightVersionC = C.CString(weightVersion)
+		defer C.free(unsafe.Pointer(weightVersionC))
+	}
+
 	converterHandle := C.sgl_grpc_response_converter_create(
 		tokenizerHandle,
 		modelC,
@@ -186,6 +212,7 @@ func createGrpcResponseConverterWithTokenizerHandle(
 		stopTokenIDsJSONC,
 		skipSpecialTokensC,
 		initialPromptTokensC,
+		weightVersionC,
 		&errorOut,
 	)
 
@@ -201,16 +228,19 @@ func createGrpcResponseConverterWithTokenizerHandle(
 		return nil, fmt.Errorf("%s", errorMsg)
 	}
 
+	liveGrpcResponseConverters.Add(1)
 	return &GrpcResponseConverterHandle{
 		handle: converterHandle,
 	}, nil
 }
 
-// FreeGrpcResponseConverter frees a gRPC response converter handle
+// FreeGrpcResponseConverter frees a gRPC response converter handle. A handle
+// that was freed already is left alone.
 func FreeGrpcResponseConverter(handle *GrpcResponseConverterHandle) {
 	if handle != nil && handle.handle != nil {
 		C.sgl_grpc_response_converter_free(handle.handle)
 		handle.handle = nil
+		liveGrpcResponseConverters.Add(-1)
 	}
 }
 

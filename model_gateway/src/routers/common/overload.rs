@@ -8,7 +8,7 @@
 //!
 //! The verdict is taken from the candidate pool the caller selected over, never
 //! from the model index: selection narrows by worker type and transport first,
-//! and a whole-model predicate would miss a saturated PD leg, a mixed-transport
+//! and a whole-model predicate would miss a saturated PD side, a mixed-transport
 //! model, or the model-less wildcard.
 
 use std::sync::{
@@ -98,6 +98,14 @@ pub fn all_vetoed(candidates: &[Arc<dyn Worker>]) -> bool {
             .all(|w| w.is_overloaded() || w.stall_reason().is_some())
 }
 
+/// Whether `worker` is kept out of selection by the overload thresholds
+/// alone: over them, and otherwise routable (ready, circuit closed, not
+/// vetoed by the liveness tracker).
+pub fn vetoed_by_overload_alone(worker: &dyn Worker) -> bool {
+    let state = worker.routing_state();
+    state.overloaded && state.eligible_ignoring_overload()
+}
+
 /// The steering answer to a pool whose every worker is vetoed: the
 /// least-loaded worker that is routable but for its veto (ready, circuit
 /// closed). A fleet that is uniformly over the thresholds, or whose last
@@ -183,7 +191,7 @@ pub fn shed_if_worker_overloaded(
     ))
 }
 
-/// Shed a disaggregated dispatch the decode leg cannot admit: the `rooms`
+/// Shed a disaggregated dispatch the decode side cannot admit: the `rooms`
 /// bootstrap rooms it needs do not fit in the engine's running `window`, and
 /// none freed inside the admission wait.
 ///

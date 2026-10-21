@@ -17,6 +17,7 @@
 mod deepseek;
 mod kimi;
 mod minimax;
+mod openai;
 mod zai;
 
 use std::{
@@ -25,14 +26,17 @@ use std::{
 };
 
 use crate::{
-    chat::{ChatCompletionRequest, ChatMessage},
-    common::Tool,
+    chat::{thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessage},
+    common::{invalid, Tool},
     ext::retain_if,
 };
 
-/// A model's resolved contract, independent of its public serving name.
+/// A model's resolved contract: the provider family of [`ProviderProfile`]
+/// refined to the version whose rules differ (Kimi K3, GLM-5.3, DeepSeek
+/// V4.1), independent of the name the request carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelProfile {
+    Generic,
     OpenAi,
     Kimi,
     KimiK3,
@@ -45,17 +49,19 @@ pub enum ModelProfile {
 }
 
 impl ModelProfile {
-    /// Infer from the model name, falling back to its configured alias contract.
+    /// The contract for a model id: the one recorded for a registered alias
+    /// or served model id ([`ProviderProfile::register_model_aliases`]), else
+    /// the one its name selects ([`Self::for_model_name`]).
     pub fn for_model(model: &str) -> Self {
-        let profile = Self::for_model_name(model);
-        if profile != Self::OpenAi {
-            return profile;
-        }
-        let aliased = alias_profiles().read().unwrap_or_else(|e| e.into_inner());
-        aliased.get(model).copied().unwrap_or(Self::OpenAi)
+        let registered = alias_profiles()
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(model)
+            .copied();
+        registered.unwrap_or_else(|| Self::for_model_name(model))
     }
 
-    /// Infer from the name itself, before applying configured alias fallbacks.
+    /// The contract the name itself selects, before any registered alias.
     pub fn for_model_name(model: &str) -> Self {
         Self::from_provider(ProviderProfile::from_model_segments(model), model)
     }
@@ -63,6 +69,7 @@ impl ModelProfile {
     /// Refine a provider family into the version-specific contract it names.
     fn from_provider(provider: ProviderProfile, model: &str) -> Self {
         match provider {
+            ProviderProfile::Generic => Self::Generic,
             ProviderProfile::OpenAi => Self::OpenAi,
             ProviderProfile::Kimi if kimi::is_k3(model) => Self::KimiK3,
             ProviderProfile::Kimi => Self::Kimi,
@@ -80,12 +87,19 @@ impl ModelProfile {
     /// The provider family whose message extensions this contract accepts.
     pub fn provider(self) -> ProviderProfile {
         match self {
+            Self::Generic => ProviderProfile::Generic,
             Self::OpenAi => ProviderProfile::OpenAi,
             Self::Kimi | Self::KimiK3 => ProviderProfile::Kimi,
             Self::Minimax => ProviderProfile::Minimax,
             Self::Zai | Self::ZaiWithSamplingDefaults | Self::ZaiGlm53 => ProviderProfile::Zai,
             Self::DeepSeekV4 | Self::DeepSeekV41 => ProviderProfile::DeepSeek,
         }
+    }
+
+    /// Whether this is a vendor's contract, one an alias may bind to a served
+    /// model ([`ProviderProfile::is_vendor_contract`]).
+    pub fn is_vendor_contract(self) -> bool {
+        self.provider().is_vendor_contract()
     }
 }
 
@@ -102,7 +116,15 @@ fn alias_profiles() -> &'static RwLock<HashMap<String, ModelProfile>> {
 /// Provider dialect for a request, selected from the model id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderProfile {
-    /// OpenAI baseline: no extra rules beyond core validation.
+    /// The default: a model whose id selects no vendor contract, which is
+    /// every self-hosted deployment. Only the structural rules of core
+    /// validation apply; strict schemas, `json_object` prompts and tool-message
+    /// pairing go through to the engine, whose grammar compiler validates
+    /// what it needs.
+    Generic,
+    /// OpenAI's own hosted models ([`is_openai_vendor_model`]): the public
+    /// API's structured-output and tool-message rules on top of core
+    /// validation.
     OpenAi,
     /// Kimi/Moonshot contract (Kimi-Vendor-Verifier).
     Kimi,
@@ -128,7 +150,8 @@ impl ProviderProfile {
             ProviderProfile::DeepSeek
             | ProviderProfile::Minimax
             | ProviderProfile::Zai
-            | ProviderProfile::OpenAi => Box::new(std::iter::empty()),
+            | ProviderProfile::OpenAi
+            | ProviderProfile::Generic => Box::new(std::iter::empty()),
         }
     }
 
@@ -142,40 +165,77 @@ impl ProviderProfile {
         matches!(self, ProviderProfile::Minimax)
     }
 
-    /// Select the profile from a model id.
+    /// Select the profile for a model id.
     ///
-    /// Matches the way the tool and reasoning parser factories do: any
+    /// A registered alias or served model id takes the profile recorded for
+    /// it at startup ([`Self::register_model_aliases`]): an alias resolves to
+    /// its served model's profile, so the profile is the same before and
+    /// after the alias is resolved into the served name. Otherwise the name
+    /// decides, the way the tool and reasoning parser factories match: any
     /// `/`-separated segment that starts with a vendor marker selects the
     /// profile, so `kimi-k3`, `/models/Kimi-K3`, `moonshotai/kimi-k2` and
-    /// `openrouter/moonshotai/kimi-k2` all resolve to Kimi. A served model id
-    /// that names no vendor takes the profile of a vendor-named alias it was
-    /// registered with (see [`Self::register_model_aliases`]), so the profile
-    /// stays the same before and after an alias is resolved into the served
-    /// name. Without such an alias, an opaque served name keeps the OpenAI
-    /// baseline: any extension a request carried is dropped with a warning,
-    /// and a `root` message is rejected outright, so that role needs a
-    /// MiniMax model id.
-    /// DeepSeek is narrower: only the calibrated V4 / V4.1 model segments
-    /// and `deepseek-flash` alias select its profile; older versions and
-    /// unrecognized suffixes keep the baseline.
+    /// `openrouter/moonshotai/kimi-k2` all resolve to Kimi; OpenAI's own
+    /// model ids ([`is_openai_vendor_model`]: `gpt-4o`, `openai/gpt-4.1`,
+    /// `chatgpt-4o-latest`, `o3-mini`) resolve to OpenAI. Any other id is the
+    /// default profile: a self-hosted model, whose extensions from another
+    /// vendor are dropped with a warning and whose `root` message is rejected
+    /// outright (that role needs a MiniMax model id or alias). DeepSeek is
+    /// narrower: only the calibrated V4 / V4.1 model segments and the
+    /// `deepseek-flash` alias select its profile; older versions and
+    /// unrecognized suffixes keep the default.
     pub fn for_model(model: &str) -> Self {
         ModelProfile::for_model(model).provider()
     }
 
-    /// Record the configured model aliases (`alias -> served model id`). A
-    /// served model id that has a vendor-named alias selects that alias's
-    /// version-specific contract, whichever of its names a request carries.
-    /// Aliases that select no vendor profile change nothing; when two aliases
-    /// of one served model name different contracts, the first registered wins
-    /// and the conflict is logged. Recognized model names still take precedence.
+    /// The thinking on/off preference the profile reads from a request's
+    /// effective `reasoning_effort` (`thinking.effort`, else the top-level
+    /// field) when the request states no `thinking.type`. The OpenAI reading
+    /// ([`thinking_from_reasoning_effort`]: `none` and `minimal` switch
+    /// thinking off, every other value leaves the template's default) for
+    /// every profile but MiniMax, whose contract keeps thinking on for every
+    /// value: `none` is the model's default depth and `minimal` is `low`.
+    pub fn thinking_from_reasoning_effort(self, reasoning_effort: Option<&str>) -> Option<bool> {
+        match self {
+            ProviderProfile::Minimax => None,
+            _ => thinking_from_reasoning_effort(reasoning_effort),
+        }
+    }
+
+    /// Whether an explicit `reasoning_effort` outranks `thinking.type:
+    /// disabled`: under the MiniMax contract it does (an effort asks for
+    /// thinking at that depth); every other profile honours the toggle.
+    pub fn effort_outranks_thinking_disabled(self) -> bool {
+        matches!(self, ProviderProfile::Minimax)
+    }
+
+    /// Record the configured model aliases (`alias -> served model id`).
+    ///
+    /// A served model id whose own name selects no vendor contract takes the
+    /// version-specific contract of a vendor-named alias (Kimi, MiniMax,
+    /// z.ai, DeepSeek) it is served under, whichever of its names a request
+    /// carries; when two aliases of one served model name different
+    /// contracts, the first wins and the conflict is logged (the gateway's
+    /// configuration validation refuses such a set before it gets here). An
+    /// OpenAI-looking alias (`gpt-4o=local-model`) is compatibility naming
+    /// for OpenAI clients, not a contract: it binds nothing, and because
+    /// every alias resolves to its served model's profile, a request naming
+    /// such an alias is judged as the self-hosted model it reaches, not under
+    /// the public API's rules.
     pub fn register_model_aliases<'a>(aliases: impl IntoIterator<Item = (&'a str, &'a str)>) {
+        let aliases: Vec<(&str, &str)> = aliases.into_iter().collect();
         let mut map = alias_profiles().write().unwrap_or_else(|e| e.into_inner());
-        for (alias, canonical) in aliases {
-            let profile = ModelProfile::for_model_name(alias);
-            if profile == ModelProfile::OpenAi {
+        // First the served models' contracts, from their own names or their
+        // vendor-named aliases ...
+        for (alias, canonical) in &aliases {
+            let own = ModelProfile::for_model_name(canonical);
+            if own.is_vendor_contract() {
                 continue;
             }
-            match map.get(canonical) {
+            let profile = ModelProfile::for_model_name(alias);
+            if !profile.is_vendor_contract() {
+                continue;
+            }
+            match map.get(*canonical) {
                 Some(existing) if *existing != profile => tracing::warn!(
                     canonical,
                     alias,
@@ -185,10 +245,32 @@ impl ProviderProfile {
                 ),
                 Some(_) => {}
                 None => {
-                    map.insert(canonical.to_string(), profile);
+                    map.insert((*canonical).to_string(), profile);
                 }
             }
         }
+        // ... then every alias resolves to its served model's profile.
+        for (alias, canonical) in &aliases {
+            let profile = map
+                .get(*canonical)
+                .copied()
+                .unwrap_or_else(|| ModelProfile::for_model_name(canonical));
+            map.insert((*alias).to_string(), profile);
+        }
+    }
+
+    /// Whether this is a vendor's contract (Kimi, MiniMax, z.ai, DeepSeek)
+    /// that an alias may bind to a served model; the default profile and
+    /// OpenAI's are not: the former is the absence of a contract, the latter
+    /// follows OpenAI's own model names only.
+    pub fn is_vendor_contract(self) -> bool {
+        matches!(
+            self,
+            ProviderProfile::Kimi
+                | ProviderProfile::Minimax
+                | ProviderProfile::Zai
+                | ProviderProfile::DeepSeek
+        )
     }
 
     /// The vendor a model id names in one of its `/`-separated segments.
@@ -214,12 +296,15 @@ impl ProviderProfile {
                 return ProviderProfile::Zai;
             }
         }
-        ProviderProfile::OpenAi
+        if is_openai_vendor_model(model) {
+            return ProviderProfile::OpenAi;
+        }
+        ProviderProfile::Generic
     }
 
     /// Shape the request for dispatch under this profile: the provider's own
-    /// normalization first (MiniMax folds every root message into a
-    /// leading system message), then every message drops the extension struct that
+    /// normalization first (MiniMax merges the root messages into one
+    /// leading root), then every message drops the extension struct that
     /// belongs to another provider, so a foreign field never reaches a
     /// backend or a chat template. Runs from `Normalizable::normalize`, so it
     /// covers every request that enters through `ValidatedJson`; the HTTP
@@ -234,7 +319,8 @@ impl ProviderProfile {
             ProviderProfile::DeepSeek
             | ProviderProfile::Kimi
             | ProviderProfile::Zai
-            | ProviderProfile::OpenAi => {}
+            | ProviderProfile::OpenAi
+            | ProviderProfile::Generic => {}
         }
         let mut dropped: Vec<&'static str> = Vec::new();
         for message in &mut req.messages {
@@ -268,9 +354,52 @@ impl ProviderProfile {
         match self {
             ProviderProfile::DeepSeek => deepseek::normalize_chat(req),
             ProviderProfile::Kimi => kimi::normalize_chat(req),
+            ProviderProfile::Minimax => minimax::apply_defaults(req),
             ProviderProfile::Zai => zai::normalize_chat(req),
-            ProviderProfile::OpenAi | ProviderProfile::Minimax => {}
+            ProviderProfile::OpenAi | ProviderProfile::Generic => {}
         }
+    }
+
+    /// The call id of a tool result the assistant turn right before it did
+    /// not issue, under the contracts that refuse such a history (OpenAI's
+    /// and DeepSeek's); `None` otherwise. The rule a history the gateway
+    /// assembles (the Responses conversions build one from input items and
+    /// stored turns) is held to: every tool result answers a call of the
+    /// assistant turn right before it, so a result with no call before it at
+    /// all, whether it opens the history or follows another role, answers
+    /// nothing and is refused as the public API refuses it, not sent to the
+    /// engine as a turn the model never asked for. The gateway's history
+    /// loader keeps a stored turn with its calls and drops a stored result
+    /// whose call did not survive the reload (a chain cut at a depth cap, at
+    /// an expired or deleted record or at another tenant's; a conversation
+    /// window), so a result with no call before it is the client's. The chat
+    /// endpoint's own history gets the full pairing rule, unanswered calls
+    /// included, through [`Self::validate_chat`].
+    pub fn unanswerable_tool_result(self, messages: &[ChatMessage]) -> Option<&str> {
+        if !matches!(self, ProviderProfile::OpenAi | ProviderProfile::DeepSeek) {
+            return None;
+        }
+        // The call ids of the assistant turn right before the current
+        // message: empty when it issued none or another role spoke since.
+        let mut issued: Vec<&str> = Vec::new();
+        for message in messages {
+            match message {
+                ChatMessage::Assistant { tool_calls, .. } => {
+                    issued = tool_calls
+                        .iter()
+                        .flatten()
+                        .map(|call| call.id.as_str())
+                        .collect();
+                }
+                ChatMessage::Tool { tool_call_id, .. } => {
+                    if !issued.contains(&tool_call_id.as_str()) {
+                        return Some(tool_call_id.as_str());
+                    }
+                }
+                _ => issued.clear(),
+            }
+        }
+        None
     }
 
     /// Contract rules applied on top of core validation.
@@ -290,9 +419,14 @@ impl ProviderProfile {
             }
             ProviderProfile::DeepSeek => {
                 reject_root(req)?;
+                openai::validate_tool_message_pairing(&req.messages)?;
                 deepseek::validate_chat(req)
             }
-            ProviderProfile::OpenAi => reject_root(req),
+            ProviderProfile::OpenAi => {
+                reject_root(req)?;
+                openai::validate_chat(req)
+            }
+            ProviderProfile::Generic => reject_root(req),
         }
     }
 }
@@ -357,9 +491,7 @@ fn reject_root(req: &ChatCompletionRequest) -> Result<(), validator::ValidationE
         .iter()
         .any(|m| matches!(m, ChatMessage::Root { .. }))
     {
-        let mut e = validator::ValidationError::new("invalid_role");
-        e.message = Some("invalid role: root".into());
-        return Err(e);
+        return Err(invalid("invalid_role", "invalid role: root"));
     }
     Ok(())
 }
@@ -418,13 +550,24 @@ mod tests {
             ProviderProfile::for_model("served-model-alpha"),
             ProviderProfile::Kimi
         );
+        // An OpenAI-looking alias is compatibility naming, not a contract:
+        // the served model stays on the default profile, and a request
+        // naming the alias is judged as that model, not under OpenAI's rules.
         assert_eq!(
             ProviderProfile::for_model("served-model-beta"),
-            ProviderProfile::OpenAi
+            ProviderProfile::Generic
+        );
+        assert_eq!(
+            ProviderProfile::for_model("gpt-4o-public-name"),
+            ProviderProfile::Generic
+        );
+        assert_eq!(
+            ProviderProfile::for_model("kimi-k3-public-name"),
+            ProviderProfile::Kimi
         );
         assert_eq!(
             ProviderProfile::for_model("served-model-gamma"),
-            ProviderProfile::OpenAi
+            ProviderProfile::Generic
         );
 
         // A request that entered under the vendor name and had its model id
@@ -454,6 +597,7 @@ mod tests {
         assert!(!ProviderProfile::Kimi.parses_tool_calls_without_tools());
         assert!(!ProviderProfile::Zai.parses_tool_calls_without_tools());
         assert!(!ProviderProfile::OpenAi.parses_tool_calls_without_tools());
+        assert!(!ProviderProfile::Generic.parses_tool_calls_without_tools());
     }
 
     #[test]
@@ -530,13 +674,13 @@ mod tests {
         }
         for model in [
             "gpt-4o-mini",
-            "",
-            "/models/llama-3",
-            "my-kimi-alias",
+            "GPT-5-nano",
             "openai/gpt-4o",
-            "my-glm-alias",
-            // ChatGLM predates the z.ai chat contract.
-            "THUDM/chatglm3-6b",
+            "openrouter/openai/o3-mini",
+            "chatgpt-4o-latest",
+            "codex-mini-latest",
+            "o1",
+            "o4-mini-2025-04-16",
         ] {
             assert_eq!(
                 ProviderProfile::for_model(model),
@@ -544,5 +688,153 @@ mod tests {
                 "{model}"
             );
         }
+        for model in [
+            "",
+            "/models/llama-3",
+            "qwen3-8b",
+            "Qwen/Qwen3-VL-8B-Instruct",
+            "gpt-oss-20b",
+            "openai/gpt-oss-120b",
+            "olmo-3-7b-instruct",
+            "o1js-chat",
+            "my-kimi-alias",
+            "my-glm-alias",
+            // ChatGLM predates the z.ai chat contract.
+            "THUDM/chatglm3-6b",
+        ] {
+            assert_eq!(
+                ProviderProfile::for_model(model),
+                ProviderProfile::Generic,
+                "{model}"
+            );
+        }
+    }
+
+    /// A tool result no call of the assistant turn right before it issued is
+    /// a malformed history under the DeepSeek contract, as under OpenAI's:
+    /// the chat endpoint refuses it with the public API's code, and a history
+    /// assembled elsewhere names the id, for an unknown id as for a result
+    /// with no call before it at all; the generic profile leaves every shape
+    /// to the engine.
+    #[test]
+    fn a_tool_result_without_its_call_is_refused_under_the_deepseek_contract() {
+        let request = |model: &str, messages: serde_json::Value| -> ChatCompletionRequest {
+            serde_json::from_value(serde_json::json!({"model": model, "messages": messages}))
+                .expect("a chat request")
+        };
+        let wrong = |model: &str| {
+            request(
+                model,
+                serde_json::json!([
+                    {"role": "user", "content": "Add 17 and 25."},
+                    {"role": "assistant", "content": null, "tool_calls": [{
+                        "id": "call_1", "type": "function",
+                        "function": {"name": "add_integers", "arguments": "{\"a\":17,\"b\":25}"}
+                    }]},
+                    {"role": "tool", "tool_call_id": "call_doesnotexist", "content": "42"}
+                ]),
+            )
+        };
+        let right = request(
+            "deepseek-flash",
+            serde_json::json!([
+                {"role": "user", "content": "Add 17 and 25."},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_1", "type": "function",
+                    "function": {"name": "add_integers", "arguments": "{\"a\":17,\"b\":25}"}
+                }]},
+                {"role": "tool", "tool_call_id": "call_1", "content": "42"}
+            ]),
+        );
+        let code = |request: &ChatCompletionRequest| {
+            ProviderProfile::for_model(&request.model)
+                .validate_chat(request)
+                .err()
+                .map(|error| error.code.to_string())
+        };
+        assert_eq!(
+            code(&wrong("deepseek-flash")).as_deref(),
+            Some("tool_call_id_not_found")
+        );
+        assert_eq!(code(&right), None);
+        assert_eq!(code(&wrong("local-model")), None);
+
+        let deepseek = ProviderProfile::DeepSeek;
+        assert_eq!(
+            deepseek.unanswerable_tool_result(&wrong("deepseek-flash").messages),
+            Some("call_doesnotexist")
+        );
+        assert_eq!(deepseek.unanswerable_tool_result(&right.messages), None);
+        assert_eq!(
+            ProviderProfile::Generic.unanswerable_tool_result(&wrong("local-model").messages),
+            None
+        );
+        // The shapes a Responses history takes, under the same rule. A result
+        // for one of two calls answers a call the turn before it issued.
+        let two_calls_one_result = request(
+            "deepseek-flash",
+            serde_json::json!([
+                {"role": "user", "content": "Add 17 and 25, then 3 and 4."},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "call_a", "type": "function",
+                     "function": {"name": "add_integers", "arguments": "{\"a\":17,\"b\":25}"}},
+                    {"id": "call_b", "type": "function",
+                     "function": {"name": "add_integers", "arguments": "{\"a\":3,\"b\":4}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "call_b", "content": "7"}
+            ]),
+        );
+        assert_eq!(
+            deepseek.unanswerable_tool_result(&two_calls_one_result.messages),
+            None
+        );
+        // A result with no call before it answers nothing: after the user's
+        // message, as the first message ahead of the call it names, and after
+        // a user turn that ended the turn it could have answered.
+        let orphan = request(
+            "deepseek-flash",
+            serde_json::json!([
+                {"role": "user", "content": "Add 17 and 25."},
+                {"role": "tool", "tool_call_id": "call_a", "content": "42"}
+            ]),
+        );
+        assert_eq!(
+            deepseek.unanswerable_tool_result(&orphan.messages),
+            Some("call_a")
+        );
+        let result_before_call = request(
+            "deepseek-flash",
+            serde_json::json!([
+                {"role": "tool", "tool_call_id": "call_a", "content": "42"},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_a", "type": "function",
+                    "function": {"name": "add_integers", "arguments": "{\"a\":17,\"b\":25}"}
+                }]}
+            ]),
+        );
+        assert_eq!(
+            deepseek.unanswerable_tool_result(&result_before_call.messages),
+            Some("call_a")
+        );
+        let user_between = request(
+            "deepseek-flash",
+            serde_json::json!([
+                {"role": "user", "content": "Add 17 and 25."},
+                {"role": "assistant", "content": null, "tool_calls": [{
+                    "id": "call_a", "type": "function",
+                    "function": {"name": "add_integers", "arguments": "{\"a\":17,\"b\":25}"}
+                }]},
+                {"role": "user", "content": "Never mind."},
+                {"role": "tool", "tool_call_id": "call_a", "content": "42"}
+            ]),
+        );
+        assert_eq!(
+            deepseek.unanswerable_tool_result(&user_between.messages),
+            Some("call_a")
+        );
+        assert_eq!(
+            ProviderProfile::Generic.unanswerable_tool_result(&orphan.messages),
+            None
+        );
     }
 }

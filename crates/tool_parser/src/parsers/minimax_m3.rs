@@ -1,9 +1,12 @@
+use std::collections::{HashMap, HashSet};
+
 use async_trait::async_trait;
 use openai_protocol::common::Tool;
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 
 use crate::{
     errors::ParserResult,
+    factory::GrammarStart,
     parsers::helpers,
     traits::ToolParser,
     types::{FunctionCall, StreamingParseResult, ToolCall, ToolCallItem},
@@ -25,6 +28,42 @@ const ELEMENT_START: &str = "]<]minimax[>[<";
 const ELEMENT_END_START: &str = "]<]minimax[>[</";
 /// Reserved field name used to preserve mixed text within an object element.
 const MIXED_TEXT_FIELD: &str = "$text";
+/// Opening marker of the model's thought.
+const THINK_START: &str = "<mm:think>";
+/// Closing marker of the model's thought.
+const THINK_END: &str = "</mm:think>";
+/// The element tag of a list's items, as the model writes an array.
+const ITEM: &str = "item";
+/// The markers that end a call wherever they stand; no argument value may hold one.
+const CALL_EXITS: [&str; 3] = ["</invoke>", "<invoke name=\"", "</tool_call>"];
+/// How deep the structural tag follows a schema's nesting; below that, a value is any text.
+const DEPTH: usize = 16;
+/// How many elements one invoke's grammar may hold; past that, the values still to write are
+/// free text. An acyclic schema unfolds as k^d elements for k properties over d levels, which the
+/// depth cap alone does not bound; ordinary tool schemas stay far below this. The budget is each
+/// invoke's own: a tag for many tools holds up to this many elements per tool. The budget is spent
+/// depth first, in the schema's order, but an object's later properties each keep one element
+/// while an earlier one is descended into, so what runs short loses its structure from the inside
+/// out: the nested objects first, the top-level arguments last. The budget counts elements, not
+/// bytes: a value's own spelling (an enum's words, a number's schema) is counted by
+/// [`LEAF_BYTES`], and a property typed `null`, written as nothing, costs none.
+const NODES: usize = 1024;
+/// How many bytes the leaves of one invoke may spell: an enum's words, a number's schema with the
+/// definitions its pointers reach. Past that, a string with an enum is text as it is and a number
+/// is free text, so a value that is large, or reused through references, cannot multiply the
+/// grammar: a 5,000-word enum reached by a thousand number leaves is written while it fits, not a
+/// thousand times. The budget is each invoke's own, as [`NODES`] is, and is spent in the schema's
+/// order.
+const LEAF_BYTES: usize = 256 * 1024;
+/// How many bytes the walks behind one invoke's number leaves may size, the refused walks counted
+/// too. A walk stops at what the leaves may still spell, but a leaf that is refused spends none of
+/// that, so a thousand distinct leaves at a definition just past the budget would each walk it to
+/// the end; past this allowance a number leaf with pointers is free text without a walk. A leaf
+/// without pointers walks nothing but itself, which the request already holds, and the allowance
+/// neither bounds nor charges it.
+const WALK_BYTES: usize = 4 * LEAF_BYTES;
+/// What an enum's word costs beyond its length: the alternative that spells it.
+const WORD_FRAMING: usize = 36;
 
 /// MiniMax M3 format parser for tool calls.
 ///
@@ -533,6 +572,691 @@ impl MinimaxM3Parser {
             None => text.to_string(),
         };
         (normal_text, calls)
+    }
+
+    /// Constrain the forced calls in the model's own syntax: one block,
+    /// `]<]minimax[>[<tool_call>` and a newline, one invoke or more, the
+    /// separator and `</tool_call>`; an invoke is the separator,
+    /// `<invoke name="NAME">`, one element per schema property in the
+    /// schema's order (optional unless the schema requires it), the
+    /// separator, `</invoke>` and a newline; an element is the separator and
+    /// `<key>`, the value, the separator and `</key>`. A value follows the
+    /// type its schema pins: a string as text free of the separator, a string
+    /// `enum` as one of its values, a number as the JSON its schema accepts, a
+    /// boolean as one of the words the parser reads, an object as nested
+    /// elements, an array as `<item>` elements, `null` as nothing (the
+    /// template leaves such an argument out), anything untyped as free text
+    /// up to the closing tag. A nameless tool is skipped; with no named tool
+    /// the block is empty, which parses to no calls. The separator stays in
+    /// the trigger: this parser reads the block only with it.
+    ///
+    /// The forced block is written at once, so the tag opens with what the
+    /// model writes before a call when the template leaves the thought to it
+    /// (its default): the thought block, or the bare `</mm:think>` the model
+    /// writes for an empty one, or nothing. A prompt that ends inside the
+    /// thought gets the registry's [`Self::reasoning_prefix`] in front as
+    /// well (see `ParserRegistry::generate_tool_constraint`).
+    pub fn build_structural_tag(tools: &[Tool], at_least_one: bool) -> Value {
+        let invokes: Vec<Value> = tools
+            .iter()
+            .filter(|tool| !tool.function.name.is_empty())
+            .map(|tool| Elements::of(&tool.function.parameters).invoke(&tool.function.name))
+            .collect();
+        // An empty list of invokes is unsatisfiable; with no named tool, admit
+        // only an empty block.
+        let invokes = if invokes.is_empty() {
+            json!({ "type": "const_string", "value": "" })
+        } else {
+            json!({
+                "type": "tags_with_separator",
+                "tags": invokes,
+                "separator": "",
+                "at_least_one": true,
+            })
+        };
+        json!({
+            "format": {
+                "type": "sequence",
+                "elements": [
+                    Self::before_the_block(),
+                    {
+                        "type": "triggered_tags",
+                        "triggers": [TOOL_CALL_START],
+                        "tags": [{
+                            "type": "tag",
+                            "begin": format!("{TOOL_CALL_START}\n"),
+                            "content": invokes,
+                            "end": TOOL_CALL_END,
+                        }],
+                        "at_least_one": at_least_one,
+                    },
+                ],
+            }
+        })
+    }
+
+    /// What the model writes before the block when the template leaves the
+    /// thought to it: its thought between `<mm:think>` and `</mm:think>`,
+    /// free of the markers and the separator, or the bare close it writes
+    /// for an empty thought, or nothing at all.
+    fn before_the_block() -> Value {
+        json!({
+            "type": "optional",
+            "content": {
+                "type": "or",
+                "elements": [
+                    {
+                        "type": "tag",
+                        "begin": THINK_START,
+                        "content": {
+                            "type": "any_text",
+                            "excludes": [THINK_START, THINK_END, NAMESPACE],
+                        },
+                        "end": THINK_END,
+                    },
+                    { "type": "const_string", "value": THINK_END },
+                ],
+            },
+        })
+    }
+
+    /// What precedes a forced call on a prompt that ends inside the thought,
+    /// by where the engine starts the grammar; the registry emits
+    /// `sequence[prefix, calls]`. Where the engine applies the grammar only
+    /// after its reasoning parser has seen the model's own `</mm:think>`,
+    /// nothing precedes the calls. Where it applies the grammar from the
+    /// first token, the prefix is the thought, free of the think markers and
+    /// the separator, closed by `</mm:think>`, so the call follows the
+    /// thought. Where the worker does not say, the prefix is free text that
+    /// writes no separator, so no call marker, with nothing owed at its end:
+    /// the thought and its close on the one kind of engine, nothing on the
+    /// other.
+    pub fn reasoning_prefix(start: GrammarStart) -> Option<Value> {
+        match start {
+            GrammarStart::AfterReasoning => None,
+            GrammarStart::Unknown => Some(json!({
+                "type": "any_text",
+                "excludes": [NAMESPACE],
+            })),
+            GrammarStart::FirstToken => Some(json!({
+                "type": "tag",
+                "begin": "",
+                "content": {
+                    "type": "any_text",
+                    "excludes": [THINK_START, THINK_END, NAMESPACE],
+                },
+                "end": THINK_END,
+            })),
+        }
+    }
+}
+
+/// The elements of one invoke, written from the tool's `parameters` schema.
+///
+/// Local references (`#/$defs/Name`, `#/definitions/Name`) are followed, the pointer's escapes
+/// undone; a bare `#` is not, since it would name the fragment's own document once the engine
+/// compiles a fragment alone; a reference back into a schema already being written, directly or
+/// through another definition, is written as free text where it recurs, so a schema that refers
+/// to itself stays bounded, the depth cap the outer bound. The elements of one invoke are counted
+/// against [`NODES`]: once they are spent, the values still to write (the rest of an object, a
+/// list) are free text, so a wide fan-out stays bounded too; before a property is descended into,
+/// one element is held for each of the properties after it that writes one, so an early object
+/// cannot take the elements its siblings need for their own tags. The leaves' spellings are
+/// counted against [`LEAF_BYTES`]: an enum's words, and a number's schema with the definitions
+/// its pointers reach (those and no other, each written once per fragment); once they are spent,
+/// an enum is text as it is and a number free text. The walks that size a number's definitions,
+/// refused ones too, are counted against [`WALK_BYTES`]; once it is spent, a number with pointers
+/// is free text without a walk.
+///
+/// The `symphony` crate's `grammar/xml.rs` writes the same model's block from its table, and
+/// spells the same output for a schema within the budgets; it follows the references and the
+/// depth cap the same way and has the same element and byte budgets, and takes the same walk
+/// allowance in its follow-up.
+struct Elements<'a> {
+    root: &'a Value,
+    /// The pointers of the references on the path being written, outermost first.
+    path: Vec<&'a str>,
+    /// The elements this invoke may still write.
+    nodes: usize,
+    /// How many of them are held for the properties after the one being written, at every level
+    /// of the descent together.
+    reserved: usize,
+    /// The bytes the invoke's leaves may still spell.
+    leaf_bytes: usize,
+    /// The bytes the walks behind its number leaves may still size, refused walks counted too.
+    walk_bytes: usize,
+    /// The serialized size of each root definition a fragment reached, by the entry's address,
+    /// worked out once per invoke.
+    entry_bytes: HashMap<usize, usize>,
+    /// What each number leaf's fragment costs and reaches, by the leaf schema's address: `None`
+    /// for a leaf the budget or the walks' allowance refused, which they refuse again, both only
+    /// shrinking.
+    reached_by_leaf: HashMap<usize, Option<(usize, Vec<Reached<'a>>)>>,
+    /// What each enum costs, by its word list's address.
+    enum_bytes: HashMap<usize, usize>,
+}
+
+/// A root definition a fragment reaches: its block, its name and its entry.
+type Reached<'a> = (&'static str, &'a str, &'a Value);
+
+/// How a value's schema is written: as free text, at the depth cap or behind a reference that
+/// recurs; or by its type, its references followed and on the path, `pushed` of them, which the
+/// writer unwinds once the value is written. A schema typed `null` is written as nothing, and is
+/// neither ([`Elements::how`]).
+enum Writes<'a> {
+    FreeText,
+    Typed {
+        schema: &'a Value,
+        pushed: usize,
+        depth: usize,
+    },
+}
+
+/// What writing a property gives: nothing, for a property typed `null`; no element, once the
+/// invoke's budget is spent, when the caller writes the rest as free text; or the element.
+enum Element {
+    Nothing,
+    Spent,
+    Written(Value),
+}
+
+impl<'a> Elements<'a> {
+    fn of(root: &'a Value) -> Self {
+        Self {
+            root,
+            path: Vec::new(),
+            nodes: NODES,
+            reserved: 0,
+            leaf_bytes: LEAF_BYTES,
+            walk_bytes: WALK_BYTES,
+            entry_bytes: HashMap::new(),
+            reached_by_leaf: HashMap::new(),
+            enum_bytes: HashMap::new(),
+        }
+    }
+
+    /// `cost` bytes off the leaves' budget; `false` when they do not fit, when the caller writes
+    /// the value's fallback and the budget stays for a smaller leaf.
+    fn takes_bytes(&mut self, cost: usize) -> bool {
+        if cost > self.leaf_bytes {
+            return false;
+        }
+        self.leaf_bytes -= cost;
+        true
+    }
+
+    /// Whether the budget has an element left beyond the ones held for later siblings.
+    fn has_an_element(&self) -> bool {
+        self.nodes > self.reserved
+    }
+
+    /// One element off the budget, which [`Self::has_an_element`] said was there.
+    fn take_an_element(&mut self) {
+        self.nodes = self.nodes.saturating_sub(1);
+    }
+
+    /// How `schema` is written at `depth`, or `None` for a schema typed `null`, written as
+    /// nothing: the one place that decides, for the count of an object's properties that write
+    /// and for the writing itself.
+    fn how(&mut self, schema: &'a Value, depth: usize) -> Option<Writes<'a>> {
+        let Some(depth) = depth.checked_sub(1) else {
+            return Some(Writes::FreeText);
+        };
+        let Some((schema, pushed)) = self.follow(schema) else {
+            return Some(Writes::FreeText);
+        };
+        if MinimaxM3Parser::schema_type(Some(schema)) == Some("null") {
+            self.unwind(pushed);
+            return None;
+        }
+        Some(Writes::Typed {
+            schema,
+            pushed,
+            depth,
+        })
+    }
+
+    /// Whether a property's schema writes an element: everything but `null`, as [`Self::how`]
+    /// has it.
+    fn writes_an_element(&mut self, schema: &'a Value, depth: usize) -> bool {
+        match self.how(schema, depth) {
+            None => false,
+            Some(writes) => {
+                self.leaves(writes);
+                true
+            }
+        }
+    }
+
+    /// A value classified and not written: its references, if [`Self::how`] followed any, off
+    /// the path again.
+    fn leaves(&mut self, writes: Writes<'a>) {
+        if let Writes::Typed { pushed, .. } = writes {
+            self.unwind(pushed);
+        }
+    }
+
+    /// One invoke: the separator and the opener with the tool's name, the
+    /// elements the schema shapes, the separator, `</invoke>` and a newline.
+    fn invoke(mut self, name: &str) -> Value {
+        let content = match self.follow(self.root) {
+            Some((schema, pushed)) => {
+                let content = self.members(schema, "</invoke>", DEPTH);
+                self.unwind(pushed);
+                content
+            }
+            None => Self::free_text("</invoke>"),
+        };
+        json!({
+            "type": "tag",
+            "begin": format!("{INVOKE_START} name=\"{name}\">"),
+            "content": content,
+            "end": format!("{INVOKE_END}\n"),
+        })
+    }
+
+    /// The schema a local pointer names: an entry under `$defs` or `definitions`, the pointer's
+    /// escapes (`~1` for `/`, `~0` for `~`) undone; nothing for a bare `#`, a pointer elsewhere,
+    /// or a missing target.
+    fn definition(&self, pointer: &str) -> Option<&'a Value> {
+        let mut segments = pointer.strip_prefix("#/")?.split('/');
+        let block = match segments.next()? {
+            block @ ("$defs" | "definitions") => block,
+            _ => return None,
+        };
+        let mut node = self.root.get(block)?;
+        for segment in segments {
+            node = node.get(segment.replace("~1", "/").replace("~0", "~"))?;
+        }
+        Some(node)
+    }
+
+    /// `schema` with its references followed, and how many of them the path took on (the caller
+    /// unwinds them once the schema is written); `None` when a reference re-enters a schema on
+    /// the path, or the hops exceed the depth cap: that node is written as free text. A pointer
+    /// that names nothing stops the following, and the schema stays what it is: untyped.
+    fn follow(&mut self, schema: &'a Value) -> Option<(&'a Value, usize)> {
+        let mut schema = schema;
+        let mut pushed = 0;
+        while let Some(pointer) = schema.get("$ref").and_then(Value::as_str) {
+            let Some(target) = self.definition(pointer) else {
+                break;
+            };
+            if self.path.contains(&pointer) || pushed == DEPTH {
+                self.unwind(pushed);
+                return None;
+            }
+            self.path.push(pointer);
+            pushed += 1;
+            schema = target;
+        }
+        Some((schema, pushed))
+    }
+
+    /// The path without its last `pushed` references.
+    fn unwind(&mut self, pushed: usize) {
+        let keep = self.path.len().saturating_sub(pushed);
+        self.path.truncate(keep);
+    }
+
+    /// An object's elements: one per property in the schema's order, each
+    /// optional unless the schema requires it, a property typed `null` left
+    /// out at no cost to the budget; free text up to `close` for a schema
+    /// without properties, and for the properties left once the invoke's
+    /// element budget is spent. While a property's value is written, one
+    /// element is held for each property after it that writes one, so each
+    /// still gets its own tag.
+    fn members(&mut self, schema: &'a Value, close: &str, depth: usize) -> Value {
+        let properties = schema
+            .get("properties")
+            .and_then(Value::as_object)
+            .filter(|properties| !properties.is_empty());
+        let Some(properties) = properties else {
+            return Self::free_text(close);
+        };
+        let required: Vec<&str> = schema
+            .get("required")
+            .and_then(Value::as_array)
+            .map(|names| names.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        // The properties that write, counted first: while one is written, one element is held
+        // for each of them after it.
+        let mut later: usize = 0;
+        for schema in properties.values() {
+            if self.writes_an_element(schema, depth) {
+                later += 1;
+            }
+        }
+        let mut elements: Vec<Value> = Vec::new();
+        for (key, schema) in properties {
+            match self.element(key, schema, depth, later.saturating_sub(1)) {
+                Element::Nothing => {}
+                Element::Spent => {
+                    elements.push(Self::free_text(close));
+                    break;
+                }
+                Element::Written(element) => {
+                    later = later.saturating_sub(1);
+                    elements.push(if required.contains(&key.as_str()) {
+                        element
+                    } else {
+                        json!({ "type": "optional", "content": element })
+                    });
+                }
+            }
+        }
+        if elements.is_empty() {
+            return json!({ "type": "const_string", "value": "" });
+        }
+        json!({ "type": "sequence", "elements": elements })
+    }
+
+    /// One element: the separator and `<key>`, the value, the separator and
+    /// `</key>`, one element off the budget, with `later` held for the
+    /// properties after it while its value is written; nothing for a property
+    /// typed `null`, at no cost and whatever the budget; no element once the
+    /// budget is spent.
+    fn element(&mut self, key: &str, schema: &'a Value, depth: usize, later: usize) -> Element {
+        let Some(writes) = self.how(schema, depth) else {
+            return Element::Nothing;
+        };
+        if !self.has_an_element() {
+            self.leaves(writes);
+            return Element::Spent;
+        }
+        self.take_an_element();
+        self.reserved += later;
+        let value = self.value(&format!("</{key}>"), writes);
+        self.reserved -= later;
+        Element::Written(json!({
+            "type": "sequence",
+            "elements": [
+                { "type": "const_string", "value": format!("{ELEMENT_START}{key}>") },
+                value,
+                { "type": "const_string", "value": format!("{ELEMENT_END_START}{key}>") },
+            ],
+        }))
+    }
+
+    /// The value between an element's tags, as [`Self::how`] says it is
+    /// written: free text, or by the type its schema pins.
+    fn value(&mut self, close: &str, writes: Writes<'a>) -> Value {
+        let Writes::Typed {
+            schema,
+            pushed,
+            depth,
+        } = writes
+        else {
+            return Self::free_text(close);
+        };
+        let value = match MinimaxM3Parser::schema_type(Some(schema)) {
+            Some("boolean") => Self::one_of(["true", "false", "True", "False"]),
+            Some("object") => self.members(schema, close, depth),
+            Some("array") => match schema.get("items") {
+                Some(items) if self.has_an_element() => {
+                    self.take_an_element();
+                    self.items(items, depth)
+                }
+                _ => Self::free_text(close),
+            },
+            Some("string") => match schema.get("enum").and_then(Value::as_array) {
+                Some(values) if !values.is_empty() && values.iter().all(Value::is_string) => {
+                    let key = std::ptr::from_ref(values) as usize;
+                    let cost = *self.enum_bytes.entry(key).or_insert_with(|| {
+                        values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(|word| word.len() + WORD_FRAMING)
+                            .sum()
+                    });
+                    if self.takes_bytes(cost) {
+                        Self::one_of(values.iter().filter_map(Value::as_str))
+                    } else {
+                        Self::text(close)
+                    }
+                }
+                _ => Self::text(close),
+            },
+            Some("integer" | "number") => self.fragment(schema, close),
+            _ => Self::free_text(close),
+        };
+        self.unwind(pushed);
+        value
+    }
+
+    /// A list's items: any number of `<item>` elements, each a value of the
+    /// items' type, an item typed `null` an empty element.
+    fn items(&mut self, items: &'a Value, depth: usize) -> Value {
+        let open = format!("{ELEMENT_START}{ITEM}>");
+        let close = format!("{ELEMENT_END_START}{ITEM}>");
+        let item = match self.how(items, depth) {
+            Some(writes) => {
+                let value = self.value(&format!("</{ITEM}>"), writes);
+                json!({
+                    "type": "sequence",
+                    "elements": [
+                        { "type": "const_string", "value": open },
+                        value,
+                        { "type": "const_string", "value": close },
+                    ],
+                })
+            }
+            None => json!({ "type": "const_string", "value": format!("{open}{close}") }),
+        };
+        json!({ "type": "star", "content": item })
+    }
+
+    /// A number's schema as the engine gets it: with the root's definitions its pointers reach
+    /// beside it, those and no other (the entry a pointer names by its first segment, and the
+    /// entries those reach), so each pointer resolves once the engine compiles the fragment
+    /// alone; a definition the schema declares itself stays. Free text up to `close` once the
+    /// leaves' byte budget cannot take the fragment, definitions included, or the walks' allowance
+    /// ([`WALK_BYTES`]) is spent before the fragment's definitions are sized.
+    fn fragment(&mut self, schema: &'a Value, close: &str) -> Value {
+        let Some((cost, reached)) = self.reached_within(schema) else {
+            return Self::free_text(close);
+        };
+        if !self.takes_bytes(cost) {
+            return Self::free_text(close);
+        }
+        let mut fragment = schema.clone();
+        if let Some(object) = fragment.as_object_mut() {
+            for (block, name, entry) in reached {
+                let slot = object.entry(block.to_string()).or_insert_with(|| json!({}));
+                if let Some(entries) = slot.as_object_mut() {
+                    entries
+                        .entry(name.to_string())
+                        .or_insert_with(|| entry.clone());
+                }
+            }
+        }
+        json!({ "type": "json_schema", "json_schema": fragment })
+    }
+
+    /// What a number leaf's fragment costs, with the root's definitions its pointers reach,
+    /// directly or through one another (each as its block, `$defs` or `definitions`, its name,
+    /// the first segment after the block, since a pointer deeper into an entry needs the whole
+    /// entry, and its entry), when that fits what the leaves may still spell; `None` as soon as
+    /// the running count passes it, so a leaf the budget refuses costs the walk up to the budget
+    /// and no more. Worked out once per leaf schema per invoke: a leaf refused once is refused
+    /// again, the budget only shrinking. The walks, refused ones too, spend [`WALK_BYTES`] at the
+    /// pace of the bytes they size; past it a leaf with pointers is refused without a walk, while
+    /// a leaf without pointers, which walks nothing but itself, is neither bound nor charged.
+    fn reached_within(&mut self, schema: &'a Value) -> Option<(usize, Vec<Reached<'a>>)> {
+        let key = std::ptr::from_ref(schema) as usize;
+        if let Some(known) = self.reached_by_leaf.get(&key) {
+            return match known {
+                Some((cost, reached)) if *cost <= self.leaf_bytes => Some((*cost, reached.clone())),
+                _ => None,
+            };
+        }
+        // A leaf without pointers walks nothing but itself, which the request already holds: the
+        // allowance is for the definitions a leaf reaches, and neither bounds nor charges one.
+        let walks = !local_pointers(schema).is_empty();
+        let limit = if walks {
+            self.leaf_bytes.min(self.walk_bytes)
+        } else {
+            self.leaf_bytes
+        };
+        let found = self.walk_reached(schema, limit);
+        if walks {
+            self.walk_bytes = self
+                .walk_bytes
+                .saturating_sub(found.as_ref().map_or(limit, |(cost, _)| *cost));
+        }
+        self.reached_by_leaf.insert(key, found.clone());
+        found
+    }
+
+    /// The walk behind [`Self::reached_within`], within `limit`.
+    fn walk_reached(
+        &mut self,
+        schema: &'a Value,
+        limit: usize,
+    ) -> Option<(usize, Vec<Reached<'a>>)> {
+        let mut cost = json_bytes(schema);
+        if cost > limit {
+            return None;
+        }
+        let mut reached: Vec<Reached<'a>> = Vec::new();
+        let mut seen: HashSet<(&'static str, &'a str)> = HashSet::new();
+        let mut pending: Vec<&'a Value> = vec![schema];
+        while let Some(node) = pending.pop() {
+            for pointer in local_pointers(node) {
+                let Some((block, name, entry)) = self.entry_of(pointer) else {
+                    continue;
+                };
+                if !seen.insert((block, name)) {
+                    continue;
+                }
+                cost += self.entry_bytes(entry);
+                if cost > limit {
+                    return None;
+                }
+                reached.push((block, name, entry));
+                pending.push(entry);
+            }
+        }
+        Some((cost, reached))
+    }
+
+    /// The block, the name and the entry a local pointer names, the name's escapes undone (`~1`
+    /// for `/`, `~0` for `~`); nothing for a bare `#`, a pointer elsewhere or a missing entry.
+    fn entry_of(&self, pointer: &str) -> Option<(&'static str, &'a str, &'a Value)> {
+        let mut segments = pointer.strip_prefix("#/")?.split('/');
+        let block = match segments.next()? {
+            "$defs" => "$defs",
+            "definitions" => "definitions",
+            _ => return None,
+        };
+        let entries = self.root.get(block)?.as_object()?;
+        let name = segments.next()?.replace("~1", "/").replace("~0", "~");
+        let (key, entry) = entries.get_key_value(name.as_str())?;
+        Some((block, key.as_str(), entry))
+    }
+
+    /// The serialized size of a definition's entry, worked out once per invoke.
+    fn entry_bytes(&mut self, entry: &'a Value) -> usize {
+        let key = std::ptr::from_ref(entry) as usize;
+        if let Some(bytes) = self.entry_bytes.get(&key) {
+            return *bytes;
+        }
+        let bytes = json_bytes(entry);
+        self.entry_bytes.insert(key, bytes);
+        bytes
+    }
+
+    /// One of the words.
+    fn one_of(words: impl IntoIterator<Item = &'a str>) -> Value {
+        let words: Vec<Value> = words
+            .into_iter()
+            .map(|word| json!({ "type": "const_string", "value": word }))
+            .collect();
+        json!({ "type": "or", "elements": words })
+    }
+
+    /// A string as it is: text that holds neither the separator, nor `close`,
+    /// nor a marker that ends the call.
+    fn text(close: &str) -> Value {
+        Self::excluding(&[NAMESPACE, close])
+    }
+
+    /// A value the schema does not shape: text that holds neither `close` nor
+    /// a marker that ends the call, separators and nested tags included,
+    /// which the parser reads as it infers.
+    fn free_text(close: &str) -> Value {
+        Self::excluding(&[close])
+    }
+
+    /// Any text that holds none of `first` and none of the markers that end
+    /// the call, each listed once.
+    fn excluding(first: &[&str]) -> Value {
+        let mut excludes: Vec<&str> = Vec::new();
+        for text in first.iter().chain(CALL_EXITS.iter()) {
+            if !excludes.contains(text) {
+                excludes.push(text);
+            }
+        }
+        json!({ "type": "any_text", "excludes": excludes })
+    }
+}
+
+/// The local pointers in `schema`, wherever a `$ref`, `$dynamicRef` or `$recursiveRef` stands.
+fn local_pointers(schema: &Value) -> Vec<&str> {
+    fn collect<'v>(schema: &'v Value, pointers: &mut Vec<&'v str>) {
+        match schema {
+            Value::Object(object) => {
+                for (key, value) in object {
+                    if matches!(key.as_str(), "$ref" | "$dynamicRef" | "$recursiveRef") {
+                        if let Some(pointer) =
+                            value.as_str().filter(|pointer| pointer.starts_with('#'))
+                        {
+                            pointers.push(pointer);
+                        }
+                    }
+                    collect(value, pointers);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| collect(item, pointers)),
+            _ => {}
+        }
+    }
+    let mut pointers = Vec::new();
+    collect(schema, &mut pointers);
+    pointers
+}
+
+/// About how many bytes `value` takes serialized, the escapes counted: what a leaf costs the
+/// invoke's byte budget.
+fn json_bytes(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Bool(flag) => {
+            if *flag {
+                4
+            } else {
+                5
+            }
+        }
+        Value::Number(number) => number.to_string().len(),
+        Value::String(text) => {
+            text.len()
+                + 2
+                + text
+                    .bytes()
+                    .filter(|byte| matches!(byte, b'"' | b'\\') || *byte < 0x20)
+                    .count()
+        }
+        Value::Array(items) => {
+            2 + items.iter().map(json_bytes).sum::<usize>() + items.len().saturating_sub(1)
+        }
+        Value::Object(object) => {
+            2 + object
+                .iter()
+                .map(|(key, value)| key.len() + 3 + json_bytes(value))
+                .sum::<usize>()
+                + object.len().saturating_sub(1)
+        }
     }
 }
 

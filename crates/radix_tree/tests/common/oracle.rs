@@ -1,25 +1,33 @@
-//! The differential oracle: `kv_index::PositionalIndexer` behind the
-//! same glue the service engine holds today (per-holder caller-owned
+//! The differential oracle: `kv_index::ChainIndex` behind the same
+//! glue the service engine holds today (per-holder caller-owned
 //! reverse maps, worker interning, id->holder resolution), driven by
-//! the harness's operation stream.
+//! the harness's operation stream. One chain index holds at most
+//! 1,024 workers, so a holder count above that (`RADIX_BENCH_SCALE=large`)
+//! runs on the sharded index, one shard per 1,024 holders, which is
+//! exact across its shards; at the default scales it is one shard of
+//! `holder_count` slots.
 
 use std::collections::BTreeMap;
 
-use kv_index::{ContentHash, PositionalIndexer, SequenceHash, StoredBlock, WorkerBlockMap};
+use kv_index::{ChainBlockMap, ContentHash, SequenceHash, ShardedChainIndex, StoredBlock};
 
 use super::Op;
 
+/// Worker slots of one chain index shard.
+const HOLDERS_PER_SHARD: usize = 1024;
+
 pub struct Oracle {
-    index: PositionalIndexer,
+    index: ShardedChainIndex,
     /// worker_id by holder index (dense).
     ids: Vec<u32>,
     /// The engine-side caller-owned reverse maps, one per holder.
-    blocks: Vec<WorkerBlockMap>,
+    blocks: Vec<ChainBlockMap>,
 }
 
 impl Oracle {
     pub fn new(holder_count: usize) -> Self {
-        let index = PositionalIndexer::new(64);
+        let shards = holder_count.div_ceil(HOLDERS_PER_SHARD).max(1);
+        let index = ShardedChainIndex::new(shards, holder_count.clamp(1, HOLDERS_PER_SHARD));
         let mut ids = Vec::with_capacity(holder_count);
         let mut blocks = Vec::with_capacity(holder_count);
         for h in 0..holder_count {
@@ -27,7 +35,7 @@ impl Oracle {
                 .intern_worker(&format!("holder-{h}"))
                 .expect("id space");
             ids.push(id);
-            blocks.push(WorkerBlockMap::default());
+            blocks.push(ChainBlockMap::default());
         }
         Self { index, ids, blocks }
     }

@@ -1,4 +1,4 @@
-"""Unit tests for the prefill leg's media identity (engine-free, needs torch).
+"""Unit tests for the prefill side's media identity (engine-free, needs torch).
 
 Run with: pytest grpc_servicer/tests/test_vllm_media_identity.py
 """
@@ -146,7 +146,7 @@ class TestTensorToProto:
         )
 
     def test_matches_the_routers_wire_form(self):
-        # The router writes little-endian element bytes; a decode leg reads
+        # The router writes little-endian element bytes; a decode side reads
         # either sender the same way.
         proto = media_identity.tensor_to_proto(torch.tensor([1, 4, 6], dtype=torch.int64))
         assert proto.inline == struct.pack("<3q", 1, 4, 6)

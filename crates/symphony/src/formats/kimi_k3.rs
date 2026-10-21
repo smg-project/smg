@@ -6,39 +6,11 @@
 //! `<|open|>call tool="…" index="N"<|sep|>` and `<|close|>call<|sep|>`, and the whole turn closed
 //! by `<|close|>message<|sep|>`. As recorded for `moonshotai/Kimi-K3`.
 //!
-//! What this table says beyond the DeepSeek one:
-//!
-//! - **The turn itself is a state.** Between the regions there is nothing: the template writes
-//!   the regions back to back, and the end-of-turn tag after the last. `message` is that
-//!   wrapping, so a byte there is `Dropped { Wrapper }` when it is whitespace and `Malformed`
-//!   otherwise, and it is the state the turn opener leaves the engine in. Content is only what the
-//!   `response` region holds, every byte of it; the recorded answers match it exactly.
-//! - **Two states for the calls**, as for DSML: `tools` is the wrapping between calls, and `call`
-//!   is one call's arguments, read by the XTML assembler ([`tagged::xtml`](crate::tagged::xtml)).
-//!   The call tag's opening is the terminal that enters `call`, so the assembler starts inside the
-//!   function's name; the call's closing tag leaves it, and the call's end carries its bytes. A
-//!   second call before the first closed ends the first (`call + call_open = call`), and the
-//!   block's close ends a call still open (`call + tools_close = message`).
-//! - **The end-of-turn tag ends whatever is open.** `<|close|>message<|sep|>` is a token the model
-//!   cannot write by accident, so from any state it ends the region and returns to `message`: a
-//!   thought or an answer cut by it is closed, a call is closed into its object, and the tag
-//!   itself is dropped as wrapping. The same holds for a region's opening inside the thought
-//!   (`reasoning + response_open = content`, `reasoning + tools_open = tools`) and for a tools
-//!   block opened inside the answer (`content + tools_open = tools`): the region ended, however
-//!   the model left it, since the tags are tokens the model cannot write as text.
-//! - **The prompt opens the thought.** The template ends the generation prompt with
-//!   `<|open|>message role="assistant"<|sep|><|open|>think<|sep|>`, so an empty thought writes
-//!   `<|close|>think<|sep|>` at once, and the engine's prompt replay puts the output inside the
-//!   thought first. The turn opener is the message tag with the assistant's role, so an earlier
-//!   turn's regions move nothing.
-//! - **`<|open|>` and `<|close|>` are structural tokens.** Each is one token of the vocabulary,
-//!   so an output cut by `max_tokens` inside a tag (`<|close|>message` with no `<|sep|>` after
-//!   it) ends in a tail the model cannot have written as text: the engine drops it at the end of
-//!   the output, as the engine's own streaming parser does, instead of releasing it as content.
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
 
 use crate::{
     format::{CallSyntax, Emits, Format},
-    tagged::xtml,
+    tagged::attributed::Tags,
 };
 
 /// The Kimi K3 table.
@@ -51,7 +23,7 @@ pub fn kimi_k3() -> Format {
         .terminal("tools_open", "<|open|>tools<|sep|>")
         .terminal("tools_close", "<|close|>tools<|sep|>")
         .terminal("call_open", "<|open|>call tool=\"")
-        .terminal("call_close", xtml::CALL_CLOSE)
+        .terminal("call_close", Tags::XTML.invoke_close)
         .terminal("message_close", "<|close|>message<|sep|>")
         .structural_token("<|open|>")
         .structural_token("<|close|>")
@@ -78,19 +50,27 @@ pub fn kimi_k3() -> Format {
         .transition("tools", "tools_close", "message")
         .transition("tools", "message_close", "message")
         .transition("message", "message_close", "message")
-        .calls(CallSyntax::Xtml)
+        .calls(CallSyntax::Attributed(Tags::XTML))
         .opens_turn("<|open|>message role=\"assistant\"<|sep|>")
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::{
+        ids::CallIds,
+        testing::{arguments_of, bytes, content, drive, reasoning},
+    };
+
+    fn ids() -> CallIds {
+        CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
+    }
+    use crate::{
         engine::Engine,
-        event::{DropReason, Event, Events, MalformedReason, Text},
-        input::{EngineFinish, Input},
-        parser::Parser,
-        tagged::Declared,
+        event::{DropReason, Event, MalformedReason, Text},
+        Declared,
     };
 
     /// The generation prompt's tail: the assistant's message opened, and its thought.
@@ -106,90 +86,27 @@ mod tests {
         "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
     );
 
-    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event> {
-        let mut parser = Engine::new(kimi_k3(), Declared::default());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        for piece in pieces {
-            parser
-                .feed(
-                    Input::Delta {
-                        token_ids: &[],
-                        text: piece,
-                        spans: &[],
-                    },
-                    &mut out,
-                )
-                .expect("delta");
-        }
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
+        drive(
+            &mut Engine::with_call_ids(Arc::new(kimi_k3()), Declared::default(), ids()),
+            prompt,
+            pieces,
+        )
     }
 
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
-    }
-
-    fn arguments_of(events: &[Event], call: u32) -> String {
+    fn ends<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::ToolCallArguments { index, json, .. } if *index == call => {
-                    Some(json.as_str())
-                }
+                Event::ToolCallEnd { source, .. } => Some(&*source.text),
                 _ => None,
             })
             .collect()
     }
 
-    fn content(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn ends(events: &[Event]) -> Vec<&str> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::ToolCallEnd { source, .. } => Some(source.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn dropped(text: &str) -> Event {
+    fn dropped(text: &str) -> Event<'static> {
         Event::Dropped {
-            text: Text::uncounted(text),
+            text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
         }
     }
@@ -214,7 +131,7 @@ mod tests {
             events[7],
             Event::ToolCallStart {
                 index: 0,
-                id: "call_0".into(),
+                id: ids().id(0),
                 name: "ChaDri_change_drink".into(),
                 source: Text::uncounted("ChaDri_change_drink\" index=\"1\"<|sep|>"),
             }
@@ -223,7 +140,7 @@ mod tests {
             arguments_of(&events, 0),
             r#"{"drink_id": "latte", "new_preferences": {"size": "large", "temperature": "hot"}}"#
         );
-        assert_eq!(ends(&events), [xtml::CALL_CLOSE]);
+        assert_eq!(ends(&events), [Tags::XTML.invoke_close]);
         assert_eq!(content(&events), "");
         assert!(events.contains(&dropped("<|close|>tools<|sep|>")));
         assert!(events.contains(&dropped("<|close|>message<|sep|>")));
@@ -328,9 +245,18 @@ mod tests {
         assert_eq!(starts, [(0, "f"), (1, "g"), (2, "h")]);
         assert_eq!(arguments_of(&events, 0), r#"{"a": true}"#);
         assert_eq!(arguments_of(&events, 1), "{}");
-        // The block's close cut `h` inside a string: the string and the object are closed.
-        assert_eq!(arguments_of(&events, 2), r#"{"b": "x"}"#);
-        assert_eq!(ends(&events), [xtml::CALL_CLOSE, "", ""]);
+        // The block's close cut `h` inside a string: nothing is closed for a value the model
+        // never closed, and the one word of no bytes before the end says so.
+        assert_eq!(arguments_of(&events, 2), r#"{"b": "x"#);
+        let ended = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { index: 2, .. }))
+            .expect("the third call ends");
+        assert!(matches!(
+            &events[ended - 1],
+            Event::Malformed { text, .. } if text.text.is_empty()
+        ));
+        assert_eq!(ends(&events), [Tags::XTML.invoke_close, "", ""]);
         assert!(matches!(
             events.last(),
             Some(Event::Finish { tool_calls: 3, .. })
@@ -447,7 +373,7 @@ mod tests {
         assert!(events.contains(&dropped("\n")));
         assert!(events.iter().any(|event| matches!(
             event,
-            Event::Malformed { text, why: MalformedReason::Other(_) } if text.text == "Hello"
+            Event::Malformed { text, why: MalformedReason::TextBetweenCalls } if text.text == "Hello"
         )));
     }
 
@@ -560,16 +486,6 @@ mod tests {
         "<|sep|>",
         "",
     ];
-
-    fn reasoning(events: &[Event]) -> String {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
-                _ => None,
-            })
-            .collect()
-    }
 
     #[test]
     fn a_tag_the_end_of_the_output_cut_short_is_dropped_not_released_as_content() {

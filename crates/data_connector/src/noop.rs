@@ -82,6 +82,7 @@ impl ConversationItemStorage for NoOpConversationItemStorage {
             content: item.content,
             status: item.status,
             created_at: Utc::now(),
+            tenant: item.tenant,
         })
     }
 
@@ -173,12 +174,17 @@ impl ResponseStorage for NoOpResponseStorage {
     async fn list_identifier_responses(
         &self,
         _identifier: &str,
+        _tenant: Option<&str>,
         _limit: Option<usize>,
     ) -> ResponseResult<Vec<StoredResponse>> {
         Ok(Vec::new())
     }
 
-    async fn delete_identifier_responses(&self, _identifier: &str) -> ResponseResult<usize> {
+    async fn delete_identifier_responses(
+        &self,
+        _identifier: &str,
+        _tenant: Option<&str>,
+    ) -> ResponseResult<usize> {
         Ok(0)
     }
 }
@@ -212,6 +218,7 @@ mod tests {
         let input = NewConversation {
             id: Some(ConversationId::from("conv_custom_123")),
             metadata: None,
+            tenant: None,
         };
         let conv = store
             .create_conversation(input)
@@ -271,6 +278,7 @@ mod tests {
             role: role.map(|r| r.to_string()),
             content: json!([]),
             status: Some("completed".to_string()),
+            tenant: None,
         }
     }
 
@@ -299,6 +307,7 @@ mod tests {
             role: Some("assistant".to_string()),
             content: json!(["hello"]),
             status: Some("completed".to_string()),
+            tenant: None,
         };
         let item = store
             .create_item(input)
@@ -433,7 +442,7 @@ mod tests {
     async fn test_list_identifier_responses_returns_empty() {
         let store = NoOpResponseStorage::new();
         let responses = store
-            .list_identifier_responses("any_identifier", None)
+            .list_identifier_responses("any_identifier", None, None)
             .await
             .expect("list_identifier_responses should succeed");
         assert!(
@@ -446,7 +455,7 @@ mod tests {
     async fn test_delete_identifier_responses_returns_zero() {
         let store = NoOpResponseStorage::new();
         let count = store
-            .delete_identifier_responses("any_identifier")
+            .delete_identifier_responses("any_identifier", None)
             .await
             .expect("delete_identifier_responses should succeed");
         assert_eq!(count, 0, "NoOp delete_identifier_responses should return 0");

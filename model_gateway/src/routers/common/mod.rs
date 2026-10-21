@@ -20,12 +20,12 @@
 //!   guard, shared by the HTTP and gRPC selection paths
 //! - [`pd_admission`] — the disaggregated dispatch's admission gate: never
 //!   post more bootstrap rooms to a pair than its decode engine can admit
-//! - [`placement`] — policy-driven worker placement over the routing
+//! - `placement` — policy-driven worker placement over the routing
 //!   pools (single worker and prefill/decode pairs), the one sequence the
 //!   HTTP and gRPC families used to each carry a copy of
 //! - [`worker_selection`] — per-request worker-selection helpers used
 //!   by every routing path (regular, PD, fallback, external provider)
-//! - [`attempt_ledger`] — one request's bookkeeping across its retry
+//! - `attempt_ledger` — one request's bookkeeping across its retry
 //!   attempts: the circuit breaker charged once per request per worker,
 //!   and a worker's definitive answer never replayed on it
 //! - [`request_lease`] — dispatch-phase owner of a request's parsed
@@ -54,7 +54,7 @@ pub use smg_external_router::realtime;
 pub mod request_lease;
 pub(crate) use smg_external_router::sglang_fields;
 pub use smg_external_router::{retry, sse};
-pub(crate) mod sse_rechunk;
+pub mod sse_rechunk;
 pub mod worker_selection;
 
 /// Threshold above which upstream request bodies are sent as one-shot

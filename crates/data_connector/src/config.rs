@@ -1,5 +1,7 @@
 //! Storage backend configuration types.
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -15,6 +17,55 @@ pub enum HistoryBackend {
     Oracle,
     Postgres,
     Redis,
+}
+
+/// Bounds of the in-memory history backend. Its records live in the
+/// gateway's own memory, so it keeps at most `max_responses` stored responses
+/// and `max_items` conversation items and drops a record older than
+/// `retention_secs`: the oldest go first, checked on every write. The
+/// defaults hold a default deployment at a few hundred MB (a stored response
+/// of a short exchange takes about 12 KB, a conversation item about 1.5 KB).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct MemoryConfig {
+    /// Most stored responses kept; the oldest go first.
+    pub max_responses: usize,
+    /// Most conversation items kept; the oldest go first, unlinked from every
+    /// conversation that lists them.
+    pub max_items: usize,
+    /// How long a record is kept, in seconds; `None` (or 0) keeps a record
+    /// until a count bound drops it. Conversations follow the retention only,
+    /// counted from their last use (created, read or updated); a background
+    /// response still running is not dropped by a count bound.
+    pub retention_secs: Option<u64>,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        Self {
+            max_responses: 10_000,
+            max_items: 100_000,
+            retention_secs: Some(24 * 60 * 60),
+        }
+    }
+}
+
+impl MemoryConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_responses == 0 || self.max_items == 0 {
+            return Err(
+                "memory history: max_responses and max_items must be at least 1".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The retention as a duration; `None` for no retention.
+    pub fn retention(&self) -> Option<Duration> {
+        self.retention_secs
+            .filter(|secs| *secs > 0)
+            .map(Duration::from_secs)
+    }
 }
 
 /// Oracle history backend configuration
@@ -88,6 +139,13 @@ pub struct PostgresConfig {
     pub db_url: String,
     // Database pool max size
     pub pool_max: usize,
+    /// Bound, in seconds, on one call to the store: waiting for a pooled
+    /// connection, connecting, and the operation itself. A call that exceeds
+    /// it fails as a timeout, which the API answers as `503
+    /// storage_unavailable`, instead of holding its request for as long as
+    /// the client waits. Must be > 0.
+    #[serde(default = "default_op_timeout_secs")]
+    pub op_timeout_secs: u64,
     /// Optional schema customization (table names, column names, extra columns).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<SchemaConfig>,
@@ -96,6 +154,30 @@ pub struct PostgresConfig {
 impl PostgresConfig {
     pub fn default_pool_max() -> usize {
         16
+    }
+
+    pub fn default_op_timeout_secs() -> u64 {
+        default_op_timeout_secs()
+    }
+
+    /// The bound on one call to the store.
+    pub fn op_timeout(&self) -> Duration {
+        Duration::from_secs(self.op_timeout_secs)
+    }
+
+    /// The numeric invariants every entry path must hold (the CLI, the
+    /// Python bindings, a config built by hand), checked by the factory
+    /// before any connection. The connection string's shape is left to the
+    /// driver here: [`Self::validate`] checks it for the CLI's URLs, while a
+    /// socket path or a key=value string the driver understands passes.
+    pub fn validate_bounds(&self) -> Result<(), String> {
+        if self.pool_max == 0 {
+            return Err("pool_max must be greater than 0".to_string());
+        }
+        if self.op_timeout_secs == 0 {
+            return Err("op_timeout_secs must be greater than 0".to_string());
+        }
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -124,11 +206,7 @@ impl PostgresConfig {
             return Err("db_url must include a database name".to_string());
         }
 
-        if self.pool_max == 0 {
-            return Err("pool_max must be greater than 0".to_string());
-        }
-
-        Ok(())
+        self.validate_bounds()
     }
 }
 
@@ -140,6 +218,13 @@ pub struct RedisConfig {
     // Connection pool max size
     #[serde(default = "default_redis_pool_max")]
     pub pool_max: usize,
+    /// Bound, in seconds, on one call to the store: waiting for a pooled
+    /// connection, connecting, and the operation itself. A call that exceeds
+    /// it fails as a timeout, which the API answers as `503
+    /// storage_unavailable`, instead of holding its request for as long as
+    /// the client waits. Must be > 0.
+    #[serde(default = "default_op_timeout_secs")]
+    pub op_timeout_secs: u64,
     /// Optional schema customization (key prefix, field names, extra fields).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<SchemaConfig>,
@@ -152,6 +237,13 @@ fn default_redis_pool_max() -> usize {
     16
 }
 
+/// The default bound on one store call, in seconds: a few seconds, so a store
+/// that stopped answering degrades the stateful endpoints instead of pinning
+/// their requests, while a slow store still works.
+fn default_op_timeout_secs() -> u64 {
+    5
+}
+
 #[expect(
     clippy::unnecessary_wraps,
     reason = "serde default function must match field type Option<u64>"
@@ -161,6 +253,37 @@ fn default_redis_retention_days() -> Option<u64> {
 }
 
 impl RedisConfig {
+    pub fn default_op_timeout_secs() -> u64 {
+        default_op_timeout_secs()
+    }
+
+    /// The bound on one call to the store.
+    pub fn op_timeout(&self) -> Duration {
+        Duration::from_secs(self.op_timeout_secs)
+    }
+
+    /// The numeric invariants every entry path must hold (the CLI, the
+    /// Python bindings, a config built by hand), checked by the factory
+    /// before any connection. The connection string's shape is left to the
+    /// driver here: [`Self::validate`] checks it for the CLI's URLs, while a
+    /// socket path the driver understands passes.
+    pub fn validate_bounds(&self) -> Result<(), String> {
+        if self.pool_max == 0 {
+            return Err("pool_max must be greater than 0".to_string());
+        }
+        if self.op_timeout_secs == 0 {
+            return Err("op_timeout_secs must be greater than 0".to_string());
+        }
+        // A retention of 0 days would expire every record the moment it is
+        // written; persistent records are spelled by leaving the retention unset.
+        if self.retention_days == Some(0) {
+            return Err(
+                "retention_days must be at least 1; persistent records are spelled -1 on the command line and in Python (unset in Rust)".to_string(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         let s = self.url.trim();
         if s.is_empty() {
@@ -178,17 +301,53 @@ impl RedisConfig {
             return Err("redis url must have a host".to_string());
         }
 
-        if self.pool_max == 0 {
-            return Err("pool_max must be greater than 0".to_string());
-        }
-
-        Ok(())
+        self.validate_bounds()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── validate_bounds ─────────────────────────────────────────────────
+
+    /// The factory's check holds the bounds only: a connection string the
+    /// driver understands but the CLI's URL check does not (a key=value
+    /// string, a socket path) passes it, and a zero bound does not.
+    #[test]
+    fn validate_bounds_leaves_the_connection_string_to_the_driver() {
+        let postgres = PostgresConfig {
+            db_url: "host=/var/run/postgresql dbname=smg user=smg".to_string(),
+            pool_max: 4,
+            op_timeout_secs: 5,
+            schema: None,
+        };
+        assert!(postgres.validate_bounds().is_ok());
+        assert!(postgres.validate().is_err());
+        let zero = PostgresConfig {
+            op_timeout_secs: 0,
+            ..postgres
+        };
+        assert!(zero
+            .validate_bounds()
+            .unwrap_err()
+            .contains("op_timeout_secs"));
+
+        let redis = RedisConfig {
+            url: "unix:///run/redis.sock".to_string(),
+            pool_max: 4,
+            op_timeout_secs: 5,
+            retention_days: Some(1),
+            schema: None,
+        };
+        assert!(redis.validate_bounds().is_ok());
+        assert!(redis.validate().is_err());
+        let zero = RedisConfig {
+            pool_max: 0,
+            ..redis
+        };
+        assert!(zero.validate_bounds().unwrap_err().contains("pool_max"));
+    }
 
     // ── PostgresConfig::validate ────────────────────────────────────────
 
@@ -197,6 +356,7 @@ mod tests {
         let cfg = PostgresConfig {
             db_url: "postgres://user:pass@localhost:5432/mydb".to_string(),
             pool_max: 16,
+            op_timeout_secs: 5,
             schema: None,
         };
         cfg.validate()
@@ -208,6 +368,7 @@ mod tests {
         let cfg = PostgresConfig {
             db_url: "postgresql://user:pass@localhost/mydb".to_string(),
             pool_max: 8,
+            op_timeout_secs: 5,
             schema: None,
         };
         cfg.validate()
@@ -219,6 +380,7 @@ mod tests {
         let cfg = PostgresConfig {
             db_url: "  ".to_string(),
             pool_max: 16,
+            op_timeout_secs: 5,
             schema: None,
         };
         let err = cfg.validate().expect_err("empty URL should fail");
@@ -233,6 +395,7 @@ mod tests {
         let cfg = PostgresConfig {
             db_url: "mysql://user:pass@localhost/mydb".to_string(),
             pool_max: 16,
+            op_timeout_secs: 5,
             schema: None,
         };
         let err = cfg.validate().expect_err("mysql scheme should be rejected");
@@ -248,6 +411,7 @@ mod tests {
         let cfg = PostgresConfig {
             db_url: "postgres:///mydb".to_string(),
             pool_max: 16,
+            op_timeout_secs: 5,
             schema: None,
         };
         let err = cfg.validate().expect_err("missing host should fail");
@@ -262,6 +426,7 @@ mod tests {
         let cfg = PostgresConfig {
             db_url: "postgres://user:pass@localhost".to_string(),
             pool_max: 16,
+            op_timeout_secs: 5,
             schema: None,
         };
         let err = cfg
@@ -278,6 +443,7 @@ mod tests {
         let cfg = PostgresConfig {
             db_url: "postgres://user:pass@localhost/mydb".to_string(),
             pool_max: 0,
+            op_timeout_secs: 5,
             schema: None,
         };
         let err = cfg.validate().expect_err("pool_max=0 should fail");
@@ -294,6 +460,7 @@ mod tests {
         let cfg = RedisConfig {
             url: "redis://:password@localhost:6379/0".to_string(),
             pool_max: 16,
+            op_timeout_secs: 5,
             retention_days: Some(30),
             schema: None,
         };
@@ -306,6 +473,7 @@ mod tests {
         let cfg = RedisConfig {
             url: "rediss://:password@redis.example.com:6380".to_string(),
             pool_max: 8,
+            op_timeout_secs: 5,
             retention_days: None,
             schema: None,
         };
@@ -318,6 +486,7 @@ mod tests {
         let cfg = RedisConfig {
             url: String::new(),
             pool_max: 16,
+            op_timeout_secs: 5,
             retention_days: Some(30),
             schema: None,
         };
@@ -333,6 +502,7 @@ mod tests {
         let cfg = RedisConfig {
             url: "http://localhost:6379".to_string(),
             pool_max: 16,
+            op_timeout_secs: 5,
             retention_days: Some(30),
             schema: None,
         };
@@ -348,6 +518,7 @@ mod tests {
         let cfg = RedisConfig {
             url: "redis:///0".to_string(),
             pool_max: 16,
+            op_timeout_secs: 5,
             retention_days: Some(30),
             schema: None,
         };
@@ -363,12 +534,81 @@ mod tests {
         let cfg = RedisConfig {
             url: "redis://localhost:6379".to_string(),
             pool_max: 0,
+            op_timeout_secs: 5,
             retention_days: Some(30),
             schema: None,
         };
         let err = cfg.validate().expect_err("pool_max=0 should fail");
         assert!(
             err.contains("greater than 0"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    // ── op_timeout_secs ─────────────────────────────────────────────────
+
+    #[test]
+    fn op_timeout_defaults_to_five_seconds_and_reads_the_configured_value() {
+        let pg: PostgresConfig = serde_json::from_value(
+            serde_json::json!({"db_url": "postgres://u:p@h/d", "pool_max": 4}),
+        )
+        .expect("a config without the field");
+        assert_eq!(pg.op_timeout_secs, 5);
+        assert_eq!(pg.op_timeout(), Duration::from_secs(5));
+        let redis: RedisConfig = serde_json::from_value(serde_json::json!({"url": "redis://h"}))
+            .expect("a config without the field");
+        assert_eq!(redis.op_timeout_secs, 5);
+
+        let pg: PostgresConfig = serde_json::from_value(
+            serde_json::json!({"db_url": "postgres://u:p@h/d", "pool_max": 4, "op_timeout_secs": 12}),
+        )
+        .expect("a config with the field");
+        assert_eq!(pg.op_timeout(), Duration::from_secs(12));
+        let redis: RedisConfig =
+            serde_json::from_value(serde_json::json!({"url": "redis://h", "op_timeout_secs": 3}))
+                .expect("a config with the field");
+        assert_eq!(redis.op_timeout(), Duration::from_secs(3));
+    }
+
+    #[test]
+    fn a_zero_op_timeout_is_refused() {
+        let pg = PostgresConfig {
+            db_url: "postgres://user:pass@localhost:5432/mydb".to_string(),
+            pool_max: 16,
+            op_timeout_secs: 0,
+            schema: None,
+        };
+        let err = pg.validate().expect_err("op_timeout_secs=0 should fail");
+        assert!(
+            err.contains("op_timeout_secs"),
+            "unexpected error message: {err}"
+        );
+        let redis = RedisConfig {
+            url: "redis://localhost:6379".to_string(),
+            pool_max: 16,
+            op_timeout_secs: 0,
+            retention_days: Some(30),
+            schema: None,
+        };
+        let err = redis.validate().expect_err("op_timeout_secs=0 should fail");
+        assert!(
+            err.contains("op_timeout_secs"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn redis_retention_zero_fails() {
+        let cfg = RedisConfig {
+            url: "redis://localhost:6379/0".to_string(),
+            pool_max: 16,
+            op_timeout_secs: 5,
+            retention_days: Some(0),
+            schema: None,
+        };
+        let err = cfg.validate().expect_err("retention_days=0 should fail");
+        assert!(
+            err.contains("retention_days must be at least 1"),
             "unexpected error message: {err}"
         );
     }

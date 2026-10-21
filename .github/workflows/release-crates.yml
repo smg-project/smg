@@ -75,6 +75,8 @@ jobs:
             path: crates/rl
           - crate: smg-external-router
             path: crates/external_router
+          - crate: smg-symphony
+            path: crates/symphony
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/publish-crate
@@ -95,6 +97,8 @@ jobs:
             path: crates/multimodal
           - crate: engine-zmq-adapter
             path: crates/engine_zmq_adapter
+          - crate: smg-response-template
+            path: crates/response_template
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/publish-crate

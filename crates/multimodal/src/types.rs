@@ -11,7 +11,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
-    audio::DecodedAudio, error::MediaConnectorError, media::decode_image_bytes, vision::execution,
+    audio::DecodedAudio,
+    error::MediaConnectorError,
+    media::{apply_transparency, decode_image_bytes},
+    vision::execution,
 };
 
 /// Supported multimodal modalities.
@@ -138,6 +141,41 @@ pub enum VideoSource {
     File { path: PathBuf },
 }
 
+/// How an image that carries an alpha channel becomes RGB when a frame is
+/// decoded. The serving engines' own image loaders differ: one composites
+/// such an image over opaque white before its processor runs, another drops
+/// the channel and keeps the stored colour, and a processor whose reference
+/// is handed the image as stored handles alpha itself. The gateway resolves
+/// the policy from the destination engine; a frame without one keeps the
+/// image as decoded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransparencyPolicy {
+    /// The image as decoded, alpha channel included; the processor composites
+    /// or drops it itself.
+    #[default]
+    KeepAlpha,
+    /// Composite over opaque white with the integer paste-through-mask blend
+    /// `(src * a + 255 * (255 - a) + 127) / 255`; a truecolour PNG with a
+    /// `tRNS` colour key keeps its stored colour, as that loader keeps it.
+    CompositeOverWhite,
+    /// Drop the alpha channel and keep every pixel's stored colour (Pillow's
+    /// `convert("RGB")`): a fully transparent pixel reads as its stored
+    /// colour, usually black.
+    DropAlpha,
+}
+
+impl TransparencyPolicy {
+    /// The policy's name as the configuration and the cache keys spell it.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::KeepAlpha => "keep_alpha",
+            Self::CompositeOverWhite => "composite_over_white",
+            Self::DropAlpha => "drop_alpha",
+        }
+    }
+}
+
 /// Concrete image payload captured by the media connector: the encoded bytes
 /// with their identity and size, decoded on first use, so a request whose
 /// pixels are already cached never pays for the decode.
@@ -153,6 +191,13 @@ pub struct ImageFrame {
     pub source: ImageSource,
     /// Blake3 hex-digest of `raw_bytes` and the resolution cap.
     pub hash: String,
+    /// The policy the decode applies to an alpha channel: `KeepAlpha` unless
+    /// the frame was built [`with_transparency`](Self::with_transparency).
+    transparency: TransparencyPolicy,
+    /// Whether the frame was built from pixels ([`new`](Self::new)) rather
+    /// than from bytes it decodes: a later policy applies to those pixels,
+    /// as there is nothing to decode again.
+    from_pixels: bool,
 }
 
 /// Decoded audio payload captured by the media connector.
@@ -419,6 +464,8 @@ impl ImageFrame {
             detail,
             source,
             hash,
+            transparency: TransparencyPolicy::KeepAlpha,
+            from_pixels: true,
         }
     }
 
@@ -440,16 +487,54 @@ impl ImageFrame {
             detail,
             source,
             hash,
+            transparency: TransparencyPolicy::KeepAlpha,
+            from_pixels: false,
         }
     }
 
     /// The decoded pixels, decoding on the first call. A body its header did
     /// not vouch for fails here, as the caller's input.
     pub fn image(&self) -> Result<&DynamicImage, MediaConnectorError> {
-        self.decoded
-            .get_or_try_init(|| decode_image_bytes(&self.raw_bytes, self.max_long_side_pixel))
+        self.decoded.get_or_try_init(|| {
+            decode_image_bytes(
+                &self.raw_bytes,
+                self.max_long_side_pixel,
+                self.transparency(),
+            )
+        })
     }
 
+    /// The transparency policy the decode applies (see [`TransparencyPolicy`]).
+    pub fn transparency(&self) -> TransparencyPolicy {
+        self.transparency
+    }
+
+    /// The frame decoded under `policy`. The media connector builds frames
+    /// this way with a `hash` computed for the same policy
+    /// ([`hash_image_with_transparency`](crate::hasher::hash_image_with_transparency)),
+    /// so the caches that key on the hash never serve one policy's pixels for
+    /// another's; a caller building frames itself does the same.
+    ///
+    /// The pixels always agree with [`transparency`](Self::transparency): a
+    /// frame already decoded from its bytes drops that decode and decodes
+    /// them again under `policy` when next asked (the policy applies before
+    /// the long-side cap, as in any decode); a frame built from pixels has
+    /// `policy` applied to the pixels it holds (an alpha channel is
+    /// composited over white or dropped; `KeepAlpha` leaves them as given).
+    /// The same policy again changes nothing.
+    pub fn with_transparency(mut self, policy: TransparencyPolicy) -> Self {
+        if policy == self.transparency {
+            return self;
+        }
+        self.transparency = policy;
+        if let Some(pixels) = self.decoded.take() {
+            if self.from_pixels {
+                // The cell is empty after `take`, so this first `set` holds.
+                let _ = self.decoded.set(apply_transparency(pixels, &[], policy));
+            }
+        }
+        self
+    }
     /// Decode the pixels of every frame that is still encoded, in parallel on
     /// the preprocessing pool (inline under `Parallelism::Inline`), instead of
     /// one photo after another on the calling thread. [`image`](Self::image)
@@ -637,6 +722,21 @@ impl PromptReplacement {
         }
     }
 
+    /// One repeated replacement per media item, in batch order, each as long as the item's
+    /// feature-token count: the shape of a spec whose placeholder is one token repeated, which
+    /// most vision specs are.
+    pub fn repeated_per_item(
+        modality: Modality,
+        placeholder_token: &str,
+        token_id: TokenId,
+        counts: &[usize],
+    ) -> Vec<Self> {
+        counts
+            .iter()
+            .map(|&count| Self::repeated(modality, placeholder_token, token_id, count))
+            .collect()
+    }
+
     pub fn sequence(modality: Modality, placeholder_token: &str, sequence: Vec<TokenId>) -> Self {
         Self {
             modality,
@@ -698,6 +798,30 @@ mod tests {
                 offset: 1,
                 length: 2
             }])
+        );
+    }
+
+    #[test]
+    fn repeated_per_item_gives_one_replacement_per_count_in_order() {
+        let replacements =
+            PromptReplacement::repeated_per_item(Modality::Image, "<image>", 100, &[3, 0, 2]);
+        assert_eq!(
+            replacements
+                .iter()
+                .map(|replacement| replacement.tokens.len())
+                .collect::<Vec<_>>(),
+            vec![3, 0, 2],
+            "one replacement per item, as long as its count, a zero count kept"
+        );
+        for replacement in &replacements {
+            assert_eq!(replacement.modality, Modality::Image);
+            assert_eq!(replacement.placeholder_token, "<image>");
+            assert!(replacement.tokens.iter().all(|&token| token == 100));
+            assert!(replacement.feature_ranges.is_none());
+            assert_eq!(replacement.structural_prefix, 0);
+        }
+        assert!(
+            PromptReplacement::repeated_per_item(Modality::Image, "<image>", 100, &[]).is_empty()
         );
     }
 
@@ -767,6 +891,199 @@ mod tests {
             ImageSize::new(width, height),
             None,
         )
+    }
+
+    #[test]
+    fn capped_decode_does_not_wait_for_its_own_pool() {
+        use std::{
+            process::Command,
+            sync::mpsc,
+            time::{Duration, Instant},
+        };
+
+        const CHILD: &str = "SMG_CAPPED_DECODE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // Isolate the process-wide pool and bound a deadlock regression.
+            let directory = tempfile::tempdir().expect("completion directory");
+            let completed = directory.path().join("completed");
+            let name = format!(
+                "{}::capped_decode_does_not_wait_for_its_own_pool",
+                module_path!().split_once("::").expect("crate path").1,
+            );
+            let mut child = Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", name.as_str(), "--nocapture"])
+                .env(CHILD, &completed)
+                .spawn()
+                .expect("start child");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status) = child.try_wait().expect("child status") {
+                    assert!(status.success(), "shared capped decode failed: {status}");
+                    assert!(
+                        completed.is_file(),
+                        "child did not complete the regression test"
+                    );
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().expect("kill blocked child");
+                    child.wait().expect("reap child");
+                    panic!("shared capped decode blocked the vision pool");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        execution::configure_parallelism(execution::Parallelism::Pool(
+            std::num::NonZeroUsize::new(2).expect("two threads"),
+        ))
+        .expect("configure isolated pool");
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        DynamicImage::new_rgb8(2048, 1024)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode RGB fixture");
+        let frame = ImageFrame::encoded(
+            encoded.into_inner().into(),
+            ImageDetail::Auto,
+            ImageSource::InlineBytes,
+            String::new(),
+            ImageSize::new(1008, 504),
+            Some(1008),
+        );
+        let (initializing_tx, initializing_rx) = mpsc::channel();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        std::thread::scope(|threads| {
+            let frame = &frame;
+            let initializer = threads.spawn(move || {
+                frame
+                    .decoded
+                    .get_or_try_init(|| {
+                        initializing_tx.send(()).expect("initializer ready");
+                        for _ in 0..2 {
+                            waiting_rx.recv().expect("pool waiter ready");
+                        }
+                        decode_image_bytes(
+                            &frame.raw_bytes,
+                            frame.max_long_side_pixel,
+                            frame.transparency(),
+                        )
+                    })
+                    .expect("decode and cap")
+            });
+            initializing_rx.recv().expect("initializer owns the cell");
+            // Independent callers can wait on the same frame even though
+            // decode_all deduplicates frames within each individual batch.
+            execution::scope(|spawner| {
+                for _ in 0..2 {
+                    let waiting_tx = &waiting_tx;
+                    spawner.spawn(move |_| {
+                        waiting_tx.send(()).expect("pool waiter ready");
+                        assert_eq!(frame.image().expect("shared decode").width(), 1008);
+                    });
+                }
+            });
+            assert_eq!(initializer.join().expect("initializer").height(), 504);
+        });
+        std::fs::write(
+            std::env::var_os(CHILD).expect("completion path"),
+            b"completed",
+        )
+        .expect("record completed regression test");
+    }
+
+    /// A 2x1 RGBA PNG: a fully transparent black pixel, then an opaque colour.
+    fn transparent_png() -> bytes::Bytes {
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        transparent_pixels()
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode RGBA fixture");
+        encoded.into_inner().into()
+    }
+
+    fn transparent_pixels() -> DynamicImage {
+        DynamicImage::ImageRgba8(
+            image::RgbaImage::from_raw(2, 1, vec![0, 0, 0, 0, 10, 20, 30, 255]).expect("2x1"),
+        )
+    }
+
+    fn encoded_frame(bytes: bytes::Bytes) -> ImageFrame {
+        ImageFrame::encoded(
+            bytes,
+            ImageDetail::Auto,
+            ImageSource::InlineBytes,
+            String::new(),
+            ImageSize::new(2, 1),
+            None,
+        )
+    }
+
+    #[test]
+    fn with_transparency_decodes_an_already_decoded_frame_again_under_the_new_policy() {
+        let frame = encoded_frame(transparent_png());
+        assert!(frame.image().expect("decode").color().has_alpha());
+        let frame = frame.with_transparency(TransparencyPolicy::CompositeOverWhite);
+        assert_eq!(frame.transparency(), TransparencyPolicy::CompositeOverWhite);
+        assert!(
+            frame.decoded.get().is_none(),
+            "the previous decode is dropped"
+        );
+        assert_eq!(
+            frame.image().expect("decode").to_rgb8().as_raw(),
+            &[255, 255, 255, 10, 20, 30]
+        );
+        let frame = frame.with_transparency(TransparencyPolicy::DropAlpha);
+        assert_eq!(
+            frame.image().expect("decode").to_rgb8().as_raw(),
+            &[0, 0, 0, 10, 20, 30]
+        );
+        let frame = frame.with_transparency(TransparencyPolicy::KeepAlpha);
+        assert!(frame.image().expect("decode").color().has_alpha());
+    }
+
+    #[test]
+    fn with_transparency_keeps_the_decode_when_the_policy_is_the_same() {
+        let frame = encoded_frame(transparent_png());
+        frame.image().expect("decode");
+        let frame = frame.with_transparency(TransparencyPolicy::KeepAlpha);
+        assert!(frame.decoded.get().is_some());
+        let frame = frame.with_transparency(TransparencyPolicy::DropAlpha);
+        frame.image().expect("decode");
+        let frame = frame.with_transparency(TransparencyPolicy::DropAlpha);
+        assert!(frame.decoded.get().is_some());
+        assert!(!frame.image().expect("decode").color().has_alpha());
+    }
+
+    #[test]
+    fn with_transparency_applies_the_policy_to_a_frame_built_from_pixels() {
+        let built = |policy| {
+            ImageFrame::new(
+                transparent_pixels(),
+                bytes::Bytes::new(),
+                ImageDetail::Auto,
+                ImageSource::InlineBytes,
+                String::new(),
+            )
+            .with_transparency(policy)
+        };
+        let white = built(TransparencyPolicy::CompositeOverWhite);
+        assert_eq!(white.transparency(), TransparencyPolicy::CompositeOverWhite);
+        assert!(!white.image().expect("pixels").color().has_alpha());
+        assert_eq!(
+            white.image().expect("pixels").to_rgb8().as_raw(),
+            &[255, 255, 255, 10, 20, 30]
+        );
+        let dropped = built(TransparencyPolicy::DropAlpha);
+        assert!(!dropped.image().expect("pixels").color().has_alpha());
+        assert_eq!(
+            dropped.image().expect("pixels").to_rgb8().as_raw(),
+            &[0, 0, 0, 10, 20, 30]
+        );
+        let kept = built(TransparencyPolicy::KeepAlpha);
+        assert!(kept.image().expect("pixels").color().has_alpha());
+        assert_eq!(
+            kept.image().expect("pixels").as_bytes(),
+            transparent_pixels().as_bytes()
+        );
     }
 
     #[test]

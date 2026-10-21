@@ -1,0 +1,39 @@
+{
+  "date": "2026-10-13",
+  "base_commit": "d52de821b938f3260ace47a256592b994fcf9b5c",
+  "rust": "1.98.0",
+  "cpu_model": "INTEL(R) XEON(R) PLATINUM 8573C",
+  "cpu_max": "400000 100000",
+  "platform": "Linux-6.18.44-x86_64-with-glibc2.41",
+  "models": [
+    {
+      "name": "minimax-m3",
+      "repo": "MiniMaxAI/MiniMax-M3",
+      "revision": "f0e1c1e04d40177e4673a22097036854f536e9c0",
+      "marker": "[e~[",
+      "sha256": "bb1f1626cf01448f1e3b6036d0a061ffc66c91d9046aada14ea23a5441b5ad6e"
+    },
+    {
+      "name": "glm-5.3",
+      "repo": "zai-org/GLM-5.3",
+      "revision": "c5087a76d148760811ffbdedfe6ff9f194e46e38",
+      "marker": "<|assistant|>",
+      "sha256": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d"
+    },
+    {
+      "name": "qwen3-8b",
+      "repo": "Qwen/Qwen3-8B",
+      "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "marker": "<|im_end|>",
+      "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+    },
+    {
+      "name": "deepseek-v3.2",
+      "repo": "deepseek-ai/DeepSeek-V3.2",
+      "revision": "a7e62ac04ecb2c0a54d736dc46601c5606cf10a6",
+      "marker": "<｜end▁of▁sentence｜>",
+      "sha256": "cd050be35cae877f8f0aa847f45aa87e23835a56ca32b29b28545597852784e5"
+    }
+  ],
+  "cargo_lock_sha256": "22d674e935b3189bf7e394c9e4b2e1a32b1d62b2f59e0014f1d27954a6d688c9"
+}

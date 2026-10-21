@@ -177,10 +177,7 @@ impl VisionPreProcessor for PixtralProcessor {
         config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
         if images.is_empty() {
-            return Err(TransformError::InvalidShape {
-                expected: "non-empty image batch".to_string(),
-                actual: vec![0],
-            });
+            return Err(TransformError::EmptyBatch);
         }
 
         // Apply config overrides if present
@@ -201,7 +198,7 @@ impl VisionPreProcessor for PixtralProcessor {
 
         for image in images {
             let (pixels, size) = processor.process_single_image(image)?;
-            let tokens = processor.calculate_num_tokens(image.width(), image.height(), config);
+            let tokens = processor.calculate_num_tokens(image.width(), image.height(), config)?;
 
             all_pixel_values.push(pixels);
             all_image_sizes.push(size);
@@ -256,7 +253,12 @@ impl VisionPreProcessor for PixtralProcessor {
         })
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
         let processor = Self::from_preprocessor_config(config);
         let (target_h, target_w) = processor.get_resize_output_size(height, width);
         let patch_size = processor.patch_size;
@@ -264,7 +266,7 @@ impl VisionPreProcessor for PixtralProcessor {
         // Number of tokens = num_patches_h * num_patches_w
         let num_patches_h = target_h / patch_size;
         let num_patches_w = target_w / patch_size;
-        (num_patches_h * num_patches_w) as usize
+        Ok((num_patches_h * num_patches_w) as usize)
     }
 
     fn model_name(&self) -> &'static str {
@@ -406,7 +408,14 @@ mod tests {
         let config = PreProcessorConfig::default();
 
         // 200x150 -> 208x160 -> 13*10 = 130 patches
-        let tokens = processor.calculate_num_tokens(200, 150, &config);
+        let tokens = processor.calculate_num_tokens(200, 150, &config).unwrap();
         assert_eq!(tokens, 130);
+    }
+
+    #[test]
+    fn an_empty_batch_is_refused_as_empty_batch() {
+        let processor = PixtralProcessor::new();
+        let result = processor.preprocess(&[], &PreProcessorConfig::default());
+        assert!(matches!(result, Err(TransformError::EmptyBatch)));
     }
 }

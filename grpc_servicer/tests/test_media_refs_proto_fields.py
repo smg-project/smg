@@ -54,6 +54,7 @@ class TestGetServerInfoResponseMediaFields:
         assert fields["mm_media_ref_schemes"].number == 17
         assert fields["mm_item_limits"].number == 21
         assert fields["multimodal_encoder_dtype"].number == 22
+        assert fields["mm_encoder_budget"].number == 25
 
     def test_empty_by_default(self):
         info = vllm_engine_pb2.GetServerInfoResponse()

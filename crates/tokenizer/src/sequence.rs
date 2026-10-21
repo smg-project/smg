@@ -40,6 +40,10 @@ pub struct Sequence {
     /// The backend's own per-stream decoder, when it has one. Then
     /// `token_ids`, `prefix_index` and `cached_prefix` stay unused.
     incremental: Option<Box<dyn IncrementalDecoder>>,
+    eager_stop_matching: bool,
+    /// Steps and finishes whose decode no longer started with the emitted text
+    /// and streamed a best-effort remainder instead (see [`DecodeStep`]).
+    prefix_mismatches: u32,
 }
 
 impl std::fmt::Debug for Sequence {
@@ -76,6 +80,8 @@ impl Sequence {
     pub fn new_with_options(tokenizer: Arc<dyn TokenizerTrait>, skip_special_tokens: bool) -> Self {
         Self {
             incremental: tokenizer.incremental_decoder(skip_special_tokens),
+            eager_stop_matching: false,
+            prefix_mismatches: 0,
             tokenizer,
             token_ids: Vec::new(),
             total_tokens: 0,
@@ -83,6 +89,15 @@ impl Sequence {
             cached_prefix: String::new(),
             skip_special_tokens,
         }
+    }
+
+    pub(crate) fn for_stop_matching(
+        tokenizer: Arc<dyn TokenizerTrait>,
+        skip_special_tokens: bool,
+    ) -> Self {
+        let mut sequence = Self::new_with_options(tokenizer, skip_special_tokens);
+        sequence.eager_stop_matching = true;
+        sequence
     }
 
     /// Create a sequence with initial tokens
@@ -107,10 +122,12 @@ impl Sequence {
         }
         Self {
             incremental,
+            eager_stop_matching: false,
+            prefix_mismatches: 0,
             tokenizer,
             token_ids,
             total_tokens: len,
-            prefix_index: 0,
+            prefix_index: len,
             cached_prefix: String::new(),
             skip_special_tokens,
         }
@@ -134,6 +151,7 @@ impl Sequence {
         self.total_tokens = 0;
         self.prefix_index = 0;
         self.cached_prefix.clear();
+        self.prefix_mismatches = 0;
         if let Some(decoder) = self.incremental.as_mut() {
             decoder.reset();
         }
@@ -172,18 +190,40 @@ impl Sequence {
             self.total_tokens += 1;
             return Ok(text);
         }
-        let result = self.tokenizer.decode_step(
+        let step = self.tokenizer.decode_step_reporting(
             token_id,
             &mut self.token_ids,
             &mut self.cached_prefix,
             &mut self.prefix_index,
             self.skip_special_tokens,
+            self.eager_stop_matching,
         )?;
         self.total_tokens += 1;
-        match result {
-            Some(text) => Ok(text),
-            None => Ok(String::new()),
+        if step.prefix_mismatch {
+            self.prefix_mismatches += 1;
         }
+        Ok(step.into_text())
+    }
+
+    /// Finish incremental decoding without inventing an extra token.
+    pub fn finish(&mut self) -> Result<String> {
+        let step = self.tokenizer.finish_decode(
+            &mut self.token_ids,
+            &mut self.cached_prefix,
+            &mut self.prefix_index,
+            self.skip_special_tokens,
+        )?;
+        if step.prefix_mismatch {
+            self.prefix_mismatches += 1;
+        }
+        Ok(step.into_text())
+    }
+
+    /// How many steps or finishes of this sequence streamed a best-effort
+    /// remainder because the decoder had rewritten text already emitted.
+    #[inline]
+    pub fn prefix_mismatches(&self) -> u32 {
+        self.prefix_mismatches
     }
 
     /// Get a reference to the tokenizer

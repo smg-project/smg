@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
     audio::{AudioPreProcessor, InklingAudioProcessor},
@@ -104,18 +104,14 @@ impl ModelProcessorSpec for InklingSpec {
         Ok(limits)
     }
 
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
-    }
-
     fn audio_processor(
         &self,
         model_config: &Value,
         _preprocessor_config: &PreProcessorConfig,
-    ) -> Option<Box<dyn AudioPreProcessor>> {
-        Some(Box::new(InklingAudioProcessor::from_model_config(
+    ) -> RegistryResult<Option<Box<dyn AudioPreProcessor>>> {
+        Ok(Some(Box::new(InklingAudioProcessor::from_model_config(
             model_config,
-        )))
+        ))))
     }
 
     fn prompt_replacements(
@@ -271,6 +267,7 @@ mod tests {
         let config = json!({"audio_config": {"n_mel_bins": 8}});
         let processor = InklingSpec
             .audio_processor(&config, &PreProcessorConfig::default())
+            .unwrap()
             .expect("inkling spec must provide an audio processor");
 
         let clip = Arc::new(AudioClip::new(

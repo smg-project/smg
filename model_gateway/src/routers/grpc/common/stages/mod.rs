@@ -66,10 +66,13 @@ mod worker_selection;
 // Export stage implementations
 pub(crate) use client_acquisition::acquire_clients;
 pub(crate) use context_length::{
-    enforce_context_length, enforce_decisions_context_length, enforce_output_budget,
+    context_length_exceeded, enforce_context_length, enforce_decisions_context_length,
+    enforce_output_budget, smallest_context_length, ContextRequirements,
 };
 pub(crate) use dispatch_metadata::prepare_dispatch_metadata;
 pub(crate) use encode::EncodeStage;
 pub(crate) use rate_limit::{RateLimitCell, RateLimitOutcome, RateLimitReserveStage};
 pub(crate) use request_execution::execute_plan;
-pub(crate) use worker_selection::{WorkerSelectionMode, WorkerSelectionStage};
+pub(crate) use worker_selection::{
+    WorkerSelectionMode, WorkerSelectionStage, SELECTION_QUEUE_TIMEOUT_ERROR_CODE,
+};

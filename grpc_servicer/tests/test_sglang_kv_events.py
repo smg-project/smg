@@ -35,6 +35,27 @@ def test_one_source_per_data_parallel_rank():
     assert without_replay[0].replay_endpoint is None
 
 
+def test_one_source_per_scheduler_on_either_release():
+    """The engine's newer releases resolve --dp-size N --enable-dp-attention
+    into attn_dp_size=N, dp_size=1: still N schedulers, N publishers (the
+    engine runs one of the two widths at 1, so the product is its own
+    num_dp_ranks); plain data parallelism on those releases carries
+    attn_dp_size=1."""
+    rewritten = SimpleNamespace(attn_dp_size=8, dp_size=1, enable_dp_attention=False)
+    assert transport.dp_rank_count(rewritten) == 8
+    pinned = SimpleNamespace(dp_size=8, enable_dp_attention=True)
+    assert transport.dp_rank_count(pinned) == 8
+    replicas = SimpleNamespace(dp_size=4, attn_dp_size=1, enable_dp_attention=False)
+    assert transport.dp_rank_count(replicas) == 4
+    config = SimpleNamespace(endpoint="tcp://*:5557", replay_endpoint="tcp://*:5558", topic="")
+    sources = transport.sources(config, SimpleNamespace(attn_dp_size=3, dp_size=1))
+    assert [(s.rank, s.endpoint, s.replay_endpoint) for s in sources] == [
+        (0, "tcp://127.0.0.1:5557", "tcp://127.0.0.1:5558"),
+        (1, "tcp://127.0.0.1:5558", "tcp://127.0.0.1:5559"),
+        (2, "tcp://127.0.0.1:5559", "tcp://127.0.0.1:5560"),
+    ]
+
+
 def _subscribe_method(namespace):
     # The real RPC method without importing SGLang/torch.
     tree = ast.parse(_SERVICER.read_text())
@@ -52,19 +73,26 @@ def _subscribe_method(namespace):
 async def test_servicer_hands_config_server_args_and_cursor_to_the_relay():
     calls = []
 
-    async def fake_subscribe(config, server_args, start, context):
-        calls.append((config, server_args, start, context))
+    async def fake_subscribe(config, server_args, start, context, *, load_source=None):
+        calls.append((config, server_args, start, context, load_source))
         yield common_pb2.KvEventBatch(sequence_number=1)
 
     method = _subscribe_method({"subscribe_kv_events": fake_subscribe})
     config = SimpleNamespace(endpoint="tcp://*:5557", topic="kv")
     server_args = SimpleNamespace(dp_size=2)
-    servicer = SimpleNamespace(_kv_events_config=config, server_args=server_args)
+
+    def load_record(dp_rank):
+        return None
+
+    servicer = SimpleNamespace(
+        _kv_events_config=config, server_args=server_args, _load_record=load_record
+    )
     context = SimpleNamespace()
     request = common_pb2.SubscribeKvEventsRequest(start_sequence_number=7)
     batches = [batch async for batch in method(servicer, request, context)]
     assert [b.sequence_number for b in batches] == [1]
-    assert calls == [(config, server_args, 7, context)]
+    # The servicer's load record rides the stream: its source goes to the relay.
+    assert calls == [(config, server_args, 7, context, load_record)]
 
 
 @pytest.mark.asyncio

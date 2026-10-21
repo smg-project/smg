@@ -9,10 +9,10 @@ use std::{collections::HashMap, sync::Arc, time::Instant};
 use anyhow::{Context, Result};
 use futures::{future::try_join_all, StreamExt, TryStreamExt};
 use llm_multimodal::{
-    AsyncMultiModalTracker, AudioClip, EncoderFieldLayouts, ImageFrame, MediaItemInfo, Modality,
-    ModelMetadata, ModelProcessorSpec, PlaceholderRange, PreProcessorConfig,
-    PreprocessedEncoderInputs, PromptReplacement, TrackedMedia, TrackerOutput, VideoClip,
-    VisionProcessorRegistry,
+    AsyncMultiModalTracker, AudioClip, EncoderDtype, EncoderFieldLayouts, ImageFrame,
+    MediaItemInfo, Modality, ModelMetadata, ModelProcessorSpec, PlaceholderRange,
+    PreProcessorConfig, PreprocessedEncoderInputs, PromptReplacement, TrackedMedia, TrackerOutput,
+    TransparencyPolicy, VideoClip, VisionPreProcessor, VisionProcessorRegistry,
 };
 use llm_tokenizer::TokenizerTrait;
 use rayon::prelude::*;
@@ -20,9 +20,11 @@ use tracing::{debug, info, warn};
 
 use super::{
     config::{MultimodalComponents, MultimodalModelConfig},
+    encoder_budget::check_item_feature_budget,
     log_mm_timing_enabled,
     pixel_cache::{config_fingerprint, CachedPreprocessedItem, PixelCache, PixelCacheKey},
     plan::MediaPlan,
+    transparency::frame_transparency,
     MediaBatch, MultimodalIntermediate, MultimodalOutput, PrecomputedMultimodalIntermediate,
     PromptBinding, RegistryTokenizer,
 };
@@ -39,7 +41,130 @@ struct PreparedMultimodalPart {
     encoder_input_key: Option<String>,
 }
 
+/// What every step of a plan's processing reads: the components, the model
+/// and its type, the processor spec and the model config the registry
+/// resolved for it, the tokenizer the cache keys by, and the wire's dtype
+/// and transparency policy.
+struct PlanContext<'a> {
+    components: &'a MultimodalComponents,
+    model_id: &'a str,
+    model_type: Option<&'a str>,
+    spec: &'a dyn ModelProcessorSpec,
+    tokenizer_id: &'a str,
+    model_config: &'a MultimodalModelConfig,
+    image_wire_dtype: Option<EncoderDtype>,
+    transparency: TransparencyPolicy,
+    /// The engine's per-item bound in feature tokens, when known (see
+    /// [`super::encoder_budget`]).
+    encoder_budget: Option<usize>,
+}
+
+/// The milliseconds each step of a plan's processing took, filled by the
+/// processor as it goes and read by its timing log.
+#[derive(Default)]
+struct Timings {
+    config_lookup_ms: f64,
+    media_fetch_decode_ms: f64,
+    preprocess_ms: f64,
+    token_expand_ms: f64,
+}
+
+fn elapsed_ms(since: Instant) -> f64 {
+    since.elapsed().as_secs_f64() * 1000.0
+}
+
+/// What the tracker fetched and decoded for the plan, per modality, in the
+/// plan's order.
+struct Fetched {
+    images: Vec<Arc<ImageFrame>>,
+    videos: Vec<Arc<VideoClip>>,
+    audios: Vec<Arc<AudioClip>>,
+}
+
+/// The counts the timing log reports.
+struct MediaCounts {
+    images: usize,
+    videos: usize,
+    audios: usize,
+    video_frames: usize,
+}
+
+impl Fetched {
+    /// The tracker's media of one modality, in order; `pick` reads the variant.
+    fn tracked<T>(
+        output: &TrackerOutput,
+        modality: Modality,
+        pick: fn(&TrackedMedia) -> Option<&Arc<T>>,
+    ) -> Vec<Arc<T>> {
+        output
+            .data
+            .get(&modality)
+            .map(|media_vec| media_vec.iter().filter_map(pick).cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn of(output: &TrackerOutput) -> Self {
+        Self {
+            images: Self::tracked(output, Modality::Image, |m| match m {
+                TrackedMedia::Image(frame) => Some(frame),
+                _ => None,
+            }),
+            videos: Self::tracked(output, Modality::Video, |m| match m {
+                TrackedMedia::Video(clip) => Some(clip),
+                _ => None,
+            }),
+            audios: Self::tracked(output, Modality::Audio, |m| match m {
+                TrackedMedia::Audio(clip) => Some(clip),
+                _ => None,
+            }),
+        }
+    }
+
+    fn counts(&self) -> MediaCounts {
+        MediaCounts {
+            images: self.images.len(),
+            videos: self.videos.len(),
+            audios: self.audios.len(),
+            video_frames: self.videos.first().map_or(0, |video| {
+                if video.frames().is_empty() {
+                    video
+                        .rgb_video()
+                        .map_or(0, |rgb_video| rgb_video.frames.len())
+                } else {
+                    video.frames().len()
+                }
+            }),
+        }
+    }
+
+    /// One batch per modality present, images then videos then audios; a
+    /// plan whose fetch yielded nothing is an error.
+    fn batches(self) -> Result<Vec<MediaBatch>> {
+        let mut media_batches = Vec::with_capacity(3);
+        if !self.images.is_empty() {
+            media_batches.push(MediaBatch::Images(self.images));
+        }
+        if !self.videos.is_empty() {
+            media_batches.push(MediaBatch::Videos(self.videos));
+        }
+        if !self.audios.is_empty() {
+            media_batches.push(MediaBatch::Audios(self.audios));
+        }
+        if media_batches.is_empty() {
+            return Err(anyhow::anyhow!(
+                "No media was successfully fetched for multimodal request"
+            ));
+        }
+        Ok(media_batches)
+    }
+}
+
 /// Process a protocol-independent, ordered media plan.
+///
+/// `encoder_budget` is the engine's per-item bound in feature tokens, when
+/// known (see [`super::encoder_budget`]): an item above it is refused once
+/// its features are counted, before anything reaches the engine.
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn process_multimodal_plan(
     plan: MediaPlan,
     model_id: &str,
@@ -48,9 +173,13 @@ pub(crate) async fn process_multimodal_plan(
     components: &MultimodalComponents,
     tokenizer_id: &str,
     tokenizer_source: &str,
+    image_wire_dtype: Option<EncoderDtype>,
+    transparency: TransparencyPolicy,
+    encoder_budget: Option<usize>,
 ) -> Result<MultimodalOutput> {
     let log_timing = log_mm_timing_enabled();
     let total_started = Instant::now();
+    let mut timings = Timings::default();
 
     // Step 1: Resolve the model spec; it decides how media is fetched.
     let config_started = Instant::now();
@@ -72,15 +201,89 @@ pub(crate) async fn process_multimodal_plan(
         .model_registry
         .lookup(&metadata)
         .ok_or_else(|| anyhow::anyhow!("Multimodal not supported for model: {model_id}"))?;
-    let config_elapsed_ms = config_started.elapsed().as_secs_f64() * 1000.0;
+    // The frames decode under the destination engine's transparency policy,
+    // unless the processor takes the image as decoded and handles alpha itself.
+    let transparency = frame_transparency(
+        &components.vision_processor_registry,
+        model_id,
+        model_type,
+        transparency,
+    );
+    timings.config_lookup_ms = elapsed_ms(config_started);
+    let ctx = PlanContext {
+        components,
+        model_id,
+        model_type,
+        spec,
+        tokenizer_id,
+        model_config: &model_config,
+        image_wire_dtype,
+        transparency,
+        encoder_budget,
+    };
 
     let media_started = Instant::now();
-    let mut tracker = AsyncMultiModalTracker::new(components.media_connector.clone())
-        .with_default_video_sample_fps(spec.default_video_sample_fps())
-        .with_video_frame_sampling(
-            spec.video_frame_sampling()
-                .with_frame_budget(components.video_frame_budget),
+    let fetched = fetch_media(plan, &ctx).await?;
+    timings.media_fetch_decode_ms = elapsed_ms(media_started);
+    let counts = fetched.counts();
+    let media_batches = fetched.batches()?;
+    let present_modalities = media_batches
+        .iter()
+        .map(MediaBatch::modality)
+        .collect::<Vec<_>>();
+    log_fetched(&media_batches, counts.video_frames);
+
+    // Step 2: Preprocess media.
+    let preprocess_started = Instant::now();
+    let prepared_parts = prepare_parts(media_batches, &ctx, &metadata, tokenizer).await?;
+    timings.preprocess_ms = elapsed_ms(preprocess_started);
+
+    // Step 3: Compute prompt replacements and expand tokens.
+    let expansion_started = Instant::now();
+    let expanded = expand_prompt(&token_ids, &prepared_parts)?;
+    timings.token_expand_ms = elapsed_ms(expansion_started);
+    let original_tokens = token_ids.len();
+    let expanded_tokens = expanded.token_ids.len();
+
+    // Step 4: Build lightweight intermediate (defers tensor serialization to assembly)
+    let intermediate = intermediate_of(prepared_parts, expanded.bindings, spec)?;
+
+    if log_timing {
+        info!(
+            modalities = ?present_modalities,
+            image_count = counts.images,
+            audio_count = counts.audios,
+            video_count = counts.videos,
+            video_frame_count = counts.video_frames,
+            media_fetch_decode_ms = timings.media_fetch_decode_ms,
+            config_lookup_ms = timings.config_lookup_ms,
+            preprocess_ms = timings.preprocess_ms,
+            token_expand_ms = timings.token_expand_ms,
+            total_ms = elapsed_ms(total_started),
+            original_tokens,
+            expanded_tokens,
+            "smg_mm_timing process_multimodal_plan"
         );
+    }
+
+    Ok(MultimodalOutput {
+        expanded_token_ids: expanded.token_ids,
+        intermediate,
+    })
+}
+
+/// Fetch and decode the plan's media through the tracker, under the spec's
+/// video sampling and the frames' transparency policy.
+async fn fetch_media(plan: MediaPlan, ctx: &PlanContext<'_>) -> Result<Fetched> {
+    let video_config = ctx.model_config.video_preprocessor_config.as_ref();
+    let mut tracker = AsyncMultiModalTracker::new(ctx.components.media_connector.clone())
+        .with_default_video_sample_fps(ctx.spec.default_video_sample_fps_with(video_config))
+        .with_video_frame_sampling(
+            ctx.spec
+                .video_frame_sampling_with(video_config)
+                .with_frame_budget(ctx.components.video_frame_budget),
+        )
+        .with_image_transparency(ctx.transparency);
 
     for part in plan.into_parts() {
         tracker
@@ -92,83 +295,12 @@ pub(crate) async fn process_multimodal_plan(
         .finalize()
         .await
         .context("Failed to finalize multimodal tracker")?;
+    Ok(Fetched::of(&tracker_output))
+}
 
-    let images: Vec<Arc<ImageFrame>> = tracker_output
-        .data
-        .get(&Modality::Image)
-        .map(|media_vec| {
-            media_vec
-                .iter()
-                .filter_map(|m| match m {
-                    TrackedMedia::Image(frame) => Some(frame.clone()),
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let videos: Vec<Arc<VideoClip>> = tracker_output
-        .data
-        .get(&Modality::Video)
-        .map(|media_vec| {
-            media_vec
-                .iter()
-                .filter_map(|m| match m {
-                    TrackedMedia::Video(clip) => Some(clip.clone()),
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let audios: Vec<Arc<AudioClip>> = tracker_output
-        .data
-        .get(&Modality::Audio)
-        .map(|media_vec| {
-            media_vec
-                .iter()
-                .filter_map(|m| match m {
-                    TrackedMedia::Audio(clip) => Some(clip.clone()),
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let media_elapsed_ms = media_started.elapsed().as_secs_f64() * 1000.0;
-    let image_count = images.len();
-    let audio_count = audios.len();
-    let video_count = videos.len();
-    let video_frame_count = videos.first().map_or(0, |video| {
-        if video.frames().is_empty() {
-            video
-                .rgb_video()
-                .map_or(0, |rgb_video| rgb_video.frames.len())
-        } else {
-            video.frames().len()
-        }
-    });
-    let mut media_batches = Vec::with_capacity(3);
-    if !images.is_empty() {
-        media_batches.push(MediaBatch::Images(images));
-    }
-    if !videos.is_empty() {
-        media_batches.push(MediaBatch::Videos(videos));
-    }
-    if !audios.is_empty() {
-        media_batches.push(MediaBatch::Audios(audios));
-    }
-    if media_batches.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No media was successfully fetched for multimodal request"
-        ));
-    }
-    let present_modalities = media_batches
-        .iter()
-        .map(MediaBatch::modality)
-        .collect::<Vec<_>>();
-
-    for batch in &media_batches {
+/// What was fetched, per batch, in the debug log.
+fn log_fetched(media_batches: &[MediaBatch], video_frame_count: usize) {
+    for batch in media_batches {
         match batch {
             MediaBatch::Images(images) => {
                 debug!(
@@ -192,101 +324,125 @@ pub(crate) async fn process_multimodal_plan(
             }
         }
     }
+}
 
-    // Step 2: Preprocess media.
-    let preprocess_started = Instant::now();
-    let mut prepared_parts = Vec::with_capacity(media_batches.len());
-    // Every modality batch is independent until prompt expansion. Poll all
-    // preprocessors concurrently and preserve the batch order in the returned
-    // vector so the media/preprocessed zip below remains exact for any model-
-    // validated modality combination.
-    let preprocessed_parts = try_join_all(media_batches.iter().map(|media| {
-        preprocess_modality(
-            media,
-            components,
-            model_id,
-            model_type,
-            spec,
-            tokenizer_id,
-            &model_config,
-        )
-    }))
+/// Preprocess every batch and pair each with its prompt replacements and
+/// placeholder tokens. Every modality batch is independent until prompt
+/// expansion: all preprocessors are polled concurrently and the batch order
+/// is preserved, so the media/preprocessed zip stays exact for any
+/// model-validated modality combination.
+async fn prepare_parts(
+    media_batches: Vec<MediaBatch>,
+    ctx: &PlanContext<'_>,
+    metadata: &ModelMetadata<'_>,
+    tokenizer: &dyn TokenizerTrait,
+) -> Result<Vec<PreparedMultimodalPart>> {
+    let preprocessed_parts = try_join_all(
+        media_batches
+            .iter()
+            .map(|media| preprocess_modality(media, ctx)),
+    )
     .await?;
 
-    for (media, preprocessed) in media_batches.into_iter().zip(preprocessed_parts) {
-        let modality = media.modality();
-        debug!(
-            ?modality,
-            item_count = preprocessed.feature_token_counts.len(),
-            total_tokens = preprocessed.feature_token_counts.iter().sum::<usize>(),
-            "Multimodal preprocessing complete"
-        );
+    media_batches
+        .into_iter()
+        .zip(preprocessed_parts)
+        .map(|(media, preprocessed)| prepared_part(media, preprocessed, ctx, metadata, tokenizer))
+        .collect()
+}
 
-        let media_info = media_item_infos(&media);
-        let prompt_replacements = spec
-            .prompt_replacements_with_media(
-                &metadata,
-                &preprocessed,
-                modality,
-                &media_info,
-                preprocessor_config_for(&model_config, modality),
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to compute prompt replacements: {e}"))?;
+/// One batch's prepared part: its preprocessed inputs checked against its
+/// item count, its prompt replacements, its placeholder tokens and the spec's
+/// layouts for the modality.
+fn prepared_part(
+    media: MediaBatch,
+    preprocessed: PreprocessedEncoderInputs,
+    ctx: &PlanContext<'_>,
+    metadata: &ModelMetadata<'_>,
+    tokenizer: &dyn TokenizerTrait,
+) -> Result<PreparedMultimodalPart> {
+    let spec = ctx.spec;
+    let modality = media.modality();
+    debug!(
+        ?modality,
+        item_count = preprocessed.feature_token_counts.len(),
+        total_tokens = preprocessed.feature_token_counts.iter().sum::<usize>(),
+        "Multimodal preprocessing complete"
+    );
 
-        let media_count = media.len();
-        anyhow::ensure!(
-            preprocessed.feature_token_counts.len() == media_count,
-            "Preprocessing item count mismatch for {modality}: {} media items, {} feature-token counts",
-            media_count,
-            preprocessed.feature_token_counts.len()
-        );
-        anyhow::ensure!(
-            prompt_replacements.len() == media_count,
-            "Prompt replacement count mismatch for {modality}: {} media items, {} replacements",
-            media_count,
-            prompt_replacements.len()
-        );
+    let media_info = media_item_infos(&media);
+    // The engine never places an item above its encoder budget: refuse one
+    // here, on the count the expansion below uses.
+    check_item_feature_budget(
+        modality,
+        &preprocessed.feature_token_counts,
+        &media_info,
+        ctx.encoder_budget,
+    )?;
+    let prompt_replacements = spec
+        .prompt_replacements_with_media(
+            metadata,
+            &preprocessed,
+            modality,
+            &media_info,
+            preprocessor_config_for(ctx.model_config, modality),
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to compute prompt replacements: {e}"))?;
 
-        // Two token IDs may differ for the same placeholder:
-        // - search_token_id: what the tokenizer actually emits (e.g. 200090 for "<|image|>")
-        // - placeholder_token_id: what the model config declares (e.g. image_token_id/video_token_id)
-        let placeholder_token = spec
-            .placeholder_token_for(&metadata, modality)
-            .map_err(|e| anyhow::anyhow!("Failed to get placeholder token: {e}"))?;
-        let search_token_id = tokenizer.token_to_id(&placeholder_token);
-        let placeholder_token_id: Option<u32> = match spec
-            .placeholder_token_id_for(&metadata, modality)
-        {
-            Ok(id) => Some(u32::try_from(id).map_err(|_| {
-                anyhow::anyhow!(
-                    "Invalid negative placeholder token ID {id} for modality {modality}"
-                )
-            })?),
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    ?search_token_id,
-                    "Failed to resolve placeholder_token_id from config, falling back to tokenizer lookup"
-                );
-                search_token_id
-            }
-        };
+    let media_count = media.len();
+    anyhow::ensure!(
+        preprocessed.feature_token_counts.len() == media_count,
+        "Preprocessing item count mismatch for {modality}: {} media items, {} feature-token counts",
+        media_count,
+        preprocessed.feature_token_counts.len()
+    );
+    anyhow::ensure!(
+        prompt_replacements.len() == media_count,
+        "Prompt replacement count mismatch for {modality}: {} media items, {} replacements",
+        media_count,
+        prompt_replacements.len()
+    );
 
-        prepared_parts.push(PreparedMultimodalPart {
-            preprocessed,
-            media,
-            prompt_replacements,
-            search_token_id,
-            placeholder_token_id,
-            field_layouts: spec.encoder_field_layouts_for(modality),
-            keep_on_cpu_keys: spec.keep_on_cpu_keys_for(modality),
-            encoder_input_key: spec.encoder_input_key_for(modality),
-        });
-    }
-    let preprocess_elapsed_ms = preprocess_started.elapsed().as_secs_f64() * 1000.0;
+    // Two token IDs may differ for the same placeholder:
+    // - search_token_id: what the tokenizer actually emits (e.g. 200090 for "<|image|>")
+    // - placeholder_token_id: what the model config declares (e.g. image_token_id/video_token_id)
+    let placeholder_token = spec
+        .placeholder_token_for(metadata, modality)
+        .map_err(|e| anyhow::anyhow!("Failed to get placeholder token: {e}"))?;
+    let search_token_id = tokenizer.token_to_id(&placeholder_token);
+    let placeholder_token_id: Option<u32> = match spec.placeholder_token_id_for(metadata, modality)
+    {
+        Ok(id) => Some(u32::try_from(id).map_err(|_| {
+            anyhow::anyhow!("Invalid negative placeholder token ID {id} for modality {modality}")
+        })?),
+        Err(e) => {
+            warn!(
+                error = %e,
+                ?search_token_id,
+                "Failed to resolve placeholder_token_id from config, falling back to tokenizer lookup"
+            );
+            search_token_id
+        }
+    };
 
-    // Step 3: Compute prompt replacements and expand tokens.
-    let expansion_started = Instant::now();
+    Ok(PreparedMultimodalPart {
+        preprocessed,
+        media,
+        prompt_replacements,
+        search_token_id,
+        placeholder_token_id,
+        field_layouts: spec.encoder_field_layouts_for(modality),
+        keep_on_cpu_keys: spec.keep_on_cpu_keys_for(modality),
+        encoder_input_key: spec.encoder_input_key_for(modality),
+    })
+}
+
+/// The prompt expanded with every part's replacements, and the bindings of
+/// each part's items to the expanded positions.
+fn expand_prompt(
+    token_ids: &[u32],
+    prepared_parts: &[PreparedMultimodalPart],
+) -> Result<ExpandedMultimodalTokens> {
     let expansions = prepared_parts
         .iter()
         .map(|part| ModalityExpansion {
@@ -296,7 +452,7 @@ pub(crate) async fn process_multimodal_plan(
             replacements: &part.prompt_replacements,
         })
         .collect::<Vec<_>>();
-    let expanded = expand_tokens_for_modalities(&token_ids, &expansions)?;
+    let expanded = expand_tokens_for_modalities(token_ids, &expansions)?;
     let placeholder_count = expanded.bindings.iter().map(Vec::len).sum::<usize>();
 
     debug!(
@@ -306,14 +462,19 @@ pub(crate) async fn process_multimodal_plan(
         modality_count = prepared_parts.len(),
         "Token expansion complete"
     );
-    let expansion_elapsed_ms = expansion_started.elapsed().as_secs_f64() * 1000.0;
-    let original_tokens = token_ids.len();
-    let expanded_tokens = expanded.token_ids.len();
+    Ok(expanded)
+}
 
-    // Step 4: Build lightweight intermediate (defers tensor serialization to assembly)
+/// The lightweight intermediate of the prepared parts and their bindings;
+/// tensor serialization is deferred to assembly.
+fn intermediate_of(
+    prepared_parts: Vec<PreparedMultimodalPart>,
+    bindings: Vec<Vec<PromptBinding>>,
+    spec: &dyn ModelProcessorSpec,
+) -> Result<MultimodalIntermediate> {
     let batches = prepared_parts
         .into_iter()
-        .zip(expanded.bindings)
+        .zip(bindings)
         .map(|(part, bindings)| PrecomputedMultimodalIntermediate {
             preprocessed: part.preprocessed,
             media: part.media,
@@ -324,154 +485,169 @@ pub(crate) async fn process_multimodal_plan(
             encoder_input_key: part.encoder_input_key,
         })
         .collect::<Vec<_>>();
-    let intermediate = MultimodalIntermediate::try_new(batches)?;
-
-    if log_timing {
-        info!(
-            modalities = ?present_modalities,
-            image_count,
-            audio_count,
-            video_count,
-            video_frame_count,
-            media_fetch_decode_ms = media_elapsed_ms,
-            config_lookup_ms = config_elapsed_ms,
-            preprocess_ms = preprocess_elapsed_ms,
-            token_expand_ms = expansion_elapsed_ms,
-            total_ms = total_started.elapsed().as_secs_f64() * 1000.0,
-            original_tokens,
-            expanded_tokens,
-            "smg_mm_timing process_multimodal_plan"
-        );
-    }
-
-    Ok(MultimodalOutput {
-        expanded_token_ids: expanded.token_ids,
-        intermediate,
-    })
+    Ok(MultimodalIntermediate::try_new(batches)?
+        .with_encoder_input_format(spec.encoder_input_format()))
 }
 
+/// Preprocess one modality's batch: a small image batch through the pixel
+/// cache, image by image, when the cache is on and the processor allows it;
+/// every other batch whole, on the blocking pool.
 async fn preprocess_modality(
     media: &MediaBatch,
-    components: &MultimodalComponents,
-    model_id: &str,
-    model_type: Option<&str>,
-    spec: &dyn ModelProcessorSpec,
-    tokenizer_id: &str,
-    model_config: &MultimodalModelConfig,
+    ctx: &PlanContext<'_>,
 ) -> Result<PreprocessedEncoderInputs> {
-    // Run CPU-intensive preprocessing on a blocking thread pool so it doesn't
-    // block the tokio async runtime under concurrent load.
-    // TODO: consider making the thread pool size configurable.
-    let modality = media.modality();
-    let pp_config = preprocessor_config_for(model_config, modality).clone();
-
-    if let MediaBatch::Images(images) = media {
-        if let Some(cache) = &components.pixel_cache {
-            let processor = components
-                .vision_processor_registry
-                .find(model_id, model_type);
-            // Retaining individual tensors plus their concatenation is costly
-            // for large requests. Keep their whole-batch allocation path.
-            if images.len() == 1
-                || (images.len() < 32
-                    && processor.is_some_and(|p| p.supports_per_image_preprocessing()))
-            {
-                let mut config = serde_json::json!({
-                    "model_id": model_id,
-                    "model_type": model_type,
-                    "model_config": model_config.config,
-                    "preprocessor_config": pp_config,
-                });
-                config.sort_all_objects();
-                let fingerprint = config_fingerprint(tokenizer_id, &config);
-                // Deduplicate within the request even if the result cannot fit
-                // in the cache. Record every position before scheduling work.
-                let mut unique = HashMap::new();
-                let mut positions: Vec<Vec<usize>> = Vec::new();
-                let tasks = images
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(position, image)| {
-                        let next = unique.len();
-                        let index = *unique
-                            .entry(PixelCacheKey {
-                                image_hash: image.hash.clone(),
-                                config_fingerprint: fingerprint,
-                            })
-                            .or_insert(next);
-                        if index == next {
-                            positions.push(vec![position]);
-                            Some(image)
-                        } else {
-                            positions[index].push(position);
-                            None
-                        }
-                    })
-                    .map(|image| {
-                        preprocess_image_cached(
-                            cache.clone(),
-                            image.clone(),
-                            components.vision_processor_registry.clone(),
-                            model_id.to_string(),
-                            model_type.map(String::from),
-                            pp_config.clone(),
-                            fingerprint,
-                        )
-                    })
-                    .collect::<Vec<_>>();
-                let parts = futures::stream::iter(tasks)
-                    // Keep unique results aligned with their recorded positions.
-                    .buffered(4)
-                    .try_collect::<Vec<_>>()
-                    .await?;
-                let layouts = spec
-                    .encoder_field_layouts_for(Modality::Image)
-                    .model_specific;
-                let image_count = images.len();
-                return tokio::task::spawn_blocking(move || -> Result<_> {
-                    let mut ordered = vec![None; image_count];
-                    for (part, positions) in parts.into_iter().zip(positions) {
-                        let (&last, repeats) = positions
-                            .split_last()
-                            .context("Unique image has no position")?;
-                        for &position in repeats {
-                            ordered[position] = Some(part.clone());
-                        }
-                        ordered[last] = Some(part);
-                    }
-                    let parts = ordered
-                        .into_iter()
-                        .collect::<Option<Vec<_>>>()
-                        .context("Missing image output position")?;
-                    PreprocessedEncoderInputs::concat(parts, &layouts)
-                })
-                .await
-                .context("Image batch assembly task panicked")?
-                .context("Image batch assembly failed");
-            }
-        }
+    let pp_config = preprocessor_config_for(ctx.model_config, media.modality()).clone();
+    if let Some(preprocessed) = cached_images(media, ctx, &pp_config).await? {
+        return Ok(preprocessed);
     }
+    preprocess_batch(media, ctx, pp_config).await
+}
 
-    let registry = components.vision_processor_registry.clone();
-    let model_id_owned = model_id.to_string();
-    let model_type_owned = model_type.map(String::from);
+/// The per-image path through the pixel cache for an image batch the cache
+/// takes: one image, or fewer than 32 of a processor that preprocesses each
+/// image independently (retaining individual tensors plus their concatenation
+/// is costly for large requests, which keep their whole-batch allocation
+/// path). `None` sends the batch down the whole-batch path.
+async fn cached_images(
+    media: &MediaBatch,
+    ctx: &PlanContext<'_>,
+    pp_config: &PreProcessorConfig,
+) -> Result<Option<PreprocessedEncoderInputs>> {
+    let MediaBatch::Images(images) = media else {
+        return Ok(None);
+    };
+    let Some(cache) = &ctx.components.pixel_cache else {
+        return Ok(None);
+    };
+    let processor = ctx
+        .components
+        .vision_processor_registry
+        .find(ctx.model_id, ctx.model_type);
+    if !(images.len() == 1
+        || (images.len() < 32 && processor.is_some_and(|p| p.supports_per_image_preprocessing())))
+    {
+        return Ok(None);
+    }
+    let mut config = serde_json::json!({
+        "model_id": ctx.model_id,
+        "model_type": ctx.model_type,
+        "model_config": ctx.model_config.config,
+        "preprocessor_config": pp_config,
+        // A one-pass result is only right for its own wire.
+        "image_wire_dtype": ctx.image_wire_dtype.map(|dtype| dtype.to_string()),
+        "transparency": ctx.transparency,
+    });
+    config.sort_all_objects();
+    let fingerprint = config_fingerprint(ctx.tokenizer_id, &config);
+    // Deduplicate within the request even if the result cannot fit
+    // in the cache. Record every position before scheduling work.
+    let mut unique = HashMap::new();
+    let mut positions: Vec<Vec<usize>> = Vec::new();
+    let tasks = images
+        .iter()
+        .enumerate()
+        .filter_map(|(position, image)| {
+            let next = unique.len();
+            let index = *unique
+                .entry(PixelCacheKey {
+                    image_hash: image.hash.clone(),
+                    config_fingerprint: fingerprint,
+                })
+                .or_insert(next);
+            if index == next {
+                positions.push(vec![position]);
+                Some(image)
+            } else {
+                positions[index].push(position);
+                None
+            }
+        })
+        .map(|image| {
+            preprocess_image_cached(
+                cache.clone(),
+                image.clone(),
+                ctx.components.vision_processor_registry.clone(),
+                ctx.model_id.to_string(),
+                ctx.model_type.map(String::from),
+                pp_config.clone(),
+                fingerprint,
+                ctx.image_wire_dtype,
+            )
+        })
+        .collect::<Vec<_>>();
+    let parts = futures::stream::iter(tasks)
+        // Keep unique results aligned with their recorded positions.
+        .buffered(4)
+        .try_collect::<Vec<_>>()
+        .await?;
+    let layouts = ctx
+        .spec
+        .encoder_field_layouts_for(Modality::Image)
+        .model_specific;
+    let image_count = images.len();
+    tokio::task::spawn_blocking(move || -> Result<_> {
+        let mut ordered = vec![None; image_count];
+        for (part, positions) in parts.into_iter().zip(positions) {
+            let (&last, repeats) = positions
+                .split_last()
+                .context("Unique image has no position")?;
+            for &position in repeats {
+                ordered[position] = Some(part.clone());
+            }
+            ordered[last] = Some(part);
+        }
+        let parts = ordered
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .context("Missing image output position")?;
+        PreprocessedEncoderInputs::concat(parts, &layouts)
+    })
+    .await
+    .context("Image batch assembly task panicked")?
+    .context("Image batch assembly failed")
+    .map(Some)
+}
+
+/// The whole batch preprocessed on the blocking pool: the CPU-intensive
+/// preprocessing must not block the tokio async runtime under concurrent
+/// load. TODO: consider making the thread pool size configurable.
+async fn preprocess_batch(
+    media: &MediaBatch,
+    ctx: &PlanContext<'_>,
+    pp_config: PreProcessorConfig,
+) -> Result<PreprocessedEncoderInputs> {
+    let registry = ctx.components.vision_processor_registry.clone();
+    let model_id_owned = ctx.model_id.to_string();
+    let model_type_owned = ctx.model_type.map(String::from);
     let media_for_preprocess = media.clone(); // cheap Arc refcount bumps
-    let video_layouts = spec
+    let video_layouts = ctx
+        .spec
         .encoder_field_layouts_for(Modality::Video)
         .model_specific;
-    let audio_processor = if modality == Modality::Audio {
+    let audio_processor = if media.modality() == Modality::Audio {
         Some(
-            spec.audio_processor(&model_config.config, &model_config.preprocessor_config)
+            ctx.spec
+                .audio_processor(
+                    &ctx.model_config.config,
+                    &ctx.model_config.preprocessor_config,
+                )
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "The audio processor of model spec {} cannot be built: {error}",
+                        ctx.spec.name()
+                    )
+                })?
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "No audio processor registered for model spec: {}",
-                        spec.name()
+                        ctx.spec.name()
                     )
                 })?,
         )
     } else {
         None
     };
+    let image_wire_dtype = ctx.image_wire_dtype;
 
     tokio::task::spawn_blocking(move || match media_for_preprocess {
         MediaBatch::Images(images) => {
@@ -495,9 +671,7 @@ async fn preprocess_modality(
                         .map_err(llm_multimodal::MultiModalError::Media)
                 })
                 .collect::<Result<_, _>>()?;
-            processor
-                .preprocess(&raw_images, &pp_config)
-                .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
+            preprocess_images(processor, &raw_images, &pp_config, image_wire_dtype)
         }
         MediaBatch::Videos(videos) => {
             let processor = registry
@@ -566,7 +740,7 @@ async fn preprocess_modality(
         }
     })
     .await
-    .map_err(|e| anyhow::anyhow!("Preprocessing task panicked: {e}"))?
+    .map_err(|e| anyhow::Error::new(e).context("Preprocessing task panicked"))?
 }
 
 /// The preprocessor config for one clip: its sampled frame rate and, when the
@@ -614,6 +788,7 @@ fn media_item_infos(media: &MediaBatch) -> Vec<MediaItemInfo> {
 }
 
 /// Pixel-cache lookup and preprocessing for one image.
+#[expect(clippy::too_many_arguments)]
 async fn preprocess_image_cached(
     cache: Arc<PixelCache>,
     image: Arc<ImageFrame>,
@@ -622,6 +797,7 @@ async fn preprocess_image_cached(
     model_type: Option<String>,
     pp_config: PreProcessorConfig,
     fingerprint: u64,
+    image_wire_dtype: Option<EncoderDtype>,
 ) -> Result<PreprocessedEncoderInputs> {
     let key = PixelCacheKey {
         image_hash: image.hash.clone(),
@@ -639,8 +815,13 @@ async fn preprocess_image_cached(
         model_type,
         pp_config,
         std::slice::from_ref(&image),
+        image_wire_dtype,
     )
     .await?;
+    // The entry is the form the request is sent in: the wire bytes when a
+    // dtype was resolved (twice the neutral bytes at the half widths, four
+    // times at float32, against the same budget), so a hit skips the write
+    // pass; the neutral patches otherwise.
     cache.insert(
         key,
         Arc::new(CachedPreprocessedItem {
@@ -656,6 +837,7 @@ async fn preprocess_image_batch(
     model_type: Option<String>,
     pp_config: PreProcessorConfig,
     images: &[Arc<ImageFrame>],
+    image_wire_dtype: Option<EncoderDtype>,
 ) -> Result<PreprocessedEncoderInputs> {
     let images = images.to_vec();
     tokio::task::spawn_blocking(move || {
@@ -671,12 +853,25 @@ async fn preprocess_image_batch(
         let processor = registry
             .find(&model_id, model_type.as_deref())
             .ok_or_else(|| anyhow::anyhow!("No vision processor found for model: {model_id}"))?;
-        processor
-            .preprocess(&raw_images, &pp_config)
-            .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
+        preprocess_images(processor, &raw_images, &pp_config, image_wire_dtype)
     })
     .await
-    .map_err(|e| anyhow::anyhow!("Preprocessing task panicked: {e}"))?
+    .map_err(|e| anyhow::Error::new(e).context("Preprocessing task panicked"))?
+}
+
+/// The images preprocessed: laid out in `wire_dtype` in one pass when the
+/// dtype is known and the processor writes it, through the per-destination
+/// write otherwise. Both arms produce the same bytes on the wire.
+fn preprocess_images(
+    processor: &dyn VisionPreProcessor,
+    images: &[image::DynamicImage],
+    pp_config: &PreProcessorConfig,
+    wire_dtype: Option<EncoderDtype>,
+) -> Result<PreprocessedEncoderInputs> {
+    wire_dtype
+        .and_then(|dtype| processor.preprocess_wire(images, pp_config, dtype))
+        .unwrap_or_else(|| processor.preprocess(images, pp_config))
+        .map_err(|e| anyhow::anyhow!("Image preprocessing failed: {e}"))
 }
 
 struct ModalityExpansion<'a> {

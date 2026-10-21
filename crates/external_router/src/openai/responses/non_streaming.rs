@@ -21,7 +21,8 @@ use crate::{
         mcp::{execute_tool_loop, prepare_mcp_tools_as_functions, ToolLoopExecutionContext},
     },
     openai_bridge,
-    persistence_utils::persist_conversation_items,
+    persistence_utils::{persist_conversation_items, PersistStep},
+    tenant::storage_tenant,
 };
 
 /// Handle a non-streaming responses request
@@ -181,17 +182,32 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
         ctx.components.conversation_item_storage(),
         ctx.components.response_storage(),
     ) {
+        let tenant = ctx.tenant_request_meta.as_ref().and_then(storage_tenant);
         if let Err(err) = persist_conversation_items(
             conv_storage.clone(),
             item_storage.clone(),
             resp_storage.clone(),
             &response_json,
             original_body,
+            tenant.as_deref(),
             ctx.storage_request_context.clone(),
         )
         .await
         {
-            warn!("Failed to persist conversation items: {}", err);
+            if matches!(err.step, PersistStep::Input | PersistStep::ResponseRecord) {
+                // Nothing of the response is stored and the client expects it
+                // stored (store: true): the request fails with a store-class
+                // answer instead of a response that can be neither retrieved
+                // nor continued.
+                warn!("Response not stored: {err}");
+                let message = format!("The response was not stored: {err}");
+                return if err.retryable {
+                    error::service_unavailable("storage_unavailable", message)
+                } else {
+                    error::internal_error("store_response_failed", message)
+                };
+            }
+            warn!("Response stored; its items were not linked into the conversation: {err}");
         }
     } else {
         warn!("Storage not configured, skipping conversation persistence");

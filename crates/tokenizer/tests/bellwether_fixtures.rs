@@ -22,14 +22,30 @@
 //! unpack` writes (`fixtures-plain/` unless `--out` names another), where
 //! every fixture set is plain JSON Lines beside each model's `manifest.toml`
 //! and `sets.toml`; without it the test prints a skip notice and passes.
+//! The tree the lists below are judged against is the one CI unpacks,
+//! bellwether at the commit `.github/versions/bellwether.ref` pins: a
+//! case's reference moves between bellwether commits, so an entry taken
+//! from another checkout's tree fails the run there as stale, or leaves a
+//! difference unlisted.
 //! bellwether's own `fixtures/` directory keeps a benchmark set as
 //! `<set>.jsonl.zst` in Git LFS, so a compressed set or a Git LFS pointer under
 //! the root fails the run and says to unpack first. Each case is compared as
 //! its line is read, and the cases read from each set must number what the
 //! model's `sets.toml` lists for it; a set the table lists that the tree lacks,
 //! or a set file the table does not list, fails the run too, so it cannot pass
-//! on part of the fixtures. The run prints each set with its count, each
-//! difference, and a tally per model.
+//! on part of the fixtures.
+//!
+//! The run prints one line per model: for each direction the cases compared,
+//! matching and differing, how many of the differing are listed and
+//! unlisted, and the model's stale entries of the list; under it the first
+//! unlisted differences of the model, up to [`SHOWN`]; then one count of the
+//! models without sets, and the totals. The per-case report, each set read
+//! with its count and each difference with its description and its reason
+//! when it is listed, followed by the summary and the failures, goes to a
+//! file: `bellwether_fixtures.txt` under `BELLWETHER_REPORT_DIR`, or under
+//! the build's `target/tmp` when the variable is not set, and the run says
+//! where. `BELLWETHER_VERBOSE=1` prints the per-case report on stdout too,
+//! as the run did before it went to a file.
 //!
 //! Tokenizer files come from the Hugging Face cache snapshot at the
 //! manifest's revision when it is there, else from a one-time download into
@@ -52,7 +68,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs,
-    io::{BufRead, BufReader, Read},
+    io::{self, BufRead, BufReader, BufWriter, Read, Write},
     num::NonZeroUsize,
     ops::Bound,
     path::{Path, PathBuf},
@@ -67,8 +83,21 @@ use llm_tokenizer::{create_tokenizer, traits::Tokenizer, MockTokenizer, Sequence
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 
+mod common;
+
 const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
 const CACHE_DIR: &str = ".tokenizer_cache/bellwether";
+/// Set to anything but empty or `0`, the per-case report is printed on stdout
+/// as well.
+const VERBOSE_ENV: &str = "BELLWETHER_VERBOSE";
+/// The directory the per-case report is written to; the build's `target/tmp`
+/// when it is not set.
+const REPORT_DIR_ENV: &str = "BELLWETHER_REPORT_DIR";
+/// The per-case report's file name under that directory.
+const REPORT_FILE: &str = "bellwether_fixtures.txt";
+/// How many unlisted differences of one model stdout shows, and how many
+/// lines of a failure; the rest are in the per-case report.
+const SHOWN: usize = 20;
 /// The fixture kinds this test reads, each a directory of sets beside a
 /// model's manifest.
 const KINDS: [&str; 2] = ["render", "parse"];
@@ -85,72 +114,7 @@ const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 /// pre-tokenizer for instance, and is held to the rule an id is: the run
 /// fails when no loaded case under it differs any more, and when no loaded
 /// case is under it at all.
-const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
-    (
-        "qwen-agentworld-35b-a3b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump that follows removes this entry",
-    ),
-    (
-        "qwen-drive-1.0-4b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump that follows removes this entry",
-    ),
-    (
-        "qwen3.5-27b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump that follows removes this entry",
-    ),
-    (
-        "qwen3.5-2b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump that follows removes this entry",
-    ),
-    (
-        "qwen3.5-9b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump that follows removes this entry",
-    ),
-    (
-        "qwen3.8-2.4t-a95b/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump that follows removes this entry",
-    ),
-    (
-        "qwen3.8-flash-next/render/*",
-        "the reference's ids follow transformers' Qwen2Tokenizer pattern, which splits \
-         combining marks from their letters where tokenizer.json keeps them \
-         (smg-project/smg-lab#56); re-recorded with the file's encoder in \
-         smg-project/bellwether#104, the pin bump that follows removes this entry",
-    ),
-    (
-        "phi-4-multimodal-instruct/render/*",
-        "the reference's ids follow transformers' GPT2Tokenizer pattern, which splits \
-         contractions, digit runs and punctuation as GPT-2 does where tokenizer.json carries \
-         an o200k-style regex (smg-project/smg-lab#102); re-recorded with the file's encoder \
-         in smg-project/bellwether#104, the pin bump that follows removes this entry",
-    ),
-    (
-        "tinyllama-1.1b-chat-v1.0/render/*",
-        "the reference's ids follow transformers' LlamaTokenizer with legacy=false, which \
-         prepends the dummy space once per input where tokenizer.json's normalizer prepends \
-         it per segment, so no dummy space follows a special token (smg-project/smg-lab#104); \
-         re-recorded with the file's encoder in smg-project/bellwether#104, the pin bump that \
-         follows removes this entry",
-    ),
-];
+const KNOWN_DIFFERENCES: &[(&str, &str)] = &[];
 
 /// Models whose tokenizer is known not to load, with the reason and where it
 /// is tracked, so the run compares the others: an unlisted model that does
@@ -236,6 +200,8 @@ struct Tally {
     cases: usize,
     ids: usize,
     differ: usize,
+    /// How many of the differing cases [`KNOWN_DIFFERENCES`] lists.
+    listed: usize,
 }
 
 impl fmt::Display for Tally {
@@ -245,12 +211,113 @@ impl fmt::Display for Tally {
         }
         write!(
             f,
-            "{} cases ({} ids) compared, {} match, {} differ",
+            "{} cases ({} ids) compared, {} match, {} differ, {} listed, {} unlisted",
             self.cases,
             self.ids,
             self.cases - self.differ,
-            self.differ
+            self.differ,
+            self.listed,
+            self.differ - self.listed
         )
+    }
+}
+
+/// The first unlisted differences of a model, as stdout shows them.
+#[derive(Default)]
+struct Shown {
+    lines: String,
+    unlisted: usize,
+}
+
+impl Shown {
+    /// Count one unlisted difference, and keep its line while fewer than
+    /// [`SHOWN`] are kept.
+    fn unlisted(&mut self, line: &str) {
+        self.unlisted += 1;
+        if self.unlisted <= SHOWN {
+            self.lines.push_str(line);
+        }
+    }
+
+    /// The lines kept, and how many more the per-case report has.
+    fn text(mut self, slug: &str) -> String {
+        if self.unlisted > SHOWN {
+            self.lines.push_str(&format!(
+                "  ... and {} more unlisted differences of {slug}, every one in the per-case \
+                 report\n",
+                self.unlisted - SHOWN
+            ));
+        }
+        self.lines
+    }
+}
+
+/// The run's stdout, through `print!`, which the test harness captures as it
+/// does every test's output unless it runs with `--nocapture`.
+struct Stdout;
+
+impl Write for Stdout {
+    #[expect(
+        clippy::print_stdout,
+        reason = "the per-model lines are test diagnostic output"
+    )]
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        print!("{}", String::from_utf8_lossy(buf));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stdout().flush()
+    }
+}
+
+/// Where a run writes: the per-case report to `report`, and to `stdout` as
+/// well when the run is verbose; else `stdout` gets one line per model, the
+/// first unlisted differences of each, and the totals.
+struct Output<'a> {
+    stdout: &'a mut dyn Write,
+    report: &'a mut dyn Write,
+    verbose: bool,
+}
+
+impl Output<'_> {
+    /// Write what comparing one model gave.
+    fn model(&mut self, compared: &Compared) -> io::Result<()> {
+        self.report.write_all(compared.lines.as_bytes())?;
+        if self.verbose {
+            return self.stdout.write_all(compared.lines.as_bytes());
+        }
+        if compared.has_sets {
+            writeln!(self.stdout, "{}", compared.summary)?;
+            self.stdout.write_all(compared.shown.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Write the summary, with the line of every model, and the totals.
+    fn finish(
+        &mut self,
+        summaries: &[String],
+        without_sets: usize,
+        totals: &str,
+    ) -> io::Result<()> {
+        let mut summary = String::from("summary:\n");
+        for line in summaries {
+            summary.push_str(&format!("  {line}\n"));
+        }
+        summary.push_str(totals);
+        summary.push('\n');
+        self.report.write_all(summary.as_bytes())?;
+        if self.verbose {
+            return self.stdout.write_all(summary.as_bytes());
+        }
+        if without_sets > 0 {
+            writeln!(
+                self.stdout,
+                "{without_sets} models without render or parse sets"
+            )?;
+        }
+        writeln!(self.stdout, "{totals}")
     }
 }
 
@@ -270,11 +337,15 @@ struct Report {
     /// file for the set) and the cases listed (none when the table does not
     /// list it).
     mismatches: Vec<(String, Option<usize>, Option<usize>)>,
+    /// The first unlisted differences, as stdout shows them; of one model's
+    /// report, not merged.
+    shown: Shown,
 }
 
 impl Report {
     /// Count one compared case into `tally`, and keep its difference if it
-    /// has one, written to `lines` as it is found.
+    /// has one, written to `lines` as it is found, with its reason when it is
+    /// listed; an unlisted one is counted into the shown ones too.
     fn record(
         &mut self,
         id: String,
@@ -292,10 +363,15 @@ impl Report {
         tally.ids += ids;
         if let Err(why) = outcome {
             tally.differ += 1;
-            let listed = known_reason(known, &id).map_or(String::new(), |reason| {
-                format!("\n          known: {reason}")
-            });
-            lines.push_str(&format!("  differs {id}: {why}{listed}\n"));
+            let line = format!("  differs {id}: {why}\n");
+            lines.push_str(&line);
+            match known_reason(known, &id) {
+                Some(reason) => {
+                    tally.listed += 1;
+                    lines.push_str(&format!("          known: {reason}\n"));
+                }
+                None => self.shown.unlisted(&line),
+            }
             self.differences.insert(id, why);
         }
     }
@@ -368,44 +444,42 @@ impl Report {
                 root.display()
             ));
         }
-        let unexpected: Vec<String> = self
+        let unexpected: Vec<(&str, &str)> = self
             .differences
             .iter()
             .filter(|(id, _)| known_reason(known, id).is_none())
-            .map(|(id, why)| format!("{id}: {why}"))
+            .map(|(id, why)| (id.as_str(), why.as_str()))
             .collect();
         if !unexpected.is_empty() {
+            let mut per_model: BTreeMap<&str, usize> = BTreeMap::new();
+            for (id, _) in &unexpected {
+                *per_model
+                    .entry(id.split('/').next().unwrap_or_default())
+                    .or_default() += 1;
+            }
+            let models: Vec<String> = per_model
+                .iter()
+                .map(|(slug, count)| format!("{slug} {count}"))
+                .collect();
+            let cases: Vec<String> = unexpected
+                .iter()
+                .map(|(id, why)| format!("{id}: {why}"))
+                .collect();
             failures.push(format!(
-                "differences not listed in KNOWN_DIFFERENCES:\n{}",
-                unexpected.join("\n")
+                "differences not listed in KNOWN_DIFFERENCES: {} ({}):\n{}",
+                unexpected.len(),
+                models.join(", "),
+                cases.join("\n")
             ));
         }
-        let healed: Vec<&str> = known
-            .keys()
-            .copied()
-            .filter(|entry| match prefix_of(entry) {
-                Some(prefix) => self.seen_under(prefix) && !self.differs_under(prefix),
-                None => self.seen.contains(*entry) && !self.differences.contains_key(*entry),
-            })
-            .collect();
+        let healed = self.healed(known);
         if !healed.is_empty() {
             failures.push(format!(
                 "listed in KNOWN_DIFFERENCES but matching the reference now; remove: {}",
                 healed.join(", ")
             ));
         }
-        let gone: Vec<&str> = known
-            .keys()
-            .copied()
-            .filter(|entry| {
-                let dir = entry.rsplit_once('/').map_or("", |(dir, _)| dir);
-                self.loaded_dirs.contains(dir)
-                    && match prefix_of(entry) {
-                        Some(prefix) => !self.seen_under(prefix),
-                        None => !self.seen.contains(*entry),
-                    }
-            })
-            .collect();
+        let gone = self.gone(known);
         if !gone.is_empty() {
             failures.push(format!(
                 "listed in KNOWN_DIFFERENCES but no longer among the loaded fixtures; remove or \
@@ -431,12 +505,43 @@ impl Report {
             .next()
             .is_some_and(|(id, _)| id.starts_with(prefix))
     }
+
+    /// The entries of `known` whose compared cases all match the reference
+    /// now.
+    fn healed<'k>(&self, known: &BTreeMap<&'k str, &'k str>) -> Vec<&'k str> {
+        known
+            .keys()
+            .copied()
+            .filter(|entry| match prefix_of(entry) {
+                Some(prefix) => self.seen_under(prefix) && !self.differs_under(prefix),
+                None => self.seen.contains(*entry) && !self.differences.contains_key(*entry),
+            })
+            .collect()
+    }
+
+    /// The entries of `known` for a kind whose sets were read that are no
+    /// longer among its cases.
+    fn gone<'k>(&self, known: &BTreeMap<&'k str, &'k str>) -> Vec<&'k str> {
+        known
+            .keys()
+            .copied()
+            .filter(|entry| {
+                let dir = entry.rsplit_once('/').map_or("", |(dir, _)| dir);
+                self.loaded_dirs.contains(dir)
+                    && match prefix_of(entry) {
+                        Some(prefix) => !self.seen_under(prefix),
+                        None => !self.seen.contains(*entry),
+                    }
+            })
+            .collect()
+    }
 }
 
 #[test]
 #[expect(
     clippy::print_stderr,
-    reason = "the skip notice is test diagnostic output"
+    clippy::print_stdout,
+    reason = "the skip notice and the per-case report's path are test diagnostic output"
 )]
 fn encode_and_incremental_decode_match_the_reference() {
     let Some(root) = std::env::var_os(FIXTURES_ENV).map(PathBuf::from) else {
@@ -480,59 +585,128 @@ fn encode_and_incremental_decode_match_the_reference() {
         );
     }
     let known_unloaded: BTreeMap<&str, &str> = KNOWN_UNLOADED.iter().copied().collect();
-    let report =
-        compare(&root, &manifests, &known, load_tokenizer).unwrap_or_else(|e| panic!("{e}"));
+    let verbose = verbose();
+    let (path, mut file) = report_file().unwrap_or_else(|e| panic!("{e}"));
+    let mut stdout = Stdout;
+    let report = compare(
+        &root,
+        &manifests,
+        &known,
+        load_tokenizer,
+        &mut Output {
+            stdout: &mut stdout,
+            report: &mut file,
+            verbose,
+        },
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
     let failures = report.failures(&root, &known, &known_unloaded);
-    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    for failure in &failures {
+        writeln!(file, "{failure}")
+            .unwrap_or_else(|e| panic!("cannot write {}: {e}", path.display()));
+    }
+    file.flush()
+        .unwrap_or_else(|e| panic!("cannot write {}: {e}", path.display()));
+    println!("per-case report: {}", path.display());
+    let message = if verbose {
+        failures.join("\n")
+    } else {
+        let capped: Vec<String> = failures
+            .iter()
+            .map(|failure| capped(failure, SHOWN, &path))
+            .collect();
+        capped.join("\n")
+    };
+    assert!(failures.is_empty(), "{message}");
+}
+
+/// Whether [`VERBOSE_ENV`] asks for the per-case report on stdout: set to
+/// anything but empty or `0`.
+fn verbose() -> bool {
+    std::env::var(VERBOSE_ENV).is_ok_and(|value| !value.is_empty() && value != "0")
+}
+
+/// The per-case report's file, [`REPORT_FILE`] under [`REPORT_DIR_ENV`] or
+/// the build's `target/tmp`, created with its directory.
+fn report_file() -> Result<(PathBuf, BufWriter<fs::File>), String> {
+    let dir = std::env::var_os(REPORT_DIR_ENV)
+        .map_or_else(|| PathBuf::from(env!("CARGO_TARGET_TMPDIR")), PathBuf::from);
+    fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let path = dir.join(REPORT_FILE);
+    let file =
+        fs::File::create(&path).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    Ok((path, BufWriter::new(file)))
+}
+
+/// `failure` with at most `shown` lines after its first; the rest are
+/// counted, and the reader sent to the per-case report at `report`.
+fn capped(failure: &str, shown: usize, report: &Path) -> String {
+    let lines: Vec<&str> = failure.lines().collect();
+    if lines.len() <= shown + 1 {
+        return failure.to_string();
+    }
+    format!(
+        "{}\n... and {} more lines, every one in {}",
+        lines[..=shown].join("\n"),
+        lines.len() - shown - 1,
+        report.display()
+    )
 }
 
 /// Compare each model's render and parse sets under `root` with the tokenizer
 /// `load` gives for the model, each case as its line is read, and the cases
 /// read from each set with the model's `sets.toml`. The models are compared
-/// on as many threads as the run has CPUs; what each printed is written in
-/// the manifests' order, each model as soon as it and the ones before it are
-/// done, so the output reads as a serial run's. A model whose tokenizer does
-/// not load is kept in the report and the run goes on. Prints each set read,
-/// each difference, and a tally per model.
-#[expect(
-    clippy::print_stdout,
-    reason = "the per-set and per-model report is test diagnostic output"
-)]
+/// on as many threads as the run has CPUs; what each gave is written to `out`
+/// in the manifests' order, each model as soon as it and the ones before it
+/// are done, so the report reads as a serial run's. A model whose tokenizer
+/// does not load is kept in the report and the run goes on.
 fn compare(
     root: &Path,
     manifests: &[(String, Manifest)],
     known: &BTreeMap<&str, &str>,
     load: impl Fn(&str, &Manifest) -> Result<(Arc<dyn Tokenizer>, String), String> + Sync,
+    out: &mut Output<'_>,
 ) -> Result<Report, String> {
     let mut report = Report::default();
     let mut summaries = Vec::with_capacity(manifests.len());
+    let mut without_sets = 0;
+    let mut not_written = None;
     in_order(
         manifests,
         |slug, manifest| compare_model(root, slug, manifest, known, &load),
         |compared| {
-            print!("{}", compared.lines);
+            if let Err(e) = out.model(&compared) {
+                not_written.get_or_insert(e);
+            }
+            if !compared.has_sets {
+                without_sets += 1;
+            }
             report.merge(compared.report);
             summaries.push(compared.summary);
         },
     )?;
-    println!("summary:");
-    for summary in &summaries {
-        println!("  {summary}");
+    if let Some(e) = not_written {
+        return Err(format!("cannot write the report: {e}"));
     }
-    println!(
+    let totals = format!(
         "{} cases compared, {} match, {} differ",
         report.seen.len(),
         report.seen.len() - report.differences.len(),
         report.differences.len()
     );
+    out.finish(&summaries, without_sets, &totals)
+        .map_err(|e| format!("cannot write the report: {e}"))?;
     Ok(report)
 }
 
-/// What comparing one model gave: the lines a serial run would have printed
-/// for it, its line of the summary, and its part of the report.
+/// What comparing one model gave: the per-case lines a serial run would have
+/// printed for it, its line of the summary, the first unlisted differences
+/// stdout shows, whether it had sets to compare, and its part of the report.
 struct Compared {
     lines: String,
     summary: String,
+    shown: String,
+    has_sets: bool,
     report: Report,
 }
 
@@ -560,6 +734,8 @@ where
         return Ok(Compared {
             lines,
             summary: format!("{slug}: no render or parse sets"),
+            shown: String::new(),
+            has_sets: false,
             report,
         });
     }
@@ -577,6 +753,8 @@ where
             return Ok(Compared {
                 lines,
                 summary: format!("{slug}: not compared, its tokenizer did not load"),
+                shown: String::new(),
+                has_sets: true,
                 report,
             });
         }
@@ -630,9 +808,12 @@ where
     report
         .mismatches
         .extend(set_mismatches(slug, &read, &listed));
+    let stale = report.healed(known).len() + report.gone(known).len();
     Ok(Compared {
         lines,
-        summary: format!("{slug}: encode: {encode}; incremental decode: {decode}"),
+        summary: format!("{slug}: encode: {encode}; incremental decode: {decode}; {stale} stale"),
+        shown: std::mem::take(&mut report.shown).text(slug),
+        has_sets: true,
         report,
     })
 }
@@ -1016,7 +1197,7 @@ fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, Str
     }
     let dir = PathBuf::from(CACHE_DIR).join(slug).join(revision);
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let client = reqwest::blocking::Client::new();
+    let client = common::http_client();
     download(&client, model, revision, &dir, "tokenizer_config.json", 100)?
         .ok_or_else(|| format!("{model} at {revision} serves no tokenizer_config.json"))?;
     download(&client, model, revision, &dir, "config.json", 2)?;
@@ -1115,7 +1296,7 @@ fn snapshot_under(hub: &Path, model: &str, revision: &str) -> Option<PathBuf> {
 
 /// A fixture tree in a temporary directory: each file's path under the root
 /// and its contents.
-fn tree(files: &[(&str, &str)]) -> std::io::Result<tempfile::TempDir> {
+fn tree(files: &[(&str, &str)]) -> io::Result<tempfile::TempDir> {
     let root = tempfile::tempdir()?;
     for (path, contents) in files {
         let path = root.path().join(path);
@@ -1180,6 +1361,28 @@ fn mock() -> (Arc<dyn Tokenizer>, String) {
     )
 }
 
+/// [`compare`] writing to buffers nobody reads, for the tests that read the
+/// report it returns.
+fn compare_quietly(
+    root: &Path,
+    manifests: &[(String, Manifest)],
+    known: &BTreeMap<&str, &str>,
+    load: impl Fn(&str, &Manifest) -> Result<(Arc<dyn Tokenizer>, String), String> + Sync,
+) -> Result<Report, String> {
+    let (mut stdout, mut report) = (Vec::new(), Vec::new());
+    compare(
+        root,
+        manifests,
+        known,
+        load,
+        &mut Output {
+            stdout: &mut stdout,
+            report: &mut report,
+            verbose: false,
+        },
+    )
+}
+
 #[test]
 fn compressed_sets_and_lfs_pointers_are_found_under_the_root() {
     let pointer = "version https://git-lfs.github.com/spec/v1\n\
@@ -1227,7 +1430,8 @@ fn the_cases_read_must_be_the_cases_sets_toml_lists() {
     ])
     .unwrap();
     let manifests = read_manifests(root.path()).unwrap();
-    let report = compare(root.path(), &manifests, &BTreeMap::new(), |_, _| Ok(mock())).unwrap();
+    let report =
+        compare_quietly(root.path(), &manifests, &BTreeMap::new(), |_, _| Ok(mock())).unwrap();
     assert_eq!(
         report.mismatches,
         [
@@ -1251,7 +1455,7 @@ fn sets_without_a_sets_toml_stop_the_run() {
     ])
     .unwrap();
     let manifests = read_manifests(root.path()).unwrap();
-    let error = compare(root.path(), &manifests, &BTreeMap::new(), |_, _| Ok(mock()))
+    let error = compare_quietly(root.path(), &manifests, &BTreeMap::new(), |_, _| Ok(mock()))
         .err()
         .expect("sets with no sets.toml to check them against should stop the run");
     assert!(error.contains("sets.toml"), "{error}");
@@ -1315,7 +1519,7 @@ fn a_model_whose_tokenizer_does_not_load_fails_the_run_after_the_others() {
     ])
     .unwrap();
     let manifests = read_manifests(root.path()).unwrap();
-    let report = compare(
+    let report = compare_quietly(
         root.path(),
         &manifests,
         &BTreeMap::new(),
@@ -1374,7 +1578,7 @@ fn a_prefix_entry_covers_the_cases_under_it_and_must_cover_one() {
     .unwrap();
     let manifests = read_manifests(root.path()).unwrap();
     let listed = BTreeMap::from([("m/render/mgsm-th-*", "recorded with another pre-tokenizer")]);
-    let report = compare(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
     assert_eq!(report.differences.len(), 2, "{:#?}", report.differences);
     // The prefix covers both differing cases, so nothing fails the run.
     assert_eq!(
@@ -1412,6 +1616,147 @@ fn a_prefix_entry_covers_the_cases_under_it_and_must_cover_one() {
                 && !failure.contains("mgsm-th")
         }),
         "{failures:#?}"
+    );
+}
+
+#[test]
+fn stdout_has_one_line_per_model_and_the_report_every_case() {
+    // "m" has one listed difference and SHOWN + 1 unlisted ones, "n" no sets,
+    // "o" one matching case that the list says differs.
+    let (m, o) = ("org/m", "org/o");
+    let mut gsm8k = String::new();
+    for i in 0..=SHOWN {
+        gsm8k += &differing_line(&format!("m/render/gsm8k-{i}"), m);
+    }
+    let root = tree(&[
+        ("m/manifest.toml", &manifest(m)),
+        (
+            "m/sets.toml",
+            &sets_toml(&[("render/common", 1), ("render/gsm8k", SHOWN + 1)]),
+        ),
+        (
+            "m/render/common.jsonl",
+            &differing_line("m/render/common-0", m),
+        ),
+        ("m/render/gsm8k.jsonl", &gsm8k),
+        ("n/manifest.toml", &manifest("org/n")),
+        ("o/manifest.toml", &manifest(o)),
+        ("o/sets.toml", &sets_toml(&[("render/common", 1)])),
+        (
+            "o/render/common.jsonl",
+            &render_line("o/render/common-0", o),
+        ),
+    ])
+    .unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let listed = BTreeMap::from([
+        ("m/render/common-0", "the reference ids are not the text's"),
+        ("o/render/common-0", "matches now"),
+    ]);
+    let (mut stdout, mut report) = (Vec::new(), Vec::new());
+    compare(
+        root.path(),
+        &manifests,
+        &listed,
+        |_, _| Ok(mock()),
+        &mut Output {
+            stdout: &mut stdout,
+            report: &mut report,
+            verbose: false,
+        },
+    )
+    .unwrap();
+    let (stdout, report) = (
+        String::from_utf8(stdout).unwrap(),
+        String::from_utf8(report).unwrap(),
+    );
+    // stdout: m's line and its first SHOWN unlisted differences, o's line, the
+    // count of the models without sets, the totals; no listed difference, no
+    // set read.
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines[0],
+        format!(
+            "m: encode: {} cases ({} ids) compared, 0 match, {} differ, 1 listed, {} unlisted; \
+             incremental decode: no fixtures; 0 stale",
+            SHOWN + 2,
+            SHOWN + 2,
+            SHOWN + 2,
+            SHOWN + 1
+        ),
+        "{stdout}"
+    );
+    assert!(
+        lines[1..=SHOWN]
+            .iter()
+            .all(|line| line.starts_with("  differs m/render/gsm8k-")),
+        "{stdout}"
+    );
+    assert_eq!(
+        lines[SHOWN + 1..].join("\n"),
+        format!(
+            "  ... and 1 more unlisted differences of m, every one in the per-case report\n\
+             o: encode: 1 cases (1 ids) compared, 1 match, 0 differ, 0 listed, 0 unlisted; \
+             incremental decode: no fixtures; 1 stale\n\
+             1 models without render or parse sets\n\
+             {} cases compared, 1 match, {} differ",
+            SHOWN + 3,
+            SHOWN + 2
+        ),
+        "{stdout}"
+    );
+    assert!(
+        !stdout.contains("known:") && !stdout.contains("common"),
+        "{stdout}"
+    );
+    // The report: every difference, with its reason when listed, each set
+    // read, the summary with every model, the totals.
+    assert!(
+        report.contains("  differs m/render/common-0: ")
+            && report.contains("\n          known: the reference ids are not the text's\n"),
+        "{report}"
+    );
+    assert_eq!(
+        report.matches("  differs m/render/gsm8k-").count(),
+        SHOWN + 1,
+        "{report}"
+    );
+    assert!(
+        report.contains("\n  render/common: 1 read, sets.toml lists 1")
+            && report.contains("\nsummary:\n  m: ")
+            && report.contains("\n  n: no render or parse sets\n")
+            && report.ends_with(&format!(
+                "\n{} cases compared, 1 match, {} differ\n",
+                SHOWN + 3,
+                SHOWN + 2
+            )),
+        "{report}"
+    );
+    // Verbose, stdout gets the report too.
+    let (mut stdout, mut again) = (Vec::new(), Vec::new());
+    compare(
+        root.path(),
+        &manifests,
+        &listed,
+        |_, _| Ok(mock()),
+        &mut Output {
+            stdout: &mut stdout,
+            report: &mut again,
+            verbose: true,
+        },
+    )
+    .unwrap();
+    assert_eq!(stdout, again);
+    assert_eq!(String::from_utf8(again).unwrap(), report);
+}
+
+#[test]
+fn a_failure_shows_its_first_lines_and_counts_the_rest() {
+    let report = Path::new("reports/tokenizer.txt");
+    assert_eq!(capped("header\na\nb", 2, report), "header\na\nb");
+    assert_eq!(
+        capped("header\na\nb\nc\nd", 2, report),
+        "header\na\nb\n... and 2 more lines, every one in reports/tokenizer.txt"
     );
 }
 

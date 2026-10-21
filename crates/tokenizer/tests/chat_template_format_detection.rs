@@ -583,10 +583,13 @@ fn a_loop_over_a_content_variable_inside_a_macro_is_string_format() {
 }
 
 #[test]
-fn an_assignment_from_messages_to_a_namespace_falls_back_to_string_format() {
-    // The engine's walk stops at an assignment from `messages` whose target is
-    // not a plain name and falls back to its default, the string format; the
-    // gateway follows it there too.
+fn an_assignment_from_messages_to_a_namespace_attribute_still_reaches_the_content_loop() {
+    // A template that keeps its messages in a namespace attribute and then
+    // iterates a message's content parts renders parts: the parts format. A
+    // deliberate divergence from the engine's walk, which stops at an
+    // assignment from `messages` whose target is not a plain name and falls
+    // back to the string format: that heuristic under-detects such a
+    // template, whose content loop is right there after the assignment.
     let template = r"
         {%- set ns = namespace(msgs=[]) %}
         {%- set ns.msgs = messages %}
@@ -596,7 +599,7 @@ fn an_assignment_from_messages_to_a_namespace_falls_back_to_string_format() {
         ";
     assert_eq!(
         detect_chat_template_content_format(template),
-        ChatTemplateContentFormat::String
+        ChatTemplateContentFormat::OpenAI
     );
 }
 

@@ -69,26 +69,44 @@ def test_all_exited_schedulers_request_shutdown(caplog):
     assert [process.terminate_calls for process in processes] == [0, 0]
 
 
-def test_partial_scheduler_exit_does_not_request_shutdown():
+def test_one_exited_scheduler_process_requests_shutdown(caplog):
+    """smg-lab #292: a scheduler process that exits on its own leaves an
+    engine that cannot serve (a tensor-parallel rank, or the only one), so
+    the watchdog stops the server at the first exit, not after the last, and
+    reports it so the servicer exits non-zero."""
+    watchdog = _load_watchdog()
+    caplog.set_level(logging.ERROR)
+
+    async def exercise():
+        stop_event = asyncio.Event()
+        exited = await watchdog.wait_for_scheduler_shutdown(
+            [_Process(exitcode=1), _Process(exitcode=None)],
+            stop_event,
+            poll_interval_seconds=0,
+        )
+        assert stop_event.is_set()
+        assert exited is True
+        assert not _watchdog_tasks(watchdog)
+
+    asyncio.run(exercise())
+    assert "[1, None]" in caplog.text
+
+
+def test_a_signal_shutdown_reports_no_scheduler_exit():
+    """The stop event set by a signal: the watchdog is cancelled and
+    `wait_for_scheduler_shutdown` reports no engine exit."""
     watchdog = _load_watchdog()
 
     async def exercise():
         stop_event = asyncio.Event()
-        task = asyncio.create_task(
-            watchdog.watch_scheduler_processes(
-                [_Process(exitcode=1), _Process(exitcode=None)],
-                stop_event,
-                poll_interval_seconds=3600,
+        waiter = asyncio.create_task(
+            watchdog.wait_for_scheduler_shutdown(
+                [_Process(exitcode=None)], stop_event, poll_interval_seconds=0.01
             )
         )
-        await asyncio.sleep(0)
-
-        assert not stop_event.is_set()
-        assert not task.done()
-
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        await asyncio.sleep(0.03)
+        stop_event.set()
+        assert await waiter is False
 
     asyncio.run(exercise())
 

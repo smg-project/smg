@@ -46,6 +46,17 @@ pub const REQUEST_BODY_TIMEOUT: &str = "request_body_timeout";
 /// Error code of a body that crossed the payload limit (`max_payload_size`).
 pub const REQUEST_BODY_TOO_LARGE: &str = "request_body_too_large";
 
+/// The refusal of a body over the payload limit: one code and one message
+/// for every framing (the chunked read here, a declared length at the edge
+/// in `body_limit`).
+pub(crate) fn request_body_too_large_response() -> Response {
+    create_error(
+        StatusCode::PAYLOAD_TOO_LARGE,
+        REQUEST_BODY_TOO_LARGE,
+        "Request body exceeded the payload limit (max_payload_size)",
+    )
+}
+
 const READING: u8 = 0;
 const STALLED: u8 = 1;
 const TIMED_OUT: u8 = 2;
@@ -112,11 +123,7 @@ pub async fn request_body_timeout_middleware(
                 format!("Request body was not complete after {timeout_secs} seconds"),
             )
         }
-        TOO_LARGE => create_error(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            REQUEST_BODY_TOO_LARGE,
-            "Request body exceeded the payload limit (max_payload_size)",
-        ),
+        TOO_LARGE => request_body_too_large_response(),
         _ => response,
     }
 }
@@ -126,7 +133,7 @@ pub async fn request_body_timeout_middleware(
 /// this one, and every `Body::new` over a wrapped body adds a layer of
 /// `axum::Error`; the JSON extractor's 413 branch, like axum's own, looks
 /// two layers deep, which this wrapper's layer put the limit error beyond.
-fn crossed_payload_limit(err: &axum::Error) -> bool {
+pub(super) fn crossed_payload_limit(err: &axum::Error) -> bool {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(err);
     while let Some(err) = source {
         if err.is::<http_body_util::LengthLimitError>() {
@@ -358,7 +365,7 @@ mod tests {
     /// more, past where the extractors look for it.
     #[tokio::test(start_paused = true)]
     async fn a_body_over_the_payload_limit_is_413_request_body_too_large() {
-        let app = app(timeouts(5, 60)).layer(tower_http::limit::RequestBodyLimitLayer::new(8));
+        let app = app(timeouts(5, 60)).layer(crate::middleware::RequestBodyLimitLayer::new(8));
         let response = app
             .oneshot(echo(Body::from("more than eight bytes")))
             .await

@@ -1,7 +1,5 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
-
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{
@@ -25,7 +23,7 @@ const MEDIA_END: &str = "<|media_end|>";
 ///
 /// That block cannot be built while rendering — the chat template runs before
 /// any media is fetched, so the dimensions do not exist yet. It is built here
-/// instead, from the sizes the preprocessor reports, as vLLM does in
+/// instead, from the sizes the preprocessor reports, as the reference implementation does in
 /// `kimi_k3.py::_get_prompt_updates`.
 pub(super) struct KimiK3VisionSpec;
 
@@ -38,21 +36,6 @@ impl KimiK3VisionSpec {
             .ok_or_else(|| ModelRegistryError::MissingConfigField {
                 field: "media_placeholder_token_id".to_string(),
             })
-    }
-
-    /// Encode ordinary text into token ids.
-    ///
-    /// The dimension text sits between two special tokens, which are hard
-    /// segment boundaries for the encoder, so encoding it alone yields the same
-    /// ids as the reference's one-shot encoding of the whole block.
-    fn encode_plain_text(metadata: &ModelMetadata, text: &str) -> RegistryResult<Vec<TokenId>> {
-        let ids = metadata.tokenizer.encode_text(text).ok_or_else(|| {
-            ModelRegistryError::TextEncodingFailed {
-                spec: "kimi_k3",
-                text: text.to_string(),
-            }
-        })?;
-        Ok(ids.into_iter().map(|id| id as TokenId).collect())
     }
 }
 
@@ -69,7 +52,11 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
                 .is_some_and(|mt| mt == "kimi_k3")
     }
 
-    /// The reference renders content parts positionally.
+    /// The reference renders content parts positionally, so a string
+    /// template of the family gets the media parts where the request put
+    /// them. The family's own renderer takes the parts and places them
+    /// itself, whatever this says, and its profile wins over any template,
+    /// so this is read only for a model of the family served without it.
     fn media_part_order(&self) -> MediaPartOrder {
         MediaPartOrder::Authored
     }
@@ -87,10 +74,6 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
         _metadata: &ModelMetadata,
     ) -> RegistryResult<HashMap<Modality, usize>> {
         Ok(HashMap::from([(Modality::Image, 10)]))
-    }
-
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
     }
 
     fn prompt_replacements(
@@ -112,7 +95,11 @@ impl ModelProcessorSpec for KimiK3VisionSpec {
             .iter()
             .zip(&preprocessed.item_sizes)
             .map(|(&num_tokens, &(width, height))| {
-                let dims = Self::encode_plain_text(metadata, &format!("image {width}x{height}"))?;
+                // The dimension text sits between two special tokens, which
+                // are hard segment boundaries for the encoder, so encoding it
+                // alone yields the same ids as the reference's one-shot
+                // encoding of the whole block.
+                let dims = metadata.encode_plain("kimi_k3", &format!("image {width}x{height}"))?;
                 let mut tokens = Vec::with_capacity(dims.len() + num_tokens + 3);
                 tokens.push(media_begin);
                 tokens.extend(dims);
@@ -280,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    /// vLLM's `kimi_k3` prompt updates target `<|kimi_image_placeholder|>`
+    /// The engine's `kimi_k3` prompt updates target `<|kimi_image_placeholder|>`
     /// (id 163838), not the gateway's `<|media_pad|>` anchor (id 163605), so
     /// a forwarded reference fails the engine's prompt replacement: media
     /// stay router-side.

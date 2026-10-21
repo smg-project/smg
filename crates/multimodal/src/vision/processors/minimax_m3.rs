@@ -5,7 +5,7 @@
 //! images the Qwen2-VL way: a Qwen-style `smart_resize` onto a
 //! `patch_size * merge_size` grid, patchified into a flat
 //! `[total_patches, channels * temporal_patch_size * patch_size^2]` tensor
-//! alongside an `image_grid_thw` triple. vLLM's M3 vision tower consumes exactly
+//! alongside an `image_grid_thw` triple. The engine's M3 vision tower consumes exactly
 //! that layout, so this processor wraps the shared [`QwenVLProcessorBase`],
 //! supplies M3's own parameters, and raises images below M3's short-side floor
 //! before delegating.
@@ -45,7 +45,7 @@ use crate::{
     vision::{
         preprocessor_config::PreProcessorConfig,
         processor::{PreprocessedEncoderInputs, VisionPreProcessor},
-        transforms::{pil_to_filter, resize, resize_bicubic_pil, TransformError},
+        transforms::{pil_to_filter, resize, resize_bicubic_torch_aa, TransformError},
     },
 };
 
@@ -154,7 +154,8 @@ impl MiniMaxM3VisionProcessor {
                 std: CLIP_STD,
                 model_name: "minimax_m3",
             })
-            .allow_video_dimensions_below_factor(),
+            .allow_video_dimensions_below_factor()
+            .raise_rounded_sides_to_factor(),
         }
     }
 
@@ -197,12 +198,13 @@ impl MiniMaxM3VisionProcessor {
             .or(nested))
     }
 
-    /// Frames per temporal patch this processor pairs under `config`; unset or unusable values fall back to the default.
-    pub fn temporal_patch_size_from(config: &PreProcessorConfig) -> usize {
-        Self::declared_temporal_patch_size(config)
-            .ok()
-            .flatten()
-            .unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE)
+    /// Frames per temporal patch this processor pairs under `config`: the flat
+    /// key, else the compression block, else the default. A present but
+    /// unusable block value is the configuration error the construction path
+    /// reports, so a prompt's stamps are never paired by a default that the
+    /// preprocessing of the same config refuses.
+    pub fn temporal_patch_size_from(config: &PreProcessorConfig) -> Result<usize, TransformError> {
+        Ok(Self::declared_temporal_patch_size(config)?.unwrap_or(DEFAULT_TEMPORAL_PATCH_SIZE))
     }
 
     /// Build a processor from a preprocessor config, falling back to M3's
@@ -363,14 +365,17 @@ impl MiniMaxM3VisionProcessor {
             self.inner
                 .smart_resize(image.height() as usize, image.width() as usize)?;
         }
-        // The base's grid stage picks its kernel the same way, so both stages use one filter.
+        // The base's grid stage picks its kernel the same way, so both stages use
+        // one filter and, for BICUBIC, the same torchvision `uint8` kernel (the
+        // reference image processor is torchvision-backed and resizes once; this
+        // raise is the port's staging step before that resize).
         let filter = pil_to_filter(config.resampling.or(Some(3)));
         let mut staged = Vec::with_capacity(images.len());
         for image in images {
             staged.push(
                 match self.staging_dimensions(image.width(), image.height())? {
                     Some((width, height)) if filter == FilterType::CatmullRom => {
-                        resize_bicubic_pil(image, width, height)
+                        resize_bicubic_torch_aa(image, width, height)
                     }
                     Some((width, height)) => resize(image, width, height, filter),
                     None => image.clone(),
@@ -445,15 +450,20 @@ impl VisionPreProcessor for MiniMaxM3VisionProcessor {
             .preprocess_video_rgb(frames, config)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        // Infallible signature: a malformed config surfaces on the preprocess
-        // call, so fall back to this processor's own settings here.
-        let layered = self.for_request(config).unwrap_or_else(|_| self.clone());
-        let staged = config
-            .do_resize
-            .unwrap_or(true)
-            .then(|| layered.staging_dimensions(width, height).ok().flatten())
-            .flatten();
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
+        // The request's config layered over this processor's settings, as
+        // `preprocess` does; a config it refuses is refused here too.
+        let layered = self.for_request(config)?;
+        let staged = if config.do_resize.unwrap_or(true) {
+            layered.staging_dimensions(width, height)?
+        } else {
+            None
+        };
         let (width, height) = staged.unwrap_or((width, height));
         layered.inner.calculate_num_tokens(width, height, config)
     }
@@ -556,7 +566,10 @@ mod tests {
 
         // A 448x448 image is 32x32 patches at patch_size 14, which is
         // 16x16 = 256 tokens after the 2x2 merge.
-        assert_eq!(processor.calculate_num_tokens(448, 448, &config), 256);
+        assert_eq!(
+            processor.calculate_num_tokens(448, 448, &config).unwrap(),
+            256
+        );
     }
 
     #[test]
@@ -706,39 +719,69 @@ mod tests {
         // The flat key, then the checkpoint block, then the default.
         let mut config = m3_config();
         assert_eq!(
-            MiniMaxM3VisionProcessor::temporal_patch_size_from(&config),
+            MiniMaxM3VisionProcessor::temporal_patch_size_from(&config).unwrap(),
             2
         );
         config.temporal_patch_size = Some(4);
         assert_eq!(
-            MiniMaxM3VisionProcessor::temporal_patch_size_from(&config),
+            MiniMaxM3VisionProcessor::temporal_patch_size_from(&config).unwrap(),
             4
         );
         assert_eq!(
-            MiniMaxM3VisionProcessor::temporal_patch_size_from(&PreProcessorConfig::default()),
+            MiniMaxM3VisionProcessor::temporal_patch_size_from(&PreProcessorConfig::default())
+                .unwrap(),
             DEFAULT_TEMPORAL_PATCH_SIZE
         );
     }
 
     #[test]
-    fn temporal_patch_size_from_treats_unusable_values_as_unset() {
-        // A zero flat key defers to the block; a zero or malformed block value is the default.
+    fn temporal_patch_size_from_rejects_unusable_block_values() {
+        // A zero flat key defers to the block; a zero or malformed block value
+        // is the configuration error the construction path reports, not the
+        // default.
         let mut config = m3_config();
         config.temporal_patch_size = Some(0);
         assert_eq!(
-            MiniMaxM3VisionProcessor::temporal_patch_size_from(&config),
+            MiniMaxM3VisionProcessor::temporal_patch_size_from(&config).unwrap(),
             2
         );
         for bad in ["0", "-1", "2.5", "\"two\"", "null"] {
             let raw =
                 format!(r#"{{"img_token_compression_config": {{"temporal_patch_size": {bad}}}}}"#);
             let config: PreProcessorConfig = serde_json::from_str(&raw).unwrap();
+            let error = MiniMaxM3VisionProcessor::temporal_patch_size_from(&config)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("temporal_patch_size"), "{error}");
+            let constructed = MiniMaxM3VisionProcessor::from_preprocessor_config(&config)
+                .err()
+                .unwrap()
+                .to_string();
             assert_eq!(
-                MiniMaxM3VisionProcessor::temporal_patch_size_from(&config),
-                DEFAULT_TEMPORAL_PATCH_SIZE,
-                "temporal_patch_size {bad}"
+                error, constructed,
+                "temporal_patch_size {bad}: one reader, one error"
             );
         }
+    }
+
+    #[test]
+    fn token_count_refuses_the_config_construction_refuses() {
+        // A malformed compression block is the construction path's error for
+        // the count too, not a count taken from this processor's own settings.
+        let config: PreProcessorConfig = serde_json::from_str(
+            r#"{"img_token_compression_config": {"spatial_merge_size": "two"}}"#,
+        )
+        .unwrap();
+        let processor = MiniMaxM3VisionProcessor::new();
+        let counted = processor
+            .calculate_num_tokens(448, 448, &config)
+            .unwrap_err()
+            .to_string();
+        let constructed = MiniMaxM3VisionProcessor::from_preprocessor_config(&config)
+            .err()
+            .unwrap()
+            .to_string();
+        assert_eq!(counted, constructed);
     }
 
     #[test]
@@ -763,7 +806,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 layered.temporal_patch_size(),
-                MiniMaxM3VisionProcessor::temporal_patch_size_from(&config)
+                MiniMaxM3VisionProcessor::temporal_patch_size_from(&config).unwrap()
             );
         }
     }
@@ -877,10 +920,19 @@ mod tests {
         let processor = MiniMaxM3VisionProcessor::new();
         let config = m3_config();
         // 400x40 is raised to 1120x112: an 8x80 patch grid, 160 tokens after the 2x2 merge.
-        assert_eq!(processor.calculate_num_tokens(400, 40, &config), 160);
-        assert_eq!(processor.calculate_num_tokens(40, 400, &config), 160);
+        assert_eq!(
+            processor.calculate_num_tokens(400, 40, &config).unwrap(),
+            160
+        );
+        assert_eq!(
+            processor.calculate_num_tokens(40, 400, &config).unwrap(),
+            160
+        );
         // A short side already at the floor is left alone.
-        assert_eq!(processor.calculate_num_tokens(400, 112, &config), 56);
+        assert_eq!(
+            processor.calculate_num_tokens(400, 112, &config).unwrap(),
+            56
+        );
     }
 
     #[test]
@@ -914,7 +966,7 @@ mod tests {
         let config = m3_config();
         let tokens: Vec<usize> = [90, 40, 20]
             .into_iter()
-            .map(|short| processor.calculate_num_tokens(400, short, &config))
+            .map(|short| processor.calculate_num_tokens(400, short, &config).unwrap())
             .collect();
         assert_eq!(tokens, vec![72, 160, 320]);
     }
@@ -928,7 +980,7 @@ mod tests {
         let config = m3_config();
         let tokens: Vec<usize> = [20, 10, 5]
             .into_iter()
-            .map(|short| processor.calculate_num_tokens(400, short, &config))
+            .map(|short| processor.calculate_num_tokens(400, short, &config).unwrap())
             .collect();
         assert_eq!(tokens, vec![320, 453, 428]);
     }
@@ -972,7 +1024,10 @@ mod tests {
         assert!(processor
             .preprocess(&[DynamicImage::new_rgb8(400, 40)], &config)
             .is_err());
-        assert_eq!(processor.calculate_num_tokens(400, 40, &config), 14);
+        assert_eq!(
+            processor.calculate_num_tokens(400, 40, &config).unwrap(),
+            14
+        );
     }
 
     #[test]
@@ -1041,7 +1096,9 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 out.feature_token_counts,
-                vec![processor.calculate_num_tokens(width, height, &config)],
+                vec![processor
+                    .calculate_num_tokens(width, height, &config)
+                    .unwrap()],
                 "{width}x{height}"
             );
         }
@@ -1059,7 +1116,9 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{width}x{height}: {err}"));
             assert_eq!(
                 out.feature_token_counts,
-                vec![processor.calculate_num_tokens(width, height, &config)],
+                vec![processor
+                    .calculate_num_tokens(width, height, &config)
+                    .unwrap()],
                 "{width}x{height}"
             );
         }
@@ -1109,7 +1168,11 @@ mod tests {
         let config = m3_config();
         let tokens: Vec<usize> = [(400, 40), (300, 80), (112, 20), (40, 400), (80, 300)]
             .into_iter()
-            .map(|(width, height)| processor.calculate_num_tokens(width, height, &config))
+            .map(|(width, height)| {
+                processor
+                    .calculate_num_tokens(width, height, &config)
+                    .unwrap()
+            })
             .collect();
         assert_eq!(tokens, vec![160, 60, 88, 160, 60]);
     }
@@ -1126,7 +1189,9 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 out.feature_token_counts,
-                vec![processor.calculate_num_tokens(width, height, &config)],
+                vec![processor
+                    .calculate_num_tokens(width, height, &config)
+                    .unwrap()],
                 "{width}x{height}"
             );
         }
@@ -1145,7 +1210,10 @@ mod tests {
             layered.staging_dimensions(400, 3).unwrap(),
             Some((4089, 31))
         );
-        assert_eq!(processor.calculate_num_tokens(400, 3, &config), 129);
+        assert_eq!(
+            processor.calculate_num_tokens(400, 3, &config).unwrap(),
+            129
+        );
     }
 
     #[test]
@@ -1154,8 +1222,14 @@ mod tests {
         // a percent of the full raise's (293 and 339 tokens).
         let processor = MiniMaxM3VisionProcessor::new();
         let config = m3_config();
-        assert_eq!(processor.calculate_num_tokens(150, 1, &config), 292);
-        assert_eq!(processor.calculate_num_tokens(200, 1, &config), 336);
+        assert_eq!(
+            processor.calculate_num_tokens(150, 1, &config).unwrap(),
+            292
+        );
+        assert_eq!(
+            processor.calculate_num_tokens(200, 1, &config).unwrap(),
+            336
+        );
     }
 
     #[test]
@@ -1239,10 +1313,21 @@ mod tests {
         let config = m3_config();
 
         // Well past the bound: the count must clamp to image_seq_length.
-        let tokens = processor.calculate_num_tokens(4096, 4096, &config);
+        let tokens = processor.calculate_num_tokens(4096, 4096, &config).unwrap();
         assert!(
             tokens <= 576,
             "expected at most image_seq_length (576) tokens, got {tokens}"
         );
+    }
+
+    #[test]
+    fn smart_resize_floors_a_side_that_rounds_to_zero_like_the_reference() {
+        // MiniMax-M3's reference takes `max(factor, round(side / factor) * factor)`
+        // before the pixel-budget test, so a 1x100 image keeps its rounded long
+        // side (28x112 = exactly min_pixels, no scale-up); the Qwen rule would
+        // scale it up to 28x560.
+        let processor = MiniMaxM3VisionProcessor::new();
+        assert_eq!(processor.inner.smart_resize(1, 100).unwrap(), (28, 112));
+        assert_eq!(processor.inner.smart_resize(100, 1).unwrap(), (112, 28));
     }
 }

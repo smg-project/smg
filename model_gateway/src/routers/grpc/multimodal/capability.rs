@@ -3,30 +3,46 @@
 //!
 //! Previously this was implicit and duplicated across assembly (per-backend
 //! `into_single_image_batch` / `into_single_vision_batch` / ad-hoc `bail!`s with
-//! divergent messages). Centralizing it here lets the pipeline reject an
-//! unsupported (engine, modality) request at worker selection -- once the
-//! runtime is known, before request building assembles the payload -- with one
-//! consistent message, and lets assembly assert against the same matrix as
-//! defense in depth.
+//! divergent messages). Centralizing it here lets the pipeline refuse an
+//! unsupported (engine, modality) request in preparation -- on the request's
+//! declared parts, against the engines of the model's registered workers,
+//! before any media is fetched or decoded -- and again at worker selection
+//! for the pools preparation lets through, once the runtime is known and
+//! before request building assembles the payload, with one consistent
+//! message; and lets assembly assert against the same matrix as defense in
+//! depth.
 
 use anyhow::Result;
-use llm_multimodal::Modality;
+use axum::response::Response;
+use llm_multimodal::{EncoderInputFormat, Modality};
 
-use super::MultimodalIntermediate;
-use crate::worker::{RuntimeType, Worker};
+use super::{plan::MediaPlan, refs::worker_accepts_media_refs, MultimodalIntermediate};
+use crate::{
+    routers::error,
+    worker::{RuntimeType, Worker, WorkerRegistry},
+};
 
 /// Worker label carrying the engine's vision-input capability (the vLLM
 /// gRPC servicer's `GetModelInfoResponse.supports_vision`). `"false"` on a
 /// multimodal architecture means the engine runs `--language-model-only`:
-/// no vision encoder, encoder-cache budget 0, so no multimodal payload may
-/// reach it. A multimodal model reports `"true"`; a text-only model also
-/// reports `"false"`, which is harmless — its requests carry no mm payload
-/// to strip in the first place.
+/// no vision encoder, encoder-cache budget 0, so no pixel payload (image,
+/// video) may reach it. A multimodal model reports `"true"`; a text-only
+/// model also reports `"false"`. The label speaks for the vision encoder
+/// only: the servicer reports `"false"` as well for an engine that still
+/// takes audio or pre-computed embeddings, so it says nothing about those
+/// (the runtime capability matrix below does). The label is tri-state:
+/// only vLLM's `false` becomes a label; for the other runtimes a `false`
+/// cannot be told from a servicer's default and is dropped
+/// (`ModelInfo::to_labels`), and an absent label reads as unknown, never as
+/// a refusal. An SGLang servicer that carries no media to its engine writes
+/// a deliberate `false` into its `server_args`, which is kept
+/// (`ServerInfo::to_labels`).
 pub(crate) const SUPPORTS_VISION_LABEL: &str = "supports_vision";
 
-/// Whether the worker's engine accepts no multimodal inputs at all (a vLLM
-/// `--language-model-only` worker). Absent label (non-vLLM runtimes, older
-/// servicers) reads as multimodal-capable so behavior stays as today.
+/// Whether the worker's engine runs without a vision encoder (a vLLM
+/// `--language-model-only` worker), so no pixel payload may reach it. Absent
+/// label (non-vLLM runtimes, older servicers) reads as vision-capable so
+/// behavior stays as today.
 pub(crate) fn worker_language_model_only(worker: &dyn Worker) -> bool {
     worker
         .metadata()
@@ -34,6 +50,152 @@ pub(crate) fn worker_language_model_only(worker: &dyn Worker) -> bool {
         .labels
         .get(SUPPORTS_VISION_LABEL)
         .is_some_and(|value| value == "false")
+}
+
+/// Whether every worker registered for `model_id` runs without a vision
+/// encoder (`supports_vision=false`, see [`SUPPORTS_VISION_LABEL`]). Such a
+/// pool takes no pixel payload at all: a vLLM engine admits the request and
+/// never schedules it (encoder-cache budget 0), so a request carrying images
+/// or video must be refused before any of it is decoded, preprocessed or
+/// dispatched. An empty pool reads as capable: worker selection answers for a
+/// model with no workers. So does a mixed pool (some workers with the vision
+/// encoder, some without, or unlabeled: a rolling redeploy, or the vision
+/// workers unhealthy): its image requests go on to worker selection, which
+/// keeps them off the workers without the encoder ([`request_needs_vision`]
+/// is the demand) and refuses them the same way once no candidate has one.
+pub(crate) fn model_workers_language_model_only(registry: &WorkerRegistry, model_id: &str) -> bool {
+    let workers = registry.get_by_model(model_id);
+    !workers.is_empty()
+        && workers
+            .iter()
+            .all(|worker| worker_language_model_only(worker.as_ref()))
+}
+
+/// The modalities of `plan` that need a vision encoder: the pixel payloads
+/// the `supports_vision` label speaks for. Audio and pre-computed image
+/// embeddings are not among them: an engine may take those with every visual
+/// input disabled, and whether a runtime takes them at all is the capability
+/// matrix's call ([`runtime_supports_modality`]).
+fn pixel_modalities(plan: &MediaPlan) -> Vec<Modality> {
+    plan.modalities()
+        .iter()
+        .copied()
+        .filter(|modality| is_pixel_modality(*modality))
+        .collect()
+}
+
+/// Refuse a request's media that no worker of `model_id` takes. Runs in
+/// preparation, on the request's declared parts, before any byte of media
+/// is fetched, decoded or preprocessed; the answers never depended on the
+/// decode. Two rules:
+///
+/// - images and video to a pool whose every worker is language model only
+///   (the `supports_vision` label): the same prompt 400 the public API gives
+///   image input to a model without vision, instead of a dispatch the engine
+///   never schedules;
+/// - a modality no registered pipeline worker's engine takes (the capability
+///   matrix, [`runtime_supports_modality`]): the refusal worker selection
+///   gives for the pair after the decode ([`ensure_backend_supports_modalities`]),
+///   with the same code and sentence.
+///
+/// A plan without media passes. So does a model with no registered pipeline
+/// workers (selection answers for it), and a pool of mixed engines where at
+/// least one takes the modality: selection then answers for the worker it
+/// picks. A worker that processes media references itself
+/// ([`worker_accepts_media_refs`]) counts as taking every modality here:
+/// what its engine's own processor takes, audio among them, is the
+/// reference gates' call, not the matrix's.
+pub(crate) fn ensure_model_accepts_media(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    plan: &MediaPlan,
+) -> Result<(), Response> {
+    if plan.is_empty() {
+        return Ok(());
+    }
+    let pixel = pixel_modalities(plan);
+    if !pixel.is_empty() && model_workers_language_model_only(registry, model_id) {
+        let modalities = pixel
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(error::bad_request(
+            "multimodal_not_supported",
+            format!(
+                "{modalities} input is not supported by model '{model_id}': none of its workers \
+                 accept vision input (the engine runs as a language model only, or its servicer \
+                 does not carry media to it)"
+            ),
+        ));
+    }
+    ensure_pool_takes_modalities(registry, model_id, plan)
+}
+
+/// The matrix rule of [`ensure_model_accepts_media`]: every modality of
+/// `plan` has a registered pipeline worker of `model_id` that takes it
+/// ([`worker_takes_modality`]); otherwise the refusal names the pool's
+/// engines and the modality. HTTP workers of the model sit in another
+/// router's pool and never receive the gateway's media.
+fn ensure_pool_takes_modalities(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    plan: &MediaPlan,
+) -> Result<(), Response> {
+    let workers = registry.get_by_model(model_id);
+    let pool: Vec<&dyn Worker> = workers
+        .iter()
+        .filter(|worker| worker.connection_mode().uses_grpc_pipeline())
+        .map(|worker| worker.as_ref())
+        .collect();
+    if pool.is_empty() {
+        return Ok(());
+    }
+    for &modality in plan.modalities() {
+        if pool
+            .iter()
+            .any(|worker| worker_takes_modality(*worker, modality))
+        {
+            continue;
+        }
+        let mut runtimes: Vec<RuntimeType> = pool
+            .iter()
+            .map(|worker| worker.metadata().spec.runtime_type)
+            .collect();
+        runtimes.sort_by_key(|runtime| runtime.as_str());
+        runtimes.dedup();
+        return Err(error::bad_request(
+            "multimodal_not_supported",
+            unsupported_modality_message(&runtimes, modality),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `worker` may take `modality`: its engine does by the matrix, or
+/// it processes media references itself and the reference gates decide.
+fn worker_takes_modality(worker: &dyn Worker, modality: Modality) -> bool {
+    runtime_supports_modality(worker.metadata().spec.runtime_type, modality)
+        || worker_accepts_media_refs(worker)
+}
+
+/// The sentence an (engine, modality) refusal carries, the same in
+/// preparation ([`ensure_model_accepts_media`]) and at worker selection
+/// ([`ensure_backend_supports_modalities`]), so a client sees one refusal
+/// whichever check answers. `runtimes` are the distinct engines that would
+/// have taken the request: the selected worker's, or every one of the pool's.
+fn unsupported_modality_message(runtimes: &[RuntimeType], modality: Modality) -> String {
+    match runtimes {
+        [runtime] => format!("backend {runtime} does not support {modality} inputs"),
+        _ => format!(
+            "backends {} do not support {modality} inputs",
+            runtimes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 /// Whether `runtime` accepts multimodal inputs of `modality`.
@@ -46,9 +208,10 @@ pub(crate) fn worker_language_model_only(worker: &dyn Worker) -> bool {
 /// - Audio: TokenSpeed
 /// - MLX: none
 ///
-/// `Modality::ImageEmbeds` cannot actually reach the early check today because a
-/// [`crate::routers::grpc::multimodal::MediaBatch`] only ever yields
-/// Image/Video/Audio; it is kept in the matrix for correctness/defense in depth.
+/// `Modality::ImageEmbeds` cannot actually reach either check today because a
+/// plan's parts and a [`crate::routers::grpc::multimodal::MediaBatch`] only
+/// ever carry Image/Video/Audio; it is kept in the matrix for
+/// correctness/defense in depth.
 pub(crate) fn runtime_supports_modality(runtime: RuntimeType, modality: Modality) -> bool {
     match modality {
         Modality::Image => matches!(
@@ -61,22 +224,81 @@ pub(crate) fn runtime_supports_modality(runtime: RuntimeType, modality: Modality
     }
 }
 
-/// Reject early if the selected backend does not support every modality present
-/// in the request. Runs at worker selection, once the runtime is known but
-/// before request building assembles the payload, so an unsupported combination
-/// fails fast with one clear message instead of dying deep in assembly.
+/// Whether `runtime`'s models read encoder inputs in `format` (see
+/// `ModelProcessorSpec::encoder_input_format`).
+pub(crate) fn runtime_reads_format(runtime: RuntimeType, format: EncoderInputFormat) -> bool {
+    match format {
+        EncoderInputFormat::Reference => true,
+        EncoderInputFormat::Packed => matches!(runtime, RuntimeType::TokenSpeed),
+    }
+}
+
+/// Whether every gRPC-pipeline worker registered for `model_id` reads
+/// `format`. HTTP workers of the model sit in another router's pool and never
+/// receive the gateway's tensors. With none registered yet the format is
+/// readable, so the request fails at worker selection as for any model.
+pub(crate) fn fleet_reads_format(
+    registry: &WorkerRegistry,
+    model_id: &str,
+    format: EncoderInputFormat,
+) -> bool {
+    registry
+        .get_by_model(model_id)
+        .iter()
+        .filter(|worker| worker.connection_mode().uses_grpc_pipeline())
+        .all(|worker| runtime_reads_format(worker.metadata().spec.runtime_type, format))
+}
+
+/// Reject an unsupported (backend, modality) pair at worker selection, once
+/// the runtime is known and before request building assembles the payload.
+/// Preparation refused the request already when no worker of the model took
+/// a modality ([`ensure_model_accepts_media`]); this answers, with the same
+/// sentence, for the pools it let through: the pick landed on a worker whose
+/// engine does not take the modality (a pool of mixed engines, a worker
+/// registered after preparation), or the media was preprocessed into an
+/// encoder input format the selected engine does not read.
 pub(crate) fn ensure_backend_supports_modalities(
     runtime: RuntimeType,
     intermediate: &MultimodalIntermediate,
 ) -> Result<()> {
+    // A worker of another engine may have registered since the spec was applied.
+    anyhow::ensure!(
+        runtime_reads_format(runtime, intermediate.encoder_input_format()),
+        "this model's media was preprocessed into a format backend {runtime} does not read"
+    );
     for batch in intermediate.batches() {
         let modality = batch.media.modality();
-        anyhow::ensure!(
-            runtime_supports_modality(runtime, modality),
-            "backend {runtime} does not support {modality} inputs"
-        );
+        if !runtime_supports_modality(runtime, modality) {
+            anyhow::bail!(unsupported_modality_message(&[runtime], modality));
+        }
     }
     Ok(())
+}
+
+/// Whether `modality` is a pixel payload that needs a vision encoder: image
+/// or video, the inputs the `supports_vision` label speaks for. Audio and
+/// pre-computed image embeddings are not: an engine may take those with its
+/// visual inputs disabled, and whether a runtime takes them at all is
+/// [`runtime_supports_modality`]'s call.
+pub(crate) fn is_pixel_modality(modality: Modality) -> bool {
+    matches!(modality, Modality::Image | Modality::Video)
+}
+
+/// Whether a request needs a worker with a vision encoder: a pixel modality
+/// among its decoded batches (`intermediate`, router-side processing) or in
+/// its media-reference plan (`refs`, worker-side processing). A worker
+/// without one ([`worker_language_model_only`]) admits such a request and
+/// never schedules it, so worker selection keeps the request off it.
+pub(crate) fn request_needs_vision(
+    intermediate: Option<&MultimodalIntermediate>,
+    refs: Option<&MediaPlan>,
+) -> bool {
+    let decoded = intermediate
+        .into_iter()
+        .flat_map(MultimodalIntermediate::batches)
+        .map(|batch| batch.media.modality());
+    let referenced = refs.into_iter().flat_map(MediaPlan::modalities).copied();
+    decoded.chain(referenced).any(is_pixel_modality)
 }
 
 #[cfg(test)]
@@ -135,6 +357,44 @@ mod tests {
         }
     }
 
+    /// Only image and video need a vision encoder; audio and pre-computed
+    /// embeddings go by the runtime matrix alone.
+    #[test]
+    fn pixel_modalities_are_image_and_video() {
+        assert!(is_pixel_modality(Modality::Image));
+        assert!(is_pixel_modality(Modality::Video));
+        assert!(!is_pixel_modality(Modality::Audio));
+        assert!(!is_pixel_modality(Modality::ImageEmbeds));
+    }
+
+    /// A request needs vision for an image among its decoded batches or in
+    /// its reference plan, and not for audio alone or for no media at all.
+    #[test]
+    fn request_needs_vision_for_pixel_media_only() {
+        use llm_multimodal::MediaContentPart;
+
+        assert!(!request_needs_vision(None, None));
+
+        let decoded = single_image_intermediate();
+        assert!(request_needs_vision(Some(&decoded), None));
+
+        let audio = MediaPlan::new([MediaContentPart::AudioUrl {
+            url: "data:audio/wav;base64,AAAA".to_string(),
+            uuid: None,
+        }]);
+        assert!(!audio.is_empty());
+        assert!(!request_needs_vision(None, Some(&audio)));
+
+        let image = MediaPlan::new([MediaContentPart::ImageUrl {
+            url: "data:image/png;base64,AAAA".to_string(),
+            detail: None,
+            uuid: None,
+            max_long_side_pixel: None,
+        }]);
+        assert!(request_needs_vision(None, Some(&image)));
+        assert!(!request_needs_vision(None, Some(&MediaPlan::default())));
+    }
+
     fn single_image_intermediate() -> MultimodalIntermediate {
         use std::{collections::HashMap, sync::Arc};
 
@@ -191,5 +451,378 @@ mod tests {
         // Image on MLX is not.
         let err = ensure_backend_supports_modalities(RuntimeType::Mlx, &intermediate).unwrap_err();
         assert_eq!(err.to_string(), "backend mlx does not support image inputs");
+    }
+
+    /// Packed inputs reach only an engine that reads them, even from a worker
+    /// of another engine that registered after the spec was applied.
+    #[test]
+    fn packed_inputs_reach_only_an_engine_that_reads_them() {
+        let intermediate =
+            single_image_intermediate().with_encoder_input_format(EncoderInputFormat::Packed);
+        assert!(ensure_backend_supports_modalities(RuntimeType::TokenSpeed, &intermediate).is_ok());
+        let err = ensure_backend_supports_modalities(RuntimeType::Vllm, &intermediate).unwrap_err();
+        assert!(err.to_string().contains("does not read"), "{err}");
+    }
+
+    mod pool {
+        use std::sync::Arc;
+
+        use llm_multimodal::MediaContentPart;
+        use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+
+        use super::*;
+        use crate::worker::{BasicWorkerBuilder, ConnectionMode, WorkerType};
+
+        const MODEL: &str = "pool-test-model";
+
+        /// A gRPC-pipeline worker of `runtime` serving the model, with `labels`.
+        fn worker_of(url: &str, runtime: RuntimeType, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
+            let mut builder = BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(MODEL))
+                .worker_type(WorkerType::Regular)
+                .runtime_type(runtime)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                });
+            for (key, value) in labels {
+                builder = builder.label(*key, *value);
+            }
+            Arc::new(builder.build())
+        }
+
+        fn worker(url: &str, labels: &[(&str, &str)]) -> Arc<dyn Worker> {
+            worker_of(url, RuntimeType::Vllm, labels)
+        }
+
+        fn engine_worker(url: &str, runtime: RuntimeType) -> Arc<dyn Worker> {
+            worker_of(url, runtime, &[])
+        }
+
+        fn registry_with(workers: Vec<Arc<dyn Worker>>) -> WorkerRegistry {
+            let registry = WorkerRegistry::new();
+            for worker in workers {
+                registry.register(worker).expect("register");
+            }
+            registry
+        }
+
+        fn image_part() -> MediaContentPart {
+            MediaContentPart::ImageUrl {
+                url: "data:image/png;base64,AAAA".to_string(),
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: None,
+            }
+        }
+
+        fn audio_part() -> MediaContentPart {
+            MediaContentPart::AudioUrl {
+                url: "data:audio/wav;base64,AAAA".to_string(),
+                uuid: None,
+            }
+        }
+
+        fn image_plan() -> MediaPlan {
+            MediaPlan::new([image_part()])
+        }
+
+        fn video_part() -> MediaContentPart {
+            MediaContentPart::VideoUrl {
+                url: "data:video/mp4;base64,AAAA".to_string(),
+                uuid: None,
+                fps: Some(0.5),
+                max_long_side_pixel: None,
+            }
+        }
+
+        fn video_plan() -> MediaPlan {
+            MediaPlan::new([video_part()])
+        }
+
+        /// The refusal as the client reads it: `(code, message)`.
+        async fn refusal(response: Response) -> (String, String) {
+            assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+            let code = response.headers()[error::HEADER_X_SMG_ERROR_CODE]
+                .to_str()
+                .expect("code header")
+                .to_string();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("drain body");
+            let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+            assert_eq!(body["error"]["code"], code, "{body}");
+            let message = body["error"]["message"]
+                .as_str()
+                .expect("message")
+                .to_string();
+            (code, message)
+        }
+
+        /// A video to a pool whose every engine takes no video is refused in
+        /// preparation, before any byte of the clip is fetched or decoded,
+        /// with the code and the sentence worker selection gave after the
+        /// decode; an image to the same pool goes on, and so does a video to
+        /// an engine that takes it.
+        #[tokio::test]
+        async fn video_to_a_pool_whose_engines_take_no_video_is_refused_before_the_decode() {
+            let pool = registry_with(vec![engine_worker(
+                "grpc://10.0.0.1:1",
+                RuntimeType::Sglang,
+            )]);
+            let response = ensure_model_accepts_media(&pool, MODEL, &video_plan()).unwrap_err();
+            let (code, message) = refusal(response).await;
+            assert_eq!(code, "multimodal_not_supported");
+            assert_eq!(message, "backend sglang does not support video inputs");
+
+            assert!(ensure_model_accepts_media(&pool, MODEL, &image_plan()).is_ok());
+            for runtime in [RuntimeType::Vllm, RuntimeType::TokenSpeed] {
+                let pool = registry_with(vec![engine_worker("grpc://10.0.0.1:1", runtime)]);
+                assert!(
+                    ensure_model_accepts_media(&pool, MODEL, &video_plan()).is_ok(),
+                    "{runtime}"
+                );
+            }
+        }
+
+        /// The sentence is the one worker selection writes for the same pair
+        /// after the decode, so a client sees one refusal whichever check
+        /// answers; a pool of several engines that take none of a modality
+        /// names them all.
+        #[tokio::test]
+        async fn the_preparation_refusal_reads_as_the_selection_refusal() {
+            let mlx = registry_with(vec![engine_worker("grpc://10.0.0.1:1", RuntimeType::Mlx)]);
+            let early = ensure_model_accepts_media(&mlx, MODEL, &image_plan()).unwrap_err();
+            let (_, early_message) = refusal(early).await;
+            let late =
+                ensure_backend_supports_modalities(RuntimeType::Mlx, &single_image_intermediate())
+                    .unwrap_err();
+            assert_eq!(early_message, late.to_string());
+
+            let two = registry_with(vec![
+                engine_worker("grpc://10.0.0.1:1", RuntimeType::Trtllm),
+                engine_worker("grpc://10.0.0.2:1", RuntimeType::Sglang),
+            ]);
+            let response = ensure_model_accepts_media(&two, MODEL, &video_plan()).unwrap_err();
+            let (_, message) = refusal(response).await;
+            assert_eq!(
+                message,
+                "backends sglang, trtllm do not support video inputs"
+            );
+        }
+
+        /// Audio follows the matrix in preparation as it did at selection,
+        /// unless a worker processes media references itself: what its
+        /// engine's own processor takes is the reference gates' call.
+        #[tokio::test]
+        async fn audio_follows_the_matrix_unless_a_worker_processes_media_itself() {
+            use crate::routers::grpc::multimodal::refs::MM_PROCESSOR_LABEL;
+
+            let audio = MediaPlan::new([audio_part()]);
+            let vllm = registry_with(vec![engine_worker("grpc://10.0.0.1:1", RuntimeType::Vllm)]);
+            let response = ensure_model_accepts_media(&vllm, MODEL, &audio).unwrap_err();
+            let (code, message) = refusal(response).await;
+            assert_eq!(code, "multimodal_not_supported");
+            assert_eq!(message, "backend vllm does not support audio inputs");
+
+            let tokenspeed = registry_with(vec![engine_worker(
+                "grpc://10.0.0.1:1",
+                RuntimeType::TokenSpeed,
+            )]);
+            assert!(ensure_model_accepts_media(&tokenspeed, MODEL, &audio).is_ok());
+
+            let refs = registry_with(vec![worker(
+                "grpc://10.0.0.1:1",
+                &[(MM_PROCESSOR_LABEL, "inprocess")],
+            )]);
+            assert!(worker_accepts_media_refs(
+                refs.get_by_model(MODEL)[0].as_ref()
+            ));
+            assert!(ensure_model_accepts_media(&refs, MODEL, &audio).is_ok());
+        }
+
+        /// A pool of mixed engines where one takes the modality passes
+        /// preparation: selection answers for the worker it picks. A model
+        /// with no pipeline worker (none registered, or HTTP workers only)
+        /// is left to selection as well.
+        #[test]
+        fn a_mixed_or_empty_pool_is_left_to_selection() {
+            let mixed = registry_with(vec![
+                engine_worker("grpc://10.0.0.1:1", RuntimeType::Sglang),
+                engine_worker("grpc://10.0.0.2:1", RuntimeType::Vllm),
+            ]);
+            assert!(ensure_model_accepts_media(&mixed, MODEL, &video_plan()).is_ok());
+            assert!(
+                ensure_model_accepts_media(&registry_with(vec![]), MODEL, &video_plan()).is_ok()
+            );
+            let http: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("http://10.0.0.3:1")
+                    .model(ModelCard::new(MODEL))
+                    .worker_type(WorkerType::Regular)
+                    .runtime_type(RuntimeType::Sglang)
+                    .connection_mode(ConnectionMode::Http)
+                    .build(),
+            );
+            assert!(
+                ensure_model_accepts_media(&registry_with(vec![http]), MODEL, &video_plan())
+                    .is_ok()
+            );
+        }
+
+        /// The language-model-only rule answers first, so a video to such a
+        /// pool keeps the refusal that names the model.
+        #[tokio::test]
+        async fn the_language_model_only_rule_answers_before_the_matrix() {
+            let pool = registry_with(vec![worker_of(
+                "grpc://10.0.0.1:1",
+                RuntimeType::Sglang,
+                &[(SUPPORTS_VISION_LABEL, "false")],
+            )]);
+            let response = ensure_model_accepts_media(&pool, MODEL, &video_plan()).unwrap_err();
+            let (code, message) = refusal(response).await;
+            assert_eq!(code, "multimodal_not_supported");
+            assert!(
+                message.starts_with(&format!("video input is not supported by model '{MODEL}'")),
+                "{message}"
+            );
+        }
+
+        /// Only a pool whose every worker says `supports_vision=false` is
+        /// language model only; an absent label keeps today's reading
+        /// (capable), and an empty pool is left to worker selection.
+        #[test]
+        fn pool_is_language_model_only_when_every_worker_says_so() {
+            let lmo = |url| worker(url, &[(SUPPORTS_VISION_LABEL, "false")]);
+            let vision = |url| worker(url, &[(SUPPORTS_VISION_LABEL, "true")]);
+            let unlabeled = |url| worker(url, &[]);
+
+            let all_lmo = registry_with(vec![lmo("grpc://10.0.0.1:1"), lmo("grpc://10.0.0.2:1")]);
+            assert!(model_workers_language_model_only(&all_lmo, MODEL));
+
+            let mixed = registry_with(vec![lmo("grpc://10.0.0.1:1"), vision("grpc://10.0.0.2:1")]);
+            assert!(!model_workers_language_model_only(&mixed, MODEL));
+
+            let legacy = registry_with(vec![
+                lmo("grpc://10.0.0.1:1"),
+                unlabeled("grpc://10.0.0.2:1"),
+            ]);
+            assert!(!model_workers_language_model_only(&legacy, MODEL));
+
+            let empty = registry_with(vec![]);
+            assert!(!model_workers_language_model_only(&empty, MODEL));
+            assert!(!model_workers_language_model_only(
+                &all_lmo,
+                "another-model"
+            ));
+        }
+
+        /// Packed inputs suit a fleet unless one of its gRPC workers runs an
+        /// engine that does not read them; with none registered, worker
+        /// selection answers.
+        #[test]
+        fn a_fleet_reads_packed_inputs_unless_another_engine_is_registered() {
+            let packed = |registry: &WorkerRegistry| {
+                fleet_reads_format(registry, MODEL, EncoderInputFormat::Packed)
+            };
+            let tokenspeed = |url| -> Arc<dyn Worker> {
+                Arc::new(
+                    BasicWorkerBuilder::new(url)
+                        .model(ModelCard::new(MODEL))
+                        .worker_type(WorkerType::Regular)
+                        .runtime_type(RuntimeType::TokenSpeed)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .build(),
+                )
+            };
+            assert!(packed(&registry_with(vec![])));
+            assert!(packed(&registry_with(vec![tokenspeed(
+                "grpc://10.0.0.1:1"
+            )])));
+            let mixed = registry_with(vec![
+                tokenspeed("grpc://10.0.0.1:1"),
+                worker("grpc://10.0.0.2:1", &[]),
+            ]);
+            assert!(!packed(&mixed));
+            assert!(fleet_reads_format(
+                &mixed,
+                MODEL,
+                EncoderInputFormat::Reference
+            ));
+            // An HTTP worker of the model is outside the gRPC pool.
+            let http: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("http://10.0.0.3:1")
+                    .model(ModelCard::new(MODEL))
+                    .worker_type(WorkerType::Regular)
+                    .runtime_type(RuntimeType::Vllm)
+                    .connection_mode(ConnectionMode::Http)
+                    .build(),
+            );
+            assert!(packed(&registry_with(vec![
+                tokenspeed("grpc://10.0.0.1:1"),
+                http
+            ])));
+        }
+
+        /// Media to a language-model-only pool is a 400 naming the modality
+        /// and the model; text-only requests and capable pools pass.
+        #[test]
+        fn media_to_a_language_model_only_pool_is_a_bad_request() {
+            let all_lmo = registry_with(vec![worker(
+                "grpc://10.0.0.1:1",
+                &[(SUPPORTS_VISION_LABEL, "false")],
+            )]);
+            let response = ensure_model_accepts_media(&all_lmo, MODEL, &image_plan()).unwrap_err();
+            assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+            assert_eq!(
+                response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+                "multimodal_not_supported"
+            );
+
+            assert!(ensure_model_accepts_media(&all_lmo, MODEL, &MediaPlan::default()).is_ok());
+
+            let vision = registry_with(vec![worker(
+                "grpc://10.0.0.1:1",
+                &[(SUPPORTS_VISION_LABEL, "true")],
+            )]);
+            assert!(ensure_model_accepts_media(&vision, MODEL, &image_plan()).is_ok());
+        }
+
+        /// The label speaks for the vision encoder only: audio to a
+        /// language-model-only pool is not the label's refusal (an engine
+        /// that takes audio passes with the label on; one that does not gets
+        /// the matrix's sentence, as at worker selection), and a request
+        /// mixing audio with an image is refused for the image alone.
+        #[tokio::test]
+        async fn audio_to_a_language_model_only_pool_is_not_refused_by_the_label() {
+            let audio = MediaPlan::new([audio_part()]);
+            assert!(!audio.is_empty());
+            assert!(pixel_modalities(&audio).is_empty());
+            let takes_audio = registry_with(vec![worker_of(
+                "grpc://10.0.0.1:1",
+                RuntimeType::TokenSpeed,
+                &[(SUPPORTS_VISION_LABEL, "false")],
+            )]);
+            assert!(ensure_model_accepts_media(&takes_audio, MODEL, &audio).is_ok());
+
+            let all_lmo = registry_with(vec![worker(
+                "grpc://10.0.0.1:1",
+                &[(SUPPORTS_VISION_LABEL, "false")],
+            )]);
+            let response = ensure_model_accepts_media(&all_lmo, MODEL, &audio).unwrap_err();
+            let (code, message) = refusal(response).await;
+            assert_eq!(code, "multimodal_not_supported");
+            assert_eq!(message, "backend vllm does not support audio inputs");
+
+            let mixed = MediaPlan::new([audio_part(), image_part()]);
+            assert_eq!(pixel_modalities(&mixed), vec![Modality::Image]);
+            let response = ensure_model_accepts_media(&all_lmo, MODEL, &mixed).unwrap_err();
+            let (code, message) = refusal(response).await;
+            assert_eq!(code, "multimodal_not_supported");
+            assert!(
+                message.starts_with("image input is not supported by model"),
+                "{message}"
+            );
+        }
     }
 }

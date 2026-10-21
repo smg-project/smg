@@ -26,6 +26,7 @@ import logging
 import os
 from typing import Any
 
+from smg_grpc_servicer.sglang import ENGINE_INDEX_ENV, HANDSHAKE_ENV
 from smg_grpc_servicer.sglang.zmq_msgpack import (
     MAX_ENGINE_INDEX,
     MsgpackRecvSocket,
@@ -34,10 +35,6 @@ from smg_grpc_servicer.sglang.zmq_msgpack import (
 )
 
 logger = logging.getLogger(__name__)
-
-# The headless launcher sets these for the scheduler ranks it spawns.
-HANDSHAKE_ENV = "SMG_SGLANG_ZMQ_HANDSHAKE"
-ENGINE_INDEX_ENV = "SMG_SGLANG_ZMQ_ENGINE_INDEX"
 
 _SCHEDULER = "sglang.srt.managers.scheduler.Scheduler"
 _CHANNELS = "sglang.srt.managers.scheduler_components.ipc_channels.SchedulerIpcChannels"

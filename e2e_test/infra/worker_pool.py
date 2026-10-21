@@ -64,6 +64,11 @@ class WorkerPool:
         self._gateway_key: tuple | None = None
         self._closed = False
 
+    def current_workers(self) -> list[Worker]:
+        """The cached regular workers as they stand (a snapshot; may be empty)."""
+        with self._lock:
+            return list(self._workers)
+
     def acquire(
         self,
         *,
@@ -134,7 +139,7 @@ class WorkerPool:
 
             if tp is not None or kv_backend is not None or extra_env is not None:
                 raise ValueError(
-                    "a per-leg tp, kv_backend or extra_env is only meaningful for "
+                    "a tp, kv_backend or extra_env of their own is only meaningful for "
                     "PD prefill/decode workers"
                 )
 

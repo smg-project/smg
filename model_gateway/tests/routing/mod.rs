@@ -13,7 +13,6 @@ pub mod model_profile_test;
 pub mod payload_size_test;
 pub mod pd_routing_test;
 pub mod policy_completion_test;
-pub mod policy_registry_integration;
 pub mod power_of_two_test;
 pub mod prefix_hash_test;
 pub mod service_discovery_test;

@@ -40,20 +40,53 @@ impl std::fmt::Debug for EncodeJob {
     }
 }
 
+/// How the active renderer expects media content to reach its template.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MediaHandling {
+    /// Resolve and preprocess media using the model's multimodal configuration.
+    #[default]
+    Preprocess,
+    /// The template renders media as plain text. Preserve authored content order
+    /// and skip media processing; the resulting prompt needs only text tokenization.
+    TemplateText,
+}
+
 /// Renderer behaviours the gateway mirrors when it prepares a request, so
 /// the rendered prompt and the request handling never disagree.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RendererCapabilities {
+    /// Resolved when the renderer is loaded or its template is replaced.
+    pub media_handling: MediaHandling,
     /// The renderer reads `enable_thinking` as an alias of its thinking key.
     pub enable_thinking_alias: bool,
-    /// With `add_generation_prompt` false the renderer continues a trailing
-    /// assistant message itself (no EOS, no generation header); the gateway
-    /// must keep the message instead of popping it into a text prefix.
+    /// With `add_generation_prompt` false and `continue_final_message` set
+    /// the renderer continues a trailing assistant message itself (no EOS, no
+    /// generation header); the gateway must keep the message instead of
+    /// popping it into a text prefix.
     pub native_assistant_continuation: bool,
     /// The renderer parses tool-call `arguments` strings itself with the
-    /// reference's tolerance (non-object and double-encoded values); the
-    /// gateway must forward them as written instead of pre-parsing them.
+    /// reference's tolerance (non-object and double-encoded values), or its
+    /// template writes them as the text the request sent (a template that
+    /// concatenates them cannot render an object); the gateway must forward
+    /// them as written instead of pre-parsing them.
     pub raw_tool_call_arguments: bool,
+    /// The renderer declares the request's tools when `tool_choice` is
+    /// `none` and tells the model not to call them, as its reference does;
+    /// the gateway keeps the tools for it. Without it the gateway renders no
+    /// tool under `none`, so the model is not offered a call it may not make.
+    pub declares_tools_under_tool_choice_none: bool,
+    /// The renderer's reference writes a turn of its own, and the assistant
+    /// header after the last one, for user and developer messages only: a
+    /// `system` message after the first renders as bare text with no role
+    /// marker, and one that ends the conversation leaves the prompt without
+    /// the header, so the model answers an empty turn. On the Messages path
+    /// the gateway renders a `system`-role message sent inside `messages[]`
+    /// past the leading run of system messages (the system prompt, which
+    /// every renderer writes, whether it came as the top-level `system` or
+    /// as the first messages) as a user turn at its position for such a
+    /// renderer; elsewhere the message is forwarded in place, for the
+    /// templates that render a system turn anywhere.
+    pub leading_system_only: bool,
 }
 
 /// How the `text` of a [`ChatTemplateOutput`] becomes token ids.
@@ -74,6 +107,12 @@ pub struct ChatTemplateOutput {
     pub encoding: PromptEncoding,
     /// Prompt tokens the provider does not bill (K3's response-channel stub); 0 for flat renderers.
     pub unbilled_prompt_tokens: u32,
+    /// The prompt ends inside the final message, kept and left open as
+    /// `continue_final_message` asks. False when that was not asked for, and
+    /// when a template could not continue the message and its text follows
+    /// the generation prompt instead: the completion then starts wherever
+    /// that prompt leaves it, inside a reasoning block it opens for one.
+    pub continued_final_message: bool,
 }
 
 /// Core encoding trait - separate from decoding for modularity
@@ -96,9 +135,45 @@ pub trait IncrementalDecoder: Send + Sync {
     fn reset(&mut self);
 }
 
+/// What one incremental decode step, or finishing a sequence, produced.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct DecodeStep {
+    /// Newly decoded text; `None` while the step holds an incomplete character.
+    pub text: Option<String>,
+    /// The decoder chain rewrote text that was already emitted (an invalid byte
+    /// collapsed a byte run, a replacement spanned the emitted boundary). `text`
+    /// is then the best-effort remainder: nothing already emitted is retracted.
+    pub prefix_mismatch: bool,
+}
+
+impl DecodeStep {
+    /// The step's text, empty when it held.
+    pub fn into_text(self) -> String {
+        self.text.unwrap_or_default()
+    }
+}
+
 /// Core decoding trait - can be implemented independently
 pub trait Decoder: Send + Sync {
     fn decode(&self, token_ids: &[TokenIdType], skip_special_tokens: bool) -> Result<String>;
+
+    /// Whether the configured decoder contains ByteFallback byte-run buffering.
+    fn uses_byte_fallback(&self) -> bool {
+        false
+    }
+
+    /// Release text buffered by incremental decoding at end of input. A
+    /// decoder whose final text no longer starts with what it emitted reports
+    /// `prefix_mismatch` and returns the remainder instead of failing.
+    fn finish_decode(
+        &self,
+        _ids: &mut Vec<TokenIdType>,
+        _prefix: &mut String,
+        _prefix_index: &mut usize,
+        _skip_special_tokens: bool,
+    ) -> Result<DecodeStep> {
+        Ok(DecodeStep::default())
+    }
 
     /// Incremental decode step — called once per generated token.
     ///
@@ -106,9 +181,11 @@ pub trait Decoder: Send + Sync {
     /// produce incremental text output. The default implementation uses the
     /// double-decode algorithm (decode prefix, decode prefix+new, diff).
     ///
-    /// HuggingFace overrides this with the native `step_decode_stream` from the
-    /// `tokenizers` crate, which uses the same algorithm internally but avoids
-    /// trait-method overhead for the two `decode()` calls.
+    /// HuggingFace overrides this with its own copy of that algorithm run on the
+    /// concrete tokenizer (no trait-method overhead for the two `decode()`
+    /// calls) which, where the decode no longer starts with the emitted text,
+    /// emits the remainder instead of failing (see
+    /// [`decode_step_reporting`](Self::decode_step_reporting) for the report).
     fn decode_step(
         &self,
         token_id: TokenIdType,
@@ -150,6 +227,42 @@ pub trait Decoder: Send + Sync {
         }
     }
 
+    /// Eager text observation for engine-side stop matching. Unlike client
+    /// output, this must observe a stop at its original generated-token count.
+    fn decode_step_eager(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+    ) -> Result<Option<String>> {
+        self.decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)
+    }
+
+    /// [`decode_step`](Self::decode_step) (or the eager variant) with the
+    /// step's diagnostics: a backend that recovers from a rewritten prefix
+    /// reports it here. The default reports nothing.
+    fn decode_step_reporting(
+        &self,
+        token_id: TokenIdType,
+        ids: &mut Vec<TokenIdType>,
+        prefix: &mut String,
+        prefix_index: &mut usize,
+        skip_special_tokens: bool,
+        eager: bool,
+    ) -> Result<DecodeStep> {
+        let text = if eager {
+            self.decode_step_eager(token_id, ids, prefix, prefix_index, skip_special_tokens)?
+        } else {
+            self.decode_step(token_id, ids, prefix, prefix_index, skip_special_tokens)?
+        };
+        Ok(DecodeStep {
+            text,
+            prefix_mismatch: false,
+        })
+    }
+
     /// A dedicated per-stream decoder, when the backend has a cheaper
     /// algorithm than [`decode_step`](Self::decode_step) (byte-level BPE
     /// vocabularies do). `None`, the default, means callers use `decode_step`.
@@ -172,6 +285,14 @@ pub trait Tokenizer: Encoder + Decoder {
     /// Enable downcasting to concrete types
     fn as_any(&self) -> &dyn std::any::Any;
 
+    /// The `response_template` object of `tokenizer_config.json`, if any.
+    ///
+    /// The value is kept verbatim. Parser selection decides whether it
+    /// describes a supported output format.
+    fn response_template(&self) -> Option<&serde_json::Value> {
+        None
+    }
+
     /// Apply chat template to messages. Default returns an error for tokenizers without template support.
     fn apply_chat_template(
         &self,
@@ -187,13 +308,16 @@ pub trait Tokenizer: Encoder + Decoder {
     /// `continue_final_message` prefill applied. The default appends the
     /// prefill to the flat rendering and reports [`PromptEncoding::FromText`];
     /// renderers whose ids are not a function of the text override it and
-    /// hand back a deferred encode instead.
+    /// hand back a deferred encode instead. The default reports a requested
+    /// `continue_final_message` as honored; renderers that can fall back
+    /// from it override this to report what they did.
     fn apply_chat_template_with_encoding(
         &self,
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
+        let continued_final_message = params.continue_final_message;
         let mut text = self.apply_chat_template(messages, params)?;
         if let Some(prefix) = assistant_prefix {
             text.push_str(prefix);
@@ -202,6 +326,7 @@ pub trait Tokenizer: Encoder + Decoder {
             text,
             encoding: PromptEncoding::FromText,
             unbilled_prompt_tokens: 0,
+            continued_final_message,
         })
     }
 
@@ -238,6 +363,16 @@ pub trait Tokenizer: Encoder + Decoder {
     /// Whether the template injects `<think>` in the generation prompt.
     fn think_in_prefill(&self) -> bool {
         false
+    }
+
+    /// Whether the generation prompt opens a `<think>` block it does not
+    /// close, so a completion starts inside reasoning. Stricter than
+    /// `think_in_prefill`: a template that writes an empty, closed
+    /// `<think></think>` (a non-thinking template) injects the tag but opens
+    /// nothing. Arms the reasoning parser of a template without a thinking
+    /// switch.
+    fn prefill_opens_think_block(&self) -> bool {
+        self.think_in_prefill()
     }
 
     /// Renderer behaviours the gateway mirrors when it prepares a request.
@@ -277,6 +412,30 @@ pub trait Tokenizer: Encoder + Decoder {
     /// Models can have multiple EOS tokens (e.g., Llama 3: end_of_text + eom_id + eot_id).
     fn eos_token_ids(&self) -> &[TokenIdType] {
         &[]
+    }
+
+    /// The added tokens that are not special and are extracted from the raw
+    /// text, in the same pass as the special tokens (`normalized: false`):
+    /// strings the tokenizer takes whole before pre-tokenization. A cache
+    /// that splits text at special tokens must not split inside one of these
+    /// (a special token can be a substring of a longer added token), so it
+    /// matches them too, as text that is never a boundary. The added tokens
+    /// matched after normalization, on the pieces that pass leaves, are not
+    /// listed: they can never take a raw-pass token's place. Empty when a
+    /// tokenizer has none.
+    fn added_token_strings(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// The added tokens, special or not, that are matched after
+    /// normalization rather than on the raw text (`normalized: true`). A
+    /// cache that splits text at special tokens does not split at any of
+    /// these, whatever a configuration calls them (a BOS or EOS named there
+    /// can be such a token): where they are extracted depends on the
+    /// normalized text and on the other tokens of that pass. Empty when a
+    /// tokenizer has none.
+    fn added_tokens_after_normalization(&self) -> Vec<String> {
+        Vec::new()
     }
 }
 

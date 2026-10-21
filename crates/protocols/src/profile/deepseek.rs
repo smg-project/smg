@@ -11,25 +11,25 @@ use serde_json::Value;
 
 use crate::{
     chat::{ChatCompletionRequest, ThinkingType},
-    common::{ToolChoice, ToolChoiceValue},
+    common::{invalid, ToolChoice},
     profile::ModelProfile,
 };
 
+const V41_MODELS: [&str; 2] = ["deepseek-v4.1-flash", "deepseek-v4.1-flash-1017"];
+
 pub(super) fn matches_model(segment: &str) -> bool {
-    [
-        "deepseek-flash",
-        "deepseek-v4-flash",
-        "deepseek-v4-pro",
-        "deepseek-v4.1-flash",
-    ]
-    .iter()
-    .any(|model| segment.eq_ignore_ascii_case(model))
+    ["deepseek-flash", "deepseek-v4-flash", "deepseek-v4-pro"]
+        .iter()
+        .chain(&V41_MODELS)
+        .any(|model| segment.eq_ignore_ascii_case(model))
 }
 
 pub(super) fn is_v41_model(model: &str) -> bool {
-    model
-        .split('/')
-        .any(|segment| segment.eq_ignore_ascii_case("deepseek-v4.1-flash"))
+    model.split('/').any(|segment| {
+        V41_MODELS
+            .iter()
+            .any(|v41| segment.eq_ignore_ascii_case(v41))
+    })
 }
 
 pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
@@ -46,7 +46,7 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
         match effort.as_str() {
             "minimal" => *effort = "low".into(),
             "medium" => *effort = "high".into(),
-            // V4.1 has its own native xhigh budget (75 rather than high's 50).
+            // V4.1 accepts xhigh natively (its renderer gives it a budget).
             "xhigh" if !is_v41 => *effort = "high".into(),
             _ => {}
         }
@@ -70,7 +70,7 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
                 .get(key)
                 .is_some_and(|value| !value.is_null() && !value.is_boolean())
             {
-                return Err(error(
+                return Err(invalid(
                     "invalid_thinking_override",
                     "DeepSeek thinking template overrides must be booleans or null",
                 ));
@@ -81,7 +81,7 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
             kwargs.get("enable_thinking").and_then(Value::as_bool),
         ) {
             if thinking != alias {
-                return Err(error(
+                return Err(invalid(
                     "conflicting_thinking_overrides",
                     "DeepSeek thinking and enable_thinking template overrides must agree",
                 ));
@@ -93,7 +93,7 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
         .as_ref()
         .is_some_and(|thinking| thinking.r#type == Some(ThinkingType::Adaptive))
     {
-        return Err(error(
+        return Err(invalid(
             "thinking_type_not_supported",
             "thinking.type must be enabled or disabled for DeepSeek V4",
         ));
@@ -119,7 +119,7 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
         if !["none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&effort)
             && !native_budget
         {
-            return Err(error(
+            return Err(invalid(
                 "reasoning_effort_not_allowed",
                 if is_v41 {
                     "DeepSeek V4.1 reasoning effort must be none, low, high, xhigh, max or an integer budget from 1 to 100 (minimal and medium aliases are accepted)"
@@ -129,13 +129,13 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
             ));
         }
     }
-    let forced = match req.tool_choice.as_ref() {
-        Some(ToolChoice::Value(ToolChoiceValue::Required) | ToolChoice::Function { .. }) => true,
-        Some(ToolChoice::AllowedTools { mode, .. }) => mode == "required",
-        _ => false,
-    };
-    if thinking_enabled(req) && forced {
-        return Err(error(
+    if thinking_enabled(req)
+        && req
+            .tool_choice
+            .as_ref()
+            .is_some_and(ToolChoice::forces_call)
+    {
+        return Err(invalid(
             "tool_choice_not_supported",
             "DeepSeek V4 requires thinking to be disabled for forced tool choice",
         ));
@@ -165,10 +165,4 @@ fn thinking_enabled(req: &ChatCompletionRequest) -> bool {
         })
         .or_else(|| req.thinking_toggle())
         .unwrap_or_else(|| req.effective_reasoning_effort() != Some("none"))
-}
-
-fn error(code: &'static str, message: &'static str) -> validator::ValidationError {
-    let mut error = validator::ValidationError::new(code);
-    error.message = Some(message.into());
-    error
 }

@@ -363,6 +363,13 @@ message GetServerInfoResponse {
 
   string tokenspeed_version = 7;
   google.protobuf.Timestamp start_time = 8;
+
+  // When the gateway hands this engine a grammar: "always" for a model read
+  // through one on every turn, "requested" for a grammar only when the request
+  // asks (a forced tool choice or a JSON response format), "" when the engine
+  // does not say, which the gateway treats as "requested". Flattened into the
+  // `constrained_decoding` worker label.
+  string constrained_decoding = 9;
 }
 
 // =====================

@@ -17,6 +17,7 @@ from smg_grpc_servicer.kv_events import (
     to_int64,
 )
 from smg_grpc_servicer.kv_relay import RankSource, rank_sources
+from smg_grpc_servicer.vllm.config_view import EngineConfigView
 
 __all__ = [
     "convert_batch",
@@ -34,24 +35,23 @@ logger = logging.getLogger(__name__)
 def resolve_kv_events_config(engine: object):
     """Return the vLLM KVEventsConfig iff ZMQ event publishing is enabled, else None.
 
-    Reads ``engine.vllm_config.kv_events_config`` via getattr so it tolerates any
-    vLLM version and is testable with a fake engine.
+    Reads ``engine.vllm_config.kv_events_config`` through the config view, so
+    it tolerates any vLLM version and is testable with a fake engine.
     """
-    vllm_config = getattr(engine, "vllm_config", None)
-    cfg = getattr(vllm_config, "kv_events_config", None)
-    if cfg is None:
+    events = EngineConfigView(getattr(engine, "vllm_config", None)).kv_events
+    if events.config is None:
         return None
-    if not getattr(cfg, "enable_kv_cache_events", False):
+    if not events.enable_kv_cache_events:
         logger.info("vLLM KV cache events not enabled; SubscribeKvEvents disabled")
         return None
-    if getattr(cfg, "publisher", None) != "zmq":
+    if events.publisher != "zmq":
         logger.info(
             "vLLM KV events publisher is %r, not 'zmq'; SubscribeKvEvents disabled",
-            getattr(cfg, "publisher", None),
+            events.publisher,
         )
         return None
-    logger.info("vLLM KV events enabled: endpoint=%s", getattr(cfg, "endpoint", "?"))
-    return cfg
+    logger.info("vLLM KV events enabled: endpoint=%s", events.endpoint or "?")
+    return events.config
 
 
 def rank_sources_for(config: object, engine: object) -> list[RankSource]:
@@ -89,7 +89,6 @@ def rank_sources_for(config: object, engine: object) -> list[RankSource]:
             )
         if sources:
             return sources
-    parallel = getattr(getattr(engine, "vllm_config", None), "parallel_config", None)
-    dp_size = getattr(parallel, "data_parallel_size", None)
-    dp_size = int(dp_size) if isinstance(dp_size, int) and dp_size > 0 else 1
+    dp_size = EngineConfigView(getattr(engine, "vllm_config", None)).parallel.data_parallel_size
+    dp_size = dp_size or 1
     return rank_sources(config, range(dp_size))

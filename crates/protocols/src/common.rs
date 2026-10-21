@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+};
 
 use serde::{
     de::{self, value::SeqAccessDeserializer, SeqAccess, Visitor},
@@ -28,6 +31,16 @@ pub fn to_value_exact<T: Serialize>(value: &T) -> serde_json::Result<Value> {
 /// Uses UNKNOWN_MODEL_ID so routers treat it as "any available worker."
 pub fn default_unknown_model() -> String {
     super::UNKNOWN_MODEL_ID.to_string()
+}
+
+/// Serde skip predicate: the wildcard model id is a gateway-internal
+/// placeholder for "the request named no model", never a value to forward.
+/// A model-less SGLang-native `/generate` (slime, verl) must reach the
+/// engine without a `model` key, exactly as the client sent it; a
+/// model-aware upstream (a sidecar in front of another gateway) would
+/// otherwise look up a model called "unknown" and answer 404.
+pub fn is_unknown_model(model: &str) -> bool {
+    model == super::UNKNOWN_MODEL_ID
 }
 
 /// Helper function for serde default value (returns true)
@@ -62,6 +75,18 @@ where
     D: Deserializer<'de>,
 {
     Option::<bool>::deserialize(deserializer).map(|opt| opt.unwrap_or(false))
+}
+
+/// Deserialize a list that also accepts JSON `null` (mapped to the empty list).
+///
+/// Use with `#[serde(default, deserialize_with = "deserialize_null_as_empty_vec")]`
+/// on always-present lists an upstream may write as `null`.
+pub fn deserialize_null_as_empty_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<Vec<T>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 /// Deserialize an `Option<bool>` where JSON `null` means the default `true`.
@@ -248,6 +273,16 @@ impl<'a> Iterator for StringOrArrayIter<'a> {
 
 impl<'a> ExactSizeIterator for StringOrArrayIter<'a> {}
 
+/// A validation error with the public API's `code` and message.
+pub(crate) fn invalid(
+    code: &'static str,
+    message: impl Into<Cow<'static, str>>,
+) -> validator::ValidationError {
+    let mut e = validator::ValidationError::new(code);
+    e.message = Some(message.into());
+    e
+}
+
 /// Validates stop sequences (max 4, non-empty strings)
 /// Used by both ChatCompletionRequest and ResponsesRequest
 pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationError> {
@@ -261,8 +296,12 @@ pub fn validate_stop(stop: &StringOrArray) -> Result<(), validator::ValidationEr
         }
         StringOrArray::Array(arr) => {
             if arr.len() > 4 {
-                return Err(validator::ValidationError::new(
-                    "maximum 4 stop sequences allowed",
+                return Err(invalid(
+                    "array_above_max_length",
+                    format!(
+                        "Invalid 'stop': array too long. Expected an array with maximum length 4, but got an array with length {} instead.",
+                        arr.len()
+                    ),
                 ));
             }
             for s in arr {
@@ -430,9 +469,7 @@ pub fn validate_json_schema_shape(
     } else {
         return Ok(());
     };
-    let mut e = validator::ValidationError::new(code);
-    e.message = Some(message.into());
-    Err(e)
+    Err(invalid(code, message))
 }
 
 // ============================================================================
@@ -517,6 +554,17 @@ impl Default for ToolChoice {
 }
 
 impl ToolChoice {
+    /// Whether the choice leaves the model no choice but a call: a named
+    /// function, `required`, or allowed tools in `required` mode.
+    pub fn forces_call(&self) -> bool {
+        match self {
+            ToolChoice::Function { .. } => true,
+            ToolChoice::Value(ToolChoiceValue::Required) => true,
+            ToolChoice::AllowedTools { mode, .. } => mode == "required",
+            ToolChoice::Value(_) => false,
+        }
+    }
+
     /// Serialize tool_choice to string for ResponsesResponse
     ///
     /// Returns the JSON-serialized tool_choice or "auto" as default
@@ -633,7 +681,7 @@ impl ToolReference {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Tool {
     #[serde(rename = "type")]
     pub tool_type: String, // "function"
@@ -660,7 +708,7 @@ fn deserialize_parameters<'de, D: Deserializer<'de>>(deserializer: D) -> Result<
 }
 
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct Function {
     pub name: String,
     pub description: Option<String>,
@@ -741,7 +789,7 @@ impl<'de> Deserialize<'de> for FunctionCall {
 }
 
 impl schemars::JsonSchema for FunctionCall {
-    fn schema_name() -> std::borrow::Cow<'static, str> {
+    fn schema_name() -> Cow<'static, str> {
         "FunctionCall".into()
     }
     fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
@@ -899,9 +947,14 @@ pub struct LogProbs {
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(untagged)]
 pub enum ChatLogProbs {
+    /// The public API's object: `content` and `refusal` are both always
+    /// present (`null` when there is none); the gateway produces no refusals,
+    /// so `refusal` is `null`.
     Detailed {
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         content: Option<Vec<ChatLogProbsContent>>,
+        #[serde(default)]
+        refusal: Option<Vec<ChatLogProbsContent>>,
     },
     Raw(Value),
 }
@@ -1198,6 +1251,20 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn the_logprobs_object_carries_content_and_refusal() {
+        // Parsed as an engine reports it (content only), the object leaves
+        // with both of the public API's properties, `refusal` null.
+        let logprobs: ChatLogProbs = serde_json::from_value(json!({
+            "content": [{"token": "Hi", "logprob": -0.1, "bytes": [72, 105], "top_logprobs": []}]
+        }))
+        .expect("parse");
+        assert!(matches!(logprobs, ChatLogProbs::Detailed { .. }));
+        let value = serde_json::to_value(&logprobs).expect("serialize");
+        assert_eq!(value["content"][0]["token"], "Hi", "{value}");
+        assert_eq!(value.get("refusal"), Some(&Value::Null), "{value}");
+    }
 
     #[test]
     fn to_value_exact_keeps_f32_fields_as_the_client_wrote_them() {
@@ -1576,6 +1643,28 @@ mod tests {
                 }
                 None => assert!(result.is_ok(), "{name:?}/{schema} should pass"),
             }
+        }
+    }
+
+    /// A named function, `required`, and allowed tools in `required` mode
+    /// force a call; `auto`, `none`, and allowed tools in `auto` mode do not.
+    #[test]
+    fn a_tool_choice_says_whether_it_forces_a_call() {
+        let choice =
+            |body: Value| -> ToolChoice { serde_json::from_value(body).expect("a tool choice") };
+        for forcing in [
+            json!("required"),
+            json!({"type": "function", "function": {"name": "lookup"}}),
+            json!({"type": "allowed_tools", "mode": "required", "tools": []}),
+        ] {
+            assert!(choice(forcing.clone()).forces_call(), "{forcing}");
+        }
+        for free in [
+            json!("auto"),
+            json!("none"),
+            json!({"type": "allowed_tools", "mode": "auto", "tools": []}),
+        ] {
+            assert!(!choice(free.clone()).forces_call(), "{free}");
         }
     }
 }

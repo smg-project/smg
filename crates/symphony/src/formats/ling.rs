@@ -3,8 +3,9 @@
 //! request's tools, with the template's newline after the name and after `</arg_key>`. Everything
 //! else is content. The prompt opens the thought, and a turn opens with `<role>ASSISTANT</role>`,
 //! so the prompt's replay starts there. Recorded as `ling-3.0-flash` (inclusionAI/Ling-3.0-flash);
-//! GLM 4.5 and 4.6 write the same syntax; GLM 4.7 and later write it with nothing between the
-//! tags, under their own turn opener ([`glm()`](super::glm())).
+//! GLM 4.5 and 4.6 write it with the newline after each `</arg_value>` instead of before the close
+//! ([`glm4()`](super::glm4())); GLM 4.7 and later write it with nothing between the tags, under
+//! their own turn opener ([`glm()`](super::glm())).
 
 use crate::{
     format::{CallSyntax, Emits, Format},
@@ -41,7 +42,8 @@ mod tests {
         event::{Event, Events},
         input::{EngineFinish, Input},
         parser::Parser,
-        tagged::Declared,
+        testing::{bytes, drive},
+        Declared,
     };
 
     fn declared() -> Declared {
@@ -67,51 +69,8 @@ mod tests {
         "</tool_call>\n<tool_call>get_weather\n</tool_call>"
     );
 
-    fn run(prompt: &str, output: &str) -> Vec<Event> {
-        let mut parser = Engine::new(ling(), declared());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        parser
-            .feed(
-                Input::Delta {
-                    token_ids: &[],
-                    text: output,
-                    spans: &[],
-                },
-                &mut out,
-            )
-            .expect("delta");
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
-    }
-
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
+    fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
+        drive(&mut Engine::new(ling(), declared()), prompt, &[output])
     }
 
     fn arguments(events: &[Event]) -> Vec<(String, String)> {
@@ -144,14 +103,14 @@ mod tests {
         let reasoning: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
+                Event::Reasoning(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();
         let content: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -180,7 +139,7 @@ mod tests {
         let reasoning: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
+                Event::Reasoning(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();

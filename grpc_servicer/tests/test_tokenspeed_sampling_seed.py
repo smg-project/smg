@@ -58,7 +58,10 @@ def servicer():
         ],
         type_ignores=[],
     )
+    from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
+
     namespace = {
+        "EngineConfigView": EngineConfigView,
         "json": json,
         "_engine_supports_dp_rank_pin": lambda: False,
         "_lazy_generate_req_input": lambda: SimpleNamespace,
@@ -67,6 +70,7 @@ def servicer():
     converter = namespace["_sampling_params_from_proto"]
     instance = SimpleNamespace(
         server_args=SimpleNamespace(reasoning_parser=None),
+        _config=EngineConfigView(SimpleNamespace(reasoning_parser=None)),
         _sampling_params_from_proto=converter,
     )
     return converter, namespace["_build_generate_req"], instance

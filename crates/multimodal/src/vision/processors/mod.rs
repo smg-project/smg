@@ -22,6 +22,7 @@
 //! - **Phi4-Vision** (`phi4_vision`): Dynamic HD transform with 448x448 tiles and SiGLIP encoder
 //! - **LLaMA 4 Vision** (`llama4_vision`): Tile-based processing with 336x336 tiles and global tile
 //! - **Pixtral/Mistral3** (`pixtral`): CLIP-based preprocessing with dynamic resolution
+//! - **Nemotron-H Omni** (`nemotron_omni`): C-RADIO dynamic resolution, an even 16px patch grid with CLIP normalization
 
 pub mod deepseek_v41;
 pub mod gemma4;
@@ -33,6 +34,8 @@ pub mod llama4_vision;
 pub mod llava;
 pub mod minimax_m3;
 pub mod moonvit;
+pub mod muse_spark;
+pub mod nemotron_omni;
 pub mod phi3_vision;
 pub mod phi4_vision;
 pub mod pixtral;
@@ -50,6 +53,8 @@ pub use kimi_k3::KimiK3Processor;
 pub use llama4_vision::Llama4VisionProcessor;
 pub use llava::{ImageAspectRatio, LlavaNextProcessor, LlavaProcessor};
 pub use minimax_m3::MiniMaxM3VisionProcessor;
+pub use muse_spark::MuseSparkVisionProcessor;
+pub use nemotron_omni::NemotronOmniProcessor;
 pub use phi3_vision::Phi3VisionProcessor;
 pub use phi4_vision::Phi4VisionProcessor;
 pub use pixtral::PixtralProcessor;

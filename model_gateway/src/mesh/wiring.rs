@@ -107,7 +107,12 @@ impl MeshAdapters {
                 routing: StreamRouting::Targeted,
             },
         );
-        let worker = WorkerSyncAdapter::new(worker_ns, worker_registry);
+        let worker = WorkerSyncAdapter::new(
+            worker_ns,
+            worker_registry,
+            node_name.clone(),
+            cluster_state.clone(),
+        );
         let rate_limit = RateLimitSyncAdapter::new(rl_ns, node_name.clone());
         let peers: Arc<dyn PeerList> =
             Arc::new(ClusterStatePeerList::new(cluster_state, node_name.clone()));
@@ -199,7 +204,7 @@ impl PolicyRegistryTreeHandle {
 
     /// Visit every distinct [`CacheAwarePolicy`] the registry could
     /// dispatch requests through for `model_id`, in
-    /// most-specific-first order (per-model → default → PD/EPD legs),
+    /// most-specific-first order (per-model → default → PD/EPD roles),
     /// invoking `f` on each. The `Arc<dyn ...>` is held for the
     /// duration of each `f` call, so downcast borrows are safe
     /// against concurrent registry churn.
@@ -279,9 +284,9 @@ impl TreeHandle for PolicyRegistryTreeHandle {
 
     fn apply_repair_page(&self, page: &TreeRepairPage) -> usize {
         // Seed every cache-aware policy in the chain from the same
-        // page: in PD/EPD deployments both the prefill leg and the
-        // decode leg maintain their own routing tree and each needs
-        // the peer's state; delivering the page once per leg is
+        // page: in PD/EPD deployments both the prefill role and the
+        // decode role maintain their own routing tree and each needs
+        // the peer's state; delivering the page once per role is
         // cheap (per-entry `insert_text` / `insert_tokens`).
         let mut total: usize = 0;
         self.for_each_cache_aware(&page.model_id, |policy| {
@@ -351,6 +356,7 @@ mod tests {
             load: 0.0,
             version: 1,
             spec: vec![],
+            owner: "node-b".into(),
         };
         adapters.worker().on_worker_changed("w1", &state);
 
@@ -477,6 +483,8 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         }
     }
 
@@ -667,7 +675,7 @@ mod tests {
         );
     }
 
-    /// A cache-aware default policy (no per-model entry, no PD legs)
+    /// A cache-aware default policy (no per-model entry, no PD roles)
     /// must be reachable through the bridge — that's the shape a
     /// single-model non-PD deployment has, and the fallback CodeRabbit
     /// flagged as missing.

@@ -165,15 +165,6 @@ impl KvEventMonitor {
                 );
                 degraded_changed = true;
             }
-            Admission::Buffered => {
-                if let Some(cursor) = state.ranks.get_mut(&rank) {
-                    if !cursor.buffer_live(batch.clone()) {
-                        Metrics::record_kv_event_batch(worker_url, "tail_overflow");
-                    }
-                    Metrics::set_kv_event_tail_depth(worker_url, cursor.tail_len());
-                }
-                return BatchOutcome::Skipped;
-            }
         }
 
         on_batch(batch);
@@ -375,10 +366,7 @@ mod tests {
     };
 
     use super::{super::apply::convert_kv_block, *};
-    use crate::worker::{
-        kv_event_recovery::{Cursor, RESTART_WINDOW},
-        kv_index_backend::KvIndexKind,
-    };
+    use crate::worker::kv_event_recovery::{Cursor, RESTART_WINDOW};
 
     /// Token ids for engine block `id`: distinct content per id.
     fn tokens_for(id: i64) -> Vec<u32> {
@@ -435,16 +423,9 @@ mod tests {
 
     /// `smg_kv_index_blocks{worker}` is set where applied batches are counted,
     /// from the index's own per-worker counter: it follows stores, removals and
-    /// a clear, and costs the lookup path nothing. Both indexes keep that
-    /// counter, so the gauge reads the same under `--kv-index chain`.
+    /// a clear, and costs the lookup path nothing.
     #[test]
     fn index_block_gauge_follows_stores_removals_and_a_clear() {
-        for kind in [KvIndexKind::Positional, KvIndexKind::Chain] {
-            index_block_gauge_follows_the_index(kind);
-        }
-    }
-
-    fn index_block_gauge_follows_the_index(kind: KvIndexKind) {
         use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
         fn index_blocks(handle: &PrometheusHandle) -> Option<f64> {
@@ -459,7 +440,7 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
-            let mut sim = Sim::with_kind(kind);
+            let mut sim = Sim::new();
             assert_eq!(index_blocks(&handle), None, "nothing applied yet");
 
             assert_eq!(
@@ -467,34 +448,26 @@ mod tests {
                 BatchOutcome::Applied
             );
             assert_eq!(sim.indexer.worker_block_count(sim.worker), 3);
-            assert_eq!(
-                index_blocks(&handle),
-                Some(3.0),
-                "{kind:?}: three blocks stored"
-            );
+            assert_eq!(index_blocks(&handle), Some(3.0), "three blocks stored");
 
             assert_eq!(
                 sim.feed(&batch(2, None, vec![removed(&[3])])),
                 BatchOutcome::Applied
             );
-            assert_eq!(index_blocks(&handle), Some(2.0), "{kind:?}: one removed");
+            assert_eq!(index_blocks(&handle), Some(2.0), "one removed");
 
             assert_eq!(
                 sim.feed(&batch(3, None, vec![stored(Some(2), &[4, 5])])),
                 BatchOutcome::Applied
             );
-            assert_eq!(
-                index_blocks(&handle),
-                Some(4.0),
-                "{kind:?}: two more stored"
-            );
+            assert_eq!(index_blocks(&handle), Some(4.0), "two more stored");
 
             assert_eq!(
                 sim.feed(&batch(4, None, vec![cleared()])),
                 BatchOutcome::Applied
             );
             assert_eq!(sim.indexer.worker_block_count(sim.worker), 0);
-            assert_eq!(index_blocks(&handle), Some(0.0), "{kind:?}: cleared");
+            assert_eq!(index_blocks(&handle), Some(0.0), "cleared");
         });
     }
 
@@ -589,12 +562,7 @@ mod tests {
 
     impl Sim {
         fn new() -> Self {
-            Self::with_kind(KvIndexKind::Positional)
-        }
-
-        /// The same harness over the index selected by `--kv-index`.
-        fn with_kind(kind: KvIndexKind) -> Self {
-            let indexer = KvIndex::new(kind, 8);
+            let indexer = KvIndex::chain();
             let worker = indexer.intern_worker("grpc://w1:9000").unwrap();
             Self {
                 indexer,
@@ -656,19 +624,6 @@ mod tests {
         fn deliver(&mut self, b: &KvEventBatch) -> BatchOutcome {
             self.reference_apply(b);
             self.feed(b)
-        }
-
-        /// Apply a batch straight into the worker's index state, bypassing
-        /// admission (how a snapshot or a buffered tail lands).
-        fn apply_direct(&mut self, b: &KvEventBatch) {
-            for event in &b.events {
-                KvEventMonitor::apply_event(
-                    event,
-                    self.worker,
-                    &self.indexer,
-                    &mut self.state.index,
-                );
-            }
         }
 
         fn assert_matches_reference(&self) {
@@ -1213,48 +1168,6 @@ mod tests {
         assert!(sim.state.snapshot.is_none());
         assert_eq!(sim.state.resume_sequence(), 10);
         assert!(!sim.state.abandon_snapshot());
-    }
-
-    #[test]
-    fn recovery_snapshot_resync_applies_the_tail_in_order() {
-        let mut sim = Sim::new();
-        sim.deliver(&batch(1, None, vec![stored(None, &[1, 2])]));
-        sim.deliver(&batch(2, None, vec![stored(Some(2), &[3])]));
-        // Lost history: the subscriber asks for a snapshot out of band and
-        // holds live batches meanwhile.
-        sim.state.ranks.get_mut(&0).unwrap().begin_snapshot();
-        let live3 = batch(3, None, vec![removed(&[3])]);
-        let live4 = batch(4, None, vec![stored(Some(2), &[5])]);
-        assert_eq!(sim.feed(&live3), BatchOutcome::Skipped);
-        assert_eq!(sim.feed(&live4), BatchOutcome::Skipped);
-        assert_eq!(sim.state.ranks[&0].tail_len(), 2);
-        // The snapshot (engine state through sequence 2) replaces the rank.
-        let snapshot = batch(
-            2,
-            None,
-            vec![cleared(), stored(None, &[1, 2]), stored(Some(2), &[3])],
-        );
-        KvEventMonitor::apply_cleared(sim.worker, &sim.indexer, &mut sim.state.index);
-        sim.apply_direct(&snapshot);
-        let tail = sim
-            .state
-            .ranks
-            .get_mut(&0)
-            .unwrap()
-            .finish_snapshot(2)
-            .expect("tail intact");
-        assert_eq!(tail.len(), 2);
-        for b in &tail {
-            sim.apply_direct(b);
-        }
-        sim.reference_apply(&live3);
-        sim.reference_apply(&live4);
-        assert_eq!(
-            sim.deliver(&batch(5, None, vec![stored(Some(5), &[6])])),
-            BatchOutcome::Applied
-        );
-        assert!(!sim.state.ranks[&0].is_degraded());
-        sim.assert_matches_reference();
     }
 
     /// A store whose parent the index does not hold is placed from the root

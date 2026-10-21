@@ -812,7 +812,7 @@ def _bind_consecutive(ctx, kind, count, attempts=20):
 
 
 @pytest_asyncio.fixture
-async def bridge():
+async def bridge(request):
     ctx = zmq.asyncio.Context()
     base, pubs = _bind_consecutive(ctx, zmq.XPUB, 2)
     replay_base, routers = _bind_consecutive(ctx, zmq.ROUTER, 2)
@@ -822,6 +822,8 @@ async def bridge():
         topic="kv",
     )
     options = {"replay_timeout": 0.3, "recv_timeout": 0.1}
+    # Indirect parametrization adds relay options (a load source, its intervals).
+    options.update(getattr(request, "param", None) or {})
 
     async def handler(request, context):
         sources = kv_relay.rank_sources(config, range(len(pubs)))
@@ -921,7 +923,7 @@ async def read_error(call, after_at_most=3):
 
 
 @pytest.mark.asyncio
-async def test_ranks_are_tagged_from_their_socket_and_numbered_contiguously(bridge):
+async def test_ranks_are_tagged_from_their_socket_and_keep_their_own_sequence_numbers(bridge):
     call = bridge.subscribe()
     await bridge.subscribed()
     await bridge.publish(0, 0)
@@ -929,13 +931,15 @@ async def test_ranks_are_tagged_from_their_socket_and_numbered_contiguously(brid
     await bridge.publish(1, 0)  # rank 1 starts its own count; not stale
     await bridge.publish(1, 1)
     seen = [await read(call) for _ in range(4)]
-    assert [batch.sequence_number for batch in seen] == [1, 2, 3, 4]
     # The two sockets are polled together, so ranks interleave; each rank's
-    # own order holds and every batch carries its socket's rank.
+    # own order and numbering hold (the gateway keeps a cursor per rank) and
+    # every batch carries its socket's rank.
     per_rank = {0: [], 1: []}
     for batch in seen:
-        per_rank[batch.dp_rank].append(batch.events[0].stored.blocks[0].block_hash)
-    assert per_rank == {0: [1, 2], 1: [1, 2]}
+        per_rank[batch.dp_rank].append(
+            (batch.sequence_number, batch.events[0].stored.blocks[0].block_hash)
+        )
+    assert per_rank == {0: [(0, 1), (1, 2)], 1: [(0, 1), (1, 2)]}
     call.cancel()
 
 
@@ -976,7 +980,7 @@ async def test_live_batches_the_replay_already_covered_are_duplicates_not_a_rest
     call = bridge.subscribe()
     await bridge.subscribed()
     await bridge.publish(0, 0)
-    assert (await read(call)).sequence_number == 1
+    assert (await read(call)).sequence_number == 0
     await bridge.publish(0, 3)  # 1 and 2 skipped
     identity, start = await bridge.replay_request(0)
     assert start == 1
@@ -1002,7 +1006,7 @@ async def test_the_replay_window_closes_once_the_live_stream_is_past_it(bridge):
     call = bridge.subscribe()
     await bridge.subscribed()
     await bridge.publish(0, 0)
-    assert (await read(call)).sequence_number == 1
+    assert (await read(call)).sequence_number == 0
     await bridge.publish(0, 3)  # 1 and 2 skipped
     identity, start = await bridge.replay_request(0)
     assert start == 1
@@ -1024,7 +1028,7 @@ async def test_an_unverifiable_replay_ends_the_stream_with_data_loss(bridge, fau
     call = bridge.subscribe()
     await bridge.subscribed()
     await bridge.publish(0, 0)
-    assert (await read(call)).sequence_number == 1
+    assert (await read(call)).sequence_number == 0
     await bridge.publish(0, 4)
     identity, start = await bridge.replay_request(0)
     assert start == 1
@@ -1046,7 +1050,7 @@ async def test_a_gap_without_a_replay_endpoint_ends_the_stream(bridge):
     call = bridge.subscribe()
     await bridge.subscribed()
     await bridge.publish(0, 0)
-    assert (await read(call)).sequence_number == 1
+    assert (await read(call)).sequence_number == 0
     await bridge.publish(0, 2)
     assert await read_error(call) == grpc.StatusCode.DATA_LOSS
 
@@ -1056,7 +1060,7 @@ async def test_a_publisher_restart_ends_the_stream_with_data_loss(bridge):
     call = bridge.subscribe()
     await bridge.subscribed()
     await bridge.publish(0, 5)
-    assert (await read(call)).sequence_number == 1
+    assert (await read(call)).sequence_number == 5
     await bridge.publish(0, 0)
     assert await read_error(call) == grpc.StatusCode.DATA_LOSS
 
@@ -1069,7 +1073,7 @@ async def test_a_nonzero_cursor_is_refused_before_subscribing(bridge):
 
 
 @pytest.mark.asyncio
-async def test_bad_payloads_and_duplicates_are_skipped_without_replay(bridge):
+async def test_bad_payloads_relay_empty_and_duplicates_are_skipped_without_replay(bridge):
     call = bridge.subscribe()
     await bridge.subscribed()
     await bridge.publish(0, 0)
@@ -1078,10 +1082,16 @@ async def test_bad_payloads_and_duplicates_are_skipped_without_replay(bridge):
     await bridge.pubs[0].send_multipart([b"kv", b"short"])
     await bridge.publish(0, 2)
     await bridge.publish(0, 2)
-    first = await read(call)
-    second = await read(call)
-    assert (first.sequence_number, second.sequence_number) == (1, 2)
-    assert second.events[0].stored.blocks[0].block_hash == 3
+    seen = [await read(call) for _ in range(3)]
+    # The undecodable payload goes out as an empty batch under its sequence,
+    # so the gateway sees no gap for it; its repeat and the repeat of 2 are
+    # duplicates, the short frame is ignored.
+    assert [(b.sequence_number, b.dp_rank, len(b.events)) for b in seen] == [
+        (0, 0, 1),
+        (1, 0, 0),
+        (2, 0, 1),
+    ]
+    assert seen[2].events[0].stored.blocks[0].block_hash == 3
     assert not await bridge.routers[0].poll(timeout=50), "no replay for a consumed sequence"
     call.cancel()
 
@@ -1263,3 +1273,100 @@ def test_hash_check_is_off_unless_asked(caplog):
     normalizer = kv_relay.Normalizer()
     normalizer.normalize_batch(kv_relay.decode_batch(_batch([_store([1], [1, 2, 3, 4])])), 1)
     assert _checked(normalizer) == (0, 0, 0)
+
+
+# ---------------------------------------------------------------------------
+# Streaming: the load record on the stream
+# ---------------------------------------------------------------------------
+
+
+class _Loads:
+    """A load source the tests move: the record for any rank."""
+
+    def __init__(self):
+        self.record = common_pb2.EngineLoad(
+            running_requests=1, token_usage=0.25, cache_hit_rate=0.5, max_total_num_tokens=400
+        )
+
+    def __call__(self, rank):
+        copy = common_pb2.EngineLoad()
+        copy.CopyFrom(self.record)
+        return copy
+
+
+_LOADS = _Loads()
+_WITH_LOADS = {
+    "load_source": _LOADS,
+    "load_tick": 0.02,
+    "heartbeat_interval": 0.2,
+    "heartbeat_backoff": 1.0,
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bridge", [_WITH_LOADS], indirect=True)
+async def test_every_relayed_batch_carries_the_servicers_load_record(bridge):
+    _LOADS.record.running_requests = 1
+    call = bridge.subscribe()
+    await bridge.subscribed()
+    await bridge.publish(0, 0)
+    await bridge.publish(1, 0)
+    seen = [await read(call) for _ in range(2)]
+    assert sorted((batch.dp_rank, batch.sequence_number) for batch in seen) == [(0, 0), (1, 0)]
+    assert [batch.load.sample for batch in seen] == [1, 2]
+    assert all(not batch.load.load_only for batch in seen)
+    assert all(batch.load.running_requests == 1 for batch in seen)
+    # The telemetry rides the first record only; the core rides every batch.
+    assert seen[0].load.cache_hit_rate == 0.5 and seen[0].load.max_total_num_tokens == 400
+    assert not seen[1].load.HasField("cache_hit_rate")
+    assert seen[1].load.token_usage == 0.25
+    call.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bridge", [_WITH_LOADS], indirect=True)
+async def test_an_idle_stream_heartbeats_a_load_only_batch_on_the_last_sequence(bridge):
+    _LOADS.record.running_requests = 1
+    call = bridge.subscribe()
+    await bridge.subscribed()
+    await bridge.publish(1, 0)
+    first = await read(call)
+    assert (first.sequence_number, first.dp_rank) == (0, 1)
+    started = asyncio.get_running_loop().time()
+    beat = await read(call)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert beat.load.load_only and beat.sequence_number == 0 and beat.dp_rank == 1
+    assert beat.events == [] and beat.load.sample == 2
+    assert 0.1 < elapsed < 1.0, elapsed  # the heartbeat interval, not the backoff
+    assert beat.load.cache_hit_rate == 0.5  # the telemetry rides the heartbeat
+    call.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bridge", [_WITH_LOADS], indirect=True)
+async def test_a_changed_record_is_pushed_within_the_tick_without_an_event(bridge):
+    _LOADS.record.running_requests = 1
+    call = bridge.subscribe()
+    await bridge.subscribed()
+    await bridge.publish(0, 0)
+    assert (await read(call)).sequence_number == 0
+    _LOADS.record.running_requests = 5
+    started = asyncio.get_running_loop().time()
+    pushed = await read(call)
+    elapsed = asyncio.get_running_loop().time() - started
+    assert pushed.load.load_only and pushed.load.running_requests == 5
+    assert pushed.sequence_number == 0
+    assert elapsed < 0.15, elapsed  # the tick, not the heartbeat interval
+    call.cancel()
+
+
+@pytest.mark.asyncio
+async def test_without_a_load_source_the_stream_carries_cache_events_only(bridge):
+    call = bridge.subscribe()
+    await bridge.subscribed()
+    await bridge.publish(0, 0)
+    batch = await read(call)
+    assert not batch.HasField("load")
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(call.read(), 0.5)  # no heartbeat either
+    call.cancel()

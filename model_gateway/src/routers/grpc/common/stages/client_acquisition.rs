@@ -44,7 +44,7 @@ pub(crate) async fn acquire_clients(
             decode,
             ..
         } => {
-            // Every assigned leg, encode included: an encode worker is
+            // Every assigned worker, encode included: an encode worker is
             // vetoed at selection through the same filter, so leaving it out
             // of the re-check would be the one dispatch path that can send
             // to a worker known to be over the ceiling.

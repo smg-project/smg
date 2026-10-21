@@ -48,9 +48,13 @@ impl AdmissionMode {
     /// spawns the dispatcher on its watch channel, and returns
     /// `Priority(..)`.
     ///
-    /// On any startup error (bad YAML, reservations exceed capacity), logs
-    /// at ERROR and falls back to `Legacy` rather than aborting the whole
-    /// gateway — a misconfigured scheduler must not take the data plane down.
+    /// The YAML file is checked by `ConfigValidator` before start-up, so a
+    /// file that cannot be read, parsed or validated is a configuration
+    /// error the gateway refuses to start on. What can still fail here is
+    /// the scheduler against the fleet's initial capacity (reservations
+    /// exceed it): that is logged at ERROR and falls back to `Legacy`
+    /// rather than aborting the whole gateway — a too-small fleet must not
+    /// take the data plane down.
     pub fn from_config(
         rc: &RouterConfig,
         registry: Arc<WorkerRegistry>,
@@ -96,15 +100,7 @@ impl AdmissionMode {
         // a gap where the first fleet update is lost.
         let capacity_watch = worker_capacity.watch();
 
-        let default_max_class = Class::parse_header(&rc.priority_scheduler_default_max_class);
-        let yaml = load_yaml(rc.priority_scheduler_config.as_deref())?;
-        let settings = SchedulerSettings::from_cli_and_yaml(
-            true,
-            default_max_class,
-            rc.priority_scheduler_tenant_metric_top_n,
-            yaml.as_ref(),
-        )
-        .map_err(|e| e.to_string())?;
+        let settings = settings_from_config(rc).map_err(|e| e.to_string())?;
 
         // The atomic value covers any update that won the race before the
         // receiver subscribed; subsequent updates remain queued for the
@@ -129,6 +125,57 @@ impl AdmissionMode {
             resolver,
             rate_limiter,
         })))
+    }
+}
+
+/// Why a router configuration's scheduler settings are refused: the
+/// configuration field at fault, its value and the reason, the shape
+/// `ConfigValidator` reports a start-up error in.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{field} `{value}`: {reason}")]
+pub struct SchedulerConfigError {
+    /// The `RouterConfig` field.
+    pub field: &'static str,
+    /// Its configured value (the file's path for the YAML's errors).
+    pub value: String,
+    pub reason: String,
+}
+
+/// The scheduler settings a router configuration describes: the CLI fields
+/// plus the optional YAML file, read, parsed and validated. `ConfigValidator`
+/// runs this before start-up and the admission mode builds on it, so both see
+/// the same configuration the same way. The error names the field at fault
+/// and what is wrong with it: a default max class that is none of the four
+/// names (the header parser's fallback to `default` is for requests, not for
+/// an operator's flag), a file that cannot be read or parsed (an unknown key
+/// included) or a value the settings refuse.
+pub fn settings_from_config(rc: &RouterConfig) -> Result<SchedulerSettings, SchedulerConfigError> {
+    let default_max_class =
+        Class::parse_name(&rc.priority_scheduler_default_max_class).map_err(|e| {
+            SchedulerConfigError {
+                field: "priority_scheduler_default_max_class",
+                value: rc.priority_scheduler_default_max_class.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+    let yaml = load_yaml(rc.priority_scheduler_config.as_deref())
+        .map_err(|reason| file_error(rc, reason))?;
+    SchedulerSettings::from_cli_and_yaml(
+        true,
+        default_max_class,
+        rc.priority_scheduler_tenant_metric_top_n,
+        yaml.as_ref(),
+    )
+    .map_err(|e| file_error(rc, e.to_string()))
+}
+
+/// A refusal of the YAML file (or of the settings it yields), named after
+/// the path field.
+fn file_error(rc: &RouterConfig, reason: String) -> SchedulerConfigError {
+    SchedulerConfigError {
+        field: "priority_scheduler_config",
+        value: rc.priority_scheduler_config.clone().unwrap_or_default(),
+        reason,
     }
 }
 

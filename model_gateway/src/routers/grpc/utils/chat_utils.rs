@@ -2,17 +2,22 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     sync::{Arc, OnceLock},
+    time::Duration,
 };
 
 use anyhow::anyhow;
-use axum::response::Response;
+use axum::{
+    http::{header::RETRY_AFTER, HeaderValue},
+    response::Response,
+};
 use bytes::Bytes;
 use llm_multimodal::{MediaPartOrder, Modality};
 use llm_tokenizer::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams},
     stop::StopSequenceDecoderBuilder,
-    traits::{Encoding, PromptEncoding, Tokenizer},
+    traits::{Encoding, PromptEncoding, RendererCapabilities, Tokenizer},
     StopSequenceDecoder,
 };
 use openai_protocol::{
@@ -24,15 +29,26 @@ use openai_protocol::{
     generate::GenerateFinishReason,
     profile::ModelProfile,
 };
+use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::sync::Semaphore;
-use tracing::{debug, error};
+use tool_parser::types::ToolCallItem;
+use tracing::{debug, error, warn};
 use uuid::Uuid;
 
-use crate::routers::{
-    common::sse,
-    error,
-    grpc::{context::RequestContext, multimodal::PlaceholderTokens, ProcessedMessages},
+use crate::{
+    middleware::ReportedRefusal,
+    observability::log_throttle::KeyedLogThrottle,
+    routers::{
+        common::sse,
+        error,
+        grpc::{
+            context::RequestContext,
+            multimodal::{anchor_rendered_markers, PlaceholderTokens},
+            ProcessedMessages,
+        },
+    },
+    workflow::TokenizerLoadFailure,
 };
 
 /// Type alias for the SSE channel sender used across streaming endpoints.
@@ -43,25 +59,59 @@ use crate::routers::{
 /// backpressure to a slow client.
 pub(crate) type SseSender = sse::SseSender;
 
-/// Send an SSE error event with a typed error body.
-///
-/// Produces `data: {"error":{"message":"...","type":"..."}}\n\n` using
-/// `serde_json` so that quotes, newlines, and other special characters in the
-/// error message are properly escaped.
+/// The body of an SSE error event, `{"error":{"message":...,"type":...}}`,
+/// serialized straight into its frame: the message is written through
+/// `Display` into the JSON escaper, so the frame is the one allocation.
+#[derive(Serialize)]
+#[serde(bound = "M: fmt::Display")]
+struct SseErrorFrame<'a, M: fmt::Display> {
+    error: SseErrorBody<'a, M>,
+}
+
+#[derive(Serialize)]
+#[serde(bound = "M: fmt::Display")]
+struct SseErrorBody<'a, M: fmt::Display> {
+    #[serde(serialize_with = "serialize_display")]
+    message: M,
+    #[serde(rename = "type")]
+    error_type: &'a str,
+}
+
+fn serialize_display<M: fmt::Display, S: serde::Serializer>(
+    message: &M,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(message)
+}
+
+/// Send an SSE error event with a typed error body:
+/// `data: {"error":{"message":"...","type":"..."}}\n\n`, the message
+/// JSON-escaped (quotes, newlines, control characters).
 ///
 /// `async` because the sender is bounded: awaits if the buffer is full so the
 /// terminal error frame still applies backpressure rather than being dropped.
-pub(crate) async fn send_error_sse(tx: &SseSender, message: impl ToString, error_type: &str) {
-    let chunk = format!(
-        "data: {}\n\n",
-        json!({
-            "error": {
-                "message": message.to_string(),
-                "type": error_type,
-            }
-        })
-    );
-    let _ = tx.send(Ok(Bytes::from(chunk))).await;
+pub(crate) async fn send_error_sse(tx: &SseSender, message: impl fmt::Display, error_type: &str) {
+    const PREFIX: &[u8] = b"data: ";
+    let mut frame = Vec::with_capacity(256);
+    frame.extend_from_slice(PREFIX);
+    let body = SseErrorFrame {
+        error: SseErrorBody {
+            message,
+            error_type,
+        },
+    };
+    // Unreachable in practice: a `Vec` writer never fails, and serde_json
+    // panics (as `to_string` did) on a `Display` that errors rather than
+    // returning the error; the fallback keeps the frame well-formed should
+    // either ever change.
+    if serde_json::to_writer(&mut frame, &body).is_err() {
+        frame.truncate(PREFIX.len());
+        frame.extend_from_slice(
+            br#"{"error":{"message":"the error message could not be serialized","type":"internal_error"}}"#,
+        );
+    }
+    frame.extend_from_slice(b"\n\n");
+    let _ = tx.send(Ok(Bytes::from(frame))).await;
 }
 
 /// Resolve tokenizer from registry and cache it in request context.
@@ -82,16 +132,14 @@ pub(crate) fn resolve_tokenizer(
         .get(model_id)
         .ok_or_else(|| {
             let served = ctx.components.worker_registry.contains_model(model_id);
-            if served {
-                error!(
-                    function = %stage_name,
-                    model = %model_id,
-                    "Tokenizer not found for model"
-                );
-            } else {
-                debug!(function = %stage_name, model = %model_id, "Unknown model");
-            }
-            Box::new(missing_tokenizer_response(model_id, served))
+            let failure = ctx.components.tokenizer_load_failures.get(model_id);
+            Box::new(missing_tokenizer_response(
+                stage_name,
+                model_id,
+                served,
+                ctx.components.tokenizer_autoload,
+                failure.as_ref(),
+            ))
         })?;
 
     // Cache tokenizer in context for reuse in response processing stage
@@ -100,18 +148,130 @@ pub(crate) fn resolve_tokenizer(
     Ok(tokenizer)
 }
 
-/// The error for a model without a registered tokenizer: a model nobody
-/// serves is the client's mistake (404), a served model with no tokenizer is
-/// a gateway fault (500).
-fn missing_tokenizer_response(model_id: &str, served: bool) -> Response {
-    if served {
-        error::internal_error(
-            "tokenizer_not_found",
-            format!("Tokenizer not found for model: {model_id}"),
-        )
-    } else {
-        error::model_not_found(model_id)
+/// Lines per second the tokenizer-window WARN admits per model, and the
+/// models the throttle tracks: the allowance of the worker-selection
+/// refusal line, for the same reason (a client retrying at once through the
+/// window is one condition, not a line per request).
+const TOKENIZER_NOT_READY_LINES_PER_SECOND: u32 = 10;
+const TOKENIZER_NOT_READY_LOG_MODELS: usize = 64;
+
+static TOKENIZER_NOT_READY_LOG: KeyedLogThrottle = KeyedLogThrottle::new(
+    TOKENIZER_NOT_READY_LINES_PER_SECOND,
+    Duration::from_secs(1),
+    TOKENIZER_NOT_READY_LOG_MODELS,
+);
+
+/// The client-visible code of [`tokenizer_not_ready`].
+pub(crate) const TOKENIZER_NOT_READY_CODE: &str = "tokenizer_not_ready";
+
+/// Seconds a client is asked to wait before retrying through the window: a
+/// tokenizer registration takes a fraction of a second on a warm cache.
+const TOKENIZER_NOT_READY_RETRY_AFTER_SECS: u32 = 1;
+
+/// The 503 for a served model whose tokenizer the gateway has not registered
+/// yet: the window between a worker turning healthy and the end of its
+/// tokenizer load, which `/readiness` reports as not ready ("tokenizer not
+/// yet registered"). A planned, transient state, so the answer is the
+/// retryable class with a `Retry-After`, like a pool with no available
+/// worker, not a 500. One WARN per request, capped per model at
+/// [`TOKENIZER_NOT_READY_LINES_PER_SECOND`] a second (the overflow is counted
+/// as `suppressed` on the next admitted line); the response is marked
+/// [`ReportedRefusal`], so the pipeline's and the access log's lines for it
+/// stay at DEBUG (three ERROR lines per request were the storm of the 500).
+/// A served model whose tokenizer load was skipped or failed for good is
+/// answered [`tokenizer_load_failed`] instead.
+pub(crate) fn tokenizer_not_ready(function: &str, model_id: &str) -> Response {
+    let mut response = error::service_unavailable(
+        TOKENIZER_NOT_READY_CODE,
+        format!("Tokenizer for model '{model_id}' is not registered yet; retry shortly"),
+    );
+    response.headers_mut().insert(
+        RETRY_AFTER,
+        HeaderValue::from(TOKENIZER_NOT_READY_RETRY_AFTER_SECS),
+    );
+    response.extensions_mut().insert(ReportedRefusal);
+    if let Some(admitted) = TOKENIZER_NOT_READY_LOG.admit(model_id) {
+        warn!(
+            function = %function,
+            model = %model_id,
+            suppressed = admitted.suppressed,
+            "Tokenizer not yet registered for a served model"
+        );
     }
+    response
+}
+
+/// The client-visible code of [`tokenizer_load_failed`].
+pub(crate) const TOKENIZER_LOAD_FAILED_CODE: &str = "tokenizer_load_failed";
+
+/// The 503 for a served model whose tokenizer the gateway will not register
+/// on its own: its load was skipped (no path to load it from) or failed for
+/// good, or its tokenizer was removed, as the registration recorded for the
+/// model (a load in flight is pending, not this). The envelope
+/// of [`tokenizer_not_ready`] without the `Retry-After`: a retry changes
+/// nothing until a tokenizer registers for the model (a worker re-registering
+/// with a usable path, an operator's `POST /v1/tokenizers`), which clears
+/// the record. The message names the reason class, not the path or the
+/// error: the gateway's log has those, in the one line written when the
+/// model entered the state, not per request. Marked [`ReportedRefusal`], so
+/// the pipeline's and the access log's lines for it stay at DEBUG.
+pub(crate) fn tokenizer_load_failed(
+    function: &str,
+    model_id: &str,
+    failure: &TokenizerLoadFailure,
+) -> Response {
+    debug!(
+        function = %function,
+        model = %model_id,
+        reason = failure.reason(),
+        "Tokenizer load failed for a served model"
+    );
+    let mut response = error::service_unavailable(
+        TOKENIZER_LOAD_FAILED_CODE,
+        format!(
+            "Tokenizer for model '{model_id}' could not be loaded: {}",
+            failure.reason()
+        ),
+    );
+    response.extensions_mut().insert(ReportedRefusal);
+    response
+}
+
+/// The error for a model without a registered tokenizer: a model nobody
+/// serves is the client's mistake (404); a served model whose tokenizer load
+/// was skipped or failed for good, or whose tokenizer was removed, gets none
+/// on its own (503 without a retry hint, [`tokenizer_load_failed`]); a
+/// served model whose tokenizer the
+/// gateway is still loading is not ready yet (503 with a `Retry-After`, the
+/// state `/readiness` reports); a served model with no tokenizer when the
+/// gateway does not load tokenizers itself (`--disable-tokenizer-autoload`)
+/// is a gateway fault (500): nothing will register one.
+pub(crate) fn missing_tokenizer_response(
+    function: &str,
+    model_id: &str,
+    served: bool,
+    tokenizer_autoload: bool,
+    failure: Option<&TokenizerLoadFailure>,
+) -> Response {
+    if !served {
+        debug!(function = %function, model = %model_id, "Unknown model");
+        return error::model_not_found(model_id);
+    }
+    if let Some(failure) = failure {
+        return tokenizer_load_failed(function, model_id, failure);
+    }
+    if tokenizer_autoload {
+        return tokenizer_not_ready(function, model_id);
+    }
+    error!(
+        function = %function,
+        model = %model_id,
+        "Tokenizer not found for model"
+    );
+    error::internal_error(
+        "tokenizer_not_found",
+        format!("Tokenizer not found for model: {model_id}"),
+    )
 }
 
 /// Below this input size (in bytes) the `spawn_blocking` + permit round-trip
@@ -181,7 +341,9 @@ pub(crate) async fn encode_prompt_blocking(
 }
 
 /// Process tool call arguments in messages
-/// Per Transformers docs, tool call arguments in assistant messages should be dicts
+/// Per Transformers docs, tool call arguments in assistant messages should be dicts. An empty
+/// `arguments` string is a call with no arguments, `{}`; any other text that is not JSON is
+/// refused.
 pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), String> {
     for msg in messages {
         let role = msg.get("role").and_then(|v| v.as_str());
@@ -203,6 +365,10 @@ pub(crate) fn process_tool_call_arguments(messages: &mut [Value]) -> Result<(), 
             let Some(args_str) = args.as_str() else {
                 continue;
             };
+            if args_str.trim().is_empty() {
+                *args = json!({});
+                continue;
+            }
 
             // Parse JSON string to object (like Python json.loads)
             match serde_json::from_str::<Value>(args_str) {
@@ -233,9 +399,21 @@ pub(crate) fn process_content_format(
     )
 }
 
-const REASONING_EFFORT_KEY: &str = "reasoning_effort";
+pub(super) const REASONING_EFFORT_KEY: &str = "reasoning_effort";
 const TOOL_CHOICE_KEY: &str = "tool_choice";
 const RESPONSE_FORMAT_KEY: &str = "response_format";
+
+/// The template kwarg both prompt paths tell the tool choice through: the
+/// chat value as sent, so a renderer reads one shape under
+/// `/v1/chat/completions`, `/v1/messages` and `count_tokens`.
+pub(crate) fn insert_tool_choice_kwarg(
+    kwargs: &mut HashMap<String, Value>,
+    tool_choice: &ToolChoice,
+) {
+    if let Ok(value) = serde_json::to_value(tool_choice) {
+        kwargs.insert(TOOL_CHOICE_KEY.to_string(), value);
+    }
+}
 
 /// Merge request-level reasoning, tool, and output-format controls with any
 /// request `chat_template_kwargs`, forwarding each verbatim. The chat template
@@ -248,9 +426,7 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
     let kwargs_capacity = 3 + request.chat_template_kwargs.as_ref().map_or(0, |k| k.len());
     let mut combined = HashMap::with_capacity(kwargs_capacity);
     if let Some(tool_choice) = &request.tool_choice {
-        if let Ok(value) = serde_json::to_value(tool_choice) {
-            combined.insert(TOOL_CHOICE_KEY.to_string(), value);
-        }
+        insert_tool_choice_kwarg(&mut combined, tool_choice);
     }
     if let Some(response_format) = &request.response_format {
         if let Ok(value) = serde_json::to_value(response_format) {
@@ -269,11 +445,11 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
     combined
 }
 
-/// Typed `thinking.type` first, else the OpenAI mapping of the effective effort.
+/// The thinking preference the prompt is rendered with: the typed toggle,
+/// else the effective effort, both as the request's provider profile reads
+/// them (`ChatCompletionRequest::template_thinking`).
 fn resolve_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
-    request.thinking_toggle().or_else(|| {
-        openai_protocol::chat::thinking_from_reasoning_effort(request.effective_reasoning_effort())
-    })
+    request.template_thinking()
 }
 
 /// gRPC backends require content parts the gateway knows how to render.
@@ -349,10 +525,15 @@ fn process_content_format_with_order(
 /// public preprocessing bindings do not have model metadata, so their legacy
 /// `None` path continues to omit media parts.
 ///
-/// Media parts are emitted before text by default, matching vLLM's
-/// `interleave_mm_strings=false` behavior and preserving existing VQA behavior.
-/// TML/Inkling opts into authored order because part order is protocol-visible
-/// in its canonical renderer.
+/// Where a message's media goes relative to its text is the template's
+/// business when the template takes parts (`OpenAI` format): it walks them
+/// and writes each anchor where its part sits, so the parts reach it in the
+/// request's order, as the engine's own server hands them to such a
+/// template. A template that takes one string per message cannot place them
+/// itself; there the media is written before the text by default (the
+/// engine's own server's placement for such a template) and a renderer
+/// whose string form is positional opts into the request's order
+/// (`MediaPartOrder::Authored`).
 fn transform_content_field(
     content_value: &mut Value,
     content_format: ChatTemplateContentFormat,
@@ -365,9 +546,9 @@ fn transform_content_field(
 
     match content_format {
         ChatTemplateContentFormat::String => {
-            // Replace media parts with placeholders. The default branch builds
-            // separate media/text buckets for vLLM-compatible front placement;
-            // the TML branch appends each rendered part as it is encountered.
+            // Replace media parts with placeholders. The default order builds
+            // separate media/text buckets for the front placement; the
+            // authored order appends each rendered part as it is encountered.
             let mut media_parts: Vec<String> = Vec::new();
             let mut text_parts: Vec<String> = Vec::new();
             let mut authored_parts: Vec<String> = Vec::new();
@@ -418,7 +599,11 @@ fn transform_content_field(
             }
         }
         ChatTemplateContentFormat::OpenAI => {
-            // Replace media URLs with simple type placeholders
+            // Replace media URLs with simple type placeholders. The parts keep
+            // the request's order whatever `media_order` says: the template
+            // walks them and writes each anchor where its part sits (a text
+            // part before an image renders before it), which is how the
+            // engine's own server hands them to such a template.
             let processed_parts: Vec<Value> = content_array
                 .iter()
                 .map(|part| {
@@ -434,25 +619,7 @@ fn transform_content_field(
                 })
                 .collect();
 
-            // The default branch places media before the remaining parts,
-            // matching vLLM front placement. `partition` is stable, so relative
-            // order within media and within text is kept. TML skips partitioning.
-            let ordered_parts = match media_order {
-                MediaPartOrder::Authored => processed_parts,
-                MediaPartOrder::MediaFirst => {
-                    let (mut media, rest): (Vec<Value>, Vec<Value>) =
-                        processed_parts.into_iter().partition(|p| {
-                            matches!(
-                                p.get("type").and_then(|t| t.as_str()),
-                                Some("image") | Some("video") | Some("audio")
-                            )
-                        });
-                    media.extend(rest);
-                    media
-                }
-            };
-
-            *content_value = Value::Array(ordered_parts);
+            *content_value = Value::Array(processed_parts);
         }
     }
 
@@ -460,9 +627,9 @@ fn transform_content_field(
 }
 
 /// A popped assistant message's prefill: its string content, or its text parts joined in order.
-fn prefill_text(content: &Value) -> Option<String> {
+fn prefill_text(content: Value) -> Option<String> {
     match content {
-        Value::String(text) => Some(text.clone()),
+        Value::String(text) => Some(text),
         Value::Array(parts) => Some(
             parts
                 .iter()
@@ -507,7 +674,7 @@ pub(crate) fn filter_chat_request_by_tool_choice(
         if let Some(filtered_tools) = filter_tools_by_tool_choice(tools, body.tool_choice.as_ref())
         {
             let mut filtered_body = body.clone();
-            filtered_body.tools = Some(filtered_tools);
+            filtered_body.tools = Some(filtered_tools.into());
             return std::borrow::Cow::Owned(filtered_body);
         }
     }
@@ -519,13 +686,25 @@ pub(crate) fn filter_chat_request_by_tool_choice(
 /// The request whose tools the template renders. A named `tool_choice`
 /// renders every tool, as the engine's own server renders it (the named call
 /// is forced by the tool constraint, built from `callable_tools`); an
-/// `allowed_tools` choice renders its subset; any other request renders as
-/// it is.
-pub(crate) fn request_as_rendered(
+/// `allowed_tools` choice renders its subset; `none` renders no tool, as the
+/// Responses path renders it, so the model is not offered a call it may not
+/// make and answers in text, unless the renderer declares the tools under
+/// `none` itself and forbids the call in the prompt
+/// ([`RendererCapabilities::declares_tools_under_tool_choice_none`]); any
+/// other request renders as it is.
+pub fn request_as_rendered(
     request: &ChatCompletionRequest,
+    capabilities: RendererCapabilities,
 ) -> std::borrow::Cow<'_, ChatCompletionRequest> {
     match request.tool_choice {
         Some(ToolChoice::Function { .. }) => std::borrow::Cow::Borrowed(request),
+        Some(ToolChoice::Value(ToolChoiceValue::None))
+            if request.tools.is_some() && !capabilities.declares_tools_under_tool_choice_none =>
+        {
+            let mut rendered = request.clone();
+            rendered.tools = None;
+            std::borrow::Cow::Owned(rendered)
+        }
         _ => filter_chat_request_by_tool_choice(request),
     }
 }
@@ -535,26 +714,16 @@ pub(crate) fn request_as_rendered(
 ///
 /// Returns the flat prompt only. A renderer that must encode the prompt itself
 /// (Kimi-K3) cannot be honored through this entry point; the gRPC pipeline
-/// uses [`process_chat_messages_with_placeholders`] and encodes what it
-/// returns.
+/// uses `process_chat_messages_with_placeholders` and encodes what it
+/// returns, and a caller outside it takes
+/// [`process_chat_messages_with_encoding`].
 pub fn process_chat_messages(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,
     image_placeholder: Option<&str>,
 ) -> Result<ProcessedMessages, String> {
-    // Bindings call this entry point without the gRPC preparation stage.
-    validate_chat_content_parts(&request.messages)?;
-    let placeholder_tokens = image_placeholder.map(|token| {
-        let mut placeholders = PlaceholderTokens::default();
-        placeholders.insert(Modality::Image, token.to_string());
-        placeholders
-    });
-    let (processed, encoding) = process_chat_messages_with_placeholders(
-        request,
-        tokenizer,
-        placeholder_tokens.as_ref(),
-        MediaPartOrder::MediaFirst,
-    )?;
+    let (processed, encoding) =
+        process_chat_messages_with_encoding(request, tokenizer, image_placeholder)?;
     if matches!(encoding, PromptEncoding::Deferred(_)) {
         static WARNED: OnceLock<()> = OnceLock::new();
         WARNED.get_or_init(|| {
@@ -566,6 +735,30 @@ pub fn process_chat_messages(
         });
     }
     Ok(processed)
+}
+
+/// [`process_chat_messages`] with how the tokenize step must encode the
+/// prompt: [`PromptEncoding::FromText`] for every flat renderer, or the
+/// deferred encode a segment-aware renderer prepared, whose ids are the
+/// prompt the gateway sends.
+pub fn process_chat_messages_with_encoding(
+    request: &ChatCompletionRequest,
+    tokenizer: &dyn Tokenizer,
+    image_placeholder: Option<&str>,
+) -> Result<(ProcessedMessages, PromptEncoding), String> {
+    // Bindings call this entry point without the gRPC preparation stage.
+    validate_chat_content_parts(&request.messages)?;
+    let placeholder_tokens = image_placeholder.map(|token| {
+        let mut placeholders = PlaceholderTokens::default();
+        placeholders.insert(Modality::Image, token.to_string());
+        placeholders
+    });
+    process_chat_messages_with_placeholders(
+        request,
+        tokenizer,
+        placeholder_tokens.as_ref(),
+        MediaPartOrder::MediaFirst,
+    )
 }
 
 /// Render the chat prompt. The second element says how the tokenize step must
@@ -588,9 +781,10 @@ pub(crate) fn process_chat_messages_with_placeholders(
         )?;
 
         // Process tool call arguments in assistant messages. Renderers that
-        // parse `arguments` strings themselves with the reference's tolerance
-        // (DeepSeek-V4.1) get them as written; every other template gets the
-        // parsed object the Transformers docs expect.
+        // parse `arguments` strings themselves with the reference's tolerance,
+        // and templates that write them as the text the request sent, get
+        // them as written; every other template gets the parsed object the
+        // Transformers docs expect.
         if !tokenizer.renderer_capabilities().raw_tool_call_arguments {
             process_tool_call_arguments(&mut transformed_messages)?;
         }
@@ -616,14 +810,10 @@ pub(crate) fn process_chat_messages_with_placeholders(
             Some(&combined_template_kwargs)
         };
 
-        let continues_final_assistant = request.continue_final_message
-            && transformed_messages
-                .last()
-                .and_then(|msg| msg.get("role"))
-                .and_then(|v| v.as_str())
-                == Some("assistant");
+        let continues_final_assistant = request.continues_final_assistant();
         // Renderers that continue a trailing assistant message natively
-        // (DeepSeek-V4.1: rendered without EOS and without a generation
+        // (Jinja templates, cut right after the message as transformers
+        // does; DeepSeek-V4.1: rendered without EOS and without a generation
         // header) keep the message and are called without a generation
         // prompt; other templates get the message popped and its content
         // appended after the generation prompt as a prefix.
@@ -634,6 +824,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
 
         let params = ChatTemplateParams {
             add_generation_prompt: !native_continuation,
+            continue_final_message: native_continuation,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
             // The tokenizer applies the toggle under the template's own key.
@@ -646,17 +837,20 @@ pub(crate) fn process_chat_messages_with_placeholders(
             // Pop the last message to render it as the prefix. A trailing
             // assistant role implies a non-empty list, so the `else` arm is
             // only defensive.
-            let Some(last_msg) = transformed_messages.pop() else {
+            let Some(mut last_msg) = transformed_messages.pop() else {
                 return Ok((
                     ProcessedMessages {
                         text: String::new(),
-                        stop_sequences: request.stop.clone(),
                         unbilled_prompt_tokens: 0,
+                        continued_final_message: false,
                     },
                     PromptEncoding::FromText,
                 ));
             };
-            last_msg.get("content").and_then(prefill_text)
+            last_msg
+                .get_mut("content")
+                .map(Value::take)
+                .and_then(prefill_text)
         } else {
             None
         };
@@ -673,11 +867,12 @@ pub(crate) fn process_chat_messages_with_placeholders(
             .map_err(|e| format!("Failed to apply chat template: {e}"))?
     };
 
+    let text = anchor_rendered_markers(placeholder_tokens, &rendered.encoding, rendered.text);
     Ok((
         ProcessedMessages {
-            text: rendered.text,
-            stop_sequences: request.stop.clone(),
+            text,
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
+            continued_final_message: rendered.continued_final_message,
         },
         rendered.encoding,
     ))
@@ -733,6 +928,24 @@ pub fn create_stop_decoder(
     }
 
     builder.build()
+}
+
+/// With parallel tool calls turned off (`parallel_tool_calls: false`, or
+/// Messages `disable_parallel_tool_use: true`) a response returns only its
+/// first tool call; the calls a model writes after it are dropped.
+pub(crate) fn keep_first_tool_call(calls: &mut Option<Vec<ToolCall>>) {
+    if let Some(calls) = calls.as_mut().filter(|calls| calls.len() > 1) {
+        debug!(
+            dropped = calls.len() - 1,
+            "parallel tool calls are off: returning the first call"
+        );
+        calls.truncate(1);
+    }
+}
+
+/// The streamed form of [`keep_first_tool_call`].
+pub(crate) fn keep_first_tool_call_items(items: &mut Vec<ToolCallItem>) {
+    items.retain(|item| item.tool_index == 0);
 }
 
 /// Parse tool calls from JSON schema constrained response
@@ -816,22 +1029,6 @@ pub(crate) fn parse_json_schema_response(
     }
 }
 
-/// Count the number of tool calls in the request message history
-/// This is used for KimiK2 format which needs globally unique indices
-pub(crate) fn get_history_tool_calls_count(request: &ChatCompletionRequest) -> usize {
-    request
-        .messages
-        .iter()
-        .filter_map(|msg| {
-            if let ChatMessage::Assistant { tool_calls, .. } = msg {
-                tool_calls.as_ref().map(|calls| calls.len())
-            } else {
-                None
-            }
-        })
-        .sum()
-}
-
 /// Generate a tool call ID based on model format
 ///
 /// # Arguments
@@ -900,6 +1097,47 @@ pub(crate) fn generate_tool_call_id_with_profile(
     }
 }
 
+/// The completion API's finish reason from the engine's: a local stop beats
+/// the engine's reason (which is "length" when stop strings are enforced
+/// gateway-side rather than by the backend); the API's words `stop`,
+/// `length` and `content_filter` pass, and so do the engines' own signals
+/// `abort`, `error` and `failed`, which the chat paths pass through too and
+/// clients read as the failure they are; each as a plain word or as a JSON
+/// object's `type`. Anything else (an empty reason, an unmapped type, an
+/// unrecognized word) is `stop`, logged once with the raw value. One table
+/// for the streamed and the non-streamed completion.
+pub(crate) fn completion_finish_reason(local_stop: bool, engine: &str) -> &'static str {
+    if local_stop {
+        return "stop";
+    }
+    let known = |word: &str| -> Option<&'static str> {
+        match word {
+            "stop" => Some("stop"),
+            "length" => Some("length"),
+            "content_filter" => Some("content_filter"),
+            "abort" => Some("abort"),
+            "error" => Some("error"),
+            "failed" => Some("failed"),
+            _ => None,
+        }
+    };
+    if let Some(reason) = known(engine) {
+        return reason;
+    }
+    if let Ok(json) = serde_json::from_str::<Value>(engine) {
+        if let Some(reason) = json.get("type").and_then(Value::as_str).and_then(known) {
+            return reason;
+        }
+    }
+    if !engine.is_empty() {
+        warn!(
+            unexpected_finish_reason = engine,
+            "Unrecognized finish_reason from backend, defaulting to stop"
+        );
+    }
+    "stop"
+}
+
 /// Parse finish_reason string into GenerateFinishReason enum
 ///
 /// Uses serde to deserialize the finish_reason, which handles all tagged variants automatically.
@@ -937,1305 +1175,4 @@ pub(crate) fn parse_finish_reason(
 }
 
 #[cfg(test)]
-mod tests {
-    use llm_tokenizer::chat_template::ChatTemplateContentFormat;
-    use openai_protocol::{
-        chat::{ChatCompletionRequest, ChatMessage, MessageContent},
-        common::{AudioUrl, ContentPart, ImageUrl, InputAudio, VideoUrl},
-    };
-    use serde_json::json;
-
-    use super::*;
-
-    fn placeholders(entries: &[(Modality, &str)]) -> PlaceholderTokens {
-        let mut tokens = PlaceholderTokens::default();
-        for (modality, token) in entries {
-            tokens.insert(*modality, (*token).to_string());
-        }
-        tokens
-    }
-
-    #[test]
-    fn unknown_chat_content_parts_are_rejected_in_every_role() {
-        for role in ["system", "user", "assistant", "tool", "developer"] {
-            let message: ChatMessage = serde_json::from_value(json!({
-                "role": role,
-                "tool_call_id": "call_1",
-                "content": [
-                    {"type": "text", "text": "hello"},
-                    {"type": "vendor_media", "payload": {"id": "media_1"}}
-                ]
-            }))
-            .unwrap();
-            let error = validate_chat_content_parts(&[message]).unwrap_err();
-            assert!(error.contains("vendor_media"), "{role}: {error}");
-            assert!(error.contains("gRPC"), "{role}: {error}");
-        }
-    }
-
-    #[test]
-    fn process_chat_messages_rejects_unknown_content_parts() {
-        let request: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": "test-model",
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": "Describe this attachment"},
-                {"type": "vendor_media", "payload": "media_1"}
-            ]}]
-        }))
-        .unwrap();
-        let tokenizer = llm_tokenizer::MockTokenizer::new();
-        let error = process_chat_messages(&request, &tokenizer, None).unwrap_err();
-        assert!(error.contains("vendor_media"));
-    }
-
-    #[test]
-    fn known_chat_content_parts_are_accepted() {
-        let messages: Vec<ChatMessage> = serde_json::from_value(json!([
-            {"role": "system", "content": "system prompt"},
-            {"role": "user", "content": [
-                {"type": "text", "text": "hello"},
-                {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}},
-                {"type": "audio_url", "audio_url": {"url": "https://example.com/audio.wav"}},
-                {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}},
-                {"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}
-            ]},
-            {"role": "assistant", "content": null},
-            {"role": "function", "name": "lookup", "content": "result"}
-        ]))
-        .unwrap();
-        assert!(validate_chat_content_parts(&messages).is_ok());
-    }
-
-    #[test]
-    fn test_transform_messages_string_format() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "Hello".to_string(),
-                },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "https://example.com/image.jpg".to_string(),
-                        detail: None,
-                        max_long_side_pixel: None,
-                    },
-                },
-                ContentPart::Text {
-                    text: "World".to_string(),
-                },
-            ]),
-            name: None,
-        }];
-
-        let tokens = placeholders(&[(Modality::Image, "<|image|>")]);
-        let result =
-            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
-                .unwrap();
-
-        assert_eq!(result.len(), 1);
-        let transformed_message = &result[0];
-
-        // Media is hoisted and uses the modality-specific placeholder.
-        assert_eq!(
-            transformed_message["content"].as_str().unwrap(),
-            "<|image|>\nHello\nWorld"
-        );
-        assert_eq!(transformed_message["role"].as_str().unwrap(), "user");
-    }
-
-    #[test]
-    fn test_transform_messages_string_format_without_placeholders_omits_media() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "Describe this".to_string(),
-                },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "https://example.com/image.png".to_string(),
-                        detail: None,
-                        max_long_side_pixel: None,
-                    },
-                },
-            ]),
-            name: None,
-        }];
-
-        let result =
-            process_content_format(&messages, ChatTemplateContentFormat::String, None).unwrap();
-
-        assert_eq!(result[0]["content"], "Describe this");
-    }
-
-    #[test]
-    fn test_transform_messages_string_format_with_video_placeholder() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "Watch this".to_string(),
-                },
-                ContentPart::VideoUrl {
-                    video_url: VideoUrl {
-                        url: "https://example.com/video.mp4".to_string(),
-                        fps: None,
-                        max_long_side_pixel: None,
-                    },
-                },
-            ]),
-            name: None,
-        }];
-
-        let tokens = placeholders(&[(Modality::Video, "<|video|>")]);
-        let result =
-            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
-                .unwrap();
-
-        // Media placeholder is emitted before the text (vLLM front placement).
-        assert_eq!(
-            result[0]["content"].as_str().unwrap(),
-            "<|video|>\nWatch this"
-        );
-    }
-
-    #[test]
-    fn test_transform_messages_string_format_uses_per_modality_placeholders() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "Describe and transcribe".to_string(),
-                },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "image".to_string(),
-                        detail: None,
-                        max_long_side_pixel: None,
-                    },
-                },
-                ContentPart::AudioUrl {
-                    audio_url: AudioUrl {
-                        url: "audio".to_string(),
-                    },
-                },
-            ]),
-            name: None,
-        }];
-        let tokens = placeholders(&[(Modality::Image, "<image>"), (Modality::Audio, "<audio>")]);
-
-        let result =
-            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
-                .unwrap();
-
-        assert_eq!(
-            result[0]["content"],
-            "<image>\n<audio>\nDescribe and transcribe"
-        );
-
-        let openai =
-            process_content_format(&messages, ChatTemplateContentFormat::OpenAI, Some(&tokens))
-                .unwrap();
-        assert_eq!(
-            openai[0]["content"],
-            json!([
-                {"type": "image"},
-                {"type": "audio"},
-                {"type": "text", "text": "Describe and transcribe"}
-            ])
-        );
-    }
-
-    #[test]
-    fn test_transform_messages_input_audio_uses_audio_placeholder() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "Transcribe this".to_string(),
-                },
-                ContentPart::InputAudio {
-                    input_audio: InputAudio {
-                        data: "UklGRg==".to_string(),
-                        format: "wav".to_string(),
-                    },
-                },
-            ]),
-            name: None,
-        }];
-        let tokens = placeholders(&[(Modality::Audio, "<audio>")]);
-
-        let string =
-            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
-                .unwrap();
-        assert_eq!(string[0]["content"], "<audio>\nTranscribe this");
-
-        let openai =
-            process_content_format(&messages, ChatTemplateContentFormat::OpenAI, Some(&tokens))
-                .unwrap();
-        assert_eq!(
-            openai[0]["content"],
-            json!([
-                {"type": "audio"},
-                {"type": "text", "text": "Transcribe this"}
-            ])
-        );
-    }
-
-    #[test]
-    fn test_transform_messages_string_format_rejects_missing_modality_placeholder() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![ContentPart::AudioUrl {
-                audio_url: AudioUrl {
-                    url: "audio".to_string(),
-                },
-            }]),
-            name: None,
-        }];
-        let tokens = placeholders(&[(Modality::Image, "<image>")]);
-
-        let error =
-            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
-                .unwrap_err();
-
-        assert!(error.contains("missing audio placeholder"));
-    }
-
-    #[test]
-    fn test_transform_messages_openai_format() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "Describe this image:".to_string(),
-                },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "https://example.com/image.jpg".to_string(),
-                        detail: Some("high".to_string()),
-                        max_long_side_pixel: None,
-                    },
-                },
-            ]),
-            name: None,
-        }];
-
-        let result =
-            process_content_format(&messages, ChatTemplateContentFormat::OpenAI, None).unwrap();
-
-        assert_eq!(result.len(), 1);
-        let transformed_message = &result[0];
-
-        // Media URLs replaced with simple type placeholders, and the image is
-        // hoisted before the text (vLLM front placement; image-after-question
-        // degrades VQA accuracy).
-        let content_array = transformed_message["content"].as_array().unwrap();
-        assert_eq!(content_array.len(), 2);
-
-        // Image part comes first now.
-        assert_eq!(content_array[0], json!({"type": "image"}));
-
-        // Text part follows, unchanged.
-        assert_eq!(content_array[1]["type"], "text");
-        assert_eq!(content_array[1]["text"], "Describe this image:");
-    }
-
-    #[test]
-    fn test_transform_messages_simple_string_content() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Text("Simple text message".to_string()),
-            name: None,
-        }];
-
-        let tokens = placeholders(&[(Modality::Image, "<|image|>")]);
-        let result =
-            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
-                .unwrap();
-
-        assert_eq!(result.len(), 1);
-        let transformed_message = &result[0];
-
-        // Simple string content should remain unchanged
-        assert_eq!(
-            transformed_message["content"].as_str().unwrap(),
-            "Simple text message"
-        );
-    }
-
-    #[test]
-    fn test_transform_messages_multiple_messages() {
-        let messages = vec![
-            ChatMessage::System {
-                ext: Default::default(),
-                content: MessageContent::Text("System prompt".to_string()),
-                name: None,
-            },
-            ChatMessage::User {
-                ext: Default::default(),
-                content: MessageContent::Parts(vec![
-                    ContentPart::Text {
-                        text: "User message".to_string(),
-                    },
-                    ContentPart::ImageUrl {
-                        image_url: ImageUrl {
-                            url: "https://example.com/image.jpg".to_string(),
-                            detail: None,
-                            max_long_side_pixel: None,
-                        },
-                    },
-                ]),
-                name: None,
-            },
-        ];
-
-        let tokens = placeholders(&[(Modality::Image, "<|image|>")]);
-        let result =
-            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
-                .unwrap();
-
-        assert_eq!(result.len(), 2);
-
-        // System message should remain unchanged
-        assert_eq!(result[0]["role"].as_str().unwrap(), "system");
-        assert_eq!(result[0]["content"].as_str().unwrap(), "System prompt");
-
-        // User message retains the media anchor.
-        assert_eq!(result[1]["role"].as_str().unwrap(), "user");
-        assert_eq!(
-            result[1]["content"].as_str().unwrap(),
-            "<|image|>\nUser message"
-        );
-    }
-
-    #[test]
-    fn test_transform_messages_empty_text_parts() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![ContentPart::ImageUrl {
-                image_url: ImageUrl {
-                    url: "https://example.com/image.jpg".to_string(),
-                    detail: None,
-                    max_long_side_pixel: None,
-                },
-            }]),
-            name: None,
-        }];
-
-        let tokens = placeholders(&[(Modality::Image, "<|image|>")]);
-        let result =
-            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
-                .unwrap();
-
-        assert_eq!(result.len(), 1);
-        let transformed_message = &result[0];
-
-        assert_eq!(transformed_message["content"], "<|image|>");
-    }
-
-    #[test]
-    fn test_transform_messages_mixed_content_types() {
-        let messages = vec![
-            ChatMessage::User {
-                ext: Default::default(),
-                content: MessageContent::Text("Plain text".to_string()),
-                name: None,
-            },
-            ChatMessage::User {
-                ext: Default::default(),
-                content: MessageContent::Parts(vec![
-                    ContentPart::Text {
-                        text: "With image".to_string(),
-                    },
-                    ContentPart::ImageUrl {
-                        image_url: ImageUrl {
-                            url: "https://example.com/image.jpg".to_string(),
-                            detail: Some("low".to_string()),
-                            max_long_side_pixel: None,
-                        },
-                    },
-                ]),
-                name: None,
-            },
-        ];
-
-        let tokens = placeholders(&[(Modality::Image, "<|image|>")]);
-        let result_string =
-            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
-                .unwrap();
-
-        assert_eq!(result_string.len(), 2);
-        assert_eq!(result_string[0]["content"].as_str().unwrap(), "Plain text");
-        assert_eq!(
-            result_string[1]["content"].as_str().unwrap(),
-            "<|image|>\nWith image"
-        );
-
-        let result_openai =
-            process_content_format(&messages, ChatTemplateContentFormat::OpenAI, None).unwrap();
-
-        assert_eq!(result_openai.len(), 2);
-        assert_eq!(result_openai[0]["content"].as_str().unwrap(), "Plain text");
-
-        let content_array = result_openai[1]["content"].as_array().unwrap();
-        assert_eq!(content_array.len(), 2);
-        // Image hoisted before text.
-        assert_eq!(content_array[0], json!({"type": "image"}));
-        assert_eq!(content_array[1]["type"], "text");
-    }
-
-    #[test]
-    fn test_media_hoisted_before_text_openai() {
-        // Real MMBench shape: [question text, image] must render image-first.
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "Question: ...\nAnswer with only the option letter.".to_string(),
-                },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "data:image/jpeg;base64,XXX".to_string(),
-                        detail: None,
-                        max_long_side_pixel: None,
-                    },
-                },
-            ]),
-            name: None,
-        }];
-
-        let result =
-            process_content_format(&messages, ChatTemplateContentFormat::OpenAI, None).unwrap();
-        let arr = result[0]["content"].as_array().unwrap();
-        assert_eq!(arr[0], json!({"type": "image"}));
-        assert_eq!(arr[1]["type"], "text");
-    }
-
-    #[test]
-    fn test_media_hoisted_before_text_string() {
-        // String-format template: placeholder prepended, matching vLLM exactly.
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "Question?".to_string(),
-                },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "data:image/jpeg;base64,XXX".to_string(),
-                        detail: None,
-                        max_long_side_pixel: None,
-                    },
-                },
-            ]),
-            name: None,
-        }];
-
-        let tokens = placeholders(&[(Modality::Image, "<|image_pad|>")]);
-        let result =
-            process_content_format(&messages, ChatTemplateContentFormat::String, Some(&tokens))
-                .unwrap();
-        assert_eq!(
-            result[0]["content"].as_str().unwrap(),
-            "<|image_pad|>\nQuestion?"
-        );
-    }
-
-    #[test]
-    fn test_media_first_stable_and_multi() {
-        // Multiple media + text keep relative order within each group, media first.
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "a".to_string(),
-                },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "i1".to_string(),
-                        detail: None,
-                        max_long_side_pixel: None,
-                    },
-                },
-                ContentPart::Text {
-                    text: "b".to_string(),
-                },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "i2".to_string(),
-                        detail: None,
-                        max_long_side_pixel: None,
-                    },
-                },
-            ]),
-            name: None,
-        }];
-
-        let result =
-            process_content_format(&messages, ChatTemplateContentFormat::OpenAI, None).unwrap();
-        let arr = result[0]["content"].as_array().unwrap();
-        assert_eq!(arr[0], json!({"type": "image"}));
-        assert_eq!(arr[1], json!({"type": "image"}));
-        assert_eq!(arr[2]["text"], "a");
-        assert_eq!(arr[3]["text"], "b");
-    }
-
-    #[test]
-    fn test_tml_preserves_authored_multipart_order_openai() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "question".to_string(),
-                },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "image".to_string(),
-                        detail: None,
-                        max_long_side_pixel: None,
-                    },
-                },
-            ]),
-            name: None,
-        }];
-
-        let expected = json!([
-            {"type": "text", "text": "question"},
-            {"type": "image"}
-        ]);
-        let result = process_content_format_with_order(
-            &messages,
-            ChatTemplateContentFormat::OpenAI,
-            None,
-            MediaPartOrder::Authored,
-        )
-        .unwrap();
-        assert_eq!(result[0]["content"], expected);
-    }
-
-    #[test]
-    fn test_absent_assistant_content_renders_null() {
-        let messages = vec![ChatMessage::Assistant {
-            ext: Default::default(),
-            content: None,
-            name: None,
-            tool_calls: None,
-            reasoning_content: None,
-        }];
-
-        let result = process_content_format_with_order(
-            &messages,
-            ChatTemplateContentFormat::OpenAI,
-            None,
-            MediaPartOrder::MediaFirst,
-        )
-        .unwrap();
-        assert!(result[0]["content"].is_null());
-    }
-
-    #[test]
-    fn test_tml_preserves_authored_multipart_order_string() {
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "question".to_string(),
-                },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "image".to_string(),
-                        detail: None,
-                        max_long_side_pixel: None,
-                    },
-                },
-            ]),
-            name: None,
-        }];
-        let tokens = placeholders(&[(Modality::Image, "<image>")]);
-
-        let result = process_content_format_with_order(
-            &messages,
-            ChatTemplateContentFormat::String,
-            Some(&tokens),
-            MediaPartOrder::Authored,
-        )
-        .unwrap();
-
-        assert_eq!(result[0]["content"], "question\n<image>");
-    }
-
-    /// A named `tool_choice` renders every tool (the engine's own server
-    /// renders them all and forces the call with its grammar), while the
-    /// constraint still targets the named tool; an `allowed_tools` subset
-    /// still narrows the rendered list.
-    #[test]
-    fn a_named_tool_choice_renders_every_tool() {
-        let request = |tool_choice: Value| -> ChatCompletionRequest {
-            serde_json::from_value(json!({
-                "model": "m",
-                "messages": [{"role": "user", "content": "q"}],
-                "tools": [
-                    {"type": "function", "function": {"name": "get_weather", "parameters": {"type": "object", "properties": {}}}},
-                    {"type": "function", "function": {"name": "get_time", "parameters": {"type": "object", "properties": {}}}}
-                ],
-                "tool_choice": tool_choice,
-            }))
-            .expect("chat request")
-        };
-        let names = |request: &ChatCompletionRequest| -> Vec<String> {
-            request
-                .tools
-                .iter()
-                .flatten()
-                .map(|tool| tool.function.name.clone())
-                .collect()
-        };
-
-        let named = request(json!({"type": "function", "function": {"name": "get_weather"}}));
-        assert_eq!(
-            names(&request_as_rendered(&named)),
-            ["get_weather", "get_time"]
-        );
-        assert_eq!(
-            named
-                .callable_tools()
-                .iter()
-                .map(|tool| tool.function.name.as_str())
-                .collect::<Vec<_>>(),
-            ["get_weather"]
-        );
-
-        let allowed = request(json!({
-            "type": "allowed_tools", "mode": "auto",
-            "tools": [{"type": "function", "name": "get_time"}]
-        }));
-        assert_eq!(names(&request_as_rendered(&allowed)), ["get_time"]);
-
-        let auto = request(json!("auto"));
-        assert_eq!(
-            names(&request_as_rendered(&auto)),
-            ["get_weather", "get_time"]
-        );
-    }
-
-    fn effort_request(reasoning_effort: Option<&str>) -> ChatCompletionRequest {
-        ChatCompletionRequest {
-            model: "inkling-chat".to_string(),
-            messages: vec![ChatMessage::User {
-                ext: Default::default(),
-                content: MessageContent::Text("hello".to_string()),
-                name: None,
-            }],
-            reasoning_effort: reasoning_effort.map(str::to_string),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn reasoning_effort_is_forwarded_verbatim() {
-        // The chat template owns level->value mapping, defaulting, and validation;
-        // the router forwards the string and omits it when absent so the template
-        // applies its own default.
-        let kwargs = build_chat_template_kwargs(&effort_request(Some("high")));
-        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("high")));
-
-        let kwargs = build_chat_template_kwargs(&effort_request(None));
-        assert!(!kwargs.contains_key(REASONING_EFFORT_KEY));
-    }
-
-    /// The request-level `reasoning_effort` is written over a
-    /// `chat_template_kwargs` entry, as the engine's own server renders it;
-    /// the other entries pass through, and the entry stands when the request
-    /// carries no field.
-    #[test]
-    fn top_level_effort_overrides_a_chat_template_kwargs_entry() {
-        let mut request = effort_request(Some("high"));
-        request.chat_template_kwargs = Some(HashMap::from([
-            (REASONING_EFFORT_KEY.to_string(), json!("low")),
-            ("custom".to_string(), json!(true)),
-        ]));
-        let kwargs = build_chat_template_kwargs(&request);
-        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("high")));
-        assert_eq!(kwargs.get("custom"), Some(&Value::Bool(true)));
-
-        let mut request = effort_request(None);
-        request.chat_template_kwargs = Some(HashMap::from([(
-            REASONING_EFFORT_KEY.to_string(),
-            json!("low"),
-        )]));
-        let kwargs = build_chat_template_kwargs(&request);
-        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
-    }
-
-    fn thinking_request(thinking: Value, reasoning_effort: Option<&str>) -> ChatCompletionRequest {
-        let mut request = effort_request(reasoning_effort);
-        request.thinking = Some(serde_json::from_value(thinking).expect("thinking param"));
-        request
-    }
-
-    #[test]
-    fn thinking_effort_overrides_top_level_effort_in_kwargs() {
-        // KVV test_reasoning_effort_ignored_when_effort_present: effort=low beats max.
-        let request = thinking_request(json!({"type": "enabled", "effort": "low"}), Some("max"));
-        let kwargs = build_chat_template_kwargs(&request);
-        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
-
-        // Absent `thinking.effort`, the top-level field still applies.
-        let request = thinking_request(json!({"type": "enabled"}), Some("max"));
-        let kwargs = build_chat_template_kwargs(&request);
-        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("max")));
-
-        // The request-level effort outranks an explicit chat_template_kwargs entry too.
-        let mut request = thinking_request(json!({"effort": "low"}), Some("max"));
-        request.chat_template_kwargs = Some(HashMap::from([(
-            REASONING_EFFORT_KEY.to_string(),
-            json!("high"),
-        )]));
-        let kwargs = build_chat_template_kwargs(&request);
-        assert_eq!(kwargs.get(REASONING_EFFORT_KEY), Some(&json!("low")));
-    }
-
-    #[test]
-    fn thinking_disabled_projects_params_thinking_false() {
-        let request = thinking_request(json!({"type": "disabled"}), Some("high"));
-        assert_eq!(resolve_template_thinking(&request), Some(false));
-        // `adaptive` and an omitted `type` leave the template default in charge.
-        for thinking in [json!({"type": "adaptive"}), json!({"keep": "all"})] {
-            assert_eq!(
-                resolve_template_thinking(&thinking_request(thinking, None)),
-                None
-            );
-        }
-        assert_eq!(resolve_template_thinking(&effort_request(None)), None);
-        assert_eq!(
-            resolve_template_thinking(&effort_request(Some("none"))),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn thinking_enabled_beats_reasoning_effort_none() {
-        let request = thinking_request(json!({"type": "enabled"}), Some("none"));
-        assert_eq!(resolve_template_thinking(&request), Some(true));
-        // A `none` inside `thinking.effort` is the switch too when no type is given.
-        let request = thinking_request(json!({"effort": "none"}), Some("high"));
-        assert_eq!(resolve_template_thinking(&request), Some(false));
-    }
-
-    #[test]
-    fn tool_and_output_controls_are_forwarded_to_renderer() {
-        let request: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": "kimi-k3",
-            "messages": [{"role": "user", "content": "hello"}],
-            "tool_choice": "required",
-            "response_format": {"type": "json_object"}
-        }))
-        .unwrap();
-        let kwargs = build_chat_template_kwargs(&request);
-        assert_eq!(kwargs.get(TOOL_CHOICE_KEY), Some(&json!("required")));
-        assert_eq!(
-            kwargs.get(RESPONSE_FORMAT_KEY),
-            Some(&json!({"type": "json_object"}))
-        );
-
-        // Absent both, neither key is forwarded.
-        let bare: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": "kimi-k3",
-            "messages": [{"role": "user", "content": "hello"}]
-        }))
-        .unwrap();
-        let kwargs = build_chat_template_kwargs(&bare);
-        assert!(!kwargs.contains_key(TOOL_CHOICE_KEY));
-        assert!(!kwargs.contains_key(RESPONSE_FORMAT_KEY));
-    }
-
-    /// End-to-end: run a real MMBench-shaped `[text, image]` message through the
-    /// full SMG pipeline (`process_content_format` + the actual model chat
-    /// template) and assert the rendered prompt places the image BEFORE the
-    /// question. Proves the fix end-to-end without needing the GPU worker.
-    /// Ignored by default (needs the real template); run with:
-    ///   QWEN35_CHAT_TEMPLATE=/path/chat_template.jinja cargo test -p smg \
-    ///     render_image_before_question -- --ignored --nocapture
-    #[test]
-    #[ignore = "needs real chat_template.jinja via QWEN35_CHAT_TEMPLATE"]
-    fn test_render_image_before_question_real_template() {
-        use llm_tokenizer::chat_template::{
-            detect_chat_template_content_format, ChatTemplateParams, ChatTemplateProcessor,
-        };
-
-        let Ok(path) = std::env::var("QWEN35_CHAT_TEMPLATE") else {
-            return; // skip when not provided
-        };
-        let template = std::fs::read_to_string(&path).expect("read template");
-        let format = detect_chat_template_content_format(&template);
-
-        let messages = vec![ChatMessage::User {
-            ext: Default::default(),
-            content: MessageContent::Parts(vec![
-                ContentPart::Text {
-                    text: "Question: Which description is correct?\n\
-                           Answer with only the option letter (A/B/C/D)."
-                        .to_string(),
-                },
-                ContentPart::ImageUrl {
-                    image_url: ImageUrl {
-                        url: "data:image/jpeg;base64,XXX".to_string(),
-                        detail: None,
-                        max_long_side_pixel: None,
-                    },
-                },
-            ]),
-            name: None,
-        }];
-
-        let tokens = placeholders(&[(Modality::Image, "<|image_pad|>")]);
-        let transformed = process_content_format(&messages, format, Some(&tokens)).unwrap();
-
-        let mut kwargs = HashMap::new();
-        kwargs.insert("enable_thinking".to_string(), json!(false));
-        let params = ChatTemplateParams {
-            add_generation_prompt: true,
-            template_kwargs: Some(&kwargs),
-            ..Default::default()
-        };
-        let rendered = ChatTemplateProcessor::new(template)
-            .unwrap()
-            .apply_chat_template(&transformed, params)
-            .unwrap();
-
-        let vstart = rendered
-            .find("<|vision_start|>")
-            .expect("rendered prompt has <|vision_start|>");
-        let qpos = rendered
-            .find("Question:")
-            .expect("rendered prompt has the question");
-        assert!(
-            vstart < qpos,
-            "image must precede the question (vstart={vstart}, qpos={qpos}).\n--- rendered ---\n{rendered}"
-        );
-    }
-
-    #[test]
-    fn test_generate_tool_call_id_kimi_k3_opaque_format() {
-        // K3: `{name}_{history + index}` — no `functions.` prefix, `_` (not K2's
-        // `:`) as the separator, and a history offset that keeps ids unique
-        // across turns.
-        assert_eq!(
-            generate_tool_call_id("moonshotai/Kimi-K3", "get_weather", 0, 0),
-            "get_weather_0"
-        );
-        assert_eq!(
-            generate_tool_call_id("kimi_k3", "get_weather", 1, 5),
-            "get_weather_6"
-        );
-    }
-
-    #[test]
-    fn test_generate_tool_call_id_kimi_k3_continues_across_turns() {
-        // A first turn emitting three parallel calls yields 0,1,2; the next
-        // turn's three calls continue at 3,4,5 instead of colliding with them.
-        // K3 matches tool results back to calls by opaque id equality, so a
-        // repeated id would be ambiguous to any caller correlating by id.
-        let first: Vec<String> = (0..3)
-            .map(|i| generate_tool_call_id("Kimi-K3", "get_weather", i, 0))
-            .collect();
-        let second: Vec<String> = (0..3)
-            .map(|i| generate_tool_call_id("Kimi-K3", "get_weather", i, 3))
-            .collect();
-
-        assert_eq!(first, ["get_weather_0", "get_weather_1", "get_weather_2"]);
-        assert_eq!(second, ["get_weather_3", "get_weather_4", "get_weather_5"]);
-        assert!(
-            first.iter().all(|id| !second.contains(id)),
-            "ids must not repeat across turns: {first:?} vs {second:?}"
-        );
-    }
-
-    #[test]
-    fn test_generate_tool_call_id_kimi_k2_unchanged() {
-        // K2 keeps the globally unique `functions.{name}:{history + index}` form.
-        assert_eq!(
-            generate_tool_call_id("moonshotai/Kimi-K2-Instruct", "get_weather", 0, 0),
-            "functions.get_weather:0"
-        );
-        assert_eq!(
-            generate_tool_call_id("Kimi-K2", "get_weather", 1, 2),
-            "functions.get_weather:3"
-        );
-    }
-
-    #[test]
-    fn test_generate_tool_call_id_non_kimi_uses_uuid() {
-        let id = generate_tool_call_id("gpt-4o", "get_weather", 0, 0);
-        assert!(id.starts_with("call_"), "got: {id}");
-        assert!(!id.contains("get_weather"), "got: {id}");
-    }
-
-    // --- render -> encode contract -------------------------------------------
-
-    fn prefill_request() -> ChatCompletionRequest {
-        serde_json::from_value(json!({
-            "model": "m",
-            "continue_final_message": true,
-            "messages": [
-                {"role": "user", "content": "Hello"},
-                {"role": "assistant", "content": "Sure"}
-            ]
-        }))
-        .unwrap()
-    }
-
-    fn block_on<F: std::future::Future>(future: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(future)
-    }
-
-    #[test]
-    fn flat_renderer_joins_the_prefill_and_reports_from_text() {
-        let tokenizer = llm_tokenizer::MockTokenizer::new();
-        let (processed, encoding) = process_chat_messages_with_placeholders(
-            &prefill_request(),
-            &tokenizer,
-            None,
-            MediaPartOrder::MediaFirst,
-        )
-        .unwrap();
-        assert_eq!(processed.text, "user: Hello\nassistant: Sure");
-        assert!(matches!(encoding, PromptEncoding::FromText));
-
-        // The tokenize step encodes the text exactly as before.
-        let tokenizer: Arc<dyn Tokenizer> = Arc::new(tokenizer);
-        let ids = block_on(encode_prompt_blocking(
-            tokenizer.clone(),
-            &processed.text,
-            encoding,
-        ))
-        .unwrap();
-        assert_eq!(
-            ids.token_ids(),
-            tokenizer
-                .encode(&processed.text, false)
-                .unwrap()
-                .token_ids()
-        );
-    }
-
-    // --- renderer-capability gates on the render path ------------------------
-
-    /// Render `request` through a mock that declares `capabilities` and
-    /// hands back the message list it received as JSON, so both gates are
-    /// observable without a checkpoint: which messages reach the template,
-    /// whether a generation prompt was requested, and whether tool-call
-    /// `arguments` arrive as written.
-    fn render_with(
-        capabilities: llm_tokenizer::traits::RendererCapabilities,
-        request: &ChatCompletionRequest,
-    ) -> Value {
-        let tokenizer = llm_tokenizer::MockTokenizer::new()
-            .with_renderer_capabilities(capabilities)
-            .with_json_chat_template();
-        let (processed, _) = process_chat_messages_with_placeholders(
-            request,
-            &tokenizer,
-            None,
-            MediaPartOrder::MediaFirst,
-        )
-        .unwrap();
-        // The default `apply_chat_template_with_encoding` appends the
-        // assistant prefix after the rendered text, so a prefill that was
-        // popped shows up as a suffix on the JSON document.
-        let split = processed.text.rfind('}').unwrap() + 1;
-        let (rendered, suffix) = processed.text.split_at(split);
-        let mut value: Value = serde_json::from_str(rendered).unwrap();
-        value["assistant_prefix"] = json!(suffix);
-        value
-    }
-
-    const NATIVE_CONTINUATION: llm_tokenizer::traits::RendererCapabilities =
-        llm_tokenizer::traits::RendererCapabilities {
-            enable_thinking_alias: false,
-            native_assistant_continuation: true,
-            raw_tool_call_arguments: false,
-        };
-    const RAW_ARGUMENTS: llm_tokenizer::traits::RendererCapabilities =
-        llm_tokenizer::traits::RendererCapabilities {
-            enable_thinking_alias: false,
-            native_assistant_continuation: false,
-            raw_tool_call_arguments: true,
-        };
-
-    /// Without the capability the trailing assistant message is popped and its
-    /// content is appended after a generation prompt; with it the message
-    /// stays in the list and no generation prompt is requested (the renderer
-    /// continues the turn itself).
-    #[test]
-    fn native_continuation_keeps_the_trailing_assistant_message_instead_of_prefixing_it() {
-        let request = prefill_request();
-
-        let default = render_with(Default::default(), &request);
-        assert_eq!(default["messages"].as_array().unwrap().len(), 1);
-        assert_eq!(default["messages"][0]["role"], "user");
-        assert_eq!(default["add_generation_prompt"], json!(true));
-        assert_eq!(default["assistant_prefix"], json!("Sure"));
-
-        let native = render_with(NATIVE_CONTINUATION, &request);
-        assert_eq!(native["messages"].as_array().unwrap().len(), 2);
-        assert_eq!(native["messages"][1]["role"], "assistant");
-        assert_eq!(native["messages"][1]["content"], "Sure");
-        assert_eq!(native["add_generation_prompt"], json!(false));
-        assert_eq!(native["assistant_prefix"], json!(""));
-    }
-
-    /// Under the OpenAI content format the popped assistant message keeps its
-    /// parts, so the prefill is their text.
-    #[test]
-    fn parts_valued_prefill_reaches_the_render_call_under_openai_content_format() {
-        let request: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": "m",
-            "continue_final_message": true,
-            "messages": [
-                {"role": "user", "content": "Hello"},
-                {"role": "assistant", "content": [
-                    {"type": "text", "text": "Sure"},
-                    {"type": "text", "text": "!"}
-                ]}
-            ]
-        }))
-        .unwrap();
-        let tokenizer = llm_tokenizer::MockTokenizer::new()
-            .with_content_format(ChatTemplateContentFormat::OpenAI)
-            .with_json_chat_template();
-        let (processed, _) = process_chat_messages_with_placeholders(
-            &request,
-            &tokenizer,
-            None,
-            MediaPartOrder::MediaFirst,
-        )
-        .unwrap();
-        let (rendered, prefix) = processed
-            .text
-            .split_at(processed.text.rfind('}').unwrap() + 1);
-        let rendered: Value = serde_json::from_str(rendered).unwrap();
-        assert_eq!(rendered["messages"].as_array().unwrap().len(), 1);
-        assert_eq!(rendered["add_generation_prompt"], json!(true));
-        assert_eq!(prefix, "Sure!");
-    }
-
-    /// A tool definition carries whatever the client wrote beyond name,
-    /// description, parameters and strict (the `response` schema of a BFCL
-    /// tool); the template renders the tool object as given, so the typed
-    /// request hands it on whole and in the client's order.
-    #[test]
-    fn tool_fields_beyond_the_schema_reach_the_template_in_order() {
-        let function = json!({
-            "name": "authenticate",
-            "description": "Authenticate a user.",
-            "parameters": {"type": "object", "properties": {"user": {"type": "string"}}},
-            "response": {"type": "dict", "properties": {"ok": {"type": "boolean"}}}
-        });
-        let request: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": "m",
-            "messages": [{"role": "user", "content": "Log me in"}],
-            "tools": [{"type": "function", "function": function.clone()}]
-        }))
-        .unwrap();
-
-        let rendered = render_with(Default::default(), &request);
-        assert_eq!(
-            rendered["tools"][0]["function"].to_string(),
-            function.to_string()
-        );
-    }
-
-    /// Without the capability a tool call's `arguments` string is parsed into
-    /// an object before rendering (what Transformers templates expect); with
-    /// it the string reaches the renderer as written, so a native renderer can
-    /// apply the reference's own tolerance.
-    #[test]
-    fn raw_tool_call_arguments_reach_the_renderer_as_written() {
-        let request: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": "m",
-            "messages": [
-                {"role": "user", "content": "Hello"},
-                {
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {"name": "f", "arguments": "{\"city\": \"Hangzhou\"}"}
-                    }]
-                },
-                {"role": "tool", "tool_call_id": "call_1", "content": "ok"}
-            ]
-        }))
-        .unwrap();
-
-        let parsed = render_with(Default::default(), &request);
-        assert_eq!(
-            parsed["messages"][1]["tool_calls"][0]["function"]["arguments"],
-            json!({"city": "Hangzhou"})
-        );
-
-        let raw = render_with(RAW_ARGUMENTS, &request);
-        assert_eq!(
-            raw["messages"][1]["tool_calls"][0]["function"]["arguments"],
-            json!("{\"city\": \"Hangzhou\"}")
-        );
-    }
-
-    /// A renderer that parses `arguments` itself (K3) gets a malformed history
-    /// string as written and applies its own tolerance; Transformers templates
-    /// keep the 400.
-    #[test]
-    fn malformed_tool_call_arguments_are_forwarded_when_the_renderer_parses_them() {
-        let request: ChatCompletionRequest = serde_json::from_value(json!({
-            "model": "m",
-            "messages": [
-                {"role": "user", "content": "北京天气"},
-                {
-                    "role": "assistant",
-                    "content": null,
-                    "tool_calls": [{
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {"name": "get_weather", "arguments": "{\"location\":\"北京\""}
-                    }]
-                },
-                {"role": "tool", "tool_call_id": "call_1", "content": "晴"}
-            ]
-        }))
-        .unwrap();
-
-        let err = process_chat_messages_with_placeholders(
-            &request,
-            &llm_tokenizer::MockTokenizer::new(),
-            None,
-            MediaPartOrder::MediaFirst,
-        )
-        .unwrap_err();
-        assert!(err.contains("Failed to parse tool call arguments"), "{err}");
-
-        let raw = render_with(RAW_ARGUMENTS, &request);
-        assert_eq!(
-            raw["messages"][1]["tool_calls"][0]["function"]["arguments"],
-            json!("{\"location\":\"北京\"")
-        );
-    }
-
-    #[test]
-    fn deferred_renderer_gets_the_prefill_and_its_job_runs_in_the_tokenize_step() {
-        let tokenizer = llm_tokenizer::MockTokenizer::new()
-            .with_deferred_chat_ids(vec![7, 8, 9])
-            .with_unbilled_prompt_tokens(3);
-        let (processed, encoding) = process_chat_messages_with_placeholders(
-            &prefill_request(),
-            &tokenizer,
-            None,
-            MediaPartOrder::MediaFirst,
-        )
-        .unwrap();
-        assert_eq!(
-            processed.text, "user: Hello\nassistant: Sure",
-            "the prefill is passed into the render call"
-        );
-        assert!(matches!(encoding, PromptEncoding::Deferred(_)));
-        assert_eq!(
-            processed.unbilled_prompt_tokens, 3,
-            "the renderer's unbilled count rides along"
-        );
-        let (flat, _) = process_chat_messages_with_placeholders(
-            &prefill_request(),
-            &llm_tokenizer::MockTokenizer::new(),
-            None,
-            MediaPartOrder::MediaFirst,
-        )
-        .unwrap();
-        assert_eq!(flat.unbilled_prompt_tokens, 0);
-
-        let tokenizer: Arc<dyn Tokenizer> = Arc::new(tokenizer);
-        let ids = block_on(encode_prompt_blocking(tokenizer, &processed.text, encoding)).unwrap();
-        assert_eq!(ids.token_ids(), &[7, 8, 9]);
-    }
-
-    #[test]
-    fn deferred_encode_takes_the_offload_path_for_large_prompts() {
-        use std::{
-            sync::Mutex,
-            thread::{self, ThreadId},
-        };
-        // The job records the thread it ran on. `block_on` polls on this
-        // thread, so an offloaded job runs somewhere else.
-        let ran_on: Arc<Mutex<Option<ThreadId>>> = Arc::new(Mutex::new(None));
-        let probe = {
-            let ran_on = ran_on.clone();
-            move || *ran_on.lock().unwrap() = Some(thread::current().id())
-        };
-        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
-            llm_tokenizer::MockTokenizer::new()
-                .with_deferred_chat_ids(vec![1, 2])
-                .with_deferred_chat_probe(probe),
-        );
-        let render = |content: &str| {
-            let request: ChatCompletionRequest = serde_json::from_value(json!({
-                "model": "m",
-                "messages": [{"role": "user", "content": content}]
-            }))
-            .unwrap();
-            process_chat_messages_with_placeholders(
-                &request,
-                &*tokenizer,
-                None,
-                MediaPartOrder::MediaFirst,
-            )
-            .unwrap()
-        };
-        let encode = |text: &str, encoding: PromptEncoding| {
-            block_on(encode_prompt_blocking(tokenizer.clone(), text, encoding)).unwrap()
-        };
-
-        let (processed, encoding) = render(&"x".repeat(ENCODE_OFFLOAD_MIN_BYTES * 4));
-        assert!(processed.text.len() >= ENCODE_OFFLOAD_MIN_BYTES);
-        assert_eq!(encode(&processed.text, encoding).token_ids(), &[1, 2]);
-        let offloaded = ran_on.lock().unwrap().take().expect("the job ran");
-        assert_ne!(
-            offloaded,
-            thread::current().id(),
-            "a large deferred encode is offloaded"
-        );
-
-        let (processed, encoding) = render("hi");
-        assert!(processed.text.len() < ENCODE_OFFLOAD_MIN_BYTES);
-        encode(&processed.text, encoding);
-        let inline = ran_on.lock().unwrap().take().expect("the job ran");
-        assert_eq!(
-            inline,
-            thread::current().id(),
-            "a small deferred encode runs inline"
-        );
-    }
-
-    #[test]
-    fn public_entry_point_keeps_the_flat_text_for_a_deferred_renderer() {
-        let tokenizer = llm_tokenizer::MockTokenizer::new().with_deferred_chat_ids(vec![7]);
-        let processed = process_chat_messages(&prefill_request(), &tokenizer, None).unwrap();
-        assert_eq!(processed.text, "user: Hello\nassistant: Sure");
-    }
-
-    #[test]
-    fn missing_tokenizer_is_a_client_error_only_for_unknown_models() {
-        assert_eq!(
-            missing_tokenizer_response("nonexistent-model", false).status(),
-            http::StatusCode::NOT_FOUND
-        );
-        assert_eq!(
-            missing_tokenizer_response("served-model", true).status(),
-            http::StatusCode::INTERNAL_SERVER_ERROR
-        );
-    }
-}
+mod tests;

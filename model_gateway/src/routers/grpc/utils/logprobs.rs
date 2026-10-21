@@ -54,6 +54,7 @@ pub(crate) fn convert_proto_logprobs(
 
     ChatLogProbs::Detailed {
         content: (!content_items.is_empty()).then_some(content_items),
+        refusal: None,
     }
 }
 
@@ -81,6 +82,7 @@ pub(crate) fn convert_proto_to_openai_logprobs(
 fn truncate_top_logprobs(logprobs: &mut ChatLogProbs, requested: usize) {
     if let ChatLogProbs::Detailed {
         content: Some(items),
+        ..
     } = logprobs
     {
         for item in items {
@@ -152,6 +154,7 @@ mod tests {
         truncate_top_logprobs(&mut logprobs, top_logprobs.unwrap_or(0) as usize);
         let ChatLogProbs::Detailed {
             content: Some(items),
+            ..
         } = logprobs
         else {
             panic!("detailed logprobs expected");
@@ -162,6 +165,18 @@ mod tests {
             .iter()
             .map(|item| item.top_logprobs.iter().map(|t| t.token.clone()).collect())
             .collect()
+    }
+
+    #[test]
+    fn the_logprobs_object_carries_content_and_refusal() {
+        let value = serde_json::to_value(convert_proto_logprobs(&proto(), |id| format!("t{id}")))
+            .expect("serialize");
+        assert_eq!(value["content"][0]["token"], "t1", "{value}");
+        assert_eq!(
+            value.get("refusal"),
+            Some(&serde_json::Value::Null),
+            "{value}"
+        );
     }
 
     #[test]

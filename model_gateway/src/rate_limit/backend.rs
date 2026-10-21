@@ -28,10 +28,21 @@ pub enum ReserveOutcome {
 /// Authoritative usage after a successful call, used to true up the
 /// reservation via `(actual_input_tokens + completion_tokens) -
 /// estimated_input_tokens`.
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// `cached_input_tokens` and `reasoning_tokens` are the engine's own split
+/// of those two counts: the prompt tokens it served from its prefix cache
+/// and the completion tokens it spent on reasoning. They take no part in
+/// the true-up; they are carried for the consumers that price or report a
+/// settlement, and are zero where the engine reports none (a reasoning
+/// split the gateway's own parser made is not substituted here).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UsageSettlement {
     pub actual_input_tokens: u32,
     pub completion_tokens: u32,
+    /// Of `actual_input_tokens`, the tokens served from the engine's cache.
+    pub cached_input_tokens: u32,
+    /// Of `completion_tokens`, the tokens the engine counted as reasoning.
+    pub reasoning_tokens: u32,
 }
 
 /// Reserve-once-per-logical-request, settle/close/abandon-once lifecycle,

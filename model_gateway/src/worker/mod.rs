@@ -1,5 +1,7 @@
 //! Worker domain — identity, registry, health, resilience, monitoring, service.
 
+pub(crate) mod admin_json;
+pub(crate) mod bootstrap_probe;
 pub mod builder;
 pub mod capacity;
 pub mod circuit_breaker;
@@ -13,7 +15,8 @@ pub mod kv_event_monitor;
 mod kv_event_recovery;
 pub mod kv_index_backend;
 pub(crate) mod liveness;
-pub(crate) mod load_state;
+pub mod load;
+pub mod load_state;
 pub mod manager;
 pub mod metrics_aggregator;
 pub mod monitor;
@@ -23,6 +26,7 @@ pub mod pd_pairing;
 pub mod prefill_admission;
 pub mod registry;
 pub mod resilience;
+pub mod runtime;
 pub mod sampling_defaults;
 pub mod service;
 // FIXME: worker.rs is a 1800-line monolith containing the Worker trait,
@@ -46,6 +50,7 @@ pub use hash_ring::HashRing;
 pub use http_client::WorkerHttpClientCache;
 pub use kv_event_monitor::KvEventMonitor;
 pub use kv_index_backend::{KvIndex, WorkerBlocks};
+pub use liveness::{budgets as liveness_budgets, Budgets as LivenessBudgets};
 pub use manager::WorkerManager;
 pub use monitor::{WorkerLoadManager, WorkerMonitor};
 // Re-export UNKNOWN_MODEL_ID from protocols
@@ -70,7 +75,7 @@ pub use sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL;
 pub use service::WorkerService;
 pub(crate) use worker::ConnectionModeExt;
 pub use worker::{
-    AttachedBody, BasicWorker, ConnectionMode, RequestCompletionSink, RuntimeType, Worker,
+    BasicWorker, ConnectionMode, GuardedStream, RequestCompletionSink, RuntimeType, Worker,
     WorkerLoadGuard, WorkerType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR,
     MORIIO_MODE_LABEL, NIXL_CONNECTOR,
 };

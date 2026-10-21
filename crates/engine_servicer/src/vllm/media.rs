@@ -18,7 +18,9 @@ use std::{
 };
 
 pub use engine_zmq_adapter::ProcessedMedia as MediaFeatures;
-use smg_grpc_client::{common_proto as common, vllm_proto as vllm};
+use smg_grpc_client::{
+    common_proto as common, stamp_media_code, vllm_proto as vllm, WorkerMediaFault,
+};
 use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tonic::Status;
 
@@ -27,8 +29,15 @@ use super::State;
 /// A `Send` boxed future, the shape a processor's calls take.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
-/// One `media_refs` item: the modality name (`image`, `video`) and the
-/// reference to fetch.
+/// The reference modalities a processor of pixels takes, as `media_refs`
+/// names them.
+pub const PIXEL_MODALITIES: &[&str] = &["image", "video"];
+/// Every reference modality the wire names, for a processor that takes what
+/// the model takes.
+pub const ALL_MODALITIES: &[&str] = &["image", "video", "audio"];
+
+/// One `media_refs` item: the modality name (`image`, `video`, `audio`) and
+/// the reference to fetch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaRefItem {
     pub modality: String,
@@ -45,15 +54,15 @@ pub struct MediaRequest {
     pub prompt_text: Option<String>,
     pub items: Vec<MediaRefItem>,
     pub arrival_time: f64,
-    /// Whether to also build the identity a PD prefill leg returns on its
-    /// `Complete`, so the decode leg is served without pixels or references.
+    /// Whether to also build the identity a PD prefill side returns on its
+    /// `Complete`, so the decode side is served without pixels or references.
     pub want_identity: bool,
 }
 
 /// What a processor produced: the prompt with its placeholders expanded, the
 /// engine-side features in the shape its pipeline makes them (vLLM's own
 /// encoding of `mm_features`, or the Router's batches for smg's pipeline),
-/// and, when asked, the identity a PD prefill leg returns.
+/// and, when asked, the identity a PD prefill side returns.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ProcessedMedia {
     pub prompt_token_ids: Vec<u32>,
@@ -74,6 +83,21 @@ pub enum MediaError {
     Unavailable(String),
     /// A processor failure (`INTERNAL`).
     Internal(String),
+    /// The media the request names failed, by whose fault: the request's
+    /// own or its host's for now, never this worker's. The status carries
+    /// the report as trailers (see [`WorkerMediaFault`] and the code's,
+    /// `smg_grpc_client::MEDIA_CODE_METADATA_KEY`) under the gRPC code the
+    /// fault would have had without them (`INVALID_ARGUMENT`,
+    /// `UNAVAILABLE`), so a Router that reads the trailers answers a 400 for
+    /// the media under `code` and records no worker failure, and one that
+    /// does not reads the gRPC code as before.
+    Media {
+        fault: WorkerMediaFault,
+        /// The code the public API answers: `media_fetch_failed` or
+        /// `media_too_large`.
+        code: &'static str,
+        message: String,
+    },
 }
 
 impl MediaError {
@@ -82,6 +106,17 @@ impl MediaError {
             Self::Invalid(message) => Status::invalid_argument(message),
             Self::Unavailable(message) => Status::unavailable(message),
             Self::Internal(message) => Status::internal(message),
+            Self::Media {
+                fault,
+                code,
+                message,
+            } => stamp_media_code(
+                fault.stamp(match fault {
+                    WorkerMediaFault::Client => Status::invalid_argument(message),
+                    WorkerMediaFault::Transient => Status::unavailable(message),
+                }),
+                code,
+            ),
         }
     }
 }
@@ -100,6 +135,14 @@ pub trait MediaProcessor: Send + Sync + 'static {
     fn source(&self) -> &str;
     /// How many requests it processes at once; as many again may wait.
     fn max_inflight(&self) -> usize;
+    /// The modalities it takes references of, as `media_refs` names them
+    /// ([`ALL_MODALITIES`] for the engine's own processors, which take
+    /// whatever the model takes, audio included; [`PIXEL_MODALITIES`] for a
+    /// pipeline of pixels); a reference of another modality is refused
+    /// before any work, naming the modes that take it. Every processor
+    /// states its set: a default would let the next bridge refuse audio
+    /// without a word.
+    fn modalities(&self) -> &'static [&'static str];
     /// Whether it can take requests now (a sidecar's liveness); the backend
     /// is advertised only while this holds.
     fn probe(&self) -> BoxFuture<bool>;
@@ -168,13 +211,20 @@ pub(super) const PROCESSOR_OFF: &str =
 
 /// The request's `media_refs` as processor items, checked as the Python
 /// servicer checks them (`parse_media_refs`): a fetchable modality and a
-/// non-empty reference each, at least one item.
-fn parse_media_refs(refs: &vllm::MediaRefs) -> Result<Vec<MediaRefItem>, Status> {
+/// non-empty reference each, at least one item; and, on this servicer, a
+/// modality the configured processor takes, so a reference it would refuse
+/// after the fetch is refused before it.
+fn parse_media_refs(
+    refs: &vllm::MediaRefs,
+    processor: &dyn MediaProcessor,
+) -> Result<Vec<MediaRefItem>, Status> {
+    let taken = processor.modalities();
     let mut items = Vec::with_capacity(refs.items.len());
     for (index, item) in refs.items.iter().enumerate() {
         let modality = match common::Modality::try_from(item.modality) {
             Ok(common::Modality::Image) => "image",
             Ok(common::Modality::Video) => "video",
+            Ok(common::Modality::Audio) => "audio",
             other => {
                 let name = other.map_or_else(
                     |_| item.modality.to_string(),
@@ -185,6 +235,15 @@ fn parse_media_refs(refs: &vllm::MediaRefs) -> Result<Vec<MediaRefItem>, Status>
                 )));
             }
         };
+        if !taken.contains(&modality) {
+            return Err(Status::invalid_argument(format!(
+                "media_refs[{index}]: the {} media processor on this worker takes {} \
+                 references, not {modality}; --mm-processor inprocess or redis processes \
+                 {modality} with the engine's own processor",
+                processor.name(),
+                taken.join(" and "),
+            )));
+        }
         if item.url.is_empty() {
             return Err(Status::invalid_argument(format!(
                 "media_refs[{index}]: empty url"
@@ -205,7 +264,7 @@ fn parse_media_refs(refs: &vllm::MediaRefs) -> Result<Vec<MediaRefItem>, Status>
 
 /// Resolve a request's `media_refs` through the configured processor. The
 /// request leaves with its references consumed and its prompt expanded; what
-/// comes back is the engine-side media to attach and, for a PD prefill leg,
+/// comes back is the engine-side media to attach and, for a PD prefill side,
 /// the identity its `Complete` carries. `None` when the request named no
 /// media.
 pub(super) async fn process_media_refs(
@@ -228,7 +287,7 @@ pub(super) async fn process_media_refs(
     let Some(gate) = state.media.as_ref() else {
         return Err(Status::invalid_argument(PROCESSOR_OFF));
     };
-    let items = parse_media_refs(&refs)?;
+    let items = parse_media_refs(&refs, gate.processor.as_ref())?;
     let request = MediaRequest {
         request_id: req.request_id.clone(),
         prompt_token_ids: tokenized.input_ids.clone(),

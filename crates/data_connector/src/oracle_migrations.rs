@@ -22,10 +22,16 @@ const ORACLE_V3: Migration = Migration {
     description: "Drop redundant output, metadata, instructions, tool_calls columns from responses",
     up: oracle_v3_up,
 };
+const ORACLE_V4: Migration = Migration {
+    version: 4,
+    description: "Add tenant column to responses, conversations and conversation items",
+    up: oracle_v4_up,
+};
 
 /// Core history-backend migrations required by the SQL response/conversation
 /// storage path during normal gateway startup.
-pub(crate) static ORACLE_HISTORY_MIGRATIONS: [Migration; 3] = [ORACLE_V1, ORACLE_V2, ORACLE_V3];
+pub(crate) static ORACLE_HISTORY_MIGRATIONS: [Migration; 4] =
+    [ORACLE_V1, ORACLE_V2, ORACLE_V3, ORACLE_V4];
 
 fn oracle_v1_up(schema: &SchemaConfig) -> Vec<String> {
     let s = &schema.responses;
@@ -39,6 +45,29 @@ fn oracle_v1_up(schema: &SchemaConfig) -> Vec<String> {
         "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE {table} ADD ({col} VARCHAR2(128))'; \
          EXCEPTION WHEN OTHERS THEN IF SQLCODE != -1430 THEN RAISE; END IF; END;"
     )]
+}
+
+/// The nullable `tenant` column of responses, conversations and conversation
+/// items: the tenant a record is scoped to. Rows from before the column stay
+/// NULL and are served to every caller, as they were.
+fn oracle_v4_up(schema: &SchemaConfig) -> Vec<String> {
+    [
+        &schema.responses,
+        &schema.conversations,
+        &schema.conversation_items,
+    ]
+    .into_iter()
+    .filter(|s| !s.is_skipped("tenant"))
+    .map(|s| {
+        let table = s.qualified_table(schema.owner.as_deref());
+        let col = s.col("tenant");
+        // PL/SQL block: ORA-01430 = "column already exists" (idempotent)
+        format!(
+            "BEGIN EXECUTE IMMEDIATE 'ALTER TABLE {table} ADD ({col} VARCHAR2(255))'; \
+                 EXCEPTION WHEN OTHERS THEN IF SQLCODE != -1430 THEN RAISE; END IF; END;"
+        )
+    })
+    .collect()
 }
 
 fn oracle_v2_up(schema: &SchemaConfig) -> Vec<String> {
@@ -109,7 +138,39 @@ mod tests {
             .iter()
             .map(|migration| migration.version)
             .collect();
-        assert_eq!(versions, vec![1, 2, 3]);
+        assert_eq!(versions, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn oracle_v4_up_adds_the_tenant_column_to_responses_and_conversations() {
+        let mut schema = SchemaConfig::default();
+        schema.uppercase_for_oracle();
+        let stmts = oracle_v4_up(&schema);
+        assert_eq!(stmts.len(), 3);
+        assert!(
+            stmts[2].contains("ALTER TABLE CONVERSATION_ITEMS ADD (tenant VARCHAR2(255))"),
+            "got: {}",
+            stmts[2]
+        );
+        // An unmapped logical column keeps its spelling, as migration 1's
+        // safety_identifier does: Oracle folds the unquoted name to upper case.
+        assert!(
+            stmts[0].contains("ALTER TABLE RESPONSES ADD (tenant VARCHAR2(255))"),
+            "got: {}",
+            stmts[0]
+        );
+        assert!(
+            stmts[1].contains("ALTER TABLE CONVERSATIONS ADD (tenant VARCHAR2(255))"),
+            "got: {}",
+            stmts[1]
+        );
+        assert!(stmts.iter().all(|s| s.contains("-1430")), "idempotent");
+        // skip_columns hold logical (lower-case) names.
+        schema
+            .conversations
+            .skip_columns
+            .insert("tenant".to_string());
+        assert_eq!(oracle_v4_up(&schema).len(), 2);
     }
 
     #[test]

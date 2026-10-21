@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use validator::Validate;
 
-use super::common::StringOrArray;
+use super::common::{invalid, StringOrArray};
 
 /// Sampling parameters for text generation
 #[serde_with::skip_serializing_none]
@@ -49,11 +49,24 @@ pub struct SamplingParams {
 // Shared Validation Functions
 // ============================================================================
 
-/// Validates top_p: 0.0 < top_p <= 1.0 (can't use range validator for open interval)
+/// Validates top_p: 0.0 < top_p <= 1.0 (can't use range validator for open
+/// interval). The error names the bound crossed as the public API does
+/// (`decimal_above_max_value`, `decimal_below_min_value`).
 pub fn validate_top_p_value(top_p: f32) -> Result<(), validator::ValidationError> {
-    if !(top_p > 0.0 && top_p <= 1.0) {
-        return Err(validator::ValidationError::new(
-            "top_p must be in (0, 1] - greater than 0.0 and at most 1.0",
+    if top_p > 1.0 {
+        return Err(invalid(
+            "decimal_above_max_value",
+            format!(
+                "Invalid 'top_p': decimal above maximum value. Expected a value <= 1.0, but got {top_p} instead."
+            ),
+        ));
+    }
+    if top_p <= 0.0 || top_p.is_nan() {
+        return Err(invalid(
+            "decimal_below_min_value",
+            format!(
+                "Invalid 'top_p': decimal below minimum value. Expected a value > 0.0, but got {top_p} instead."
+            ),
         ));
     }
     Ok(())

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from array import array
 from collections.abc import Iterable
-from http import HTTPStatus
 
 import grpc
+
+from smg_grpc_servicer.engine_status import grpc_code_for_http_status
 
 
 def to_token_id_array(token_ids: Iterable[int] | None) -> array | None:
@@ -25,11 +26,22 @@ def to_token_id_array(token_ids: Iterable[int] | None) -> array | None:
     return array("q", token_ids)
 
 
-_HTTP_TO_GRPC_CODE = {
-    HTTPStatus.BAD_REQUEST: grpc.StatusCode.INVALID_ARGUMENT,
-    HTTPStatus.SERVICE_UNAVAILABLE: grpc.StatusCode.UNAVAILABLE,
-    HTTPStatus.INTERNAL_SERVER_ERROR: grpc.StatusCode.INTERNAL,
-}
+def scheduler_abort(output: dict) -> dict | None:
+    """The scheduler's own abort of the request, when the output's finish
+    reason carries one with a status code (its refusal of the caller's input,
+    a full queue, an internal failure): the request did not complete and the
+    status says whose fault it is, so the stream ends with a gRPC status (see
+    :func:`abort_code_from_output`), not with a completion. A plain abort with
+    no status code (the caller's own cancel) is not the scheduler's and stays a
+    completion; so does any other finish. Returns the finish-reason dict."""
+    finish_reason = output.get("meta_info", {}).get("finish_reason")
+    if (
+        isinstance(finish_reason, dict)
+        and finish_reason.get("type") == "abort"
+        and finish_reason.get("status_code") is not None
+    ):
+        return finish_reason
+    return None
 
 
 def abort_code_from_output(output: dict) -> grpc.StatusCode:
@@ -38,5 +50,5 @@ def abort_code_from_output(output: dict) -> grpc.StatusCode:
     if isinstance(finish_reason, dict):
         status_code = finish_reason.get("status_code")
         if status_code is not None:
-            return _HTTP_TO_GRPC_CODE.get(status_code, grpc.StatusCode.INTERNAL)
+            return grpc_code_for_http_status(status_code)
     return grpc.StatusCode.INTERNAL

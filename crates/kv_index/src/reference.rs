@@ -1,5 +1,5 @@
-//! A single-threaded reference model of what [`PositionalIndexer`](crate::PositionalIndexer)
-//! promises, for the exactness guardrail (`docs/kv-router-leap.md`, section 3).
+//! A single-threaded reference model of what [`ChainIndex`](crate::ChainIndex) promises, for
+//! the exactness guardrail.
 //!
 //! Nothing here is meant to be fast. Every structure is the most literal one that states the
 //! contract:
@@ -16,14 +16,14 @@
 //!   request's at `i`; the first position without such a block ends the prefix; workers with an
 //!   empty prefix are not reported.
 //!
-//! The chain hash is the crate's own [`chain_prefix_hash`], not a copy of it, so both indexers
-//! always agree on what a prefix hash is.
+//! The chain hash is the crate's own [`chain_prefix_hash`], not a copy of it, so the index and
+//! the reference always agree on what a prefix hash is.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::event_tree::{chain_prefix_hash, ApplyError, ContentHash, SequenceHash, StoredBlock};
+use crate::block::{chain_prefix_hash, ApplyError, ContentHash, SequenceHash, StoredBlock};
 
 /// One worker's blocks, indexed two ways: by the engine hash (how removals name them) and by
 /// `(position, content hash)` (how lookups find them), each position holding every prefix hash

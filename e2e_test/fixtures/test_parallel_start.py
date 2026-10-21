@@ -50,7 +50,7 @@ def fleet(monkeypatch):
     return events, clock, create
 
 
-def test_pd_default_spawns_all_legs_before_waiting(fleet):
+def test_pd_default_spawns_all_pools_before_waiting(fleet):
     events, _, create = fleet
     backend = create()
     next(backend)
@@ -136,7 +136,7 @@ def test_pd_readiness_failure_stops_the_entire_fleet(fleet, monkeypatch):
     assert setup._worker_start_failures == {"vllm": 1}
 
 
-def test_partial_pd_leg_failure_stops_previously_started_workers(fleet, monkeypatch):
+def test_partial_pd_pool_failure_stops_previously_started_workers(fleet, monkeypatch):
     events, _, _ = fleet
     start = setup._start_workers_tracked
 
@@ -147,7 +147,7 @@ def test_partial_pd_leg_failure_stops_previously_started_workers(fleet, monkeypa
 
     monkeypatch.setattr(setup, "_start_workers_tracked", fail_second)
     with pytest.raises(RuntimeError, match="second launch failed"):
-        setup._start_pd_leg(
+        setup._start_pd_pool(
             model_id="model",
             engine="vllm",
             mode=ConnectionMode.HTTP,

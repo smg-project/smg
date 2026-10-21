@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smg-grpc-servicer"
-version = "0.13.6"
+version = "0.14.0"
 description = "SMG gRPC servicer implementations for LLM inference engines (vLLM, MLX, TokenSpeed, SGLang)"
 requires-python = ">=3.10"
 dependencies = [
-    "smg-grpc-proto>=0.4.25",  # TokenSpeed active_token_usage for non-evictable KV pressure
+    "smg-grpc-proto>=0.4.27",  # constrained_decoding and mm_item_limits on the worker handshake
     "grpcio>=1.81.1",
     "grpcio-reflection>=1.81.1",
     "grpcio-health-checking>=1.81.1",
@@ -42,7 +42,13 @@ vllm-redis = ["redis>=5.0", "msgspec>=0.18.0"]
 # it tracked 0.5.18 dropping the same parameter from
 # create_load_snapshot_reader(). (Earlier floors recorded the shmem load
 # snapshots that replaced the WatchLoadUpdateReq piggyback path in 0.5.13,
-# removed upstream in v0.5.14.)
+# removed upstream in v0.5.14.) The request wire the Rust servicer speaks is
+# covered on every release the floor admits by the handshake: 0.5.22 inserted
+# `watermark` into SamplingParams before the scheduler's own fields, the
+# servicer sends the API prefix through `custom_params` (the same bytes on
+# both releases) and the plugin declares each struct's field order at the
+# handshake, where the servicer checks the prefixes it fills and names a
+# release that moved one instead of failing every request.
 sglang = ["sglang>=0.5.21", "pyzmq>=25.0.0", "msgspec>=0.18.0"]
 # smg-grpc-proto>=0.4.7 is the first release that ships mlx_engine_pb2;
 # without this floor, installing [mlx] against an older proto build would

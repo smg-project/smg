@@ -64,7 +64,6 @@ async fn spawn_capture_worker() -> (String, Captured) {
 
 fn least_load_policy() -> PolicyConfig {
     PolicyConfig::LeastLoad {
-        load_check_interval_secs: 10,
         kv_pressure_weight: 0.15,
         mean_prefill_tokens: 1024,
         default_throughput: 2000.0,
@@ -89,6 +88,8 @@ fn cache_aware_policy() -> PolicyConfig {
         cache_boundaries: Vec::new(),
         selection_policy: None,
         selection_accounting_ttl_ms: 0,
+        balance_prefix_margin_tokens: 0,
+        balance_uncached_credit: false,
     }
 }
 

@@ -176,7 +176,10 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
         shm_namespace_id: model.shm_namespace_id.clone(),
         mm_device_do_normalize: model.mm_device_do_normalize,
         mm_item_limits: model.mm_item_limits.clone(),
+        mm_encoder_budget: model.mm_encoder_budget,
         max_num_seqs: max_num_seqs(state),
+        engine_reasoning_parser: model.engine_reasoning_parser.clone(),
+        constrained_decoding_start: model.constrained_decoding_start.clone(),
         ..Default::default()
     }
 }
@@ -200,8 +203,8 @@ fn max_num_seqs(state: &State) -> i32 {
 /// response shape, with the handshake's capacity figures and, from this
 /// servicer's own bookkeeping ([`crate::load_tracker`]), the queued
 /// token-work, generation throughput and hit rate that vLLM's stats do not
-/// carry. The servicer forwards to one engine process, so those three go on
-/// the first rank's entry.
+/// carry, each rank's own: the servicer picks the rank a request goes to
+/// and sees what that rank cached and streamed for it.
 pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
     let client = state.engine()?;
     let ready = client.ready_response();
@@ -217,6 +220,7 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
         .into_iter()
         .map(|load| {
             let num_used_tokens = (load.token_usage * f64::from(max_total_num_tokens)).round();
+            let estimate = state.loads.estimate(load.dp_rank, load.num_waiting_reqs);
             vllm::SchedulerLoad {
                 dp_rank: load.dp_rank,
                 num_running_reqs: load.num_running_reqs,
@@ -227,16 +231,12 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
                 utilization: load.token_usage,
                 max_running_requests,
                 max_total_num_tokens,
-                ..Default::default()
+                num_waiting_uncached_tokens: estimate.queued_token_work,
+                gen_throughput: estimate.gen_throughput,
+                cache_hit_rate: estimate.cache_hit_rate,
             }
         })
         .collect();
-    if let Some(first) = loads.first_mut() {
-        let estimate = state.loads.estimate(first.num_waiting_reqs);
-        first.num_waiting_uncached_tokens = estimate.queued_token_work;
-        first.gen_throughput = estimate.gen_throughput;
-        first.cache_hit_rate = estimate.cache_hit_rate;
-    }
     if loads.is_empty() {
         // No output batch has carried a snapshot yet. The Python servicer
         // reports a zero-filled entry per rank, and the Router reads an
@@ -248,11 +248,26 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
             .unwrap_or(1)
             .max(1);
         loads = (0..ranks)
-            .map(|rank| vllm::SchedulerLoad {
-                dp_rank: i32::try_from(rank).unwrap_or(i32::MAX),
-                max_running_requests,
-                max_total_num_tokens,
-                ..Default::default()
+            .map(|rank| {
+                let dp_rank = i32::try_from(rank).unwrap_or(i32::MAX);
+                // The servicer's own figures do not wait for the engine's
+                // first snapshot: what this rank cached and streamed so far,
+                // and the token-work queued to it. The engine has not said
+                // how many requests it holds waiting, and before its first
+                // snapshot that is every request submitted to the rank and
+                // not started, so all of them count (an overestimate by
+                // what is already in prefill, better than a zero that reads
+                // as known-empty).
+                let estimate = state.loads.estimate(dp_rank, i32::MAX);
+                vllm::SchedulerLoad {
+                    dp_rank,
+                    max_running_requests,
+                    max_total_num_tokens,
+                    num_waiting_uncached_tokens: estimate.queued_token_work,
+                    gen_throughput: estimate.gen_throughput,
+                    cache_hit_rate: estimate.cache_hit_rate,
+                    ..Default::default()
+                }
             })
             .collect();
         dp_rank_count = loads.len().try_into().unwrap_or_default();

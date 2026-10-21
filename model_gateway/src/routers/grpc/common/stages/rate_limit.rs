@@ -15,7 +15,7 @@ use std::sync::{
 use async_trait::async_trait;
 use axum::response::Response;
 use parking_lot::Mutex;
-use tracing::{error, warn};
+use tracing::warn;
 
 use super::PipelineStage;
 use crate::{
@@ -23,7 +23,7 @@ use crate::{
         rejection_response, RateLimitManager, Reservation, ReservationAttachment, ReserveRequest,
         SharedReservationHandle,
     },
-    routers::{error, grpc::context::RequestContext},
+    routers::grpc::context::{stage_output, RequestContext},
 };
 
 /// Outcome of the first reserve attempt for one logical request, cached so
@@ -69,6 +69,12 @@ impl RateLimitCell {
 
     pub(crate) fn peek(&self) -> Option<RateLimitOutcome> {
         self.outcome.lock().clone()
+    }
+
+    /// Place an outcome from outside the reserve stage, for tests only.
+    #[cfg(test)]
+    pub(crate) fn set_for_test(&self, outcome: RateLimitOutcome) {
+        self.set(outcome);
     }
 
     fn set(&self, outcome: RateLimitOutcome) {
@@ -147,16 +153,10 @@ impl PipelineStage for RateLimitReserveStage {
                     );
                     return Ok(());
                 };
-                let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
-                    error!(
-                        function = "RateLimitReserveStage::execute",
-                        "Preparation stage not completed"
-                    );
-                    error::internal_error(
-                        "preparation_stage_not_completed",
-                        "Preparation stage not completed",
-                    )
-                })?;
+                let prep = stage_output(
+                    ctx.state.preparation.as_ref(),
+                    "RateLimitReserveStage::execute",
+                )?;
 
                 let request = ReserveRequest {
                     request_charge_id: tenant_meta.request_charge_id,

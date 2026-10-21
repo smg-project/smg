@@ -80,6 +80,7 @@ impl MistralParser {
                         "type": "tags_with_separator",
                         "tags": tags,
                         "separator": ", ",
+                        "at_least_one": at_least_one,
                     },
                     "end": "]",
                 }],

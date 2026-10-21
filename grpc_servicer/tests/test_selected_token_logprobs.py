@@ -83,6 +83,7 @@ def servicer(monkeypatch, manager_mod):
 
 def _manager_and_state(module, *, stream=False):
     manager = module.GrpcRequestManager.__new__(module.GrpcRequestManager)
+    manager.enable_trace = False  # built without __init__: the tracing switch is off
     state = module.GrpcReqState(
         request_id="score",
         grpc_context=None,

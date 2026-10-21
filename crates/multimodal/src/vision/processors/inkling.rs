@@ -319,12 +319,17 @@ impl VisionPreProcessor for InklingImageProcessor {
         )
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
         let processor = self.with_preprocessor_config(config);
         let (scaled_width, scaled_height) = processor.scaled_image_dimensions(width, height);
-        processor
+        Ok(processor
             .patch_grid(scaled_width as usize, scaled_height as usize)
-            .2
+            .2)
     }
 
     fn model_name(&self) -> &'static str {
@@ -467,8 +472,8 @@ mod tests {
             }),
             ..PreProcessorConfig::default()
         };
-        assert_eq!(processor.calculate_num_tokens(80, 40, &config), 3);
-        assert_eq!(processor.calculate_num_tokens(81, 41, &config), 6);
+        assert_eq!(processor.calculate_num_tokens(80, 40, &config).unwrap(), 3);
+        assert_eq!(processor.calculate_num_tokens(81, 41, &config).unwrap(), 6);
     }
 
     #[test]
@@ -476,9 +481,18 @@ mod tests {
         let processor = InklingImageProcessor::new();
         let config = PreProcessorConfig::default();
 
-        assert_eq!(processor.calculate_num_tokens(640, 480, &config), 204);
-        assert_eq!(processor.calculate_num_tokens(1200, 600, &config), 465);
-        assert_eq!(processor.calculate_num_tokens(3000, 2000, &config), 3800);
+        assert_eq!(
+            processor.calculate_num_tokens(640, 480, &config).unwrap(),
+            204
+        );
+        assert_eq!(
+            processor.calculate_num_tokens(1200, 600, &config).unwrap(),
+            465
+        );
+        assert_eq!(
+            processor.calculate_num_tokens(3000, 2000, &config).unwrap(),
+            3800
+        );
     }
 
     #[test]
@@ -489,7 +503,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(processor.calculate_num_tokens(640, 480, &config), 792);
+        assert_eq!(
+            processor.calculate_num_tokens(640, 480, &config).unwrap(),
+            792
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! DeepSeek-V4.1 vision preprocessor.
 //!
 //! Port of the reference `load_image` in the checkpoint's
-//! `inference/image_processor.py` (the same math as vLLM's
+//! `inference/image_processor.py` (the same math as the serving engine's
 //! `models/deepseek_v4_1/common/mm_preprocess.py`) so that token counts and
 //! pixel values match the reference. Each `<｜deepseek_image｜>` placeholder
 //! in the prompt expands to `[IMAGE_START] + ([IMAGE] * n_llm_w +
@@ -11,8 +11,8 @@
 //! IMAGE slots receive aligner rows in reading order; the delimiters take the
 //! learned `image_start` / `image_newline` / `image_end` vectors.
 //!
-//! The span is spliced verbatim: vLLM removed its compressor-alignment pad
-//! (vllm-project/vllm#56554), so the budget is the full `max_image_tokens`
+//! The span is spliced verbatim: the engine no longer pads the span for
+//! compressor alignment, so the budget is the full `max_image_tokens`
 //! and no token is reserved.
 
 use image::{DynamicImage, Rgb, RgbImage};
@@ -363,7 +363,7 @@ impl VisionPreProcessor for DeepseekV41Processor {
                     .expect("patch array is standard-layout by construction"),
             );
         }
-        // The engine consumes patches as `(np, 3, p, p)` (see vLLM's
+        // The engine consumes patches as `(np, 3, p, p)` (see its
         // `DeepseekV4VLImagePixelInputs`).
         let p = processor.patch_size;
         let encoder_input = Array4::from_shape_vec((total_patches, 3, p, p), encoder_input)
@@ -398,10 +398,16 @@ impl VisionPreProcessor for DeepseekV41Processor {
         )
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        self.with_preprocessor_config(config)
+    fn calculate_num_tokens(
+        &self,
+        width: u32,
+        height: u32,
+        config: &PreProcessorConfig,
+    ) -> Result<usize, TransformError> {
+        Ok(self
+            .with_preprocessor_config(config)
             .plan_image_grid(width, height)
-            .num_image_tokens()
+            .num_image_tokens())
     }
 
     fn model_name(&self) -> &'static str {
@@ -533,13 +539,21 @@ mod tests {
         let config: PreProcessorConfig =
             serde_json::from_value(serde_json::json!({"max_image_tokens": 320})).unwrap();
 
-        assert!(processor.calculate_num_tokens(4000, 4000, &config) <= 320);
-        assert!(processor.calculate_num_tokens(4000, 4000, &PreProcessorConfig::default()) > 320);
+        assert!(processor.calculate_num_tokens(4000, 4000, &config).unwrap() <= 320);
+        assert!(
+            processor
+                .calculate_num_tokens(4000, 4000, &PreProcessorConfig::default())
+                .unwrap()
+                > 320
+        );
         // A budget below the geometry's minimum is floored instead of
         // underflowing the resize maths.
         let tiny: PreProcessorConfig =
             serde_json::from_value(serde_json::json!({"max_image_tokens": 1})).unwrap();
-        assert_eq!(processor.calculate_num_tokens(4000, 4000, &tiny), 4);
+        assert_eq!(
+            processor.calculate_num_tokens(4000, 4000, &tiny).unwrap(),
+            4
+        );
     }
 
     #[test]

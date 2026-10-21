@@ -5,14 +5,31 @@
 //! [`responses::output`](super::responses::output): call ids ride on the events, the stop reason is
 //! decided from the `Finish` event alone, and nothing is remembered between calls. The driver wraps
 //! the blocks in the message envelope (id, model, usage) and, when its stop decoder matched a stop
-//! sequence, sets `stop_sequence` and that reason, since the events carry neither.
+//! sequence, sets `stop_sequence` and that reason, since the events carry neither. A `tool_use`
+//! block's `input` is the call's argument fragments parsed as one JSON value. Fragments that are no
+//! whole JSON text, which the parser said in a `Malformed` event (the output cut inside the
+//! arguments, or the model wrote something else after a prefix a strict reader accepts), give the
+//! value their complete members make ([`Prefix::closed`]): the prefix the readers sent, cut back to
+//! the last member complete at every level and closed, which is the value a client's partial JSON
+//! reader ends with from the stream's deltas; `{}` where nothing of it is complete, and for a call
+//! the model closed without arguments. Fragments that are one whole JSON text no `input` value
+//! holds get `{}` too, and nothing in the events says so: [`Output::refused`] names each such call
+//! with the reader's reason, so that the driver decides what the client gets rather than hand over
+//! `{}` for arguments the model wrote. Whole by its syntax is what a reader that keeps no value
+//! takes; what no value holds is a number outside the range a reader keeps, a surrogate escape
+//! without its other half, or nesting past the value reader's limit. The crate's own readers refuse
+//! the last two as they arrive and say so, so from them the set is the numbers.
 //!
 //! [`Stream`] is the streaming half, the content-block machine: one block is open at a time, and
 //! each parser event becomes the `content_block_start`, `content_block_delta` and
 //! `content_block_stop` events a client expects, the block index advancing by one per block. A
 //! `thinking` block opens at the first reasoning text and closes when the region ends; a `text`
 //! block opens at the first content; a `tool_use` block opens at `ToolCallStart` with an empty
-//! `input` and closes at `ToolCallEnd`; a block closes when text of another kind arrives.
+//! `input` and closes at `ToolCallEnd`, and its `input_json_delta`s stop at a `Malformed {
+//! InvalidArguments }` event of no bytes (the fragments after it are the model's bytes as written
+//! and go nowhere), so the joined `partial_json` is the prefix a strict reader accepted, which a
+//! client's partial JSON reader closes into the value its complete members make, the fold's
+//! `input` for the call; a block closes when text of another kind arrives.
 //! Whitespace-only text that arrives with no text block open is held: it leads the text block when
 //! text with substance follows, and is let go when a block of another kind starts or the stream
 //! ends, so the template's separators between blocks open no block of their own. `Finish` closes
@@ -27,64 +44,24 @@
 //! fragment to its call, and once its text has substance keeps every run of whitespace in it, the
 //! separators after a call included.
 //!
-//! The blocks are the ones SMG's gateway builds today from a finished turn, in the order the
-//! Messages API uses:
-//!
-//! - one `thinking` block when there was reasoning, with an empty `signature`: the engines sign
-//!   nothing, and a signature a client could verify needs a decision of its own;
-//! - one `text` block when the content is not whitespace, every content and malformed text in
-//!   order;
-//! - one `tool_use` block per call in the order the calls started, its `input` the joined argument
-//!   fragments parsed as JSON.
-//!
-//! This is the same folding as `chat::message` and `responses::output`, so the three adapters agree
-//! on what a turn contains.
-//!
-//! Ids: a call id of the form `call_<suffix>` becomes `toolu_<suffix>`, the prefix Anthropic SDKs
-//! and tooling pattern-match; any other shape passes through unchanged, since a model family whose
-//! id format is load-bearing in the prompt must keep it. The rule is deterministic, so a client
-//! echoing the id back names the same call.
-//!
-//! Stop reason, from the `Finish` event: `length` is `max_tokens`, and parsed calls do not override
-//! a truncation; `tool_calls`, and any other reason after at least one tool call, are `tool_use`,
-//! since a message with `tool_use` blocks says so whatever stopped the model, as the API itself
-//! does; `stop` is `end_turn`; `abort` and engine-specific reasons are `end_turn` too when no call
-//! was made, since the Messages API has no word for them and the driver decides whether a failed
-//! generation is a message at all. A sequence without `Finish` has no stop reason.
-//!
-//! Policy this adapter sets, where the events say more than the Messages API can:
-//!
-//! - `ReasoningStart` and `Dropped` shape nothing, and `ReasoningEnd` and `ToolCallEnd` only close
-//!   their blocks in the stream: the markers a format consumes never reach the client.
-//! - `Malformed` text is content, as in `chat`: the model wrote it, and the client sees it rather
-//!   than losing it.
-//! - A call whose argument fragments are not a whole JSON value, because the output was cut or the
-//!   model wrote something else, has `{}` as its `input`: `input` must be a JSON value, and the
-//!   fragments are not one. Chat carries the fragments as a string and Responses marks the call
-//!   `incomplete`; here `max_tokens` is all a client learns. A call the model closed without
-//!   arguments has `{}` too.
-//! - Argument fragments for a call that never started cannot occur under the `Event` contract;
-//!   should one arrive, its text joins the content so that no byte is lost. In the stream the same
-//!   goes for a fragment whose call has no open `tool_use` block because other text, or another
-//!   call, came between the call's start and the fragment: the Messages API streams one block at a
-//!   time and cannot reopen a closed one, so the fragment is text, where the fold still gives it to
-//!   its call. The formats parse a call from one contiguous region, so this does not happen for
-//!   them, and nothing is dropped if it does; the old driver dropped such fragments.
-//! - In the stream, the thinking block stops when the reasoning region ends rather than when the
-//!   next text arrives, as the old driver did, so a client sees the block close as soon as the
-//!   model stops thinking.
-//! - In the stream, whitespace-only text opens no block until text with substance joins it; the old
-//!   driver opened a text block for any non-empty text, so a separator between a thinking block
-//!   and a call became a block holding one newline.
+//! Notes on what this module decides, and on what it leaves open: `docs/adapters.md`.
 
 use std::mem;
 
-use openai_protocol::messages::{ContentBlock, ContentBlockDelta, MessageStreamEvent, StopReason};
+use openai_protocol::messages::{
+    ContentBlock, ContentBlockDelta, MessageStreamEvent, StopReason, ToolUseCaller,
+};
+use serde::de::IgnoredAny;
 use serde_json::{Map, Value};
 
-use crate::event::{Event, FinishReason};
+use super::fold::fold;
+use crate::{
+    event::{Event, FinishReason, MalformedReason},
+    json::Prefix,
+};
 
-/// A whole output as the Messages API reports it: the content blocks and the stop reason.
+/// A whole output as the Messages API reports it: the content blocks and the stop reason, and the
+/// calls whose `tool_use` block could not carry their arguments.
 #[derive(Clone, Debug)]
 pub struct Output {
     /// The content blocks in the Messages API's order: thinking, text, then the calls as they
@@ -92,72 +69,70 @@ pub struct Output {
     pub content: Vec<ContentBlock>,
     /// The stop reason decided from the `Finish` event; none when the sequence has not finished.
     pub stop_reason: Option<StopReason>,
+    /// The calls whose argument fragments are one whole JSON text that no `input` value holds (a
+    /// number outside the range a reader keeps; a surrogate escape without its other half or
+    /// nesting past the value reader's limit, which the crate's readers refuse before they get
+    /// here), in the order the calls started: their block carries `{}`, and no `Malformed` event
+    /// says so, since the text is JSON by its syntax. Empty when every block carries its call's
+    /// arguments, or the parser said they are none.
+    pub refused: Vec<RefusedInput>,
 }
 
-/// One started call and what its events said.
-struct Call {
-    index: u32,
-    id: String,
-    name: String,
-    arguments: String,
+/// A call whose `tool_use` block carries `{}` in place of arguments that are JSON by their syntax
+/// ([`Output::refused`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefusedInput {
+    /// The call's index among the output's calls.
+    pub index: u32,
+    /// The function's name.
+    pub name: String,
+    /// The arguments as the model wrote them, the fragments joined.
+    pub arguments: String,
+    /// Why no `input` value holds them, in the reader's words.
+    pub why: String,
 }
 
 /// The message's content and stop reason, folded from a whole event sequence.
-pub fn output<'a>(events: impl IntoIterator<Item = &'a Event>) -> Output {
-    let mut content = String::new();
-    let mut reasoning = String::new();
-    let mut calls: Vec<Call> = Vec::new();
-    let mut stop_reason = None;
-    for event in events {
-        match event {
-            Event::Content(text) | Event::Malformed { text, .. } => content.push_str(&text.text),
-            Event::Reasoning(text) => reasoning.push_str(&text.text),
-            Event::ToolCallStart {
-                index, id, name, ..
-            } => calls.push(Call {
-                index: *index,
-                id: id.clone(),
-                name: name.clone(),
-                arguments: String::new(),
-            }),
-            Event::ToolCallArguments { index, json, .. } => {
-                match calls.iter_mut().find(|call| call.index == *index) {
-                    Some(call) => call.arguments.push_str(json),
-                    None => content.push_str(json),
-                }
-            }
-            Event::Finish {
-                reason, tool_calls, ..
-            } => stop_reason = Some(stop(reason, *tool_calls)),
-            Event::ReasoningStart
-            | Event::ReasoningEnd
-            | Event::ToolCallEnd { .. }
-            | Event::Dropped { .. } => {}
-        }
-    }
-
+pub fn output<'a, 'd: 'a>(events: impl IntoIterator<Item = &'a Event<'d>>) -> Output {
+    let folded = fold(events);
     let mut blocks = Vec::new();
-    if !reasoning.is_empty() {
+    if !folded.reasoning.is_empty() {
         blocks.push(ContentBlock::Thinking {
-            thinking: reasoning,
+            thinking: folded.reasoning,
             signature: String::new(),
         });
     }
-    if !content.trim().is_empty() {
+    if !folded.content.trim().is_empty() {
         blocks.push(ContentBlock::Text {
-            text: content,
+            text: folded.content,
             citations: None,
         });
     }
-    blocks.extend(calls.into_iter().map(|call| ContentBlock::ToolUse {
-        id: tool_use_id(&call.id),
-        name: call.name,
-        input: input(&call.arguments),
+    let mut refused = Vec::new();
+    blocks.extend(folded.calls.into_iter().map(|call| {
+        let input = input(&call.arguments).unwrap_or_else(|why| {
+            refused.push(RefusedInput {
+                index: call.index,
+                name: call.name.clone(),
+                arguments: call.arguments.clone(),
+                why,
+            });
+            Value::Object(Map::new())
+        });
+        ContentBlock::ToolUse {
+            id: tool_use_id(&call.id),
+            name: call.name,
+            input,
+            caller: ToolUseCaller::Direct,
+        }
     }));
 
     Output {
         content: blocks,
-        stop_reason,
+        stop_reason: folded
+            .finish
+            .map(|finish| stop(&finish.reason, finish.tool_calls)),
+        refused,
     }
 }
 
@@ -174,6 +149,12 @@ pub struct Stream {
     index: u32,
     /// Whitespace-only text that arrived with no text block open, waiting for text with substance.
     held: String,
+    /// Whether the open `tool_use` block's arguments stopped being JSON (a `Malformed {
+    /// InvalidArguments }` event of no bytes while it was open): its later fragments are not
+    /// sent, so the joined `partial_json` stays the prefix the readers accepted, which a client's
+    /// partial JSON reader closes into the value its complete members make, as the fold does for
+    /// the call ([`input`]).
+    refused: bool,
 }
 
 /// The kind of block that is open.
@@ -195,8 +176,18 @@ impl Stream {
 
     /// Appends the stream events `event` produces to `out`, in order. Returns the stop reason when
     /// `event` is `Finish`, after closing the open block.
-    pub fn feed(&mut self, event: &Event, out: &mut Vec<MessageStreamEvent>) -> Option<StopReason> {
+    pub fn feed(
+        &mut self,
+        event: &Event<'_>,
+        out: &mut Vec<MessageStreamEvent>,
+    ) -> Option<StopReason> {
         match event {
+            Event::Malformed {
+                text,
+                why: MalformedReason::InvalidArguments,
+            } if text.text.is_empty() && matches!(self.open, Some(Block::ToolUse { .. })) => {
+                self.refused = true;
+            }
             Event::Content(text) | Event::Malformed { text, .. } => self.text(&text.text, out),
             Event::Reasoning(text) => self.reasoning(&text.text, out),
             Event::ReasoningEnd => {
@@ -212,6 +203,7 @@ impl Stream {
                     id: tool_use_id(id),
                     name: name.clone(),
                     input: Value::Object(Map::new()),
+                    caller: ToolUseCaller::Direct,
                 },
                 out,
             ),
@@ -244,6 +236,7 @@ impl Stream {
         if self.open.take().is_some() {
             out.push(MessageStreamEvent::ContentBlockStop { index: self.index });
             self.index += 1;
+            self.refused = false;
         }
     }
 
@@ -270,13 +263,19 @@ impl Stream {
     }
 
     /// A fragment of call `call`'s arguments into its open `tool_use` block; text when the call has
-    /// no open block, so that no byte is lost.
+    /// no open block, so that no byte is lost; nothing once the block's arguments stopped being
+    /// JSON (a client's partial JSON reader takes a prefix cut short, not a token that is no JSON;
+    /// it closes the prefix into the value its complete members make, as the fold does for the
+    /// call).
     fn arguments(&mut self, call: u32, json: &str, out: &mut Vec<MessageStreamEvent>) {
         if json.is_empty() {
             return;
         }
         if self.open != Some(Block::ToolUse { call }) {
             self.text(json, out);
+            return;
+        }
+        if self.refused {
             return;
         }
         out.push(MessageStreamEvent::ContentBlockDelta {
@@ -362,10 +361,30 @@ fn tool_use_id(id: &str) -> String {
     }
 }
 
-/// The `input` for a call's joined argument fragments: the JSON value they form, or `{}` when they
-/// do not form one.
-fn input(arguments: &str) -> Value {
-    serde_json::from_str(arguments).unwrap_or_else(|_| Value::Object(Map::new()))
+/// The `input` for a call's joined argument fragments: the JSON value they form; when they form
+/// none and the parser said so (the output cut inside the arguments, or arguments that stopped
+/// being JSON, whose bytes from the break on are the model's as written), the value their complete
+/// members make, the prefix a strict reader accepts cut back to the last complete member at every
+/// level and closed ([`Prefix::closed`]), which is the value a client's partial JSON reader ends
+/// with from the fragments the stream sent, and `{}` where nothing of it is complete (a call
+/// closed without arguments, a first value cut short) or no value holds the closure (the parser's
+/// word stands); and the reader's refusal, in its words, when they are one whole JSON text that no
+/// value holds (a number outside the range a reader keeps, a surrogate escape without its other
+/// half, nesting past the value reader's limit), which nothing else says.
+fn input(arguments: &str) -> Result<Value, String> {
+    match serde_json::from_str(arguments) {
+        Ok(value) => Ok(value),
+        Err(why) if whole_json(arguments) => Err(why.to_string()),
+        Err(_) => Ok(Prefix::closed(arguments)
+            .and_then(|closed| serde_json::from_str(&closed).ok())
+            .unwrap_or_else(|| Value::Object(Map::new()))),
+    }
+}
+
+/// Whether `text` is one whole JSON text by its syntax, whatever its values: what a reader that
+/// keeps no value takes, as the Responses adapter judges a call's arguments.
+fn whole_json(text: &str) -> bool {
+    !text.is_empty() && serde_json::from_str::<IgnoredAny>(text).is_ok()
 }
 
 #[cfg(test)]
@@ -373,9 +392,14 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::event::{DropReason, MalformedReason, Text};
+    use crate::{
+        event::{DropReason, MalformedReason, Text},
+        formats::qwen3,
+        ids::is_minted,
+        CallSyntax, Declared, Engine, EngineFinish, Events, Input, Parser,
+    };
 
-    fn call(index: u32, name: &str) -> Event {
+    fn call(index: u32, name: &str) -> Event<'static> {
         Event::ToolCallStart {
             index,
             id: format!("call_{index}"),
@@ -384,7 +408,7 @@ mod tests {
         }
     }
 
-    fn arguments(index: u32, json: &str) -> Event {
+    fn arguments(index: u32, json: &str) -> Event<'static> {
         Event::ToolCallArguments {
             index,
             json: json.into(),
@@ -392,14 +416,14 @@ mod tests {
         }
     }
 
-    fn end(index: u32) -> Event {
+    fn end(index: u32) -> Event<'static> {
         Event::ToolCallEnd {
             index,
             source: Text::default(),
         }
     }
 
-    fn finish(reason: FinishReason, tool_calls: u32) -> Event {
+    fn finish(reason: FinishReason, tool_calls: u32) -> Event<'static> {
         Event::Finish {
             reason,
             tool_calls,
@@ -436,6 +460,7 @@ mod tests {
                     "id": "toolu_0",
                     "name": "get_weather",
                     "input": {"city": "Paris"},
+                    "caller": {"type": "direct"},
                 },
             ])
         );
@@ -488,8 +513,10 @@ mod tests {
         assert_eq!(
             wire(&output(&events).content),
             json!([
-                {"type": "tool_use", "id": "toolu_0", "name": "get_weather", "input": {"city": "Paris"}},
-                {"type": "tool_use", "id": "toolu_1", "name": "get_time", "input": {"zone": "CET"}},
+                {"type": "tool_use", "id": "toolu_0", "name": "get_weather", "input": {"city": "Paris"},
+                 "caller": {"type": "direct"}},
+                {"type": "tool_use", "id": "toolu_1", "name": "get_time", "input": {"zone": "CET"},
+                 "caller": {"type": "direct"}},
             ])
         );
     }
@@ -528,16 +555,60 @@ mod tests {
         assert_eq!(output(&[]).stop_reason, None);
     }
 
+    /// The output of one call of `f` with `fragments` for its arguments, ended by `length`.
+    fn one_call(fragments: &[&str]) -> Output {
+        let mut events = vec![call(0, "f")];
+        events.extend(fragments.iter().map(|json| arguments(0, json)));
+        events.push(end(0));
+        events.push(finish(FinishReason::Length, 1));
+        output(&events)
+    }
+
+    /// Arguments that are no whole JSON value: the `input` is the value their complete members
+    /// make, the prefix a strict reader accepts cut back to the last complete member at every
+    /// level and closed, as a client's partial JSON reader ends with it from the stream; `{}`
+    /// where nothing of them is complete, and for a call closed without arguments. The parser's
+    /// word stands: none of these is named as refused.
     #[test]
-    fn arguments_that_are_not_a_whole_json_value_give_an_empty_input() {
+    fn arguments_that_are_no_whole_json_value_give_the_value_their_complete_members_make() {
         let inputs = |fragments: &[&str]| {
-            let mut events = vec![call(0, "f")];
-            events.extend(fragments.iter().map(|json| arguments(0, json)));
-            events.push(end(0));
-            events.push(finish(FinishReason::Length, 1));
-            wire(&output(&events).content)[0]["input"].clone()
+            let output = one_call(fragments);
+            assert!(
+                output.refused.is_empty(),
+                "{fragments:?}: the parser's word stands"
+            );
+            wire(&output.content)[0]["input"].clone()
         };
-        assert_eq!(inputs(&[r#"{"city":"#]), json!({}), "cut short");
+        assert_eq!(
+            inputs(&[r#"{"city":"#]),
+            json!({}),
+            "cut before the first value"
+        );
+        assert_eq!(
+            inputs(&[r#"{"city": "Par"#]),
+            json!({}),
+            "cut inside the first value"
+        );
+        assert_eq!(
+            inputs(&[r#"{"city": "Paris", "#, r#""days": 3"#]),
+            json!({"city": "Paris", "days": 3}),
+            "cut after a number whole as it stands"
+        );
+        assert_eq!(
+            inputs(&[r#"{"city": "Paris", "days": [1, "#, "2"]),
+            json!({"city": "Paris", "days": [1, 2]}),
+            "cut inside a nested array: closed at every level"
+        );
+        assert_eq!(
+            inputs(&[r#"{"city": "Paris", "days": "#]),
+            json!({"city": "Paris"}),
+            "cut after a key: the key leaves with the value it never got"
+        );
+        assert_eq!(
+            inputs(&[r#"{"city": "Paris", "days": [1, "tw"#]),
+            json!({"city": "Paris", "days": [1]}),
+            "cut inside a string: the string leaves, the members before it stay"
+        );
         assert_eq!(inputs(&["not json"]), json!({}), "not JSON at all");
         assert_eq!(inputs(&[]), json!({}), "closed without arguments");
         assert_eq!(
@@ -550,6 +621,150 @@ mod tests {
             json!([1, 2]),
             "a whole value of another kind"
         );
+    }
+
+    /// Arguments that are JSON by their syntax and that no `input` value holds: the block carries
+    /// `{}`, as for arguments that are none, and the output names the call with the reader's
+    /// reason, since no event says so; the stream carries the text as the model wrote it. Three
+    /// kinds of text are such: a number outside the range a reader keeps, a surrogate escape
+    /// without its other half, and nesting past the value reader's limit (the crate's readers
+    /// refuse the last two as they arrive, so from them only the numbers get here).
+    #[test]
+    fn arguments_no_input_value_holds_are_named_as_refused_with_the_readers_reason() {
+        let deep = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        for (text, reason) in [
+            (r#"{"days": 9.99e999999}"#, "number out of range"),
+            (r#"{"n": 1e400, "city": "Paris"}"#, "number out of range"),
+            ("[-1e400]", "number out of range"),
+            (r#"{"q": "\ud800"}"#, "hex escape"),
+            (deep.as_str(), "recursion limit exceeded"),
+        ] {
+            let folded = one_call(&[text]);
+            assert_eq!(wire(&folded.content)[0]["input"], json!({}), "{text}");
+            assert_eq!(folded.refused.len(), 1, "{text}: {:?}", folded.refused);
+            let refused = &folded.refused[0];
+            assert_eq!((refused.index, refused.name.as_str()), (0, "f"), "{text}");
+            assert_eq!(refused.arguments, text);
+            assert!(refused.why.contains(reason), "{text}: {}", refused.why);
+            assert_eq!(
+                folded.stop_reason,
+                Some(StopReason::MaxTokens),
+                "{text}: the stop reason is the finish's, as for every output"
+            );
+            // The same arguments in two fragments and in two calls: each call is named once, in
+            // the order the calls started, with its own arguments.
+            let (head, tail) = text.split_at(4);
+            let mut events = vec![
+                call(0, "f"),
+                arguments(0, head),
+                arguments(0, tail),
+                end(0),
+                call(1, "g"),
+                arguments(1, r#"{"ok": true}"#),
+                end(1),
+                call(2, "h"),
+                arguments(2, text),
+                end(2),
+                finish(FinishReason::Stop, 3),
+            ];
+            let folded = output(&events);
+            assert_eq!(
+                folded
+                    .refused
+                    .iter()
+                    .map(|refused| (refused.index, refused.name.as_str()))
+                    .collect::<Vec<_>>(),
+                [(0, "f"), (2, "h")],
+                "{text}"
+            );
+            assert_eq!(
+                wire(&folded.content)[1]["input"],
+                json!({"ok": true}),
+                "{text}"
+            );
+            // The stream hands the fragments on as written, for the client's own reader.
+            events.truncate(4);
+            let mut stream = Stream::new();
+            let mut out = Vec::new();
+            for event in &events {
+                stream.feed(event, &mut out);
+            }
+            let partial: String = stream_wire(&out)
+                .as_array()
+                .expect("events")
+                .iter()
+                .filter_map(|event| event["delta"]["partial_json"].as_str().map(String::from))
+                .collect();
+            assert_eq!(partial, text);
+        }
+    }
+
+    /// The stream of a call whose arguments stop being JSON: the fragments before the break are
+    /// `input_json_delta`s, the break (a `Malformed { InvalidArguments }` event of no bytes) ends
+    /// them, and the fragments after it go nowhere, since a client's partial JSON reader takes a
+    /// prefix cut short but not a token that is no JSON: it closes the prefix into the value its
+    /// complete members make, which is the fold's `input` for the call, so a streaming client and
+    /// a whole-message client end with the same call. The next call's block streams whole again.
+    #[test]
+    fn arguments_that_stop_being_json_stream_the_prefix_and_nothing_after_the_break() {
+        let events = [
+            call(0, "plot_sine_wave"),
+            arguments(0, r#"{"start_range": 0, "end_range": 2.0 "#),
+            Event::Malformed {
+                text: Text::default(),
+                why: MalformedReason::InvalidArguments,
+            },
+            arguments(0, r#"* Math.PI, "frequency": 5}"#),
+            end(0),
+            call(1, "g"),
+            arguments(1, r#"{"ok": true}"#),
+            end(1),
+            finish(FinishReason::ToolCalls, 2),
+        ];
+        let mut stream = Stream::new();
+        let mut out = Vec::new();
+        for event in &events {
+            stream.feed(event, &mut out);
+        }
+        let events_wire = stream_wire(&out);
+        let events_wire = events_wire.as_array().expect("events");
+        let partial = |index: u64| -> String {
+            events_wire
+                .iter()
+                .filter(|event| event["index"] == index)
+                .filter_map(|event| event["delta"]["partial_json"].as_str().map(String::from))
+                .collect()
+        };
+        assert_eq!(partial(0), r#"{"start_range": 0, "end_range": 2.0 "#);
+        assert_eq!(partial(1), r#"{"ok": true}"#);
+        assert!(
+            events_wire
+                .iter()
+                .all(|event| event["delta"]["type"] != "text_delta"),
+            "nothing of the tail is text: {events_wire:?}"
+        );
+        assert_eq!(
+            events_wire
+                .iter()
+                .filter(|event| event["type"] == "content_block_start")
+                .count(),
+            2,
+            "two tool_use blocks and nothing else: {events_wire:?}"
+        );
+        let folded = output(&events);
+        assert_eq!(
+            wire(&folded.content)[0]["input"],
+            json!({"start_range": 0, "end_range": 2.0}),
+            "the fold: the prefix's complete members, nothing of the tail"
+        );
+        let closed_by_a_client: Value =
+            serde_json::from_str(&format!("{}}}", partial(0).trim_end())).expect("closed");
+        assert_eq!(
+            wire(&folded.content)[0]["input"],
+            closed_by_a_client,
+            "the stream's prefix, closed as a client's partial reader closes it"
+        );
+        assert_eq!(wire(&folded.content)[1]["input"], json!({"ok": true}));
     }
 
     #[test]
@@ -651,7 +866,8 @@ mod tests {
                  "delta": {"type": "text_delta", "text": "check."}},
                 {"type": "content_block_stop", "index": 1},
                 {"type": "content_block_start", "index": 2,
-                 "content_block": {"type": "tool_use", "id": "toolu_0", "name": "get_weather", "input": {}}},
+                 "content_block": {"type": "tool_use", "id": "toolu_0", "name": "get_weather", "input": {},
+                                   "caller": {"type": "direct"}}},
                 {"type": "content_block_delta", "index": 2,
                  "delta": {"type": "input_json_delta", "partial_json": "{\"city\":"}},
                 {"type": "content_block_delta", "index": 2,
@@ -921,31 +1137,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_stream_and_the_fold_agree_on_an_output_in_block_order() {
-        let events = [
-            Event::ReasoningStart,
-            Event::Reasoning(Text::uncounted("plan")),
-            Event::ReasoningEnd,
-            Event::Content(Text::uncounted("\n\n")),
-            Event::Content(Text::uncounted("Let me ")),
-            Event::Malformed {
-                text: Text::uncounted("<tool_call>{broken"),
-                why: MalformedReason::InvalidArguments,
-            },
-            call(0, "get_weather"),
-            arguments(0, r#"{"city":"#),
-            arguments(0, r#""Paris"}"#),
-            end(0),
-            call(1, "get_time"),
-            arguments(1, r#"{"zone":"#),
-            end(1),
-            finish(FinishReason::Length, 2),
-        ];
-        let (out, stop) = stream(&events);
+    /// The blocks a client assembles from the stream: the text and thinking deltas joined, and a
+    /// `tool_use` block's `input` read from its joined `input_json_delta`s by a partial JSON
+    /// reader that keeps complete members only ([`Prefix::closed`]), `{}` where nothing of them is
+    /// complete.
+    fn client_blocks(out: &[MessageStreamEvent]) -> Vec<Value> {
         let mut blocks: Vec<Value> = Vec::new();
         let mut inputs: Vec<String> = Vec::new();
-        for event in &out {
+        for event in out {
             match event {
                 MessageStreamEvent::ContentBlockStart { .. } => {
                     blocks.push(event_wire(event)["content_block"].clone());
@@ -977,11 +1176,198 @@ mod tests {
         }
         for (block, input) in blocks.iter_mut().zip(&inputs) {
             if block["type"] == "tool_use" {
-                block["input"] = serde_json::from_str(input).unwrap_or_else(|_| json!({}));
+                block["input"] = Prefix::closed(input)
+                    .and_then(|closed| serde_json::from_str(&closed).ok())
+                    .unwrap_or_else(|| json!({}));
             }
         }
+        blocks
+    }
+
+    #[test]
+    fn the_stream_and_the_fold_agree_on_an_output_in_block_order() {
+        let events = [
+            Event::ReasoningStart,
+            Event::Reasoning(Text::uncounted("plan")),
+            Event::ReasoningEnd,
+            Event::Content(Text::uncounted("\n\n")),
+            Event::Content(Text::uncounted("Let me ")),
+            Event::Malformed {
+                text: Text::uncounted("<tool_call>{broken"),
+                why: MalformedReason::InvalidArguments,
+            },
+            call(0, "get_weather"),
+            arguments(0, r#"{"city":"#),
+            arguments(0, r#""Paris"}"#),
+            end(0),
+            call(1, "get_time"),
+            arguments(1, r#"{"zone": "CET", "offset":"#),
+            end(1),
+            finish(FinishReason::Length, 2),
+        ];
+        let (out, stop) = stream(&events);
+        // A client's partial JSON reader closes a block's joined deltas into the value their
+        // complete members make: the call the output cut ends as `{"zone": "CET"}` for it, and
+        // the fold gives the call the same.
+        let blocks = client_blocks(&out);
         let folded = output(&events);
+        assert_eq!(wire(&folded.content)[3]["input"], json!({"zone": "CET"}));
         assert_eq!(Value::Array(blocks), wire(&folded.content));
         assert_eq!(stop, folded.stop_reason);
+    }
+
+    /// The recorded output of a call whose arguments stop being JSON, through the table arriving
+    /// in two pieces at every cut and ended at every byte. In two pieces: the fold gives the same
+    /// blocks as for the whole, the stream's `tool_use` block carries the prefix a strict reader
+    /// accepts and nothing after the break, the blocks a client assembles from the stream are the
+    /// fold's, and the stop reasons agree. Ended at the byte: the `input` a client closes from the
+    /// stream is the fold's, and the stop reasons agree.
+    #[test]
+    fn the_stream_and_the_fold_agree_on_a_call_whose_arguments_stop_being_json_at_every_cut() {
+        const OUTPUT: &str = concat!(
+            "<tool_call>\n{\"name\": \"plot_sine_wave\", \"arguments\": ",
+            "{\"start_range\": 0, \"end_range\": 2.0 * Math.PI, \"frequency\": 5}}\n</tool_call>"
+        );
+        const PREFIX: &str = r#"{"start_range": 0, "end_range": 2.0 "#;
+        let whole = output(&parsed(OUTPUT));
+        let blocks = wire(&whole.content);
+        assert_eq!(blocks.as_array().map(Vec::len), Some(1), "{blocks}");
+        assert_eq!(blocks[0]["type"], "tool_use", "{blocks}");
+        assert_eq!(
+            blocks[0]["input"],
+            json!({"start_range": 0, "end_range": 2.0}),
+            "{blocks}"
+        );
+        assert_eq!(whole.stop_reason, Some(StopReason::ToolUse));
+        // The ids are minted per reading: a comparison of two readings leaves them out.
+        let without_ids = |blocks: &Value| -> Value {
+            let mut blocks = blocks.clone();
+            for block in blocks.as_array_mut().expect("blocks") {
+                block.as_object_mut().expect("a block").remove("id");
+            }
+            blocks
+        };
+        let tool_use_input = |blocks: &[Value]| -> Option<Value> {
+            blocks
+                .iter()
+                .find(|block| block["type"] == "tool_use")
+                .map(|block| block["input"].clone())
+        };
+        let mut cuts = 0;
+        for cut in 1..OUTPUT.len() {
+            if !OUTPUT.is_char_boundary(cut) {
+                continue;
+            }
+            cuts += 1;
+            let events = parsed_in(&[&OUTPUT[..cut], &OUTPUT[cut..]], EngineFinish::Stop);
+            let folded = output(&events);
+            assert_eq!(
+                without_ids(&wire(&folded.content)),
+                without_ids(&blocks),
+                "cut at {cut}"
+            );
+            let (out, stop) = stream(&events);
+            let partial: String = out
+                .iter()
+                .map(event_wire)
+                .filter_map(|event| event["delta"]["partial_json"].as_str().map(String::from))
+                .collect();
+            assert_eq!(partial, PREFIX, "cut at {cut}");
+            assert_eq!(
+                Value::Array(client_blocks(&out)),
+                wire(&folded.content),
+                "cut at {cut}"
+            );
+            assert_eq!(stop, folded.stop_reason, "cut at {cut}");
+
+            let events = parsed_in(&[&OUTPUT[..cut]], EngineFinish::Length);
+            let folded = wire(&output(&events).content);
+            let folded = folded.as_array().expect("blocks");
+            let (out, stop) = stream(&events);
+            assert_eq!(
+                tool_use_input(&client_blocks(&out)),
+                tool_use_input(folded),
+                "ended at {cut}"
+            );
+            assert_eq!(stop, output(&events).stop_reason, "ended at {cut}");
+        }
+        assert!(cuts > 100, "{cuts} cuts");
+    }
+
+    /// The events of `output` read by the Qwen3 table through an engine of its own, as the gateway
+    /// reads each request.
+    fn parsed(output: &str) -> Vec<Event<'static>> {
+        parsed_in(&[output], EngineFinish::Stop)
+    }
+
+    /// The events of an output that arrives in `pieces`, read by the Qwen3 table through an engine
+    /// of its own and ended by `finish`.
+    fn parsed_in(pieces: &[&str], finish: EngineFinish) -> Vec<Event<'static>> {
+        let mut engine = Engine::new(qwen3(CallSyntax::Json), Declared::default());
+        let mut out = Events::new();
+        for &text in pieces {
+            engine
+                .feed(
+                    Input::Delta {
+                        token_ids: &[],
+                        text,
+                        spans: &[],
+                    },
+                    &mut out,
+                )
+                .expect("a delta");
+        }
+        engine
+            .feed(Input::End { finish }, &mut out)
+            .expect("the end");
+        out.into_owned().drain()
+    }
+
+    /// Two calls of Qwen3's syntax in one output.
+    const TWO_CALLS: &str = concat!(
+        "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n</tool_call>\n",
+        "<tool_call>\n{\"name\": \"get_time\", \"arguments\": {\"zone\": \"CET\"}}\n</tool_call>"
+    );
+
+    #[test]
+    fn two_turns_of_two_calls_carry_four_distinct_tool_use_ids_the_stream_and_the_fold_agree_on() {
+        // A client keeps its `tool_use` blocks and `tool_result`s by id across the conversation:
+        // no id of one turn may come back in the next, and the stream must name the block as the
+        // folded message does.
+        let mut seen: Vec<String> = Vec::new();
+        for turn in 0..2 {
+            let events = parsed(TWO_CALLS);
+            let folded: Vec<String> = wire(&output(&events).content)
+                .as_array()
+                .expect("blocks")
+                .iter()
+                .filter(|block| block["type"] == "tool_use")
+                .map(|block| block["id"].as_str().expect("an id").to_string())
+                .collect();
+            let (out, _) = stream(&events);
+            let streamed: Vec<String> = out
+                .iter()
+                .map(event_wire)
+                .filter(|event| event["content_block"]["type"] == "tool_use")
+                .map(|event| {
+                    event["content_block"]["id"]
+                        .as_str()
+                        .expect("an id")
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(folded.len(), 2, "turn {turn}: {folded:?}");
+            assert_eq!(streamed, folded, "turn {turn}");
+            for id in &folded {
+                let hex = id
+                    .strip_prefix("toolu_")
+                    .unwrap_or_else(|| panic!("turn {turn}: {id}"));
+                assert!(is_minted(&format!("call_{hex}")), "turn {turn}: {id}");
+            }
+            seen.extend(folded);
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 4, "{seen:?}");
     }
 }

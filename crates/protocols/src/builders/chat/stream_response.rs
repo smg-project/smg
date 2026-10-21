@@ -2,8 +2,6 @@
 //!
 //! Provides an ergonomic fluent API for constructing streaming chat completion responses.
 
-use std::borrow::Cow;
-
 use crate::{
     chat::*,
     common::{FunctionCallDelta, ToolCallDelta, Usage},
@@ -152,53 +150,6 @@ impl ChatCompletionStreamResponseBuilder {
                 content: None,
                 tool_calls: None,
                 reasoning_content: None,
-            },
-            logprobs: None,
-            finish_reason: None,
-            matched_stop: None,
-        });
-        self
-    }
-
-    /// Add a choice delta that appends a tool-call *arguments delta*
-    /// Uses `Cow` so you can pass `&str` or `String` without extra clones
-    pub fn add_choice_tool_args(
-        mut self,
-        index: u32,
-        args_delta: impl Into<Cow<'static, str>>,
-    ) -> Self {
-        self.choices.push(ChatStreamChoice {
-            index,
-            delta: ChatMessageDelta {
-                role: None,
-                content: None,
-                tool_calls: Some(vec![ToolCallDelta {
-                    index: 0,
-                    id: None,
-                    tool_type: None,
-                    function: Some(FunctionCallDelta {
-                        name: None,
-                        arguments: Some(args_delta.into().into_owned()),
-                    }),
-                }]),
-                reasoning_content: None,
-            },
-            logprobs: None,
-            finish_reason: None,
-            matched_stop: None,
-        });
-        self
-    }
-
-    /// Add a choice delta that sets reasoning content (for models that stream reasoning)
-    pub fn add_choice_reasoning(mut self, index: u32, reasoning: impl Into<String>) -> Self {
-        self.choices.push(ChatStreamChoice {
-            index,
-            delta: ChatMessageDelta {
-                role: None,
-                content: None,
-                tool_calls: None,
-                reasoning_content: Some(reasoning.into()),
             },
             logprobs: None,
             finish_reason: None,

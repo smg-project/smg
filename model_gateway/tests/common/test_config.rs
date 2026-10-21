@@ -101,7 +101,7 @@ impl TestRouterConfig {
         apply_test_defaults(
             RouterConfig::builder()
                 .regular_mode(vec![])
-                .power_of_two_policy(5) // load_check_interval_secs
+                .power_of_two_policy()
                 .host(defaults::HOST)
                 .port(port)
                 .max_payload_size(defaults::MAX_PAYLOAD_SIZE)

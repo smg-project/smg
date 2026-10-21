@@ -13,7 +13,7 @@ use crate::{
     worker::ConnectionMode,
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
-        Job, TokenizerConfigRequest,
+        Job, TokenizerConfigRequest, TokenizerLoadFailure,
     },
 };
 
@@ -81,21 +81,24 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
         for worker in workers {
             let model_id = worker.model_id().to_string();
 
-            // Get tokenizer path with fallback chain:
+            // Get tokenizer path with fallback chain (an empty value is no path):
             // 1. Worker labels: tokenizer_path
             // 2. Worker labels: model_path
             // 3. Router config (CLI args): --tokenizer-path
             // 4. Router config (CLI args): --model-path
+            let usable = |path: &&String| !path.is_empty();
             let tokenizer_path: String = if let Some(path) = labels
                 .get("tokenizer_path")
-                .or_else(|| labels.get("model_path"))
+                .filter(usable)
+                .or_else(|| labels.get("model_path").filter(usable))
             {
                 path.clone()
             } else if let Some(path) = app_context
                 .router_config
                 .tokenizer_path
                 .as_ref()
-                .or(app_context.router_config.model_path.as_ref())
+                .filter(usable)
+                .or_else(|| app_context.router_config.model_path.as_ref().filter(usable))
             {
                 debug!(
                     "Using router config tokenizer path '{}' for model {}",
@@ -103,9 +106,23 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
                 );
                 path.clone()
             } else {
+                // Nothing of this worker's loads the model's tokenizer. Unless
+                // the model has one already (another worker's or the
+                // operator's registration) or a load of it is in flight (that
+                // load decides), record it, so that requests are answered with
+                // the fact instead of a retry hint.
+                let recorded = !app_context.tokenizer_registry.contains(&model_id)
+                    && app_context
+                        .tokenizer_load_failures
+                        .record(&model_id, TokenizerLoadFailure::NoSource);
                 warn!(
-                    "No tokenizer_path or model_path found for model {} (checked worker labels and router config)",
-                    model_id
+                    "No tokenizer_path or model_path found for model {} (checked worker labels and router config){}",
+                    model_id,
+                    if recorded {
+                        "; its requests answer 503 tokenizer_load_failed until a tokenizer is registered"
+                    } else {
+                        ""
+                    }
                 );
                 continue;
             };
@@ -129,7 +146,8 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
                 fail_on_duplicate: false,
             };
 
-            // Submit job (fire-and-forget, don't wait for completion)
+            // Submit job (fire-and-forget, don't wait for completion); the
+            // queue counts the accepted load in flight for the model.
             if let Err(e) = job_queue
                 .submit(Job::AddTokenizer {
                     config: Box::new(config),
@@ -139,6 +157,12 @@ impl StepExecutor<WorkerWorkflowData> for SubmitTokenizerJobStep {
                 warn!(
                     "Failed to submit tokenizer job for model {}: {}",
                     model_id, e
+                );
+                app_context.tokenizer_load_failures.record(
+                    &model_id,
+                    TokenizerLoadFailure::Failed(format!(
+                        "the registration job was not accepted: {e}"
+                    )),
                 );
             }
         }

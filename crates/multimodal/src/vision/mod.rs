@@ -33,22 +33,26 @@
 //! ```
 
 pub mod execution;
+pub(crate) mod orientation;
 pub mod preprocessor_config;
 pub mod processor;
 pub mod processors;
+pub(crate) mod rgb_runs;
 pub(crate) mod scratch;
+mod torch_resample;
 pub mod transforms;
 
 // Re-export commonly used types, including compatibility paths for shared
 // preprocessing outputs.
 pub use preprocessor_config::PreProcessorConfig;
 pub use processor::{
-    ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor, VisionProcessorRegistry,
+    ModelSpecificValue, PreprocessedEncoderInputs, VisionPreProcessor, VisionPreprocessingContext,
+    VisionProcessorRegistry,
 };
 pub use processors::{
     DeepseekV41Processor, Gemma4Processor, Glm53FlashProcessor, Llama4VisionProcessor,
-    LlavaNextProcessor, LlavaProcessor, MiniMaxM3VisionProcessor, Phi3VisionProcessor,
-    Phi4VisionProcessor, PixtralProcessor, Qwen2VLProcessor, Qwen3OmniVisionProcessor,
-    Qwen3VLProcessor,
+    LlavaNextProcessor, LlavaProcessor, MiniMaxM3VisionProcessor, NemotronOmniProcessor,
+    Phi3VisionProcessor, Phi4VisionProcessor, PixtralProcessor, Qwen2VLProcessor,
+    Qwen3OmniVisionProcessor, Qwen3VLProcessor,
 };
 pub use transforms::TransformError;

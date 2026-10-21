@@ -12,15 +12,36 @@
 //! entry wakes a share of those workers whether or not there is work for
 //! them. Preprocessing a single image is sub-millisecond, so on a large host
 //! the wake-ups cost several times the work itself.
+//!
+//! Under load the pool is shared by every request. A split is bounded by the
+//! pool's free share, counted from the tasks spawned and not yet returned, so
+//! one image on an idle host spreads across the pool while eight concurrent
+//! images each keep their caller's thread instead of queueing behind one
+//! another's bands. The bytes do not depend on the split.
+//!
+//! The pool's size therefore bounds one image's split, not the total: an
+//! operation that finds the pool busy runs on its caller's thread, so
+//! preprocessing under load uses about the pool's threads plus one per
+//! concurrent request.
 
-use std::{marker::PhantomData, num::NonZeroUsize, sync::OnceLock};
+use std::{
+    marker::PhantomData,
+    num::NonZeroUsize,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        OnceLock,
+    },
+};
 
 const PARALLEL_MIN_BYTES: usize = 1 << 19;
 const MAX_TASKS_PER_OPERATION: usize = 8;
 /// Threads in the dedicated pool when the host names no size: enough to
 /// split one large image, few enough to leave the host its cores.
 const DEFAULT_POOL_THREADS: usize = 8;
-/// Overrides the dedicated pool's size (a positive thread count).
+/// Overrides the dedicated pool's size (a positive thread count): how many
+/// threads one image's stages may spread over. An operation that finds the
+/// pool busy runs on its caller's thread rather than waiting for it, so this
+/// is not a cap on the preprocessing CPU under load.
 pub const POOL_THREADS_ENV: &str = "SMG_MM_THREADS";
 /// Prefix of the dedicated pool's thread names.
 pub const POOL_THREAD_NAME_PREFIX: &str = "smg-mm-";
@@ -54,6 +75,26 @@ impl Parallelism {
 
 static PARALLELISM: OnceLock<Parallelism> = OnceLock::new();
 static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
+/// Tasks spawned on the pool and not yet returned: the pool's busy share,
+/// which a new operation's split leaves alone.
+static BUSY_TASKS: AtomicUsize = AtomicUsize::new(0);
+
+/// One task counted in [`BUSY_TASKS`] from its spawn until it returns or
+/// unwinds.
+struct BusyTask;
+
+impl BusyTask {
+    fn begin() -> Self {
+        BUSY_TASKS.fetch_add(1, Ordering::Relaxed);
+        BusyTask
+    }
+}
+
+impl Drop for BusyTask {
+    fn drop(&mut self) {
+        BUSY_TASKS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
 
 /// Choose where preprocessing runs, once per process, before the first
 /// preprocessing call. Returns the mode already in force when it differs
@@ -111,11 +152,15 @@ impl<'scope> Spawner<'_, 'scope> {
         F: FnOnce(&Spawner<'_, 'scope>) + Send + 'scope,
     {
         match self.inner {
-            SpawnerInner::Pool(scope) => scope.spawn(move |scope| {
-                task(&Spawner {
-                    inner: SpawnerInner::Pool(scope),
+            SpawnerInner::Pool(scope) => {
+                let busy = BusyTask::begin();
+                scope.spawn(move |scope| {
+                    let _busy = busy;
+                    task(&Spawner {
+                        inner: SpawnerInner::Pool(scope),
+                    });
                 });
-            }),
+            }
             SpawnerInner::Inline(_) => task(&Spawner {
                 inner: SpawnerInner::Inline(PhantomData),
             }),
@@ -147,7 +192,9 @@ where
 }
 
 /// How many tasks to split an operation into: one unless the output is
-/// large and the mode runs tasks concurrently.
+/// large, the mode runs tasks concurrently and the pool has threads to
+/// spare; an operation that finds the pool busy runs whole on its caller's
+/// thread rather than queueing its bands behind other operations' tasks.
 pub(crate) fn task_count(
     output_bytes: usize,
     work_items: usize,
@@ -161,8 +208,12 @@ pub(crate) fn task_count(
     if output_bytes < PARALLEL_MIN_BYTES || work_items < 2 * min_items_per_task {
         return 1;
     }
+    let free = threads.saturating_sub(BUSY_TASKS.load(Ordering::Relaxed));
+    if free <= 1 {
+        return 1;
+    }
     (work_items / min_items_per_task)
-        .min(threads)
+        .min(free)
         .clamp(1, MAX_TASKS_PER_OPERATION)
 }
 
@@ -195,9 +246,79 @@ mod tests {
         assert!(threads.get() <= DEFAULT_POOL_THREADS);
     }
 
+    /// The two tests of this module that hold the shared pool take this, so
+    /// neither holds it under the other; tests elsewhere in the binary spawn
+    /// on the pool too, which is why the counts below are read with slack.
+    static POOL_TESTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_busy_pool_keeps_a_new_operation_whole() {
+        use std::{
+            sync::{mpsc, Mutex},
+            time::{Duration, Instant},
+        };
+        let _serial = POOL_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Parallelism::Pool(threads) = parallelism() else {
+            return;
+        };
+        let threads = threads.get();
+        let before = BUSY_TASKS.load(Ordering::Relaxed);
+        let (release, held) = mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        let split = std::thread::scope(|threads_scope| {
+            threads_scope.spawn(|| {
+                scope(|spawner| {
+                    for _ in 0..threads {
+                        spawner.spawn(|_| {
+                            // Holds a pool thread until released.
+                            let _ = held
+                                .lock()
+                                .expect("receiver")
+                                .recv_timeout(Duration::from_secs(10));
+                        });
+                    }
+                });
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while BUSY_TASKS.load(Ordering::Relaxed) < before + threads && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let split = task_count(PARALLEL_MIN_BYTES, usize::MAX, 1);
+            // Released before any assertion, so a failure cannot wait out
+            // the holds.
+            for _ in 0..threads {
+                let _ = release.send(());
+            }
+            drop(release);
+            split
+        });
+        assert_eq!(
+            split, 1,
+            "a pool held by {threads} tasks splits a new operation no further"
+        );
+        // The count returns once the held tasks do. Other tests of the binary
+        // spawn on the pool as well, so the count is not exact at an instant:
+        // what holds is that it comes back down to, or below, its reading
+        // before the holds, within the time their tasks take.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while BUSY_TASKS.load(Ordering::Relaxed) > before && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            BUSY_TASKS.load(Ordering::Relaxed) <= before,
+            "the count did not return once the held tasks did"
+        );
+    }
+
     #[test]
     fn a_scope_runs_every_task_once() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+        let _serial = POOL_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let count = AtomicUsize::new(0);
         scope(|spawner| {
             for _ in 0..16 {

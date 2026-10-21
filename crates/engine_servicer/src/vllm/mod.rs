@@ -46,7 +46,7 @@ use llm_tokenizer::traits::Tokenizer;
 use media::MediaGate;
 pub use media::{
     BoxFuture, MediaError, MediaFeatures, MediaProcessor, MediaRefItem, MediaRequest,
-    ProcessedMedia,
+    ProcessedMedia, ALL_MODALITIES, PIXEL_MODALITIES,
 };
 use service::VllmEngineService;
 use smg_grpc_client::vllm_proto::vllm_engine_server::VllmEngineServer;
@@ -58,7 +58,7 @@ use tracing::{info, warn};
 
 use crate::{
     engine_link::EngineLink, health::HealthReporter, requests::RequestRegistry, ServerThread,
-    ServicerError, Shutdown,
+    ServicerConfig, ServicerError, Shutdown,
 };
 
 pub(crate) const SERVICE_NAME: &str = "vllm.grpc.engine.VllmEngine";
@@ -129,54 +129,58 @@ pub struct VllmModelInfo {
     /// as the `mm_item_limits` label the Router's media pipeline holds
     /// requests to (`image=8,video=2`); empty when the engine has none.
     pub mm_item_limits: String,
+    /// The engine's encoder budget in feature tokens, as its own front end
+    /// derives it: the most one media item may carry and still be scheduled,
+    /// advertised as `mm_encoder_budget` so the Router's media pipeline
+    /// refuses a larger item before the engine; 0 when unknown.
+    pub mm_encoder_budget: i32,
     /// The scheduler's running window (`--max-num-seqs`) as the launcher read
     /// it: how many requests the engine runs at once, which `GetServerInfo`
     /// advertises as the bound the Router's PD admission gate claims decode
     /// rooms against. The handshake's figure is the fallback for a launcher
     /// that reported none.
     pub max_num_seqs: i32,
+    /// The engine's reasoning parser (`--reasoning-parser`, "glm45", ...),
+    /// advertised as the `engine_reasoning_parser` label; empty when it runs
+    /// none.
+    pub engine_reasoning_parser: String,
+    /// Where the engine starts a request's grammar on a thinking prompt, as
+    /// the launcher read it off the structured-outputs config and the Router
+    /// shapes a forced tool call's grammar by (`constrained_decoding_start`
+    /// label): `after_reasoning` when the engine waits for its reasoning
+    /// parser to see the thought's end, `first_token` when the grammar runs
+    /// from the first generated token; empty when the config does not say.
+    pub constrained_decoding_start: String,
+    /// Whether the engine's scheduler statistics are on (vLLM's
+    /// `--disable-log-stats` not given), as the launcher started it: such an
+    /// engine's wire reports every scheduler step, and the pushed load record
+    /// says so (`engine_reports_steps`) from the first record rather than
+    /// from the first stats-only step batch, so an engine that freezes before
+    /// its first batch is judged on the step-reporting path too. `None` when
+    /// the launcher did not say (an older one): the wire is then classified
+    /// by what it shows.
+    pub log_stats: Option<bool>,
 }
 
 /// How to bind, where the engine dials in, and what to advertise.
 #[derive(Clone)]
 pub struct VllmServicerConfig {
-    /// `host:port` for the gRPC listener.
-    pub bind_address: String,
-    /// `ipc://<path>` base for the data-plane sockets (`<path>-in.sock` and
-    /// `<path>-out.sock`), owned by this process's uid.
-    pub ipc_base_url: String,
-    /// `tcp://host:port` the headless engine dials for the handshake (its
-    /// `--data-parallel-address`/`--data-parallel-rpc-port`).
-    /// An `ipc://<path>` endpoint is accepted too: one per test, so parallel
-    /// tests never share a probed TCP port.
-    pub handshake_address: String,
-    /// Engines that will dial in (the engine-level data-parallel size).
-    pub engine_count: usize,
-    /// Local directory holding the model's tokenizer files; without it,
-    /// requests carrying string stops are refused.
-    pub tokenizer_dir: Option<String>,
+    /// The listener, the engine's endpoints, the tokenizer directory and the
+    /// start-up bounds. `handshake_address` is what the headless engine dials
+    /// (its `--data-parallel-address`/`--data-parallel-rpc-port`),
+    /// `engine_count` its engine-level data-parallel size; without
+    /// `tokenizer_dir`, requests carrying string stops are refused.
+    pub servicer: ServicerConfig,
     pub model: VllmModelInfo,
     /// Worker-side media processing for `media_refs`; `None` refuses them, as
     /// the Python servicer does with `--mm-processor off`.
     pub media_processor: Option<Arc<dyn MediaProcessor>>,
-    /// Bound on silence during the engine's startup handshake: a handshake
-    /// message or a [`VllmServicerServer::note_engine_alive`] report resets
-    /// it; see [`crate::DEFAULT_ENGINE_STARTUP_TIMEOUT`].
-    pub engine_startup_timeout: Duration,
-    /// Bound on the whole startup handshake however alive the engine is;
-    /// `None` leaves that to the silence bound and the lifecycle owner. See
-    /// [`crate::DEFAULT_ENGINE_STARTUP_CEILING`].
-    pub engine_startup_ceiling: Option<Duration>,
 }
 
 impl std::fmt::Debug for VllmServicerConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VllmServicerConfig")
-            .field("bind_address", &self.bind_address)
-            .field("ipc_base_url", &self.ipc_base_url)
-            .field("handshake_address", &self.handshake_address)
-            .field("engine_count", &self.engine_count)
-            .field("tokenizer_dir", &self.tokenizer_dir)
+            .field("servicer", &self.servicer)
             .field("model", &self.model)
             .field(
                 "media_processor",
@@ -204,18 +208,25 @@ impl crate::kv_events::LoadSource for LoadFromState {
     fn load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
         let state = self.0.upgrade()?;
         let response = info::loads(&state).ok()?;
-        let rank = dp_rank.unwrap_or(0);
-        let load = response
-            .loads
-            .iter()
-            .find(|load| load.dp_rank == rank)
-            .or_else(|| response.loads.first())?;
-        // The queued token-work is this servicer's estimate for the first
-        // rank (see `info::loads`); the other ranks do not report it.
-        let estimated = response.loads.first().map(|first| first.dp_rank) == Some(load.dp_rank);
+        let load = match dp_rank {
+            // A rank the report has no entry for (it has not reported a
+            // scheduler step while another rank has) gets no record rather
+            // than another rank's figures, as under the Python servicer.
+            Some(rank) => response.loads.iter().find(|load| load.dp_rank == rank)?,
+            None => response
+                .loads
+                .iter()
+                .find(|load| load.dp_rank == 0)
+                .or_else(|| response.loads.first())?,
+        };
+        // The queued token-work is this servicer's own estimate for the
+        // rank (see `info::loads`), so every rank's record reports it.
         let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
         record.waiting_uncached_tokens =
-            estimated.then(|| u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+            Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
+        record.engine_silence_ms = state.engine.output_silence_ms();
+        record.engine_reports_steps = state.engine.reports_steps();
+        record.prefill_pending_tokens = state.engine.prefill_pending_tokens();
         Some(record)
     }
 }
@@ -227,7 +238,7 @@ pub(super) struct State {
     pub(super) kv_relay: Option<Arc<crate::kv_events::KvEventRelay>>,
     pub(super) stats: Stats,
     /// Queued token-work, generation throughput and hit rate from the
-    /// requests this servicer forwards, for `GetLoads`.
+    /// requests this servicer forwards, per rank, for `GetLoads`.
     pub(super) loads: crate::load_tracker::LoadTracker,
     /// The local tokenizer directory the servicer loaded (`GetTokenizer`
     /// bundles it); `None` when none resolved.
@@ -316,42 +327,22 @@ impl VllmServicerServer {
         config: VllmServicerConfig,
         tokenizer: Option<Arc<dyn Tokenizer>>,
     ) -> Result<Self, ServicerError> {
-        let invalid = |message: &str| ServicerError::InvalidConfig(message.to_string());
-        if config.bind_address.rsplit_once(':').is_none() {
-            return Err(invalid("bind_address must be host:port"));
-        }
-        if !config.ipc_base_url.starts_with("ipc://") {
-            return Err(invalid("ipc_base_url must be ipc://<path>"));
-        }
-        if !config.handshake_address.starts_with("tcp://")
-            && !config.handshake_address.starts_with("ipc://")
-        {
-            return Err(invalid(
-                "handshake_address must be tcp://host:port or ipc://<path>",
+        config.servicer.validate()?;
+        if config.model.model_path.trim().is_empty() {
+            return Err(ServicerError::InvalidConfig(
+                "model_path must not be empty".to_string(),
             ));
         }
-        if config.engine_count == 0 {
-            return Err(invalid("engine_count must be positive"));
-        }
-        if config.engine_startup_timeout.is_zero() {
-            return Err(invalid("engine_startup_timeout must be positive"));
-        }
-        if config
-            .engine_startup_ceiling
-            .is_some_and(|ceiling| ceiling.is_zero())
-        {
-            return Err(invalid("engine_startup_ceiling must be positive when set"));
-        }
-        if config.model.model_path.trim().is_empty() {
-            return Err(invalid("model_path must not be empty"));
-        }
+        // One publisher per data-parallel rank: the launcher's width (the
+        // handshake's figure, which may differ, is not known yet).
         let kv_relay = crate::kv_events::KvEventRelay::for_publisher(
             &config.model.kv_events_endpoint,
             Some(&config.model.kv_events_replay_endpoint),
             &config.model.kv_events_topic,
+            u32::try_from(config.model.data_parallel_size).unwrap_or(1),
         );
         let state = Arc::new(State {
-            tokenizer_dir: config.tokenizer_dir.clone(),
+            tokenizer_dir: config.servicer.tokenizer_dir.clone(),
             model: config.model,
             kv_relay,
             stats: Stats::default(),
@@ -380,7 +371,7 @@ impl VllmServicerServer {
         let connect_state = Arc::clone(&state);
         let stats_state = Arc::clone(&state);
         let kv_relay = state.kv_relay.clone();
-        let VllmServicerConfig {
+        let ServicerConfig {
             bind_address,
             ipc_base_url,
             handshake_address,
@@ -388,8 +379,7 @@ impl VllmServicerServer {
             tokenizer_dir,
             engine_startup_timeout,
             engine_startup_ceiling,
-            ..
-        } = config;
+        } = config.servicer;
         let thread = ServerThread::start(
             "smg-vllm-servicer",
             &bind_address,
