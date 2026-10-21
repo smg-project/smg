@@ -798,18 +798,21 @@ fn convert_assistant_message(content: &InputContent) -> Value {
 
 /// Format content parts based on the template's content format preference.
 ///
-/// - `String` format: join text parts into a single string
-/// - `OpenAI` format: keep as array of typed parts
+/// - `String` format: join text parts into a single string, the media parts
+///   placed as `media_order` says (the template cannot place them itself)
+/// - `OpenAI` format: keep as array of typed parts, in the request's order:
+///   the template walks them and writes each anchor where its part sits, as
+///   the engine's own server hands them to such a template
 fn format_content_parts(
     parts: Vec<Value>,
     content_format: ChatTemplateContentFormat,
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
 ) -> Value {
-    let ordered = order_media_parts(parts, media_order);
     let image_placeholder = placeholder_tokens.and_then(|tokens| tokens.get(Modality::Image));
     match content_format {
         ChatTemplateContentFormat::String => {
+            let ordered = order_media_parts(parts, media_order);
             // Extract text parts; optionally replace image parts with placeholders
             let text: String = ordered
                 .iter()
@@ -826,13 +829,14 @@ fn format_content_parts(
                 .join("\n");
             Value::String(text)
         }
-        ChatTemplateContentFormat::OpenAI => Value::Array(ordered),
+        ChatTemplateContentFormat::OpenAI => Value::Array(parts),
     }
 }
 
-/// Hoist media parts before text for `MediaFirst`, matching vLLM front
-/// placement; `Authored` keeps request order. `partition` is stable so relative
-/// order within each group is preserved.
+/// For a template that takes one string per message: hoist media parts
+/// before text under `MediaFirst` (the engine's own server's placement for
+/// such a template); `Authored` keeps the request's order. `partition` is
+/// stable so relative order within each group is preserved.
 fn order_media_parts(parts: Vec<Value>, media_order: MediaPartOrder) -> Vec<Value> {
     match media_order {
         MediaPartOrder::Authored => parts,
@@ -1049,6 +1053,9 @@ mod tests {
 
     #[test]
     fn test_user_media_order_follows_contract() {
+        // A template that takes parts gets them in the request's order under
+        // both media orders; a string template places the media as the order
+        // says.
         let messages = vec![InputMessage {
             role: Role::User,
             content: InputContent::Blocks(vec![
@@ -1067,27 +1074,96 @@ mod tests {
             ]),
         }];
 
-        let media_first = process_message_content_format(
-            &messages,
-            ChatTemplateContentFormat::OpenAI,
-            None,
-            MediaPartOrder::MediaFirst,
-        )
-        .unwrap();
-        let arr = media_first[0]["content"].as_array().unwrap();
-        assert_eq!(arr[0], json!({"type": "image"}));
-        assert_eq!(arr[1]["text"], "question");
+        for order in [MediaPartOrder::MediaFirst, MediaPartOrder::Authored] {
+            let parts = process_message_content_format(
+                &messages,
+                ChatTemplateContentFormat::OpenAI,
+                None,
+                order,
+            )
+            .unwrap();
+            let arr = parts[0]["content"].as_array().unwrap();
+            assert_eq!(arr[0]["text"], "question", "{order:?}");
+            assert_eq!(arr[1], json!({"type": "image"}), "{order:?}");
+        }
 
-        let authored = process_message_content_format(
-            &messages,
-            ChatTemplateContentFormat::OpenAI,
-            None,
-            MediaPartOrder::Authored,
-        )
-        .unwrap();
-        let arr = authored[0]["content"].as_array().unwrap();
-        assert_eq!(arr[0]["text"], "question");
-        assert_eq!(arr[1], json!({"type": "image"}));
+        let mut tokens = PlaceholderTokens::default();
+        tokens.insert(Modality::Image, "<image>".to_string());
+        let string = |order| {
+            process_message_content_format(
+                &messages,
+                ChatTemplateContentFormat::String,
+                Some(&tokens),
+                order,
+            )
+            .unwrap()[0]["content"]
+                .clone()
+        };
+        assert_eq!(string(MediaPartOrder::MediaFirst), "<image>\nquestion");
+        assert_eq!(string(MediaPartOrder::Authored), "question\n<image>");
+    }
+
+    /// The Messages path renders a user turn's blocks where the request put
+    /// them on a template that walks the parts, like the chat path.
+    #[test]
+    fn a_parts_template_renders_the_blocks_where_the_request_put_them() {
+        let tokenizer = jinja(
+            r"{%- for m in messages -%}<|turn|>{{ m.role }}<|body|>
+{%- if m.content is string -%}{{ m.content }}{%- else -%}{%- for part in m.content -%}
+{%- if part.type == 'image' -%}<|image|>{%- elif part.type == 'text' -%}{{ part.text }}{%- endif -%}
+{%- endfor -%}{%- endif -%}<|end|>{%- endfor -%}
+{%- if add_generation_prompt -%}<|turn|>assistant<|body|>{%- endif -%}",
+        );
+        assert_eq!(
+            tokenizer.chat_template_content_format(),
+            ChatTemplateContentFormat::OpenAI
+        );
+        let image = json!({"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAAA"}});
+        let text = |text: &str| json!({"type": "text", "text": text});
+        let render = |blocks: Vec<Value>| {
+            let request: CreateMessageRequest = serde_json::from_value(json!({
+                "model": "m",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": blocks}]
+            }))
+            .unwrap();
+            process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
+                .unwrap()
+                .0
+                .text
+        };
+        let turn =
+            |body: &str| format!("<|turn|>user<|body|>{body}<|end|><|turn|>assistant<|body|>");
+        assert_eq!(
+            render(vec![text("What is in this picture?"), image.clone()]),
+            turn("What is in this picture?<|image|>")
+        );
+        assert_eq!(
+            render(vec![image.clone(), text("What is in this picture?")]),
+            turn("<|image|>What is in this picture?")
+        );
+        assert_eq!(
+            render(vec![
+                text("Figure 1: "),
+                image.clone(),
+                text(" Figure 2: "),
+                image.clone(),
+                text(" Which?")
+            ]),
+            turn("Figure 1: <|image|> Figure 2: <|image|> Which?")
+        );
+        assert_eq!(
+            render(vec![
+                image.clone(),
+                image,
+                text("Which picture is brighter?")
+            ]),
+            turn("<|image|><|image|>Which picture is brighter?")
+        );
+        assert_eq!(
+            render(vec![text("No picture here.")]),
+            turn("No picture here.")
+        );
     }
 
     #[test]

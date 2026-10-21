@@ -284,6 +284,15 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     .resilience(resolved_resilience.clone())
                     .health_config(health_config.clone())
                     .health_endpoint(health_endpoint)
+                    .zmq_startup_timeout(Duration::from_secs(
+                        app_context.router_config.zmq_startup_timeout_secs,
+                    ))
+                    // The request bound of the HTTP worker client, for the
+                    // ZMQ link: a stream the engine leaves silent ends at it.
+                    .zmq_request_timeout(zmq_request_timeout(
+                        &spec,
+                        app_context.router_config.request_timeout_secs,
+                    ))
                     .overload_defaults(overload_defaults)
                     .labels(labels_for_rank(&labels, dp, &config.labels))
                     // The engine's report in this rank's space, sized by the
@@ -331,13 +340,15 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
 
         // A registration that worker-side media placement cannot use is said
         // once, here, with the worker's address: an engine with a vision
-        // encoder that does not process media references never receives an
-        // image under `--mm-processing worker`. The line says what follows
-        // for the model, read from its pool (the registered workers and the
-        // ones registering with it): with a capable worker beside this one
-        // the media is served (selection picks that worker); without one the
-        // model's multimodal requests are refused (`no_media_ref_capable_worker`)
-        // and `/readiness` names the model until such a worker registers.
+        // encoder that does not process media references never receives a
+        // media reference under `--mm-processing worker` (a request with
+        // per-item hints it still serves, through the router's pipeline). The
+        // line says what follows for the model, read from its pool (the
+        // registered workers and the ones registering with it): with a capable
+        // worker beside this one the references are served (selection picks
+        // that worker); without one the model's requests that forward media
+        // references are refused (`no_media_ref_capable_worker`) and
+        // `/readiness` names the model until such a worker registers.
         // The registration itself is not refused. A model on the
         // encode-prefill-decode pipeline (an encode worker among its
         // registered workers or these) is not warned about: references never
@@ -355,17 +366,17 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                     continue;
                 }
                 let consequence = if pool_processes_media_refs(pool()) {
-                    "other workers of the model process media references and serve them"
+                    "other workers of the model process them"
                 } else {
-                    "the model's multimodal requests are refused until a worker of it \
-                     processes media references"
+                    "the model's requests that forward media references are refused until a \
+                     worker of it processes them"
                 };
                 warn!(
                     url = %worker.url(),
                     model = %worker.model_id(),
                     "worker reports a vision encoder but no worker-side media processor (no \
-                     mm_processor label): under --mm-processing worker it receives no \
-                     multimodal request; {consequence}"
+                     mm_processor label): under --mm-processing worker it receives no media \
+                     references; {consequence}"
                 );
             }
         }
@@ -774,6 +785,19 @@ fn validate_overload_overrides(config: &WorkerSpec) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The bound on a request over a ZMQ worker's link: the worker's own
+/// `http_pool.timeout_secs` when it sets one, else the router's
+/// `request_timeout_secs` (`--request-timeout-secs`), the way the HTTP worker
+/// client resolves its per-request timeout, so a worker registered with a
+/// longer bound for its long generations keeps it on either link.
+fn zmq_request_timeout(spec: &WorkerSpec, router_request_timeout_secs: u64) -> Duration {
+    Duration::from_secs(
+        spec.http_pool
+            .timeout_secs
+            .unwrap_or(router_request_timeout_secs),
+    )
 }
 
 /// `zmq_handshake_address` only steers the ZMQ handshake bind; on any other
@@ -1221,7 +1245,7 @@ mod tests {
 
         Arc::new(crate::app_context::AppContext {
             gateway_auth: AuthConfig::new(None),
-            client: crate::http_client::client(),
+            client: crate::clients::http_client(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,
@@ -1293,7 +1317,7 @@ mod tests {
             create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::http_client::client()));
+        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
         let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
 
         assert_eq!(
@@ -1340,7 +1364,7 @@ mod tests {
             create_worker_workflow_data(spec, WorkerRegistrationMode::Upsert, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::http_client::client()));
+        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
         data.discovered_labels = HashMap::from([
             ("page_size".to_string(), "256".to_string()),
             ("max_num_seqs".to_string(), "8".to_string()),
@@ -1388,7 +1412,7 @@ mod tests {
         );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::http_client::client()));
+        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
         data.discovered_labels = HashMap::from([
             ("enable_dp_attention".to_string(), "true".to_string()),
             ("max_running_requests".to_string(), "256".to_string()),
@@ -1442,7 +1466,7 @@ mod tests {
         );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::http_client::client()));
+        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
         data.discovered_labels =
             HashMap::from([("max_running_requests".to_string(), "256".to_string())]);
         data.dp_info = Some(DpInfo {
@@ -1510,7 +1534,7 @@ mod tests {
         let mut data = create_worker_workflow_data(spec, registration_mode, make_app_context());
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::http_client::client()));
+        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
         WorkflowContext::new(WorkflowInstanceId::new(), data)
     }
 
@@ -1955,6 +1979,18 @@ mod tests {
         spec.connection_mode = ConnectionMode::Zmq;
         spec.zmq_handshake_address = handshake_override.map(str::to_string);
         Arc::new(BasicWorkerBuilder::from_spec(spec).build())
+    }
+
+    /// The ZMQ link's request bound resolves as the HTTP worker client's
+    /// does: the worker's own `http_pool.timeout_secs` when set, else the
+    /// router's `request_timeout_secs`.
+    #[test]
+    fn zmq_request_timeout_takes_the_workers_pool_timeout_over_the_routers() {
+        let mut spec = WorkerSpec::new("ipc:///tmp/smg-zmq/bound.ipc");
+        spec.connection_mode = ConnectionMode::Zmq;
+        assert_eq!(zmq_request_timeout(&spec, 1800), Duration::from_secs(1800));
+        spec.http_pool.timeout_secs = Some(7200);
+        assert_eq!(zmq_request_timeout(&spec, 1800), Duration::from_secs(7200));
     }
 
     #[test]

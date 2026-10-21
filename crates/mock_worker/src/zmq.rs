@@ -17,11 +17,12 @@ use engine_zmq_client::{
     codec::OpaqueValue,
     mock_engine::{connect_to_frontend, default_ready_response, EngineInbound},
     protocol::vllm::{
+        logprobs::{Logprobs, PositionLogprobs, TokenLogprob},
         output::{
             EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
-            UtilityCallOutput, UtilityOutput,
+            StopReason, UtilityCallOutput, UtilityOutput,
         },
-        stats::SchedulerStats,
+        stats::{PrefillStats, SchedulerStats},
     },
     EngineId,
 };
@@ -34,6 +35,7 @@ use crate::{
     config::Config,
     drain::InFlight,
     engine::{Engine, GenEvent, LoadSnapshot, NewRequest},
+    script::{self, Answer, MatchedStop},
 };
 
 /// Run one mock ZMQ EngineCore rank: connect to `handshake_address`, then serve
@@ -52,6 +54,14 @@ pub async fn serve_until(
     engine_index: u32,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) {
+    if let Err(e) = script::ensure_loaded(&cfg) {
+        tracing::error!("zmq engine {engine_index} cannot load script: {e}");
+        return;
+    }
+    // The rank's name in the process (`zmq:<index>`): what the admin API and
+    // the script store address it by.
+    let name = format!("zmq:{engine_index}");
+    script::register(&name);
     let mut ready = default_ready_response();
     ready.data_parallel_rank = engine_index;
     ready.instance_id = format!("mock-zmq-{engine_index}");
@@ -74,7 +84,7 @@ pub async fn serve_until(
     let (mut input, output) = mock.split();
     let engine = cfg
         .realistic
-        .then(|| Engine::spawn_named(cfg.engine.clone(), format!("zmq:{engine_index}"), true));
+        .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
     // The rank's KV-event publisher, numbered after the gRPC workers and
     // stamping the batches with the rank this engine advertised.
     let publisher = engine.as_ref().and_then(|engine| {
@@ -168,6 +178,39 @@ pub async fn serve_until(
                     .unwrap_or(cfg.output_tokens);
 
                 let in_flight = InFlight::enter();
+                // A scripted answer, ahead of either engine mode: the rank's
+                // queue or the prompt's key decides ([`crate::script`]).
+                let scripted = match script::take_ids(&cfg, &name, &prompt) {
+                    Ok(scripted) => scripted,
+                    Err(_) => {
+                        // The reason is in the log; the request ends as one
+                        // an engine failed, which the gateway reports.
+                        let _ = out_tx.send(terminal_batch(
+                            engine_index,
+                            request_id,
+                            EngineCoreFinishReason::Error,
+                        ));
+                        continue;
+                    }
+                };
+                if let Some(answer) = scripted {
+                    let want_logprobs = request
+                        .sampling_params
+                        .as_ref()
+                        .is_some_and(|params| params.logprobs.is_some());
+                    let forwarder = forwarders.spawn(scripted_request(
+                        request_id.clone(),
+                        engine_index,
+                        prompt.len(),
+                        answer,
+                        want_logprobs,
+                        out_tx.clone(),
+                        engine.clone(),
+                        in_flight,
+                    ));
+                    inflight.insert(request_id, forwarder);
+                    continue;
+                }
                 let (gen_tx, gen_rx) = mpsc::unbounded_channel::<GenEvent>();
                 match &engine {
                     Some(engine) => engine.submit(NewRequest {
@@ -294,6 +337,98 @@ async fn forward_request(
     // Channel closed without Done (the request was aborted); nothing to send.
 }
 
+/// Push one scripted answer as `EngineCoreOutputs`: a batch per frame with
+/// the answer's pause before every frame but the first, the prompt's prefill
+/// stats on the first batch, the finish reason and the matched stop on the
+/// last (a batch of its own when the answer has no tokens); the logprobs
+/// ride along when the request asked for them.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one request's wire facts, handed to its forwarder task"
+)]
+async fn scripted_request(
+    request_id: String,
+    engine_index: u32,
+    prompt_len: usize,
+    answer: Answer,
+    want_logprobs: bool,
+    out_tx: mpsc::UnboundedSender<EngineCoreOutputs>,
+    engine: Option<Engine>,
+    // Held until the last batch is in the funnel: the request's share of
+    // the in-flight count.
+    _in_flight: InFlight,
+) {
+    let mut frames = answer.token_frames();
+    if frames.is_empty() {
+        frames.push(script::Frame {
+            ids: Vec::new(),
+            pieces: Vec::new(),
+            logprobs: Vec::new(),
+            last: true,
+        });
+    }
+    let prompt_tokens = answer.prompt_tokens(prompt_len);
+    let prefill = PrefillStats {
+        num_prompt_tokens: prompt_tokens,
+        num_computed_tokens: prompt_tokens,
+        num_cached_tokens: answer.cached_tokens,
+        ..Default::default()
+    };
+    for (n, frame) in frames.into_iter().enumerate() {
+        if n > 0 && !answer.delay.is_zero() {
+            tokio::time::sleep(answer.delay).await;
+        }
+        let load = engine
+            .as_ref()
+            .map(|engine| to_scheduler_stats(&engine.load()));
+        let new_logprobs =
+            (want_logprobs && !frame.ids.is_empty() && frame.logprobs.len() == frame.ids.len())
+                .then(|| Logprobs {
+                    positions: frame
+                        .ids
+                        .iter()
+                        .zip(&frame.logprobs)
+                        .map(|(&token_id, &logprob)| PositionLogprobs {
+                            entries: vec![TokenLogprob {
+                                token_id,
+                                logprob,
+                                rank: 1,
+                            }],
+                        })
+                        .collect(),
+                });
+        let (finish_reason, stop_reason) = if frame.last {
+            (
+                Some(map_finish(&answer.finish_reason)),
+                answer.matched_stop.as_ref().map(|stop| match stop {
+                    MatchedStop::Token(id) => StopReason::TokenId(*id),
+                    MatchedStop::Text(text) => StopReason::Text(text.clone()),
+                }),
+            )
+        } else {
+            (None, None)
+        };
+        let batch = EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+            engine_index,
+            outputs: vec![EngineCoreOutput {
+                request_id: request_id.clone(),
+                new_token_ids: frame.ids,
+                new_logprobs,
+                finish_reason,
+                stop_reason,
+                prefill_stats: (n == 0).then(|| prefill.clone()),
+                ..Default::default()
+            }],
+            scheduler_stats: load.map(Box::new),
+            finished_requests: frame.last.then(|| BTreeSet::from([request_id.clone()])),
+            ..Default::default()
+        });
+        if out_tx.send(batch).is_err() {
+            return;
+        }
+    }
+}
+
 /// Canned generator for non-realistic mode: emit `output_tokens` synthetic
 /// tokens then a terminal Done.
 async fn canned_generate(
@@ -375,6 +510,7 @@ fn map_finish(reason: &str) -> EngineCoreFinishReason {
     match reason {
         "length" => EngineCoreFinishReason::Length,
         "abort" => EngineCoreFinishReason::Abort,
+        "error" => EngineCoreFinishReason::Error,
         _ => EngineCoreFinishReason::Stop,
     }
 }

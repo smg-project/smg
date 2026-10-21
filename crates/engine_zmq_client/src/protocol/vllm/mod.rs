@@ -38,10 +38,13 @@ use crate::{
 
 /// Map vLLM's piggybacked scheduler stats onto the engine-neutral load signal.
 impl From<SchedulerStats> for EngineLoad {
+    /// Count both runnable and deferred queues, saturating the waiting total.
     fn from(stats: SchedulerStats) -> Self {
         Self {
             num_running: stats.num_running_reqs,
-            num_waiting: stats.num_waiting_reqs,
+            num_waiting: stats
+                .num_waiting_reqs
+                .saturating_add(stats.num_skipped_waiting_reqs),
             kv_cache_usage: stats.kv_cache_usage,
         }
     }
@@ -179,6 +182,29 @@ mod tests {
 
     use super::*;
     use crate::codec::decode_value;
+
+    /// Waiting load includes deferred work and saturates instead of wrapping.
+    #[test]
+    fn scheduler_load_includes_deferred_waiting() {
+        for (runnable, deferred, total) in [
+            (0, 4, 4),
+            (3, 4, 7),
+            (3, 0, 3),
+            (0, 0, 0),
+            (u64::MAX, 1, u64::MAX),
+        ] {
+            let load = EngineLoad::from(SchedulerStats {
+                num_running_reqs: 2,
+                num_waiting_reqs: runnable,
+                num_skipped_waiting_reqs: deferred,
+                kv_cache_usage: 0.5,
+                ..Default::default()
+            });
+            assert_eq!(load.num_waiting, total);
+            assert_eq!(load.num_running, 2);
+            assert_eq!(load.kv_cache_usage, 0.5);
+        }
+    }
 
     /// The engine core reports every request it stepped on every step
     /// (streaming is the frontend's affair and not on the request), so every

@@ -340,6 +340,28 @@ def test_server_facts_carry_where_the_engine_starts_a_grammar(monkeypatch):
     assert "constrained_decoding_start" not in older and "engine_reasoning_parser" not in older
 
 
+def test_server_facts_carry_the_grammar_backend_the_scheduler_runs(monkeypatch):
+    # The grammar backend, resolved, under the engine's own argument name: the
+    # Rust servicer refuses a constraint that backend cannot enforce before
+    # the scheduler. The raw argument is None unless set (the engine's default
+    # is xgrammar); without the scheduler's tokenizer there is no backend.
+    monkeypatch.setattr(rust, "pairing_protocol_from_env", lambda: "")
+    pinned = json.loads(
+        rust.server_facts(_server_args(grammar_backend="outlines"))["server_args_json"]
+    )
+    assert pinned["grammar_backend"] == "outlines"
+    default = json.loads(rust.server_facts(_server_args(grammar_backend=None))["server_args_json"])
+    assert default["grammar_backend"] == "xgrammar"
+    no_tokenizer = json.loads(
+        rust.server_facts(_server_args(grammar_backend="xgrammar", skip_tokenizer_init=True))[
+            "server_args_json"
+        ]
+    )
+    assert no_tokenizer["grammar_backend"] == "none"
+    older = json.loads(rust.server_facts(_server_args())["server_args_json"])
+    assert "grammar_backend" not in older
+
+
 def test_server_facts_carry_the_kv_events_publisher(monkeypatch):
     monkeypatch.setattr(rust, "pairing_protocol_from_env", lambda: "")
     off = rust.server_facts(_server_args())

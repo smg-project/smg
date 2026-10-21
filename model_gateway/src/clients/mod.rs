@@ -17,7 +17,7 @@ use crate::tls::install_crypto_provider;
     clippy::disallowed_methods,
     reason = "the crate's one direct client construction; the process TLS crypto provider is installed first"
 )]
-pub fn client() -> reqwest::Client {
+pub fn http_client() -> reqwest::Client {
     install_crypto_provider();
     reqwest::Client::new()
 }
@@ -27,7 +27,7 @@ pub fn client() -> reqwest::Client {
     clippy::disallowed_methods,
     reason = "the crate's one direct client construction; the process TLS crypto provider is installed first"
 )]
-pub fn client_builder() -> reqwest::ClientBuilder {
+pub fn http_client_builder() -> reqwest::ClientBuilder {
     install_crypto_provider();
     reqwest::Client::builder()
 }
@@ -40,7 +40,7 @@ pub fn client_builder() -> reqwest::ClientBuilder {
     clippy::disallowed_methods,
     reason = "the crate's one direct client construction; the process TLS crypto provider is installed first"
 )]
-pub fn blocking_client() -> reqwest::blocking::Client {
+pub fn blocking_http_client() -> reqwest::blocking::Client {
     install_crypto_provider();
     reqwest::blocking::Client::new()
 }

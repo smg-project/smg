@@ -370,3 +370,71 @@ fn a_replacement_template_that_reads_tools_keeps_its_rendering() {
         .unwrap();
     assert!(render(&tokenizer, &messages, &tools).contains("## Tools\n"));
 }
+
+/// An engine's tool template for the family in miniature: it serializes a
+/// history call's arguments object instead of concatenating the string.
+const SERIALIZING_TEMPLATE: &str = r"{{ bos_token }}{% for m in messages %}{% if m.tool_calls %}{% for t in m.tool_calls %}<call>{{ t.function.name }}:{{ t.function.arguments | tojson }}</call>{% endfor %}{% else %}<|{{ m.role }}|>{{ m.content }}{% endif %}{% endfor %}";
+
+/// The first user turn after a call and its result, no tools in the request:
+/// the checkpoint's template run by transformers' `apply_chat_template` on
+/// the request as the API carries it, the call's arguments the string sent.
+const FIRST_TURN_AFTER_A_CALL: &str = r#"<｜begin▁of▁sentence｜><｜User｜>What is the weather in Paris in celsius?<｜Assistant｜></think><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{"city": "Paris", "unit": "celsius"}<｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜><｜tool▁output▁begin｜>{"temp_c": 18, "sky": "cloudy"}<｜tool▁output▁end｜><｜User｜>Thanks. Now the same for Rome, also in celsius, with the tool.<｜Assistant｜></think>"#;
+
+/// The same oracle on arguments spelled compactly, with non-ASCII text and
+/// escapes: the template writes the string as sent, nothing re-serialized.
+const ARGUMENTS_AS_WRITTEN: &str = r#"<｜begin▁of▁sentence｜><｜User｜>Weather in Zürich?<｜Assistant｜></think><｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{"city": "Zürich", "note": "a\"b\\c 東京"}<｜tool▁call▁end｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{"city":"Rome","unit":"celsius"}<｜tool▁call▁end｜><｜tool▁calls▁end｜><｜end▁of▁sentence｜><｜tool▁output▁begin｜>{"temp_c": 12}<｜tool▁output▁end｜><｜tool▁output▁begin｜>{"temp_c": 24}<｜tool▁output▁end｜><｜User｜>Thanks.<｜Assistant｜></think>"#;
+
+fn call(id: &str, arguments: &str) -> Value {
+    json!({"id": id, "type": "function", "function": {"name": "get_weather", "arguments": arguments}})
+}
+
+fn tool_result(id: &str, text: &str) -> Value {
+    json!({"role": "tool", "tool_call_id": id, "content": text})
+}
+
+/// The checkpoint's template writes a history call's arguments by string
+/// concatenation, so it takes them as the text the request sent and says so
+/// in its renderer capabilities (the gateway hands them on unparsed); a
+/// replacement template that serializes the object answers for itself.
+#[test]
+fn the_checkpoint_template_takes_tool_call_arguments_as_the_text_the_request_sent() {
+    let (_dir, mut tokenizer) = load("DeepseekV3ForCausalLM", V31_TEMPLATE);
+    assert!(tokenizer.renderer_capabilities().raw_tool_call_arguments);
+    tokenizer
+        .set_chat_template(SERIALIZING_TEMPLATE.to_string())
+        .unwrap();
+    assert!(!tokenizer.renderer_capabilities().raw_tool_call_arguments);
+    tokenizer
+        .set_chat_template(V31_TEMPLATE.to_string())
+        .unwrap();
+    assert!(tokenizer.renderer_capabilities().raw_tool_call_arguments);
+}
+
+/// A history with a call and its result, then the first user turn after it,
+/// renders byte for byte what the checkpoint's template renders for the
+/// request as the API carries it; the arguments keep their spelling.
+#[test]
+fn a_history_call_renders_with_its_arguments_as_the_request_sent_them() {
+    let (_dir, tokenizer) = load("DeepseekV3ForCausalLM", V31_TEMPLATE);
+    let messages = [
+        user("What is the weather in Paris in celsius?"),
+        json!({"role": "assistant", "content": "", "tool_calls": [
+            call("call_1", r#"{"city": "Paris", "unit": "celsius"}"#)
+        ]}),
+        tool_result("call_1", r#"{"temp_c": 18, "sky": "cloudy"}"#),
+        user("Thanks. Now the same for Rome, also in celsius, with the tool."),
+    ];
+    assert_eq!(render(&tokenizer, &messages, &[]), FIRST_TURN_AFTER_A_CALL);
+
+    let messages = [
+        user("Weather in Zürich?"),
+        json!({"role": "assistant", "content": null, "tool_calls": [
+            call("call_1", r#"{"city": "Zürich", "note": "a\"b\\c 東京"}"#),
+            call("call_2", r#"{"city":"Rome","unit":"celsius"}"#),
+        ]}),
+        tool_result("call_1", r#"{"temp_c": 12}"#),
+        tool_result("call_2", r#"{"temp_c": 24}"#),
+        user("Thanks."),
+    ];
+    assert_eq!(render(&tokenizer, &messages, &[]), ARGUMENTS_AS_WRITTEN);
+}

@@ -101,7 +101,12 @@
 //!   sides is backed up (on the parallel dispatch shape a side's first
 //!   response also waits for the decode side), not frozen, and its side
 //!   waits on; a side in flight when the longest prompt yet lands behind
-//!   it is given what is left of the cold-shape grace since its dispatch.
+//!   it is given what is left of the cold-shape grace since its dispatch;
+//!   and a worker whose current run of pending prompts has not answered
+//!   yet (a burst after an idle spell, or before its first answer ever) has
+//!   shown no silence before the run began, so its side waits until the
+//!   run has gone unanswered for the time the backlog the worker held then
+//!   takes, as the pile rule gives a worker its backlog.
 //!
 //! - **stale records** (an unreachable veto by another rule): a worker whose
 //!   KV-event stream has pushed load records is heard from every few
@@ -239,61 +244,136 @@ pub(crate) fn decode_side_bound(
     prefill_side_bound(prefills, prompt_tokens)
 }
 
-/// Whether a prefill side past its own bound waits on, and how much longer.
-/// A side is given up on only when its worker is silent as a whole, with no
-/// first response on any prompt within the bound, as the pile rule judges
-/// a worker by its pile and not by one request. A worker that answered
-/// another side a moment ago is backed up, not frozen (on the parallel
-/// dispatch shape a side's first response also waits for the decode side to
-/// admit it), so the side waits until a bound has passed since that answer.
-/// The bound was read at the side's dispatch, `dispatched_ago` back: a
-/// prompt longer than any the worker has answered that landed behind the
-/// side since blocks the engine for the side too while it builds, so while
-/// the worker is on that shape the side is given what is left of the
-/// cold-shape grace since its dispatch, as a side dispatched now would be
-/// ([`prefill_side_bound`]), a bound at a time so the shape's first token
-/// returns it to the rule above. `None` when the worker has answered
-/// nothing within the bound, or ever, and no grace is left: the verdict.
+/// Where a prefill side past its own bound stands (see
+/// [`prefill_side_reprieve`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SideReprieve {
+    /// The worker answered another prompt within the side's bound, or a
+    /// cold-shape grace is left: the side is judged again after this.
+    WithinBound(Duration),
+    /// The worker answered nothing within the side's bound, but its current
+    /// run of prompts has not answered yet and has not gone unanswered for
+    /// the time its backlog takes: the side is judged again after this, a
+    /// bound at most.
+    FirstAnswerDue(Duration),
+    /// The verdict: the worker was `silent` (`None`: it never answered) for
+    /// the `window` it was judged against, the side's bound or the time its
+    /// backlog takes.
+    Silent {
+        silent: Option<Duration>,
+        window: Duration,
+    },
+}
+
+impl SideReprieve {
+    /// Whether the worker answered nothing within the side's bound and no
+    /// cold-shape grace is left: where the side was given up on before a
+    /// run's first answer was allowed for, and where a stalled decode
+    /// partner still takes the verdict.
+    pub(crate) fn past_bound(self) -> bool {
+        !matches!(self, Self::WithinBound(_))
+    }
+}
+
+/// Where a prefill side past its own bound stands, re-read at each check.
+/// A side is given up on only when its worker is silent as a whole, as the
+/// pile rule judges a worker by its pile and not by one request: a worker
+/// that answered another prompt within the side's bound is backed up, not
+/// frozen (on the parallel dispatch shape a side's first response also
+/// waits for the decode side to admit it), so the side waits until a bound
+/// has passed since that answer. The bound was read at the side's dispatch,
+/// `dispatched_ago` back: a prompt longer than any the worker has answered
+/// that landed behind the side since blocks the engine for the side too
+/// while it builds, so while the worker is on that shape the side is given
+/// what is left of the cold-shape grace since its dispatch, as a side
+/// dispatched now would be ([`prefill_side_bound`]), a bound at a time so
+/// the shape's first token returns it to the rule above.
+///
+/// A worker whose current run of pending prompts has not answered yet (a
+/// burst that reached it after an idle spell, or before it ever answered)
+/// has shown no silence before the run began, and the side dispatched first
+/// to its empty book has a short bound while the engine may well serve the
+/// burst booked behind it first. Past the rule above, its side waits until
+/// the run has gone unanswered ([`Worker::prefill_unanswered_run`]) for the
+/// time the worker's backlog takes at its prefill rate, capped
+/// ([`backlog_bound`]). That backlog is read once, the first time the rule
+/// above gives up on the side, and kept in `backlog`, so prompts that go on
+/// arriving at a frozen worker do not extend the wait; the side is judged
+/// again a bound at a time, so a first answer returns it to the rule above
+/// and a stalled decode partner is seen within a bound. A run that has
+/// answered is judged by the rule above alone.
 pub(crate) fn prefill_side_reprieve(
     worker: &Arc<dyn Worker>,
     bound: Duration,
     dispatched_ago: Duration,
-) -> Option<Duration> {
+    backlog: &OnceLock<Duration>,
+) -> SideReprieve {
     side_reprieve(
         cold_shape_grace(worker, 0),
         worker.prefill_answered_ago(),
+        worker.prefill_unanswered_run(),
         bound,
+        || *backlog.get_or_init(|| backlog_bound(worker)),
         dispatched_ago,
     )
 }
 
-/// [`prefill_side_reprieve`] for a worker under a cold-shape `grace` (zero:
-/// on no such shape) whose latest first response was `answered_ago`
-/// (`None`: never). A grace the side's own bound already covers (a longer
+/// How long a worker whose run of prompts has not answered yet may take to
+/// answer one: the time its whole pending backlog takes at its measured
+/// prefill rate (the cold prior until one is measured), capped. A side's
+/// own bound covers its prompt behind what was pending at its dispatch; the
+/// prompts of the run booked since, which the engine need not serve after
+/// it, are in the backlog by the time that bound passes.
+fn backlog_bound(worker: &Arc<dyn Worker>) -> Duration {
+    worker.prefill_backlog().min(WEDGE_BOUND_CAP)
+}
+
+/// [`prefill_side_reprieve`] for a side of `bound` on a worker under a
+/// cold-shape `grace` (zero: on no such shape), whose latest first response
+/// was `answered_ago` (`None`: never), and whose current run of prompts has
+/// gone `unanswered_run` without an answer (`None`: nothing pending, or the
+/// run has answered). `backlog` is read only once the rule of the bound
+/// gives up on the side. A grace the side's bound already covers (a longer
 /// configured threshold) adds nothing.
 fn side_reprieve(
     grace: Duration,
     answered_ago: Option<Duration>,
+    unanswered_run: Option<Duration>,
     bound: Duration,
+    backlog: impl FnOnce() -> Duration,
     dispatched_ago: Duration,
-) -> Option<Duration> {
+) -> SideReprieve {
     if grace > bound {
         if let Some(left) = grace
             .checked_sub(dispatched_ago)
             .filter(|left| !left.is_zero())
         {
-            return Some(left.min(bound));
+            return SideReprieve::WithinBound(left.min(bound));
         }
     }
-    reprieve(answered_ago, bound)
+    if let Some(left) = reprieve(answered_ago, bound) {
+        return SideReprieve::WithinBound(left);
+    }
+    let Some(silent) = unanswered_run else {
+        return SideReprieve::Silent {
+            silent: answered_ago,
+            window: bound,
+        };
+    };
+    let window = bound.max(backlog());
+    match reprieve(Some(silent), window) {
+        Some(left) => SideReprieve::FirstAnswerDue(left.min(bound)),
+        None => SideReprieve::Silent {
+            silent: Some(silent),
+            window,
+        },
+    }
 }
 
-/// [`prefill_side_reprieve`] for a worker whose latest first response was
-/// `answered_ago` (`None`: never).
-fn reprieve(answered_ago: Option<Duration>, bound: Duration) -> Option<Duration> {
-    bound
-        .checked_sub(answered_ago?)
-        .filter(|left| !left.is_zero())
+/// How much of `bound` is left to a worker silent for `silent` (`None`:
+/// never answered): `None` once it has all passed.
+fn reprieve(silent: Option<Duration>, bound: Duration) -> Option<Duration> {
+    bound.checked_sub(silent?).filter(|left| !left.is_zero())
 }
 
 static THRESHOLDS: OnceLock<(Duration, Duration, Duration)> = OnceLock::new();
@@ -1211,16 +1291,149 @@ mod tests {
         assert_eq!(reprieve(Some(Duration::from_secs(10)), bound), None);
         let w = worker();
         assert_eq!(
-            prefill_side_reprieve(&w, bound, Duration::ZERO),
-            None,
+            prefill_side_reprieve(&w, bound, Duration::ZERO, &OnceLock::new()),
+            SideReprieve::Silent {
+                silent: None,
+                window: bound
+            },
             "a fresh worker has answered nothing"
         );
         w.note_prefill_started(256, true);
         w.note_prefill_ended(256, true, Some(0));
+        let standing = prefill_side_reprieve(&w, bound, Duration::ZERO, &OnceLock::new());
         assert!(
-            prefill_side_reprieve(&w, bound, Duration::ZERO)
-                .is_some_and(|left| left > Duration::from_secs(2)),
-            "answered just now: a bound's reprieve, less the moment since"
+            matches!(standing, SideReprieve::WithinBound(left) if left > Duration::from_secs(2)),
+            "answered just now: a bound's reprieve, less the moment since: {standing:?}"
+        );
+        assert!(!standing.past_bound());
+    }
+
+    /// A worker whose current run of prompts has not answered yet (a burst
+    /// after an idle spell, or before its first answer ever) has shown no
+    /// silence before the run began: past the rule of the bound, its side
+    /// waits until the run has gone unanswered for the time the worker's
+    /// backlog takes, a bound at a time. The backlog is read once, so
+    /// prompts that go on arriving do not extend the wait; a run that has
+    /// answered is judged by the rule of the bound alone.
+    #[test]
+    fn a_prefill_side_waits_on_while_its_workers_run_awaits_its_first_answer() {
+        let bound = DEFAULT_WEDGE;
+        let never = None;
+        let backlog = Duration::from_secs(10);
+        let at_bound = Duration::from_secs(3);
+        assert_eq!(
+            side_reprieve(
+                Duration::ZERO,
+                never,
+                Some(at_bound),
+                bound,
+                || backlog,
+                at_bound
+            ),
+            SideReprieve::FirstAnswerDue(bound),
+            "a burst on a worker that never answered: the backlog's time, a bound at a time"
+        );
+        assert_eq!(
+            side_reprieve(
+                Duration::ZERO,
+                Some(Duration::from_secs(61)),
+                Some(Duration::from_secs(9)),
+                bound,
+                || backlog,
+                Duration::from_secs(9)
+            ),
+            SideReprieve::FirstAnswerDue(Duration::from_secs(1)),
+            "after an idle minute: what is left of the backlog's time since the run began"
+        );
+        let verdict = side_reprieve(
+            Duration::ZERO,
+            Some(Duration::from_secs(61)),
+            Some(backlog),
+            bound,
+            || backlog,
+            backlog,
+        );
+        assert_eq!(
+            verdict,
+            SideReprieve::Silent {
+                silent: Some(backlog),
+                window: backlog
+            },
+            "unanswered for the backlog's time: the verdict"
+        );
+        assert!(verdict.past_bound());
+        assert_eq!(
+            side_reprieve(
+                Duration::ZERO,
+                never,
+                Some(Duration::from_secs(4)),
+                bound,
+                || Duration::from_secs(1),
+                Duration::from_secs(4)
+            ),
+            SideReprieve::Silent {
+                silent: Some(Duration::from_secs(4)),
+                window: bound
+            },
+            "a backlog shorter than the bound adds nothing"
+        );
+        let backlog_read = std::cell::Cell::new(false);
+        assert_eq!(
+            side_reprieve(
+                Duration::ZERO,
+                Some(Duration::from_secs(5)),
+                None,
+                bound,
+                || {
+                    backlog_read.set(true);
+                    backlog
+                },
+                Duration::from_secs(10)
+            ),
+            SideReprieve::Silent {
+                silent: Some(Duration::from_secs(5)),
+                window: bound
+            },
+            "a run that has answered, silent for a bound since: the verdict, as before"
+        );
+        assert!(
+            !backlog_read.get(),
+            "a run that has answered reads no backlog"
+        );
+        // The worker: forty 100k prompts booked on a fresh worker, past a
+        // short side's bound. Its backlog is read once, at the cap here.
+        let w = worker();
+        for _ in 0..40 {
+            w.note_prefill_started(100_000, true);
+        }
+        let read = OnceLock::new();
+        assert_eq!(
+            prefill_side_reprieve(&w, bound, bound, &read),
+            SideReprieve::FirstAnswerDue(bound),
+            "forty 100k prompts pending: the side waits on"
+        );
+        assert_eq!(read.get(), Some(&WEDGE_BOUND_CAP), "read once, capped");
+        // A smaller backlog, read once: more prompts arriving later do not
+        // move it.
+        let w = worker();
+        for _ in 0..2 {
+            w.note_prefill_started(10_000, true);
+        }
+        let read = OnceLock::new();
+        assert!(prefill_side_reprieve(&w, Duration::from_secs(1), bound, &read).past_bound());
+        assert_eq!(
+            read.get(),
+            Some(&Duration::from_secs(2)),
+            "20k at the cold prior"
+        );
+        for _ in 0..40 {
+            w.note_prefill_started(10_000, true);
+        }
+        assert!(prefill_side_reprieve(&w, Duration::from_secs(1), bound, &read).past_bound());
+        assert_eq!(
+            read.get(),
+            Some(&Duration::from_secs(2)),
+            "the prompts booked since do not extend it"
         );
     }
 
@@ -1233,41 +1446,107 @@ mod tests {
     fn a_prefill_side_in_flight_before_a_longer_prompt_waits_through_the_build() {
         let bound = DEFAULT_WEDGE;
         let silent = Some(Duration::from_secs(10));
+        let verdict = SideReprieve::Silent {
+            silent,
+            window: bound,
+        };
+        let no_backlog = || Duration::ZERO;
         assert_eq!(
             reprieve(silent, bound),
             None,
             "silent for a bound: the verdict"
         );
         assert_eq!(
-            side_reprieve(COLD_SHAPE_GRACE, silent, bound, Duration::from_secs(10)),
-            Some(bound),
+            side_reprieve(
+                COLD_SHAPE_GRACE,
+                silent,
+                None,
+                bound,
+                no_backlog,
+                Duration::from_secs(10)
+            ),
+            SideReprieve::WithinBound(bound),
             "on a cold shape: the grace since the dispatch, a bound at a time"
         );
         assert_eq!(
             side_reprieve(
                 COLD_SHAPE_GRACE,
                 silent,
+                None,
                 bound,
+                no_backlog,
                 COLD_SHAPE_GRACE - Duration::from_secs(1)
             ),
-            Some(Duration::from_secs(1)),
+            SideReprieve::WithinBound(Duration::from_secs(1)),
             "what is left of it"
         );
         assert_eq!(
-            side_reprieve(COLD_SHAPE_GRACE, silent, bound, COLD_SHAPE_GRACE),
-            None,
+            side_reprieve(
+                COLD_SHAPE_GRACE,
+                silent,
+                None,
+                bound,
+                no_backlog,
+                COLD_SHAPE_GRACE
+            ),
+            verdict,
             "the grace has passed: the verdict"
         );
         assert_eq!(
-            side_reprieve(Duration::ZERO, silent, bound, Duration::from_secs(10)),
-            None,
+            side_reprieve(
+                Duration::ZERO,
+                silent,
+                None,
+                bound,
+                no_backlog,
+                Duration::from_secs(10)
+            ),
+            verdict,
             "on no cold shape: the rule above"
         );
         let long = Duration::from_secs(600);
         assert_eq!(
-            side_reprieve(COLD_SHAPE_GRACE, silent, long, Duration::from_secs(10)),
-            reprieve(silent, long),
+            side_reprieve(
+                COLD_SHAPE_GRACE,
+                silent,
+                None,
+                long,
+                no_backlog,
+                Duration::from_secs(10)
+            ),
+            SideReprieve::WithinBound(long - Duration::from_secs(10)),
             "a longer configured threshold already covers the grace: the rule above alone"
+        );
+        // A run that has not answered, with a backlog at the cap: the grace
+        // still runs a bound at a time, and once it has passed the run has
+        // gone unanswered past the cap: the verdict, as before.
+        let unanswered = Some(COLD_SHAPE_GRACE + Duration::from_secs(1));
+        assert_eq!(
+            side_reprieve(
+                COLD_SHAPE_GRACE,
+                None,
+                unanswered,
+                bound,
+                || WEDGE_BOUND_CAP,
+                Duration::from_secs(10)
+            ),
+            SideReprieve::WithinBound(bound),
+            "a backlog at the cap leaves the grace as it was"
+        );
+        assert_eq!(
+            side_reprieve(
+                COLD_SHAPE_GRACE,
+                None,
+                unanswered,
+                bound,
+                || WEDGE_BOUND_CAP,
+                COLD_SHAPE_GRACE
+            ),
+            SideReprieve::Silent {
+                silent: unanswered,
+                window: WEDGE_BOUND_CAP
+            },
+            "unanswered past the backlog's time once the grace has passed: the verdict"
         );
         // The worker: a short side dispatched, then the longest prompt yet
         // behind it.
@@ -1280,17 +1559,17 @@ mod tests {
         assert!(w.prefill_cold_shape(0));
         let late = COLD_SHAPE_GRACE - Duration::from_secs(1);
         assert_eq!(
-            prefill_side_reprieve(&w, bound, late),
-            Some(Duration::from_secs(1)),
+            prefill_side_reprieve(&w, bound, late, &OnceLock::new()),
+            SideReprieve::WithinBound(Duration::from_secs(1)),
             "the short side, dispatched before the longer prompt, waits out the grace"
         );
         // The shape shown: the side is judged by the worker's answers again.
         w.note_prefill_ended(8_192, true, Some(0));
         assert!(!w.prefill_cold_shape(0));
+        let standing = prefill_side_reprieve(&w, bound, late, &OnceLock::new());
         assert!(
-            prefill_side_reprieve(&w, bound, late)
-                .is_some_and(|left| left > Duration::from_secs(2)),
-            "answered just now: a bound's reprieve"
+            matches!(standing, SideReprieve::WithinBound(left) if left > Duration::from_secs(2)),
+            "answered just now: a bound's reprieve: {standing:?}"
         );
     }
 

@@ -459,7 +459,7 @@ mod tests {
     /// A client transport to `url` over the test binary's HTTP client.
     fn client_transport(url: &str) -> StreamableHttpClientTransport<reqwest::Client> {
         StreamableHttpClientTransport::with_client(
-            smg::http_client::client(),
+            smg::clients::http_client(),
             StreamableHttpClientTransportConfig::with_uri(url),
         )
     }

@@ -1,14 +1,20 @@
 {
  "source": "deepseek-ai/DeepSeek-V4.1-Flash encoding/encoding.py",
  "revision": "517ef625df",
- "vllm_source": "vllm/tokenizers/deepseek_v41_encoding.py",
- "vllm_revision": "ea723c81c3ea26425cb69503a5d5e90822a04a45",
  "effort_tiers": {
   "low": 25,
   "high": 50,
   "xhigh": 75,
   "max": 100
  },
+ "current_revision": "2cba9e42",
+ "current_effort_tiers": {
+  "low": 50,
+  "high": 75,
+  "max": 100
+ },
+ "vllm_source": "vllm/tokenizers/deepseek_v41_encoding.py",
+ "vllm_revision": "ea723c81c3ea26425cb69503a5d5e90822a04a45",
  "cases": [
   {
    "name": "hf_1",
@@ -1103,6 +1109,62 @@
    "drop_thinking": true,
    "continue_final_message": false,
    "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n\n\n## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n{\"name\": \"lookup\", \"description\": \"Look up\", \"parameters\": {\"type\": \"object\", \"properties\": {\"query\": {\"type\": \"string\"}}, \"required\": [\"query\"]}}\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n<｜User｜>Follow the policy.<｜User｜>Question?<｜Assistant｜><think>"
+  },
+  {
+   "name": "thinking_default_effort_current",
+   "oracle": "hf",
+   "encoder_revision": "2cba9e42",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>"
+  },
+  {
+   "name": "thinking_low_current",
+   "oracle": "hf",
+   "encoder_revision": "2cba9e42",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": "low",
+   "drop_thinking": true,
+   "continue_final_message": false,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>"
+  },
+  {
+   "name": "continue_final_message_current",
+   "oracle": "hf",
+   "encoder_revision": "2cba9e42",
+   "messages": [
+    {
+     "role": "user",
+     "content": "q"
+    },
+    {
+     "role": "assistant",
+     "reasoning_content": "r",
+     "content": "Sure,"
+    }
+   ],
+   "tools": null,
+   "thinking_mode": "thinking",
+   "reasoning_effort": null,
+   "drop_thinking": true,
+   "continue_final_message": true,
+   "text": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>r</think>Sure,"
   }
  ]
 }

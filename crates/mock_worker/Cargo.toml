@@ -31,6 +31,7 @@ clap = { version = "4", features = ["derive"] }
 reqwest = { workspace = true, features = ["json", "stream", "rustls-no-provider"] }
 serde = { workspace = true, features = ["derive"] }
 smg-grpc-client.workspace = true
+llm-tokenizer.workspace = true
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }

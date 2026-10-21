@@ -262,6 +262,68 @@ advertises (`--context-length`), and the worker's decode limit. The gateway
 sends `Generate` with no size limit of its own and decodes each response
 message up to tonic's 4 MiB default, which a streamed chunk never approaches.
 
+## Scripted output
+
+What the model says can be stated ahead of the request, on every wire (HTTP,
+gRPC, ZMQ), ahead of either engine mode. Two sources feed one store:
+
+- `--script PATH`: a JSONL of answers keyed by the prompt's token ids, for
+  recorded corpora and bisects. One answer per line:
+
+  ```json
+  {"input_ids": [151644, 872, 198], "output_ids": [9707, 11, 1879], "output_text": ["Hello", ",", " world"],
+   "finish_reason": "stop", "matched_stop": 151645, "cached_tokens": 0, "prompt_tokens": 3,
+   "logprobs": [-0.1, -0.2, -0.3], "delay_ms": 0, "chunk_tokens": 1}
+  ```
+
+  `key` may stand in for `input_ids`: `<len>:<fold>`, the prompt's length and
+  the FNV-style fold of its ids (`h = (h * 1099511628211) ^ id` over a `u64`
+  from 0, wrapping). Everything but one of `output_ids` / `output_text` is
+  optional: `finish_reason` defaults to `stop`; `matched_stop` is a token id
+  or a string; `prompt_tokens` defaults to the request's own count;
+  `logprobs` holds the sampled token's logprob per output token and is sent
+  when the request asks for logprobs; `delay_ms` is the pause before every
+  frame but the first; `chunk_tokens` the tokens per frame (1 by default).
+- `POST /admin/script/{worker}` on the admin API, with one such answer or an
+  array of them: the answers the worker's next requests get, in order
+  (`all`: whichever worker gets the request). An answer with a `key` or
+  `input_ids` is filed under its prompt for every worker instead.
+  `GET /admin/script/{worker}` reads `queued`, `hits`, `misses` and the
+  `keyed` count; `DELETE` drops the queue; a name no worker of the process
+  has is a 404. This is the form a test wants: it states the model's answer
+  right before it sends the request, no tokenizer prediction needed.
+
+For a request a worker looks in this order: its own queue, the shared queue,
+the keyed answers under its prompt's key. Nothing found is a miss, counted
+per worker, and the request goes to the canned or realistic engine as if no
+script existed. A scripted answer is served by the wire, not by the engine
+simulator: no load, no KV events, no request record.
+
+Per wire: a gRPC worker streams `chunk_tokens` ids per `Chunk` and ends with
+the `Complete` (`output_ids`, `finish_reason`, `matched_stop`,
+`cached_tokens`, `output_logprobs` when `return_logprob` is set); a ZMQ rank
+pushes one `EngineCoreOutputs` batch per frame, the prompt's prefill stats
+on the first, the finish reason and `stop_reason` on the last; an HTTP worker
+answers `/v1/chat/completions`, `/v1/completions` and `/generate` with the
+`output_text` pieces (one SSE frame per `chunk_tokens` pieces, the finish
+frame with `matched_stop`, under `stream_options.include_usage` a usage
+chunk of its own, then `[DONE]`; or one JSON body) and keys its prompt on its synthetic ids, one
+per whitespace word of the prompt text (`http::synth_token_ids`). An answer
+without `output_ids` is encoded on the token wires with the worker's
+`--tokenizer`, which must then name local tokenizer files (a directory with
+`tokenizer.json`, or the file): the mock never fetches a tokenizer, and an
+answer it cannot encode (no such files, or per-piece `logprobs` that do not
+align with the encoded ids) fails the request with the reason instead of a
+canned answer; one without `output_text` has no frames on the HTTP wire.
+
+```bash
+cargo run --release -p mock-worker -- \
+  --grpc-base-port 19000 --grpc-count 1 --http-base-port 9000 --http-count 1 \
+  --admin-port 9100 --model m --script answers.jsonl
+curl -s -X POST localhost:9100/admin/script/grpc:19000 -H 'content-type: application/json' \
+  -d '{"output_ids": [9707, 11, 1879], "finish_reason": "stop", "logprobs": [-0.1, -0.2, -0.3]}'
+```
+
 ## Capturing requests
 
 `--capture PATH` appends every gRPC `Generate` request a worker receives to

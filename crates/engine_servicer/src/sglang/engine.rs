@@ -47,6 +47,7 @@ pub(super) async fn connect_engine(
     .await
     {
         Ok(client) => {
+            client.set_structured_outputs_support(super::structured_outputs_support(&state.model));
             info!(
                 handshake = %handshake_address,
                 engines = engine_count,

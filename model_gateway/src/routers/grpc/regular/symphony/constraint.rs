@@ -140,8 +140,11 @@ pub(crate) fn grammar_start_from(start: WorkerGrammarStart) -> GrammarStart {
 /// Where the model's `workers` start a grammar, before one is selected: the start every one of
 /// them names in its `constrained_decoding_start` label, a prefill or encode worker left out
 /// since it generates no token a grammar constrains (the roles that do are allow-listed, so a
-/// role added later is left out until it is named); unknown when none says or they differ, and
-/// the tag takes the prefix that fits either kind of engine.
+/// role added later is left out until it is named); `Either` when one that starts at the first
+/// token stands beside one that does not, since no one tag fits both (the answer keeps the
+/// prefix a forced call takes: [`Format::answer_grammar_for`]); unknown when none says, and
+/// when workers that start after their reasoning parser stand beside ones that do not say,
+/// since the unknown start's tags fit both (a forced call's prefix, an answer's schema alone).
 pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
     let mut starts = workers
         .iter()
@@ -164,9 +167,14 @@ pub(crate) fn grammar_start_of(workers: &[Arc<dyn Worker>]) -> GrammarStart {
     let Some(first) = starts.next() else {
         return GrammarStart::Unknown;
     };
-    if starts.all(|start| start == first) {
+    let starts: Vec<_> = std::iter::once(first).chain(starts).collect();
+    if starts.iter().all(|start| *start == first) {
         grammar_start_from(first)
+    } else if starts.contains(&WorkerGrammarStart::FirstToken) {
+        // An engine that starts at the first token beside one that does not: no one tag fits both.
+        GrammarStart::Either
     } else {
+        // After the reasoning parser beside not saying: the unknown start's tags fit both.
         GrammarStart::Unknown
     }
 }
@@ -356,14 +364,18 @@ pub(super) fn callable<'t>(choice: Option<&ToolChoice>, declared: &'t [Tool]) ->
     }
 }
 
-/// The structural tag the table gives a request's forced or required call to one of `tools`, or a
-/// chat request's JSON `response_format`, with `reasoning_open` when the prompt leaves the model
-/// inside its thought ([`calls_tag`], [`answer_tag`]). `Ok(None)` when no table reads the response
-/// ([`reads`]), the request asks neither, or the table has no tag for it; the older registry then
-/// decides as before. An error refuses the request: the response template's table cannot
-/// constrain what is asked, or a chat request's `regex` or `ebnf` constraint would apply outside
-/// its format. `thought_closed` says the prompt closed the thought itself and wrote the template's
-/// text after it, which the calls' tag then owes nothing of.
+/// What the table gives a request's forced or required call to one of `tools`, or a chat request's
+/// JSON `response_format`, with `reasoning_open` when the prompt leaves the model inside its
+/// thought: the call's structural tag, built for `start`, where the model's workers start the
+/// grammar together ([`calls_tag`], [`grammar_start_of`]); the answer's as it derives for the
+/// selected worker's own start ([`Prepared::Answer`], [`AnswerTag`]), since a pool whose workers
+/// start the grammar at different places has no one answer tag that fits them all.
+/// [`Prepared::None`] when no table reads the response ([`reads`]), the request asks neither, or
+/// the table has no tag for the call; the older registry then decides as before. An error refuses
+/// the request: the response template's table cannot constrain the call it is asked (the answer's
+/// refusal comes with the derivation), or a chat request's `regex` or `ebnf` constraint would
+/// apply outside its format. `thought_closed` says the prompt closed the thought itself and wrote
+/// the template's text after it, which the calls' tag then owes nothing of.
 #[expect(
     clippy::too_many_arguments,
     reason = "the table, the request's ask, where the prompt and the engines leave the model"
@@ -377,9 +389,9 @@ pub(crate) fn constraint(
     thought_closed: bool,
     start: GrammarStart,
     templates: &Templates,
-) -> Result<Option<ToolConstraint>, SymphonyError> {
+) -> PreparedConstraint {
     let Some((format, compiled)) = table_reading(parser, names, asks.model(), templates)? else {
-        return Ok(None);
+        return Ok(Prepared::None);
     };
     if compiled && asks.constrains_outside_the_format() {
         return Err(SymphonyError::Constraint(format!(
@@ -400,20 +412,20 @@ pub(crate) fn constraint(
             thought_closed,
             start,
             continues,
-        );
+        )
+        .map(Prepared::from);
     }
-    match asks.answer_schema() {
-        Some(schema) => answer_tag(
-            &format,
+    Ok(match asks.answer_schema() {
+        Some(schema) => Prepared::Answer(Arc::new(AnswerTag {
+            format,
             compiled,
-            asks.model(),
-            &schema,
+            model: asks.model().to_string(),
+            schema,
             reasoning_open,
-            start,
             continues,
-        ),
-        None => Ok(None),
-    }
+        })),
+        None => Prepared::None,
+    })
 }
 
 /// The tag of the calls a request's model may make under `auto`, for a worker whose engine takes
@@ -476,11 +488,124 @@ pub(super) fn auto_tag(
         .map(|grammar| ToolConstraint::StructuralTag(grammar.payload_text()))
 }
 
-/// The constraint preparation finds for what a request asks, before its worker is known: the
-/// table's tag for a forced call or a JSON answer, else the registry's; or why the table cannot
-/// constrain the request ([`constraint`]). Request building decides on the
-/// selected worker ([`worker_constraint`]).
-pub(crate) type PreparedConstraint = Result<Option<ToolConstraint>, SymphonyError>;
+/// The constraint preparation finds for what a request asks, before its worker is known
+/// ([`constraint`]): a forced call's tag, the table's or the older registry's; a JSON answer's tag
+/// as it derives for a worker's start; or why the table cannot constrain the request. Request
+/// building decides on the selected worker ([`worker_constraint`]).
+pub(crate) type PreparedConstraint = Result<Prepared, SymphonyError>;
+
+/// What preparation found for a request's constraint, before its worker is known.
+#[derive(Debug)]
+pub(crate) enum Prepared {
+    /// Nothing: the request asks for no constraint the table or the older registry gives.
+    None,
+    /// A constraint every worker takes as it is: a forced call's tag, the table's built for the
+    /// start the model's workers name together ([`grammar_start_of`]) or the older registry's,
+    /// which request building shapes for the worker (`utils::tool_constraints_for_worker`).
+    Constraint(ToolConstraint),
+    /// A JSON answer's tag, which derives for the selected worker's own start as the `auto` tag
+    /// does ([`AnswerTag`]): the schema alone behind a reasoning parser's gate or where the engine
+    /// does not say, the closed thought then the schema from the first token. A pool whose
+    /// workers start the grammar at different places so gives each worker its own shape, where
+    /// one tag for the whole pool fit one kind and left the other the free-text prefix, which
+    /// says nothing of where the schema begins.
+    Answer(Arc<AnswerTag>),
+}
+
+impl Prepared {
+    /// The constraint a worker whose engine starts the grammar at `start` takes: a JSON answer's
+    /// tag derived for it, what was found as it is otherwise.
+    pub(crate) fn for_start(
+        self,
+        start: GrammarStart,
+    ) -> Result<Option<ToolConstraint>, SymphonyError> {
+        match self {
+            Self::None => Ok(None),
+            Self::Constraint(constraint) => Ok(Some(constraint)),
+            Self::Answer(answer) => answer.for_start(start),
+        }
+    }
+}
+
+impl From<Option<ToolConstraint>> for Prepared {
+    fn from(constraint: Option<ToolConstraint>) -> Self {
+        constraint.map_or(Self::None, Self::Constraint)
+    }
+}
+
+/// The table's tag for a JSON answer, as it derives for where a worker's engine starts the grammar
+/// on a prompt that leaves the thought open ([`answer_tag`]): preparation builds it before the
+/// worker is known, request building derives the tag for the worker it selected
+/// ([`worker_constraint`]), and the attempt stamp for the worker each retry takes, whose start may
+/// differ (`helpers::ToolConstraintStamp`). It owns what [`answer_tag`] reads, since the request
+/// is gone from the pipeline once the plan is built: the table (shared), the request's schema, and
+/// where the prompt leaves the model. Where the tag is the schema alone, the request's own schema
+/// is the engine's constraint ([`TagForStart::schema`], serialized only when a retry's worker takes
+/// it), and the worker a retry takes gets the one in the other's place.
+pub(crate) struct AnswerTag {
+    format: Arc<Format>,
+    /// The table is the response template's, which takes its tag either way and refuses what it
+    /// cannot constrain ([`tagged`]).
+    compiled: bool,
+    model: String,
+    schema: Value,
+    /// The prompt leaves the model inside its thought.
+    reasoning_open: bool,
+    /// The prompt continues the assistant's message.
+    continues: bool,
+}
+
+impl AnswerTag {
+    /// The tag for an engine whose grammar starts at `start`; `None` where the answer is the
+    /// schema alone, the engine's own constraint, or the table has no tag for it; an error where
+    /// the response template's table cannot constrain the answer.
+    pub(crate) fn for_start(
+        &self,
+        start: GrammarStart,
+    ) -> Result<Option<ToolConstraint>, SymphonyError> {
+        answer_tag(
+            &self.format,
+            self.compiled,
+            &self.model,
+            &self.schema,
+            self.reasoning_open,
+            start,
+            self.continues,
+        )
+    }
+}
+
+impl TagForStart for AnswerTag {
+    fn tag_for(&self, start: WorkerGrammarStart) -> Result<Option<String>, String> {
+        self.for_start(grammar_start_from(start))
+            .map(tag_text)
+            .map_err(String::from)
+    }
+
+    fn schema(&self) -> Option<&Value> {
+        Some(&self.schema)
+    }
+}
+
+impl fmt::Debug for AnswerTag {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AnswerTag")
+            .field("table", &self.format.name())
+            .field("compiled", &self.compiled)
+            .field("model", &self.model)
+            .field("reasoning_open", &self.reasoning_open)
+            .field("continues", &self.continues)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The text of a table's structural tag; the schema kind is not built by a table ([`tagged`]).
+fn tag_text(constraint: Option<ToolConstraint>) -> Option<String> {
+    match constraint? {
+        ToolConstraint::StructuralTag(tag) => Some(tag),
+        ToolConstraint::JsonSchema(_) => None,
+    }
+}
 
 /// What constrains a request's output on the worker selected for it.
 pub(crate) struct WorkerConstraint {
@@ -491,10 +616,11 @@ pub(crate) struct WorkerConstraint {
     /// The worker's policy chose the constraint (the whole turn's grammar or the `auto` tag), not
     /// the request: a worker of another policy would not send it.
     pub by_policy: bool,
-    /// The `auto` tag the policy chose, as it derives for a worker's grammar start: the attempt
-    /// stamp gives the worker a retry takes the shape its own start needs ([`AutoTag::for_start`],
-    /// `helpers::ToolConstraintStamp`).
-    pub auto: Option<Arc<AutoTag>>,
+    /// What derives the constraint for a worker's grammar start, where the table shapes it by the
+    /// start: the `auto` tag the policy chose ([`AutoTag::for_start`]) or a JSON answer's
+    /// ([`AnswerTag::for_start`]). The attempt stamp gives the worker a retry takes the shape its
+    /// own start needs (`helpers::ToolConstraintStamp`).
+    pub table_tag: Option<Arc<dyn TagForStart>>,
 }
 
 /// The table's `auto` tag for a request, derived for where a worker's engine starts the grammar on
@@ -583,15 +709,14 @@ impl AutoTag {
 
 impl TagForStart for AutoTag {
     fn tag_for(&self, start: WorkerGrammarStart) -> Result<Option<String>, String> {
-        // The table's `auto` tag is a structural tag ([`auto_tag`]); the schema kind is not built
-        // here.
-        Ok(self
-            .for_start(grammar_start_from(start))
-            .map_err(String::from)?
-            .and_then(|constraint| match constraint {
-                ToolConstraint::StructuralTag(tag) => Some(tag),
-                ToolConstraint::JsonSchema(_) => None,
-            }))
+        self.for_start(grammar_start_from(start))
+            .map(tag_text)
+            .map_err(String::from)
+    }
+
+    /// The `auto` tag stands in for nothing: a worker the table gives none goes unconstrained.
+    fn schema(&self) -> Option<&Value> {
+        None
     }
 }
 
@@ -617,7 +742,8 @@ impl fmt::Debug for AutoTag {
 /// on every turn or only when the request asks and starts it where its label says (`decoding`,
 /// under PD the decode worker's). The one place a worker's policy decides:
 ///
-/// - `requested`, the default: what preparation found (`prepared`), its refusal included.
+/// - `requested`, the default: what preparation found (`prepared`), its refusal included; a JSON
+///   answer's tag derived for the worker's start ([`Prepared::for_start`]).
 /// - `always`, on an engine that starts the grammar at the first token: the whole turn's grammar
 ///   (`turn`, [`turn_constraint`]) where it starts; its refusal refuses the request.
 /// - `always` otherwise, or where the whole turn's grammar does not start: what preparation found,
@@ -625,8 +751,8 @@ impl fmt::Debug for AutoTag {
 ///   [`AutoTag`], derived for the worker's start).
 ///
 /// When the policy chose the constraint, a retry re-selects only workers that decide alike
-/// ([`WorkerDecoding::decides_alike`]); the `auto` tag goes with the plan as it derives, for the
-/// retry's worker to take in the shape its own start needs.
+/// ([`WorkerDecoding::decides_alike`]); the `auto` tag and a JSON answer's go with the plan as
+/// they derive, for the retry's worker to take in the shape its own start needs.
 pub(crate) fn worker_constraint(
     decoding: WorkerDecoding,
     prepared: PreparedConstraint,
@@ -640,24 +766,30 @@ pub(crate) fn worker_constraint(
                 constraint: Some(constraint),
                 whole_turn: true,
                 by_policy: true,
-                auto: None,
+                table_tag: None,
             });
         }
     }
-    let (constraint, by_policy, auto) = match prepared? {
-        None if always => {
+    let start = grammar_start_from(decoding.start);
+    let (constraint, by_policy, table_tag) = match prepared? {
+        Prepared::None if always => {
             let auto = auto();
-            let tag = auto.for_start(grammar_start_from(decoding.start))?;
+            let tag = auto.for_start(start)?;
             let by_policy = tag.is_some();
-            (tag, by_policy, by_policy.then(|| Arc::new(auto)))
+            let table_tag = by_policy.then(|| -> Arc<dyn TagForStart> { Arc::new(auto) });
+            (tag, by_policy, table_tag)
         }
-        prepared => (prepared, false, None),
+        Prepared::Answer(answer) => {
+            let tag = answer.for_start(start)?;
+            (tag, false, Some(answer as Arc<dyn TagForStart>))
+        }
+        prepared => (prepared.for_start(start)?, false, None),
     };
     Ok(WorkerConstraint {
         constraint,
         whole_turn: false,
         by_policy,
-        auto,
+        table_tag,
     })
 }
 
@@ -734,42 +866,56 @@ mod tests {
     use super::*;
     use crate::routers::grpc::regular::symphony::testing::{assign, constraint, *};
 
-    /// Where the model's workers start the grammar shapes what precedes a table's answer or its
+    /// Where a worker's engine starts the grammar shapes what precedes a table's answer or its
     /// calls when the prompt leaves the thought open: nothing after the reasoning parser's gate
     /// (a JSON answer then needs no tag; the request's own schema goes to the engine as it is),
-    /// the thought closed first from the first token, and the free-text prefix when the workers
-    /// do not say.
+    /// the thought closed first from the first token, the schema alone (the request's own, no
+    /// tag) when the worker does not say, and for the calls the free-text prefix when the
+    /// model's workers name different starts. The answer's tag derives for the selected worker,
+    /// whatever start the pool names.
     #[test]
     fn the_workers_grammar_start_shapes_what_precedes_a_tables_answer_and_calls() {
         let deepseek = names(Some("deepseek_v4"), Some("deepseek_v4"));
-        let answer = request(json!({"response_format": {
+        let asked = request(json!({"response_format": {
             "type": "json_schema",
             "json_schema": {"name": "city", "schema": {"type": "object"}},
         }}));
-        let tag_of = |start| {
-            super::constraint(
-                ParserChoice::Symphony,
-                &deepseek,
-                Asks::Chat(&answer),
-                &[],
-                true,
-                false,
-                start,
-                &templates(),
-            )
-            .expect("no hf")
-            .map(|constraint| match constraint {
-                ToolConstraint::StructuralTag(tag) => {
-                    serde_json::from_str::<Value>(&tag).expect("JSON")
-                }
-                ToolConstraint::JsonSchema(schema) => {
-                    panic!("a structural tag, not the JSON schema {schema}")
-                }
-            })
+        // The pool names either kind (a first-token worker beside another): the answer's tag is
+        // not built for it, but for the worker each attempt selects.
+        let prepared = super::constraint(
+            ParserChoice::Symphony,
+            &deepseek,
+            Asks::Chat(&asked),
+            &[],
+            true,
+            false,
+            symphony::GrammarStart::Either,
+            &templates(),
+        );
+        let Ok(Prepared::Answer(answer)) = prepared else {
+            panic!("the answer's tag, derived per worker, not {prepared:?}");
         };
-        let unknown = tag_of(symphony::GrammarStart::Unknown).expect("a tag with the prefix");
-        assert_eq!(unknown["format"]["elements"][0]["type"], "any_text");
-        assert_eq!(unknown["format"]["elements"][1]["type"], "json_schema");
+        let tag_of = |start| {
+            answer
+                .for_start(start)
+                .expect("no hf")
+                .map(|constraint| match constraint {
+                    ToolConstraint::StructuralTag(tag) => {
+                        serde_json::from_str::<Value>(&tag).expect("JSON")
+                    }
+                    ToolConstraint::JsonSchema(schema) => {
+                        panic!("a structural tag, not the JSON schema {schema}")
+                    }
+                })
+        };
+        // Where the worker does not say, the answer takes no prefix either: free text before a
+        // schema constrains nothing, so the schema stands alone and goes to the engine as the
+        // request's own, as it does after the gate.
+        assert_eq!(
+            tag_of(symphony::GrammarStart::Unknown),
+            None,
+            "the schema stands alone where the worker does not say"
+        );
         assert_eq!(
             tag_of(symphony::GrammarStart::AfterReasoning),
             None,
@@ -782,7 +928,7 @@ mod tests {
         assert_eq!(first["format"]["elements"][1]["type"], "json_schema");
         let forced = request(json!({"tool_choice": "required"}));
         let call_of = |start| {
-            let Some(ToolConstraint::StructuralTag(tag)) = super::constraint(
+            let Ok(Prepared::Constraint(ToolConstraint::StructuralTag(tag))) = super::constraint(
                 ParserChoice::Symphony,
                 &deepseek,
                 Asks::Chat(&forced),
@@ -791,8 +937,7 @@ mod tests {
                 false,
                 start,
                 &templates(),
-            )
-            .expect("no hf") else {
+            ) else {
                 panic!("a forced tag");
             };
             serde_json::from_str::<Value>(&tag).expect("JSON")
@@ -828,7 +973,7 @@ mod tests {
             "tool_choice": "required",
         }));
         for (asked, one_call) in [(&named, true), (&required, false)] {
-            let Some(ToolConstraint::StructuralTag(tag)) = super::constraint(
+            let Ok(Prepared::Constraint(ToolConstraint::StructuralTag(tag))) = super::constraint(
                 ParserChoice::Symphony,
                 &kimi,
                 Asks::Chat(asked),
@@ -837,8 +982,7 @@ mod tests {
                 false,
                 symphony::GrammarStart::AfterReasoning,
                 &templates(),
-            )
-            .expect("no hf") else {
+            ) else {
                 panic!("the table's tag, not the older registry's schema");
             };
             let format = serde_json::from_str::<Value>(&tag).expect("JSON");
@@ -896,7 +1040,7 @@ mod tests {
             "tool_choice": "required",
         }));
         for (asked, one_call) in [(&named, true), (&required, false)] {
-            let Some(ToolConstraint::StructuralTag(tag)) = super::constraint(
+            let Ok(Prepared::Constraint(ToolConstraint::StructuralTag(tag))) = super::constraint(
                 ParserChoice::Symphony,
                 &deepseek,
                 Asks::Chat(asked),
@@ -905,8 +1049,7 @@ mod tests {
                 false,
                 symphony::GrammarStart::AfterReasoning,
                 &templates(),
-            )
-            .expect("no hf") else {
+            ) else {
                 panic!("the table's tag, not the older registry's schema");
             };
             let format = serde_json::from_str::<Value>(&tag).expect("JSON");
@@ -956,8 +1099,10 @@ mod tests {
         .is_none());
     }
 
-    /// The model's workers name the start when they all carry the same label; none, a missing
-    /// label or a disagreement leaves it unknown. A worker's own label maps one to one.
+    /// The model's workers name the start when they all carry the same label; none or a missing
+    /// label leaves it unknown, as does a pool of workers that start after their reasoning parser
+    /// beside ones that do not say, and a first-token worker beside another kind names either
+    /// kind. A worker's own label maps one to one.
     #[test]
     fn the_models_workers_name_the_grammar_start_when_they_agree() {
         let worker = |start: Option<&str>| -> Arc<dyn Worker> {
@@ -986,11 +1131,25 @@ mod tests {
         );
         assert_eq!(
             grammar_start_of(&[worker(Some("after_reasoning")), worker(Some("first_token"))]),
-            symphony::GrammarStart::Unknown
+            symphony::GrammarStart::Either
         );
+        // After the reasoning parser beside not saying: the unknown start's tags fit both (a
+        // forced call's prefix, an answer's schema alone), so the pool needs no prefix.
         assert_eq!(
             grammar_start_of(&[worker(Some("after_reasoning")), worker(None)]),
             symphony::GrammarStart::Unknown
+        );
+        assert_eq!(
+            grammar_start_of(&[worker(Some("first_token")), worker(None)]),
+            symphony::GrammarStart::Either
+        );
+        assert_eq!(
+            grammar_start_of(&[
+                worker(Some("after_reasoning")),
+                worker(None),
+                worker(Some("first_token"))
+            ]),
+            symphony::GrammarStart::Either
         );
         // A prefill worker generates no token a grammar constrains: its label does not count.
         let prefill = |start: Option<&str>| -> Arc<dyn Worker> {
@@ -1050,9 +1209,11 @@ mod tests {
     /// A prompt the template leaves without a turn opener (a system message rendered in place
     /// after the user turn) starts the model inside its thought on the DeepSeek V4 table, and the
     /// grammar built for the request reads it as the engine does, whatever the thinking switch
-    /// said: the answer tag of a JSON `response_format` takes the thought first, as it does on a
-    /// prompt that opened the thought. A prompt that opened and closed the thought (thinking off)
-    /// leaves the model in the content, and the legacy choice asks the table nothing.
+    /// said: the answer tag of a JSON `response_format` takes the closed thought first where the
+    /// engine starts the grammar at the first token, and is the engine's own schema where it does
+    /// not say or starts after its reasoning parser's gate, as on a prompt that opened the
+    /// thought. A prompt that opened and closed the thought (thinking off) leaves the model in
+    /// the content, and the legacy choice asks the table nothing.
     #[test]
     fn a_turn_the_prompt_leaves_unopened_is_inside_the_thought_for_the_grammar_too() {
         let model = "deepseek-ai/DeepSeek-V4-Flash";
@@ -1070,12 +1231,14 @@ mod tests {
         assert_eq!(is_open(ParserChoice::Symphony, thinking), Some(true));
         assert_eq!(is_open(ParserChoice::Symphony, closed), Some(false));
         assert_eq!(is_open(ParserChoice::Legacy, unopened), None);
-        // The JSON answer's tag on the unopened prompt is the thinking prompt's, thought first;
-        // with the thought closed the schema alone is the engine's own constraint, and no tag.
+        // The JSON answer's tag on the unopened prompt is the thinking prompt's: the closed
+        // thought first where the engine starts at the first token, and otherwise the schema
+        // alone, the engine's own constraint and no tag; with the thought closed the schema alone
+        // on every start.
         let request = request(json!({
             "model": model, "response_format": {"type": "json_object"}
         }));
-        let answer = |prompt| {
+        let answer = |prompt, start| {
             super::constraint(
                 ParserChoice::Symphony,
                 &names(None, None),
@@ -1086,9 +1249,26 @@ mod tests {
                 symphony::GrammarStart::Unknown,
                 &templates(),
             )
+            .and_then(|prepared| prepared.for_start(start))
         };
-        assert_eq!(tag_of(answer(unopened)), tag_of(answer(thinking)));
-        assert!(matches!(answer(closed), Ok(None)));
+        let first = tag_of(answer(unopened, symphony::GrammarStart::FirstToken));
+        assert_eq!(
+            first,
+            tag_of(answer(thinking, symphony::GrammarStart::FirstToken))
+        );
+        assert_eq!(first["format"]["elements"][0]["end"], "</think>", "{first}");
+        for start in [
+            symphony::GrammarStart::Unknown,
+            symphony::GrammarStart::AfterReasoning,
+        ] {
+            assert!(matches!(answer(unopened, start), Ok(None)), "{start:?}");
+            assert!(matches!(answer(thinking, start), Ok(None)), "{start:?}");
+            assert!(matches!(answer(closed, start), Ok(None)), "{start:?}");
+        }
+        assert!(matches!(
+            answer(closed, symphony::GrammarStart::FirstToken),
+            Ok(None)
+        ));
     }
 
     #[test]
@@ -1182,6 +1362,7 @@ mod tests {
                 symphony::GrammarStart::Unknown,
                 &templates(),
             )
+            .and_then(|prepared| prepared.for_start(symphony::GrammarStart::Unknown))
         };
         // The named table, for a model the registry does not know: `json_object` asks for any
         // object, written in the message to the user.
@@ -1270,16 +1451,12 @@ mod tests {
         assert!(answer(&ModelNames::default(), content_first.clone(), false)
             .expect("read")
             .is_none());
-        // With the prompt inside the thought, the schema follows the prefix a forced call takes,
-        // free text that closes the thought, so the JSON is not written inside it.
-        let led = tag_of(answer(&ModelNames::default(), content_first, true));
-        assert_eq!(led["format"]["type"], "sequence", "{led}");
-        assert_eq!(led["format"]["elements"][0]["type"], "any_text", "{led}");
-        assert_eq!(
-            led["format"]["elements"][1],
-            json!({"type": "json_schema", "json_schema": {"type": "object"}}),
-            "{led}"
-        );
+        // With the prompt inside the thought and the engine silent on where it starts the
+        // grammar, the schema stands alone as well: a free-text prefix would let the answer run
+        // on unconstrained, and the engine's own constraint applies where the engine starts.
+        assert!(answer(&ModelNames::default(), content_first, true)
+            .expect("read")
+            .is_none());
         // A table that admits a thought before its answer (MiniMax M3's) keeps that tag with the
         // thought closed: the thought the model may write first, then the schema.
         let thought_first = tag_of(answer(
@@ -1506,6 +1683,7 @@ mod tests {
                 symphony::GrammarStart::Unknown,
                 templates,
             )
+            .and_then(|prepared| prepared.for_start(symphony::GrammarStart::Unknown))
         };
         // A forced call, one call for a named function, and a JSON answer take the table's tags.
         let required = tag_of(constrain(&with_layout, json!({"tool_choice": "required"})));
@@ -1554,6 +1732,7 @@ mod tests {
                 symphony::GrammarStart::Unknown,
                 &templates(),
             )
+            .and_then(|prepared| prepared.for_start(symphony::GrammarStart::Unknown))
             .expect("read")
             .is_none(),
             "the Qwen3 table's answer tag is the schema alone, the engine's own constraint, so the \
@@ -1633,6 +1812,7 @@ mod tests {
                 symphony::GrammarStart::Unknown,
                 &templates(),
             )
+            .and_then(|prepared| prepared.for_start(symphony::GrammarStart::Unknown))
         };
         let any = tag_of(constrain(json!({"tool_choice": {"type": "any"}})));
         let one = tag_of(constrain(
@@ -1695,9 +1875,7 @@ mod tests {
         use GrammarStart::{AfterReasoning, FirstToken, Unknown};
 
         let tag = |text: &str| ToolConstraint::StructuralTag(text.to_string());
-        let refused = |why: &str| {
-            Err::<Option<ToolConstraint>, SymphonyError>(SymphonyError::Constraint(why.to_string()))
-        };
+        let refusal = |why: &str| SymphonyError::Constraint(why.to_string());
         // The request's `auto` tag: DeepSeek V4's table over one tool, the thought left open, so
         // the tag takes a shape for each start.
         let templates = Arc::new(templates());
@@ -1713,7 +1891,10 @@ mod tests {
         // What one decision gives (the tag's text, whether it is the whole turn's, whether the
         // policy chose it, and whether the `auto` tag goes with the plan), and which of the whole
         // turn's grammar and the `auto` tag it built.
-        let decide = |policy, start, prepared: PreparedConstraint, turn: PreparedConstraint| {
+        let decide = |policy,
+                      start,
+                      prepared: PreparedConstraint,
+                      turn: Result<Option<ToolConstraint>, SymphonyError>| {
             let built = std::cell::RefCell::new(Vec::new());
             let decided = worker_constraint(
                 WorkerDecoding { policy, start },
@@ -1733,7 +1914,7 @@ mod tests {
                     text,
                     decided.whole_turn,
                     decided.by_policy,
-                    decided.auto.is_some(),
+                    decided.table_tag.is_some(),
                 )
             });
             (decided, built.into_inner())
@@ -1757,31 +1938,46 @@ mod tests {
                 decide(
                     Requested,
                     start,
-                    Ok(Some(tag("prepared"))),
+                    Ok(Prepared::Constraint(tag("prepared"))),
                     Ok(Some(tag("turn")))
                 ),
                 (found("prepared"), vec![])
             );
             assert_eq!(
-                decide(Requested, start, refused("no tag"), Ok(Some(tag("turn")))),
+                decide(
+                    Requested,
+                    start,
+                    Err(refusal("no tag")),
+                    Ok(Some(tag("turn")))
+                ),
                 (Err(SymphonyError::Constraint("no tag".to_string())), vec![])
             );
             assert_eq!(
-                decide(Requested, start, Ok(None), Ok(Some(tag("turn")))),
+                decide(Requested, start, Ok(Prepared::None), Ok(Some(tag("turn")))),
                 (Ok((None, false, false, false)), vec![])
             );
         }
         // `always` from the first token: the whole turn's grammar stands over what preparation
         // found or refused, and its refusal refuses the request.
         assert_eq!(
-            decide(Always, FirstToken, refused("no tag"), Ok(Some(tag("turn")))),
+            decide(
+                Always,
+                FirstToken,
+                Err(refusal("no tag")),
+                Ok(Some(tag("turn")))
+            ),
             (
                 Ok((Some("turn".to_string()), true, true, false)),
                 vec!["turn"]
             )
         );
         assert_eq!(
-            decide(Always, FirstToken, Ok(None), refused("cannot hold")),
+            decide(
+                Always,
+                FirstToken,
+                Ok(Prepared::None),
+                Err(refusal("cannot hold"))
+            ),
             (
                 Err(SymphonyError::Constraint("cannot hold".to_string())),
                 vec!["turn"]
@@ -1790,36 +1986,41 @@ mod tests {
         // Where the whole turn's grammar does not start, and on an engine that starts the grammar
         // later or does not say: what preparation found or refused, else the `auto` tag.
         assert_eq!(
-            decide(Always, FirstToken, Ok(Some(tag("prepared"))), Ok(None)),
+            decide(
+                Always,
+                FirstToken,
+                Ok(Prepared::Constraint(tag("prepared"))),
+                Ok(None)
+            ),
             (found("prepared"), vec!["turn"])
         );
         assert_eq!(
-            decide(Always, FirstToken, refused("no tag"), Ok(None)),
+            decide(Always, FirstToken, Err(refusal("no tag")), Ok(None)),
             (
                 Err(SymphonyError::Constraint("no tag".to_string())),
                 vec!["turn"]
             )
         );
         assert_eq!(
-            decide(Always, FirstToken, Ok(None), Ok(None)),
+            decide(Always, FirstToken, Ok(Prepared::None), Ok(None)),
             (auto(FirstToken), vec!["turn", "auto"])
         );
         for start in [AfterReasoning, Unknown] {
             assert_eq!(
-                decide(Always, start, refused("no tag"), Ok(Some(tag("turn")))),
+                decide(Always, start, Err(refusal("no tag")), Ok(Some(tag("turn")))),
                 (Err(SymphonyError::Constraint("no tag".to_string())), vec![])
             );
             assert_eq!(
                 decide(
                     Always,
                     start,
-                    Ok(Some(tag("prepared"))),
+                    Ok(Prepared::Constraint(tag("prepared"))),
                     Ok(Some(tag("turn")))
                 ),
                 (found("prepared"), vec![])
             );
             assert_eq!(
-                decide(Always, start, Ok(None), Ok(Some(tag("turn")))),
+                decide(Always, start, Ok(Prepared::None), Ok(Some(tag("turn")))),
                 (auto(start), vec!["auto"])
             );
         }
@@ -1829,7 +2030,7 @@ mod tests {
                 policy: Always,
                 start: AfterReasoning,
             },
-            Ok(None),
+            Ok(Prepared::None),
             || Ok(None),
             || AutoTag {
                 parser: ParserChoice::Symphony,
@@ -1842,11 +2043,112 @@ mod tests {
             },
         )
         .unwrap();
-        assert!(nothing.constraint.is_none() && !nothing.by_policy && nothing.auto.is_none());
+        assert!(nothing.constraint.is_none() && !nothing.by_policy && nothing.table_tag.is_none());
         assert_eq!(
-            decide(Requested, Unknown, Ok(None), Ok(None)).0,
+            decide(Requested, Unknown, Ok(Prepared::None), Ok(None)).0,
             Ok((None, false, false, false))
         );
+    }
+
+    /// A JSON answer's tag derives for the selected worker's own start, not for the pool's: from
+    /// one mixed pool (a first-token worker beside one that does not say, which names either
+    /// kind), a worker that starts after its reasoning parser or does not say gets the schema
+    /// alone, the engine's own constraint, and the first-token worker the closed thought then the
+    /// schema. The derivation goes with the plan, and the worker a retry takes gets its own shape
+    /// from it, the request's own schema standing in where the table gives it no tag. A forced
+    /// call's tag keeps the pool's start, and its prefix for a pool of either kind.
+    #[test]
+    fn a_json_answers_tag_derives_for_the_selected_worker_and_the_worker_a_retry_takes() {
+        use GrammarStart::{AfterReasoning, FirstToken, Unknown};
+        let worker = |start: Option<&str>| -> Arc<dyn Worker> {
+            let mut builder =
+                BasicWorkerBuilder::new("grpc://engine:50051").worker_type(WorkerType::Regular);
+            if let Some(start) = start {
+                builder = builder.label(WorkerGrammarStart::LABEL, start);
+            }
+            Arc::new(builder.build())
+        };
+        let pool = [worker(Some("first_token")), worker(None)];
+        assert_eq!(grammar_start_of(&pool), symphony::GrammarStart::Either);
+        let deepseek = names(Some("deepseek_v4"), Some("deepseek_v4"));
+        let schema = json!({"type": "object", "properties": {"city": {"type": "string"}}});
+        let asked = request(json!({"response_format": {
+            "type": "json_schema", "json_schema": {"name": "city", "schema": schema},
+        }}));
+        let prepared = super::constraint(
+            ParserChoice::Symphony,
+            &deepseek,
+            Asks::Chat(&asked),
+            &[],
+            true,
+            false,
+            grammar_start_of(&pool),
+            &templates(),
+        );
+        let Ok(Prepared::Answer(answer)) = prepared else {
+            panic!("the answer's tag, derived per worker, not {prepared:?}");
+        };
+        // Decided on the selected worker: each kind its own shape.
+        let decided = |start| {
+            worker_constraint(
+                WorkerDecoding {
+                    policy: ConstrainedDecoding::Requested,
+                    start,
+                },
+                Ok(Prepared::Answer(Arc::clone(&answer))),
+                || panic!("requested: the whole turn is not asked"),
+                || panic!("requested: the auto tag is not asked"),
+            )
+            .expect("decided")
+        };
+        for start in [AfterReasoning, Unknown] {
+            let decided = decided(start);
+            assert!(
+                decided.constraint.is_none(),
+                "{start:?}: the schema alone, the engine's own constraint, not {:?}",
+                decided.constraint
+            );
+            assert!(!decided.by_policy && !decided.whole_turn, "{start:?}");
+            let stamp = decided
+                .table_tag
+                .expect("the derivation goes with the plan");
+            assert_eq!(stamp.tag_for(start).expect("a table"), None, "{start:?}");
+            assert_eq!(stamp.schema(), Some(&schema), "{start:?}");
+        }
+        let first = decided(FirstToken);
+        let Some(ToolConstraint::StructuralTag(text)) = first.constraint else {
+            panic!("the closed thought then the schema: {:?}", first.constraint);
+        };
+        let tag: Value = serde_json::from_str(&text).expect("JSON");
+        assert_eq!(tag["format"]["elements"][0]["end"], "</think>", "{tag}");
+        assert_eq!(tag["format"]["elements"][1]["type"], "json_schema", "{tag}");
+        assert_eq!(tag["format"]["elements"][1]["json_schema"], schema, "{tag}");
+        assert!(!first.by_policy && !first.whole_turn);
+        // The worker a retry takes, of the other kind, and back.
+        let stamp = first.table_tag.expect("the derivation goes with the plan");
+        assert_eq!(stamp.tag_for(AfterReasoning).expect("a table"), None);
+        assert_eq!(stamp.tag_for(Unknown).expect("a table"), None);
+        assert_eq!(
+            stamp.tag_for(FirstToken).expect("a table").as_deref(),
+            Some(text.as_str())
+        );
+        assert_eq!(stamp.schema(), Some(&schema));
+        // The forced call's tag keeps the pool's start: the prefix that fits either kind.
+        let forced = request(json!({"tool_choice": "required"}));
+        let Ok(Prepared::Constraint(ToolConstraint::StructuralTag(call))) = super::constraint(
+            ParserChoice::Symphony,
+            &deepseek,
+            Asks::Chat(&forced),
+            &tools(),
+            true,
+            false,
+            grammar_start_of(&pool),
+            &templates(),
+        ) else {
+            panic!("a forced tag");
+        };
+        let call: Value = serde_json::from_str(&call).expect("JSON");
+        assert_eq!(call["format"]["elements"][0]["type"], "any_text", "{call}");
     }
 
     /// The request's `auto` tag derives again for where another worker's engine starts the

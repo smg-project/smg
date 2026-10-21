@@ -91,7 +91,7 @@ impl LazyHttpClient {
 
     fn init(&self) -> &Arc<reqwest::Client> {
         self.cell
-            .get_or_init(|| Arc::new(crate::http_client::client()))
+            .get_or_init(|| Arc::new(crate::clients::http_client()))
     }
 }
 
@@ -114,6 +114,8 @@ async fn connect_zmq_backend(
     runtime: RuntimeType,
     handshake_override: Option<String>,
     engine_count: usize,
+    startup: Duration,
+    request_timeout: Option<Duration>,
 ) -> WorkerResult<Arc<BackendClient>> {
     zmq_client::connect_for_worker(
         &base_url,
@@ -121,6 +123,8 @@ async fn connect_zmq_backend(
         runtime,
         handshake_override.as_deref(),
         engine_count,
+        startup,
+        request_timeout,
     )
     .await
     .map(|client| Arc::new(BackendClient::Zmq(client)))
@@ -192,8 +196,8 @@ fn require_backend_client(
 
 /// EngineCore exposes no admin RPCs over ZMQ, so these ops can never succeed for
 /// a ZMQ worker. Reject them up front rather than dispatching to client
-/// acquisition, which would otherwise drive the (up to 10-minute) lazy handshake
-/// only to return `unimplemented`.
+/// acquisition, which would otherwise drive the lazy handshake (as long as a
+/// model load) only to return `unimplemented`.
 fn zmq_admin_unsupported(url: &str, operation: &str) -> WorkerError {
     WorkerError::OperationFailed {
         url: url.to_string(),
@@ -762,6 +766,17 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         None
     }
 
+    /// How long the worker's current run of pending prompts (since its
+    /// pending backlog last left zero) has waited for its first answer,
+    /// plus the time earlier runs since its latest first response held
+    /// prompts and ended unanswered (given up on, or dropped): its silence,
+    /// the spells it held nothing left out. `None` while nothing is pending,
+    /// once the run has had an answer, or for a worker that does not track
+    /// its runs.
+    fn prefill_unanswered_run(&self) -> Option<Duration> {
+        None
+    }
+
     /// Whether the engine behind the worker is on a prompt shape it has not
     /// shown it runs: a prompt pending on the worker, or one of `tokens`
     /// about to be dispatched, longer than any the worker has answered since
@@ -1214,6 +1229,17 @@ pub struct WorkerMetadata {
     pub health_config: HealthCheckConfig,
     /// Health check endpoint path (internal-only, from router config).
     pub health_endpoint: String,
+    /// The longest any one stage of a ZMQ engine's startup handshake may stay
+    /// silent (from router config); it alone covers the engine's init between
+    /// its HELLO and its READY, which the gateway sees nothing of otherwise.
+    pub zmq_startup_timeout: Duration,
+    /// The bound on a request over the worker's ZMQ link, from its dispatch
+    /// to its last message (resolved at registration as the HTTP worker
+    /// client's per-request timeout is: the worker's own
+    /// `http_pool.timeout_secs`, else the router's `request_timeout_secs`);
+    /// `None` leaves the link's streams open for as long as the client reads
+    /// them.
+    pub zmq_request_timeout: Option<Duration>,
     /// Effective absolute overload thresholds (per signal: `spec.overload`
     /// override, else gateway default). Resolved once at registration; the
     /// load monitor's ingestion predicate scores every report against these,
@@ -1527,6 +1553,8 @@ impl BasicWorker {
         let runtime = self.metadata.spec.runtime_type;
         let handshake_override = self.metadata.spec.zmq_handshake_address.clone();
         let engine_count = self.metadata.zmq_engine_count();
+        let startup = self.metadata.zmq_startup_timeout;
+        let request_timeout = self.metadata.zmq_request_timeout;
         // Capture the readiness signal and the revision at hand-off. The
         // manager only promotes if this revision still matches, so a
         // same-URL replacement racing the handshake is discarded.
@@ -1547,6 +1575,8 @@ impl BasicWorker {
                         runtime,
                         handshake_override,
                         engine_count,
+                        startup,
+                        request_timeout,
                     )
                 })
                 .await
@@ -1987,6 +2017,10 @@ impl Worker for BasicWorker {
 
     fn prefill_answered_ago(&self) -> Option<Duration> {
         self.runtime.load().prefill_answered_ago()
+    }
+
+    fn prefill_unanswered_run(&self) -> Option<Duration> {
+        self.runtime.load().prefill_unanswered_run()
     }
 
     fn prefill_cold_shape(&self, tokens: u64) -> bool {
@@ -3450,6 +3484,8 @@ mod tests {
             spec: Arc::new(WorkerSpec::new("http://test:8080")),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
+            zmq_startup_timeout: Duration::from_secs(600),
+            zmq_request_timeout: None,
             overload: OverloadThresholds::default(),
             http2: false,
             discovered_labels: Arc::default(),
@@ -3477,6 +3513,8 @@ mod tests {
             spec: Arc::new(spec),
             health_config: HealthCheckConfig::default(),
             health_endpoint: "/health".to_string(),
+            zmq_startup_timeout: Duration::from_secs(600),
+            zmq_request_timeout: None,
             overload: OverloadThresholds::default(),
             http2: false,
             discovered_labels: Arc::default(),
@@ -3638,10 +3676,14 @@ mod tests {
     }
 
     /// Build a ZMQ worker whose sockets no engine will ever dial, plus the
-    /// data-plane socket path its handshake driver binds.
+    /// data-plane socket path its handshake driver binds. The handshake takes
+    /// an OS-assigned loopback port: the port derived from a temporary ipc
+    /// path is a hash into a band other listeners on the host may hold, and a
+    /// collision there fails the bind these tests wait for.
     fn unattended_zmq_worker(dir: &std::path::Path) -> (BasicWorker, std::path::PathBuf) {
         let worker = BasicWorkerBuilder::new(format!("ipc://{}", dir.join("ts0.ipc").display()))
             .connection_mode(ConnectionMode::Zmq)
+            .zmq_handshake_address("tcp://127.0.0.1:0")
             .health_config(no_health_check())
             .build();
         (worker, dir.join("ts0.ipc-in.sock"))

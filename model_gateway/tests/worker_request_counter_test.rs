@@ -56,7 +56,7 @@ use tower::ServiceExt;
 const MODEL: &str = "counter-test-model";
 
 async fn scrape(addr: SocketAddr) -> String {
-    smg::http_client::client()
+    smg::clients::http_client()
         .get(format!("http://{addr}/metrics"))
         .send()
         .await

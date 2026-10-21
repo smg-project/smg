@@ -1,8 +1,12 @@
 name: E2E Kind Discovery
 
 # Run automatically for service-discovery code and test-infrastructure
-# changes. GitHub-hosted ubuntu-latest provides Docker for the kind node;
-# manual dispatch keeps the runner selectable for ad-hoc validation.
+# changes, and weekly: the Slurm lane installs Slurm from Ubuntu's archive,
+# whose updates can change it with no change here. GitHub-hosted ubuntu-24.04
+# provides Docker for the kind node and the Slurm cluster. It is pinned, not
+# ubuntu-latest: the binaries built here run in Ubuntu 24.04 images (the
+# Slurm one for its Slurm 23.11), so they need its glibc or an older one.
+# Manual dispatch keeps the runner selectable for ad-hoc validation.
 on:
   pull_request:
     paths:
@@ -13,15 +17,19 @@ on:
       - model_gateway/src/server.rs
       - model_gateway/src/main.rs
       - model_gateway/tests/k8s_discovery_test.rs
-      - e2e_test/kind_discovery/**
-      - e2e_test/file_discovery/**
+      - e2e_test/discovery/kind/**
+      - e2e_test/discovery/file/**
+      - e2e_test/discovery/slurm/**
+      - e2e_test/discovery/common.py
       - .github/workflows/e2e-kind-discovery.yml
+  schedule:
+    - cron: '0 6 * * 1'
   workflow_dispatch:
     inputs:
       runner:
-        description: Runner label (needs Docker for the kind node container)
+        description: Runner label (needs Docker, and glibc no newer than Ubuntu 24.04's)
         required: false
-        default: ubuntu-latest
+        default: ubuntu-24.04
 
 env:
   RUSTC_WRAPPER: sccache
@@ -29,8 +37,8 @@ env:
 
 jobs:
   kind-discovery:
-    runs-on: ${{ inputs.runner || 'ubuntu-latest' }}
-    timeout-minutes: 45
+    runs-on: ${{ inputs.runner || 'ubuntu-24.04' }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
@@ -54,9 +62,9 @@ jobs:
       - name: Build mock-worker and gateway images
         run: |
           docker build -t smg-mock-worker:e2e \
-            -f e2e_test/kind_discovery/Dockerfile.mock-worker target/debug
+            -f e2e_test/discovery/kind/Dockerfile.mock-worker target/debug
           docker build -t smg-gateway:e2e \
-            -f e2e_test/kind_discovery/Dockerfile.smg target/debug
+            -f e2e_test/discovery/kind/Dockerfile.smg target/debug
           # Fail here (not as CrashLoopBackOff later) on any linkage problem.
           docker run --rm smg-mock-worker:e2e --help >/dev/null 2>&1 || true
           docker run --rm --entrypoint /usr/local/bin/smg smg-gateway:e2e --help >/dev/null
@@ -67,8 +75,8 @@ jobs:
           pip install pytest requests
           SMG_KIND_E2E=1 SMG_MOCK_IMAGE=smg-mock-worker:e2e \
             SMG_GATEWAY_IMAGE=smg-gateway:e2e \
-            pytest e2e_test/kind_discovery \
-            --confcutdir e2e_test/kind_discovery -m kind -v
+            pytest e2e_test/discovery/kind \
+            --confcutdir e2e_test/discovery/kind -m kind -v
 
       # Host processes only (the smg and mock-worker binaries built above),
       # so it runs even when the kind lane failed.
@@ -77,5 +85,32 @@ jobs:
         timeout-minutes: 10
         run: |
           pip install pytest requests
-          SMG_FILE_E2E=1 pytest e2e_test/file_discovery \
-            --confcutdir e2e_test/file_discovery -v
+          SMG_FILE_E2E=1 pytest e2e_test/discovery/file \
+            --confcutdir e2e_test/discovery/file -v
+
+      # A real Slurm 23.11 cluster in containers (a controller and six
+      # nodes), with the gateway on the controller polling squeue and scontrol.
+      - name: Run Slurm discovery e2e
+        if: ${{ !cancelled() }}
+        timeout-minutes: 20
+        run: |
+          pip install pytest requests
+          stage=$(mktemp -d)
+          cp e2e_test/discovery/slurm/Dockerfile e2e_test/discovery/slurm/slurm.conf \
+            e2e_test/discovery/slurm/cgroup.conf e2e_test/discovery/slurm/entrypoint.sh \
+            target/debug/smg target/debug/mock-worker "$stage"
+          docker build -t smg-slurm:e2e "$stage"
+          # Fail here, before the cluster starts, if the binaries built above
+          # need a newer glibc than the image's (smg checks for both).
+          docker run --rm --entrypoint smg smg-slurm:e2e --help >/dev/null
+          SMG_SLURM_E2E=1 SMG_SLURM_IMAGE=smg-slurm:e2e \
+            SMG_SLURM_LOGS="$RUNNER_TEMP/slurm-logs" \
+            pytest e2e_test/discovery/slurm --confcutdir e2e_test/discovery/slurm -v
+
+      - name: Upload the Slurm, gateway and job logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: slurm-discovery-logs
+          path: ${{ runner.temp }}/slurm-logs
+          if-no-files-found: warn

@@ -1958,6 +1958,9 @@ pub struct ChatTemplateState {
     /// messages, the way such a request was dispatched before the MiniMax
     /// profile kept the role, instead of letting the template drop them.
     root_role_supported: bool,
+    /// Whether the template writes a history tool call's `arguments` as the
+    /// text the request sent (see [`Self::raw_tool_call_arguments`]).
+    raw_tool_call_arguments: bool,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -1985,7 +1988,7 @@ impl ChatTemplateState {
             .is_none_or(detect_developer_role_support);
         let root_role_supported = template.as_deref().is_none_or(detect_root_role_support);
         let env = template.map(build_environment).transpose()?;
-        Ok(Self {
+        let mut state = Self {
             env,
             content_format,
             thinking_toggle,
@@ -1994,7 +1997,10 @@ impl ChatTemplateState {
             prefill_opens_think_block,
             developer_role_supported,
             root_role_supported,
-        })
+            raw_tool_call_arguments: false,
+        };
+        state.raw_tool_call_arguments = state.writes_tool_call_arguments_as_text();
+        Ok(state)
     }
 
     /// Create a `ChatTemplateState` with no template set.
@@ -2011,6 +2017,7 @@ impl ChatTemplateState {
             prefill_opens_think_block: false,
             developer_role_supported: true,
             root_role_supported: true,
+            raw_tool_call_arguments: false,
         }
     }
 
@@ -2152,6 +2159,7 @@ impl ChatTemplateState {
         self.think_in_prefill = think_in_prefill;
         self.prefill_opens_think_block = prefill_opens_think_block;
         self.env = Some(env);
+        self.raw_tool_call_arguments = self.writes_tool_call_arguments_as_text();
         Ok(())
     }
 
@@ -2192,11 +2200,102 @@ impl ChatTemplateState {
     pub fn prefill_opens_think_block(&self) -> bool {
         self.prefill_opens_think_block
     }
+
+    /// Whether the template writes a history tool call's `arguments` as the
+    /// text the request sent: the Jinja renderer's answer to
+    /// `RendererCapabilities::raw_tool_call_arguments`. The API carries the
+    /// arguments as a JSON string and the gateway parses them into the object
+    /// the Transformers docs say a template reads; a template that writes
+    /// them by string concatenation (`'<sep>' + tool['function']['arguments']
+    /// + '<end>'`) cannot render that object, so the string must reach it as
+    /// written. Resolved when the template is bound (see
+    /// [`Self::writes_tool_call_arguments_as_text`]).
+    pub fn raw_tool_call_arguments(&self) -> bool {
+        self.raw_tool_call_arguments
+    }
+
+    /// Decide [`Self::raw_tool_call_arguments`] by the template's behaviour,
+    /// not its source: one history call rendered with the arguments as the
+    /// string and as the object. The template takes the text only when the
+    /// object fails to render and the string renders, so a template that
+    /// takes the object (`tojson`, indexing, an `is string` branch) and one
+    /// that renders neither keep the parsed form the gateway hands every
+    /// template today.
+    fn writes_tool_call_arguments_as_text(&self) -> bool {
+        if self.env.is_none() {
+            return false;
+        }
+        let renders = |arguments: serde_json::Value| {
+            let messages = [
+                serde_json::json!({"role": "user", "content": "probe"}),
+                serde_json::json!({"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "probe", "arguments": arguments},
+                }]}),
+                serde_json::json!({"role": "tool", "tool_call_id": "call_0", "content": "probe"}),
+            ];
+            self.apply(&messages, ChatTemplateParams::default()).is_ok()
+        };
+        renders(serde_json::json!("{\"probe\": 1}")) && !renders(serde_json::json!({"probe": 1}))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A history call's `arguments` reach a template as the text the request
+    /// sent only when the template writes them that way: one that concatenates
+    /// them cannot render the parsed object; one that serializes or indexes
+    /// the object, or branches on its type, and one without a tool-call branch
+    /// keep the object.
+    #[test]
+    fn a_template_that_concatenates_tool_call_arguments_takes_them_as_text() {
+        let state = ChatTemplateState::new(Some(CONCATENATING_CALLS.to_string())).unwrap();
+        assert!(state.raw_tool_call_arguments());
+
+        let indexing = "{% for m in messages %}{% if m.tool_calls %}{% for t in m.tool_calls %}\
+                        <call>{{ t.function.name }}:{% for k, v in t.function.arguments | items %}\
+                        {{ k }}={{ v }}{% endfor %}</call>{% endfor %}{% else %}{{ m.content }}\
+                        {% endif %}{% endfor %}";
+        let branching = "{% for m in messages %}{% if m.tool_calls %}{% for t in m.tool_calls %}\
+                         <call>{{ t.function.name }}:{% if t.function.arguments is string %}\
+                         {{ t.function.arguments }}{% else %}{{ t.function.arguments | tojson }}\
+                         {% endif %}</call>{% endfor %}{% else %}{{ m.content }}{% endif %}{% endfor %}";
+        let without_calls = "{% for m in messages %}{{ m.content }}{% endfor %}";
+        for template in [SERIALIZING_CALLS, indexing, branching, without_calls] {
+            let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+            assert!(!state.raw_tool_call_arguments(), "{template}");
+        }
+        assert!(!ChatTemplateState::empty().raw_tool_call_arguments());
+        assert!(!ChatTemplateState::new(None)
+            .unwrap()
+            .raw_tool_call_arguments());
+    }
+
+    /// A replacement template answers for itself.
+    #[test]
+    fn a_replacement_template_refreshes_the_tool_call_arguments_answer() {
+        let mut state = ChatTemplateState::new(Some(SERIALIZING_CALLS.to_string())).unwrap();
+        assert!(!state.raw_tool_call_arguments());
+        state.set(CONCATENATING_CALLS.to_string()).unwrap();
+        assert!(state.raw_tool_call_arguments());
+        state.set(SERIALIZING_CALLS.to_string()).unwrap();
+        assert!(!state.raw_tool_call_arguments());
+    }
+
+    /// A template that writes a history call by string concatenation, as the
+    /// DeepSeek V3 line's templates do.
+    const CONCATENATING_CALLS: &str =
+        "{% for m in messages %}{% if m.tool_calls %}{% for t in m.tool_calls %}\
+         {{ '<call>' + t.function.name + ':' + t.function.arguments + '</call>' }}\
+         {% endfor %}{% else %}{{ m.content }}{% endif %}{% endfor %}";
+    /// A template that serializes the arguments object, as most do.
+    const SERIALIZING_CALLS: &str =
+        "{% for m in messages %}{% if m.tool_calls %}{% for t in m.tool_calls %}\
+         <call>{{ t.function.name }}:{{ t.function.arguments | tojson }}</call>\
+         {% endfor %}{% else %}{{ m.content }}{% endif %}{% endfor %}";
 
     /// Transformers' `{% generation %}` block (the assistant-token mask marker)
     /// renders its body; the engine here has no such statement, so the block

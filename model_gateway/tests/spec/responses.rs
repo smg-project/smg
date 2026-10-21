@@ -901,17 +901,31 @@ fn test_validate_tool_choice_requires_tools() {
         "tool_choice=none without tools should be valid"
     );
 
-    // Invalid: tool_choice=auto without tools
+    // Valid: tool_choice=auto without tools (absent or empty list) is OK
+    for tools in [None, Some(vec![])] {
+        let request = ResponsesRequest {
+            input: ResponseInput::Text("test".to_string()),
+            tools,
+            tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
+            ..Default::default()
+        };
+        assert!(
+            request.validate().is_ok(),
+            "tool_choice=auto without tools should be valid"
+        );
+    }
+
+    // Invalid: tool_choice=required without tools
     let request = ResponsesRequest {
         input: ResponseInput::Text("test".to_string()),
-        tools: None,
-        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
+        tools: Some(vec![]),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Required)),
         ..Default::default()
     };
     let result = request.validate();
     assert!(
         result.is_err(),
-        "tool_choice=auto without tools should be invalid"
+        "tool_choice=required without tools should be invalid"
     );
 
     if let Err(errors) = result {

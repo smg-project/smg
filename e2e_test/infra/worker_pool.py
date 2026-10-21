@@ -64,6 +64,11 @@ class WorkerPool:
         self._gateway_key: tuple | None = None
         self._closed = False
 
+    def current_workers(self) -> list[Worker]:
+        """The cached regular workers as they stand (a snapshot; may be empty)."""
+        with self._lock:
+            return list(self._workers)
+
     def acquire(
         self,
         *,

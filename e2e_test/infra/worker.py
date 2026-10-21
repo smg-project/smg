@@ -91,6 +91,11 @@ class Worker:
     # Environment for the engine process on top of the infra's own settings
     # (a deployment-injected SMG_PAIRING_PROTOCOL, for instance).
     extra_env: dict[str, str] | None = None
+    # Mock engine only: the port of the mock worker's admin API, where a test
+    # states the answers the worker's next requests get.
+    admin_port: int | None = None
+    # Whether the harness picked ``admin_port`` (and releases it at stop).
+    _admin_port_auto: bool = field(default=False, repr=False)
     process: subprocess.Popen | None = field(default=None, repr=False)
     # Where the engine's output lands when it is not shown on the terminal.
     log_path: str | None = field(default=None, repr=False)
@@ -122,6 +127,13 @@ class Worker:
     def http_url(self) -> str:
         """HTTP URL (used for health checks even on gRPC workers)."""
         return f"http://{host_port(DEFAULT_HOST, self.port)}"
+
+    @property
+    def admin_url(self) -> str | None:
+        """The mock worker's admin API, or ``None`` for an engine that has none."""
+        if self.admin_port is None:
+            return None
+        return f"http://{host_port(DEFAULT_HOST, self.admin_port)}"
 
     def start(
         self,
@@ -288,6 +300,10 @@ class Worker:
         if self.dist_init_port is not None:
             release_port(self.dist_init_port)
             self.dist_init_port = None
+        if self._admin_port_auto and self.admin_port is not None:
+            release_port(self.admin_port)
+            self.admin_port = None
+            self._admin_port_auto = False
         for port in self._moriio_ports:
             release_port(port)
 
@@ -334,6 +350,8 @@ class Worker:
             cmd = self._build_trtllm_cmd(model_path, tp_size, spec)
         elif self.engine == "mlx":
             cmd = self._build_mlx_cmd(model_path, spec)
+        elif self.engine == "mock":
+            cmd = self._build_mock_cmd(model_path, spec)
         elif self.engine == "tokenspeed":
             if self.mode == ConnectionMode.ZMQ:
                 cmd = self._build_tokenspeed_zmq_cmd(model_path, tp_size, spec)
@@ -525,6 +543,46 @@ class Worker:
                 "tp_size": str(tp),
             },
         }
+
+    def _build_mock_cmd(self, model_path: str, spec: dict) -> list[str]:
+        """The scripted mock worker (``crates/mock_worker``) on this worker's wire.
+
+        It advertises the spec's model and tokenizer, so the gateway tokenizes
+        prompts with the model's files and decodes the ids the mock sends
+        back; the mock encodes a scripted text with the same files. The
+        binary is ``MOCK_WORKER_BIN`` or ``mock-worker`` on the PATH. Its
+        admin API, where a test states the answers, binds ``admin_port``.
+        """
+        if self.admin_port is None:
+            self.admin_port = get_open_port()
+            self._admin_port_auto = True
+        cmd = [
+            os.environ.get("MOCK_WORKER_BIN", "mock-worker"),
+            "--host",
+            DEFAULT_HOST,
+            "--model",
+            model_path,
+            "--tokenizer",
+            model_path,
+            "--context-length",
+            str(spec.get("context_length", 32768)),
+            "--admin-port",
+            str(self.admin_port),
+        ]
+        if self.mode == ConnectionMode.GRPC:
+            cmd += ["--grpc-base-port", str(self.port), "--grpc-count", "1"]
+        elif self.mode == ConnectionMode.ZMQ:
+            # The gateway binds the handshake it derives from the worker's
+            # ipc:// URL on the IPv4 loopback whatever the lane's host is
+            # (the ZMQ adapter's fixed loopback); the rank dials it, as an
+            # engine does.
+            from smg.serve import _zmq_handshake_port
+
+            handshake = f"tcp://127.0.0.1:{_zmq_handshake_port(self.base_url)}"
+            cmd += ["--zmq-handshake", handshake, "--zmq-count", "1"]
+        else:
+            cmd += ["--http-base-port", str(self.port), "--http-count", "1"]
+        return cmd
 
     def _build_mlx_cmd(self, model_path: str, spec: dict) -> list[str]:
         """Build MLX gRPC server command (Apple Silicon, gRPC-only)."""

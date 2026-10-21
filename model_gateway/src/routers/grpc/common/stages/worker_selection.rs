@@ -2166,6 +2166,7 @@ mod tests {
         config::types::PolicyConfig,
         mesh::adapters::tree_sync::RepairEntry,
         middleware::{ReportedRefusal, TenantRequestMeta},
+        observability::logging::test_support::test_subscriber,
         policies::{CacheAwareConfig, CacheAwarePolicy, PolicyFactory, TreeHandle, TreeKind},
         routers::{
             common::{
@@ -6194,16 +6195,13 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_for_a_drained_pool_is_marked_and_written_at_warn_within_the_allowance() {
         use openai_protocol::worker::WorkerStatus;
-        use tracing_subscriber::layer::SubscriberExt;
 
         let errors = Arc::new(AtomicUsize::new(0));
         let refusal_lines = Arc::new(AtomicUsize::new(0));
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::Registry::default().with(RefusalLineCounter {
-                errors: Arc::clone(&errors),
-                refusal_lines: Arc::clone(&refusal_lines),
-            }),
-        );
+        let _subscriber = test_subscriber(RefusalLineCounter {
+            errors: Arc::clone(&errors),
+            refusal_lines: Arc::clone(&refusal_lines),
+        });
         let registry = Arc::new(WorkerRegistry::new());
         let down = worker("grpc://127.0.0.1:30010", WorkerType::Regular);
         down.set_status(WorkerStatus::NotReady);
@@ -6284,16 +6282,12 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_for_a_model_nobody_serves_is_marked_and_written_at_warn_within_the_allowance(
     ) {
-        use tracing_subscriber::layer::SubscriberExt;
-
         let errors = Arc::new(AtomicUsize::new(0));
         let refusal_lines = Arc::new(AtomicUsize::new(0));
-        let _guard = tracing::subscriber::set_default(
-            tracing_subscriber::Registry::default().with(RefusalLineCounter {
-                errors: Arc::clone(&errors),
-                refusal_lines: Arc::clone(&refusal_lines),
-            }),
-        );
+        let _subscriber = test_subscriber(RefusalLineCounter {
+            errors: Arc::clone(&errors),
+            refusal_lines: Arc::clone(&refusal_lines),
+        });
         let registry = Arc::new(WorkerRegistry::new());
         let stage = regular_stage(Arc::clone(&registry));
         let allowance = usize::try_from(placement::REFUSAL_LINES_PER_SECOND).unwrap();

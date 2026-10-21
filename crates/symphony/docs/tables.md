@@ -57,7 +57,23 @@ What this table says beyond the Qwen ones:
 - **The prompt opens the thought.** The template ends the generation prompt with `<think>`, and
   an empty thought writes `</think>` at once, so most recorded outputs start with
   `</think>\n\n`; the engine's prompt replay puts the output inside the thought first. The
-  turn opener is `<｜Assistant｜>`, so a marker quoted in an earlier turn moves nothing.
+  turn opener is `<｜Assistant｜>`, so a marker quoted in an earlier turn moves nothing. A tool
+  result renders as a user turn, and the model's turn after it opens with `<｜Assistant｜>` and
+  the thought opened or closed (thinking mode, chat mode), so the output always starts in a stay
+  of its own.
+- **The block's opener is the blank line and the tag.** The template writes two newlines between
+  a message's content and its calls block, and the family's reference parser (the checkpoint's
+  `encoding` module) looks for the block as `\n\n<｜DSML｜ calls`, reading the content up to
+  there and otherwise as written: a blank line inside the content, a third newline or a space
+  before the block's blank line, and whitespace at the turn's end stay. The table spells the
+  opener the same way, as a second terminal beside the bare tag, so the blank line leaves with
+  the tag wherever the block opens (after a text preamble, after the thought's close, at a chat
+  turn's start, after a tool result), whole and streamed alike: the scanner takes the longer
+  marker where the blank line stands and holds a newline that may begin it. The bare tag still
+  opens a block written without the blank line, as it did; what precedes it is content. V4 and
+  V3.2 keep their reading (the blank line is content where text precedes it) until their
+  reference parsers are read the same way; the legacy `deepseek_v41` parser strips exactly this
+  blank line too.
 
 ## DeepSeek V4 (`deepseek_v4`)
 
@@ -78,7 +94,8 @@ V4.1's, and the registry reads each checkpoint with its own. Beyond that:
   needs: the table enters the block on its opener wherever it stands, after the thought's text or
   the content's last byte as much as after the newlines, and the newlines the model writes are
   content, the model's own (the legacy parser trims them; bellwether #17's question, as for Qwen3).
-  The family's reference parser is the one that looks for the block after the two newlines. The prompt ends with `<think>` in thinking mode and with `</think>` right after
+  The family's reference parser is the one that looks for the block after the two newlines; the
+  V4.1 table spells its opener that way (its section). The prompt ends with `<think>` in thinking mode and with `</think>` right after
   `<｜Assistant｜>` in chat mode, so the replay starts the output inside the thought or in the content;
   bellwether has not recorded the group's set yet.
 - **A turn the prompt leaves unopened starts inside the thought.** The template writes
@@ -367,18 +384,21 @@ What the table says beyond the others:
   marker itself. Before this, the tag's `begin` wrote the marker again after the model's own on
   such an engine, and the answer came back as `<|content_text|>{...}`.
 - **A kind said again inside a body is the kind.** The family's own parsers read the blocks as
-  self-describing, in any order: `<|content_text|>` inside the answer starts its text over,
-  `<|content_thinking|>` inside the answer or the thought opens a thought, and none of the three
-  is the body's text; the table has the same rows (`content` on `text` back to `content`, on
-  `thinking` to `reasoning`; `reasoning` on `thinking` to itself), so the markers are framing
-  there, dropped, and the whitespace a stay held before one is the template's.
-  `<|content_text|>` inside a thought has no row, although the family's parsers switch to the
-  answer there as well: the tag derivation reads every row out of the thought as a close of it,
-  and that row would end the thought the answer tag and a forced call's tag admit at the marker
-  instead of at the message's close the model writes; no recorded output holds the shape, and
-  under the tag the thought's text excludes the marker, so such a marker stays the thought's
-  text (a follow-up, with a derivation that tells a kind switch from a close). The rows are
-  what an engine that starts a JSON answer's grammar after its reasoning parser needs: the tag
+  self-describing, in any order: `<|content_text|>` inside the answer starts its text over and
+  inside the thought starts the answer, `<|content_thinking|>` inside the answer or the thought
+  opens a thought, and none of the four is the body's text; the table has the same rows
+  (`content` on `text` back to `content`, on `thinking` to `reasoning`; `reasoning` on
+  `thinking` to itself, on `text` to `content`), so the markers are framing there, dropped, and
+  the whitespace a stay held before one is the template's. The message closes where it did: the
+  tag derivation tells a kind said again (a row from one body into another on the marker that
+  opens that body from the message's header, `Format::is_kind_switch`) from a close of the
+  thought (its row into the space between the messages), so the answer tag and a forced call's
+  tag end the thought at `<|end_message|><|message_model|>` as before, and the thought's text
+  under them writes no kind marker. Before the fourth row, `<|content_text|>` inside a thought
+  was the thought's text: such an answer came back as reasoning, with empty content and nothing
+  malformed (no recorded output holds the shape; a model held to a JSON answer could write it).
+  The rows are what an engine that starts a JSON answer's grammar after its reasoning parser
+  needs: the tag
   above cannot tell that engine's start from the first token, so at the gate, past the model's
   own `<|content_text|>`, its optional thought and marker are open to the model once more, and a
   model held to a JSON it had not planned writes one of the two before the JSON about two times

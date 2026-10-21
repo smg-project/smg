@@ -97,7 +97,8 @@ pub(super) fn assign(
     .expect("no hf")
 }
 
-/// [`super::constraint`](fn@super::constraint) with no templates, as [`assign`].
+/// [`super::constraint`](fn@super::constraint) with no templates, as [`assign`]; a JSON answer's
+/// tag as a worker that does not say where it starts the grammar takes it.
 pub(super) fn constraint(
     parser: ParserChoice,
     names: &ModelNames<'_>,
@@ -115,6 +116,7 @@ pub(super) fn constraint(
         symphony::GrammarStart::Unknown,
         &templates(),
     )
+    .and_then(|prepared| prepared.for_start(symphony::GrammarStart::Unknown))
     .expect("no hf")
 }
 

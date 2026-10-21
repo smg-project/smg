@@ -225,7 +225,9 @@ impl ModelProcessorSpec for Gemma4Spec {
             || id.contains("gemma4")
     }
 
-    /// The template renders the parts in the order they were written.
+    /// The family's renderer is positional: a string template of it gets the
+    /// media parts where the request put them. Its own template takes the
+    /// parts and places them itself, whatever this says.
     fn media_part_order(&self) -> MediaPartOrder {
         MediaPartOrder::Authored
     }

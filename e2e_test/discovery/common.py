@@ -1,5 +1,13 @@
-"""Shared pieces of the host-process file-discovery e2e: the in-process fake
-engine, the manifest writer, and the gateway driver."""
+"""What the file and Slurm discovery e2e lanes share: the binaries, free
+ports, the in-process fake engine, the mock-worker launcher, and the gateway
+driver.
+
+The file lane runs its gateway and engines as processes on this host. The
+Slurm lane runs them in its cluster's containers, so it takes only the model,
+a free port, the gateway driver (subclassed to run on the controller) and
+`served_by`. Each lane adds the source it drives and the flags that select
+its provider.
+"""
 
 from __future__ import annotations
 
@@ -11,18 +19,16 @@ import socket
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
+import pytest
 import requests
 
-MODEL = "file-e2e-model"
-# Rereads, health checks and removals all run on one-second clocks here, so
+MODEL = "discovery-e2e-model"
+# Reads, health checks and removals all run on one-second clocks here, so
 # convergence is a few seconds; this bounds a scenario that never converges.
 CONVERGE = 60.0
-# A periodic reread no test outlives: under it, only the startup read and
-# the watcher read the manifest.
-NO_REREAD_SECS = 3600
 
 
 def binary(env: str, default: str) -> Path:
@@ -31,9 +37,9 @@ def binary(env: str, default: str) -> Path:
     return path
 
 
-def free_port() -> int:
+def free_port(host: str = "127.0.0.1") -> int:
     with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
+        sock.bind((host, 0))
         return sock.getsockname()[1]
 
 
@@ -58,9 +64,9 @@ def free_port_range(count: int) -> int:
 
 class FakeEngine:
     """An in-process engine: healthy until told otherwise, and every answer
-    names the port that served it."""
+    names the address that served it."""
 
-    def __init__(self):
+    def __init__(self, host: str = "127.0.0.1", port: int = 0):
         engine = self
         self.healthy = True
 
@@ -74,12 +80,12 @@ class FakeEngine:
                 elif path == "/model_info":
                     code, body = 200, {"model_path": MODEL, "is_generation": True}
                 elif path == "/server_info":
-                    code, body = 200, {"version": "file-e2e"}
+                    code, body = 200, {"version": "discovery-e2e"}
                 elif path == "/v1/chat/completions":
                     code, body = (
                         200,
                         {
-                            "id": "cmpl-file-e2e",
+                            "id": "cmpl-discovery-e2e",
                             "object": "chat.completion",
                             "created": 0,
                             "model": MODEL,
@@ -88,7 +94,7 @@ class FakeEngine:
                                     "index": 0,
                                     "message": {
                                         "role": "assistant",
-                                        "content": f"served-by-{engine.port}",
+                                        "content": engine.served_by,
                                     },
                                     "finish_reason": "stop",
                                 }
@@ -117,9 +123,12 @@ class FakeEngine:
             def log_message(self, *args):
                 pass
 
-        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server = http.server.ThreadingHTTPServer((host, port), Handler)
+        self.host = host
         self.port = self.server.server_address[1]
-        self.url = f"http://127.0.0.1:{self.port}"
+        self.url = f"http://{host}:{self.port}"
+        # What a chat completion it serves answers.
+        self.served_by = f"served-by-{host}:{self.port}"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def stop(self) -> None:
@@ -127,33 +136,65 @@ class FakeEngine:
         self.server.server_close()
 
 
-class Manifest:
-    def __init__(self, path: Path):
-        self.path = path
+@pytest.fixture
+def engines() -> Iterator[Callable[[int], list[FakeEngine]]]:
+    """Start `count` fake engines on free loopback ports; they are stopped
+    after the test."""
+    started: list[FakeEngine] = []
 
-    @staticmethod
-    def document(workers: list[dict]) -> str:
-        return json.dumps({"version": 1, "workers": workers})
+    def start(count: int) -> list[FakeEngine]:
+        new = [FakeEngine() for _ in range(count)]
+        started.extend(new)
+        return new
 
-    def write(self, workers: list[dict]) -> None:
-        """Replace the manifest as writers should: a temporary file beside
-        it, renamed over it."""
-        staged = self.path.with_suffix(".staged")
-        staged.write_text(self.document(workers))
-        staged.replace(self.path)
+    yield start
+    for engine in started:
+        engine.stop()
 
-    def rewrite_in_place(self, workers: list[dict]) -> None:
-        """Overwrite the manifest itself, as an editor does."""
-        with open(self.path, "w") as manifest:
-            manifest.write(self.document(workers))
+
+@pytest.fixture
+def mock_worker() -> Iterator[Callable[..., None]]:
+    """Start the mock-worker binary; it is stopped after the test."""
+    procs: list[subprocess.Popen] = []
+
+    def start(*args: str, ready_port: int, ready_host: str = "127.0.0.1") -> None:
+        proc = subprocess.Popen(
+            [str(binary("MOCK_WORKER_BIN", "target/debug/mock-worker")), *args],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        procs.append(proc)
+        deadline = time.monotonic() + 30
+        while True:
+            assert proc.poll() is None, f"mock-worker exited ({proc.returncode})"
+            with socket.socket() as sock:
+                if sock.connect_ex((ready_host, ready_port)) == 0:
+                    return
+            assert time.monotonic() < deadline, f"mock-worker never listened on {ready_port}"
+            time.sleep(0.2)
+
+    yield start
+    for proc in procs:
+        proc.kill()
+        proc.wait(timeout=10)
 
 
 class Gateway:
-    """One smg process with file discovery, plus /workers assertions."""
+    """One smg process discovering its workers, plus /workers assertions.
 
-    def __init__(self, manifest: Manifest, log_path: Path):
-        self.manifest = manifest
+    `discovery_args` gives the flags that select and configure the provider,
+    for a check interval; `env` is the process environment.
+    """
+
+    def __init__(
+        self,
+        discovery_args: Callable[[int], list[str]],
+        log_path: Path,
+        env: dict[str, str] | None = None,
+    ):
+        self.discovery_args = discovery_args
         self.log_path = log_path
+        self.env = env
         self.proc: subprocess.Popen | None = None
         self.base_url = ""
 
@@ -170,12 +211,7 @@ class Gateway:
                 str(port),
                 "--prometheus-port",
                 str(free_port()),
-                "--discovery-provider",
-                "file",
-                "--discovery-file",
-                str(self.manifest.path),
-                "--discovery-check-interval-secs",
-                str(check_interval_secs),
+                *self.discovery_args(check_interval_secs),
                 "--policy",
                 "round_robin",
                 "--health-check-interval-secs",
@@ -192,6 +228,7 @@ class Gateway:
             ],
             stdout=log,
             stderr=subprocess.STDOUT,
+            env=self.env,
         )
         deadline = time.monotonic() + 60
         while True:
@@ -215,6 +252,12 @@ class Gateway:
 
     def log_tail(self, lines: int = 40) -> str:
         return "\n".join(self.log_path.read_text().splitlines()[-lines:])
+
+    def wait_for_log(self, needle: str, what: str, within: float = CONVERGE) -> None:
+        deadline = time.monotonic() + within
+        while needle not in self.log_path.read_text():
+            assert time.monotonic() < deadline, f"timed out waiting for {what}; {self.log_tail()}"
+            time.sleep(0.25)
 
     def workers(self) -> list[dict] | None:
         """The registered workers, or None when the gateway could not be

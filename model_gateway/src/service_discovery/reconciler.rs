@@ -1005,7 +1005,7 @@ mod tests {
         );
         data.worker_kind = Some(WorkerKind::Local);
         data.connection_mode = Some(ConnectionMode::Http);
-        data.http_client_handle = Some(Arc::new(crate::http_client::client()));
+        data.http_client_handle = Some(Arc::new(crate::clients::http_client()));
         let mut ctx = WorkflowContext::new(WorkflowInstanceId::new(), data);
         assert_eq!(
             CreateLocalWorkerStep.execute(&mut ctx).await.unwrap(),

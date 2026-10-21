@@ -482,7 +482,7 @@ impl WorkerMediaPipeline {
             "media fetch policy for worker-side processing"
         );
         let connector = build_with(
-            || crate::http_client::client_builder().timeout(Duration::from_secs(30)),
+            || crate::clients::http_client_builder().timeout(Duration::from_secs(30)),
             false,
             "media HTTP client",
             |client| MediaConnector::new(client, connector_config.clone()),

@@ -45,6 +45,11 @@ pub enum Error {
     InputRegistrationTimeout { timeout: Duration },
     #[error("unexpected startup handshake message: {message}")]
     UnexpectedHandshakeMessage { message: String },
+    /// The field order the engine declared for a positional struct at its
+    /// handshake differs from the prefix this client encodes for it: no
+    /// request goes out to be refused one by one.
+    #[error("wire layout mismatch: {message}")]
+    WireLayoutMismatch { message: String },
     #[error("unsupported field `{field}` in {context}")]
     UnsupportedField {
         context: &'static str,

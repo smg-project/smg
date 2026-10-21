@@ -20,7 +20,7 @@ use crate::{
     worker::ConnectionMode,
     workflow::{
         data::{WorkerKind, WorkerWorkflowData},
-        steps::util::{do_grpc_health_check, grpc_base_url, http_base_url},
+        steps::util::{grpc_base_url, grpc_health_answer, http_base_url},
     },
 };
 
@@ -29,21 +29,25 @@ use crate::{
 /// Detect gRPC backend by trying runtime-specific health checks sequentially.
 ///
 /// If `runtime_hint` is provided (from explicit config), tries that first.
-/// Otherwise tries sglang → vllm → trtllm → mlx.
+/// Otherwise tries sglang → vllm → trtllm → tokenspeed → mlx.
+///
+/// A runtime that answers its health RPC identifies itself whatever the
+/// answer says about the engine: an engine still loading, or draining, is
+/// that runtime all the same. Whether the engine is healthy enough to admit
+/// is the connection-mode detection's question, asked before this step.
 async fn detect_grpc_backend(
     url: &str,
     timeout_secs: u64,
     runtime_hint: Option<&str>,
 ) -> Result<String, String> {
     let grpc_url = grpc_base_url(url);
+    let mut errors = Vec::new();
 
     // If we have a hint, try it first (fast path)
     if let Some(hint) = runtime_hint {
-        if do_grpc_health_check(&grpc_url, timeout_secs, hint)
-            .await
-            .is_ok()
-        {
-            return Ok(hint.to_string());
+        match grpc_health_answer(&grpc_url, timeout_secs, hint).await {
+            Ok(_) => return Ok(hint.to_string()),
+            Err(error) => errors.push(format!("{hint}: {error}")),
         }
     }
 
@@ -52,16 +56,15 @@ async fn detect_grpc_backend(
         if Some(*runtime) == runtime_hint {
             continue;
         }
-        if do_grpc_health_check(&grpc_url, timeout_secs, runtime)
-            .await
-            .is_ok()
-        {
-            return Ok((*runtime).to_string());
+        match grpc_health_answer(&grpc_url, timeout_secs, runtime).await {
+            Ok(_) => return Ok((*runtime).to_string()),
+            Err(error) => errors.push(format!("{runtime}: {error}")),
         }
     }
 
     Err(format!(
-        "gRPC backend detection failed for {url} (tried sglang, vllm, trtllm, tokenspeed, mlx)"
+        "gRPC backend detection failed for {url} (tried sglang, vllm, trtllm, tokenspeed, mlx): {}",
+        errors.join("; ")
     ))
 }
 
@@ -376,7 +379,38 @@ mod tests {
     use serde_json::json;
     use tokio::net::TcpListener;
 
-    use super::detect_http_backend;
+    use super::{detect_grpc_backend, detect_http_backend};
+    use crate::workflow::steps::util::mock_grpc_engine;
+
+    /// A runtime that answers its health RPC with `healthy: false` (its
+    /// engine still loading) is identified all the same, with and without
+    /// the hint; an endpoint nobody answers on names every runtime's reason.
+    #[tokio::test]
+    async fn grpc_detection_identifies_a_runtime_that_reports_not_healthy() {
+        let (url, engine) = mock_grpc_engine().await;
+        engine.set_serving(false);
+
+        assert_eq!(
+            detect_grpc_backend(&url, 5, None).await.as_deref(),
+            Ok("tokenspeed")
+        );
+        assert_eq!(
+            detect_grpc_backend(&url, 5, Some("tokenspeed"))
+                .await
+                .as_deref(),
+            Ok("tokenspeed")
+        );
+
+        let err = detect_grpc_backend("grpc://127.0.0.1:0", 1, None)
+            .await
+            .expect_err("nothing answers on a closed endpoint");
+        for runtime in ["sglang", "vllm", "trtllm", "tokenspeed", "mlx"] {
+            assert!(
+                err.contains(&format!("{runtime}: gRPC connection")),
+                "the error does not carry {runtime}'s reason: {err}"
+            );
+        }
+    }
 
     async fn serve_router(router: Router) -> (String, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -411,7 +445,7 @@ mod tests {
         })))
         .await;
 
-        let runtime = detect_http_backend(&url, 5, &crate::http_client::client(), None)
+        let runtime = detect_http_backend(&url, 5, &crate::clients::http_client(), None)
             .await
             .unwrap();
         server.abort();
@@ -427,7 +461,7 @@ mod tests {
         })))
         .await;
 
-        let runtime = detect_http_backend(&url, 5, &crate::http_client::client(), None)
+        let runtime = detect_http_backend(&url, 5, &crate::clients::http_client(), None)
             .await
             .unwrap();
         server.abort();
@@ -448,7 +482,7 @@ mod tests {
         );
         let (url, server) = serve_router(router).await;
 
-        let runtime = detect_http_backend(&url, 5, &crate::http_client::client(), None)
+        let runtime = detect_http_backend(&url, 5, &crate::clients::http_client(), None)
             .await
             .unwrap();
         server.abort();
@@ -467,7 +501,7 @@ mod tests {
         let err = detect_http_backend(
             &format!("http://{addr}"),
             1,
-            &crate::http_client::client(),
+            &crate::clients::http_client(),
             None,
         )
         .await
@@ -482,7 +516,7 @@ mod tests {
         // retries instead of registering a backend with nothing to serve.
         let (url, server) = serve_router(models_route(json!({"object": "list", "data": []}))).await;
 
-        let result = detect_http_backend(&url, 5, &crate::http_client::client(), None).await;
+        let result = detect_http_backend(&url, 5, &crate::clients::http_client(), None).await;
         server.abort();
 
         result.unwrap_err();
@@ -496,7 +530,7 @@ mod tests {
         })))
         .await;
 
-        let runtime = detect_http_backend(&url, 5, &crate::http_client::client(), None)
+        let runtime = detect_http_backend(&url, 5, &crate::clients::http_client(), None)
             .await
             .unwrap();
         server.abort();

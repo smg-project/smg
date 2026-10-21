@@ -595,6 +595,16 @@ pub enum ToolResultContentBlock {
     Image(ImageBlock),
     Document(DocumentBlock),
     SearchResult(SearchResultBlock),
+    /// A tool loaded by tool search (Claude Code's ToolSearch over deferred tools)
+    ToolReference(ToolResultReferenceBlock),
+}
+
+/// `tool_reference` inside a tool result: names a tool the search loaded
+#[serde_with::skip_serializing_none]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ToolResultReferenceBlock {
+    pub tool_name: String,
+    pub cache_control: Option<CacheControl>,
 }
 
 /// Thinking block
@@ -603,8 +613,14 @@ pub struct ThinkingBlock {
     /// The thinking content
     pub thinking: String,
 
-    /// Signature for the thinking block
+    /// Signature for the thinking block; history echoed without one (the
+    /// Anthropic Python SDK sends `null` or drops the field) reads as empty
+    #[serde(default, deserialize_with = "null_as_empty")]
     pub signature: String,
+}
+
+fn null_as_empty<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(d)?.unwrap_or_default())
 }
 
 /// Redacted thinking block
@@ -2460,6 +2476,32 @@ mod tests {
     use serde_json::{self, json};
 
     use super::*;
+
+    /// History echoed by Claude Code (a ToolSearch result) and by the Anthropic
+    /// Python SDK (thinking without a signature, or with a null one) parses, and
+    /// is forwarded with the reference intact and an empty signature.
+    #[test]
+    fn echoed_tool_reference_and_unsigned_thinking_are_accepted() {
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m", "max_tokens": 8,
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "t"},
+                    {"type": "thinking", "thinking": "u", "signature": null},
+                    {"type": "tool_use", "id": "t1", "name": "ToolSearch", "input": {}}]},
+                {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1",
+                    "content": [{"type": "tool_reference", "tool_name": "WebSearch"}]}]}]
+        }))
+        .expect("a Messages request");
+        let forwarded = serde_json::to_value(&request).unwrap();
+        assert_eq!(forwarded["messages"][1]["content"][0]["signature"], "");
+        assert_eq!(forwarded["messages"][1]["content"][1]["signature"], "");
+        assert_eq!(
+            forwarded["messages"][2]["content"][0]["content"][0],
+            json!({"type": "tool_reference", "tool_name": "WebSearch"})
+        );
+    }
 
     /// A trailing assistant message is continued when it has text and no
     /// tool call: as a string, as text blocks, with thinking before the

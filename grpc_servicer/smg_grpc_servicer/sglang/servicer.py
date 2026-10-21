@@ -68,7 +68,12 @@ from smg_grpc_servicer.sglang.utils import (
 from smg_grpc_servicer.tensor_wire import tensor_from_parts
 from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
 
-from ..constrained_decoding import grammar_start_labels, sglang_constrained_decoding_start
+from ..constrained_decoding import (
+    grammar_backend_entry,
+    grammar_start_labels,
+    sglang_constrained_decoding_start,
+    sglang_grammar_backend,
+)
 from ..mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from ..pd_pairing import pairing_protocol_from_env
 
@@ -571,6 +576,9 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 self.server_args, sglang_constrained_decoding_start(self.server_args)
             )
         )
+        # The grammar backend the scheduler runs, resolved (the raw argument
+        # is None unless set), under the same key the Rust servicer reads.
+        grammar_backend_entry(serializable_args, sglang_grammar_backend(self.server_args))
         # The gateway reads this worker's running window (its PD admission
         # bound, its share of the fleet's capacity) from `max_running_requests`
         # here, which is None unless the operator set the flag: the scheduler

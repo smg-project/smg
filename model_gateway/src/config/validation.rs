@@ -1347,6 +1347,14 @@ impl ConfigValidator {
             ));
         }
 
+        if config.zmq_startup_timeout_secs == 0 {
+            return Err(ConfigError::invalid_value(
+                "zmq_startup_timeout_secs",
+                config.zmq_startup_timeout_secs,
+                "Must be > 0",
+            ));
+        }
+
         if config.load_monitor_interval_secs == 0 {
             return Err(ConfigError::invalid_value(
                 "load_monitor_interval_secs",
@@ -1533,7 +1541,146 @@ impl ConfigValidator {
                 Self::validate_kubernetes_discovery(kubernetes, mode)
             }
             DiscoveryConfig::File(file) => Self::validate_file_discovery(file, mode),
+            DiscoveryConfig::Slurm(slurm) => Self::validate_slurm_discovery(slurm, mode),
         }
+    }
+
+    /// What `squeue` and `scontrol` report is checked at every poll, not here.
+    /// This checks that the job names map onto the routing mode's pools.
+    fn validate_slurm_discovery(
+        discovery: &SlurmDiscoveryConfig,
+        mode: &RoutingMode,
+    ) -> ConfigResult<()> {
+        let invalid = |field: &str, value: String, reason: &str| ConfigError::InvalidValue {
+            field: field.to_string(),
+            value,
+            reason: reason.to_string(),
+        };
+        if discovery.port == 0 {
+            return Err(invalid(
+                "discovery.port",
+                "0".to_string(),
+                "Port must be > 0",
+            ));
+        }
+        if discovery.bootstrap_port == Some(0) {
+            return Err(invalid(
+                "discovery.bootstrap_port",
+                "0".to_string(),
+                "Port must be > 0",
+            ));
+        }
+        if discovery.check_interval_secs == 0 {
+            return Err(invalid(
+                "discovery.check_interval_secs",
+                "0".to_string(),
+                "Must be > 0",
+            ));
+        }
+
+        let roles = [
+            ("discovery.job_names", "regular", &discovery.job_names),
+            (
+                "discovery.encode_job_names",
+                "encode",
+                &discovery.encode_job_names,
+            ),
+            (
+                "discovery.prefill_job_names",
+                "prefill",
+                &discovery.prefill_job_names,
+            ),
+            (
+                "discovery.decode_job_names",
+                "decode",
+                &discovery.decode_job_names,
+            ),
+        ];
+        // Each value reaches `squeue` inside a comma-separated list, where a
+        // comma would split it into two filters.
+        let scopes = [
+            ("discovery.user", &discovery.user),
+            ("discovery.account", &discovery.account),
+            ("discovery.partition", &discovery.partition),
+        ];
+        let values = roles
+            .iter()
+            .flat_map(|(field, _, names)| names.iter().map(move |name| (*field, name)))
+            .chain(
+                scopes
+                    .iter()
+                    .filter_map(|(field, value)| value.as_ref().map(|value| (*field, value))),
+            );
+        for (field, value) in values {
+            if value.is_empty() || value.contains(',') {
+                return Err(invalid(
+                    field,
+                    value.clone(),
+                    "Must be non-empty and contain no comma",
+                ));
+            }
+        }
+
+        let mut role_of = std::collections::HashMap::<&str, &str>::new();
+        for (_, role, names) in &roles {
+            for name in *names {
+                if let Some(other) = role_of.insert(name, role) {
+                    if other != *role {
+                        return Err(ConfigError::ValidationFailed {
+                            reason: format!(
+                                "Slurm job name '{name}' maps to both {other} and {role} workers"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+
+        let [regular, encode, prefill, decode] = roles.map(|(_, _, names)| !names.is_empty());
+        let (needed, unused) = match mode {
+            RoutingMode::Regular { .. } => (
+                (!regular)
+                    .then_some("Regular mode with Slurm discovery requires a regular job name"),
+                (encode || prefill || decode).then_some(
+                    "Regular mode has no encode, prefill or decode workers to map Slurm jobs to",
+                ),
+            ),
+            RoutingMode::PrefillDecode { .. } => (
+                (!(prefill || decode)).then_some(
+                    "PD mode with Slurm discovery requires a prefill or decode job name",
+                ),
+                (regular || encode)
+                    .then_some("PD mode has no regular or encode workers to map Slurm jobs to"),
+            ),
+            RoutingMode::EncodePrefillDecode { .. } => (
+                (!(encode && prefill && decode)).then_some(
+                    "EPD mode with Slurm discovery requires encode, prefill and decode job names",
+                ),
+                regular.then_some("EPD mode has no regular workers to map Slurm jobs to"),
+            ),
+            RoutingMode::OpenAI { .. } => {
+                (Some("OpenAI mode does not support service discovery"), None)
+            }
+            RoutingMode::Anthropic { .. } => (
+                Some("Anthropic mode does not support service discovery"),
+                None,
+            ),
+            RoutingMode::Gemini { .. } => {
+                (Some("Gemini mode does not support service discovery"), None)
+            }
+        };
+        if let Some(reason) = needed.or(unused) {
+            return Err(ConfigError::ValidationFailed {
+                reason: reason.to_string(),
+            });
+        }
+        if discovery.bootstrap_port.is_some() && !(encode || prefill) {
+            return Err(ConfigError::ValidationFailed {
+                reason: "A Slurm bootstrap port applies only to encode and prefill workers"
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// The manifest's own contents (worker types against the routing mode
@@ -3301,6 +3448,174 @@ mod tests {
         openai.discovery = file("/run/smg/workers.json", 30);
         assert!(matches!(
             ConfigValidator::validate(&openai),
+            Err(ConfigError::ValidationFailed { ref reason })
+                if reason.contains("does not support service discovery")
+        ));
+    }
+
+    fn slurm(names: [&[&str]; 4]) -> SlurmDiscoveryConfig {
+        let [regular, encode, prefill, decode] =
+            names.map(|names| names.iter().map(|name| name.to_string()).collect());
+        SlurmDiscoveryConfig {
+            job_names: regular,
+            encode_job_names: encode,
+            prefill_job_names: prefill,
+            decode_job_names: decode,
+            port: 8000,
+            bootstrap_port: None,
+            user: None,
+            account: None,
+            partition: None,
+            check_interval_secs: 30,
+        }
+    }
+
+    #[test]
+    fn test_validate_slurm_discovery() {
+        let epd = RoutingMode::EncodePrefillDecode {
+            encode_urls: vec![],
+            prefill_urls: vec![],
+            decode_urls: vec![],
+            encode_policy: None,
+            prefill_policy: None,
+            decode_policy: None,
+        };
+        let validate = |mode: &RoutingMode, discovery: SlurmDiscoveryConfig| {
+            let config = RouterConfig {
+                mode: mode.clone(),
+                discovery: Some(DiscoveryConfig::Slurm(discovery)),
+                ..Default::default()
+            };
+            ConfigValidator::validate(&config)
+        };
+        let regular = regular_mode_config().mode;
+        let pd = pd_mode_config().mode;
+
+        // Each mode with the job names it needs; a repeated name in one role
+        // is harmless.
+        for (mode, discovery) in [
+            (&regular, slurm([&["w", "w2"], &[], &[], &[]])),
+            (&pd, slurm([&[], &[], &["p", "p2"], &["d"]])),
+            (&pd, slurm([&[], &[], &["p"], &[]])),
+            (&epd, slurm([&[], &["e"], &["p"], &["d"]])),
+            (&regular, slurm([&["w", "w"], &[], &[], &[]])),
+            (
+                &pd,
+                SlurmDiscoveryConfig {
+                    bootstrap_port: Some(8998),
+                    user: Some("svc".to_string()),
+                    account: Some("acct".to_string()),
+                    partition: Some("gpu".to_string()),
+                    ..slurm([&[], &[], &["p"], &["d"]])
+                },
+            ),
+        ] {
+            assert!(validate(mode, discovery.clone()).is_ok(), "{discovery:?}");
+        }
+
+        for (mode, discovery, expected) in [
+            (
+                &regular,
+                slurm([&[], &[], &[], &[]]),
+                "requires a regular job name",
+            ),
+            (
+                &regular,
+                slurm([&["w"], &[], &["p"], &[]]),
+                "has no encode, prefill or decode",
+            ),
+            (
+                &pd,
+                slurm([&[], &[], &[], &[]]),
+                "requires a prefill or decode job name",
+            ),
+            (
+                &pd,
+                slurm([&["w"], &[], &["p"], &["d"]]),
+                "has no regular or encode",
+            ),
+            (
+                &epd,
+                slurm([&[], &["e"], &["p"], &[]]),
+                "requires encode, prefill and decode",
+            ),
+            (
+                &epd,
+                slurm([&["w"], &["e"], &["p"], &["d"]]),
+                "has no regular workers",
+            ),
+            (
+                &pd,
+                slurm([&[], &[], &["x"], &["x"]]),
+                "maps to both prefill and decode",
+            ),
+            (
+                &regular,
+                SlurmDiscoveryConfig {
+                    bootstrap_port: Some(8998),
+                    ..slurm([&["w"], &[], &[], &[]])
+                },
+                "applies only to encode and prefill",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    validate(mode, discovery.clone()),
+                    Err(ConfigError::ValidationFailed { ref reason }) if reason.contains(expected)
+                ),
+                "{discovery:?}: expected {expected:?}, got {:?}",
+                validate(mode, discovery.clone())
+            );
+        }
+
+        let base = || slurm([&["w"], &[], &[], &[]]);
+        for (discovery, field) in [
+            (SlurmDiscoveryConfig { port: 0, ..base() }, "discovery.port"),
+            (
+                SlurmDiscoveryConfig {
+                    bootstrap_port: Some(0),
+                    ..base()
+                },
+                "discovery.bootstrap_port",
+            ),
+            (
+                SlurmDiscoveryConfig {
+                    check_interval_secs: 0,
+                    ..base()
+                },
+                "discovery.check_interval_secs",
+            ),
+            (slurm([&["a,b"], &[], &[], &[]]), "discovery.job_names"),
+            (slurm([&[""], &[], &[], &[]]), "discovery.job_names"),
+            (
+                SlurmDiscoveryConfig {
+                    user: Some(String::new()),
+                    ..base()
+                },
+                "discovery.user",
+            ),
+            (
+                SlurmDiscoveryConfig {
+                    partition: Some("gpu,cpu".to_string()),
+                    ..base()
+                },
+                "discovery.partition",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    validate(&regular, discovery.clone()),
+                    Err(ConfigError::InvalidValue { field: ref actual, .. }) if actual == field
+                ),
+                "{discovery:?}: expected {field}"
+            );
+        }
+
+        let openai = RoutingMode::OpenAI {
+            worker_urls: vec![],
+        };
+        assert!(matches!(
+            validate(&openai, base()),
             Err(ConfigError::ValidationFailed { ref reason })
                 if reason.contains("does not support service discovery")
         ));

@@ -190,7 +190,7 @@ mod tests {
     /// for it (HTTP version, TLS identity, pool tuning), not a second one.
     #[test]
     fn http_worker_controls_itself_with_its_negotiated_client() {
-        let client = Arc::new(crate::http_client::client());
+        let client = Arc::new(crate::clients::http_client());
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://engine:30000")
                 .connection_mode(ConnectionMode::Http)

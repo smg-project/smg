@@ -10,9 +10,33 @@
 //!   row leads, kept as content text (`Event::Malformed`), by its reason; the bytes reach the
 //!   client as content, or, where the syntax's block is never prose, are dropped behind an event of
 //!   no bytes (`Dropped { MalformedCall }`) and sized here as that event's; nothing is lost in the
-//!   events, and nothing says so to the client;
+//!   events, and nothing says so to the client. An output whose only answer is such a dropped
+//!   block (no content, no call: a call written as Python where the name goes) is the one case
+//!   where the reader releases dropped bytes as content before the finish (`Reader::end`): the
+//!   output's own slice from the block's opener to the last refused byte, so a client reads
+//!   what the model wrote instead of an empty answer; the output still counts as `malformed`,
+//!   and its line says how many bytes went out;
 //! - `dropped`: bytes the table treats as the template's wrapping (`Event::Dropped`): correct,
 //!   expected on every output, not counted here;
+//! - `empty`: an output with no text, no reasoning and no call: only bytes the table drops
+//!   (whitespace before any text, the template's markers and separators) or no bytes at all.
+//!   The reader releases the dropped whitespace of such an output as one content event before
+//!   the finish (`Reader::end`): the chat stream carries it as the answer, as the engine's own
+//!   server streams it, and a whole response's adapter applies its own rule for whitespace-only
+//!   content; the output is counted as its own outcome either way, and written like a malformed
+//!   output, on a bucket of its own, with the engine's finish, the dropped bytes by class and the
+//!   bytes released, so a model that answers with whitespace under a forced length, or a stream
+//!   that ended with nothing, is seen;
+//! - `unknown_tool`: an output the table read whole in which a call names a function the request
+//!   did not declare (the engine's `UnknownTool` event of no bytes right before the call's
+//!   start): the call goes out as the model named it, nothing says so to the client, and the
+//!   output is counted once under this outcome rather than as `malformed`, so the malformed rate
+//!   stays the table's reading and this one the model's naming; each such call still counts
+//!   under `reason="unknown_tool"`. An output with a refused run as well is `malformed`, with
+//!   `unknown_tool` among its reasons. The line such an output writes, from a bucket of its own,
+//!   names the first undeclared function: the one place a byte of model output is logged, an
+//!   identifier where a declared name was expected, cut to [`NAME_SHOWN`] bytes with its whole
+//!   length beside it, so an operator tells a shortened name from a misspelt one;
 //! - `forgiven`: a repair that keeps the answer's shape. Of those, the calls after the first
 //!   dropped under `parallel_tool_calls: false` are counted (`suppressed_calls`); the refined
 //!   finish, the empty arguments of a call without an `arguments` member and the chunking rule's
@@ -31,11 +55,15 @@
 //! Cost: a clean output records one counter increment through a key built once per table (the
 //! `metrics` macros build a key, with a `Vec` of labels, on every call), no allocation. A
 //! malformed one adds a histogram observation, the per-reason counters, and, when the table's
-//! token bucket allows it, one `warn` line: the only allocations. The run's text is model output
-//! and is never logged, at any level: `at` and `bytes` locate it in the response for a reader with
-//! access to it. Suppressed calls are counted and write no line. A request the legacy parsers
-//! read under Symphony records one counter increment, through a key built once per reason and
-//! table, and nothing where a table reads.
+//! token bucket allows it, one `warn` line: the only allocations. One counted `unknown_tool` adds
+//! the per-reason counters, the first undeclared name cut to [`NAME_SHOWN`] bytes (one small
+//! allocation, made when the call starts) and, from a bucket of its own, one `warn` line; no
+//! histogram observation, the table having read it whole. A run's text is model output and is
+//! never logged, at any level: `at` and `bytes` locate it in the response for a reader with
+//! access to it; the undeclared name on the `unknown_tool` line is the one exception, an
+//! identifier where a declared name was expected. Suppressed calls are counted and write no line.
+//! A request the legacy parsers read under Symphony records one counter increment, through a key
+//! built once per reason and table, and nothing where a table reads.
 
 use std::{
     sync::{
@@ -47,16 +75,18 @@ use std::{
 
 use metrics::{Key, Label, Level, Metadata};
 use parking_lot::Mutex;
-use symphony::{formats::Table, DropReason, Event, MalformedReason};
+use symphony::{formats::Table, DropReason, Event, FinishReason, MalformedReason};
 use tracing::warn;
 
 use super::names::Fallback;
 
-/// Outputs read to their end, by `table` and `outcome` (`clean`, `malformed`, `failed`).
+/// Outputs read to their end, by `table` and `outcome` (`clean`, `malformed`, `failed`,
+/// `empty`, `unknown_tool`).
 pub(crate) const OUTPUTS: &str = "smg_symphony_outputs_total";
 /// Malformed runs, by `table` and `reason`.
 pub(crate) const MALFORMED: &str = "smg_symphony_malformed_total";
-/// The bytes of the malformed runs of one output, by `table`; observed for an output with one.
+/// The bytes of the malformed runs of one output, by `table`; observed for an output counted
+/// `malformed`.
 pub(crate) const MALFORMED_BYTES: &str = "smg_symphony_malformed_bytes";
 /// Calls after the first dropped under `parallel_tool_calls: false`, by `table`.
 pub(crate) const CALLS_SUPPRESSED: &str = "smg_symphony_calls_suppressed_total";
@@ -76,20 +106,45 @@ const OTHER_TABLE: &str = "other";
 /// The `table` label of a request no table reads ([`FALLBACK`]).
 const NO_TABLE: &str = "none";
 
-/// The `reason` labels, in the order of [`Tally::reasons`]: the three reasons that say what the
-/// model got wrong, the table's own marker where no row leads (an answer's opener written again
-/// inside the answer: a frame the table did not read, kept as content), and `other` for the
-/// crate's syntax-level reasons (text where the call's syntax has none, a tag out of place, a key
-/// without a value, ...), each spelled by the crate's sentence on the sampled line.
-const REASONS: [&str; 5] = [
+/// The `reason` labels, in the order of [`Tally::reasons`]: every reason the crate names
+/// (`MalformedReason`, in its order, each under the crate's own spelling of it), so a dashboard
+/// tells a stray tag from a call written in the wrong syntax without the sampled line, and
+/// `other` for a reason this build does not know (the crate's enum is non-exhaustive).
+const REASONS: [&str; 29] = [
     "unterminated_region",
     "invalid_arguments",
     "unknown_tool",
+    "text_between_tags",
+    "tag_out_of_place",
+    "tag_cut_short",
+    "tag_tail",
+    "empty_name",
+    "call_without_name",
+    "call_without_function_tag",
+    "second_function_tag",
+    "closed_before_the_name",
+    "text_where_the_name_should_be",
+    "text_between_calls",
+    "text_where_an_argument_should_begin",
+    "text_in_place_of_the_list",
+    "text_after_the_arguments",
+    "text_after_the_list",
+    "name_without_arguments",
+    "name_without_a_call",
+    "key_written_twice",
+    "key_without_a_value",
+    "key_cut_short",
+    "value_cut_short",
+    "empty_key",
+    "block_without_a_complete_call",
+    "no_forced_function",
     "marker_out_of_place",
     "other",
 ];
+/// The place of `other` in [`REASONS`]: a reason the match below does not know.
+const OTHER_REASON: usize = REASONS.len() - 1;
 /// The `outcome` labels, in the order of [`Series::outputs`].
-const OUTCOMES: [&str; 3] = ["clean", "malformed", "failed"];
+const OUTCOMES: [&str; 5] = ["clean", "malformed", "failed", "empty", "unknown_tool"];
 /// The `reason` labels of [`FALLBACK`], in the order of [`fallback_index`]: the four decisions
 /// that leave a model to the legacy parsers, and the table that has no tag for a forced call.
 const FALLBACK_REASONS: [&str; 5] = [
@@ -102,6 +157,13 @@ const FALLBACK_REASONS: [&str; 5] = [
 const CLEAN: usize = 0;
 const MALFORMED_OUTCOME: usize = 1;
 const FAILED: usize = 2;
+const EMPTY: usize = 3;
+const UNKNOWN_TOOL: usize = 4;
+/// The place of `unknown_tool` in [`REASONS`]: the runs that are calls to functions the request
+/// did not declare, which decide between the `malformed` and the `unknown_tool` outcome.
+const UNKNOWN_TOOL_REASON: usize = 2;
+/// The bytes of an undeclared function's name the `unknown_tool` line shows at most.
+const NAME_SHOWN: usize = 64;
 
 /// The `table` label of the format named `name`: the registry table's own name, the response
 /// template's, or `other`. Static, so a record allocates nothing for it.
@@ -117,20 +179,56 @@ pub(crate) fn table_label(name: &str) -> &'static str {
         })
 }
 
-/// The `reason` label of a malformed run, and its place in [`REASONS`].
+/// The `reason` label of a malformed run, and its place in [`REASONS`]. The arms follow the
+/// crate's enum; a variant this build does not know lands on `other`.
 fn reason_index(why: MalformedReason) -> usize {
     match why {
         MalformedReason::UnterminatedRegion => 0,
         MalformedReason::InvalidArguments => 1,
         MalformedReason::UnknownTool => 2,
-        MalformedReason::MarkerOutOfPlace => 3,
-        _ => 4,
+        MalformedReason::TextBetweenTags => 3,
+        MalformedReason::TagOutOfPlace => 4,
+        MalformedReason::TagCutShort => 5,
+        MalformedReason::TagTail => 6,
+        MalformedReason::EmptyName => 7,
+        MalformedReason::CallWithoutName => 8,
+        MalformedReason::CallWithoutFunctionTag => 9,
+        MalformedReason::SecondFunctionTag => 10,
+        MalformedReason::ClosedBeforeTheName => 11,
+        MalformedReason::TextWhereTheNameShouldBe => 12,
+        MalformedReason::TextBetweenCalls => 13,
+        MalformedReason::TextWhereAnArgumentShouldBegin => 14,
+        MalformedReason::TextInPlaceOfTheList => 15,
+        MalformedReason::TextAfterTheArguments => 16,
+        MalformedReason::TextAfterTheList => 17,
+        MalformedReason::NameWithoutArguments => 18,
+        MalformedReason::NameWithoutACall => 19,
+        MalformedReason::KeyWrittenTwice => 20,
+        MalformedReason::KeyWithoutAValue => 21,
+        MalformedReason::KeyCutShort => 22,
+        MalformedReason::ValueCutShort => 23,
+        MalformedReason::EmptyKey => 24,
+        MalformedReason::BlockWithoutACompleteCall => 25,
+        MalformedReason::NoForcedFunction => 26,
+        MalformedReason::MarkerOutOfPlace => 27,
+        _ => OTHER_REASON,
     }
 }
 
 /// The `reason` label of a malformed run.
 pub(crate) fn reason_label(why: MalformedReason) -> &'static str {
     REASONS[reason_index(why)]
+}
+
+/// The engine's finish as the line spells it, the public API's words.
+fn finish_label(reason: &FinishReason) -> &'static str {
+    match reason {
+        FinishReason::Stop => "stop",
+        FinishReason::Length => "length",
+        FinishReason::ToolCalls => "tool_calls",
+        FinishReason::Abort => "abort",
+        FinishReason::Other(_) => "other",
+    }
 }
 
 /// The place of a fallback's `reason` label in [`FALLBACK_REASONS`].
@@ -156,6 +254,16 @@ pub(super) fn bytes_of(event: &Event) -> usize {
     }
 }
 
+/// `name` cut to [`NAME_SHOWN`] bytes on a character boundary: what the `unknown_tool` line shows
+/// of an undeclared function's name.
+fn shown_name(name: &str) -> Box<str> {
+    let mut end = name.len().min(NAME_SHOWN);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    name[..end].into()
+}
+
 /// Whose output a reader reports on, for the line a non-clean output writes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Who<'a> {
@@ -164,7 +272,9 @@ pub(crate) struct Who<'a> {
     pub choice: u32,
 }
 
-/// The first malformed run of an output, as the line shows it.
+/// The first malformed run of an output the table refused or kept as content, as the malformed
+/// line shows it. The event of no bytes before a call to a function the request did not declare
+/// is not one: the `unknown_tool` line locates that call ([`Undeclared`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FirstRun {
     /// Its `reason` label.
@@ -177,19 +287,56 @@ pub(crate) struct FirstRun {
     pub bytes: usize,
 }
 
+/// The first call of an output to a function the request did not declare, as the `unknown_tool`
+/// line shows it.
+#[derive(Debug)]
+struct Undeclared {
+    /// The function's name, cut to [`NAME_SHOWN`] bytes.
+    name: Box<str>,
+    /// The name's whole length in bytes.
+    bytes: usize,
+    /// Where the call starts in the output, in bytes.
+    at: usize,
+}
+
 /// What the reader has seen of one output so far, counted as the events are drained.
 #[derive(Debug, Default)]
 pub(crate) struct Tally {
     /// The bytes of the events seen so far: where the next event's bytes start.
     at: usize,
-    /// Malformed runs by reason, in the order of [`REASONS`].
-    reasons: [u32; 5],
+    /// Malformed runs by reason, in the order of [`REASONS`]; allocated by the first run, so a
+    /// clean output carries no counters and the tally stays small.
+    reasons: Option<Box<[u32; REASONS.len()]>>,
     malformed_bytes: u64,
     first: Option<FirstRun>,
     /// The event before the next is the first run's: refused bytes that follow it are its size.
     announced: bool,
+    /// The next call to start names a function the request did not declare: its `UnknownTool`
+    /// event came right before it, and the first such call is the `unknown_tool` line's.
+    naming: bool,
+    /// The first call to a function the request did not declare, as the `unknown_tool` line
+    /// shows it; allocated only for an output with one.
+    undeclared: Option<Undeclared>,
     suppressed_calls: u32,
     tool_calls: u32,
+    /// The bytes the client was shown: content, reasoning, malformed text kept as content, and
+    /// the source of the call events.
+    shown: u64,
+    /// The calls the output began, suppressed or not.
+    calls_begun: u32,
+    /// The bytes dropped as whitespace, and as anything else the table drops.
+    dropped_space: u64,
+    dropped_wrapping: u64,
+    /// The engine tokens of the dropped bytes, where the events carried their counts.
+    dropped_tokens: u32,
+    /// The engine's finish, as the `Finish` event says it.
+    finish: &'static str,
+    /// The bytes the reader released as content at the end of the output: the dropped whitespace
+    /// of an empty output, whether it reaches the client being the surface's rule (the chat
+    /// stream carries it), or the slice of an output that answered with nothing but refused call
+    /// blocks, from the first block's opener to the last refused byte, which every surface
+    /// carries.
+    released: u64,
 }
 
 impl Tally {
@@ -197,11 +344,27 @@ impl Tally {
     /// drops the calls after the first, which are then counted as suppressed.
     pub(crate) fn see(&mut self, event: &Event, first_call_only: bool) {
         let announced = std::mem::take(&mut self.announced);
+        let naming = std::mem::take(&mut self.naming);
         match event {
+            Event::Content(text) | Event::Reasoning(text) => {
+                self.shown += text.text.len() as u64;
+            }
+            Event::ToolCallArguments { source, .. } | Event::ToolCallEnd { source, .. } => {
+                self.shown += source.text.len() as u64;
+            }
             Event::Malformed { text, why } => {
-                self.reasons[reason_index(*why)] += 1;
+                self.shown += text.text.len() as u64;
+                self.reasons
+                    .get_or_insert_with(|| Box::new([0; REASONS.len()]))[reason_index(*why)] += 1;
                 self.malformed_bytes += text.text.len() as u64;
-                if self.first.is_none() {
+                // The event of no bytes before a call to a function the request did not declare:
+                // the call starts next, and the first such call is the `unknown_tool` line's. The
+                // malformed line's first run is one the table refused or kept as content, never
+                // this event, so its `reason`, `at` and `bytes` locate debris, not a call read
+                // whole.
+                if matches!(why, MalformedReason::UnknownTool) {
+                    self.naming = true;
+                } else if self.first.is_none() {
                     self.first = Some(FirstRun {
                         reason: reason_label(*why),
                         why: why.sentence(),
@@ -227,11 +390,39 @@ impl Tally {
                     }
                 }
             }
-            Event::ToolCallStart { index, .. } if first_call_only && *index > 0 => {
-                self.suppressed_calls += 1;
+            Event::Dropped { text, why } => {
+                match why {
+                    DropReason::Whitespace => self.dropped_space += text.text.len() as u64,
+                    _ => self.dropped_wrapping += text.text.len() as u64,
+                }
+                self.dropped_tokens += text.tokens.unwrap_or(0);
             }
-            Event::Finish { tool_calls, .. } => self.tool_calls = *tool_calls,
-            _ => {}
+            Event::ToolCallStart {
+                index,
+                name,
+                source,
+                ..
+            } => {
+                self.calls_begun += 1;
+                self.shown += source.text.len() as u64;
+                if first_call_only && *index > 0 {
+                    self.suppressed_calls += 1;
+                }
+                if naming && self.undeclared.is_none() {
+                    self.undeclared = Some(Undeclared {
+                        name: shown_name(name),
+                        bytes: name.len(),
+                        at: self.at,
+                    });
+                }
+            }
+            Event::Finish {
+                reason, tool_calls, ..
+            } => {
+                self.tool_calls = *tool_calls;
+                self.finish = finish_label(reason);
+            }
+            Event::ReasoningStart | Event::ReasoningEnd => {}
         }
         self.at += bytes_of(event);
     }
@@ -241,6 +432,25 @@ impl Tally {
     /// after it.
     pub(crate) fn grew(&mut self, bytes: usize) {
         self.at += bytes;
+        self.shown += bytes as u64;
+    }
+
+    /// Where the next event's bytes start in the output: the bytes of the events seen so far.
+    pub(super) fn at(&self) -> usize {
+        self.at
+    }
+
+    /// Whether the output showed nothing: no text, no call begun, and no malformed run (whose
+    /// text is content); only dropped bytes, or none at all.
+    pub(super) fn is_empty(&self) -> bool {
+        self.shown == 0 && self.calls_begun == 0 && self.malformed() == 0
+    }
+
+    /// `bytes` the table dropped were released as content at the end of the output: whitespace
+    /// of an empty output, or the slice of one that answered with nothing but refused call
+    /// blocks, from the first block's opener to the last refused byte.
+    pub(super) fn released(&mut self, bytes: usize) {
+        self.released += bytes as u64;
     }
 
     /// The first malformed run, for the reader's tests.
@@ -249,15 +459,28 @@ impl Tally {
         self.first.as_ref()
     }
 
-    /// Malformed runs seen.
-    fn malformed(&self) -> u32 {
-        self.reasons.iter().sum()
+    /// Malformed runs by reason, in the order of [`REASONS`]: none for a clean output.
+    fn reasons(&self) -> &[u32] {
+        self.reasons.as_deref().map_or(&[], |reasons| &reasons[..])
     }
 
-    /// The distinct reason labels seen, in a fixed order, joined with a comma.
+    /// Malformed runs seen.
+    fn malformed(&self) -> u32 {
+        self.reasons().iter().sum()
+    }
+
+    /// The calls to functions the request did not declare among them (`unknown_tool`).
+    fn undeclared_calls(&self) -> u32 {
+        self.reasons()
+            .get(UNKNOWN_TOOL_REASON)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// The distinct reason labels seen, in the order of [`REASONS`], joined with a comma.
     fn reasons_seen(&self) -> String {
         let mut seen = String::new();
-        for (count, label) in self.reasons.iter().zip(REASONS) {
+        for (count, label) in self.reasons().iter().zip(REASONS) {
             if *count > 0 {
                 if !seen.is_empty() {
                     seen.push(',');
@@ -268,33 +491,106 @@ impl Tally {
         seen
     }
 
+    /// Writes the line of an output counted `unknown_tool`, when the table's bucket for those
+    /// lines allows one: the first undeclared function's name, cut to [`NAME_SHOWN`] bytes with
+    /// its whole length beside it, where its call starts, and how many such calls the output
+    /// made.
+    fn write_unknown_tool(
+        &self,
+        series: &Series,
+        table: &'static str,
+        who: Who<'_>,
+        undeclared: u32,
+    ) {
+        let Some(suppressed_lines) = series.unknown_tool_lines.allow() else {
+            return;
+        };
+        let (tool, tool_bytes, at) = match &self.undeclared {
+            Some(call) => (&*call.name, call.bytes, call.at),
+            None => ("", 0, 0),
+        };
+        warn!(
+            target: "smg::symphony",
+            request_id = who.request_id,
+            choice = who.choice,
+            model = who.model,
+            table,
+            outcome = OUTCOMES[UNKNOWN_TOOL],
+            finish = self.finish,
+            undeclared_calls = undeclared,
+            tool,
+            tool_bytes,
+            at,
+            tool_calls = self.tool_calls,
+            suppressed_calls = self.suppressed_calls,
+            suppressed_lines,
+            "Symphony read a call to a function the request did not declare; the call went out as the model named it"
+        );
+    }
+
     /// Records the output under `table`, read to its end: the counters, and the line when the
-    /// output has a malformed run and the table's bucket allows one. Suppressed calls are counted
-    /// and not written: the request asked for them to be dropped.
+    /// output has a malformed run, a call to a function the request did not declare, or showed
+    /// nothing ([`Self::is_empty`]), and the table's bucket for that kind of line allows one (the
+    /// empty lines and the undeclared-call lines have buckets of their own, so a flow of either
+    /// suppresses no malformed line). An output whose malformed runs are all such calls is
+    /// counted `unknown_tool`, not `malformed`: the table read it whole. Suppressed calls are
+    /// counted and not written: the request asked for them to be dropped.
     pub(crate) fn report(&self, table: &'static str, who: Who<'_>) {
         let series = series(table);
         let malformed = self.malformed();
-        let outcome = if malformed > 0 {
+        let undeclared = self.undeclared_calls();
+        let empty = self.is_empty();
+        let outcome = if malformed > undeclared {
             MALFORMED_OUTCOME
+        } else if undeclared > 0 {
+            UNKNOWN_TOOL
+        } else if empty {
+            EMPTY
         } else {
             CLEAN
         };
         increment(&series.outputs[outcome], 1);
+        if empty {
+            let Some(suppressed_lines) = series.empty_lines.allow() else {
+                return;
+            };
+            warn!(
+                target: "smg::symphony",
+                request_id = who.request_id,
+                choice = who.choice,
+                model = who.model,
+                table,
+                outcome = OUTCOMES[EMPTY],
+                finish = self.finish,
+                bytes = self.at,
+                whitespace_bytes = self.dropped_space,
+                wrapper_bytes = self.dropped_wrapping,
+                dropped_tokens = self.dropped_tokens,
+                released_bytes = self.released,
+                suppressed_lines,
+                "Symphony read an output with no text, reasoning or call: whitespace and framing alone, or nothing"
+            );
+            return;
+        }
         if malformed == 0 && self.suppressed_calls == 0 {
             return;
         }
-        for (count, key) in self.reasons.iter().zip(&series.malformed) {
+        for (count, key) in self.reasons().iter().zip(&series.malformed) {
             if *count > 0 {
                 increment(key, u64::from(*count));
             }
         }
-        if malformed > 0 {
+        if outcome == MALFORMED_OUTCOME {
             observe(&series.malformed_bytes, self.malformed_bytes as f64);
         }
         if self.suppressed_calls > 0 {
             increment(&series.calls_suppressed, u64::from(self.suppressed_calls));
         }
         if malformed == 0 {
+            return;
+        }
+        if outcome == UNKNOWN_TOOL {
+            self.write_unknown_tool(series, table, who, undeclared);
             return;
         }
         let Some(suppressed_lines) = series.sampler.allow() else {
@@ -321,6 +617,7 @@ impl Tally {
             reasons = %self.reasons_seen(),
             tool_calls = self.tool_calls,
             suppressed_calls = self.suppressed_calls,
+            released_bytes = self.released,
             suppressed_lines,
             "Symphony did not read the whole output as content, reasoning and calls"
         );
@@ -361,15 +658,24 @@ fn observe(key: &Key, value: f64) {
 /// The keys of one table's series, built once, and the bucket for its lines.
 struct Series {
     /// [`OUTPUTS`] by outcome, in the order of [`OUTCOMES`].
-    outputs: [Key; 3],
+    outputs: [Key; OUTCOMES.len()],
     /// [`MALFORMED`] by reason, in the order of [`REASONS`].
-    malformed: [Key; 5],
+    malformed: [Key; REASONS.len()],
     malformed_bytes: Key,
     calls_suppressed: Key,
     /// [`FALLBACK`] by reason, in the order of [`FALLBACK_REASONS`]: the series of the table
     /// that had no tag for a forced call, or of `none`, under which the other reasons count.
     fallback: [Key; 5],
+    /// The bucket of the lines on malformed outputs.
     sampler: Sampler,
+    /// The bucket of the lines on empty outputs: their own, so a steady flow of empty outputs (a
+    /// probe with `max_tokens: 1`, a keepalive that finishes with no token) suppresses no
+    /// malformed line and counts on none.
+    empty_lines: Sampler,
+    /// The bucket of the lines on outputs with a call to a function the request did not declare:
+    /// their own, so a model that names its functions freely suppresses no malformed line and
+    /// counts on none.
+    unknown_tool_lines: Sampler,
 }
 
 impl Series {
@@ -390,6 +696,8 @@ impl Series {
             calls_suppressed: key(CALLS_SUPPRESSED, &[]),
             fallback: FALLBACK_REASONS.map(|reason| key(FALLBACK, &[("reason", reason)])),
             sampler: Sampler::new(),
+            empty_lines: Sampler::new(),
+            unknown_tool_lines: Sampler::new(),
         }
     }
 }
@@ -489,10 +797,14 @@ mod tests {
     }
 
     fn call_start(index: u32, source: &str) -> Event<'static> {
+        call_named(index, "lookup", source)
+    }
+
+    fn call_named(index: u32, name: &str, source: &str) -> Event<'static> {
         Event::ToolCallStart {
             index,
             id: format!("call_{index}"),
-            name: "lookup".into(),
+            name: name.to_owned(),
             source: Text::uncounted(source.to_owned()),
         }
     }
@@ -549,7 +861,7 @@ mod tests {
         );
         assert_eq!(
             tally.reasons_seen(),
-            "unterminated_region,invalid_arguments,other"
+            "unterminated_region,invalid_arguments,call_without_name"
         );
         assert_eq!(tally.suppressed_calls, 0);
     }
@@ -578,7 +890,7 @@ mod tests {
         assert_eq!(
             tally.first,
             Some(FirstRun {
-                reason: "other",
+                reason: "tag_cut_short",
                 why: "a tag that another tag or the call's end cut short",
                 at: 2,
                 bytes: 18,
@@ -673,7 +985,7 @@ mod tests {
         assert_eq!(
             tally.first,
             Some(FirstRun {
-                reason: "other",
+                reason: "tag_out_of_place",
                 why: "a tag where the call's syntax has none",
                 at: "</think>At once:<tool_call>f".len(),
                 bytes: "</arg_key>".len(),
@@ -683,26 +995,75 @@ mod tests {
     }
 
     #[test]
-    fn the_first_run_of_another_reason_carries_its_sentence() {
+    fn the_first_run_of_a_syntax_reason_carries_its_own_label_and_sentence() {
         let mut tally = Tally::default();
         tally.see(
             &malformed("<|end|>", MalformedReason::NameWithoutACall),
             false,
         );
         let first = tally.first.as_ref().expect("a first run");
-        assert_eq!(first.reason, "other");
+        assert_eq!(first.reason, "name_without_a_call");
         assert_eq!(first.why, "a name without a call");
         assert_eq!(first.at, 0);
     }
 
     #[test]
+    fn every_reason_the_crate_names_has_a_label_of_its_own_spelled_as_the_crate_spells_it() {
+        // The crate's own list of its reasons (`MalformedReason::ALL`, written with the enum by
+        // one macro list) drives this: the label is the crate's serde spelling of the reason, so a
+        // line, a trace and the counter agree on the name; no two reasons share a label, none
+        // lands on `other`, and a reason added to the crate fails this test until it has a label.
+        let mut labels = std::collections::HashSet::new();
+        for (index, why) in MalformedReason::ALL.iter().copied().enumerate() {
+            let label = reason_label(why);
+            let spelled = serde_json::to_value(why).expect("a reason serializes");
+            assert_eq!(Some(label), spelled.as_str(), "{why:?}");
+            assert_eq!(reason_index(why), index, "{why:?}");
+            assert_ne!(label, "other", "{why:?}");
+            assert!(labels.insert(label), "{why:?} shares its label");
+        }
+        assert_eq!(labels.len() + 1, REASONS.len());
+        assert_eq!(REASONS[OTHER_REASON], "other");
+    }
+
+    #[test]
+    fn a_clean_tally_allocates_no_counters_and_a_botched_one_counts_each_reason_by_name() {
+        let mut tally = Tally::default();
+        tally.see(&Event::Content(Text::uncounted("Hi")), false);
+        tally.see(&finish(0), false);
+        assert!(tally.reasons.is_none());
+        assert_eq!(tally.malformed(), 0);
+        assert_eq!(tally.reasons_seen(), "");
+        let mut tally = Tally::default();
+        for event in [
+            malformed("", MalformedReason::TextWhereTheNameShouldBe),
+            malformed("", MalformedReason::TagOutOfPlace),
+            malformed("", MalformedReason::TextBetweenTags),
+            malformed("", MalformedReason::TagOutOfPlace),
+            malformed("", MalformedReason::CallWithoutName),
+            finish(0),
+        ] {
+            tally.see(&event, false);
+        }
+        assert_eq!(tally.malformed(), 5);
+        assert_eq!(
+            tally.reasons_seen(),
+            "text_between_tags,tag_out_of_place,call_without_name,text_where_the_name_should_be"
+        );
+        let reasons = tally.reasons();
+        assert_eq!(reasons[reason_index(MalformedReason::TagOutOfPlace)], 2);
+        assert_eq!(reasons[reason_index(MalformedReason::TextBetweenTags)], 1);
+    }
+
+    #[test]
     fn a_kind_said_again_inside_an_answer_counts_the_output_as_clean() {
         // Through the table whose messages say their kind after their opener, as a request
-        // without tools reads it: a JSON answer whose text marker the model wrote twice, and one
+        // without tools reads it: a JSON answer whose text marker the model wrote twice, one
         // with a second thought opened inside the answer's message, as an engine that starts the
-        // grammar after its own reasoning parser lets the model write them. The markers are
-        // framing, the second thought is reasoning, the JSON is the content, and the tally sees
-        // no malformed run: the output counts as clean, under no reason.
+        // grammar after its own reasoning parser lets the model write them, and one whose text
+        // marker the model wrote inside its thought. The markers are framing, the thoughts are
+        // reasoning, the JSON is the content, and the tally sees no malformed run: the output
+        // counts as clean, under no reason.
         use symphony::{formats::Table, Declared, Engine, EngineFinish, Events, Input, Parser};
         let json = "{\"city\": \"Oslo\"}";
         for output in [
@@ -715,6 +1076,7 @@ mod tests {
                  <|content_thinking|>more<|end_message|><|message_model|><|content_text|>{json}\
                  <|end_message|>"
             ),
+            format!("<|content_thinking|>plan<|content_text|>{json}<|end_message|>"),
         ] {
             let mut engine =
                 Engine::new(Table::Inkling.format().without_calls(), Declared::default());
@@ -1035,6 +1397,178 @@ mod tests {
         assert!(!logs_contain("req-dropped"));
     }
 
+    fn dropped(text: &str, tokens: u32, why: DropReason) -> Event<'static> {
+        Event::Dropped {
+            text: Text::new(text.to_owned(), tokens),
+            why,
+        }
+    }
+
+    fn finished(reason: FinishReason) -> Event<'static> {
+        Event::Finish {
+            reason,
+            tool_calls: 0,
+            reasoning_tokens: 0,
+        }
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn an_output_of_dropped_bytes_alone_is_empty_and_writes_one_line() {
+        let scrape = rendered(|| {
+            let mut tally = Tally::default();
+            tally.see(&dropped("</think>", 1, DropReason::Wrapper), false);
+            tally.see(&dropped("\n\n\n", 3, DropReason::Whitespace), false);
+            tally.see(&finished(FinishReason::Length), false);
+            tally.report(
+                "qwen3",
+                Who {
+                    request_id: "req-empty",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        let outputs = line_with(&scrape, OUTPUTS, &["table=\"qwen3\"", "outcome=\"empty\""])
+            .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        assert!(
+            line_with(&scrape, OUTPUTS, &["table=\"qwen3\"", "outcome=\"clean\""])
+                .is_none_or(|line| line.ends_with(" 0"))
+        );
+        assert!(!scrape.contains(MALFORMED), "{scrape}");
+        assert!(logs_contain(
+            "Symphony read an output with no text, reasoning or call: whitespace and framing alone, or nothing"
+        ));
+        assert!(logs_contain("req-empty"));
+        assert!(logs_contain("released_bytes=0"));
+        assert!(logs_contain("finish=\"length\""));
+        assert!(logs_contain("bytes=11"));
+        assert!(logs_contain("whitespace_bytes=3"));
+        assert!(logs_contain("wrapper_bytes=8"));
+        assert!(logs_contain("dropped_tokens=4"));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn an_output_of_no_bytes_is_empty_with_the_engines_finish() {
+        let scrape = rendered(|| {
+            let mut tally = Tally::default();
+            tally.see(&finished(FinishReason::Stop), false);
+            tally.report(
+                "qwen3",
+                Who {
+                    request_id: "req-nothing",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        let outputs = line_with(&scrape, OUTPUTS, &["table=\"qwen3\"", "outcome=\"empty\""])
+            .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        assert!(logs_contain("req-nothing"));
+        assert!(logs_contain("finish=\"stop\""));
+        assert!(logs_contain("bytes=0"));
+    }
+
+    /// The empty lines have a bucket of their own: a flow of empty outputs past the burst
+    /// suppresses no malformed line, whose `suppressed_lines` keeps counting malformed lines alone.
+    #[tracing_test::traced_test]
+    #[test]
+    fn empty_lines_take_from_a_bucket_of_their_own() {
+        let empties: u32 = 40;
+        rendered(|| {
+            for choice in 0..empties {
+                let mut tally = Tally::default();
+                tally.see(&finished(FinishReason::Stop), false);
+                tally.report(
+                    "olmo3",
+                    Who {
+                        request_id: "req-empty-flow",
+                        model: "m",
+                        choice,
+                    },
+                );
+            }
+            let mut tally = Tally::default();
+            tally.see(
+                &malformed("<tool_call>{", MalformedReason::UnterminatedRegion),
+                false,
+            );
+            tally.see(&finished(FinishReason::Stop), false);
+            tally.report(
+                "olmo3",
+                Who {
+                    request_id: "req-malformed-after-empties",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        logs_assert(|lines: &[&str]| {
+            let empty_lines = lines
+                .iter()
+                .filter(|line| line.contains("req-empty-flow"))
+                .count();
+            if empty_lines >= empties as usize {
+                return Err(format!(
+                    "no empty line was suppressed: {empty_lines} written"
+                ));
+            }
+            match lines
+                .iter()
+                .find(|line| line.contains("req-malformed-after-empties"))
+            {
+                Some(line) if line.contains("suppressed_lines=0") => Ok(()),
+                Some(line) => Err(format!(
+                    "the malformed line counts suppressed empty lines: {line}"
+                )),
+                None => Err("the empty flow suppressed the malformed line".to_string()),
+            }
+        });
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn whitespace_before_text_or_a_call_is_not_an_empty_output() {
+        let scrape = rendered(|| {
+            let mut text = Tally::default();
+            text.see(&dropped("\n", 1, DropReason::Whitespace), false);
+            text.see(&Event::Content(Text::new("Hi", 1)), false);
+            text.see(&finished(FinishReason::Stop), false);
+            text.report(
+                "qwen3",
+                Who {
+                    request_id: "req-text",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+            let mut call = Tally::default();
+            call.see(&dropped("\n", 1, DropReason::Whitespace), false);
+            call.see(&call_start(0, "<tool_call>"), false);
+            call.see(&finish(1), false);
+            call.report(
+                "qwen3",
+                Who {
+                    request_id: "req-call",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        let outputs = line_with(&scrape, OUTPUTS, &["table=\"qwen3\"", "outcome=\"clean\""])
+            .expect("the outputs counter");
+        assert!(outputs.ends_with(" 2"), "{outputs}");
+        assert!(
+            line_with(&scrape, OUTPUTS, &["table=\"qwen3\"", "outcome=\"empty\""])
+                .is_none_or(|line| line.ends_with(" 0"))
+        );
+        assert!(!logs_contain("req-text"));
+        assert!(!logs_contain("req-call"));
+    }
+
     #[test]
     fn a_request_the_legacy_parsers_read_is_counted_by_reason_under_the_table_or_none() {
         let scrape = rendered(|| {
@@ -1088,5 +1622,269 @@ mod tests {
         assert!(!std::ptr::eq(series(NO_TABLE), series(OTHER_TABLE)));
         assert!(!std::ptr::eq(series(NO_TABLE), series(TEMPLATE)));
         assert_eq!(series(NO_TABLE).fallback.len(), FALLBACK_REASONS.len());
+    }
+
+    /// The events of a call to `name`, as the engine gives them for a function the request did
+    /// not declare: its event of no bytes, then the call's start.
+    fn undeclared_call(index: u32, name: &str) -> [Event<'static>; 2] {
+        [
+            malformed("", MalformedReason::UnknownTool),
+            call_named(index, name, &format!("<tool_call>{name}")),
+        ]
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_call_to_an_undeclared_function_is_an_outcome_of_its_own_and_the_line_names_it() {
+        assert_eq!(REASONS[UNKNOWN_TOOL_REASON], "unknown_tool");
+        assert_eq!(
+            reason_index(MalformedReason::UnknownTool),
+            UNKNOWN_TOOL_REASON
+        );
+        assert_eq!(OUTCOMES[UNKNOWN_TOOL], "unknown_tool");
+        let scrape = rendered(|| {
+            let mut tally = Tally::default();
+            tally.see(&Event::Content(Text::uncounted("Sure.")), false);
+            for event in undeclared_call(0, "math_pow") {
+                tally.see(&event, false);
+            }
+            tally.see(&finish(1), false);
+            tally.report(
+                "qwen3",
+                Who {
+                    request_id: "req-undeclared",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        let outputs = line_with(
+            &scrape,
+            OUTPUTS,
+            &["table=\"qwen3\"", "outcome=\"unknown_tool\""],
+        )
+        .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        assert!(
+            line_with(
+                &scrape,
+                OUTPUTS,
+                &["table=\"qwen3\"", "outcome=\"malformed\""]
+            )
+            .is_none(),
+            "{scrape}"
+        );
+        let runs = line_with(
+            &scrape,
+            MALFORMED,
+            &["table=\"qwen3\"", "reason=\"unknown_tool\""],
+        )
+        .expect("the reason counter");
+        assert!(runs.ends_with(" 1"), "{runs}");
+        assert!(
+            !scrape.contains(MALFORMED_BYTES),
+            "no refused bytes to observe: {scrape}"
+        );
+        assert!(logs_contain(
+            "Symphony read a call to a function the request did not declare; the call went out as the model named it"
+        ));
+        assert!(logs_contain("outcome=\"unknown_tool\""));
+        assert!(logs_contain("table=\"qwen3\""));
+        assert!(logs_contain("tool=\"math_pow\""));
+        assert!(logs_contain("tool_bytes=8"));
+        assert!(logs_contain("undeclared_calls=1"));
+        assert!(logs_contain("at=5"));
+        assert!(logs_contain("tool_calls=1"));
+        assert!(logs_contain("request_id=\"req-undeclared\""));
+        assert!(!logs_contain("did not read the whole output"));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn every_undeclared_call_is_a_run_and_the_output_counts_once_under_the_first_name() {
+        let scrape = rendered(|| {
+            let mut tally = Tally::default();
+            for event in undeclared_call(0, "lookup_v2") {
+                tally.see(&event, false);
+            }
+            tally.see(&call_start(1, "<tool_call>lookup"), false);
+            for event in undeclared_call(2, "look_up") {
+                tally.see(&event, false);
+            }
+            tally.see(&finish(3), false);
+            tally.report(
+                "glm",
+                Who {
+                    request_id: "req-undeclared-twice",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        let outputs = line_with(
+            &scrape,
+            OUTPUTS,
+            &["table=\"glm\"", "outcome=\"unknown_tool\""],
+        )
+        .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        let runs = line_with(
+            &scrape,
+            MALFORMED,
+            &["table=\"glm\"", "reason=\"unknown_tool\""],
+        )
+        .expect("the reason counter");
+        assert!(runs.ends_with(" 2"), "{runs}");
+        assert!(logs_contain("undeclared_calls=2"));
+        assert!(logs_contain("tool=\"lookup_v2\""));
+        assert!(!logs_contain("tool=\"look_up\""));
+        assert!(logs_contain("tool_calls=3"));
+        assert!(logs_contain("at=0"));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn an_undeclared_call_beside_a_refused_run_leaves_the_output_malformed() {
+        let scrape = rendered(|| {
+            let mut tally = Tally::default();
+            for event in undeclared_call(0, "lookup_v2") {
+                tally.see(&event, false);
+            }
+            tally.see(
+                &malformed("<tool_call>{", MalformedReason::UnterminatedRegion),
+                false,
+            );
+            tally.see(&finish(1), false);
+            tally.report(
+                "qwen3",
+                Who {
+                    request_id: "req-undeclared-and-refused",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        let outputs = line_with(
+            &scrape,
+            OUTPUTS,
+            &["table=\"qwen3\"", "outcome=\"malformed\""],
+        )
+        .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        assert!(
+            line_with(
+                &scrape,
+                OUTPUTS,
+                &["table=\"qwen3\"", "outcome=\"unknown_tool\""]
+            )
+            .is_none(),
+            "{scrape}"
+        );
+        for reason in ["unknown_tool", "unterminated_region"] {
+            let runs = line_with(
+                &scrape,
+                MALFORMED,
+                &["table=\"qwen3\"", &format!("reason=\"{reason}\"")],
+            )
+            .expect("the reason counter");
+            assert!(runs.ends_with(" 1"), "{runs}");
+        }
+        let count = line_with(&scrape, &format!("{MALFORMED_BYTES}_count"), &[])
+            .expect("the refused bytes observed");
+        assert!(count.ends_with(" 1"), "{count}");
+        assert!(logs_contain(
+            "Symphony did not read the whole output as content, reasoning and calls"
+        ));
+        // The line's first run is the refused one, after the undeclared call's 20 bytes; the
+        // event of no bytes before that call is not a run the line locates.
+        assert!(logs_contain("reason=\"unterminated_region\""));
+        assert!(logs_contain("at=20 bytes=12"));
+        assert!(!logs_contain("reason=\"unknown_tool\""));
+        assert!(logs_contain("reasons=unterminated_region,unknown_tool"));
+        assert!(!logs_contain(
+            "Symphony read a call to a function the request did not declare"
+        ));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_long_undeclared_name_is_cut_on_the_line_with_its_whole_length_beside_it() {
+        // Forty two-byte characters: the cut falls on a character boundary, below the bound.
+        let name = "ü".repeat(40);
+        rendered(|| {
+            let mut tally = Tally::default();
+            for event in undeclared_call(0, &name) {
+                tally.see(&event, false);
+            }
+            tally.see(&finish(1), false);
+            tally.report(
+                "qwen3",
+                Who {
+                    request_id: "req-undeclared-long",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        assert!(logs_contain(&format!("tool=\"{}\"", "ü".repeat(32))));
+        assert!(logs_contain("tool_bytes=80"));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn unknown_tool_lines_take_from_a_bucket_of_their_own() {
+        let flow: u32 = 40;
+        rendered(|| {
+            for choice in 0..flow {
+                let mut tally = Tally::default();
+                for event in undeclared_call(0, "lookup_v2") {
+                    tally.see(&event, false);
+                }
+                tally.see(&finish(1), false);
+                tally.report(
+                    "hy4",
+                    Who {
+                        request_id: "req-undeclared-flow",
+                        model: "m",
+                        choice,
+                    },
+                );
+            }
+            let mut tally = Tally::default();
+            tally.see(
+                &malformed("<tool_call>{", MalformedReason::UnterminatedRegion),
+                false,
+            );
+            tally.see(&finished(FinishReason::Stop), false);
+            tally.report(
+                "hy4",
+                Who {
+                    request_id: "req-malformed-after-undeclared",
+                    model: "m",
+                    choice: 0,
+                },
+            );
+        });
+        logs_assert(|lines: &[&str]| {
+            let written = lines
+                .iter()
+                .filter(|line| line.contains("req-undeclared-flow"))
+                .count();
+            if written >= flow as usize {
+                return Err(format!(
+                    "no undeclared-call line was suppressed: {written} written"
+                ));
+            }
+            match lines
+                .iter()
+                .find(|line| line.contains("req-malformed-after-undeclared"))
+            {
+                Some(line) if line.contains("suppressed_lines=0") => Ok(()),
+                Some(line) => Err(format!(
+                    "the malformed line counts suppressed undeclared-call lines: {line}"
+                )),
+                None => Err("the undeclared-call flow suppressed the malformed line".to_string()),
+            }
+        });
     }
 }

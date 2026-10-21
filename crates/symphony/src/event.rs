@@ -108,122 +108,110 @@ pub enum DropReason {
     MalformedCall,
 }
 
-/// Why a region could not be parsed. Its text is returned, never lost: with the event, or, for a
-/// call syntax whose block is never prose, as `Dropped { MalformedCall }` beside an event of no
-/// bytes, right after it, or right before it and the call's end where a cut ended the call
-/// ([`DropReason::MalformedCall`]).
-///
-/// The set is closed: every reason a parser gives is one of these, so a reader can count them
-/// and a client can match on them; a new reason is a new variant. [`Display`](std::fmt::Display)
-/// writes the sentence a log or a report shows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-#[non_exhaustive]
-pub enum MalformedReason {
+/// The reasons, each with its doc and the sentence a log or a report shows: one list defines the
+/// enum, [`MalformedReason::ALL`] and [`MalformedReason::sentence`], so a reason added here is in
+/// all three at once.
+macro_rules! malformed_reasons {
+    ($($(#[$doc:meta])* $name:ident => $sentence:literal,)*) => {
+        /// Why a region could not be parsed. Its text is returned, never lost: with the event, or,
+        /// for a call syntax whose block is never prose, as `Dropped { MalformedCall }` beside an
+        /// event of no bytes, right after it, or right before it and the call's end where a cut
+        /// ended the call ([`DropReason::MalformedCall`]).
+        ///
+        /// The set is closed: every reason a parser gives is one of these, so a reader can count
+        /// them and a client can match on them; a new reason is a new variant.
+        /// [`Display`](std::fmt::Display) writes the sentence a log or a report shows.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        #[non_exhaustive]
+        pub enum MalformedReason {
+            $($(#[$doc])* $name,)*
+        }
+
+        impl MalformedReason {
+            /// Every reason, in the enum's order: what a reader that labels or counts the reasons
+            /// iterates. The list, the enum and the sentences come from one definition, so a reason
+            /// added to the crate is in all three at once (the enum is non-exhaustive outside the
+            /// crate).
+            pub const ALL: &'static [Self] = &[$(Self::$name,)*];
+
+            /// The sentence a log or a report shows for the reason.
+            pub fn sentence(self) -> &'static str {
+                match self {
+                    $(Self::$name => $sentence,)*
+                }
+            }
+        }
+    };
+}
+
+malformed_reasons! {
     /// The stream ended inside a region that never closed.
-    UnterminatedRegion,
+    UnterminatedRegion => "the stream ended inside a region that never closed",
     /// Tool-call arguments did not parse under the format's argument syntax. From a JSON syntax
     /// the event carries no bytes and stands where the arguments stopped being JSON; the call's
     /// fragments carry every byte the model wrote.
-    InvalidArguments,
+    InvalidArguments => "arguments that did not parse under the call's syntax",
     /// A tool call named a function the request did not declare. The engine's own event, for
     /// every syntax: it stands right before the call's start and carries no bytes, the call goes
     /// out as the syntax read it, and a request that declares no tools is not asked.
-    UnknownTool,
+    UnknownTool => "a call to a function the request did not declare",
     /// Text where the call's syntax has only tags: between a tag and the next, outside a value.
-    TextBetweenTags,
+    TextBetweenTags => "text between a call's tags",
     /// A tag of the syntax where it has no place: a value's close with no value open, a
     /// parameter tag before the function's.
-    TagOutOfPlace,
+    TagOutOfPlace => "a tag where the call's syntax has none",
     /// A tag another tag, or the call's end, cut short before it closed.
-    TagCutShort,
+    TagCutShort => "a tag that another tag or the call's end cut short",
     /// Text between a tag's name and its close, where the syntax has none.
-    TagTail,
+    TagTail => "text after a tag's name",
     /// A tag with no name between its opener and its close.
-    EmptyName,
+    EmptyName => "a tag without a name",
     /// A call (an object, a block, an invoke) that names no function.
-    CallWithoutName,
+    CallWithoutName => "a call without a name",
     /// A call region with no function tag in it.
-    CallWithoutFunctionTag,
+    CallWithoutFunctionTag => "a tool call without a function tag",
     /// A second function tag inside a call that has one.
-    SecondFunctionTag,
+    SecondFunctionTag => "a second function tag inside a call",
     /// A call that closed before its name's tag closed.
-    ClosedBeforeTheName,
+    ClosedBeforeTheName => "a call that closed before its name closed",
     /// Text where the call's name should be: a name holds no whitespace, quote or bracket.
-    TextWhereTheNameShouldBe,
+    TextWhereTheNameShouldBe => "text where the call's name should be",
     /// Text where the syntax has a call or nothing: between a block's or a list's calls, or
     /// where a call should begin.
-    TextBetweenCalls,
+    TextBetweenCalls => "text between calls",
     /// Text where an argument should begin.
-    TextWhereAnArgumentShouldBegin,
+    TextWhereAnArgumentShouldBegin => "text where an argument should begin",
     /// Text where the list of calls should be.
-    TextInPlaceOfTheList,
+    TextInPlaceOfTheList => "text where the list of calls should be",
     /// Text after a call's arguments and before the terminal that closes the call.
-    TextAfterTheArguments,
+    TextAfterTheArguments => "text after a call's arguments",
     /// Text after the list of calls closed.
-    TextAfterTheList,
+    TextAfterTheList => "text after the list's end",
     /// A call that names a function and writes no arguments.
-    NameWithoutArguments,
+    NameWithoutArguments => "a call that names a tool and writes no arguments",
     /// A name with no call after it: a message that names a tool and writes none, a Python
     /// name without its parenthesis.
-    NameWithoutACall,
+    NameWithoutACall => "a name without a call",
     /// A parameter whose key the call already wrote.
-    KeyWrittenTwice,
+    KeyWrittenTwice => "a parameter whose key the call already wrote",
     /// A key with no value after it.
-    KeyWithoutAValue,
+    KeyWithoutAValue => "a key without a value",
     /// A key the call's end cut short.
-    KeyCutShort,
+    KeyCutShort => "a key the call's end cut short",
     /// A value the call's end cut short.
-    ValueCutShort,
+    ValueCutShort => "a value the call's end cut short",
     /// A key with no text.
-    EmptyKey,
+    EmptyKey => "a key with no text",
     /// A tool-call block that closed without a complete call in it.
-    BlockWithoutACompleteCall,
+    BlockWithoutACompleteCall => "a tool-call block that closed without a complete call",
     /// Arguments with no forced function to name them.
-    NoForcedFunction,
+    NoForcedFunction => "arguments with no forced function to name them",
     /// A marker of the table in a content state no row leads out of on it, kept as that state's
     /// text where the model put it (an answer's opener written again inside the answer, a close
     /// with nothing open). The event carries no bytes and stands before the marker's text: a frame
     /// the table did not read is counted without a byte moving.
-    MarkerOutOfPlace,
-}
-
-impl MalformedReason {
-    /// The sentence a log or a report shows for the reason.
-    pub fn sentence(self) -> &'static str {
-        match self {
-            Self::UnterminatedRegion => "the stream ended inside a region that never closed",
-            Self::InvalidArguments => "arguments that did not parse under the call's syntax",
-            Self::UnknownTool => "a call to a function the request did not declare",
-            Self::TextBetweenTags => "text between a call's tags",
-            Self::TagOutOfPlace => "a tag where the call's syntax has none",
-            Self::TagCutShort => "a tag that another tag or the call's end cut short",
-            Self::TagTail => "text after a tag's name",
-            Self::EmptyName => "a tag without a name",
-            Self::CallWithoutName => "a call without a name",
-            Self::CallWithoutFunctionTag => "a tool call without a function tag",
-            Self::SecondFunctionTag => "a second function tag inside a call",
-            Self::ClosedBeforeTheName => "a call that closed before its name closed",
-            Self::TextWhereTheNameShouldBe => "text where the call's name should be",
-            Self::TextBetweenCalls => "text between calls",
-            Self::TextWhereAnArgumentShouldBegin => "text where an argument should begin",
-            Self::TextInPlaceOfTheList => "text where the list of calls should be",
-            Self::TextAfterTheArguments => "text after a call's arguments",
-            Self::TextAfterTheList => "text after the list's end",
-            Self::NameWithoutArguments => "a call that names a tool and writes no arguments",
-            Self::NameWithoutACall => "a name without a call",
-            Self::KeyWrittenTwice => "a parameter whose key the call already wrote",
-            Self::KeyWithoutAValue => "a key without a value",
-            Self::KeyCutShort => "a key the call's end cut short",
-            Self::ValueCutShort => "a value the call's end cut short",
-            Self::EmptyKey => "a key with no text",
-            Self::BlockWithoutACompleteCall => {
-                "a tool-call block that closed without a complete call"
-            }
-            Self::NoForcedFunction => "arguments with no forced function to name them",
-            Self::MarkerOutOfPlace => "a marker of the table where no row leads, kept as text",
-        }
-    }
+    MarkerOutOfPlace => "a marker of the table where no row leads, kept as text",
 }
 
 impl std::fmt::Display for MalformedReason {
@@ -562,6 +550,29 @@ pub fn first_call_only(events: &mut [Event]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_reason_is_in_all_once_with_its_own_sentence_and_name() {
+        // One definition writes the enum, `ALL` and the sentences, so the list cannot drift from
+        // the enum; what is checked is the list itself: each reason once, a sentence of its own
+        // (non-empty and shared with no other reason, so a sampled line names one reason), and a
+        // serde name that reads back to it.
+        let mut seen = std::collections::HashSet::new();
+        let mut sentences = std::collections::HashSet::new();
+        for why in MalformedReason::ALL.iter().copied() {
+            assert!(seen.insert(why), "{why:?} is listed twice");
+            assert!(!why.sentence().is_empty(), "{why:?}");
+            assert!(
+                sentences.insert(why.sentence()),
+                "{why:?} shares its sentence with another reason"
+            );
+            let name = serde_json::to_value(why).expect("a reason serializes");
+            let back: MalformedReason =
+                serde_json::from_value(name.clone()).expect("the name reads back");
+            assert_eq!(back, why, "{name}");
+        }
+        assert_eq!(seen.len(), MalformedReason::ALL.len());
+    }
 
     #[test]
     fn reasoning_text_tokens_sum_the_reasoning_texts_alone() {

@@ -35,8 +35,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from smg_grpc_servicer.constrained_decoding import (
+    grammar_backend_entry,
     grammar_start_labels,
     tokenspeed_constrained_decoding_start,
+    tokenspeed_grammar_backend,
 )
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 
@@ -241,6 +243,11 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     # The engine's reasoning parser and where it starts a grammar on a thinking
     # prompt, as the Python servicer adds them.
     args_dict.update(grammar_start_labels(server_args, tokenspeed_constrained_decoding_start()))
+    # The grammar backend the scheduler runs, resolved (an unset flag is the
+    # checkpoint's default, which the engine may not have read yet): the Rust
+    # servicer refuses a constraint that backend cannot enforce before the
+    # scheduler, and judges nothing when the backend is not known.
+    grammar_backend_entry(args_dict, tokenspeed_grammar_backend(server_args))
     kv_events = resolve_kv_events_config(server_args)
     try:
         from tokenspeed.version import __version__ as tokenspeed_version

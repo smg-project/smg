@@ -129,10 +129,26 @@ Policy this adapter sets, where the events say more than the Messages API can:
 - `Malformed` text is content, as in `chat`: the model wrote it, and the client sees it rather
   than losing it.
 - A call whose argument fragments are not a whole JSON value, because the output was cut or the
-  model wrote something else, has `{}` as its `input`: `input` must be a JSON value, and the
-  fragments are not one. Chat carries the fragments as a string and Responses marks the call
-  `incomplete`; here `max_tokens` is all a client learns, with the parser's `Malformed` word. A
-  call the model closed without arguments has `{}` too.
+  model wrote something else after a prefix a strict reader accepts, has as its `input` the value
+  the prefix's complete members make: the fragments up to where they stop being JSON, cut back to
+  the last member complete at every level (a string, a number or a word cut at the end leaves with
+  the key or the comma before it; a number or a word whole as it stands stays) and closed
+  (`json::Prefix::closed`); `{}` where nothing of them is complete, and for a call the model
+  closed without arguments. `input` must be a JSON value, and the fragments are not one; this is
+  the value a client's partial JSON reader ends with from the stream's `input_json_delta`s (a
+  reader that keeps complete members only, as the Python SDK's partial mode does, ends with exactly
+  this), so the whole message and the stream agree on the call. The crate's partial parser
+  (`json::PartialJson`) is not used for it: it reads `null`, `0` or a literal for a value cut short,
+  which would hand a tool arguments the model never wrote. Chat carries the fragments as a string
+  and Responses marks the call `incomplete`; here `max_tokens`, or the parser's `Malformed` word,
+  says the arguments were not whole. Where the arguments stopped being JSON right after a value
+  (`"end_range": 2.0 * Math.PI`), the member the break interrupted keeps the value the prefix had
+  (`2.0`) and the members after the break are not there (`"frequency": 5`): that is what the
+  stream's client has, since the stream cannot take back the bytes it sent, and the whole message
+  says the same rather than a different wrong value. The parser's `Malformed { InvalidArguments }`
+  event at the break is the driver's signal on both paths (the gateway counts it under
+  `invalid_arguments`), where `{}` was none: a tool whose parameters are all optional ran with
+  none of the arguments the model wrote.
 - A call whose argument fragments are one whole JSON text that no `input` value holds has `{}` as
   its `input` as well, and the parser said no word, since the text is JSON by its syntax:
   `Output::refused` names the call with the reader's reason, so that the driver decides what the
@@ -147,8 +163,8 @@ Policy this adapter sets, where the events say more than the Messages API can:
   `Malformed { InvalidArguments }` event of no bytes): from there the call's fragments go nowhere,
   since a client's partial JSON reader takes a prefix cut short, not a token that is no JSON. The
   streamed `input` is therefore the prefix the readers accepted, which such a reader closes into
-  an object, where the fold gives the call `{}`: the two differ for this call, as they do for the
-  blocks' order and the whitespace between them.
+  the value its complete members make, the fold's `input` for the call (the bullet above): the
+  stream and the fold agree on it.
 - Argument fragments for a call that never started cannot occur under the `Event` contract;
   should one arrive, its text joins the content so that no byte is lost. In the stream the same
   goes for a fragment whose call has no open `tool_use` block because other text, or another

@@ -1102,8 +1102,9 @@ async fn spec_decode_counts_reach_the_complete() {
 }
 
 /// The grammar backend on every structured request is the engine's
-/// configured one (`auto` settles on xgrammar as vLLM's frontend does), not
-/// a per-constraint guess: the engine pins one backend at first use.
+/// configured one (`auto` settles on xgrammar, the backend structural tags
+/// compile on), not a per-constraint guess: the engine pins one backend at
+/// first use.
 #[tokio::test]
 async fn structured_output_backend_follows_the_launcher_config() {
     use vllm::sampling_params::Constraint;
@@ -1134,10 +1135,10 @@ async fn structured_output_backend_follows_the_launcher_config() {
         h.server.stop(Duration::from_secs(5)).expect("clean stop");
     }
 
-    // `auto` resolves per constraint as vLLM's frontend does: a Lark grammar
-    // goes to xgrammar unchanged (vLLM 0.30 parses Lark there), a schema with
-    // a feature xgrammar lacks goes to guidance, and a choice is lowered to
-    // the grammar xgrammar compiles. The streams stay open so no abort
+    // `auto` is xgrammar for every constraint: a Lark grammar goes there
+    // unchanged (vLLM 0.30 parses Lark there) and a choice is lowered to the
+    // grammar xgrammar compiles; a schema with a feature xgrammar lacks is
+    // refused before the engine (below). The streams stay open so no abort
     // interleaves with the engine's inbound requests.
     let mut h = harness(model_info(), None).await;
     let lark = "start: \"yes\" | \"no\"";
@@ -1148,14 +1149,6 @@ async fn structured_output_backend_follows_the_launcher_config() {
             Constraint::Grammar(lark.to_string()),
             StructuredOutputBackend::Xgrammar,
             StructuredOutputConstraint::Grammar(lark.to_string()),
-        ),
-        (
-            "so3",
-            Constraint::JsonSchema(r#"{"type":"integer","multipleOf":3}"#.to_string()),
-            StructuredOutputBackend::Guidance,
-            StructuredOutputConstraint::Json(
-                serde_json::json!({"type": "integer", "multipleOf": 3}),
-            ),
         ),
         (
             "so4",
@@ -1183,6 +1176,57 @@ async fn structured_output_backend_follows_the_launcher_config() {
         assert_eq!(structured.backend, expected_backend, "{id}");
         assert_eq!(structured.constraint, expected_constraint, "{id}");
     }
+    // A schema with a feature xgrammar lacks is refused under `auto` before it
+    // reaches the engine, as vLLM's frontend refuses it under
+    // `backend=xgrammar`: xgrammar would compile it with the keyword dropped
+    // and the engine would answer off the schema.
+    let mut request = generate_request("so3", true, Vec::new());
+    request.sampling_params.as_mut().unwrap().constraint = Some(Constraint::JsonSchema(
+        r#"{"type":"integer","multipleOf":3}"#.to_string(),
+    ));
+    let status = h.client.generate(request).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status.message().contains("`multipleOf` at its root"),
+        "{}",
+        status.message()
+    );
+    // The same keyword inside a forced call's structural tag (a parser with
+    // structural tags embeds each tool's parameters as a `json_schema`
+    // element) is refused under `auto` the same way, before the engine.
+    let mut request = generate_request("so5", true, Vec::new());
+    request.sampling_params.as_mut().unwrap().constraint = Some(Constraint::StructuralTag(
+        serde_json::json!({"format": {"type": "triggered_tags", "triggers": ["<tool_call>"],
+            "tags": [{"begin": "<tool_call>{\"name\": \"t\", \"arguments\": ",
+                      "content": {"type": "json_schema", "json_schema": {"type": "object",
+                          "properties": {"tags": {"type": "array", "items": {"type": "string"},
+                                                  "uniqueItems": true}}}},
+                      "end": "}</tool_call>"}],
+            "at_least_one": true}})
+        .to_string(),
+    ));
+    let status = h.client.generate(request).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert!(
+        status.message().contains(
+            "`uniqueItems` at `/format/tags/0/content/json_schema/properties/tags` (inside the \
+             tag that begins `<tool_call>{\"name\": \"t\", \"arguments\": `)"
+        ),
+        "{}",
+        status.message()
+    );
+    // Nothing refused reached the engine: its next request is the next one
+    // served.
+    let mut request = generate_request("so6", true, Vec::new());
+    request.sampling_params.as_mut().unwrap().constraint = Some(Constraint::JsonObject(true));
+    streams.push(
+        h.client
+            .generate(request)
+            .await
+            .expect("generate")
+            .into_inner(),
+    );
+    assert_eq!(recv_add(&mut h.engine_in).await.request_id, "so6");
     drop(streams);
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
@@ -1460,6 +1504,56 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
     }
     assert_eq!(relay.counts().served_from_history, 1);
     drop(stream);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Deferred requests survive the wire, adapter, gRPC poll and KV load record,
+/// remain rank-local, and disappear when the engine drains its queues.
+#[tokio::test]
+async fn remote_kv_waiting_load_is_reported_per_rank() {
+    let mut model = model_info();
+    model.data_parallel_size = 2;
+    let (mut h, _rank1_in, mut rank1_out) = two_rank_harness(model).await;
+    let source = LoadFromState(Arc::downgrade(&h.server.state));
+    for (runnable, deferred) in [(0_u64, 4_u64), (3, 4), (0, 0)] {
+        let expected_total = i32::try_from(runnable + deferred).unwrap();
+        let expected_record_total = u32::try_from(expected_total).unwrap();
+        rank1_out
+            .send_outputs(&EngineCoreOutputs::RequestBatch(RequestBatchOutputs {
+                engine_index: 1,
+                scheduler_stats: Some(Box::new(SchedulerStats {
+                    num_waiting_reqs: runnable,
+                    num_skipped_waiting_reqs: deferred,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        wait_until(|| {
+            h.server.state.engine().is_ok_and(|client| {
+                client
+                    .get_loads()
+                    .loads
+                    .iter()
+                    .any(|load| load.dp_rank == 1 && load.num_waiting_reqs == expected_total)
+            })
+        })
+        .await;
+        let loads = h
+            .client
+            .get_loads(vllm::GetLoadsRequest::default())
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(loads.loads.len(), 1);
+        let load = &loads.loads[0];
+        assert_eq!(load.dp_rank, 1);
+        assert_eq!(load.num_waiting_reqs, expected_total);
+        let record = kv_events::LoadSource::load(&source, Some(1)).unwrap();
+        assert_eq!(record.waiting_requests, expected_record_total);
+        assert!(kv_events::LoadSource::load(&source, Some(0)).is_none());
+    }
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
@@ -3699,4 +3793,55 @@ async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
         "a clean end after the completion, not a status"
     );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// Expanded media must be refused before normal engine admission; a PD leg
+/// still releases its remote prefill through the abort-only notice.
+#[tokio::test]
+async fn expanded_context_rejection_preserves_pd_cleanup() {
+    for remote_prefill in [false, true] {
+        let mut media = processed_media();
+        media.prompt_token_ids = vec![7; 1_049_692];
+        let processor = MockMediaProcessor::answering(Ok(media));
+        let mut h = harness_with(model_info(), None, Some(processor.clone())).await;
+        let mut request = media_request("oversized");
+        request.sampling_params.as_mut().unwrap().max_tokens = Some(16_384);
+        if remote_prefill {
+            request.kv_transfer_params_json =
+                Some(r#"{"do_remote_prefill":true,"remote_block_ids":[3]}"#.to_string());
+        }
+        let status = h
+            .client
+            .generate(request)
+            .await
+            .expect_err("expanded input refused");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(status.message().contains("1049692"));
+        assert!(status.message().contains("1048576"));
+        if remote_prefill {
+            let notice = recv_add(&mut h.engine_in).await;
+            assert_eq!(notice.request_id, "oversized");
+            assert!(notice.abort_immediately);
+            assert_eq!(notice.prompt_token_ids.as_deref(), Some(&[0][..]));
+            assert_eq!(
+                recv_abort(&mut h.engine_in).await,
+                vec!["oversized".to_string()]
+            );
+        }
+        assert_engine_idle(&mut h.engine_in).await;
+        assert!(h.server.engine_ready());
+        // Reusing the rejected id proves registration and media permits were
+        // released, and a healthy request can still reach the engine.
+        *processor.outcome.lock().unwrap() = Ok(processed_media());
+        let _stream = h
+            .client
+            .generate(media_request("oversized"))
+            .await
+            .expect("healthy request after refusal")
+            .into_inner();
+        let accepted = recv_add(&mut h.engine_in).await;
+        assert!(!accepted.abort_immediately);
+        assert_eq!(accepted.prompt_token_ids, Some(vec![7, 8, 9, 10]));
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
 }

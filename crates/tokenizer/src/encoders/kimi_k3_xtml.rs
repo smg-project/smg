@@ -41,6 +41,7 @@ use anyhow::{anyhow, Result};
 use serde_json::{Map, Value};
 
 use super::RendererProfile;
+pub(crate) use super::{join_segments, PromptSegment};
 use crate::{
     chat_template::{
         ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
@@ -50,7 +51,9 @@ use crate::{
 
 /// What this renderer answers around a render (see [`RendererProfile`]).
 pub(crate) const PROFILE: RendererProfile = RendererProfile {
-    // Content parts are rendered positionally, so the gateway passes them through.
+    // Content parts are rendered positionally, so the gateway passes them
+    // through in the request's order (a parts-format renderer: the
+    // multimodal spec's `MediaPartOrder` is not consulted).
     content_format: Some(ChatTemplateContentFormat::OpenAI),
     // No Jinja template; the native renderer defaults thinking ON (the
     // reference's `build_chat_segments(thinking=True)`).
@@ -89,38 +92,6 @@ const SEP_TOKEN: &str = "<|sep|>";
 const END_OF_MSG_TOKEN: &str = "<|end_of_msg|>";
 /// The gateway's per-image anchor (`KimiK3VisionSpec::placeholder_token`).
 const MEDIA_ANCHOR: &str = "<|media_pad|>";
-
-/// One piece of a rendered prompt, tagged with how special-token strings in
-/// it must be encoded: the reference's `EncodeSegment { text, allow_special }`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PromptSegment {
-    pub(crate) text: String,
-    /// `true`: special-token strings map to their control ids (structural
-    /// markers emitted by the renderer). `false`: ordinary BPE, so a literal
-    /// marker string inside message text stays text.
-    pub(crate) allow_special: bool,
-}
-
-impl PromptSegment {
-    pub(crate) fn control(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            allow_special: true,
-        }
-    }
-
-    pub(crate) fn text(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            allow_special: false,
-        }
-    }
-}
-
-/// The flat prompt string: segment texts concatenated in order.
-pub(crate) fn join_segments(segments: &[PromptSegment]) -> String {
-    segments.iter().map(|s| s.text.as_str()).collect()
-}
 
 /// A rendered prompt and the span of its response-channel opener.
 #[derive(Debug)]

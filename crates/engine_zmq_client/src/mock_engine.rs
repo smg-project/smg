@@ -90,6 +90,7 @@ pub fn default_ready_response() -> EngineCoreReadyResponse {
         kv_cache_max_concurrency: None,
         kv_events_config: None,
         cache_trace_epochs: Vec::new(),
+        positional_layouts: std::collections::BTreeMap::new(),
     }
 }
 
@@ -356,6 +357,29 @@ pub async fn connect_to_frontend(
 }
 
 impl MockEngineHandshake {
+    /// Dial the handshake endpoint again on a fresh socket with the same
+    /// identity, keeping the INIT already held: what a real engine's handshake
+    /// socket does by itself when the frontend binds again while the engine is
+    /// loading (libzmq reconnects a dialing socket transparently; this crate's
+    /// pure-Rust sockets do not, so the mock dials anew).
+    pub async fn redial(self, handshake_address: &str) -> Result<Self> {
+        let Self { identity, init, .. } = self;
+        wait_for_endpoint(handshake_address).await?;
+        let mut handshake_options = SocketOptions::default();
+        handshake_options.peer_identity(identity.clone());
+        let mut handshake = DealerSocket::with_options(handshake_options);
+        within(
+            "mock engine: dialing the handshake endpoint again",
+            handshake.connect(handshake_address),
+        )
+        .await??;
+        Ok(Self {
+            handshake,
+            identity,
+            init,
+        })
+    }
+
     /// Announce READY, then register on the input socket with `ready_response`
     /// and open the output PUSH socket.
     pub async fn ready(self, ready_response: EngineCoreReadyResponse) -> Result<MockEngine> {

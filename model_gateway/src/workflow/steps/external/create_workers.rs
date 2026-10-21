@@ -230,7 +230,7 @@ mod tests {
     /// worker but for the models: one build, one set of settings.
     #[test]
     fn the_worker_is_built_the_same_way_with_and_without_model_cards() {
-        let client = Arc::new(crate::http_client::client());
+        let client = Arc::new(crate::clients::http_client());
         let labels = HashMap::from([("tier".to_string(), "gold".to_string())]);
         let cards = [ModelCard::new("m1"), ModelCard::new("m2")];
         let wildcard = build_external_worker(parts(&[], &labels, &client));

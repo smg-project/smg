@@ -22,6 +22,7 @@ use tracing::warn;
 use crate::{
     fanout::fan_out_n,
     stream::{poll_mapped, MappedGenerateStream, StreamState},
+    structured_outputs::ConstraintRef,
 };
 
 /// Streaming generate output for one TokenSpeed sub-request, mapping each
@@ -52,6 +53,11 @@ impl TokenSpeedGenerateStream {
     /// The choice index this stream stamps on its responses.
     pub fn index(&self) -> u32 {
         self.index
+    }
+
+    /// The engine-side id of this choice's request.
+    pub fn request_id(&self) -> &str {
+        self.inner.request_id()
     }
 
     /// Whether the engine already finished this choice and its terminal
@@ -589,6 +595,19 @@ pub(crate) fn apply_tokenspeed_constraint(
     }
 }
 
+/// The request's constraint as the shared refusal reads it
+/// ([`crate::structured_outputs::refuse_unenforceable_constraint`]): the
+/// proto `constraint` one-of by kind, with its text.
+pub(crate) fn constraint_ref(sp: &tokenspeed_proto::SamplingParams) -> Option<ConstraintRef<'_>> {
+    use tokenspeed_proto::sampling_params::Constraint;
+    Some(match sp.constraint.as_ref()? {
+        Constraint::JsonSchema(schema) => ConstraintRef::JsonSchema(schema),
+        Constraint::Regex(regex) => ConstraintRef::Regex(regex),
+        Constraint::EbnfGrammar(grammar) => ConstraintRef::Ebnf(grammar),
+        Constraint::StructuralTag(tag) => ConstraintRef::StructuralTag(tag),
+    })
+}
+
 /// Normalize a TokenSpeed wire finish-reason string into the canonical set the
 /// gateway's response layer exact-matches (`stop`, `length`, `abort`, `error`) —
 /// the same set the vLLM path emits via [`finish_reason_str`]. TokenSpeed emits
@@ -712,6 +731,8 @@ mod tests {
                 .send_frames(vec![bytes::Bytes::from(encode_msgpack(&done).unwrap())])
                 .await
                 .unwrap();
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
 
         let req = tokenspeed_proto::GenerateRequest {
@@ -1275,6 +1296,8 @@ mod tests {
                 .send_frames(vec![bytes::Bytes::from(encode_msgpack(&done).unwrap())])
                 .await
                 .unwrap();
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
 
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams {

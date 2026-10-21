@@ -40,6 +40,8 @@ class _CapturingReq:
 def _make_servicer():
     servicer = TokenSpeedSchedulerServicer.__new__(TokenSpeedSchedulerServicer)
     servicer.server_args = SimpleNamespace(reasoning_parser=None)
+    # `_config` reads the engine's model config off `async_llm`.
+    servicer.async_llm = None
     return servicer
 
 

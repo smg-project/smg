@@ -267,26 +267,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template run keeps or drops the role",
     ),
     (
-        "deepseek-r1/render/tools-history-single-call",
-        "the gateway parses tool-call arguments into objects before rendering and the R1 template \
-         concatenates them as text, so the render fails (smg-project/smg#2783)",
-    ),
-    (
-        "deepseek-r1/render/tools-history-parallel-calls",
-        "the gateway parses tool-call arguments into objects before rendering and the R1 template \
-         concatenates them as text, so the render fails (smg-project/smg#2783)",
-    ),
-    (
-        "deepseek-r1/render/tools-history-results-reordered",
-        "the gateway parses tool-call arguments into objects before rendering and the R1 template \
-         concatenates them as text, so the render fails (smg-project/smg#2783)",
-    ),
-    (
-        "deepseek-r1/render/tools-history-content-and-call",
-        "the gateway parses tool-call arguments into objects before rendering and the R1 template \
-         concatenates them as text, so the render fails (smg-project/smg#2783)",
-    ),
-    (
         "qwen3-8b/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the engines do; \
          the Qwen3 template accepts an object (smg-project/bellwether#12, needs:simo)",
@@ -391,40 +371,10 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template run keeps or drops the role",
     ),
     (
-        "deepseek-v3-0324/render/hermes-func-calling-*",
-        "the gateway parses tool-call arguments into objects before rendering and this \
-         template concatenates them as text, so the render fails (smg-project/smg#2783)",
-    ),
-    (
-        "deepseek-v3-0324/render/hermes-glaive-func-calling-*",
-        "the gateway parses tool-call arguments into objects before rendering and this \
-         template concatenates them as text, so the render fails (smg-project/smg#2783)",
-    ),
-    (
         "deepseek-v3-0324/render/text-developer-role",
         "the gateway renders a developer message as a system message when the template has no \
          developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
          template run keeps or drops the role",
-    ),
-    (
-        "deepseek-v3-0324/render/tools-history-content-and-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "deepseek-v3-0324/render/tools-history-parallel-calls",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "deepseek-v3-0324/render/tools-history-results-reordered",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
-    ),
-    (
-        "deepseek-v3-0324/render/tools-history-single-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783)",
     ),
     (
         "deepseek-v3.1/render/bfcl-*",
@@ -434,17 +384,13 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     ),
     (
         "deepseek-v3.1/render/hermes-func-calling-*",
-        "the gateway parses tool-call arguments into objects before rendering and this \
-         template concatenates them as text, so the render fails (smg-project/smg#2783); and \
-         the checkpoint's template never reads the request's tools and the reference is \
+        "the checkpoint's template never reads the request's tools and the reference is \
          its own render; the gateway writes the family's tools block into the system prompt \
          as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
         "deepseek-v3.1/render/hermes-glaive-func-calling-*",
-        "the gateway parses tool-call arguments into objects before rendering and this \
-         template concatenates them as text, so the render fails (smg-project/smg#2783); and \
-         the checkpoint's template never reads the request's tools and the reference is \
+        "the checkpoint's template never reads the request's tools and the reference is \
          its own render; the gateway writes the family's tools block into the system prompt \
          as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
@@ -473,33 +419,25 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     ),
     (
         "deepseek-v3.1/render/tools-history-content-and-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783); and \
-         the checkpoint's template never reads the request's tools and the reference is \
+        "the checkpoint's template never reads the request's tools and the reference is \
          its own render; the gateway writes the family's tools block into the system prompt \
          as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
         "deepseek-v3.1/render/tools-history-parallel-calls",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783); and \
-         the checkpoint's template never reads the request's tools and the reference is \
+        "the checkpoint's template never reads the request's tools and the reference is \
          its own render; the gateway writes the family's tools block into the system prompt \
          as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
         "deepseek-v3.1/render/tools-history-results-reordered",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783); and \
-         the checkpoint's template never reads the request's tools and the reference is \
+        "the checkpoint's template never reads the request's tools and the reference is \
          its own render; the gateway writes the family's tools block into the system prompt \
          as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
         "deepseek-v3.1/render/tools-history-single-call",
-        "the gateway parses tool-call arguments into objects before rendering, which this \
-         template does not render as the reference does (smg-project/smg#2783); and \
-         the checkpoint's template never reads the request's tools and the reference is \
+        "the checkpoint's template never reads the request's tools and the reference is \
          its own render; the gateway writes the family's tools block into the system prompt \
          as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
@@ -510,17 +448,58 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
-        "deepseek-v4.1-flash/render/*",
-        "the gateway renders continue_final_message by popping the assistant turn and \
-         appending its text after the generation header, which does not reproduce this \
-         template's continued turn (smg-project/smg#2779); and the gateway's default \
-         reasoning effort for this family is not the template's own default \
-         (smg-project/smg-lab#33); and add_generation_prompt is not a field of SMG's chat \
-         request; the header is always appended (smg-project/smg#2780); and SMG's request \
-         schema types tool-call arguments as a string, as the API and the engines do; the \
-         template accepts an object (smg-project/bellwether#12); and the gateway parses \
-         tool-call arguments into objects before rendering, which this template does not \
-         render as the reference does (smg-project/smg#2783)",
+        "deepseek-v4.1-flash/render/hermes-func-calling-*",
+        "the checkpoint's own encoder, which this renderer follows and the engines port, \
+         parses a history call's `arguments` string into one DSML parameter per key; the \
+         checkpoint's Jinja template cannot read JSON text and writes the string whole as a \
+         single `arguments` parameter, so the reference is the template's own rendering of \
+         a call history, not the encoder's (the single-turn set under this prefix matches)",
+    ),
+    (
+        "deepseek-v4.1-flash/render/hermes-glaive-func-calling-*",
+        "the checkpoint's own encoder, which this renderer follows and the engines port, \
+         parses a history call's `arguments` string into one DSML parameter per key; the \
+         checkpoint's Jinja template cannot read JSON text and writes the string whole as a \
+         single `arguments` parameter, so the reference is the template's own rendering of \
+         a call history, not the encoder's (the cases without a call history match)",
+    ),
+    (
+        "deepseek-v4.1-flash/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is always \
+         appended (smg-project/smg#2780)",
+    ),
+    (
+        "deepseek-v4.1-flash/render/tools-call-arguments-object",
+        "SMG's request schema types tool-call arguments as a string, as the API and the \
+         engines do; the template accepts an object (smg-project/bellwether#12)",
+    ),
+    (
+        "deepseek-v4.1-flash/render/tools-history-content-and-call",
+        "the checkpoint's own encoder, which this renderer follows and the engines port, \
+         parses a history call's `arguments` string into one DSML parameter per key; the \
+         checkpoint's Jinja template writes the string whole as a single `arguments` \
+         parameter",
+    ),
+    (
+        "deepseek-v4.1-flash/render/tools-history-parallel-calls",
+        "the checkpoint's own encoder, which this renderer follows and the engines port, \
+         parses a history call's `arguments` string into one DSML parameter per key; the \
+         checkpoint's Jinja template writes the string whole as a single `arguments` \
+         parameter",
+    ),
+    (
+        "deepseek-v4.1-flash/render/tools-history-results-reordered",
+        "the checkpoint's own encoder, which this renderer follows and the engines port, \
+         parses a history call's `arguments` string into one DSML parameter per key; the \
+         checkpoint's Jinja template writes the string whole as a single `arguments` \
+         parameter",
+    ),
+    (
+        "deepseek-v4.1-flash/render/tools-history-single-call",
+        "the checkpoint's own encoder, which this renderer follows and the engines port, \
+         parses a history call's `arguments` string into one DSML parameter per key; the \
+         checkpoint's Jinja template writes the string whole as a single `arguments` \
+         parameter",
     ),
     (
         "dots3-note-prev/render/no-generation-prompt",
@@ -2364,7 +2343,7 @@ fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, Str
     }
     let dir = PathBuf::from(CACHE_DIR).join(slug).join(revision);
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let client = smg::http_client::blocking_client();
+    let client = smg::clients::blocking_http_client();
     download(&client, model, revision, &dir, "tokenizer_config.json", 100)?
         .ok_or_else(|| format!("{model} at {revision} serves no tokenizer_config.json"))?;
     for (file, min_bytes) in [

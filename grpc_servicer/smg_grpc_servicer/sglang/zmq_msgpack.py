@@ -8,7 +8,10 @@ module adds the one thing it lacks, discovery, and keeps everything else:
 * SMG BINDS a handshake socket (ROUTER), an input socket (ROUTER) and an
   output socket (PULL); the scheduler rank that owns request I/O DIALS the
   handshake with a two-byte engine identity, learns the data-plane addresses
-  from INIT, registers with its ready response and connects in;
+  from INIT, registers with its ready response (its geometry, and the field
+  order of the positional structs it decodes, which SMG checks the prefixes
+  it encodes against once, there, rather than failing request by request)
+  and connects in;
 * requests arrive as ``[type_byte, payload, *aux]`` frames whose payload is
   the scheduler's own positional ``TokenizedGenerateReqInput`` or
   ``TokenizedEmbeddingReqInput`` (``ADD``, told apart by the tag), a plain
@@ -137,6 +140,13 @@ class WireEngineCoreReadyResponse(msgspec.Struct):
     kv_cache_size_tokens: int | None = None
     kv_cache_max_concurrency: float | None = None
     kv_events_config: dict | None = None
+    # The field order of each positional struct this side decodes, by class
+    # name (the tag of a tagged struct not counted): SMG compares the prefixes
+    # it encodes with it once, at the handshake, so a release that moved a
+    # field is named there instead of refusing every request. Empty, never
+    # None: the key goes out on every response (nothing is omitted here), and
+    # an empty map is what SMG reads as "nothing declared".
+    positional_layouts: dict[str, list[str]] = {}
 
 
 # ----------------------------------------------------------------------------
@@ -1012,6 +1022,23 @@ def _parallel_rank(state: Any, name: str) -> int | None:
     return int(rank) if rank is not None else None
 
 
+def request_layouts() -> dict[str, list[str]]:
+    """The field order of the structs an ``ADD`` decodes into and of the
+    sampling params nested in them, from the running release's own classes
+    (``__struct_fields__``: declaration order, base classes first, the tag
+    not counted), by class name."""
+    from sglang.srt.managers.io_struct import (
+        TokenizedEmbeddingReqInput,
+        TokenizedGenerateReqInput,
+    )
+    from sglang.srt.sampling.sampling_params import SamplingParams
+
+    return {
+        cls.__name__: list(cls.__struct_fields__)
+        for cls in (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput, SamplingParams)
+    }
+
+
 def ready_response_for_scheduler(scheduler: Scheduler) -> WireEngineCoreReadyResponse:
     """The facts SMG reads at registration, from a loaded scheduler."""
     args = scheduler.server_args
@@ -1051,6 +1078,7 @@ def ready_response_for_scheduler(scheduler: Scheduler) -> WireEngineCoreReadyRes
         max_num_batched_tokens=max(0, int(chunked_prefill_size)),
         instance_id=str(args.served_model_name or scheduler.model_config.model_path),
         kv_cache_size_tokens=max_total,
+        positional_layouts=request_layouts(),
     )
 
 

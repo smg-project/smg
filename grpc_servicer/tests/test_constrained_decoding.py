@@ -1,6 +1,7 @@
 """The ``constrained_decoding_start`` and ``engine_reasoning_parser`` labels the
-servicers carry as ``server_args`` keys: the rule per engine, under each
-server configuration, and the entries written for the Router."""
+servicers carry as ``server_args`` keys, and the ``grammar_backend`` key beside
+them: the rule per engine, under each server configuration, and the entries
+written for the Router and the Rust servicer."""
 
 from __future__ import annotations
 
@@ -102,3 +103,77 @@ def test_tokenspeed_starts_the_grammar_at_the_first_token_whatever_the_parser():
     assert cd.grammar_start_labels(
         SimpleNamespace(reasoning_parser=None), cd.tokenspeed_constrained_decoding_start()
     ) == {cd.CONSTRAINED_DECODING_START_KEY: "first_token"}
+
+
+def test_sglang_grammar_backend_is_the_resolved_argument_or_the_default():
+    # Given as typed.
+    assert cd.sglang_grammar_backend(SimpleNamespace(grammar_backend="outlines")) == "outlines"
+    assert cd.sglang_grammar_backend(SimpleNamespace(grammar_backend="none")) == "none"
+    # Not given: the engine's default, which its resolution hook declares in
+    # _resolved_overrides (last writer wins) and older releases set in place.
+    assert cd.sglang_grammar_backend(SimpleNamespace(grammar_backend=None)) == "xgrammar"
+    declared = SimpleNamespace(
+        grammar_backend=None,
+        _resolved_overrides=[("_handle_grammar_backend", {"grammar_backend": "xgrammar"})],
+    )
+    assert cd.sglang_grammar_backend(declared) == "xgrammar"
+    # Without the scheduler's tokenizer its grammar manager builds no backend,
+    # whatever the flag says.
+    assert (
+        cd.sglang_grammar_backend(
+            SimpleNamespace(grammar_backend="xgrammar", skip_tokenizer_init=True)
+        )
+        == "none"
+    )
+    # No such field at all: say nothing.
+    assert cd.sglang_grammar_backend(SimpleNamespace(model_path="org/model")) == ""
+
+
+def test_tokenspeed_grammar_backend_is_the_flag_or_the_resolved_checkpoint_default():
+    # Given as typed.
+    assert cd.tokenspeed_grammar_backend(SimpleNamespace(grammar_backend="xgrammar")) == "xgrammar"
+    explicit_none = SimpleNamespace(grammar_backend="none", _grammar_backend_unset=False)
+    assert cd.tokenspeed_grammar_backend(explicit_none) == "none"
+    # Not given: the engine starts from none and flips the checkpoints it
+    # defaults otherwise once it has read the checkpoint.
+    assert (
+        cd.tokenspeed_grammar_backend(
+            SimpleNamespace(
+                grammar_backend="none", _grammar_backend_unset=True, _beam_checkpoint=True
+            )
+        )
+        == "xgrammar"
+    )
+    assert (
+        cd.tokenspeed_grammar_backend(
+            SimpleNamespace(
+                grammar_backend="none", _grammar_backend_unset=True, _beam_checkpoint=False
+            )
+        )
+        == "none"
+    )
+    # Not read yet: unknown, say nothing.
+    assert (
+        cd.tokenspeed_grammar_backend(
+            SimpleNamespace(
+                grammar_backend="none", _grammar_backend_unset=True, _beam_checkpoint=None
+            )
+        )
+        == ""
+    )
+    # Not given and the engine's own post-init not run yet (the raw argument
+    # is None): unknown as well, say nothing.
+    assert cd.tokenspeed_grammar_backend(SimpleNamespace(grammar_backend=None)) == ""
+    # No such field at all: say nothing.
+    assert cd.tokenspeed_grammar_backend(SimpleNamespace(model="org/model")) == ""
+
+
+def test_grammar_backend_entry_replaces_the_raw_argument():
+    args = {"grammar_backend": None, "tp_size": 2}
+    cd.grammar_backend_entry(args, "xgrammar")
+    assert args == {"grammar_backend": "xgrammar", "tp_size": 2}
+    # Nothing known: no key, so the servicer judges nothing ahead of the engine.
+    args = {"grammar_backend": "none", "tp_size": 2}
+    cd.grammar_backend_entry(args, "")
+    assert args == {"tp_size": 2}
+    assert cd.GRAMMAR_BACKEND_KEY == "grammar_backend"

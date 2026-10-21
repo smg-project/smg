@@ -247,6 +247,8 @@ fn download_tokenizer_file(
 /// A directory holding the DeepSeek-V4.1-Flash tokenizer files
 /// (`tokenizer.json`, `tokenizer_config.json`) plus a minimal `config.json`
 /// naming the architecture so renderer detection selects DeepSeek-V4.1.
+/// Without the checkpoint's `encoding/` directory the renderer uses the
+/// rescaled effort table the checkpoint carries today.
 ///
 /// `DEEPSEEK_V41_MODEL_DIR` points at a full checkpoint directory and skips
 /// the download; otherwise the two tokenizer files are fetched once from the

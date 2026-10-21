@@ -16,7 +16,7 @@ use tracing::warn;
 /// installed, panicking when there is none. Installing is idempotent: a
 /// provider installed earlier, by an embedding process or a previous start in
 /// the same process, stays. [`crate::server::startup`] calls it first thing,
-/// and so do the functions of [`crate::http_client`], through which this
+/// and so do the functions of [`crate::clients`], through which this
 /// crate, its bindings and its tests build every HTTP client; nothing else
 /// needs to.
 pub fn install_crypto_provider() {

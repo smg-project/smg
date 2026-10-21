@@ -23,6 +23,7 @@ use tracing::warn;
 use crate::{
     fanout::fan_out_n,
     stream::{poll_mapped, MappedGenerateStream, StreamState},
+    structured_outputs::ConstraintRef,
 };
 
 /// Streaming generate output for one SGLang sub-request, mapping each
@@ -68,6 +69,11 @@ impl SglangGenerateStream {
     /// Reasoning tokens the scheduler has counted for this choice so far.
     pub fn reasoning_tokens(&self) -> u32 {
         self.reasoning_tokens
+    }
+
+    /// The engine-side id of this choice's request.
+    pub fn request_id(&self) -> &str {
+        self.inner.request_id()
     }
 
     /// Convert a stream item without discarding SGLang-only score rows.
@@ -671,6 +677,19 @@ pub(crate) fn translate_sampling_sglang(sp: sglang_proto::SamplingParams) -> Sgl
     params
 }
 
+/// The request's constraint as the shared refusal reads it
+/// ([`crate::structured_outputs::refuse_unenforceable_constraint`]): the
+/// proto `constraint` one-of by kind, with its text.
+pub(crate) fn constraint_ref(sp: &sglang_proto::SamplingParams) -> Option<ConstraintRef<'_>> {
+    use sglang_proto::sampling_params::Constraint;
+    Some(match sp.constraint.as_ref()? {
+        Constraint::JsonSchema(schema) => ConstraintRef::JsonSchema(schema),
+        Constraint::Regex(regex) => ConstraintRef::Regex(regex),
+        Constraint::EbnfGrammar(grammar) => ConstraintRef::Ebnf(grammar),
+        Constraint::StructuralTag(tag) => ConstraintRef::StructuralTag(tag),
+    })
+}
+
 /// The gRPC status for a request the scheduler aborted with an HTTP-style
 /// status: the table the engine's Python servicer uses for the same status,
 /// so the two front ends of one engine answer alike. 400 is the caller's
@@ -772,7 +791,7 @@ mod tests {
         assert_eq!(params.n, 1);
         assert_eq!(params.json_schema.as_deref(), Some("{}"));
         assert_eq!(params.logit_bias.unwrap()["5"], 1.5);
-        assert!(!params.is_normalized);
+        assert!(params.stop_regex.is_none() && params.custom_params.is_none());
     }
 
     #[test]
@@ -1003,6 +1022,8 @@ mod tests {
                     .await
                     .unwrap();
             }
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
 
         let req = sglang_proto::GenerateRequest {
@@ -1128,6 +1149,8 @@ mod tests {
                 .send_frames(vec![bytes::Bytes::from(encode_msgpack(&done).unwrap())])
                 .await
                 .unwrap();
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
         let req = sglang_proto::GenerateRequest {
             request_id: "r1".to_string(),
@@ -1219,6 +1242,8 @@ mod tests {
                     .await
                     .unwrap();
             }
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
         for (rid, code) in [
             ("r2", tonic::Code::InvalidArgument),

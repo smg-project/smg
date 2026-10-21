@@ -32,10 +32,10 @@ use crate::{
 /// What preparation found for the response.
 pub(crate) struct Prepared {
     /// The constraint for what the request asks, before its worker is known:
-    /// the table's tag for a forced call or a JSON answer, else the older
-    /// registry's; or why the table cannot constrain the request, which
-    /// request building answers on the selected worker
-    /// (`regular::symphony::worker_constraint`).
+    /// the table's tag for a forced call, else the older registry's; a JSON
+    /// answer's tag as it derives for a worker's start; or why the table
+    /// cannot constrain the request. Request building decides on the selected
+    /// worker (`regular::symphony::worker_constraint`).
     pub constraint: PreparedConstraint,
     /// The constraint is a JSON schema: the older path's forced call, under
     /// which no table reads.
@@ -50,7 +50,8 @@ pub(crate) struct Prepared {
 /// the response, its table gives a forced call, or a JSON `response_format`,
 /// its tag, so the output comes back in the syntax the table parses
 /// (`regular::symphony::constraint`, which decides with the predicate the
-/// reader is assigned by); the older registry decides for every other request
+/// reader is assigned by; the answer's tag derives for the selected worker at
+/// request building); the older registry decides for every other request
 /// (`generate_tool_constraint`, over `tools`, the ones the request's choice
 /// lets the model call, and the legacy tool parser's name). On a thinking
 /// prompt a parser with a reasoning prefix gets its tag wrapped so a forced
@@ -81,8 +82,9 @@ pub(crate) fn prepare(
     let model = asks.model();
     let parser = ctx.state.parser.unwrap_or_default();
     let names = ctx.components.parser_resolver.names(model);
-    // The tag takes the start the model's workers name, when they agree; the
-    // selected worker's own start decides the `auto` tag at request building.
+    // A forced call's tag takes the start the model's workers name together;
+    // a JSON answer's tag and the `auto` tag take the selected worker's own
+    // start at request building.
     let workers = ctx
         .components
         .worker_registry
@@ -114,26 +116,32 @@ pub(crate) fn prepare(
     );
     let choice = asks.choice();
     let constraint = match (from_the_table, choice.as_deref()) {
-        (Ok(None), Some(tool_choice)) if !tools.is_empty() => Ok(ctx
-            .components
-            .tool_parser_factory
-            .registry()
-            .generate_tool_constraint(
-                ctx.components.parser_resolver.legacy_tool(&names),
-                tools,
-                tool_choice,
-                reasoning,
-            )
-            .map_err(|e| {
-                error!(function = stage, error = %e, "Invalid tool configuration");
-                error::bad_request(
-                    "invalid_tool_configuration",
-                    format!("Invalid tool configuration: {e}"),
+        (Ok(symphony::Prepared::None), Some(tool_choice)) if !tools.is_empty() => {
+            let constraint = ctx
+                .components
+                .tool_parser_factory
+                .registry()
+                .generate_tool_constraint(
+                    ctx.components.parser_resolver.legacy_tool(&names),
+                    tools,
+                    tool_choice,
+                    reasoning,
                 )
-            })?),
+                .map_err(|e| {
+                    error!(function = stage, error = %e, "Invalid tool configuration");
+                    error::bad_request(
+                        "invalid_tool_configuration",
+                        format!("Invalid tool configuration: {e}"),
+                    )
+                })?;
+            Ok(symphony::Prepared::from(constraint))
+        }
         (prepared, _) => prepared,
     };
-    let json_schema = matches!(&constraint, Ok(Some(c)) if c.is_json_schema());
+    let json_schema = matches!(
+        &constraint,
+        Ok(symphony::Prepared::Constraint(c)) if c.is_json_schema()
+    );
     let keeps_special_tokens = match symphony::keeps_special_tokens(
         parser,
         &names,
@@ -221,11 +229,12 @@ pub(crate) struct Auto {
 
 /// What [`decide`] decided for the response.
 pub(crate) struct Decided {
-    /// What derives the `auto` tag for a worker's start, when the worker's
-    /// policy chose that tag: the attempt stamp carries it, so a retry gives
-    /// the worker it selects the tag shaped for where its own engine starts
-    /// the grammar (`helpers::ToolConstraintStamp`).
-    pub auto_tag: Option<Arc<dyn TagForStart>>,
+    /// What derives the table's tag for a worker's start, where the table
+    /// shapes it by the start (the `auto` tag the worker's policy chose, a
+    /// JSON answer's): the attempt stamp carries it, so a retry gives the
+    /// worker it selects the tag shaped for where its own engine starts the
+    /// grammar (`helpers::ToolConstraintStamp`).
+    pub table_tag: Option<Arc<dyn TagForStart>>,
     /// The constraint as the request carries it, before the plan builder
     /// shapes it for the worker.
     pub tool_constraints: Option<(String, String)>,
@@ -240,9 +249,10 @@ pub(crate) struct Decided {
 /// What constrains the output, decided on the worker selected for the
 /// request (`regular::symphony::worker_constraint`): the whole turn's grammar
 /// on a worker whose engine takes one on every turn from its first token;
-/// else what preparation found (`prepared`), and on a worker that takes a
-/// grammar on every turn the table's tag for the calls the request allows
-/// under `auto` (`auto`, derived for the worker's start). When the worker's
+/// else what preparation found (`prepared`; a JSON answer's tag derived for
+/// the worker's start), and on a worker that takes a grammar on every turn
+/// the table's tag for the calls the request allows under `auto` (`auto`,
+/// derived for the worker's start). When the worker's
 /// policy chose the constraint, the state records the worker's decoding, so a
 /// retry re-selects only workers that decide alike
 /// (`utils::WorkerDecoding::decides_alike`); what the request asked for suits
@@ -315,7 +325,7 @@ pub(crate) fn decide(
         None => ParserChoice::Legacy,
     });
     Ok(Decided {
-        auto_tag: decided.auto.map(|auto| -> Arc<dyn TagForStart> { auto }),
+        table_tag: decided.table_tag,
         tool_constraints,
         whole_turn: decided.whole_turn,
         assignment,
@@ -373,12 +383,12 @@ mod tests {
     /// policy is `requested`; no `auto` tag is derived.
     fn decided(ctx: &mut RequestContext, asks: Asks<'_>) -> Outcome {
         ctx.state.parser = Some(ParserChoice::Symphony);
-        let decided = decide(ctx, asks, &[], PROMPT, Ok(None), |_| {
+        let decided = decide(ctx, asks, &[], PROMPT, Ok(symphony::Prepared::None), |_| {
             panic!("the policy is requested: no auto tag")
         })
         .map_err(|response| response.status())
         .expect("nothing refused");
-        assert!(!decided.whole_turn && decided.auto_tag.is_none());
+        assert!(!decided.whole_turn && decided.table_tag.is_none());
         Outcome {
             parser: ctx.state.parser,
             assigned: decided

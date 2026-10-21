@@ -289,9 +289,19 @@ impl StepExecutor<WorkerUpdateWorkflowData> for UpdateWorkerPropertiesStep {
                 .overload_defaults(OverloadThresholds::from_gateway_config(
                     &app_context.router_config,
                 ))
+                // The ZMQ handshake bound is the router config's, set at registration;
+                // the rebuilt worker keeps the live value rather than the builder's
+                // default, so the bound an operator set stays in force across an update.
+                .zmq_startup_timeout(worker.metadata().zmq_startup_timeout)
                 .status(next_status);
             if let Some(config) = circuit_breaker_config {
                 builder = builder.circuit_breaker_config(config);
+            }
+            // The ZMQ link's request bound, resolved at registration (the
+            // worker's own pool timeout, else the router's), is kept across the
+            // rebuild as the handshake bound is.
+            if let Some(timeout) = worker.metadata().zmq_request_timeout {
+                builder = builder.zmq_request_timeout(timeout);
             }
             if refresh {
                 // A connector or role the operator configured none of follows
@@ -714,7 +724,7 @@ mod tests {
 
         Arc::new(AppContext {
             gateway_auth: AuthConfig::new(None),
-            client: crate::http_client::client(),
+            client: crate::clients::http_client(),
             router_config: router_config.clone(),
             rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
             rate_limit_manager: None,
@@ -1720,6 +1730,7 @@ mod tests {
                 .runtime_type(RuntimeType::Vllm)
                 .zmq_handshake_address(handshake.clone())
                 .zmq_engine_group(2)
+                .zmq_startup_timeout(Duration::from_secs(7200))
                 .health_config(HealthCheckConfig::default())
                 .overload(OverloadUpdate {
                     waiting_requests: Some(8),
@@ -1759,6 +1770,13 @@ mod tests {
             new.metadata().spec.labels.get("tier"),
             Some(&"gold".to_string())
         );
+        // The handshake bound an operator set survives the rebuild: the live value,
+        // not the builder's default.
+        assert_eq!(
+            new.metadata().zmq_startup_timeout,
+            Duration::from_secs(7200),
+            "the ZMQ startup bound survives the update"
+        );
         assert_eq!(
             new.metadata().spec.zmq_handshake_address.as_deref(),
             Some(handshake.as_str())
@@ -1793,7 +1811,7 @@ mod tests {
     /// entry the old worker was keeping alive.
     #[tokio::test]
     async fn http_update_adopts_the_materialized_shared_client() {
-        let client = Arc::new(crate::http_client::client());
+        let client = Arc::new(crate::clients::http_client());
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://w:8080")
                 .http_client(Arc::clone(&client))
@@ -1819,7 +1837,7 @@ mod tests {
     async fn http_update_preserves_http2() {
         let worker: Arc<dyn Worker> = Arc::new(
             BasicWorkerBuilder::new("http://w:8080")
-                .http_client(Arc::new(crate::http_client::client()))
+                .http_client(Arc::new(crate::clients::http_client()))
                 .http2(true)
                 .status(WorkerStatus::Ready)
                 .build(),

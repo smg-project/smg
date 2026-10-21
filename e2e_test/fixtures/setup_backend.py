@@ -49,6 +49,7 @@ from infra.worker_pool import get_pool
 
 from .hooks import FINALIZED_ZMQ_GATEWAY_KEY, SERVING_CLASS_FAILED_KEY
 from .markers import get_marker_kwargs, get_marker_value, model_id_for_engine, resolve_class_marker
+from .mock_answers import clear_class_workers, set_class_workers
 
 logger = logging.getLogger(__name__)
 
@@ -442,12 +443,17 @@ def _setup_pooled_zmq(
     except (TimeoutError, RuntimeError):
         _worker_start_failures[engine] = _worker_start_failures.get(engine, 0) + 1
         raise
+    # The pair's engines, for the answers a test states on the mock engine
+    # (a pool double without the accessor names none).
+    current_workers = getattr(pool, "current_workers", None)
+    set_class_workers(current_workers() if current_workers else [])
     try:
         yield backend_name, model_path, _make_openai_client(gateway), gateway
     except BaseException:
         pool.discard_zmq(gateway)
         raise
     finally:
+        clear_class_workers()
         # Keep the service for the remaining methods of a failed class, then
         # start the next class fresh rather than carrying potentially bad state.
         class_node.stash[FINALIZED_ZMQ_GATEWAY_KEY] = gateway
@@ -495,6 +501,9 @@ def _setup_local(
         **gateway_config,
         "timeout": _gateway_readiness_timeout(connection_mode, model_id, gateway_config["timeout"]),
     }
+    # The class's workers, cached or not, for the answers a test states on
+    # the mock engine.
+    set_class_workers(workers)
     try:
         _start_gateway(
             gateway,
@@ -506,6 +515,7 @@ def _setup_local(
         logger.info("%s backend ready at %s", backend_name, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
     finally:
+        clear_class_workers()
         logger.info(
             "Tearing down %s backend (%s)",
             backend_name,

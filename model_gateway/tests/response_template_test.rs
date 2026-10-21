@@ -113,6 +113,8 @@ struct Setup {
     eos: &'static str,
     /// The tokenizer reports the rendered prompt as ending inside the model's thought.
     think_in_prefill: bool,
+    /// Selection takes the workers in turn (round robin) instead of at random.
+    round_robin: bool,
 }
 
 impl Default for Setup {
@@ -130,6 +132,7 @@ impl Default for Setup {
             labels: Vec::new(),
             eos: EOS,
             think_in_prefill: false,
+            round_robin: false,
         }
     }
 }
@@ -240,12 +243,17 @@ async fn serve_engines(setup: Setup, engines: Vec<Engine>) -> Gateway {
         ));
         logs.push(requests);
     }
-    let mut config = RouterConfig::builder()
+    let config = RouterConfig::builder()
         .mode(RoutingMode::Regular {
             worker_urls: vec![],
         })
-        .grpc_connection()
-        .random_policy()
+        .grpc_connection();
+    let config = if setup.round_robin {
+        config.round_robin_policy()
+    } else {
+        config.random_policy()
+    };
+    let mut config = config
         .host("127.0.0.1")
         .port(0)
         .max_payload_size(1024 * 1024)
@@ -626,9 +634,9 @@ async fn always_constrains_the_calls_a_request_allows_under_auto() {
     assert_eq!(requested.last_constraint(), None);
 
     // On a registry table too. A JSON response_format is the request's own constraint, which
-    // the auto tag never displaces: the answer's constraint is sent instead, the JSON where the
-    // calls' block would be (its shape on this template, whose prompt leaves the thought open:
-    // `a_registry_tables_json_answer_follows_the_thought_the_prompt_leaves_open`).
+    // the auto tag never displaces: the answer's constraint is sent instead; on a worker that
+    // names no grammar start that is the engine's own schema, whatever the prompt
+    // (`a_registry_tables_json_answer_follows_the_thought_the_prompt_leaves_open`).
     let registry = serve(Setup {
         constrained_decoding: Some(ConstrainedDecoding::Always),
         tool_parser: Some("qwen"),
@@ -645,22 +653,23 @@ async fn always_constrains_the_calls_a_request_allows_under_auto() {
         json!({"tools": tools(), "response_format": {"type": "json_object"}}),
     )
     .await;
-    let (kind, tag) = registry.last_constraint().expect("the answer's constraint");
-    assert_eq!(kind, "structural_tag");
-    assert_eq!(block_of(&tag), "json_schema", "{tag}");
+    let (kind, schema) = registry.last_constraint().expect("the answer's constraint");
+    assert_eq!(kind, "json_schema");
+    let schema: Value = serde_json::from_str(&schema).expect("the schema as JSON");
+    assert_eq!(schema, json!({"type": "object"}));
 }
 
 /// A registry table's JSON `response_format` under `always` follows the prompt as the table and
 /// the engine read it (`regular::symphony::reasoning_open`), not the thinking switch alone. The
 /// Qwen 3.5 chat template's generation prompt ends in `<think>\n`, so the model writes its thought
-/// first and the answer after its close: the engine receives the table's answer tag, the
-/// thought's free text (closing itself) and then the JSON, where the bare schema from the first
-/// token would force the JSON inside the thought, which the table reads as reasoning, and the
-/// client would get no content. The engine's own schema constraint stays wherever the tag would
-/// be the schema alone: a request with thinking off, whose prompt closes the thought
-/// (`<think>\n\n</think>\n\n`), and an engine that starts the grammar after its reasoning parser
-/// has seen the close; one that runs it from the first token gets the closed thought, then the
-/// schema.
+/// first and the answer after its close. The engine's own schema constraint is sent wherever the
+/// tag would be the schema alone: an engine that does not say where it starts the grammar (free
+/// text before the schema would constrain nothing: the model may write a fence and prose around
+/// its JSON, with the end of the turn masked until a whole JSON follows), one that starts it
+/// after its reasoning parser has seen the close, and a request with thinking off, whose prompt
+/// closes the thought (`<think>\n\n</think>\n\n`); an engine that runs the grammar from the first
+/// token gets the closed thought, then the schema, so the JSON is not forced inside the thought,
+/// which the table reads as reasoning.
 #[tokio::test]
 async fn a_registry_tables_json_answer_follows_the_thought_the_prompt_leaves_open() {
     let answer = json!({"tools": tools(), "response_format": {"type": "json_object"}});
@@ -671,19 +680,18 @@ async fn a_registry_tables_json_answer_follows_the_thought_the_prompt_leaves_ope
         labels,
         ..Setup::default()
     };
-    // The template's default leaves the thought open: the thought's free text, then the JSON,
-    // for an engine that does not say where it starts the grammar.
+    // The template's default leaves the thought open: for an engine that does not say where it
+    // starts the grammar, the schema alone, the engine's own constraint.
     let prompt = rendered(&answer);
     assert!(prompt.ends_with(THINKING), "{prompt:?}");
     let gateway = serve(registry(Vec::new())).await;
     chat(&gateway, answer.clone()).await;
     let sent = gateway.last_constraint();
-    assert_eq!(shape_of(sent.clone()), "the free text then the block");
-    let (_, tag) = sent.expect("the answer's tag");
-    assert_eq!(block_of(&tag), "json_schema", "{tag}");
-    let tag: Value = serde_json::from_str(&tag).expect("the tag as JSON");
-    let block = &tag["format"]["elements"][1];
-    assert_eq!(block["json_schema"], json!({"type": "object"}), "{tag}");
+    assert_eq!(shape_of(sent.clone()), "not a tag");
+    let (kind, schema) = sent.expect("the schema constraint");
+    assert_eq!(kind, "json_schema");
+    let schema: Value = serde_json::from_str(&schema).expect("the schema as JSON");
+    assert_eq!(schema, json!({"type": "object"}));
     // Thinking off closes the thought in the prompt: the tag would be the schema alone, and the
     // engine's own constraint is sent, as before.
     let off = HashMap::from([("enable_thinking".to_string(), json!(false))]);
@@ -807,6 +815,151 @@ async fn a_retry_takes_the_auto_tag_in_the_shape_its_own_workers_start_needs() {
                 .iter()
                 .all(|shape| *shape == "the free text then the block"),
         "an engine that does not say: {unsaid:?} {unsaid_tags:?}"
+    );
+}
+
+/// What one worker received: the shape of every request's constraint, and the constraints
+/// themselves for the message.
+type Received = (Vec<&'static str>, Vec<Option<(String, String)>>);
+
+#[expect(clippy::expect_used, reason = "test helper")]
+fn received(log: &Arc<Mutex<Vec<ts::GenerateRequest>>>) -> Received {
+    let log = log.lock().expect("the worker's log");
+    let shapes = log
+        .iter()
+        .map(|request| shape_of(constraint_of(request)))
+        .collect();
+    let constraints = log.iter().map(constraint_of).collect();
+    (shapes, constraints)
+}
+
+/// Two workers of the model whose engines start the grammar at different places, one at the first
+/// token and one that does not say, and a JSON `response_format` on a prompt that leaves the
+/// thought open: selection takes the two in turn, and every request's constraint takes the shape
+/// of the worker it reaches, the closed thought then the schema on the first, the schema alone
+/// (the engine's own constraint) on the other. No request carries the free-text prefix, which
+/// fits neither: the first-token engine would let the model write around its JSON, the other
+/// cannot be told where the schema begins. On a registry table (Qwen 3.5's).
+#[tokio::test]
+async fn a_mixed_pools_json_answer_takes_the_shape_of_the_worker_each_request_reaches() {
+    const REQUESTS: usize = 6;
+    let answer = json!({"tools": tools(), "response_format": {"type": "json_object"}});
+    assert!(rendered(&answer).ends_with(THINKING));
+    let gateway = serve_engines(
+        Setup {
+            tool_parser: Some("qwen"),
+            reasoning_parser: None,
+            round_robin: true,
+            ..Setup::default()
+        },
+        vec![
+            Engine {
+                labels: vec![("constrained_decoding_start", "first_token")],
+                finish_reasons: vec!["stop"],
+            },
+            Engine {
+                labels: vec![],
+                finish_reasons: vec!["stop"],
+            },
+        ],
+    )
+    .await;
+    for _ in 0..REQUESTS {
+        chat(&gateway, answer.clone()).await;
+    }
+    let (first, first_tags) = received(&gateway.requests[0]);
+    let (unsaid, unsaid_tags) = received(&gateway.requests[1]);
+    assert_eq!(first.len() + unsaid.len(), REQUESTS, "{first:?} {unsaid:?}");
+    assert!(
+        !first.is_empty() && !unsaid.is_empty(),
+        "{first:?} {unsaid:?}"
+    );
+    let wrong = first
+        .iter()
+        .filter(|shape| **shape != "the closed thought then the block")
+        .count()
+        + unsaid.iter().filter(|shape| **shape != "not a tag").count();
+    assert_eq!(
+        wrong, 0,
+        "{wrong} of {REQUESTS} requests in a shape not the worker's own; first token: {first:?} \
+         {first_tags:?}; does not say: {unsaid:?} {unsaid_tags:?}"
+    );
+    // The worker that does not say gets the request's own schema, as the engine takes it.
+    for constraint in &unsaid_tags {
+        let (kind, schema) = constraint.clone().expect("the schema constraint");
+        assert_eq!(kind, "json_schema");
+        let schema: Value = serde_json::from_str(&schema).expect("the schema as JSON");
+        assert_eq!(schema, json!({"type": "object"}));
+    }
+    for constraint in &first_tags {
+        let (_, tag) = constraint.clone().expect("the answer's tag");
+        assert_eq!(block_of(&tag), "json_schema", "{tag}");
+    }
+}
+
+/// The same two kinds of worker, each refusing its first `Generate`, so a JSON answer's request
+/// crosses to the other worker and back before it is served: three attempts, every one carrying
+/// the answer's constraint in the shape of the worker it reached, the schema alone behind the
+/// reasoning parser's gate and the closed thought then the schema from the first token, whichever
+/// kind the first attempt took. A retry re-derives the constraint for its worker, the one shape
+/// standing in for the other.
+#[tokio::test]
+async fn a_retry_takes_the_json_answers_tag_in_the_shape_its_own_workers_start_needs() {
+    let gateway = serve_engines(
+        Setup {
+            tool_parser: Some("qwen"),
+            reasoning_parser: None,
+            ..Setup::default()
+        },
+        vec![
+            Engine {
+                labels: vec![("constrained_decoding_start", "after_reasoning")],
+                finish_reasons: vec!["unavailable", "stop"],
+            },
+            Engine {
+                labels: vec![("constrained_decoding_start", "first_token")],
+                finish_reasons: vec!["unavailable", "stop"],
+            },
+        ],
+    )
+    .await;
+    let served = chat(
+        &gateway,
+        json!({"tools": tools(), "response_format": {"type": "json_object"}}),
+    )
+    .await;
+    let (gated, gated_tags) = received(&gateway.requests[0]);
+    let (first, first_tags) = received(&gateway.requests[1]);
+    let wrong = gated.iter().filter(|shape| **shape != "not a tag").count()
+        + first
+            .iter()
+            .filter(|shape| **shape != "the closed thought then the block")
+            .count();
+    assert!(!served.finish.is_empty(), "served after the retries");
+    assert_eq!(gated.len() + first.len(), 3, "{gated:?} {first:?}");
+    assert_eq!(
+        wrong,
+        0,
+        "{wrong} of {} attempts in a shape not the worker's own; after the gate: {gated:?} \
+         {gated_tags:?}; from the first token: {first:?} {first_tags:?}",
+        gated.len() + first.len()
+    );
+    assert!(
+        !gated.is_empty() && gated.iter().all(|shape| *shape == "not a tag"),
+        "after the gate: {gated:?} {gated_tags:?}"
+    );
+    for constraint in &gated_tags {
+        let (kind, schema) = constraint.clone().expect("the schema constraint");
+        assert_eq!(kind, "json_schema");
+        let schema: Value = serde_json::from_str(&schema).expect("the schema as JSON");
+        assert_eq!(schema, json!({"type": "object"}));
+    }
+    assert!(
+        !first.is_empty()
+            && first
+                .iter()
+                .all(|shape| *shape == "the closed thought then the block"),
+        "from the first token: {first:?} {first_tags:?}"
     );
 }
 

@@ -379,15 +379,15 @@ pub(crate) fn init_metrics() {
     // (`routers::grpc::regular::symphony::telemetry`).
     describe_counter!(
         symphony_telemetry::OUTPUTS,
-        "Outputs a Symphony table read to their end, by table and outcome: clean, malformed (a call region the table gave up on, or a marker of the table where no row leads, kept as content), failed (the table refused the output and the request failed)"
+        "Outputs a Symphony table read to their end, by table and outcome: clean, malformed (a call region the table gave up on, or a marker of the table where no row leads, kept as content), failed (the table refused the output and the request failed), empty (no text, reasoning or call: whitespace and framing alone, or nothing), unknown_tool (read whole, with a call to a function the request did not declare, delivered as the model named it)"
     );
     describe_counter!(
         symphony_telemetry::MALFORMED,
-        "Malformed runs in the outputs a Symphony table read, by table and reason (unterminated_region, invalid_arguments, unknown_tool, marker_out_of_place, other)"
+        "Malformed runs in the outputs a Symphony table read, by table and reason: the crate's own name of the reason (unterminated_region, invalid_arguments, unknown_tool, tag_out_of_place, text_where_the_name_should_be, key_without_a_value, ..., marker_out_of_place), other for a reason this build does not name"
     );
     describe_histogram!(
         symphony_telemetry::MALFORMED_BYTES,
-        "Bytes of the malformed runs of one output a Symphony table read, by table; observed for every output with at least one"
+        "Bytes of the malformed runs of one output a Symphony table read, by table; observed for every output counted malformed"
     );
     describe_counter!(
         symphony_telemetry::CALLS_SUPPRESSED,
@@ -767,8 +767,9 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_worker_overload_fallback_total",
-        "Requests routed to the least-loaded worker because every worker for the model is \
-         overloaded and shedding is off, by stage"
+        "Requests placed although every worker they could use is overloaded and shedding is \
+         off, by stage: routed to the least-loaded worker, or, for a cache-aware prefill pool \
+         of a prefill/decode pair, placed by that policy"
     );
     describe_counter!(
         "smg_worker_liveness_fallback_total",
@@ -932,6 +933,10 @@ pub(crate) fn init_metrics() {
     describe_counter!(
         "smg_discovery_snapshot_errors_total",
         "Discovery source observations rejected, by source and reason"
+    );
+    describe_counter!(
+        "smg_discovery_skipped_total",
+        "Discovered workers left out of an otherwise good snapshot, by source and reason"
     );
 
     // Layer 5: MCP metrics
@@ -2105,8 +2110,10 @@ impl Metrics {
         .increment(1);
     }
 
-    /// Record a request steered to the least-loaded worker because every
-    /// worker for the model is overloaded and shedding is off.
+    /// Record a request placed although every worker it could use is
+    /// overloaded and shedding is off: steered to the least-loaded worker,
+    /// or, for a cache-aware prefill pool of a prefill/decode pair, placed by
+    /// that policy (which counts the pick as a selection too).
     pub fn record_worker_overload_fallback(stage: &'static str) {
         counter!(
             "smg_worker_overload_fallback_total",
@@ -2667,6 +2674,17 @@ impl Metrics {
             "source" => source
         )
         .set(count as f64);
+    }
+
+    /// Record a discovered worker a provider left out of a snapshot it
+    /// otherwise applied
+    pub fn record_discovery_skip(source: &'static str, reason: &'static str) {
+        counter!(
+            "smg_discovery_skipped_total",
+            "source" => source,
+            "reason" => reason
+        )
+        .increment(1);
     }
 
     /// Record a discovery source observation that was rejected; the provider

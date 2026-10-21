@@ -156,9 +156,15 @@ impl Default for EncodeParams {
 // (re-exported under this renderer's path), this version's own follow. Copied
 // verbatim from the Python source.
 // ---------------------------------------------------------------------------
-use super::deepseek_common::{ASSISTANT_SP_TOKEN, LATEST_REMINDER_SP_TOKEN, USER_SP_TOKEN};
 pub use super::deepseek_common::{
     BOS_TOKEN, DSML_TOKEN, EOS_TOKEN, THINKING_END_TOKEN, THINKING_START_TOKEN,
+};
+use super::{
+    deepseek_common::{
+        mark_grounding_tokens, ASSISTANT, BOS, DSML, EOS, LATEST_REMINDER, THINKING_END,
+        THINKING_START, USER,
+    },
+    marks,
 };
 const TOOL_CALLS_BLOCK_NAME: &str = "tool_calls";
 /// V4's DSML tag strings: bare `invoke`/`parameter`, no leading space. The
@@ -249,7 +255,7 @@ fn render_message(
         }
         "user" => render_user(&mut prompt, msg, content),
         "latest_reminder" => {
-            prompt.push_str(LATEST_REMINDER_SP_TOKEN);
+            prompt.push_str(LATEST_REMINDER);
             prompt.push_str(content);
         }
         "tool" => {
@@ -328,7 +334,7 @@ fn render_developer(
     response_format: Option<&Value>,
 ) {
     let mut content_developer = String::new();
-    content_developer.push_str(USER_SP_TOKEN);
+    content_developer.push_str(USER);
     content_developer.push_str(content);
     if let Some(tools) = tools.filter(|t| !t.is_empty()) {
         content_developer.push_str("\n\n");
@@ -343,7 +349,7 @@ fn render_developer(
 /// A user message: the user token, then its content blocks (tool results
 /// mixed with text) joined, or its plain content.
 fn render_user(prompt: &mut String, msg: &Value, content: &str) {
-    prompt.push_str(USER_SP_TOKEN);
+    prompt.push_str(USER);
     // Handle content blocks (tool results mixed with text)
     if let Some(content_blocks) = msg.get("content_blocks").and_then(|v| v.as_array()) {
         let mut parts: Vec<String> = Vec::with_capacity(content_blocks.len());
@@ -422,25 +428,25 @@ fn render_assistant(prompt: &mut String, parts: &AssistantParts<'_>) {
             let arguments = tc.get("arguments").unwrap_or(&Value::Null);
             let args = encode_arguments_to_dsml(arguments, &DSML_TAGS);
             tc_list.push(format!(
-                "<{DSML_TOKEN}{invoke} name=\"{name}\">\n{args}\n</{DSML_TOKEN}{invoke}>",
+                "<{DSML}{invoke} name=\"{name}\">\n{args}\n</{DSML}{invoke}>",
                 invoke = DSML_TAGS.invoke,
             ));
         }
         let joined = tc_list.join("\n");
         let _ = write!(
             tc_content,
-            "\n\n<{DSML_TOKEN}{TOOL_CALLS_BLOCK_NAME}>\n{joined}\n</{DSML_TOKEN}{TOOL_CALLS_BLOCK_NAME}>"
+            "\n\n<{DSML}{TOOL_CALLS_BLOCK_NAME}>\n{joined}\n</{DSML}{TOOL_CALLS_BLOCK_NAME}>"
         );
     }
     if parts.emits_thinking {
-        thinking_part.push_str(parts.reasoning_content);
-        thinking_part.push_str(THINKING_END_TOKEN);
+        thinking_part.push_str(&mark_grounding_tokens(parts.reasoning_content));
+        thinking_part.push_str(THINKING_END);
     }
     prompt.push_str(&thinking_part);
-    prompt.push_str(parts.content);
+    prompt.push_str(&mark_grounding_tokens(parts.content));
     prompt.push_str(&tc_content);
     if !parts.wo_eos {
-        prompt.push_str(EOS_TOKEN);
+        prompt.push_str(EOS);
     }
 }
 
@@ -475,11 +481,11 @@ fn render_turn_open(
             task_sp_token(task).ok_or_else(|| DsEncodingError::InvalidTask(task.to_string()))?;
         if task == "action" {
             // Action task: append Assistant + thinking token + action sp token.
-            prompt.push_str(ASSISTANT_SP_TOKEN);
+            prompt.push_str(ASSISTANT);
             prompt.push_str(if thinking_mode == ThinkingMode::Thinking {
-                THINKING_START_TOKEN
+                THINKING_START
             } else {
-                THINKING_END_TOKEN
+                THINKING_END
             });
             prompt.push_str(sp_token);
         } else {
@@ -488,13 +494,13 @@ fn render_turn_open(
         }
     } else if matches!(role, "user" | "developer") {
         // Normal generation: append Assistant + thinking token.
-        prompt.push_str(ASSISTANT_SP_TOKEN);
+        prompt.push_str(ASSISTANT);
         let opens_thinking = thinking_mode == ThinkingMode::Thinking
             && (!drop_thinking || at_or_after_last_user(index, last_user_idx));
         if opens_thinking {
-            prompt.push_str(THINKING_START_TOKEN);
+            prompt.push_str(THINKING_START);
         } else {
-            prompt.push_str(THINKING_END_TOKEN);
+            prompt.push_str(THINKING_END);
         }
     }
     Ok(())
@@ -521,11 +527,29 @@ pub fn encode_messages(
     thinking_mode: ThinkingMode,
     params: &EncodeParams,
 ) -> Result<String, DsEncodingError> {
+    render_messages(messages, thinking_mode, params)
+        .map(|marked| marks::strip(&marked).into_owned())
+}
+
+/// [`encode_messages`] with the renderer's own control tokens marked (see
+/// `marks`): the form the tokenizer wrapper encodes by segments, so that a
+/// control-token spelling typed in a message stays text. Request strings
+/// lose any mark a client wrote into them first.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "the same signature as `encode_messages`"
+)]
+pub(crate) fn render_messages(
+    messages: &[Value],
+    thinking_mode: ThinkingMode,
+    params: &EncodeParams,
+) -> Result<String, DsEncodingError> {
+    let messages = marks::without_marks(messages);
     // Preprocess: merge tool messages and sort tool results.
-    let merged = merge_tool_messages(messages);
+    let merged = merge_tool_messages(&messages);
     let mut full_messages = sort_tool_results_by_call_order(merged);
     let mut prompt = if params.add_default_bos_token {
-        BOS_TOKEN.to_string()
+        BOS.to_string()
     } else {
         String::new()
     };
@@ -561,7 +585,10 @@ pub fn encode_messages(
 mod tests {
     use serde_json::json;
 
-    use super::*;
+    use super::{
+        super::deepseek_common::{ASSISTANT_SP_TOKEN, USER_SP_TOKEN},
+        *,
+    };
 
     // The task tokens as the recorded prompts spell them, independent of
     // `task_sp_token`.

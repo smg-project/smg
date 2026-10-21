@@ -470,6 +470,9 @@ struct Router {
     /// The `discovery` mapping, read by the same rules as
     /// `RouterConfig.discovery`.
     discovery: Option<config::DiscoveryConfig>,
+    /// The interval of `service_discovery=True` Kubernetes discovery
+    /// (`None`: the default every provider has, 30s).
+    discovery_check_interval_secs: Option<u64>,
     dp_aware: bool,
     dp_minimum_tokens_scheduler: bool,
     drain_settle_secs: u64,
@@ -641,6 +644,9 @@ struct Router {
     worker_wedge_secs: u64,
     /// DP engines per startup ZMQ worker (grouped worker; None/1 = ungrouped).
     zmq_engine_count: Option<usize>,
+    /// Seconds any one stage of a ZMQ engine's startup handshake may stay
+    /// silent; it alone covers the engine's init between HELLO and READY.
+    zmq_startup_timeout_secs: u64,
     // Derived from the URL lists; not a parameter.
     connection_mode: worker::ConnectionMode,
 }
@@ -962,7 +968,9 @@ impl Router {
             Some(DiscoveryConfig::Kubernetes(KubernetesDiscoveryConfig {
                 namespace: self.service_discovery_namespace.clone(),
                 port: self.service_discovery_port,
-                check_interval_secs: 60,
+                check_interval_secs: self
+                    .discovery_check_interval_secs
+                    .unwrap_or(config::DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS),
                 selector: self.selector.clone(),
                 encode_selector: self.encode_selector.clone(),
                 prefill_selector: self.prefill_selector.clone(),
@@ -1086,6 +1094,7 @@ impl Router {
             .connection_mode(self.connection_mode)
             .startup_worker_runtime_type(startup_worker_runtime_type)
             .zmq_engine_count(self.zmq_engine_count)
+            .zmq_startup_timeout_secs(self.zmq_startup_timeout_secs)
             .max_payload_size(self.max_payload_size)
             .request_timeout_secs(self.request_timeout_secs)
             .worker_startup_timeout_secs(self.worker_startup_timeout_secs)
@@ -1308,6 +1317,7 @@ impl Router {
         disable_retries = false,
         disable_tokenizer_autoload = false,
         discovery = None,
+        discovery_check_interval_secs = None,
         dp_aware = false,
         dp_minimum_tokens_scheduler = false,
         drain_settle_secs = 5,
@@ -1473,6 +1483,7 @@ impl Router {
         worker_warmup_thin_ratio = 0.5,
         worker_wedge_secs = 3,
         zmq_engine_count = None,
+        zmq_startup_timeout_secs = 3600,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1516,6 +1527,7 @@ impl Router {
         disable_retries: bool,
         disable_tokenizer_autoload: bool,
         discovery: Option<Bound<'_, PyAny>>,
+        discovery_check_interval_secs: Option<u64>,
         dp_aware: bool,
         dp_minimum_tokens_scheduler: bool,
         drain_settle_secs: u64,
@@ -1681,11 +1693,19 @@ impl Router {
         worker_warmup_thin_ratio: f32,
         worker_wedge_secs: u64,
         zmq_engine_count: Option<usize>,
+        zmq_startup_timeout_secs: u64,
     ) -> PyResult<Self> {
         // Two spellings of one choice: refuse both rather than pick one.
         if service_discovery && discovery.is_some() {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "Pass service_discovery=True or a discovery mapping, not both",
+            ));
+        }
+        // A `discovery` mapping carries its own `check_interval_secs`.
+        if discovery_check_interval_secs.is_some() && !service_discovery {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "discovery_check_interval_secs applies to service_discovery=True; \
+                 a discovery mapping takes check_interval_secs",
             ));
         }
         let discovery = discovery
@@ -1754,6 +1774,7 @@ impl Router {
             disable_retries,
             disable_tokenizer_autoload,
             discovery,
+            discovery_check_interval_secs,
             dp_aware,
             dp_minimum_tokens_scheduler,
             drain_settle_secs,
@@ -1919,6 +1940,7 @@ impl Router {
             worker_warmup_thin_ratio,
             worker_wedge_secs,
             zmq_engine_count,
+            zmq_startup_timeout_secs,
             connection_mode,
         })
     }

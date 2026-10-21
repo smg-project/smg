@@ -21,7 +21,10 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use engine_zmq_adapter::ZmqEngineClient;
+use engine_zmq_adapter::{
+    StructuredOutputBackend, StructuredOutputsBackendConfig, StructuredOutputsSupport,
+    ZmqEngineClient,
+};
 use futures::FutureExt;
 use llm_tokenizer::traits::Tokenizer;
 use smg_grpc_client::tokenspeed_proto::token_speed_scheduler_server::TokenSpeedSchedulerServer;
@@ -96,6 +99,35 @@ pub struct TokenSpeedModelInfo {
     /// and for the batches published before its subscription joined.
     pub kv_events_replay_endpoint: String,
     pub kv_events_topic: String,
+}
+
+/// What the scheduler enforces of a structured request, read off the
+/// launcher's `server_args`: the `grammar_backend` the launcher resolved
+/// (TokenSpeed's `--grammar-backend`, `xgrammar` or `none`: `none` unless
+/// set, `xgrammar` for the checkpoints the engine defaults so). `none`
+/// enforces nothing: the scheduler refuses such a request at admission with
+/// a 400 that the slim wire reports as a bare `abort`, which reaches the
+/// caller as an empty answer. `xgrammar` compiles all four kinds, a JSON
+/// schema with the features it lacks dropped. A launcher that wrote no
+/// backend could not tell (a checkpoint default not resolved yet, or an
+/// older launcher), and a name this servicer does not know is not one the
+/// engine starts with: nothing is judged ahead of the engine then. The
+/// adapter refuses a constraint outside this before the scheduler, as on
+/// every wire.
+pub(super) fn structured_outputs_support(model: &TokenSpeedModelInfo) -> StructuredOutputsSupport {
+    use StructuredOutputsBackendConfig::{Other, Pinned};
+
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    let backend = args
+        .get("grammar_backend")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    match backend {
+        "none" => StructuredOutputsSupport::DISABLED,
+        "xgrammar" => Pinned(StructuredOutputBackend::Xgrammar).into(),
+        _ => Other.into(),
+    }
 }
 
 /// How to bind, where the engines dial in, and what to advertise.

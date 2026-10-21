@@ -45,7 +45,7 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
         match effort.as_str() {
             "minimal" => *effort = "low".into(),
             "medium" => *effort = "high".into(),
-            // V4.1 has its own native xhigh budget (75 rather than high's 50).
+            // V4.1 accepts xhigh natively (its renderer gives it a budget).
             "xhigh" if !is_v41 => *effort = "high".into(),
             _ => {}
         }

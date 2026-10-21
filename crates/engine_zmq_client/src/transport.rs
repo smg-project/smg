@@ -13,12 +13,13 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures::channel::mpsc::Receiver as SocketEvents;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 use zeromq::{
     prelude::{Socket, SocketRecv, SocketSend},
     util::PeerIdentity,
-    PullSocket, RouterSendHalf, RouterSocket, ZmqError, ZmqMessage,
+    PullSocket, RouterRecvHalf, RouterSendHalf, RouterSocket, SocketEvent, ZmqError, ZmqMessage,
 };
 
 use crate::{
@@ -132,6 +133,10 @@ pub struct ConnectedTransport {
     pub engines: Vec<ConnectedEngine>,
     /// The sending half of the shared input ROUTER socket.
     pub input_send: RouterSendHalf,
+    /// Reports asynchronous disconnects after local send admission.
+    pub input_events: SocketEvents<SocketEvent>,
+    /// Drives read-side disconnect detection after the registration handshake.
+    pub input_recv: RouterRecvHalf,
     /// The shared output PULL socket for receiving all engines' responses.
     pub output_socket: PullSocket,
 }
@@ -185,6 +190,7 @@ pub async fn connect_handshake(
     //    same data-plane addresses during handshake.
     let (input_address, mut input_socket, output_address, output_socket) =
         bind_local_sockets(local_input_address, local_output_address).await?;
+    let input_events = input_socket.monitor();
     info!(%input_address, %output_address, "bound local transport sockets");
 
     // 2. Bind the shared handshake socket. All engines connect here with their
@@ -199,41 +205,83 @@ pub async fn connect_handshake(
     //    HELLO is answered with INIT while engines are still missing and
     //    refused once all are known, and a READY marks its engine whenever
     //    it arrives.
+    //
+    //    An engine says HELLO once when it starts and READY once when its
+    //    init is done, and repeats neither; the frontend that answered its
+    //    HELLO need not be the one that hears its READY, when the frontend
+    //    restarted or bound again while the engine was loading. So a READY
+    //    from an engine no HELLO of this handshake introduced is taken as
+    //    that engine's (the INIT it holds names these same addresses), and a
+    //    second HELLO from an engine still between INIT and READY is a
+    //    restarted engine process, greeted again. Either way the engine
+    //    registers on the input socket once ready, as every engine does.
     while engines.len() < engine_count || engines.values().any(|state| !state.is_ready_received()) {
         let awaiting_hello = engines.len() < engine_count;
         let stage = if awaiting_hello { "HELLO" } else { "READY" };
         let message = clock.wait(stage, handshake_socket.recv()).await??;
         let (engine_id, handshake_message) = decode_handshake_message(message)?;
         match handshake_message.status.as_deref() {
-            Some("HELLO") if awaiting_hello => {
-                if engines.contains_key(&engine_id) {
+            Some("HELLO") => match engines.get(&engine_id) {
+                None if awaiting_hello => {
+                    debug!(?engine_id, "received HELLO from engine");
+                    send_init_message(
+                        &mut handshake_socket,
+                        &engine_id,
+                        &input_address,
+                        &output_address,
+                    )
+                    .await?;
+                    engines.insert(engine_id, EngineStartupState::HelloReceived);
+                }
+                None => {
                     return Err(unexpected_handshake(format!(
-                        "duplicate engine id {engine_id:?} during startup handshake"
+                        "duplicate HELLO for engine id {engine_id:?} after INIT phase: every one \
+                         of the {engine_count} expected engine(s) is known"
                     )));
                 }
-                debug!(?engine_id, "received HELLO from engine");
-                send_init_message(
-                    &mut handshake_socket,
-                    &engine_id,
-                    &input_address,
-                    &output_address,
-                )
-                .await?;
-                engines.insert(engine_id, EngineStartupState::HelloReceived);
-            }
-            Some("HELLO") => {
-                return Err(unexpected_handshake(format!(
-                    "duplicate HELLO for engine id {engine_id:?} after INIT phase"
-                )));
-            }
+                Some(EngineStartupState::HelloReceived) => {
+                    info!(
+                        ?engine_id,
+                        "received a second HELLO from an engine between INIT and READY: its \
+                         process restarted while it was loading; greeting it again"
+                    );
+                    send_init_message(
+                        &mut handshake_socket,
+                        &engine_id,
+                        &input_address,
+                        &output_address,
+                    )
+                    .await?;
+                }
+                Some(EngineStartupState::ReadyReceived) => {
+                    return Err(unexpected_handshake(format!(
+                        "duplicate HELLO for engine id {engine_id:?} after its READY"
+                    )));
+                }
+            },
             Some("READY") => match engines.get_mut(&engine_id) {
                 Some(state) if !state.is_ready_received() => {
                     debug!(?engine_id, "received READY from engine");
                     *state = EngineStartupState::ReadyReceived;
                 }
-                _ => {
+                Some(_) => {
                     return Err(unexpected_handshake(format!(
-                        "READY for unexpected or duplicate engine id {engine_id:?}"
+                        "duplicate READY for engine id {engine_id:?}"
+                    )));
+                }
+                None if awaiting_hello => {
+                    warn!(
+                        ?engine_id,
+                        "received READY from an engine this handshake never greeted: an earlier \
+                         handshake of this frontend answered its HELLO with these same addresses \
+                         while it was loading; taking it as ready"
+                    );
+                    engines.insert(engine_id, EngineStartupState::ReadyReceived);
+                }
+                None => {
+                    return Err(unexpected_handshake(format!(
+                        "READY for unexpected engine id {engine_id:?}: every one of the \
+                         {engine_count} expected engine(s) is known"
                     )));
                 }
             },
@@ -250,13 +298,15 @@ pub async fn connect_handshake(
         wait_for_input_registrations(&mut input_socket, engines.into_keys(), &clock).await?;
     info!(engine_count = engines.len(), "engines connected");
 
-    let (input_send, _) = input_socket.split();
+    let (input_send, input_recv) = input_socket.split();
 
     Ok(ConnectedTransport {
         input_address,
         output_address,
         engines,
         input_send,
+        input_events,
+        input_recv,
         output_socket,
     })
 }
@@ -375,6 +425,26 @@ async fn wait_for_input_registrations(
             })
         })
         .collect()
+}
+
+/// Check every connected engine's declared positional layouts against the
+/// prefixes `P`'s encoders fill ([`EngineProtocol::check_layouts`]), once,
+/// before the first request goes out: a mismatch fails the connection with
+/// the engine, the struct and the field named, rather than failing each
+/// request that engine cannot decode.
+pub fn check_engine_layouts<P: EngineProtocol>(transport: &ConnectedTransport) -> Result<()> {
+    for engine in &transport.engines {
+        if let Err(error) = P::check_layouts(&engine.ready_response) {
+            let engine_id = &engine.engine_id;
+            return Err(match error {
+                Error::WireLayoutMismatch { message } => Error::WireLayoutMismatch {
+                    message: format!("engine {engine_id:?}: {message}"),
+                },
+                other => other,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Send an encoded request to one engine over the shared input ROUTER socket.
@@ -696,6 +766,104 @@ mod tests {
         assert!(
             message.contains("duplicate HELLO") && message.contains("after INIT phase"),
             "{message}"
+        );
+    }
+
+    /// An engine says HELLO once, so a second HELLO from an engine between
+    /// INIT and READY is a restarted engine process: it is greeted again and
+    /// connects, where refusing it would leave the new process waiting for
+    /// an INIT that never comes.
+    #[tokio::test]
+    async fn a_second_hello_from_an_engine_still_initialising_is_greeted_again() {
+        let ns = IpcNamespace::new().unwrap();
+        let (handshake, input, output) = (
+            ns.handshake_endpoint(),
+            ns.input_endpoint(),
+            ns.output_endpoint(),
+        );
+        let engine = async {
+            // The first process says HELLO, holds its INIT and dies loading;
+            // the frontend hears nothing of that.
+            let first = hello(&handshake, EngineId::from_engine_index(0))
+                .await
+                .expect("first HELLO");
+            // Its replacement says HELLO under the same identity, is greeted
+            // again, loads, and says READY.
+            let second = hello(&handshake, EngineId::from_engine_index(0))
+                .await
+                .expect("second HELLO");
+            let connected = second.ready(default_ready_response()).await;
+            drop(first);
+            connected
+        };
+        let (transport, engine) = tokio::join!(
+            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
+            engine
+        );
+        let transport = transport.expect("frontend handshake");
+        engine.expect("restarted mock engine");
+        assert_eq!(transport.engines.len(), 1);
+        assert_eq!(
+            transport.engines[0].engine_id,
+            EngineId::from_engine_index(0)
+        );
+    }
+
+    /// The frontend that answered an engine's HELLO need not be the one that
+    /// hears its READY: when the frontend gave up its wait (or restarted) and
+    /// bound again while the engine was loading, the engine's one READY and
+    /// one input registration reach a handshake that never greeted it. They
+    /// are taken as that engine's: the INIT it holds names these same
+    /// addresses, and an engine says HELLO once, so waiting for another
+    /// would strand it for good.
+    #[tokio::test]
+    async fn a_ready_from_an_engine_an_earlier_handshake_greeted_completes_the_handshake() {
+        let ns = IpcNamespace::new().unwrap();
+        let (handshake, input, output) = (
+            ns.handshake_endpoint(),
+            ns.input_endpoint(),
+            ns.output_endpoint(),
+        );
+        // The first handshake greets the engine and gives up its READY wait
+        // while the engine is still loading.
+        let (gave_up, engine) = tokio::join!(
+            connect_handshake(&handshake, 1, &input, &output, Duration::from_millis(300)),
+            hello(&handshake, EngineId::from_engine_index(0)),
+        );
+        let Err(error) = gave_up else {
+            panic!("the first handshake must give up its READY wait");
+        };
+        assert!(
+            matches!(error, Error::HandshakeTimeout { stage: "READY", .. }),
+            "{error}"
+        );
+        let engine = engine.expect("HELLO/INIT with the first handshake");
+        // The dropped listeners' socket files go on their own tasks; a real
+        // frontend binds again a health probe later.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The frontend binds again; the engine's handshake socket reconnects,
+        // and its READY, then its registration, arrive at the new handshake.
+        let (transport, engine) = tokio::join!(
+            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
+            async {
+                engine
+                    .redial(&handshake)
+                    .await?
+                    .ready(default_ready_response())
+                    .await
+            },
+        );
+        let transport = transport.expect("the second handshake takes the engine");
+        engine.expect("mock engine connected");
+        assert_eq!(transport.engines.len(), 1);
+        assert_eq!(
+            transport.engines[0].engine_id,
+            EngineId::from_engine_index(0)
+        );
+        assert_eq!(
+            transport.engines[0].ready_response.vllm_version,
+            "test-vllm-version"
         );
     }
 }

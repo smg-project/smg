@@ -375,6 +375,36 @@ def test_server_facts_carry_where_the_engine_starts_a_grammar(monkeypatch):
     assert "engine_reasoning_parser" not in plain
 
 
+@dataclasses.dataclass
+class _GrammarServerArgs(FakeServerArgs):
+    grammar_backend: str | None = "none"
+
+
+def test_server_facts_carry_the_grammar_backend_the_scheduler_runs(monkeypatch):
+    # The grammar backend, resolved, under the engine's own argument name: the
+    # Rust servicer refuses a constraint that backend cannot enforce before
+    # the scheduler. An unset flag is the checkpoint's default, which the
+    # engine resolves once it has read the checkpoint; until then nothing is
+    # written, so nothing is judged ahead of the engine.
+    _stub_servicer_module(monkeypatch)
+    monkeypatch.delenv("SMG_PAIRING_PROTOCOL", raising=False)
+    pinned = json.loads(
+        rust.server_facts(_GrammarServerArgs(grammar_backend="xgrammar"))["server_args_json"]
+    )
+    assert pinned["grammar_backend"] == "xgrammar"
+    explicit_none = _GrammarServerArgs(grammar_backend="none")
+    explicit_none._grammar_backend_unset = False
+    assert json.loads(rust.server_facts(explicit_none)["server_args_json"])["grammar_backend"] == (
+        "none"
+    )
+    unset = _GrammarServerArgs(grammar_backend="none")
+    unset._grammar_backend_unset = True
+    unset._beam_checkpoint = None
+    assert "grammar_backend" not in json.loads(rust.server_facts(unset)["server_args_json"])
+    unset._beam_checkpoint = True
+    assert json.loads(rust.server_facts(unset)["server_args_json"])["grammar_backend"] == "xgrammar"
+
+
 def test_server_facts_never_carry_credentials(monkeypatch):
     """The Rust server reports the same server args as the Python one, so the
     in-engine RL control key and tokens must not leave the engine here either.

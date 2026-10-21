@@ -215,7 +215,7 @@ mod tests {
         let owned_by = probe_models_owned_by(
             &format!("http://{addr}"),
             5,
-            &crate::http_client::client(),
+            &crate::clients::http_client(),
             None,
         )
         .await

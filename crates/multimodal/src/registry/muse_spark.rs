@@ -367,7 +367,9 @@ impl ModelProcessorSpec for MuseSparkSpec {
         id.contains("muse-spark") || id.contains("muse_spark")
     }
 
-    /// The template renders parts in request order.
+    /// The family's renderer is positional: a string template of it gets the
+    /// media parts where the request put them. Its own template takes the
+    /// parts and places them itself, whatever this says.
     fn media_part_order(&self) -> MediaPartOrder {
         MediaPartOrder::Authored
     }

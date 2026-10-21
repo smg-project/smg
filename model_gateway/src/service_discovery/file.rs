@@ -47,12 +47,13 @@ use tracing::{info, warn};
 
 use super::{
     provider::{DiscoveredWorker, DiscoveryKind},
-    reconciler::{self, DesiredState},
+    reconciler::DesiredState,
+    snapshot::{LastGood, SnapshotError},
 };
 use crate::{
     app_context::AppContext,
     config::{ConfigError, ConfigResult, RoutingMode},
-    observability::metrics::{metrics_labels, Metrics},
+    observability::metrics::metrics_labels,
     worker::{endpoint::Endpoint, EndpointKey},
 };
 
@@ -266,7 +267,7 @@ enum ManifestError {
     Invalid { path: String, reason: String },
 }
 
-impl ManifestError {
+impl SnapshotError for ManifestError {
     fn metric_reason(&self) -> &'static str {
         match self {
             Self::Unreadable { .. } => metrics_labels::SNAPSHOT_ERROR_UNREADABLE,
@@ -445,7 +446,7 @@ struct FileDiscovery {
     /// Held for as long as the loop runs: dropping it stops the watch.
     watch: Option<ManifestWatch>,
     warned: bool,
-    last_good: Option<DesiredState>,
+    last_good: LastGood,
 }
 
 /// The loop's timers, held across passes: the tick, and the retry of a watch
@@ -471,6 +472,11 @@ impl Timers {
 impl FileDiscovery {
     fn new(config: FileProviderConfig, app_context: Arc<AppContext>) -> Self {
         let (wake, woken) = mpsc::channel(1);
+        let last_good = LastGood::new(
+            DiscoveryKind::File,
+            format!("Discovery manifest {}", config.path.display()),
+            "manifest",
+        );
         Self {
             config,
             app_context,
@@ -478,7 +484,7 @@ impl FileDiscovery {
             woken,
             watch: None,
             warned: false,
-            last_good: None,
+            last_good,
         }
     }
 
@@ -498,10 +504,9 @@ impl FileDiscovery {
         self.rewatch_if_lost(timers);
         let started_at = time::Instant::now();
         self.reread().await;
-        if let Some(desired) = &self.last_good {
-            reconciler::reconcile(desired, DiscoveryKind::File, &self.app_context, started_at)
-                .await;
-        }
+        self.last_good
+            .reconcile(&self.app_context, started_at)
+            .await;
     }
 
     /// Wait for what causes the next pass: the tick, a burst of change events
@@ -574,29 +579,7 @@ impl FileDiscovery {
     /// reported and leaves the snapshot in place, so a half-written or broken
     /// file never removes a worker.
     async fn reread(&mut self) {
-        match read_manifest(&self.config).await {
-            Ok(desired) => {
-                if self.last_good.as_ref() != Some(&desired) {
-                    info!(
-                        "Discovery manifest {} lists {} worker(s)",
-                        self.config.path.display(),
-                        desired.workers.len()
-                    );
-                }
-                self.last_good = Some(desired);
-            }
-            Err(error) => {
-                Metrics::record_discovery_snapshot_error(
-                    DiscoveryKind::File.metric_label(),
-                    error.metric_reason(),
-                );
-                if self.last_good.is_some() {
-                    warn!("{error}; keeping the last good manifest");
-                } else {
-                    warn!("{error}; no workers discovered yet");
-                }
-            }
-        }
+        self.last_good.update(read_manifest(&self.config).await);
     }
 }
 
@@ -1045,7 +1028,7 @@ mod tests {
     /// The endpoints of the last good snapshot, `None` before the first good
     /// read.
     fn listed(discovery: &FileDiscovery) -> Option<Vec<String>> {
-        discovery.last_good.as_ref().map(|desired| {
+        discovery.last_good.desired().map(|desired| {
             desired
                 .workers
                 .values()

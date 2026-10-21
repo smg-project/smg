@@ -65,9 +65,10 @@ fn reasoning_decision(
 /// and injects PD/EPD metadata — returning the plan, attempt stamp and rendered
 /// reasoning state. The caller supplies the `ResponseSpec`.
 /// `continued_final_message` is the rendered prompt's
-/// (`ProcessedMessages::continued_final_message`). `auto_tag` derives the
-/// table's `auto` tag for a worker's grammar start when `tool_constraints` is
-/// that tag (`regular::symphony::constraint::WorkerConstraint::auto`).
+/// (`ProcessedMessages::continued_final_message`). `table_tag` derives the
+/// table's tag for a worker's grammar start when `tool_constraints` is one
+/// the table shapes by the start, the `auto` tag or a JSON answer's
+/// (`regular::symphony::constraint::WorkerConstraint::table_tag`).
 #[expect(clippy::too_many_arguments)]
 pub(crate) async fn build_chat_backed_plan(
     ctx: &mut RequestContext,
@@ -76,7 +77,7 @@ pub(crate) async fn build_chat_backed_plan(
     continued_final_message: bool,
     token_ids: Vec<u32>,
     tool_constraints: Option<(String, String)>,
-    auto_tag: Option<Arc<dyn TagForStart>>,
+    table_tag: Option<Arc<dyn TagForStart>>,
     id_prefix: &'static str,
     inject_pd_metadata: bool,
     plan_kind: ExecutionPlanKind,
@@ -104,8 +105,8 @@ pub(crate) async fn build_chat_backed_plan(
     // thought and then the calls from the first token (the worker's
     // `constrained_decoding_start` label; see `utils::tool_constraints_for_worker`).
     // The unshaped constraint stays on the attempt stamp, or what derives the
-    // table's `auto` tag for a start: a retry gives the worker it selects the
-    // same shaping (`helpers::ToolConstraintStamp`).
+    // table's tag for a start (the `auto` tag, a JSON answer's): a retry gives
+    // the worker it selects the same shaping (`helpers::ToolConstraintStamp`).
     let tool_parser = ctx
         .components
         .parser_resolver
@@ -158,8 +159,8 @@ pub(crate) async fn build_chat_backed_plan(
         "build_chat_backed_plan",
     )?;
 
-    let tool_constraint = match auto_tag {
-        Some(auto_tag) => helpers::ToolConstraintStamp::capture_table(auto_tag, &proto_request),
+    let tool_constraint = match table_tag {
+        Some(table_tag) => helpers::ToolConstraintStamp::capture_table(table_tag, &proto_request),
         None => helpers::ToolConstraintStamp::capture(
             unshaped_tool_constraints,
             tool_parser.as_deref(),
@@ -211,7 +212,7 @@ impl BuildStage for ChatRequestBuildingStage {
         // (`reasoning_decision`). The state records which parser reads the
         // response, for the response's header.
         let reading::Decided {
-            auto_tag,
+            table_tag,
             tool_constraints,
             whole_turn,
             assignment,
@@ -265,7 +266,7 @@ impl BuildStage for ChatRequestBuildingStage {
             continued_final_message,
             token_ids,
             tool_constraints,
-            auto_tag,
+            table_tag,
             "chatcmpl-",
             self.inject_pd_metadata,
             self.plan_kind,

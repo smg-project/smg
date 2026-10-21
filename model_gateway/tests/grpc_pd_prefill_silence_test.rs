@@ -26,7 +26,12 @@
 //! five at once: the last answers well past the bound) and expect every
 //! request answered and nothing charged to the prefill worker. One more
 //! lets a call given up on fail late, and expects the worker
-//! charged once, at the verdict.
+//! charged once, at the verdict. One more sends a burst of long prompts to
+//! a prefill worker that has answered nothing yet and whose first answer
+//! comes past the first side's bound (a cold engine, or a decode side that
+//! admits the burst late), then one every turn: the worker's silence counts
+//! from the burst, which has the time its backlog takes, so every request
+//! is answered.
 //!
 //! The decode side of the sequential shape has a bound of its own, counted
 //! from its dispatch once the prefill side has answered: a handoff that
@@ -93,6 +98,14 @@ const TURN: Duration = Duration::from_millis(1_200);
 const QUEUED_CALLS: usize = 5;
 /// How long after the bound a held call fails, in the late-failure case.
 const LATE: Duration = Duration::from_secs(2);
+/// How long after its first call a cold engine answers it, in the
+/// cold-burst case: past the first side's bound, inside the time the
+/// burst's backlog takes at the cold prior.
+const COLD_START: Duration = Duration::from_secs(5);
+/// The prompt of each cold-burst request, in tokens (the mock tokenizer's
+/// `Hello` is one): the five of them are ten seconds of prefill at the
+/// cold prior of 10k tokens/s.
+const LONG_PROMPT_TOKENS: usize = 20_000;
 
 type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
 
@@ -117,6 +130,9 @@ enum Behaviour {
 #[derive(Clone, Default)]
 struct Gate {
     next: Arc<tokio::sync::Mutex<Option<tokio::time::Instant>>>,
+    /// How long after the first call its turn comes: zero for an engine that
+    /// answers its first call at once.
+    first_turn_after: Duration,
 }
 
 impl Gate {
@@ -125,7 +141,7 @@ impl Gate {
         let at = {
             let mut next = self.next.lock().await;
             let now = tokio::time::Instant::now();
-            let at = next.map_or(now, |next| next.max(now));
+            let at = next.map_or(now + self.first_turn_after, |next| next.max(now));
             *next = Some(at + TURN);
             at
         };
@@ -541,6 +557,21 @@ async fn start_queued_grpc_worker(shape: ParallelShape) -> (u16, QueuedEngine) {
     (port, engine)
 }
 
+/// [`start_queued_grpc_worker`] for an engine that answers its first call
+/// `cold` after it arrives, and one call every turn after that.
+async fn start_cold_queued_grpc_worker(cold: Duration) -> (u16, QueuedEngine) {
+    let engine = QueuedEngine {
+        gate: Gate {
+            first_turn_after: cold,
+            ..Gate::default()
+        },
+        shape: ParallelShape::Queued,
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let port = serve_engine(TokenSpeedSchedulerServer::new(engine.clone())).await;
+    (port, engine)
+}
+
 /// Serve a sequential-dispatch mock engine in-process; returns its port.
 async fn start_mock_engine(engine: Engine) -> u16 {
     serve_engine(proto::vllm_engine_server::VllmEngineServer::new(engine)).await
@@ -731,6 +762,40 @@ async fn one_chat(
         "messages": [{"role": "user", "content": "Hello world"}],
         "max_tokens": 8,
         "stream": streaming,
+    }))
+    .unwrap();
+    let started = Instant::now();
+    let response =
+        tokio::time::timeout(CASE_CAP, router.route_chat(None, &tenant(), request, MODEL))
+            .await
+            .expect(
+                "the request must be answered within the case cap, not held to the request timeout",
+            );
+    let status = response.status();
+    let bytes = tokio::time::timeout(
+        CASE_CAP,
+        axum::body::to_bytes(response.into_body(), 1 << 20),
+    )
+    .await
+    .expect("the response body must end within the case cap")
+    .expect("response body");
+    let body = String::from_utf8(bytes.to_vec()).expect("utf-8 body");
+    (status, body, started.elapsed())
+}
+
+/// One streaming chat through `router` whose prompt is
+/// [`LONG_PROMPT_TOKENS`] long: its status, body and duration.
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+async fn one_long_streaming_chat(router: &dyn RouterTrait) -> (http::StatusCode, String, Duration) {
+    let request = serde_json::from_value(serde_json::json!({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": "Hello ".repeat(LONG_PROMPT_TOKENS)}],
+        "max_tokens": 8,
+        "stream": true,
     }))
     .unwrap();
     let started = Instant::now();
@@ -1124,6 +1189,61 @@ fn a_parallel_prefill_whose_calls_queue_behind_the_decode_side_is_not_given_up_o
             workers[0].circuit_breaker_state(),
             CircuitState::Closed,
             "a backed-up prefill is not a failing one"
+        );
+    });
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        0.0,
+        "no call was given up on:\n{rendered}"
+    );
+}
+
+/// Parallel dispatch, a burst of long prompts on a prefill worker that has
+/// answered nothing yet, whose engine answers its first call past the first
+/// side's bound (a cold engine, or a decode side admitting the burst late)
+/// and then one call every turn. The worker's silence counts from the burst,
+/// and the burst's backlog (ten seconds at the cold prior) is the time it
+/// may take, so no side is given up on: every request is answered, nothing
+/// is charged to the prefill worker, and its breaker stays closed. Judged
+/// by each side's own bound and a worker that "never answered", the sides
+/// would be given up on one after another, each before its call's turn.
+#[test]
+fn a_cold_burst_of_long_prompts_answered_past_the_bound_is_not_given_up_on() {
+    let rendered = render_after(|| async {
+        let (prefill_port, prefill) = start_cold_queued_grpc_worker(COLD_START).await;
+        let decode_port = start_mock_grpc_worker(Duration::ZERO).await;
+        let (router, workers) = build_pd_router_with(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::TokenSpeed,
+            CircuitBreakerConfig {
+                failure_threshold: 2,
+                ..Default::default()
+            },
+        )
+        .await;
+        let answers =
+            join_all((0..QUEUED_CALLS).map(|_| one_long_streaming_chat(router.as_ref()))).await;
+        for (status, body, elapsed) in &answers {
+            assert_eq!(*status, http::StatusCode::OK, "{body} ({elapsed:?})");
+            assert!(body.contains("data: [DONE]"), "{body}");
+        }
+        let first = answers
+            .iter()
+            .map(|(_, _, elapsed)| *elapsed)
+            .min()
+            .unwrap_or_default();
+        assert!(
+            first >= COLD_START,
+            "the first answer comes past the bound: {first:?}"
+        );
+        assert_eq!(prefill.calls(), QUEUED_CALLS, "each call dispatched once");
+        assert_eq!(
+            workers[0].circuit_breaker_state(),
+            CircuitState::Closed,
+            "a cold, backed-up prefill is not a failing one"
         );
     });
     assert_eq!(

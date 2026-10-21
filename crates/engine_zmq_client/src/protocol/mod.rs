@@ -11,6 +11,7 @@
 
 use bytes::Bytes;
 
+use self::handshake::EngineCoreReadyResponse;
 use crate::{codec::OpaqueValue, Result};
 
 pub mod handshake;
@@ -27,7 +28,7 @@ pub mod vllm;
 pub struct EngineLoad {
     /// Requests currently in model-execution batches.
     pub num_running: u64,
-    /// Requests waiting in the scheduler queue.
+    /// Total waiting requests, including deferred requests.
     pub num_waiting: u64,
     /// KV-cache usage ratio (`1.0` == 100%).
     pub kv_cache_usage: f64,
@@ -157,6 +158,17 @@ pub trait EngineProtocol: Send + Sync + 'static {
         _args: &[OpaqueValue],
     ) -> Result<Option<(Bytes, Vec<u8>)>> {
         Ok(None)
+    }
+    /// Check the positional layouts the engine declared at its handshake
+    /// ([`EngineCoreReadyResponse::positional_layouts`], the field order of
+    /// each array-encoded struct it decodes) against the prefixes this
+    /// protocol's encoders fill, once per engine before its first request: a
+    /// struct whose field order moved under this client is named here, with
+    /// the field that differs, instead of failing every request it is sent
+    /// in. `Ok(())` for an engine that declares no layouts, and for a
+    /// protocol with no positional request structs to check.
+    fn check_layouts(_ready: &EngineCoreReadyResponse) -> Result<()> {
+        Ok(())
     }
     /// Decode one output message (frame 0 plus ordered aux frames) into a batch.
     fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>>;

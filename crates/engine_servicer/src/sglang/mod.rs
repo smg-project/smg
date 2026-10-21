@@ -22,7 +22,10 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use engine_zmq_adapter::ZmqEngineClient;
+use engine_zmq_adapter::{
+    ConstraintKinds, StructuredOutputBackend, StructuredOutputsBackendConfig,
+    StructuredOutputsSupport, ZmqEngineClient,
+};
 use futures::FutureExt;
 use smg_grpc_client::sglang_proto::sglang_scheduler_server::SglangSchedulerServer;
 use tokio::net::TcpListener;
@@ -96,6 +99,53 @@ pub struct SglangModelInfo {
     pub kv_events_replay_endpoint: String,
     /// The publisher's topic prefix (empty by default).
     pub kv_events_topic: String,
+}
+
+/// What the scheduler enforces of a structured request, read off the
+/// launcher's `server_args`: the `grammar_backend` the launcher resolved
+/// (SGLang's `--grammar-backend`: `xgrammar` unless set, `outlines`,
+/// `llguidance` or `none`) and whether the scheduler keeps its tokenizer,
+/// without which (`--skip-tokenizer-init`) its grammar manager builds no
+/// backend at all. `none` enforces nothing: the scheduler admits such a
+/// request and aborts it with a 400. `outlines` compiles JSON schemas and
+/// regular expressions and fails the other kinds at compile; `xgrammar` and
+/// `llguidance` compile all four, xgrammar with the schema features it lacks
+/// dropped. A name this servicer does not know is a plugin backend of the
+/// scheduler's: nothing is judged ahead of it. A launcher that wrote no
+/// backend (an older one) leaves the engine's default, xgrammar. The adapter
+/// refuses a constraint outside this before the scheduler, as on every wire.
+pub(super) fn structured_outputs_support(model: &SglangModelInfo) -> StructuredOutputsSupport {
+    use StructuredOutputsBackendConfig::{Other, Pinned};
+
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    if args
+        .get("skip_tokenizer_init")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return StructuredOutputsSupport::DISABLED;
+    }
+    let backend = args
+        .get("grammar_backend")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    match backend {
+        "" => StructuredOutputsSupport::default(),
+        "xgrammar" => Pinned(StructuredOutputBackend::Xgrammar).into(),
+        "llguidance" => Pinned(StructuredOutputBackend::Guidance).into(),
+        "outlines" => StructuredOutputsSupport::new(
+            Pinned(StructuredOutputBackend::Outlines),
+            ConstraintKinds {
+                json_schema: true,
+                regex: true,
+                ebnf: false,
+                structural_tag: false,
+            },
+        ),
+        "none" => StructuredOutputsSupport::DISABLED,
+        _ => Other.into(),
+    }
 }
 
 /// How to bind, where the engines dial in, and what to advertise.

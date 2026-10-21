@@ -35,8 +35,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from smg_grpc_servicer.constrained_decoding import (
+    grammar_backend_entry,
     grammar_start_labels,
     sglang_constrained_decoding_start,
+    sglang_grammar_backend,
 )
 from smg_grpc_servicer.mm_item_limits import MM_ITEM_LIMITS_KEY, sglang_item_limits
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
@@ -208,6 +210,10 @@ def server_facts(server_args: Any) -> dict[str, Any]:
     args_dict.update(
         grammar_start_labels(server_args, sglang_constrained_decoding_start(server_args))
     )
+    # The grammar backend the scheduler runs, resolved (the raw argument is
+    # None unless set): the Rust servicer refuses a constraint that backend
+    # cannot enforce before the scheduler.
+    grammar_backend_entry(args_dict, sglang_grammar_backend(server_args))
     try:
         from sglang.version import __version__ as sglang_version
     except ImportError:  # the launcher's unit tests run without SGLang
