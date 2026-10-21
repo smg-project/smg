@@ -1718,3 +1718,145 @@ async fn test_cleanup_task_reclaims_state_and_stops_on_shutdown() {
         .expect("cleanup task did not stop on shutdown")
         .unwrap();
 }
+
+/// A step that fails on every attempt, tells the test when its first attempt
+/// runs, and holds that attempt until the test releases it.
+struct HeldFailingStep {
+    attempts: Arc<AtomicU32>,
+    first_attempt_running: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl StepExecutor<TestWorkflowData> for HeldFailingStep {
+    async fn execute(
+        &self,
+        _context: &mut WorkflowContext<TestWorkflowData>,
+    ) -> WorkflowResult<StepResult> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.first_attempt_running.notify_one();
+            self.release.notified().await;
+        }
+        Err(WorkflowError::StepFailed {
+            step_id: StepId::new("held_step"),
+            message: "fails every time".to_string(),
+        })
+    }
+}
+
+/// A workflow cancelled while a step's attempt is under way is not attempted
+/// again: the retry loop reads the cancellation before every attempt.
+#[tokio::test]
+async fn a_cancelled_workflow_stops_before_the_next_attempt() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let attempts = Arc::new(AtomicU32::new(0));
+    let first_attempt_running = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+
+    let workflow = WorkflowDefinition::new("cancel_before_retry_workflow", "Cancel Before Retry")
+        .add_step(
+            StepDefinition::new(
+                "held_step",
+                "Step held in its first attempt",
+                Arc::new(HeldFailingStep {
+                    attempts: Arc::clone(&attempts),
+                    first_attempt_running: Arc::clone(&first_attempt_running),
+                    release: Arc::clone(&release),
+                }),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: 10,
+                backoff: BackoffStrategy::Fixed(Duration::from_millis(10)),
+            })
+            .with_timeout(Duration::from_secs(5)),
+        );
+
+    let workflow_id = workflow.id.clone();
+    engine.register_workflow(workflow).unwrap();
+    let instance_id = engine
+        .start_workflow(workflow_id, TestWorkflowData::default())
+        .await
+        .unwrap();
+
+    timeout(Duration::from_secs(5), first_attempt_running.notified())
+        .await
+        .expect("the first attempt runs");
+    engine.cancel_workflow(instance_id).await.unwrap();
+    release.notify_one();
+
+    // The workflow's task ends once the loop reads the cancellation.
+    for _ in 0..250 {
+        if engine.active_workflow_count() == 0 {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        engine.active_workflow_count(),
+        0,
+        "the workflow's task ended"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "no attempt after the cancellation"
+    );
+    let state = engine.get_status(instance_id).await.unwrap();
+    assert_eq!(state.status, WorkflowStatus::Cancelled);
+}
+
+/// A `RetryIndefinitely` step keeps retrying past its policy's attempts: the
+/// policy's `max_attempts` bounds the other failure actions only.
+#[tokio::test]
+async fn a_retry_indefinitely_step_keeps_retrying_past_the_policy_s_attempts() {
+    let engine: WorkflowEngine<TestWorkflowData> = WorkflowEngine::new();
+    let counter = Arc::new(AtomicU32::new(0));
+
+    let workflow = WorkflowDefinition::new("retry_indefinitely_workflow", "Retry Indefinitely")
+        .add_step(
+            StepDefinition::new(
+                "stubborn_step",
+                "Step that succeeds on its fifth attempt",
+                Arc::new(CountingStep {
+                    counter: Arc::clone(&counter),
+                    should_succeed_after: 5,
+                }),
+            )
+            .with_retry(RetryPolicy {
+                max_attempts: 2,
+                backoff: BackoffStrategy::Fixed(Duration::from_millis(1)),
+            })
+            .with_failure_action(FailureAction::RetryIndefinitely)
+            .with_timeout(Duration::from_secs(5)),
+        );
+
+    let workflow_id = workflow.id.clone();
+    engine.register_workflow(workflow).unwrap();
+    let instance_id = engine
+        .start_workflow(workflow_id, TestWorkflowData::default())
+        .await
+        .unwrap();
+
+    let mut completed = false;
+    for _ in 0..250 {
+        if engine
+            .get_status(instance_id)
+            .await
+            .is_ok_and(|state| state.status == WorkflowStatus::Completed)
+        {
+            completed = true;
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    assert!(completed, "the workflow completes once the step succeeds");
+
+    let state = engine.get_status(instance_id).await.unwrap();
+    let step_state = state
+        .step_states
+        .get(&StepId::new("stubborn_step"))
+        .unwrap();
+    assert_eq!(step_state.status, StepStatus::Succeeded);
+    assert_eq!(step_state.attempt, 5);
+    assert_eq!(counter.load(Ordering::SeqCst), 5);
+}
