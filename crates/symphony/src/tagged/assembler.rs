@@ -130,8 +130,9 @@ struct ValueState {
 #[derive(Clone, Debug)]
 enum Mode {
     /// Pushed piece by piece; `held_newline` says `carried` ends with a newline that may be the
-    /// template's.
-    Streaming { held_newline: bool },
+    /// template's, `wrote` that a fragment of the value's text went out (the opening fragment
+    /// goes out with the parameter tag, before any byte of the value).
+    Streaming { held_newline: bool, wrote: bool },
     /// Written at the close with [`json`]; the text is `carried[start..]`.
     Whole { start: usize },
     /// A string that may be null: written whole if its text is a null word, streamed from the
@@ -249,6 +250,44 @@ impl Assembler {
         } else {
             self.leftover(MalformedReason::UnterminatedRegion, out);
         }
+    }
+
+    /// The stream's stop inside the block: the model's own end of output, not a cut. The call
+    /// ends as the block's end would end it ([`Self::close`]): after the last value the object is
+    /// closed, a name, a key or a value held for its close that the stop found open is reported
+    /// and the object closes without that member. A streamed string still open is closed first:
+    /// the model wrote nothing after its bytes, so they are the value whole, the start of a tag
+    /// the scanner held is its text too, since no tag followed, and a newline held as the
+    /// template's framing before the closing tag stays the template's, the closing quote's
+    /// source. One `Malformed { OpenAtTheStop }` event of no bytes stands before the fragment
+    /// that closes what was open ([`open_at_the_stop`](super::open_at_the_stop)): for a string
+    /// the stop closed under any table, and for the call itself where the table has no stop row
+    /// (`as_marker`), since there the template writes the marker the model skipped.
+    pub fn stop(mut self, as_marker: bool, out: &mut Events) {
+        let string_open = self.started() && self.open_string();
+        // The opening fragment goes out with the parameter tag: a string no byte of the value
+        // followed is no value the model wrote, and is left open as the block's end leaves it
+        // ([`Self::close`]), nothing made up for it.
+        let written = matches!(
+            &self.stage,
+            Stage::Value(ValueState {
+                mode: Mode::Streaming { wrote: true, .. },
+                ..
+            })
+        );
+        if string_open && written {
+            let held = self.scanner.set_aside();
+            if !held.is_empty() {
+                self.stream(&held, out);
+            }
+            super::open_at_the_stop(out);
+            let source = Text::uncounted(std::mem::take(&mut self.carried));
+            self.push_fragment("\"".to_string(), source, out);
+            self.stage = Stage::Between;
+        } else if self.started() && !as_marker && !string_open {
+            super::open_at_the_stop(out);
+        }
+        self.close(out);
     }
 
     /// The whitespace the block ends with after its last call, which the engine drops as the
@@ -505,6 +544,7 @@ impl Assembler {
                 self.open_string_fragment(&key, out);
                 Mode::Streaming {
                     held_newline: false,
+                    wrote: false,
                 }
             }
             Some(Kind::NullableString) => Mode::Undecided {
@@ -577,6 +617,7 @@ impl Assembler {
         let key = value.key.clone();
         value.mode = Mode::Streaming {
             held_newline: false,
+            wrote: false,
         };
         self.open_string_fragment(&key, out);
         self.stream(&arrived, out);
@@ -589,7 +630,11 @@ impl Assembler {
     fn stream(&mut self, text: &str, out: &mut Events) {
         let own_line = self.placement == Placement::OwnLine;
         let Stage::Value(ValueState {
-            mode: Mode::Streaming { held_newline },
+            mode:
+                Mode::Streaming {
+                    held_newline,
+                    wrote,
+                },
             ..
         }) = &mut self.stage
         else {
@@ -606,6 +651,7 @@ impl Assembler {
             self.carried.push('\n');
             return;
         }
+        *wrote = true;
         let mut json = String::with_capacity(body.len() + 2);
         if had_newline {
             json.push_str("\\n");
@@ -726,6 +772,10 @@ impl crate::engine::CallAssembler for Assembler {
 
     fn finish(self: Box<Self>, out: &mut Events) {
         (*self).finish(out);
+    }
+
+    fn stop(self: Box<Self>, as_marker: bool, out: &mut Events) {
+        (*self).stop(as_marker, out);
     }
 }
 
@@ -1844,6 +1894,75 @@ mod tests {
                 format!("{{\"city\": {json}}}"),
                 "{value:?} on a line of its own"
             );
+        }
+    }
+
+    /// Feeds the pieces at `placement`, then the stream's stop under a table with no stop row.
+    fn stopped(pieces: &[&str], placement: Placement) -> Vec<Event<'static>> {
+        let declared = declared();
+        let mut assembler = Assembler::new(0, ids(), placement);
+        let mut out = Events::new();
+        for piece in pieces {
+            assembler.feed(piece, &declared, &mut out);
+        }
+        assembler.stop(false, &mut out);
+        out.drain()
+    }
+
+    #[test]
+    fn the_stop_closes_a_string_a_byte_of_which_went_out_and_leaves_one_without_open() {
+        // The model's own end of output inside a streamed string: the string and the object
+        // close, the newline held as the template's framing is the quote's source, and the one
+        // word of no bytes says the stop closed them; under both placements.
+        for (placement, output, source) in [
+            (
+                Placement::OwnLine,
+                "<function=f>\n<parameter=city>\nPa\n",
+                "\n",
+            ),
+            (Placement::Direct, "<function=f><parameter=city>Pa", ""),
+        ] {
+            let events = stopped(&[output], placement);
+            assert_eq!(arguments(&events), r#"{"city": "Pa"}"#, "{placement:?}");
+            assert_eq!(
+                malformed(&events),
+                [(String::new(), MalformedReason::OpenAtTheStop)],
+                "{placement:?}"
+            );
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    Event::ToolCallArguments { json, source: s, .. } if json == "\"" && s.text == source
+                )),
+                "{placement:?}: {events:?}"
+            );
+            assert_eq!(bytes(&events), output, "{placement:?}");
+        }
+        // The opening fragment went out with the parameter tag, no byte of the value followed:
+        // nothing is made up for a value the model never wrote, so the string is left open and
+        // the one word says the arguments are no whole value, as the block's end leaves it.
+        for (placement, output) in [
+            (Placement::OwnLine, "<function=f>\n<parameter=city>\n"),
+            (Placement::OwnLine, "<function=f>\n<parameter=city>"),
+            (Placement::Direct, "<function=f><parameter=city>"),
+        ] {
+            let events = stopped(&[output], placement);
+            assert_eq!(
+                arguments(&events),
+                r#"{"city": ""#,
+                "{placement:?} {output:?}"
+            );
+            assert!(
+                malformed(&events)
+                    .iter()
+                    .all(|(_, why)| *why == MalformedReason::UnterminatedRegion),
+                "{placement:?} {output:?}: {events:?}"
+            );
+            assert!(
+                !malformed(&events).is_empty(),
+                "{placement:?} {output:?}: the end says the arguments are no whole value"
+            );
+            assert_eq!(bytes(&events), output, "{placement:?} {output:?}");
         }
     }
 }

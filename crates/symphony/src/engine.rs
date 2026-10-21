@@ -33,12 +33,14 @@ use crate::{
     Declared,
 };
 
-/// Why a call region closed: its closing terminal (or the next opener) arrived, or the stream
-/// stopped where the table says a stop closes it; or the stream ended.
+/// Why a call region closed: its closing terminal (or the next opener) arrived; the stream
+/// stopped, the model's own end of output (`EngineFinish::Stop`); or the stream was cut, by the
+/// token limit, an abort or a finish the crate does not read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Closed {
-    ByMarker,
-    ByEnd,
+    Marker,
+    Stop,
+    Cut,
 }
 
 /// A [`Format`] running as a [`Parser`]. One per generated choice.
@@ -214,9 +216,27 @@ pub(crate) trait CallAssembler: std::fmt::Debug + Send + Sync {
     /// source); otherwise the engine drops them as the region's.
     fn close(self: Box<Self>, terminal: &str, out: &mut Events) -> bool;
 
-    /// The stream ended inside the region: nothing is closed for the client, so arguments cut
+    /// The stream was cut inside the region: nothing is closed for the client, so arguments cut
     /// short never look complete.
     fn finish(self: Box<Self>, out: &mut Events);
+
+    /// The stream stopped inside the region: the model's own end of output, not a cut.
+    /// `as_marker` says that the table's stop row names the state ([`Format::closes_at_stop`]),
+    /// so the stop stands for the closing marker the stop decoder hides, and the call ends as
+    /// that marker would end it, with no bytes; without the row a syntax whose JSON is the
+    /// model's own (JSON, Python, Gemma's tokens, a call given as data) ends the call as a cut
+    /// ends it, since the model closed neither its call nor its value. The syntaxes that write
+    /// the arguments' JSON for values the model wrote as text between tags have their own
+    /// ending here ([`crate::tagged`]): the call ends as its closing marker would, a string
+    /// still open is closed first, since the model wrote nothing after its bytes, and one
+    /// `Malformed { OpenAtTheStop }` event says so.
+    fn stop(self: Box<Self>, as_marker: bool, out: &mut Events) {
+        if as_marker {
+            self.close("", out);
+        } else {
+            self.finish(out);
+        }
+    }
 }
 
 /// A call given as data ([`CallSyntax::Shaped`]) behind the trait. Its assembler types values by
@@ -420,26 +440,26 @@ impl Engine {
     /// scan stands where the old one cut the text with nothing held, from which on the two cut it
     /// alike; at the end of the stream everything is scanned to the end, and a header still
     /// undecided is decided once nothing more comes.
-    fn run(&mut self, scanned: &Scanned<'_>, at_end: bool, out: &mut Events) {
+    fn run(&mut self, scanned: &Scanned<'_>, end: Option<Closed>, out: &mut Events) {
         // The pieces are taken as scanned until a header decides; from then on, what the scan
         // that reads again gives and the pieces not reached yet stand in a queue, which nothing
         // is allocated for before.
         let mut pieces = scanned.pieces();
         let mut queue = VecDeque::new();
         while let Some(piece) = pieces.next() {
-            if let Some(again) = self.step(piece, at_end, out) {
+            if let Some(again) = self.step(piece, end, out) {
                 queue.extend(pieces.by_ref());
-                self.scan_again(again, &mut queue, at_end);
+                self.scan_again(again, &mut queue, end.is_some());
                 break;
             }
         }
         loop {
             while let Some(piece) = queue.pop_front() {
-                if let Some(again) = self.step(piece, at_end, out) {
-                    self.scan_again(again, &mut queue, at_end);
+                if let Some(again) = self.step(piece, end, out) {
+                    self.scan_again(again, &mut queue, end.is_some());
                 }
             }
-            if !at_end {
+            if end.is_none() {
                 return;
             }
             let Some(again) = self.decide_at_end(out) else {
@@ -449,15 +469,16 @@ impl Engine {
         }
     }
 
-    /// Takes one piece: a tag the end cut short is dropped, anything else is taken as the table
-    /// says ([`Self::take`]). What a header that decided hands back to read again.
-    fn step(&mut self, piece: Piece<'_>, at_end: bool, out: &mut Events) -> Option<String> {
-        match piece {
-            Piece::Text(text) if at_end && self.cut_tag(&text) => {
-                self.drop_cut_tag(text.into_owned(), out);
+    /// Takes one piece: at the end of the stream (`end` says how it ended) a tag the end cut
+    /// short is dropped, anything else is taken as the table says ([`Self::take`]). What a header
+    /// that decided hands back to read again.
+    fn step(&mut self, piece: Piece<'_>, end: Option<Closed>, out: &mut Events) -> Option<String> {
+        match (piece, end) {
+            (Piece::Text(text), Some(closed)) if self.cut_tag(&text) => {
+                self.drop_cut_tag(text.into_owned(), closed, out);
                 None
             }
-            piece => self.take(piece, out),
+            (piece, _) => self.take(piece, out),
         }
     }
 
@@ -896,7 +917,7 @@ impl Engine {
             self.end_stay(out);
         }
         let taken =
-            self.emits() == Emits::Arguments && self.close_call(Closed::ByMarker, &terminal, out);
+            self.emits() == Emits::Arguments && self.close_call(Closed::Marker, &terminal, out);
         let shown = !taken && self.format.shown(index);
         if !taken {
             let text = self.tokens.text(terminal);
@@ -967,8 +988,9 @@ impl Engine {
 
     /// Ends the call region: the assembler closes what arrived, and the result says whether it took
     /// `terminal`, the bytes that closed the region, as the call's end. A region its terminal
-    /// closed reports leftover bytes as a block without a complete call; `UnterminatedRegion` is
-    /// kept for a region the end of the stream cut.
+    /// closed, or the stop closed where the table's stop row stands for the marker, reports
+    /// leftover bytes as a block without a complete call; `UnterminatedRegion` is kept for a
+    /// region the end of the stream cut.
     fn close_call(&mut self, closed: Closed, terminal: &str, out: &mut Events) -> bool {
         let Some(mut call) = self.call.take() else {
             return false;
@@ -984,9 +1006,18 @@ impl Engine {
             self.push_carried_out(dropped, out);
         }
         let mut finished = Events::new();
+        let mut as_marker = closed == Closed::Marker;
         let taken = match closed {
-            Closed::ByMarker => call.close(terminal, &mut finished),
-            Closed::ByEnd => {
+            Closed::Marker => call.close(terminal, &mut finished),
+            Closed::Stop => {
+                // The stop token that closes the call is hidden, so the call's end has no bytes. A
+                // shaped call of one JSON value or object needs its trailer to end where the
+                // stream does; tagged parameters close wherever it stands.
+                as_marker = self.format.stop_closes(self.state) && call.closes("");
+                call.stop(as_marker, &mut finished);
+                false
+            }
+            Closed::Cut => {
                 call.finish(&mut finished);
                 false
             }
@@ -995,7 +1026,7 @@ impl Engine {
             self.region.fed += terminal.len();
         }
         let mut finished = finished.drain();
-        if closed == Closed::ByMarker {
+        if as_marker {
             for event in &mut finished {
                 if let Event::Malformed { why, .. } = event {
                     if *why == MalformedReason::UnterminatedRegion {
@@ -1174,12 +1205,13 @@ impl Engine {
     }
 
     /// A tag the end cut short is dropped as the whole tag would have been. Inside a call the
-    /// assembler still holds the call's bytes, which came before the tail: the call ends first, so
-    /// every byte leaves in order.
-    fn drop_cut_tag(&mut self, text: String, out: &mut Events) {
+    /// assembler still holds the call's bytes, which came before the tail: the call ends first, as
+    /// the stream's end ends it (`closed`: the model's own stop, or a cut), so every byte leaves
+    /// in order.
+    fn drop_cut_tag(&mut self, text: String, closed: Closed, out: &mut Events) {
         self.end_stay(out);
         if self.emits() == Emits::Arguments {
-            self.close_call(Closed::ByEnd, "", out);
+            self.close_call(closed, "", out);
         }
         out.push(Event::Dropped {
             text: self.tokens.text(text),
@@ -1188,26 +1220,22 @@ impl Engine {
     }
 
     fn end(&mut self, finish: EngineFinish, out: &mut Events) {
+        // The model's own end of output is a call's third ending; any other finish is a cut. A
+        // call still open ends so, whether the tail cut a tag short or not.
+        let closed = if matches!(finish, EngineFinish::Stop) {
+            Closed::Stop
+        } else {
+            Closed::Cut
+        };
         // What the scanner held back as a possible terminal is text now that no more bytes come,
         // except a tag the end cut short.
         let scanned = self.scanner.finish();
-        self.run(&scanned, true, out);
+        self.run(&scanned, Some(closed), out);
         self.scanner.reclaim(scanned);
         self.end_stay(out);
         match self.emits() {
             Emits::Reasoning => out.push(Event::ReasoningEnd),
             Emits::Arguments => {
-                // The stop token that closes the call is hidden, so the call's end has no bytes. A
-                // shaped call of one JSON value or object needs its trailer to end where the stream
-                // does; tagged parameters close wherever it stands.
-                let closed = if matches!(finish, EngineFinish::Stop)
-                    && self.format.stop_closes(self.state)
-                    && self.call_closes("")
-                {
-                    Closed::ByMarker
-                } else {
-                    Closed::ByEnd
-                };
                 self.close_call(closed, "", out);
             }
             Emits::Content | Emits::Wrapper => {}
@@ -1278,7 +1306,7 @@ impl Parser for Engine {
                 // [`Self::place`] would take it, without the piece, like a delta read as text.
                 match scanned.whole_text() {
                     Some(whole) if self.pending.is_none() => self.place_text(whole, out),
-                    _ => self.run(&scanned, false, out),
+                    _ => self.run(&scanned, None, out),
                 }
                 self.scanner.reclaim(scanned);
                 Ok(())
@@ -1629,6 +1657,17 @@ mod tests {
         calls
     }
 
+    /// The malformed events as (text, reason), in order.
+    fn malformed(events: &[Event]) -> Vec<(String, MalformedReason)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn a_stop_closes_the_call_where_the_table_says_and_a_cut_stays_cut() {
         let closed = calls(&run(
@@ -1657,15 +1696,47 @@ mod tests {
     }
 
     #[test]
-    fn without_the_row_a_stop_leaves_the_call_cut() {
+    fn without_the_row_a_stop_ends_the_call_as_the_marker_would_and_says_so() {
+        // The model's own end of output inside a call under a table with no stop row: the
+        // template writes the closing marker the model skipped, so the call ends as that marker
+        // would end it, the object closed, and one `Malformed { OpenAtTheStop }` event of no
+        // bytes stands before the closing brace. A cut, by the token limit or an abort, leaves
+        // the call open as before and says `UnterminatedRegion`.
         let events = run(glm(), LAST_CALL, EngineFinish::Stop);
         assert_eq!(
             calls(&events),
             [(
-                r#"{"city": "Paris", "days": 3"#.to_string(),
+                r#"{"city": "Paris", "days": 3}"#.to_string(),
                 Some(String::new())
             )]
         );
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::OpenAtTheStop)]
+        );
+        let at = events
+            .iter()
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the one word");
+        assert!(
+            matches!(&events[at + 1], Event::ToolCallArguments { json, .. } if json == "}"),
+            "{events:?}"
+        );
+        assert_eq!(bytes(&events), LAST_CALL);
+        for finish in [EngineFinish::Length, EngineFinish::Abort] {
+            let events = run(glm(), LAST_CALL, finish);
+            assert_eq!(
+                calls(&events),
+                [(
+                    r#"{"city": "Paris", "days": 3"#.to_string(),
+                    Some(String::new())
+                )]
+            );
+            assert_eq!(
+                malformed(&events),
+                [(String::new(), MalformedReason::UnterminatedRegion)]
+            );
+        }
     }
 
     #[test]
@@ -1688,10 +1759,9 @@ mod tests {
 
     #[test]
     fn a_stop_closes_the_call_as_its_closing_marker_would_wherever_it_stands() {
-        // Inside a string, inside an integer, between two parameters and inside a key: the call
-        // ends as `</tool_call>` there would end it, with no bytes for the end.
+        // Inside an integer, between two parameters and inside a key: the call ends as
+        // `</tool_call>` there would end it, with no bytes for the end.
         for output in [
-            "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
             "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>\
              <arg_key>days</arg_key><arg_value>2",
             "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value>",
@@ -1719,15 +1789,35 @@ mod tests {
             );
             assert_eq!(bytes(&stopped), output);
         }
-        // Inside a string the stop closes nothing, as the marker would not: the call ends with
-        // the fragments it sent and the word that says they are no whole value.
+        // Inside a string the stop closes the string too, which the marker does not: the model
+        // wrote nothing after the value's bytes, so they are the value whole, and the one word
+        // of no bytes before the closing quote says the stop closed it, under the row as
+        // without it; the marker leaves the string open and says the arguments are no whole
+        // value, as before.
+        let output = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par";
+        for format in [glm().closes_at_stop("call"), glm()] {
+            let events = run(format, output, EngineFinish::Stop);
+            assert_eq!(
+                calls(&events),
+                [(r#"{"city": "Par"}"#.to_string(), Some(String::new()))]
+            );
+            assert_eq!(
+                malformed(&events),
+                [(String::new(), MalformedReason::OpenAtTheStop)]
+            );
+            assert_eq!(bytes(&events), output);
+        }
+        let marked = run(glm(), &format!("{output}</tool_call>"), EngineFinish::Stop);
         assert_eq!(
-            calls(&run(
-                glm().closes_at_stop("call"),
-                "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
-                EngineFinish::Stop,
-            )),
-            [(r#"{"city": "Par"#.to_string(), Some(String::new()))]
+            calls(&marked),
+            [(
+                r#"{"city": "Par"#.to_string(),
+                Some("</tool_call>".to_string())
+            )]
+        );
+        assert_eq!(
+            malformed(&marked),
+            [(String::new(), MalformedReason::BlockWithoutACompleteCall)]
         );
     }
 
@@ -2808,7 +2898,7 @@ mod tests {
     }
 
     #[test]
-    fn the_row_closes_a_call_of_another_syntax_the_same_way() {
+    fn a_stop_closes_a_call_of_another_syntax_the_same_way_with_or_without_the_row() {
         let tagged = || qwen3(CallSyntax::Tagged(Spelling::Json, Placement::OwnLine));
         let output = "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n";
         let closed = run(tagged().closes_at_stop("calls"), output, EngineFinish::Stop);
@@ -2816,12 +2906,27 @@ mod tests {
             calls(&closed),
             [(r#"{"city": "Paris"}"#.to_string(), Some(String::new()))]
         );
+        assert!(malformed(&closed).is_empty());
         assert_eq!(bytes(&closed), output);
-        let cut = run(tagged(), output, EngineFinish::Stop);
+        // Without the row the stop ends the call as the marker would too, and says so.
+        let stopped = run(tagged(), output, EngineFinish::Stop);
         assert_eq!(
-            calls(&cut),
-            [(r#"{"city": "Paris""#.to_string(), Some(String::new()))]
+            calls(&stopped),
+            [(r#"{"city": "Paris"}"#.to_string(), Some(String::new()))]
         );
+        assert_eq!(
+            malformed(&stopped),
+            [(String::new(), MalformedReason::OpenAtTheStop)]
+        );
+        assert_eq!(bytes(&stopped), output);
+        // A cut leaves it open, with the row or without.
+        for format in [tagged().closes_at_stop("calls"), tagged()] {
+            let cut = run(format, output, EngineFinish::Length);
+            assert_eq!(
+                calls(&cut),
+                [(r#"{"city": "Paris""#.to_string(), Some(String::new()))]
+            );
+        }
     }
 
     /// Two calls of Qwen3's syntax in one output.

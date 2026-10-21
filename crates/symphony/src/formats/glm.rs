@@ -43,7 +43,8 @@ mod tests {
     use crate::{
         engine::Engine,
         event::{DropReason, Event, MalformedReason, Text},
-        testing::{arguments_of, bytes, content, drive, reasoning},
+        input::EngineFinish,
+        testing::{arguments_of, bytes, content, drive, drive_to, reasoning},
         Declared,
     };
 
@@ -265,7 +266,12 @@ mod tests {
     fn a_stream_cut_inside_a_call_ends_the_call_with_its_arguments_cut() {
         let output =
             "</think><tool_call>ChaDri_change_drink<arg_key>drink_id</arg_key><arg_value>lat";
-        let events = run(PROMPT, &[output]);
+        let events = drive_to(
+            &mut Engine::new(glm(), declared()),
+            PROMPT,
+            &[output],
+            EngineFinish::Length,
+        );
         assert_eq!(bytes(&events), output);
         // The declared string streamed as it arrived and stays open: the client sees the cut.
         assert_eq!(arguments_of(&events, 0), r#"{"drink_id": "lat"#);
@@ -277,6 +283,15 @@ mod tests {
             events.last(),
             Some(Event::Finish { tool_calls: 1, .. })
         ));
+        // The model's own end of output there is no cut: the string and the object close, and
+        // one `Malformed { OpenAtTheStop }` event says the stop closed them.
+        let stopped = run(PROMPT, &[output]);
+        assert_eq!(bytes(&stopped), output);
+        assert_eq!(arguments_of(&stopped, 0), r#"{"drink_id": "lat"}"#);
+        assert!(stopped.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+        )));
     }
 
     #[test]

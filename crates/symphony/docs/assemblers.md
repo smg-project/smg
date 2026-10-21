@@ -174,6 +174,36 @@ tag, the template's newline) or no bytes when the cut fell between events. The f
 since a fragment passed on cannot be taken back, and nothing is made up for a value the model never
 finished; the four assemblers of `tagged` share that end (`tagged::end_cut_call`).
 
+A third ending, the stream's stop. `Assembler::stop` is for the model's own end of output inside
+the block (`EngineFinish::Stop`; a cut for length, an abort or any other finish is `finish`): the
+call ends as the block's end would end it, and a streamed string still open is closed first, its
+quote and then the object's brace, since the model wrote nothing after the value's bytes, so they
+are the value whole, and a call delivered under `tool_calls` has to read as JSON. The start of a tag
+held at the stop is the value's text, since no tag followed, unless it begins with one of the
+family's structural tokens (XTML's `<|close|>argument`, `Tags::structural_tokens`), which the model
+cannot have written as text: that tail is a tag the end cut short and is dropped after the call,
+as the engine drops its own terminals' held prefixes; a newline held as the template's
+framing before the closing tag stays the template's, the closing quote's source. One `Malformed {
+OpenAtTheStop }` event of no bytes stands before the fragment that closes what was open: for a
+string the stop closed under any table, and for the call itself where the table has no stop row,
+since there the template writes the closing marker the model skipped (under the row the stop
+stands for that marker, and a call open at it is the expected shape; `docs/engine.md`). A value
+held for its close (a number, an object, a string that may still be null) and a string the model
+opened without writing a byte of it keep the marker's path: reported or refused, the member never
+written, or, where its opening fragment went out with the parameter tag (the Qwen assembler), left
+open and said as the block's end leaves it; nothing made up. The two differ by what the client has
+seen: a streamed string's fragments already reached it, so closing the string adds the quote alone,
+while a held value's bytes reached nobody and its close is a tag the model never wrote, so the stop
+writes no member of it; a held scalar that reads whole as its declared kind (`1.5` under `number`)
+is reported and dropped the same way today. A cut keeps `finish`'s, the prefix as
+written under `length`. The four
+assemblers of `tagged` share this ending (`tagged::open_at_the_stop`); the JSON, pythonic and Gemma
+assemblers, whose quotes and braces are the model's own, end a call the stop found open as a cut
+ends it. The shape that decided it, recorded on GLM-4.5V: a call whose string value the model ends
+with its end-of-box marker, a newline and the end of its output, writing neither `</arg_value>` nor
+`</tool_call>`; the family's own parser drops the pair, and the prefix as written reached clients
+as `tool_calls` with arguments no JSON reader takes.
+
 `feed` takes one piece and takes every byte of it: the block's calls follow one another, and the
 block's closing marker is the format's to read. The templates write one function block per call
 region, and a model answering with several calls at once writes them one after another inside one
@@ -210,7 +240,11 @@ What the syntax says, and what the assembler does with it:
   value (`tagged::end_cut_call`). `Assembler::finish` is a stream that was cut: nothing is
   closed, what was held is refused, and a started call ends as the Qwen assembler's does, after
   one `Malformed { UnterminatedRegion }` event of no bytes that says its arguments are no whole
-  value (`tagged::end_cut_call`).
+  value (`tagged::end_cut_call`). `Assembler::stop` is the stream's stop, the model's own end:
+  the call ends as the marker would end it, a call not yet named is named from its text, a
+  streamed string still open is closed first, with the start of a tag held as its text, and the
+  one `Malformed { OpenAtTheStop }` event says so (the third ending of the Qwen assembler,
+  above).
 - **Nothing the syntax cannot read is content** (`tagged::refuse`). The block's markers and its
   four tags are the format's own tokens, and the text between them where the syntax has no place
   for text (a value whose key never opened, a tag written twice, a name that is prose, Python or

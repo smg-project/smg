@@ -49,7 +49,8 @@ mod tests {
     use crate::{
         engine::Engine,
         event::{DropReason, Event, MalformedReason, Text},
-        testing::{arguments_of, bytes, content, drive, names, reasoning},
+        input::EngineFinish,
+        testing::{arguments_of, bytes, content, drive, drive_to, names, reasoning},
         Declared,
     };
 
@@ -335,7 +336,24 @@ mod tests {
     #[test]
     fn a_stream_cut_inside_an_invoke_ends_the_call_with_its_arguments_cut() {
         let output = "</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par";
-        let events = run_with(tools(), "", &[output]);
+        // The model's own end of output there closes the string and the object, and says so.
+        let stopped = run_with(tools(), "", &[output]);
+        assert_eq!(bytes(&stopped), output);
+        assert_eq!(
+            fragments_of(&stopped, 0),
+            [r#"{"name": ""#, "Par", "\"", "}"]
+        );
+        assert!(stopped.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+        )));
+        // Cut by the token limit, nothing closes.
+        let events = drive_to(
+            &mut Engine::new(minimax_m3(), tools()),
+            "",
+            &[output],
+            EngineFinish::Length,
+        );
         assert_eq!(bytes(&events), output);
         assert_eq!(fragments_of(&events, 0), [r#"{"name": ""#, "Par"]);
         assert_eq!(ends(&events), 1);

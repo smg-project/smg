@@ -676,11 +676,17 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
     let mut broke: Vec<u32> = Vec::new();
     let mut reasoning_open = false;
     let mut finished = false;
+    // Whether the last event was the word of a call, or a string in it, that the stream's stop
+    // closed (`Malformed { OpenAtTheStop }`, of no bytes): the fragment right after it may close
+    // the string with no byte of the output behind it, since the model's own end of output is
+    // what closed it.
+    let mut after_the_stops_word = false;
     for (at, event) in replayed.events.iter().enumerate() {
         let place = || format!("{} ({which}), event {at}: {event:?}", describe(case));
         breach("after-finish", !finished, || {
             format!("{}: an event after Finish", place())
         });
+        let stop_closed = std::mem::take(&mut after_the_stops_word);
         match event {
             Event::ToolCallStart { index, .. } => {
                 breach("second-start", !started.contains(index), || {
@@ -704,10 +710,14 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                     // A fragment that closes a string the arguments so far left open carries the
                     // bytes that closed it, the model's quote, closing tag or token: a closing
                     // quote with no byte of the output behind it (none, or whitespace alone) is
-                    // one the reader made up for a value the model never closed.
+                    // one the reader made up for a value the model never closed. The one
+                    // exception is the model's own end of output: the stop has no bytes, and the
+                    // word right before the fragment says the stop closed the string.
                     breach(
                         "made-up-quote",
-                        !closes_an_open_string(so_far, json) || !source.text.trim().is_empty(),
+                        !closes_an_open_string(so_far, json)
+                            || !source.text.trim().is_empty()
+                            || stop_closed,
                         || {
                             format!(
                                 "{}: the fragment {json:?} closes a string with no byte of the output behind it",
@@ -830,8 +840,14 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                 }
             }
             Event::Malformed { text, why } => {
+                // The word of a call, or a string in it, that the stream's stop closed: the
+                // fragment right after it may close the string with no bytes behind it, and the
+                // call's arguments at its end are whole JSON, which the end checks as for a call
+                // no word was said about.
+                let stops_word = *why == MalformedReason::OpenAtTheStop && text.text.is_empty();
+                after_the_stops_word = stops_word;
                 for index in &started {
-                    if !ended.contains(index) && !malformed_inside.contains(index) {
+                    if !ended.contains(index) && !malformed_inside.contains(index) && !stops_word {
                         malformed_inside.push(*index);
                     }
                     if !ended.contains(index)

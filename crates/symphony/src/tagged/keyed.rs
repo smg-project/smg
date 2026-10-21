@@ -334,6 +334,45 @@ impl Assembler {
         }
     }
 
+    /// The stream's stop inside the call: the model's own end of output, not a cut. The call ends
+    /// as its closing marker would end it, with no bytes for the end ([`Self::close`]): a call
+    /// not yet named is named from its text, a key or a value held for its close that the stop
+    /// found open is refused and the object closes without that member, a block with no name has
+    /// its bytes refused. A streamed string still open is closed first: the model wrote nothing
+    /// after its bytes, so they are the value whole, and the bytes the scanner held as the start
+    /// of a tag are its text too, since no tag followed. One `Malformed { OpenAtTheStop }` event
+    /// of no bytes stands before the fragment that closes what was open, so that the shape is
+    /// counted ([`open_at_the_stop`](super::open_at_the_stop)): for a string the stop closed
+    /// under any table, and for the call itself where the table has no stop row (`as_marker`),
+    /// since there the template writes the marker the model skipped.
+    pub fn stop(mut self, as_marker: bool, out: &mut Events) {
+        if self.done {
+            return;
+        }
+        if matches!(self.stage, Stage::Name) {
+            let held = self.scanner.set_aside();
+            self.object.carried.push_str(&held);
+            self.name_call(out);
+        }
+        let string_open = matches!(
+            self.stage,
+            Stage::Value(ValueState {
+                mode: Mode::Streaming { opened: true },
+                ..
+            })
+        );
+        if string_open {
+            let held = self.scanner.set_aside();
+            self.value_text(&held, out);
+            super::open_at_the_stop(out);
+            self.object.close_member("\"".to_string(), "", out);
+            self.stage = Stage::Between;
+        } else if self.started() && !as_marker {
+            super::open_at_the_stop(out);
+        }
+        self.close("", out);
+    }
+
     fn take(&mut self, piece: Piece<'_>, declared: &Declared, out: &mut Events) {
         match piece {
             Piece::Text(text) => self.text(&text, out),
@@ -507,6 +546,10 @@ impl crate::engine::CallAssembler for Assembler {
 
     fn finish(self: Box<Self>, out: &mut Events) {
         (*self).finish(out);
+    }
+
+    fn stop(self: Box<Self>, as_marker: bool, out: &mut Events) {
+        (*self).stop(as_marker, out);
     }
 }
 

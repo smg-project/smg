@@ -383,7 +383,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         symphony_telemetry::MALFORMED,
-        "Malformed runs in the outputs a Symphony table read, by table and reason: the crate's own name of the reason (unterminated_region, invalid_arguments, unknown_tool, tag_out_of_place, text_where_the_name_should_be, key_without_a_value, ..., marker_out_of_place), other for a reason this build does not name"
+        "Malformed runs in the outputs a Symphony table read, by table and reason: the crate's own name of the reason (unterminated_region, invalid_arguments, unknown_tool, tag_out_of_place, text_where_the_name_should_be, key_without_a_value, ..., marker_out_of_place, open_at_the_stop), other for a reason this build does not name"
     );
     describe_histogram!(
         symphony_telemetry::MALFORMED_BYTES,

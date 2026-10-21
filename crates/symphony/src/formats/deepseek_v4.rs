@@ -62,7 +62,7 @@ mod tests {
     use super::*;
     use crate::{
         ids::CallIds,
-        testing::{arguments_of, bytes, content, drive, reasoning},
+        testing::{arguments_of, bytes, content, drive, drive_to, reasoning},
     };
 
     fn ids() -> CallIds {
@@ -260,12 +260,15 @@ mod tests {
 
     #[test]
     fn a_stream_cut_inside_an_invoke_ends_the_call_with_its_arguments_cut() {
-        let events = run(
+        let output = concat!(
+            "</think>\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n",
+            "<｜DSML｜parameter name=\"x\" string=\"false\">1"
+        );
+        let events = drive_to(
+            &mut Engine::with_call_ids(Arc::new(deepseek_v4()), Declared::default(), ids()),
             "<think>",
-            &[concat!(
-                "</think>\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n",
-                "<｜DSML｜parameter name=\"x\" string=\"false\">1"
-            )],
+            &[output],
+            EngineFinish::Length,
         );
         assert!(events.iter().any(|event| matches!(
             event,
@@ -282,6 +285,15 @@ mod tests {
             events.last(),
             Some(Event::Finish { tool_calls: 1, .. })
         ));
+        // The model's own end of output there ends the call as its closing tag would: the value
+        // held for its close is reported, the object closes without it, and one word says the
+        // stop closed the call.
+        let stopped = run("<think>", &[output]);
+        assert_eq!(arguments_of(&stopped, 0), "{}");
+        assert!(stopped.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+        )));
     }
 
     #[test]

@@ -30,6 +30,21 @@ pub use assembler::{Placement, Spelling};
 
 use crate::event::{DropReason, Event, Events, MalformedReason, Text};
 
+/// The one event of a call, or a string value in it, that the stream's stop closed: the model's
+/// own end of output found the call open (the closing marker never came) or a streamed string
+/// open (its closing tag never came), and the assembler closes what the model left open, since
+/// the model wrote nothing after its bytes. The event carries no bytes and stands before the
+/// fragment that closes what was open, the quote or the brace, so that a reader counts the
+/// shape where the fragments it accounts for begin ([`MalformedReason::OpenAtTheStop`]). The
+/// four assemblers of this module push it from their `stop`; a call cut by the token limit, an
+/// abort or any finish but `Stop` never comes here ([`end_cut_call`]).
+pub(crate) fn open_at_the_stop(out: &mut Events) {
+    out.push(Event::Malformed {
+        text: Text::uncounted(String::new()),
+        why: MalformedReason::OpenAtTheStop,
+    });
+}
+
 /// The end of a started call that was cut, for the four assemblers of this module and the pythonic
 /// one: by the end of the stream, whatever stage the cut found; by the call's closing marker (the
 /// region's, or the next call's opener) inside a streamed string; or, for the pythonic one, by the

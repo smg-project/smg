@@ -212,6 +212,14 @@ malformed_reasons! {
     /// with nothing open). The event carries no bytes and stands before the marker's text: a frame
     /// the table did not read is counted without a byte moving.
     MarkerOutOfPlace => "a marker of the table where no row leads, kept as text",
+    /// A call, or a string value in it, that the model left open at its own end of output (the
+    /// stream's stop, not a cut), closed there by a syntax that writes the arguments' JSON for
+    /// values the model wrote as text between tags: the string gets its closing quote, the
+    /// object its brace, so that a call delivered under `tool_calls` reads as JSON. The event
+    /// carries no bytes and stands before the fragment that closes what was open. A string the
+    /// stop closed is counted under every table; the call itself only where the table has no
+    /// stop row, since there the template writes the closing marker the model skipped.
+    OpenAtTheStop => "a call, or a string value in it, left open at the stream's stop",
 }
 
 impl std::fmt::Display for MalformedReason {

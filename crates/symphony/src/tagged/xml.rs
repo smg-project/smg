@@ -241,6 +241,46 @@ impl Assembler {
         }
     }
 
+    /// The stream's stop inside the invoke: the model's own end of output, not a cut. The call
+    /// ends as its closing tag would end it, with no bytes for the end ([`Self::close`]): every
+    /// open container is closed, a leaf never written and an element without a child are
+    /// reported, the object is closed, an invoke whose name never closed has its bytes reported.
+    /// A streamed string still open is closed first: the model wrote nothing after its bytes, so
+    /// they are the value whole, and the start of a tag held is its text too, since no tag
+    /// followed. One `Malformed { OpenAtTheStop }` event of no bytes stands before the fragment
+    /// that closes what was open ([`open_at_the_stop`](super::open_at_the_stop)): for a string
+    /// the stop closed under any table, and for the call itself where the table has no stop row
+    /// (`as_marker`), since there the template writes the marker the model skipped.
+    pub fn stop(mut self, as_marker: bool, out: &mut Events) {
+        if self.done {
+            return;
+        }
+        self.hold_tag();
+        let string_open = matches!(
+            self.open.last(),
+            Some(Element {
+                shape: Shape::Leaf(Leaf {
+                    mode: Mode::Streaming,
+                    ..
+                }),
+                ..
+            })
+        );
+        if string_open {
+            let held = std::mem::take(&mut self.carried);
+            if !held.is_empty() {
+                self.leaf_text(&held, out);
+            }
+            super::open_at_the_stop(out);
+            self.open.pop();
+            self.value.clear();
+            self.push_fragment("\"".to_string(), Text::default(), out);
+        } else if self.started() && !as_marker {
+            super::open_at_the_stop(out);
+        }
+        self.close("", out);
+    }
+
     /// Reads as much of `text` as one step takes and returns the rest.
     fn take<'a>(&mut self, text: &'a str, declared: &Declared, out: &mut Events) -> &'a str {
         match self.stage {
@@ -723,5 +763,9 @@ impl crate::engine::CallAssembler for Assembler {
 
     fn finish(self: Box<Self>, out: &mut Events) {
         (*self).finish(out);
+    }
+
+    fn stop(self: Box<Self>, as_marker: bool, out: &mut Events) {
+        (*self).stop(as_marker, out);
     }
 }

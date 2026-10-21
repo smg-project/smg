@@ -56,7 +56,7 @@
 
 use super::object::{Mode, Object};
 use crate::{
-    event::{runs, Event, Events, MalformedReason, Text},
+    event::{runs, DropReason, Event, Events, MalformedReason, Text},
     markers::{Piece, Scanner},
     tagged::{
         end_cut_call,
@@ -144,6 +144,12 @@ pub struct Tags {
     pub tag_end: TagEnd,
     /// Whether a call tag's tail may be the model's count of the turn's calls, ` index="N"`.
     pub indexed_calls: bool,
+    /// The special tokens the family's tags are built of, where they are (XTML's `<|open|>` and
+    /// `<|close|>`; the family's table declares them to the engine from here, `kimi_k3()`): a tail
+    /// the scanner holds at the model's own stop that begins with one is a tag the end cut short,
+    /// never the model's text, and is dropped as the engine drops its own terminals' held
+    /// prefixes. Empty where the tags are text the model can write (`</parameter>`).
+    pub structural_tokens: &'static [&'static str],
 }
 
 impl Tags {
@@ -160,6 +166,7 @@ impl Tags {
         before_block: "\n",
         tag_end: TagEnd::Angle,
         indexed_calls: false,
+        structural_tokens: &[],
     };
     /// dots3's: MiniMax M2's tags, a block around each call, every value on a line of its own.
     pub const DOTS3: Self = Self {
@@ -174,6 +181,7 @@ impl Tags {
         before_block: "\n",
         tag_end: TagEnd::Angle,
         indexed_calls: false,
+        structural_tokens: &[],
     };
     /// MiniCPM5's: `<param name="…">`, `</param>` and `</function>`, a value a CDATA section when
     /// it holds `<`, `&` or a newline.
@@ -189,6 +197,7 @@ impl Tags {
         before_block: "\n",
         tag_end: TagEnd::Angle,
         indexed_calls: false,
+        structural_tokens: &[],
     };
     /// DeepSeek's DSML: `<｜DSML｜ parameter name="…" string="…">`, `</｜DSML｜ parameter>`
     /// and `</｜DSML｜ invoke>`, each tag on a line of its own, the value typed by its `string`
@@ -205,6 +214,7 @@ impl Tags {
         before_block: "\n\n",
         tag_end: TagEnd::Angle,
         indexed_calls: false,
+        structural_tokens: &[],
     };
     /// DeepSeek's DSML as V4 spells it, before V4.1 put a space after the sentinel:
     /// `<｜DSML｜parameter name="…" string="…">`, `</｜DSML｜parameter>` and `</｜DSML｜invoke>`,
@@ -222,6 +232,7 @@ impl Tags {
         before_block: "\n\n",
         tag_end: TagEnd::Angle,
         indexed_calls: false,
+        structural_tokens: &[],
     };
     /// Kimi K3's XTML: `<|open|>argument key="…" type="…"<|sep|>`, `<|close|>argument<|sep|>` and
     /// `<|close|>call<|sep|>`, nothing between the tags, the value typed by its `type` attribute,
@@ -238,7 +249,19 @@ impl Tags {
         before_block: "",
         tag_end: TagEnd::Marker("<|sep|>"),
         indexed_calls: true,
+        structural_tokens: &["<|open|>", "<|close|>"],
     };
+
+    /// Whether `tail`, held by the scanner at the model's own stop, is a tag the end cut short:
+    /// it begins with one of the family's structural tokens, which the model cannot have written
+    /// as text.
+    fn is_cut_tag(&self, tail: &str) -> bool {
+        !tail.is_empty()
+            && self
+                .structural_tokens
+                .iter()
+                .any(|token| tail.starts_with(token))
+    }
 
     /// The markers the scanner reads inside an invoke: the two parameter tags, and the tail's end
     /// where it is a marker.
@@ -448,6 +471,79 @@ impl Assembler {
             out.push(Event::Malformed {
                 text: Text::uncounted(std::mem::take(&mut self.object.carried)),
                 why: MalformedReason::UnterminatedRegion,
+            });
+        }
+    }
+
+    /// The stream's stop inside the invoke: the model's own end of output, not a cut. The call
+    /// ends as its closing tag would end it, with no bytes for the end ([`Self::close`]): after
+    /// the last parameter the object is closed, a name, a tag or a value held for its close that
+    /// the stop found open is reported and the object closes without that member, an invoke that
+    /// never named a function has its bytes reported. A streamed string still open is closed
+    /// first: the model wrote nothing after its bytes, so they are the value whole, the start of
+    /// a tag the scanner held and the start of a CDATA closer the value held are its text too,
+    /// since neither completed, and a newline held as the template's framing before the closing
+    /// tag stays the template's, the closing quote's source. One `Malformed { OpenAtTheStop }`
+    /// event of no bytes stands before the fragment that closes what was open
+    /// ([`open_at_the_stop`](super::open_at_the_stop)): for a string the stop closed under any
+    /// table, and for the call itself where the table has no stop row (`as_marker`), since there
+    /// the template writes the marker the model skipped.
+    pub fn stop(mut self, as_marker: bool, out: &mut Events) {
+        if self.done {
+            return;
+        }
+        let string_open = matches!(
+            self.stage,
+            Stage::Value(ValueState {
+                mode: Mode::Streaming { opened: true },
+                ..
+            })
+        );
+        let mut cut_tag = None;
+        if string_open {
+            // The value's held bytes (the start of a CDATA closer that never completed, or the
+            // newline that may be the template's framing) came before the start of a tag the
+            // scanner holds: at the model's own end no closer and no tag follows, so both are
+            // the value's text, in that order; a newline alone is the framing, the closing
+            // quote's source. After a CDATA section closed the value ended at its closer: the
+            // closer carried is the quote's source, and the start of a tag after it is the
+            // call's end's.
+            let section_closed = matches!(
+                &self.stage,
+                Stage::Value(ValueState {
+                    cdata: Cdata::Done,
+                    ..
+                })
+            );
+            let mut text = self.take_held();
+            if !section_closed {
+                // A held tail that begins with one of the family's structural tokens is a tag the
+                // end cut short, never the model's text (the engine drops its own terminals' held
+                // prefixes the same way): it leaves after the call, dropped as the whole tag would
+                // have been, so every byte keeps its place.
+                let tail = self.scanner.set_aside();
+                if self.tags.is_cut_tag(&tail) {
+                    cut_tag = Some(tail);
+                } else {
+                    text.push_str(&tail);
+                }
+            }
+            if self.tags.value_on_its_own_line && text == "\n" {
+                self.object.carried.push('\n');
+            } else {
+                self.value_bytes(&text, out);
+            }
+            super::open_at_the_stop(out);
+            self.object.close_member("\"".to_string(), "", out);
+            self.stage = Stage::Between;
+        } else if self.started() && !as_marker {
+            super::open_at_the_stop(out);
+        }
+        self.close("", out);
+        if let Some(tail) = cut_tag {
+            out.push(Event::Dropped {
+                text: Text::uncounted(tail),
+                why: DropReason::Wrapper,
             });
         }
     }
@@ -875,6 +971,10 @@ impl crate::engine::CallAssembler for Assembler {
 
     fn finish(self: Box<Self>, out: &mut Events) {
         (*self).finish(out);
+    }
+
+    fn stop(self: Box<Self>, as_marker: bool, out: &mut Events) {
+        (*self).stop(as_marker, out);
     }
 }
 
