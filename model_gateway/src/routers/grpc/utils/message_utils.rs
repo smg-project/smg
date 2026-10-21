@@ -102,7 +102,7 @@ pub fn process_messages(
     )
 }
 
-/// [`process_messages`] for a request without media: the entry point for
+/// `process_messages` for a request without media: the entry point for
 /// callers outside the pipeline (bindings, tests), the Messages-side twin
 /// of `process_chat_messages_with_encoding`.
 pub fn process_messages_with_encoding(

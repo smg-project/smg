@@ -713,7 +713,7 @@ pub fn request_as_rendered(
 ///
 /// Returns the flat prompt only. A renderer that must encode the prompt itself
 /// (Kimi-K3) cannot be honored through this entry point; the gRPC pipeline
-/// uses [`process_chat_messages_with_placeholders`] and encodes what it
+/// uses `process_chat_messages_with_placeholders` and encodes what it
 /// returns, and a caller outside it takes
 /// [`process_chat_messages_with_encoding`].
 pub fn process_chat_messages(

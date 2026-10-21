@@ -445,10 +445,10 @@ pub fn reasoning_starts_in_prefill(
     )
 }
 
-/// [`reasoning_starts_in_prefill`] for a chat request, without its rendered
+/// `reasoning_starts_in_prefill` for a chat request, without its rendered
 /// prompt (the Go binding): a trailing assistant message is taken to be
 /// continued whenever the request asks for it. The gateway decides from the
-/// rendered prompt with [`chat_reasoning_starts_in_rendered_prefill`].
+/// rendered prompt with `chat_reasoning_starts_in_rendered_prefill`.
 pub fn chat_reasoning_starts_in_prefill(
     request: &ChatCompletionRequest,
     tokenizer: &dyn Tokenizer,

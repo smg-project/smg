@@ -6,7 +6,7 @@
 //! piece, so the gateway buffers `content`, `reasoning_content`, `reasoning`
 //! and tool-call `arguments` and emits them again in moderate slices. Text is
 //! only held back briefly: the relays flush it when the upstream has been
-//! quiet for [`IDLE_FLUSH`], except a remainder shorter than `MIN_TAIL_CHARS`
+//! quiet for `IDLE_FLUSH`, except a remainder shorter than `MIN_TAIL_CHARS`
 //! (a token or two that arrived just before the engine paused), which waits
 //! for the next text or the end of the stream: an event of its own would be
 //! exactly the tiny delta the contract forbids.
@@ -17,7 +17,7 @@
 //! choices, events carrying `logprobs` or fields this module does not know.
 //!
 //! The HTTP relay drives [`SseRechunker`] inline; the gRPC pipeline wraps
-//! its own channel in [`rechunk_stream`].
+//! its own channel in `rechunk_stream`.
 //!
 //! Every slice the stage emits, text or tool-call arguments, is shown to a
 //! [`DeltaObserver`] first, in the pieces the client will see and on both

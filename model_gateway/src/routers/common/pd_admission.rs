@@ -42,7 +42,7 @@
 //! Nothing here runs when the engine does not report a window: admission is
 //! not the gateway's to decide then, and dispatch behaves exactly as it did
 //! before this module existed. That is said once, loudly, when such a decode
-//! worker registers ([`announce_decode_window`]), and the window itself is
+//! worker registers (`announce_decode_window`), and the window itself is
 //! published per worker, so a gate that is off is a value an operator can
 //! read rather than an absence of series.
 
