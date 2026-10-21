@@ -4833,6 +4833,10 @@ mod video_sampling_tests {
                     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19,
                 ],
             ),
+            (24, 23.976, 2.0, &[0, 12]),
+            (30, 29.97, 1.0, &[0, 0]),
+            (3, 1.0, 2.0, &[0, 1, 2, 2]),
+            (1, 30.0, 2.0, &[0]),
         ];
         for &(total, fps, rate, expected) in cases {
             assert_eq!(
@@ -4845,7 +4849,25 @@ mod video_sampling_tests {
             glm5_next_frame_indices(90, 30.0, 2.0, 2048),
             Some(vec![0, 15, 30, 45, 60, 75])
         );
+        assert_eq!(
+            glm5_next_frame_indices(58, 29.97, 2.0, 2048),
+            Some(vec![0, 7, 15, 15])
+        );
+        // The cap on the reference's count: a 32-frame clip at 1 fps sampled
+        // at 2 fps asks for 64 frames, capped to 16 of the loop's 32 picks by
+        // `linspace(0, 31, 16)`; at 8 the cap equals the count.
+        assert_eq!(
+            glm5_next_frame_indices(32, 1.0, 2.0, 16),
+            Some(vec![
+                0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 31
+            ])
+        );
+        assert_eq!(
+            glm5_next_frame_indices(32, 8.0, 2.0, 8),
+            Some(vec![0, 4, 8, 12, 16, 20, 24, 28])
+        );
         assert_eq!(glm5_next_frame_indices(5, 24.0, 2.0, 2048), None);
+        assert_eq!(glm5_next_frame_indices(1, 30.0, 2.0, 2048), None);
         assert_eq!(
             sampled_frame_indices(5, 24.0, up_to_then_rate_cfg(2.0)),
             vec![0, 1, 2, 3, 4]

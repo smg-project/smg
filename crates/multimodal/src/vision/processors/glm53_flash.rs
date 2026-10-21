@@ -847,6 +847,18 @@ mod tests {
             floats[[0, 2 * channel_block]].to_bits(),
             reference(7.0, 2).to_bits()
         );
+        // Every byte of every channel maps to the reference's f32, bit for
+        // bit: the table a float destination reads is the whole contract.
+        let table = norm.table_f32();
+        for (channel, column) in table.iter().enumerate() {
+            for (byte, value) in column.iter().enumerate() {
+                assert_eq!(
+                    value.to_bits(),
+                    reference(byte as f32, channel).to_bits(),
+                    "channel {channel} byte {byte}"
+                );
+            }
+        }
     }
 
     #[test]

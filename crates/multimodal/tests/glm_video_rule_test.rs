@@ -1,13 +1,16 @@
 //! A video for the GLM 5 family costs what it costs on the serving engine's
-//! own server: its default loader's frames (32, spread from the first to the
-//! last), its serving cap on the clip's vision tokens (30,000), and the
-//! stamp of each temporal group taken from the sampled frames.
+//! own server: its default loader's frames (at most 32, spread from the first
+//! to the last), resampled at the reference video processor's own rate when
+//! the loader kept the clip whole, its serving cap on the clip's vision tokens
+//! (30,000), and the stamp of each temporal group taken from the sampled
+//! frames.
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 
 use llm_multimodal::{
-    vision::Glm53FlashProcessor, FrameSampling, MediaItemInfo, Modality, ModelMetadata,
-    ModelRegistry, ModelSpecificValue, PreProcessorConfig, RgbFrameRef, TokenId, Tokenizer,
-    VideoSamplingInfo, VisionPreProcessor,
+    media::sampled_frame_indices, vision::Glm53FlashProcessor, FrameSampling, MediaItemInfo,
+    Modality, ModelMetadata, ModelProcessorSpec, ModelRegistry, ModelSpecificValue,
+    PreProcessorConfig, RgbFrameRef, TokenId, Tokenizer, VideoFetchConfig, VideoSamplingInfo,
+    VisionPreProcessor,
 };
 
 const IMAGE_ID: u32 = 154854;
@@ -68,10 +71,58 @@ fn grid(output: &llm_multimodal::PreprocessedEncoderInputs) -> Vec<i64> {
     }
 }
 
+/// The family's sampling under its checkpoint's video processor config: the
+/// engine's default loader keeps at most 32 frames spread from the first to
+/// the last, and when that kept the whole clip the reference processor
+/// resamples it at the config's rate (2 frames a second), at most 2,048.
+fn family_sampling(spec: &dyn ModelProcessorSpec, config: &PreProcessorConfig) -> VideoFetchConfig {
+    let sampling = spec.video_frame_sampling_with(Some(config));
+    assert_eq!(
+        sampling,
+        FrameSampling::UpToThenRate {
+            max_frames: 32,
+            rate_max_frames: 2048,
+        }
+    );
+    let sample_fps = spec
+        .default_video_sample_fps_with(Some(config))
+        .expect("the family's sampling rate");
+    assert_eq!(sample_fps, 2.0);
+    VideoFetchConfig {
+        sample_fps,
+        sampling,
+        ..VideoFetchConfig::default()
+    }
+}
+
+/// The prompt a clip becomes: one temporal group per entry of `stamps`,
+/// `tokens` image tokens each, followed by its stamp.
+fn stamped_prompt(tokenizer: &MarkerTokenizer, stamps: &[&str], tokens: usize) -> Vec<TokenId> {
+    stamps
+        .iter()
+        .flat_map(|second| {
+            [BEGIN_ID]
+                .into_iter()
+                .chain(std::iter::repeat_n(IMAGE_ID, tokens))
+                .chain([END_ID])
+                .chain(
+                    tokenizer
+                        .encode_text(&format!("{second} seconds"))
+                        .expect("stamp"),
+                )
+                .map(|id| id as TokenId)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// 32 frames of a 1708x1030 clip (the issue's aspect, half its size: 1.76
 /// million pixels a frame against the 1.47 million the serving cap leaves
 /// each of 32 frames) fit the engine's canvas, 952x1540: grid
 /// `[16, 68, 110]`, 29,920 image tokens, and the stamps follow the frames.
+/// The clip has 278 frames at 30 fps, more than the loader keeps, so the
+/// loader's picks stand as they are: the reference processor resamples only
+/// a clip the loader kept whole.
 #[test]
 fn a_clip_costs_what_it_costs_on_the_engines_own_server() {
     let (width, height) = (1708u32, 1030u32);
@@ -99,13 +150,8 @@ fn a_clip_costs_what_it_costs_on_the_engines_own_server() {
     };
     let registry = ModelRegistry::new();
     let spec = registry.lookup(&metadata).expect("the family's spec");
-    assert_eq!(
-        spec.video_frame_sampling(),
-        FrameSampling::UpToThenRate {
-            max_frames: 32,
-            rate_max_frames: 2048
-        }
-    );
+    let sampling = family_sampling(spec, &config);
+    assert_eq!(sampled_frame_indices(278, 30.0, sampling), loader_indices());
 
     let media = [MediaItemInfo {
         video_sampling: Some(VideoSamplingInfo {
@@ -122,21 +168,66 @@ fn a_clip_costs_what_it_costs_on_the_engines_own_server() {
         "0.0", "0.0", "1.0", "1.0", "2.0", "2.0", "3.0", "4.0", "4.0", "5.0", "5.0", "6.0", "7.0",
         "7.0", "8.0", "8.0",
     ];
-    let expected: Vec<TokenId> = stamps
+    assert_eq!(
+        replacement.tokens,
+        stamped_prompt(&tokenizer, &stamps, 34 * 55)
+    );
+}
+
+/// A 4-second clip of 32 frames at 8 fps is kept whole by the loader, so the
+/// reference processor resamples it at the config's 2 frames a second: its
+/// `sample_frames` picks every fourth frame, `[0, 4, 8, ..., 28]`, eight
+/// frames in four temporal groups stamped 0.0 to 3.0 seconds. Four groups
+/// leave each frame 5.88 million pixels of the serving cap, so a 1708x1030
+/// frame keeps its size, aligned to the 28-pixel factor: grid `[4, 74, 122]`,
+/// 9,028 image tokens (four groups of 2,257 at the frame's own size) against
+/// the 29,920 (sixteen groups of 1,870 on the shrunk canvas) the loader's 32
+/// frames cost under the serving cap.
+#[test]
+fn a_clip_the_loader_keeps_whole_is_resampled_at_the_processors_rate() {
+    let tokenizer = MarkerTokenizer;
+    let model_config = serde_json::json!({"model_type": "glm53_flash", "image_token_id": IMAGE_ID});
+    let metadata = ModelMetadata {
+        model_id: "zai-org/GLM-5.3-Flash",
+        tokenizer: &tokenizer,
+        config: &model_config,
+    };
+    let registry = ModelRegistry::new();
+    let spec = registry.lookup(&metadata).expect("the family's spec");
+    let config = video_config();
+    let sampling = family_sampling(spec, &config);
+    let picks = sampled_frame_indices(32, 8.0, sampling);
+    assert_eq!(picks, vec![0, 4, 8, 12, 16, 20, 24, 28]);
+
+    let (width, height) = (1708u32, 1030u32);
+    let pixels = vec![128u8; (width * height * 3) as usize];
+    let frames: Vec<RgbFrameRef<'_>> = picks
         .iter()
-        .flat_map(|second| {
-            [BEGIN_ID]
-                .into_iter()
-                .chain(std::iter::repeat_n(IMAGE_ID, 34 * 55))
-                .chain([END_ID])
-                .chain(
-                    tokenizer
-                        .encode_text(&format!("{second} seconds"))
-                        .expect("stamp"),
-                )
-                .map(|id| id as TokenId)
-                .collect::<Vec<_>>()
+        .map(|_| RgbFrameRef {
+            width,
+            height,
+            data: &pixels,
         })
         .collect();
-    assert_eq!(replacement.tokens, expected);
+    let output = Glm53FlashProcessor::new()
+        .preprocess_video_rgb(&frames, &config)
+        .expect("preprocessed clip");
+    assert_eq!(grid(&output), vec![4, 74, 122]);
+    assert_eq!(output.feature_token_counts, vec![4 * 37 * 61]);
+
+    let media = [MediaItemInfo {
+        video_sampling: Some(VideoSamplingInfo {
+            source_fps: 8.0,
+            frame_indices: picks,
+        }),
+    }];
+    let replacement = spec
+        .prompt_replacements_with_media(&metadata, &output, Modality::Video, &media, &config)
+        .expect("video replacement")
+        .pop()
+        .expect("one clip");
+    assert_eq!(
+        replacement.tokens,
+        stamped_prompt(&tokenizer, &["0.0", "1.0", "2.0", "3.0"], 37 * 61)
+    );
 }
