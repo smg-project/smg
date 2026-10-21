@@ -691,7 +691,8 @@ impl AppContextBuilder {
                 // Below the request timeout, as the worker clients keep it
                 // (`worker::http_client::connect_timeout_secs_below`): a dark
                 // external host fails as a connect timeout, not as the
-                // request's own.
+                // request's own (except under a 1 s request timeout, where the
+                // two timers race).
                 .connect_timeout(Duration::from_secs(connect_timeout_secs_below(
                     DEFAULT_CONNECT_TIMEOUT_SECS,
                     timeout_secs,

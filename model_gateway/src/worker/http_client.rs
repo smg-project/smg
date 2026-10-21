@@ -73,8 +73,9 @@ fn tune_http2(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ClientKey {
     /// Below `timeout_secs` where whole seconds allow it
-    /// ([`connect_timeout_secs_below`]): the connect phase must time out as
-    /// a connect failure, never as the request's own timeout.
+    /// ([`connect_timeout_secs_below`]): the connect phase times out as a
+    /// connect failure, not as the request's own timeout, except under a 1 s
+    /// request timeout, where the two timers race.
     connect_timeout_secs: u64,
     pool_max_idle_per_host: usize,
     /// `0` keeps idle connections indefinitely.
