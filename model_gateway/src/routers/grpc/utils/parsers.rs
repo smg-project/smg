@@ -574,23 +574,30 @@ impl WorkerDecoding {
 /// call is forced right there as the engine's own server does, the thought
 /// block and then the calls for an engine that starts it at the first token.
 /// A worker that does not say, a JSON-schema constraint and a tag without the
-/// prefix pass through unchanged.
+/// prefix pass through unchanged. The flag beside the constraint says the
+/// shaping led the tag with the thought block for an engine that starts the
+/// grammar at the first token: the engine's request then says the grammar
+/// starts there whatever reasoning parser the engine runs
+/// (`ProtoGenerateRequest::set_grammar_from_first_token`); a constraint that
+/// passed through unchanged starts where the engine does.
 pub fn tool_constraints_for_worker(
     tool_parser_factory: &ToolParserFactory,
     configured_parser: Option<&str>,
     tool_constraints: Option<(String, String)>,
     workers: Option<&WorkerSelection>,
-) -> Result<Option<(String, String)>, String> {
+) -> Result<(Option<(String, String)>, bool), String> {
     let Some((kind, value)) = tool_constraints else {
-        return Ok(None);
+        return Ok((None, false));
     };
     if kind != "structural_tag" {
-        return Ok(Some((kind, value)));
+        return Ok((Some((kind, value)), false));
     }
+    let start = grammar_start_for(workers);
     let shaped = tool_parser_factory
         .registry()
-        .structural_tag_for_grammar_start(configured_parser, &value, grammar_start_for(workers))?;
-    Ok(Some((kind, shaped.unwrap_or(value))))
+        .structural_tag_for_grammar_start(configured_parser, &value, start)?;
+    let first_token = shaped.is_some() && start == GrammarStart::FirstToken;
+    Ok((Some((kind, shaped.unwrap_or(value))), first_token))
 }
 
 /// Resolve the user's effective thinking preference: the answer of a
@@ -959,25 +966,27 @@ mod tests {
         let built_tag: Value = serde_json::from_str(&built.1).unwrap();
         assert_eq!(built_tag["format"]["type"], "sequence");
 
-        let shape = |labels: &[(&str, &str)]| -> Value {
-            let (kind, value) = tool_constraints_for_worker(
+        let shape = |labels: &[(&str, &str)]| -> (Value, bool) {
+            let (shaped, first_token) = tool_constraints_for_worker(
                 &factory,
                 parser,
                 Some(built.clone()),
                 Some(&worker(labels)),
             )
-            .unwrap()
-            .expect("the constraint stays");
+            .unwrap();
+            let (kind, value) = shaped.expect("the constraint stays");
             assert_eq!(kind, "structural_tag");
-            serde_json::from_str(&value).unwrap()
+            (serde_json::from_str(&value).unwrap(), first_token)
         };
-        let deferred = shape(&[("constrained_decoding_start", "after_reasoning")]);
+        let (deferred, led) = shape(&[("constrained_decoding_start", "after_reasoning")]);
+        assert!(!led, "nothing led the bare calls");
         assert_eq!(
             deferred["format"]["type"], "triggered_tags",
             "nothing precedes the calls: {deferred}"
         );
         assert_eq!(deferred["format"]["at_least_one"], true);
-        let first_token = shape(&[("constrained_decoding_start", "first_token")]);
+        let (first_token, led) = shape(&[("constrained_decoding_start", "first_token")]);
+        assert!(led, "the thought block led the calls for the first token");
         assert_eq!(first_token["format"]["type"], "sequence");
         assert_eq!(first_token["format"]["elements"][0]["type"], "tag");
         assert_eq!(first_token["format"]["elements"][0]["end"], "</think>");
@@ -987,14 +996,27 @@ mod tests {
         );
         assert_eq!(
             shape(&[]),
-            built_tag,
+            (built_tag, false),
             "a worker that does not say keeps the shape that fits both"
         );
 
+        // A parser without a reasoning prefix leaves the tag as built, on any
+        // start: nothing led it, so it starts where the engine does.
+        assert_eq!(
+            tool_constraints_for_worker(
+                &factory,
+                Some("mistral"),
+                Some(built.clone()),
+                Some(&worker(&[("constrained_decoding_start", "first_token")]))
+            )
+            .unwrap(),
+            (Some(built.clone()), false),
+            "a parser without a prefix leads nothing"
+        );
         // Nothing else is touched: no selection, a JSON-schema constraint, no constraint.
         assert_eq!(
             tool_constraints_for_worker(&factory, parser, Some(built.clone()), None).unwrap(),
-            Some(built.clone())
+            (Some(built.clone()), false)
         );
         let schema = ("json_schema".to_string(), "{}".to_string());
         assert_eq!(
@@ -1002,17 +1024,15 @@ mod tests {
                 &factory,
                 parser,
                 Some(schema.clone()),
-                Some(&worker(&[(
-                    "constrained_decoding_start",
-                    "after_reasoning"
-                )]))
+                Some(&worker(&[("constrained_decoding_start", "first_token")]))
             )
             .unwrap(),
-            Some(schema)
+            (Some(schema), false),
+            "a schema is not led: it starts where the engine does"
         );
         assert_eq!(
             tool_constraints_for_worker(&factory, parser, None, Some(&worker(&[]))).unwrap(),
-            None
+            (None, false)
         );
     }
 

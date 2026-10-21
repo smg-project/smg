@@ -61,6 +61,7 @@ fn build_messages_backed_plan(
     token_ids: Vec<u32>,
     tool_constraints: Option<(String, String)>,
     table_tag: Option<Arc<dyn TagForStart>>,
+    first_token_tag: bool,
     require_reasoning: bool,
     multimodal_data: Option<MultimodalData>,
     inject_pd_metadata: bool,
@@ -86,7 +87,7 @@ fn build_messages_backed_plan(
         .parser_resolver
         .tool_parser(&messages_request.model);
     let unshaped_tool_constraints = tool_constraints.clone();
-    let tool_constraints = utils::tool_constraints_for_worker(
+    let (tool_constraints, led_for_first_token) = utils::tool_constraints_for_worker(
         &ctx.components.tool_parser_factory,
         tool_parser.as_deref(),
         tool_constraints,
@@ -110,6 +111,7 @@ fn build_messages_backed_plan(
                 multimodal_inputs: multimodal_data,
                 tool_constraints,
                 require_reasoning,
+                first_token_grammar: first_token_tag || led_for_first_token,
             },
         )
         .map_err(|e| {
@@ -136,6 +138,7 @@ fn build_messages_backed_plan(
         None => helpers::ToolConstraintStamp::capture(
             unshaped_tool_constraints,
             tool_parser.as_deref(),
+            first_token_tag,
             &proto_request,
         ),
     };
@@ -203,6 +206,7 @@ impl BuildStage for MessageRequestBuildingStage {
         let reading::Decided {
             table_tag,
             tool_constraints,
+            first_token,
             assignment,
             ..
         } = reading::decide(
@@ -251,6 +255,7 @@ impl BuildStage for MessageRequestBuildingStage {
             token_ids,
             tool_constraints,
             table_tag,
+            first_token,
             require_reasoning,
             multimodal_data,
             self.inject_pd_metadata,

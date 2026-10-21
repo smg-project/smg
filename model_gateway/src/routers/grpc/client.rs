@@ -60,6 +60,12 @@ pub struct GenerateRequestBuildOptions {
     pub multimodal_inputs: Option<MultimodalData>,
     pub tool_constraints: Option<(String, String)>,
     pub require_reasoning: bool,
+    /// `tool_constraints` was led with the model's thought and its close for
+    /// a worker whose engine starts the grammar at the first generated token:
+    /// the request says so where its dialect has a switch for the gate behind
+    /// the engine's reasoning parser
+    /// (`ProtoGenerateRequest::set_grammar_from_first_token`).
+    pub first_token_grammar: bool,
 }
 
 impl GrpcClient {
@@ -536,6 +542,7 @@ impl GrpcClient {
             multimodal_inputs,
             tool_constraints,
             require_reasoning,
+            first_token_grammar,
         } = options;
         let EngineBuilders {
             sglang,
@@ -544,7 +551,7 @@ impl GrpcClient {
             mlx,
             tokenspeed,
         } = builders;
-        match self {
+        let mut request = match self {
             Self::Sglang(client) => {
                 let sglang_mm = engine_multimodal(multimodal_inputs, |mm| match mm {
                     MultimodalData::Sglang(data) => Some(data.into_proto()),
@@ -624,7 +631,9 @@ impl GrpcClient {
                     )
                 })
             }
-        }
+        }?;
+        request.set_grammar_from_first_token(first_token_grammar);
+        Ok(request)
     }
 
     /// The per-engine dispatch of a request kind with neither multimodal inputs

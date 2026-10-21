@@ -696,6 +696,16 @@ pub(crate) fn translate_request_with_media(
         validate_sampling(sp, sp.max_tokens.unwrap_or(default_max_tokens))?;
         refuse_unenforceable_constraint(constraint_ref(sp), support)?;
     }
+    // A grammar the gateway led with the model's thought for a worker whose
+    // grammar starts at the first token starts there whatever reasoning parser
+    // the engine runs: `reasoning_ended = true` is the engine's own switch for
+    // the gate behind its parser being passed. A request that constrains
+    // nothing, or whose grammar the gateway did not shape, says nothing of it,
+    // and the engine starts the grammar where it does.
+    let grammar_from_first_token = req
+        .sampling_params
+        .as_ref()
+        .is_some_and(|sp| sp.grammar_from_first_token && sp.constraint.is_some());
     let sampling_params = match (req.sampling_params, kv_transfer_params.is_some()) {
         (None, false) => None,
         (sp, _) => Some(translate_sampling(
@@ -714,6 +724,7 @@ pub(crate) fn translate_request_with_media(
         arrival_time: now_secs(),
         data_parallel_rank,
         cache_salt,
+        reasoning_ended: grammar_from_first_token.then_some(true),
         ..EngineCoreRequest::default()
     })
 }
@@ -1520,6 +1531,39 @@ mod tests {
             stream: true,
             ..Default::default()
         }
+    }
+
+    /// A grammar the gateway led for a first-token start reaches the engine
+    /// with `reasoning_ended = true`, the gate behind its reasoning parser
+    /// taken as passed; a grammar the gateway did not shape, and a request
+    /// that constrains nothing, say nothing of it.
+    #[test]
+    fn a_grammar_led_for_the_first_token_starts_there_whatever_the_engines_parser() {
+        let translated = |sampling| {
+            translate_request(
+                tokenized_req(sampling),
+                4096,
+                ModelDtype::BFloat16,
+                &EosTokenIds::default(),
+            )
+            .expect("translated")
+        };
+        let led = translated(vllm::SamplingParams {
+            constraint: Some(vllm::sampling_params::Constraint::JsonObject(true)),
+            grammar_from_first_token: true,
+            ..Default::default()
+        });
+        assert_eq!(led.reasoning_ended, Some(true));
+        let unshaped = translated(vllm::SamplingParams {
+            constraint: Some(vllm::sampling_params::Constraint::JsonObject(true)),
+            ..Default::default()
+        });
+        assert_eq!(unshaped.reasoning_ended, None);
+        let free = translated(vllm::SamplingParams {
+            grammar_from_first_token: true,
+            ..Default::default()
+        });
+        assert_eq!(free.reasoning_ended, None, "no grammar, nothing to start");
     }
 
     #[test]

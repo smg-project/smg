@@ -5,6 +5,7 @@ use std::{collections::HashMap, time::Duration};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use tool_parser::GrammarStart;
 use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
@@ -462,6 +463,26 @@ fn zmq_model(router_model: Option<String>, declared_model: &str) -> Option<Strin
     router_model.filter(|path| declared_model == UNKNOWN_MODEL_ID || declared_model == path)
 }
 
+/// The labels of a ZMQ worker before its handshake: the model's sampling
+/// defaults ([`zmq_model_labels`]) and where its grammars start. The gateway's
+/// own link fronts an engine it did not launch, whose handshake does not say
+/// whether a reasoning parser gates its grammars, so the worker says the start
+/// the gateway's tags are shaped for: the first generated token, the thought
+/// closed ahead of the calls or the schema (the `constrained_decoding_start`
+/// label a servicer's worker carries for its engine's real gate). An engine
+/// that starts there applies such a tag at once; one that gates behind a
+/// parser is told by the request that this grammar starts at the first token
+/// (`GenerateRequestBuildOptions::first_token_grammar`), and a grammar the
+/// gateway did not shape starts where the engine does, on either kind.
+async fn zmq_worker_labels(model: Option<&str>) -> HashMap<String, String> {
+    let mut labels = zmq_model_labels(model).await;
+    labels.insert(
+        GrammarStart::LABEL.to_string(),
+        GrammarStart::FIRST_TOKEN.to_string(),
+    );
+    labels
+}
+
 /// Labels for a ZMQ worker from the gateway's model: the sampling defaults in
 /// its `generation_config.json`. A local directory is read in place; a Hub
 /// repo id is served from the HF cache the gateway's tokenizer loads from,
@@ -645,14 +666,15 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                     .map(|(labels, rt)| (labels, Some(rt)))
             }
             // A ZMQ engine reports its geometry at the handshake, which runs
-            // after this step; the one fact worth having earlier is the
+            // after this step; the facts worth having earlier are the
             // model's own sampling defaults, read from the model the gateway
             // was started with (a local directory, or a Hub id through the
             // HF cache), for a worker that serves that model (one registered
-            // for another model, by spec or label, must not inherit them).
-            // The runtime stays `None`: the handshake is shared across
-            // engines, so it cannot be probed here and the configured or
-            // detected runtime is preserved.
+            // for another model, by spec or label, must not inherit them),
+            // and where the gateway's own link starts a grammar, which is
+            // the link's rule and needs no engine. The runtime stays `None`:
+            // the handshake is shared across engines, so it cannot be probed
+            // here and the configured or detected runtime is preserved.
             ConnectionMode::Zmq => {
                 let router_model = context
                     .data
@@ -660,7 +682,7 @@ impl StepExecutor<WorkerWorkflowData> for DiscoverMetadataStep {
                     .as_ref()
                     .and_then(|app| app.router_config.model_path.clone());
                 let model = zmq_model(router_model, resolve_model_id(config, &config.labels));
-                Ok((zmq_model_labels(model.as_deref()).await, None))
+                Ok((zmq_worker_labels(model.as_deref()).await, None))
             }
         }
         .unwrap_or_else(|e| {
@@ -747,6 +769,31 @@ mod tests {
     }
 
     use super::*;
+
+    /// A ZMQ worker's labels say its grammars start at the first generated
+    /// token (the gateway's own link holds them there), with or without the
+    /// model's sampling defaults, in the value the grammar-start reader names.
+    #[tokio::test]
+    async fn zmq_labels_say_the_links_grammar_start() {
+        let labels = zmq_worker_labels(None).await;
+        assert_eq!(labels.len(), 1, "{labels:?}");
+        assert_eq!(
+            GrammarStart::from_label(labels.get(GrammarStart::LABEL).map(String::as_str)),
+            GrammarStart::FirstToken
+        );
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("generation_config.json"),
+            r#"{"temperature": 0.7, "top_p": 0.8}"#,
+        )
+        .unwrap();
+        let labels = zmq_worker_labels(Some(dir.path().to_str().unwrap())).await;
+        assert!(labels.contains_key(DEFAULT_SAMPLING_PARAMS_LABEL));
+        assert_eq!(
+            labels.get(GrammarStart::LABEL).map(String::as_str),
+            Some(GrammarStart::FIRST_TOKEN)
+        );
+    }
 
     /// Every engine's spelling of the parallelism widths folds into the
     /// canonical labels, and an existing canonical label is never overwritten.

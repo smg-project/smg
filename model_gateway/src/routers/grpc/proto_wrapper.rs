@@ -1830,6 +1830,33 @@ impl ProtoGenerateRequest {
         }
     }
 
+    /// Say whether the request's grammar starts at the first generated token
+    /// whatever reasoning parser the engine runs: the gateway led it with the
+    /// model's thought and its close for a worker whose grammar starts there
+    /// (`SamplingParams.grammar_from_first_token`). Only the dialect with a
+    /// request-side switch for the gate behind its parser carries it; the
+    /// others start every grammar where their engine does.
+    pub(crate) fn set_grammar_from_first_token(&mut self, first_token: bool) {
+        if let Self::Vllm(req) = self {
+            if let Some(params) = req.sampling_params.as_mut() {
+                params.grammar_from_first_token = first_token;
+            }
+        }
+    }
+
+    /// Whether the request says its grammar starts at the first generated
+    /// token ([`Self::set_grammar_from_first_token`]); what the tests read.
+    #[cfg(test)]
+    pub(crate) fn grammar_from_first_token(&self) -> bool {
+        match self {
+            Self::Vllm(req) => req
+                .sampling_params
+                .as_ref()
+                .is_some_and(|params| params.grammar_from_first_token),
+            Self::Sglang(_) | Self::Trtllm(_) | Self::Mlx(_) | Self::TokenSpeed(_) => false,
+        }
+    }
+
     /// Replace the structural tag the request's constraint carries; a request
     /// whose constraint is anything else, or none, is left as it is.
     pub fn set_structural_tag(&mut self, tag: String) {

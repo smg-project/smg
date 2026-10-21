@@ -1646,6 +1646,77 @@ mod tests {
         assert_eq!(client.cache_trace_epochs(), vec!["capture-0", "capture-1"]);
     }
 
+    /// A streamed vLLM request over a tokenized prompt, with `constraint` as
+    /// its grammar when given and `led` saying the gateway led the grammar for
+    /// a first-token start.
+    fn vllm_request(
+        id: &str,
+        constraint: Option<vllm::sampling_params::Constraint>,
+        led: bool,
+    ) -> vllm::GenerateRequest {
+        vllm::GenerateRequest {
+            request_id: id.to_string(),
+            input: Some(vllm::generate_request::Input::Tokenized(
+                vllm::TokenizedInput {
+                    original_text: String::new(),
+                    input_ids: vec![1, 2, 3],
+                },
+            )),
+            sampling_params: Some(vllm::SamplingParams {
+                max_tokens: Some(4),
+                constraint,
+                grammar_from_first_token: led,
+                ..Default::default()
+            }),
+            stream: true,
+            ..Default::default()
+        }
+    }
+
+    /// The next add-request a mock rank receives.
+    async fn next_add(engine: &mut MockEngine) -> EngineCoreRequest {
+        let EngineInbound::Add(request) = engine.recv().await.expect("inbound") else {
+            panic!("expected an add-request");
+        };
+        *request
+    }
+
+    /// A grammar the gateway led for a first-token start reaches the engine
+    /// with the gate behind its reasoning parser taken as passed
+    /// (`reasoning_ended = true`); a grammar the gateway did not shape, and a
+    /// request without one, carry nothing, and the engine starts where it does.
+    #[tokio::test]
+    async fn a_grammar_led_for_the_first_token_reaches_the_engine_with_its_gate_passed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (client, mut engines) = connected_ranks(dir.path(), 1).await;
+        let schema = || {
+            Some(vllm::sampling_params::Constraint::JsonSchema(
+                r#"{"type":"object"}"#.to_string(),
+            ))
+        };
+        // The streams stay alive until the end: a dropped stream aborts its
+        // engine-side request, and the abort would be the next inbound.
+        let _led = client
+            .generate_vllm(vllm_request("r1", schema(), true))
+            .await
+            .expect("submitted");
+        assert_eq!(next_add(&mut engines[0]).await.reasoning_ended, Some(true));
+        let _unshaped = client
+            .generate_vllm(vllm_request("r2", schema(), false))
+            .await
+            .expect("submitted");
+        assert_eq!(next_add(&mut engines[0]).await.reasoning_ended, None);
+        let _free = client
+            .generate_vllm(vllm_request("r3", None, true))
+            .await
+            .expect("submitted");
+        assert_eq!(
+            next_add(&mut engines[0]).await.reasoning_ended,
+            None,
+            "a request without a grammar carries nothing"
+        );
+    }
+
     /// Answer each rank's next utility call with its entry in `answers`,
     /// returning the calls received.
     async fn answer_reset(

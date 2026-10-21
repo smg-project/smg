@@ -63,6 +63,7 @@ impl BuildStage for TranscriptionRequestBuildingStage {
             token_ids,
             None,
             None,
+            false,
             "transcription-",
             /* inject_pd_metadata */ false,
             ExecutionPlanKind::Single,

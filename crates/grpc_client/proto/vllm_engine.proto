@@ -77,6 +77,13 @@ message SamplingParams {
   bool include_stop_str_in_output = 25;  // Whether to include stop strings in output
   map<int32, float> logit_bias = 26;  // Token ID to bias mapping (-100 to 100)
   optional int32 truncate_prompt_tokens = 27;  // Prompt truncation (-1 for model max)
+  // The constraint starts at the first generated token whatever reasoning
+  // parser the engine runs: the gateway led it with the model's thought and
+  // its close for a worker whose grammar starts there, so an engine that holds
+  // a grammar back until its reasoning parser has seen the close starts this
+  // one at once (vLLM: the request's `reasoning_ended`). Unset for a
+  // constraint the gateway did not shape, which starts where the engine does.
+  bool grammar_from_first_token = 28;
 
   // Structured outputs (one of) - matches vLLM's StructuredOutputsParams
   oneof constraint {
