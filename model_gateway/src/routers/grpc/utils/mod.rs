@@ -2,6 +2,7 @@
 
 mod aliases;
 mod chat_utils;
+pub(crate) mod isolation;
 mod logprobs;
 pub(crate) mod message_utils;
 mod metrics;

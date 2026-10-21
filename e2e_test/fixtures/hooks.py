@@ -87,8 +87,9 @@ def pytest_configure(config: pytest.Config) -> None:
     )
     config.addinivalue_line(
         "markers",
-        "gateway(policy=..., timeout=..., extra_args=..., reuse=False): gateway/router "
-        "configuration; opt reviewed functional classes into identical ZMQ serving reuse",
+        "gateway(policy=..., timeout=..., extra_args=..., env=..., reuse=False): gateway/router "
+        "configuration (env: variables added to the gateway process's environment); opt "
+        "reviewed functional classes into identical ZMQ serving reuse",
     )
     config.addinivalue_line(
         "markers",

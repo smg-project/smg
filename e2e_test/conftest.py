@@ -8,8 +8,8 @@ Markers
 @pytest.mark.workers(count=1, prefill=None, decode=None, gpus=None, extra_engine_args=None)
     Configure worker topology for the test.
 
-@pytest.mark.gateway(policy="round_robin", timeout=None, extra_args=None)
-    Configure the gateway/router.
+@pytest.mark.gateway(policy="round_robin", timeout=None, extra_args=None, env=None)
+    Configure the gateway/router (``env``: variables added to its process's environment).
 
 @pytest.mark.e2e
     Mark test as an end-to-end test requiring GPU workers.
