@@ -761,8 +761,23 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// its first token (or, for a non-streaming generation, its one answer):
     /// the worker's latest first response, the evidence that it answers at
     /// all. `None` for a worker that has answered none since the gateway
-    /// started, or does not track it.
+    /// started, or does not track it. A handoff is not an answer (see
+    /// [`Self::prefill_handed_off_ago`]).
     fn prefill_answered_ago(&self) -> Option<Duration> {
+        None
+    }
+
+    /// A decode side showed a handoff of this prefill worker's: on the
+    /// parallel dispatch shape, its first output, which the decode engine
+    /// produces from the KV the worker handed off. Evidence for
+    /// [`super::liveness::prefill_side_reprieve`] only: no prompt is released,
+    /// nothing is timed, no run is answered.
+    fn note_prefill_handoff(&self) {}
+
+    /// How long ago a decode side last showed a handoff of this worker's
+    /// ([`Self::note_prefill_handoff`]); `None` for a worker that has shown
+    /// none since the gateway started, or does not track it.
+    fn prefill_handed_off_ago(&self) -> Option<Duration> {
         None
     }
 
@@ -2017,6 +2032,14 @@ impl Worker for BasicWorker {
 
     fn prefill_answered_ago(&self) -> Option<Duration> {
         self.runtime.load().prefill_answered_ago()
+    }
+
+    fn note_prefill_handoff(&self) {
+        self.runtime.load().note_prefill_handoff();
+    }
+
+    fn prefill_handed_off_ago(&self) -> Option<Duration> {
+        self.runtime.load().prefill_handed_off_ago()
     }
 
     fn prefill_unanswered_run(&self) -> Option<Duration> {

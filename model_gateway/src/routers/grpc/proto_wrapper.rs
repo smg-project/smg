@@ -2287,6 +2287,47 @@ impl ProtoGenerateResponse {
         }
     }
 
+    /// Whether this is the engine's output: a chunk, or a complete the
+    /// engine neither aborted nor failed (the Rust servicers end an aborted
+    /// choice with a complete, `finish_reason` "abort", in place of a
+    /// status). An empty response is not.
+    pub fn is_output(&self) -> bool {
+        let finished = |reason: &str| !matches!(reason, "abort" | "error");
+        match self {
+            Self::Sglang(resp) => match &resp.response {
+                Some(sglang::generate_response::Response::Chunk(_)) => true,
+                Some(sglang::generate_response::Response::Complete(c)) => {
+                    finished(&c.finish_reason)
+                }
+                None => false,
+            },
+            Self::Vllm(resp) => match &resp.response {
+                Some(vllm::generate_response::Response::Chunk(_)) => true,
+                Some(vllm::generate_response::Response::Complete(c)) => finished(&c.finish_reason),
+                None => false,
+            },
+            Self::Trtllm(resp) => match &resp.response {
+                Some(trtllm::generate_response::Response::Chunk(_)) => true,
+                Some(trtllm::generate_response::Response::Complete(c)) => {
+                    finished(&c.finish_reason)
+                }
+                None => false,
+            },
+            Self::Mlx(resp) => match &resp.response {
+                Some(mlx::generate_response::Response::Chunk(_)) => true,
+                Some(mlx::generate_response::Response::Complete(c)) => finished(&c.finish_reason),
+                None => false,
+            },
+            Self::TokenSpeed(resp) => match &resp.response {
+                Some(tokenspeed::generate_response::Response::Chunk(_)) => true,
+                Some(tokenspeed::generate_response::Response::Complete(c)) => {
+                    finished(&c.finish_reason)
+                }
+                None => false,
+            },
+        }
+    }
+
     /// The prompt tokens the engine reports served from its prefix cache, on
     /// a chunk or a complete; zero when it reports none.
     pub fn cached_tokens(&self) -> u32 {
@@ -2957,6 +2998,18 @@ pub enum ProtoStream {
     /// The decode side of a disaggregated request: every response restamped
     /// with the prefill side's prefix-cache hit (see [`PrefillCachedTokens`]).
     DecodeSide(Box<DecodeStream>),
+    /// A stream whose first item was pulled ahead of its reader (see
+    /// [`ProtoStream::first_item_ahead`]): replayed once, then the stream as
+    /// it was.
+    Ahead(Box<AheadStream>),
+}
+
+/// A stream with its first item (`None`: its end) pulled ahead of its reader
+/// and held, with nothing booked for it: whatever tracks the stream later
+/// books the item when its reader meets it.
+pub struct AheadStream {
+    inner: ProtoStream,
+    first: Option<Result<ProtoGenerateResponse, tonic::Status>>,
 }
 
 /// A disaggregated request's decode side. Its engine loads the prompt's KV
@@ -3196,7 +3249,7 @@ mod tracked_tests {
     use std::sync::Arc;
 
     use super::{
-        sglang, vllm, DispatchBooking, FanoutStream, FirstItem, PrefillTicket,
+        sglang, tokenspeed, vllm, DispatchBooking, FanoutStream, FirstItem, PrefillTicket,
         ProtoGenerateResponse, ProtoStream,
     };
     use crate::worker::{BasicWorkerBuilder, Worker};
@@ -3438,6 +3491,115 @@ mod tracked_tests {
         assert!(stream.next().await.is_none(), "and the stream stays ended");
     }
 
+    /// The parallel decode side's first item, pulled ahead while its prefill
+    /// side is awaited, is held unbooked and replayed once to its reader,
+    /// then the stream as it was; whatever tracks the stream then books it
+    /// at the replay: the decode worker's output, and its success.
+    #[tokio::test]
+    async fn a_first_item_pulled_ahead_is_replayed_once_and_booked_by_its_reader() {
+        use crate::worker::circuit_breaker::{CircuitBreakerConfig, CircuitState};
+        type Item = Result<ProtoGenerateResponse, tonic::Status>;
+        // Chunks told apart by the count each carries.
+        let chunk = |cached_tokens| -> Item {
+            let chunk = vllm::GenerateStreamChunk {
+                cached_tokens,
+                ..Default::default()
+            };
+            let response = Some(vllm::generate_response::Response::Chunk(chunk));
+            Ok(ProtoGenerateResponse::Vllm(Box::new(
+                vllm::GenerateResponse { response },
+            )))
+        };
+        let which = |item: Option<&Item>| Some(item?.as_ref().ok()?.cached_tokens());
+        // A child that yields chunks 1 and 2 (each replayed by a tracked
+        // layer of its own, on an engine of its own) and ends, read through
+        // a fan-out: its first item is pulled from it.
+        let engine: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("grpc://e:30000").build());
+        let empty = ProtoStream::Fanout(FanoutStream::new(Vec::new()));
+        let child = [2, 1].into_iter().fold(empty, |inner, id| {
+            let mut layer = inner.tracked(Arc::clone(&engine), 0, false);
+            if let ProtoStream::Tracked(tracked) = &mut layer {
+                tracked.replay = Some(Some(chunk(id)));
+            }
+            layer
+        });
+        let mut stream = ProtoStream::Fanout(FanoutStream::new(vec![child]));
+        assert_eq!(which(stream.first_item_ahead().await), Some(1), "pulled");
+        assert_eq!(
+            which(stream.first_item_ahead().await),
+            Some(1),
+            "held, not read again"
+        );
+        assert!(stream.worker().is_none());
+        let stream = stream.defer_abort_until_first_item();
+        assert!(stream.holds_item_ahead(), "rewrapped with what it holds");
+        let worker: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 2,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        worker.record_outcome(504);
+        let mut stream = stream.tracked_decode_side(Arc::clone(&worker));
+        assert!(worker.output_silence().is_none(), "nothing booked unread");
+        assert_eq!(which(stream.next().await.as_ref()), Some(1), "replayed");
+        assert!(worker.output_silence().is_some(), "booked at the replay");
+        assert_eq!(which(stream.next().await.as_ref()), Some(2), "then on");
+        assert!(stream.next().await.is_none(), "to the stream's end");
+        worker.record_outcome(504);
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Closed,
+            "a success, booked at the replay, between the two failures"
+        );
+    }
+
+    /// A decode side's first item is its prefill worker's handoff only when
+    /// it is output: a chunk, or a complete that ended neither in an abort
+    /// (an aborted choice, as the Rust servicers end one) nor in an error.
+    #[test]
+    fn output_is_a_chunk_or_a_complete_the_engine_neither_aborted_nor_failed() {
+        use sglang::generate_response::Response as Sg;
+        use tokenspeed::generate_response::Response as Ts;
+        let ts = |response: Ts| {
+            let response = Some(response);
+            let response = tokenspeed::GenerateResponse {
+                response,
+                ..Default::default()
+            };
+            ProtoGenerateResponse::TokenSpeed(Box::new(response)).is_output()
+        };
+        let sg = |response: Sg| {
+            let response = Some(response);
+            let response = sglang::GenerateResponse {
+                response,
+                ..Default::default()
+            };
+            ProtoGenerateResponse::Sglang(Box::new(response)).is_output()
+        };
+        assert!(ts(Ts::Chunk(Default::default())) && sg(Sg::Chunk(Default::default())));
+        for (reasons, output) in [(["stop", "length"], true), (["abort", "error"], false)] {
+            for reason in reasons {
+                let finish_reason = reason.to_string();
+                let complete = sglang::GenerateComplete {
+                    finish_reason,
+                    ..Default::default()
+                };
+                assert_eq!(sg(Sg::Complete(complete)), output, "{reason}");
+                let finish_reason = reason.to_string();
+                let complete = tokenspeed::GenerateComplete {
+                    finish_reason,
+                    ..Default::default()
+                };
+                assert_eq!(ts(Ts::Complete(complete)), output, "{reason}");
+            }
+        }
+        let empty = ProtoGenerateResponse::TokenSpeed(Box::default());
+        assert!(!empty.is_output(), "an empty response");
+    }
+
     #[test]
     fn a_dispatch_booking_holds_the_prompt_and_the_pile_until_its_stream_takes_over() {
         let worker: Arc<dyn Worker> = Arc::new(BasicWorkerBuilder::new("http://w1:8000").build());
@@ -3607,11 +3769,38 @@ impl ProtoStream {
         Ok(first)
     }
 
+    /// The stream's first item (`None`: its end), pulled ahead of its reader
+    /// and held for the next [`Self::next`] as it was, unbooked: a stream
+    /// tracked later books it when its reader meets it. Only for a stream
+    /// nothing tracks yet (the parallel decode side while its prefill side
+    /// is awaited). Cancel-safe: dropped before the item comes, it leaves
+    /// the stream as it was.
+    pub(crate) async fn first_item_ahead(
+        &mut self,
+    ) -> Option<&Result<ProtoGenerateResponse, tonic::Status>> {
+        if !self.holds_item_ahead() {
+            let first = self.next_untracked().await;
+            let inner = std::mem::replace(self, Self::Fanout(FanoutStream::new(Vec::new())));
+            *self = Self::Ahead(Box::new(AheadStream { inner, first }));
+        }
+        let Self::Ahead(ahead) = self else {
+            return None;
+        };
+        ahead.first.as_ref()
+    }
+
+    /// Whether the stream holds an item pulled ahead of its reader (see
+    /// [`Self::first_item_ahead`]).
+    pub(crate) fn holds_item_ahead(&self) -> bool {
+        matches!(self, Self::Ahead(_))
+    }
+
     /// The worker this stream was dispatched to, when it is tracked.
     pub fn worker(&self) -> Option<&Arc<dyn Worker>> {
         match self {
             Self::Tracked(tracked) => Some(&tracked.worker),
             Self::DecodeSide(side) => side.inner.worker(),
+            Self::Ahead(ahead) => ahead.inner.worker(),
             _ => None,
         }
     }
@@ -3727,6 +3916,13 @@ impl ProtoStream {
             // Reached only with one wrapper inside another: [`Self::next`]
             // polls a decode side in place.
             Self::DecodeSide(_) => return Box::pin(self.next()).await,
+            // The held item, mapped when it was read, and the layer goes.
+            Self::Ahead(ahead) => {
+                let first = ahead.first.take();
+                let empty = Self::Fanout(FanoutStream::new(Vec::new()));
+                *self = std::mem::replace(&mut ahead.inner, empty);
+                return first;
+            }
         };
         item.map(reject_engine_error)
     }
@@ -3743,6 +3939,7 @@ impl ProtoStream {
             Self::Fanout(stream) => stream.mark_completed(),
             Self::Tracked(stream) => stream.inner.mark_completed(),
             Self::DecodeSide(side) => side.inner.mark_completed(),
+            Self::Ahead(ahead) => ahead.inner.mark_completed(),
         }
     }
 
@@ -3789,6 +3986,13 @@ impl ProtoStream {
                 Self::DecodeSide(Box::new(DecodeStream {
                     inner: inner.defer_abort_until_first_item(),
                     prefill,
+                }))
+            }
+            Self::Ahead(ahead) => {
+                let AheadStream { inner, first } = *ahead;
+                Self::Ahead(Box::new(AheadStream {
+                    inner: inner.defer_abort_until_first_item(),
+                    first,
                 }))
             }
         }

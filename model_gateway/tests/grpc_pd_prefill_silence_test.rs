@@ -33,6 +33,21 @@
 //! from the burst, which has the time its backlog takes, so every request
 //! is answered.
 //!
+//! A prefill engine may also answer an engine step after its handoff (a
+//! TokenSpeed prefill worker answers once it has polled the transfer's
+//! success, after its next forward), and the decode side's first output is
+//! the handoff. Two cases send a burst, after a warm-up, to a prefill worker
+//! that answers its first burst call past the bound and then one every turn,
+//! while each decode side shows its handoff before the bound: in the
+//! dispatch phase (the calls return with their first message, as the Python
+//! servicers send them) and in the first-response phase (the streams return
+//! at once, as the Rust servicers send them). Every request is answered in
+//! full (the decode side's first chunk, read ahead as the handoff, reaches
+//! its client once) and nothing is charged. Two more freeze the prefill after
+//! its handoff, or let its engine step after the handoff outlast the bound,
+//! and expect the side given up on a bound after the handoff: a handoff
+//! stands in for an answer for one bound, as an answer does.
+//!
 //! The decode side of the sequential shape has a bound of its own, counted
 //! from its dispatch once the prefill side has answered: a handoff that
 //! waits on a prefill engine that stalled right after answering, or a
@@ -106,6 +121,12 @@ const COLD_START: Duration = Duration::from_secs(5);
 /// `Hello` is one): the five of them are ten seconds of prefill at the
 /// cold prior of 10k tokens/s.
 const LONG_PROMPT_TOKENS: usize = 20_000;
+/// How long after its dispatch a decode side shows the prefill's handoff,
+/// in the handoff cases: inside the bound.
+const HANDOFF: Duration = Duration::from_millis(2_500);
+/// How long after a burst the prefill answers its first call, in the
+/// handoff cases: past the bound, an engine step after the handoff.
+const LATE_ANSWER: Duration = Duration::from_secs(4);
 
 type GenerateTx = mpsc::Sender<Result<proto::GenerateResponse, Status>>;
 
@@ -416,6 +437,11 @@ enum ParallelShape {
     /// Every call streams its tokens at once and then stalls without a
     /// completion (a decode engine that stopped mid-stream).
     StreamThenStall,
+    /// The first call is answered at once; every later call's first chunk
+    /// comes at its turn at the engine's gate (`queued`) or at the gate's
+    /// first turn after the call, with its headers when `headers_held` (a
+    /// servicer that sends them with the first message).
+    AnswerFirstThenLate { queued: bool, headers_held: bool },
 }
 
 /// A parallel-dispatch mock engine (the TokenSpeed proto, as the mock-worker
@@ -464,6 +490,28 @@ impl TokenSpeedScheduler for QueuedEngine {
                 drop(tx);
             }
             ParallelShape::StreamThenStall => produce_then_stall(tx, request_id),
+            ParallelShape::AnswerFirstThenLate { .. } if call == 1 => {
+                produce_at_turn(tx, Gate::default(), request_id);
+            }
+            ParallelShape::AnswerFirstThenLate {
+                queued,
+                headers_held,
+            } => {
+                let gate = if queued {
+                    self.gate.clone()
+                } else {
+                    Gate {
+                        first_turn_after: self.gate.first_turn_after,
+                        ..Gate::default()
+                    }
+                };
+                if headers_held {
+                    gate.turn().await;
+                    produce_at_turn(tx, Gate::default(), request_id);
+                } else {
+                    produce_at_turn(tx, gate, request_id);
+                }
+            }
         }
         Ok(Response::new(ReceiverStream::new(rx)))
     }
@@ -566,6 +614,29 @@ async fn start_cold_queued_grpc_worker(cold: Duration) -> (u16, QueuedEngine) {
             ..Gate::default()
         },
         shape: ParallelShape::Queued,
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let port = serve_engine(TokenSpeedSchedulerServer::new(engine.clone())).await;
+    (port, engine)
+}
+
+/// [`start_queued_grpc_worker`] for [`ParallelShape::AnswerFirstThenLate`],
+/// whose gate's first turn comes `first_turn_after` the call that waits on
+/// it first.
+async fn start_late_grpc_worker(
+    queued: bool,
+    headers_held: bool,
+    first_turn_after: Duration,
+) -> (u16, QueuedEngine) {
+    let engine = QueuedEngine {
+        gate: Gate {
+            first_turn_after,
+            ..Gate::default()
+        },
+        shape: ParallelShape::AnswerFirstThenLate {
+            queued,
+            headers_held,
+        },
         calls: Arc::new(AtomicUsize::new(0)),
     };
     let port = serve_engine(TokenSpeedSchedulerServer::new(engine.clone())).await;
@@ -823,6 +894,26 @@ async fn concurrent_streaming_chats(
     n: usize,
 ) -> Vec<(http::StatusCode, String, Duration)> {
     join_all((0..n).map(|_| one_streaming_chat(router))).await
+}
+
+/// The text a streamed chat's content deltas add up to; an event that does
+/// not parse, or reports an error, fails the case.
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn streamed_text(body: &str) -> String {
+    let events = body.lines().filter_map(|line| line.strip_prefix("data: "));
+    events
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str::<serde_json::Value>(data).unwrap())
+        .inspect(|event| assert!(event.get("error").is_none(), "{event}"))
+        .filter_map(|event| {
+            event["choices"][0]["delta"]["content"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect()
 }
 
 /// Every chat answered in full, and the slowest of them later than the
@@ -1251,6 +1342,127 @@ fn a_cold_burst_of_long_prompts_answered_past_the_bound_is_not_given_up_on() {
         0.0,
         "no call was given up on:\n{rendered}"
     );
+}
+
+/// The PD router of the handoff cases over a prefill and a decode worker,
+/// every breaker set to one; the workers come back with it.
+async fn build_handoff_router(
+    prefill: u16,
+    decode: u16,
+) -> (Box<dyn RouterTrait>, Vec<Arc<dyn Worker>>) {
+    let breaker = CircuitBreakerConfig {
+        failure_threshold: 1,
+        ..Default::default()
+    };
+    let endpoints = [(prefill, WorkerType::Prefill), (decode, WorkerType::Decode)];
+    let (router, workers) =
+        build_pd_router_with(&endpoints, RuntimeType::TokenSpeed, breaker).await;
+    let (status, body, _) = one_streaming_chat(router.as_ref()).await;
+    assert_eq!(status, http::StatusCode::OK, "the warm-up answers: {body}");
+    (router, workers)
+}
+
+/// Parallel dispatch, the incident's shape: after a warm-up, a burst of
+/// short prompts on a prefill worker that answers its first burst call at
+/// [`LATE_ANSWER`], past the bound, and one every turn after it, while each
+/// decode side shows the handoff at [`HANDOFF`], inside it. The handoff is
+/// the worker's sign of life: every request is answered, nothing is charged
+/// to the prefill worker and its breaker stays closed. Without it, the
+/// worker answered nothing for the bound and the burst's run nothing for its
+/// small backlog, and every side was given up on at the bound.
+/// `headers_held` picks the phase the sides wait in: their calls return with
+/// the first message, or their streams at once. Each decode side's first
+/// chunk, read ahead as the handoff, reaches its client once, in its place.
+fn handoff_burst_case(headers_held: bool) {
+    let rendered = render_after(|| async {
+        let (prefill_port, prefill) = start_late_grpc_worker(true, headers_held, LATE_ANSWER).await;
+        let (decode_port, _) = start_late_grpc_worker(false, headers_held, HANDOFF).await;
+        let (router, workers) = build_handoff_router(prefill_port, decode_port).await;
+        let answers = concurrent_streaming_chats(router.as_ref(), QUEUED_CALLS).await;
+        for (status, body, elapsed) in &answers {
+            assert_eq!(*status, http::StatusCode::OK, "{body} ({elapsed:?})");
+            assert!(body.contains("data: [DONE]"), "{body}");
+            assert_eq!(streamed_text(body), "Hello world test", "{body}");
+        }
+        let slowest = answers
+            .iter()
+            .map(|(_, _, elapsed)| *elapsed)
+            .max()
+            .unwrap_or_default();
+        let turns = TURN * u32::try_from(QUEUED_CALLS - 1).unwrap_or(u32::MAX);
+        assert!(
+            slowest >= LATE_ANSWER && slowest < LATE_ANSWER + turns + SLACK,
+            "answered at its turn: {slowest:?}"
+        );
+        assert_eq!(
+            prefill.calls(),
+            1 + QUEUED_CALLS,
+            "each call dispatched once"
+        );
+        assert_eq!(workers[0].circuit_breaker_state(), CircuitState::Closed);
+    });
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        0.0,
+        "no side was given up on:\n{rendered}"
+    );
+}
+
+#[test]
+fn a_burst_on_a_parallel_prefill_that_answers_an_engine_step_after_its_handoff_is_not_given_up_on()
+{
+    handoff_burst_case(true);
+}
+
+#[test]
+fn a_burst_on_a_parallel_prefill_whose_streams_return_at_once_is_not_given_up_on_either() {
+    handoff_burst_case(false);
+}
+
+/// Parallel dispatch, a prefill worker silent after its handoff: the second
+/// request's decode side shows the handoff at [`HANDOFF`] and its prefill
+/// call returns `answer_after` its dispatch, a bound or more after the
+/// handoff. A handoff stands in for an answer for one bound, as an answer
+/// does: the side is given up on a bound after it, 504
+/// `prefill_worker_silent`, one `timeout` on the prefill worker and nothing
+/// on the decode worker.
+fn silent_after_its_handoff_case(answer_after: Duration) {
+    let rendered = render_after(|| async {
+        let (prefill_port, _) = start_late_grpc_worker(true, true, answer_after).await;
+        let (decode_port, _) = start_late_grpc_worker(false, false, HANDOFF).await;
+        let (router, workers) = build_handoff_router(prefill_port, decode_port).await;
+        let (status, body, elapsed) = one_streaming_chat(router.as_ref()).await;
+        assert_eq!(status, http::StatusCode::GATEWAY_TIMEOUT, "{body}");
+        assert!(body.contains("prefill_worker_silent"), "{body}");
+        assert!(
+            elapsed >= HANDOFF + BOUND && elapsed < HANDOFF + BOUND + SLACK,
+            "given up on a bound after the handoff: {elapsed:?}"
+        );
+        assert_eq!(workers[1].circuit_breaker_state(), CircuitState::Closed);
+    });
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        1.0,
+        "{rendered}"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "decode", "backend_error"),
+        0.0,
+        "{rendered}"
+    );
+}
+
+#[test]
+fn a_parallel_prefill_frozen_after_its_handoff_is_given_up_on_a_bound_after_it() {
+    silent_after_its_handoff_case(FOREVER);
+}
+
+/// The limit of the handoff's credit: an engine step after the handoff that
+/// outlasts the bound is given up on as a freeze is (the answer comes only
+/// past the verdict's window), as one before the handoff is.
+#[test]
+fn a_parallel_prefill_whose_step_after_its_handoff_outlasts_the_bound_is_given_up_on_too() {
+    silent_after_its_handoff_case(HANDOFF + BOUND + SLACK);
 }
 
 /// Parallel dispatch, the decode worker stalls mid-stream: the first

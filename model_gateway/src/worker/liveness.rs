@@ -100,7 +100,13 @@
 //!   bound ([`prefill_side_reprieve`]): a worker that keeps answering other
 //!   sides is backed up (on the parallel dispatch shape a side's first
 //!   response also waits for the decode side), not frozen, and its side
-//!   waits on; a side in flight when the longest prompt yet lands behind
+//!   waits on; on that shape a decode side's first output counts as an
+//!   answer of its prefill worker's too (the decode engine produces it from
+//!   the KV the worker handed off, and the prefill engine may answer only an
+//!   engine step later: a TokenSpeed prefill worker answers once it has
+//!   polled the transfer's success after its next forward), for at most a
+//!   bound past where its answers leave the side, and not for one that has
+//!   never answered; a side in flight when the longest prompt yet lands behind
 //!   it is given what is left of the cold-shape grace since its dispatch;
 //!   and a worker whose current run of pending prompts has not answered
 //!   yet (a burst after an idle spell, or before its first answer ever) has
@@ -248,8 +254,10 @@ pub(crate) fn decode_side_bound(
 /// [`prefill_side_reprieve`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SideReprieve {
-    /// The worker answered another prompt within the side's bound, or a
-    /// cold-shape grace is left: the side is judged again after this.
+    /// The worker answered another prompt, or a decode side showed one of
+    /// its handoffs (see [`answered_or_handed_off`]), within the side's
+    /// bound, or a cold-shape grace is left: the side is judged again after
+    /// this.
     WithinBound(Duration),
     /// The worker answered nothing within the side's bound, but its current
     /// run of prompts has not answered yet and has not gone unanswered for
@@ -289,6 +297,21 @@ impl SideReprieve {
 /// dispatched now would be ([`prefill_side_bound`]), a bound at a time so
 /// the shape's first token returns it to the rule above.
 ///
+/// On the parallel dispatch shape a decode side's first output is the
+/// decode engine producing from the KV the worker handed off
+/// ([`Worker::prefill_handed_off_ago`]), and it may come an engine step
+/// before the prefill side's own response (a TokenSpeed prefill worker
+/// answers once it has polled the transfer's success, after its next
+/// forward). The rule above takes it for the worker's answer, until two
+/// bounds after the later of the side's dispatch and the worker's latest
+/// answer, so an engine that keeps handing off while its answers never
+/// reach the gateway does not hold a side for good; on a worker that has
+/// never answered it counts for nothing ([`answered_or_handed_off`]). A
+/// handoff is good for one bound, as an answer is, so an engine step longer
+/// than the bound still gets the verdict, after the handoff as before it:
+/// an engine whose steps can take longer (a cold node building kernels)
+/// needs a longer wedge threshold either way.
+///
 /// A worker whose current run of pending prompts has not answered yet (a
 /// burst that reached it after an idle spell, or before it ever answered)
 /// has shown no silence before the run began, and the side dispatched first
@@ -310,12 +333,42 @@ pub(crate) fn prefill_side_reprieve(
 ) -> SideReprieve {
     side_reprieve(
         cold_shape_grace(worker, 0),
-        worker.prefill_answered_ago(),
+        answered_or_handed_off(
+            worker.prefill_answered_ago(),
+            worker.prefill_handed_off_ago(),
+            bound,
+            dispatched_ago,
+        ),
         worker.prefill_unanswered_run(),
         bound,
         || *backlog.get_or_init(|| backlog_bound(worker)),
         dispatched_ago,
     )
+}
+
+/// The silence the rule of a side's `bound` judges its worker by: its latest
+/// first response `answered` ago (`None`: never, whatever was handed off),
+/// or the latest handoff a decode side showed, `handed_off` ago, while that
+/// is newer than the answer and less than a bound old, but never less than
+/// what has passed of a second bound since the later of the side's dispatch
+/// (`dispatched_ago`) and that answer. A handoff so stands in for an answer
+/// for at most a bound past where the answers alone leave the side; in that
+/// credit the silence is below the bound (a reprieve, never a verdict), and
+/// out of it the answer's age, as a verdict reports it.
+fn answered_or_handed_off(
+    answered: Option<Duration>,
+    handed_off: Option<Duration>,
+    bound: Duration,
+    dispatched_ago: Duration,
+) -> Option<Duration> {
+    let answered = answered?;
+    let past = answered.min(dispatched_ago).saturating_sub(bound);
+    Some(match handed_off {
+        Some(handed_off) if handed_off < answered && handed_off < bound && past < bound => {
+            handed_off.max(past)
+        }
+        _ => answered,
+    })
 }
 
 /// How long a worker whose run of prompts has not answered yet may take to
@@ -330,11 +383,11 @@ fn backlog_bound(worker: &Arc<dyn Worker>) -> Duration {
 
 /// [`prefill_side_reprieve`] for a side of `bound` on a worker under a
 /// cold-shape `grace` (zero: on no such shape), whose latest first response
-/// was `answered_ago` (`None`: never), and whose current run of prompts has
-/// gone `unanswered_run` without an answer (`None`: nothing pending, or the
-/// run has answered). `backlog` is read only once the rule of the bound
-/// gives up on the side. A grace the side's bound already covers (a longer
-/// configured threshold) adds nothing.
+/// (or the handoff standing in for it) was `answered_ago` (`None`: never),
+/// and whose current run of prompts has gone `unanswered_run` without an
+/// answer (`None`: nothing pending, or the run has answered). `backlog` is
+/// read only once the rule of the bound gives up on the side. A grace the
+/// side's bound already covers (a longer configured threshold) adds nothing.
 fn side_reprieve(
     grace: Duration,
     answered_ago: Option<Duration>,
@@ -1306,6 +1359,55 @@ mod tests {
             "answered just now: a bound's reprieve, less the moment since: {standing:?}"
         );
         assert!(!standing.past_bound());
+    }
+
+    /// On the parallel shape a decode side's first output is a handoff of
+    /// the prefill worker's: it stands in for an answer while it is newer
+    /// than the latest and less than a bound old, for at most a bound past
+    /// where the answers alone leave the side (two bounds after the later of
+    /// its dispatch and the latest answer), and never for a worker that has
+    /// not answered. The first rows are the incident's.
+    #[test]
+    fn a_handoff_stands_in_for_an_answer_for_one_bound_past_the_answers() {
+        const NEVER: u64 = u64::MAX;
+        let (bound, zero, ms) = (DEFAULT_WEDGE, Duration::ZERO, Duration::from_millis);
+        let opt = |ago: u64| (ago != NEVER).then(|| ms(ago));
+        // Milliseconds since the latest answer, handoff and the dispatch,
+        // and the silence the rule of the bound is to judge.
+        for [answered, handed_off, dispatched, silent] in [
+            [2_416, 514, 3_000, 514],      // four of its decodes had answered
+            [3_001, 1_099, 3_585, 1_099],  // the instant of the verdict
+            [5_000, 500, 5_000, 2_000],    // a bound past the answers, at most
+            [6_000, 500, 6_000, 6_000],    // two bounds on: the answers alone
+            [33_000, 1_000, 3_000, 1_000], // an idle spell before the dispatch
+            [1_000, 2_000, 3_000, 1_000],  // an older handoff adds nothing
+            [4_000, 3_500, 4_000, 4_000],  // nor one a bound old
+            [NEVER, 1_000, 3_000, NEVER],  // never answered: no credit
+            [2_000, NEVER, 3_000, 2_000],  // no handoff
+        ] {
+            let seen =
+                answered_or_handed_off(opt(answered), opt(handed_off), bound, ms(dispatched));
+            assert_eq!(seen, opt(silent), "{answered} {handed_off} {dispatched}");
+        }
+        let judge = |silent: u64, run: u64, dispatched: u64| {
+            side_reprieve(zero, opt(silent), opt(run), bound, || ms(5), ms(dispatched))
+        };
+        let within = |left: u64| SideReprieve::WithinBound(ms(left));
+        let silent = |silent: u64| SideReprieve::Silent {
+            silent: opt(silent),
+            window: bound,
+        };
+        for (silence, run, dispatched, standing) in [
+            (514, NEVER, 3_000, within(2_486)),
+            (1_099, NEVER, 3_585, within(1_901)),
+            (3_001, NEVER, 3_585, silent(3_001)), // the verdict, without the handoff
+            (2_000, NEVER, 5_000, within(1_000)),
+            (6_000, NEVER, 6_000, silent(6_000)),
+            (1_000, 3_000, 3_000, within(2_000)),
+            (NEVER, 3_002, 3_000, silent(3_002)), // the startup probe, as before
+        ] {
+            assert_eq!(judge(silence, run, dispatched), standing);
+        }
     }
 
     /// A worker whose current run of prompts has not answered yet (a burst

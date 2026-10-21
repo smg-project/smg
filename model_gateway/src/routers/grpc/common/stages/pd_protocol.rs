@@ -17,7 +17,12 @@ pub(crate) enum PdDispatch {
     /// KV handoff state between the sides (vLLM `kv_transfer_params`).
     Sequential,
     /// Prefill and decode dispatch together and rendezvous on bootstrap info
-    /// carried in the request itself.
+    /// carried in the request itself. The decode side's first output follows
+    /// the prefill side's KV handoff, and may come an engine step before the
+    /// prefill side's own response: the prefill silence rule takes it as the
+    /// prefill worker's sign of life (`liveness::prefill_side_reprieve`). A
+    /// runtime whose decode could answer without the handoff does not fit
+    /// this shape as it stands.
     Parallel,
 }
 
