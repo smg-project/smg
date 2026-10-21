@@ -1,4 +1,5 @@
 use smg_mesh::{MeshKV, StreamConfig, StreamRouting};
+use tracing_test::traced_test;
 
 use super::*;
 
@@ -342,6 +343,36 @@ async fn handle_incoming_batch_ignores_malformed_payload() {
     let adapter = adapter_with_empty_handle(&mesh, "node-a");
 
     adapter.handle_incoming_batch("model-1", &[Bytes::from_static(b"not-bincode")]);
+}
+
+/// A fragment set that does not decode is dropped on each of the three
+/// paths with one warning and nothing else: no delta reaches the tree, no
+/// page is published, no repair session is opened.
+#[tokio::test]
+#[traced_test]
+async fn an_undecodable_payload_is_dropped_with_one_warning_on_each_path() {
+    let mesh = MeshKV::new("node-a".into());
+    let adapter = adapter_with_empty_handle(&mesh, "node-a");
+    let garbage = [Bytes::from_static(b"not-bincode")];
+
+    adapter.handle_incoming_batch("model-1", &garbage);
+    adapter.handle_incoming_repair_request(&garbage);
+    adapter.handle_incoming_repair_page(&garbage);
+    tokio::task::yield_now().await;
+
+    assert!(adapter.outstanding_repairs.is_empty());
+    assert!(drain_page_publishes(&mesh).is_empty());
+    logs_assert(|lines: &[&str]| {
+        let warnings = lines
+            .iter()
+            .filter(|line| line.contains("WARN") && line.contains("failed to decode"))
+            .count();
+        if warnings == 3 {
+            Ok(())
+        } else {
+            Err(format!("{warnings} decode warnings, expected one per path"))
+        }
+    });
 }
 
 #[tokio::test]

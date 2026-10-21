@@ -28,7 +28,7 @@ use bytes::Bytes;
 use dashmap::DashMap;
 use kv_index::TenantId;
 use rand::seq::IndexedRandom;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use smg_mesh::{DrainHandle, StreamNamespace, MAX_STREAM_CHUNK_BYTES};
 use tracing::{debug, error, trace, warn};
 use uuid::Uuid;
@@ -476,6 +476,39 @@ impl std::fmt::Debug for TreeSyncAdapter {
     }
 }
 
+/// The fragments of one stream event reassembled into one buffer and
+/// decoded as a `T`; a payload that does not decode goes to `on_error` (the
+/// caller's one warning) and is dropped.
+fn decode<T: DeserializeOwned>(
+    fragments: &[Bytes],
+    on_error: impl FnOnce(&bincode::Error),
+) -> Option<T> {
+    let total: usize = fragments.iter().map(Bytes::len).sum();
+    let mut bytes = Vec::with_capacity(total);
+    for frag in fragments {
+        bytes.extend_from_slice(frag);
+    }
+    match bincode::deserialize(&bytes) {
+        Ok(value) => Some(value),
+        Err(err) => {
+            on_error(&err);
+            None
+        }
+    }
+}
+
+/// A value encoded for one stream event; a value that does not encode goes
+/// to `on_error` (the caller's one warning) and is not sent.
+fn encode<T: Serialize>(value: &T, on_error: impl FnOnce(&bincode::Error)) -> Option<Bytes> {
+    match bincode::serialize(value) {
+        Ok(bytes) => Some(Bytes::from(bytes)),
+        Err(err) => {
+            on_error(&err);
+            None
+        }
+    }
+}
+
 impl TreeSyncAdapter {
     /// Build an adapter wrapping the `td:` broadcast namespace
     /// (tenant deltas), the `tree:req:` targeted namespace
@@ -544,96 +577,37 @@ impl TreeSyncAdapter {
             "TreeSyncAdapter::start called more than once",
         );
 
-        // Same `Weak` pattern for the subscription task so a late
-        // channel close can't strand the adapter alive. Exit on
-        // first upgrade-None.
-        let sub_owner = Arc::downgrade(self);
-        let mut sub = self.tenant_deltas.subscribe("");
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "subscription task ends automatically when the mesh KV drops and closes the channel; no handle needed"
-        )]
-        tokio::spawn(async move {
-            while let Some((key, value)) = sub.receiver.recv().await {
-                let Some(this) = sub_owner.upgrade() else {
-                    debug!("TreeSyncAdapter dropped, exiting tenant-delta subscription");
-                    break;
-                };
-                let Some(model_id) = key.strip_prefix(PREFIX).filter(|s| !s.is_empty()) else {
-                    warn!(key, "td: subscription yielded unexpected key shape");
-                    continue;
-                };
-                match value {
-                    Some(fragments) => this.handle_incoming_batch(model_id, &fragments),
-                    None => {
-                        // Shared CRDT/stream subscription API — td:
-                        // never emits tombstones today.
-                        debug!(model_id, "unexpected td: tombstone event");
-                    }
-                }
-            }
-            debug!("TreeSyncAdapter tenant-delta subscription closed");
-        });
+        self.subscribe(
+            &self.tenant_deltas,
+            PREFIX,
+            "tenant-delta",
+            |key| key.strip_prefix(PREFIX).filter(|rest| !rest.is_empty()),
+            |this, model_id, fragments| this.handle_incoming_batch(model_id, fragments),
+        );
 
         // Responder side of the repair protocol: subscribe to
         // `tree:req:`, dispatch each request to a bounded per-
         // session task that pages the local tree out via
         // `tree:page:` to the requester.
-        let req_owner = Arc::downgrade(self);
-        let mut req_sub = self.tree_repair_requests.subscribe("");
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "subscription task ends automatically when the mesh KV drops and closes the channel; no handle needed"
-        )]
-        tokio::spawn(async move {
-            while let Some((key, value)) = req_sub.receiver.recv().await {
-                let Some(this) = req_owner.upgrade() else {
-                    debug!("TreeSyncAdapter dropped, exiting tree:req: subscription");
-                    break;
-                };
-                if !key.starts_with(REPAIR_REQUEST_PREFIX) {
-                    warn!(key, "tree:req: subscription yielded unexpected key shape");
-                    continue;
-                }
-                match value {
-                    Some(fragments) => this.handle_incoming_repair_request(&fragments),
-                    None => {
-                        debug!("unexpected tree:req: tombstone event");
-                    }
-                }
-            }
-            debug!("TreeSyncAdapter tree:req: subscription closed");
-        });
+        self.subscribe(
+            &self.tree_repair_requests,
+            REPAIR_REQUEST_PREFIX,
+            REPAIR_REQUEST_PREFIX,
+            |key| key.strip_prefix(REPAIR_REQUEST_PREFIX),
+            |this, _, fragments| this.handle_incoming_repair_request(fragments),
+        );
 
         // Receiver side of the repair protocol: subscribe to
         // `tree:page:`, decode each page, dedupe + apply via
         // `TreeHandle::apply_repair_page`, and clean up the
         // outstanding session on the terminal page.
-        let page_owner = Arc::downgrade(self);
-        let mut page_sub = self.tree_repair_pages.subscribe("");
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "subscription task ends automatically when the mesh KV drops and closes the channel; no handle needed"
-        )]
-        tokio::spawn(async move {
-            while let Some((key, value)) = page_sub.receiver.recv().await {
-                let Some(this) = page_owner.upgrade() else {
-                    debug!("TreeSyncAdapter dropped, exiting tree:page: subscription");
-                    break;
-                };
-                if !key.starts_with(REPAIR_PAGE_PREFIX) {
-                    warn!(key, "tree:page: subscription yielded unexpected key shape");
-                    continue;
-                }
-                match value {
-                    Some(fragments) => this.handle_incoming_repair_page(&fragments),
-                    None => {
-                        debug!("unexpected tree:page: tombstone event");
-                    }
-                }
-            }
-            debug!("TreeSyncAdapter tree:page: subscription closed");
-        });
+        self.subscribe(
+            &self.tree_repair_pages,
+            REPAIR_PAGE_PREFIX,
+            REPAIR_PAGE_PREFIX,
+            |key| key.strip_prefix(REPAIR_PAGE_PREFIX),
+            |this, _, fragments| this.handle_incoming_repair_page(fragments),
+        );
 
         // Periodic retry/timeout scan: reissues stale repair
         // sessions with a fresh session_id and the
@@ -663,6 +637,50 @@ impl TreeSyncAdapter {
                     TREE_REPAIR_MAX_RETRIES,
                 );
             }
+        });
+    }
+
+    /// One namespace's subscription loop, spawned once per namespace.
+    /// Each event's key is read by `key_rest` (what follows the namespace
+    /// prefix; `None` for a key of an unexpected shape, which is logged and
+    /// skipped); a value goes to `handle` with that rest; a tombstone is
+    /// logged (no namespace emits one today, the subscription API is shared
+    /// with the CRDTs). `label` names the subscription in its lifecycle
+    /// lines. The task holds the adapter weakly, so a late channel close
+    /// cannot strand the adapter alive: it ends on the first failed upgrade
+    /// or when the mesh KV drops and closes the channel.
+    fn subscribe(
+        self: &Arc<Self>,
+        namespace: &StreamNamespace,
+        prefix: &'static str,
+        label: &'static str,
+        key_rest: fn(&str) -> Option<&str>,
+        handle: fn(&Arc<Self>, &str, &[Bytes]),
+    ) {
+        let owner = Arc::downgrade(self);
+        let mut sub = namespace.subscribe("");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "subscription task ends automatically when the mesh KV drops and closes the channel; no handle needed"
+        )]
+        tokio::spawn(async move {
+            while let Some((key, value)) = sub.receiver.recv().await {
+                let Some(this) = owner.upgrade() else {
+                    debug!("TreeSyncAdapter dropped, exiting {label} subscription");
+                    break;
+                };
+                let Some(rest) = key_rest(&key) else {
+                    warn!(key, "{prefix} subscription yielded unexpected key shape");
+                    continue;
+                };
+                match value {
+                    Some(fragments) => handle(&this, rest, &fragments),
+                    None => {
+                        debug!(key, "unexpected {prefix} tombstone event");
+                    }
+                }
+            }
+            debug!("TreeSyncAdapter {label} subscription closed");
         });
     }
 
@@ -731,17 +749,10 @@ impl TreeSyncAdapter {
     }
 
     fn handle_incoming_batch(&self, model_id: &str, fragments: &[Bytes]) {
-        let total = fragments.iter().map(Bytes::len).sum();
-        let mut bytes = Vec::with_capacity(total);
-        for frag in fragments {
-            bytes.extend_from_slice(frag);
-        }
-        let batch: Vec<TreeDelta> = match bincode::deserialize(&bytes) {
-            Ok(batch) => batch,
-            Err(err) => {
-                warn!(model_id, %err, "failed to decode tenant-delta batch");
-                return;
-            }
+        let Some(batch) = decode::<Vec<TreeDelta>>(fragments, |err| {
+            warn!(model_id, %err, "failed to decode tenant-delta batch");
+        }) else {
+            return;
         };
         debug!(
             model_id,
@@ -782,17 +793,10 @@ impl TreeSyncAdapter {
     /// dropped silently — targeted routing should already filter,
     /// but defense-in-depth against future routing changes.
     fn handle_incoming_repair_request(self: &Arc<Self>, fragments: &[Bytes]) {
-        let total: usize = fragments.iter().map(Bytes::len).sum();
-        let mut bytes = Vec::with_capacity(total);
-        for frag in fragments {
-            bytes.extend_from_slice(frag);
-        }
-        let request: TreeRepairRequest = match bincode::deserialize(&bytes) {
-            Ok(req) => req,
-            Err(err) => {
-                warn!(%err, "failed to decode TreeRepairRequest");
-                return;
-            }
+        let Some(request) = decode::<TreeRepairRequest>(fragments, |err| {
+            warn!(%err, "failed to decode TreeRepairRequest");
+        }) else {
+            return;
         };
         if request.target_peer_id != self.node_name {
             trace!(
@@ -843,18 +847,16 @@ impl TreeSyncAdapter {
                 "{REPAIR_PAGE_PREFIX}{}:{}",
                 page.session_id, page.page_index,
             );
-            let bytes = match bincode::serialize(&page) {
-                Ok(b) => Bytes::from(b),
-                Err(err) => {
-                    warn!(
-                        session_id = %page.session_id,
-                        page_index = page.page_index,
-                        entry_count = page.entries.len(),
-                        %err,
-                        "failed to serialize TreeRepairPage; skipping",
-                    );
-                    continue;
-                }
+            let Some(bytes) = encode(&page, |err| {
+                warn!(
+                    session_id = %page.session_id,
+                    page_index = page.page_index,
+                    entry_count = page.entries.len(),
+                    %err,
+                    "failed to serialize TreeRepairPage; skipping",
+                );
+            }) else {
+                continue;
             };
             self.tree_repair_pages
                 .publish_to(&request.requester_peer_id, &key, bytes);
@@ -911,13 +913,11 @@ impl TreeSyncAdapter {
             reason: RepairReason::UnknownHash(node_hash),
         };
 
-        let bytes = match bincode::serialize(&request) {
-            Ok(bytes) => Bytes::from(bytes),
-            Err(err) => {
-                // Schema is fixed-shape — should be unreachable.
-                warn!(model_id, %err, "failed to serialize tree repair request");
-                return;
-            }
+        // Schema is fixed-shape — should be unreachable.
+        let Some(bytes) = encode(&request, |err| {
+            warn!(model_id, %err, "failed to serialize tree repair request");
+        }) else {
+            return;
         };
 
         let stream_key = format!("{REPAIR_REQUEST_PREFIX}{}", request.session_id);
@@ -953,17 +953,10 @@ impl TreeSyncAdapter {
     /// against a delayed retry response from a different peer
     /// stomping on a fresh session.
     fn handle_incoming_repair_page(&self, fragments: &[Bytes]) {
-        let total: usize = fragments.iter().map(Bytes::len).sum();
-        let mut bytes = Vec::with_capacity(total);
-        for frag in fragments {
-            bytes.extend_from_slice(frag);
-        }
-        let page: TreeRepairPage = match bincode::deserialize(&bytes) {
-            Ok(p) => p,
-            Err(err) => {
-                warn!(%err, "failed to decode TreeRepairPage");
-                return;
-            }
+        let Some(page) = decode::<TreeRepairPage>(fragments, |err| {
+            warn!(%err, "failed to decode TreeRepairPage");
+        }) else {
+            return;
         };
 
         let key = (page.model_id.clone(), page.tree_kind);
@@ -1144,12 +1137,10 @@ impl TreeSyncAdapter {
                 reason: RepairReason::UnknownHash(0),
             };
 
-            let bytes = match bincode::serialize(&request) {
-                Ok(b) => Bytes::from(b),
-                Err(err) => {
-                    warn!(model_id = %key.0, %err, "failed to serialize retry repair request");
-                    continue;
-                }
+            let Some(bytes) = encode(&request, |err| {
+                warn!(model_id = %key.0, %err, "failed to serialize retry repair request");
+            }) else {
+                continue;
             };
             let stream_key = format!("{REPAIR_REQUEST_PREFIX}{new_session_id}");
             self.tree_repair_requests
