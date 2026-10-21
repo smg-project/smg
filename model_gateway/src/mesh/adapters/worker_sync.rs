@@ -28,7 +28,7 @@
 //! `health=true`. Every published state therefore names its owner, and the
 //! inbound side ignores (and removes a registered import of) any key whose
 //! owner the cluster state has shown as `Down` or `Leaving` for
-//! [`DEAD_OWNER_GRACE`]. The key itself stays until its owner returns and
+//! `DEAD_OWNER_GRACE`. The key itself stays until its owner returns and
 //! re-publishes or tombstones it; a returning owner's keys import again.
 //!
 //! Removed endpoints: the adapter also remembers every endpoint this gateway

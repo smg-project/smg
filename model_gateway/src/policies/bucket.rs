@@ -202,7 +202,7 @@ impl LoadBalancingPolicy for BucketPolicy {
 
     /// A worker that left the fleet leaves every bucket that listed it; a
     /// neighbour takes its size range over (see
-    /// [`Bucket::remove_prefill_worker_url`]). A URL names one worker across
+    /// `Bucket::remove_prefill_worker_url`). A URL names one worker across
     /// models, so every bucket is asked.
     fn remove_worker(&self, url: &str) {
         let buckets: Vec<(String, Arc<RwLock<Bucket>>)> = self

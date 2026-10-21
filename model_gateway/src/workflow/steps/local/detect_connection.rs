@@ -24,7 +24,7 @@ use crate::{
 ///
 /// Explicit URL schemes are honored. For bare host:port URLs, probes both
 /// protocols in parallel and HTTP takes priority if both succeed. An HTTP
-/// worker also gets its HTTP version resolved here (see [`HttpVersionPolicy`]).
+/// worker also gets its HTTP version resolved here (see `HttpVersionPolicy`).
 /// Does NOT detect backend runtime — that's handled by DetectBackendStep.
 pub struct DetectConnectionModeStep;
 

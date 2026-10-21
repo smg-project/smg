@@ -10,7 +10,7 @@
 //! runtime worker, and every connection it was driving, once per access-log
 //! line.
 //!
-//! The writer threads write in batches ([`Batched`]): the first line after a
+//! The writer threads write in batches (`Batched`): the first line after a
 //! quiet moment opens a short window, and the lines queued within it leave
 //! in one write. Nothing but the writer thread waits for the window; a line
 //! is visible a few milliseconds later at most.
@@ -90,7 +90,7 @@ impl Default for LoggingConfig {
     }
 }
 
-/// What `init_logging` hands back. The writer threads live in [`SINKS`] for
+/// What `init_logging` hands back. The writer threads live in `SINKS` for
 /// the process, not in this value: the subscriber is installed once per
 /// process and every router started after the first (the Python binding
 /// starts them in one process) logs through the same writers, so a guard

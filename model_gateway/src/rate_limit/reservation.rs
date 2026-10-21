@@ -23,7 +23,7 @@ enum ReservationState {
 
 /// Shared handle to an in-flight reservation. Only the first of
 /// [`Self::settle_success`], [`Self::close_reserved_only`], or
-/// [`Self::abandon_if_open`] takes effect; later calls are no-ops, which
+/// `Self::abandon_if_open` takes effect; later calls are no-ops, which
 /// makes `Drop`-triggered `abandon_if_open` safe even after an explicit
 /// settle/close.
 pub struct SharedReservationHandle {

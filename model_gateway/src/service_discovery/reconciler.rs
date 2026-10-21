@@ -41,7 +41,7 @@ pub const DISCOVERY_LABEL_PREFIX: &str = "smg.ai/discovery-";
 pub const DISCOVERY_PROVIDER_LABEL: &str = "smg.ai/discovery-provider";
 /// The provider's stable identity for the worker instance.
 pub const DISCOVERY_ID_LABEL: &str = "smg.ai/discovery-id";
-/// BLAKE3 fingerprint of the [`DiscoveredWorker`] it was registered from. A
+/// BLAKE3 fingerprint of the `DiscoveredWorker` it was registered from. A
 /// change to it updates the worker in place.
 pub const DISCOVERY_SPEC_HASH_LABEL: &str = "smg.ai/discovery-spec-hash";
 

@@ -67,7 +67,7 @@ fn write_utc_seconds(w: &mut impl fmt::Write, time: DateTime<Utc>) -> fmt::Resul
 
 /// The span-field format of the JSON layer: a span's entries, each
 /// `"name":value` serialized as the stock format serializes it, separated by
-/// [`ENTRY_SEPARATOR`] in the order they were recorded. A field recorded
+/// `ENTRY_SEPARATOR` in the order they were recorded. A field recorded
 /// again is appended again; [`JsonLine`] keeps the last value and writes the
 /// entries in key order, which is what the stock format's map did.
 #[derive(Clone, Copy, Debug, Default)]

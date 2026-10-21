@@ -17,7 +17,7 @@ pub struct WorkerRemovalRequest {
     /// removal was decided.
     ///
     /// A DP-aware URL expands into one worker per rank, each with its own
-    /// independent revision, and [`super::find_workers_by_url`] returns the
+    /// independent revision, and `super::find_workers_by_url` returns the
     /// whole group for a base URL. A single revision therefore cannot guard
     /// the group: it would retain only the ranks that happen to share it and
     /// silently leave the rest registered against a Pod that is already gone.
