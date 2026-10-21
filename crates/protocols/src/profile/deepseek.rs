@@ -5,13 +5,17 @@
 //! Older V3/R1 models and opaque aliases retain the baseline. This profile
 //! does not claim the vendor's context window, sampling behavior or JSON
 //! constraints for a self-hosted worker, nor enforce documented history and
-//! identifier restrictions the official API did not enforce in calibration.
+//! identifier restrictions the official API did not enforce in calibration,
+//! nor the vendor's refusal of a forced tool choice while thinking is on: a
+//! self-hosted engine serves that call (the gateway shapes the call's grammar
+//! for where the engine starts it, after the thought or around it), and the
+//! vendor's own API refuses it by itself where it still does.
 
 use serde_json::Value;
 
 use crate::{
     chat::{ChatCompletionRequest, ThinkingType},
-    common::{invalid, ToolChoice},
+    common::invalid,
 };
 
 const V41_MODELS: [&str; 2] = ["deepseek-v4.1-flash", "deepseek-v4.1-flash-1017"];
@@ -127,17 +131,6 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
                 },
             ));
         }
-    }
-    if thinking_enabled(req)
-        && req
-            .tool_choice
-            .as_ref()
-            .is_some_and(ToolChoice::forces_call)
-    {
-        return Err(invalid(
-            "tool_choice_not_supported",
-            "DeepSeek V4 requires thinking to be disabled for forced tool choice",
-        ));
     }
     Ok(())
 }

@@ -86,34 +86,32 @@ fn deepseek_rejects_unsupported_thinking_and_effort() {
     }
 }
 
+/// A forced tool choice (a named function, `required`) validates in either
+/// thinking mode: a self-hosted engine serves the call after the model's
+/// thought, and the vendor's own API refuses the combination by itself where
+/// it does. `auto` and `none` validate as before.
 #[test]
-fn deepseek_forced_tools_require_non_thinking_mode() {
+fn deepseek_forced_tools_validate_in_either_thinking_mode() {
     for choice in [
         json!("required"),
         json!({"type": "function", "function": {"name": "weather"}}),
     ] {
-        for (mode, valid) in [
-            (json!({}), false),
-            (json!({"thinking": {"type": "enabled"}}), false),
-            (json!({"thinking": {"type": "disabled"}}), true),
-            (json!({"reasoning_effort": "none"}), true),
-            (json!({"reasoning_effort": "minimal"}), false),
-            (json!({"chat_template_kwargs": {"thinking": false}}), true),
-            (
-                json!({"chat_template_kwargs": {"enable_thinking": false}}),
-                true,
-            ),
-            (
-                json!({"chat_template_kwargs": {"reasoning_effort": "none"}}),
-                true,
-            ),
+        for mode in [
+            json!({}),
+            json!({"thinking": {"type": "enabled"}}),
+            json!({"thinking": {"type": "disabled"}}),
+            json!({"reasoning_effort": "none"}),
+            json!({"reasoning_effort": "minimal"}),
+            json!({"chat_template_kwargs": {"thinking": false}}),
+            json!({"chat_template_kwargs": {"enable_thinking": false}}),
+            json!({"chat_template_kwargs": {"reasoning_effort": "none"}}),
         ] {
             let mut extra = json!({"tools": [{"type": "function", "function": {"name": "weather", "parameters": {"type": "object", "properties": {}}}}], "tool_choice": choice});
             extra
                 .as_object_mut()
                 .unwrap()
                 .extend(mode.as_object().unwrap().clone());
-            assert_eq!(request(extra.clone()).validate().is_ok(), valid, "{extra}");
+            assert!(request(extra.clone()).validate().is_ok(), "{extra}");
         }
     }
     for choice in ["auto", "none"] {
@@ -171,15 +169,17 @@ fn deepseek_projects_one_thinking_decision_for_validation_and_rendering() {
     }
 }
 
+/// `allowed_tools` in `required` mode is a forced choice too, and validates in
+/// either thinking mode like the others.
 #[test]
-fn deepseek_required_allowed_tools_obeys_the_same_thinking_guard() {
+fn deepseek_required_allowed_tools_validate_in_either_thinking_mode() {
     for enabled in [true, false] {
         let req = request(json!({
             "thinking":{"type": if enabled {"enabled"} else {"disabled"}},
             "tools":[{"type":"function","function":{"name":"weather"}}],
             "tool_choice":{"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"weather"}]}
         }));
-        assert_eq!(req.validate().is_ok(), !enabled);
+        assert!(req.validate().is_ok(), "thinking enabled: {enabled}");
     }
 }
 
