@@ -42,6 +42,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        adapt::chat,
         engine::Engine,
         event::{Event, Events},
         input::{EngineFinish, Input},
@@ -89,6 +90,44 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// Prose after the call's object, before its closing marker: the chat message's content and
+    /// the stream's deltas are the model's words with the spaces between them, whole, at every
+    /// cut and one character at a time alike; the call keeps its arguments.
+    #[test]
+    fn text_after_the_object_reaches_the_client_as_the_model_wrote_it() {
+        let output = "<|tool_call>call:play{artist:<|\"|>Maroon 5<|\"|>} please note this and that <tool_call|>";
+        let prose = "please note this and that";
+        let shown = |events: &[Event]| chat::message(0, events).message.content;
+        let streamed = |events: &[Event]| -> String {
+            chat::deltas(0, events)
+                .into_iter()
+                .filter_map(|choice| choice.delta.content)
+                .collect()
+        };
+        let whole = run(PROMPT, &[output]);
+        assert_eq!(bytes(&whole), output);
+        assert_eq!(arguments_of(&whole, 0), r#"{"artist": "Maroon 5"}"#);
+        assert_eq!(
+            malformed(&whole),
+            ["please", " note", " this", " and", " that"]
+        );
+        assert_eq!(shown(&whole).as_deref(), Some(prose));
+        assert_eq!(streamed(&whole), prose);
+        for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
+            let events = run(PROMPT, &[&output[..cut], &output[cut..]]);
+            assert_eq!(bytes(&events), output, "cut at {cut}");
+            assert_eq!(shown(&events).as_deref(), Some(prose), "cut at {cut}");
+            assert_eq!(streamed(&events), prose, "cut at {cut}");
+        }
+        let pieces: Vec<&str> = output
+            .char_indices()
+            .map(|(at, c)| &output[at..at + c.len_utf8()])
+            .collect();
+        let events = run(PROMPT, &pieces);
+        assert_eq!(shown(&events).as_deref(), Some(prose));
+        assert_eq!(streamed(&events), prose);
     }
 
     #[test]

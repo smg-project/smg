@@ -30,6 +30,7 @@ pub fn json() -> Format {
 mod tests {
     use super::*;
     use crate::{
+        adapt::chat,
         engine::Engine,
         event::{DropReason, Event, Events, FinishReason, MalformedReason},
         input::{EngineFinish, Input},
@@ -75,6 +76,42 @@ mod tests {
             )
             .expect("end");
         out.into_owned().drain()
+    }
+
+    /// Prose between two objects of a list: the chat message's content and the stream's deltas
+    /// are the model's words with the spaces between them, whole, at every cut and one
+    /// character at a time alike; both objects are calls.
+    #[test]
+    fn text_between_the_lists_objects_reaches_the_client_as_the_model_wrote_it() {
+        let output = concat!(
+            "[{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}} some words here ",
+            "{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Rome\"}}]"
+        );
+        let prose = "some words here";
+        let shown = |events: &[Event]| chat::message(0, events).message.content;
+        let streamed = |events: &[Event]| -> String {
+            chat::deltas(0, events)
+                .into_iter()
+                .filter_map(|choice| choice.delta.content)
+                .collect()
+        };
+        let whole = run(&[output]);
+        assert_eq!(bytes(&whole), output);
+        assert_eq!(calls(&whole).len(), 2);
+        assert_eq!(shown(&whole).as_deref(), Some(prose));
+        assert_eq!(streamed(&whole), prose);
+        for cut in 1..output.len() {
+            let events = run(&[&output[..cut], &output[cut..]]);
+            assert_eq!(bytes(&events), output, "cut at {cut}");
+            assert_eq!(calls(&events).len(), 2, "cut at {cut}");
+            assert_eq!(shown(&events).as_deref(), Some(prose), "cut at {cut}");
+            assert_eq!(streamed(&events), prose, "cut at {cut}");
+        }
+        let pieces: Vec<String> = output.chars().map(String::from).collect();
+        let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+        let events = run(&refs);
+        assert_eq!(shown(&events).as_deref(), Some(prose));
+        assert_eq!(streamed(&events), prose);
     }
 
     #[test]

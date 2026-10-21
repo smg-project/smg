@@ -86,6 +86,48 @@ pub(crate) fn runs_at(text: &str) -> impl Iterator<Item = (std::ops::Range<usize
     })
 }
 
+/// Text a syntax has no place for where its structure stands (a word between tags, between a
+/// list's objects or between a block's calls, a tag out of its place, text after a call's object),
+/// released as `Malformed` with `why`, which the chat surface shows as content. `carried` holds
+/// the whitespace read since the syntax last read its structure (a tag, an object, a bracket, a
+/// marker); `released` says whether text was released since then. Before any, that whitespace is
+/// the template's spacing after its structure and is dropped (`Dropped { Wrapper }`), so the
+/// report holds the model's text alone; after released text it is the model's, between two pieces
+/// of its text, and leaves with this piece, so that a client reads the text as the model wrote
+/// it, byte for byte, however the bytes were cut. One event per piece, so a reader that counts
+/// the reason counts as before; a piece of no bytes releases the carried whitespace alone, for a
+/// reader that must place something between two pieces of it. The reader clears `released` where
+/// its syntax reads its structure again. `text` keeps its borrow when nothing is carried before
+/// it, so a reader that borrows from the delta costs no copy there.
+pub(crate) fn release_between<'d>(
+    carried: &mut String,
+    released: &mut bool,
+    text: Cow<'d, str>,
+    why: MalformedReason,
+    out: &mut Events<'d>,
+) {
+    if !*released && !carried.is_empty() {
+        out.push(Event::Dropped {
+            text: Text::uncounted(std::mem::take(carried)),
+            why: DropReason::Wrapper,
+        });
+    }
+    let text = if carried.is_empty() {
+        text
+    } else {
+        carried.push_str(&text);
+        Cow::Owned(std::mem::take(carried))
+    };
+    if text.is_empty() {
+        return;
+    }
+    out.push(Event::Malformed {
+        text: Text::uncounted(text),
+        why,
+    });
+    *released = true;
+}
+
 /// Why text was dropped rather than shown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -550,6 +592,51 @@ pub fn first_call_only(events: &mut [Event]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_between_drops_the_carried_whitespace_before_the_first_piece_and_keeps_it_after() {
+        let mut out = Events::new();
+        let (mut carried, mut released) = (String::from("\n"), false);
+        let why = MalformedReason::TextBetweenTags;
+        release_between(&mut carried, &mut released, "please".into(), why, &mut out);
+        carried.push(' ');
+        release_between(&mut carried, &mut released, "note".into(), why, &mut out);
+        release_between(&mut carried, &mut released, "".into(), why, &mut out);
+        // A piece of no bytes after released text: the whitespace alone, in its place.
+        carried.push(' ');
+        release_between(&mut carried, &mut released, "".into(), why, &mut out);
+        let events = out.drain();
+        assert!(matches!(
+            &events[0],
+            Event::Dropped { text, why: DropReason::Wrapper } if text.text == "\n"
+        ));
+        assert!(matches!(
+            &events[1],
+            Event::Malformed { text, why: MalformedReason::TextBetweenTags } if text.text == "please"
+        ));
+        assert!(matches!(&events[2], Event::Malformed { text, .. } if text.text == " note"));
+        assert!(matches!(&events[3], Event::Malformed { text, .. } if text.text == " "));
+        assert_eq!(events.len(), 4);
+        assert!(released);
+        assert!(carried.is_empty());
+        // Nothing carried before the first piece: no event is spent on it, and the piece keeps
+        // its borrow.
+        let mut out = Events::new();
+        let (mut carried, mut released) = (String::new(), false);
+        release_between(
+            &mut carried,
+            &mut released,
+            Cow::Borrowed("word"),
+            why,
+            &mut out,
+        );
+        let events = out.drain();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            Event::Malformed { text, .. } if matches!(text.text, Cow::Borrowed("word"))
+        ));
+    }
 
     #[test]
     fn every_reason_is_in_all_once_with_its_own_sentence_and_name() {

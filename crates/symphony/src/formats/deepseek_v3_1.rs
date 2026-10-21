@@ -64,6 +64,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        adapt::chat,
         engine::Engine,
         event::{DropReason, Event, Events, FinishReason},
         grammar::{GrammarStart, Options},
@@ -365,6 +366,61 @@ mod tests {
             event,
             Event::ToolCallStart { index: 0, name, .. } if name == "get_weather"
         )));
+    }
+
+    /// Prose between two calls of the block, where the template writes nothing: the chat
+    /// message's content and the stream's deltas are the model's words with the spaces between
+    /// them, whole, at every cut and one character at a time alike; both calls are read, and the
+    /// space after the first call's end and the one before the next call's opener are the
+    /// template's.
+    #[test]
+    fn prose_between_two_calls_reaches_the_client_as_the_model_wrote_it() {
+        let output = concat!(
+            "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{\"city\": \"Paris\"}",
+            "<｜tool▁call▁end｜> and also this one <｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>",
+            "{\"city\": \"Rome\"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+        );
+        let prose = "and also this one";
+        let expected_calls = [
+            (
+                "get_weather".to_string(),
+                "{\"city\": \"Paris\"}".to_string(),
+            ),
+            (
+                "get_weather".to_string(),
+                "{\"city\": \"Rome\"}".to_string(),
+            ),
+        ];
+        let shown = |events: &[Event]| chat::message(0, events).message.content;
+        let streamed = |events: &[Event]| -> String {
+            chat::deltas(0, events)
+                .into_iter()
+                .filter_map(|choice| choice.delta.content)
+                .collect()
+        };
+        let whole = run(CHAT, &[output]);
+        assert_eq!(bytes(&whole), output);
+        assert_eq!(calls(&whole), expected_calls);
+        assert_eq!(content(&whole), "");
+        assert_eq!(malformed(&whole), ["and", " also", " this", " one"]);
+        assert_eq!(shown(&whole).as_deref(), Some(prose));
+        assert_eq!(streamed(&whole), prose);
+        for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
+            let events = run(CHAT, &[&output[..cut], &output[cut..]]);
+            assert_eq!(bytes(&events), output, "cut at {cut}");
+            assert_eq!(calls(&events), expected_calls, "cut at {cut}");
+            assert_eq!(shown(&events).as_deref(), Some(prose), "cut at {cut}");
+            assert_eq!(streamed(&events), prose, "cut at {cut}");
+        }
+        let pieces: Vec<&str> = output
+            .char_indices()
+            .map(|(at, c)| &output[at..at + c.len_utf8()])
+            .collect();
+        let events = run(CHAT, &pieces);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(calls(&events), expected_calls);
+        assert_eq!(shown(&events).as_deref(), Some(prose));
+        assert_eq!(streamed(&events), prose);
     }
 
     #[test]

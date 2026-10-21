@@ -258,7 +258,7 @@ pub enum Emits {
     /// A call's arguments, assembled by the format's call syntax.
     Arguments,
     /// The template's wrapping between calls: whitespace is `Dropped { Wrapper }`, anything else
-    /// `Malformed`.
+    /// `Malformed`, the whitespace between two runs of it the model's (`Engine::wrapping`).
     Wrapper,
 }
 

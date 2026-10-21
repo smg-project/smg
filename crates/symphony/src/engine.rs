@@ -6,8 +6,9 @@
 //!
 //! Every byte of the output lands in exactly one event: a terminal that moves the engine as
 //! `Dropped { Wrapper }`, the whitespace between a call and the terminal that closes it as
-//! `Dropped { Wrapper }` too, any other text there as `Malformed`, run by run so that where the
-//! chunks were cut changes nothing, the whitespace a content stay begins with as
+//! `Dropped { Wrapper }` too except between two runs of other text there, which is the model's and
+//! rides in the second run's `Malformed` event, any other text there as `Malformed`, run by run so
+//! that where the chunks were cut changes nothing, the whitespace a content stay begins with as
 //! `Dropped { Whitespace }` when no text follows it in the stay (the template's spacing after a
 //! thought's close, between two calls, or after a thought nothing follows, held until what
 //! follows says whose it is) unless the table keeps the state's text as written, and the rest as
@@ -18,7 +19,9 @@
 use std::{borrow::Cow, collections::VecDeque, ops::Range, sync::Arc};
 
 use crate::{
-    event::{runs_at, DropReason, Event, Events, FinishReason, MalformedReason, Text},
+    event::{
+        release_between, runs_at, DropReason, Event, Events, FinishReason, MalformedReason, Text,
+    },
     format::{CallId, CallSyntax, Emits, Format, Replay},
     gemma,
     ids::CallIds,
@@ -109,10 +112,11 @@ struct Pending {
     call: shape::Assembler,
 }
 
-/// The stay in a state, from the row that entered it to the row that leaves it, as trimming and
-/// the held lead read it: whether text other than whitespace has arrived, and the run held. A
-/// trimmed stay holds the run after its last text that is not whitespace; a content stay holds
-/// the run before its first ([`Engine::lead`]).
+/// The stay in a state, from the row that entered it to the row that leaves it, as trimming, the
+/// held lead and the wrapping read it: whether text other than whitespace has arrived, and the
+/// run held. A trimmed stay holds the run after its last text that is not whitespace; a content
+/// stay holds the run before its first ([`Engine::lead`]); a wrapping stay (between a block's
+/// calls, after a call's object) holds the run after its last text ([`Engine::wrapping`]).
 #[derive(Debug, Default)]
 struct Stay {
     begun: bool,
@@ -120,7 +124,7 @@ struct Stay {
 }
 
 /// Bytes a stay holds, in the output's order: a trimmed stay's run after its last text that is not
-/// whitespace, or a content stay's lead before its first.
+/// whitespace, a content stay's lead before its first, or a wrapping stay's run after its last.
 #[derive(Debug)]
 enum Held {
     /// Whitespace: the state's text if more text follows in the stay, dropped if the stay ends.
@@ -780,11 +784,18 @@ impl Engine {
     }
 
     /// The stay ends: the run it held is the template's and is dropped, a trimmed stay's run
-    /// after its last text as much as a lead no text followed.
+    /// after its last text as much as a lead no text followed, and the run a wrapping stay held
+    /// after its last text, the template's spacing before the terminal that ended the stay.
     fn end_stay(&mut self, out: &mut Events) {
+        // A content or reasoning stay's run is whitespace the format treats as structural; a
+        // wrapping stay's is the template's wrapping, as it is before the stay's first text.
+        let spacing = match self.emits() {
+            Emits::Content | Emits::Reasoning => DropReason::Whitespace,
+            Emits::Arguments | Emits::Wrapper => DropReason::Wrapper,
+        };
         for held in std::mem::take(&mut self.stay.held) {
             let (text, why) = match held {
-                Held::Space(space) => (space, DropReason::Whitespace),
+                Held::Space(space) => (space, spacing),
                 Held::Ignored(terminal) => (terminal, DropReason::Wrapper),
             };
             out.push(Event::Dropped {
@@ -794,29 +805,78 @@ impl Engine {
         }
     }
 
-    /// Text where the template only wraps: after a call and before its closing terminal, or
-    /// between a block's calls. Each run of whitespace is the template's and is dropped, each run
-    /// of anything else is malformed with `why`. Classifying run by run keeps the result the same
-    /// wherever the chunks were cut.
+    /// Text where the template only wraps: after a call's object and before its closing terminal,
+    /// or between a block's calls. Whitespace before the stay's first other text is the template's
+    /// and is dropped as it arrives; each run of anything else is malformed with `why`, with the
+    /// whitespace held since the last such run in front of it, which is the model's, between two
+    /// pieces of its text ([`release_between`], the rule every reader of such text states); the
+    /// whitespace after a run is held, the next run's when one follows and the template's spacing
+    /// before the terminal that ends the stay otherwise, which [`Self::end_stay`] drops. One event
+    /// per run, so a reader that counts the reason counts as before, and classifying run by run
+    /// keeps the result the same wherever the chunks were cut.
     fn wrapping<'d>(&mut self, surplus: Cow<'d, str>, why: MalformedReason, out: &mut Events<'d>) {
         for (range, space) in runs_at(&surplus) {
-            let run = self.tokens.text(part(&surplus, range));
-            out.push(if space {
-                Event::Dropped {
-                    text: run,
-                    why: DropReason::Wrapper,
+            if space {
+                if self.stay.begun {
+                    self.hold(&surplus[range]);
+                } else {
+                    out.push(Event::Dropped {
+                        text: self.tokens.text(part(&surplus, range)),
+                        why: DropReason::Wrapper,
+                    });
                 }
-            } else {
-                Event::Malformed { text: run, why }
-            });
+                continue;
+            }
+            let mut before = self.held_before_text(why, out);
+            self.release_wrapping(&mut before, part(&surplus, range), why, out);
         }
+    }
+
+    /// The run a wrapping stay held, as text follows it: the whitespace is the text's and comes
+    /// back to stand in front of it; a terminal the table ignores among it is dropped in its
+    /// place, the whitespace before it released on its own, so every byte keeps its order.
+    fn held_before_text(&mut self, why: MalformedReason, out: &mut Events) -> String {
+        let mut before = String::new();
+        for held in std::mem::take(&mut self.stay.held) {
+            match held {
+                Held::Space(space) => before.push_str(&space),
+                Held::Ignored(terminal) => {
+                    self.release_wrapping(&mut before, Cow::Borrowed(""), why, out);
+                    out.push(Event::Dropped {
+                        text: self.tokens.text(terminal),
+                        why: DropReason::Wrapper,
+                    });
+                }
+            }
+        }
+        before
+    }
+
+    /// A piece of text where the template only wraps, released as the rule has it
+    /// ([`release_between`]) with `before`, the whitespace held in front of it, and counted;
+    /// text released begins the stay. The engine carries nothing before the stay's first text,
+    /// which it dropped as it arrived, so the piece keeps its borrow on the delta there.
+    fn release_wrapping<'d>(
+        &mut self,
+        before: &mut String,
+        text: Cow<'d, str>,
+        why: MalformedReason,
+        out: &mut Events<'d>,
+    ) {
+        let mut released = self.stay.begun;
+        let mut events = Events::new();
+        release_between(before, &mut released, text, why, &mut events);
+        for event in events.drain() {
+            out.push(self.tokens.relabel(event));
+        }
+        self.stay.begun = released;
     }
 
     /// A terminal arrived: move where the table says, or keep it as text where the model put it.
     /// A terminal the table ignores is dropped where it stands, and moves nothing: inside a call
     /// whose assembler holds bytes it is placed where it arrived once the bytes around it leave
-    /// ([`Region`]), and in a stay's held run (a trimmed stay's tail, a content stay's lead) it
-    /// keeps its place among them.
+    /// ([`Region`]), and in a stay's held run (a trimmed stay's tail, a content stay's lead, the
+    /// run a wrapping stay holds after its text) it keeps its place among them.
     fn terminal(&mut self, index: usize, out: &mut Events) {
         if self.format.ignored(index) {
             let text = self.format.terminal_text(index).to_string();
@@ -829,11 +889,6 @@ impl Engine {
                         self.region.carried.push((self.region.fed, text));
                         return;
                     }
-                    out.push(Event::Dropped {
-                        text: self.tokens.text(text),
-                        why: DropReason::Wrapper,
-                    });
-                    return;
                 }
             }
             // Inside a stay's held run, the terminal keeps its place among the bytes held.
@@ -1851,6 +1906,145 @@ mod tests {
                 assert_eq!(bytes(&events), output);
             }
         }
+    }
+
+    /// Prose where the template only wraps, between a block's two calls: the words keep the
+    /// model's whitespace between them, one `Malformed { TextBetweenCalls }` event per word with
+    /// the whitespace before it; the whitespace right after the first call's close and the run
+    /// before the next call's opener are the template's, dropped; the same whole, at every cut
+    /// and one character at a time.
+    #[test]
+    fn prose_between_two_calls_keeps_the_models_whitespace_between_its_words() {
+        let format = Format::new("block")
+            .terminal("calls_open", "<calls>")
+            .terminal("calls_close", "</calls>")
+            .terminal("call_open", "<call>")
+            .terminal("call_close", "</call>")
+            .state("content", Emits::Content)
+            .state("calls", Emits::Wrapper)
+            .state("call", Emits::Arguments)
+            .transition("content", "calls_open", "calls")
+            .transition("calls", "call_open", "call")
+            .transition("call", "call_close", "calls")
+            .transition("calls", "calls_close", "content")
+            .calls(CallSyntax::Json);
+        let call = |city: &str| {
+            format!(
+                "<call>{{\"name\": \"get_weather\", \"arguments\": {{\"city\": \"{city}\"}}}}</call>"
+            )
+        };
+        let output = format!(
+            "<calls>\n{}\n and also this one \n{}\n</calls>",
+            call("Paris"),
+            call("Rome")
+        );
+        let [content, _, dropped, malformed] = same_at_every_cut(&format, "", &output);
+        assert_eq!(
+            [content.as_str(), malformed.as_str()],
+            ["", "and also this one"]
+        );
+        assert_eq!(
+            dropped,
+            "<calls>\n<call></call>\n  \n<call></call>\n</calls>"
+        );
+        let events = run(format, &output, EngineFinish::Stop);
+        assert_eq!(
+            wrapping_words(&events, MalformedReason::TextBetweenCalls),
+            ["and", " also", " this", " one"]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::ToolCallStart { .. }))
+                .count(),
+            2
+        );
+    }
+
+    /// Text after a call's object, before the call's closing marker: the words keep the model's
+    /// whitespace between them, one `Malformed { TextAfterTheArguments }` event per word with the
+    /// whitespace before it; the whitespace right after the object and the run before the marker
+    /// are the template's; a terminal the table ignores inside the held run keeps its place; the
+    /// same whole, at every cut and one character at a time. A stream that ends there drops the
+    /// held run as the template's and loses no word.
+    #[test]
+    fn text_after_a_calls_object_keeps_the_models_whitespace_between_its_words() {
+        let format = qwen3(CallSyntax::Json);
+        let object = "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}";
+        let output = format!("<tool_call>\n{object}\nplease note this and that\n</tool_call>");
+        let [content, _, dropped, malformed] = same_at_every_cut(&format, "", &output);
+        assert_eq!(
+            [content.as_str(), malformed.as_str()],
+            ["", "please note this and that"]
+        );
+        assert_eq!(dropped, "<tool_call>\n\n</tool_call>");
+        let events = run(format.clone(), &output, EngineFinish::Stop);
+        assert_eq!(
+            wrapping_words(&events, MalformedReason::TextAfterTheArguments),
+            ["please", " note", " this", " and", " that"]
+        );
+        // A terminal the table ignores inside the whitespace the stay holds keeps its place, the
+        // model's whitespace around it in events of its own, and the run before the marker is the
+        // template's with the terminal in it.
+        let separated = format.clone().ignores("sep", "|");
+        let output = format!("<tool_call>\n{object}\nplease | note |\n</tool_call>");
+        let [_, _, dropped, malformed] = same_at_every_cut(&separated, "", &output);
+        assert_eq!(
+            [dropped.as_str(), malformed.as_str()],
+            ["<tool_call>\n| |\n</tool_call>", "please  note"]
+        );
+        let events = run(separated, &output, EngineFinish::Stop);
+        let end = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+            .expect("the call's end");
+        let after_the_call: Vec<(bool, &str)> = events[end + 1..]
+            .iter()
+            .filter_map(|event| match event {
+                Event::Dropped { text, .. } => Some((false, &*text.text)),
+                Event::Malformed { text, .. } => Some((true, &*text.text)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            after_the_call,
+            [
+                (false, "\n"),
+                (true, "please"),
+                (true, " "),
+                (false, "|"),
+                (true, " note"),
+                (false, " "),
+                (false, "|"),
+                (false, "\n"),
+                (false, "</tool_call>"),
+            ]
+        );
+        // The stream ends after the prose: the held run is the template's, dropped.
+        let events = run(
+            format,
+            &format!("<tool_call>\n{object}\nplease note "),
+            EngineFinish::Length,
+        );
+        assert_eq!(
+            wrapping_words(&events, MalformedReason::TextAfterTheArguments),
+            ["please", " note"]
+        );
+        let [_, _, dropped, _] = kinds(&events);
+        assert_eq!(dropped, "<tool_call>\n ");
+    }
+
+    /// The `Malformed` events of `why`, each one's text: a word with the whitespace before it.
+    fn wrapping_words(events: &[Event], why: MalformedReason) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, why: reason } if *reason == why => {
+                    Some(text.text.to_string())
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]

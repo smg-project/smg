@@ -26,10 +26,12 @@ pub fn qwen2_5() -> Format {
 mod tests {
     use super::*;
     use crate::{
+        adapt::chat,
         engine::Engine,
-        event::{DropReason, Event, Events, Text},
+        event::{DropReason, Event, Events, MalformedReason, Text},
         input::{EngineFinish, Input},
         parser::Parser,
+        testing::{arguments_of, bytes},
         Declared,
     };
 
@@ -39,18 +41,24 @@ mod tests {
     );
 
     fn run(output: &str) -> Vec<Event<'static>> {
+        run_pieces(&[output])
+    }
+
+    fn run_pieces(pieces: &[&str]) -> Vec<Event<'static>> {
         let mut parser = Engine::new(qwen2_5(), Declared::default());
         let mut out = Events::new();
-        parser
-            .feed(
-                Input::Delta {
-                    token_ids: &[],
-                    text: output,
-                    spans: &[],
-                },
-                &mut out,
-            )
-            .expect("delta");
+        for piece in pieces {
+            parser
+                .feed(
+                    Input::Delta {
+                        token_ids: &[],
+                        text: piece,
+                        spans: &[],
+                    },
+                    &mut out,
+                )
+                .expect("delta");
+        }
         parser
             .feed(
                 Input::End {
@@ -60,6 +68,65 @@ mod tests {
             )
             .expect("end");
         out.into_owned().drain()
+    }
+
+    /// Text after the call's object, before `</tool_call>`: the chat message's content and the
+    /// stream's deltas are the model's words with the spaces between them, whole, at every cut
+    /// and one character at a time alike; the call keeps its arguments, and the newline after the
+    /// object and the one before the marker are the template's.
+    #[test]
+    fn text_after_the_calls_object_reaches_the_client_as_the_model_wrote_it() {
+        let output = concat!(
+            "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n",
+            "please note this and that\n</tool_call>"
+        );
+        let prose = "please note this and that";
+        let shown = |events: &[Event]| chat::message(0, events).message.content;
+        let streamed = |events: &[Event]| -> String {
+            chat::deltas(0, events)
+                .into_iter()
+                .filter_map(|choice| choice.delta.content)
+                .collect()
+        };
+        let words = |events: &[Event]| -> Vec<(String, MalformedReason)> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let whole = run(output);
+        assert_eq!(bytes(&whole), output);
+        assert_eq!(arguments_of(&whole, 0), r#"{"city": "Paris"}"#);
+        let expected: Vec<(String, MalformedReason)> =
+            ["please", " note", " this", " and", " that"]
+                .into_iter()
+                .map(|word| (word.to_string(), MalformedReason::TextAfterTheArguments))
+                .collect();
+        assert_eq!(words(&whole), expected);
+        assert_eq!(shown(&whole).as_deref(), Some(prose));
+        assert_eq!(streamed(&whole), prose);
+        for cut in 1..output.len() {
+            let events = run_pieces(&[&output[..cut], &output[cut..]]);
+            assert_eq!(bytes(&events), output, "cut at {cut}");
+            assert_eq!(
+                arguments_of(&events, 0),
+                r#"{"city": "Paris"}"#,
+                "cut at {cut}"
+            );
+            assert_eq!(shown(&events).as_deref(), Some(prose), "cut at {cut}");
+            assert_eq!(streamed(&events), prose, "cut at {cut}");
+        }
+        let pieces: Vec<&str> = output
+            .char_indices()
+            .map(|(at, c)| &output[at..at + c.len_utf8()])
+            .collect();
+        let events = run_pieces(&pieces);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(shown(&events).as_deref(), Some(prose));
+        assert_eq!(streamed(&events), prose);
     }
 
     #[test]

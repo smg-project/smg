@@ -22,7 +22,7 @@
 //! [`formats::minimax_m3`]: crate::formats::minimax_m3()
 
 use crate::{
-    event::{runs, DropReason, Event, Events, MalformedReason, Text},
+    event::{release_between, runs, Event, Events, MalformedReason, Text},
     tagged::{
         assembler::{push_escaped, push_quoted},
         end_cut_call,
@@ -59,6 +59,12 @@ pub struct Assembler {
     /// Whether the last bytes taken were the table's ignored terminal: the separator the
     /// template writes before every tag, and never inside a value.
     after_separator: bool,
+    /// Whether text where the syntax has tags was released as content since the last tag the
+    /// syntax read (a word between tags, a tag out of its place, a tag reported with its bytes):
+    /// the whitespace carried after it is the model's, between two pieces of its text, and leaves
+    /// with the next piece ([`release_between`]); before any, the whitespace after a tag is the
+    /// template's, dropped before a report or carried into the next event's source.
+    released: bool,
     done: bool,
 }
 
@@ -128,6 +134,7 @@ impl Assembler {
             written: 0,
             tag: None,
             after_separator: false,
+            released: false,
             done: false,
         }
     }
@@ -295,6 +302,7 @@ impl Assembler {
             source: Text::uncounted(std::mem::take(&mut self.carried)),
         });
         self.function = Some(name);
+        self.released = false;
         if !tail_bytes.is_empty() {
             out.push(Event::Malformed {
                 text: Text::uncounted(tail_bytes),
@@ -366,11 +374,13 @@ impl Assembler {
             return;
         }
         if !self.started() {
-            self.drop_carried(out);
-            out.push(Event::Malformed {
-                text: Text::uncounted(bytes),
-                why: MalformedReason::TagOutOfPlace,
-            });
+            release_between(
+                &mut self.carried,
+                &mut self.released,
+                bytes.into(),
+                MalformedReason::TagOutOfPlace,
+                out,
+            );
             return;
         }
         if closing {
@@ -414,6 +424,7 @@ impl Assembler {
             shape: Shape::Open,
             written: 0,
         });
+        self.released = false;
     }
 
     /// A closing tag: it closes the innermost element when it names it; inside a leaf, or under
@@ -425,13 +436,13 @@ impl Assembler {
                 shape: Shape::Leaf(_) | Shape::Open,
                 ..
             }) => self.text(bytes, declared, out),
-            Some(_) | None => {
-                self.drop_carried(out);
-                out.push(Event::Malformed {
-                    text: Text::uncounted(bytes.to_owned()),
-                    why: MalformedReason::TagOutOfPlace,
-                });
-            }
+            Some(_) | None => release_between(
+                &mut self.carried,
+                &mut self.released,
+                bytes.to_owned().into(),
+                MalformedReason::TagOutOfPlace,
+                out,
+            ),
         }
     }
 
@@ -501,17 +512,21 @@ impl Assembler {
         }
     }
 
-    /// Text where the syntax has tags: whitespace is the template's, anything else is reported.
+    /// Text where the syntax has tags: whitespace is carried, since whose it is depends on what
+    /// follows, anything else is released with the whitespace before it when text was released
+    /// since the last tag the syntax read, after it dropped otherwise ([`release_between`]).
     fn text_between(&mut self, text: &str, out: &mut Events) {
         for (run, space) in runs(text) {
             if space {
                 self.carried.push_str(run);
             } else {
-                self.drop_carried(out);
-                out.push(Event::Malformed {
-                    text: Text::uncounted(run.to_owned()),
-                    why: MalformedReason::TextBetweenTags,
-                });
+                release_between(
+                    &mut self.carried,
+                    &mut self.released,
+                    run.to_owned().into(),
+                    MalformedReason::TextBetweenTags,
+                    out,
+                );
             }
         }
     }
@@ -658,9 +673,11 @@ impl Assembler {
         let mut source = std::mem::take(&mut self.carried);
         source.push_str(bytes);
         self.push_fragment(fragment, Text::uncounted(source), out);
+        self.released = false;
     }
 
-    /// Reports the carried bytes as `Malformed` with `why`, whitespace included.
+    /// Reports the carried bytes as `Malformed` with `why`, whitespace included: released, so the
+    /// whitespace after them is the model's.
     fn report(&mut self, why: MalformedReason, out: &mut Events) {
         if self.carried.is_empty() {
             return;
@@ -669,18 +686,7 @@ impl Assembler {
             text: Text::uncounted(std::mem::take(&mut self.carried)),
             why,
         });
-    }
-
-    /// Whitespace carried before text that is reported: the template's, dropped so the report
-    /// holds only the text.
-    fn drop_carried(&mut self, out: &mut Events) {
-        if self.carried.is_empty() {
-            return;
-        }
-        out.push(Event::Dropped {
-            text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why: DropReason::Wrapper,
-        });
+        self.released = true;
     }
 
     /// `}` or `{}`, with `source` as its bytes.

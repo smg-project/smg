@@ -38,14 +38,16 @@
 //! Every byte lands in one event. The header's bytes are the start's source (dropped as wrapping
 //! when the arguments' object names the call, since its start carries that object's head); the
 //! arguments' bytes are their fragments' sources; the trailer and the closing terminal are the
-//! end's source. Whitespace after the arguments that is not the trailer is dropped as wrapping, and
-//! anything else there is `Malformed`, run by run, so that where the chunks were cut changes
+//! end's source. Whitespace after the arguments that is not the trailer is dropped as wrapping
+//! before the first run of other text and after the last; between two runs it is the model's and
+//! rides in the second run's `Malformed` event, so that where the chunks were cut changes
 //! nothing. A region the stream cut is ended with what arrived. Tagged parameters close as the
 //! template's reader closes a region at the end of its text: the arguments' object is closed over
 //! the parameters that finished, and the text of one the cut left unfinished is dropped as
 //! wrapping. One JSON value or object is not closed for the client, and what was held after it
-//! comes back as `Malformed` with `UnterminatedRegion`, its whitespace dropped. A value that never
-//! began, the cut or the region's close right after the header, is said to be none the same way a
+//! comes back as `Malformed` with `UnterminatedRegion`, the whitespace between its words kept and
+//! the runs before the first word and after the last dropped as wrapping. A value that never began,
+//! the cut or the region's close right after the header, is said to be none the same way a
 //! value cut short is, by a `Malformed` event of no bytes before the call's end
 //! ([`json::Arguments::finish`]), so that a call is never handed over whole with an empty string
 //! for its arguments.
@@ -54,7 +56,7 @@
 
 use super::params::Params;
 use crate::{
-    event::{runs, DropReason, Event, Events, MalformedReason, Text},
+    event::{release_between, runs, DropReason, Event, Events, MalformedReason, Text},
     format::CallId,
     json::{self, arguments::Strings},
     shape::{
@@ -144,6 +146,12 @@ struct Value {
     tail: Option<Suffix<'static>>,
     /// Where the trailer starts in `after`, once a closing terminal was found to end it.
     trailer_at: Option<usize>,
+    /// Under a shape with no trailer, where text after the arguments is classified as it arrives:
+    /// the whitespace held since the last run of text, the model's if more text follows and the
+    /// template's spacing before the terminal otherwise ([`release_between`]).
+    carried: String,
+    /// Under a shape with no trailer: whether text after the arguments was released.
+    released: bool,
 }
 
 /// How the arguments are read.
@@ -386,11 +394,13 @@ impl Assembler {
     }
 
     /// The region closed at `terminal` (empty for the stream's stop), which [`closes`] said it
-    /// does: the call ends. Bytes after a value or an object and before the trailer are dropped
-    /// where they are whitespace and malformed otherwise, and parameters still undecided are
-    /// decided as at the end of the call's text; the trailer and the terminal are the end's
-    /// source. Returns whether the terminal was taken so; when the arguments' own object named the
-    /// call, its close was the call's end, and the trailer and the terminal are the region's.
+    /// does: the call ends. Bytes after a value or an object and before the trailer are malformed
+    /// run by run, the whitespace before the first run and after the last dropped as the
+    /// template's and the whitespace between two runs kept as the model's, and parameters still
+    /// undecided are decided as at the end of the call's text; the trailer and the terminal are
+    /// the end's source. Returns whether the terminal was taken so; when the arguments' own
+    /// object named the call, its close was the call's end, and the trailer and the terminal are
+    /// the region's.
     ///
     /// [`closes`]: Self::closes
     pub fn close(mut self, terminal: &str, declared: &Declared, out: &mut Events) -> bool {
@@ -413,10 +423,11 @@ impl Assembler {
 
     /// The stream was cut inside the region: the call ends with what arrived. One JSON value or
     /// object is not closed for the client, and what was held after it comes back as `Malformed`
-    /// with `UnterminatedRegion`, its whitespace dropped; a value that never began is said to be
-    /// none before the end, as one cut short is. Tagged parameters close as at the end of the
-    /// text: those still undecided are decided there, the bytes no parameter took are dropped as
-    /// wrapping, and the arguments' object is closed.
+    /// with `UnterminatedRegion`, the whitespace around it dropped and the whitespace between its
+    /// words kept; a value that never began is said to be none before the end, as one cut short
+    /// is. Tagged parameters close as at the end of the text: those still undecided are decided
+    /// there, the bytes no parameter took are dropped as wrapping, and the arguments' object is
+    /// closed.
     pub fn finish(mut self, declared: &Declared, out: &mut Events) {
         let Stage::Body(body) = std::mem::replace(&mut self.stage, Stage::Done) else {
             return;
@@ -474,6 +485,8 @@ impl Value {
             after: String::new(),
             tail: None,
             trailer_at: None,
+            carried: String::new(),
+            released: false,
         }
     }
 
@@ -516,7 +529,7 @@ impl Value {
             }
         }
         if shape.trailer.0.is_empty() {
-            wrapping(rest, self.reader.surplus(), out);
+            self.surplus(rest, out);
             return;
         }
         let tail = self.tail.get_or_insert_with(|| {
@@ -544,6 +557,46 @@ impl Value {
         at.is_some()
     }
 
+    /// Text after the arguments under a shape with no trailer, as it arrives: whitespace before
+    /// the first run of text is the template's and is dropped; a run is malformed with the
+    /// reader's reason, with the whitespace held since the last run in front of it, the model's
+    /// between two pieces of its text ([`release_between`]); the whitespace after a run is held,
+    /// the next run's when one follows and the template's spacing before the terminal otherwise,
+    /// which the close or the stream's end drops. The same wherever the chunks were cut.
+    fn surplus(&mut self, text: &str, out: &mut Events) {
+        let why = self.reader.surplus();
+        for (run, space) in runs(text) {
+            if !space {
+                release_between(
+                    &mut self.carried,
+                    &mut self.released,
+                    run.to_owned().into(),
+                    why,
+                    out,
+                );
+            } else if self.released {
+                self.carried.push_str(run);
+            } else {
+                out.push(Event::Dropped {
+                    text: Text::uncounted(run.to_owned()),
+                    why: DropReason::Wrapper,
+                });
+            }
+        }
+    }
+
+    /// The whitespace held after the last run of text under a shape with no trailer, as the
+    /// region closes or the stream ends: the template's spacing, dropped.
+    fn drop_carried(carried: String, out: &mut Events) {
+        if carried.is_empty() {
+            return;
+        }
+        out.push(Event::Dropped {
+            text: Text::uncounted(carried),
+            why: DropReason::Wrapper,
+        });
+    }
+
     /// The region closed: the bytes after the arguments and before the trailer are classified,
     /// and the trailer is returned for the call's end; or, for an object that named the call and
     /// ended it at its close, the trailer is the region's wrapping and nothing is returned.
@@ -552,6 +605,7 @@ impl Value {
             reader,
             after,
             trailer_at,
+            carried,
             ..
         } = self;
         let at = trailer_at.unwrap_or(after.len());
@@ -567,6 +621,7 @@ impl Value {
                 true
             }
         };
+        Self::drop_carried(carried, out);
         wrapping(between, surplus, out);
         if enveloped {
             if !trailer.is_empty() {
@@ -584,36 +639,42 @@ impl Value {
     /// the caller's to push, unless the arguments' object ended the call. Returns whether the
     /// caller ends it.
     fn finish(self, out: &mut Events) -> bool {
-        match self.reader {
+        let Self {
+            reader,
+            after,
+            carried,
+            ..
+        } = self;
+        let ends = match reader {
             JsonReader::Json(mut arguments) => {
                 arguments.finish(out);
-                wrapping(&self.after, MalformedReason::UnterminatedRegion, out);
                 true
             }
             JsonReader::Envelope(assembler) => {
                 assembler.finish(out);
-                wrapping(&self.after, MalformedReason::UnterminatedRegion, out);
                 false
             }
-        }
+        };
+        Self::drop_carried(carried, out);
+        wrapping(&after, MalformedReason::UnterminatedRegion, out);
+        ends
     }
 }
 
-/// Bytes after a call's arguments that are no part of the call: each run of whitespace dropped as
-/// wrapping, each run of anything else `Malformed` for `why`. Classifying run by run keeps the
-/// result the same wherever the chunks were cut.
+/// Bytes after a call's arguments that are no part of the call, classified whole: whitespace
+/// before the first run of text and after the last is the template's wrapping, dropped; each run
+/// of anything else is `Malformed` for `why`, with the whitespace between it and the run before it
+/// in front of it, which is the model's ([`release_between`]).
 fn wrapping(text: &str, why: MalformedReason, out: &mut Events) {
+    let (mut carried, mut released) = (String::new(), false);
     for (run, space) in runs(text) {
-        let run = Text::uncounted(run.to_owned());
-        out.push(if space {
-            Event::Dropped {
-                text: run,
-                why: DropReason::Wrapper,
-            }
+        if space {
+            carried.push_str(run);
         } else {
-            Event::Malformed { text: run, why }
-        });
+            release_between(&mut carried, &mut released, run.to_owned().into(), why, out);
+        }
     }
+    Value::drop_carried(carried, out);
 }
 
 #[cfg(test)]
@@ -1136,6 +1197,26 @@ mod tests {
                 content("Done."),
                 finish(1),
             ]
+        );
+        // Words between the arguments and the trailer keep the model's whitespace between them;
+        // the whitespace before the first and after the last is the template's.
+        assert_eq!(
+            run(&format, "<c><n=f>{\"a\": 1} x y </f>\n</c>Done."),
+            [
+                wrapper("<c>"),
+                start("f", "<n=f>"),
+                arguments("{\"a\": 1}"),
+                wrapper(" "),
+                Event::Malformed {
+                    text: Text::uncounted("x y"),
+                    why: MalformedReason::TextAfterTheArguments,
+                },
+                wrapper(" "),
+                end("</f>\n</c>"),
+                content("Done."),
+                finish(1),
+            ],
+            "the whitespace between two words after the arguments is the model's"
         );
         let events = run_after(
             &format,

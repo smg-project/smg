@@ -135,6 +135,16 @@ is a later step).
   which releases it as the state's text, or a row ends the stay or the stream ends, which drops
   it. Held bytes have not reached the ledger, so the tokens are counted in the output's order
   whatever the run turns out to be.
+- Text where the template only wraps (a wrapper state between a block's calls, the bytes after a
+  call's object before its closing marker) is classified run by run: whitespace before the stay's
+  first other text is `Dropped { Wrapper }` as it arrives; every other run is `Malformed`
+  (`TextBetweenCalls`, `TextAfterTheArguments`), one event per run, with the whitespace held
+  since the last run in front of it, since between two pieces of the model's text the whitespace
+  is the model's (`event::release_between`, the rule every reader of such text states); the run
+  after the last is held, a terminal the table ignores inside it in its place, and dropped as
+  the template's spacing when a row ends the stay or the stream does. So a client reads prose
+  between two calls, or after a call's object, as the model wrote it, byte for byte, whole and
+  streamed alike.
 - A call given as data (`CallSyntax::Shaped`) opens only when the header after its terminal
   matches: the engine holds the terminal and every byte after it, and takes no row, until the
   header decides. A header that cannot match gives the terminal back: its first character is the

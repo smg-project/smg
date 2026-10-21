@@ -10,9 +10,10 @@
 //!   object with no name leaves no gap; every call streams as a Qwen3 call does. The `[`, the
 //!   commas between objects, the whitespace around them, the `]` and whitespace that ends the
 //!   output after it are the template's and come back as `Dropped { Wrapper }`; any other text
-//!   between objects is `Malformed`, one event per run, and so is text after the `]`, with the
-//!   whitespace before and between its words: once text follows the list, every byte after the
-//!   `]` is the model's prose, which the template's reference keeps as written.
+//!   between objects is `Malformed`, one event per word, the whitespace between two words the
+//!   model's and in the next word's event, and so is text after the `]`, with the whitespace
+//!   before and between its words: once text follows the list, every byte after the `]` is the
+//!   model's prose, which the template's reference keeps as written.
 //! - Anything else makes the whole output content: that byte and every later one come back as
 //!   `Content`, since the model answered in prose. The whitespace held before it comes back as
 //!   content too. A `[` that is followed by anything but an object or the `]` is prose as well
@@ -56,7 +57,7 @@
 //! a `;`, another object or prose after it (`docs/assemblers.md`).
 
 use crate::{
-    event::{DropReason, Event, Events, MalformedReason, Text},
+    event::{release_between, DropReason, Event, Events, MalformedReason, Text},
     ids::CallIds,
     json,
 };
@@ -85,6 +86,10 @@ pub struct Assembler {
     /// whitespace included, is the model's prose after its calls. Before it, whitespace is held,
     /// the template's wrapping if nothing follows.
     prose_after: bool,
+    /// Whether text between the list's objects was released since the `[` or the last object:
+    /// the list's wrapping carried after it is the model's, between two pieces of its text, and
+    /// leaves with the next piece ([`release_between`]); before any, it is the template's.
+    released: bool,
     /// The family's call marker the output may open with ([`Framing::ObjectOrList`]), until the
     /// first byte that is not whitespace has decided whether it does.
     opener: Option<&'static str>,
@@ -162,6 +167,7 @@ impl Assembler {
             listed: false,
             framed: framing == Framing::Framed,
             prose_after: false,
+            released: false,
             opener: framing.opener(),
             separated: false,
         }
@@ -319,16 +325,19 @@ impl Assembler {
                         ""
                     }
                     _ => {
-                        // A run of text between objects, reported whole.
+                        // A run of text between objects, reported whole, with the wrapping held
+                        // before it once text was released since the last object.
                         let end = text[at..]
                             .char_indices()
                             .find(|(_, c)| c.is_whitespace() || matches!(c, ',' | '{' | ']'))
                             .map_or(text.len(), |(i, _)| at + i);
-                        self.drop_carried(out);
-                        out.push(Event::Malformed {
-                            text: Text::uncounted(text[at..end].to_owned()),
-                            why: MalformedReason::TextBetweenCalls,
-                        });
+                        release_between(
+                            &mut self.carried,
+                            &mut self.released,
+                            text[at..end].to_owned().into(),
+                            MalformedReason::TextBetweenCalls,
+                            out,
+                        );
                         &text[end..]
                     }
                 }
@@ -398,6 +407,7 @@ impl Assembler {
     /// and the object goes to an assembler of its own with the next free index.
     fn open_object(&mut self, out: &mut Events) {
         self.drop_carried(out);
+        self.released = false;
         let index = self.next_index;
         self.objects += 1;
         self.stage = Stage::Object(Box::new(json::Assembler::new(index, self.ids.id(index))));
@@ -592,6 +602,40 @@ mod tests {
             })
             .collect();
         assert_eq!(malformed, ["junk", " tail"]);
+    }
+
+    #[test]
+    fn text_between_objects_keeps_the_models_whitespace_between_its_words() {
+        // Prose between two objects of the list: the whitespace right after the first object is
+        // the list's wrapping, the words keep the spaces between them (one event per word, the
+        // space before it in the event), and the whitespace before the next object is the
+        // list's again; the same whole, at every cut and one character at a time.
+        let output =
+            "[{\"name\": \"f\", \"arguments\": {}} some words here {\"name\": \"g\", \"arguments\": {}}]";
+        let whole = whole_and_per_char(run, output);
+        assert_eq!(calls(&whole).len(), 2);
+        assert_eq!(
+            malformed(&whole, MalformedReason::TextBetweenCalls),
+            "some words here"
+        );
+        let words: Vec<&str> = whole
+            .iter()
+            .filter_map(|event| match event {
+                Event::Malformed { text, .. } => Some(&*text.text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(words, ["some", " words", " here"]);
+        assert_eq!(dropped(&whole), ["[", " ", " ", "]"]);
+        at_every_cut(run, output);
+        // A comma between the words rides with them, the one before the next object is wrapping.
+        let output = "[{\"name\": \"f\", \"arguments\": {}}, some, words, {\"name\": \"g\"}]";
+        let whole = whole_and_per_char(run, output);
+        assert_eq!(
+            malformed(&whole, MalformedReason::TextBetweenCalls),
+            "some, words"
+        );
+        assert_eq!(dropped(&whole), ["[", ", ", ", ", "]"]);
     }
 
     #[test]
