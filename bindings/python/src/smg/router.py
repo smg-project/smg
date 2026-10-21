@@ -19,7 +19,10 @@ from smg.smg_rs import Router as _Router
 
 
 def _is_set(value: object) -> bool:
-    return value not in (None, "", [])
+    """Whether a discovery field was given: an empty string was, so Rust's
+    validation refuses it rather than this reading it as unset; an empty list
+    is the default of a repeatable flag never given."""
+    return value is not None and value != []
 
 
 @dataclasses.dataclass(frozen=True)

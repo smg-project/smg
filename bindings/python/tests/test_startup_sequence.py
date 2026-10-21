@@ -448,6 +448,45 @@ class TestRouterInitialization:
         for key in kwargs:
             assert not key.startswith("consul_"), key
 
+    def test_from_args_passes_explicitly_empty_settings_on_for_rejection(self):
+        """An empty string is a value given, not an unset field: it reaches
+        Rust, whose validation refuses it, instead of falling back to a
+        default such as the agent's own datacenter."""
+        from smg.router import _discovery_arguments
+
+        consul = _discovery_arguments(
+            RouterArgs(
+                discovery_provider="consul",
+                consul_service="smg-worker",
+                consul_address="",
+                consul_datacenter="",
+            )
+        )
+        assert consul["discovery"] == {
+            "provider": "consul",
+            "service": "smg-worker",
+            "address": "",
+            "datacenter": "",
+        }
+        slurm = _discovery_arguments(
+            RouterArgs(
+                discovery_provider="slurm",
+                slurm_job_name=["w"],
+                slurm_port=8000,
+                slurm_user="",
+            )
+        )
+        assert slurm["discovery"]["user"] == ""
+        # An empty one given to another provider is misplaced, as any value.
+        with pytest.raises(ValueError, match="only to discovery_provider='consul'"):
+            _discovery_arguments(
+                RouterArgs(
+                    discovery_provider="file",
+                    discovery_file="/run/smg/workers.json",
+                    consul_datacenter="",
+                )
+            )
+
     @pytest.mark.parametrize(
         "args, message",
         [
