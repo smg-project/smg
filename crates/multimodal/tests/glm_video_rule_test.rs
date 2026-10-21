@@ -101,7 +101,10 @@ fn a_clip_costs_what_it_costs_on_the_engines_own_server() {
     let spec = registry.lookup(&metadata).expect("the family's spec");
     assert_eq!(
         spec.video_frame_sampling(),
-        FrameSampling::UpTo { max_frames: 32 }
+        FrameSampling::UpToThenRate {
+            max_frames: 32,
+            rate_max_frames: 2048
+        }
     );
 
     let media = [MediaItemInfo {
