@@ -200,8 +200,9 @@ pub(crate) async fn execute_streaming_tool_calls(
             match prepared_arguments(args_str, response_format, request_tools, request_user) {
                 Ok(v) => v,
                 Err(e) => {
-                    let err_str = format!("Failed to parse tool arguments: {e}");
-                    warn!("{}", err_str);
+                    warn!(tool = %call.name, error = %e, "Failed to parse tool arguments as JSON");
+                    let err_str = invalid_tool_arguments(&e);
+                    record_parse_failure(model_id, &call.name);
                     let error_output = json!({ "error": &err_str });
                     let mut mcp_call_item = build_transformed_mcp_call_item(
                         &error_output,
@@ -1115,7 +1116,7 @@ async fn dispatch_call(
         Ok(v) => v,
         Err(e) => {
             warn!(tool = %call.name, error = %e, "Failed to parse tool arguments as JSON");
-            let error_output = format!("Invalid tool arguments: {e}");
+            let error_output = invalid_tool_arguments(&e);
             let error_json = json!({ "error": &error_output });
             let transformed_item = build_transformed_mcp_call_item(
                 &error_json,
@@ -1126,18 +1127,14 @@ async fn dispatch_call(
                 &call.arguments,
             );
 
-            Metrics::record_mcp_tool_call(
-                &original_body.model,
-                &call.name,
-                metrics_labels::RESULT_ERROR,
-            );
+            record_parse_failure(&original_body.model, &call.name);
 
             state.record_call(
                 session.is_builtin_tool(&call.name),
                 call.call_id,
                 call.name,
                 call.arguments,
-                error_output,
+                error_json.to_string(),
                 transformed_item,
             );
             return None;
@@ -1223,6 +1220,18 @@ fn prepared_arguments(
     }
     prepare_hosted_dispatch_args(&mut arguments, response_format, request_tools, request_user);
     Ok(arguments)
+}
+
+/// The error a call records when the model's arguments are not JSON: the
+/// same text on the call's item in both loops.
+fn invalid_tool_arguments(e: &serde_json::Error) -> String {
+    format!("Invalid tool arguments: {e}")
+}
+
+/// A call that never ran because its arguments did not parse, counted as an
+/// errored call by model and tool, in both loops.
+fn record_parse_failure(model_id: &str, tool_name: &str) {
+    Metrics::record_mcp_tool_call(model_id, tool_name, metrics_labels::RESULT_ERROR);
 }
 
 /// A dispatched call's duration and result, by model and tool.
@@ -1518,6 +1527,8 @@ fn extract_function_calls(resp: &Value) -> Vec<ExtractedFunctionCall> {
 mod tests {
     use std::collections::HashSet;
 
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    use openai_protocol::responses::ResponsesRequest;
     use serde_json::json;
     use smg_mcp::{
         BuiltinToolType, McpConfig, McpOrchestrator, McpServerBinding, McpServerConfig,
@@ -1530,7 +1541,7 @@ mod tests {
         is_internal_mcp_response_item, mcp_list_tools_bindings_to_emit,
         not_executed_tool_call_item, ToolLoopState, NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
     };
-    use crate::openai_bridge::ResponseFormat;
+    use crate::openai_bridge::{FormatRegistry, ResponseFormat};
 
     fn test_tool(name: &str) -> Tool {
         let mut schema = serde_json::Map::new();
@@ -2383,6 +2394,104 @@ mod tests {
         assert_eq!(overwritten, json!({ "query": "weather", "user": "u-1" }));
         assert!(
             super::prepared_arguments("not json", ResponseFormat::Passthrough, &[], None).is_err()
+        );
+    }
+
+    /// The `output` of the one `function_call_output` item a loop recorded
+    /// for the model's next round.
+    fn function_call_output(state: &ToolLoopState) -> String {
+        let item = state
+            .conversation_history
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .expect("a function_call_output item");
+        item["output"]
+            .as_str()
+            .expect("the output is a string")
+            .to_string()
+    }
+
+    /// A call whose arguments are not JSON is counted as an errored call in
+    /// both loops (the streaming one counted nothing before), and both loops
+    /// word the error on the call's item the same way.
+    #[tokio::test]
+    async fn a_call_with_non_json_arguments_is_counted_and_worded_alike_in_both_loops() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+        let (orchestrator, bindings) = function_tool_session().await;
+        let session = McpToolSession::new(&orchestrator, bindings, "test-request");
+        let registry = FormatRegistry::new();
+
+        let (tx, mut rx) = mpsc::channel(16);
+        let mut state = ToolLoopState::new(Vec::new());
+        let mut sequence_number = 0u64;
+        let mut call = super::FunctionCallInProgress::new("call_1".to_string(), 0);
+        call.name = "wiki_search".to_string();
+        call.arguments_buffer = "not json".to_string();
+        let client_stayed = super::execute_streaming_tool_calls(
+            vec![call],
+            &session,
+            &registry,
+            &tx,
+            &mut state,
+            &mut sequence_number,
+            "m",
+            &[],
+            None,
+        )
+        .await;
+        assert!(client_stayed);
+        let streamed = state.mcp_call_items[0].to_string();
+        assert!(
+            streamed.contains("Invalid tool arguments: "),
+            "the streaming loop's item: {streamed}"
+        );
+        let streamed_output = function_call_output(&state);
+        drop(tx);
+        while rx.recv().await.is_some() {}
+
+        let mut state = ToolLoopState::new(Vec::new());
+        let body: ResponsesRequest =
+            serde_json::from_value(json!({ "model": "m", "input": "q" })).expect("a request");
+        let approval = super::dispatch_call(
+            super::ExtractedFunctionCall {
+                call_id: "call_2".to_string(),
+                item_id: "fc_2".to_string(),
+                name: "wiki_search".to_string(),
+                arguments: "not json".to_string(),
+            },
+            &mut state,
+            &session,
+            &registry,
+            &body,
+        )
+        .await;
+        assert!(approval.is_none());
+        let direct = state.mcp_call_items[0].to_string();
+        assert!(
+            direct.contains("Invalid tool arguments: "),
+            "the non-streaming loop's item: {direct}"
+        );
+        let direct_output = function_call_output(&state);
+        assert!(
+            direct_output.starts_with("{\"error\":\"Invalid tool arguments: ") && direct_output == streamed_output,
+            "the function_call_output the model reads back, both loops: {direct_output} vs {streamed_output}"
+        );
+
+        let series: Vec<String> = handle
+            .render()
+            .lines()
+            .filter(|line| {
+                line.contains("smg_mcp_tool_calls_total") && line.contains("wiki_search")
+            })
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(series.len(), 1, "one errored-call series: {series:?}");
+        assert!(
+            series[0].contains("result=\"error\"") && series[0].ends_with(" 2"),
+            "both loops counted: {}",
+            series[0]
         );
     }
 }
