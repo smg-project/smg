@@ -1,4 +1,5 @@
 use std::{
+    convert::Infallible,
     future::Future,
     pin::Pin,
     sync::{
@@ -12,7 +13,7 @@ use axum::{
     extract::{Extension, Path, Query, RawQuery, Request, State},
     http::{header::InvalidHeaderName, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, post},
+    routing::{delete, get, post, Route},
     Json, Router,
 };
 use llm_tokenizer::TokenizerRegistry;
@@ -1029,13 +1030,55 @@ pub struct ServerConfig {
     pub secret_sources: posture::SecretSources,
 }
 
+/// `Router::layer` and `Router::route_layer` for a layer a configuration may
+/// leave out.
+///
+/// axum wraps every route in a fresh boxed service for whatever layer it is
+/// given, an identity layer included, and each wrapper costs a clone of the
+/// service and a boxed future per request; a layer with nothing to do is left
+/// uninstalled rather than installed empty.
+trait LayerIfSome<L> {
+    /// `Router::layer` with `layer` when there is one; the router unchanged
+    /// otherwise.
+    fn layer_if_some(self, layer: Option<L>) -> Self;
+
+    /// `Router::route_layer` with `layer` when there is one; the router
+    /// unchanged otherwise.
+    fn route_layer_if_some(self, layer: Option<L>) -> Self;
+}
+
+impl<S, L> LayerIfSome<L> for Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    L: tower::Layer<Route> + Clone + Send + Sync + 'static,
+    L::Service: tower::Service<Request> + Clone + Send + Sync + 'static,
+    <L::Service as tower::Service<Request>>::Response: IntoResponse + 'static,
+    <L::Service as tower::Service<Request>>::Error: Into<Infallible> + 'static,
+    <L::Service as tower::Service<Request>>::Future: Send + 'static,
+{
+    fn layer_if_some(self, layer: Option<L>) -> Self {
+        match layer {
+            Some(layer) => self.layer(layer),
+            None => self,
+        }
+    }
+
+    fn route_layer_if_some(self, layer: Option<L>) -> Self {
+        match layer {
+            Some(layer) => self.route_layer(layer),
+            None => self,
+        }
+    }
+}
+
 /// Apply the request-admission layer to a protected route group.
 ///
 /// `AdmissionMode::Priority` installs the priority scheduler middleware
 /// (carrying its own `Arc<SchedulerState>`); `AdmissionMode::Legacy` installs
-/// the original `concurrency_limit_middleware`. Either runs innermost of the
-/// protective layers (closest to the handler), after tenant resolution has
-/// populated `RouteRequestMeta`.
+/// the original `concurrency_limit_middleware` when a rate limiter is
+/// configured, and nothing otherwise (it would pass every request through).
+/// Either runs innermost of the protective layers (closest to the handler),
+/// after tenant resolution has populated `RouteRequestMeta`.
 ///
 /// Invariant: a request parked at admission keeps its body unread — bodies
 /// are collected only at handler extraction, after a permit is granted.
@@ -1051,12 +1094,18 @@ fn with_admission_layer(
                 middleware::scheduler::priority_admission_middleware,
             ))
         }
-        middleware::scheduler::AdmissionMode::Legacy => {
+        // Without a rate limiter the legacy layer passes every request through;
+        // it is not installed then (a from_fn layer clones and boxes per
+        // request whatever it does).
+        middleware::scheduler::AdmissionMode::Legacy
+            if app_state.context.rate_limiter.is_some() =>
+        {
             router.route_layer(axum::middleware::from_fn_with_state(
                 app_state,
                 middleware::concurrency_limit_middleware,
             ))
         }
+        middleware::scheduler::AdmissionMode::Legacy => router,
     }
 }
 
@@ -1133,15 +1182,15 @@ pub fn build_apps(
     // The serving auth layer, built once for every route group that takes
     // it: with no serving key configured it would pass every request through,
     // so it is not installed then (a from_fn layer clones and boxes per request
-    // whatever it does). The keys are fixed at start-up, so the decision at
+    // whatever it does, and axum wraps every route in a boxed service for an
+    // empty layer as well). The keys are fixed at start-up, so the decision at
     // build time is the one the layer made per request.
-    let serving_auth_layer =
-        tower::util::option_layer(serving_auth_config.is_enabled().then(|| {
-            axum::middleware::from_fn_with_state(
-                serving_auth_config.clone(),
-                middleware::auth_middleware,
-            )
-        }));
+    let serving_auth_layer = serving_auth_config.is_enabled().then(|| {
+        axum::middleware::from_fn_with_state(
+            serving_auth_config.clone(),
+            middleware::auth_middleware,
+        )
+    });
 
     // Choose the admission path once at startup: priority scheduler when
     // enabled (and it starts cleanly), otherwise the legacy concurrency limit.
@@ -1198,10 +1247,10 @@ pub fn build_apps(
             // Bound the buffered body read: inside admission, so a stalled
             // upload releases its permit, and inside the stream-vs-buffer
             // decision, since the streamed relay has its own watchdog.
-            .route_layer(axum::middleware::from_fn_with_state(
-                middleware::RequestBodyTimeouts::from_config(&app_state.context.router_config),
-                middleware::request_body_timeout_middleware,
-            ))
+            .route_layer(
+                middleware::RequestBodyTimeouts::from_config(&app_state.context.router_config)
+                    .layer(),
+            )
             // Per-request buffer-vs-stream decision for typed-JSON bodies;
             // declined requests pass to the handlers untouched.
             .route_layer(axum::middleware::from_fn_with_state(
@@ -1231,15 +1280,15 @@ pub fn build_apps(
         app_state.clone(),
     )
     .route_layer(tenant_resolution_state.clone().layer())
-    .route_layer(serving_auth_layer.clone())
+    .route_layer_if_some(serving_auth_layer.clone())
     // The wasm hooks run only with wasm enabled and a module manager; the
     // layer is not installed otherwise.
-    .route_layer(tower::util::option_layer(
+    .route_layer_if_some(
         (app_state.context.router_config.enable_wasm && app_state.context.wasm_manager.is_some())
             .then(|| {
                 axum::middleware::from_fn_with_state(app_state.clone(), middleware::wasm_middleware)
             }),
-    ))
+    )
     // Outermost on these routes: a refusal by any layer inside (authentication,
     // admission, the body timeout) leaves in the Messages envelope as well.
     .route_layer(middleware::MessagesErrorEnvelopeLayer);
@@ -1255,7 +1304,7 @@ pub fn build_apps(
         app_state.clone(),
     )
     .route_layer(tenant_resolution_state.clone().layer())
-    .route_layer(serving_auth_layer.clone());
+    .route_layer_if_some(serving_auth_layer.clone());
 
     // Multipart upload routes: auth + concurrency but NO WASM middleware.
     // The WASM OnRequest phase buffers the full body into a `Vec<u8>` subject
@@ -1268,7 +1317,7 @@ pub fn build_apps(
         app_state.clone(),
     )
     .route_layer(tenant_resolution_state.layer())
-    .route_layer(serving_auth_layer.clone());
+    .route_layer_if_some(serving_auth_layer.clone());
 
     let public_routes = Router::new()
         .route("/liveness", get(liveness))
@@ -1444,9 +1493,9 @@ where
         .layer(middleware::create_logging_layer(access_log_fields))
         .layer(middleware::HttpMetricsLayer::new(inflight_tracker))
         .layer(middleware::RequestIdLayer::new(request_id_headers))
-        .layer(tower::util::option_layer(create_cors_layer(
-            cors_allowed_origins,
-        )))
+        // CORS runs only with allowed origins configured; the layer is not
+        // installed otherwise.
+        .layer_if_some(create_cors_layer(cors_allowed_origins))
 }
 
 /// Discovery tasks owned by `startup`, aborted when this guard drops.
@@ -3310,10 +3359,9 @@ mod tests {
                         },
                     ),
                 )
-                .route_layer(axum::middleware::from_fn_with_state(
-                    middleware::RequestBodyTimeouts::from_config(&RouterConfig::default()),
-                    middleware::request_body_timeout_middleware,
-                )),
+                .route_layer(
+                    middleware::RequestBodyTimeouts::from_config(&RouterConfig::default()).layer(),
+                ),
             1024,
             InFlightRequestTracker::new(),
             vec![],
