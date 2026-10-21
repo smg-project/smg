@@ -43,6 +43,7 @@ fn assigned(mut spec: ChatResponseSpec, format: Format, prompt: &str) -> ChatRes
     spec.symphony = Some(Assignment {
         format: Arc::new(format),
         prompt: prompt.to_string(),
+        forbids_calls: false,
     });
     spec
 }
@@ -507,6 +508,7 @@ fn assigned_message(format: Format, prompt: &str, thinking: bool) -> MessagesRes
         symphony: Some(Assignment {
             format: Arc::new(format),
             prompt: prompt.to_string(),
+            forbids_calls: false,
         }),
     }
 }

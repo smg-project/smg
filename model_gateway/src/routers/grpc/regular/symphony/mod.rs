@@ -33,9 +33,12 @@
 //! [`telemetry`]), so an operator can tell how often, and why, before and after the default
 //! changes. What a
 //! request asks of the channels takes a variant of the table rather than another reader: where the
-//! legacy path would run no tool parser (`tool_choice: none`; no tools declared, for a provider
-//! that reads calls only with them), the table without its calls; with
-//! `separate_reasoning: false`, the table without its thought ([`assign`]).
+//! legacy path would run no tool parser (no tools declared, for a provider that reads calls only
+//! with them), the table without its calls; with `separate_reasoning: false`, the table without
+//! its thought ([`assign`]). A `tool_choice` of `none` over declared tools keeps the table's
+//! calls: the prompt declares the tools as under `auto`, as the engine's own server renders it,
+//! and the reader drops every call the model writes anyway, counted per table
+//! (`smg_symphony_calls_forbidden_total`), so none is delivered as a call or as content.
 //!
 //! Request building assigns Symphony to a request ([`assign`]) and stores
 //! the [`Assignment`] in the response spec: the table, and the part of the rendered prompt the

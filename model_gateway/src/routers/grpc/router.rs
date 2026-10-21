@@ -833,11 +833,7 @@ impl GrpcRouter {
                     .as_ref(),
             ));
         };
-        let tools = message_utils::template_tools(
-            chat_tools,
-            tool_choice,
-            tokenizer.renderer_capabilities(),
-        );
+        let tools = message_utils::template_tools(chat_tools, tool_choice);
         let media = message_utils::resolve_messages_media(
             &self.shared_components,
             model_id,
