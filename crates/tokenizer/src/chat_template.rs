@@ -858,21 +858,26 @@ pub struct ChatTemplateParams<'a> {
     pub continue_final_message: bool,
 }
 
-/// JSON separator pair passed through HuggingFace's `tojson` filter.
+/// The initial size of a `tojson` output buffer: room for a function schema
+/// of the usual size without a reallocation.
+const TOJSON_BUFFER_BYTES: usize = 1024;
+
+/// JSON separator pair passed through HuggingFace's `tojson` filter. The
+/// defaults are the static bytes; only a `separators` argument owns its own.
 #[derive(Debug, Clone)]
 struct JsonSeparators {
-    item: Vec<u8>,
-    key: Vec<u8>,
+    item: Cow<'static, [u8]>,
+    key: Cow<'static, [u8]>,
 }
 
 impl JsonSeparators {
     fn python_default(indent: Option<i64>) -> Self {
         // Python's json.dumps defaults to `(', ', ': ')` for compact output
         // and `(',', ': ')` when pretty indentation is enabled.
-        let item = if indent.is_some() { "," } else { ", " };
+        let item: &'static [u8] = if indent.is_some() { b"," } else { b", " };
         Self {
-            item: item.as_bytes().to_vec(),
-            key: b": ".to_vec(),
+            item: Cow::Borrowed(item),
+            key: Cow::Borrowed(b": "),
         }
     }
 }
@@ -1103,8 +1108,8 @@ fn parse_separators(
         .ok_or_else(|| invalid_tojson_option("key separator must be a string"))?;
 
     Ok(JsonSeparators {
-        item: item.as_bytes().to_vec(),
-        key: key.as_bytes().to_vec(),
+        item: Cow::Owned(item.as_bytes().to_vec()),
+        key: Cow::Owned(key.as_bytes().to_vec()),
     })
 }
 
@@ -1125,7 +1130,9 @@ fn serialize_with_python_json<T: Serialize>(
         .transpose()?;
 
     let formatter = PythonJsonFormatter::new(indent, separators, ensure_ascii);
-    let mut buf = Vec::new();
+    // Sized for a tool schema up front: a buffer grown from empty is
+    // reallocated at every doubling on the way to the same size.
+    let mut buf = Vec::with_capacity(TOJSON_BUFFER_BYTES);
     let mut serializer = serde_json::Serializer::with_formatter(&mut buf, formatter);
     value.serialize(&mut serializer).map_err(|e| {
         MinijinjaError::new(
@@ -1161,30 +1168,28 @@ fn tojson_filter(value: Value, kwargs: Kwargs) -> std::result::Result<Value, Min
     // Ensure all kwargs are consumed to avoid "unknown keyword argument" errors
     kwargs.assert_all_used()?;
 
-    let json_value: serde_json::Value = serde_json::to_value(&value).map_err(|e| {
-        MinijinjaError::new(
-            ErrorKind::InvalidOperation,
-            format!("Failed to convert to JSON value: {e}"),
-        )
-    })?;
-
-    // Serialize with options
-    let json_str: std::result::Result<String, MinijinjaError> = {
-        let sorted_json;
-        let value_to_serialize = if sort_keys.unwrap_or(false) {
-            sorted_json = sort_json_keys(&json_value);
-            &sorted_json
-        } else {
-            &json_value
-        };
-
-        let separators = parse_separators(separators, indent)?;
+    let separators = parse_separators(separators, indent)?;
+    let ensure_ascii = ensure_ascii.unwrap_or(false);
+    // The template value is written straight into its JSON text: its serde
+    // form is what a `serde_json::Value` built from it would serialize as
+    // (the same `Serialize` impl drives both, in the same key order), so
+    // the tree is built only when the keys are to be sorted, which needs
+    // the value as a whole.
+    let json_str = if sort_keys.unwrap_or(false) {
+        let json_value: serde_json::Value = serde_json::to_value(&value).map_err(|e| {
+            MinijinjaError::new(
+                ErrorKind::InvalidOperation,
+                format!("Failed to convert to JSON value: {e}"),
+            )
+        })?;
         serialize_with_python_json(
-            value_to_serialize,
+            &sort_json_keys(&json_value),
             indent,
             separators,
-            ensure_ascii.unwrap_or(false),
+            ensure_ascii,
         )
+    } else {
+        serialize_with_python_json(&value, indent, separators, ensure_ascii)
     };
 
     json_str.map(Value::from_safe_string)
@@ -2429,6 +2434,69 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("2 is required"), "{error}");
+    }
+
+    /// `tojson` writes the template value straight into its text; the text is
+    /// Python's `json.dumps` of the value under each option, and the same as
+    /// a `serde_json::Value` built from the template value would serialize
+    /// as (the path the sorted form still takes).
+    #[test]
+    fn tojson_writes_the_value_as_python_and_as_its_tree_would() {
+        let value = serde_json::json!({
+            "name": "Zoë", "n": 1, "big": 18446744073709551615u64, "neg": -5, "f": 1.5,
+            "whole": 2.0, "t": true, "none": null,
+            "list": [1, "two", [3.25, {"k": "v"}]],
+            "nested": {"b": 1, "a": {"c": [], "d": {}}},
+            "esc": "quote\" back\\ tab\t nl\n ctl\u{1} emoji😀",
+        });
+        let template = "{{ messages[0].v | tojson }}\n\
+                        {{ messages[0].v | tojson(ensure_ascii=True) }}\n\
+                        {{ messages[0].v | tojson(indent=2) }}\n\
+                        {{ messages[0].v | tojson(separators=(',', ':')) }}\n\
+                        {{ messages[0].v | tojson(sort_keys=True) }}";
+        let messages = [serde_json::json!({"role": "user", "v": value})];
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let rendered = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        // Each line is `json.dumps(v, ensure_ascii=False, ...)` with that option.
+        let want = [
+            r#"{"name": "Zoë", "n": 1, "big": 18446744073709551615, "neg": -5, "f": 1.5, "whole": 2.0, "t": true, "none": null, "list": [1, "two", [3.25, {"k": "v"}]], "nested": {"b": 1, "a": {"c": [], "d": {}}}, "esc": "quote\" back\\ tab\t nl\n ctl\u0001 emoji😀"}"#,
+            r#"{"name": "Zo\u00eb", "n": 1, "big": 18446744073709551615, "neg": -5, "f": 1.5, "whole": 2.0, "t": true, "none": null, "list": [1, "two", [3.25, {"k": "v"}]], "nested": {"b": 1, "a": {"c": [], "d": {}}}, "esc": "quote\" back\\ tab\t nl\n ctl\u0001 emoji\ud83d\ude00"}"#,
+            "{\n  \"name\": \"Zoë\",\n  \"n\": 1,\n  \"big\": 18446744073709551615,\n  \"neg\": -5,\n  \"f\": 1.5,\n  \"whole\": 2.0,\n  \"t\": true,\n  \"none\": null,\n  \"list\": [\n    1,\n    \"two\",\n    [\n      3.25,\n      {\n        \"k\": \"v\"\n      }\n    ]\n  ],\n  \"nested\": {\n    \"b\": 1,\n    \"a\": {\n      \"c\": [],\n      \"d\": {}\n    }\n  },\n  \"esc\": \"quote\\\" back\\\\ tab\\t nl\\n ctl\\u0001 emoji😀\"\n}",
+            r#"{"name":"Zoë","n":1,"big":18446744073709551615,"neg":-5,"f":1.5,"whole":2.0,"t":true,"none":null,"list":[1,"two",[3.25,{"k":"v"}]],"nested":{"b":1,"a":{"c":[],"d":{}}},"esc":"quote\" back\\ tab\t nl\n ctl\u0001 emoji😀"}"#,
+            r#"{"big": 18446744073709551615, "esc": "quote\" back\\ tab\t nl\n ctl\u0001 emoji😀", "f": 1.5, "list": [1, "two", [3.25, {"k": "v"}]], "n": 1, "name": "Zoë", "neg": -5, "nested": {"a": {"c": [], "d": {}}, "b": 1}, "none": null, "t": true, "whole": 2.0}"#,
+        ];
+        assert_eq!(rendered, want.join("\n"));
+
+        // The direct write and the write of the tree agree byte for byte.
+        let given = Value::from_serialize(&messages[0]["v"]);
+        for (indent, ensure_ascii) in [
+            (None, false),
+            (None, true),
+            (Some(2), false),
+            (Some(0), true),
+        ] {
+            let direct = serialize_with_python_json(
+                &given,
+                indent,
+                JsonSeparators::python_default(indent),
+                ensure_ascii,
+            )
+            .unwrap();
+            let tree: serde_json::Value = serde_json::to_value(&given).unwrap();
+            let through_tree = serialize_with_python_json(
+                &tree,
+                indent,
+                JsonSeparators::python_default(indent),
+                ensure_ascii,
+            )
+            .unwrap();
+            assert_eq!(
+                direct, through_tree,
+                "indent {indent:?} ensure_ascii {ensure_ascii}"
+            );
+        }
     }
 
     /// transformers renders with `tools=None` and `documents=None` when the
