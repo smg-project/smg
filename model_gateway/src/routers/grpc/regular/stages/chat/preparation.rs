@@ -1,6 +1,5 @@
 //! Chat preparation stage: Filter tools, process messages, tokenize, build constraints
 
-use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::{
     chat::ChatCompletionRequest,
@@ -12,7 +11,6 @@ use crate::{
     routers::{
         error,
         grpc::{
-            common::stages::PipelineStage,
             context::{PreparationOutput, RequestContext},
             multimodal,
             regular::{
@@ -44,16 +42,14 @@ impl ChatPreparationStage {
     }
 }
 
-#[async_trait]
-impl PipelineStage for ChatPreparationStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+impl ChatPreparationStage {
+    /// The stage's work. The chat+generate dispatcher calls this directly, so
+    /// the stage's future lives inline in the dispatcher's: one box per stage
+    /// call, not a second one for a boxed trait method.
+    pub(crate) async fn prepare(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         let request = ctx.chat_request_arc();
         self.prepare_chat(ctx, &request).await?;
         Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        "ChatPreparation"
     }
 }
 

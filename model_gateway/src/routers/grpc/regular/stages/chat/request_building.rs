@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
@@ -10,10 +9,7 @@ use crate::routers::{
     error,
     grpc::{
         client::GenerateRequestBuildOptions,
-        common::stages::{
-            helpers::{self, TagForStart},
-            BuildStage,
-        },
+        common::stages::helpers::{self, TagForStart},
         context::{
             stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
             ExecutionPlanKind, PreparationOutput, RequestContext,
@@ -180,9 +176,14 @@ pub(crate) async fn build_chat_backed_plan(
     ))
 }
 
-#[async_trait]
-impl BuildStage for ChatRequestBuildingStage {
-    async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
+impl ChatRequestBuildingStage {
+    /// The stage's work. The chat+generate dispatcher calls this directly, so
+    /// the stage's future lives inline in the dispatcher's: one box per stage
+    /// call, not a second one for a boxed trait method.
+    pub(crate) async fn build_plan(
+        &self,
+        ctx: &mut RequestContext,
+    ) -> Result<BuildOutput, Response> {
         // Take preparation state (last consumer — worker_selection already ran)
         let prep = stage_output(
             ctx.state.preparation.take(),
@@ -286,12 +287,11 @@ impl BuildStage for ChatRequestBuildingStage {
         })
     }
 
-    fn name(&self) -> &'static str {
-        "ChatRequestBuilding"
-    }
-
+    /// Stable descriptor of the stage plus its mode-bearing args, compared
+    /// against golden literals in the pipeline parity test (through the
+    /// chat+generate dispatcher's own `signature`).
     #[cfg(test)]
-    fn signature(&self) -> String {
+    pub(crate) fn signature(&self) -> String {
         format!(
             "ChatRequestBuildingStage(inject_pd_metadata={}, {:?})",
             self.inject_pd_metadata, self.plan_kind
