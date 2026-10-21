@@ -128,6 +128,12 @@ pub(crate) struct ZmqConnectionMeta {
     /// The engine's supported tasks (`get_supported_tasks`), fetched on first
     /// use and kept for the connection, as vLLM's frontend keeps them.
     supported_tasks: tokio::sync::OnceCell<Arc<[String]>>,
+    /// Set once by the caller that knows it (the servicer that launched the
+    /// engine) when the engine was started to cut a long prompt down to its
+    /// own bound instead of refusing it: the prompt admission then applies
+    /// no upper bound on this connection
+    /// (see [`ZmqEngineClient::note_engine_truncates_long_prompts`]).
+    engine_truncates_long_prompts: OnceLock<()>,
     /// The bound on every generate request this connection opens, from its
     /// dispatch to its last message, set once by the caller that knows it
     /// (see [`ZmqEngineClient::set_request_timeout`]); unset leaves the
@@ -333,7 +339,7 @@ impl ZmqEngineClient {
             }
             ZmqDialect::Sglang => ZmqBackend::Sglang(Arc::new(SglangClient::new(transport))),
         };
-        Ok(Self {
+        let client = Self {
             backend,
             meta: Arc::new(ZmqConnectionMeta {
                 model_id,
@@ -341,9 +347,20 @@ impl ZmqEngineClient {
                 tokenizer_eos: OnceLock::new(),
                 structured_outputs: OnceLock::new(),
                 supported_tasks: tokio::sync::OnceCell::new(),
+                engine_truncates_long_prompts: OnceLock::new(),
                 request_timeout: OnceLock::new(),
             }),
-        })
+        };
+        // Every wire bounds a prompt by the window the engine reported
+        // (`crate::context_window`); an engine that reported none leaves
+        // prompts unbounded before it, said once here.
+        if client.context_window().is_ok_and(|window| window == 0) {
+            tracing::warn!(
+                "the engine reported no context window at the handshake (max_model_len 0): \
+                 prompt lengths are not bounded before the engine"
+            );
+        }
+        Ok(client)
     }
 
     /// Adopt the tokenizer's EOS ids when the connect-time model-dir lookup
@@ -404,6 +421,25 @@ impl ZmqEngineClient {
     /// call changes nothing.
     pub fn set_request_timeout(&self, timeout: Duration) {
         let _ = self.meta.request_timeout.set(timeout);
+    }
+
+    /// The engine was started to cut a long prompt down to its own bound
+    /// instead of refusing it, as the launcher that started it knows: the
+    /// prompt admission applies no upper bound on this connection from now
+    /// (an empty prompt is still refused; see [`crate::context_window`]).
+    /// Set once: a later call changes nothing.
+    pub fn note_engine_truncates_long_prompts(&self) {
+        let _ = self.meta.engine_truncates_long_prompts.set(());
+    }
+
+    /// The window the prompt admission applies on this connection: the
+    /// engine's context window, or none (`0`) for an engine that cuts long
+    /// prompts down itself ([`Self::note_engine_truncates_long_prompts`]).
+    fn prompt_bound(&self) -> Result<u64, tonic::Status> {
+        if self.meta.engine_truncates_long_prompts.get().is_some() {
+            return Ok(0);
+        }
+        self.context_window()
     }
 
     /// The deadline of a generate request dispatched now, when the
@@ -520,6 +556,17 @@ impl ZmqEngineClient {
     /// sizes, KV capacity) a frontend re-exposes as metadata.
     pub fn ready_response(&self) -> Option<&EngineCoreReadyResponse> {
         self.engines().first().map(|engine| &engine.ready_response)
+    }
+
+    /// The engine's context window as the ready handshake reported it (`0`
+    /// from an engine that reported none), the bound every wire's prompt
+    /// admission applies ([`crate::context_window`]); a connected engine is
+    /// required.
+    fn context_window(&self) -> Result<u64, tonic::Status> {
+        self.engines()
+            .first()
+            .map(|engine| engine.ready_response.max_model_len)
+            .ok_or_else(|| tonic::Status::unavailable("no connected ZMQ engine"))
     }
 
     /// Capture identities from every connected replica, or none if any replica
@@ -790,11 +837,12 @@ impl ZmqEngineClient {
             )
             .map_err(tonic::Status::invalid_argument)?;
         }
+        let max_model_len = self.prompt_bound()?;
         // Sub-streams submitted before a mid-loop failure are dropped with the
         // error, which auto-aborts their engine-side requests.
         let mut streams = Vec::new();
         for (index, sub) in fan_out_tokenspeed_requests(req).into_iter().enumerate() {
-            let request = translate_request_tokenspeed_for(sub, grid_tensors)
+            let request = translate_request_tokenspeed_for(sub, grid_tensors, max_model_len)
                 .map_err(tonic::Status::invalid_argument)?;
             let stream = client.submit(request).await.map_err(zmq_status)?;
             streams.push(TokenSpeedGenerateStream::new(stream, index as u32));
@@ -857,10 +905,11 @@ impl ZmqEngineClient {
             )
             .map_err(tonic::Status::invalid_argument)?;
         }
+        let max_model_len = self.prompt_bound()?;
         let mut streams = Vec::new();
         for (index, sub) in fan_out_sglang_requests(req).into_iter().enumerate() {
-            let mut request =
-                translate_request_sglang(sub).map_err(tonic::Status::invalid_argument)?;
+            let mut request = translate_request_sglang(sub, max_model_len)
+                .map_err(tonic::Status::invalid_argument)?;
             request.trace_headers.clone_from(&trace_headers);
             let stream = client
                 .submit(SglangRequest::Generate(request))

@@ -20,6 +20,7 @@ use smg_grpc_client::{common_proto as common, tokenspeed_proto, vllm_proto as vl
 use tracing::warn;
 
 use crate::{
+    context_window::admit_prompt,
     fanout::fan_out_n,
     stream::{poll_mapped, MappedGenerateStream, StreamState},
     structured_outputs::ConstraintRef,
@@ -305,10 +306,14 @@ impl GridTensors {
 /// `TokenizedGenerateReqInput`. ZMQ mode requires pre-tokenized input (SMG
 /// tokenizes upstream). `grid_tensors` says whether a multimodal item's grid
 /// tensors are MRoPE positions, refused on this wire, or a patch layout that
-/// passes ([`GridTensors`]).
+/// passes ([`GridTensors`]). `max_model_len` is the context window the
+/// scheduler reported at the handshake: an empty prompt, or one that fills
+/// the window, is refused before it reaches the scheduler
+/// ([`admit_prompt`]).
 pub(crate) fn translate_request_tokenspeed_for(
     req: tokenspeed_proto::GenerateRequest,
     grid_tensors: GridTensors,
+    max_model_len: u64,
 ) -> Result<TokenizedGenerateReqInput, String> {
     let mut input_ids = match req.tokenized {
         Some(tokenized) => tokenized.input_ids,
@@ -324,6 +329,13 @@ pub(crate) fn translate_request_tokenspeed_for(
         }
         None => (None, None),
     };
+    // The prompt as the scheduler will hold it (the multimodal translation
+    // keeps its length). The engine's own bound on the prompt lives in the
+    // frontend this wire bypasses; its scheduler admits any length and clamps
+    // the output budget, so the window is judged here as on every wire. An
+    // unset `max_new_tokens` stays unset: the scheduler caps it at the
+    // remaining context itself.
+    admit_prompt(input_ids.len(), max_model_len)?;
     // Over the ZMQ wire TokenSpeed returns only the single sampled-token logprob
     // per token: no top-k candidates (`top_logprobs_num > 1`) and no prompt
     // logprobs (`token_ids_logprob`). Reject both rather than silently return
@@ -642,6 +654,14 @@ mod tests {
     use super::*;
     use crate::{client::ZmqEngineClient, eos::EosTokenIds};
 
+    /// The translation under the mock scheduler's context window.
+    fn translate_for(
+        req: tokenspeed_proto::GenerateRequest,
+        grid_tensors: GridTensors,
+    ) -> Result<TokenizedGenerateReqInput, String> {
+        translate_request_tokenspeed_for(req, grid_tensors, default_ready_response().max_model_len)
+    }
+
     /// End-to-end over ipc:// for a TokenSpeed backend: the adapter frames a
     /// tagged `TokenizedGenerateReqInput`, and maps `BatchTokenIDOutSlim`
     /// batches back to vLLM-proto responses. The mock engine speaks the shared
@@ -861,12 +881,11 @@ mod tests {
         // logprob (count 0/1 in `top_logprobs_num` is the same case).
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.return_logprob = true;
-        let wire = translate_request_tokenspeed_for(req, GridTensors::Positions)
-            .expect("return_logprob accepted");
+        let wire = translate_for(req, GridTensors::Positions).expect("return_logprob accepted");
         assert!(wire.return_logprob);
 
         // Unset -> the flag stays false.
-        let wire = translate_request_tokenspeed_for(
+        let wire = translate_for(
             ts_tokenized_req(tokenspeed_proto::SamplingParams::default()),
             GridTensors::Positions,
         )
@@ -879,18 +898,18 @@ mod tests {
         // Top-k logprobs (count > 1) cannot be honored over the wire.
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.top_logprobs_num = 5;
-        assert!(translate_request_tokenspeed_for(req, GridTensors::Positions).is_err());
+        assert!(translate_for(req, GridTensors::Positions).is_err());
 
         // Prompt (input) logprobs cannot be produced.
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.token_ids_logprob = vec![1, 2];
-        assert!(translate_request_tokenspeed_for(req, GridTensors::Positions).is_err());
+        assert!(translate_for(req, GridTensors::Positions).is_err());
 
         // A bare count of 0/1 is the plain sampled-token case: accepted.
         for count in [0, 1] {
             let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
             req.top_logprobs_num = count;
-            assert!(translate_request_tokenspeed_for(req, GridTensors::Positions).is_ok());
+            assert!(translate_for(req, GridTensors::Positions).is_ok());
         }
     }
 
@@ -941,7 +960,7 @@ mod tests {
         // String stops are resolved upstream; any that reach here are dropped
         // (the token-only engine cannot match them) while stop token ids ride
         // through and the router-side decoder trims residual text.
-        let req = translate_request_tokenspeed_for(
+        let req = translate_for(
             ts_tokenized_req(tokenspeed_proto::SamplingParams {
                 stop: vec!["</s>".to_string()],
                 stop_token_ids: vec![13],
@@ -991,8 +1010,7 @@ mod tests {
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
             items: vec![ts_mm_item(&0xDEAD_BEEFu64.to_le_bytes(), 1, 3)],
         });
-        let wire =
-            translate_request_tokenspeed_for(req, GridTensors::Positions).expect("translated");
+        let wire = translate_for(req, GridTensors::Positions).expect("translated");
 
         let expected_pad = mm_pad_value(TokenSpeedWireModality::Image, 0xDEAD_BEEF);
         assert_eq!(
@@ -1011,6 +1029,72 @@ mod tests {
         assert_eq!(item.pad_value, expected_pad);
         assert_eq!(item.offsets, vec![(1, 3)]);
         assert_eq!(item.model_specific_data["vit_grid"].dtype, "uint32");
+    }
+
+    /// Prompt bounds apply before the scheduler, with or without an output
+    /// limit, under the window the handshake reported; the request's own
+    /// limit is kept as it is (an unset one stays the scheduler's to cap).
+    #[test]
+    fn tokenspeed_validates_prompt_length_even_with_explicit_max_new_tokens() {
+        for sampling in [
+            None,
+            Some(tokenspeed_proto::SamplingParams::default()),
+            Some(tokenspeed_proto::SamplingParams {
+                max_new_tokens: Some(16_384),
+                ..Default::default()
+            }),
+        ] {
+            for (prompt_len, max_model_len, accepted) in [
+                (0, 4, false),
+                (3, 4, true),
+                (4, 4, false),
+                (5, 4, false),
+                (1_049_692, 1_048_576, false),
+                // A scheduler that reported no window bounds nothing but
+                // emptiness.
+                (1_049_692, 0, true),
+                (0, 0, false),
+            ] {
+                let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+                req.sampling_params = sampling.clone();
+                req.tokenized.as_mut().unwrap().input_ids = vec![1; prompt_len];
+                let result =
+                    translate_request_tokenspeed_for(req, GridTensors::Positions, max_model_len);
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "prompt_len={prompt_len}, max_model_len={max_model_len}, max_new_tokens={:?}",
+                    sampling.as_ref().and_then(|sp| sp.max_new_tokens)
+                );
+                match result {
+                    Err(error) => assert!(error.contains("prompt"), "{error}"),
+                    Ok(wire) => assert_eq!(
+                        wire.sampling_params.max_new_tokens,
+                        sampling.as_ref().and_then(|sp| sp.max_new_tokens)
+                    ),
+                }
+            }
+        }
+    }
+
+    /// A multimodal prompt is judged as the scheduler will hold it, after the
+    /// pad substitution (which keeps its length): one that fills the window
+    /// is refused with its items in order, one position short of it passes.
+    #[test]
+    fn tokenspeed_judges_a_multimodal_prompt_after_its_translation() {
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        req.tokenized.as_mut().unwrap().input_ids = vec![10, 20, 30, 40, 50];
+        req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
+            items: vec![ts_mm_item(&0xDEAD_BEEFu64.to_le_bytes(), 1, 3)],
+        });
+        let error = translate_request_tokenspeed_for(req.clone(), GridTensors::Positions, 5)
+            .expect_err("the prompt fills the window");
+        assert!(error.contains("length 5"), "{error}");
+        assert!(error.contains("model length of 5"), "{error}");
+        let wire = translate_request_tokenspeed_for(req, GridTensors::Positions, 6)
+            .expect("one position left for output");
+        assert_eq!(wire.input_ids.len(), 5);
+        assert!(wire.multimodal_inputs.is_some());
     }
 
     #[test]
@@ -1049,8 +1133,7 @@ mod tests {
             placeholder_token_id: Some(100),
         };
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
-        let wire =
-            translate_request_tokenspeed_for(req, GridTensors::Positions).expect("translated");
+        let wire = translate_for(req, GridTensors::Positions).expect("translated");
 
         let expected_pad = mm_pad_value(TokenSpeedWireModality::Audio, 0x0123_4567_89AB_CDEF);
         assert_ne!(
@@ -1082,22 +1165,18 @@ mod tests {
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
             items: vec![ts_mm_item(b"12345678", 1, 3)],
         });
-        assert!(
-            translate_request_tokenspeed_for(req, GridTensors::Positions)
-                .unwrap_err()
-                .contains("exceeds")
-        );
+        assert!(translate_for(req, GridTensors::Positions)
+            .unwrap_err()
+            .contains("exceeds"));
 
         // Missing content hash: pad value cannot be derived.
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
             items: vec![ts_mm_item(b"", 0, 1)],
         });
-        assert!(
-            translate_request_tokenspeed_for(req, GridTensors::Positions)
-                .unwrap_err()
-                .contains("content hash")
-        );
+        assert!(translate_for(req, GridTensors::Positions)
+            .unwrap_err()
+            .contains("content hash"));
 
         // Byte-length mismatch would be silently dropped engine-side; the
         // translate must catch it while the client can still see an error.
@@ -1105,22 +1184,18 @@ mod tests {
         let mut item = ts_mm_item(b"12345678", 0, 1);
         item.encoder_input.as_mut().unwrap().shape = vec![3, 4];
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
-        assert!(
-            translate_request_tokenspeed_for(req, GridTensors::Positions)
-                .unwrap_err()
-                .contains("byte length")
-        );
+        assert!(translate_for(req, GridTensors::Positions)
+            .unwrap_err()
+            .contains("byte length"));
 
         // Unspecified modality is rejected, mirroring the gRPC servicer.
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         let mut item = ts_mm_item(b"12345678", 0, 1);
         item.modality = common::Modality::Unspecified as i32;
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
-        assert!(
-            translate_request_tokenspeed_for(req, GridTensors::Positions)
-                .unwrap_err()
-                .contains("modality")
-        );
+        assert!(translate_for(req, GridTensors::Positions)
+            .unwrap_err()
+            .contains("modality"));
 
         // Known MRoPE families fail loudly: nothing derives mrope_positions
         // on this wire, and 1-D fallback would silently degrade grounding.
@@ -1137,11 +1212,9 @@ mod tests {
             },
         );
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
-        assert!(
-            translate_request_tokenspeed_for(req, GridTensors::Positions)
-                .unwrap_err()
-                .contains("MRoPE")
-        );
+        assert!(translate_for(req, GridTensors::Positions)
+            .unwrap_err()
+            .contains("MRoPE"));
     }
 
     #[test]
@@ -1171,18 +1244,16 @@ mod tests {
         );
         assert_eq!(GridTensors::for_model(Some(true)), GridTensors::Positions);
         assert_eq!(GridTensors::for_model(None), GridTensors::Positions);
-        let wire = translate_request_tokenspeed_for(with_grid(), GridTensors::PatchLayout)
+        let wire = translate_for(with_grid(), GridTensors::PatchLayout)
             .expect("a patch-layout grid passes");
         let items = &wire
             .multimodal_inputs
             .expect("multimodal inputs on the wire")
             .mm_items;
         assert!(items[0].model_specific_data.contains_key("image_grid_thw"));
-        assert!(
-            translate_request_tokenspeed_for(with_grid(), GridTensors::Positions)
-                .unwrap_err()
-                .contains("MRoPE")
-        );
+        assert!(translate_for(with_grid(), GridTensors::Positions)
+            .unwrap_err()
+            .contains("MRoPE"));
     }
 
     #[test]

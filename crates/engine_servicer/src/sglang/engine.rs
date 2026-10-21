@@ -48,6 +48,9 @@ pub(super) async fn connect_engine(
     {
         Ok(client) => {
             client.set_structured_outputs_support(super::structured_outputs_support(&state.model));
+            if super::truncates_long_prompts(&state.model) {
+                client.note_engine_truncates_long_prompts();
+            }
             info!(
                 handshake = %handshake_address,
                 engines = engine_count,

@@ -37,15 +37,6 @@ pub(super) async fn generate(
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
     }
-    if req
-        .tokenized
-        .as_ref()
-        .is_none_or(|tokenized| tokenized.input_ids.is_empty())
-    {
-        return Err(Status::invalid_argument(
-            "tokenized.input_ids is required: the Router tokenizes before it dispatches",
-        ));
-    }
     let request_id: Arc<str> = Arc::from(req.request_id.as_str());
     // Register before the submit: an `Abort` landing in the gap must find the
     // entry, and a duplicate id is refused up front.

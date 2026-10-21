@@ -23,6 +23,7 @@ use futures::Stream;
 use smg_grpc_client::vllm_proto as vllm;
 
 use crate::{
+    context_window::admit_prompt,
     eos::EosTokenIds,
     fanout::fan_out_n,
     multimodal,
@@ -654,7 +655,8 @@ pub(crate) fn translate_request_with_backend(
 
 /// Translate a request whose media was already translated
 /// ([`translate_media`]), so the choices of one request share the work.
-/// Reject empty or full-context prompts before they can reach the engine.
+/// An empty prompt, or one that fills the context window, is refused before
+/// it can reach the engine ([`admit_prompt`]).
 pub(crate) fn translate_request_with_media(
     req: vllm::GenerateRequest,
     media: TranslatedMedia,
@@ -665,16 +667,9 @@ pub(crate) fn translate_request_with_media(
     // Connector params ride `SamplingParams.extra_args`, where vLLM's own
     // frontend puts them, so a request carrying them always gets params.
     let kv_transfer_params = kv_transfer_params(&req)?;
-    let prompt_len = prompt_token_ids(&req)?.len() as u64;
-    if prompt_len == 0 {
-        return Err("the decoder prompt cannot be empty".to_string());
-    }
-    if prompt_len >= max_model_len {
-        return Err(format!(
-            "the decoder prompt (length {prompt_len}) must be shorter than the maximum \
-             model length of {max_model_len} to leave room for at least one output token"
-        ));
-    }
+    // vLLM's frontend defaults an unset `max_tokens` to the remaining context
+    // (`max_model_len - prompt_len`).
+    let default_max_tokens = admit_prompt(prompt_token_ids(&req)?.len(), max_model_len)?;
     let prompt_token_ids = match req.input {
         Some(vllm::generate_request::Input::Tokenized(tokenized)) => Some(tokenized.input_ids),
         _ => None,
@@ -688,10 +683,6 @@ pub(crate) fn translate_request_with_media(
         .data_parallel_rank
         .map(|rank| u32::try_from(rank).map_err(|_| format!("invalid data_parallel_rank: {rank}")))
         .transpose()?;
-    // vLLM's frontend defaults an unset `max_tokens` to the remaining context
-    // (`max_model_len - prompt_len`).
-    let default_max_tokens =
-        u32::try_from(max_model_len.saturating_sub(prompt_len)).unwrap_or(u32::MAX);
     if let Some(sp) = req.sampling_params.as_ref() {
         validate_sampling(sp, sp.max_tokens.unwrap_or(default_max_tokens))?;
         refuse_unenforceable_constraint(constraint_ref(sp), support)?;
@@ -1961,6 +1952,10 @@ mod tests {
                 (4, 4, false),
                 (5, 4, false),
                 (1_049_692, 1_048_576, false),
+                // An engine that reported no window bounds nothing but
+                // emptiness (unreachable from vLLM, which always reports one).
+                (1_049_692, 0, true),
+                (0, 0, false),
             ] {
                 let mut req = tokenized_req(vllm::SamplingParams::default());
                 req.sampling_params = sampling.clone();
@@ -1979,11 +1974,26 @@ mod tests {
                 assert_eq!(
                     result.is_ok(),
                     accepted,
-                    "prompt_len={prompt_len}, max_tokens={:?}",
+                    "prompt_len={prompt_len}, max_model_len={max_model_len}, max_tokens={:?}",
                     sampling.as_ref().and_then(|sp| sp.max_tokens)
                 );
-                if let Err(error) = result {
-                    assert!(error.contains("prompt"), "{error}");
+                match result {
+                    Err(error) => assert!(error.contains("prompt"), "{error}"),
+                    Ok(request) => {
+                        // The request's own limit is kept; an unset one is the
+                        // window's remainder, and no bound under no window.
+                        if let Some(sp) = sampling.as_ref() {
+                            let remainder = if max_model_len == 0 {
+                                u32::MAX
+                            } else {
+                                u32::try_from(max_model_len - prompt_len as u64).unwrap()
+                            };
+                            assert_eq!(
+                                request.sampling_params.expect("params").max_tokens,
+                                sp.max_tokens.unwrap_or(remainder)
+                            );
+                        }
+                    }
                 }
             }
         }

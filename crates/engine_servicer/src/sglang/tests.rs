@@ -2072,3 +2072,103 @@ async fn a_constraint_the_grammar_backend_cannot_enforce_is_refused_before_the_s
         h.server.stop(Duration::from_secs(5)).expect("clean stop");
     }
 }
+
+/// A prompt that fills the scheduler's context window, or an empty one, is
+/// refused before the scheduler sees it, with both lengths named; the
+/// refusal releases the registration, so the same id then serves a healthy
+/// request.
+#[tokio::test]
+async fn a_prompt_the_window_cannot_hold_is_refused_before_the_scheduler() {
+    let mut h = harness(model_info()).await;
+    for (input_ids, max_new_tokens) in [
+        (vec![7; 1_049_692], Some(16_384)),
+        (vec![7; 1_048_576], None),
+        (Vec::new(), Some(8)),
+    ] {
+        let mut request = generate_request("window", true, Vec::new());
+        request
+            .tokenized
+            .as_mut()
+            .unwrap()
+            .input_ids
+            .clone_from(&input_ids);
+        request.sampling_params.as_mut().unwrap().max_new_tokens = max_new_tokens;
+        let status = h
+            .client
+            .generate(request)
+            .await
+            .expect_err("the prompt leaves no room for output");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        if input_ids.is_empty() {
+            assert!(status.message().contains("empty"), "{}", status.message());
+        } else {
+            assert!(
+                status.message().contains(&input_ids.len().to_string()),
+                "{}",
+                status.message()
+            );
+            assert!(status.message().contains("1048576"), "{}", status.message());
+        }
+    }
+    let mut request = generate_request("window", true, Vec::new());
+    request.tokenized = None;
+    let status = h
+        .client
+        .generate(request)
+        .await
+        .expect_err("no tokenized input");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_scheduler_idle(&mut h.engine_in).await;
+    assert!(h.server.engine_ready());
+    // Reusing the refused id proves the registration was released, and a
+    // healthy request still reaches the scheduler.
+    let _stream = h
+        .client
+        .generate(generate_request("window", true, Vec::new()))
+        .await
+        .expect("healthy request after refusal")
+        .into_inner();
+    let accepted = recv_add(&mut h.engine_in).await;
+    assert_eq!(accepted.rid, "window");
+    assert_eq!(accepted.input_ids, vec![1, 2, 3]);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A scheduler started with `--allow-auto-truncate` cuts a long prompt down
+/// to its own bound instead of aborting the request: its servicer leaves the
+/// upper bound to it, so the window-filling prompt reaches the scheduler
+/// whole, while an empty prompt is still refused before it.
+#[tokio::test]
+async fn a_scheduler_started_to_truncate_keeps_the_upper_bound_to_itself() {
+    let mut model = model_info();
+    let args = model.server_args_json.replace(
+        "\"tp_size\":2",
+        "\"tp_size\":2,\"allow_auto_truncate\":true",
+    );
+    assert_ne!(
+        args, model.server_args_json,
+        "the flag was added to the launcher's arguments"
+    );
+    model.server_args_json = args;
+    let mut h = harness(model).await;
+    let mut request = generate_request("long", true, Vec::new());
+    request.tokenized.as_mut().unwrap().input_ids = vec![7; 1_049_692];
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("left to the scheduler's own bound")
+        .into_inner();
+    let accepted = recv_add(&mut h.engine_in).await;
+    assert_eq!(accepted.rid, "long");
+    assert_eq!(accepted.input_ids.len(), 1_049_692);
+    let mut empty = generate_request("empty", true, Vec::new());
+    empty.tokenized.as_mut().unwrap().input_ids.clear();
+    let status = h
+        .client
+        .generate(empty)
+        .await
+        .expect_err("an empty prompt is refused whatever the scheduler truncates");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}

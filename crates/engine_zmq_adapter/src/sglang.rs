@@ -21,6 +21,7 @@ use smg_grpc_client::{sglang_proto, vllm_proto as vllm};
 use tracing::warn;
 
 use crate::{
+    context_window::admit_prompt,
     fanout::fan_out_n,
     stream::{poll_mapped, MappedGenerateStream, StreamState},
     structured_outputs::ConstraintRef,
@@ -425,14 +426,25 @@ pub(crate) fn fan_out_sglang_requests(
 /// with their ranked and selected candidates; what it has no columns for
 /// (hidden states) and what
 /// the wire does not carry (multimodal payloads, PD bootstrap fields) is
-/// refused rather than silently dropped.
+/// refused rather than silently dropped. `max_model_len` is the context
+/// window the scheduler reported at the handshake: an empty prompt, or one
+/// that fills the window, is refused before it reaches the scheduler
+/// ([`admit_prompt`]).
 pub(crate) fn translate_request_sglang(
     req: sglang_proto::GenerateRequest,
+    max_model_len: u64,
 ) -> Result<TokenizedGenerateReqInput, String> {
     let input_ids = req
         .tokenized
         .map(|tokenized| tokenized.input_ids)
         .ok_or_else(|| "ZMQ mode requires pre-tokenized input; no input provided".to_string())?;
+    // The scheduler's own bound on the prompt applies only after admission
+    // (an abort with its reason; a cut down to the bound for a scheduler
+    // started with `--allow-auto-truncate`, whose servicer then passes no
+    // window here) and nothing of its own refuses an empty prompt. An unset
+    // `max_new_tokens` stays unset: the scheduler caps it at the remaining
+    // context itself.
+    admit_prompt(input_ids.len(), max_model_len)?;
     if req.mm_inputs.is_some() {
         return Err(
             "multimodal inputs are not supported over the SGLang ZMQ backend yet".to_string(),
@@ -742,6 +754,11 @@ mod tests {
     use super::*;
     use crate::{client::ZmqEngineClient, eos::EosTokenIds};
 
+    /// The translation under the mock scheduler's context window.
+    fn translate(req: sglang_proto::GenerateRequest) -> Result<WireRequest, String> {
+        translate_request_sglang(req, default_ready_response().max_model_len)
+    }
+
     #[test]
     fn a_scheduler_abort_carries_the_status_its_http_code_means() {
         let rows = [
@@ -804,13 +821,13 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(translate_request_sglang(sglang_proto::GenerateRequest {
+        assert!(translate(sglang_proto::GenerateRequest {
             tokenized: None,
             ..base.clone()
         })
         .is_err());
         assert_eq!(
-            translate_request_sglang(sglang_proto::GenerateRequest {
+            translate(sglang_proto::GenerateRequest {
                 top_logprobs_num: 3,
                 ..base.clone()
             })
@@ -818,18 +835,18 @@ mod tests {
             .top_logprobs_num,
             3
         );
-        assert!(translate_request_sglang(sglang_proto::GenerateRequest {
+        assert!(translate(sglang_proto::GenerateRequest {
             return_hidden_states: true,
             ..base.clone()
         })
         .is_err());
-        assert!(translate_request_sglang(sglang_proto::GenerateRequest {
+        assert!(translate(sglang_proto::GenerateRequest {
             disaggregated_params: Some(sglang_proto::DisaggregatedParams::default()),
             ..base.clone()
         })
         .is_err());
         // Forwarded as the Python servicer forwards them.
-        let forwarded = translate_request_sglang(sglang_proto::GenerateRequest {
+        let forwarded = translate(sglang_proto::GenerateRequest {
             lora_id: "adapter".into(),
             custom_logit_processor: "proc".into(),
             sampling_params: Some(sglang_proto::SamplingParams {
@@ -858,7 +875,7 @@ mod tests {
             )]))
         );
         // Prompt logprobs ride the wire now.
-        let prompt = translate_request_sglang(sglang_proto::GenerateRequest {
+        let prompt = translate(sglang_proto::GenerateRequest {
             return_logprob: true,
             logprob_start_len: 0,
             top_logprobs_num: 2,
@@ -868,7 +885,7 @@ mod tests {
         assert!(prompt.return_logprob && prompt.logprob_start_len == 0);
         // Output logprobs only: `-1` is the builders' "no prompt logprobs"
         // (the proto default of 0 would ask for them from the first token).
-        let ok = translate_request_sglang(sglang_proto::GenerateRequest {
+        let ok = translate(sglang_proto::GenerateRequest {
             return_logprob: true,
             logprob_start_len: -1,
             stream: true,
@@ -880,9 +897,64 @@ mod tests {
         assert!(ok.return_logprob && ok.stream && ok.require_reasoning);
     }
 
+    /// Prompt bounds apply before the scheduler, with or without an output
+    /// limit, under the window the handshake reported; the request's own
+    /// limit is kept as it is (an unset one stays the scheduler's to cap).
+    #[test]
+    fn sglang_validates_prompt_length_even_with_explicit_max_new_tokens() {
+        let request = |prompt_len: usize, sampling: Option<sglang_proto::SamplingParams>| {
+            sglang_proto::GenerateRequest {
+                request_id: "r".into(),
+                tokenized: Some(sglang_proto::TokenizedInput {
+                    input_ids: vec![1; prompt_len],
+                    original_text: String::new(),
+                }),
+                sampling_params: sampling,
+                ..Default::default()
+            }
+        };
+        for sampling in [
+            None,
+            Some(sglang_proto::SamplingParams::default()),
+            Some(sglang_proto::SamplingParams {
+                max_new_tokens: Some(16_384),
+                ..Default::default()
+            }),
+        ] {
+            for (prompt_len, max_model_len, accepted) in [
+                (0, 4, false),
+                (3, 4, true),
+                (4, 4, false),
+                (5, 4, false),
+                (1_049_692, 1_048_576, false),
+                // A scheduler that reported no window bounds nothing but
+                // emptiness.
+                (1_049_692, 0, true),
+                (0, 0, false),
+            ] {
+                let result =
+                    translate_request_sglang(request(prompt_len, sampling.clone()), max_model_len);
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "prompt_len={prompt_len}, max_model_len={max_model_len}, max_new_tokens={:?}",
+                    sampling.as_ref().and_then(|sp| sp.max_new_tokens)
+                );
+                match result {
+                    Err(error) => assert!(error.contains("prompt"), "{error}"),
+                    Ok(wire) => {
+                        if let Some(sp) = sampling.as_ref() {
+                            assert_eq!(wire.sampling_params.max_new_tokens, sp.max_new_tokens);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn sglang_scoring_request_keeps_selected_ids_without_generating_tokens() {
-        let request = translate_request_sglang(sglang_proto::GenerateRequest {
+        let request = translate(sglang_proto::GenerateRequest {
             request_id: "score".into(),
             tokenized: Some(sglang_proto::TokenizedInput {
                 input_ids: vec![1, 2],

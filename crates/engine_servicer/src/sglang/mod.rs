@@ -148,6 +148,17 @@ pub(super) fn structured_outputs_support(model: &SglangModelInfo) -> StructuredO
     }
 }
 
+/// Whether the scheduler was started with `--allow-auto-truncate`: it then
+/// cuts a prompt longer than its bound down to it instead of aborting the
+/// request, and the connection's prompt admission leaves the upper bound to
+/// it (an empty prompt is still refused before the scheduler).
+pub(super) fn truncates_long_prompts(model: &SglangModelInfo) -> bool {
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    args.get("allow_auto_truncate")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+}
+
 /// How to bind, where the engines dial in, and what to advertise.
 #[derive(Debug, Clone)]
 pub struct SglangServicerConfig {

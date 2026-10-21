@@ -21,6 +21,7 @@
 //! params an `Embed` request carries ([`translate_embed_request`]).
 
 mod client;
+mod context_window;
 mod embed;
 mod eos;
 mod fanout;
