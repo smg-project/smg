@@ -103,6 +103,8 @@ const COMMON: &[&str] = &[
     "<>",
     "</",
     "/>",
+    "<![CDATA[",
+    "]]>",
     "=",
     "\n",
     "\n\n",
@@ -903,4 +905,154 @@ fn a_corruption_keeps_the_text_on_character_boundaries_and_a_plan_cuts_there() {
         let spans = spans(&text, &mut next_id);
         assert!(TokenSpan::partitions(&text, &spans), "{text:?}: {spans:?}");
     }
+}
+
+/// What may follow a CDATA section's closer before the closing tag, which the template never
+/// writes: nothing, whitespace, a word, words, a bracket run, the closer again, a tag cut short,
+/// another section, a parameter tag, text in other scripts.
+const AFTER_THE_CLOSER: &[&str] = &[
+    "",
+    "",
+    "",
+    " ",
+    "\n",
+    "tail",
+    " tail",
+    "tail more",
+    " x\n",
+    "]",
+    "]]",
+    "]]>",
+    "<",
+    "</par",
+    "<![CDATA[y]]>",
+    "<param name=\"z\">",
+    "東京",
+    "🌧",
+];
+
+/// A seeded output of the attributed syntax around CDATA sections, in MiniCPM5's spelling: one
+/// to three invokes, each of one to three parameters of every kind the syntax types (a string
+/// that streams; an integer, a boolean, an object, an array written whole; a string that may be
+/// null; a key no tool declares), each value plain, in a section, or in a section never closed,
+/// with [`AFTER_THE_CLOSER`] after it, the closing tags present or missing, text between the
+/// invokes, and once in four the output cut short. The scramble's vocabulary holds the section's
+/// delimiters as pieces; this corpus puts a section where the syntax reads one.
+fn cdata_output(random: &mut Random) -> String {
+    const NAMES: &[&str] = &["get_weather", "f", "nosuch"];
+    const KEYS: &[&str] = &[
+        "city", "days", "metric", "options", "tags", "note", "nosuch",
+    ];
+    const VALUES: &[&str] = &[
+        "Paris",
+        "3",
+        "true",
+        "{\"k\": 1}",
+        "[1, \"x\"]",
+        "null",
+        "None",
+        "nu",
+        "",
+        "a]b",
+        "a]]b",
+        "<v> & \"q\"\nline",
+        "東京",
+    ];
+    let mut text = String::new();
+    for _ in 0..1 + random.below(3) {
+        text.push_str("<function name=\"");
+        text.push_str(random.pick(NAMES));
+        text.push_str("\">");
+        for _ in 0..1 + random.below(3) {
+            text.push_str("<param name=\"");
+            text.push_str(random.pick(KEYS));
+            text.push_str("\">");
+            let value = random.pick(VALUES);
+            match random.below(4) {
+                0 => text.push_str(value),
+                1 => {
+                    text.push_str("<![CDATA[");
+                    text.push_str(value);
+                }
+                _ => {
+                    text.push_str("<![CDATA[");
+                    text.push_str(value);
+                    text.push_str("]]>");
+                }
+            }
+            text.push_str(random.pick(AFTER_THE_CLOSER));
+            if random.below(6) != 0 {
+                text.push_str("</param>");
+            }
+        }
+        if random.below(8) != 0 {
+            text.push_str("</function>");
+        }
+        if random.below(3) == 0 {
+            text.push_str(random.pick(&["\n", " and then ", "\n\n"]));
+        }
+    }
+    if random.below(4) == 0 {
+        let bounds: Vec<usize> = text.char_indices().map(|(at, _)| at).collect();
+        text.truncate(*random.pick(&bounds));
+    }
+    text
+}
+
+/// The attributed syntax around CDATA sections, with the tools declared and without: twenty
+/// outputs of [`cdata_output`] per scramble case (two thousand by default; `SYMPHONY_SCRAMBLE_CASES`,
+/// `SYMPHONY_SCRAMBLE_SEED` and `SYMPHONY_SCRAMBLE_REPORT` as for the scramble), each through the
+/// scramble's check: no panic, the contract kept, the same said whole, character by character and
+/// on seeded plans.
+#[test]
+fn the_attributed_syntax_reads_every_cdata_section_and_what_follows_it_however_it_is_cut() {
+    let format = Table::MiniCpm5.format();
+    let cases = cases() * 20;
+    let first = first_seed();
+    let mut failures = Vec::new();
+    for with_tools in [true, false] {
+        let declared = if with_tools {
+            Declared::of(&tools())
+        } else {
+            Declared::default()
+        };
+        for seed in first..first + cases {
+            let mut random = Random::new(seed ^ (u64::from(with_tools) << 56) ^ (0xCDA7 << 40));
+            let text = cdata_output(&mut random);
+            let finish = finish(&mut random);
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                check(&format, &declared, "", &text, &finish, &mut random)
+            }));
+            let failure = match outcome {
+                Ok(Ok(())) => continue,
+                Ok(Err(breach)) => breach,
+                Err(payload) => format!("PANIC: {}", panic_message(payload)),
+            };
+            failures.push(format!(
+                "{}, seed {seed}, finish {finish:?}, output {text:?}:\n  {failure}",
+                if with_tools {
+                    "tools declared"
+                } else {
+                    "no tools"
+                }
+            ));
+        }
+    }
+    if let Some(path) = std::env::var_os(REPORT_ENV) {
+        let report = failures.join("\n");
+        std::fs::write(&path, report).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    }
+    assert!(
+        failures.is_empty(),
+        "{} of {} CDATA outputs broke the contract or panicked; the first {}:\n{}",
+        failures.len(),
+        cases * 2,
+        failures.len().min(SHOWN),
+        failures
+            .iter()
+            .take(SHOWN)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
 }

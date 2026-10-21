@@ -35,7 +35,7 @@ use crate::{
     ids::CallIds,
     markers::{Piece, Scanner},
     tagged::{
-        end_cut_call,
+        end_cut_call, held_text,
         value::{json, Kind, NULL_WORDS},
     },
     Declared,
@@ -648,7 +648,7 @@ impl Assembler {
     /// The text of a value written whole: what came after the tag and its newline, less the
     /// newline the template writes before `</parameter>`, where the template writes one.
     fn whole_text(&self, start: usize) -> &str {
-        let text = &self.carried[start..];
+        let text = held_text(&self.carried, start, None);
         match self.placement {
             Placement::OwnLine => text.strip_suffix('\n').unwrap_or(text),
             Placement::Direct => text,

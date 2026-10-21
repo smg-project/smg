@@ -88,3 +88,13 @@ pub(crate) fn drop_refused(text: String, out: &mut Events) {
         why: DropReason::MalformedCall,
     });
 }
+
+/// The text of a value held whole for its close: the carried bytes from `start` to `end`, or to
+/// their end. A value is held by its position in the carried bytes, which holds only while
+/// nothing takes them from under it ([`Object::carried`](object::Object::carried)); a position
+/// past them reads as no text, never as a panic, since a reader never panics on bytes.
+pub(super) fn held_text(carried: &str, start: usize, end: Option<usize>) -> &str {
+    let end = end.unwrap_or(carried.len()).min(carried.len());
+    debug_assert!(start <= end, "a value held past the carried bytes");
+    carried.get(start..end).unwrap_or_default()
+}

@@ -33,6 +33,9 @@ pub(super) enum Mode {
 pub(super) struct Object {
     pub(super) index: u32,
     /// Bytes no event has accounted for yet, in order; the next event takes them as its source.
+    /// An assembler that holds a name or a value by its position in here (a whole value, up to
+    /// its close) writes or reports it before any other event takes the bytes: no position
+    /// outlives the bytes it points into.
     pub(super) carried: String,
     /// Members written so far.
     written: u32,
