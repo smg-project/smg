@@ -10,12 +10,13 @@
 //!   row leads, kept as content text (`Event::Malformed`), by its reason; the bytes reach the
 //!   client as content, or, where the syntax's block is never prose, are dropped behind an event of
 //!   no bytes (`Dropped { MalformedCall }`) and sized here as that event's; nothing is lost in the
-//!   events, and nothing says so to the client. An output whose only answer is such a dropped
-//!   block (no content, no call: a call written as Python where the name goes) is the one case
-//!   where the reader releases dropped bytes as content before the finish (`Reader::end`): the
-//!   output's own slice from the block's opener to the last refused byte, so a client reads
-//!   what the model wrote instead of an empty answer; the output still counts as `malformed`,
-//!   and its line says how many bytes went out;
+//!   events, and nothing says so to the client. An output that made no call and ended in such
+//!   dropped blocks (a call written as Python where the name goes, after the thought or after
+//!   the answer's text) is the one case where the reader releases dropped bytes as content
+//!   before the finish (`Reader::end`): the output's own slice from the first of those blocks'
+//!   opener to the last refused byte, so a client reads what the model wrote instead of an empty
+//!   answer or a text that ends where the call should be; the output still counts as
+//!   `malformed`, and its line says how many bytes went out;
 //! - `dropped`: bytes the table treats as the template's wrapping (`Event::Dropped`): correct,
 //!   expected on every output, not counted here;
 //! - `empty`: an output with no text, no reasoning and no call: only bytes the table drops
@@ -333,9 +334,8 @@ pub(crate) struct Tally {
     finish: &'static str,
     /// The bytes the reader released as content at the end of the output: the dropped whitespace
     /// of an empty output, whether it reaches the client being the surface's rule (the chat
-    /// stream carries it), or the slice of an output that answered with nothing but refused call
-    /// blocks, from the first block's opener to the last refused byte, which every surface
-    /// carries.
+    /// stream carries it), or the refused call blocks an output that made no call ended in,
+    /// from the first of them's opener to the last refused byte, which every surface carries.
     released: u64,
 }
 
@@ -447,8 +447,8 @@ impl Tally {
     }
 
     /// `bytes` the table dropped were released as content at the end of the output: whitespace
-    /// of an empty output, or the slice of one that answered with nothing but refused call
-    /// blocks, from the first block's opener to the last refused byte.
+    /// of an empty output, or the refused call blocks one that made no call ended in, from the
+    /// first of them's opener to the last refused byte.
     pub(super) fn released(&mut self, bytes: usize) {
         self.released += bytes as u64;
     }

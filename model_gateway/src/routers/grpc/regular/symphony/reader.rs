@@ -249,21 +249,22 @@ pub(crate) struct Reader {
     /// spacing when text follows it, the model's whole answer when nothing does, which is then
     /// released as one content event before the `Finish` ([`Self::end`]).
     unshown: String,
-    /// Whether the output answered yet: content, or a call that started. A thought alone is not
-    /// an answer.
-    answered: bool,
-    /// The bytes of the call blocks the table refused before the output answered
-    /// (`Dropped { MalformedCall }`: a block that names no call, Python or prose where the name
-    /// goes), with the marker that led into the first of them and what the table dropped between
-    /// two of them (its whitespace, the next marker), in the output's order: the output's own
-    /// slice from the first block's opener to the last refused byte ([`Self::hold_refused`]).
-    /// Debris beside the content or the call that follows, which stays dropped as the table
-    /// says; the model's whole answer when nothing else comes, which is then released as one
-    /// content event before the `Finish` ([`Self::end`]).
+    /// Whether the output made a call: a call that started. Nothing is held past one: what the
+    /// table refuses beside a call is debris, as the table says.
+    called: bool,
+    /// The bytes of the call blocks the table refused since the output's last text, while it
+    /// made no call (`Dropped { MalformedCall }`: a block that names no call, Python or prose
+    /// where the name goes), with the marker that led into the first of them and what the table
+    /// dropped between two of them (its whitespace, the next marker), in the output's order: the
+    /// output's own slice from the first block's opener to the last refused byte
+    /// ([`Self::hold_refused`]). Debris when text or a call follows, which stays dropped as the
+    /// table says; the tail of the model's answer when nothing else comes after it (its whole
+    /// answer, or what it wrote after its text), which is then released as one content event
+    /// before the `Finish` ([`Self::end`]).
     refused: String,
-    /// What the table dropped since the last event that was not a drop, before the output
-    /// answered, run by run with its place in the output: the marker that leads into a refused
-    /// block and the bytes between two refused blocks go out with the blocks
+    /// What the table dropped since the last event that was not a drop, while the output made no
+    /// call, run by run with its place in the output: the marker that leads into a refused block
+    /// and the bytes between two refused blocks go out with the blocks
     /// ([`Self::hold_refused`]); the rest is the template's.
     framing: Vec<Framing>,
     /// Where the held bytes sit in the output, as byte ranges, in order: the whitespace's and
@@ -296,7 +297,7 @@ impl Reader {
             first_call_only: false,
             shown: false,
             unshown: String::new(),
-            answered: false,
+            called: false,
             refused: String::new(),
             framing: Vec::new(),
             unshown_spans: Vec::new(),
@@ -415,17 +416,19 @@ impl Reader {
     /// spacing around text that never came. The chat stream carries it as the engine's own server
     /// streams it; a whole response's adapter applies its own rule for whitespace-only content
     /// (the chat message, the Messages blocks and the Responses items leave it out). The markers
-    /// and separators dropped with it stay dropped: they are the template's. An output that
-    /// answered with nothing but call blocks the table refused (a call written as Python where
-    /// the name goes, which the keyed syntax never reads as content) releases the same way the
-    /// output's own slice from the first block's opener to the last refused byte: the blocks'
-    /// bytes as the table refused them, the marker that led into the first, and what the table
-    /// dropped between two blocks (its whitespace, the next marker), in the order the model
-    /// wrote them, so the client reads what the model wrote, as its own server shows it; the
-    /// whitespace before the first opener and after the last refused byte stays the template's,
-    /// and the table's rule keeps debris out of an answer that has content or a call. The
+    /// and separators dropped with it stay dropped: they are the template's. An output that made
+    /// no call and ended in call blocks the table refused (a call written as Python where the
+    /// name goes, which the keyed syntax never reads as content), after its thought or after its
+    /// text, releases the same way the output's own slice from the first of those blocks' opener
+    /// to the last refused byte: the blocks' bytes as the table refused them, the marker that led
+    /// into the first, and what the table dropped between two blocks (its whitespace, the next
+    /// marker), in the order the model wrote them, after the text that came before, so the
+    /// client reads what the model wrote, as its own server shows it, rather than a text that
+    /// ends where the call should be; the whitespace before the first opener and after the last
+    /// refused byte stays the template's, and the table's rule keeps debris out of an answer
+    /// that went on past the block: a block that text or a call follows stays dropped. The
     /// output is recorded here, under `who`: its counters, and the line when it was not clean
-    /// ([`Tally::report`]); an output of whitespace alone counts as `empty`, one of refused
+    /// ([`Tally::report`]); an output of whitespace alone counts as `empty`, one with refused
     /// blocks as `malformed`, whether or not bytes were released, and the line says how many
     /// were.
     pub(crate) fn end(
@@ -444,7 +447,7 @@ impl Reader {
             self.released_spans = std::mem::take(&mut self.unshown_spans);
             self.tally.released(released.len());
             release_before_the_finish(released, out);
-        } else if !self.answered && !self.refused.is_empty() {
+        } else if !self.refused.is_empty() {
             let released = std::mem::take(&mut self.refused);
             self.released_spans = std::mem::take(&mut self.refused_spans);
             self.tally.released(released.len());
@@ -506,11 +509,12 @@ impl Reader {
         for event in fresh.iter() {
             self.tally.see(event, self.first_call_only);
         }
-        // Until the output answers, the bytes of the call blocks the table refuses are kept for
-        // the end ([`Self::end`]), with the marker that led into the first and what the table
-        // dropped between two ([`Self::hold_refused`]); the first content or call makes them
-        // debris for good. What the table dropped before a thought is the template's.
-        if !self.answered {
+        // While the output makes no call, the bytes of the call blocks the table refuses are
+        // kept for the end ([`Self::end`]), with the marker that led into the first and what the
+        // table dropped between two ([`Self::hold_refused`]); text after them makes them debris
+        // and the hold starts over behind it, a call makes them debris for good. What the table
+        // dropped before a thought is the template's.
+        if !self.called {
             let mut at = start;
             for event in fresh.iter() {
                 let bytes = telemetry::bytes_of(event);
@@ -530,9 +534,9 @@ impl Reader {
                         if !text.text.is_empty() =>
                     {
                         self.drop_held();
-                        break;
                     }
                     Event::ToolCallStart { .. } => {
+                        self.called = true;
                         self.drop_held();
                         break;
                     }
@@ -628,13 +632,13 @@ impl Reader {
         hold_span(&mut self.refused_spans, at, text.len());
     }
 
-    /// The output answered, with content or a call: what was held for the end is debris beside
-    /// it, as the table says, and nothing more is held.
+    /// The output went on past what was held, with text or a call: the held runs are debris
+    /// beside it, as the table says. After text the hold starts over, for the blocks that may end
+    /// the answer; after a call nothing more is held (`called`).
     fn drop_held(&mut self) {
-        self.answered = true;
-        self.refused = String::new();
-        self.refused_spans = Vec::new();
-        self.framing = Vec::new();
+        self.refused.clear();
+        self.refused_spans.clear();
+        self.framing.clear();
     }
 }
 
@@ -951,7 +955,8 @@ mod tests {
 
     /// The released bytes have their places in the output, not the event's: the content spans
     /// a logprobs filter reads are the released slice's range, from the block's opener, and the
-    /// released event past the output's end is left out; an output that answered has no released
+    /// released event past the output's end is left out; an output that answered in text before
+    /// the block has the text's range, then the slice's; one that made a call has no released
     /// range and the crate's spans alone.
     #[test]
     fn the_released_bytes_are_placed_where_the_output_wrote_them() {
@@ -982,10 +987,46 @@ mod tests {
         let events = read_tail(&mut reader, output);
         let block = "</think>".len();
         assert_eq!(reader.content_spans(&events), [(block, output.len())]);
-        // An answered output: nothing released, the crate's spans.
+        // An output that answered in text before the block: the text's range is the crate's,
+        // the released slice's follows it, from the opener.
         let mut events = Events::new();
         let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
         let output = "</think>Let me look:<tool_call>Read(file_path=\"x\")</tool_call>";
+        let events = read_tail(&mut reader, output);
+        let text = "</think>".len();
+        let opener = "</think>Let me look:".len();
+        assert_eq!(reader.released_spans(), [(opener, output.len())]);
+        assert_eq!(
+            reader.content_spans(&events),
+            [(text, opener), (opener, output.len())],
+            "{events:?}"
+        );
+        // A block held, then text, then a block: the hold started over behind the text, so the
+        // released range is the second block's alone, from its opener; the first block is debris
+        // and no range of it is content.
+        let mut events = Events::new();
+        let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
+        let output = concat!(
+            "</think><tool_call>a(x=1)</tool_call>",
+            "Sorry.",
+            "<tool_call>b(y=2)</tool_call>"
+        );
+        let events = read_tail(&mut reader, output);
+        let text = "</think><tool_call>a(x=1)</tool_call>".len();
+        let opener = "</think><tool_call>a(x=1)</tool_call>Sorry.".len();
+        assert_eq!(reader.released_spans(), [(opener, output.len())]);
+        assert_eq!(
+            reader.content_spans(&events),
+            [(text, opener), (opener, output.len())],
+            "{events:?}"
+        );
+        // An output that made a call: nothing released, the crate's spans.
+        let mut events = Events::new();
+        let mut reader = Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
+        let output = concat!(
+            "</think>Let me look:<tool_call>Read(file_path=\"x\")</tool_call>",
+            "<tool_call>lookup<arg_key>q</arg_key><arg_value>1</arg_value></tool_call>"
+        );
         let events = read_tail(&mut reader, output);
         assert!(reader.released_spans().is_empty());
         assert_eq!(
@@ -1195,24 +1236,171 @@ mod tests {
         assert_eq!(reader.content_spans(&events), [(opener, output.len())]);
     }
 
-    /// A refused block beside content or a call is debris, as the table says: nothing of it
-    /// goes out, whether the content comes before the block or after it, or a well-formed call
-    /// follows it; and a thought alone does not make the block the answer. Two blocks and what
-    /// stands between them the same.
+    /// A call written as Python inside the block's markers after the answer's text (the recorded
+    /// shape: a sentence, then the block): the table keeps the text as content and refuses the
+    /// block, and nothing comes after it, so the block is the tail of the answer. The reader
+    /// releases it, from its opener, as one content event after the text, right before the
+    /// `Finish`, as the model wrote it; the whole chat message carries the text and the block, one
+    /// after the other; the thought stays reasoning. The same at every cut, when the stream's end
+    /// cuts the block, with two blocks and the template's newline between them after the text,
+    /// and on other keyed tables, whose templates write a newline between the thought's close and
+    /// the text. Each output counts as malformed under its reason, never as empty, with the bytes
+    /// released on its line.
     #[test]
-    fn a_refused_block_beside_content_or_a_call_stays_dropped() {
+    fn a_refused_block_after_the_text_goes_out_after_it_before_the_finish() {
+        use symphony::{
+            adapt::chat::message,
+            formats::{glm, glm4, ling},
+        };
+        let text = "I'll place both orders for you.";
+        let block = "<tool_call>whole_foods_order(location=\"downtown\")</tool_call>";
+        let answer = format!("{text}{block}");
+        let scrape = rendered(|| {
+            let cuts: [&[&str]; 3] = [
+                &["plan</think>I'll place both orders for you.<tool_call>whole_foods_order(location=\"downtown\")</tool_call>"],
+                &[
+                    "plan</think>",
+                    "I'll place both ",
+                    "orders for you.",
+                    "<tool_call>",
+                    "whole_foods_order(location=",
+                    "\"downtown\")",
+                    "</tool_call>",
+                ],
+                &[
+                    "plan</think>I'll place both orders for you.<tool_",
+                    "call>whole_foods_order(location=\"downtown\")</tool_call>",
+                ],
+            ];
+            for pieces in cuts {
+                let events = read_pieces(glm(), GLM_PROMPT, pieces, EngineFinish::Stop);
+                let (contents, finish_last) = content_events(&events);
+                assert_eq!(contents.concat(), answer, "{pieces:?}: {events:?}");
+                assert_eq!(
+                    contents.last().map(String::as_str),
+                    Some(block),
+                    "{pieces:?}: {events:?}"
+                );
+                assert!(finish_last, "{events:?}");
+                assert!(events
+                    .iter()
+                    .all(|event| !matches!(event, Event::ToolCallStart { .. })));
+                let choice = message(0, &events);
+                assert_eq!(choice.message.content.as_deref(), Some(answer.as_str()));
+                assert!(choice.message.tool_calls.is_none());
+                assert_eq!(choice.message.reasoning_content.as_deref(), Some("plan"));
+                assert_eq!(choice.finish_reason.as_deref(), Some("stop"));
+            }
+            // The stream's end cuts the block: what came of it goes out after the text.
+            let events = read_pieces(
+                glm(),
+                GLM_PROMPT,
+                &[
+                    "plan</think>Let me look:<tool_call>Read(file_path=\"x",
+                    "yz",
+                ],
+                EngineFinish::Length,
+            );
+            assert_eq!(
+                content_events(&events).0,
+                vec!["Let me look:", "<tool_call>Read(file_path=\"xyz"],
+                "{events:?}"
+            );
+            // Two blocks after the text, the template's newline between them: the slice from the
+            // first opener to the last refused byte.
+            let events = read_pieces(
+                glm(),
+                GLM_PROMPT,
+                &[
+                    "</think>Both:",
+                    "<tool_call>a(x=1)</tool_call>\n<tool_call>b(y=2)</tool_call>",
+                ],
+                EngineFinish::Stop,
+            );
+            assert_eq!(
+                content_events(&events).0,
+                vec![
+                    "Both:",
+                    "<tool_call>a(x=1)</tool_call>\n<tool_call>b(y=2)</tool_call>"
+                ],
+                "{events:?}"
+            );
+            // A block held before the text, then the text, then a block: the first is debris
+            // beside the text (the table's rule), the hold starts over behind the text, and the
+            // second goes out alone, from its opener.
+            let events = read_pieces(
+                glm(),
+                GLM_PROMPT,
+                &[
+                    "</think><tool_call>a(x=1)</tool_call>",
+                    "Sorry.",
+                    "<tool_call>b(y=2)</tool_call>",
+                ],
+                EngineFinish::Stop,
+            );
+            assert_eq!(
+                content_events(&events).0,
+                vec!["Sorry.", "<tool_call>b(y=2)</tool_call>"],
+                "{events:?}"
+            );
+            // Other keyed tables, whose templates write a newline after the thought's close.
+            let block = "<tool_call>get_weather(city=\"Paris\")</tool_call>";
+            let pieces = ["\n<think>plan</think>\nI'll check.", block];
+            let events = read_pieces(glm4(), GLM4_PROMPT, &pieces, EngineFinish::Stop);
+            let (contents, finish_last) = content_events(&events);
+            assert!(
+                contents.concat().ends_with(&format!("I'll check.{block}")),
+                "{events:?}"
+            );
+            assert_eq!(
+                contents.last().map(String::as_str),
+                Some(block),
+                "{events:?}"
+            );
+            assert!(finish_last, "{events:?}");
+            let pieces = ["plan</think>\nI'll check.", block, "\n"];
+            let events = read_pieces(ling(), "<think>\n", &pieces, EngineFinish::Stop);
+            let (contents, finish_last) = content_events(&events);
+            assert!(
+                contents.concat().ends_with(&format!("I'll check.{block}")),
+                "{events:?}"
+            );
+            assert_eq!(
+                contents.last().map(String::as_str),
+                Some(block),
+                "{events:?}"
+            );
+            assert!(finish_last, "{events:?}");
+        });
+        for (table, count) in [("glm", " 6"), ("glm4", " 1"), ("ling", " 1")] {
+            let label = format!("table=\"{table}\"");
+            let outputs = line_with(
+                &scrape,
+                "smg_symphony_outputs_total",
+                &[&label, "outcome=\"malformed\""],
+            )
+            .expect("the outputs counter");
+            assert!(outputs.ends_with(count), "{outputs}");
+            assert!(
+                line_with(
+                    &scrape,
+                    "smg_symphony_outputs_total",
+                    &[&label, "outcome=\"empty\""]
+                )
+                .is_none(),
+                "{scrape}"
+            );
+        }
+    }
+
+    /// A refused block that text or a call follows is debris, as the table says: nothing of it
+    /// goes out when text comes after the block, whether or not text came before it, when a
+    /// well-formed call follows it, before or after text, or when the block follows a call; a
+    /// thought alone does not make the block the answer. Two blocks and what stands between them
+    /// the same.
+    #[test]
+    fn a_refused_block_that_text_or_a_call_follows_stays_dropped() {
         use symphony::formats::glm;
-        let events = read_pieces(
-            glm(),
-            GLM_PROMPT,
-            &["</think>Let me look:<tool_call>Read(file_path=\"x\")</tool_call>"],
-            EngineFinish::Stop,
-        );
-        assert_eq!(
-            content_events(&events).0,
-            vec!["Let me look:"],
-            "{events:?}"
-        );
         // What was held is let go when the answer comes after the block.
         let events = read_pieces(
             glm(),
@@ -1242,6 +1430,21 @@ mod tests {
             vec!["Sorry, no tool for that."],
             "{events:?}"
         );
+        // Text on both sides of the block: the text goes out, the block stays dropped.
+        let events = read_pieces(
+            glm(),
+            GLM_PROMPT,
+            &[
+                "</think>Let me look:<tool_call>Read(file_path=\"x\")</tool_call>",
+                "Sorry, no tool for that.",
+            ],
+            EngineFinish::Stop,
+        );
+        assert_eq!(
+            content_events(&events).0,
+            vec!["Let me look:", "Sorry, no tool for that."],
+            "{events:?}"
+        );
         // A well-formed call after a block of prose: the call, and no content at all.
         let events = read_pieces(
             glm(),
@@ -1253,6 +1456,34 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, Event::ToolCallStart { name, .. } if name == "lookup")));
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
+        // A well-formed call after the text and the block: the text and the call, nothing of
+        // the block.
+        let events = read_pieces(
+            glm(),
+            GLM_PROMPT,
+            &["</think>Let me look:<tool_call>Read(file_path=\"x\")</tool_call><tool_call>lookup<arg_key>q</arg_key><arg_value>1</arg_value></tool_call>"],
+            EngineFinish::Stop,
+        );
+        assert_eq!(content_of(&events), "Let me look:", "{events:?}");
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
+        // A block after a call: debris beside the call.
+        let events = read_pieces(
+            glm(),
+            GLM_PROMPT,
+            &[
+                "</think><tool_call>lookup<arg_key>q</arg_key><arg_value>1</arg_value></tool_call>",
+                "<tool_call>Read(file_path=\"x\")</tool_call>",
+            ],
+            EngineFinish::Stop,
+        );
+        assert_eq!(content_of(&events), "", "{events:?}");
         assert!(matches!(
             events.last(),
             Some(Event::Finish { tool_calls: 1, .. })
