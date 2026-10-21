@@ -25,16 +25,17 @@ pub use body_limit::{RequestBodyLimit, RequestBodyLimitLayer};
 pub use body_timeout::{request_body_timeout_middleware, RequestBodyTimeouts};
 pub use concurrency::{concurrency_limit_middleware, AdmissionQueue};
 pub use logging::{
-    create_logging_layer, trace_context_response, AccessLogFields, AccessLogRecord, ProbeResponse,
-    ReportedRefusal, RequestLogger, RequestSpan, ResponseLogger, StreamFailureLogger,
+    create_logging_layer, trace_context_on_response, AccessLogFields, AccessLogRecord,
+    ProbeResponse, ReportedRefusal, RequestLogger, RequestSpan, ResponseLogger,
+    StreamFailureLogger,
 };
 pub use messages_errors::{
-    into_messages_envelope, messages_error_envelope_middleware, messages_error_type, request_id_of,
-    wants_messages_envelope,
+    into_messages_envelope, messages_error_type, request_id_of, wants_messages_envelope,
+    MessagesErrorEnvelopeLayer,
 };
 pub use metrics::{HttpMetricsLayer, HttpMetricsMiddleware};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdMiddleware};
-pub use sse_keepalive::{sse_keepalive_middleware, SseKeepAlive};
+pub use sse_keepalive::{sse_keepalive_middleware, SseKeepAlive, SseKeepAliveLayer};
 pub use storage_context::storage_context_middleware;
 pub use tenant_resolution::{
     ordinary_tenant_resolution_middleware, route_request_meta_middleware, TenantResolutionState,

@@ -3213,12 +3213,41 @@ mod tests {
     /// frozen-core cases below: short, so they run in milliseconds.
     const SEND_WINDOW: Duration = Duration::from_millis(300);
 
-    /// A 64 MiB aux frame exceeds socket buffers but fits local queue admission.
+    /// A 64 MiB typed tensor exercises encoding and exceeds socket buffers.
     fn large_request(request_id: &str) -> (EngineCoreRequest, Vec<Bytes>) {
-        (
-            request_for(request_id, 0),
-            vec![Bytes::from(vec![0u8; 64 << 20])],
-        )
+        use crate::{
+            codec::tensor::WireTensor,
+            protocol::vllm::multimodal::{
+                MmBatchedField, MmFeatureSpec, MmField, MmFieldElem, MmKwargValue, PlaceholderRange,
+            },
+        };
+
+        let mut request = request_for(request_id, 0);
+        request.mm_features = Some(
+            vec![MmFeatureSpec {
+                data: Some(std::collections::BTreeMap::from([(
+                    "pixels".into(),
+                    MmFieldElem {
+                        data: Some(MmKwargValue::Tensor(WireTensor::from_raw(
+                            "uint8",
+                            vec![64 << 20],
+                            vec![0; 64 << 20],
+                        ))),
+                        field: MmField::Batched(MmBatchedField { keep_on_cpu: false }),
+                    },
+                )])),
+                modality: "image".into(),
+                identifier: "large-image".into(),
+                mm_position: PlaceholderRange {
+                    offset: 0,
+                    length: 1,
+                    is_embed: None,
+                },
+                mm_hash: None,
+            }]
+            .into(),
+        );
+        (request, Vec::new())
     }
 
     /// Queue large frames until our ownership budget stalls the writer, without

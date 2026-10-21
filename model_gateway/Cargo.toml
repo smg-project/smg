@@ -82,7 +82,7 @@ reqwest = { workspace = true, features = ["stream", "blocking", "json", "rustls-
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["full"] }
 tokio-util.workspace = true
-uuid = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["serde", "fast-rng"] }
 
 # Workspace crates
 openai-protocol = { workspace = true, features = ["axum"] }
@@ -121,6 +121,7 @@ bytes = "1.12.0"
 http-body = "1.0"
 http-body-util = "0.1"
 futures-util = "0.3"
+pin-project-lite = "0.2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 tracing-log = "0.2"
 tracing-appender = "0.2.5"

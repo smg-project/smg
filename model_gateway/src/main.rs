@@ -42,8 +42,11 @@ use smg::{
     mesh_discovery::MeshDiscoveryConfig,
     observability::metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
     policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
-    posture::{SecretSource, SecretSources},
-    server::{self, ServerConfig},
+    server::{
+        self,
+        posture::{SecretSource, SecretSources},
+        ServerConfig,
+    },
     service_discovery::{ModelIdSource, RuntimeDiscoveryConfig},
     version,
     worker::{ConnectionMode, RuntimeType},
