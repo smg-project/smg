@@ -22,14 +22,14 @@ pub mod structured_outputs;
 use bytes::Bytes;
 
 use crate::{
-    codec::{encode_msgpack, tensor::WireArrayData, OpaqueValue},
+    codec::{encode_msgpack, tensor::encode_with_aux_frames, OpaqueValue},
     error::Result,
     protocol::{
         vllm::{
             output::{
                 decode_engine_core_outputs, DpControlMessage, EngineCoreOutput, EngineCoreOutputs,
             },
-            request::{EngineCoreRequest, EngineCoreRequestType, MmFeaturesPayload, UtilityCall},
+            request::{EngineCoreRequest, EngineCoreRequestType, UtilityCall},
             stats::SchedulerStats,
         },
         EngineBatch, EngineLoad, EngineOutput, EngineProtocol, UtilityReply, WaveEvent,
@@ -63,9 +63,6 @@ impl EngineOutput for EngineCoreOutput {
 /// The vLLM EngineCore protocol: drives [`EngineCoreRequest`] over the shared ZMQ
 /// transport and decodes [`EngineCoreOutputs`] back.
 pub struct VllmProtocol;
-
-/// Keep small tensors inline where copying costs less than cloning request metadata.
-const TENSOR_AUX_MIN_BYTES: usize = 32 * 1024;
 
 impl EngineProtocol for VllmProtocol {
     type Request = EngineCoreRequest;
@@ -104,42 +101,11 @@ impl EngineProtocol for VllmProtocol {
         request.validate()
     }
 
-    /// Encode large typed tensors as shared auxiliary frames, preserving caller indices.
+    /// Encode the request with its large typed tensors as auxiliary frames
+    /// ([`encode_with_aux_frames`]); raw features keep the encoding their
+    /// producer gave them, and the text path its one allocation.
     fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)> {
-        let Some(MmFeaturesPayload::Typed(features)) = &request.mm_features else {
-            // Raw features already reference the caller's aux frames. Preserve
-            // their indices, and keep the text path allocation unchanged.
-            return Ok((encode_msgpack(request)?, Vec::new()));
-        };
-        let mut has_large_tensor = false;
-        let has_aux_indices = any_tensor_data(features, &mut |data| match data {
-            WireArrayData::AuxIndex(_) => true,
-            WireArrayData::RawView(bytes) => {
-                has_large_tensor |= bytes.len() >= TENSOR_AUX_MIN_BYTES;
-                false
-            }
-        });
-        // Avoid cloning metadata for small requests. Existing indices address
-        // caller-provided frames, so preserve the entire encoding in that case.
-        if has_aux_indices || !has_large_tensor {
-            return Ok((encode_msgpack(request)?, Vec::new()));
-        }
-        // Tensor storage is Bytes: cloning this metadata shares its buffers.
-        let mut wire_request = request.clone();
-        let Some(MmFeaturesPayload::Typed(features)) = &mut wire_request.mm_features else {
-            return Ok((encode_msgpack(request)?, Vec::new()));
-        };
-        let mut frames = Vec::new();
-        visit_tensor_data(features, &mut |data| {
-            if let WireArrayData::RawView(bytes) = data {
-                // Large tensors share their storage with separate wire frames.
-                if bytes.len() >= TENSOR_AUX_MIN_BYTES {
-                    frames.push(bytes.clone());
-                    *data = WireArrayData::AuxIndex(frames.len());
-                }
-            }
-        });
-        Ok((encode_msgpack(&wire_request)?, frames))
+        encode_with_aux_frames(request)
     }
 
     fn encode_abort(request_id: &str) -> Result<Vec<u8>> {
@@ -212,83 +178,18 @@ impl EngineProtocol for VllmProtocol {
     }
 }
 
-/// Inspect tensor storage without cloning request metadata or tensor buffers.
-fn any_tensor_data(
-    features: &multimodal::MmFeatures,
-    predicate: &mut impl FnMut(&WireArrayData) -> bool,
-) -> bool {
-    /// Inspect nested values, stopping at the first matching tensor.
-    fn any_value(
-        value: &multimodal::MmKwargValue,
-        predicate: &mut impl FnMut(&WireArrayData) -> bool,
-    ) -> bool {
-        match value {
-            multimodal::MmKwargValue::Tensor(tensor) => predicate(&tensor.data),
-            multimodal::MmKwargValue::List(values) => {
-                values.iter().any(|value| any_value(value, predicate))
-            }
-            multimodal::MmKwargValue::Int(_) | multimodal::MmKwargValue::Float(_) => false,
-        }
-    }
-    features.iter().any(|feature| {
-        feature
-            .data
-            .iter()
-            .flat_map(|item| item.values())
-            .any(|field| {
-                field
-                    .data
-                    .as_ref()
-                    .is_some_and(|value| any_value(value, predicate))
-            })
-            || feature
-                .mm_position
-                .is_embed
-                .as_ref()
-                .is_some_and(|mask| predicate(&mask.data))
-    })
-}
-
-/// Visit tensor storage in nested feature values and embedding masks.
-fn visit_tensor_data(
-    features: &mut multimodal::MmFeatures,
-    visit: &mut impl FnMut(&mut WireArrayData),
-) {
-    /// Descend through nested keyword values without changing their structure.
-    fn visit_value(
-        value: &mut multimodal::MmKwargValue,
-        visit: &mut impl FnMut(&mut WireArrayData),
-    ) {
-        match value {
-            multimodal::MmKwargValue::Tensor(tensor) => visit(&mut tensor.data),
-            multimodal::MmKwargValue::List(values) => {
-                for value in values {
-                    visit_value(value, visit);
-                }
-            }
-            multimodal::MmKwargValue::Int(_) | multimodal::MmKwargValue::Float(_) => {}
-        }
-    }
-    for feature in features {
-        if let Some(item) = &mut feature.data {
-            for field in item.values_mut() {
-                if let Some(value) = &mut field.data {
-                    visit_value(value, visit);
-                }
-            }
-        }
-        if let Some(mask) = &mut feature.mm_position.is_embed {
-            visit(&mut mask.data);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use rmpv::Value;
 
     use super::*;
-    use crate::codec::decode_value;
+    use crate::{
+        codec::{
+            decode_value,
+            tensor::{TensorFields, WireArrayData, TENSOR_AUX_MIN_BYTES},
+        },
+        protocol::vllm::request::MmFeaturesPayload,
+    };
 
     /// Build nested large and small tensors plus an embedding mask.
     fn media_request() -> EngineCoreRequest {
@@ -352,12 +253,8 @@ mod tests {
         );
         assert!(payload.len() < 1024);
         assert_eq!(before, encode_msgpack(&request).unwrap());
-        let mut original = request.clone();
-        let Some(MmFeaturesPayload::Typed(features)) = &mut original.mm_features else {
-            panic!()
-        };
         let mut pointers = Vec::new();
-        visit_tensor_data(features, &mut |data| {
+        request.for_each_tensor(&mut |data| {
             if let WireArrayData::RawView(bytes) = data {
                 if bytes.len() >= TENSOR_AUX_MIN_BYTES {
                     pointers.push(bytes.as_ptr());
@@ -371,10 +268,7 @@ mod tests {
         let mut decoded: EngineCoreRequest = decode_msgpack(&payload).unwrap();
         let mut frames = vec![Bytes::from(payload)];
         frames.extend(aux);
-        let Some(MmFeaturesPayload::Typed(features)) = &mut decoded.mm_features else {
-            panic!()
-        };
-        visit_tensor_data(features, &mut |data| {
+        decoded.for_each_tensor_mut(&mut |data| {
             *data =
                 WireArrayData::RawView(resolve_array_bytes(data.clone(), "test", &frames).unwrap());
         });

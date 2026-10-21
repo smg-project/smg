@@ -24,7 +24,7 @@ pub mod sampling;
 use bytes::Bytes;
 
 use crate::{
-    codec::{decode_msgpack, encode_msgpack},
+    codec::{decode_msgpack, encode_msgpack, tensor::encode_with_aux_frames},
     error::Result,
     protocol::{
         tokenspeed::{
@@ -85,9 +85,13 @@ impl EngineProtocol for TokenSpeedProtocol {
         Ok(())
     }
 
+    /// Encode the request with its large multimodal tensors as auxiliary
+    /// frames ([`encode_with_aux_frames`]): the engine's `MsgpackDecoder`
+    /// resolves a tensor's frame index against the message's frames, the
+    /// payload being frame 0, as it resolves its own encoder's. A text
+    /// request, or one whose tensors are all small, keeps its one frame.
     fn encode_add(request: &Self::Request) -> Result<(Vec<u8>, Vec<Bytes>)> {
-        // Text path carries no aux tensor frames.
-        Ok((encode_msgpack(request)?, Vec::new()))
+        encode_with_aux_frames(request)
     }
 
     fn encode_abort(request_id: &str) -> Result<Vec<u8>> {
@@ -146,7 +150,168 @@ impl EngineProtocol for TokenSpeedProtocol {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use rmpv::Value;
+
     use super::*;
+    use crate::{
+        codec::{
+            decode_value,
+            tensor::{
+                resolve_array_bytes, TensorFields, WireArrayData, WireTensor, TENSOR_AUX_MIN_BYTES,
+            },
+        },
+        protocol::tokenspeed::multimodal::{
+            mm_pad_value, TokenSpeedWireMmInputs, TokenSpeedWireMmItem, TokenSpeedWireModality,
+        },
+    };
+
+    /// A multimodal item whose feature has `feature` bytes and whose one side
+    /// tensor has `side` bytes.
+    fn media_item(hash: u64, feature: usize, side: usize) -> TokenSpeedWireMmItem {
+        TokenSpeedWireMmItem {
+            modality: TokenSpeedWireModality::Image,
+            hash,
+            pad_value: mm_pad_value(TokenSpeedWireModality::Image, hash),
+            offsets: vec![(1, 2)],
+            feature: WireTensor::from_raw("uint8", vec![feature], vec![7; feature]),
+            model_specific_data: BTreeMap::from([(
+                "grid".to_string(),
+                WireTensor::from_raw("uint8", vec![side], vec![3; side]),
+            )]),
+        }
+    }
+
+    /// A request with two items: a feature of the auxiliary size beside a
+    /// small side tensor, then a small feature beside a side tensor of that
+    /// size.
+    fn media_request() -> TokenizedGenerateReqInput {
+        let pad = mm_pad_value(TokenSpeedWireModality::Image, 1);
+        TokenizedGenerateReqInput {
+            rid: "media".into(),
+            input_ids: vec![10, pad, pad, 50],
+            input_ids_unpadded: Some(vec![10, 20, 30, 50]),
+            multimodal_inputs: Some(TokenSpeedWireMmInputs {
+                mm_items: vec![
+                    media_item(1, 4 * TENSOR_AUX_MIN_BYTES, 255),
+                    media_item(2, 256, TENSOR_AUX_MIN_BYTES),
+                ],
+                im_token_id: Some(9),
+                video_token_id: None,
+            }),
+            ..TokenizedGenerateReqInput::default()
+        }
+    }
+
+    /// The `(dtype, shape, data)` tuple's data slot of an item's feature
+    /// (slot 4) or of its one side tensor (slot 6, under its key).
+    fn tensor_data(item: &Value, feature: bool) -> Value {
+        let Value::Array(slots) = item else {
+            panic!("an item is a positional array, got {item:?}");
+        };
+        let tensor = if feature {
+            slots[4].clone()
+        } else {
+            let Value::Map(side) = &slots[6] else {
+                panic!("model_specific_data is a map, got {:?}", slots[6]);
+            };
+            side[0].1.clone()
+        };
+        let Value::Array(tuple) = tensor else {
+            panic!("a tensor is a tuple, got {tensor:?}");
+        };
+        tuple[2].clone()
+    }
+
+    /// The large tensors leave the payload as frames, in slot order, sharing
+    /// the request's buffers; the small ones stay inline; the payload
+    /// addresses the frames one-based and the request itself is untouched.
+    #[test]
+    fn large_media_tensors_ride_as_frames_the_payload_addresses() {
+        let request = media_request();
+        let inline = encode_msgpack(&request).unwrap();
+        let (payload, aux) = TokenSpeedProtocol::encode_add(&request).unwrap();
+        assert_eq!(
+            aux.iter().map(Bytes::len).collect::<Vec<_>>(),
+            vec![4 * TENSOR_AUX_MIN_BYTES, TENSOR_AUX_MIN_BYTES]
+        );
+        assert!(payload.len() < 1024, "{} bytes", payload.len());
+        assert_eq!(encode_msgpack(&request).unwrap(), inline);
+        let mut pointers = Vec::new();
+        request.for_each_tensor(&mut |data| {
+            if let WireArrayData::RawView(bytes) = data {
+                if bytes.len() >= TENSOR_AUX_MIN_BYTES {
+                    pointers.push(bytes.as_ptr());
+                }
+            }
+        });
+        assert_eq!(
+            pointers,
+            aux.iter().map(|bytes| bytes.as_ptr()).collect::<Vec<_>>()
+        );
+        // The engine's view: the request array's multimodal slot, its items.
+        let Value::Array(array) = decode_value(&payload).unwrap() else {
+            panic!("a positional array");
+        };
+        let Value::Array(mm) = &array[22] else {
+            panic!("multimodal_inputs at 22, got {:?}", array[22]);
+        };
+        let Value::Array(items) = &mm[0] else {
+            panic!("mm_items at 0, got {:?}", mm[0]);
+        };
+        assert_eq!(tensor_data(&items[0], true), Value::from(1u64));
+        assert!(matches!(tensor_data(&items[0], false), Value::Ext(3, _)));
+        assert!(matches!(tensor_data(&items[1], true), Value::Ext(3, _)));
+        assert_eq!(tensor_data(&items[1], false), Value::from(2u64));
+        // The frames resolve to the tensors' bytes, and the text prefix of
+        // the payload still decodes.
+        let mut frames = vec![Bytes::from(payload.clone())];
+        frames.extend(aux);
+        let item = &request.multimodal_inputs.as_ref().unwrap().mm_items[1];
+        assert_eq!(
+            resolve_array_bytes(WireArrayData::AuxIndex(2), "grid", &frames).unwrap(),
+            *item.model_specific_data["grid"].data.as_raw_view().unwrap()
+        );
+        let decoded: TokenizedGenerateReqInput = decode_msgpack(&payload).unwrap();
+        assert_eq!(decoded.rid, "media");
+        assert_eq!(decoded.input_ids, request.input_ids);
+    }
+
+    /// Requests whose tensors are all below the auxiliary size, and text
+    /// requests, are encoded as before: one frame, byte for byte.
+    #[test]
+    fn small_media_tensors_and_text_requests_keep_their_one_frame() {
+        for size in [0, 255, 256, 4096, TENSOR_AUX_MIN_BYTES - 1] {
+            let mut request = media_request();
+            request.multimodal_inputs.as_mut().unwrap().mm_items =
+                vec![media_item(1, size, size), media_item(2, size, 0)];
+            let (payload, aux) = TokenSpeedProtocol::encode_add(&request).unwrap();
+            assert!(aux.is_empty(), "size={size}");
+            assert_eq!(payload, encode_msgpack(&request).unwrap(), "size={size}");
+        }
+        let text = TokenizedGenerateReqInput {
+            rid: "text".into(),
+            input_ids: vec![1, 2, 3],
+            ..TokenizedGenerateReqInput::default()
+        };
+        let (payload, aux) = TokenSpeedProtocol::encode_add(&text).unwrap();
+        assert!(aux.is_empty());
+        assert_eq!(payload, encode_msgpack(&text).unwrap());
+    }
+
+    /// A payload that already addresses auxiliary frames (a caller's own
+    /// split) is sent as it is: a second extraction would rebase its indices.
+    #[test]
+    fn a_payload_that_already_addresses_frames_is_sent_as_it_is() {
+        let mut request = media_request();
+        request.multimodal_inputs.as_mut().unwrap().mm_items[1]
+            .feature
+            .data = WireArrayData::AuxIndex(1);
+        let (payload, aux) = TokenSpeedProtocol::encode_add(&request).unwrap();
+        assert!(aux.is_empty());
+        assert_eq!(payload, encode_msgpack(&request).unwrap());
+    }
 
     fn slim_batch() -> BatchTokenIDOutSlim {
         BatchTokenIDOutSlim {

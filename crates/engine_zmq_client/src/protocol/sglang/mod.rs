@@ -136,6 +136,10 @@ impl EngineProtocol for SglangProtocol {
         let payload = encode_msgpack(request)?;
         // The request's metadata (the caller's trace context) rides as one
         // more frame: the positional array is the scheduler's own struct.
+        // No tensor rides this wire yet (`mm_inputs` is refused upstream of
+        // it); the day one does, its frames go behind the metadata frame,
+        // which the plugin reads at a fixed position, or their indices skip
+        // it, and the plugin resolves them (`codec::tensor::TensorFields`).
         let meta = match request {
             SglangRequest::Generate(request) => RequestMeta::for_request(request),
             SglangRequest::Embed(_) => None,

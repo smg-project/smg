@@ -489,14 +489,16 @@ pub(crate) fn translate_tokenspeed_multimodal(
     ))
 }
 
-/// Convert an inline proto tensor to the wire `(dtype, shape, ext)` tuple.
+/// Convert an inline proto tensor to the wire `(dtype, shape, data)` tuple,
+/// viewing the request's bytes rather than copying them: a tensor of the
+/// auxiliary size then travels to the engine as a frame sharing that view.
 /// SHM/remote payloads never reach this translate: ZMQ assembly runs with SHM
 /// disabled and RDMA staging off.
 pub(crate) fn wire_tensor_tokenspeed(
     tensor: tokenspeed_proto::TensorData,
 ) -> Result<WireTensor, String> {
     let bytes = match tensor.payload {
-        Some(tokenspeed_proto::tensor_data::Payload::Inline(bytes)) => Vec::from(bytes),
+        Some(tokenspeed_proto::tensor_data::Payload::Inline(bytes)) => bytes,
         Some(_) => {
             return Err(
                 "ZMQ multimodal requires inline tensor payloads; got a SHM/remote handle"
@@ -521,11 +523,7 @@ pub(crate) fn wire_tensor_tokenspeed(
             ));
         }
     }
-    Ok(WireTensor::from_raw_bytes(
-        tensor.dtype,
-        shape,
-        bytes.into(),
-    ))
+    Ok(WireTensor::from_raw_bytes(tensor.dtype, shape, bytes))
 }
 
 /// Byte width of the wire dtypes the gateway emits; `None` for dtypes we do

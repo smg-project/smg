@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
-use crate::codec::tensor::WireTensor;
+use crate::codec::tensor::{TensorFields, WireArrayData, WireTensor};
 
 /// Multimodal feature payload carried at `EngineCoreRequest.mm_features`.
 ///
@@ -38,6 +38,19 @@ pub struct MmFeatureSpec {
     /// The hash for caching processor outputs (without LoRA prefix).
     #[serde(default)]
     pub mm_hash: Option<String>,
+}
+
+impl TensorFields for MmFeatureSpec {
+    /// The item's data (its fields in key order), then its embedding mask.
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        self.data.for_each_tensor(visit);
+        self.mm_position.is_embed.for_each_tensor(visit);
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        self.data.for_each_tensor_mut(visit);
+        self.mm_position.is_embed.for_each_tensor_mut(visit);
+    }
 }
 
 /// Placeholder location information for one multimodal item.
@@ -86,6 +99,35 @@ pub enum MmKwargValue {
     Int(i64),
     Float(f64),
     List(Vec<MmKwargValue>),
+}
+
+impl TensorFields for MmFieldElem {
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        self.data.for_each_tensor(visit);
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        self.data.for_each_tensor_mut(visit);
+    }
+}
+
+impl TensorFields for MmKwargValue {
+    /// Nested lists are descended in order; scalars carry no tensor.
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        match self {
+            Self::Tensor(tensor) => tensor.for_each_tensor(visit),
+            Self::List(values) => values.for_each_tensor(visit),
+            Self::Int(_) | Self::Float(_) => {}
+        }
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        match self {
+            Self::Tensor(tensor) => tensor.for_each_tensor_mut(visit),
+            Self::List(values) => values.for_each_tensor_mut(visit),
+            Self::Int(_) | Self::Float(_) => {}
+        }
+    }
 }
 
 /// How to interpret tensor data belonging to a keyword argument.
