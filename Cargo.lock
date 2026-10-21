@@ -10863,22 +10863,21 @@ dependencies = [
 [[package]]
 name = "zeromq"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "efb2c254fd8f366755335c9e43b865f8484fe3bd717d65ffe7c3f28852863030"
+source = "git+https://github.com/zeromq/zmq.rs?rev=67dcba97559ebe8e8206dab753710d8b9cb07591#67dcba97559ebe8e8206dab753710d8b9cb07591"
 dependencies = [
  "async-trait",
  "asynchronous-codec",
  "bytes",
  "crossbeam-queue",
  "futures",
+ "futures-channel",
  "log",
- "num-traits",
- "once_cell",
  "parking_lot",
- "rand 0.9.5",
+ "rand 0.10.2",
  "regex",
  "scc",
- "thiserror 1.0.69",
+ "socket2",
+ "thiserror 2.0.21",
  "tokio",
  "tokio-util",
  "uuid",

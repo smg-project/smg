@@ -13,12 +13,13 @@ use std::{
 };
 
 use bytes::Bytes;
+use futures::channel::mpsc::Receiver as SocketEvents;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, trace, warn};
 use zeromq::{
     prelude::{Socket, SocketRecv, SocketSend},
     util::PeerIdentity,
-    PullSocket, RouterSendHalf, RouterSocket, ZmqError, ZmqMessage,
+    PullSocket, RouterSendHalf, RouterSocket, SocketEvent, ZmqError, ZmqMessage,
 };
 
 use crate::{
@@ -132,6 +133,8 @@ pub struct ConnectedTransport {
     pub engines: Vec<ConnectedEngine>,
     /// The sending half of the shared input ROUTER socket.
     pub input_send: RouterSendHalf,
+    /// Reports asynchronous disconnects after local send admission.
+    pub input_events: SocketEvents<SocketEvent>,
     /// The shared output PULL socket for receiving all engines' responses.
     pub output_socket: PullSocket,
 }
@@ -185,6 +188,7 @@ pub async fn connect_handshake(
     //    same data-plane addresses during handshake.
     let (input_address, mut input_socket, output_address, output_socket) =
         bind_local_sockets(local_input_address, local_output_address).await?;
+    let input_events = input_socket.monitor();
     info!(%input_address, %output_address, "bound local transport sockets");
 
     // 2. Bind the shared handshake socket. All engines connect here with their
@@ -299,6 +303,7 @@ pub async fn connect_handshake(
         output_address,
         engines,
         input_send,
+        input_events,
         output_socket,
     })
 }
