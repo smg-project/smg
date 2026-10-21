@@ -1005,6 +1005,7 @@ async def drain_server(server: Any, engine: Any, timeout: float, poll_secs: floa
 
     Older bindings without a count retain their bounded grace period.
     Health/admission must already have been closed by ``set_serving(False)``.
+    A zero timeout checks the final status without waiting for requests.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -1092,7 +1093,7 @@ async def supervise(
     finally:
         mark_not_serving(server)
         try:
-            if stop_event.is_set() and drain_secs > 0:
+            if stop_event.is_set():
                 if not await drain_server(server, engine, drain_secs, poll_secs):
                     exit_code = 1
         finally:

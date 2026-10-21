@@ -1164,14 +1164,15 @@ def test_supervise_stops_server_then_engine_even_if_drain_is_cancelled(monkeypat
     assert events == [("serving", False), "server stopped", "engine stopped"]
 
 
-@pytest.mark.parametrize("failure", ["engine", "server", "error", "clean_engine"])
-def test_supervise_reports_a_failure_at_the_drain_boundary(monkeypatch, failure):
+@pytest.mark.parametrize("drain_secs", [0, 1100])
+@pytest.mark.parametrize("failure", ["engine", "server", "error", "clean_engine", "live_engine"])
+def test_supervise_reports_a_failure_at_the_drain_boundary(monkeypatch, failure, drain_secs):
     """A signal preserves failures but allows a clean process-group shutdown."""
     events = []
     server = types.SimpleNamespace(
         running=failure != "server",
         last_error="failed" if failure == "error" else None,
-        active_requests=0,
+        active_requests=int(drain_secs == 0),
         set_serving=lambda serving: events.append(("serving", serving)),
         stop=lambda timeout: events.append("server stopped"),
     )
@@ -1184,7 +1185,9 @@ def test_supervise_reports_a_failure_at_the_drain_boundary(monkeypatch, failure)
         """Enter supervision with the shutdown signal already pending."""
         stop = asyncio.Event()
         stop.set()
-        return await rust_lifecycle.supervise(server, engine, stop_event=stop, drain_secs=1100)
+        return await asyncio.wait_for(
+            rust_lifecycle.supervise(server, engine, stop_event=stop, drain_secs=drain_secs), 1
+        )
 
-    assert asyncio.run(run()) == (0 if failure == "clean_engine" else 1)
+    assert asyncio.run(run()) == int(failure in ("engine", "server", "error"))
     assert events == [("serving", False), "server stopped", "engine stopped"]
