@@ -131,8 +131,9 @@ async fn submit(
     let (registration, cancel) = state.registry.register(&request_id).inspect_err(|error| {
         // The id names a request that is still live; a notice under it would
         // reuse it (and, past an `n > 1` fan-out, get in and free the live
-        // side's blocks).
-        if error.code() == tonic::Code::AlreadyExists {
+        // side's blocks). Only a drain refusal proves admission is closed;
+        // a poisoned registry cannot establish whether the id is live.
+        if error.code() != tonic::Code::Unavailable {
             notice.disarm();
         }
     })?;

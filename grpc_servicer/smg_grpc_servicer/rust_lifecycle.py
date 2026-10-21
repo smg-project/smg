@@ -1010,8 +1010,15 @@ async def drain_server(server: Any, engine: Any, timeout: float, poll_secs: floa
     deadline = loop.time() + timeout
     logger.info("Draining for up to %.1fs before stopping", timeout)
     while True:
-        if engine.poll() is not None or server.last_error or not server.running:
-            logger.error("Engine or Rust servicer failed during drain")
+        if server.last_error or not server.running:
+            logger.error("Rust servicer failed during drain")
+            return False
+        rc = engine.poll()
+        if rc is not None:
+            if rc == 0:
+                logger.info("Engine exited cleanly during drain")
+                return True
+            logger.error("Engine exited with code %s during drain", rc)
             return False
         active = getattr(server, "active_requests", None)
         if active == 0:
