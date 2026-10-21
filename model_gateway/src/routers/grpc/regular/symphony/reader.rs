@@ -1,10 +1,14 @@
 //! The reader: Symphony's assignment to a response and the reader the drivers run over the
 //! stop decoder's output, one per choice.
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 
 use llm_tokenizer::stop::{SequenceDecoderOutput, StopSequenceDecoder};
 use openai_protocol::common::Tool;
+use parking_lot::RwLock;
 use symphony::{
     adapt::chat, Declared, DropReason, Engine, EngineFinish, Event, Events, Format, Input,
     Parser as _, Text, TokenSpan,
@@ -46,14 +50,80 @@ pub(super) fn asked(format: Arc<Format>, no_calls: bool, no_reasoning: bool) -> 
     if !no_calls && !no_reasoning {
         return format;
     }
-    let mut format = Arc::unwrap_or_clone(format);
+    // A table nobody else holds (one built for this request) is made over in
+    // place, as before; a shared table's variant is kept, so the next request
+    // that asks the same of it reads with the one copy.
+    if Arc::strong_count(&format) == 1 {
+        return Arc::new(variant_of(
+            Arc::unwrap_or_clone(format),
+            no_calls,
+            no_reasoning,
+        ));
+    }
+    let key = (Arc::as_ptr(&format) as usize, no_calls, no_reasoning);
+    if let Some(kept) = ASKED_VARIANTS.read().get(&key) {
+        return Arc::clone(&kept.variant);
+    }
+    let variant = Arc::new(variant_of((*format).clone(), no_calls, no_reasoning));
+    let mut kept = ASKED_VARIANTS.write();
+    // Another request may have kept the same variant between the read and
+    // the write: theirs is the one every reader shares from here on.
+    if let Some(kept) = kept.get(&key) {
+        return Arc::clone(&kept.variant);
+    }
+    if kept.len() >= ASKED_VARIANTS_KEPT {
+        kept.clear();
+    }
+    kept.insert(
+        key,
+        AskedVariant {
+            table: format,
+            variant: Arc::clone(&variant),
+        },
+    );
+    variant
+}
+
+/// `format` as [`asked`] makes it: without its calls, its thought, or both.
+fn variant_of(mut format: Format, no_calls: bool, no_reasoning: bool) -> Format {
     if no_calls {
         format = format.without_calls();
     }
     if no_reasoning {
         format = format.without_reasoning();
     }
-    Arc::new(format)
+    format
+}
+
+/// The variants [`asked`] made of the shared tables, by the table's address
+/// and the ask. A chat request without tools asks for the table without its
+/// calls, which was rebuilt from the shared table on every such request (a
+/// clone and the walks of `without_calls`: 19 allocation calls per request,
+/// 2026-10-21).
+static ASKED_VARIANTS: LazyLock<RwLock<AskedVariants>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// The kept variants by the shared table's address and the ask (no calls, no
+/// reasoning).
+type AskedVariants = HashMap<(usize, bool, bool), AskedVariant>;
+
+/// How many variants are kept before the map starts over: the registry's
+/// groups, the named tables and the templates' tables come to a few hundred,
+/// each with up to three asks; a gateway serving every one of them with every
+/// ask stays under this, and a stream of tables built per worker cannot grow
+/// the map without bound.
+const ASKED_VARIANTS_KEPT: usize = 1024;
+
+/// One kept variant: the shared table it was made of (held, so the address
+/// the entry is keyed by stays its own for as long as the entry lives) and
+/// the variant.
+struct AskedVariant {
+    #[expect(
+        dead_code,
+        reason = "held so the address the entry is keyed by cannot be reused"
+    )]
+    table: Arc<Format>,
+    variant: Arc<Format>,
 }
 
 /// Symphony's assignment to a request, if a table reads the response ([`reading`]) and the
@@ -605,6 +675,44 @@ fn release_before_the_finish(released: String, out: &mut Events<'_>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_shared_tables_asked_variant_is_kept_and_read_with_by_the_next_request() {
+        let shared = symphony::formats::Table::Qwen3.shared();
+        let first = asked(Arc::clone(&shared), true, false);
+        let second = asked(Arc::clone(&shared), true, false);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the same ask of the same shared table reads with the one kept variant"
+        );
+        assert_eq!(
+            *first,
+            (*shared).clone().without_calls(),
+            "the kept variant is the table without its calls"
+        );
+        let other = asked(Arc::clone(&shared), false, true);
+        assert!(
+            !Arc::ptr_eq(&first, &other),
+            "another ask is another variant"
+        );
+        assert_eq!(*other, (*shared).clone().without_reasoning());
+        assert!(
+            Arc::ptr_eq(&asked(Arc::clone(&shared), false, false), &shared),
+            "a request that asks for nothing reads with the shared table itself"
+        );
+        let unique = Arc::new((*shared).clone());
+        let weak = Arc::downgrade(&unique);
+        let made_over = asked(unique, true, true);
+        assert_eq!(
+            *made_over,
+            (*shared).clone().without_calls().without_reasoning(),
+            "a table nobody else holds is made over in place"
+        );
+        assert!(
+            weak.upgrade().is_none(),
+            "a table nobody else holds is not kept: nothing pins it"
+        );
+    }
     use crate::routers::grpc::regular::symphony::testing::{assign, constraint, *};
 
     /// A reader over `format` after `prompt`, fed `pieces` one by one, ended with `finish`.
