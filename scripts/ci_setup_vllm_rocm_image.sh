@@ -21,6 +21,26 @@ python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 echo "image: $(python3 -V), ROCm $(cat /opt/rocm/.info/version 2>/dev/null || echo unknown)"
 
+# The image's PyGObject package needs Pycairo and its native Cairo library.
+if ! python3 -c '
+import cairo
+from importlib.metadata import version
+from packaging.version import Version
+assert Version(version("pycairo")) >= Version("1.16.0")
+' >/dev/null 2>&1; then
+    if ! command -v pkg-config >/dev/null || ! pkg-config --exists 'cairo >= 1.15.10'; then
+        if [[ "${GITHUB_ACTIONS:-}" != true || "$(id -u)" != 0 || ! -f /.dockerenv ]]; then
+            echo "ERROR: Cairo prerequisites require the root Actions container" >&2
+            exit 1
+        fi
+        $RETRY 3 10 apt-get update
+        $RETRY 3 10 apt-get install -y --no-install-recommends pkg-config libcairo2-dev
+    fi
+    SMG_CI_PYCAIRO_SOURCE='https://files.pythonhosted.org/packages/bb/5e/19ab2572981a996ce96b853a189d2dcced40506b67d9555a7568457abcf2/pycairo-1.29.2.tar.gz#sha256=3e69fff74fe64f5ba2dfa31f67c6bdf26413342574047437d2ac520d35e9a489'
+    $RETRY 3 10 python3 -m pip install --retries 0 --no-deps --no-cache-dir --no-binary=pycairo "$SMG_CI_PYCAIRO_SOURCE"
+    python3 -c 'import cairo; print(cairo.cairo_version_string())'
+fi
+
 # Install gRPC packages from source (not PyPI) so PR changes are always tested
 $RETRY 3 10 pip install "vllm==${VLLM_VERSION}" -e crates/grpc_client/python/ -e grpc_servicer/
 

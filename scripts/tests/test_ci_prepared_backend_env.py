@@ -1,5 +1,6 @@
 """Exercise setup/install decisions without GPUs, downloads or system changes."""
 
+import json
 import os
 import shutil
 import subprocess
@@ -360,6 +361,81 @@ os.execv({sys.executable!r}, [{sys.executable!r}] + sys.argv[1:])
         self.run_script("ci_ensure_python_headers.sh", TEST_UID="0")
         self.assertIn("apt-get install", self.commands())
         self.assertNotIn("sudo ", self.commands())
+
+    def rocm_cairo_tools(self):
+        self.write_tool(
+            "python3",
+            f"#!{sys.executable}\n"
+            + """
+import json,os,sys
+from pathlib import Path
+args=sys.argv[1:]
+with open(os.environ['TEST_LOG'],'a') as output:
+    output.write('PYTHON_ARGV='+json.dumps(args)+'\\n')
+if args[:2]==['-m','venv']:
+    folder=Path('.venv/bin');folder.mkdir(parents=True,exist_ok=True)
+    (folder/'activate').write_text('export VIRTUAL_ENV="$PWD/.venv"\\n')
+if args[:1]==['-c']:
+    if 'version("vllm")' in args[-1]:print('0.31.0+rocm723 1.78.0')
+    elif 'version("pycairo")' in args[-1]:sys.exit(0 if os.environ.get('TEST_CAIRO_PRESENT')=='1' else 1)
+    elif 'import cairo' in args[-1] and os.environ.get('TEST_CAIRO_NATIVE_FAIL')=='1':sys.exit(7)
+""",
+        )
+        self.write_tool("pip", '#!/bin/sh\necho "pip $*" >> "$TEST_LOG"\n')
+        self.write_tool("pkg-config", '#!/bin/sh\nexit "${TEST_CAIRO_PKG_FAIL:-0}"\n')
+
+    def test_rocm_cairo_skips_usable_packages_and_requires_native_import_after_build(self):
+        self.rocm_cairo_tools()
+        for present, native_fail in ((True, False), (False, False), (False, True)):
+            with self.subTest(present=present, native_fail=native_fail):
+                Path(self.env["TEST_LOG"]).unlink(missing_ok=True)
+                kwargs = dict(
+                    TEST_CAIRO_PRESENT=str(int(present)),
+                    TEST_CAIRO_NATIVE_FAIL=str(int(native_fail)),
+                )
+                if native_fail:
+                    with self.assertRaises(subprocess.CalledProcessError) as error:
+                        self.run_script("ci_setup_vllm_rocm_image.sh", **kwargs)
+                    self.assertEqual(error.exception.returncode, 7)
+                else:
+                    self.run_script("ci_setup_vllm_rocm_image.sh", **kwargs)
+                commands = [
+                    json.loads(line.removeprefix("PYTHON_ARGV="))
+                    for line in self.commands().splitlines()
+                    if line.startswith("PYTHON_ARGV=")
+                ]
+                installs = [args for args in commands if args[:3] == ["-m", "pip", "install"]]
+                self.assertEqual(len(installs), int(not present))
+                if installs:
+                    self.assertIn("--no-deps", installs[0])
+                    self.assertIn("--no-cache-dir", installs[0])
+                    self.assertIn("--no-binary=pycairo", installs[0])
+                    self.assertEqual(
+                        installs[0][-1].split("#sha256=")[1],
+                        "3e69fff74fe64f5ba2dfa31f67c6bdf26413342574047437d2ac520d35e9a489",
+                    )
+                self.assertNotIn("apt-get", self.commands())
+                if native_fail:
+                    self.assertNotIn("pip install vllm", self.commands())
+                else:
+                    self.assertIn("pip install vllm==0.31.0+rocm723", self.commands())
+                    self.assertNotIn("pip install torch", self.commands())
+
+    def test_rocm_cairo_cannot_install_system_packages_outside_root_actions(self):
+        self.rocm_cairo_tools()
+        for actions, uid in (("false", "0"), ("true", "1000")):
+            with self.subTest(actions=actions, uid=uid):
+                Path(self.env["TEST_LOG"]).unlink(missing_ok=True)
+                with self.assertRaises(subprocess.CalledProcessError) as error:
+                    self.run_script(
+                        "ci_setup_vllm_rocm_image.sh",
+                        TEST_CAIRO_PKG_FAIL="1",
+                        GITHUB_ACTIONS=actions,
+                        TEST_UID=uid,
+                    )
+                self.assertIn("root Actions container", error.exception.stderr)
+                self.assertNotIn("apt-get", self.commands())
+                self.assertNotIn("pycairo-1.29.2.tar.gz", self.commands())
 
 
 if __name__ == "__main__":
