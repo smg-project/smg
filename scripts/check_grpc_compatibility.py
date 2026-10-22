@@ -98,7 +98,10 @@ async def client(generated, address):
             ("slow", grpc.StatusCode.DEADLINE_EXCEEDED),
         ]:
             try:
-                await stub.Abort(pb.AbortRequest(request_ids=[request_id]), timeout=0.05)
+                await stub.Abort(
+                    pb.AbortRequest(request_ids=[request_id]),
+                    timeout=0.05 if request_id == "slow" else 3,
+                )
                 raise AssertionError("Expected RPC refusal")
             except grpc.aio.AioRpcError as error:
                 assert error.code() == expected
