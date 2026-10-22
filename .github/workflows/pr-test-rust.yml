@@ -5,11 +5,11 @@ permissions:
   contents: read
   actions: read
 concurrency:
-  group: amd-pd-nixl-close-e915
+  group: amd-pd-nixl-env-close-e915
   cancel-in-progress: false
 jobs:
-  pd-nixl-close-probe:
-    name: pd-nixl-close-probe
+  pd-nixl-env-close:
+    name: pd-nixl-env-close
     runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_8 || '8-gpu-mi300x' }}
     timeout-minutes: 15
     container:
@@ -49,7 +49,7 @@ jobs:
         timeout-minutes: 10
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 .github/amd-pd-close/diagnostic_budget.py
+        run: python3 .github/amd-pd-env/diagnostic_budget.py
       - name: Reap only processes from this job
         if: always() && env.E2E_JOB_MARKER != ''
         timeout-minutes: 2

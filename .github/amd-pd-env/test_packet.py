@@ -28,7 +28,7 @@ def job(monkeypatch, tmp_path):
     now = datetime.datetime.now(datetime.UTC)
     own = dict(
         id=19,
-        name="pd-nixl-close-probe",
+        name="pd-nixl-env-close",
         runner_name="offline-runner",
         status="in_progress",
         head_sha="a" * 40,
@@ -72,7 +72,7 @@ def test_unfrozen_artifacts_fail_before_api(job, tmp_path, monkeypatch):
     record = reuse.consumer_budget()
     p = tmp_path / "budget.json"
     p.write_text(json.dumps(record))
-    monkeypatch.setenv("SMG_PD_CLOSE_BUDGET_FILE", str(p))
+    monkeypatch.setenv("SMG_PD_ENV_BUDGET_FILE", str(p))
     monkeypatch.setattr(reuse, "api_get", lambda *a: pytest.fail("producer API accessed"))
     with pytest.raises(ValueError, match="ready=false"):
         reuse.main()
@@ -83,7 +83,7 @@ def test_budget_receipt_cannot_be_extended(job, tmp_path, monkeypatch):
     record["diagnostic_deadline_epoch"] += 60
     p = tmp_path / "budget.json"
     p.write_text(json.dumps(record))
-    monkeypatch.setenv("SMG_PD_CLOSE_BUDGET_FILE", str(p))
+    monkeypatch.setenv("SMG_PD_ENV_BUDGET_FILE", str(p))
     with pytest.raises(ValueError, match="budget policy"):
         reuse.load_budget()
 
@@ -146,7 +146,7 @@ def interrupt(*args):
 signal.signal(signal.SIGINT,interrupt)
 args=sys.argv[1:]
 with open('commands.jsonl','a') as log:log.write(json.dumps(args)+'\\n')
-record=json.loads(Path(os.environ['SMG_PD_CLOSE_BUDGET_FILE']).read_text())
+record=json.loads(Path(os.environ['SMG_PD_ENV_BUDGET_FILE']).read_text())
 assert record['consumer_job']==19
 Path('diagnostic-results').mkdir(exist_ok=True)
 if os.environ['SLOW']=='1':time.sleep(.7)
@@ -169,7 +169,7 @@ if args[:2]==['-m','venv']:
     result = budget_runner.main()
     elapsed = time.monotonic() - before
     commands = [json.loads(line) for line in (tmp_path / "commands.jsonl").read_text().splitlines()]
-    assert commands[0] == [".github/amd-pd-close/reuse_foundation.py"]
+    assert commands[0] == [".github/amd-pd-env/reuse_foundation.py"]
     assert (
         json.loads((tmp_path / "diagnostic-results/job-budget.json").read_text())[
             "consumer_started_at"

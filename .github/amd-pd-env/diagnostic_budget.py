@@ -8,14 +8,14 @@ from pathlib import Path
 
 import reuse_foundation as reuse
 
-COMMAND = ["bash", ".github/amd-pd-close/run_pd_close.sh"]
+COMMAND = ["bash", ".github/amd-pd-env/run_pd_close.sh"]
 
 
 def main():
     budget = reuse.consumer_budget()
-    path = Path(os.environ["RUNNER_TEMP"]) / f"pd-close-budget-{budget['consumer_job']}.json"
+    path = Path(os.environ["RUNNER_TEMP"]) / f"pd-env-budget-{budget['consumer_job']}.json"
     path.write_text(json.dumps(budget, indent=2) + "\n")
-    env = dict(os.environ, SMG_PD_CLOSE_BUDGET_FILE=str(path))
+    env = dict(os.environ, SMG_PD_ENV_BUDGET_FILE=str(path))
     try:
         remaining = int(1000 * (budget["diagnostic_deadline_epoch"] - time.time())) / 1000
         reuse.require(remaining > 0, "diagnostic budget elapsed before execution")

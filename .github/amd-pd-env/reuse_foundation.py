@@ -132,7 +132,7 @@ def consumer_budget():
     own = [
         j
         for j in consumer_jobs
-        if j["name"] == "pd-nixl-close-probe"
+        if j["name"] == "pd-nixl-env-close"
         and j["runner_name"] == os.environ["RUNNER_NAME"]
         and j["status"] == "in_progress"
         and j["head_sha"] == os.environ["GITHUB_SHA"]
@@ -156,7 +156,7 @@ def consumer_budget():
 
 
 def load_budget():
-    budget = json.loads(Path(os.environ["SMG_PD_CLOSE_BUDGET_FILE"]).read_text())
+    budget = json.loads(Path(os.environ["SMG_PD_ENV_BUDGET_FILE"]).read_text())
     require(
         all(
             budget[key] == os.environ[env]
