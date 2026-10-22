@@ -1,4 +1,4 @@
-name: AMD NIXL controlled close diagnostic
+name: AMD NIXL environment-backed close diagnostic
 on:
   workflow_dispatch:
 permissions:
@@ -25,6 +25,7 @@ jobs:
       E2E_LOG_DIR: e2e-logs
       PYTHONPATH: e2e_test
       PYTEST_ADDOPTS: ''
+      PIP_RETRIES: '0'
       HF_HOME: /models
       HF_HUB_OFFLINE: '1'
       TRANSFORMERS_OFFLINE: '1'
@@ -50,10 +51,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 .github/amd-pd-env/diagnostic_budget.py
-      - name: Reap only processes from this job
+      - name: Reap owned processes and preserve final environment state
         if: always() && env.E2E_JOB_MARKER != ''
-        timeout-minutes: 2
-        run: python3 scripts/ci_reap_job_processes.py "$E2E_JOB_MARKER"
+        timeout-minutes: 3
+        run: |
+          status=0
+          python3 scripts/ci_reap_job_processes.py "$E2E_JOB_MARKER" || status=1
+          if test -f .venv/bin/activate; then source .venv/bin/activate; fi
+          if test -f diagnostic-results/install-complete; then
+            python3 -m pip check > diagnostic-results/pip-check-final.txt 2>&1 || status=1
+            python3 .github/amd-qa/closure_audit.py snapshot diagnostic-results/final-packages.json || status=1
+            python3 .github/amd-pd-env/runtime_environment.py final || status=1
+          fi
+          exit "$status"
       - name: Upload diagnostic evidence including failures
         if: always()
         timeout-minutes: 2
