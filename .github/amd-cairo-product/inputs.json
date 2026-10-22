@@ -1,0 +1,14 @@
+{
+  "ready": false,
+  "product": "04acb7750bfdd329e396040b82494b7fa3c7366b",
+  "image": "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f",
+  "job": "cairo-product-setup",
+  "job_seconds": 300,
+  "core_soft_seconds": 235,
+  "core_kill_grace_seconds": 5,
+  "core_hard_seconds": 240,
+  "cleanup_upload_seconds": 60,
+  "automatic_retry": false,
+  "GPU_device_mapping": false,
+  "models_mount": false
+}
