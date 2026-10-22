@@ -420,6 +420,56 @@ mod tests {
     }
 
     #[test]
+    fn a_call_the_token_limit_cut_inside_an_object_keeps_it_in_its_arguments() {
+        // The report's shape under `length`: the string whole, the object cut inside a nested
+        // string. The arguments are the prefix as written, the cut member's key and bytes
+        // included (before this the member left the call as a failed call's bytes and the
+        // arguments stopped at the string), no closing quote and no brace, the one `Malformed {
+        // UnterminatedRegion }` event of no bytes, nothing dropped as a failed call; whole, one
+        // character at a time and at every two-way cut.
+        let output = concat!(
+            "\n<think></think>\n<tool_call>ChaDri_change_drink\n",
+            "<arg_key>drink_id</arg_key>\n<arg_value>latte</arg_value>\n",
+            "<arg_key>new_preferences</arg_key>\n<arg_value>{\"size\": \"large\", \"temp"
+        );
+        let run = |pieces: &[&str]| {
+            drive_to(
+                &mut Engine::new(glm4(), declared()),
+                PROMPT,
+                pieces,
+                EngineFinish::Length,
+            )
+        };
+        let said = the_same_at_every_cut(run, output);
+        assert_eq!(
+            said.calls,
+            vec![(
+                "ChaDri_change_drink".to_string(),
+                r#"{"drink_id": "latte", "new_preferences": {"size": "large", "temp"#.to_string()
+            )]
+        );
+        assert_eq!(said.finish, Some((FinishReason::Length, 1)));
+        assert_eq!(said.content, "");
+        assert!(serde_json::from_str::<serde_json::Value>(&said.calls[0].1).is_err());
+        let events = run(&[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::UnterminatedRegion)]
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::Dropped {
+                    why: DropReason::MalformedCall,
+                    ..
+                }
+            )),
+            "nothing of the call is a failed call's bytes: {events:?}"
+        );
+    }
+
+    #[test]
     fn a_call_the_model_leaves_open_between_its_pairs_at_its_own_end_is_closed_there_and_said() {
         // The sibling shape: the second call's last value closed, then the end of the output
         // with no `</tool_call>`. Both calls read whole, the second's object closed at the stop,

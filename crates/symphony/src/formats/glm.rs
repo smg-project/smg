@@ -42,9 +42,11 @@ mod tests {
     use super::*;
     use crate::{
         engine::Engine,
-        event::{DropReason, Event, MalformedReason, Text},
+        event::{DropReason, Event, FinishReason, MalformedReason, Text},
         input::EngineFinish,
-        testing::{arguments_of, bytes, content, drive, drive_to, reasoning},
+        testing::{
+            arguments_of, bytes, content, drive, drive_to, reasoning, the_same_at_every_cut,
+        },
         Declared,
     };
 
@@ -292,6 +294,44 @@ mod tests {
             event,
             Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
         )));
+        // The same call cut inside its object value, which the assembler holds for its close:
+        // the member leaves as written, the cut member's key and bytes included, nothing of the
+        // call is a failed call's bytes, and the finish is `length`; whole, one character at a
+        // time and at every two-way cut.
+        let output = concat!(
+            "</think><tool_call>ChaDri_change_drink<arg_key>drink_id</arg_key><arg_value>latte",
+            "</arg_value><arg_key>new_preferences</arg_key><arg_value>{\"size\": \"large\", \"temp"
+        );
+        let cut = |pieces: &[&str]| {
+            drive_to(
+                &mut Engine::new(glm(), declared()),
+                PROMPT,
+                pieces,
+                EngineFinish::Length,
+            )
+        };
+        let said = the_same_at_every_cut(cut, output);
+        assert_eq!(
+            said.calls,
+            vec![(
+                "ChaDri_change_drink".to_string(),
+                r#"{"drink_id": "latte", "new_preferences": {"size": "large", "temp"#.to_string()
+            )]
+        );
+        assert_eq!(said.finish, Some((FinishReason::Length, 1)));
+        assert_eq!(said.content, "");
+        let events = cut(&[output]);
+        assert_eq!(bytes(&events), output);
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::Dropped {
+                    why: DropReason::MalformedCall,
+                    ..
+                }
+            )),
+            "nothing of the call is a failed call's bytes: {events:?}"
+        );
     }
 
     #[test]

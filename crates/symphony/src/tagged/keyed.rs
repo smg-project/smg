@@ -31,11 +31,11 @@
 
 use super::object::{Mode, Object};
 use crate::{
-    event::{runs, Event, Events, MalformedReason, Text},
+    event::{runs, DropReason, Event, Events, MalformedReason, Text},
     markers::{Piece, Scanner},
     tagged::{
         drop_refused, end_cut_call, held_text, refuse,
-        value::{json, Kind},
+        value::{cut as cut_json, json, Kind},
     },
     Declared,
 };
@@ -305,23 +305,87 @@ impl Assembler {
     }
 
     /// The stream was cut: nothing is closed, so arguments cut short never look complete to a
-    /// client. A streamed string's open fragment stays open; a call that started still ends, with
-    /// no bytes of its own, as every assembler ends one, everything it held refused, after the one
-    /// `Malformed { UnterminatedRegion }` event of no bytes that says that its arguments are no
-    /// whole value ([`end_cut_call`]); what a block that named no call held is refused as
-    /// `UnterminatedRegion` too.
+    /// client, and the call's bytes stay the call's. A streamed string's open fragment stays
+    /// open, the bytes the scanner held as a start of a tag its text, since no tag followed; a
+    /// value held for its close leaves as the call's own fragment, its key and its bytes as the
+    /// model wrote them (`, "prefs": {"size": "large", "temp`) where they are a strict prefix of
+    /// a JSON value and as the opening of a string holding them where they are not
+    /// ([`cut_json`]), since a client reads the prefix as written under `length`, the member is
+    /// never lost (before this the held value was refused, and the call said nothing of it) and
+    /// every fragment keeps the arguments a strict JSON prefix, a start of a tag held behind it
+    /// leaving after the call's end as the syntax's wrapping; a
+    /// string whose key came and no byte of it opens, `{"key": "`; a key whose two tags came and
+    /// whose value tag did not opens its member, `"key": `, and a start of the value tag leaves
+    /// after the call's end as the syntax's wrapping; a key tag the cut found open and the
+    /// template's whitespace between pairs leave as wrapping too ([`DropReason::Wrapper`]). A
+    /// call that started still ends, with no bytes of its own, as every assembler ends one,
+    /// after the one `Malformed { UnterminatedRegion }` event of no bytes that says that its
+    /// arguments are no whole value ([`end_cut_call`]); what a block that named no call held is
+    /// refused as `UnterminatedRegion`.
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
         }
-        let held = self.scanner.held().to_string();
-        self.object.carried.push_str(&held);
-        if self.started() {
-            drop_refused(std::mem::take(&mut self.object.carried), out);
-            end_cut_call(self.object.index, String::new(), "", out);
-        } else {
+        let tail = self.scanner.set_aside();
+        if !self.started() {
+            self.object.carried.push_str(&tail);
             self.object.refuse(MalformedReason::UnterminatedRegion, out);
+            self.done = true;
+            return;
         }
+        let cut_tag = match std::mem::replace(&mut self.stage, Stage::Between) {
+            Stage::Value(ValueState {
+                key,
+                start,
+                mut mode,
+                ..
+            }) => {
+                match mode {
+                    Mode::Streaming { opened: false } if tail.is_empty() => {
+                        let opening = self.object.member(&key, "\"");
+                        let source = Text::uncounted(std::mem::take(&mut self.object.carried));
+                        self.object.push_fragment(opening, source, out);
+                    }
+                    Mode::Streaming { .. } => {
+                        self.object.value_bytes(&key, start, &mut mode, &tail, out);
+                    }
+                    Mode::Whole | Mode::Undecided => {
+                        let raw = cut_json(held_text(&self.object.carried, start, None));
+                        let member = self.object.member(&key, &raw);
+                        let source = Text::uncounted(std::mem::take(&mut self.object.carried));
+                        self.object.push_fragment(member, source, out);
+                        return self.end_cut(tail, out);
+                    }
+                }
+                None
+            }
+            Stage::Keyed { key } => {
+                let member = self.object.member(&key, "");
+                let source = Text::uncounted(std::mem::take(&mut self.object.carried));
+                self.object.push_fragment(member, source, out);
+                (!tail.is_empty()).then_some(tail)
+            }
+            Stage::Key { .. } | Stage::Between | Stage::Name => {
+                self.object.carried.push_str(&tail);
+                self.object.drop_carried(out);
+                None
+            }
+        };
+        self.end_cut(cut_tag.unwrap_or_default(), out);
+    }
+
+    /// The cut call's end ([`Self::finish`]): the one `Malformed { UnterminatedRegion }` event of
+    /// no bytes and `ToolCallEnd`, then `tag`, a start of a tag the cut left short behind a value
+    /// or a key, as the syntax's wrapping, so that every byte keeps its place.
+    fn end_cut(&mut self, tag: String, out: &mut Events) {
+        end_cut_call(self.object.index, String::new(), "", out);
+        if !tag.is_empty() {
+            out.push(Event::Dropped {
+                text: Text::uncounted(tag),
+                why: DropReason::Wrapper,
+            });
+        }
+        self.done = true;
     }
 
     /// The stream's stop inside the call: the model's own end of output, not a cut. The call ends
@@ -563,7 +627,7 @@ mod tests {
     use serde_json::json as value;
 
     use super::*;
-    use crate::{event::DropReason, testing::bytes};
+    use crate::testing::bytes;
 
     const CLOSE: &str = "</tool_call>";
 
@@ -827,15 +891,17 @@ mod tests {
             [Event::Malformed { .. }, Event::ToolCallEnd { .. }]
         ));
         assert_eq!(bytes(&events), "f<arg_key>s</arg_key><arg_value>Pa");
-        // A value held for its close is refused, and the one event has no bytes.
+        // A value held for its close is the call's own fragment, its key and its bytes as
+        // written; nothing of the block is refused, and the one event has no bytes.
         let events = run(&["f<arg_key>n</arg_key><arg_value>12"], true);
-        assert_eq!(fragments(&events), Vec::<&str>::new());
+        assert_eq!(fragments(&events), [r#"{"n": 12"#]);
         assert_eq!(
             malformed(&events),
             [("", MalformedReason::UnterminatedRegion)]
         );
-        assert_eq!(refused(&events), ["<arg_key>n</arg_key><arg_value>12"]);
+        assert!(refused(&events).is_empty(), "{events:?}");
         assert_eq!(ends(&events), [""]);
+        assert_eq!(bytes(&events), "f<arg_key>n</arg_key><arg_value>12");
         // A block with no name at all, cut: the tag before any name and the text after it are
         // refused as they arrive, nothing is held at the cut, and no call started.
         let events = run(&["<arg_key>a"], true);
@@ -849,6 +915,120 @@ mod tests {
             ]
         );
         assert_eq!(refused(&events), ["<arg_key>", "a"]);
+    }
+
+    /// A call the end of the stream cut inside a value held for its close, inside a streamed
+    /// string, after a key's tags, inside a key tag or between pairs: the member leaves as the
+    /// call's own fragment, its key and its bytes as written (an object, an integer, a string
+    /// that may still be null, an undeclared key's text, the start of a tag held inside the
+    /// value included), a string whose key came opens, a key whose value tag never came opens
+    /// its member, a key tag cut short and the template's whitespace leave as wrapping, nothing
+    /// is refused and nothing reaches a chat client as content, and the one `Malformed` event of
+    /// no bytes still says that the arguments are no whole value before the call's end; whole
+    /// and one character at a time.
+    #[test]
+    fn a_value_the_stream_end_cuts_leaves_as_the_calls_own_bytes_and_nothing_is_lost() {
+        let cases: [(&str, &str, &[&str]); 16] = [
+            // A declared string: streamed as it came, a held start of a tag its text.
+            ("f<arg_key>s</arg_key><arg_value>Pa", r#"{"s": "Pa"#, &[]),
+            ("f<arg_key>s</arg_key><arg_value>Pa<", r#"{"s": "Pa<"#, &[]),
+            (
+                "f<arg_key>s</arg_key><arg_value>Pa</arg_v",
+                r#"{"s": "Pa</arg_v"#,
+                &[],
+            ),
+            // The key of a string came and no byte of it: the string opens.
+            ("f<arg_key>s</arg_key><arg_value>", r#"{"s": ""#, &[]),
+            // A value held for its close: as written where that is a JSON prefix, a start of a
+            // tag held behind it leaving after the call's end; a word that is no literal is the
+            // opening of the string it would be written as.
+            ("f<arg_key>n</arg_key><arg_value>12", r#"{"n": 12"#, &[]),
+            (
+                "f<arg_key>n</arg_key><arg_value>12</arg_v",
+                r#"{"n": 12"#,
+                &["</arg_v"],
+            ),
+            ("f<arg_key>x</arg_key><arg_value>hel", r#"{"x": "hel"#, &[]),
+            ("f<arg_key>n</arg_key><arg_value>", r#"{"n": "#, &[]),
+            (
+                "f<arg_key>o</arg_key><arg_value>{\"size\": \"large\", \"temp",
+                r#"{"o": {"size": "large", "temp"#,
+                &[],
+            ),
+            ("f<arg_key>ns</arg_key><arg_value>nu", r#"{"ns": nu"#, &[]),
+            ("f<arg_key>x</arg_key><arg_value>tr", r#"{"x": tr"#, &[]),
+            // The key's two tags came and the value tag did not: the member opens; a start of
+            // the value tag leaves after the call's end.
+            ("f<arg_key>n</arg_key>", r#"{"n": "#, &[]),
+            ("f<arg_key>n</arg_key>\n<arg_v", r#"{"n": "#, &["<arg_v"]),
+            // Inside a key tag, and between pairs with a start of the next key tag: wrapping.
+            ("f<arg_key>n", "", &["<arg_key>n"]),
+            (
+                "f<arg_key>s</arg_key><arg_value>Paris</arg_value>\n<arg_k",
+                r#"{"s": "Paris""#,
+                &["\n<arg_k"],
+            ),
+            (
+                "f<arg_key>s</arg_key><arg_value>Paris</arg_value>",
+                r#"{"s": "Paris""#,
+                &[],
+            ),
+        ];
+        for (call, expected, wrapping) in cases {
+            let characters: Vec<&str> = call
+                .char_indices()
+                .map(|(at, c)| &call[at..at + c.len_utf8()])
+                .collect();
+            for (how, pieces) in [("whole", vec![call]), ("by character", characters)] {
+                let events = run(&pieces, true);
+                assert_eq!(bytes(&events), call, "{call:?} {how}");
+                assert_eq!(arguments(&events), expected, "{call:?} {how}: {events:?}");
+                // The contract of every fragment: the arguments so far are a strict prefix of a
+                // JSON value, one `serde_json` reads whole or stops reading only at its end.
+                let strict_prefix = match serde_json::from_str::<serde_json::Value>(expected) {
+                    Ok(_) => true,
+                    Err(error) => error.is_eof(),
+                };
+                assert!(
+                    strict_prefix,
+                    "{call:?}: no JSON value begins with {expected:?}"
+                );
+                assert!(refused(&events).is_empty(), "{call:?} {how}: {events:?}");
+                assert_eq!(
+                    malformed(&events),
+                    [("", MalformedReason::UnterminatedRegion)],
+                    "{call:?} {how}: {events:?}"
+                );
+                let ended = events
+                    .iter()
+                    .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+                    .expect("the call ends");
+                assert!(
+                    matches!(
+                        &events[ended - 1..],
+                        [Event::Malformed { .. }, Event::ToolCallEnd { source, .. }]
+                            | [
+                                Event::Malformed { .. },
+                                Event::ToolCallEnd { source, .. },
+                                Event::Dropped { why: DropReason::Wrapper, .. }
+                            ] if source.text.is_empty()
+                    ),
+                    "{call:?} {how}: {events:?}"
+                );
+                let dropped_after_the_start: Vec<&str> = events
+                    .iter()
+                    .skip_while(|event| !matches!(event, Event::ToolCallStart { .. }))
+                    .filter_map(|event| match event {
+                        Event::Dropped { text, .. } => Some(&*text.text),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    dropped_after_the_start, wrapping,
+                    "{call:?} {how}: {events:?}"
+                );
+            }
+        }
     }
 
     /// The call's closing marker inside a streamed string: the model ended the call, so the
@@ -932,7 +1112,9 @@ mod tests {
         for (output, cut) in [
             // The shapes of a live cell's botched blocks: a name with a space, a key tag that
             // never opened, a key a value close cut short, a value close written twice, a call
-            // written as Python with tags inside, an empty key; and the cut ones.
+            // written as Python with tags inside, an empty key; and the cut ones (a value held
+            // for its close that the stream's end cuts is the call's own, not a refusal: see the
+            // cut tests).
             (
                 "probability_dice roll<arg_key>n</arg_key><arg_value>2</arg_value>",
                 false,
@@ -945,7 +1127,7 @@ mod tests {
             ),
             ("f(base</arg_key>3,exponent</arg_key>5)", false),
             ("f<arg_key></arg_key><arg_value>x</arg_value>", false),
-            ("f<arg_key>n</arg_key><arg_value>12", true),
+            ("f<arg_key></arg_key><arg_value>x", true),
             ("<arg_key>a", true),
         ] {
             let end = if cut { "" } else { CLOSE };
