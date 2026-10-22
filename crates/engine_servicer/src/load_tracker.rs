@@ -147,11 +147,8 @@ impl LoadTracker {
         }
     }
 
-    /// `rank` streamed `tokens` to the client just now.
-    pub(crate) fn generated(&self, rank: i32, tokens: u32) {
-        self.generated_at(rank, tokens, Instant::now());
-    }
-
+    /// `rank` streamed `tokens` to the client at `at` (the instant the
+    /// caller already read for its own bookkeeping).
     pub(crate) fn generated_at(&self, rank: i32, tokens: u32, at: Instant) {
         if tokens == 0 {
             return;

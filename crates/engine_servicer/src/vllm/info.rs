@@ -2,10 +2,7 @@
 //! Metadata comes from the launcher's config (what the Python servicer reads
 //! off vLLM's `ModelConfig`) and from the engine handshake.
 
-use std::{
-    sync::{atomic::Ordering, Arc},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::ZmqEngineClient;
 use smg_grpc_client::vllm_proto as vllm;
@@ -32,8 +29,8 @@ pub(super) async fn log_engine_stats(state: Arc<State>) {
         let Some(client) = state.engine.client.get() else {
             continue;
         };
-        let prompt = state.stats.prompt_tokens.load(Ordering::Relaxed);
-        let generation = state.stats.generation_tokens.load(Ordering::Relaxed);
+        let prompt = state.metrics.prompt_tokens_total();
+        let generation = state.metrics.generation_tokens_total();
         let prompt_delta = prompt.saturating_sub(last_prompt);
         let generation_delta = generation.saturating_sub(last_generation);
         (last_prompt, last_generation) = (prompt, generation);

@@ -32,6 +32,7 @@ impl VllmEngine for VllmEngineService {
         let trace_headers = crate::trace_context::trace_headers(request.metadata());
         generate::generate(&self.state, request.into_inner(), trace_headers)
             .await
+            .inspect_err(|status| self.state.metrics.request_not_started(status))
             .map(Response::new)
     }
 

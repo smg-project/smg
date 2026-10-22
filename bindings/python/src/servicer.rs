@@ -690,6 +690,7 @@ impl PyVllmGrpcServer {
         engine_startup_ceiling_secs = None,
         engine_silence_timeout_secs = None,
         engine_prefill_tokens_per_sec = None,
+        metrics_bind_address = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -741,6 +742,7 @@ impl PyVllmGrpcServer {
         engine_startup_ceiling_secs: Option<f64>,
         engine_silence_timeout_secs: Option<f64>,
         engine_prefill_tokens_per_sec: Option<i64>,
+        metrics_bind_address: Option<String>,
     ) -> PyResult<Self> {
         if media_processor.is_some() && smg_media_processor.is_some() {
             return Err(PyValueError::new_err(
@@ -804,6 +806,7 @@ impl PyVllmGrpcServer {
             engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
             engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
             engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
+            metrics_bind_address,
         };
         let mut config = VllmServicerConfig {
             servicer,
@@ -863,6 +866,13 @@ impl PyVllmGrpcServer {
     #[getter]
     fn address(&self) -> String {
         self.inner.address()
+    }
+
+    /// The metrics listener's bound `ip:port`; `None` when the server was
+    /// built without `metrics_bind_address`.
+    #[getter]
+    fn metrics_address(&self) -> Option<String> {
+        self.inner.metrics_address()
     }
 
     #[getter]
@@ -976,6 +986,7 @@ impl PyTokenSpeedGrpcServer {
         engine_startup_ceiling_secs = None,
         engine_silence_timeout_secs = None,
         engine_prefill_tokens_per_sec = None,
+        metrics_bind_address = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1017,6 +1028,7 @@ impl PyTokenSpeedGrpcServer {
         engine_startup_ceiling_secs: Option<f64>,
         engine_silence_timeout_secs: Option<f64>,
         engine_prefill_tokens_per_sec: Option<i64>,
+        metrics_bind_address: Option<String>,
     ) -> PyResult<Self> {
         let model = TokenSpeedModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
@@ -1058,6 +1070,7 @@ impl PyTokenSpeedGrpcServer {
             engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
             engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
             engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
+            metrics_bind_address,
         };
         let config = TokenSpeedServicerConfig { servicer, model };
         let inner = py
@@ -1070,6 +1083,13 @@ impl PyTokenSpeedGrpcServer {
     #[getter]
     fn address(&self) -> String {
         self.inner.address()
+    }
+
+    /// The metrics listener's bound `ip:port`; `None` when the server was
+    /// built without `metrics_bind_address`.
+    #[getter]
+    fn metrics_address(&self) -> Option<String> {
+        self.inner.metrics_address()
     }
 
     #[getter]
@@ -1182,6 +1202,7 @@ impl PySglangGrpcServer {
         engine_startup_ceiling_secs = None,
         engine_silence_timeout_secs = None,
         engine_prefill_tokens_per_sec = None,
+        metrics_bind_address = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn new(
@@ -1221,6 +1242,7 @@ impl PySglangGrpcServer {
         engine_startup_ceiling_secs: Option<f64>,
         engine_silence_timeout_secs: Option<f64>,
         engine_prefill_tokens_per_sec: Option<i64>,
+        metrics_bind_address: Option<String>,
     ) -> PyResult<Self> {
         let model = SglangModelInfo {
             served_model_name: served_model_name.unwrap_or_else(|| model_path.clone()),
@@ -1260,6 +1282,7 @@ impl PySglangGrpcServer {
             engine_startup_ceiling: startup_ceiling(engine_startup_ceiling_secs)?,
             engine_silence_timeout: silence_timeout(engine_silence_timeout_secs)?,
             engine_prefill_tokens_per_sec: prefill_tokens_per_sec(engine_prefill_tokens_per_sec)?,
+            metrics_bind_address,
         };
         let config = SglangServicerConfig { servicer, model };
         let inner = py
@@ -1272,6 +1295,13 @@ impl PySglangGrpcServer {
     #[getter]
     fn address(&self) -> String {
         self.inner.address()
+    }
+
+    /// The metrics listener's bound `ip:port`; `None` when the server was
+    /// built without `metrics_bind_address`.
+    #[getter]
+    fn metrics_address(&self) -> Option<String> {
+        self.inner.metrics_address()
     }
 
     #[getter]

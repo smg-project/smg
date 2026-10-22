@@ -240,6 +240,31 @@ if resolve_servicer_impl(args) == "rust":
     raise SystemExit(await serve_rust(args))
 ```
 
+##### Metrics (`--metrics-port`)
+
+The Rust servicer serves Prometheus metrics on a listener of its own when
+asked: `--metrics-port <port>` (`--metrics-host` picks the interface; it
+defaults to the gRPC `--host`), or the environment form
+`SMG_VLLM_SERVICER_METRICS_PORT` / `SMG_VLLM_SERVICER_METRICS_HOST` that the
+flags override. Without either, no endpoint. The families are the same on every
+engine (`smg_servicer_*`, labels `model`, `rank`, `wire`): requests by finish
+reason, refusals, errors, in-flight requests, prompt / cached / generated
+tokens, and the time-to-first-token, inter-token, per-request-mean and
+end-to-end latency histograms (vLLM's own bucket edges), plus the servicer's
+lifecycle state and start time. The listener binds beside the gRPC one, before
+the engine connects (a scrape during the engine's start answers
+`smg_servicer_state{state="starting"} 1`; a readiness hold with admission open
+reads `warming_up`, a drain `draining`), runs on its own thread, and closes
+with the servicer; a port equal to `--port` is refused before the engine
+starts, and the flag needs `--servicer-impl rust` (the Python servicer exposes
+no endpoint). A planned warm-up's own requests go through the request path
+and are counted like any other, so the first scrapes include them.
+
+```bash
+vllm serve Qwen/Qwen3-0.6B --grpc --port 50051 --servicer-impl rust --metrics-port 29100
+curl -s http://127.0.0.1:29100/metrics | grep smg_servicer_requests_total
+```
+
 ##### Supported vLLM releases
 
 The switch binds `serve_grpc` in the launcher module of the installed release
@@ -707,6 +732,23 @@ every turn the grammar of the model's response template table where that table
 spells whole turns; otherwise it constrains the calls a tool request allows under
 `auto`.
 
+#### Metrics (`--metrics-port`)
+
+With `--servicer-impl rust`, `--metrics-port <port>` (and `--metrics-host`,
+defaulting to the gRPC `--host`) serves the Rust servicer's Prometheus metrics
+on a listener of its own; `SMG_TOKENSPEED_SERVICER_METRICS_PORT` /
+`SMG_TOKENSPEED_SERVICER_METRICS_HOST` are the environment forms the flags
+override, and without either there is no endpoint. The families and labels are
+the ones every engine's Rust servicer exposes (see the vLLM section above):
+requests by finish reason, refusals, errors, in-flight requests, prompt /
+cached / generated tokens, the latency histograms, the lifecycle state. A port
+equal to `--port` is refused before the engine starts, and the flag is refused
+under the Python servicer, which exposes no endpoint.
+
+```bash
+python -m smg_grpc_servicer.tokenspeed --model <model> --port 50051 --servicer-impl rust --metrics-port 29100
+```
+
 #### Multi-node engines: the worker pod's liveness
 
 An engine whose tensor-parallel ranks span pods is launched on every pod with
@@ -880,6 +922,26 @@ and `SMG_SGLANG_SERVICER_PREFILL_TOKENS_PER_SEC` (default 2000; the connected
 scheduler's silence bound and its prefill allowance as for TokenSpeed above:
 this wire too carries token batches only), `SMG_ZMQ_SOCKET_DIR`,
 `SMG_SERVICER_WORKER_THREADS`.
+
+#### Metrics (`--metrics-port`)
+
+With `--servicer-impl rust`, `--metrics-port <port>` (and `--metrics-host`,
+defaulting to the gRPC `--host`) serves the Rust servicer's Prometheus metrics
+on a listener of its own; `SMG_SGLANG_SERVICER_METRICS_PORT` /
+`SMG_SGLANG_SERVICER_METRICS_HOST` are the environment forms the flags
+override, and without either there is no endpoint. The flags are this package's
+(the same plugin that adds `--servicer-impl`); a `SGLANG_PLUGINS` whitelist
+without `smg-servicer` removes them, not the environment form. The families
+and labels are the ones every engine's Rust servicer exposes (see the vLLM
+section above); the scheduler matches string stops itself, so this servicer
+has no `smg_servicer_string_stops_total` series. A port equal to `--port` is
+refused before the scheduler starts, and the flag is refused under the Python
+servicer, which exposes no endpoint (SGLang's own HTTP sidecar is not started
+on the Rust path either).
+
+```bash
+sglang serve --model-path Qwen/Qwen3-0.6B --grpc-mode --port 30000 --servicer-impl rust --metrics-port 29100
+```
 
 #### Headless over ZMQ (no SGLang change)
 

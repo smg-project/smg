@@ -70,6 +70,16 @@ fn parse_worker_threads(value: Option<&str>) -> usize {
         .unwrap_or(DEFAULT_WORKER_THREADS)
 }
 
+/// The runtime a [`ServerThread`] drives its server on.
+#[derive(Clone, Copy)]
+enum RuntimeShape {
+    /// The request runtime: [`DEFAULT_WORKER_THREADS`] workers (or the
+    /// override), each on its own thread.
+    Servicer,
+    /// A current-thread runtime on the server's own thread alone.
+    CurrentThread,
+}
+
 /// A gRPC server on a dedicated runtime thread: `start` returns once the
 /// listener is bound (so the address is known and probes get a refusal, not a
 /// hang, from then on), the service future runs until `stop` or exit, and
@@ -96,6 +106,34 @@ impl ServerThread {
         F: FnOnce(TcpListener, Shutdown, SharedError) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), String>>,
     {
+        Self::start_inner(name, bind_address, RuntimeShape::Servicer, serve)
+    }
+
+    /// [`Self::start`] on a current-thread runtime: everything the server
+    /// does runs on its own OS thread, and nothing of it touches the
+    /// request runtime's workers (the metrics listener).
+    pub(crate) fn start_current_thread<F, Fut>(
+        name: &str,
+        bind_address: &str,
+        serve: F,
+    ) -> Result<Self, ServicerError>
+    where
+        F: FnOnce(TcpListener, Shutdown, SharedError) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>>,
+    {
+        Self::start_inner(name, bind_address, RuntimeShape::CurrentThread, serve)
+    }
+
+    fn start_inner<F, Fut>(
+        name: &str,
+        bind_address: &str,
+        shape: RuntimeShape,
+        serve: F,
+    ) -> Result<Self, ServicerError>
+    where
+        F: FnOnce(TcpListener, Shutdown, SharedError) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>>,
+    {
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<Duration>();
@@ -113,14 +151,19 @@ impl ServerThread {
         let thread = thread::Builder::new()
             .name(name.to_string())
             .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(parse_worker_threads(
-                        std::env::var(WORKER_THREADS_ENV).ok().as_deref(),
-                    ))
-                    .thread_name("smg-servicer-rt")
-                    .enable_all()
-                    .build()
-                {
+                let mut builder = match shape {
+                    RuntimeShape::Servicer => {
+                        let mut builder = tokio::runtime::Builder::new_multi_thread();
+                        builder
+                            .worker_threads(parse_worker_threads(
+                                std::env::var(WORKER_THREADS_ENV).ok().as_deref(),
+                            ))
+                            .thread_name("smg-servicer-rt");
+                        builder
+                    }
+                    RuntimeShape::CurrentThread => tokio::runtime::Builder::new_current_thread(),
+                };
+                let runtime = match builder.enable_all().build() {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = started_tx.send(Err(format!("failed to create runtime: {error}")));

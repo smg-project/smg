@@ -41,6 +41,7 @@ from smg_grpc_servicer.hostport import host_port, loopback_target
 
 # The switch's flag and choices live with the plugins' registration (stdlib
 # only); re-exported here as this module's documented values.
+from smg_grpc_servicer.metrics_flag import METRICS_PORT_FLAG
 from smg_grpc_servicer.servicer_impl_flag import (  # noqa: F401
     IMPLS,
     SERVICER_IMPL_FLAG,
@@ -236,6 +237,82 @@ def env_port(name: str, *, environ: Mapping[str, str] | None = None) -> int | No
     if not 1 <= value <= 65535:
         raise ServicerConfigError(f"{name}={raw!r} must be between 1 and 65535")
     return value
+
+
+def metrics_port(
+    args: Any, env_name: str, *, environ: Mapping[str, str] | None = None
+) -> int | None:
+    """The port the Rust servicer serves Prometheus metrics on, or ``None``
+    for no endpoint: ``--metrics-port`` when the launcher's namespace carries
+    it (``args.metrics_port``), else ``environ[env_name]``, else none. The
+    flag's action exports its value under the variable on every launcher, so
+    a launcher whose namespace keeps only the engine's own fields reads the
+    flag through the variable too. 0 binds an ephemeral port (tests); any
+    other value outside 1 to 65535 is a :class:`ServicerConfigError` naming
+    the flag and the variable."""
+    source = os.environ if environ is None else environ
+    value = getattr(args, "metrics_port", None) if args is not None else None
+    origin = METRICS_PORT_FLAG
+    if value is None:
+        raw = source.get(env_name)
+        if raw is None or not raw.strip():
+            return None
+        origin = env_name
+        try:
+            value = int(raw)
+        except ValueError:
+            raise ServicerConfigError(f"{env_name}={raw!r} is not a port number") from None
+    if not 0 <= int(value) <= 65535:
+        raise ServicerConfigError(f"{origin}={value!r} must be a port between 0 and 65535")
+    return int(value)
+
+
+def metrics_bind_address(
+    args: Any,
+    *,
+    port_env: str,
+    host_env: str,
+    environ: Mapping[str, str] | None = None,
+) -> str | None:
+    """Where the Rust servicer serves ``GET /metrics``, as ``host:port`` (an
+    IPv6 host bracketed), or ``None`` for no endpoint: the port from
+    :func:`metrics_port`; the host from ``--metrics-host``
+    (``args.metrics_host``), else ``environ[host_env]``, else the gRPC
+    listener's host (``args.host``; every interface when unset, as the gRPC
+    bind). A metrics port equal to the gRPC port (``args.port``) is a
+    :class:`ServicerConfigError`: the listener could not bind beside the
+    gRPC one, and the error belongs before the engine starts."""
+    source = os.environ if environ is None else environ
+    port = metrics_port(args, port_env, environ=source)
+    if port is None:
+        return None
+    grpc_port = int(getattr(args, "port", 0) or 0)
+    if port and port == grpc_port:
+        raise ServicerConfigError(
+            f"{METRICS_PORT_FLAG}={port} is the gRPC port: the metrics listener needs a port "
+            f"of its own (or 0 for an ephemeral one)"
+        )
+    host = getattr(args, "metrics_host", None) if args is not None else None
+    if not host:
+        host = source.get(host_env) or None
+    if not host:
+        host = getattr(args, "host", None) or "0.0.0.0"
+    return host_port(host, port)
+
+
+def check_metrics_port_needs_rust(
+    impl: str, args: Any, env_name: str, *, environ: Mapping[str, str] | None = None
+) -> None:
+    """A metrics port given (the flag or its variable) with the Python
+    servicer selected is a :class:`ServicerConfigError`: the Python servicer
+    exposes no metrics endpoint, and a port nobody will serve is a
+    misconfiguration best refused before the engine starts."""
+    if impl == "rust" or metrics_port(args, env_name, environ=environ) is None:
+        return
+    raise ServicerConfigError(
+        f"{METRICS_PORT_FLAG} (or {env_name}) needs {SERVICER_IMPL_FLAG} rust: the Python "
+        "servicer exposes no metrics endpoint"
+    )
 
 
 def free_port() -> int:
@@ -1287,6 +1364,10 @@ class RustLauncher:
     silence_timeout_secs_env: str
     prefill_tokens_per_sec_env: str
     kv_events_env: str
+    # The metrics endpoint's variables (the fallbacks of --metrics-port and
+    # --metrics-host; see :func:`metrics_bind_address`).
+    metrics_port_env: str
+    metrics_host_env: str
     # What the servicer loses without a local tokenizer directory, for the warning.
     without_tokenizer: str
     # The planned warm-up's knob (:mod:`smg_grpc_servicer.warmup`); a launcher
@@ -1343,6 +1424,20 @@ class RustLauncher:
         host = getattr(args, "host", None) or "0.0.0.0"
         return host_port(host, int(getattr(args, "port", 0) or 0))
 
+    def metrics_bind_address(
+        self, args: Any, environ: Mapping[str, str] | None = None
+    ) -> str | None:
+        """Where the Rust server serves Prometheus metrics, or ``None`` for no
+        endpoint (:func:`metrics_bind_address` with this launcher's
+        variables): ``--metrics-port``, else the variable, else none; the
+        host from ``--metrics-host``, its variable, else the gRPC host."""
+        return metrics_bind_address(
+            args,
+            port_env=self.metrics_port_env,
+            host_env=self.metrics_host_env,
+            environ=environ,
+        )
+
     def server_extras(self, args: Any, tokenizer_dir: str | None) -> dict[str, Any]:
         """Further keyword arguments of the Rust server (none by default)."""
         return {}
@@ -1393,6 +1488,9 @@ class RustLauncher:
             engine_count,
             self.counted,
         )
+        metrics_address = getattr(server, "metrics_address", None)
+        if metrics_address:
+            logger.info("Prometheus metrics on http://%s/metrics", metrics_address)
         logger.info(
             "%s startup bounds: %gs without a sign of life (%s), ceiling %s (%s); "
             "the handshake waits while the %s process is alive",
@@ -1441,6 +1539,10 @@ class RustLauncher:
         if self.warmup_env:
             plan = plan_for(warmup_setting, self.warmup_inputs(args, facts), knob=self.warmup_env)
         handshake_port = knobs.handshake_port or free_port()
+        # The metrics endpoint, resolved and checked before the port is
+        # bound and the engine starts (a clash with the gRPC port is refused
+        # here, not by a bind after the engine loaded).
+        metrics_bind_address = self.metrics_bind_address(args)
         server = getattr(servicer, self.server_class)(
             bind_address=self.bind_address(args),
             # Per process, not per requested port: `--port 0` launchers would
@@ -1453,6 +1555,7 @@ class RustLauncher:
             engine_startup_ceiling_secs=knobs.startup_ceiling_secs,
             engine_silence_timeout_secs=knobs.silence_timeout_secs,
             engine_prefill_tokens_per_sec=knobs.prefill_tokens_per_sec,
+            metrics_bind_address=metrics_bind_address,
             **self.server_extras(args, tokenizer_dir),
             **facts,
         )

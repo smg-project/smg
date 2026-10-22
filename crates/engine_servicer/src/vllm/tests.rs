@@ -50,7 +50,7 @@ use zip::{CompressionMethod, ZipArchive};
 use super::*;
 use crate::{
     kv_events,
-    testing::{servicer_config, Bounded},
+    testing::{assert_bucket_edges, assert_golden, http_get, servicer_config, Bounded},
     tokenizer_bundle, ServicerError,
 };
 
@@ -3952,4 +3952,694 @@ async fn the_configured_silence_bound_and_prefill_allowance_reach_the_engine_lin
         "given up on at the window plus the prompt's allowance, not before or much after: {elapsed:?}"
     );
     server.stop(Duration::from_secs(5)).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Metrics: the `/metrics` listener and the families the request path records.
+// ---------------------------------------------------------------------------
+
+/// A bound servicer with its metrics listener on an ephemeral port, a
+/// handshaken mock engine and a gRPC client.
+async fn metrics_harness(model: VllmModelInfo, tokenizer: Option<Arc<dyn Tokenizer>>) -> Harness {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let mut config = config(dir.path(), &handshake, model);
+    config.servicer.metrics_bind_address = Some("127.0.0.1:0".to_string());
+    let server = match tokenizer {
+        Some(tokenizer) => VllmServicerServer::start_with_tokenizer(config, tokenizer),
+        None => VllmServicerServer::start(config),
+    }
+    .expect("servicer starts");
+    let engine = connect_to_frontend(
+        &handshake,
+        EngineId::from_engine_index(0),
+        default_ready_response(),
+    )
+    .await
+    .expect("mock engine handshake");
+    wait_until(|| server.engine_ready()).await;
+    let client = VllmEngineClient::new(grpc_channel(server.address()).await);
+    let (engine_in, engine_out) = engine.split();
+    Harness {
+        server,
+        engine_in,
+        engine_out,
+        client,
+        _dir: dir,
+    }
+}
+
+/// One scrape of the servicer's metrics listener.
+fn scrape(server: &VllmServicerServer) -> String {
+    let address = server
+        .metrics_address()
+        .expect("a metrics listener")
+        .parse()
+        .expect("a socket address");
+    let (status, body) = http_get(address, "/metrics");
+    assert_eq!(status, 200);
+    body
+}
+
+/// The value of the sample of `name` whose labels contain `labels`.
+fn sample(body: &str, name: &str, labels: &str) -> f64 {
+    let prefix = format!("{name}{{");
+    body.lines()
+        .find(|line| {
+            line.starts_with(&prefix) && labels.split(',').all(|label| line.contains(label))
+        })
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("no sample {name}{{{labels}}} in:\n{body}"))
+}
+
+/// A batch whose output carries the engine's prefill figures (the prompt
+/// and the cached tokens it reports at a request's first output).
+fn batch_with_prefill(
+    request_id: &str,
+    tokens: Vec<u32>,
+    finish: Option<EngineCoreFinishReason>,
+    prompt_tokens: u32,
+    cached_tokens: u32,
+) -> EngineCoreOutputs {
+    let mut outputs = batch(request_id, tokens, finish, None);
+    if let EngineCoreOutputs::RequestBatch(batch) = &mut outputs {
+        batch.outputs[0].prefill_stats = Some(PrefillStats {
+            num_prompt_tokens: prompt_tokens,
+            num_cached_tokens: cached_tokens,
+            ..Default::default()
+        });
+    }
+    outputs
+}
+
+/// The exposition after the scripted sequence of
+/// `the_scrape_pins_the_families_after_a_scripted_sequence`: every family,
+/// type, label set and value, the histogram buckets aside (their edges are
+/// pinned apart) and the clock-dependent values replaced by `<v>`.
+const GOLDEN_SCRAPE: &str = r#"
+# HELP smg_servicer_e2e_request_latency_seconds Seconds from a request's arrival at the servicer to the end of its stream.
+# HELP smg_servicer_generation_tokens_total Generated tokens streamed to callers.
+# HELP smg_servicer_inter_token_latency_seconds Seconds between consecutive output chunks of a choice, per token when a chunk carries several (servicer clock; sampled above a pending-observation bound).
+# HELP smg_servicer_metrics_dropped_total Observations the pressure sampler dropped, by family.
+# HELP smg_servicer_metrics_scrape_seconds How long the last scrape took to render.
+# HELP smg_servicer_metrics_scrapes_total Scrapes answered, by HTTP status code.
+# HELP smg_servicer_prompt_tokens_cached_total Prompt tokens the engine served from its prefix cache.
+# HELP smg_servicer_prompt_tokens_total Prompt tokens as the engine reported them at each request's first output.
+# HELP smg_servicer_request_errors_total Requests that failed with a gRPC status, by code.
+# HELP smg_servicer_request_generation_tokens Generated tokens per request.
+# HELP smg_servicer_request_params_max_tokens The max_tokens parameter of requests that set it.
+# HELP smg_servicer_request_params_n The n parameter of requests.
+# HELP smg_servicer_request_prompt_tokens Prompt tokens per request.
+# HELP smg_servicer_request_time_per_output_token_seconds Mean seconds per generated token after the first, per request (servicer clock).
+# HELP smg_servicer_requests_active Admitted requests still preprocessing, streaming, or unwinding an abort.
+# HELP smg_servicer_requests_refused_total Requests refused before they reached the engine, by reason.
+# HELP smg_servicer_requests_total Requests whose stream ended, by how they ended; a fan-out (n > 1) is one request with the reason of its last choice to end, an abort winning.
+# HELP smg_servicer_start_time_seconds When the servicer started, in seconds since the Unix epoch.
+# HELP smg_servicer_state The servicer's lifecycle state, one-hot: starting, serving, warming_up (readiness held with admission open), draining (admission closed) or engine_down.
+# HELP smg_servicer_string_stops_total Requests this servicer ended on a stop string it matched itself.
+# HELP smg_servicer_time_to_first_token_seconds Seconds from a request's arrival at the servicer to its first output.
+# TYPE smg_servicer_e2e_request_latency_seconds histogram
+# TYPE smg_servicer_generation_tokens_total counter
+# TYPE smg_servicer_inter_token_latency_seconds histogram
+# TYPE smg_servicer_metrics_dropped_total counter
+# TYPE smg_servicer_metrics_scrape_seconds gauge
+# TYPE smg_servicer_metrics_scrapes_total counter
+# TYPE smg_servicer_prompt_tokens_cached_total counter
+# TYPE smg_servicer_prompt_tokens_total counter
+# TYPE smg_servicer_request_errors_total counter
+# TYPE smg_servicer_request_generation_tokens histogram
+# TYPE smg_servicer_request_params_max_tokens histogram
+# TYPE smg_servicer_request_params_n histogram
+# TYPE smg_servicer_request_prompt_tokens histogram
+# TYPE smg_servicer_request_time_per_output_token_seconds histogram
+# TYPE smg_servicer_requests_active gauge
+# TYPE smg_servicer_requests_refused_total counter
+# TYPE smg_servicer_requests_total counter
+# TYPE smg_servicer_start_time_seconds gauge
+# TYPE smg_servicer_state gauge
+# TYPE smg_servicer_string_stops_total counter
+# TYPE smg_servicer_time_to_first_token_seconds histogram
+smg_servicer_e2e_request_latency_seconds_count{model="served",wire="vllm",rank="0"} 5
+smg_servicer_e2e_request_latency_seconds_sum{model="served",wire="vllm",rank="0"} <v>
+smg_servicer_generation_tokens_total{model="served",wire="vllm",rank="0"} 8
+smg_servicer_inter_token_latency_seconds_count{model="served",wire="vllm",rank="0"} 2
+smg_servicer_inter_token_latency_seconds_sum{model="served",wire="vllm",rank="0"} <v>
+smg_servicer_metrics_dropped_total{model="served",wire="vllm",family="inter_token_latency"} 0
+smg_servicer_metrics_scrape_seconds{model="served",wire="vllm"} <v>
+smg_servicer_metrics_scrapes_total{model="served",wire="vllm",code="200"} 0
+smg_servicer_metrics_scrapes_total{model="served",wire="vllm",code="500"} 0
+smg_servicer_prompt_tokens_cached_total{model="served",wire="vllm",rank="0"} 1
+smg_servicer_prompt_tokens_total{model="served",wire="vllm",rank="0"} 6
+smg_servicer_request_errors_total{model="served",wire="vllm",code="unavailable"} 1
+smg_servicer_request_generation_tokens_count{model="served",wire="vllm",rank="0"} 5
+smg_servicer_request_generation_tokens_sum{model="served",wire="vllm",rank="0"} 8
+smg_servicer_request_params_max_tokens_count{model="served",wire="vllm",rank="0"} 5
+smg_servicer_request_params_max_tokens_sum{model="served",wire="vllm",rank="0"} 40
+smg_servicer_request_params_n_count{model="served",wire="vllm",rank="0"} 5
+smg_servicer_request_params_n_sum{model="served",wire="vllm",rank="0"} 5
+smg_servicer_request_prompt_tokens_count{model="served",wire="vllm",rank="0"} 5
+smg_servicer_request_prompt_tokens_sum{model="served",wire="vllm",rank="0"} 15
+smg_servicer_request_time_per_output_token_seconds_count{model="served",wire="vllm",rank="0"} 2
+smg_servicer_request_time_per_output_token_seconds_sum{model="served",wire="vllm",rank="0"} <v>
+smg_servicer_requests_active{model="served",wire="vllm"} 0
+smg_servicer_requests_refused_total{model="served",wire="vllm",reason="draining"} 0
+smg_servicer_requests_refused_total{model="served",wire="vllm",reason="duplicate_id"} 1
+smg_servicer_requests_refused_total{model="served",wire="vllm",reason="invalid_argument"} 0
+smg_servicer_requests_refused_total{model="served",wire="vllm",reason="media"} 0
+smg_servicer_requests_total{model="served",wire="vllm",rank="0",finish_reason="abort"} 1
+smg_servicer_requests_total{model="served",wire="vllm",rank="0",finish_reason="cut"} 1
+smg_servicer_requests_total{model="served",wire="vllm",rank="0",finish_reason="error"} 0
+smg_servicer_requests_total{model="served",wire="vllm",rank="0",finish_reason="length"} 1
+smg_servicer_requests_total{model="served",wire="vllm",rank="0",finish_reason="stop"} 2
+smg_servicer_start_time_seconds{model="served",wire="vllm"} <v>
+smg_servicer_state{model="served",wire="vllm",state="draining"} 1
+smg_servicer_state{model="served",wire="vllm",state="engine_down"} 0
+smg_servicer_state{model="served",wire="vllm",state="serving"} 0
+smg_servicer_state{model="served",wire="vllm",state="starting"} 0
+smg_servicer_state{model="served",wire="vllm",state="warming_up"} 0
+smg_servicer_string_stops_total{model="served",wire="vllm",rank="0"} 0
+smg_servicer_time_to_first_token_seconds_count{model="served",wire="vllm",rank="0"} 5
+smg_servicer_time_to_first_token_seconds_sum{model="served",wire="vllm",rank="0"} <v>
+"#;
+
+/// One streamed request (three chunks, the engine's stop), one non-streamed
+/// (the budget), one the caller aborts, one duplicate id refused, one a
+/// shutdown cuts: the scrape's families, types, label sets and values are
+/// exactly these.
+#[tokio::test]
+async fn the_scrape_pins_the_families_after_a_scripted_sequence() {
+    let mut h = metrics_harness(model_info(), None).await;
+    // Streamed: three single-token chunks, the engine's stop on the last;
+    // the prompt reported at the first output with one cached token.
+    let mut s1 = h
+        .client
+        .generate(generate_request("s1", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    h.engine_out
+        .send_outputs(&batch_with_prefill("s1", vec![10], None, 3, 1))
+        .await
+        .unwrap();
+    h.engine_out
+        .send_outputs(&batch("s1", vec![11], None, None))
+        .await
+        .unwrap();
+    h.engine_out
+        .send_outputs(&batch(
+            "s1",
+            vec![12],
+            Some(EngineCoreFinishReason::Stop),
+            None,
+        ))
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        chunk_tokens(s1.message().bounded().await.unwrap().unwrap());
+    }
+    assert_eq!(
+        complete(s1.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(s1.message().bounded().await.unwrap().is_none());
+    // Non-streamed: one two-token batch that ends on the budget.
+    let mut n1 = h
+        .client
+        .generate(generate_request("n1", false, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    h.engine_out
+        .send_outputs(&batch_with_prefill(
+            "n1",
+            vec![20, 21],
+            Some(EngineCoreFinishReason::Length),
+            3,
+            0,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        complete(n1.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "length"
+    );
+    assert!(n1.message().bounded().await.unwrap().is_none());
+    // The caller's abort after the first chunk.
+    let mut a1 = h
+        .client
+        .generate(generate_request("a1", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    h.engine_out
+        .send_outputs(&batch("a1", vec![30], None, None))
+        .await
+        .unwrap();
+    chunk_tokens(a1.message().bounded().await.unwrap().unwrap());
+    h.client
+        .abort(vllm::AbortRequest {
+            request_ids: vec!["a1".to_string()],
+        })
+        .await
+        .expect("abort");
+    assert_eq!(
+        complete(a1.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "abort"
+    );
+    assert!(a1.message().bounded().await.unwrap().is_none());
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["a1".to_string()]);
+    // A duplicate id refused while the first is in flight; the first then
+    // ends on the engine's stop.
+    let mut d1 = h
+        .client
+        .generate(generate_request("d1", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let duplicate = h
+        .client
+        .generate(generate_request("d1", true, Vec::new()))
+        .await
+        .expect_err("a live id is refused");
+    assert_eq!(duplicate.code(), Code::AlreadyExists);
+    h.engine_out
+        .send_outputs(&batch(
+            "d1",
+            vec![40],
+            Some(EngineCoreFinishReason::Stop),
+            None,
+        ))
+        .await
+        .unwrap();
+    chunk_tokens(d1.message().bounded().await.unwrap().unwrap());
+    complete(d1.message().bounded().await.unwrap().unwrap());
+    assert!(d1.message().bounded().await.unwrap().is_none());
+    // A shutdown cuts a request still open: the drain announced, every
+    // registered cancellation fired, the stream ends with the status.
+    let mut c1 = h
+        .client
+        .generate(generate_request("c1", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    h.engine_out
+        .send_outputs(&batch("c1", vec![50], None, None))
+        .await
+        .unwrap();
+    chunk_tokens(c1.message().bounded().await.unwrap().unwrap());
+    h.server.set_serving(false);
+    h.server.state.registry.cancel_all().unwrap();
+    let cut = c1.message().bounded().await.expect_err("a cut is a status");
+    assert_eq!(cut.code(), Code::Unavailable);
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["c1".to_string()]);
+    wait_until(|| h.server.active_requests() == 0).await;
+
+    let body = scrape(&h.server);
+    assert_bucket_edges(&body, 4096);
+    assert_golden(&body, GOLDEN_SCRAPE);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A stop string this servicer matches is its own stop: counted as one,
+/// and the request ends as `stop`.
+#[tokio::test]
+async fn a_string_stop_counts_as_the_servicers_own_stop() {
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(MockTokenizer::new());
+    let mut h = metrics_harness(model_info(), Some(tokenizer)).await;
+    let mut stream = h
+        .client
+        .generate(generate_request(
+            "r3",
+            true,
+            vec!["Hello world".to_string()],
+        ))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    h.engine_out
+        .send_outputs(&batch("r3", vec![1], None, None))
+        .await
+        .unwrap();
+    h.engine_out
+        .send_outputs(&batch("r3", vec![2], None, None))
+        .await
+        .unwrap();
+    chunk_tokens(stream.message().bounded().await.unwrap().unwrap());
+    chunk_tokens(stream.message().bounded().await.unwrap().unwrap());
+    assert_eq!(
+        complete(stream.message().bounded().await.unwrap().unwrap()).finish_reason,
+        "stop"
+    );
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["r3".to_string()]);
+    wait_until(|| h.server.active_requests() == 0).await;
+    let body = scrape(&h.server);
+    assert_eq!(
+        sample(&body, "smg_servicer_string_stops_total", "rank=\"0\""),
+        1.0
+    );
+    assert_eq!(
+        sample(
+            &body,
+            "smg_servicer_requests_total",
+            "finish_reason=\"stop\""
+        ),
+        1.0
+    );
+    assert_eq!(
+        sample(
+            &body,
+            "smg_servicer_requests_total",
+            "finish_reason=\"abort\""
+        ),
+        0.0
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A fan-out (`n = 2`) is one request: one count, one first-token latency,
+/// one end-to-end latency, the tokens of both choices.
+#[tokio::test]
+async fn a_fan_out_counts_one_request_and_one_ttft() {
+    let mut h = metrics_harness(model_info(), None).await;
+    let mut request = generate_request("f1", false, Vec::new());
+    if let Some(params) = request.sampling_params.as_mut() {
+        params.n = 2;
+    }
+    let mut stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let first = recv_add(&mut h.engine_in).await.request_id.clone();
+    let second = recv_add(&mut h.engine_in).await.request_id.clone();
+    for (id, token) in [(first, 10), (second, 11)] {
+        h.engine_out
+            .send_outputs(&batch_with_prefill(
+                &id,
+                vec![token],
+                Some(EngineCoreFinishReason::Stop),
+                3,
+                0,
+            ))
+            .await
+            .unwrap();
+    }
+    complete(stream.message().bounded().await.unwrap().unwrap());
+    complete(stream.message().bounded().await.unwrap().unwrap());
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    wait_until(|| h.server.active_requests() == 0).await;
+    let body = scrape(&h.server);
+    assert_eq!(
+        sample(
+            &body,
+            "smg_servicer_requests_total",
+            "finish_reason=\"stop\""
+        ),
+        1.0
+    );
+    assert_eq!(
+        sample(
+            &body,
+            "smg_servicer_time_to_first_token_seconds_count",
+            "rank=\"0\""
+        ),
+        1.0
+    );
+    assert_eq!(
+        sample(
+            &body,
+            "smg_servicer_e2e_request_latency_seconds_count",
+            "rank=\"0\""
+        ),
+        1.0
+    );
+    assert_eq!(
+        sample(&body, "smg_servicer_generation_tokens_total", "rank=\"0\""),
+        2.0
+    );
+    assert_eq!(
+        sample(&body, "smg_servicer_prompt_tokens_total", "rank=\"0\""),
+        3.0,
+        "the prompt counts once per request"
+    );
+    assert_eq!(
+        sample(&body, "smg_servicer_request_params_n_sum", "rank=\"0\""),
+        2.0
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A choice aborted after one token has an end-to-end latency but no mean
+/// time per output token (there is no second token to measure to).
+#[tokio::test]
+async fn an_aborted_choice_records_e2e_but_no_tpot_when_one_token() {
+    let mut h = metrics_harness(model_info(), None).await;
+    let mut stream = h
+        .client
+        .generate(generate_request("a2", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    h.engine_out
+        .send_outputs(&batch("a2", vec![10], None, None))
+        .await
+        .unwrap();
+    chunk_tokens(stream.message().bounded().await.unwrap().unwrap());
+    h.client
+        .abort(vllm::AbortRequest {
+            request_ids: vec!["a2".to_string()],
+        })
+        .await
+        .expect("abort");
+    complete(stream.message().bounded().await.unwrap().unwrap());
+    assert!(stream.message().bounded().await.unwrap().is_none());
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["a2".to_string()]);
+    wait_until(|| h.server.active_requests() == 0).await;
+    let body = scrape(&h.server);
+    assert_eq!(
+        sample(
+            &body,
+            "smg_servicer_requests_total",
+            "finish_reason=\"abort\""
+        ),
+        1.0
+    );
+    assert_eq!(
+        sample(
+            &body,
+            "smg_servicer_e2e_request_latency_seconds_count",
+            "rank=\"0\""
+        ),
+        1.0
+    );
+    assert_eq!(
+        sample(
+            &body,
+            "smg_servicer_request_time_per_output_token_seconds_count",
+            "rank=\"0\""
+        ),
+        0.0
+    );
+    assert_eq!(
+        sample(
+            &body,
+            "smg_servicer_request_generation_tokens_sum",
+            "rank=\"0\""
+        ),
+        1.0
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The in-flight gauge reads the registry at scrape: one while a stream is
+/// open, zero once the caller dropped it (which counts as the caller's
+/// abort).
+#[tokio::test]
+async fn the_active_gauge_falls_when_the_stream_drops() {
+    let mut h = metrics_harness(model_info(), None).await;
+    let stream = h
+        .client
+        .generate(generate_request("g1", true, Vec::new()))
+        .await
+        .expect("generate")
+        .into_inner();
+    recv_add(&mut h.engine_in).await;
+    let body = scrape(&h.server);
+    assert_eq!(
+        sample(&body, "smg_servicer_requests_active", "wire=\"vllm\""),
+        1.0
+    );
+    assert_eq!(
+        sample(&body, "smg_servicer_state", "state=\"serving\""),
+        1.0
+    );
+    drop(stream);
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["g1".to_string()]);
+    wait_until(|| h.server.active_requests() == 0).await;
+    let body = scrape(&h.server);
+    assert_eq!(
+        sample(&body, "smg_servicer_requests_active", "wire=\"vllm\""),
+        0.0
+    );
+    assert_eq!(
+        sample(
+            &body,
+            "smg_servicer_requests_total",
+            "finish_reason=\"abort\""
+        ),
+        1.0
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// The listener is bound before the engine connects, so a scrape during the
+/// engine's start answers `starting`; once the engine is up it answers
+/// `serving`, a readiness hold `warming_up`, and the drain `draining`.
+#[tokio::test]
+async fn the_listener_binds_before_the_engine_connects_and_answers_starting() {
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.metrics_bind_address = Some("127.0.0.1:0".to_string());
+    let server = VllmServicerServer::start(config).expect("servicer starts");
+    let body = scrape(&server);
+    assert_eq!(
+        sample(&body, "smg_servicer_state", "state=\"starting\""),
+        1.0
+    );
+    assert_eq!(
+        sample(&body, "smg_servicer_state", "state=\"serving\""),
+        0.0
+    );
+    assert!(sample(&body, "smg_servicer_start_time_seconds", "wire=\"vllm\"") > 1.0e9);
+    let engine = connect_to_frontend(
+        &handshake,
+        EngineId::from_engine_index(0),
+        default_ready_response(),
+    )
+    .await
+    .expect("mock engine handshake");
+    wait_until(|| server.engine_ready()).await;
+    let body = scrape(&server);
+    assert_eq!(
+        sample(&body, "smg_servicer_state", "state=\"serving\""),
+        1.0
+    );
+    // Readiness held with admission open (the planned warm-up) is not a
+    // drain: the drain is read off the registry.
+    server.set_ready(false);
+    let body = scrape(&server);
+    assert_eq!(
+        sample(&body, "smg_servicer_state", "state=\"warming_up\""),
+        1.0
+    );
+    assert_eq!(
+        sample(&body, "smg_servicer_state", "state=\"draining\""),
+        0.0
+    );
+    server.set_ready(true);
+    assert_eq!(
+        sample(&scrape(&server), "smg_servicer_state", "state=\"serving\""),
+        1.0
+    );
+    server.set_serving(false);
+    let body = scrape(&server);
+    assert_eq!(
+        sample(&body, "smg_servicer_state", "state=\"draining\""),
+        1.0
+    );
+    assert_eq!(
+        sample(&body, "smg_servicer_state", "state=\"serving\""),
+        0.0
+    );
+    drop(engine);
+    server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A metrics port that cannot be bound is a startup error naming the
+/// listener: the operator asked for the port.
+#[test]
+fn a_busy_metrics_port_is_a_startup_error() {
+    let busy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let handshake = handshake_address(dir.path());
+    let mut config = config(dir.path(), &handshake, model_info());
+    config.servicer.metrics_bind_address = Some(busy.local_addr().unwrap().to_string());
+    let text = match VllmServicerServer::start(config) {
+        Err(error) => error.to_string(),
+        Ok(_) => panic!("a busy port is refused"),
+    };
+    assert!(text.contains("metrics listener"), "{text}");
+    assert!(text.contains("failed to bind"), "{text}");
+}
+
+/// A scraper holding a connection does not hold the stop: the listener
+/// closes with the servicer, inside the budget, and the port refuses after.
+#[tokio::test]
+async fn stop_closes_the_listener_inside_the_budget_with_a_scraper_connected() {
+    use std::io::{Read, Write};
+
+    let h = metrics_harness(model_info(), None).await;
+    let address: std::net::SocketAddr = h.server.metrics_address().unwrap().parse().unwrap();
+    let mut held = std::net::TcpStream::connect(address).unwrap();
+    write!(held, "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n").unwrap();
+    let mut first = [0u8; 12];
+    held.read_exact(&mut first).unwrap();
+    assert!(first.starts_with(b"HTTP/1.1 200"));
+    // The budget is five seconds; the gRPC server spends its drain grace
+    // on the connected gRPC client first, the metrics listener closes at
+    // once after it, and the whole stays inside the budget.
+    let started = Instant::now();
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    held.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut rest = Vec::new();
+    let _ = held.read_to_end(&mut rest);
+    assert!(
+        std::net::TcpStream::connect(address).is_err(),
+        "the metrics port is closed with the servicer"
+    );
+}
+
+/// Two servicers in one process keep two registries: each scrape carries
+/// its own model and nothing of the other's.
+#[tokio::test]
+async fn a_process_hosting_two_servicers_keeps_two_registries() {
+    let first = metrics_harness(model_info(), None).await;
+    let second = metrics_harness(
+        VllmModelInfo {
+            served_model_name: "other".to_string(),
+            ..model_info()
+        },
+        None,
+    )
+    .await;
+    let first_body = scrape(&first.server);
+    let second_body = scrape(&second.server);
+    assert!(first_body.contains("model=\"served\""));
+    assert!(!first_body.contains("model=\"other\""));
+    assert!(second_body.contains("model=\"other\""));
+    assert!(!second_body.contains("model=\"served\""));
+    first
+        .server
+        .stop(Duration::from_secs(5))
+        .expect("clean stop");
+    second
+        .server
+        .stop(Duration::from_secs(5))
+        .expect("clean stop");
 }

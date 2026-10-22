@@ -12,7 +12,17 @@ engine-zmq-client.workspace = true
 smg-grpc-client.workspace = true
 llm-tokenizer.workspace = true
 openai-protocol.workspace = true
+# The `/metrics` endpoint: the gateway's recorder and exposition, on this
+# crate's own recorder instance.
+metrics = "0.24.6"
+metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 
+# The `/metrics` route and its server only. Declared directly rather than
+# inherited: a member's `default-features = false` is ignored for a workspace
+# dependency declared with defaults, and axum's defaults would turn on
+# `tower/log` and `tracing/log` for every crate in the graph, so the gRPC
+# stack's per-frame tracing events would pay the `log` facade too.
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio"] }
 bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
@@ -46,6 +56,10 @@ tempfile = "3"
 
 [[bench]]
 name = "kv_relay_apply"
+harness = false
+
+[[bench]]
+name = "generate_path"
 harness = false
 
 [lints]

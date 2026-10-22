@@ -77,6 +77,12 @@ impl SglangGenerateStream {
         self.inner.request_id()
     }
 
+    /// The data-parallel rank this choice's request went to; `None` for an
+    /// engine whose identity names no index.
+    pub fn engine_index(&self) -> Option<u32> {
+        self.inner.engine_index()
+    }
+
     /// Convert a stream item without discarding SGLang-only score rows.
     pub fn to_sglang_response(
         &self,

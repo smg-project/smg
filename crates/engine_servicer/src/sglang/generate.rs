@@ -10,6 +10,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Instant,
 };
 
 use engine_zmq_adapter::{to_sglang_response, SglangGenerateStream};
@@ -20,6 +21,7 @@ use tonic::Status;
 
 use super::State;
 use crate::{
+    metrics::{complete_finish_reason, ChoiceMetrics, RequestMetrics},
     requests::{settle_shutdown, CancelReason, HeldTerminal, Registration},
     BoxStream,
 };
@@ -33,6 +35,8 @@ pub(super) async fn generate(
     req: sg::GenerateRequest,
     trace_headers: Option<BTreeMap<String, String>>,
 ) -> Result<BoxStream<sg::GenerateResponse>, Status> {
+    // The request's arrival, the instant its latencies are measured from.
+    let arrival = Instant::now();
     let client = state.engine()?;
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
@@ -42,15 +46,30 @@ pub(super) async fn generate(
     // entry, and a duplicate id is refused up front.
     let (registration, cancel) = state.registry.register(&request_id)?;
     let streaming = req.stream;
+    let prompt_tokens = req.tokenized.as_ref().map_or(0, |tokenized| {
+        u32::try_from(tokenized.input_ids.len()).unwrap_or(u32::MAX)
+    });
+    let (max_tokens, n) = req
+        .sampling_params
+        .as_ref()
+        .map_or((None, 1), |params| (params.max_new_tokens, params.n));
     let subs = client
         .generate_sglang_streams_with_trace(req, trace_headers)
         .await?;
+    let metrics = state.metrics.request(
+        arrival,
+        subs.first().and_then(SglangGenerateStream::engine_index),
+        prompt_tokens,
+        max_tokens,
+        n,
+    );
     let mut choices = SelectAll::new();
     for sub in subs {
         choices.push(ChoiceStream {
             request_id: Arc::clone(&request_id),
             inner: Some(sub),
             streaming,
+            metrics: metrics.choice(),
         });
     }
     Ok(Box::pin(GenerateStream {
@@ -58,6 +77,7 @@ pub(super) async fn generate(
         cancel,
         aborted: None,
         cut: None,
+        metrics,
         _registration: registration,
     }))
 }
@@ -75,6 +95,8 @@ struct ChoiceStream {
     /// Whether the client asked for incremental chunks. A non-streaming
     /// request receives only the terminal `Complete`.
     streaming: bool,
+    /// This choice's observation of the request's metrics.
+    metrics: ChoiceMetrics,
 }
 
 impl ChoiceStream {
@@ -92,6 +114,9 @@ impl ChoiceStream {
     /// engine stream aborts the engine side.
     fn abort(&mut self) -> Option<sg::GenerateResponse> {
         let complete = self.inner.as_mut()?.complete_aborted();
+        if let Some(reason) = complete_finish_reason(&complete) {
+            self.metrics.ended(reason);
+        }
         let response = self.convert(complete);
         self.inner = None;
         Some(response)
@@ -111,6 +136,9 @@ impl HeldTerminal for ChoiceStream {
         }
         // `complete_aborted` yields the parked `Complete` when there is one.
         let complete = inner.complete_aborted();
+        if let Some(reason) = complete_finish_reason(&complete) {
+            self.metrics.ended(reason);
+        }
         let response = self.convert(complete);
         self.inner = None;
         Some(response)
@@ -142,14 +170,30 @@ impl Stream for ChoiceStream {
                 }
                 Poll::Ready(Some(Err(status))) => {
                     this.inner = None;
+                    this.metrics.failed(status.code());
                     return Poll::Ready(Some(Err(status)));
                 }
                 Poll::Ready(Some(Ok(item))) => item,
             };
-            let is_chunk = matches!(
-                item.response,
-                Some(vllm::generate_response::Response::Chunk(_))
-            );
+            let is_chunk = match item.response.as_ref() {
+                Some(vllm::generate_response::Response::Chunk(chunk)) => {
+                    this.metrics.chunk(
+                        u32::try_from(chunk.token_ids.len()).unwrap_or(u32::MAX),
+                        chunk.prompt_tokens,
+                        chunk.cached_tokens,
+                    );
+                    true
+                }
+                Some(vllm::generate_response::Response::Complete(complete)) => {
+                    this.metrics.complete(
+                        &complete.finish_reason,
+                        complete.prompt_tokens,
+                        complete.cached_tokens,
+                    );
+                    false
+                }
+                _ => false,
+            };
             if is_chunk && !this.streaming {
                 continue;
             }
@@ -184,6 +228,9 @@ struct GenerateStream {
     /// The status a shutdown ends the stream with once `aborted` is drained,
     /// when it cut a choice still open; `None` ends it plainly.
     cut: Option<Status>,
+    /// The request's observation, recorded when the stream and its choices
+    /// are gone.
+    metrics: Arc<RequestMetrics>,
     _registration: Registration,
 }
 
@@ -200,7 +247,10 @@ impl Stream for GenerateStream {
                 // The completions the choices already held went out; a
                 // shutdown that cut a choice still open ends the stream with
                 // its status, a plain abort just ends it.
-                return Poll::Ready(this.cut.take().map(Err));
+                return Poll::Ready(this.cut.take().map(|status| {
+                    this.metrics.failed(status.code());
+                    Err(status)
+                }));
             }
             // The cancellation names its cause. An `Abort` RPC is the caller's
             // own abort: the request ends as the Python servicer ends it, with
@@ -219,6 +269,9 @@ impl Stream for GenerateStream {
                     // status (see `settle_shutdown`).
                     let (finished, cut) = settle_shutdown(&mut this.choices);
                     this.aborted = Some(finished);
+                    if cut {
+                        this.metrics.cut();
+                    }
                     this.cut = cut.then(|| Status::unavailable(crate::requests::SHUTDOWN_MESSAGE));
                     continue;
                 }

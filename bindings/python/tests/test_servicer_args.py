@@ -30,6 +30,7 @@ SHARED_DEFAULTS = {
     "engine_startup_ceiling_secs": None,
     "engine_silence_timeout_secs": None,
     "engine_prefill_tokens_per_sec": None,
+    "metrics_bind_address": None,
 }
 # A call that passes the servicer's block and a model path only. The bad values
 # below are refused before anything is bound or dialled, so the endpoints need
@@ -72,6 +73,11 @@ REFUSED = [
         "engine_prefill_tokens_per_sec",
         -1,
         "engine_prefill_tokens_per_sec must be 0 or more, got -1",
+    ),
+    (
+        "metrics_bind_address",
+        "nope",
+        "invalid servicer config: metrics_bind_address must be host:port",
     ),
 ]
 
@@ -122,8 +128,36 @@ def test_every_class_starts_and_stops_on_the_servicers_block_alone(server, tmp_p
         assert started.running
         assert not started.engine_ready
         assert started.active_requests == 0
+        assert started.metrics_address is None
         started.set_serving(False)
         assert started.active_requests == 0
+    finally:
+        started.stop(timeout_secs=5.0)
+    assert not started.running
+
+
+@pytest.mark.parametrize("server", SERVERS, ids=class_name)
+def test_every_class_serves_metrics_when_asked(server, tmp_path):
+    """With ``metrics_bind_address`` every class binds a metrics listener
+    beside the gRPC one and reports where; ``stop`` closes both."""
+    import urllib.request
+
+    started = server(
+        "127.0.0.1:0",
+        f"ipc://{tmp_path}/engine",
+        f"ipc://{tmp_path}/handshake",
+        "/nonexistent/model",
+        engine_startup_timeout_secs=60.0,
+        metrics_bind_address="127.0.0.1:0",
+    )
+    try:
+        address = started.metrics_address
+        assert address is not None and address != started.address
+        with urllib.request.urlopen(f"http://{address}/metrics", timeout=10) as response:
+            body = response.read().decode()
+        assert response.status == 200
+        assert "smg_servicer_state{" in body
+        assert 'state="starting"} 1' in body
     finally:
         started.stop(timeout_secs=5.0)
     assert not started.running

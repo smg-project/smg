@@ -35,12 +35,17 @@ use tonic_health::pb::health_server::HealthServer;
 use tracing::{info, warn};
 
 use crate::{
-    engine_link::EngineLink, health::HealthReporter, requests::RequestRegistry, ServerThread,
-    ServicerConfig, ServicerError, Shutdown,
+    engine_link::EngineLink,
+    health::HealthReporter,
+    metrics::{Identity, MetricsListener, ServicerMetrics, ServicerState, Snapshot},
+    requests::RequestRegistry,
+    ServerThread, ServicerConfig, ServicerError, Shutdown,
 };
 
 /// The gRPC service name, as the health service reports it.
 pub const SERVICE_NAME: &str = "tokenspeed.grpc.scheduler.TokenSpeedScheduler";
+/// The `wire` label of this servicer's metrics.
+const WIRE: &str = "tokenspeed";
 
 /// What `GetModelInfo` and `GetServerInfo` report: the facts the Python
 /// servicer reads off TokenSpeed's `ModelConfig` and `ServerArgs`, which the
@@ -171,6 +176,8 @@ pub(super) struct State {
     /// bundles it); `None` when none resolved.
     pub(super) tokenizer_dir: Option<String>,
     pub(super) engine: EngineLink,
+    /// The request, token and latency metrics.
+    pub(super) metrics: Arc<ServicerMetrics>,
     /// Loaded once alongside the engine connect; `Some(None)` records a load
     /// that failed (string stops are then refused).
     pub(super) tokenizer: OnceLock<Option<Arc<dyn Tokenizer>>>,
@@ -184,6 +191,34 @@ pub(super) struct State {
 }
 
 impl State {
+    /// The lifecycle state a scrape reports: the drain is read off the
+    /// registry (admission closed); a cleared serving flag with admission
+    /// open is readiness held back, not a drain.
+    fn lifecycle_state(&self) -> ServicerState {
+        if !self.registry.is_accepting() {
+            return ServicerState::Draining;
+        }
+        match (self.engine.client.get(), self.engine.error()) {
+            (Some(client), _) if client.is_alive() => {
+                if self.serving.load(Ordering::Acquire) {
+                    ServicerState::Serving
+                } else {
+                    ServicerState::WarmingUp
+                }
+            }
+            (Some(_), _) | (None, Some(_)) => ServicerState::EngineDown,
+            (None, None) => ServicerState::Starting,
+        }
+    }
+
+    /// What a metrics scrape reads off the servicer at that moment.
+    pub(super) fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            active: self.registry.active(),
+            state: Some(self.lifecycle_state()),
+        }
+    }
+
     pub(super) fn engine(&self) -> Result<&ZmqEngineClient, Status> {
         if let Some(client) = self.engine.client.get() {
             return Ok(client);
@@ -233,6 +268,8 @@ impl State {
 pub struct TokenSpeedServicerServer {
     thread: ServerThread,
     state: Arc<State>,
+    /// The `/metrics` listener, when the configuration asked for one.
+    metrics_listener: Option<MetricsListener>,
 }
 
 impl TokenSpeedServicerServer {
@@ -268,11 +305,22 @@ impl TokenSpeedServicerServer {
             &config.model.kv_events_topic,
             u32::try_from(config.model.data_parallel_size).unwrap_or(1),
         );
+        let metrics = ServicerMetrics::new(
+            &Identity {
+                model: config.model.served_model_name.clone(),
+                wire: WIRE,
+                ranks: config.servicer.engine_count,
+                max_model_len: u32::try_from(config.model.max_context_length).unwrap_or(0),
+                matches_string_stops: true,
+            },
+            config.servicer.metrics_bind_address.is_some(),
+        )?;
         let state = Arc::new(State {
             tokenizer_dir: config.servicer.tokenizer_dir.clone(),
             model: config.model,
             kv_relay,
             engine: EngineLink::default(),
+            metrics,
             tokenizer: OnceLock::new(),
             registry: Arc::new(RequestRegistry::default()),
             serving: AtomicBool::new(true),
@@ -285,6 +333,26 @@ impl TokenSpeedServicerServer {
         if let Some(tokenizer) = tokenizer {
             let _ = state.tokenizer.set(Some(tokenizer));
         }
+        // The metrics listener binds beside the gRPC listener, before the
+        // scheduler connects: a scrape during its start answers.
+        let metrics_listener = config
+            .servicer
+            .metrics_bind_address
+            .as_deref()
+            .map(|address| {
+                let probe = Arc::downgrade(&state);
+                MetricsListener::start(
+                    address,
+                    Arc::clone(&state.metrics),
+                    Arc::new(move || {
+                        probe
+                            .upgrade()
+                            .map(|state| state.snapshot())
+                            .unwrap_or_default()
+                    }),
+                )
+            })
+            .transpose()?;
         let service = service::TokenSpeedService {
             state: Arc::clone(&state),
         };
@@ -370,12 +438,23 @@ impl TokenSpeedServicerServer {
                 }
             },
         )?;
-        Ok(Self { thread, state })
+        Ok(Self {
+            thread,
+            state,
+            metrics_listener,
+        })
     }
 
     /// The bound `ip:port`.
     pub fn address(&self) -> String {
         self.thread.address().to_string()
+    }
+
+    /// The metrics listener's bound `ip:port`; `None` when none was asked for.
+    pub fn metrics_address(&self) -> Option<String> {
+        self.metrics_listener
+            .as_ref()
+            .map(|listener| listener.address().to_string())
     }
 
     pub fn running(&self) -> bool {
@@ -429,6 +508,13 @@ impl TokenSpeedServicerServer {
     pub fn stop(&self, timeout: Duration) -> Result<(), ServicerError> {
         self.set_serving(false);
         self.state.registry.cancel_all()?;
-        self.thread.stop(timeout)
+        let started = Instant::now();
+        let stopped = self.thread.stop(timeout);
+        // The metrics listener goes last, inside what is left of the budget,
+        // so a scrape during the drain still reads the servicer draining.
+        if let Some(listener) = &self.metrics_listener {
+            listener.stop(timeout.saturating_sub(started.elapsed()))?;
+        }
+        stopped
     }
 }

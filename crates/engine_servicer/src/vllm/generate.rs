@@ -7,8 +7,9 @@ use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
     pin::Pin,
-    sync::{atomic::Ordering, Arc},
+    sync::Arc,
     task::{Context, Poll},
+    time::Instant,
 };
 
 use engine_zmq_adapter::{
@@ -23,6 +24,7 @@ use tonic::Status;
 
 use super::{media::process_media_refs, State};
 use crate::{
+    metrics::{complete_finish_reason, ChoiceMetrics, RequestMetrics},
     requests::{settle_shutdown, CancelReason, HeldTerminal, Registration},
     stop_match::{stop_decoder, StopMatcher},
     BoxStream,
@@ -37,11 +39,13 @@ pub(super) async fn generate(
     req: vllm::GenerateRequest,
     trace_headers: Option<BTreeMap<String, String>>,
 ) -> Result<BoxStream<vllm::GenerateResponse>, Status> {
+    // The request's arrival, the instant its latencies are measured from.
+    let arrival = Instant::now();
     let client = state.engine()?;
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
     }
-    submit(state, client, req, trace_headers).await
+    submit(state, client, req, trace_headers, arrival).await
 }
 
 /// The rejection notice a refused PD decode side owes its prefill side, so the
@@ -113,6 +117,7 @@ async fn submit(
     client: &ZmqEngineClient,
     mut req: vllm::GenerateRequest,
     trace_headers: Option<BTreeMap<String, String>>,
+    arrival: Instant,
 ) -> Result<BoxStream<vllm::GenerateResponse>, Status> {
     // A PD decode side refused before admission still owes its prefill side
     // the notice: armed from the first refusal below until the engine can
@@ -176,6 +181,10 @@ async fn submit(
         }
         _ => 0,
     };
+    let (max_tokens, n) = req
+        .sampling_params
+        .as_ref()
+        .map_or((None, 1), |params| (params.max_tokens, params.n));
     let subs = match client
         .generate_vllm_streams_with_media(req, processed_media, trace_headers)
         .await
@@ -201,6 +210,13 @@ async fn submit(
         state: Arc::clone(state),
         request_id: request_id.clone(),
     };
+    let metrics = state.metrics.request(
+        arrival,
+        u32::try_from(rank).ok(),
+        prompt_tokens,
+        max_tokens,
+        n,
+    );
     let mut choices = SelectAll::new();
     for sub in subs {
         // Each choice decodes its own text: the matcher is per sequence.
@@ -216,6 +232,7 @@ async fn submit(
             min_tokens,
             media_identity.clone(),
             request_id.clone(),
+            metrics.choice(),
         ));
     }
     Ok(Box::pin(GenerateStream {
@@ -223,6 +240,7 @@ async fn submit(
         cancel,
         aborted: None,
         cut: None,
+        metrics,
         _registration: registration,
         _loads: loads,
     }))
@@ -267,8 +285,10 @@ struct ChoiceStream {
     streaming: bool,
     /// A frontend-synthesized terminal `Complete` to yield next.
     pending: Option<vllm::GenerateResponse>,
-    /// Whether this request's prompt tokens went into the stats counters.
+    /// Whether this request's prompt went into the load tracker.
     prompt_counted: bool,
+    /// This choice's observation of the request's metrics.
+    metrics: ChoiceMetrics,
     /// A PD prefill side's account of the media it processed, stamped on
     /// every `Complete` of the request for the decode side.
     media_identity: Option<Arc<vllm::MediaIdentity>>,
@@ -280,6 +300,7 @@ struct ChoiceStream {
 }
 
 impl ChoiceStream {
+    #[expect(clippy::too_many_arguments)]
     fn new(
         state: Arc<State>,
         inner: VllmGenerateStream,
@@ -288,6 +309,7 @@ impl ChoiceStream {
         min_tokens: u32,
         media_identity: Option<Arc<vllm::MediaIdentity>>,
         request_id: String,
+        metrics: ChoiceMetrics,
     ) -> Self {
         Self {
             media_identity,
@@ -299,21 +321,18 @@ impl ChoiceStream {
             streaming,
             pending: None,
             prompt_counted: false,
+            metrics,
         }
     }
 
-    /// Count the prompt once per request (every choice of an `n > 1` fan-out
-    /// reports the same prompt) for the stats line, and tell the load tracker
-    /// the engine started it and how much of the prompt was cached.
+    /// Tell the load tracker, once per request (every choice of an `n > 1`
+    /// fan-out reports the same prompt), that the engine started it and how
+    /// much of the prompt was cached.
     fn count_prompt(&mut self, prompt_tokens: u32, cached_tokens: u32) {
         if self.prompt_counted || prompt_tokens == 0 {
             return;
         }
         if self.inner.as_ref().is_some_and(|inner| inner.index() == 0) {
-            self.state
-                .stats
-                .prompt_tokens
-                .fetch_add(u64::from(prompt_tokens), Ordering::Relaxed);
             self.state.loads.first_output(
                 self.rank,
                 &self.request_id,
@@ -334,6 +353,9 @@ impl ChoiceStream {
         }
         let mut inner = self.inner.take()?;
         let complete = inner.complete_aborted();
+        if let Some(reason) = complete_finish_reason(&complete) {
+            self.metrics.ended(reason);
+        }
         Some(self.stamped(complete))
     }
 
@@ -367,6 +389,9 @@ impl HeldTerminal for ChoiceStream {
         }
         // `complete_aborted` yields the parked `Complete` when there is one.
         let complete = inner.complete_aborted();
+        if let Some(reason) = complete_finish_reason(&complete) {
+            self.metrics.ended(reason);
+        }
         self.inner = None;
         Some(self.stamped(complete))
     }
@@ -403,6 +428,7 @@ impl Stream for ChoiceStream {
                 }
                 Poll::Ready(Some(Err(status))) => {
                     this.inner = None;
+                    this.metrics.failed(status.code());
                     return Poll::Ready(Some(Err(status)));
                 }
                 Poll::Ready(Some(Ok(item))) => item,
@@ -420,6 +446,11 @@ impl Stream for ChoiceStream {
                     item.response.as_ref()
                 {
                     this.count_prompt(complete.prompt_tokens, complete.cached_tokens);
+                    this.metrics.complete(
+                        &complete.finish_reason,
+                        complete.prompt_tokens,
+                        complete.cached_tokens,
+                    );
                     ended = true;
                 }
                 let response = this.stamped(item);
@@ -429,18 +460,18 @@ impl Stream for ChoiceStream {
                 return Poll::Ready(Some(Ok(response)));
             };
             this.count_prompt(chunk.prompt_tokens, chunk.cached_tokens);
-            this.state
-                .stats
-                .generation_tokens
-                .fetch_add(chunk.token_ids.len() as u64, Ordering::Relaxed);
-            this.state.loads.generated(
-                this.rank,
-                u32::try_from(chunk.token_ids.len()).unwrap_or(u32::MAX),
-            );
+            let tokens = u32::try_from(chunk.token_ids.len()).unwrap_or(u32::MAX);
+            // The metrics' clock read serves the load tracker's window too.
+            let at = this
+                .metrics
+                .chunk(tokens, chunk.prompt_tokens, chunk.cached_tokens)
+                .unwrap_or_else(Instant::now);
+            this.state.loads.generated_at(this.rank, tokens, at);
             let matched = match this.stops.feed(&chunk.token_ids) {
                 Ok(matched) => matched,
                 Err(status) => {
                     this.inner = None;
+                    this.metrics.failed(status.code());
                     return Poll::Ready(Some(Err(status)));
                 }
             };
@@ -454,6 +485,7 @@ impl Stream for ChoiceStream {
                         // it through instead of synthesizing an empty one.
                         if !inner.has_parked_complete() {
                             this.pending = Some(inner.complete_with_matched_stop(matched));
+                            this.metrics.string_stop();
                         }
                     }
                     if !this.streaming {
@@ -484,6 +516,9 @@ struct GenerateStream {
     /// The status a shutdown ends the stream with once `aborted` is drained,
     /// when it cut a choice still open; `None` ends it plainly.
     cut: Option<Status>,
+    /// The request's observation, recorded when the stream and its choices
+    /// are gone.
+    metrics: Arc<RequestMetrics>,
     _registration: Registration,
     _loads: LoadsGuard,
 }
@@ -501,7 +536,10 @@ impl Stream for GenerateStream {
                 // The completions the choices already held went out; a
                 // shutdown that cut a choice still open ends the stream with
                 // its status, a plain abort just ends it.
-                return Poll::Ready(this.cut.take().map(Err));
+                return Poll::Ready(this.cut.take().map(|status| {
+                    this.metrics.failed(status.code());
+                    Err(status)
+                }));
             }
             // The cancellation names its cause. An `Abort` RPC is the caller's
             // own abort: the request ends as the Python servicer ends it, with
@@ -520,6 +558,9 @@ impl Stream for GenerateStream {
                     // status (see `settle_shutdown`).
                     let (finished, cut) = settle_shutdown(&mut this.choices);
                     this.aborted = Some(finished);
+                    if cut {
+                        this.metrics.cut();
+                    }
                     this.cut = cut.then(|| Status::unavailable(crate::requests::SHUTDOWN_MESSAGE));
                     continue;
                 }

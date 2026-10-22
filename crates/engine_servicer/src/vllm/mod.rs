@@ -33,7 +33,7 @@ mod tests;
 
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, OnceLock,
     },
     time::{Duration, Instant},
@@ -57,13 +57,18 @@ use tonic_health::pb::health_server::HealthServer;
 use tracing::{info, warn};
 
 use crate::{
-    engine_link::EngineLink, health::HealthReporter, requests::RequestRegistry, ServerThread,
-    ServicerConfig, ServicerError, Shutdown,
+    engine_link::EngineLink,
+    health::HealthReporter,
+    metrics::{Identity, MetricsListener, ServicerMetrics, ServicerState, Snapshot},
+    requests::RequestRegistry,
+    ServerThread, ServicerConfig, ServicerError, Shutdown,
 };
 
 pub(crate) const SERVICE_NAME: &str = "vllm.grpc.engine.VllmEngine";
 /// `GetServerInfo.server_type` for this implementation.
 pub(crate) const SERVER_TYPE: &str = "vllm-grpc";
+/// The `wire` label of this servicer's metrics.
+const WIRE: &str = "vllm";
 
 /// What `GetModelInfo` reports. The Python servicer reads these off vLLM's
 /// `ModelConfig`; the launcher computes them from the same config before it
@@ -193,13 +198,6 @@ impl std::fmt::Debug for VllmServicerConfig {
     }
 }
 
-/// Token counters behind the periodic engine stats line.
-#[derive(Default)]
-pub(super) struct Stats {
-    pub(super) prompt_tokens: AtomicU64,
-    pub(super) generation_tokens: AtomicU64,
-}
-
 /// The servicer's `GetLoads` figures, read for the load record the relay
 /// attaches to every batch it streams.
 struct LoadFromState(std::sync::Weak<State>);
@@ -236,7 +234,9 @@ pub(super) struct State {
     /// The KV-event relay for the engine's ZMQ publisher; `None` when events
     /// are off (`SubscribeKvEvents` is then UNIMPLEMENTED).
     pub(super) kv_relay: Option<Arc<crate::kv_events::KvEventRelay>>,
-    pub(super) stats: Stats,
+    /// The request, token and latency metrics; the token totals feed the
+    /// periodic stats line whether or not a listener renders them.
+    pub(super) metrics: Arc<ServicerMetrics>,
     /// Queued token-work, generation throughput and hit rate from the
     /// requests this servicer forwards, per rank, for `GetLoads`.
     pub(super) loads: crate::load_tracker::LoadTracker,
@@ -305,6 +305,34 @@ impl State {
     pub(super) fn active_requests(&self) -> u32 {
         self.registry.len()
     }
+
+    /// The lifecycle state a scrape reports: the drain is read off the
+    /// registry (admission closed); a cleared serving flag with admission
+    /// open is readiness held back, not a drain.
+    fn lifecycle_state(&self) -> ServicerState {
+        if !self.registry.is_accepting() {
+            return ServicerState::Draining;
+        }
+        match (self.engine.client.get(), self.engine.error()) {
+            (Some(client), _) if client.is_alive() => {
+                if self.serving.load(Ordering::Acquire) {
+                    ServicerState::Serving
+                } else {
+                    ServicerState::WarmingUp
+                }
+            }
+            (Some(_), _) | (None, Some(_)) => ServicerState::EngineDown,
+            (None, None) => ServicerState::Starting,
+        }
+    }
+
+    /// What a metrics scrape reads off the servicer at that moment.
+    pub(super) fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            active: self.registry.active(),
+            state: Some(self.lifecycle_state()),
+        }
+    }
 }
 
 /// A running Rust vLLM servicer. `start` returns once the gRPC listener is
@@ -312,6 +340,8 @@ impl State {
 pub struct VllmServicerServer {
     thread: ServerThread,
     state: Arc<State>,
+    /// The `/metrics` listener, when the configuration asked for one.
+    metrics_listener: Option<MetricsListener>,
 }
 
 impl VllmServicerServer {
@@ -348,11 +378,21 @@ impl VllmServicerServer {
             &config.model.kv_events_topic,
             u32::try_from(config.model.data_parallel_size).unwrap_or(1),
         );
+        let metrics = ServicerMetrics::new(
+            &Identity {
+                model: config.model.served_model_name.clone(),
+                wire: WIRE,
+                ranks: config.servicer.engine_count,
+                max_model_len: config.model.max_context_length,
+                matches_string_stops: true,
+            },
+            config.servicer.metrics_bind_address.is_some(),
+        )?;
         let state = Arc::new(State {
             tokenizer_dir: config.servicer.tokenizer_dir.clone(),
             model: config.model,
             kv_relay,
-            stats: Stats::default(),
+            metrics,
             loads: crate::load_tracker::LoadTracker::default(),
             engine: EngineLink::default(),
             tokenizer: OnceLock::new(),
@@ -367,6 +407,26 @@ impl VllmServicerServer {
         if let Some(tokenizer) = tokenizer {
             let _ = state.tokenizer.set(Some(tokenizer));
         }
+        // The metrics listener binds beside the gRPC listener, before the
+        // engine connects: a scrape during the engine's start answers.
+        let metrics_listener = config
+            .servicer
+            .metrics_bind_address
+            .as_deref()
+            .map(|address| {
+                let probe = Arc::downgrade(&state);
+                MetricsListener::start(
+                    address,
+                    Arc::clone(&state.metrics),
+                    Arc::new(move || {
+                        probe
+                            .upgrade()
+                            .map(|state| state.snapshot())
+                            .unwrap_or_default()
+                    }),
+                )
+            })
+            .transpose()?;
         let service = VllmEngineService {
             state: Arc::clone(&state),
         };
@@ -469,12 +529,23 @@ impl VllmServicerServer {
                 }
             },
         )?;
-        Ok(Self { thread, state })
+        Ok(Self {
+            thread,
+            state,
+            metrics_listener,
+        })
     }
 
     /// The bound `ip:port`.
     pub fn address(&self) -> String {
         self.thread.address().to_string()
+    }
+
+    /// The metrics listener's bound `ip:port`; `None` when none was asked for.
+    pub fn metrics_address(&self) -> Option<String> {
+        self.metrics_listener
+            .as_ref()
+            .map(|listener| listener.address().to_string())
     }
 
     pub fn running(&self) -> bool {
@@ -529,6 +600,13 @@ impl VllmServicerServer {
         // Fire every registered cancellation so streams end before the
         // listener closes, then let the thread wind down.
         self.state.registry.cancel_all()?;
-        self.thread.stop(timeout)
+        let started = Instant::now();
+        let stopped = self.thread.stop(timeout);
+        // The metrics listener goes last, inside what is left of the budget,
+        // so a scrape during the drain still reads the servicer draining.
+        if let Some(listener) = &self.metrics_listener {
+            listener.stop(timeout.saturating_sub(started.elapsed()))?;
+        }
+        stopped
     }
 }

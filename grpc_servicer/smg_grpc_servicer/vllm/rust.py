@@ -66,7 +66,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     resolve_tokenizer_dir,
     servicer_switch,
 )
-from smg_grpc_servicer.vllm import MULTIPROC_METHOD_ENV
+from smg_grpc_servicer.vllm import METRICS_HOST_ENV, METRICS_PORT_ENV, MULTIPROC_METHOD_ENV
 from smg_grpc_servicer.vllm.config_view import (
     EngineConfigView,
     mm_processor_kwargs,
@@ -524,6 +524,8 @@ class VllmLauncher(RustLauncher):
     silence_timeout_secs_env = SILENCE_TIMEOUT_SECS_ENV
     prefill_tokens_per_sec_env = PREFILL_TOKENS_PER_SEC_ENV
     kv_events_env = KV_EVENTS_ENV
+    metrics_port_env = METRICS_PORT_ENV
+    metrics_host_env = METRICS_HOST_ENV
     without_tokenizer = "string stops will be refused"
     warmup_env = WARMUP_ENV
 

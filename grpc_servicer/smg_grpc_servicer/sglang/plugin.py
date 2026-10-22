@@ -1,5 +1,5 @@
-"""smg's SGLang plugin: ``--servicer-impl`` on SGLang's server parser,
-defined by this package.
+"""smg's SGLang plugin: ``--servicer-impl`` and the ``--metrics-*`` flags on
+SGLang's server parser, defined by this package.
 
 SGLang's launchers (``sglang serve``, ``python -m sglang.launch_server``)
 load the ``sglang.srt.plugins`` entry points before they parse the command
@@ -22,8 +22,8 @@ import os
 from typing import Any
 
 # Loaded in every SGLang process: nothing heavier than the package init here.
-from smg_grpc_servicer import servicer_impl_flag
-from smg_grpc_servicer.sglang import SERVICER_IMPL_ENV
+from smg_grpc_servicer import metrics_flag, servicer_impl_flag
+from smg_grpc_servicer.sglang import METRICS_HOST_ENV, METRICS_PORT_ENV, SERVICER_IMPL_ENV
 
 SERVICER_IMPL_FLAG = servicer_impl_flag.SERVICER_IMPL_FLAG
 SERVICER_IMPL_CHOICES = servicer_impl_flag.IMPLS
@@ -90,13 +90,27 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
     )
 
 
+def add_metrics_arguments(parser: argparse.ArgumentParser) -> bool:
+    """Add ``--metrics-port`` and ``--metrics-host`` (the Rust servicer's
+    Prometheus endpoint) to a parser that lacks them; returns whether they
+    were added. Their values travel as the variables the actions export:
+    SGLang's ``ServerArgs`` keeps only its own fields."""
+    return metrics_flag.add_metrics_arguments(
+        parser,
+        port_env=METRICS_PORT_ENV,
+        host_env=METRICS_HOST_ENV,
+        server_class="smg.servicer.SglangGrpcServer",
+    )
+
+
 def after_add_cli_args(result: Any, *args: Any, **kwargs: Any) -> None:
-    """AFTER ``ServerArgs.add_cli_args``: the flag joins the parser SGLang
-    just filled, so it is there for ``--help`` and for the parse. Leaves the
-    hooked method's result alone."""
+    """AFTER ``ServerArgs.add_cli_args``: the flags join the parser SGLang
+    just filled, so they are there for ``--help`` and for the parse. Leaves
+    the hooked method's result alone."""
     for candidate in (*args, *kwargs.values()):
         if isinstance(candidate, argparse.ArgumentParser):
             add_servicer_impl_argument(candidate)
+            add_metrics_arguments(candidate)
             break
     return None
 

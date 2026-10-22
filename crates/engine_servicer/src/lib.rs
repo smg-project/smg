@@ -16,6 +16,11 @@
 //! hash folding rule and the one-for-one forwarding of stores and removals.
 //! [`kv_state`] keeps the engine's live blocks from that stream, the state
 //! snapshot a subscriber receives once the relay's history has rolled.
+//!
+//! Every servicer exposes the same Prometheus families
+//! ([`ServicerConfig::metrics_bind_address`]; the `metrics` module): the
+//! requests, tokens and latencies observed at the points the request path
+//! already passes, on a listener of their own.
 
 pub mod engine_hash;
 mod engine_link;
@@ -26,6 +31,7 @@ pub mod kv_history;
 pub mod kv_state;
 pub mod kv_wire;
 mod load_tracker;
+mod metrics;
 mod proto_json;
 mod requests;
 mod server;

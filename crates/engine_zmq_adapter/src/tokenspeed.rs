@@ -61,6 +61,12 @@ impl TokenSpeedGenerateStream {
         self.inner.request_id()
     }
 
+    /// The data-parallel rank this choice's request went to; `None` for an
+    /// engine whose identity names no index.
+    pub fn engine_index(&self) -> Option<u32> {
+        self.inner.engine_index()
+    }
+
     /// Whether the engine already finished this choice and its terminal
     /// `Complete` is parked behind the chunk just yielded (the finish tick
     /// carried new tokens). A frontend that matched a stop on that chunk must

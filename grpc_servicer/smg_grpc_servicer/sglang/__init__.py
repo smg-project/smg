@@ -15,6 +15,8 @@ __all__ = [
     "GRAMMAR_REJECTED_ERR_TYPE",
     "GRAMMAR_REJECTED_MESSAGE",
     "HANDSHAKE_ENV",
+    "METRICS_HOST_ENV",
+    "METRICS_PORT_ENV",
     "SERVICER_IMPL_ENV",
     "SGLangSchedulerServicer",
     "resolve_servicer_impl",
@@ -23,6 +25,10 @@ __all__ = [
 
 # The flag that selects the Rust request path; see `smg_grpc_servicer.sglang.rust`.
 SERVICER_IMPL_ENV = "SMG_SGLANG_SERVICER_IMPL"
+# The Rust servicer's Prometheus endpoint: the fallbacks of --metrics-port and
+# --metrics-host (see `smg_grpc_servicer.rust_lifecycle.metrics_bind_address`).
+METRICS_PORT_ENV = "SMG_SGLANG_SERVICER_METRICS_PORT"
+METRICS_HOST_ENV = "SMG_SGLANG_SERVICER_METRICS_HOST"
 # Whoever spawns the scheduler ranks (the Rust servicer, or the standalone
 # headless launcher) sets these for them; the ZMQ plugin reads them in each
 # rank (see `smg_grpc_servicer.sglang.zmq_plugin`).

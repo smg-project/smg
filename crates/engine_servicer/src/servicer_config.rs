@@ -55,6 +55,10 @@ pub struct ServicerConfig {
     /// by the time they take at this rate. `0` allows nothing. See
     /// [`DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC`].
     pub engine_prefill_tokens_per_sec: u64,
+    /// `host:port` for the Prometheus `GET /metrics` listener (port 0 binds
+    /// an ephemeral one); `None` exposes no metrics. The listener binds
+    /// beside the gRPC one, before the engine connects, on its own thread.
+    pub metrics_bind_address: Option<String>,
 }
 
 impl ServicerConfig {
@@ -79,6 +83,7 @@ impl ServicerConfig {
             engine_startup_ceiling: Some(DEFAULT_ENGINE_STARTUP_CEILING),
             engine_silence_timeout: DEFAULT_ENGINE_SILENCE_TIMEOUT,
             engine_prefill_tokens_per_sec: DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC,
+            metrics_bind_address: None,
         }
     }
 
@@ -122,6 +127,17 @@ impl ServicerConfig {
         }
         if self.engine_silence_timeout.is_zero() {
             return Err(invalid("engine_silence_timeout must be positive"));
+        }
+        if let Some(metrics) = &self.metrics_bind_address {
+            let Some((_, port)) = metrics.rsplit_once(':') else {
+                return Err(invalid("metrics_bind_address must be host:port"));
+            };
+            // Port 0 is an ephemeral port on both listeners: two of them.
+            if port != "0" && metrics == &self.bind_address {
+                return Err(invalid(
+                    "metrics_bind_address must differ from bind_address",
+                ));
+            }
         }
         Ok(())
     }
@@ -192,6 +208,7 @@ mod tests {
             bounds.prefill_tokens_per_sec,
             DEFAULT_ENGINE_PREFILL_TOKENS_PER_SEC
         );
+        assert_eq!(config.metrics_bind_address, None);
         config.validate().expect("the defaults are valid");
     }
 
@@ -201,6 +218,17 @@ mod tests {
     fn no_prefill_allowance_is_valid() {
         let mut config = valid();
         config.engine_prefill_tokens_per_sec = 0;
+        config.validate().expect("valid");
+    }
+
+    /// A metrics listener is opt-in: a `host:port` of its own, on a port
+    /// other than the gRPC one (two ephemeral ports are two ports).
+    #[test]
+    fn a_metrics_bind_address_is_optional_and_its_own() {
+        let mut config = valid();
+        config.metrics_bind_address = Some("127.0.0.1:0".to_string());
+        config.validate().expect("valid: two ephemeral ports");
+        config.metrics_bind_address = Some("[::]:9000".to_string());
         config.validate().expect("valid");
     }
 
@@ -260,6 +288,19 @@ mod tests {
         assert_eq!(
             refusal(with(|config| config.engine_silence_timeout = Duration::ZERO)),
             "engine_silence_timeout must be positive"
+        );
+        assert_eq!(
+            refusal(with(|config| {
+                config.metrics_bind_address = Some("nope".to_string());
+            })),
+            "metrics_bind_address must be host:port"
+        );
+        assert_eq!(
+            refusal(with(|config| {
+                config.bind_address = "127.0.0.1:50051".to_string();
+                config.metrics_bind_address = Some("127.0.0.1:50051".to_string());
+            })),
+            "metrics_bind_address must differ from bind_address"
         );
     }
 }

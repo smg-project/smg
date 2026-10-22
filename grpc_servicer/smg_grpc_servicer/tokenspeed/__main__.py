@@ -4,9 +4,10 @@ Usage::
 
     python -m smg_grpc_servicer.tokenspeed --model <model> --host 127.0.0.1 --port 50051
 
-``--servicer-impl {python,rust}`` is this package's flag; every other flag is
-TokenSpeed's :class:`ServerArgs`, parsed by ``prepare_server_args`` so there
-is no flag drift vs the HTTP frontend. ``--servicer-impl rust`` (or
+``--servicer-impl {python,rust}``, ``--metrics-port`` and ``--metrics-host``
+are this package's flags; every other flag is TokenSpeed's
+:class:`ServerArgs`, parsed by ``prepare_server_args`` so there is no flag
+drift vs the HTTP frontend. ``--servicer-impl rust`` (or
 ``SMG_TOKENSPEED_SERVICER_IMPL=rust``, the fallback the flag overrides) serves
 the same contract from Rust (see :mod:`smg_grpc_servicer.tokenspeed.rust`).
 """
@@ -20,8 +21,14 @@ import sys
 
 from tokenspeed.runtime.utils.server_args import prepare_server_args
 
-from smg_grpc_servicer.rust_lifecycle import ServicerConfigError, configuration_exit
+from smg_grpc_servicer.rust_lifecycle import (
+    ServicerConfigError,
+    check_metrics_port_needs_rust,
+    configuration_exit,
+)
 from smg_grpc_servicer.tokenspeed.rust import (
+    METRICS_PORT_ENV,
+    add_metrics_arguments,
     add_servicer_impl_argument,
     serve_rust,
     servicer_impl_source,
@@ -48,6 +55,7 @@ def split_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         allow_abbrev=False,
     )
     add_servicer_impl_argument(parser)
+    add_metrics_arguments(parser)
     ours, rest = parser.parse_known_args(argv)
     if any(arg in ("-h", "--help") for arg in rest):
         parser.print_help()
@@ -76,6 +84,8 @@ def main(argv: list[str] | None = None) -> None:
         logger.info("Servicer implementation: %s (source=%s)", impl, origin)
         if impl == "rust":
             raise SystemExit(asyncio.run(serve_rust(server_args)))
+        # A metrics port under the Python servicer is a port nobody serves.
+        check_metrics_port_needs_rust(impl, ours, METRICS_PORT_ENV)
     except ServicerConfigError as error:
         # A knob the servicer cannot use: one named ERROR line and exit code
         # 2, before any engine work, not a traceback.

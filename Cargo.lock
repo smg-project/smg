@@ -2163,6 +2163,7 @@ dependencies = [
 name = "engine-servicer"
 version = "0.2.0"
 dependencies = [
+ "axum",
  "bytes",
  "chrono",
  "criterion",
@@ -2171,6 +2172,8 @@ dependencies = [
  "futures",
  "kv-index",
  "llm-tokenizer",
+ "metrics",
+ "metrics-exporter-prometheus",
  "openai-protocol",
  "portpicker",
  "prost",

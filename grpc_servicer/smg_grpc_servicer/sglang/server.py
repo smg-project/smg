@@ -33,6 +33,7 @@ from smg_grpc_servicer.rust_lifecycle import (
     EXIT_GRACE_SECS,
     ServicerConfigError,
     announce_kv_events_default,
+    check_metrics_port_needs_rust,
     configuration_exit,
     guarded_exit,
 )
@@ -41,6 +42,7 @@ from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.request_manager import GrpcRequestManager, init_request_tracing
 from smg_grpc_servicer.sglang.rust import (
     KV_EVENTS_ENV,
+    METRICS_PORT_ENV,
     SERVICER_IMPL_ENV,
     default_kv_events_config,
     serve_rust,
@@ -142,6 +144,8 @@ async def serve_grpc(
                     SERVICER_IMPL_ENV,
                 )
             raise SystemExit(await serve_rust(server_args))
+        # A metrics port under the Python servicer is a port nobody serves.
+        check_metrics_port_needs_rust(impl, server_args, METRICS_PORT_ENV)
         # The Python servicer gets the Rust path's KV-events default too:
         # server args without --kv-events-config have SGLang's ZMQ publisher
         # on, at a port found free on this host, before the schedulers and the

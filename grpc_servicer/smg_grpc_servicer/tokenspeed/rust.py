@@ -40,6 +40,7 @@ from smg_grpc_servicer.constrained_decoding import (
     tokenspeed_constrained_decoding_start,
     tokenspeed_grammar_backend,
 )
+from smg_grpc_servicer.metrics_flag import add_metrics_arguments as _add_metrics_arguments
 from smg_grpc_servicer.pd_pairing import pairing_protocol_from_env
 
 # The lifecycle's defaults and the switch's flag and choices, re-exported:
@@ -67,6 +68,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
 from smg_grpc_servicer.servicer_impl_flag import (
     add_servicer_impl_argument as _add_servicer_impl_argument,
 )
+from smg_grpc_servicer.tokenspeed import METRICS_HOST_ENV, METRICS_PORT_ENV
 from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
 from smg_grpc_servicer.tokenspeed.loads import running_window
@@ -104,6 +106,18 @@ def add_servicer_impl_argument(parser: argparse.ArgumentParser) -> bool:
             "or the Rust one (smg.servicer.TokenSpeedGrpcServer, with the scheduler(s) "
             f"headless). Unset falls back to ${SERVICER_IMPL_ENV}."
         ),
+    )
+
+
+def add_metrics_arguments(parser: argparse.ArgumentParser) -> bool:
+    """Add ``--metrics-port`` and ``--metrics-host`` (the Rust servicer's
+    Prometheus endpoint) to a launcher's parser that lacks them; returns
+    whether they were added."""
+    return _add_metrics_arguments(
+        parser,
+        port_env=METRICS_PORT_ENV,
+        host_env=METRICS_HOST_ENV,
+        server_class="smg.servicer.TokenSpeedGrpcServer",
     )
 
 
@@ -530,6 +544,8 @@ class TokenSpeedLauncher(RustLauncher):
     silence_timeout_secs_env = SILENCE_TIMEOUT_SECS_ENV
     prefill_tokens_per_sec_env = PREFILL_TOKENS_PER_SEC_ENV
     kv_events_env = KV_EVENTS_ENV
+    metrics_port_env = METRICS_PORT_ENV
+    metrics_host_env = METRICS_HOST_ENV
     without_tokenizer = "string stops will be refused"
     warmup_env = WARMUP_ENV
     # TokenSpeed's ``ModelConfig`` for the served model, built on first use
