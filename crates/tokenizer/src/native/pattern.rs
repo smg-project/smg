@@ -97,6 +97,18 @@ impl Class {
             self.contains_slow(code)
         }
     }
+
+    /// The characters the class may hold, exact below U+0080 and one bit for
+    /// the rest, set unless every member of the class is ASCII.
+    fn first(&self) -> First {
+        First {
+            ascii: self.ascii,
+            non_ascii: self.negated
+                || self.categories != 0
+                || self.ranges.iter().any(|&(_, end)| end >= 128),
+            nullable: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -117,9 +129,61 @@ enum Node {
     },
     Concat(Vec<Node>),
     /// Alternatives tried in order; the first that lets the rest match wins.
-    Alt(Vec<Node>),
+    /// `firsts` holds, per alternative, the characters a match of it can
+    /// begin with ([`first_sets`] fills them once the classes are final), so
+    /// an alternative that cannot start at a position is not stepped into.
+    Alt {
+        alternatives: Vec<Node>,
+        firsts: Vec<First>,
+    },
     /// `(?!...)` over one class: succeeds when the next character is not in it.
     NotAhead(usize),
+}
+
+/// The characters a match of a node can begin with: a bit per ASCII code
+/// point, one bit for every character beyond ASCII (set when a class may hold
+/// any of them), and whether the node can match without consuming a
+/// character, in which case any character may follow it.
+#[derive(Debug, Clone, Copy, Default)]
+struct First {
+    ascii: u128,
+    non_ascii: bool,
+    nullable: bool,
+}
+
+impl First {
+    #[inline]
+    fn may_start(&self, c: char) -> bool {
+        let code = u32::from(c);
+        self.nullable
+            || if code < 128 {
+                (self.ascii >> code) & 1 == 1
+            } else {
+                self.non_ascii
+            }
+    }
+
+    /// The set of this node followed by `next`: `next` widens it only when
+    /// this node can match empty.
+    fn then(self, next: First) -> First {
+        if self.nullable {
+            First {
+                ascii: self.ascii | next.ascii,
+                non_ascii: self.non_ascii || next.non_ascii,
+                nullable: next.nullable,
+            }
+        } else {
+            self
+        }
+    }
+
+    fn or(self, other: First) -> First {
+        First {
+            ascii: self.ascii | other.ascii,
+            non_ascii: self.non_ascii || other.non_ascii,
+            nullable: self.nullable || other.nullable,
+        }
+    }
 }
 
 /// A parsed pattern.
@@ -143,13 +207,14 @@ impl Pattern {
             classes: Vec::new(),
             case_insensitive: false,
         };
-        let root = parser.parse_alternation()?;
+        let mut root = parser.parse_alternation()?;
         if parser.chars.next().is_some() {
             return None;
         }
         if can_match_empty(&root) {
             return None;
         }
+        first_sets(&mut root, &parser.classes);
         Some(Self {
             classes: parser.classes,
             root,
@@ -213,9 +278,17 @@ impl Pattern {
             }
             Node::Repeat { node, min, max } => self.repeat(node, *min, *max, 0, text, pos, k),
             Node::Concat(nodes) => self.concat(nodes, text, pos, k),
-            Node::Alt(alternatives) => alternatives
-                .iter()
-                .any(|alternative| self.step(alternative, text, pos, k)),
+            Node::Alt {
+                alternatives,
+                firsts,
+            } => match next_char(text, pos) {
+                Some((c, _)) => alternatives.iter().zip(firsts).any(|(alternative, first)| {
+                    first.may_start(c) && self.step(alternative, text, pos, k)
+                }),
+                None => alternatives
+                    .iter()
+                    .any(|alternative| self.step(alternative, text, pos, k)),
+            },
             Node::NotAhead(class) => match next_char(text, pos) {
                 Some((c, _)) if self.classes[*class].contains(c) => false,
                 _ => k(pos),
@@ -230,11 +303,32 @@ impl Pattern {
         pos: usize,
         k: &mut dyn FnMut(usize) -> bool,
     ) -> bool {
-        match nodes.split_first() {
-            None => k(pos),
-            Some((first, rest)) => self.step(first, text, pos, &mut |p| {
-                self.concat(rest, text, p, &mut *k)
-            }),
+        // A node that matches in exactly one way (one character of a class, a
+        // lookahead) advances in place; the first node with a choice takes the
+        // rest of the run as its continuation, and the last node the caller's.
+        let mut pos = pos;
+        let mut nodes = nodes;
+        loop {
+            let Some((first, rest)) = nodes.split_first() else {
+                return k(pos);
+            };
+            match first {
+                Node::Class(class) => match next_char(text, pos) {
+                    Some((c, len)) if self.classes[*class].contains(c) => pos += len,
+                    _ => return false,
+                },
+                Node::NotAhead(class) => match next_char(text, pos) {
+                    Some((c, _)) if self.classes[*class].contains(c) => return false,
+                    _ => {}
+                },
+                _ if rest.is_empty() => return self.step(first, text, pos, k),
+                _ => {
+                    return self.step(first, text, pos, &mut |p| {
+                        self.concat(rest, text, p, &mut *k)
+                    });
+                }
+            }
+            nodes = rest;
         }
     }
 
@@ -306,8 +400,57 @@ fn can_match_empty(node: &Node) -> bool {
         Node::ClassRepeat { min, .. } => *min == 0,
         Node::Repeat { node, min, .. } => *min == 0 || can_match_empty(node),
         Node::Concat(nodes) => nodes.iter().all(can_match_empty),
-        Node::Alt(alternatives) => alternatives.iter().any(can_match_empty),
+        Node::Alt { alternatives, .. } => alternatives.iter().any(can_match_empty),
         Node::NotAhead(_) => true,
+    }
+}
+
+/// Fills the first-character sets of every alternation under `node` and
+/// returns `node`'s own. It runs once per pattern, after the parser has
+/// finished the classes.
+fn first_sets(node: &mut Node, classes: &[Class]) -> First {
+    match node {
+        Node::Class(class) => classes[*class].first(),
+        Node::ClassRepeat { class, min, .. } => First {
+            nullable: *min == 0,
+            ..classes[*class].first()
+        },
+        Node::Repeat { node, min, .. } => {
+            let first = first_sets(node, classes);
+            First {
+                nullable: *min == 0 || first.nullable,
+                ..first
+            }
+        }
+        Node::Concat(nodes) => {
+            // Every node is visited (an alternation deeper in the run needs
+            // its sets too); only the nullable prefix widens the run's own.
+            let mut first = First {
+                nullable: true,
+                ..First::default()
+            };
+            for node in nodes {
+                let next = first_sets(node, classes);
+                first = first.then(next);
+            }
+            first
+        }
+        Node::Alt {
+            alternatives,
+            firsts,
+        } => {
+            *firsts = alternatives
+                .iter_mut()
+                .map(|alternative| first_sets(alternative, classes))
+                .collect();
+            firsts
+                .iter()
+                .fold(First::default(), |all, first| all.or(*first))
+        }
+        Node::NotAhead(_) => First {
+            nullable: true,
+            ..First::default()
+        },
     }
 }
 
@@ -336,7 +479,10 @@ impl Parser<'_> {
         Some(if alternatives.len() == 1 {
             alternatives.pop()?
         } else {
-            Node::Alt(alternatives)
+            Node::Alt {
+                alternatives,
+                firsts: Vec::new(),
+            }
         })
     }
 
@@ -817,6 +963,54 @@ mod tests {
         for pattern in PATTERNS {
             assert!(Pattern::parse(pattern).is_some(), "{pattern}");
         }
+    }
+
+    #[test]
+    fn alternatives_know_the_characters_a_match_of_theirs_can_begin_with() {
+        let parsed = Pattern::parse(QWEN2).expect("parses");
+        let Node::Alt {
+            alternatives,
+            firsts,
+        } = &parsed.root
+        else {
+            panic!("the pattern is an alternation");
+        };
+        assert_eq!(firsts.len(), alternatives.len());
+        // The alternatives in the pattern's order: the clitics, a letter run
+        // with an optional lead-in, a digit, punctuation with an optional
+        // space, whitespace ending in a line break, whitespace before a
+        // non-space, whitespace.
+        let starts = |c: char| -> Vec<usize> {
+            firsts
+                .iter()
+                .enumerate()
+                .filter(|(_, first)| first.may_start(c))
+                .map(|(index, _)| index)
+                .collect()
+        };
+        assert_eq!(starts('\''), vec![0, 1, 3]);
+        assert_eq!(starts('a'), vec![1]);
+        assert_eq!(starts('7'), vec![2]);
+        assert_eq!(starts(','), vec![1, 3]);
+        assert_eq!(starts(' '), vec![1, 3, 4, 5, 6]);
+        assert_eq!(starts('\n'), vec![4, 5, 6]);
+        // Beyond ASCII the sets are exact only in the negative: a letter run
+        // may start with a non-ASCII letter, a digit alternative built from a
+        // category may hold one, and no set excludes what it cannot see.
+        assert!(starts('\u{E9}').contains(&1));
+        assert!(!starts('\u{E9}').contains(&0));
+        // The clitic group is an alternation of its own; each alternative
+        // begins with the apostrophe and with nothing else.
+        let Node::Alt {
+            firsts: clitics, ..
+        } = &alternatives[0]
+        else {
+            panic!("the clitics are an alternation");
+        };
+        assert_eq!(clitics.len(), 7);
+        assert!(clitics
+            .iter()
+            .all(|first| first.may_start('\'') && !first.may_start('s')));
     }
 
     #[test]
