@@ -13,10 +13,13 @@ from .pd_probe_prefix import read_prefix
 from .pd_scheduler_compat import require_installed_contract
 
 PROBE = "TestPDSchedulerObserverProbe"
+ABORT_PROBE = "TestPDDecodeAbortProbe"
 
 
-def explicit_context(request):
-    if request.config.getoption("keyword").strip() != PROBE:
+def explicit_context(request, selector=PROBE):
+    if selector not in (PROBE, ABORT_PROBE):
+        raise ValueError("unknown probe selector")
+    if request.config.getoption("keyword").strip() != selector:
         pytest.skip("temporary observer probe requires exact explicit selection")
     from pytest_rerunfailures import get_reruns_count
 
@@ -61,13 +64,13 @@ def explicit_context(request):
     return context, contract["root"]
 
 
-def observe_request(directory, workers, identity, state, expected_root):
+def observe_request(directory, workers, identity, state, expected_root, validator=None):
     deadline = time.monotonic() + 30
     while True:
         try:
             files = read_prefix(directory)
             state["files"] = files
-            validate_prefix(files, workers, identity, expected_root)
+            (validator or validate_prefix)(files, workers, identity, expected_root)
             return files
         except (ValueError, OSError, KeyError, TypeError, AttributeError, RecursionError) as exc:
             if time.monotonic() >= deadline:

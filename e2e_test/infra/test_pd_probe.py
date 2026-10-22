@@ -106,14 +106,25 @@ def test_explicit_context_precreates_directory_and_local_marker(configured):
 
 
 @pytest.mark.parametrize("keyword,errors,skipped", [("", 0, 1), (probe.PROBE, 1, 0)])
+@pytest.mark.parametrize("selector", [probe.PROBE, probe.ABORT_PROBE])
 def test_actual_class_autouse_precedes_real_fixture_and_disables_reruns(
-    configured, pytester, monkeypatch, keyword, errors, skipped
+    configured, pytester, monkeypatch, keyword, errors, skipped, selector
 ):
     search_path = [str(Path(__file__).resolve().parents[1]), os.environ.get("PYTHONPATH", "")]
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(path for path in search_path if path))
     block = ast.unparse(probe_class())
+    if selector == probe.ABORT_PROBE:
+        source = (Path(__file__).parents[1] / "router/test_pd_topologies.py").read_text()
+        block += "\n" + ast.unparse(
+            next(
+                n
+                for n in ast.parse(source).body
+                if isinstance(n, ast.ClassDef) and n.name == selector
+            )
+        )
+    keyword = selector if keyword else ""
     pytester.makeini("[pytest]\nmarkers=\n engine\n gpu\n e2e\n model\n gateway\n workers\n")
-    pytester.makepyfile(
+    testfile = pytester.makepyfile(
         "import os, pytest, httpx\n_MODEL='cpu'\n_LOG_DIR='cpu'\n_GATEWAY_ARGS=[]\n" + block
     )
     pytester.makeconftest("""
@@ -144,7 +155,16 @@ backend._setup_pd = cpu_boundary
 """)
     wrapper_retry = ["--reruns", "2", "--reruns-delay", "5"]
     result = pytester.runpytest_subprocess(
-        "-p", "rerunfailures", *wrapper_retry, "-s", "-q", "-W", "error", "-k", keyword
+        "-p",
+        "rerunfailures",
+        *wrapper_retry,
+        "-s",
+        "-q",
+        "-W",
+        "error",
+        "-k",
+        keyword,
+        str(testfile) + "::" + selector,
     )
     result.assert_outcomes(errors=errors, skipped=skipped)
     if errors:
@@ -153,10 +173,12 @@ backend._setup_pd = cpu_boundary
         result.stdout.fnmatch_lines(["SMG_PD_PROBE_BEGIN", "SMG_PD_PROBE_END"])
         lines = result.stdout.lines
         header = json.loads(lines[lines.index("SMG_PD_PROBE_BEGIN") + 1])
-        assert (
-            len(header["nodeids"]) == 1
-            and "::test_real_startup_and_admission[" in header["nodeids"][0]
+        method = (
+            "test_decode_client_close"
+            if selector == probe.ABORT_PROBE
+            else "test_real_startup_and_admission"
         )
+        assert len(header["nodeids"]) == 1 and f"::{method}[" in header["nodeids"][0]
     else:
         assert not (pytester.path / "starts").exists() and not configured[3].exists()
         assert not (pytester.path / "gateway").exists()

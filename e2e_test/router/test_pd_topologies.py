@@ -1221,13 +1221,15 @@ class TestPDAssembledAtRuntime:
 class TestPDSchedulerObserverProbe:
     """Temporary explicit startup/admission probe; never parity acceptance."""
 
+    _probe_selector = "TestPDSchedulerObserverProbe"
+
     @pytest.fixture(scope="class", autouse=True)
     @classmethod
     def _explicit_observer(cls, request):
         from infra.pd_probe import explicit_context
         from infra.pd_probe_prefix import export_prefix
 
-        context, expected_root = explicit_context(request)
+        context, expected_root = explicit_context(request, cls._probe_selector)
         state = dict(
             files={},
             error="probe did not complete",
@@ -1253,8 +1255,7 @@ class TestPDSchedulerObserverProbe:
                 {key: value for key, value in state.items() if key != "files"}, state["files"]
             )
 
-    def test_real_startup_and_admission(self, setup_backend):
-        from infra.pd_probe import observe_request
+    def _request_context(self, setup_backend):
         from infra.pd_request_identity import RequestIdentity
 
         _, model, _, gateway = setup_backend
@@ -1283,6 +1284,14 @@ class TestPDSchedulerObserverProbe:
         ]
         identity = RequestIdentity.new(contexts[0].run, contexts[0].attempt)
         state["request_id"] = identity.request_id
+        return model, gateway, context, state, expected_root, workers, identity
+
+    def test_real_startup_and_admission(self, setup_backend):
+        from infra.pd_probe import observe_request
+
+        model, gateway, context, state, expected_root, workers, identity = self._request_context(
+            setup_backend
+        )
         response = httpx.post(
             f"{gateway.base_url}/v1/chat/completions",
             headers=identity.headers,
@@ -1303,4 +1312,20 @@ class TestPDSchedulerObserverProbe:
         state["files"] = observe_request(
             context["trace_dir"], workers, identity, state, expected_root
         )
+        state["error"] = None
+
+
+class TestPDDecodeAbortProbe(TestPDSchedulerObserverProbe):
+    """Opt-in single-stream close; no KV ACK or peer-release assertion."""
+
+    _probe_selector = "TestPDDecodeAbortProbe"
+    test_real_startup_and_admission = None
+
+    def test_decode_client_close(self, setup_backend):
+        from infra.pd_abort_probe import run_decode_abort
+
+        model, gateway, context, state, root, workers, identity = self._request_context(
+            setup_backend
+        )
+        run_decode_abort(gateway.base_url, model, context, state, root, workers, identity)
         state["error"] = None
