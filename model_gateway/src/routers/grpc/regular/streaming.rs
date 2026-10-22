@@ -2268,24 +2268,26 @@ enum StreamEnd {
     Text(PendingText, bool),
 }
 
+/// The failure of a choice's decoder: where Symphony reads the choice and its output is not over,
+/// the reader's failed output, counted as such; the error's text either way. A reader whose output
+/// ended already has its outcome: a decoder finished a second time (the Messages stream's end after
+/// a `Complete`) counts nothing more.
+fn decoding_failed(
+    reader: Option<&mut Reader>,
+    error: impl std::fmt::Display,
+) -> utils::StreamFailure {
+    match reader.filter(|reader| !reader.ended()) {
+        Some(reader) => reader.failed(error.to_string()).into(),
+        None => utils::StreamFailure::from(error.to_string()),
+    }
+}
+
 /// One chat completion's SSE stream being read off the engine: what the
 /// spec and the dispatch decide for the whole stream, the per-choice
 /// trackers, decoders, parsers and readers the loop keeps, and the frame,
 /// encoder and buffer the chunks leave through. Each phase of the stream is
 /// a method; `StreamingProcessor::process_streaming_chunks_inner` runs them
 /// in order.
-/// The failure of a choice's decoder: where Symphony reads the choice, the reader's failed
-/// output, counted as such; the error's text either way.
-fn decoding_failed(
-    reader: Option<&mut Reader>,
-    error: impl std::fmt::Display,
-) -> utils::StreamFailure {
-    match reader {
-        Some(reader) => reader.failed(error.to_string()).into(),
-        None => utils::StreamFailure::from(error.to_string()),
-    }
-}
-
 struct ChatStream<'a> {
     processor: &'a StreamingProcessor,
     spec: &'a ChatResponseSpec,
