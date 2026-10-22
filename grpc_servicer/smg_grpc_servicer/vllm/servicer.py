@@ -420,6 +420,7 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # What a PD prefill side learned about its media, for the decode side.
         media_identity = None
         engine_started = False
+        handed_to_engine = False
         try:
             arrival_time = time.time()
             kv_transfer_params = params_from_request(request)
@@ -564,6 +565,11 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                     )
                 return ranks[choice]
 
+            # From here the engine owns the request: a caller that gives up
+            # is answered by the engine's own abort, and the pre-admission
+            # notice below must not be sent for an id the engine may still
+            # hold (see _notify_kv_transfer_rejected).
+            handed_to_engine = True
             async for output in self.engine.generate(
                 prompt=prompt,
                 sampling_params=sampling_params,
@@ -627,13 +633,15 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             # the same blocks pinned as any other pre-admission failure, and the
             # cleanup has to outlive a second cancellation to land.
             await asyncio.shield(
-                self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
+                self._notify_kv_transfer_rejected(request_id, kv_transfer_params, handed_to_engine)
             )
             raise
         except MmProcessorUnavailable as e:
             # Retryable: the router re-selects a worker on UNAVAILABLE.
             logger.warning("Media processing unavailable for request %s: %s", request_id, e)
-            await self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
+            await self._notify_kv_transfer_rejected(
+                request_id, kv_transfer_params, handed_to_engine
+            )
             await context.abort(grpc.StatusCode.UNAVAILABLE, str(e))
         except Exception as e:
             code = grpc_code_for(e)
@@ -641,7 +649,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 logger.exception("Error in Generate for request %s", request_id)
             else:
                 logger.warning("Generate request %s rejected (%s): %s", request_id, code.name, e)
-            await self._notify_kv_transfer_rejected(request_id, kv_transfer_params, engine_started)
+            await self._notify_kv_transfer_rejected(
+                request_id, kv_transfer_params, handed_to_engine
+            )
             await context.abort(code, str(e))
         finally:
             self._loads.finished(request_id)
@@ -650,14 +660,27 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         self,
         request_id: str,
         kv_transfer_params: dict | None,
-        engine_started: bool,
+        handed_to_engine: bool,
     ) -> None:
         """Free remote prefill blocks early when a decode request dies pre-admission.
 
         Without this, the prefill engine keeps the blocks pinned until the NIXL
         lease expires (30s default).
+
+        Only a request the engine never received is notified. The notice is a
+        second engine request under the same id, submitted pre-aborted so the
+        connector's request_finished hook runs, and once ``engine.generate``
+        has been entered it kills the engine either way: while the request's
+        KV is still being pulled the engine keeps the aborted request tracked
+        until the pull completes and refuses the duplicate id; once the pull is
+        done the notice's own request is freed in the step that admits it, and
+        a connector that reports its empty pull (the prefill-block release) as
+        a finished transfer names an id the scheduler no longer tracks. The
+        engine's own abort answers a caller that gives up after admission; the
+        prefill side's lease covers the window in which the engine never got
+        the request.
         """
-        if engine_started or not kv_transfer_params:
+        if handed_to_engine or not kv_transfer_params:
             return
         if not kv_transfer_params.get("do_remote_prefill"):
             return
