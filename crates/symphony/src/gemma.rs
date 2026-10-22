@@ -50,7 +50,7 @@ use crate::{
     tagged::{
         assembler::{push_escaped, push_quoted},
         end_cut_call,
-        value::cut as cut_json,
+        value::json_prefix,
     },
 };
 
@@ -334,15 +334,17 @@ impl Assembler {
 
     /// The member the end of the stream cut where its value stands ([`Self::finish`]): the key
     /// held for the value, when one is, opens the member, `"key": `, and a bare value's bytes
-    /// after it follow as the JSON they stand for so far, the digits of a number or the start
-    /// of a literal word as written, the start of the spelling's null word as the start of
-    /// `null`, and a word that is no literal (the JSON word `null` is one only where it is the
-    /// spelling's) as the opening of the string it would be written as ([`cut_json`]), so that
-    /// the arguments carry the prefix the model wrote and stay a
-    /// strict prefix of a JSON value; in a list the bytes are the next element's, after the
-    /// separator. The bytes held as a start of the string token are no value yet: they are
-    /// returned, a token the cut left short, to leave after the call's end as the syntax's
-    /// wrapping. Whitespace alone where no key is held is wrapping too.
+    /// after it follow as the JSON they stand for so far, written as [`push_bare`] writes the
+    /// whole value once the member closes: the digits of a number and the start of `true` or
+    /// `false` as written, the start of the spelling's null word as the start of `null`, and
+    /// any other text (a word that is no literal, Python's `True` or `'abc'`, a JSON quote
+    /// where the template writes its own string token) as the opening of the string it is
+    /// written as, so that the arguments carry the prefix the model wrote, stay a strict prefix
+    /// of a JSON value, and the cut never gives the value a type the closed member would not
+    /// have; in a list the bytes are the next element's, after the separator. The bytes held as
+    /// a start of the string token are no value yet: they are returned, a token the cut left
+    /// short, to leave after the call's end as the syntax's wrapping. Whitespace alone where no
+    /// key is held is wrapping too.
     fn cut_member(&mut self, out: &mut Events) -> Option<String> {
         let key = self.key.unwrap_or(0);
         let held = self.take_held();
@@ -369,16 +371,22 @@ impl Assembler {
             push_quoted(&mut json, held[..key - 1].trim());
             json.push_str(": ");
         }
-        if !value.is_empty() && self.spelling.null.starts_with(value) {
-            json.push_str(&"null"[..value.len()]);
-        } else if !value.is_empty() && self.spelling.null != "null" && "null".starts_with(value) {
-            // Under a spelling whose null word is another, a bare `null` is text the template
-            // never writes, a string once the member closes ([`push_bare`]): the cut opens that
-            // string, where [`cut_json`] would keep the start of the JSON word as written.
-            json.push('"');
-            push_escaped(&mut json, value);
-        } else {
-            json.push_str(&cut_json(value));
+        // As [`push_bare`] writes the value once the member closes: a number or `true` or
+        // `false` as written, the spelling's null word as `null`, every other text as a string.
+        let number = value
+            .strip_prefix('-')
+            .unwrap_or(value)
+            .starts_with(|c: char| c.is_ascii_digit())
+            && json_prefix(value);
+        if !value.is_empty() {
+            if self.spelling.null.starts_with(value) {
+                json.push_str(&"null"[..value.len()]);
+            } else if number || "true".starts_with(value) || "false".starts_with(value) {
+                json.push_str(value);
+            } else {
+                json.push('"');
+                push_escaped(&mut json, value);
+            }
         }
         self.push_fragment(json, Text::uncounted(source.to_owned()), out);
         cut_token
@@ -1735,7 +1743,7 @@ mod tests {
     /// a time.
     #[test]
     fn a_member_the_stream_end_cuts_leaves_as_the_calls_own_bytes_and_nothing_closes() {
-        let cases: [(&str, &str, &[&str]); 18] = [
+        let cases: [(&str, &str, &[&str]); 24] = [
             // A bare value: the digits so far, a word that may still be a literal.
             (
                 "call:play{artist:<|\"|>Taylor<|\"|>,n:1",
@@ -1752,12 +1760,40 @@ mod tests {
                 r#"{"artist": "Taylor", "n": tr"#,
                 &[],
             ),
-            // A word that is no literal: the opening of the string it would be written as.
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|>,n:-1",
+                r#"{"artist": "Taylor", "n": -1"#,
+                &[],
+            ),
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|>,n:nu",
+                r#"{"artist": "Taylor", "n": nu"#,
+                &[],
+            ),
+            // A word that is no literal: the opening of the string it would be written as, as
+            // `push_bare` writes it once the member closes: Python's words and quotes too, and a
+            // JSON quote where the template writes its own string token.
             (
                 "call:play{artist:<|\"|>Taylor<|\"|>,n:hel",
                 r#"{"artist": "Taylor", "n": "hel"#,
                 &[],
             ),
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|>,n:True",
+                r#"{"artist": "Taylor", "n": "True"#,
+                &[],
+            ),
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|>,n:None",
+                r#"{"artist": "Taylor", "n": "None"#,
+                &[],
+            ),
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|>,n:'ab",
+                r#"{"artist": "Taylor", "n": "'ab"#,
+                &[],
+            ),
+            ("call:play{city:\"Par", r#"{"city": "\"Par"#, &[]),
             // The key and its colon came, and no byte of the value.
             (
                 "call:play{artist:<|\"|>Taylor<|\"|>,n:",
@@ -1890,6 +1926,8 @@ mod tests {
         assert_eq!(function_gemma("call:f{n:No"), r#"{"n": nu"#);
         assert_eq!(function_gemma("call:f{n:nul"), r#"{"n": "nul"#);
         assert_eq!(function_gemma("call:f{n:null"), r#"{"n": "null"#);
+        assert_eq!(function_gemma("call:f{n:True"), r#"{"n": "True"#);
+        assert_eq!(function_gemma("call:f{n:tr"), r#"{"n": tr"#);
         assert_eq!(function_gemma("call:f{n:"), r#"{"n": "#);
         let null = run(&["call:f{n:nul"], true);
         assert_eq!(arguments(&null), r#"{"n": nul"#, "{null:?}");
