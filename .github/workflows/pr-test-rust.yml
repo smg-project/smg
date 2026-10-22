@@ -60,6 +60,12 @@ jobs:
           python3 scripts/ci_reap_job_processes.py "$E2E_JOB_MARKER" || status=1
           if test -f .venv/bin/activate; then source .venv/bin/activate; fi
           if test -f diagnostic-results/install-complete; then
+            if test -f diagnostic-results/runtime-pins.txt; then
+              export PIP_CONSTRAINT="${PIP_CONSTRAINT:+$PIP_CONSTRAINT }$PWD/diagnostic-results/runtime-pins.txt"
+            else
+              echo "Missing runtime constraints during final checks" >&2
+              status=1
+            fi
             python3 -m pip check > diagnostic-results/pip-check-final.txt 2>&1 || status=1
             python3 .github/amd-qa/closure_audit.py snapshot diagnostic-results/final-packages.json || status=1
             python3 .github/amd-pd-env/runtime_environment.py final || status=1
