@@ -86,6 +86,7 @@ class WorkerPool:
         tp: int | None = None,
         kv_backend: str | None = None,
         extra_env: dict[str, str] | None = None,
+        scheduler_observations: list | None = None,
     ) -> list[Worker]:
         """Return ``count`` healthy workers for the given key.
 
@@ -102,6 +103,10 @@ class WorkerPool:
         rather than competing for this one.
         """
         with self._lock:
+            if scheduler_observations is not None:
+                from .pd_worker_observation import validate_contexts
+
+                validate_contexts(scheduler_observations, count, engine, mode, worker_type)
             if self._closed:
                 raise RuntimeError("WorkerPool has been closed")
 
@@ -135,6 +140,11 @@ class WorkerPool:
                     tp=tp,
                     kv_backend=kv_backend,
                     extra_env=extra_env,
+                    **(
+                        {"scheduler_observations": scheduler_observations}
+                        if scheduler_observations is not None
+                        else {}
+                    ),
                 )
 
             if tp is not None or kv_backend is not None or extra_env is not None:
