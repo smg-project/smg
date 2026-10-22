@@ -731,8 +731,10 @@ impl L1Cache {
 
     /// Like [`Self::insert_prefix`], for a prefix one request speculates
     /// others share (the boundary right after its match). The entry enters as
-    /// the oldest the eviction sampler can find, so it never costs an entry a
-    /// request has matched; the first lookup or insert that meets it again
+    /// the oldest the eviction sampler can find, so it is evicted ahead of the
+    /// matched entries the sampler sees and speculations take up little of the
+    /// budget (the room for one is still made before it exists, from whatever
+    /// the sampler finds then); the first lookup or insert that meets it again
     /// makes it as fresh as any.
     pub(super) fn insert_prefix_speculative(
         &self,
@@ -924,7 +926,6 @@ mod tests {
     };
     use crate::*;
 
-    /// Oversized prefixes must be rejected without displacing useful entries.
     #[test]
     fn a_speculative_entry_goes_before_the_ones_requests_matched() {
         // Three entries fill the cache (one per shard: the sampler reads one
@@ -965,6 +966,7 @@ mod tests {
         );
     }
 
+    /// Oversized prefixes must be rejected without displacing useful entries.
     #[test]
     fn budget_rejects_oversized_prefix() {
         let cache = L1Cache::new(128);

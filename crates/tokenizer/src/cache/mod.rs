@@ -283,8 +283,9 @@ impl Encoder for CachedTokenizer {
                         // caching every boundary of every input copied a dozen prefixes per
                         // request into entries nothing else matches. Once the shared prefix
                         // is learned to its end, the next boundary is the request's own: it
-                        // enters as a speculation the eviction sampler takes first, so it
-                        // never displaces a deepest entry a next turn is waiting for.
+                        // enters as a speculation the sampler evicts ahead of the matched
+                        // entries it sees, so speculations take up little of the budget and
+                        // the deepest entries a next turn waits for live the longer for it.
                         let mut tokens = buffer(&prefix_tokens, hit.end);
                         let mut from = hit;
                         let mut spliced = Ok(());
