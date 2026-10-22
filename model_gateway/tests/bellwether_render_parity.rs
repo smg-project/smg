@@ -2432,11 +2432,14 @@ fn download(
     Ok(Some(path))
 }
 
-/// How many times a GET the hub rate-limits (HTTP 429) is sent, waiting what
-/// its Retry-After says in between (ten seconds when it says nothing, a minute
-/// at most): a run on a cold cache fetches a few files of several hundred
-/// models without a token, more than the hub serves one address at once.
+/// How many times a GET the hub rate-limits (HTTP 429) is sent, waiting between
+/// tries what the answer says ([`rate_limit_wait`]): a run on a cold cache fetches
+/// a few files of several hundred models without a token, more than the hub
+/// serves one address in one window.
 const RATE_LIMITED_TRIES: u32 = 6;
+/// The hub's rate-limit window (`ratelimit-policy: "fixed window";...;w=300`):
+/// the longest wait between two tries.
+const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(300);
 
 /// GET `url`, waiting out the hub's rate limit; the response, whatever its
 /// status, after the last try.
@@ -2456,15 +2459,29 @@ fn fetch(
         {
             return Ok(response);
         }
-        let wait = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(10)
-            .min(60);
-        std::thread::sleep(Duration::from_secs(wait));
+        std::thread::sleep(rate_limit_wait(response.headers()));
     }
+}
+
+/// The wait a rate-limited answer asks for: `Retry-After` in seconds, else the
+/// seconds left in the hub's window (`ratelimit: "resolvers";r=0;t=240`), else
+/// ten seconds; a whole window at most.
+fn rate_limit_wait(headers: &reqwest::header::HeaderMap) -> Duration {
+    let seconds = |value: &reqwest::header::HeaderValue| -> Option<u64> {
+        value.to_str().ok()?.trim().parse().ok()
+    };
+    let retry_after = headers.get(reqwest::header::RETRY_AFTER).and_then(seconds);
+    let window_left = headers
+        .get("ratelimit")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            value
+                .split(';')
+                .map(str::trim)
+                .find_map(|part| part.strip_prefix("t="))
+                .and_then(|left| left.parse::<u64>().ok())
+        });
+    Duration::from_secs(retry_after.or(window_left).unwrap_or(10)).min(RATE_LIMIT_WINDOW)
 }
 
 /// `<hub cache>/models--<org>--<name>/snapshots/<revision>`, the layout
@@ -3023,8 +3040,8 @@ fn an_error_in_the_fan_out_leaves_the_other_threads_their_item_in_flight_and_no_
 
 /// A loopback server for the loaders' tests: it answers its connections with `heads` in order
 /// (each a response head whole; the body is `ok`), then stops, so a request past the last answer
-/// is refused; the count is the connections answered. A failure on the server's side ends it,
-/// and the test reads it in the count or in a refused connection.
+/// is refused; the count is the requests read, bumped before the answer goes out. A failure on
+/// the server's side ends it, and the test reads it in the count or in a refused connection.
 fn loopback(heads: &'static [&'static str]) -> io::Result<(String, Arc<AtomicUsize>)> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let url = format!("http://{}", listener.local_addr()?);
@@ -3040,22 +3057,25 @@ fn loopback(heads: &'static [&'static str]) -> io::Result<(String, Arc<AtomicUsi
             while !request.ends_with(b"\r\n\r\n") && matches!(stream.read(&mut byte), Ok(1)) {
                 request.push(byte[0]);
             }
+            count.fetch_add(1, Ordering::SeqCst);
             let answer = format!("{head}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
             if stream.write_all(answer.as_bytes()).is_err() {
                 return;
             }
-            count.fetch_add(1, Ordering::SeqCst);
         }
     });
     Ok((url, served))
 }
 
-/// A GET the hub rate-limits is sent again after the Retry-After wait, and the answer past the
-/// limit is the one returned; after the last try, the limit itself is.
+/// A GET the hub rate-limits is sent again after the wait the answer asks for (`Retry-After`,
+/// or the window's rest from the `ratelimit` header), and the answer past the limit is the one
+/// returned; after the last try, the limit itself is.
 #[test]
 fn a_rate_limited_get_is_sent_again_after_the_retry_after_wait() {
     const LIMITED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0";
-    const LIMITED_EVERY_TIME: &[&str] = &[LIMITED; RATE_LIMITED_TRIES as usize];
+    const LIMITED_EVERY_TIME: &[&str] =
+        &["HTTP/1.1 429 Too Many Requests\r\nratelimit: \"resolvers\";r=0;t=0";
+            RATE_LIMITED_TRIES as usize];
     let client = smg::clients::blocking_http_client();
     let (url, served) = loopback(&[LIMITED, "HTTP/1.1 200 OK"]).unwrap();
     let response = fetch(
@@ -3074,6 +3094,47 @@ fn a_rate_limited_get_is_sent_again_after_the_retry_after_wait() {
     .unwrap();
     assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(served.load(Ordering::SeqCst), RATE_LIMITED_TRIES as usize);
+}
+
+/// The wait between two tries: `Retry-After` in seconds first, else the seconds left in the
+/// hub's window from the `ratelimit` header, else ten seconds; never more than one window (an
+/// HTTP-date `Retry-After` is not a number and falls through).
+#[test]
+fn the_wait_after_a_rate_limit_is_what_the_answer_says_and_a_window_at_most() {
+    let headers = |pairs: &[(&'static str, &str)]| {
+        let mut map = reqwest::header::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, value.parse().unwrap());
+        }
+        map
+    };
+    assert_eq!(rate_limit_wait(&headers(&[])), Duration::from_secs(10));
+    assert_eq!(
+        rate_limit_wait(&headers(&[("retry-after", "7")])),
+        Duration::from_secs(7)
+    );
+    assert_eq!(
+        rate_limit_wait(&headers(&[("ratelimit", "\"resolvers\";r=0;t=240")])),
+        Duration::from_secs(240)
+    );
+    assert_eq!(
+        rate_limit_wait(&headers(&[
+            ("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT"),
+            ("ratelimit", "\"resolvers\";r=0;t=30"),
+        ])),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        rate_limit_wait(&headers(&[
+            ("retry-after", "7"),
+            ("ratelimit", "\"resolvers\";r=0;t=240")
+        ])),
+        Duration::from_secs(7)
+    );
+    assert_eq!(
+        rate_limit_wait(&headers(&[("ratelimit", "\"resolvers\";r=0;t=1000")])),
+        RATE_LIMIT_WINDOW
+    );
 }
 
 /// A file the checkpoint does not serve is asked for once: the answer is remembered beside its
