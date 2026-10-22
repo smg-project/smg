@@ -840,7 +840,8 @@ async fn a_conversation_that_ends_with_a_system_turn_keeps_the_thought_out_of_th
 
 /// A `tool_use` block never carries `{}` for arguments the model wrote as JSON that no input
 /// value holds: the message is refused with the call named, where the stream carries the text as
-/// written for the client's own reader.
+/// written for the client's own reader. The refusal is counted once under the table by its
+/// reason; the output's own count stays the read's verdict, clean.
 #[tokio::test]
 async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() {
     let output = "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"days\": 9.99e999999}}\n\
@@ -855,17 +856,19 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
     let (stream, server) = scripted_stream(vec![frame], "0").await;
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
-    let result = ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::disabled(),
-    )
-    .process_non_streaming_messages_response(
-        context::ExecutionResult::Single { stream },
-        spec(),
-        dispatch(),
-        tokenizer,
-        &mut decoder,
+    let (result, scrape) = scraped(
+        ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        )
+        .process_non_streaming_messages_response(
+            context::ExecutionResult::Single { stream },
+            spec(),
+            dispatch(),
+            tokenizer,
+            &mut decoder,
+        ),
     )
     .await;
     server.abort();
@@ -888,9 +891,34 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
             && body.contains("number out of range"),
         "{body}"
     );
-    // The stream: the fragments as the model wrote them, and the stop reason the calls give.
-    let (result, events) =
-        message_events(vec![chunk(0, output), complete(0, "stop")], spec(), None).await;
+    // Counted once under the table by its reason; the output's own count is the read's: clean.
+    let refused = series_line(
+        &scrape,
+        "smg_symphony_refused_total",
+        &["table=\"qwen3\"", "reason=\"tool_use_input\""],
+    )
+    .expect("the refused count");
+    assert!(refused.ends_with(" 1"), "{refused}");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"clean\""],
+    )
+    .expect("the clean count");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert_eq!(
+        scrape.matches("smg_symphony_outputs_total{").count(),
+        1,
+        "{scrape}"
+    );
+    // The stream: the fragments as the model wrote them, and the stop reason the calls give;
+    // nothing refused, nothing counted as refused.
+    let ((result, events), scrape) = scraped(message_events(
+        vec![chunk(0, output), complete(0, "stop")],
+        spec(),
+        None,
+    ))
+    .await;
     assert!(result.is_ok(), "{result:?}");
     let partial: String = events
         .iter()
@@ -898,6 +926,7 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
         .collect();
     assert_eq!(partial, "{\"days\": 9.99e999999}");
     assert_eq!(message_stop_reason(&events), "tool_use");
+    assert!(!scrape.contains("smg_symphony_refused_total"), "{scrape}");
 }
 
 /// The scrape of a recorder of this test's own after `read` ran on this thread (the test

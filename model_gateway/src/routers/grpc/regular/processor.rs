@@ -29,7 +29,9 @@ use crate::routers::{
         context::{DispatchMetadata, ExecutionResult},
         proto_wrapper::ProtoGenerateComplete,
         regular::symphony::{
-            engine_finish, finished, telemetry::Who, Assignment, Delta, Reader, SymphonyError,
+            engine_finish, finished,
+            telemetry::{self, Who},
+            Assignment, Delta, Reader, SymphonyError,
         },
         spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
         utils,
@@ -310,7 +312,8 @@ impl ResponseProcessor {
     /// sequence the decoder or the engine matched is the stop reason, as on the older path; the
     /// thinking tokens are the engine's, or the reasoning text's, when the request asked for
     /// thinking. A call whose arguments no `tool_use` input holds refuses the message
-    /// (`SymphonyError::InputRefused`, the call named), rather than leave as `{}` without a word.
+    /// (`SymphonyError::InputRefused`, the call named), rather than leave as `{}` without a word;
+    /// the caller counts the refusal under the table ([`telemetry::record_refused`]).
     fn read_messages_with_symphony(
         dispatch: &DispatchMetadata,
         assignment: &Assignment,
@@ -802,6 +805,7 @@ impl ResponseProcessor {
             .map_err(|e| match e {
                 // The output's own doing: the model wrote arguments no tool_use input holds.
                 SymphonyError::InputRefused(why) => {
+                    telemetry::record_refused(telemetry::table_label(assignment.format.name()));
                     warn!(function = "process_non_streaming_messages_response", error = %why, "the message's tool_use input cannot carry the model's arguments");
                     error::internal_error("symphony_tool_use_input_refused", why)
                 }

@@ -71,8 +71,9 @@ pub(crate) const HEADER: &str = "x-smg-parser";
 /// Why the seam refused a request or failed to read an output, as six classes a caller can match
 /// on. Every caller but one takes the text, which is the one the gateway answered or logged before
 /// the classes were named: the non-streaming Messages path answers [`Self::InputRefused`] under
-/// its own code at warn level, since that one is the output's doing. A count or a status by class
-/// is a change of its own.
+/// its own code at warn level, since that one is the output's doing, and counts it under the
+/// table by its reason (`smg_symphony_refused_total`, [`telemetry::record_refused`]). A status by
+/// class is a change of its own.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum SymphonyError {
     /// The request's parser header names neither parser (a 400).
