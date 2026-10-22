@@ -2344,20 +2344,28 @@ fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, Str
     let dir = PathBuf::from(CACHE_DIR).join(slug).join(revision);
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let client = smg::clients::blocking_http_client();
-    download(&client, model, revision, &dir, "tokenizer_config.json", 100)?
-        .ok_or_else(|| format!("{model} at {revision} serves no tokenizer_config.json"))?;
+    download(
+        &client,
+        HUB,
+        model,
+        revision,
+        &dir,
+        "tokenizer_config.json",
+        100,
+    )?
+    .ok_or_else(|| format!("{model} at {revision} serves no tokenizer_config.json"))?;
     for (file, min_bytes) in [
         ("chat_template.jinja", 1),
         ("chat_template.json", 1),
         ("config.json", 50),
     ] {
-        download(&client, model, revision, &dir, file, min_bytes)?;
+        download(&client, HUB, model, revision, &dir, file, min_bytes)?;
     }
     let mut vocabulary = None;
     for files in VOCABULARIES {
         let mut whole = true;
         for file in files {
-            whole &= download(&client, model, revision, &dir, file, 100_000)?.is_some();
+            whole &= download(&client, HUB, model, revision, &dir, file, 100_000)?.is_some();
         }
         if whole {
             vocabulary = Some(files);
@@ -2377,11 +2385,16 @@ fn vocabularies() -> String {
         .join(", ")
 }
 
-/// Fetches `file` into `dir` unless it is there already; `Ok(None)` when the
-/// checkpoint does not serve it (HTTP 404), an error for any other failure
-/// or a file shorter than `min_bytes`.
+/// The hub the checkpoints' files are fetched from, at the manifest's revision.
+const HUB: &str = "https://huggingface.co";
+
+/// Fetches `file` from `hub` into `dir` unless it is there already; `Ok(None)` when the
+/// checkpoint does not serve it (HTTP 404, remembered beside the name as
+/// `<file>.absent`, since the revision is a commit and the answer final), an
+/// error for any other failure or a file shorter than `min_bytes`.
 fn download(
     client: &reqwest::blocking::Client,
+    hub: &str,
     model: &str,
     revision: &str,
     dir: &Path,
@@ -2392,12 +2405,14 @@ fn download(
     if path.is_file() {
         return Ok(Some(path));
     }
-    let url = format!("https://huggingface.co/{model}/resolve/{revision}/{file}");
-    let response = client
-        .get(&url)
-        .send()
-        .map_err(|e| format!("GET {url}: {e}"))?;
+    let absent = dir.join(format!("{file}.absent"));
+    if absent.is_file() {
+        return Ok(None);
+    }
+    let url = format!("{hub}/{model}/resolve/{revision}/{file}");
+    let response = fetch(client, &url)?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
+        fs::write(&absent, b"").map_err(|e| format!("cannot write {}: {e}", absent.display()))?;
         return Ok(None);
     }
     if !response.status().is_success() {
@@ -2415,6 +2430,41 @@ fn download(
     fs::rename(&part, &path)
         .map_err(|e| format!("cannot rename {} into place: {e}", part.display()))?;
     Ok(Some(path))
+}
+
+/// How many times a GET the hub rate-limits (HTTP 429) is sent, waiting what
+/// its Retry-After says in between (ten seconds when it says nothing, a minute
+/// at most): a run on a cold cache fetches a few files of several hundred
+/// models without a token, more than the hub serves one address at once.
+const RATE_LIMITED_TRIES: u32 = 6;
+
+/// GET `url`, waiting out the hub's rate limit; the response, whatever its
+/// status, after the last try.
+fn fetch(
+    client: &reqwest::blocking::Client,
+    url: &str,
+) -> Result<reqwest::blocking::Response, String> {
+    let mut tries = 0;
+    loop {
+        let response = client
+            .get(url)
+            .send()
+            .map_err(|e| format!("GET {url}: {e}"))?;
+        tries += 1;
+        if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS
+            || tries == RATE_LIMITED_TRIES
+        {
+            return Ok(response);
+        }
+        let wait = response
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(10)
+            .min(60);
+        std::thread::sleep(Duration::from_secs(wait));
+    }
 }
 
 /// `<hub cache>/models--<org>--<name>/snapshots/<revision>`, the layout
@@ -2969,4 +3019,74 @@ fn an_error_in_the_fan_out_leaves_the_other_threads_their_item_in_flight_and_no_
         started <= 1,
         "{started} items started beside the one that failed; the other thread had one in flight"
     );
+}
+
+/// A loopback server for the loaders' tests: it answers its connections with `heads` in order
+/// (each a response head whole; the body is `ok`), then stops, so a request past the last answer
+/// is refused; the count is the connections answered. A failure on the server's side ends it,
+/// and the test reads it in the count or in a refused connection.
+fn loopback(heads: &'static [&'static str]) -> io::Result<(String, Arc<AtomicUsize>)> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let served = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&served);
+    std::thread::spawn(move || {
+        for head in heads {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") && matches!(stream.read(&mut byte), Ok(1)) {
+                request.push(byte[0]);
+            }
+            let answer = format!("{head}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            if stream.write_all(answer.as_bytes()).is_err() {
+                return;
+            }
+            count.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    Ok((url, served))
+}
+
+/// A GET the hub rate-limits is sent again after the Retry-After wait, and the answer past the
+/// limit is the one returned; after the last try, the limit itself is.
+#[test]
+fn a_rate_limited_get_is_sent_again_after_the_retry_after_wait() {
+    const LIMITED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0";
+    const LIMITED_EVERY_TIME: &[&str] = &[LIMITED; RATE_LIMITED_TRIES as usize];
+    let client = smg::clients::blocking_http_client();
+    let (url, served) = loopback(&[LIMITED, "HTTP/1.1 200 OK"]).unwrap();
+    let response = fetch(
+        &client,
+        &format!("{url}/org/m/resolve/r/tokenizer_config.json"),
+    )
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().unwrap(), "ok");
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+    let (url, served) = loopback(LIMITED_EVERY_TIME).unwrap();
+    let response = fetch(
+        &client,
+        &format!("{url}/org/m/resolve/r/tokenizer_config.json"),
+    )
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(served.load(Ordering::SeqCst), RATE_LIMITED_TRIES as usize);
+}
+
+/// A file the checkpoint does not serve is asked for once: the answer is remembered beside its
+/// name, and the next run reads it without a request.
+#[test]
+fn a_file_the_checkpoint_does_not_serve_is_asked_for_once() {
+    let client = smg::clients::blocking_http_client();
+    let (url, served) = loopback(&["HTTP/1.1 404 Not Found"]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    for _ in 0..2 {
+        let got = download(&client, &url, "org/m", "r", dir.path(), "config.json", 2).unwrap();
+        assert!(got.is_none());
+    }
+    assert!(dir.path().join("config.json.absent").is_file());
+    assert_eq!(served.load(Ordering::SeqCst), 1);
 }
