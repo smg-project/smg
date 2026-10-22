@@ -122,43 +122,27 @@ mod handles {
         WORKER_SET_GENERATION.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// This thread's kept `smg_worker_requests_total` handles, by worker
-    /// URL then the model label as the interner gave it, with the
-    /// worker-set generation they were kept under.
-    #[derive(Default)]
-    pub(super) struct WorkerRequests {
+    /// This thread's kept handles of one per-worker family, by worker URL,
+    /// with the worker-set generation they were kept under. The rule for
+    /// every family is here: the map is cleared when the generation moves.
+    pub(super) struct ByWorker<V> {
         generation: u64,
-        by_worker: HashMap<String, HashMap<Arc<str>, Counter>>,
+        by_worker: HashMap<String, V>,
     }
 
-    impl WorkerRequests {
-        /// The handles by model for `worker_url`, after dropping every kept
-        /// handle if the worker set changed since they were kept.
-        pub(super) fn for_worker(&mut self, worker_url: &str) -> &mut HashMap<Arc<str>, Counter> {
-            let generation = WORKER_SET_GENERATION.load(Ordering::Acquire);
-            if self.generation != generation {
-                self.by_worker.clear();
-                self.generation = generation;
+    impl<V> Default for ByWorker<V> {
+        fn default() -> Self {
+            Self {
+                generation: 0,
+                by_worker: HashMap::new(),
             }
-            nested(&mut self.by_worker, worker_url)
         }
     }
 
-    /// This thread's kept handles of one per-worker gauge, by worker URL,
-    /// with the worker-set generation they were kept under: a gauge set on
-    /// every request (the active-request count, the circuit breaker's
-    /// consecutive outcomes) is set through its handle, not through a key
-    /// built and looked up per call.
-    #[derive(Default)]
-    pub(super) struct WorkerGauges {
-        generation: u64,
-        by_worker: HashMap<String, Gauge>,
-    }
-
-    impl WorkerGauges {
+    impl<V> ByWorker<V> {
         /// The handles by worker, after dropping every kept handle if the
         /// worker set changed since they were kept.
-        pub(super) fn current(&mut self) -> &mut HashMap<String, Gauge> {
+        pub(super) fn current(&mut self) -> &mut HashMap<String, V> {
             let generation = WORKER_SET_GENERATION.load(Ordering::Acquire);
             if self.generation != generation {
                 self.by_worker.clear();
@@ -167,6 +151,22 @@ mod handles {
             &mut self.by_worker
         }
     }
+
+    /// `smg_worker_requests_total`: by worker URL, then the model label as
+    /// the interner gave it.
+    pub(super) type WorkerRequests = ByWorker<HashMap<Arc<str>, Counter>>;
+
+    impl WorkerRequests {
+        /// The handles by model for `worker_url`.
+        pub(super) fn for_worker(&mut self, worker_url: &str) -> &mut HashMap<Arc<str>, Counter> {
+            nested(self.current(), worker_url)
+        }
+    }
+
+    /// A per-worker gauge set on every request (the active-request count,
+    /// the circuit breaker's consecutive outcomes): set through its kept
+    /// handle, not through a key built and looked up per call.
+    pub(super) type WorkerGauges = ByWorker<Gauge>;
 
     thread_local! {
         /// `smg_http_requests_total`.
