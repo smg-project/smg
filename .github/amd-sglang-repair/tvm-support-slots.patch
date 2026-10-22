@@ -1,0 +1,11 @@
+--- a/python/tvm/runtime/support.py
++++ b/python/tvm/runtime/support.py
+@@ -151,6 +151,8 @@
+     class TVMDerivedObject(metadata["cls"]):  # type: ignore
+         """The derived object to avoid cyclic dependency."""
+ 
++        __slots__ = ("__dict__", "__weakref__",)
++
+         _cls = cls
+         _type = "TVMDerivedObject"
+ 
