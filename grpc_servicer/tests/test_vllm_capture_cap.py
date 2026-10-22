@@ -167,8 +167,11 @@ def test_no_window_leaves_the_engines_default():
     [
         (16384, "2048", 2048),
         (16384, "1024", 1024),
-        (16384, "1000", 992),
         (None, "2048", 2048),
+        # A ceiling under 1024 could lower the engine's own 1024 on the platform
+        # whose default ceiling that is: kept out, and the line says so.
+        (16384, "1000", None),
+        (16384, "768", None),
         # The step bounds the ceiling under what the engine's default covers.
         (300, "2048", None),
         # A ceiling at or under the engine's default ceiling raises nothing.
@@ -179,18 +182,45 @@ def test_no_window_leaves_the_engines_default():
 )
 def test_a_recipes_ceiling_applies_when_the_window_is_left_to_the_engine(step, setting, cap):
     """A recipe that leaves --max-num-seqs to the engine still gets the ceiling
-    it set: the engine's own default cap is at most 512 whatever its window
-    default, so a ceiling above 512 raises it; `auto` keeps the engine's default
-    as before."""
+    it set where that raises the engine's default on every platform (512, or
+    1024 on one): a ceiling of 1024 or more applies; `auto` keeps the engine's
+    default as before."""
     decision = derive_capture_cap(max_num_seqs=None, max_num_batched_tokens=step, setting=setting)
     assert decision.cap == cap
+    assert "512 or 1024 by platform (--max-num-seqs unset" in decision.detail
     if cap is None:
         assert decision.source == "window"
-        assert "--max-num-seqs unset" in decision.detail
     else:
         assert decision.source == "derived"
         assert str(cap) in decision.detail
-        assert "at most 512 (--max-num-seqs unset" in decision.detail
+    if setting in ("1000", "768"):
+        assert "could lower it on the platform whose default ceiling is 1024" in decision.detail
+
+
+@pytest.mark.parametrize(
+    ("max_num_seqs", "setting", "cap", "mentions"),
+    [
+        # A window of 512: the engine's default is 512, or 1024 on one platform.
+        (512, "768", None, "512 or 1024 by platform (twice --max-num-seqs 512"),
+        (512, "768", None, "could lower it on the platform whose default ceiling is 1024"),
+        (512, "1024", 1024, "default was 512 or 1024 by platform"),
+        (512, "2048", 2048, "default was 512 or 1024 by platform"),
+        (512, None, None, "covers the admission step"),
+        # A window of 300: 512 or 600 by platform; 768 raises both.
+        (300, "768", 768, "default was 512 or 600 by platform (twice --max-num-seqs 300"),
+        # A window of 256 or less: one default on every platform, as before.
+        (256, "768", 768, "default was 512 (twice --max-num-seqs 256)"),
+        (32, "768", 768, "default was 64 (twice --max-num-seqs 32)"),
+    ],
+)
+def test_a_ceiling_never_lowers_the_engines_default_on_the_platform_with_the_higher_ceiling(
+    max_num_seqs, setting, cap, mentions
+):
+    decision = derive_capture_cap(
+        max_num_seqs=max_num_seqs, max_num_batched_tokens=16384, setting=setting
+    )
+    assert decision.cap == cap
+    assert mentions in decision.detail
 
 
 @pytest.mark.parametrize(
@@ -510,7 +540,7 @@ def test_a_recipe_without_the_window_flag_gets_the_ceiling_it_set(
         "2048, derived from the admission step (--max-num-batched-tokens 16384, ceiling 2048)"
         in lines[0]
     )
-    assert "at most 512 (--max-num-seqs unset" in lines[0]
+    assert "default was 512 or 1024 by platform (--max-num-seqs unset" in lines[0]
 
 
 def test_a_bad_variable_value_is_a_usage_error_that_names_it(parser_class, monkeypatch, capsys):

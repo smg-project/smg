@@ -530,10 +530,13 @@ explicit cap drops); an HTTP `vllm serve`, which is not this package's launch.
 `SMG_VLLM_CUDAGRAPH_CAPTURE_CAP` is the knob: `auto` (the default), `engine`
 (the opt-out: the engine's own default, as before this derivation), or a
 positive integer, the ceiling in place of 512, rounded down to the capture
-grid; a ceiling above 512 applies with `--max-num-seqs` left to the engine
-as well (its default cap is at most 512 whatever its window). Each captured
-size costs capture time at start and graph memory per rank: 11 sizes at the
-engine's 64, 51 at 512, 83 at 1024, 147 at 2048.
+grid. A ceiling applies only where it raises the engine's default on every
+platform (twice the window, at most 512, or at most 1024 on one newer GPU
+platform the launch cannot tell apart): with `--max-num-seqs` left to the
+engine, or set to more than 256, a ceiling of 1024 or more applies and a
+smaller one is kept out, the line saying why. Each captured size costs
+capture time at start and graph memory per rank: 11 sizes at the engine's
+64, 51 at 512, 83 at 1024, 147 at 2048.
 
 ##### Per recipe: what a ceiling above 512 buys, and what it costs
 
@@ -569,7 +572,7 @@ engine's own `--max-cudagraph-capture-size N` among the recipe's flags (it
 travels with the command line to every rank of a multi-node engine), or
 `SMG_VLLM_CUDAGRAPH_CAPTURE_CAP=N` in the environment of every rank's process,
 a ceiling the derivation still bounds by the admission step and applies where
-it raises the engine's default. Graph memory per captured size was
+it raises the engine's default on every platform. Graph memory per captured size was
 0.011-0.021 GiB per rank on these three models, which is how the KV-cache
 cost above scales with the capture list.
 
