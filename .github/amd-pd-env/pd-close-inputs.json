@@ -15,7 +15,7 @@
     "crates": "d9f44a9aa4199dc40c7d76dd307fc57a521e563f",
     "model_gateway": "0e075a5556734438d2d5dc116c679133408b9ca5",
     "grpc_servicer": "8abb3d9a201fd9e955bddea291e1f724e8de6a08",
-    "e2e_test": "5640807e349f609041ba31d9cf164c02998d0ffd",
+    "e2e_test": "c4b9154acbadcb59b8c98081944f3c2e69b2f98d",
     "scripts": "c0f693708bc1e440775822d630f8081df7f5f295",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/amd-qa": "118f63faa06ee099507e0a00dbe5717a439ce8b1"
@@ -120,14 +120,23 @@
   "producer_run_conclusion_snapshot": "failure",
   "producer_full_GPU_success_required": false,
   "environment_prerequisite": {
-    "run_id": 39865700204,
+    "run_id": 39867879364,
     "run_attempt": 1,
-    "producer_sha": "fb82a338ceb426665bd58a2d31ad5b6a089a2eaf",
-    "branch": "codex/amd-vllm-repair-e915-20261022",
-    "job_id": 120127228798,
+    "producer_sha": "68161f6097ec96a015b69e1719b5450e4b86bcfb",
+    "branch": "codex/amd-vllm-model-name-repair-20261022",
+    "job_id": 120134570199,
     "job_name": "vllm-repair",
     "image": "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f",
     "artifacts_pinned": false,
-    "artifact": null
+    "artifact": null,
+    "cairo_runtime_package": null
+  },
+  "consumer_test_harness_delta": {
+    "preserved_PD_base": "67edd9d",
+    "served_name_original_product_commit": "2e7142f9b73b5e9983809aa76fb9797ac12aa1bf",
+    "served_name_consumer_commit": "60d6dcf6632dc2126c615aeb42f3330a8406e165",
+    "producer_e2e_tree": "ebb76667f5130610dee968dec4504a70c5d10cf0",
+    "consumer_e2e_tree": "c4b9154acbadcb59b8c98081944f3c2e69b2f98d",
+    "original_PD_probe_contract_unchanged": true
   }
 }

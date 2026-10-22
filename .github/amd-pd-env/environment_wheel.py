@@ -71,6 +71,17 @@ def validate(files, environment):
         )
     for suite, count, skipped in [("completions", 19, 2), ("embeddings", 24, 0), ("router", 10, 2)]:
         junit(get(suite + "/result.xml"), count, skipped)
+    preflight = json.loads(get("pycairo/preflight.json"))
+    versions = {
+        version
+        for result in preflight["apt"]
+        for version in re.findall(r"(?m)^Setting up libcairo2:amd64 \(([^)]+)\)", result["stdout"])
+    }
+    require(
+        len(versions) == 1
+        and environment["cairo_runtime_package"] == "libcairo2=" + versions.pop(),
+        "producer Cairo runtime version not bound",
+    )
     proof = json.loads(get("pycairo/native-proof.json"))
     require(
         proof["pycairo"] == "1.29.2" and proof["source_sha256"] == SOURCE_SHA,
@@ -123,6 +134,9 @@ def main():
     verified_job = reuse.verify_environment_job(inputs)
     artifact = environment["artifact"]
     require(
+        artifact["name"] == f"amd-vllm-repair-{environment['run_id']}", "environment artifact name"
+    )
+    require(
         artifact["destination"] == "diagnostic-results/environment-producer"
         and 0 < artifact["bytes"] <= 100 * 1024 * 1024,
         "environment archive destination/size",
@@ -164,6 +178,7 @@ def main():
                 "producer_native": proof,
                 "wheel_sha256": proof["wheel_sha256"],
                 "host_wheel_used": False,
+                "cairo_runtime_package": environment["cairo_runtime_package"],
             },
             indent=2,
         )

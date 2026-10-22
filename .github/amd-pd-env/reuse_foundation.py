@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import stat
 import subprocess
 import urllib.error
@@ -218,6 +219,11 @@ def verify_environment_job(inputs):
     require(
         environment["artifacts_pinned"] and isinstance(environment["artifact"], dict),
         "target-built environment artifact is not pinned",
+    )
+    require(
+        isinstance(environment.get("cairo_runtime_package"), str)
+        and re.fullmatch(r"libcairo2=[0-9A-Za-z.+:~_-]+", environment["cairo_runtime_package"]),
+        "Cairo runtime package not bound",
     )
     with api_get(f"actions/runs/{environment['run_id']}") as response:
         run = json.load(response)

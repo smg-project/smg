@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -16,13 +17,28 @@ def preflight():
 
     contract = require_installed_contract()
     model_id = "meta-llama/Llama-3.1-8B-Instruct"
-    model = Path(get_model_spec(model_id)["model"])
-    if not model.is_absolute() or not model.is_dir():
+    requested = get_model_spec(model_id)["model"]
+    model = Path(requested)
+    revision = None
+    if not model.is_absolute():
+        if requested != model_id:
+            raise ValueError("Unknown cached model ID")
+        cache = Path(os.environ["HF_HOME"]) / "hub"
+        directory = cache / ("models--" + model_id.replace("/", "--"))
+        revision = (directory / "refs/main").read_text().strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", revision):
+            raise ValueError("Unknown cached model revision")
+        model = directory / "snapshots" / revision
+        if not model.resolve().is_relative_to(cache.resolve()):
+            raise ValueError("Cached model path escapes cache")
+    if not model.is_dir():
         raise ValueError("Existing local Llama8B model cache is required")
     # The normal loader still chooses model files. Never download or substitute weights.
     files = {}
     for name in ["config.json", "tokenizer_config.json"]:
         path = model / name
+        if revision is not None and not path.resolve().is_relative_to(cache.resolve()):
+            raise ValueError("Cached model metadata escapes cache")
         if not path.is_file() or path.stat().st_size > 8 * 1024 * 1024:
             raise ValueError(f"Missing or oversized cached model metadata: {name}")
         files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -33,6 +49,8 @@ def preflight():
         json.dumps(
             {
                 "model_id": model_id,
+                "requested_model": requested,
+                "cached_revision": revision,
                 "local_path": str(model.resolve()),
                 "metadata_sha256": files,
                 "weights_hashed": False,

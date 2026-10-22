@@ -52,6 +52,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 .github/amd-pd-env/diagnostic_budget.py
       - name: Reap owned processes and preserve final environment state
+        shell: bash
         if: always() && env.E2E_JOB_MARKER != ''
         timeout-minutes: 3
         run: |

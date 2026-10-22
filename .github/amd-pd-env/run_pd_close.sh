@@ -5,6 +5,7 @@ python3 .github/amd-pd-env/reuse_foundation.py
 python3 .github/amd-pd-env/environment_wheel.py
 python3 .github/amd-qa/closure_audit.py snapshot diagnostic-results/image-before.json
 python3 .github/amd-pd-env/runtime_environment.py before
+python3 .github/amd-pd-env/runtime_cairo.py
 export PIP_CONSTRAINT="${PIP_CONSTRAINT:+$PIP_CONSTRAINT }$PWD/diagnostic-results/runtime-pins.txt"
 
 # Same resolver roots as the reviewed ROCm helper, with one attempt per command.
