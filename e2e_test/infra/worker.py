@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
-from typing import IO, Any
+from typing import IO, TYPE_CHECKING, Any
 
 import yaml
 
@@ -57,6 +57,9 @@ from .process_utils import (
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from .pd_worker_observation import WorkerObservation
+
 
 @dataclass
 class Worker:
@@ -91,6 +94,8 @@ class Worker:
     # Environment for the engine process on top of the infra's own settings
     # (a deployment-injected SMG_PAIRING_PROTOCOL, for instance).
     extra_env: dict[str, str] | None = None
+    scheduler_observation: WorkerObservation | None = None
+    observer_instance: str | None = field(default=None, init=False, repr=False)
     # Mock engine only: the port of the mock worker's admin API, where a test
     # states the answers the worker's next requests get.
     admin_port: int | None = None
@@ -149,6 +154,17 @@ class Worker:
         """
         cmd = self._build_cmd()
         env = self._build_env()
+        env.pop("SMG_PD_OBSERVE", None)
+        self.observer_instance = None
+        if self.scheduler_observation is not None:
+            from .pd_worker_observation import WorkerObservation
+
+            if not isinstance(self.scheduler_observation, WorkerObservation):
+                raise ValueError("scheduler observation requires explicit worker context")
+            env = self.scheduler_observation.child_environment(
+                env, engine=self.engine, mode=self.mode, worker_type=self.worker_type, command=cmd
+            )
+            self.observer_instance = env["SMG_PD_TRACE_WORKER_INSTANCE"]
 
         logger.info(
             "Starting %s %s worker for %s on GPUs %s port %d",

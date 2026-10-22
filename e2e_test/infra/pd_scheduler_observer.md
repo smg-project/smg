@@ -25,6 +25,20 @@ VLLM_PLUGINS (load all), and appends only this plugin to an existing allowlist.
 The nested metadata directory is discovered only when added to child PYTHONPATH.
 Apply the helper after Worker builds its GPU-specific environment; the result is
 a complete child-process environment, rather than an extra_env override mapping.
+
+`Worker.scheduler_observation=WorkerObservation(run, attempt, worker, trace_dir)`
+now explicitly opts one vLLM HTTP PD Worker into that final environment step.
+The actual command must contain one KV config whose producer/consumer role matches
+the Worker type. This is configured role context, pending real backend validation.
+Observed launches reject KV aliases/dotted overrides and config-file inputs;
+ordinary launches keep their existing parsing.
+Every launch exposes `Worker.observer_instance` and records `worker_instance` in
+the trace, separately from each scheduler's generated `instance`. Parent/global
+environment does not opt other Workers in; no observation field means disabled.
+Fixtures/start_workers do not yet allocate these contexts, and no HTTP skip is
+removed. Request-ID forwarding, all retries/ranks and trace completeness still
+need their own integration and GPU controls. CPU child metadata/context tests do
+not execute the actual vLLM plugin loader or scheduler.
 Importing the lightweight callback with its flag absent loads neither infra nor vLLM.
 
 The callback delegates the original getter once. Only the verified EngineCore
