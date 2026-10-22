@@ -380,13 +380,22 @@ engine's own settings bound the hold, and they work only together:
 - `UCX_CUDA_IPC_CACHE=n` in the engine's environment: a mapping ends with its
   transfer instead of staying cached.
 - `kv_connector_extra_config.engine_ttl` (seconds) in `--kv-transfer-config`:
-  a peer idle longer than this is dropped the next time the connector
-  handshakes a new peer (a restarted leg counts) or sends a heartbeat; an
-  hour by the connector's default, and a known peer's own requests never run
-  the sweep. Dropping the peer releases its transfer state, the transfers
-  that were in flight when it died included; with the cache off their
-  mappings go with them, with the cache on the mappings outlive the peer
-  either way.
+  a peer idle longer than this is dropped the next time the connector runs
+  its sweep, which it does when it handshakes a new peer and when it sends a
+  heartbeat; an hour by the connector's default. A restarted leg counts as a
+  new peer only for the peers that do not hold its memory: the leg whose
+  memory a peer still holds fails its startup memory check before it
+  handshakes anyone, so its own restart cannot run the sweep that would
+  release it. The heartbeat goes out on a known peer's requests as well, on
+  the first request after a gap longer than a sixth of the connector's lease
+  (five seconds at its default), and the peer that request reads from is
+  stamped active before the sweep, so a pair's own traffic never drops the
+  pair. A single pair whose prefill died sends no heartbeat either; its
+  decode lets go of the dead leg's memory only when another peer turns up or
+  a request from a live peer runs the sweep. Dropping the peer releases its
+  transfer state, the transfers that were in flight when it died included;
+  with the cache off their mappings go with them, with the cache on the
+  mappings outlive the peer either way.
 
 Neither is free, which is why the servicer does not set them for you. With
 the cache off, every request's transfer opens and closes each of the peer's
@@ -394,12 +403,14 @@ allocations it touches (about one per layer, the way the engine allocates its
 KV cache). Measured on one host, two tensor-parallel-2 legs over CUDA IPC,
 prompts of about 5100 tokens, 40 sequential requests per arm: the first token
 came 2 % later at the median (885 to 903 ms) and 5 % later at the 90th
-percentile (900 to 943 ms), with one three-second outlier in forty. A short
-TTL costs a quiet pair nothing by itself, since the sweep only runs when a
-new peer turns up; when one does, a healthy pair that had been idle longer
-than the TTL is dropped with the dead ones and runs its handshake again on
-its next request (the peer's metadata plus a descriptor list over every one
-of its KV blocks: seconds on a large cache). Legs on different hosts are not
+percentile (900 to 943 ms), with one three-second outlier in forty, in the
+cache-off arm. A short TTL costs a quiet pair nothing by itself, since the
+sweep runs only when a new peer turns up or a heartbeat goes out on a
+request; when either happens, a healthy pair that had been idle longer than
+the TTL (other than the pair whose own request ran the sweep) is dropped
+with the dead ones and runs its handshake again on its next request (the
+peer's metadata plus a descriptor list over every one of its KV blocks:
+seconds on a large cache). Legs on different hosts are not
 affected: over TCP or RDMA nothing of the peer's memory is imported, and a
 restart passes the memory check at once. The repository's end-to-end harness
 runs its NIXL pairs with the cache off and a TTL of 3 s because it restarts
