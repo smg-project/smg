@@ -53,13 +53,14 @@
 //!   `none`. The response's `x-smg-parser` header says `legacy` for the same request; the
 //!   counter says how often, and why, across a deployment.
 //!
-//! And, after an output read clean, what the response could not carry:
+//! And, after an output was read, what the response could not carry:
 //!
 //! - `refused`: a whole Messages response whose `tool_use` block cannot carry the arguments the
 //!   model wrote (JSON no `input` value holds): the request answers with an error, the output
-//!   stays counted by the read's verdict (`clean`), and the refusal is counted once by its reason
-//!   under the table ([`record_refused`]), so a sum over the outcomes still reads the table's
-//!   reading and this series the fold's.
+//!   keeps whatever count the read gave it (`clean`; `unknown_tool` or `malformed` when an
+//!   undeclared call or a malformed run came beside the refused call), and the refusal is counted
+//!   once by its reason under the table ([`record_refused`]): this series is the fold's, a subset
+//!   of no outcome, so a sum over the outcomes still reads the table's reading.
 //!
 //! Cost: a clean output records one counter increment through a key built once per table (the
 //! `metrics` macros build a key, with a `Vec` of labels, on every call), no allocation. A
@@ -103,9 +104,9 @@ pub(crate) const CALLS_SUPPRESSED: &str = "smg_symphony_calls_suppressed_total";
 /// Requests Symphony was configured for that the legacy parsers read, by `reason` and `table`
 /// ([`record_fallback`]).
 pub(crate) const FALLBACK: &str = "smg_symphony_fallback_total";
-/// Whole Messages responses refused after an output read clean, by `table` and `reason`
-/// ([`record_refused`]): `tool_use_input`, a `tool_use` block that cannot carry the arguments the
-/// model wrote.
+/// Whole Messages responses refused after the output was read (counted under its own outcome),
+/// by `table` and `reason` ([`record_refused`]): `tool_use_input`, a `tool_use` block that cannot
+/// carry the arguments the model wrote.
 pub(crate) const REFUSED: &str = "smg_symphony_refused_total";
 /// The buckets of [`MALFORMED_BYTES`]: a marker's worth to a whole answer.
 pub(crate) const MALFORMED_BYTES_BUCKETS: [f64; 9] = [
@@ -650,9 +651,9 @@ pub(crate) fn record_failed(table: &'static str) {
     increment(&series(table).outputs[FAILED], 1);
 }
 
-/// Records a whole Messages response refused after an output read clean under `table`: its
+/// Records a whole Messages response refused after its output was read under `table`: its
 /// `tool_use` block cannot carry the arguments the model wrote. The output's own count stands,
-/// the read's verdict; this one is the fold's, by its reason.
+/// whatever outcome the read gave it; this one is the fold's, by its reason.
 pub(crate) fn record_refused(table: &'static str) {
     increment(&series(table).refused, 1);
 }
