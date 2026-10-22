@@ -11,6 +11,7 @@ on:
       - scripts/check_grpc_compatibility.py
       - scripts/ci_install_e2e_deps.sh
       - scripts/ci_setup_vllm_rocm_image.sh
+      - scripts/test_grpc_ci_dependencies.py
       - .github/workflows/grpc-compatibility-tests.yml
   workflow_dispatch:
 
@@ -35,6 +36,7 @@ jobs:
           .grpc178/bin/python -m pip install crates/grpc_client/python/ grpc_servicer/
           .grpc178/bin/python -m pip check
           .grpc178/bin/python -m pip install pytest pytest-asyncio msgspec pydantic numpy pyzmq pillow
+          .grpc178/bin/python -m pytest -q scripts/test_grpc_ci_dependencies.py
           .grpc178/bin/python -m pytest -q grpc_servicer/tests -rs
           python -m venv .grpc181
           .grpc181/bin/python -m pip install grpcio==1.81.1 grpcio-tools==1.81.1 grpcio-health-checking==1.81.1 grpcio-reflection==1.81.1 protobuf==6.33.6
