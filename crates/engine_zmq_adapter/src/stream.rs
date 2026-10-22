@@ -342,20 +342,17 @@ mod tests {
     use std::time::Duration;
 
     use engine_zmq_client::{
-        mock_engine::{
-            connect_to_frontend, default_ready_response, EngineInbound, MockEngine, MockEngineInput,
-        },
+        mock_engine::{EngineInbound, MockEngine, MockEngineInput},
         protocol::vllm::output::{
             EngineCoreFinishReason, EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs,
         },
-        EngineId,
     };
     use openai_protocol::worker::RuntimeType;
     use tokio::time::Instant;
     use tonic::Code;
 
     use super::*;
-    use crate::{client::ZmqEngineClient, eos::EosTokenIds};
+    use crate::{client::ZmqEngineClient, test_support::connected_pair_in};
 
     /// A connected vLLM-dialect client over a throwaway ipc endpoint, its
     /// requests bounded by `request_timeout` when one is given, and the mock
@@ -364,30 +361,11 @@ mod tests {
         dir: &std::path::Path,
         request_timeout: Option<Duration>,
     ) -> (ZmqEngineClient, MockEngine) {
-        let ep = |name: &str| format!("ipc://{}", dir.join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Vllm,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let client = client.expect("adapter connect");
+        let (client, engine) = connected_pair_in(dir, RuntimeType::Vllm).await;
         if let Some(timeout) = request_timeout {
             client.set_request_timeout(timeout);
         }
-        (client, engine.expect("mock engine"))
+        (client, engine)
     }
 
     /// One engine tick for `request_id`: a token, and the finish when `finish`

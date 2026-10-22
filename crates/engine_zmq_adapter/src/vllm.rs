@@ -970,20 +970,17 @@ pub(crate) fn now_secs() -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use engine_zmq_client::{
-        mock_engine::{connect_to_frontend, default_ready_response, EngineInbound},
+        mock_engine::EngineInbound,
         protocol::vllm::{
             logprobs::{Logprobs, PositionLogprobs, TokenLogprob},
             output::{EngineCoreOutputs, RequestBatchOutputs},
         },
-        EngineId,
     };
     use openai_protocol::worker::RuntimeType;
 
     use super::*;
-    use crate::{client::ZmqEngineClient, eos::EosTokenIds};
+    use crate::{eos::EosTokenIds, test_support::connected_pair};
 
     fn batch(
         request_id: &str,
@@ -1019,29 +1016,7 @@ mod tests {
     /// EngineCore, and maps the engine's outputs back to vLLM-proto responses.
     #[tokio::test]
     async fn generate_e2e_translates_and_streams_vllm_proto() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Vllm,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let client = client.expect("adapter connect");
-        let engine = engine.expect("mock engine");
+        let (client, engine, _dir) = connected_pair(RuntimeType::Vllm).await;
 
         #[expect(
             clippy::disallowed_methods,
@@ -1208,29 +1183,7 @@ mod tests {
     /// to the requested count (matching the gRPC servicer's `islice` behaviour).
     #[tokio::test]
     async fn generate_shapes_top_logprobs_to_requested_count() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Vllm,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let client = client.expect("adapter connect");
-        let engine = engine.expect("mock engine");
+        let (client, engine, _dir) = connected_pair(RuntimeType::Vllm).await;
 
         // One position with the sampled token (actual vocab rank) first, then
         // the engine's ranked candidates. The wire carries `k + 1` entries.
@@ -1345,29 +1298,7 @@ mod tests {
     /// the first token-bearing chunk (once) and on the terminal `Complete`.
     #[tokio::test]
     async fn generate_streams_prompt_logprobs() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Vllm,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let client = client.expect("adapter connect");
-        let engine = engine.expect("mock engine");
+        let (client, engine, _dir) = connected_pair(RuntimeType::Vllm).await;
 
         // Prompt position for input token 2 (the engine scores every prompt
         // token but the first), with one ranked candidate behind it.
@@ -2233,29 +2164,7 @@ mod tests {
     /// proto `index` (0 and 1) the pipeline demuxes choices by.
     #[tokio::test]
     async fn generate_e2e_fans_out_n2_vllm() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Vllm,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let client = client.expect("adapter connect");
-        let engine = engine.expect("mock engine");
+        let (client, engine, _dir) = connected_pair(RuntimeType::Vllm).await;
 
         #[expect(
             clippy::disallowed_methods,
@@ -2323,29 +2232,7 @@ mod tests {
     /// engine-side sub-request, not just one.
     #[tokio::test]
     async fn dropping_fanned_out_stream_aborts_all_subs() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Vllm,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let client = client.expect("adapter connect");
-        let engine = engine.expect("mock engine");
+        let (client, engine, _dir) = connected_pair(RuntimeType::Vllm).await;
         let (mut engine_input, _engine_output) = engine.split();
 
         let stream = client
@@ -2509,28 +2396,7 @@ mod tests {
     async fn an_error_or_abort_finish_of_a_constrained_request_keeps_the_engines_own_shape() {
         use smg_grpc_client::is_constraint_failure;
 
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Vllm,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let client = client.expect("adapter connect");
-        let engine = engine.expect("mock engine");
+        let (client, engine, _dir) = connected_pair(RuntimeType::Vllm).await;
         // (rid, the finish, constrained, a decode side carrying its KV handoff)
         let cases = [
             ("r1", EngineCoreFinishReason::Error, true, true),

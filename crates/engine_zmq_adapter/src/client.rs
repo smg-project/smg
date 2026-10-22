@@ -1289,7 +1289,7 @@ mod tests {
     use tonic::Code;
 
     use super::*;
-    use crate::eos::EosTokenIds;
+    use crate::{eos::EosTokenIds, test_support::connected_pair};
 
     /// A connected client over a throwaway ipc endpoint. The mock engine is
     /// dropped on return: these tests only inspect request-side EOS state.
@@ -1845,29 +1845,8 @@ mod tests {
     /// TokenSpeed has no prefix-cache reset on the ZMQ wire.
     #[tokio::test]
     async fn reset_prefix_cache_is_unimplemented_for_tokenspeed() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::TokenSpeed,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let _engine = engine.expect("mock engine");
+        let (client, _engine, _dir) = connected_pair(RuntimeType::TokenSpeed).await;
         let status = client
-            .expect("adapter connect")
             .reset_prefix_cache(Duration::from_secs(1))
             .await
             .expect_err("tokenspeed");
