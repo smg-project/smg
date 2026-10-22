@@ -144,6 +144,30 @@ mod handles {
         }
     }
 
+    /// This thread's kept handles of one per-worker gauge, by worker URL,
+    /// with the worker-set generation they were kept under: a gauge set on
+    /// every request (the active-request count, the circuit breaker's
+    /// consecutive outcomes) is set through its handle, not through a key
+    /// built and looked up per call.
+    #[derive(Default)]
+    pub(super) struct WorkerGauges {
+        generation: u64,
+        by_worker: HashMap<String, Gauge>,
+    }
+
+    impl WorkerGauges {
+        /// The handles by worker, after dropping every kept handle if the
+        /// worker set changed since they were kept.
+        pub(super) fn current(&mut self) -> &mut HashMap<String, Gauge> {
+            let generation = WORKER_SET_GENERATION.load(Ordering::Acquire);
+            if self.generation != generation {
+                self.by_worker.clear();
+                self.generation = generation;
+            }
+            &mut self.by_worker
+        }
+    }
+
     thread_local! {
         /// `smg_http_requests_total`.
         pub(super) static HTTP_REQUESTS: RefCell<ByMethodAndPath<Counter>> = RefCell::new(HashMap::new());
@@ -159,6 +183,12 @@ mod handles {
         pub(super) static STREAMS: RefCell<ByLabels<StreamLabels, StreamHandles>> = RefCell::new(HashMap::new());
         /// `smg_worker_requests_total`.
         pub(super) static WORKER_REQUESTS: RefCell<WorkerRequests> = RefCell::new(WorkerRequests::default());
+        /// `smg_worker_requests_active`.
+        pub(super) static WORKER_REQUESTS_ACTIVE: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
+        /// `smg_worker_cb_consecutive_failures`.
+        pub(super) static WORKER_CB_FAILURES: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
+        /// `smg_worker_cb_consecutive_successes`.
+        pub(super) static WORKER_CB_SUCCESSES: RefCell<WorkerGauges> = RefCell::new(WorkerGauges::default());
     }
 
     #[cfg(test)]
@@ -171,6 +201,9 @@ mod handles {
         HTTP_CONNECTIONS_ACTIVE.set(None);
         STREAMS.with_borrow_mut(HashMap::clear);
         WORKER_REQUESTS.with_borrow_mut(|kept| *kept = WorkerRequests::default());
+        WORKER_REQUESTS_ACTIVE.with_borrow_mut(|kept| *kept = WorkerGauges::default());
+        WORKER_CB_FAILURES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
+        WORKER_CB_SUCCESSES.with_borrow_mut(|kept| *kept = WorkerGauges::default());
     }
 
     #[cfg(test)]
@@ -2326,12 +2359,36 @@ impl Metrics {
     }
 
     pub fn set_worker_requests_active(worker: &str, count: usize) {
-        let worker_interned = intern_string(worker);
-        gauge!(
-            "smg_worker_requests_active",
-            "worker" => worker_interned
-        )
-        .set(count as f64);
+        Self::set_worker_gauge(
+            &handles::WORKER_REQUESTS_ACTIVE,
+            worker,
+            count as f64,
+            || {
+                gauge!(
+                    "smg_worker_requests_active",
+                    "worker" => intern_string(worker)
+                )
+            },
+        );
+    }
+
+    /// Sets a per-worker gauge that moves on every request: through this
+    /// thread's kept handle for `worker` (built by `build` on first sight and
+    /// dropped when the worker set changes), or through a key built per call
+    /// when handles are not kept.
+    fn set_worker_gauge(
+        kept: &'static std::thread::LocalKey<std::cell::RefCell<handles::WorkerGauges>>,
+        worker: &str,
+        value: f64,
+        build: impl FnOnce() -> metrics::Gauge,
+    ) {
+        if !handles::keep_handles() {
+            build().set(value);
+            return;
+        }
+        kept.with_borrow_mut(|kept| {
+            handles::with_handle(kept.current(), worker, build, |gauge| gauge.set(value));
+        });
     }
 
     /// Set active routing keys per worker
@@ -2680,22 +2737,32 @@ impl Metrics {
 
     /// Set circuit breaker consecutive failures
     pub fn set_worker_cb_consecutive_failures(worker: &str, count: u32) {
-        let worker_interned = intern_string(worker);
-        gauge!(
-            "smg_worker_cb_consecutive_failures",
-            "worker" => worker_interned
-        )
-        .set(count as f64);
+        Self::set_worker_gauge(
+            &handles::WORKER_CB_FAILURES,
+            worker,
+            f64::from(count),
+            || {
+                gauge!(
+                    "smg_worker_cb_consecutive_failures",
+                    "worker" => intern_string(worker)
+                )
+            },
+        );
     }
 
     /// Set circuit breaker consecutive successes
     pub fn set_worker_cb_consecutive_successes(worker: &str, count: u32) {
-        let worker_interned = intern_string(worker);
-        gauge!(
-            "smg_worker_cb_consecutive_successes",
-            "worker" => worker_interned
-        )
-        .set(count as f64);
+        Self::set_worker_gauge(
+            &handles::WORKER_CB_SUCCESSES,
+            worker,
+            f64::from(count),
+            || {
+                gauge!(
+                    "smg_worker_cb_consecutive_successes",
+                    "worker" => intern_string(worker)
+                )
+            },
+        );
     }
 
     // ========================================================================

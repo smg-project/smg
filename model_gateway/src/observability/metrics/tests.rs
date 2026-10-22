@@ -1028,6 +1028,72 @@ fn kept_worker_counters_follow_the_workers_registrations() {
     handles::reset();
 }
 
+/// With handles kept, the per-request worker gauges set the recorder's
+/// own series (the last value written shows), and a retirement drops the
+/// kept handle: a set racing the removal feeds nothing, a re-registration
+/// gets a fresh handle.
+#[test]
+fn kept_worker_gauges_set_the_recorders_series() {
+    let workers = Arc::new(WorkerSeries::new(DistributionBuilder::new(
+        parse_quantiles(DEFAULT_SUMMARY_QUANTILES),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )));
+    let recorder = WorkerSeriesRecorder::new(
+        PrometheusBuilder::new().build_recorder(),
+        Arc::clone(&workers),
+    );
+    workers.activate("http://w1");
+    // The rendered value of one per-worker series.
+    let value = |series: &str, worker: &str| -> Option<String> {
+        let mut rendered = String::new();
+        workers.render_into(&mut rendered);
+        rendered
+            .lines()
+            .find(|line| {
+                line.starts_with(&format!("{series}{{"))
+                    && line.contains(&format!("worker=\"{worker}\""))
+            })
+            .map(|line| line.rsplit(' ').next().unwrap_or_default().to_owned())
+    };
+    handles::force_on_this_thread(Some(true));
+    metrics::with_local_recorder(&recorder, || {
+        Metrics::set_worker_requests_active("http://w1", 3);
+        Metrics::set_worker_requests_active("http://w1", 2);
+        Metrics::set_worker_cb_consecutive_failures("http://w1", 1);
+        Metrics::set_worker_cb_consecutive_successes("http://w1", 4);
+        assert_eq!(
+            value("smg_worker_requests_active", "http://w1").as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            value("smg_worker_cb_consecutive_failures", "http://w1").as_deref(),
+            Some("1")
+        );
+        assert_eq!(
+            value("smg_worker_cb_consecutive_successes", "http://w1").as_deref(),
+            Some("4")
+        );
+
+        workers.retire("http://w1");
+        handles::worker_set_changed();
+        Metrics::set_worker_requests_active("http://w1", 9);
+        assert_eq!(value("smg_worker_requests_active", "http://w1"), None);
+
+        workers.activate("http://w1");
+        handles::worker_set_changed();
+        Metrics::set_worker_requests_active("http://w1", 1);
+        assert_eq!(
+            value("smg_worker_requests_active", "http://w1").as_deref(),
+            Some("1")
+        );
+    });
+    handles::reset();
+}
+
 /// The registry's registration and removal hooks are what move the
 /// worker-set generation the kept counters are checked against.
 #[test]
