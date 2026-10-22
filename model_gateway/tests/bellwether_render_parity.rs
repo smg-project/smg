@@ -146,12 +146,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          the recorded template run keeps or drops the role: one case of every such model",
     ),
     (
-        "*/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12): one \
-         case of every model",
-    ),
-    (
         "*/render/tools-history-content-and-call",
         "the gateway parses a history call's arguments into an object before rendering, \
          which the templates that write the string as recorded render otherwise: one \
@@ -322,6 +316,18 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          parameter",
     ),
     (
+        "glm-4.6/render/tools-call-arguments-object",
+        "the gateway hands the template a tool-call-only assistant turn as empty content, as \
+         the engine's renderer does (smg-project/smg#4210), and this template prints the \
+         content; the recorded template run printed the absent content as `None`",
+    ),
+    (
+        "glm-4.7-flash/render/tools-call-arguments-object",
+        "the gateway hands the template a tool-call-only assistant turn as empty content, as \
+         the engine's renderer does (smg-project/smg#4210), and this template prints the \
+         content; the recorded template run printed the absent content as `None`",
+    ),
+    (
         "granite-3.2-8b-instruct-preview/render/*",
         "the template writes the day of the render into the prompt with strftime_now and \
          the group was recorded on 2026-10-13, where the job renders SOURCE_DATE_EPOCH's \
@@ -424,6 +430,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          benchmark set in the tree's sample, every case with a call in its history",
     ),
     (
+        "minimax-m2.7/render/tools-call-arguments-object",
+        "the gateway hands the template a tool-call-only assistant turn as empty content, as \
+         the engine's renderer does (smg-project/smg#4210), and this template prints the \
+         content; the recorded template run printed the absent content as `None`",
+    ),
+    (
         "mistral-small-24b-instruct-2501/render/*",
         "the template writes the day of the render into the prompt with strftime_now and \
          the group was recorded on 2026-10-12, where the job renders SOURCE_DATE_EPOCH's \
@@ -441,6 +453,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     ("nanbeige4-3b-thinking-2511/render/*", LEGACY_FILE_PIPELINE),
     ("nanbeige4.1-3b/render/*", LEGACY_FILE_PIPELINE),
     ("nanollama/render/*", LEGACY_FILE_PIPELINE),
+    (
+        "nanbeige4.2-3b/render/tools-call-arguments-object",
+        "the gateway hands the template a tool-call-only assistant turn as empty content, as \
+         the engine's renderer does (smg-project/smg#4210), and this template prints the \
+         content; the recorded template run printed the absent content as `None`",
+    ),
     (
         "nft-7b/render/swehero-5.jsonl",
         "the gateway parses a history call's arguments into an object before rendering, \

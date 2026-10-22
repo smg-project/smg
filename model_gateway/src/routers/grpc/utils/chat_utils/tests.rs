@@ -1610,12 +1610,16 @@ fn a_template_that_writes_the_arguments_as_text_gets_them_as_the_request_sent_th
     );
 }
 
-/// An empty `arguments` string, which a call cut before it wrote any argument may carry back
-/// in history, is a call with no arguments; other text that is not JSON keeps the 400.
+/// Tool-call `arguments` reach the template as the object the engines hand
+/// theirs: a JSON text is parsed in its key order; an empty text (a call cut
+/// before it wrote any argument may carry one back in history) is a call
+/// without arguments; a text that is not JSON, or not an object, is an empty
+/// object as well instead of a refusal that would fail every later turn of
+/// the conversation; absent arguments are an empty object; an object stays.
 #[test]
-fn an_empty_arguments_string_in_history_is_no_arguments() {
-    let history = |arguments: &str| {
-        vec![json!({
+fn arguments_text_in_history_reaches_the_template_as_the_engines_hand_it() {
+    let rendered = |arguments: Value| {
+        let mut messages = vec![json!({
             "role": "assistant",
             "content": null,
             "tool_calls": [{
@@ -1623,34 +1627,74 @@ fn an_empty_arguments_string_in_history_is_no_arguments() {
                 "type": "function",
                 "function": {"name": "apply_patch", "arguments": arguments}
             }]
-        })]
+        })];
+        process_tool_call_arguments(&mut messages);
+        messages[0]["tool_calls"][0]["function"]["arguments"].take()
     };
+    let parsed = rendered(json!("{\"patch\": \"x\", \"at\": 1}"));
+    assert_eq!(parsed.to_string(), "{\"patch\":\"x\",\"at\":1}");
     for empty in ["", "  \n"] {
-        let mut messages = history(empty);
-        process_tool_call_arguments(&mut messages).expect("an empty string is no arguments");
+        assert_eq!(rendered(json!(empty)), json!({}), "{empty:?}");
+    }
+    for not_an_object in ["{", "{\"patch\": \"x\"", "[]", "42", "\"x\""] {
         assert_eq!(
-            messages[0]["tool_calls"][0]["function"]["arguments"],
+            rendered(json!(not_an_object)),
             json!({}),
-            "{empty:?}"
+            "{not_an_object:?}"
         );
     }
-    let mut messages = history("{\"patch\": \"x\"}");
-    process_tool_call_arguments(&mut messages).expect("JSON arguments");
-    assert_eq!(
-        messages[0]["tool_calls"][0]["function"]["arguments"],
-        json!({"patch": "x"})
-    );
-    for invalid in ["{", "{\"patch\": \"x\""] {
-        let err = process_tool_call_arguments(&mut history(invalid)).unwrap_err();
-        assert!(err.contains("Failed to parse tool call arguments"), "{err}");
-    }
+    assert_eq!(rendered(Value::Null), json!({}));
+    assert_eq!(rendered(json!({"patch": "y"})), json!({"patch": "y"}));
 }
 
-/// A renderer that parses `arguments` itself (K3) gets a malformed history
-/// string as written and applies its own tolerance; Transformers templates
-/// keep the 400.
+/// A history tool call whose `arguments` is the JSON object itself (a client
+/// replaying the parsed call) is accepted and renders exactly as the same
+/// call with the arguments as text, the shape the API documents: a template
+/// gets the object either way, in the request's key order, and a renderer
+/// that reads the text itself gets the object's JSON text.
 #[test]
-fn malformed_tool_call_arguments_are_forwarded_when_the_renderer_parses_them() {
+fn tool_call_arguments_sent_as_an_object_render_like_the_text() {
+    let request = |arguments: Value| -> ChatCompletionRequest {
+        serde_json::from_value(json!({
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": "Weather in Paris?"},
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": arguments}
+                    }]
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "{\"temperature\": 18}"}
+            ]
+        }))
+        .expect("a history tool call's arguments may be text or an object")
+    };
+    let as_object = request(json!({"unit": "celsius", "city": "Paris"}));
+    let as_text = request(json!("{\"unit\": \"celsius\", \"city\": \"Paris\"}"));
+    let arguments =
+        |rendered: Value| rendered["messages"][1]["tool_calls"][0]["function"]["arguments"].clone();
+
+    let object = arguments(render_with(Default::default(), &as_object));
+    assert_eq!(
+        object.to_string(),
+        "{\"unit\":\"celsius\",\"city\":\"Paris\"}"
+    );
+    assert_eq!(object, arguments(render_with(Default::default(), &as_text)));
+    assert_eq!(
+        arguments(render_with(RAW_ARGUMENTS, &as_object)),
+        json!("{\"unit\":\"celsius\",\"city\":\"Paris\"}")
+    );
+}
+
+/// A malformed `arguments` text in history: a renderer that parses
+/// `arguments` itself (K3) gets it as written and applies its own tolerance;
+/// a template gets the empty object the engines hand theirs.
+#[test]
+fn malformed_tool_call_arguments_render_as_the_engines_render_them() {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "m",
         "messages": [
@@ -1669,14 +1713,11 @@ fn malformed_tool_call_arguments_are_forwarded_when_the_renderer_parses_them() {
     }))
     .unwrap();
 
-    let err = process_chat_messages_with_placeholders(
-        &request,
-        &llm_tokenizer::MockTokenizer::new(),
-        None,
-        MediaPartOrder::MediaFirst,
-    )
-    .unwrap_err();
-    assert!(err.contains("Failed to parse tool call arguments"), "{err}");
+    let template = render_with(Default::default(), &request);
+    assert_eq!(
+        template["messages"][1]["tool_calls"][0]["function"]["arguments"],
+        json!({})
+    );
 
     let raw = render_with(RAW_ARGUMENTS, &request);
     assert_eq!(
