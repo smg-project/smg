@@ -39,9 +39,21 @@ use crate::event::{DropReason, Event, Events, MalformedReason, Text};
 /// four assemblers of this module push it from their `stop`; a call cut by the token limit, an
 /// abort or any finish but `Stop` never comes here ([`end_cut_call`]).
 pub(crate) fn open_at_the_stop(out: &mut Events) {
+    left_open(MalformedReason::OpenAtTheStop, out);
+}
+
+/// The one event of a string value that one of a call's two own ends closed: the stream's stop
+/// (`why` = [`MalformedReason::OpenAtTheStop`], [`open_at_the_stop`]) or the call's closing
+/// marker (`why` = [`MalformedReason::OpenAtTheMarker`]: the model ended the call, its own
+/// closing marker, the next call's opener or the block's close came, with the string's closing
+/// tag never written). Either way the model wrote nothing more of the value, so the assembler
+/// closes the string; the event carries no bytes and stands before the closing quote. The four
+/// assemblers of this module push it from their `close_open_string`; a value held whole for its
+/// close keeps the ending's own path, reported or refused, nothing made up for it.
+pub(crate) fn left_open(why: MalformedReason, out: &mut Events) {
     out.push(Event::Malformed {
         text: Text::uncounted(String::new()),
-        why: MalformedReason::OpenAtTheStop,
+        why,
     });
 }
 

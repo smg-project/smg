@@ -111,7 +111,7 @@ const NO_TABLE: &str = "none";
 /// (`MalformedReason`, in its order, each under the crate's own spelling of it), so a dashboard
 /// tells a stray tag from a call written in the wrong syntax without the sampled line, and
 /// `other` for a reason this build does not know (the crate's enum is non-exhaustive).
-const REASONS: [&str; 30] = [
+const REASONS: [&str; 31] = [
     "unterminated_region",
     "invalid_arguments",
     "unknown_tool",
@@ -141,6 +141,7 @@ const REASONS: [&str; 30] = [
     "no_forced_function",
     "marker_out_of_place",
     "open_at_the_stop",
+    "open_at_the_marker",
     "other",
 ];
 /// The place of `other` in [`REASONS`]: a reason the match below does not know.
@@ -214,6 +215,7 @@ fn reason_index(why: MalformedReason) -> usize {
         MalformedReason::NoForcedFunction => 26,
         MalformedReason::MarkerOutOfPlace => 27,
         MalformedReason::OpenAtTheStop => 28,
+        MalformedReason::OpenAtTheMarker => 29,
         _ => OTHER_REASON,
     }
 }

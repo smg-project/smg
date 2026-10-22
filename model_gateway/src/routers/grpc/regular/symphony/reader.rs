@@ -1909,6 +1909,73 @@ mod tests {
     }
 
     #[test]
+    fn a_string_value_a_calls_closing_marker_finds_open_is_delivered_whole_under_tool_calls() {
+        // The keyed syntax as a live stream carries it: the model skips the value's closing tag,
+        // writes the call's closing marker and then its stop token, which the engine hides. The
+        // message carries one call whose arguments parse, the value every byte the model wrote,
+        // under `tool_calls`; the output is counted malformed under the marker's reason.
+        use symphony::{adapt::chat::message, formats::glm4};
+        let tools: Vec<Tool> = serde_json::from_value(json!([{
+            "type": "function", "function": {
+                "name": "answer_string",
+                "parameters": {"type": "object", "properties": {"answer": {"type": "string"}}}
+            }
+        }]))
+        .expect("tools");
+        let assignment = Assignment {
+            format: Arc::new(glm4()),
+            prompt: GLM4_PROMPT.to_string(),
+        };
+        let pieces = [
+            "\n<think></think>\n<tool_call>answer_string\n<arg_key>answer</arg_key>\n<arg_value>",
+            "Logistic regression is a statistical method for a binary outcome",
+            ".",
+            "<|end_of_box|>",
+            "\n",
+            "</tool_call>",
+        ];
+        let mut all: Vec<Event<'static>> = Vec::new();
+        let mut events = Events::new();
+        let mut reader = Reader::new(&assignment, tools.into(), &mut events).expect("a reader");
+        all.extend(events.into_owned().drain());
+        for piece in pieces {
+            let mut delta = Delta::default();
+            let mut events = Events::new();
+            reader
+                .tail(piece.to_string(), &mut delta, &mut events)
+                .expect("read");
+            all.extend(events.into_owned().drain());
+        }
+        let mut events = Events::new();
+        reader
+            .end(EngineFinish::Stop, who(), &mut events)
+            .expect("ended");
+        all.extend(events.into_owned().drain());
+        let choice = message(0, &all);
+        assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        let calls = choice.message.tool_calls.expect("one call");
+        assert_eq!(calls.len(), 1);
+        let arguments: Value =
+            serde_json::from_str(calls[0].function.arguments.as_deref().expect("arguments"))
+                .expect("whole JSON");
+        assert_eq!(
+            arguments["answer"],
+            "Logistic regression is a statistical method for a binary outcome.<|end_of_box|>\n"
+        );
+        assert!(all.iter().any(|event| matches!(
+            event,
+            Event::Malformed {
+                why: symphony::MalformedReason::OpenAtTheMarker,
+                ..
+            }
+        )));
+        assert_eq!(
+            telemetry::reason_label(symphony::MalformedReason::OpenAtTheMarker),
+            "open_at_the_marker"
+        );
+    }
+
+    #[test]
     fn a_reader_ends_once() {
         let assignment = Assignment {
             format: Arc::new(qwen3(CallSyntax::Json)),

@@ -52,7 +52,7 @@ mod tests {
         event::{DropReason, Event, FinishReason, MalformedReason, Text},
         testing::{
             a_forced_tag_begins_with_the_templates_text, arguments_of, bytes, content, drive,
-            drive_to, reasoning, the_same_at_every_cut, Said,
+            drive_to, reasoning, said, the_same_at_every_cut, Said,
         },
         Declared, EngineFinish,
     };
@@ -304,6 +304,91 @@ mod tests {
             "{events:?}"
         );
         assert_eq!(bytes(&events), OPEN_AT_THE_STOP);
+    }
+
+    /// The same shape as the live stream carries it: the model ends the value with its end-of-box
+    /// marker and a newline, skips `</arg_value>` alone, writes `</tool_call>`, and then its
+    /// turn's stop token, which the engine hides and reports as a stop. The closing marker, not
+    /// the stop, ends the call with the string open.
+    const OPEN_AT_THE_MARKER: &str = concat!(
+        "\n<think></think>\n<tool_call>answer_string\n<arg_key>answer</arg_key>\n",
+        "<arg_value>Logistic regression is a statistical method for a binary outcome.",
+        "<|end_of_box|>\n</tool_call>"
+    );
+
+    #[test]
+    fn a_string_value_the_model_leaves_open_at_the_calls_closing_marker_is_closed_there_and_said() {
+        // Whole, one character at a time, at every two-way cut, and one piece per token at the
+        // end as the stream carries it (the text, the box marker, the newline, the marker): the
+        // call carries the value with every byte of the model's text, its arguments one JSON
+        // object under `stop` with one call, which a client reading `tool_calls` parses; the one
+        // `Malformed` event of no bytes says the marker closed the string, right before the
+        // closing quote; the marker's bytes are the call's end.
+        let run = |pieces: &[&str]| {
+            drive(
+                &mut Engine::new(glm4(), Declared::of(&answer_tool())),
+                PROMPT,
+                pieces,
+            )
+        };
+        let arguments = format!(
+            "{{\"answer\": {}}}",
+            serde_json::to_string(ANSWER).expect("json")
+        );
+        let expected = Said {
+            calls: vec![("answer_string".to_string(), arguments.clone())],
+            finish: Some((FinishReason::Stop, 1)),
+            content: String::new(),
+            reasoning: String::new(),
+        };
+        assert_eq!(the_same_at_every_cut(run, OPEN_AT_THE_MARKER), expected);
+        let as_streamed = [
+            "\n<think></think>\n<tool_call>answer_string\n<arg_key>answer</arg_key>\n<arg_value>",
+            "Logistic regression is a statistical method for a binary outcome",
+            ".",
+            "<|end_of_box|>",
+            "\n",
+            "</tool_call>",
+        ];
+        let events = run(&as_streamed);
+        assert_eq!(said(&events), expected);
+        let read: serde_json::Value =
+            serde_json::from_str(&arguments_of(&events, 0)).expect("whole JSON");
+        assert_eq!(read["answer"], ANSWER);
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::OpenAtTheMarker)]
+        );
+        let at = events
+            .iter()
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the one word");
+        assert!(
+            matches!(&events[at + 1], Event::ToolCallArguments { json, .. } if json == "\""),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::ToolCallEnd { source, .. } if source.text == "</tool_call>"
+            )),
+            "{events:?}"
+        );
+        assert_eq!(bytes(&events), as_streamed.concat());
+        // Cut by the token limit after the marker: the marker closed the call before the cut, so
+        // the arguments are the same whole object, and the engine's finish is kept.
+        let cut = drive_to(
+            &mut Engine::new(glm4(), Declared::of(&answer_tool())),
+            PROMPT,
+            &[OPEN_AT_THE_MARKER],
+            EngineFinish::Length,
+        );
+        assert_eq!(arguments_of(&cut, 0), arguments);
+        assert_eq!(
+            malformed(&cut),
+            [(String::new(), MalformedReason::OpenAtTheMarker)]
+        );
+        assert_eq!(said(&cut).finish, Some((FinishReason::Length, 1)));
     }
 
     #[test]

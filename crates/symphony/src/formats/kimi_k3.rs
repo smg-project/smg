@@ -251,16 +251,20 @@ mod tests {
         assert_eq!(starts, [(0, "f"), (1, "g"), (2, "h")]);
         assert_eq!(arguments_of(&events, 0), r#"{"a": true}"#);
         assert_eq!(arguments_of(&events, 1), "{}");
-        // The block's close cut `h` inside a string: nothing is closed for a value the model
-        // never closed, and the one word of no bytes before the end says so.
-        assert_eq!(arguments_of(&events, 2), r#"{"b": "x"#);
-        let ended = events
+        // The block's close ended `h` inside a string: the model ended the call, so the string
+        // is closed with the value's bytes whole, and the one word of no bytes before the
+        // closing quote says the marker closed it.
+        assert_eq!(arguments_of(&events, 2), r#"{"b": "x"}"#);
+        let at = events
             .iter()
-            .position(|event| matches!(event, Event::ToolCallEnd { index: 2, .. }))
-            .expect("the third call ends");
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the one word");
         assert!(matches!(
-            &events[ended - 1],
-            Event::Malformed { text, .. } if text.text.is_empty()
+            &events[at..at + 2],
+            [
+                Event::Malformed { text, why: MalformedReason::OpenAtTheMarker },
+                Event::ToolCallArguments { index: 2, json, .. }
+            ] if text.text.is_empty() && json == "\""
         ));
         assert_eq!(ends(&events), [Tags::XTML.invoke_close, "", ""]);
         assert!(matches!(

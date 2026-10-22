@@ -269,15 +269,16 @@ impl Assembler {
     /// `ToolCallEnd`), or nothing when the block ended another way. A call that has not been
     /// named yet is named from the text so far; after the last value the object is closed; inside
     /// a value held for its close what was held is refused and the object closes without that
-    /// member; inside a streamed string nothing is closed, since nothing is made up for a value
-    /// the model never finished: the fragments stand, what was held is refused, and one
-    /// `Malformed` event of no bytes says that the arguments are no whole value before the call's
-    /// end ([`end_cut_call`]); a block with no name at all has its bytes, the marker's included,
-    /// refused.
+    /// member; inside a streamed string the string is closed first
+    /// ([`Self::close_open_string`]): the model ended the call, so the value's bytes are the value
+    /// whole, and one `Malformed { OpenAtTheMarker }` event of no bytes before the closing quote
+    /// says the marker closed it; a block with no name at all has its bytes, the marker's
+    /// included, refused.
     pub fn close(mut self, terminal: &str, out: &mut Events) {
         if self.done {
             return;
         }
+        self.close_open_string(MalformedReason::OpenAtTheMarker, out);
         let held = self.scanner.held().to_string();
         self.object.carried.push_str(&held);
         if matches!(self.stage, Stage::Name) {
@@ -290,17 +291,6 @@ impl Assembler {
         }
         match std::mem::replace(&mut self.stage, Stage::Between) {
             Stage::Between | Stage::Name => {}
-            Stage::Value(ValueState {
-                mode: Mode::Streaming { opened: true },
-                ..
-            }) => {
-                // The start of a tag held at the end is refused; the one word before the end
-                // says the arguments are no whole value.
-                drop_refused(std::mem::take(&mut self.object.carried), out);
-                end_cut_call(self.object.index, String::new(), terminal, out);
-                self.done = true;
-                return;
-            }
             // A key, a tag or a value held for its close that the end cut short: its bytes are
             // refused, its member is never written, and the object closes.
             _ => self.object.refuse(MalformedReason::TagCutShort, out),
@@ -338,11 +328,10 @@ impl Assembler {
     /// as its closing marker would end it, with no bytes for the end ([`Self::close`]): a call
     /// not yet named is named from its text, a key or a value held for its close that the stop
     /// found open is refused and the object closes without that member, a block with no name has
-    /// its bytes refused. A streamed string still open is closed first: the model wrote nothing
-    /// after its bytes, so they are the value whole, and the bytes the scanner held as the start
-    /// of a tag are its text too, since no tag followed. One `Malformed { OpenAtTheStop }` event
-    /// of no bytes stands before the fragment that closes what was open, so that the shape is
-    /// counted ([`open_at_the_stop`](super::open_at_the_stop)): for a string the stop closed
+    /// its bytes refused. A streamed string still open is closed first
+    /// ([`Self::close_open_string`]), under the stop's word. One `Malformed { OpenAtTheStop }`
+    /// event of no bytes stands before the fragment that closes what was open, so that the shape
+    /// is counted ([`open_at_the_stop`](super::open_at_the_stop)): for a string the stop closed
     /// under any table, and for the call itself where the table has no stop row (`as_marker`),
     /// since there the template writes the marker the model skipped.
     pub fn stop(mut self, as_marker: bool, out: &mut Events) {
@@ -354,23 +343,35 @@ impl Assembler {
             self.object.carried.push_str(&held);
             self.name_call(out);
         }
-        let string_open = matches!(
+        let string_closed = self.close_open_string(MalformedReason::OpenAtTheStop, out);
+        if !string_closed && self.started() && !as_marker {
+            super::open_at_the_stop(out);
+        }
+        self.close("", out);
+    }
+
+    /// A streamed string still open when the call ends, at its closing marker or at the stream's
+    /// stop: the model wrote nothing more of the value after the call's end, so its bytes are the
+    /// value whole, and the bytes the scanner held as the start of a tag are its text too, since
+    /// no tag followed. The string is closed: the one word of no bytes (`why`: the end that closed
+    /// it, [`left_open`](super::left_open)), then the closing quote, and the call goes on to close
+    /// as after a value's own tag. Says whether a string was open; nothing happens otherwise.
+    fn close_open_string(&mut self, why: MalformedReason, out: &mut Events) -> bool {
+        if !matches!(
             self.stage,
             Stage::Value(ValueState {
                 mode: Mode::Streaming { opened: true },
                 ..
             })
-        );
-        if string_open {
-            let held = self.scanner.set_aside();
-            self.value_text(&held, out);
-            super::open_at_the_stop(out);
-            self.object.close_member("\"".to_string(), "", out);
-            self.stage = Stage::Between;
-        } else if self.started() && !as_marker {
-            super::open_at_the_stop(out);
+        ) {
+            return false;
         }
-        self.close("", out);
+        let held = self.scanner.set_aside();
+        self.value_text(&held, out);
+        super::left_open(why, out);
+        self.object.close_member("\"".to_string(), "", out);
+        self.stage = Stage::Between;
+        true
     }
 
     fn take(&mut self, piece: Piece<'_>, declared: &Declared, out: &mut Events) {
@@ -850,35 +851,35 @@ mod tests {
         assert_eq!(refused(&events), ["<arg_key>", "a"]);
     }
 
-    /// The call's closing marker inside a streamed string: no closing quote and no closing brace
-    /// are made up for a value the model never closed; the fragments stand, what was held (`<`
-    /// could begin `<arg_key>`) is refused, and one `Malformed` event of no bytes before the end
-    /// says that the arguments are no whole value. The marker's bytes are still the call's end.
+    /// The call's closing marker inside a streamed string: the model ended the call, so the
+    /// value's bytes are the value whole. The string is closed, what was held (`<` could begin
+    /// `<arg_key>`, but no tag followed) is its text, and one `Malformed { OpenAtTheMarker }` event
+    /// of no bytes stands before the closing quote; the object closes, the marker's bytes are the
+    /// call's end, and the arguments read as JSON.
     #[test]
-    fn the_calls_end_inside_a_streamed_string_leaves_it_open_and_says_so() {
+    fn the_calls_end_inside_a_streamed_string_closes_it_there_and_says_so() {
         let events = run(&["f<arg_key>s</arg_key><arg_value>a <"], false);
-        assert_eq!(fragments(&events), [r#"{"s": ""#, "a "]);
-        assert_eq!(
-            malformed(&events),
-            [("", MalformedReason::UnterminatedRegion)]
+        assert_eq!(fragments(&events), [r#"{"s": ""#, "a ", "<", "\"", "}"]);
+        assert_eq!(arguments(&events), r#"{"s": "a <"}"#);
+        assert_eq!(malformed(&events), [("", MalformedReason::OpenAtTheMarker)]);
+        assert!(refused(&events).is_empty());
+        let at = events
+            .iter()
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the one word");
+        assert!(
+            matches!(&events[at + 1], Event::ToolCallArguments { json, .. } if json == "\""),
+            "{events:?}"
         );
-        assert_eq!(refused(&events), ["<"]);
-        assert!(matches!(
-            &events[events.len() - 2..],
-            [Event::Malformed { .. }, Event::ToolCallEnd { .. }]
-        ));
         assert_eq!(ends(&events), [CLOSE]);
         assert_eq!(
             bytes(&events),
             format!("f<arg_key>s</arg_key><arg_value>a <{CLOSE}")
         );
-        // Nothing held: the one event has no bytes.
+        // Nothing held: the value is the text as it came.
         let events = run(&["f<arg_key>s</arg_key><arg_value>Par"], false);
-        assert_eq!(fragments(&events), [r#"{"s": ""#, "Par"]);
-        assert_eq!(
-            malformed(&events),
-            [("", MalformedReason::UnterminatedRegion)]
-        );
+        assert_eq!(arguments(&events), r#"{"s": "Par"}"#);
+        assert_eq!(malformed(&events), [("", MalformedReason::OpenAtTheMarker)]);
         assert_eq!(ends(&events), [CLOSE]);
         assert_eq!(
             bytes(&events),
@@ -946,7 +947,6 @@ mod tests {
             ("f<arg_key></arg_key><arg_value>x</arg_value>", false),
             ("f<arg_key>n</arg_key><arg_value>12", true),
             ("<arg_key>a", true),
-            ("f<arg_key>s</arg_key><arg_value>a <", false),
         ] {
             let end = if cut { "" } else { CLOSE };
             let whole = run(&[output], cut);

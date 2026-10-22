@@ -118,7 +118,11 @@ is a later step).
   text between tags, end it as the marker would and close a string still open, with one
   `Malformed { OpenAtTheStop }` event of no bytes before the closing fragment (`assemblers.md`,
   the third ending); a tag the end cut short before the stop (a partial structural terminal at
-  the end of the output) ends the call the same way. One cut for length, aborted, or ended with
+  the end of the output) ends the call the same way. A call's closing terminal inside a streamed
+  string of a tagged syntax closes the string too, under `Malformed { OpenAtTheMarker }`: the
+  marker is the model's own end of the call (the recorded shape writes `</tool_call>` after the
+  open value, then its stop token), so the value's bytes are complete there as at the stop, and
+  the two words tell the two ends apart. One cut for length, aborted, or ended with
   any finish but `Stop` is cut as before; a driver hands a stop sequence of the request's that
   matched inside the call over as such a finish, so that it never completes the call (the stop
   row in `format`).

@@ -434,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tag_the_invokes_close_cut_short_inside_a_string_is_reported() {
+    fn a_tag_the_invokes_close_cut_short_inside_a_string_is_the_values_text() {
         let output = concat!(
             "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n",
             "<｜DSML｜ parameter name=\"a\" string=\"true\">x</｜DSML｜ par</｜DSML｜ invoke>\n",
@@ -442,16 +442,21 @@ mod tests {
         );
         let events = run("<think>\n\n</think>\n\n", &[output]);
         assert_eq!(bytes(&events), output);
-        // The string the invoke's close cut stays open: nothing is made up for it, and the one
-        // word before the end carries the tag's bytes.
-        assert_eq!(arguments_of(&events, 0), r#"{"a": "x"#);
-        let ended = events
+        // The invoke's close inside the string ends the call: the string is closed with every
+        // byte the model wrote between the tag and the close, the start of a tag held there
+        // included, since no tag followed, and the one word of no bytes before the closing quote
+        // says the marker closed it.
+        assert_eq!(arguments_of(&events, 0), r#"{"a": "x</｜DSML｜ par"}"#);
+        let at = events
             .iter()
-            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
-            .expect("the call ends");
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the one word");
         assert!(matches!(
-            &events[ended - 1],
-            Event::Malformed { text, .. } if text.text == "</｜DSML｜ par"
+            &events[at..at + 2],
+            [
+                Event::Malformed { text, why: crate::event::MalformedReason::OpenAtTheMarker },
+                Event::ToolCallArguments { json, .. }
+            ] if text.text.is_empty() && json == "\""
         ));
     }
 
