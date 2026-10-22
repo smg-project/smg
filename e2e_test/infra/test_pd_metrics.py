@@ -204,6 +204,7 @@ def test_only_mori_http_workers_have_an_idle_observer(backend, moriio, skipped):
         [],
         ["data: [DONE]"],
         ['data: {"error":{"message":"bad"}}'],
+        ['data: {"error":{},"choices":[{"delta":{"content":"text"}}]}'],
         ['data: {"choices":[{"delta":{"role":"assistant"}}]}'],
         ['data: {"choices":[{"delta":{"content":""}}]}'],
         ['data: {"choices":[{"delta":{"content":"done"},"finish_reason":"length"}]}'],
