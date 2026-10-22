@@ -10,7 +10,10 @@ use async_trait::async_trait;
 use axum::{
     body::Body,
     extract::Request,
-    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
+    http::{
+        header::{CONTENT_TYPE, RETRY_AFTER},
+        HeaderMap, HeaderValue, StatusCode,
+    },
     response::{IntoResponse, Response},
 };
 use bytes::Bytes;
@@ -1092,7 +1095,8 @@ impl PDRouter {
 
     /// The answer for `side` whose worker answered a status before the side's
     /// first byte: the side never started (see `pd_failure`), under the
-    /// worker's own status, kept as it is so the retry layer and the client's
+    /// worker's own status and with the worker's `Retry-After` when it sent
+    /// one, both kept as they are so the retry layer and the client's
     /// back-off read what the worker said, with the message its error body
     /// carries. The same JSON answer whether or not the client asked for a
     /// stream: nothing of the response is out, and a client reads an error
@@ -1101,11 +1105,17 @@ impl PDRouter {
     async fn side_refused(side: PdSide, response: reqwest::Response) -> Response {
         let status = StatusCode::from_u16(response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        // Taken before the body read consumes the response.
+        let retry_after = response.headers().get(RETRY_AFTER).cloned();
         let detail = match response.bytes().await {
             Ok(body) => upstream_error_message(&body),
             Err(e) => format!("{status}, and its error body could not be read: {e}"),
         };
-        side.answer(SidePhase::Start, status, detail)
+        let mut answer = side.answer(SidePhase::Start, status, detail);
+        if let Some(value) = retry_after {
+            answer.headers_mut().insert(RETRY_AFTER, value);
+        }
+        answer
     }
 
     /// The decode side's response head, once the prefill side is done with:
@@ -2777,7 +2787,7 @@ fn upstream_error_message(body: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::header::{AUTHORIZATION, RETRY_AFTER};
+    use axum::http::header::AUTHORIZATION;
     use openai_protocol::model_card::ModelCard;
     use serde_json::json;
     use tokio::sync::{mpsc, oneshot};
@@ -5444,6 +5454,35 @@ mod tests {
         assert_eq!(
             parsed["error"]["message"],
             r#"Decode worker failed to start: {"error":"boom \"quoted\""}"#
+        );
+    }
+
+    /// A worker that refuses with a back-off hint keeps it: the 429's
+    /// `Retry-After` rides on the side's answer, under the worker's status,
+    /// so the client's back-off reads what the worker said, on a streamed
+    /// and an unstreamed request alike.
+    #[tokio::test]
+    async fn a_refused_side_keeps_the_workers_retry_after() {
+        let upstream = http::Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(RETRY_AFTER, "7")
+            .body(r#"{"error":"busy"}"#)
+            .unwrap();
+
+        let response =
+            PDRouter::side_refused(PdSide::Prefill, reqwest::Response::from(upstream)).await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            error_code(&response),
+            Some("prefill_worker_failed_to_start")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|v| v.to_str().ok()),
+            Some("7")
         );
     }
 
