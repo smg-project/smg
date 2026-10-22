@@ -1,0 +1,105 @@
+{
+  "repository": "smg-project/smg",
+  "frozen_production_sha": "e9157e32ef87c74f38c7d0f165b4a35fffd4eb57",
+  "producer_sha": "9c7957d48edfb65ec6e4862ac9c20b00ca900656",
+  "run_id": 39837886242,
+  "run_attempt": 1,
+  "build_job_id": 120030902803,
+  "source_trees": {
+    ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
+    "Cargo.toml": "7acfd64653b69c8db7490ae1fc42ce48a3053801",
+    "Cargo.lock": "a672e412e5c41c739fdbdf3c19b6f392f6a48f5e",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "40d24a38912f02da5bc5ba5e2a69df7334ec420b",
+    "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
+    "crates": "cbd521e11576c6b6cc1078e4cc0f037c6e03c858",
+    "model_gateway": "0e075a5556734438d2d5dc116c679133408b9ca5",
+    "grpc_servicer": "c9a02d16c3ea1c6824b49e799dba9daf242002a9",
+    "e2e_test": "afb3817db9da51ec033c9724e3337aa2dcacd5bf",
+    "scripts": "f364fad7d6172bb8563179bfcb74b73cd804b751",
+    ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+    "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
+    "LICENSE": "9088c2872db9763b9e6533c6960e9adb0c9cb65f",
+    "examples/wasm": "fc10fea21779371f9de247209af2028cf8173236",
+    "clippy.toml": "cfb9e85a5074e6b02e603df8da9653ee18dbcca3",
+    "rustfmt.toml": "19e1ab31f8958c31292f0f568976a036af7e683b"
+  },
+  "provenance_trees": {
+    ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
+    "Cargo.toml": "7acfd64653b69c8db7490ae1fc42ce48a3053801",
+    "Cargo.lock": "a672e412e5c41c739fdbdf3c19b6f392f6a48f5e",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "40d24a38912f02da5bc5ba5e2a69df7334ec420b",
+    "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
+    "crates": "cbd521e11576c6b6cc1078e4cc0f037c6e03c858",
+    "model_gateway": "0e075a5556734438d2d5dc116c679133408b9ca5",
+    "grpc_servicer": "c9a02d16c3ea1c6824b49e799dba9daf242002a9",
+    "e2e_test": "afb3817db9da51ec033c9724e3337aa2dcacd5bf",
+    "scripts": "f364fad7d6172bb8563179bfcb74b73cd804b751",
+    ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4"
+  },
+  "artifacts": [
+    {
+      "id": 12453886652,
+      "name": "build-provenance",
+      "bytes": 1179,
+      "sha256": "88a4419fe6fe03ee55d458036f1041e942e18d357dd76ce01b5ab119134781be",
+      "destination": "diagnostic-results/producer",
+      "files": {
+        "build-provenance.json": {
+          "bytes": 2085,
+          "sha256": "503af0c586249bc63ba942bdf0b1d87c4c8bbc000da1ef613321923f9266aa58"
+        }
+      }
+    },
+    {
+      "id": 12453532335,
+      "name": "smg-wheel",
+      "bytes": 52326548,
+      "sha256": "7851b9177b96f4dc40a30e0b349ceae57c4601c0c708e8cebe06f157c72d9a4e",
+      "destination": "wheel",
+      "files": {
+        "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
+          "bytes": 52466587,
+          "sha256": "7957039584a38932ecabb8667498410c9c88c72c37b2ed78dee00dbd219c5c32"
+        }
+      }
+    },
+    {
+      "id": 12454565577,
+      "name": "python-client-types",
+      "bytes": 34374,
+      "sha256": "0b3a93a5281b6a3cafeed9e702c6d43911ba9f79376f83fd1eeb6380b228db51",
+      "destination": "clients/python/smg_client/types",
+      "files": {
+        "_generated.py": {
+          "bytes": 187180,
+          "sha256": "295118c2d842b1c024e54a267f90d3e4652ca53a2c735028df36d8344d7b486f"
+        }
+      }
+    },
+    {
+      "id": 12453158862,
+      "name": "wasm-test-fixtures",
+      "bytes": 56596,
+      "sha256": "0f4197785e21ca432b51e4dcee5a1584eefe832bf1dd118c81ad4f54cd671e2d",
+      "destination": "crates/wasm/tests/fixtures",
+      "files": {
+        "storage_hook_guest.wasm": {
+          "bytes": 80680,
+          "sha256": "f7ab4cb2fefa9384f80b3332baa8b3120ca19a994edb1ea3ef50ccf7b76c2117"
+        },
+        "storage_hook_passthrough.wasm": {
+          "bytes": 79153,
+          "sha256": "6481ba6c503dba3a23d38a46cc4387fa16c457131c2072fa660e68112e936a78"
+        }
+      }
+    }
+  ],
+  "model": "Qwen/Qwen3-VL-8B-Instruct",
+  "model_snapshot": "0c351dd01ed87e9c1b53cbc748cba10e6187ff3b",
+  "dog_jpeg_sha256": "e1cd91db28149f21f3c410ffa074d0fb8bc8950740ba140c7eaae130f0493464",
+  "image": "lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d"
+}
