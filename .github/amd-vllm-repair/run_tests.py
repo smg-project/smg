@@ -1,5 +1,6 @@
-"""Run the original router suite using recorded cached inputs and terminal reports."""
+"""Run one complete original vLLM suite using recorded cached inputs and terminal reports."""
 
+import argparse
 import hashlib
 import importlib
 import json
@@ -49,14 +50,15 @@ def cached_models(specs, cache):
     return records
 
 
-def cache_dataset(module):
+def cache_dataset(module, output=None):
+    output = OUT if output is None else output
     require(module.MMLU_DATASET_URL == DATA_URL, "MMLU source URL changed")
     with urllib.request.urlopen(DATA_URL, timeout=60) as response:
         data = response.read(64 * 1024 * 1024 + 1)
     require(0 < len(data) <= 64 * 1024 * 1024, "MMLU dataset size")
-    path = OUT / "mmlu.csv"
+    path = output / "mmlu.csv"
     path.write_bytes(data)
-    (OUT / "mmlu-input.json").write_text(
+    (output / "mmlu-input.json").write_text(
         json.dumps(
             {"url": DATA_URL, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
         )
@@ -117,22 +119,30 @@ class Reports:
         )
 
 
-def main():
-    engine = os.environ["E2E_ENGINE"]
-    recipe = json.loads(CASES.read_text())[engine]
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("suite", choices=["completions", "embeddings", "router"])
+    args = parser.parse_args(argv)
+    require(os.environ["E2E_ENGINE"] == "vllm", "unexpected engine")
+    recipe = json.loads(CASES.read_text())[args.suite]
+    os.environ["E2E_MIN_SELECTED"] = str(recipe["min_selected"])
+    output = OUT / args.suite
+    output.mkdir()
+
     from infra.model_specs import get_model_spec
 
     models = cached_models(
         {name: get_model_spec(name)["model"] for name in recipe["models"]},
         Path(os.environ["HF_HOME"]) / "hub",
     )
-    (OUT / "models.json").write_text(json.dumps(models, indent=2) + "\n")
-    cache_dataset(importlib.import_module("infra.run_eval"))
-    reports = Reports(OUT / "case-reports.jsonl")
-    junit = OUT / "router.xml"
+    (output / "models.json").write_text(json.dumps(models, indent=2) + "\n")
+    if args.suite == "router":
+        cache_dataset(importlib.import_module("infra.run_eval"), output)
+    reports = Reports(output / "case-reports.jsonl")
+    junit = output / "result.xml"
     result = pytest.main(
         [
-            "e2e_test/router",
+            "e2e_test/" + args.suite,
             "--ignore=e2e_test/benchmarks",
             "--ignore=e2e_test/bindings_go",
             "-p",

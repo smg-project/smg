@@ -26,7 +26,10 @@ def package_records(distributions):
         name = re.sub(r"[-_.]+", "-", dist.metadata["Name"]).lower()
         if name not in NAMES:
             continue
-        origin = Path(dist._path) / "METADATA"
+        root = Path(dist._path)
+        origin = root if root.is_file() else root / "METADATA"
+        if not origin.is_file():
+            origin = root / "PKG-INFO"
         raw = origin.read_bytes()
         records.append(
             {
@@ -81,7 +84,7 @@ def runtime_pins(before):
     (OUT / "runtime-pins.txt").write_text("\n".join(constraints) + "\n")
 
 
-def capture_generated():
+def capture_generated(label):
     spec = importlib.util.find_spec("smg_grpc_proto")
     require(spec and spec.origin, "missing installed proto package")
     directory = Path(spec.origin).parent / "generated"
@@ -98,7 +101,7 @@ def capture_generated():
                 "guard_header": raw.decode().splitlines()[:40],
             }
         )
-    (OUT / "installed-generated-guards.json").write_text(json.dumps(records, indent=2) + "\n")
+    (OUT / ("generated-guards-" + label + ".json")).write_text(json.dumps(records, indent=2) + "\n")
 
 
 def main():
@@ -110,7 +113,7 @@ def main():
         runtime_pins(current)
     else:
         validate(json.loads((OUT / "origins-before.json").read_text()), current)
-        capture_generated()
+        capture_generated(args.mode)
 
 
 if __name__ == "__main__":

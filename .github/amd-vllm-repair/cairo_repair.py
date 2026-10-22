@@ -147,6 +147,8 @@ def verify():
     library = loaded.pop()
     elf = command(["readelf", "-h", str(library)])
     require(elf["returncode"] == 0, "loaded Cairo ELF inspection failed")
+    versions = command(["readelf", "-V", str(library)])
+    require(versions["returncode"] == 0, "loaded Cairo ELF version inspection failed")
     record_text = metadata.distribution("pycairo").read_text("RECORD")
     require(record_text, "missing actual installed wheel RECORD")
     (OUT / "installed-RECORD.txt").write_text(record_text)
@@ -162,6 +164,7 @@ def verify():
         "loaded_libcairo": str(library),
         "loaded_libcairo_sha256": sha(library),
         "loaded_elf": elf,
+        "loaded_elf_versions": versions,
         "png_sha256": hashlib.sha256(png).hexdigest(),
         "source_url": SOURCE,
         "source_sha256": SOURCE_SHA,
