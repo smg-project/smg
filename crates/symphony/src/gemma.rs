@@ -335,8 +335,9 @@ impl Assembler {
     /// The member the end of the stream cut where its value stands ([`Self::finish`]): the key
     /// held for the value, when one is, opens the member, `"key": `, and a bare value's bytes
     /// after it follow as the JSON they stand for so far, written as [`push_bare`] writes the
-    /// whole value once the member closes: the digits of a number and the start of `true` or
-    /// `false` as written, the start of the spelling's null word as the start of `null`, and
+    /// whole value once the member closes: the digits of a number (its minus sign alone
+    /// included) and the start of `true` or `false` as written, the start of the spelling's
+    /// null word as the start of `null`, and
     /// any other text (a word that is no literal, Python's `True` or `'abc'`, a JSON quote
     /// where the template writes its own string token) as the opening of the string it is
     /// written as, so that the arguments carry the prefix the model wrote, stay a strict prefix
@@ -373,10 +374,13 @@ impl Assembler {
         }
         // As [`push_bare`] writes the value once the member closes: a number or `true` or
         // `false` as written, the spelling's null word as `null`, every other text as a string.
-        let number = value
-            .strip_prefix('-')
-            .unwrap_or(value)
-            .starts_with(|c: char| c.is_ascii_digit())
+        // A lone `-` is the start of a number, as `tr` is the start of a literal: the digits
+        // follow it far more often than a member closes on it.
+        let number = (value == "-"
+            || value
+                .strip_prefix('-')
+                .unwrap_or(value)
+                .starts_with(|c: char| c.is_ascii_digit()))
             && json_prefix(value);
         if !value.is_empty() {
             if self.spelling.null.starts_with(value) {
@@ -1743,7 +1747,7 @@ mod tests {
     /// a time.
     #[test]
     fn a_member_the_stream_end_cuts_leaves_as_the_calls_own_bytes_and_nothing_closes() {
-        let cases: [(&str, &str, &[&str]); 24] = [
+        let cases: [(&str, &str, &[&str]); 25] = [
             // A bare value: the digits so far, a word that may still be a literal.
             (
                 "call:play{artist:<|\"|>Taylor<|\"|>,n:1",
@@ -1763,6 +1767,11 @@ mod tests {
             (
                 "call:play{artist:<|\"|>Taylor<|\"|>,n:-1",
                 r#"{"artist": "Taylor", "n": -1"#,
+                &[],
+            ),
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|>,n:-",
+                r#"{"artist": "Taylor", "n": -"#,
                 &[],
             ),
             (
