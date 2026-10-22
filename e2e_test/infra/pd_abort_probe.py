@@ -51,6 +51,8 @@ def validate_abort(files, workers, identity, root, before, internal):
         "decode ended without an abort"
     )
     finished = [(r, s) for r, s in terminals if r["event"] == "finish_requests_return"]
+    if not finished:
+        raise ValueError("decode native finish return not observed")
     assert len(finished) == 1, "missing or repeated native finish return"
     record, snapshot = finished[0]
     assert record["seq"] > before[name][1][-1]["seq"], "abort preceded pre-close checkpoint"

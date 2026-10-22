@@ -5,6 +5,7 @@ import json
 import httpx
 import pytest
 from infra import pd_abort_probe as abort
+from infra import pd_probe as probe
 
 pytest_plugins = ["infra.test_pd_probe_contract"]
 
@@ -40,6 +41,47 @@ def test_post_close_native_abort_consumer(pending):
     assert validate(pending) == dict(
         internal_request_id=pending.internal, finish_seq=4, output_tokens=7
     )
+
+
+def test_native_cleanup_prefix_retries_until_finish_return(monkeypatch, pending):
+    rows = next(rows for rows in pending.records.values() if rows[0]["role"] == "decode")
+    terminal = rows.pop()
+    cleanup = dict(
+        terminal, event="free_request_return", request=terminal["requests"][0]["request"]
+    )
+    del cleanup["requests"]
+    rows.append(cleanup)
+    partial = pending.write()
+    terminal["seq"] = 5
+    rows.append(terminal)
+    complete = pending.write()
+    prefixes, reads = iter((partial, complete)), []
+
+    def read(directory):
+        assert directory == pending.directory
+        reads.append(True)
+        return next(prefixes)
+
+    monkeypatch.setattr(probe, "read_prefix", read)
+    monkeypatch.setattr(probe.time, "sleep", lambda _: None)
+    result = probe.observe_request(
+        pending.directory,
+        pending.workers,
+        pending.identity,
+        {},
+        "/pinned/vllm",
+        validator=lambda files, workers, identity, root: abort.validate_abort(
+            files, workers, identity, root, pending.before, pending.internal
+        ),
+    )
+    assert result is complete and len(reads) == 2
+
+
+def test_duplicate_native_finish_is_rejected(pending):
+    rows = next(rows for rows in pending.records.values() if rows[0]["role"] == "decode")
+    rows.append(dict(pending.terminal, seq=5))
+    with pytest.raises(AssertionError, match="repeated native finish"):
+        validate(pending)
 
 
 @pytest.mark.parametrize(
