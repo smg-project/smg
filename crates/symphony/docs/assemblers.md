@@ -315,9 +315,12 @@ What the syntax says, and what the assembler does with it:
   text where the syntax has tags is reported.
 - **Two endings**, as DSML's: `Assembler::close` is the invoke's closing tag, or the block's
   end before it, and inside a streamed string closes the string first, as the keyed assembler's
-  does (`tagged::left_open`); `Assembler::finish` is a stream that was cut, and closes nothing: a started
-  call ends after the one `Malformed { UnterminatedRegion }` event that says its arguments are
-  no whole value (`tagged::end_cut_call`).
+  does (`tagged::left_open`), except that a held tail beginning with one of the family's
+  structural tokens is a tag the marker cut short, never the value's text, and is dropped before
+  `ToolCallEnd`, whose bytes came after it (at the stop, whose end carries no bytes, it is
+  dropped after the call, as above); `Assembler::finish` is a stream that was cut, and closes
+  nothing: a started call ends after the one `Malformed { UnterminatedRegion }` event that says
+  its arguments are no whole value (`tagged::end_cut_call`).
 - **Every byte of the call lands in exactly one event.**
 
 ## The XML assembler (`tagged::xml`)
