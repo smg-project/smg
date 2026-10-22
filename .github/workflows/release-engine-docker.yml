@@ -17,6 +17,7 @@ on:
     branches: [main]
     paths:
       - 'docker/engine.Dockerfile'
+      - 'docker/ucx.conf'
       - '.github/workflows/_build-engine-image.yml'
       - '.github/workflows/release-engine-docker.yml'
       - 'scripts/installation/**'
