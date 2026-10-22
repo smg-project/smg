@@ -428,6 +428,17 @@ fn deepseek_v41_is_read_from_the_names_that_carry_the_contract() {
     assert_eq!(req.effective_reasoning_effort(), Some("high"));
     let req = request(json!({"model": V41_NAME_OF_A_V4_MODEL, "reasoning_effort": "medium"}));
     assert_eq!(req.effective_reasoning_effort(), Some("medium"));
+
+    // One vendor's name for another vendor's model is read as that model: a
+    // Kimi-named alias of the V4.1 model takes its profile and keeps `medium`.
+    const KIMI_NAME_OF_A_V41_MODEL: &str = "cross-vendor/kimi-k2";
+    ProviderProfile::register_model_aliases([(KIMI_NAME_OF_A_V41_MODEL, "deepseek-v4.1-flash")]);
+    assert_eq!(
+        ProviderProfile::for_model(KIMI_NAME_OF_A_V41_MODEL),
+        ProviderProfile::DeepSeek
+    );
+    let req = request(json!({"model": KIMI_NAME_OF_A_V41_MODEL, "reasoning_effort": "medium"}));
+    assert_eq!(req.effective_reasoning_effort(), Some("medium"));
 }
 
 #[test]
