@@ -61,5 +61,3 @@ sends `{}`, and so must direct `fanout` calls (a bodyless POST returns 400).
 `fanout` raises `FanoutError` (with `.result.failed`) unless `allow_partial=True`.
 Keep the client connected for the whole call: the gateway cancels outstanding
 engine calls when the caller disconnects.
-
-Design: `docs/superpowers/specs/2026-09-03-rl-m1-discovery-passthrough-design.md`.

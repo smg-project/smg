@@ -1,6 +1,6 @@
 # BFCL nightly A/B — `scripts/bfcl/`
 
-**Track B** of the parser-verification proposal (`docs/proposals/2026-06-10-bfcl-nightly-parser-verification.md`): run the **official** Berkeley Function Calling Leaderboard (`bfcl-eval`) against two serving "arms" and diff the scores. The companion **Track A** (offline, deterministic parser-conformance gate) lives in `crates/parser_conformance/`.
+**Track B** of the parser-verification proposal: run the **official** Berkeley Function Calling Leaderboard (`bfcl-eval`) against two serving "arms" and diff the scores. The companion **Track A** (offline, deterministic parser-conformance gate) lives in `crates/parser_conformance/`.
 
 ## The experiment
 
