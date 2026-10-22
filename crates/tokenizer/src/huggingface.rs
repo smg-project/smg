@@ -865,28 +865,28 @@ impl HuggingFaceTokenizer {
         }
     }
 
-    /// Extract special tokens from the tokenizer, using config values when available.
+    /// The special tokens: the configuration's where it names them, with a
+    /// guess among the file's added special tokens standing in only for a
+    /// token the configuration does not mention.
     ///
-    /// Prefers explicit values from `tokenizer_config.json` (e.g., `"bos_token": "<|begin_of_text|>"`)
-    /// over pattern matching against the vocabulary, since models like Llama 4 use non-standard
-    /// token names that aren't in the hardcoded pattern list.
+    /// The rule is `transformers`': a special token is what
+    /// `tokenizer_config.json` sets (`"bos_token": "<|begin_of_text|>"`, a
+    /// string or the added-token object), an explicit `null` is the
+    /// checkpoint saying it has no such token (the attribute stays unset,
+    /// whatever the tokenizer class's default; a template's `{{ bos_token }}`
+    /// then renders nothing), and only a key the file leaves out falls back
+    /// to the class's own default (`<s>` for the Llama classes, none for the
+    /// Qwen2 class). The loader has no class table: the guess that stands in
+    /// for the default looks the usual spellings up among the added tokens
+    /// the file marks special, where a declared special token lives, never in
+    /// the plain vocabulary, where a byte-level BPE may hold the text `<s>`
+    /// as an ordinary piece.
     fn extract_special_tokens<M: Model>(
         tokenizer: &TokenizerOf<M>,
         config_tokens: &ConfigTokens,
     ) -> SpecialTokens {
-        // Get vocab with special tokens included (added_tokens like <|im_start|>)
-        let vocab = tokenizer.get_vocab(true);
-
-        let find_token = |patterns: &[&str]| -> Option<String> {
-            for pattern in patterns {
-                if vocab.contains_key(*pattern) {
-                    return Some((*pattern).to_string());
-                }
-            }
-            None
-        };
-
-        // Extract additional special tokens using the tokenizers library API
+        // The added tokens the file marks special (`<|im_start|>` and the
+        // like): the only tokens a guess may name.
         let additional_special_tokens: Vec<String> = tokenizer
             .get_added_tokens_decoder()
             .iter()
@@ -894,25 +894,31 @@ impl HuggingFaceTokenizer {
             .map(|(_id, token)| token.content.clone())
             .collect();
 
-        // Config values take priority over pattern matching
+        let find_token = |patterns: &[&str]| -> Option<String> {
+            patterns
+                .iter()
+                .find(|pattern| {
+                    additional_special_tokens
+                        .iter()
+                        .any(|token| token == *pattern)
+                })
+                .map(|pattern| (*pattern).to_string())
+        };
+
         SpecialTokens {
             bos_token: config_tokens
                 .bos_token
-                .clone()
-                .or_else(|| find_token(&["<s>", "<|startoftext|>", "<BOS>", "[CLS]"])),
+                .or_guess(|| find_token(&["<s>", "<|startoftext|>", "<BOS>", "[CLS]"])),
             eos_token: config_tokens
                 .eos_token
-                .clone()
-                .or_else(|| find_token(&["</s>", "<|endoftext|>", "<EOS>", "[SEP]"])),
+                .or_guess(|| find_token(&["</s>", "<|endoftext|>", "<EOS>", "[SEP]"])),
             unk_token: config_tokens
                 .unk_token
-                .clone()
-                .or_else(|| find_token(&["<unk>", "<UNK>", "[UNK]"])),
+                .or_guess(|| find_token(&["<unk>", "<UNK>", "[UNK]"])),
             sep_token: find_token(&["[SEP]", "<sep>", "<SEP>"]),
             pad_token: config_tokens
                 .pad_token
-                .clone()
-                .or_else(|| find_token(&["<pad>", "<PAD>", "[PAD]"])),
+                .or_guess(|| find_token(&["<pad>", "<PAD>", "[PAD]"])),
             cls_token: find_token(&["[CLS]", "<cls>", "<CLS>"]),
             mask_token: find_token(&["[MASK]", "<mask>", "<MASK>"]),
             additional_special_tokens,
@@ -944,20 +950,11 @@ impl HuggingFaceTokenizer {
             let add_bos_token = config.get("add_bos_token").and_then(|v| v.as_bool());
             let add_eos_token = config.get("add_eos_token").and_then(|v| v.as_bool());
 
-            // Extract special token strings (handles both "string" and {"content": "string"})
-            let get_token = |key: &str| -> Option<String> {
-                config.get(key).and_then(|v| {
-                    v.as_str()
-                        .map(String::from)
-                        .or_else(|| v.get("content").and_then(|c| c.as_str()).map(String::from))
-                })
-            };
-
             let config_tokens = ConfigTokens {
-                bos_token: get_token("bos_token"),
-                eos_token: get_token("eos_token"),
-                unk_token: get_token("unk_token"),
-                pad_token: get_token("pad_token"),
+                bos_token: ConfigToken::read(&config, "bos_token"),
+                eos_token: ConfigToken::read(&config, "eos_token"),
+                unk_token: ConfigToken::read(&config, "unk_token"),
+                pad_token: ConfigToken::read(&config, "pad_token"),
             };
 
             Some(TokenizerConfigResult {
@@ -1013,13 +1010,58 @@ impl HuggingFaceTokenizer {
     }
 }
 
-/// Special token strings read from tokenizer_config.json.
+/// The special tokens as `tokenizer_config.json` gives them.
 #[derive(Default)]
 struct ConfigTokens {
-    bos_token: Option<String>,
-    eos_token: Option<String>,
-    unk_token: Option<String>,
-    pad_token: Option<String>,
+    bos_token: ConfigToken,
+    eos_token: ConfigToken,
+    unk_token: ConfigToken,
+    pad_token: ConfigToken,
+}
+
+/// One special token of `tokenizer_config.json`: the key may be left out,
+/// set to `null`, or carry the token (a string, or the added-token object
+/// whose `content` is the string). The three read apart because they mean
+/// three things to `transformers` (see
+/// [`HuggingFaceTokenizer::extract_special_tokens`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+enum ConfigToken {
+    /// The key is not in the file: the tokenizer class's own default
+    /// applies, which the loader's guess stands in for.
+    #[default]
+    Unmentioned,
+    /// The key is `null`: the checkpoint has no such token.
+    Null,
+    /// The configured token.
+    Set(String),
+}
+
+impl ConfigToken {
+    /// `key` as the parsed `tokenizer_config.json` holds it. A value of
+    /// another shape (neither a string, an object with a string `content`,
+    /// nor `null`) reads as unmentioned, as it did before the three were
+    /// told apart.
+    fn read(config: &serde_json::Value, key: &str) -> Self {
+        match config.get(key) {
+            None => Self::Unmentioned,
+            Some(serde_json::Value::Null) => Self::Null,
+            Some(serde_json::Value::String(token)) => Self::Set(token.clone()),
+            Some(value) => value
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .map_or(Self::Unmentioned, |token| Self::Set(token.to_string())),
+        }
+    }
+
+    /// The token, with `guess` standing in only where the configuration
+    /// does not mention it: a configured token is itself, a `null` is none.
+    fn or_guess(&self, guess: impl FnOnce() -> Option<String>) -> Option<String> {
+        match self {
+            Self::Set(token) => Some(token.clone()),
+            Self::Null => None,
+            Self::Unmentioned => guess(),
+        }
+    }
 }
 
 /// Result of parsing tokenizer_config.json.
