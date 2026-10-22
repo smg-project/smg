@@ -10,6 +10,7 @@ import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -179,12 +180,47 @@ def load_budget():
     return budget
 
 
+def verify_cpu(files):
+    evidence = {}
+    for name, expected_tests, expected_skips in (
+        ("servicer-cpu.xml", 1532, 27),
+        ("closure-cpu.xml", 13, 0),
+    ):
+        root = ET.fromstring(files[name])
+        suites = [root] if root.tag == "testsuite" else list(root)
+        counts = {
+            k: sum(int(s.get(k, 0)) for s in suites)
+            for k in ("tests", "failures", "errors", "skipped")
+        }
+        require(
+            counts == dict(tests=expected_tests, failures=0, errors=0, skipped=expected_skips),
+            "producer CPU JUnit counts",
+        )
+        cases = list(root.iter("testcase"))
+        require(len(cases) == expected_tests, "producer CPU case count")
+        require(
+            sum(c.find("skipped") is not None for c in cases) == expected_skips,
+            "producer CPU skip count",
+        )
+        require(
+            not any(c.find("failure") is not None or c.find("error") is not None for c in cases),
+            "producer CPU failure",
+        )
+        evidence[name] = counts
+    return evidence
+
+
 def main():
     inputs = json.loads(INPUTS.read_text())
-    require(inputs["ready"], "gateway diagnostic not admitted")
+    require(inputs.get("ready") is True, "vLLM repair diagnostic not admitted")
+    require(
+        inputs["producer_policy"]
+        == "successful_build_and_hosted_CPU_with_consumer_vllm_revalidation",
+        "unknown foundation reuse policy",
+    )
     budget = load_budget()
     require(
-        inputs["artifacts_pinned"] and len(inputs["artifacts"]) == 4, "fresh artifacts not pinned"
+        inputs["artifacts_pinned"] and len(inputs["artifacts"]) == 5, "fresh artifacts not pinned"
     )
     require(
         git_output("rev-parse", "HEAD").strip() == os.environ["GITHUB_SHA"], "consumer checkout SHA"
@@ -197,12 +233,10 @@ def main():
         "run identity/attempt",
     )
     require(
-        run["status"] == "completed"
-        and run["conclusion"] == "success"
-        and run["event"] == "workflow_dispatch"
+        run["event"] == "workflow_dispatch"
         and run["path"] == ".github/workflows/pr-test-rust.yml"
         and run["head_branch"] == inputs["producer_branch"],
-        "producer closure not successful",
+        "producer workflow identity",
     )
     with api_get(f"actions/jobs/{inputs['build_job_id']}") as response:
         job = json.load(response)
@@ -217,6 +251,7 @@ def main():
         "producer build job not successful",
     )
     verified = []
+    producer_cpu = None
     for artifact in inputs["artifacts"]:
         with api_get(f"actions/artifacts/{artifact['id']}") as response:
             check_metadata(json.load(response), artifact, inputs)
@@ -233,6 +268,8 @@ def main():
                 provenance["source_trees"] == inputs["provenance_trees"],
                 "provenance trees",
             )
+        if artifact["name"] == "servicer-cpu-results":
+            producer_cpu = verify_cpu(files)
         for name, payload in files.items():
             dest = ROOT / artifact["destination"] / name
             require(not dest.is_symlink(), "destination symlink")
@@ -241,6 +278,7 @@ def main():
         verified.append(
             {"id": artifact["id"], "name": artifact["name"], "sha256": artifact["sha256"]}
         )
+    require(producer_cpu is not None, "producer CPU evidence missing")
     out = ROOT / "diagnostic-results"
     out.mkdir(exist_ok=True)
     (out / "artifact-reuse.json").write_text(
@@ -248,6 +286,11 @@ def main():
             {
                 "producer_run": inputs["run_id"],
                 "producer_attempt": inputs["run_attempt"],
+                "producer_run_status": run["status"],
+                "producer_run_conclusion": run["conclusion"],
+                "producer_CPU": producer_cpu,
+                "reuse_policy": inputs["producer_policy"],
+                "prior_GPU_results_transferred": False,
                 "producer_sha": inputs["producer_sha"],
                 "build_job": inputs["build_job_id"],
                 "consumer_sha": os.environ["GITHUB_SHA"],

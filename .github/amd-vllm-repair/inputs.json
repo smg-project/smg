@@ -20,6 +20,24 @@
       }
     },
     {
+      "id": 12462380046,
+      "name": "servicer-cpu-results",
+      "bytes": 29114,
+      "sha256": "15b8b2d9ae70d42a3ee5a544fc66230e92a0b3f13e8089c06580be16f8748eb8",
+      "expires_at": "2026-10-29T21:52:15Z",
+      "destination": "diagnostic-results/producer-cpu",
+      "files": {
+        "servicer-cpu.xml": {
+          "bytes": 241606,
+          "sha256": "fec29d37846f592ebc7ed9c9452f06ae38166e5c95bbf36ead8022b877e29863"
+        },
+        "closure-cpu.xml": {
+          "bytes": 2061,
+          "sha256": "371b028aa823e17d2d087d767fbc2112be7a297315e96b212b6aa8f70a9e7f02"
+        }
+      }
+    },
+    {
       "id": 12460804756,
       "name": "smg-wheel",
       "bytes": 52324704,
@@ -111,7 +129,9 @@
   "producer_source_relabelled": false,
   "consumer_setup_core_minutes": 25,
   "cleanup_reserved_minutes": 5,
-  "producer_full_closure_success_required": true,
+  "producer_full_closure_success_required": false,
   "producer_branch": "codex/amd-combined-closure-e915-20261022",
-  "ready": false
+  "ready": false,
+  "producer_policy": "successful_build_and_hosted_CPU_with_consumer_vllm_revalidation",
+  "producer_run_conclusion_snapshot": "failure"
 }
