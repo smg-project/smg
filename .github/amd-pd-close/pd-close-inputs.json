@@ -1,0 +1,92 @@
+{
+  "ready": false,
+  "run_id": 39854981911,
+  "run_attempt": 1,
+  "producer_sha": "34ac557ba0775adda864e7d4446bf10127f6014c",
+  "build_job_id": 120090754433,
+  "source_trees": {
+    ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
+    "Cargo.toml": "7acfd64653b69c8db7490ae1fc42ce48a3053801",
+    "Cargo.lock": "a672e412e5c41c739fdbdf3c19b6f392f6a48f5e",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "40d24a38912f02da5bc5ba5e2a69df7334ec420b",
+    "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
+    "crates": "d9f44a9aa4199dc40c7d76dd307fc57a521e563f",
+    "model_gateway": "0e075a5556734438d2d5dc116c679133408b9ca5",
+    "grpc_servicer": "8abb3d9a201fd9e955bddea291e1f724e8de6a08",
+    "e2e_test": "5640807e349f609041ba31d9cf164c02998d0ffd",
+    "scripts": "c0f693708bc1e440775822d630f8081df7f5f295",
+    ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+    ".github/amd-qa": "118f63faa06ee099507e0a00dbe5717a439ce8b1"
+  },
+  "provenance_trees": {
+    ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
+    "Cargo.toml": "7acfd64653b69c8db7490ae1fc42ce48a3053801",
+    "Cargo.lock": "a672e412e5c41c739fdbdf3c19b6f392f6a48f5e",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "40d24a38912f02da5bc5ba5e2a69df7334ec420b",
+    "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
+    "crates": "d9f44a9aa4199dc40c7d76dd307fc57a521e563f",
+    "model_gateway": "0e075a5556734438d2d5dc116c679133408b9ca5",
+    "grpc_servicer": "8abb3d9a201fd9e955bddea291e1f724e8de6a08",
+    "e2e_test": "ebb76667f5130610dee968dec4504a70c5d10cf0",
+    "scripts": "c0f693708bc1e440775822d630f8081df7f5f295",
+    ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+    ".github/amd-qa": "118f63faa06ee099507e0a00dbe5717a439ce8b1",
+    ".github/workflows": "ffdd0ad39c40029fb10be8be462d5b25ed8183f0"
+  },
+  "vllm_prerequisite_jobs": [
+    {
+      "id": null,
+      "name": "amd-closure (vllm-completions) / run"
+    },
+    {
+      "id": null,
+      "name": "amd-closure (vllm-embeddings) / run"
+    }
+  ],
+  "artifacts": [
+    {
+      "name": "build-provenance",
+      "id": null,
+      "bytes": null,
+      "sha256": null,
+      "files": {},
+      "destination": "diagnostic-results/producer"
+    },
+    {
+      "name": "smg-wheel",
+      "id": null,
+      "bytes": null,
+      "sha256": null,
+      "files": {},
+      "destination": "wheel"
+    },
+    {
+      "name": "python-client-types",
+      "id": null,
+      "bytes": null,
+      "sha256": null,
+      "files": {},
+      "destination": "clients/python/smg_client/types"
+    }
+  ],
+  "root_preflight_pending": [
+    "successful actual build and both vLLM prerequisites",
+    "actual artifact IDs, archive and payload bytes/SHA256/provenance and expiry",
+    "no overlap with closure/gateway and reconciled total budget <=15000seconds"
+  ],
+  "runner_label_evidence": {
+    "label": "8-gpu-mi300x",
+    "actual_runner_names": [
+      "amd-mi300x-1",
+      "amd-mi300x-2"
+    ],
+    "existing_nightly_job_ids": [
+      119769083565,
+      119769083497
+    ]
+  }
+}
