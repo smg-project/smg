@@ -27,15 +27,17 @@ def require(condition, message):
         raise ValueError(message)
 
 
+def git_output(*args):
+    return subprocess.check_output(
+        ["git", "-c", f"safe.directory={ROOT}", *args], cwd=ROOT, text=True
+    )
+
+
 def check_source(inputs):
     for path, oid in inputs["source_trees"].items():
-        actual = subprocess.check_output(
-            ["git", "rev-parse", f"HEAD:{path}"], cwd=ROOT, text=True
-        ).strip()
+        actual = git_output("rev-parse", f"HEAD:{path}").strip()
         require(actual == oid, f"source identity differs: {path}")
-    dirty = subprocess.check_output(
-        ["git", "status", "--porcelain", "--untracked-files=all"], cwd=ROOT, text=True
-    )
+    dirty = git_output("status", "--porcelain", "--untracked-files=all")
     require(not dirty, "diagnostic checkout must be clean before reuse")
 
 
