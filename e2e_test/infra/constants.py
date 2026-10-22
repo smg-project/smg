@@ -1,6 +1,7 @@
 """Constants and enums for E2E test infrastructure."""
 
 import os
+import shutil
 import socket
 from enum import StrEnum
 
@@ -88,6 +89,7 @@ ENV_STARTUP_TIMEOUT = (
     "E2E_STARTUP_TIMEOUT"  # Floor on every startup wait — see effective_startup_timeout
 )
 ENV_GPU_OFFSET = "E2E_GPU_OFFSET"  # First GPU index a lane's workers take — see get_gpu_offset
+ENV_GPU_VENDOR = "E2E_GPU_VENDOR"  # The GPU vendor a lane runs on — see get_gpu_vendor
 ENV_SKIP_MODEL_POOL = "SKIP_MODEL_POOL"
 ENV_SKIP_BACKEND_SETUP = "SKIP_BACKEND_SETUP"
 
@@ -333,6 +335,30 @@ def get_gpu_offset() -> int:
     if offset < 0:
         raise ValueError(f"{ENV_GPU_OFFSET}={value!r} must be a non-negative integer")
     return offset
+
+
+GPU_VENDORS = ("nvidia", "amd")
+
+
+def get_gpu_vendor() -> str:
+    """The GPU vendor a lane's workers run on: "nvidia" or "amd".
+
+    The e2e job hands its ``gpu_vendor`` input down as ``E2E_GPU_VENDOR``.
+    Unset/blank, the vendor is read from the SMI on the path: ``amd-smi``
+    without ``nvidia-smi`` is a ROCm host, anything else counts as nvidia. A
+    sweep reads it where an engine behaves differently per vendor (the PD
+    topology sweep's sole-prefill restart over NIXL).
+    """
+    value = os.environ.get(ENV_GPU_VENDOR, "").strip().lower()
+    if value:
+        if value not in GPU_VENDORS:
+            raise ValueError(
+                f"{ENV_GPU_VENDOR}={value!r} is not a GPU vendor; use one of {GPU_VENDORS}"
+            )
+        return value
+    if shutil.which("nvidia-smi") is None and shutil.which("amd-smi") is not None:
+        return "amd"
+    return "nvidia"
 
 
 def get_startup_timeout() -> int | None:

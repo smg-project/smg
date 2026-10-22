@@ -259,6 +259,7 @@ jobs:
           SHOW_ROUTER_LOGS: "1"
           E2E_LOG_DIR: e2e-logs
           E2E_MIN_SELECTED: ${{ inputs.min_selected }}
+          E2E_GPU_VENDOR: ${{ inputs.gpu_vendor }}
           BRAVE_MCP_HOST: ${{ inputs.setup_agentic_deps && 'brave-search-mcp' || '' }}
           # Every gRPC servicer runs a planned warm-up before it reports
           # SERVING (grpc_servicer/smg_grpc_servicer/warmup.py). At its default

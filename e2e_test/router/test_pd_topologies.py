@@ -58,6 +58,7 @@ import pytest
 from infra import ConnectionMode, Gateway, WorkerType, cleanup_pool, start_workers, stop_workers
 from infra.constants import (
     DEFAULT_STARTUP_TIMEOUT,
+    get_gpu_vendor,
     get_runtime,
     is_sglang,
     vllm_kv_backend,
@@ -120,6 +121,37 @@ def _moriio_holds_memory_of(role: str) -> bool:
 _MORIIO_HELD_MEMORY = (
     "the other MoRI-IO role keeps this worker's KV cache until it exits, "
     "so a restart on the same GPU runs out of memory (vllm-project/vllm#60425)"
+)
+
+
+def _nixl_decodes_keep_a_dead_prefills_memory(role: str) -> bool:
+    """Whether the decodes keep a stopped sole ``role`` worker's KV region until they serve again.
+
+    A vLLM decode over NIXL maps the prefill's KV region it pulls from and
+    forgets an idle prefill (``engine_ttl``) only while it handles a request
+    (0.31.0; 0.27.1 freed it when the prefill exited). A pool of two keeps
+    serving through its survivor, so that restart passes; the sole prefill's
+    decodes idle behind the router's 503, nothing makes them forget it, and
+    its restart on the same GPU fails vLLM's startup memory check. Seen on
+    CUDA only: the ROCm lane's decodes release the region when the prefill
+    exits and its restart passes, so that lane keeps the case. Lift the skip
+    when a release frees a dead peer's region without traffic (re-check it
+    at every engine pin move).
+    """
+    return (
+        role == "prefill"
+        and get_runtime() == "vllm"
+        and vllm_kv_backend() == "nixl"
+        and get_gpu_vendor() == "nvidia"
+    )
+
+
+_NIXL_HELD_MEMORY = (
+    "a vLLM decode over NIXL forgets a dead prefill only while it serves a request, and none "
+    "reaches it while the prefill pool is empty, so the sole prefill restarted on the same GPU "
+    "fails the engine's startup memory check (vLLM 0.31.0 on CUDA; the ROCm lane releases the "
+    "region and keeps this case; lift the skip when a release frees a dead peer's region "
+    "without traffic)"
 )
 
 
@@ -1012,6 +1044,8 @@ class TestPDTopology:
             pytest.skip("both pools have more than one worker")
         if _moriio_holds_memory_of(role):
             pytest.skip(_MORIIO_HELD_MEMORY)
+        if _nixl_decodes_keep_a_dead_prefills_memory(role):
+            pytest.skip(_NIXL_HELD_MEMORY)
 
         victim.stop()
         try:
