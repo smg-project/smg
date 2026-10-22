@@ -687,24 +687,154 @@ fn test_tml_preserves_authored_multipart_order_openai() {
     assert_eq!(result[0]["content"], expected);
 }
 
-#[test]
-fn test_absent_assistant_content_renders_null() {
-    let messages = vec![ChatMessage::Assistant {
-        ext: Default::default(),
-        content: None,
-        name: None,
-        tool_calls: None,
-        reasoning_content: None,
-    }];
+// --- an assistant turn without content on the render path ----------------
 
-    let result = process_content_format_with_order(
-        &messages,
-        ChatTemplateContentFormat::OpenAI,
-        None,
-        MediaPartOrder::MediaFirst,
+/// A template of the string format that tests and splits every assistant
+/// message's content (a reasoning model's template strips the thought it
+/// wrote before its answer this way) and prints the content after the role.
+const CONTENT_TESTING_STRING_TEMPLATE: &str = "{%- for message in messages -%}\
+{%- if message.role == 'assistant' and '</think>' in message.content -%}\
+{%- set content = message.content.split('</think>')[-1].lstrip() -%}\
+{%- else -%}{%- set content = message.content -%}{%- endif -%}\
+<|{{ message.role }}|>{{ content }}\
+{%- if message.tool_calls -%}{%- for call in message.tool_calls -%}<call:{{ call.function.name }}>{%- endfor -%}{%- endif -%}\
+<|end|>{%- endfor -%}\
+{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+
+/// A template of the OpenAI format: it walks a message's content parts, and
+/// tests an assistant message's content as the string template does.
+const CONTENT_TESTING_PARTS_TEMPLATE: &str = "{%- for message in messages -%}\
+{%- if message.role == 'assistant' and '</think>' in message.content -%}\
+{%- set content = message.content.split('</think>')[-1].lstrip() -%}\
+{%- else -%}{%- set content = message.content -%}{%- endif -%}\
+<|{{ message.role }}|>\
+{%- if content is string -%}{{ content }}\
+{%- else -%}{%- for part in content -%}{%- if part.type == 'text' -%}{{ part.text }}{%- endif -%}{%- endfor -%}{%- endif -%}\
+{%- if message.tool_calls -%}{%- for call in message.tool_calls -%}<call:{{ call.function.name }}>{%- endfor -%}{%- endif -%}\
+<|end|>{%- endfor -%}\
+{%- if add_generation_prompt -%}<|assistant|>{%- endif -%}";
+
+/// A chat request whose history holds a tool-call-only assistant turn (the
+/// OpenAI shape: `content` null beside `tool_calls`) and its tool result.
+fn request_with_a_tool_call_only_turn() -> ChatCompletionRequest {
+    serde_json::from_value(json!({
+        "model": "m",
+        "messages": [
+            {"role": "user", "content": "What is the weather in Paris?"},
+            {
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}
+                }]
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "18 celsius"}
+        ]
+    }))
+    .unwrap()
+}
+
+/// `request` rendered through `template`, whose detected content format
+/// must be `format`.
+fn render_through(
+    template: &str,
+    format: ChatTemplateContentFormat,
+    request: &ChatCompletionRequest,
+) -> Result<String, String> {
+    let mut tokenizer =
+        llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase).unwrap();
+    tokenizer.set_chat_template(template.to_string()).unwrap();
+    assert_eq!(tokenizer.chat_template_content_format(), format);
+    process_chat_messages_with_placeholders(request, &tokenizer, None, MediaPartOrder::MediaFirst)
+        .map(|(processed, _)| processed.text)
+}
+
+const TOOL_CALL_ONLY_TURN_RENDERED: &str = "<|user|>What is the weather in Paris?<|end|>\
+<|assistant|><call:get_weather><|end|><|tool|>18 celsius<|end|><|assistant|>";
+
+/// A tool-call-only assistant turn in the history renders through a
+/// string-format template that tests, splits and prints `message.content`:
+/// the turn's content reaches the template as the empty string the engine's
+/// chat utils hand it, so the check is false and nothing is printed for it
+/// (not the text `None`, and not a render failure).
+#[test]
+fn a_tool_call_only_assistant_turn_renders_through_a_content_testing_string_template() {
+    let text = render_through(
+        CONTENT_TESTING_STRING_TEMPLATE,
+        ChatTemplateContentFormat::String,
+        &request_with_a_tool_call_only_turn(),
     )
     .unwrap();
-    assert!(result[0]["content"].is_null());
+    assert_eq!(text, TOOL_CALL_ONLY_TURN_RENDERED);
+}
+
+/// The same turn through a template that takes content parts: the content
+/// reaches it as the empty parts list the engine's chat utils hand such a
+/// template, so the check is false and the parts loop writes nothing.
+#[test]
+fn a_tool_call_only_assistant_turn_renders_through_a_content_testing_parts_template() {
+    let text = render_through(
+        CONTENT_TESTING_PARTS_TEMPLATE,
+        ChatTemplateContentFormat::OpenAI,
+        &request_with_a_tool_call_only_turn(),
+    )
+    .unwrap();
+    assert_eq!(text, TOOL_CALL_ONLY_TURN_RENDERED);
+}
+
+/// `skip_serializing_none` drops an assistant message's absent content; the
+/// render path restores it as the empty content the engine's chat utils
+/// hand a template: `""` under the string format, `[]` under the OpenAI
+/// format, with or without tool calls and reasoning content beside it. A
+/// message with content is left as it is.
+#[test]
+fn an_absent_assistant_content_is_the_engines_empty_content_in_the_templates_format() {
+    let messages: Vec<ChatMessage> = serde_json::from_value(json!([
+        {"role": "assistant", "content": null},
+        {
+            "role": "assistant",
+            "content": null,
+            "reasoning_content": "a thought",
+            "tool_calls": [{
+                "id": "call_1",
+                "type": "function",
+                "function": {"name": "f", "arguments": "{}"}
+            }]
+        },
+        {"role": "assistant", "content": "hello"},
+        {"role": "assistant", "content": [{"type": "text", "text": "hello"}]}
+    ]))
+    .unwrap();
+    // Text parts under the string format are joined into the text, as the
+    // engine joins them; a parts template keeps them.
+    for (format, empty, parts) in [
+        (ChatTemplateContentFormat::String, json!(""), json!("hello")),
+        (
+            ChatTemplateContentFormat::OpenAI,
+            json!([]),
+            json!([{"type": "text", "text": "hello"}]),
+        ),
+    ] {
+        let result =
+            process_content_format_with_order(&messages, format, None, MediaPartOrder::MediaFirst)
+                .unwrap();
+        assert_eq!(result[0]["content"], empty, "{format:?}");
+        assert_eq!(result[1]["content"], empty, "{format:?}");
+        assert_eq!(
+            result[1]["reasoning_content"],
+            json!("a thought"),
+            "{format:?}"
+        );
+        assert_eq!(
+            result[1]["tool_calls"][0]["function"]["name"],
+            json!("f"),
+            "{format:?}"
+        );
+        assert_eq!(result[2]["content"], json!("hello"), "{format:?}");
+        assert_eq!(result[3]["content"], parts, "{format:?}");
+    }
 }
 
 #[test]

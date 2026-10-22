@@ -498,6 +498,19 @@ pub(crate) fn validate_chat_content_parts(messages: &[ChatMessage]) -> Result<()
     Ok(())
 }
 
+/// The content the engine's chat utils hand a template for a message without
+/// one (`null` or absent, as a tool-call-only assistant turn comes): the empty
+/// string under the string format, the empty parts list under the OpenAI
+/// format. The engine converts every message's content before it copies the
+/// tool calls or the reasoning beside it, so a turn carrying either converts
+/// the same way.
+pub(crate) fn empty_content(content_format: ChatTemplateContentFormat) -> Value {
+    match content_format {
+        ChatTemplateContentFormat::String => Value::String(String::new()),
+        ChatTemplateContentFormat::OpenAI => Value::Array(Vec::new()),
+    }
+}
+
 fn process_content_format_with_order(
     messages: &[ChatMessage],
     content_format: ChatTemplateContentFormat,
@@ -511,13 +524,15 @@ fn process_content_format_with_order(
                 .map_err(|e| format!("Failed to serialize message: {e}"))?;
 
             if let Some(obj) = message_json.as_object_mut() {
-                // skip_serializing_none omits content when None; restore it as
-                // `null` — the OpenAI-faithful representation for a tool-call-only
-                // assistant turn — so the chat template renders it correctly.
+                // skip_serializing_none omits content when None (a tool-call-only
+                // assistant turn, the OpenAI shape). The engine's chat utils hand
+                // such a turn to the template as empty content in the template's
+                // own format, never as none, which a template that tests, splits
+                // or concatenates every assistant message's content cannot take.
                 if obj.get("role").and_then(|v| v.as_str()) == Some("assistant")
                     && !obj.contains_key("content")
                 {
-                    obj.insert("content".to_string(), Value::Null);
+                    obj.insert("content".to_string(), empty_content(content_format));
                 }
 
                 if let Some(content_value) = obj.get_mut("content") {
