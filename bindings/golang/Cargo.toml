@@ -61,7 +61,7 @@ strip = true
 
 [profile.dev]
 opt-level = 0
-debug = 1
+debug = "line-tables-only"
 split-debuginfo = "unpacked"
 incremental = true
 codegen-units = 256
