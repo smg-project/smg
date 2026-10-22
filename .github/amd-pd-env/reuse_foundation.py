@@ -10,6 +10,7 @@ import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -182,15 +183,93 @@ def load_budget():
     return budget
 
 
+def verify_cpu(files):
+    evidence = {}
+    for name, expected_tests, expected_skips in (
+        ("servicer-cpu.xml", 1532, 27),
+        ("closure-cpu.xml", 13, 0),
+    ):
+        root = ET.fromstring(files[name])
+        suites = [root] if root.tag == "testsuite" else list(root)
+        counts = {
+            k: sum(int(s.get(k, 0)) for s in suites)
+            for k in ("tests", "failures", "errors", "skipped")
+        }
+        require(
+            counts == dict(tests=expected_tests, failures=0, errors=0, skipped=expected_skips),
+            "producer CPU JUnit counts",
+        )
+        cases = list(root.iter("testcase"))
+        require(len(cases) == expected_tests, "producer CPU case count")
+        require(
+            sum(c.find("skipped") is not None for c in cases) == expected_skips,
+            "producer CPU skip count",
+        )
+        require(
+            not any(c.find("failure") is not None or c.find("error") is not None for c in cases),
+            "producer CPU failure",
+        )
+        evidence[name] = counts
+    return evidence
+
+
+def verify_environment_job(inputs):
+    environment = inputs["environment_prerequisite"]
+    require(
+        environment["artifacts_pinned"] and isinstance(environment["artifact"], dict),
+        "target-built environment artifact is not pinned",
+    )
+    with api_get(f"actions/runs/{environment['run_id']}") as response:
+        run = json.load(response)
+    require(
+        run["id"] == environment["run_id"]
+        and run["run_attempt"] == environment["run_attempt"]
+        and run["head_sha"] == environment["producer_sha"]
+        and run["head_branch"] == environment["branch"]
+        and run["repository"]["full_name"] == "smg-project/smg"
+        and run["event"] == "workflow_dispatch"
+        and run["path"] == ".github/workflows/pr-test-rust.yml"
+        and run["status"] == "completed"
+        and run["conclusion"] == "success",
+        "independent vLLM environment run not successful",
+    )
+    with api_get(f"actions/jobs/{environment['job_id']}") as response:
+        job = json.load(response)
+    require(
+        job["id"] == environment["job_id"]
+        and job["run_id"] == environment["run_id"]
+        and job["run_attempt"] == environment["run_attempt"]
+        and job["head_sha"] == environment["producer_sha"]
+        and job["name"] == environment["job_name"] == "vllm-repair"
+        and job["status"] == "completed"
+        and job["conclusion"] == "success",
+        "independent vLLM environment job not successful",
+    )
+    return {
+        "run_id": run["id"],
+        "run_attempt": run["run_attempt"],
+        "head_sha": run["head_sha"],
+        "job_id": job["id"],
+        "status": run["status"],
+        "conclusion": run["conclusion"],
+    }
+
+
 def main():
     inputs = json.loads(INPUTS.read_text())
     budget = load_budget()
     require(inputs.get("ready") is True, "producer artifacts/admission not frozen: ready=false")
     require(
+        inputs["producer_policy"]
+        == "successful_foundation_build_CPU_and_independent_vllm_environment",
+        "unknown reuse policy",
+    )
+    environment = verify_environment_job(inputs)
+    require(
         {a["name"] for a in inputs["artifacts"]}
-        == {"build-provenance", "smg-wheel", "python-client-types"}
-        and len(inputs["artifacts"]) == 3,
-        "exactly three required artifacts",
+        == {"build-provenance", "smg-wheel", "python-client-types", "servicer-cpu-results"}
+        and len(inputs["artifacts"]) == 4,
+        "exactly four required foundation artifacts",
     )
     require(
         {a["name"]: a["destination"] for a in inputs["artifacts"]}
@@ -198,14 +277,21 @@ def main():
             "build-provenance": "diagnostic-results/producer",
             "smg-wheel": "wheel",
             "python-client-types": "clients/python/smg_client/types",
+            "servicer-cpu-results": "diagnostic-results/producer-cpu",
         },
         "artifact destinations",
+    )
+    require(
+        git_output("rev-parse", "HEAD").strip() == os.environ["GITHUB_SHA"], "consumer checkout SHA"
     )
     check_source(inputs)
     with api_get(f"actions/runs/{inputs['run_id']}") as response:
         run = json.load(response)
     require(
-        run["head_sha"] == inputs["producer_sha"] and run["run_attempt"] == inputs["run_attempt"],
+        run["id"] == inputs["run_id"]
+        and run["head_sha"] == inputs["producer_sha"]
+        and run["run_attempt"] == inputs["run_attempt"]
+        and run["head_branch"] == inputs["producer_branch"],
         "run identity/attempt",
     )
     require(run["status"] == "completed", "producer run not terminal")
@@ -215,22 +301,11 @@ def main():
         and run["event"] == "workflow_dispatch",
         "producer repository/workflow/event",
     )
-    for prerequisite in inputs["vllm_prerequisite_jobs"]:
-        with api_get(f"actions/jobs/{prerequisite['id']}") as response:
-            completed = json.load(response)
-        require(
-            completed["run_id"] == inputs["run_id"]
-            and completed["run_attempt"] == inputs["run_attempt"]
-            and completed["head_sha"] == inputs["producer_sha"]
-            and completed["name"] == prerequisite["name"]
-            and completed["status"] == "completed"
-            and completed["conclusion"] == "success",
-            "vLLM closure prerequisite not passed",
-        )
     with api_get(f"actions/jobs/{inputs['build_job_id']}") as response:
         job = json.load(response)
     require(
-        job["run_id"] == inputs["run_id"]
+        job["id"] == inputs["build_job_id"]
+        and job["run_id"] == inputs["run_id"]
         and job["run_attempt"] == inputs["run_attempt"]
         and job["head_sha"] == inputs["producer_sha"]
         and job["name"] == "build-wheel"
@@ -238,13 +313,8 @@ def main():
         and job["conclusion"] == "success",
         "producer build job not successful",
     )
-    require(
-        {j["name"] for j in inputs["vllm_prerequisite_jobs"]}
-        == {"amd-closure (vllm-completions) / run", "amd-closure (vllm-embeddings) / run"}
-        and len(inputs["vllm_prerequisite_jobs"]) == 2,
-        "exact vLLM prerequisite jobs",
-    )
     verified = []
+    producer_cpu = None
     provenance = None
     for artifact in sorted(inputs["artifacts"], key=lambda a: a["name"] != "build-provenance"):
         with api_get(f"actions/artifacts/{artifact['id']}") as response:
@@ -266,8 +336,10 @@ def main():
                 "provenance trees",
             )
         require(provenance is not None, "provenance must be verified first")
+        if artifact["name"] == "servicer-cpu-results":
+            producer_cpu = verify_cpu(files)
         for name, payload in files.items():
-            if artifact["name"] != "build-provenance":
+            if artifact["name"] in {"smg-wheel", "python-client-types"}:
                 original_path = (
                     "bindings/python/dist/" + name
                     if artifact["name"] == "smg-wheel"
@@ -287,6 +359,7 @@ def main():
         verified.append(
             {"id": artifact["id"], "name": artifact["name"], "sha256": artifact["sha256"]}
         )
+    require(producer_cpu is not None, "foundation CPU evidence missing")
     out = ROOT / "diagnostic-results"
     out.mkdir(exist_ok=True)
     (out / "artifact-reuse.json").write_text(
@@ -294,6 +367,11 @@ def main():
             {
                 "producer_run": inputs["run_id"],
                 "producer_attempt": inputs["run_attempt"],
+                "producer_run_status": run["status"],
+                "producer_run_conclusion": run["conclusion"],
+                "producer_CPU": producer_cpu,
+                "environment_prerequisite": environment,
+                "prior_GPU_results_transferred": False,
                 "producer_sha": inputs["producer_sha"],
                 "build_job": inputs["build_job_id"],
                 "consumer_sha": os.environ["GITHUB_SHA"],

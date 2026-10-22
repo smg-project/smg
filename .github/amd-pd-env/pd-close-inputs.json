@@ -37,16 +37,6 @@
     ".github/amd-qa": "118f63faa06ee099507e0a00dbe5717a439ce8b1",
     ".github/workflows": "ffdd0ad39c40029fb10be8be462d5b25ed8183f0"
   },
-  "vllm_prerequisite_jobs": [
-    {
-      "id": 120110274386,
-      "name": "amd-closure (vllm-completions) / run"
-    },
-    {
-      "id": 120110274324,
-      "name": "amd-closure (vllm-embeddings) / run"
-    }
-  ],
   "artifacts": [
     {
       "name": "build-provenance",
@@ -89,12 +79,30 @@
       },
       "destination": "clients/python/smg_client/types",
       "expires_at": "2026-10-23T21:51:02Z"
+    },
+    {
+      "id": 12462380046,
+      "name": "servicer-cpu-results",
+      "bytes": 29114,
+      "sha256": "15b8b2d9ae70d42a3ee5a544fc66230e92a0b3f13e8089c06580be16f8748eb8",
+      "expires_at": "2026-10-29T21:52:15Z",
+      "destination": "diagnostic-results/producer-cpu",
+      "files": {
+        "servicer-cpu.xml": {
+          "bytes": 241606,
+          "sha256": "fec29d37846f592ebc7ed9c9452f06ae38166e5c95bbf36ead8022b877e29863"
+        },
+        "closure-cpu.xml": {
+          "bytes": 2061,
+          "sha256": "371b028aa823e17d2d087d767fbc2112be7a297315e96b212b6aa8f70a9e7f02"
+        }
+      }
     }
   ],
   "root_preflight_pending": [
-    "both actual vLLM prerequisites success with original e2e/unit/pipcheck evidence",
-    "independent artifact+binding source review and live expiry recheck",
-    "no overlap with closure/gateway and reconciled total budget <=15000seconds"
+    "exact vLLM repair prerequisite success with actual native wheel/PNG/origins/units/3suites/pipchecks independently audited",
+    "real environment artifact identity/members/hashes/expiry bound",
+    "independent final packet review, current no-overlap and cumulative budget admission"
   ],
   "runner_label_evidence": {
     "label": "8-gpu-mi300x",
@@ -106,5 +114,20 @@
       119769083565,
       119769083497
     ]
+  },
+  "producer_policy": "successful_foundation_build_CPU_and_independent_vllm_environment",
+  "producer_branch": "codex/amd-combined-closure-e915-20261022",
+  "producer_run_conclusion_snapshot": "failure",
+  "producer_full_GPU_success_required": false,
+  "environment_prerequisite": {
+    "run_id": 39865700204,
+    "run_attempt": 1,
+    "producer_sha": "fb82a338ceb426665bd58a2d31ad5b6a089a2eaf",
+    "branch": "codex/amd-vllm-repair-e915-20261022",
+    "job_id": 120127228798,
+    "job_name": "vllm-repair",
+    "image": "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f",
+    "artifacts_pinned": false,
+    "artifact": null
   }
 }
