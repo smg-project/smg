@@ -119,10 +119,13 @@
 //!   answer is any token it produces: the side's first token waits for the
 //!   KV handoff, behind the handoffs of the worker's other sides on the
 //!   transport and the engine's steps for its running generations, and a
-//!   decode worker whose sides keep getting their tokens (a first token is
-//!   its answer, though nothing is booked or timed for it; a later one is
-//!   its token progress, the wedged rule's own clock) is backed up, not
-//!   frozen.
+//!   decode worker whose sides keep getting their tokens (every token of
+//!   theirs is its token progress, the wedged rule's own clock; a first
+//!   token is also the answer the verdict names, though nothing is booked
+//!   or timed for it) is backed up, not frozen, up to a ceiling of the
+//!   side's bound or the wedge cap from the side's dispatch, past which a
+//!   side whose own handoff is stuck is given up on whatever the worker
+//!   produces for the rest.
 //!
 //! - **stale records** (an unreachable veto by another rule): a worker whose
 //!   KV-event stream has pushed load records is heard from every few
@@ -277,7 +280,10 @@ pub(crate) enum SideReprieve {
     FirstAnswerDue(Duration),
     /// The verdict: the worker was `silent` (`None`: it never answered) for
     /// the `window` it was judged against, the side's bound or the time its
-    /// backlog takes.
+    /// backlog takes; or, for a decode side, the side's wait reached the
+    /// ceiling of its reprieve, the `window`, while its worker produced
+    /// (`silent` the age of the worker's latest token, under the bound; see
+    /// [`decode_side_reprieve`]).
     Silent {
         silent: Option<Duration>,
         window: Duration,
@@ -366,9 +372,11 @@ pub(crate) fn prefill_side_reprieve(
 /// running generations: the admission rooms bound the engine's running
 /// window, not the transport or the step. So a side past its bound is
 /// given up on only while the worker has produced nothing within the
-/// bound: no first token of any side ([`Worker::note_answered`], with
-/// nothing booked or timed for it) and no token on any stream it serves
-/// ([`Worker::token_progress_age`], the clock the wedged rule reads); a
+/// bound: no token on any stream it serves, a side's first token included
+/// ([`Worker::token_progress_age`], the clock the wedged rule reads; the
+/// first token's answer stamp, [`Worker::note_answered`], is what the
+/// verdict names as the worker's latest answer and nothing of the decision,
+/// since the token progress stamped beside it is never the older); a
 /// worker whose sides keep getting their tokens is backed up, not frozen,
 /// and the side waits until a bound has passed since the latest of them,
 /// in its room. That is back-pressure the rooms and the overload
@@ -380,6 +388,22 @@ pub(crate) fn prefill_side_reprieve(
 /// answer may trail the decode side's first output); the cold-shape grace
 /// and the allowance for an unanswered run apply as they do to a prefill
 /// side, and are nothing for a worker no prompt is booked on.
+///
+/// The reprieve has a ceiling of its own, counted from the side's dispatch:
+/// the side's bound or [`WEDGE_BOUND_CAP`], whichever is longer. The rule
+/// judges the worker, not the side, so a side whose own handoff is stuck
+/// while its worker keeps producing for its other sides (the prefill engine
+/// stalled right after answering it, or the decode engine lost its transfer
+/// while it serves the rest) would otherwise wait on until the request's
+/// own timeout, holding its decode room the whole time; at the ceiling it
+/// is given up on whatever the worker produces, as the prefill side's
+/// handoff credit has its own ceiling, so one stuck handoff still ends in a
+/// verdict and the retry layer takes the request to another pair. A
+/// reprieve never reaches past the ceiling, so the verdict lands there. The
+/// verdict at the ceiling says so: its window is the ceiling and its
+/// silence the age of the worker's latest token, which reads as a side
+/// reprieved up to the ceiling, not as a quiet worker. A worker that
+/// produced nothing within a bound still gets the verdict at the bound.
 pub(crate) fn decode_side_reprieve(
     worker: &Arc<dyn Worker>,
     bound: Duration,
@@ -387,17 +411,28 @@ pub(crate) fn decode_side_reprieve(
     backlog: &OnceLock<Duration>,
 ) -> SideReprieve {
     let produced_ago = worker.token_progress_age();
-    let answered_ago = worker
-        .prefill_answered_ago()
-        .map_or(produced_ago, |answered_ago| answered_ago.min(produced_ago));
-    side_reprieve(
+    let ceiling = bound.max(WEDGE_BOUND_CAP);
+    let Some(to_ceiling) = ceiling
+        .checked_sub(dispatched_ago)
+        .filter(|left| !left.is_zero())
+    else {
+        return SideReprieve::Silent {
+            silent: Some(produced_ago),
+            window: ceiling,
+        };
+    };
+    match side_reprieve(
         cold_shape_grace(worker, 0),
-        Some(answered_ago),
+        Some(produced_ago),
         worker.prefill_unanswered_run(),
         bound,
         || *backlog.get_or_init(|| backlog_bound(worker)),
         dispatched_ago,
-    )
+    ) {
+        SideReprieve::WithinBound(left) => SideReprieve::WithinBound(left.min(to_ceiling)),
+        SideReprieve::FirstAnswerDue(left) => SideReprieve::FirstAnswerDue(left.min(to_ceiling)),
+        verdict @ SideReprieve::Silent { .. } => verdict,
+    }
 }
 
 /// The silence the rule of a side's `bound` judges its worker by: its latest
@@ -1416,11 +1451,11 @@ mod tests {
     }
 
     /// A sequential decode side past its bound is given up on only while its
-    /// worker has produced nothing within the bound: no first token of any
-    /// side (a decode side's first token is its worker's answer, with
-    /// nothing booked or timed for it) and no token on any stream it serves
-    /// (its token progress). The incident's shape: sides queued behind each
-    /// other's KV handoffs and the engine's steps for its running
+    /// worker has produced nothing within the bound: no token on any stream
+    /// it serves, a side's first token included (its token progress; the
+    /// first token's answer stamp names the worker's latest answer in the
+    /// verdict and decides nothing). The incident's shape: sides queued
+    /// behind each other's KV handoffs and the engine's steps for its running
     /// generations, a token every so often. Real time, at a short bound:
     /// the clocks are the liveness clock's.
     #[test]
@@ -1446,15 +1481,18 @@ mod tests {
             decode_side_reprieve(&w, bound, bound * 2, &OnceLock::new()).past_bound(),
             "nothing since: the verdict a bound after that token"
         );
+        // The answer stamp of a side's first token is the verdict's word on
+        // the worker's latest answer and nothing of the decision: production
+        // stamps the token progress in the same arm, never later, so the
+        // stamp alone (a state production never reaches) reprieves nothing.
         w.note_answered();
         assert!(w.prefill_answered_ago().is_some_and(|ago| ago < bound));
         assert_eq!(w.prefill_backlog(), Duration::ZERO, "nothing booked");
         assert_eq!(w.prefill_rate_tps(), 0, "nothing timed");
         assert!(!w.prefill_cold_shape(1 << 20), "no shape shown");
-        let standing = decode_side_reprieve(&w, bound, bound * 2, &OnceLock::new());
         assert!(
-            matches!(standing, SideReprieve::WithinBound(left) if left > bound / 2),
-            "a side's first token just now: a bound's reprieve as well: {standing:?}"
+            decode_side_reprieve(&w, bound, bound * 2, &OnceLock::new()).past_bound(),
+            "the answer stamp alone reprieves nothing"
         );
         let bound = DEFAULT_WEDGE;
         // The rule on its inputs: a bound after the latest answer, with no
@@ -1484,6 +1522,53 @@ mod tests {
             ),
             SideReprieve::WithinBound(Duration::from_millis(2_000))
         );
+    }
+
+    /// The reprieve's ceiling: a side whose own handoff is stuck on a worker
+    /// that keeps producing for its other sides is given up on at the later
+    /// of its bound and the wedge cap, counted from its dispatch, whatever
+    /// the worker produces; the verdict names the ceiling as its window and
+    /// the age of the worker's latest token as its silence. Before the
+    /// ceiling a producing worker reprieves the side, by at most what is
+    /// left to the ceiling.
+    #[test]
+    fn a_decode_side_is_given_up_on_at_the_ceiling_however_its_worker_produces() {
+        let w = worker();
+        let none = OnceLock::new();
+        let step = Duration::from_millis(10);
+        for bound in [
+            Duration::from_millis(100),
+            DEFAULT_WEDGE,
+            WEDGE_BOUND_CAP * 2,
+        ] {
+            let ceiling = bound.max(WEDGE_BOUND_CAP);
+            // The worker produces for another side the whole time: a token
+            // just now at every check; this side's stream stays empty.
+            w.note_token_progress();
+            let standing = decode_side_reprieve(&w, bound, ceiling / 2, &none);
+            assert!(
+                matches!(standing, SideReprieve::WithinBound(left) if !left.is_zero() && left <= bound),
+                "{bound:?}: halfway to the ceiling: a bound's reprieve: {standing:?}"
+            );
+            w.note_token_progress();
+            let standing = decode_side_reprieve(&w, bound, ceiling - step, &none);
+            assert!(
+                matches!(standing, SideReprieve::WithinBound(left) if !left.is_zero() && left <= step),
+                "{bound:?}: a step before the ceiling: what is left to it: {standing:?}"
+            );
+            w.note_token_progress();
+            let standing = decode_side_reprieve(&w, bound, ceiling, &none);
+            assert!(
+                matches!(standing, SideReprieve::Silent { silent: Some(silent), window } if window == ceiling && silent < bound),
+                "{bound:?}: at the ceiling: the verdict, its window the ceiling, its silence the latest token's age: {standing:?}"
+            );
+            assert!(standing.past_bound());
+            w.note_token_progress();
+            assert!(
+                decode_side_reprieve(&w, bound, ceiling * 2, &none).past_bound(),
+                "{bound:?}: past the ceiling: the verdict however the worker produces"
+            );
+        }
     }
 
     /// On the parallel shape a decode side's first output is a handoff of

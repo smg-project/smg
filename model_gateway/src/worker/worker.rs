@@ -771,9 +771,10 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// A decode side dispatched to this worker got its first token. The
     /// side's prompt is the prefill worker's work (nothing is booked here
     /// for it, nothing timed), but its first token is this worker's latest
-    /// first response for [`Self::prefill_answered_ago`]: the evidence a
-    /// sequential decode side past its bound is reprieved on (see
-    /// [`super::liveness::decode_side_reprieve`]).
+    /// first response for [`Self::prefill_answered_ago`]: what a sequential
+    /// decode side's silence verdict names as the worker's latest answer.
+    /// The side's reprieve itself reads the token progress, which the same
+    /// first token advances (see [`super::liveness::decode_side_reprieve`]).
     fn note_answered(&self) {}
 
     /// A decode side showed a handoff of this prefill worker's: on the

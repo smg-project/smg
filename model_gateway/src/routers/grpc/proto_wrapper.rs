@@ -3061,7 +3061,7 @@ impl PrefillCachedTokens {
 /// How long a decode side its request gave up on is read for its first item
 /// before it is dropped unread (see
 /// [`ProtoStream::retire_abandoned_decode_side`]): the wait the stream's own
-/// deferred abort gives that item.
+/// deferred abort would give that item, taken in its place.
 const ABANDONED_SIDE_FIRST_ITEM_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// A [`ProtoStream`] paired with the worker serving it, so each response it
@@ -3819,9 +3819,10 @@ impl ProtoStream {
     /// and then a failure, which reset the breaker's streak on every
     /// request; a stream that ends with nothing on it earns no success
     /// either, as a prefill side's does not. The first response is also the
-    /// worker's answer to the side ([`Worker::note_answered`]): the evidence
-    /// a sequential decode side past its bound is reprieved on, on a worker
-    /// no prompt of the side's is booked on.
+    /// worker's answer to the side ([`Worker::note_answered`]), the latest
+    /// answer a sequential decode side's silence verdict names; the side's
+    /// reprieve itself reads the worker's token progress, which the same
+    /// response advances ([`crate::worker::liveness::decode_side_reprieve`]).
     #[must_use]
     pub(crate) fn tracked_decode_side(self, worker: Arc<dyn Worker>) -> Self {
         let mut stream = self.tracked(worker, 0, false);
@@ -3842,7 +3843,10 @@ impl ProtoStream {
     /// no breaker success: the request charged its verdict already, and the
     /// side's late result is neither sampled nor counted. The stream is then
     /// dropped: an item was seen, so the abort deferred past the handoff
-    /// goes out at once; past the wait, the drop defers it as it did. Read
+    /// goes out at once; past the wait, the stream is marked to abort at
+    /// once ([`Self::abort_at_once`]), since the wait here was the
+    /// deferral's own, so one wait of its length stands between the verdict
+    /// and the abort, as it did before the side was read for its item. Read
     /// below the tracked layer, as a dropped side's deferred abort reads it,
     /// the item was invisible: once a transport's queue of handoffs was
     /// deeper than the bound, every first token belonged to an abandoned
@@ -3860,7 +3864,12 @@ impl ProtoStream {
             return;
         }
         tokio::spawn(async move {
-            let _ = tokio::time::timeout(ABANDONED_SIDE_FIRST_ITEM_WAIT, self.next()).await;
+            if tokio::time::timeout(ABANDONED_SIDE_FIRST_ITEM_WAIT, self.next())
+                .await
+                .is_err()
+            {
+                self.abort_at_once();
+            }
             drop(self);
         });
     }
@@ -4121,6 +4130,25 @@ impl ProtoStream {
             }
         }
     }
+
+    /// Undo the deferral: the stream aborts on drop at once after all, for a
+    /// holder that waited out the deferral itself (see
+    /// [`Self::retire_abandoned_decode_side`]). No-op for ZMQ streams, as
+    /// the deferral is.
+    pub fn abort_at_once(&mut self) {
+        match self {
+            Self::Sglang(stream) => stream.abort_on_drop_at_once(),
+            Self::Vllm(stream) => stream.abort_on_drop_at_once(),
+            Self::Trtllm(stream) => stream.abort_on_drop_at_once(),
+            Self::Mlx(stream) => stream.abort_on_drop_at_once(),
+            Self::TokenSpeed(stream) => stream.abort_on_drop_at_once(),
+            Self::Zmq(_) => {}
+            Self::Fanout(stream) => stream.abort_at_once(),
+            Self::Tracked(stream) => stream.inner.abort_at_once(),
+            Self::DecodeSide(side) => side.inner.abort_at_once(),
+            Self::Ahead(ahead) => ahead.inner.abort_at_once(),
+        }
+    }
 }
 
 impl FanoutChild for ProtoStream {
@@ -4136,6 +4164,10 @@ impl FanoutChild for ProtoStream {
 
     fn defer_abort_until_first_item(self) -> Self {
         Self::defer_abort_until_first_item(self)
+    }
+
+    fn abort_at_once(&mut self) {
+        Self::abort_at_once(self);
     }
 
     fn worker(&self) -> Option<&Arc<dyn Worker>> {
@@ -4157,6 +4189,11 @@ pub trait FanoutChild: Send {
     /// Defer the child's abort-on-drop until its first response.
     #[must_use]
     fn defer_abort_until_first_item(self) -> Self;
+
+    /// Undo the deferral: the child aborts on drop at once after all (see
+    /// [`ProtoStream::abort_at_once`]). A child with no deferral has nothing
+    /// to undo.
+    fn abort_at_once(&mut self) {}
 
     /// The one worker the child was dispatched to, when it is tracked; a
     /// fan-out over several workers answers `None`.
@@ -4194,6 +4231,10 @@ impl<C: FanoutChild> FanoutChild for FanoutStream<C> {
 
     fn defer_abort_until_first_item(self) -> Self {
         Self::defer_abort_until_first_item(self)
+    }
+
+    fn abort_at_once(&mut self) {
+        Self::abort_at_once(self);
     }
 }
 
@@ -4272,6 +4313,13 @@ impl<C: FanoutChild> FanoutStream<C> {
                 .map(|child| child.map(FanoutChild::defer_abort_until_first_item))
                 .collect(),
             cursor: self.cursor,
+        }
+    }
+
+    /// Undo every open child's deferral (see [`FanoutChild::abort_at_once`]).
+    pub fn abort_at_once(&mut self) {
+        for child in self.children.iter_mut().flatten() {
+            child.abort_at_once();
         }
     }
 }

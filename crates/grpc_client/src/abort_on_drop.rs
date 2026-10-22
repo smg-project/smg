@@ -118,6 +118,16 @@ impl<T: Send + 'static, C: AbortOnDropClient> AbortOnDropStream<T, C> {
         self
     }
 
+    /// Abort on drop at once after all: for a deferred stream whose holder
+    /// has waited out the deferral itself (it read for the first item as
+    /// long as the deferral would have), so that the drop sends the abort
+    /// without a second wait of [`DEFERRED_ABORT_MAX_WAIT`]. Nothing changes
+    /// for a stream that yielded an item, and `mark_completed` still
+    /// suppresses the abort entirely.
+    pub fn abort_on_drop_at_once(&mut self) {
+        self.defer_abort_until_first_item = false;
+    }
+
     /// Suppress the abort-on-drop. Call after the stream completes
     /// successfully so the backend isn't told to abort an already-finished
     /// request.
