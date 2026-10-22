@@ -3,7 +3,7 @@
 
 use anyhow::{anyhow, Result};
 use serde::Serialize;
-use tokenizers::{models::ModelWrapper, Model};
+use tokenizers::{models::ModelWrapper, pre_tokenizers::PreTokenizerWrapper, Model};
 use tokenizers_v1::{
     models::bpe::PipelineBPE,
     pipeline::{
@@ -27,6 +27,18 @@ pub(crate) struct V1Encoder {
 
 // rc.2's reader can accept a Split without a usable regex engine. Check the
 // constructed pipeline, including its fused DeepSeek sequence, before selecting it.
+/// Whether `pre` is a `Metaspace` pre-tokenizer, alone or in a sequence.
+fn has_metaspace(pre: Option<&PreTokenizerWrapper>) -> bool {
+    match pre {
+        Some(PreTokenizerWrapper::Metaspace(_)) => true,
+        Some(PreTokenizerWrapper::Sequence(sequence)) => sequence
+            .as_ref()
+            .iter()
+            .any(|step| matches!(step, PreTokenizerWrapper::Metaspace(_))),
+        _ => false,
+    }
+}
+
 fn supported_splits(pre: &PipelinePreTokenizer) -> bool {
     match pre {
         PipelinePreTokenizer::Split(split) => {
@@ -83,6 +95,27 @@ impl V1Encoder {
         }
         if tokenizer.get_truncation().is_some() {
             return Err(Declined::from("truncation is configured"));
+        }
+        // The reader lowers a `Metaspace` pre-tokenizer into a normalizer (the
+        // engine has no `Metaspace` pre-tokenizer), and a normalizer runs
+        // before the added tokens matched after normalization are cut, where
+        // `tokenizers` runs the pre-tokenizer after that cut, on each split
+        // with its offset. The two agree until such a token meets the word
+        // marker the scheme prepends: at the start of the text (`first`: a
+        // marker piece before the token), after every such token (`always`:
+        // no marker piece after it). Those vocabularies keep the established
+        // implementation.
+        if has_metaspace(tokenizer.get_pre_tokenizer())
+            && tokenizer
+                .get_added_vocabulary()
+                .get_added_tokens_decoder()
+                .values()
+                .any(|token| token.normalized)
+        {
+            return Err(Declined::from(
+                "a Metaspace pre-tokenizer with added tokens matched after normalization (the \
+                 reader lowers Metaspace into a normalizer, which would run before their cut)",
+            ));
         }
         // Serialize AFTER config.json/tokenizer_config.json overrides, including
         // BOS/EOS processing. Loading the original file here would lose them.
