@@ -207,7 +207,7 @@ async fn build_router(port: u16) -> (Box<dyn RouterTrait>, Arc<dyn Worker>, Work
         app_context.worker_registry.clone(),
         WorkerManagerConfig {
             default_check_interval_secs: PROBE_INTERVAL.as_secs(),
-            remove_unhealthy: false,
+            remove_unhealthy: smg::config::UnhealthyRemovalScope::Disabled,
         },
         None,
     );

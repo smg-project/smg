@@ -30,13 +30,13 @@ use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, AccessLogField,
-        CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, ConsulDiscoveryConfig,
-        DiscoveryConfig, FileDiscoveryConfig, HealthCheckConfig, HistoryBackend,
-        KubernetesDiscoveryConfig, ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig,
-        ParserChoice, PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric,
-        RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
-        SchemaConfig, SlurmDiscoveryConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        bind_socket_addr, validate_mesh_server_name, AccessLogField, CacheIndexKind,
+        CircuitBreakerConfig, ConfigError, ConfigResult, ConsulDiscoveryConfig, DiscoveryConfig,
+        FileDiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig,
+        ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, ParserChoice,
+        PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric, RedisConfig,
+        RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode, SchemaConfig,
+        SlurmDiscoveryConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
         TurboJpegPolicy, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
@@ -1438,11 +1438,11 @@ struct ServingArgs {
     /// removed from the registry so service discovery re-registers and
     /// re-probes it once its engine returns. Without this a Failed worker
     /// stays registered, out of rotation, and keeps being probed, so it
-    /// rejoins in place as soon as it answers again. Defaults to the
-    /// --service-discovery setting: discovery-managed fleets recover by
-    /// removal plus re-registration, while a static fleet has nothing to
-    /// re-add a removed worker and recovers in place instead. Pass =false
-    /// to keep it off under discovery.
+    /// rejoins in place as soon as it answers again. Unset, it follows
+    /// discovery: with a discovery provider it removes only the workers that
+    /// provider discovered, which it re-registers, while static and
+    /// API-added workers, which nothing would re-add, recover in place. Pass
+    /// it to remove every failed local worker, or =false to remove none.
     #[arg(
         long,
         visible_alias = "worker-auto-recovery",
@@ -3332,10 +3332,9 @@ impl CliArgs {
                 check_interval_secs: self.serving.health_check_interval_secs,
                 endpoint: self.serving.health_check_endpoint.clone(),
                 disable_health_check: self.serving.disable_health_check,
-                remove_unhealthy_workers: resolve_worker_auto_recovery(
-                    self.serving.remove_unhealthy_workers,
-                    self.selected_discovery_provider().is_some(),
-                ),
+                // Kept unresolved: the server resolves it against the
+                // discovery the configuration selects.
+                remove_unhealthy_workers: self.serving.remove_unhealthy_workers,
                 drain_settle_secs: self.serving.drain_settle_secs,
             })
             .tokenizer_cache(TokenizerCacheConfig {
@@ -3625,6 +3624,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    use smg::config::UnhealthyRemovalScope;
+
     use super::*;
 
     /// Exercise both generated builders and startup parsing on Rust's default
@@ -4918,7 +4919,10 @@ mod tests {
             }))
         );
         // Recovery by removal works here too: the next reread re-adds the worker.
-        assert!(router.health_check.remove_unhealthy_workers);
+        assert_eq!(
+            router.unhealthy_removal_scope(),
+            UnhealthyRemovalScope::DiscoveryOwned
+        );
 
         let server = cli.to_server_config(router).unwrap();
         assert!(matches!(
@@ -5048,7 +5052,10 @@ mod tests {
                 check_interval_secs: 10,
             }))
         );
-        assert!(router.health_check.remove_unhealthy_workers);
+        assert_eq!(
+            router.unhealthy_removal_scope(),
+            UnhealthyRemovalScope::DiscoveryOwned
+        );
 
         let server = cli.to_server_config(router).unwrap();
         assert!(matches!(
@@ -5105,7 +5112,10 @@ mod tests {
                 check_interval_secs: 10,
             }))
         );
-        assert!(router.health_check.remove_unhealthy_workers);
+        assert_eq!(
+            router.unhealthy_removal_scope(),
+            UnhealthyRemovalScope::DiscoveryOwned
+        );
 
         let server = cli.to_server_config(router).unwrap();
         assert!(matches!(
@@ -5247,41 +5257,56 @@ mod tests {
         assert!(!no_discovery.routing.enable_igw);
     }
 
-    /// `--worker-auto-recovery` defaults to the `--service-discovery`
-    /// setting: recovery works by removal plus discovery re-registration, so
-    /// it is on exactly when discovery can complete that loop, and off when
-    /// removal would permanently shrink a static fleet. Explicit values win
-    /// in both directions.
+    /// `--worker-auto-recovery` follows discovery when it is not given:
+    /// recovery works by removal plus re-registration, so by default it
+    /// covers exactly the workers a provider discovered, which the provider
+    /// registers again, and none without discovery, where removal would
+    /// shrink a static fleet for good. An explicit value wins in both
+    /// directions, `true` taking every local worker. The CLI keeps the
+    /// setting as given; `unhealthy_removal_scope` resolves it.
     #[test]
     fn worker_auto_recovery_follows_service_discovery_by_default() {
-        let derived_on = cli_args_from(&["--service-discovery", "--selector", "app=w"])
-            .to_router_config(vec![], vec![])
-            .unwrap();
-        assert!(derived_on.health_check.remove_unhealthy_workers);
-
-        let derived_on_tagged =
-            cli_args_from(&["--discovery-provider", "kubernetes", "--selector", "app=w"])
+        let scope = |args: &[&str]| {
+            let router = cli_args_from(args)
                 .to_router_config(vec![], vec![])
                 .unwrap();
-        assert!(derived_on_tagged.health_check.remove_unhealthy_workers);
-
-        let derived_off = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
-        assert!(!derived_off.health_check.remove_unhealthy_workers);
-
-        let forced_off = cli_args_from(&[
-            "--service-discovery",
-            "--selector",
-            "app=w",
-            "--remove-unhealthy-workers=false",
-        ])
-        .to_router_config(vec![], vec![])
-        .unwrap();
-        assert!(!forced_off.health_check.remove_unhealthy_workers);
-
-        let forced_on = cli_args_from(&["--remove-unhealthy-workers"])
-            .to_router_config(vec![], vec![])
-            .unwrap();
-        assert!(forced_on.health_check.remove_unhealthy_workers);
+            (
+                router.health_check.remove_unhealthy_workers,
+                router.unhealthy_removal_scope(),
+            )
+        };
+        use UnhealthyRemovalScope::{AllLocal, Disabled, DiscoveryOwned};
+        assert_eq!(
+            scope(&["--service-discovery", "--selector", "app=w"]),
+            (None, DiscoveryOwned)
+        );
+        assert_eq!(
+            scope(&["--discovery-provider", "kubernetes", "--selector", "app=w"]),
+            (None, DiscoveryOwned)
+        );
+        assert_eq!(scope(&[]), (None, Disabled));
+        assert_eq!(
+            scope(&[
+                "--service-discovery",
+                "--selector",
+                "app=w",
+                "--remove-unhealthy-workers=false",
+            ]),
+            (Some(false), Disabled)
+        );
+        assert_eq!(
+            scope(&["--remove-unhealthy-workers"]),
+            (Some(true), AllLocal)
+        );
+        assert_eq!(
+            scope(&[
+                "--service-discovery",
+                "--selector",
+                "app=w",
+                "--worker-auto-recovery",
+            ]),
+            (Some(true), AllLocal)
+        );
     }
 
     /// `--health-check-port` must flow into BOTH conversion paths

@@ -990,7 +990,6 @@ impl Router {
         } else {
             self.discovery.clone()
         };
-        let has_discovery = discovery.is_some();
 
         // The metrics listener `start` creates: its port when unset is the
         // exporter's default, so the validator's port checks (the admin,
@@ -1158,12 +1157,9 @@ impl Router {
                 check_interval_secs: self.health_check_interval_secs,
                 endpoint: self.health_check_endpoint.clone(),
                 disable_health_check: self.disable_health_check,
-                // Explicit setting wins; otherwise recovery-by-removal follows
-                // service discovery, which is what re-adds a removed worker.
-                remove_unhealthy_workers: config::resolve_worker_auto_recovery(
-                    self.remove_unhealthy_workers,
-                    has_discovery,
-                ),
+                // Kept unresolved: the server resolves it against the
+                // discovery the configuration selects.
+                remove_unhealthy_workers: self.remove_unhealthy_workers,
                 drain_settle_secs: self.drain_settle_secs,
             })
             .tokenizer_cache(config::TokenizerCacheConfig {

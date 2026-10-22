@@ -2086,7 +2086,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         app_context.worker_registry.clone(),
         WorkerManagerConfig {
             default_check_interval_secs: config.router_config.health_check.check_interval_secs,
-            remove_unhealthy: config.router_config.health_check.remove_unhealthy_workers,
+            remove_unhealthy: config.router_config.unhealthy_removal_scope(),
         },
         app_context.worker_job_queue.get().cloned(),
         !config.router_config.health_check.disable_health_check,

@@ -560,9 +560,9 @@ class RouterArgs:
     redis_pool_max: int = 16
     redis_retention_days: int = 30
     redis_url: str | None = None
-    # None = follow service_discovery: recovery works by removal + discovery
-    # re-registration, so it defaults on exactly when discovery can complete
-    # the loop (resolved by the Rust core).
+    # None = follow discovery: with a provider, remove only the workers it
+    # discovered, which it re-registers; True removes any failed local worker,
+    # False none (resolved by the Rust core).
     remove_unhealthy_workers: bool | None = None
     request_id_headers: list[str] | None = None
     # Request timeout in seconds
@@ -2402,10 +2402,12 @@ class RouterArgs:
             help=(
                 "Let workers recover after prolonged failure: unhealthy workers"
                 " are removed so service discovery re-registers and re-probes"
-                " them once their engine returns. Defaults to the"
-                " service-discovery setting (recovery-by-removal needs"
-                " discovery to re-add the worker); use the --no- form to keep"
-                " it off under discovery"
+                " them once their engine returns. Unset, it follows discovery:"
+                " with a discovery provider it removes only the workers that"
+                " provider discovered, while static and API-added workers,"
+                " which nothing would re-add, recover in place. Pass it to"
+                " remove every failed local worker, or the --no- form to"
+                " remove none"
             ),
         )
         health_group.add_argument(
