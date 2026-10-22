@@ -5,7 +5,7 @@
 //! msgpack array whose element 0 is the class-name tag string, followed by
 //! the fields in declaration order (`python/sglang/srt/managers/io_struct.py`).
 //! Field order is the wire contract. The request here is the scheduler's own
-//! [`TokenizedGenerateReqInput`]; the encoder emits the shortest valid prefix
+//! [`request::TokenizedGenerateReqInput`]; the encoder emits the shortest valid prefix
 //! (the required fields), since `msgspec` fills missing trailing fields from
 //! their defaults, and the engine normalizes the nested
 //! [`sampling::SamplingParams`] itself (sent as its API prefix for the same

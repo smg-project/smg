@@ -1188,13 +1188,13 @@ impl<P: EngineProtocol> Client<P> {
     /// Whether the connection is still live. Becomes false once the dispatcher
     /// observes `ENGINE_CORE_DEAD`, a transport failure, or the output stream
     /// closing, or once local queue admission has stalled for
-    /// [`ENGINE_INPUT_DEATH_TIMEOUT`]. No RPC — this is a local liveness flag.
+    /// `ENGINE_INPUT_DEATH_TIMEOUT`. No RPC — this is a local liveness flag.
     pub fn is_alive(&self) -> bool {
         !self.inner.registry.lock().closed
     }
 
     /// Bound how long a submit, abort or utility call waits for zeromq to
-    /// accept its frame in the local peer queue ([`ENGINE_SEND_TIMEOUT`] by
+    /// accept its frame in the local peer queue (`ENGINE_SEND_TIMEOUT` by
     /// default). Past it the call fails with [`Error::EngineInputBlocked`];
     /// the frame is still delivered when the engine reads again.
     pub fn set_send_timeout(&self, timeout: Duration) {
@@ -1202,7 +1202,7 @@ impl<P: EngineProtocol> Client<P> {
     }
 
     /// Bound how long admission to a full zeromq peer queue may stall before
-    /// the engine is treated as dead ([`ENGINE_INPUT_DEATH_TIMEOUT`] by
+    /// the engine is treated as dead (`ENGINE_INPUT_DEATH_TIMEOUT` by
     /// default): the requests in flight fail and the client closes.
     pub fn set_input_death_timeout(&self, timeout: Duration) {
         *self.inner.input_death_timeout.lock() = timeout;
@@ -1232,7 +1232,7 @@ impl<P: EngineProtocol> Client<P> {
 
     /// Bound the add-requests that may wait behind a blocked input before new
     /// ones are refused at once with [`Error::EngineInputFull`]
-    /// ([`ENGINE_INPUT_QUEUE_FRAMES`] frames and [`ENGINE_INPUT_QUEUE_BYTES`]
+    /// (`ENGINE_INPUT_QUEUE_FRAMES` frames and `ENGINE_INPUT_QUEUE_BYTES`
     /// payload bytes by default). The same limits independently bound frames
     /// still owned by zeromq. That budget admits one oversized message alone;
     /// it is released by transport ownership, never by caller cancellation.
@@ -1304,7 +1304,7 @@ impl<P: EngineProtocol> Client<P> {
 
     /// Submit a request and return a stream of its outputs. The request is
     /// routed by `data_parallel_rank` (SMG-pinned) or, unpinned, to the
-    /// least-loaded engine (see [`ClientInner::select_engine`]).
+    /// least-loaded engine (see `ClientInner::select_engine`).
     /// Dropping the returned stream before it finishes aborts the request.
     pub async fn submit(&self, request: P::Request) -> Result<RequestStream<P>> {
         self.submit_with_aux(request, Vec::new()).await
