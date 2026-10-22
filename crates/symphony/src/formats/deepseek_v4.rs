@@ -281,6 +281,8 @@ mod tests {
             event,
             Event::ToolCallEnd { index: 0, source } if source.text.is_empty()
         )));
+        // Cut by the token limit, the held value is the call's own, as written.
+        assert_eq!(arguments_of(&events, 0), r#"{"x": 1"#);
         assert!(matches!(
             events.last(),
             Some(Event::Finish { tool_calls: 1, .. })

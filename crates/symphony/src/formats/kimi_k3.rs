@@ -640,7 +640,7 @@ mod tests {
         // assembler still holds the argument's bytes, which came before the cut tag, so the call
         // ends first (its bytes, malformed, and its end) and the cut tag is dropped after them;
         // every byte in exactly one event, in the output's order, and none of it content. Cut
-        // by the token limit the argument is the call's unfinished bytes; at the model's own
+        // by the token limit the argument is the call's own fragment, as written; at the model's own
         // stop the call ends as its closing tag would end it, the held number reported, the
         // object closed without it, and the one word says the stop closed the call.
         let tokens = [
@@ -672,13 +672,27 @@ mod tests {
             EngineFinish::Length,
         );
         in_order(&events);
+        assert_eq!(
+            arguments_of(&events, 0),
+            r#"{"n": 1.5"#,
+            "the unfinished argument is the call's own bytes, as written: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::ToolCallArguments { json, source, .. }
+                    if json == r#"{"n": 1.5"#
+                        && source.text == "<|open|>argument key=\"n\" type=\"number\"<|sep|>1.5"
+            )),
+            "{events:?}"
+        );
         assert!(
             events.iter().any(|event| matches!(
                 event,
                 Event::Malformed { text, why: MalformedReason::UnterminatedRegion }
-                    if text.text == "<|open|>argument key=\"n\" type=\"number\"<|sep|>1.5"
+                    if text.text.is_empty()
             )),
-            "the unfinished argument is the call's malformed bytes: {events:?}"
+            "the one word says the arguments are no whole value: {events:?}"
         );
         let stopped = run(PROMPT_THINKING_OFF, &tokens);
         in_order(&stopped);

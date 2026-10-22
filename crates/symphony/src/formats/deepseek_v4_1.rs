@@ -251,7 +251,8 @@ mod tests {
             }
         )));
         // The call ends, with no bytes of its own, as every assembler ends a started call at the
-        // end of the stream; its arguments stay cut, `{` without its `}`.
+        // end of the stream; its arguments stay cut, the value as written, `{` without its `}`.
+        assert_eq!(arguments_of(&events, 0), r#"{"x": 1"#);
         assert!(events.iter().any(|event| matches!(
             event,
             Event::ToolCallEnd { index: 0, source } if source.text.is_empty()
@@ -260,6 +261,77 @@ mod tests {
             events.last(),
             Some(Event::Finish { tool_calls: 1, .. })
         ));
+    }
+
+    /// A call the token limit cut, the shape of a tool request whose `max_tokens` is below the
+    /// call's length: inside a `string="true"` value and inside a `string="false"` object. The
+    /// call's arguments are the prefix as the model wrote it, the cut member's key and bytes
+    /// included; nothing of the call reaches a chat client as content (no `Malformed` text, the
+    /// tag the cut member came in is the fragment's source); the one word before the call's end
+    /// says the arguments are no whole value; and the finish is the engine's `length`, whole, a
+    /// character at a time and at every two-way cut.
+    #[test]
+    fn a_call_the_token_limit_cut_keeps_its_bytes_as_its_arguments_and_nothing_as_content() {
+        use crate::{
+            event::{FinishReason, MalformedReason},
+            testing::{drive_to, the_same_at_every_cut},
+        };
+        let invoke = concat!(
+            "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ChaDri_change_drink\">\n",
+            "<｜DSML｜ parameter name=\"drink_id\" string=\"true\">latte</｜DSML｜ parameter>\n"
+        );
+        for (tail, arguments) in [
+            (
+                "<｜DSML｜ parameter name=\"size\" string=\"true\">lar",
+                r#"{"drink_id": "latte", "size": "lar"#,
+            ),
+            (
+                "<｜DSML｜ parameter name=\"new_preferences\" string=\"false\">{\"size\": \"large\", \"temp",
+                r#"{"drink_id": "latte", "new_preferences": {"size": "large", "temp"#,
+            ),
+        ] {
+            let output = format!("{invoke}{tail}");
+            let read = |pieces: &[&str]| {
+                drive_to(
+                    &mut Engine::with_call_ids(
+                        Arc::new(deepseek_v4_1()),
+                        Declared::default(),
+                        ids(),
+                    ),
+                    "<think>",
+                    pieces,
+                    EngineFinish::Length,
+                )
+            };
+            let said = the_same_at_every_cut(read, &output);
+            assert_eq!(
+                said.calls,
+                vec![("ChaDri_change_drink".to_string(), arguments.to_string())],
+                "{tail:?}"
+            );
+            assert_eq!(said.finish, Some((FinishReason::Length, 1)), "{tail:?}");
+            let events = read(&[&output]);
+            assert_eq!(bytes(&events), output, "{tail:?}");
+            let shown: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Content(text) | Event::Malformed { text, .. } => Some(&*text.text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(shown, "", "nothing of the call is content: {events:?}");
+            assert!(
+                matches!(
+                    &events[events.len() - 3..],
+                    [
+                        Event::Malformed { text, why: MalformedReason::UnterminatedRegion },
+                        Event::ToolCallEnd { source, .. },
+                        Event::Finish { .. },
+                    ] if text.text.is_empty() && source.text.is_empty()
+                ),
+                "{tail:?}: {events:?}"
+            );
+        }
     }
 
     #[test]

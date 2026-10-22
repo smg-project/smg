@@ -15,7 +15,7 @@ use openai_protocol::{
 use serde_json::{json, Value};
 use smg_grpc_client::{tokenspeed_proto::GenerateComplete, vllm_engine::proto};
 use symphony::{
-    formats::{deepseek_v4, glm, plain, qwen3},
+    formats::{deepseek_v4, deepseek_v4_1, glm, plain, qwen3},
     CallSyntax, Format,
 };
 
@@ -364,27 +364,39 @@ async fn fold(output: &str) -> (ChatChoice, u32) {
 
 /// [`fold`] over `format` after `prompt`.
 async fn fold_with(output: &str, format: Format, prompt: &str) -> (ChatChoice, u32) {
+    fold_finished(output, format, prompt, "stop").await
+}
+
+/// [`fold_with`] with the engine's finish reason chosen.
+async fn fold_finished(
+    output: &str,
+    format: Format,
+    prompt: &str,
+    finish_reason: &str,
+) -> (ChatChoice, u32) {
     fold_through(
         Arc::new(CharacterTokenizer::default()),
         output,
         format,
         prompt,
+        finish_reason,
     )
     .await
     .expect("a choice")
 }
 
-/// [`fold_with`] decoding through `tokenizer`, with the unary path's own verdict.
+/// [`fold_finished`] decoding through `tokenizer`, with the unary path's own verdict.
 async fn fold_through(
     tokenizer: Arc<dyn Tokenizer>,
     output: &str,
     format: Format,
     prompt: &str,
+    finish_reason: &str,
 ) -> Result<(ChatChoice, u32), String> {
     let output_ids: Vec<u32> = output.chars().map(u32::from).collect();
     let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
         output_ids: output_ids.clone(),
-        finish_reason: "stop".to_string(),
+        finish_reason: finish_reason.to_string(),
         output_logprobs: Some(smg_grpc_client::tokenspeed_proto::OutputLogProbs {
             token_logprobs: vec![-0.5; output_ids.len()],
             token_ids: output_ids,
@@ -454,6 +466,86 @@ async fn symphony_folds_a_whole_output_into_the_message() {
         "Hello ",
         "the content's tokens alone keep their logprobs"
     );
+}
+
+/// A DSML call the token limit cut, the shape of a tool request whose `max_tokens` is below the
+/// call's length: the declared `lookup` tool, its first parameter whole, its second cut inside a
+/// `string="true"` value or inside a `string="false"` object.
+const CUT_CALL_PREFIX: &str = concat!(
+    "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n",
+    "<｜DSML｜ parameter name=\"q\" string=\"true\">rain</｜DSML｜ parameter>\n"
+);
+
+/// The two cut tails and the arguments a client reads for each: the prefix as the model wrote it.
+const CUT_CALL_TAILS: [(&str, &str); 2] = [
+    (
+        "<｜DSML｜ parameter name=\"city\" string=\"true\">Par",
+        r#"{"q": "rain", "city": "Par"#,
+    ),
+    (
+        "<｜DSML｜ parameter name=\"options\" string=\"false\">{\"days\": 3, \"uni",
+        r#"{"q": "rain", "options": {"days": 3, "uni"#,
+    ),
+];
+
+#[tokio::test]
+async fn a_streamed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
+    for (tail, arguments) in CUT_CALL_TAILS {
+        let output = format!("{CUT_CALL_PREFIX}{tail}");
+        // Chunked at the cut member's tag and inside its value, then the engine's `length`.
+        let at = output.find(tail).expect("the tail");
+        let inside = at + tail.len() - 2;
+        let spec = assigned(chat_spec(true), deepseek_v4_1(), "<think>");
+        let responses = vec![
+            chunk(0, &output[..at]),
+            chunk(0, &output[at..inside]),
+            chunk(0, &output[inside..]),
+            complete(0, "length"),
+        ];
+        let (result, events) = stream_events(responses, true, spec).await;
+        assert!(result.is_ok(), "{tail:?}: {result:?}");
+        let calls = tool_call_deltas(&events);
+        assert_eq!(
+            calls[0]["function"]["name"], "lookup",
+            "{tail:?}: {events:#?}"
+        );
+        let streamed: String = calls
+            .iter()
+            .filter_map(|call| call["function"]["arguments"].as_str())
+            .collect();
+        assert_eq!(streamed, arguments, "{tail:?}: {events:#?}");
+        assert_eq!(
+            chat_text(&events, 0, "content"),
+            "",
+            "nothing of the call is content: {tail:?}: {events:#?}"
+        );
+        let finish = events
+            .iter()
+            .find_map(|event| event["choices"][0]["finish_reason"].as_str())
+            .expect("a finish chunk");
+        assert_eq!(finish, "length", "{tail:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_whole_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
+    for (tail, arguments) in CUT_CALL_TAILS {
+        let output = format!("{CUT_CALL_PREFIX}{tail}");
+        let (choice, _) = fold_finished(&output, deepseek_v4_1(), "<think>", "length").await;
+        let calls = choice.message.tool_calls.as_ref().expect("the call");
+        assert_eq!(calls.len(), 1, "{tail:?}");
+        assert_eq!(calls[0].function.name, "lookup");
+        assert_eq!(
+            calls[0].function.arguments.as_deref(),
+            Some(arguments),
+            "{tail:?}: {choice:?}"
+        );
+        assert_eq!(
+            choice.message.content, None,
+            "nothing of the call is content: {tail:?}: {choice:?}"
+        );
+        assert_eq!(choice.finish_reason.as_deref(), Some("length"), "{tail:?}");
+    }
 }
 
 #[tokio::test]
@@ -1639,6 +1731,7 @@ async fn a_decoders_end_that_fails_counts_the_output_as_failed_on_the_chat_paths
         "Hello",
         format(),
         prompt,
+        "stop",
     ))
     .await;
     let error = result.expect_err("the decoder's end");

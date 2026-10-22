@@ -56,9 +56,10 @@ pub(crate) fn open_at_the_stop(out: &mut Events) {
 /// (no closing quote, no closing brace), and one `Malformed` event before the call's end says that
 /// the arguments are no whole value, as the JSON assembler says it: it carries the bytes still held
 /// (the start of a tag, a value's text, the template's newline; a pythonic key or separator cut
-/// short), or none when the cut fell between events or the syntax refused what it held first (the
-/// keyed one, [`refuse`]), so that a client that reads the arguments as JSON is told rather than
-/// left to find out. The reason is `UnterminatedRegion`, which the engine keeps for a region the
+/// short), or none when the cut fell between events, the syntax refused what it held first (the
+/// keyed one, [`refuse`]) or wrote it as the call's own fragment and dropped a cut tag first (the
+/// attributed one at the end of the stream), so that a client that reads the arguments as JSON is
+/// told rather than left to find out. The reason is `UnterminatedRegion`, which the engine keeps for a region the
 /// end of the stream cut and renames for one a marker closed; `terminal` is the marker's bytes when
 /// they are the call's own end, and nothing when they are the region's or the stream ended.
 pub(crate) fn end_cut_call(index: u32, held: String, terminal: &str, out: &mut Events) {

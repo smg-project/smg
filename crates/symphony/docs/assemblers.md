@@ -166,14 +166,24 @@ and the one `Malformed` event before `ToolCallEnd` carries what was held (the te
 the start of a tag) or no bytes and says that the arguments are no whole value, as at `finish`
 (`tagged::end_cut_call`); the engine names the reason for a block a marker closed.
 `Assembler::finish` is for a stream that was cut: nothing is closed, as in `crate::json::Assembler`,
-because arguments cut short must not look complete to a client. A value that is written whole and
-never closed comes back as `Malformed` in both, since its key was never written. At `finish` a
-started call's arguments are no whole JSON whatever stage the cut found, since the object closes
-only at the call's own end, and the call says so as the JSON assembler does: one `Malformed {
-UnterminatedRegion }` event before `ToolCallEnd`, carrying what was held (that value, the start of a
-tag, the template's newline) or no bytes when the cut fell between events. The fragments stand,
-since a fragment passed on cannot be taken back, and nothing is made up for a value the model never
-finished; the four assemblers of `tagged` share that end (`tagged::end_cut_call`).
+because arguments cut short must not look complete to a client, and the call's bytes stay the
+call's. A value held for its close that the cut found open leaves as the call's own fragment, its
+key and its bytes as the model wrote them (`, "prefs": {"size": "large", "temp`; a section that
+closed is written whole), since a client reads the prefix as written under `length`, the way the
+JSON assembler sends the word it held, and never the call's bytes as the answer's prose: before
+this the held value left as `Malformed` text, the parameter tag included, and a chat client read
+`<parameter name="prefs">{"size": "large", "temp` as content next to a call whose arguments stopped
+at the member before. A string whose key came and no byte of it opens, `{"key": "`; a parameter tag
+the cut found open and the template's whitespace between tags leave as wrapping (`Dropped`), as the
+stop drops a tag the end cut short; the start of a tag held behind a value is the value's text
+unless it begins with a structural token or follows a closed section, where it is dropped after
+the call's end so every byte keeps its place. At `finish` a started call's arguments are no whole
+JSON whatever stage the cut found, since the object closes only at the call's own end, and the call
+says so as the JSON assembler does: one `Malformed { UnterminatedRegion }` event of no bytes before
+`ToolCallEnd`. The fragments stand, since a fragment passed on cannot be taken back, and nothing is
+made up for a value the model never finished; the four assemblers of `tagged` share that end
+(`tagged::end_cut_call`), the keyed one refusing what it held and the Qwen and XML ones still
+reporting it.
 
 A third ending, the stream's stop. `Assembler::stop` is for the model's own end of output inside
 the block (`EngineFinish::Stop`; a cut for length, an abort or any other finish is `finish`): the
@@ -197,7 +207,7 @@ seen: a streamed string's fragments already reached it, so closing the string ad
 while a held value's bytes reached nobody and its close is a tag the model never wrote, so the stop
 writes no member of it; a held scalar that reads whole as its declared kind (`1.5` under `number`)
 is reported and dropped the same way today. A cut keeps `finish`'s, the prefix as
-written under `length`. The four
+written under `length`, the held value in the call. The four
 assemblers of `tagged` share this ending (`tagged::open_at_the_stop`); the JSON, pythonic and Gemma
 assemblers, whose quotes and braces are the model's own, end a call the stop found open as a cut
 ends it. The shape that decided it, recorded on GLM-4.5V: a call whose string value the model ends
