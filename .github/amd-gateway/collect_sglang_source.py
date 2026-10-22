@@ -29,6 +29,8 @@ SOURCE_PATHS = (
     "srt/disaggregation/encoder/runtime.py",
     "srt/disaggregation/encoder/server.py",
     "srt/disaggregation/encoder/receiver.py",
+    "srt/disaggregation/__init__.py",
+    "srt/disaggregation/encoder/grpc_server.py",
 )
 
 
