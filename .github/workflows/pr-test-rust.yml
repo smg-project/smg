@@ -1662,6 +1662,31 @@ jobs:
       min_selected: ${{ matrix.min_selected }}
     secrets: inherit
 
+  e2e-1gpu-gateway-sglang-amd:
+    name: e2e-1gpu-gateway-sglang-amd
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-chat-completions != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: sglang
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      timeout: 50
+      test_timeout: 30
+      test_dirs: e2e_test/router
+      min_selected: 23
+      gpu_vendor: amd
+      container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
+    secrets: inherit
+
   e2e-1gpu-gateway-amd:
     name: e2e-1gpu-gateway-amd (vllm)
     needs: [build-wheel, detect-changes]
@@ -1710,6 +1735,32 @@ jobs:
       test_dirs: e2e_test/responses
       setup_agentic_deps: true
       min_selected: 92 # floor ≈ 95% of measured effective (e2e audit 2026-08-21)
+    secrets: inherit
+
+  e2e-1gpu-responses-sglang-amd:
+    name: e2e-1gpu-responses-sglang-amd
+    needs: [build-wheel, detect-changes]
+    if: >-
+      always()
+      && !cancelled()
+      && vars.SMG_RUN_AMD_LEGS == 'true'
+      && needs.build-wheel.result == 'success'
+      && (github.event_name != 'pull_request'
+          || (vars.SMG_RUN_AMD_ON_PRS == 'true' && needs.detect-changes.result == 'success'))
+      && needs.detect-changes.outputs.skip-agentic != 'true'
+    uses: ./.github/workflows/e2e-gpu-job.yml
+    with:
+      engine: sglang
+      gpu_tier: "1"
+      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+      timeout: 50
+      test_timeout: 30
+      test_dirs: e2e_test/responses
+      min_selected: 92
+      setup_agentic_deps: true
+      gpu_vendor: amd
+      container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
+      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
     secrets: inherit
 
   e2e-2gpu-pd:
@@ -2184,7 +2235,7 @@ jobs:
           path: benchmark_go_bindings/
 
   finish:
-    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-completions-amd, e2e-1gpu-embeddings-amd, e2e-1gpu-chat-symphony, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e, e2e-1gpu-chat-sglang-amd, e2e-1gpu-completions-sglang-amd, e2e-1gpu-embeddings-sglang-amd, e2e-1gpu-chat-symphony-amd, e2e-1gpu-chat-rust-servicer-amd, e2e-1gpu-gateway-amd, e2e-1gpu-chat-symphony-sglang-amd, e2e-1gpu-chat-rust-servicer-sglang-amd, e2e-1gpu-chat-zmq-sglang-amd]
+    needs: [detect-changes, pre-commit, python-lint, grpc-proto-build-check, build-wheel, python-unit-tests, cargo-audit, rust-lint, rust-tests, rust-aarch64, benchmarks, e2e-1gpu-chat, e2e-1gpu-chat-amd, e2e-1gpu-completions-amd, e2e-1gpu-embeddings-amd, e2e-1gpu-chat-symphony, e2e-1gpu-chat-rust-servicer, e2e-1gpu-chat-mm-worker, e2e-1gpu-chat-zmq, e2e-2gpu-chat-zmq-dp, e2e-1gpu-completions, e2e-1gpu-embeddings, e2e-1gpu-realtime, e2e-1gpu-gateway, e2e-1gpu-responses, e2e-2gpu-pd, e2e-2gpu-pd-mm-worker, e2e-4gpu-chat, e2e-4gpu-gateway, e2e-4gpu-epd, e2e-4gpu-pd, e2e-vendor, go-unit-tests, go-bindings-e2e, e2e-1gpu-chat-sglang-amd, e2e-1gpu-completions-sglang-amd, e2e-1gpu-embeddings-sglang-amd, e2e-1gpu-chat-symphony-amd, e2e-1gpu-chat-rust-servicer-amd, e2e-1gpu-gateway-amd, e2e-1gpu-chat-symphony-sglang-amd, e2e-1gpu-chat-rust-servicer-sglang-amd, e2e-1gpu-chat-zmq-sglang-amd, e2e-1gpu-gateway-sglang-amd, e2e-1gpu-responses-sglang-amd]
     if: always()
     runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
     permissions:
@@ -2267,6 +2318,8 @@ jobs:
                 "${{ needs.e2e-1gpu-chat-symphony-sglang-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-rust-servicer-sglang-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-zmq-sglang-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-gateway-sglang-amd.result }}" =~ $bad || \
+                "${{ needs.e2e-1gpu-responses-sglang-amd.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-symphony.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-rust-servicer.result }}" =~ $bad || \
                 "${{ needs.e2e-1gpu-chat-mm-worker.result }}" =~ $bad || \
