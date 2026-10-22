@@ -8,13 +8,13 @@
 //! ```
 //!
 //! The table has one state, an arguments state the output starts in, and the pythonic assembler
-//! reads the turn bare ([`pythonic::Assembler::bare`](crate::pythonic::Assembler::bare)): the list
+//! reads the turn bare (`pythonic::Assembler::bare`): the list
 //! as it arrives where the turn starts with one; content otherwise, and a list after the content
 //! once it is whole, well formed and made of calls to the request's tools, since code holds
 //! `[name(` of its own; the template's wrapping after the list. The
 //! template writes every value as `"%s"` of it, so the quotes carry no type and a quoted value
 //! reads by the type the request's tool declares for the parameter
-//! ([`Dialect::LLAMA4`](crate::pythonic::Dialect::LLAMA4)). The model's `<|python_start|>` and
+//! (`Dialect::LLAMA4`). The model's `<|python_start|>` and
 //! `<|python_end|>`, which it may write around its text or the list, are dropped wherever they
 //! stand. A turn opens with `<|header_start|>assistant<|header_end|>`, so the prompt's replay
 //! starts there. Recorded as `llama-4-scout-17b-16e-instruct` and

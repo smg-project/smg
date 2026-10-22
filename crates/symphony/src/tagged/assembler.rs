@@ -53,7 +53,7 @@ pub const TAGS: [&str; 4] = ["<function=", "<parameter=", "</parameter>", "</fun
 /// kin write an object or a list as JSON (`tojson`) and a boolean or null as Python's word
 /// (`True`, `None`); Seed-OSS writes every value with Python's `str`, an object or a list as its
 /// repr (`{'size': 'large'}`). The assembler reads all of these as the JSON they stand for
-/// ([`json`]); the grammar derived from a table pins an object's or a list's
+/// (`json`); the grammar derived from a table pins an object's or a list's
 /// shape only where the template writes it as JSON.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Spelling {

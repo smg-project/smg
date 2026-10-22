@@ -2,7 +2,7 @@
 //! `</tool_call>` as its name and keyed arguments (`<arg_key>`, `<arg_value>`), typed by the
 //! request's tools, with nothing between the tags. Everything else is content; what a call block
 //! holds that the syntax cannot read (a tag out of its place, prose or Python where the name goes)
-//! is never content: refused and counted ([`keyed`]). The prompt opens
+//! is never content: refused and counted (`keyed`). The prompt opens
 //! the thought (`<|assistant|><think>`, whatever the request says: the template has no thinking
 //! switch, only `clear_thinking` for the history), so an empty thought writes `</think>` at once;
 //! a turn opens with `<|assistant|>`, so the prompt's replay starts there. The template strips the

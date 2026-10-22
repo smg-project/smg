@@ -6,7 +6,7 @@
 //! per pair of markers as the template writes it and several in one as a model may write a
 //! parallel answer. Qwen 3.5 puts the
 //! value on a line of its own and MiMo writes it between the tags directly, which the syntax's
-//! [`Placement`](crate::tagged::Placement) says.
+//! [`Placement`] says.
 //!
 //! The table carries the one part of its chat template's layout the tags write: after the
 //! thought's close the Qwen3 and Qwen 3.5 templates write two newlines before the content or the
