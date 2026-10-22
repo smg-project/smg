@@ -13,6 +13,7 @@ from infra.constants import (
     effective_startup_timeout,
     get_startup_timeout,
 )
+from infra.model_specs import MODEL_SPECS
 
 _SERVICER_WARMUP = (
     Path(__file__).resolve().parents[2] / "grpc_servicer" / "smg_grpc_servicer" / "warmup.py"
@@ -40,6 +41,21 @@ def test_default_bound_is_the_engine_start_plus_the_servicer_warmup_budget():
     if not _SERVICER_WARMUP.is_file():
         pytest.skip(f"{_SERVICER_WARMUP} is not in this tree")
     assert SERVICER_WARMUP_BUDGET_SECS == _servicer_default_budget_secs()
+
+
+def test_a_spec_that_raises_the_bound_keeps_the_warm_up_budget():
+    """A spec's ``startup_timeout`` replaces the default, so one sized for the
+    engine's start alone would lose the warm-up headroom: every spec that sets
+    one is its engine-start bound plus the budget, never below the default."""
+    overrides = {
+        name: spec["startup_timeout"]
+        for name, spec in MODEL_SPECS.items()
+        if "startup_timeout" in spec
+    }
+    assert overrides
+    for name, bound in overrides.items():
+        assert bound >= DEFAULT_STARTUP_TIMEOUT, name
+        assert bound - SERVICER_WARMUP_BUDGET_SECS >= ENGINE_START_SECS, name
 
 
 def test_unset_env_leaves_the_per_model_bound(monkeypatch):
