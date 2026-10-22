@@ -2319,12 +2319,16 @@ pub fn load_chat_template_from_file(template_path: &str) -> Result<Option<String
     // A plain .jinja file is the template as written: transformers' tokenizer
     // reads a checkpoint's `chat_template.jinja` whole, and so does the
     // `--chat-template` loader of the engine the render fixtures are recorded
-    // against, so a newline the template opens with reaches the prompt
-    // (`\n<|im_start|>system`). An engine's own HTTP server may load an
-    // operator-supplied file with a loader of its own; this renderer follows
-    // transformers. The template engine drops exactly one trailing newline of
-    // the source, as Jinja2 does.
-    Ok(Some(content.replace("\\n", "\n")))
+    // against, and neither translates its text: a newline the template opens
+    // with reaches the prompt (`\n<|im_start|>system`), and a backslash
+    // followed by an `n` in the file's text stays the two characters it is
+    // (only inside a string literal does the template engine's own escape
+    // make a newline of it, in Jinja2 and here alike), so a checkpoint whose
+    // file is one escaped line renders as the engine renders it. An engine's
+    // own HTTP server may load an operator-supplied file with a loader of its
+    // own; this renderer follows transformers. The template engine drops
+    // exactly one trailing newline of the source, as Jinja2 does.
+    Ok(Some(content))
 }
 
 /// The chat templates a `tokenizer_config.json` `chat_template` value holds:
@@ -3144,6 +3148,37 @@ mod tests {
         assert_eq!(render(&format!("\n{body}\n")), "\n<s><|user|>Hi</s>");
         assert_eq!(render(&format!("\n{body}\n\n")), "\n<s><|user|>Hi</s>\n");
         assert_eq!(render(&format!("  {body}  ")), "  <s><|user|>Hi</s>  ");
+    }
+
+    /// A backslash followed by an `n` in a template file's text is the two
+    /// characters it is, as the engine's chat utils read the file (a file
+    /// that is one escaped line renders as that line); inside a Jinja string
+    /// literal the template engine's own escape makes a newline of it, in
+    /// both engines alike.
+    #[test]
+    fn a_template_file_s_backslash_n_stays_the_two_characters_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat_template.jinja");
+        fs::write(
+            &path,
+            "<|im_start|>system<|im_end|>\\n{% for m in messages %}{{ m.content }}{{ '\\n' }}{% endfor %}",
+        )
+        .unwrap();
+        let template = load_chat_template_from_file(path.to_str().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            template,
+            "<|im_start|>system<|im_end|>\\n{% for m in messages %}{{ m.content }}{{ '\\n' }}{% endfor %}"
+        );
+        let state = ChatTemplateState::new(Some(template)).unwrap();
+        let rendered = state
+            .apply(
+                &[serde_json::json!({"role": "user", "content": "Hi"})],
+                ChatTemplateParams::default(),
+            )
+            .unwrap();
+        assert_eq!(rendered, "<|im_start|>system<|im_end|>\\nHi\n");
     }
 
     /// The rewrite keeps each tag's whitespace modifiers and leaves a template
