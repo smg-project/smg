@@ -69,6 +69,7 @@ from infra.pd_logs import (
 )
 from infra.pd_metrics import (
     vllm_work_snapshot,
+    wait_for_generated_text,
     worker_metrics,
 )
 
@@ -689,9 +690,7 @@ class TestPDTopology:
                 "POST", f"{gateway.base_url}/v1/chat/completions", json=body, timeout=60.0
             ) as resp:
                 assert resp.status_code == 200, resp.read()[:200]
-                for line in resp.iter_lines():
-                    if line.startswith("data:"):
-                        break  # first token seen; drop the connection
+                wait_for_generated_text(resp.iter_lines())
 
         errors = _run_all([_abandon for _ in range(4)], timeout=90)
         assert not errors, f"streams failed before they could be abandoned: {errors[:2]}"
@@ -713,11 +712,12 @@ class TestPDTopology:
 
         def _give_up_early() -> None:
             try:
-                httpx.post(
+                resp = httpx.post(
                     f"{gateway.base_url}/v1/chat/completions",
                     json=body,
                     timeout=httpx.Timeout(10.0, read=0.3),
                 )
+                assert resp.status_code == 200, resp.text[:200]
             except httpx.ReadTimeout:
                 return  # dropped while the prompt was still being prefilled
             # An answer inside the read window is not a failure of this test.
