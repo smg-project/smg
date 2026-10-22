@@ -91,7 +91,7 @@
 //! repeated sequence without a clear is a duplicate.
 //!
 //! Every batch a subscriber receives carries the servicer's load record
-//! ([`LoadSource`], the figures `GetLoads` answers with, as `KvEventBatch.
+//! (`LoadSource`, the figures `GetLoads` answers with, as `KvEventBatch.
 //! load`), and a subscriber hears from the relay even when the publisher is
 //! quiet: a batch with no events and the last sequence repeated, marked
 //! `load_only`, goes out when the record changed (checked every
@@ -604,7 +604,7 @@ impl Drop for KvEventRelay {
 }
 
 impl KvEventRelay {
-    /// A relay over `config.sources`, at least one ([`rank_sources`] gives
+    /// A relay over `config.sources`, at least one (`rank_sources` gives
     /// one for any width); a config without any is a caller bug.
     pub fn new(config: RelayConfig) -> Arc<Self> {
         assert!(

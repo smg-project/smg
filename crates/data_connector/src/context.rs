@@ -80,7 +80,7 @@ pub fn current_request_context() -> Option<RequestContext> {
 
 /// Run an async block with the given [`ExtraColumns`] available via task-local.
 ///
-/// Called by [`HookedStorage`](crate::hooked) wrappers to make hook-provided
+/// Called by `HookedStorage` wrappers to make hook-provided
 /// extra column values visible to the inner backend during write operations.
 pub async fn with_extra_columns<F, T>(extra: ExtraColumns, f: F) -> T
 where

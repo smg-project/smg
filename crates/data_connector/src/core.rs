@@ -1013,7 +1013,7 @@ pub trait ResponseStorage: Send + Sync {
     }
 
     /// Delete the records whose object says `store: false` and that reached a
-    /// terminal status before `cutoff` (see [`unstored_terminal_before`]):
+    /// terminal status before `cutoff` (see `unstored_terminal_before`):
     /// what a gateway that stopped inside such a record's polling window, or
     /// died, left behind in a store that outlives it. The default deletes
     /// nothing: a store without a query over the stored object answers 0.

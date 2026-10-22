@@ -59,7 +59,7 @@ pub struct PrefixMatchResult {
     /// Total number of characters in the input text
     pub input_char_count: usize,
     /// Tenants holding the deepest matched node (capped at
-    /// [`MATCHED_TENANTS_CAP`]): every one of them has the matched prefix,
+    /// `MATCHED_TENANTS_CAP`): every one of them has the matched prefix,
     /// so a router can pressure-select among them instead of being bound to
     /// the single cached `tenant`. Empty when nothing matched.
     pub matched_tenants: Vec<TenantId>,
