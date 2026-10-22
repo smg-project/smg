@@ -98,3 +98,13 @@ def request_snapshot(request):
             )
         },
     }
+
+
+def deferred_snapshot(scheduler):
+    return [
+        {
+            "fence": nonnegative_int(fence),
+            "blocks": [nonnegative_int(block.block_id) for block in blocks],
+        }
+        for fence, blocks in scheduler.deferred_frees
+    ]

@@ -1,6 +1,7 @@
 """Native lifecycle contract shared by the observer CPU tests."""
 
 import json
+from collections import deque
 from enum import IntEnum, auto
 from types import SimpleNamespace
 
@@ -25,6 +26,7 @@ def request(request_id="chatcmpl-nonce-0123abcd"):
         num_output_placeholders=0,
         last_sched_seq=3,
         max_tokens=100,
+        streaming_queue=None,
     )
 
 
@@ -36,15 +38,32 @@ class NativeContract:
         self.marker = marker
         self.requests = {}
         self.calls = [("init", marker)]
+        self.deferred_frees = deque()
+        self.processed_step_seq = 2
+        self.sched_step_seq = 3
+        self.defer = False
+        self.connector_holds = False
         self.ignore_abort = False
         self.exception = None
         self.finished = []
+        self.schedule_result = SimpleNamespace(num_scheduled_tokens={})
         self.free_result = ({"transfer": "untouched"}, None)
         self.freed = []
+        self.streaming_updates = []
 
     def add_request(self, req):
         self.calls.append(("add", req.request_id))
-        self.requests[req.request_id] = req
+        if req.request_id in self.requests:
+            existing = self.requests[req.request_id]
+            assert existing.streaming_queue is not None
+            existing.streaming_queue.append(req)
+            self.streaming_updates.append(req.request_id)
+        else:
+            self.requests[req.request_id] = req
+
+    def schedule(self, throttle_prefills=False):
+        self.calls.append(("schedule", throttle_prefills))
+        return self.schedule_result
 
     def finish_requests(self, ids, status):
         self.calls.append(("finish", ids, status))
@@ -64,7 +83,7 @@ class NativeContract:
 
     def _free_request(self, req, delay_free_blocks=False):
         self.calls.append(("free_request", req.request_id, delay_free_blocks))
-        if not delay_free_blocks:
+        if not (delay_free_blocks or self.connector_holds):
             self._free_blocks(req)
         return self.free_result
 
@@ -75,7 +94,21 @@ class NativeContract:
 
     def _free_request_blocks(self, req):
         self.calls.append(("request_blocks", req.request_id))
-        self.freed.append(req.request_id)
+        if self.defer:
+            self.deferred_frees.append((3, [SimpleNamespace(block_id=7)]))
+        else:
+            self.freed.append(req.request_id)
+
+    def _drain_deferred_frees(self):
+        self.calls.append(("drain",))
+        while self.deferred_frees and self.deferred_frees[0][0] <= self.processed_step_seq:
+            self.deferred_frees.popleft()
+
+
+class AsyncNativeContract(NativeContract):
+    def schedule(self, throttle_prefills=False):
+        self.calls.append(("async_schedule",))
+        return super().schedule(throttle_prefills=throttle_prefills)
 
 
 def observed(base=NativeContract, asynchronous=False, sink=None):

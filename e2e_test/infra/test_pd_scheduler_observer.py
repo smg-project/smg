@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 from infra.pd_scheduler_observer import SchedulerObserverMixin
 from infra.pd_scheduler_test_support import (
+    AsyncNativeContract,
     NativeContract,
     Status,
     actual_aborted_ids,
@@ -14,6 +15,33 @@ from infra.pd_scheduler_test_support import (
     request,
 )
 from infra.pd_scheduler_trace import SchedulerTrace
+
+
+@pytest.mark.parametrize(
+    "base,asynchronous", [(NativeContract, False), (AsyncNativeContract, True)]
+)
+def test_delegation_preserves_native_order_return_identity_and_async_path(base, asynchronous):
+    instrumented, trace, records = observed(base, asynchronous)
+    native = base(SimpleNamespace(async_scheduling=asynchronous), marker=instrumented.marker)
+    req, plain_req = request(), request()
+    instrumented.add_request(req)
+    native.add_request(plain_req)
+    instrumented.schedule_result.num_scheduled_tokens = {req.request_id: 1}
+    native.schedule_result.num_scheduled_tokens = {plain_req.request_id: 1}
+    assert instrumented.schedule(throttle_prefills=True) is instrumented.schedule_result
+    native.schedule(throttle_prefills=True)
+    assert (
+        instrumented.finish_requests(req.request_id, Status.FINISHED_ABORTED)
+        is instrumented.finished
+    )
+    native.finish_requests(plain_req.request_id, Status.FINISHED_ABORTED)
+    assert instrumented.calls == native.calls
+    assert instrumented.requests == native.requests == {}
+    assert instrumented.freed == native.freed
+    assert trace.unknown is None
+    assert actual_aborted_ids(records) == [req.request_id]
+    assert events(records, "first_scheduled")[0]["requests"][0]["scheduled_tokens"] == 1
+    assert [json.loads(line)["seq"] for line in records] == list(range(1, len(records) + 1))
 
 
 def test_one_shot_ids_are_not_consumed_and_unknown_id_is_not_acknowledged():
@@ -75,6 +103,36 @@ def test_native_exception_identity_and_no_post_return_ack():
     assert trace.unknown is None
 
 
+@pytest.mark.parametrize(
+    "method,args",
+    [
+        ("add_request", (request(),)),
+        ("schedule", ()),
+        ("_free_request", (request(),)),
+        ("_free_blocks", (request(),)),
+        ("_free_request_blocks", (request(),)),
+        ("_drain_deferred_frees", ()),
+    ],
+)
+def test_all_other_hooks_preserve_native_exception_and_call_once(monkeypatch, method, args):
+    error = RuntimeError("original native exception")
+    calls = []
+
+    def fail(self, *actual_args, **kwargs):
+        calls.append((actual_args, kwargs))
+        raise error
+
+    monkeypatch.setattr(NativeContract, method, fail)
+    scheduler, trace, records = observed()
+    with pytest.raises(RuntimeError) as caught:
+        getattr(scheduler, method)(*args)
+    assert caught.value is error
+    assert len(calls) == 1
+    assert calls[0][0] == args
+    assert len(records) == 1  # Startup is the only completed observation.
+    assert trace.unknown is None
+
+
 def test_trace_factory_failure_does_not_skip_native_initialization():
     class BrokenTrace(SchedulerObserverMixin, NativeContract):
         def _make_observer_trace(self):
@@ -130,6 +188,31 @@ def test_trace_failure_is_sticky_and_does_not_replace_native_exception():
         scheduler.finish_requests("id", Status.FINISHED_ABORTED)
     assert caught.value is error
     assert records == []
+
+
+def test_connector_hold_and_deferred_fence_are_distinct_from_request_removal():
+    scheduler, trace, records = observed()
+    req = request()
+    scheduler.add_request(req)
+    scheduler.connector_holds = True
+    scheduler.finish_requests(req.request_id, Status.FINISHED_ABORTED)
+    assert events(records, "free_request_return")[-1]["registered"] is True
+    assert events(records, "free_request_blocks_return") == []
+    scheduler.defer = True
+    scheduler._free_blocks(req)
+    assert events(records, "free_blocks_return")[-1]["registered"] is False
+    deferred = events(records, "free_request_blocks_return")[-1]
+    assert deferred["deferred_after"] == [{"fence": 3, "blocks": [7]}]
+    scheduler._drain_deferred_frees()
+    assert (
+        events(records, "drain_deferred_return")[-1]["deferred_after"] == deferred["deferred_after"]
+    )
+    scheduler.processed_step_seq = 3
+    scheduler._drain_deferred_frees()
+    drained = events(records, "drain_deferred_return")[-1]
+    assert drained["deferred_after"] == []
+    assert drained["transfer_ack"] is None and drained["peer_memory_released"] is None
+    assert trace.unknown is None
 
 
 def test_snapshots_keep_exact_ids_and_primitives_without_retaining_request():
