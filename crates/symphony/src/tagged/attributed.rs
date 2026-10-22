@@ -521,11 +521,13 @@ impl Assembler {
     /// string's fragments stand; a string whose key came and no byte opens, `{"key": "`; a value
     /// held for its close is written as one fragment, its key and its bytes as the JSON they
     /// stand for so far ([`cut_json`]: as written where they are a strict prefix of a JSON value,
-    /// `{"size": "large", "temp`, `12`, `nu`, and the opening of a JSON string holding them where
-    /// they are not, `"None]`, `"<![CD`, so that every fragment keeps the arguments a strict JSON
-    /// prefix, which is the crate's contract), or whole where its section closed, with the bytes
-    /// carried as its source. Whatever is still carried after that (the framing's newline, the
-    /// whitespace after a member written at its section's close) is the syntax's wrapping.
+    /// `{"size": "large", "temp`, `12`, `nu`, a Python literal the cut found complete as the JSON
+    /// the close makes of it, `True` as `true`, and the opening of a JSON string holding them
+    /// where they are neither, `"None]`, `"<![CD`, so that every fragment keeps the arguments a
+    /// strict JSON prefix, which is the crate's contract), or whole where its section closed, with
+    /// the bytes carried as its source. Whatever is still carried after that (the framing's
+    /// newline, the whitespace after a member written at its section's close) is the syntax's
+    /// wrapping.
     fn cut_value(&mut self, out: &mut Events) -> Option<String> {
         let Stage::Value(value) = &mut self.stage else {
             return None;
@@ -2043,7 +2045,7 @@ mod tests {
     /// arguments are no whole value before the call's end; whole and one character at a time.
     #[test]
     fn a_value_the_end_cut_leaves_as_the_calls_own_bytes_and_nothing_as_content() {
-        let cases: [(Tags, &str, &str, &[&str]); 17] = [
+        let cases: [(Tags, &str, &str, &[&str]); 19] = [
             // Typed by the tools: an object cut inside a nested string.
             (
                 Tags::MINIMAX_M2,
@@ -2056,8 +2058,11 @@ mod tests {
             // A string that may be null, while the word fits.
             (Tags::MINIMAX_M2, "f\">\n<parameter name=\"ns\">nu", r#"{"ns": nu"#, &[]),
             // A key no tool declares, written whole: its text so far where that is the start of
-            // a JSON value, else the opening of the string it would be written as.
+            // a JSON value, a Python literal the cut found complete as the JSON the close makes
+            // of it, else the opening of the string it would be written as.
             (Tags::MINIMAX_M2, "f\">\n<parameter name=\"x\">fal", r#"{"x": fal"#, &[]),
+            (Tags::MINIMAX_M2, "f\">\n<parameter name=\"x\">True", r#"{"x": true"#, &[]),
+            (Tags::MINIMAX_M2, "f\">\n<parameter name=\"x\">None", r#"{"x": null"#, &[]),
             (Tags::MINIMAX_M2, "f\">\n<parameter name=\"x\">hel", r#"{"x": "hel"#, &[]),
             (
                 Tags::MINIMAX_M2,

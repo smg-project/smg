@@ -679,13 +679,18 @@ fn string(text: &str) -> String {
 
 /// The JSON a value's text the end of the stream cut stands for, as far as it is known: the text
 /// as written when it is a strict prefix of a JSON value (a number's digits, the start of a
-/// literal word, an object or a list the model was writing), and otherwise the opening of a JSON
-/// string holding it, since text that is no JSON is a string once the value closes
-/// ([`inferred`]). Either way the result is a strict prefix of a JSON value, so that a client
-/// that reads the arguments as they arrive is never handed bytes no JSON value begins with.
+/// literal word, an object or a list the model was writing), the JSON of a Python literal the cut
+/// found complete (`True` as `true`, `['a', 'b']` as `["a", "b"]`), which is what the close
+/// makes of it ([`inferred`]), and otherwise the opening of a JSON string holding it, the close's
+/// reading of text that is neither. Either way the result is a strict prefix of a JSON value, so
+/// that a client that reads the arguments as they arrive is never handed bytes no JSON value
+/// begins with, and a cut that lands after a whole literal agrees with the close on its type.
 pub(crate) fn cut(text: &str) -> String {
     if json_prefix(text) {
         return text.to_owned();
+    }
+    if let Some(json) = python_literal(text.trim()).filter(|json| reads_back_as_an_argument(json)) {
+        return json;
     }
     let mut json = String::with_capacity(text.len() + 1);
     json.push('"');

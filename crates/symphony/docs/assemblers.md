@@ -169,12 +169,13 @@ the start of a tag) or no bytes and says that the arguments are no whole value, 
 because arguments cut short must not look complete to a client, and the call's bytes stay the
 call's. A value held for its close that the cut found open leaves as the call's own fragment, its
 key and its bytes as the model wrote them (`, "prefs": {"size": "large", "temp`; a section that
-closed is written whole) where they are a strict prefix of a JSON value, and as the opening of a
-JSON string holding them where they are not (`"None]`), so that every fragment keeps the
-arguments a strict JSON prefix, which is the crate's contract (`tagged::value::cut`), since a
-client reads the prefix as written under `length`, the way the
-JSON assembler sends the word it held, and never the call's bytes as the answer's prose: before
-this the held value left as `Malformed` text, the parameter tag included, and a chat client read
+closed is written whole), since a client reads the prefix as written under `length`, the way the
+JSON assembler sends the word it held, and never the call's bytes as the answer's prose. The bytes
+go as written where they are a strict prefix of a JSON value, as the JSON of a Python literal the
+cut found complete (`True` as `true`, the close's reading) and as the opening of a JSON string
+holding them where they are neither (`"None]`), so that every fragment keeps the arguments a
+strict JSON prefix, the crate's contract (`tagged::value::cut`). Before this the held value left
+as `Malformed` text, the parameter tag included, and a chat client read
 `<parameter name="prefs">{"size": "large", "temp` as content next to a call whose arguments stopped
 at the member before. A string whose key came and no byte of it opens, `{"key": "`; a parameter tag
 the cut found open and the template's whitespace between tags leave as wrapping (`Dropped`), as the
