@@ -165,6 +165,32 @@ def kill_process_tree(pid: int, sig: int = signal.SIGTERM) -> None:
         logger.warning("Failed to kill process tree for PID %d: %s", pid, e)
 
 
+def _live_processes(proc_root: str) -> list[tuple[int, int, int]]:
+    """``(pid, ppid, pgrp)`` of every process under ``proc_root`` that is not a
+    zombie awaiting reaping."""
+    live: list[tuple[int, int, int]] = []
+    for name in os.listdir(proc_root):
+        if not name.isdigit():
+            continue
+        try:
+            with open(
+                os.path.join(proc_root, name, "stat"), encoding="utf-8", errors="replace"
+            ) as f:
+                stat = f.read()
+        except OSError:
+            continue
+        # ``pid (comm) state ppid pgrp ...``: comm may contain spaces or
+        # parentheses, so split after the last closing parenthesis.
+        fields = stat.rpartition(")")[2].split()
+        if len(fields) < 3 or fields[0] == "Z":
+            continue
+        try:
+            live.append((int(name), int(fields[1]), int(fields[2])))
+        except ValueError:
+            continue
+    return live
+
+
 def live_process_group_members(pgid: int, proc_root: str = "/proc") -> list[int]:
     """PIDs still running in ``pgid``, ignoring zombies that await reaping.
 
@@ -180,26 +206,20 @@ def live_process_group_members(pgid: int, proc_root: str = "/proc") -> list[int]
         except PermissionError:
             pass
         return [pgid]
-    members: list[int] = []
-    for name in os.listdir(proc_root):
-        if not name.isdigit():
-            continue
-        try:
-            with open(
-                os.path.join(proc_root, name, "stat"), encoding="utf-8", errors="replace"
-            ) as f:
-                stat = f.read()
-        except OSError:
-            continue
-        # ``pid (comm) state ppid pgrp ...``: comm may contain spaces or
-        # parentheses, so split after the last closing parenthesis.
-        fields = stat.rpartition(")")[2].split()
-        if len(fields) < 3:
-            continue
-        state, pgrp = fields[0], fields[2]
-        if state != "Z" and pgrp == str(pgid):
-            members.append(int(name))
-    return members
+    return [pid for pid, _ppid, pgrp in _live_processes(proc_root) if pgrp == pgid]
+
+
+def live_child_processes(pid: int, proc_root: str = "/proc") -> list[int]:
+    """PIDs of the live direct children of ``pid``, ignoring zombies.
+
+    For a worker's launcher those are the engine's own processes (vLLM's
+    EngineCore, SGLang's scheduler and detokenizer, TokenSpeed's ranks), not
+    the workers those spawn in turn. Reads ``proc_root`` (``/proc`` on Linux);
+    empty where it cannot be read.
+    """
+    if not os.path.isdir(proc_root):
+        return []
+    return [child for child, ppid, _pgrp in _live_processes(proc_root) if ppid == pid]
 
 
 def wait_for_process_group_exit(pgid: int, timeout: float, kill_after: float) -> list[int]:

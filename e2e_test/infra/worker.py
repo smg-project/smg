@@ -49,6 +49,7 @@ from .process_utils import (
     get_open_port_block,
     gpu_compute_apps,
     gpu_memory_used_mib,
+    live_child_processes,
     reserve_port,
     wait_for_gpu_memory_release,
     wait_for_health,
@@ -102,6 +103,9 @@ class Worker:
     _log_file: IO[Any] | None = field(default=None, repr=False)
     # Used memory per GPU just before launch; ``stop`` waits for it to come back.
     _gpu_mem_baseline: dict[int, int] | None = field(default=None, repr=False)
+    # The launcher's process group, from its spawn to the end of ``stop``: what
+    # is reaped and waited for when the launcher itself is already gone.
+    _pgid: int | None = field(default=None, repr=False)
     _moriio_ports: list[int] = field(default_factory=list, repr=False)
 
     @property
@@ -162,6 +166,10 @@ class Worker:
 
         self._gpu_mem_baseline = gpu_memory_used_mib(self.gpu_ids)
         self.process = self._spawn_process(cmd, env)
+        # The launcher leads a session of its own (``start_new_session``), so
+        # its pid is its group's id. Kept here: ``os.getpgid`` has no answer
+        # for a launcher that has exited and been reaped.
+        self._pgid = self.process.pid
 
         if not wait_ready:
             logger.info(
@@ -210,52 +218,58 @@ class Worker:
         )
 
     def stop(self) -> None:
-        """Terminate worker process and all child processes."""
-        if self.process is None or self.process.poll() is not None:
-            return
+        """Terminate the worker and reap everything it started.
+
+        Also the teardown after the launcher exited on its own (its engine
+        died under it, or :meth:`kill_engine` took the engine away): the
+        engine's processes may outlive the launcher while they tear down
+        their device contexts, and a replacement started on the same GPUs
+        inside that window fails its startup memory check against the old
+        allocation. So the group and the memory are waited for whether the
+        launcher is alive or gone, once per start.
+        """
+        if self.process is None or (self._pgid is None and self.process.poll() is not None):
+            return  # never started, or torn down already
 
         pid = self.process.pid
-        logger.info("Stopping worker %s (PID %d)", self.model_id, pid)
-
         # Workers run in their own session, so the launcher and every engine
-        # child process share one group.
-        pgid: int | None
-        try:
-            pgid = os.getpgid(pid)
-        except (ProcessLookupError, OSError):
-            pgid = None
+        # process share one group, led by the launcher.
+        pgid = self._pgid if self._pgid is not None else pid
+        self._pgid = None
 
-        if pgid is not None:
+        if self.process.poll() is None:
+            logger.info("Stopping worker %s (PID %d)", self.model_id, pid)
             try:
                 os.killpg(pgid, signal.SIGTERM)
             except (ProcessLookupError, OSError):
                 self.process.terminate()
-        else:
-            self.process.terminate()
-
-        try:
-            self.process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
             try:
-                if pgid is None:
-                    raise ProcessLookupError
-                os.killpg(pgid, signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                self.process.kill()
-            try:
-                self.process.wait(timeout=5)
+                self.process.wait(timeout=10)
             except subprocess.TimeoutExpired:
-                logger.error("Worker PID %d did not die after SIGKILL", pid)
+                try:
+                    os.killpg(pgid, signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    self.process.kill()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    logger.error("Worker PID %d did not die after SIGKILL", pid)
+        else:
+            logger.info(
+                "Worker %s (PID %d) had exited with %s; reaping what it left behind",
+                self.model_id,
+                pid,
+                self.process.returncode,
+            )
 
         # ``process.wait`` only reaps the launcher. The engine's children
         # (vLLM's EngineCore, SGLang's scheduler) outlive it while they tear
         # down their CUDA contexts, and a replacement started on the same GPUs
         # inside that window fails its startup memory check against the old
         # allocation. Wait for the group to empty, then for the memory.
-        if pgid is not None:
-            stragglers = wait_for_process_group_exit(pgid, timeout=40.0, kill_after=20.0)
-            if stragglers:
-                logger.error("Worker %s: PIDs %s survived SIGKILL", self.model_id, stragglers)
+        stragglers = wait_for_process_group_exit(pgid, timeout=40.0, kill_after=20.0)
+        if stragglers:
+            logger.error("Worker %s: PIDs %s survived SIGKILL", self.model_id, stragglers)
         if self._gpu_mem_baseline is not None:
             # A region another process still maps (a decode holding a dead
             # prefill's KV) never frees, so the wait is a bounded courtesy.
@@ -306,6 +320,36 @@ class Worker:
             self._admin_port_auto = False
         for port in self._moriio_ports:
             release_port(port)
+
+    def kill_engine(self, sig: int = signal.SIGKILL) -> list[int]:
+        """Take the engine away from under its launcher.
+
+        Signals the launcher's live direct children, the engine's own
+        processes (vLLM's EngineCore, SGLang's scheduler and detokenizer,
+        TokenSpeed's ranks), and leaves the launcher to notice, report and
+        exit: the fault a device error or the kernel's out-of-memory killer
+        deals an engine under live requests, as opposed to the orderly
+        :meth:`stop`. Returns the PIDs signalled; empty when there is no
+        launcher, it has exited, or the engine runs inside it (the mock
+        worker). :meth:`stop` then :meth:`start` bring the worker back.
+        """
+        if self.process is None or self.process.poll() is not None:
+            return []
+        signalled: list[int] = []
+        for child in live_child_processes(self.process.pid):
+            try:
+                os.kill(child, sig)
+            except ProcessLookupError:
+                continue
+            signalled.append(child)
+        logger.info(
+            "Worker %s (PID %d): signal %d sent to its engine processes %s",
+            self.model_id,
+            self.process.pid,
+            sig,
+            signalled,
+        )
+        return signalled
 
     def is_alive(self) -> bool:
         """Check if the worker process is still running."""
