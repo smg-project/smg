@@ -115,7 +115,7 @@ impl Tokenizer for CharacterTokenizer {
     }
 }
 
-pub(super) fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
+pub(crate) fn chunk(index: u32, text: &str) -> proto::GenerateResponse {
     let token_ids: Vec<_> = text.chars().map(u32::from).collect();
     proto::GenerateResponse {
         response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
@@ -140,7 +140,7 @@ pub(super) fn chunk_with_logprobs(index: u32, text: &str) -> proto::GenerateResp
     response
 }
 
-pub(super) fn complete(index: u32, reason: &str) -> proto::GenerateResponse {
+pub(crate) fn complete(index: u32, reason: &str) -> proto::GenerateResponse {
     complete_with_prompt(index, reason, 1)
 }
 

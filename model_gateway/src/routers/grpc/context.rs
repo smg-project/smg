@@ -49,7 +49,7 @@ use crate::{
     observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
     routers::{
-        common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
+        common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard, sse::SseSender},
         error::internal_error,
         grpc::regular::symphony::{template::Templates, PreparedConstraint},
     },
@@ -1544,6 +1544,42 @@ pub(crate) enum ExecutionResult {
     Batch {
         results: Vec<ExecutionResult>,
     },
+}
+
+impl ExecutionResult {
+    /// Every stream of the result read for the client at the receiving end
+    /// of `client`'s channel (see [`ProtoStream::until_client_gone`]): the
+    /// one worker's stream, both sides of a disaggregated pair (the prefill
+    /// side is drained in the streaming task, after the response began), each
+    /// result of a batch. An embedding has no stream.
+    #[must_use]
+    pub(crate) fn until_client_gone(self, client: &SseSender, request_id: &str) -> Self {
+        match self {
+            Self::Single { stream } => Self::Single {
+                stream: stream.until_client_gone(client, request_id),
+            },
+            Self::PrefillDecode {
+                prefill,
+                decode,
+                prefill_guards,
+                pd_timing,
+                prefill_input_logprobs,
+            } => Self::PrefillDecode {
+                prefill: prefill.until_client_gone(client, request_id),
+                decode: Box::new(decode.until_client_gone(client, request_id)),
+                prefill_guards,
+                pd_timing,
+                prefill_input_logprobs,
+            },
+            Self::Embedding { .. } => self,
+            Self::Batch { results } => Self::Batch {
+                results: results
+                    .into_iter()
+                    .map(|result| result.until_client_gone(client, request_id))
+                    .collect(),
+            },
+        }
+    }
 }
 
 /// Timing context threaded from PD execution into the streaming layer so the

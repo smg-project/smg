@@ -2083,6 +2083,9 @@ mod request_release_tests {
         fail_mid_stream: bool,
         fail_constraint: bool,
         fail_engine_report: bool,
+        /// Send the first frame, then hold the stream open with nothing on
+        /// it: an engine whose generation wedged after its first token.
+        hold_after_first: bool,
         answer_after: Option<Duration>,
         frame_gap: Option<Duration>,
         calls: Arc<AtomicUsize>,
@@ -2224,6 +2227,7 @@ mod request_release_tests {
             let released = Arc::clone(&self.released);
             let frame_gap = self.frame_gap;
             let fail_mid_stream = self.fail_mid_stream;
+            let hold_after_first = self.hold_after_first;
             tokio::spawn(async move {
                 if let Some(probe) = probe {
                     Self::await_probe(&probe, &released).await;
@@ -2238,6 +2242,12 @@ mod request_release_tests {
                         frame
                     };
                     if tx.send(frame).await.is_err() {
+                        return;
+                    }
+                    if hold_after_first && index == 0 {
+                        // The stream stays open, with nothing more on it,
+                        // for longer than any wait a test sets.
+                        tokio::time::sleep(Duration::from_secs(30)).await;
                         return;
                     }
                 }
@@ -4071,6 +4081,135 @@ mod request_release_tests {
         assert_eq!(spy.wait_for(1).await, [worker.url().to_string()]);
         assert_eq!(worker.load(), 0);
         drop(hold);
+    }
+
+    /// Wait until the processor has read the first response of `worker`'s
+    /// one stream: the stream's output ticket is open from that response on
+    /// (see `Worker::output_silence`), and the processor waits on the engine
+    /// for the next one. The test tokenizer renders no text for the stub's
+    /// token, so the client's body carries no frame to wait for.
+    async fn first_response_read(worker: &Arc<dyn Worker>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while worker.output_silence().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the first response never reached the processor"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Wait for the stub to receive the abort of its one request: within
+    /// `deadline`, well inside the 30 s it holds a wedged stream open, so an
+    /// abort that only arrives with the engine's next frame is a failure.
+    async fn wait_for_abort(scheduler: &GatedScheduler, deadline: Instant) -> Duration {
+        let started = Instant::now();
+        let request_id = scheduler
+            .seen_request_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .first()
+            .cloned()
+            .expect("the stub saw the request");
+        while !scheduler
+            .aborted_request_ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&request_id)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the stub never received the abort for {request_id} after the client left"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        started.elapsed()
+    }
+
+    /// gRPC regular path: the client leaves while the engine's generation
+    /// wedged after its first token (read by the processor, which then waits
+    /// on the engine). The abort reaches the engine the moment the body is
+    /// dropped, not when the engine next speaks, and the worker's load goes
+    /// with the body.
+    #[tokio::test]
+    async fn a_client_that_leaves_a_stalled_stream_aborts_it_on_the_engine_at_once() {
+        let scheduler = GatedScheduler {
+            hold_after_first: true,
+            ..Default::default()
+        };
+        let port = spawn_stub(scheduler.clone()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker(&worker_registry, port, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(Arc::clone(&worker_registry)).await;
+
+        let response = start_stream(&pipeline, components).await;
+        first_response_read(&worker).await;
+        assert!(
+            scheduler
+                .aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "nothing is aborted while the client reads"
+        );
+        assert_eq!(worker.load(), 1);
+
+        drop(response);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        wait_for_abort(&scheduler, deadline).await;
+        while worker.load() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the worker's load stayed at {} after the body was dropped",
+                worker.load()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// gRPC PD path: the same client leaves while the decode side wedged after
+    /// its first token. The decode engine receives the abort at once and
+    /// both sides end with their load released.
+    #[tokio::test]
+    async fn a_client_that_leaves_a_stalled_pd_stream_aborts_the_decode_side_at_once() {
+        let prefill_port = spawn_stub(GatedScheduler::default()).await;
+        let decode_scheduler = GatedScheduler {
+            hold_after_first: true,
+            ..Default::default()
+        };
+        let decode_port = spawn_stub(decode_scheduler.clone()).await;
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let prefill = register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+        let decode = register_worker(&worker_registry, decode_port, WorkerType::Decode);
+        let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
+        let components = components(Arc::clone(&worker_registry)).await;
+
+        let response = start_stream(&pipeline, components).await;
+        first_response_read(&decode).await;
+        assert!(
+            decode_scheduler
+                .aborted_request_ids
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "nothing is aborted while the client reads"
+        );
+
+        drop(response);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        wait_for_abort(&decode_scheduler, deadline).await;
+        while prefill.load() != 0 || decode.load() != 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the sides' load stayed at {} and {} after the body was dropped",
+                prefill.load(),
+                decode.load()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     /// gRPC PD path: the prefill side answers on its own and reports when its
