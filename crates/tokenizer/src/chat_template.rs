@@ -18,7 +18,7 @@ use minijinja::{
     },
     syntax::SyntaxConfig,
     value::{Kwargs, ValueKind},
-    Environment, Error as MinijinjaError, ErrorKind, Value,
+    Environment, Error as MinijinjaError, ErrorKind, Output, State, Value,
 };
 use serde::Serialize;
 use serde_json::{self, ser::Formatter, Value as JsonValue};
@@ -1364,6 +1364,11 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
     env.set_trim_blocks(true);
     env.set_lstrip_blocks(true);
 
+    // Jinja2 writes `{{ x }}` as Python's `str(x)`, so a list or a dict comes
+    // out as its repr; minijinja would write it in Rust's debug form (see
+    // `python_formatter`).
+    env.set_formatter(python_formatter);
+
     // Register the template with owned storage (no lifetime dependency on caller)
     env.add_template_owned("chat".to_owned(), template)
         .map_err(|e| anyhow!("Failed to add template: {e}"))?;
@@ -1375,12 +1380,278 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
     // This overrides minijinja's built-in tojson to support additional kwargs
     // like ensure_ascii, separators, and sort_keys that HuggingFace templates use
     env.add_filter("tojson", tojson_filter);
+    // Jinja2's `string` and `trim` filters start with `str(value)` too: a
+    // value `spelled_by_python` (a sequence, a map, a float) is written as
+    // Python spells it.
+    env.add_filter("string", python_string_filter);
+    env.add_filter("trim", python_trim_filter);
     env.add_function("raise_exception", raise_exception);
     // Jinja2's dict() also builds a map from key/value pairs; minijinja's takes a mapping only
     env.add_function("dict", dict_function);
     env.add_test("iterable", is_iterable);
 
     Ok(env)
+}
+
+/// `str(value)` as Jinja2's string filters apply it: a string is itself, a
+/// value `spelled_by_python` (a sequence, a map, a float) is written as
+/// Python spells it (see `python_formatter`), anything else keeps
+/// minijinja's spelling.
+fn python_str(value: &Value) -> Cow<'_, str> {
+    match value.kind() {
+        ValueKind::String => Cow::Borrowed(value.as_str().unwrap_or_default()),
+        _ if spelled_by_python(value) => {
+            let mut text = String::new();
+            // Writing into a String cannot fail.
+            let _ = write_python_repr(&mut text, value);
+            Cow::Owned(text)
+        }
+        _ => Cow::Owned(value.to_string()),
+    }
+}
+
+/// Whether `str(value)` differs from the template engine's own spelling: a
+/// sequence or a map (Python's repr of it) and a float (`1e-05`, `1e+16`,
+/// `nan`, where the engine writes `0.00001`, `10000000000000000.0`, `NaN`).
+/// An integer, a string, `True` / `False` / `None` spell alike.
+fn spelled_by_python(value: &Value) -> bool {
+    match value.kind() {
+        ValueKind::Seq | ValueKind::Map => true,
+        ValueKind::Number => !value.is_integer(),
+        _ => false,
+    }
+}
+
+/// Jinja2's `string` filter, `str(value)`: a value `spelled_by_python` comes
+/// out as Python spells it, as it does from `{{ x }}`.
+fn python_string_filter(value: Value) -> Value {
+    match value.kind() {
+        ValueKind::String => value,
+        _ => Value::from(python_str(&value).into_owned()),
+    }
+}
+
+/// Jinja2's `trim` filter, `str(value).strip(chars)`: the same `str` as the
+/// `string` filter, then minijinja's trim.
+fn python_trim_filter(value: Value, chars: Option<Cow<'_, str>>) -> String {
+    let text = python_str(&value);
+    match chars {
+        Some(chars) => {
+            let chars: Vec<char> = chars.chars().collect();
+            text.trim_matches(&chars[..]).to_string()
+        }
+        None => text.trim().to_string(),
+    }
+}
+
+/// The output formatter of `{{ }}`: a sequence, a map or a float is written
+/// as Python's `str` spells it (see `spelled_by_python`), everything else as
+/// minijinja's default formatter writes it (a string as it is, integers,
+/// `True` / `False` / `None` already spell as `str` does). The `~` operator
+/// and the string filters other than `string` and `trim` go through the
+/// engine's own `Display`, which this renderer cannot hook.
+/// A template that prints a message's content where the engine's chat utils
+/// handed it a list of parts writes `[{'type': 'text', 'text': 'Hi'}]` into
+/// the prompt, and so must this renderer; minijinja's debug form
+/// (`[{"type": "text", "text": "Hi"}]`) is different bytes.
+fn python_formatter(
+    out: &mut Output,
+    state: &State,
+    value: &Value,
+) -> std::result::Result<(), MinijinjaError> {
+    if spelled_by_python(value) {
+        write_python_repr(out, value).map_err(Into::into)
+    } else {
+        minijinja::escape_formatter(out, state, value)
+    }
+}
+
+/// `repr(value)` of a JSON value, as the template renderer writes a value
+/// `spelled_by_python` it prints (a sequence, a map, a float; see
+/// `write_python_repr`): for a native encoder that must write the bytes the
+/// checkpoint's template would.
+pub(crate) fn python_repr(value: &JsonValue) -> String {
+    let mut text = String::new();
+    // Writing into a String cannot fail.
+    let _ = write_python_repr(&mut text, &Value::from_serialize(value));
+    text
+}
+
+/// `repr(value)` as Python writes it: strings quoted with Python's quote
+/// choice and escapes, `True` / `False` / `None`, Python's float spelling,
+/// `[a, b]` for a sequence and `{k: v}` for a map in insertion order. A value
+/// of another kind (bytes, an iterator, a plain object) keeps minijinja's
+/// spelling.
+fn write_python_repr(out: &mut dyn std::fmt::Write, value: &Value) -> std::fmt::Result {
+    match value.kind() {
+        ValueKind::None => out.write_str("None"),
+        ValueKind::Bool => out.write_str(if value.is_true() { "True" } else { "False" }),
+        ValueKind::Number if value.is_integer() => write!(out, "{value}"),
+        ValueKind::Number => match f64::try_from(value.clone()) {
+            Ok(number) => write_python_float(out, number),
+            Err(_) => write!(out, "{value}"),
+        },
+        ValueKind::String => write_python_str(out, value.as_str().unwrap_or_default()),
+        ValueKind::Seq => match value.try_iter() {
+            Ok(items) => {
+                out.write_str("[")?;
+                for (index, item) in items.enumerate() {
+                    if index > 0 {
+                        out.write_str(", ")?;
+                    }
+                    write_python_repr(out, &item)?;
+                }
+                out.write_str("]")
+            }
+            Err(_) => write!(out, "{value}"),
+        },
+        ValueKind::Map => match value.as_object().and_then(|map| map.try_iter_pairs()) {
+            Some(pairs) => {
+                out.write_str("{")?;
+                for (index, (key, item)) in pairs.enumerate() {
+                    if index > 0 {
+                        out.write_str(", ")?;
+                    }
+                    write_python_repr(out, &key)?;
+                    out.write_str(": ")?;
+                    write_python_repr(out, &item)?;
+                }
+                out.write_str("}")
+            }
+            None => write!(out, "{value}"),
+        },
+        _ => write!(out, "{value}"),
+    }
+}
+
+/// `repr(float)`: the shortest digits that read back to the number, written
+/// positionally when the decimal point falls within 1e-4 .. 1e16 and in
+/// exponent form with a sign and at least two exponent digits beyond
+/// (`1e+16`, `1e-05`), `.0` on a whole number, `nan`, `inf` and `-inf`.
+fn write_python_float(out: &mut dyn std::fmt::Write, number: f64) -> std::fmt::Result {
+    if number.is_nan() {
+        return out.write_str("nan");
+    }
+    if number.is_infinite() {
+        return out.write_str(if number < 0.0 { "-inf" } else { "inf" });
+    }
+    if number.is_sign_negative() {
+        out.write_str("-")?;
+    }
+    // Rust's `{:e}` is the shortest round-trip form: `d.ddde[-]x`.
+    let scientific = format!("{:e}", number.abs());
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    // The digits before the decimal point (Python's `decpt`).
+    let point = exponent + 1;
+    if !(-3..=16).contains(&point) {
+        out.write_str(&digits[..1])?;
+        if digits.len() > 1 {
+            write!(out, ".{}", &digits[1..])?;
+        }
+        let sign = if exponent < 0 { '-' } else { '+' };
+        return write!(out, "e{sign}{:02}", exponent.abs());
+    }
+    if point <= 0 {
+        write!(
+            out,
+            "0.{}{digits}",
+            "0".repeat(point.unsigned_abs() as usize)
+        )
+    } else if point as usize >= digits.len() {
+        write!(
+            out,
+            "{digits}{}.0",
+            "0".repeat(point as usize - digits.len())
+        )
+    } else {
+        let (whole, fraction) = digits.split_at(point as usize);
+        write!(out, "{whole}.{fraction}")
+    }
+}
+
+/// `repr(str)`: single quotes, or double quotes when the text holds a single
+/// quote and no double quote; `\\`, the quote, `\t`, `\n`, `\r` escaped, and
+/// every other character `str.isprintable` rejects as `\xNN`, `\uNNNN` or
+/// `\UNNNNNNNN`.
+fn write_python_str(out: &mut dyn std::fmt::Write, text: &str) -> std::fmt::Result {
+    let quote = if text.contains('\'') && !text.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    out.write_char(quote)?;
+    // The text is written in runs between the characters that need an
+    // escape; printable ASCII, the common case, is one run.
+    let mut plain = 0;
+    for (at, c) in text.char_indices() {
+        let code = c as u32;
+        if (0x20..0x7f).contains(&code) && c != '\\' && c != quote {
+            continue;
+        }
+        if code >= 0x80 && python_printable(c) {
+            continue;
+        }
+        out.write_str(&text[plain..at])?;
+        match c {
+            '\\' => out.write_str("\\\\")?,
+            '\t' => out.write_str("\\t")?,
+            '\n' => out.write_str("\\n")?,
+            '\r' => out.write_str("\\r")?,
+            c if c == quote => {
+                out.write_char('\\')?;
+                out.write_char(c)?;
+            }
+            _ if code < 0x100 => write!(out, "\\x{code:02x}")?,
+            _ if code < 0x10000 => write!(out, "\\u{code:04x}")?,
+            _ => write!(out, "\\U{code:08x}")?,
+        }
+        plain = at + c.len_utf8();
+    }
+    out.write_str(&text[plain..])?;
+    out.write_char(quote)
+}
+
+/// `str.isprintable` for one character, which decides what `repr` escapes:
+/// everything but the control (Cc), format (Cf), private-use (Co), separator
+/// (Zs other than the space, Zl, Zp) characters and the noncharacters. An
+/// unassigned code point (Cn), which Python also escapes, is written as it is.
+fn python_printable(c: char) -> bool {
+    let code = c as u32;
+    !(c.is_control()
+        || matches!(
+            code,
+            0xa0 | 0x1680 | 0x2000..=0x200a | 0x202f | 0x205f | 0x3000
+        )
+        || matches!(code, 0x2028 | 0x2029)
+        || matches!(
+            code,
+            0xad | 0x600..=0x605
+                | 0x61c
+                | 0x6dd
+                | 0x70f
+                | 0x890
+                | 0x891
+                | 0x8e2
+                | 0x180e
+                | 0x200b..=0x200f
+                | 0x202a..=0x202e
+                | 0x2060..=0x2064
+                | 0x2066..=0x206f
+                | 0xfeff
+                | 0xfff9..=0xfffb
+                | 0x110bd
+                | 0x110cd
+                | 0x13430..=0x1343f
+                | 0x1bca0..=0x1bca3
+                | 0x1d173..=0x1d17a
+                | 0xe0001
+                | 0xe0020..=0xe007f
+        )
+        || matches!(code, 0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd)
+        || matches!(code, 0xfdd0..=0xfdef)
+        || (code & 0xfffe) == 0xfffe)
 }
 
 /// Jinja2's `iterable` test: `iter(value)` succeeds. minijinja iterates
@@ -2373,6 +2644,101 @@ mod tests {
         assert_eq!(
             detect_chat_template_content_format(plain),
             ChatTemplateContentFormat::String
+        );
+    }
+
+    /// `{{ x }}` of a list or a dict is Python's repr, the bytes the engine's
+    /// prompt holds when a template prints a content value its chat utils
+    /// handed over as parts; a float alone spells as Python's `str` does; a
+    /// string, an integer and a flag are written as before.
+    #[test]
+    fn a_sequence_or_a_map_is_written_as_python_s_repr() {
+        let state = ChatTemplateState::new(Some("{{ messages[0].content }}".to_string())).unwrap();
+        let render = |content: serde_json::Value| {
+            state
+                .apply(
+                    &[serde_json::json!({"role": "user", "content": content})],
+                    ChatTemplateParams::default(),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            render(serde_json::json!([{"type": "text", "text": "Welcome! How can I help?"}])),
+            "[{'type': 'text', 'text': 'Welcome! How can I help?'}]"
+        );
+        // Python's quote choice and escapes (`python3 -c 'print(repr(...))'`).
+        assert_eq!(
+            render(serde_json::json!([
+                {"type": "text", "text": "it's"},
+                {"type": "text", "text": "say \"hi\""},
+                {"t": "both ' and \""}
+            ])),
+            r#"[{'type': 'text', 'text': "it's"}, {'type': 'text', 'text': 'say "hi"'}, {'t': 'both \' and "'}]"#
+        );
+        assert_eq!(
+            render(serde_json::json!({
+                "a": null, "b": true, "c": 1.0, "d": 1e16, "e": 0.0001, "f": 1e-5,
+                "g": "tab\tnl\nbs\\ nbsp\u{a0} zw\u{200b} eé 😀", "h": [1, 2.5, -3, 100.0, 0.001]
+            })),
+            "{'a': None, 'b': True, 'c': 1.0, 'd': 1e+16, 'e': 0.0001, 'f': 1e-05, \
+             'g': 'tab\\tnl\\nbs\\\\ nbsp\\xa0 zw\\u200b eé 😀', 'h': [1, 2.5, -3, 100.0, 0.001]}"
+        );
+        assert_eq!(render(serde_json::json!([])), "[]");
+        assert_eq!(render(serde_json::json!({})), "{}");
+        assert_eq!(render(serde_json::json!("plain")), "plain");
+        assert_eq!(render(serde_json::json!(2.0)), "2.0");
+        // A float printed alone spells as Python's `str` does, like one in a
+        // list; an integer as before.
+        assert_eq!(render(serde_json::json!(1e-5)), "1e-05");
+        assert_eq!(render(serde_json::json!(1e16)), "1e+16");
+        assert_eq!(render(serde_json::json!(100.0)), "100.0");
+        assert_eq!(render(serde_json::json!(-0.001)), "-0.001");
+        assert_eq!(render(serde_json::json!(12)), "12");
+        assert_eq!(render(serde_json::json!(false)), "False");
+        assert_eq!(render(serde_json::json!(null)), "None");
+
+        // The `string` and `trim` filters start with the same `str`.
+        let filtered = ChatTemplateState::new(Some(
+            "{{ messages[0].content | string }}|{{ messages[0].content | trim }}|\
+             {{ ' x ' | trim }}|{{ 'ab' | trim('a') }}|{{ 7 | string }}|{{ 0.00001 | string }}"
+                .to_string(),
+        ))
+        .unwrap();
+        let rendered = filtered
+            .apply(
+                &[serde_json::json!({"role": "user", "content": [{"type": "text", "text": "Hi"}]})],
+                ChatTemplateParams::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "[{'type': 'text', 'text': 'Hi'}]|[{'type': 'text', 'text': 'Hi'}]|x|b|7|1e-05"
+        );
+    }
+
+    /// The case of the record: a template that loops over content somewhere
+    /// (the openai content format) and prints `message.content` elsewhere
+    /// gets a string content as a one-item part list, and prints it the way
+    /// the engine's prompt holds it.
+    #[test]
+    fn a_parts_list_a_template_prints_comes_out_as_the_engine_writes_it() {
+        let template = "{%- for m in messages %}\n{%- if m.role == 'system' %}<|system|>\n{{ m.content }}\
+                        {%- else %}<|{{ m.role }}|>\n{%- for part in m.content %}{{ part.text }}{%- endfor %}\
+                        {%- endif %}{%- endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(state.content_format(), ChatTemplateContentFormat::OpenAI);
+        let rendered = state
+            .apply(
+                &[
+                    serde_json::json!({"role": "system", "content": "You are a terse assistant."}),
+                    serde_json::json!({"role": "user", "content": "Hello."}),
+                ],
+                ChatTemplateParams::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|system|>\n[{'type': 'text', 'text': 'You are a terse assistant.'}]<|user|>Hello."
         );
     }
 
