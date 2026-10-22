@@ -131,7 +131,7 @@
   "cleanup_reserved_minutes": 5,
   "producer_full_closure_success_required": false,
   "producer_branch": "codex/amd-combined-closure-e915-20261022",
-  "ready": false,
+  "ready": true,
   "producer_policy": "successful_build_and_hosted_CPU_with_consumer_vllm_revalidation",
   "producer_run_conclusion_snapshot": "failure"
 }
