@@ -222,7 +222,9 @@ mod tests {
     /// The turns bellwether's common set records for `llama-4-scout-17b-16e-instruct`, less the
     /// nested one (its template writes a quote inside a quoted value without escaping it, which
     /// no reader can take back; `docs/tables.md`): one call, a call with no arguments, three calls,
-    /// a call after content, non-ASCII values with a list, and content alone; then the probes.
+    /// a call after content, non-ASCII values with a list, a value that ends in a backslash
+    /// (`dir C:\`, as the recorded benchmark sets write it) alone and after content, and content
+    /// alone; then the probes.
     const TURNS: &[Turn] = &[
         Turn {
             output: "[get_weather(city=\"Paris\")]",
@@ -255,6 +257,16 @@ mod tests {
                 "save_note",
                 "{\"title\": \"計画\", \"body\": \"今日は晴れ 🌤️ — très bien\", \"tags\": [\"日本語\"]}",
             )],
+        },
+        Turn {
+            output: "[get_weather(city=\"dir C:\\\", unit=\"N/A\")]",
+            content: "",
+            calls: &[("get_weather", "{\"city\": \"dir C:\\\\\", \"unit\": \"N/A\"}")],
+        },
+        Turn {
+            output: "Listing.[get_weather(city=\"dir C:\\\")]",
+            content: "Listing.",
+            calls: &[("get_weather", "{\"city\": \"dir C:\\\\\"}")],
         },
         Turn {
             output: "Hello!",

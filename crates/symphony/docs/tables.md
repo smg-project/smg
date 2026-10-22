@@ -593,10 +593,12 @@ list and nothing after it; no thought. What the table says beyond the others:
   declares reads by its text, a number or a word as what it is and anything else as the string.
   The text between the quotes is the value's characters as they are: the template decodes no
   escape, so a backslash and an `r` in a value stay those two characters (the recorded patches
-  are full of them), and the table reads them so. A value the model writes bare (`days=3`,
-  `detailed=False`, `city='Paris'`), the spelling its model card and the family's parsers take,
-  reads as Python's, a single-quoted string with its escapes. The structural tags write Python's
-  values, the spelling the model is told to write.
+  are full of them), and the table reads them so; a backslash before the closing quote is the
+  value's last character, not an escape, so a value that ends in one (`command="dir C:\"`, as
+  the recorded benchmark sets write it) closes at its quote, whole and at every cut. A value the
+  model writes bare (`days=3`, `detailed=False`, `city='Paris'`), the spelling its model card and
+  the family's parsers take, reads as Python's, a single-quoted string with its escapes. The
+  structural tags write Python's values, the spelling the model is told to write.
 - **A quote inside a quoted value is the template's loss.** The template does not escape a `"`
   inside a string it quotes, so the bytes it writes for such a value cannot be read back by any
   reader, this one included; the recorded sets hold a few such cases (five in a hundred thousand
