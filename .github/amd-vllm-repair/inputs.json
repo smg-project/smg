@@ -95,7 +95,7 @@
     "crates": "d9f44a9aa4199dc40c7d76dd307fc57a521e563f",
     "model_gateway": "0e075a5556734438d2d5dc116c679133408b9ca5",
     "grpc_servicer": "8abb3d9a201fd9e955bddea291e1f724e8de6a08",
-    "e2e_test": "ebb76667f5130610dee968dec4504a70c5d10cf0",
+    "e2e_test": "51f6806365cd347e23d78aa53e8cdb0e9abb5196",
     "scripts": "c0f693708bc1e440775822d630f8081df7f5f295",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/amd-qa": "118f63faa06ee099507e0a00dbe5717a439ce8b1",
@@ -131,7 +131,19 @@
   "cleanup_reserved_minutes": 5,
   "producer_full_closure_success_required": false,
   "producer_branch": "codex/amd-combined-closure-e915-20261022",
-  "ready": true,
+  "ready": false,
   "producer_policy": "successful_build_and_hosted_CPU_with_consumer_vllm_revalidation",
-  "producer_run_conclusion_snapshot": "failure"
+  "producer_run_conclusion_snapshot": "failure",
+  "consumer_test_harness_delta": {
+    "base": "fb82a338ceb426665bd58a2d31ad5b6a089a2eaf",
+    "product_commit": "2e7142f9b73b5e9983809aa76fb9797ac12aa1bf",
+    "producer_e2e_tree": "ebb76667f5130610dee968dec4504a70c5d10cf0",
+    "consumer_e2e_tree": "51f6806365cd347e23d78aa53e8cdb0e9abb5196",
+    "paths": [
+      "e2e_test/infra/worker.py",
+      "e2e_test/infra/test_vllm_model_name.py"
+    ],
+    "original_api_case_ids_assertions_unchanged": true,
+    "compiled_rust_inputs_unchanged": true
+  }
 }
