@@ -233,7 +233,7 @@ jobs:
         run: |
           python3 -c "import ${{ inputs.engine }}, msgspec, zmq"  # the gates these tests importorskip on
           pip install pytest-asyncio  # runs the @pytest.mark.asyncio cases; pytest>=8.4 fails them without a plugin
-          pytest -q grpc_servicer/tests -p no:cacheprovider -rs
+          pytest -q grpc_servicer/tests -p no:cacheprovider -rs --junitxml=servicer-engine.xml
 
       - name: Setup Oracle
         if: inputs.setup_agentic_deps
@@ -275,6 +275,7 @@ jobs:
             --ignore=e2e_test/bindings_go \
             ${{ inputs.test_filter }} \
             --reruns 2 --reruns-delay 5 \
+            --junitxml=e2e-result.xml \
             -s -vv
 
       - name: Worker failure diagnostics
@@ -355,3 +356,21 @@ jobs:
         run: |
           bash scripts/ci_agentic_svc_deps.sh cleanup-oracle-flyway-user oracle-db
           bash scripts/ci_agentic_svc_deps.sh cleanup-oracle-user oracle-db
+
+      - name: Upload API validation results
+        if: always() && hashFiles('e2e-result.xml') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: amd-api-validation-${{ inputs.min_selected }}
+          path: e2e-result.xml
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload engine servicer test results
+        if: always() && hashFiles('servicer-engine.xml') != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: amd-api-servicer-${{ inputs.min_selected }}
+          path: servicer-engine.xml
+          retention-days: 7
+          if-no-files-found: error
