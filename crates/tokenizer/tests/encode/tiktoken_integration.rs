@@ -21,7 +21,7 @@ use llm_tokenizer::{
     traits::{Decoder, Encoder, Tokenizer as TokenizerTrait},
 };
 
-mod common;
+use crate::common;
 
 // -- Download configuration --
 

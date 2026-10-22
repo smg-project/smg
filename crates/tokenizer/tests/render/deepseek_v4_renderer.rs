@@ -23,9 +23,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use tempfile::TempDir;
 
-mod common;
+use crate::common;
 
-const RENDER_FIXTURES: &str = include_str!("fixtures/deepseek_v4/render_fixtures.json");
+const RENDER_FIXTURES: &str = include_str!("../fixtures/deepseek_v4/render_fixtures.json");
 
 /// A tokenizer.json that loads; the text check never calls into it.
 const MIN_TOKENIZER_JSON: &str = r#"{

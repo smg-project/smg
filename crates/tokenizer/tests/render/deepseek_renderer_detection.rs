@@ -910,7 +910,7 @@ DEFAULT_REASONING_EFFORT = "high""#;
         );
         // Replacing a Jinja template must not override the native renderer's profile.
         tokenizer
-            .set_chat_template(include_str!("fixtures/glm53/chat_template.jinja").into())
+            .set_chat_template(include_str!("../fixtures/glm53/chat_template.jinja").into())
             .unwrap();
         assert_eq!(tokenizer.renderer_capabilities(), caps);
     }

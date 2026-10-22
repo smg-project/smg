@@ -19,7 +19,7 @@ use llm_tokenizer::{
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-mod common;
+use crate::common;
 
 const MIN_TIKTOKEN_MODEL: &str = "aGVsbG8= 0\n";
 

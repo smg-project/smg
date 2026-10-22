@@ -80,16 +80,16 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-mod common;
+use crate::common;
 
 /// The template with the root branch and its cases.
 const M3_TEMPLATE_PATH: &str = "tests/fixtures/minimax_m3/chat_template.jinja";
-const M3_TEMPLATE: &str = include_str!("fixtures/minimax_m3/chat_template.jinja");
-const M3_RENDER_FIXTURES: &str = include_str!("fixtures/minimax_m3/render_fixtures.json");
+const M3_TEMPLATE: &str = include_str!("../fixtures/minimax_m3/chat_template.jinja");
+const M3_RENDER_FIXTURES: &str = include_str!("../fixtures/minimax_m3/render_fixtures.json");
 /// The template without a root branch and its cases.
 const M2_TEMPLATE_PATH: &str = "tests/fixtures/minimax_m2/chat_template.jinja";
-const M2_TEMPLATE: &str = include_str!("fixtures/minimax_m2/chat_template.jinja");
-const M2_RENDER_FIXTURES: &str = include_str!("fixtures/minimax_m2/render_fixtures.json");
+const M2_TEMPLATE: &str = include_str!("../fixtures/minimax_m2/chat_template.jinja");
+const M2_RENDER_FIXTURES: &str = include_str!("../fixtures/minimax_m2/render_fixtures.json");
 
 /// The model id the requests are normalized under: it selects the MiniMax
 /// provider profile, the one that accepts the `root` role, for both

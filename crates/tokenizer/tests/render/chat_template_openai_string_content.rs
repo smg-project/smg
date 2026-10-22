@@ -199,7 +199,7 @@ fn gemma4_string_system_turns_render_the_engines_prompt() {
         ChatTemplateContentFormat::OpenAI
     );
     let fixtures: Fixtures =
-        serde_json::from_str(include_str!("fixtures/gemma4/render_ids_fixtures.json"))
+        serde_json::from_str(include_str!("../fixtures/gemma4/render_ids_fixtures.json"))
             .expect("render_ids_fixtures.json must match the Case schema");
     assert!(!fixtures.cases.is_empty());
     for case in &fixtures.cases {

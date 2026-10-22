@@ -29,10 +29,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-mod common;
+use crate::common;
 
-const RENDER_FIXTURES: &str = include_str!("fixtures/deepseek_v41/render_fixtures.json");
-const RENDER_IDS_FIXTURES: &str = include_str!("fixtures/deepseek_v41/render_ids_fixtures.json");
+const RENDER_FIXTURES: &str = include_str!("../fixtures/deepseek_v41/render_fixtures.json");
+const RENDER_IDS_FIXTURES: &str = include_str!("../fixtures/deepseek_v41/render_ids_fixtures.json");
 
 /// The mode the generator asked the reference encoder for.
 #[derive(Deserialize)]
