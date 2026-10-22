@@ -2464,8 +2464,9 @@ fn fetch(
 }
 
 /// The wait a rate-limited answer asks for: `Retry-After` in seconds, else the
-/// seconds left in the hub's window (`ratelimit: "resolvers";r=0;t=240`), else
-/// ten seconds; a whole window at most.
+/// seconds left in the hub's window (`ratelimit: "resolvers";r=0;t=240`) and one
+/// more, since `t=` is whole seconds and a try at the boundary is limited again
+/// with `t=0`; else ten seconds; a whole window at most.
 fn rate_limit_wait(headers: &reqwest::header::HeaderMap) -> Duration {
     let seconds = |value: &reqwest::header::HeaderValue| -> Option<u64> {
         value.to_str().ok()?.trim().parse().ok()
@@ -2480,6 +2481,7 @@ fn rate_limit_wait(headers: &reqwest::header::HeaderMap) -> Duration {
                 .map(str::trim)
                 .find_map(|part| part.strip_prefix("t="))
                 .and_then(|left| left.parse::<u64>().ok())
+                .map(|left| left + 1)
         });
     Duration::from_secs(retry_after.or(window_left).unwrap_or(10)).min(RATE_LIMIT_WINDOW)
 }
@@ -3067,15 +3069,12 @@ fn loopback(heads: &'static [&'static str]) -> io::Result<(String, Arc<AtomicUsi
     Ok((url, served))
 }
 
-/// A GET the hub rate-limits is sent again after the wait the answer asks for (`Retry-After`,
-/// or the window's rest from the `ratelimit` header), and the answer past the limit is the one
-/// returned; after the last try, the limit itself is.
+/// A GET the hub rate-limits is sent again after the wait the answer asks for, and the answer
+/// past the limit is the one returned; after the last try, the limit itself is.
 #[test]
 fn a_rate_limited_get_is_sent_again_after_the_retry_after_wait() {
     const LIMITED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0";
-    const LIMITED_EVERY_TIME: &[&str] =
-        &["HTTP/1.1 429 Too Many Requests\r\nratelimit: \"resolvers\";r=0;t=0";
-            RATE_LIMITED_TRIES as usize];
+    const LIMITED_EVERY_TIME: &[&str] = &[LIMITED; RATE_LIMITED_TRIES as usize];
     let client = smg::clients::blocking_http_client();
     let (url, served) = loopback(&[LIMITED, "HTTP/1.1 200 OK"]).unwrap();
     let response = fetch(
@@ -3097,8 +3096,9 @@ fn a_rate_limited_get_is_sent_again_after_the_retry_after_wait() {
 }
 
 /// The wait between two tries: `Retry-After` in seconds first, else the seconds left in the
-/// hub's window from the `ratelimit` header, else ten seconds; never more than one window (an
-/// HTTP-date `Retry-After` is not a number and falls through).
+/// hub's window from the `ratelimit` header plus one (whole seconds: a try at the boundary is
+/// limited again), else ten seconds; never more than one window (an HTTP-date `Retry-After` is
+/// not a number and falls through).
 #[test]
 fn the_wait_after_a_rate_limit_is_what_the_answer_says_and_a_window_at_most() {
     let headers = |pairs: &[(&'static str, &str)]| {
@@ -3115,14 +3115,14 @@ fn the_wait_after_a_rate_limit_is_what_the_answer_says_and_a_window_at_most() {
     );
     assert_eq!(
         rate_limit_wait(&headers(&[("ratelimit", "\"resolvers\";r=0;t=240")])),
-        Duration::from_secs(240)
+        Duration::from_secs(241)
     );
     assert_eq!(
         rate_limit_wait(&headers(&[
             ("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT"),
             ("ratelimit", "\"resolvers\";r=0;t=30"),
         ])),
-        Duration::from_secs(30)
+        Duration::from_secs(31)
     );
     assert_eq!(
         rate_limit_wait(&headers(&[
