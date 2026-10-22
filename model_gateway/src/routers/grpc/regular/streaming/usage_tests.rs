@@ -27,8 +27,8 @@ use tokio::task::JoinHandle;
 
 use super::{
     eof_tests::{
-        chunk, collect_events, data_frame, decoded_stream, mock_worker_endpoint, processor,
-        scripted_stream, trailers_frame, CharacterTokenizer,
+        chunk, collect_events, data_frame, decoded_stream, gated_stream, mock_worker_endpoint,
+        processor, scripted_stream, trailers_frame, CharacterTokenizer,
     },
     *,
 };
@@ -1044,4 +1044,105 @@ fn a_collected_answer_records_its_token_and_generation_families() {
             "unexpected {absent} in:\n{rendered}"
         );
     }
+}
+
+/// The engine's terminal frame read and the client gone before the terminal
+/// sends: the first chunk reached the client, the client dropped the
+/// response, then the engine's `Complete` arrived. The sends fail on the
+/// closed sender and the path returns that failure, after the reservation
+/// was settled with the engine's counts: nothing is closed as reserved-only.
+#[tokio::test]
+async fn a_chat_stream_whose_client_left_before_the_terminal_sends_settles_the_engines_counts() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "eof-test", "messages": [], "stream": true,
+        "stream_options": {"include_usage": true},
+    }))
+    .expect("chat request");
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let mut frames = choice_frames(0, &["hi"], SETTLED);
+    let complete = frames.pop().expect("the terminal frame");
+    let (stream, server) = gated_stream(frames, gate, vec![complete], "0").await;
+    let (tx, mut rx) = sse_channel();
+    let (handle, backend) = RecordingBackend::reservation();
+    let processor = processor(false);
+    let streamed = processor.process_streaming_chunks(
+        stream,
+        dispatch(),
+        tokenizer(),
+        (None, None, false, false, false),
+        ChatResponseSpec::from(&request),
+        &tx,
+        Some(handle),
+    );
+    let client = async {
+        let first = rx.recv().await.expect("the first chunk reaches the client");
+        assert!(first.is_ok(), "{first:?}");
+        drop(rx);
+        release.send(()).expect("the gate is waited on");
+    };
+    let (result, ()) = tokio::join!(streamed, client);
+    server.abort();
+    assert!(
+        result.is_err(),
+        "the terminal sends fail on the closed sender: {result:?}"
+    );
+    assert_eq!(
+        backend.settlements(),
+        vec![UsageSettlement {
+            actual_input_tokens: SETTLED.prompt,
+            completion_tokens: 2,
+            cached_input_tokens: SETTLED.cached,
+            reasoning_tokens: 0,
+        }]
+    );
+    assert_eq!(backend.closes(), 0);
+}
+
+/// The same for the Messages path: its terminal sends fail on the closed
+/// sender after the engine's counts were settled.
+#[tokio::test]
+async fn a_messages_stream_whose_client_left_before_the_terminal_sends_settles_the_engines_counts()
+{
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let mut frames = choice_frames(0, &["hi"], SETTLED);
+    let complete = frames.pop().expect("the terminal frame");
+    let (stream, server) = gated_stream(frames, gate, vec![complete], "0").await;
+    let (tx, mut rx) = sse_channel();
+    let (handle, backend) = RecordingBackend::reservation();
+    let processor = processor(false);
+    let streamed = processor.process_messages_streaming_chunks(
+        stream,
+        dispatch(),
+        tokenizer(),
+        (None, None, false, false, false),
+        messages_spec(false),
+        &tx,
+        Some(handle),
+    );
+    let client = async {
+        // message_start, then the content block's start and the delta.
+        let mut text = String::new();
+        while !text.contains("content_block_delta") {
+            let frame = rx.recv().await.expect("the first delta reaches the client");
+            text.push_str(std::str::from_utf8(&frame.expect("an SSE write")).expect("UTF-8"));
+        }
+        drop(rx);
+        release.send(()).expect("the gate is waited on");
+    };
+    let (result, ()) = tokio::join!(streamed, client);
+    server.abort();
+    assert!(
+        result.is_err(),
+        "the terminal sends fail on the closed sender: {result:?}"
+    );
+    assert_eq!(
+        backend.settlements(),
+        vec![UsageSettlement {
+            actual_input_tokens: SETTLED.prompt,
+            completion_tokens: 2,
+            cached_input_tokens: SETTLED.cached,
+            reasoning_tokens: 0,
+        }]
+    );
+    assert_eq!(backend.closes(), 0);
 }
