@@ -1,7 +1,7 @@
 //! Anthropic Messages API protocol definitions
 //!
 //! This module provides Rust types for the Anthropic Messages API.
-//! See: https://docs.anthropic.com/en/api/messages
+//! See: <https://docs.anthropic.com/en/api/messages>
 
 use std::collections::{HashMap, HashSet};
 
@@ -411,7 +411,7 @@ pub enum Role {
     /// forwarded to the chat template **in place**, so backends that render
     /// `system` inline (e.g. GLM-4.5+/5.x) keep its position, while backends
     /// that only read a leading system (e.g. MiniMax-M2) handle it per their
-    /// own template. See https://github.com/smg-project/smg/issues/1795. A
+    /// own template. See <https://github.com/smg-project/smg/issues/1795>. A
     /// renderer whose reference writes no turn for a system message past the
     /// leading run (`RendererCapabilities::leading_system_only`) gets such a
     /// message as a user turn at its position instead, so the prompt keeps
