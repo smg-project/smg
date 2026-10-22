@@ -1,6 +1,11 @@
 """Delegation hooks; CPU tests use contract stubs, not a running vLLM backend."""
 
-from .pd_scheduler_trace import SchedulerTrace, request_snapshot
+from .pd_scheduler_trace import (
+    SchedulerTrace,
+    deferred_snapshot,
+    nonnegative_int,
+    request_snapshot,
+)
 
 
 class SchedulerObserverMixin:
@@ -15,6 +20,7 @@ class SchedulerObserverMixin:
         except Exception as exc:
             self._smg_pd_trace = SchedulerTrace(None, {})
             self._smg_pd_trace.mark_unknown("setup", exc)
+        self._smg_pd_scheduled = set()
         super().__init__(*args, **kwargs)
 
         def startup():
@@ -51,6 +57,27 @@ class SchedulerObserverMixin:
         self._observe("add_request_return", lambda: self._request_record(request))
         return result
 
+    def schedule(self, *args, **kwargs):
+        result = super().schedule(*args, **kwargs)
+
+        def first_scheduled():
+            records = []
+            for request_id, count in result.num_scheduled_tokens.items():
+                if request_id not in self._smg_pd_scheduled:
+                    records.append(
+                        {
+                            "request": request_snapshot(self.requests[request_id]),
+                            "scheduled_tokens": nonnegative_int(count),
+                        }
+                    )
+                    self._smg_pd_scheduled.add(request_id)
+            return {"requests": records}
+
+        fields = self._capture("schedule_return", first_scheduled)
+        if fields is not None and fields["requests"]:
+            self._smg_pd_trace.emit("first_scheduled", **fields)
+        return result
+
     def finish_requests(self, request_ids, finished_status):
         # Do not consume a caller's one-shot request-ID iterable before delegation.
         result = super().finish_requests(request_ids, finished_status)
@@ -66,4 +93,51 @@ class SchedulerObserverMixin:
     def _free_request(self, request, delay_free_blocks=False):
         result = super()._free_request(request, delay_free_blocks=delay_free_blocks)
         self._observe("free_request_return", lambda: self._request_record(request))
+        return result
+
+    def _free_blocks(self, request):
+        result = super()._free_blocks(request)
+
+        def after():
+            if request.request_id not in self.requests:
+                self._smg_pd_scheduled.discard(request.request_id)
+            return self._request_record(request)
+
+        self._observe("free_blocks_return", after)
+        return result
+
+    def _free_request_blocks(self, request):
+        before = self._capture("free_request_blocks_before", lambda: deferred_snapshot(self))
+        result = super()._free_request_blocks(request)
+
+        def after():
+            if before is None:
+                raise ValueError("missing pre-free observation")
+            return {
+                **self._request_record(request),
+                "deferred_before": before,
+                "deferred_after": deferred_snapshot(self),
+                "processed_step_seq": nonnegative_int(self.processed_step_seq),
+                "sched_step_seq": nonnegative_int(self.sched_step_seq),
+                "transfer_ack": None,
+                "peer_memory_released": None,
+            }
+
+        self._observe("free_request_blocks_return", after)
+        return result
+
+    def _drain_deferred_frees(self):
+        before = self._capture("drain_before", lambda: deferred_snapshot(self))
+        result = super()._drain_deferred_frees()
+        if before:
+            self._observe(
+                "drain_deferred_return",
+                lambda: {
+                    "deferred_before": before,
+                    "deferred_after": deferred_snapshot(self),
+                    "processed_step_seq": nonnegative_int(self.processed_step_seq),
+                    "transfer_ack": None,
+                    "peer_memory_released": None,
+                },
+            )
         return result

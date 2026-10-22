@@ -9,3 +9,8 @@ Returned request statuses are observed; input abort IDs never become ACKs.
 Natural completion and unfinished results stay distinct from actual ABORTED returns.
 Only primitive request snapshots are retained, with exact original IDs.
 CPU tests use explicit native contract stubs; no backend or fixture is enabled.
+
+First-scheduled markers follow each native registration through full free.
+Connector hold retains the marker; streaming updates do not reset it.
+Deferred queue and fence snapshots remain distinct from request removal.
+Transfer ACK and peer-memory release stay unknown; no fixture is enabled.
