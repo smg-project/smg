@@ -35,7 +35,7 @@ use crate::{
     tagged::{
         assembler::push_escaped,
         end_cut_call,
-        value::{json, python_literal, Kind},
+        value::{cut as cut_json, json, python_literal, Kind},
     },
     Declared,
 };
@@ -420,8 +420,10 @@ impl Assembler {
     /// ends with the fragments it sent, nothing made up for the object the model never closed,
     /// and one `Malformed` event that carries what was held, a key, a value or a separator cut
     /// short, or no bytes ([`end_cut_call`]; the engine names the reason for a region a marker
-    /// closed); the stream's end, which is a cut and not the model's end, writes the held member
-    /// as the call's own instead ([`Self::finish`]). A name that never got its `(` comes back as
+    /// closed); the stream's end (a cut by the token limit, an abort, or the model's own stop,
+    /// which ends a pythonic call as a cut does, since its quotes and braces are the model's own)
+    /// writes the held member as the call's own instead ([`Self::finish`]). A name that never got
+    /// its `(` comes back as
     /// `Malformed`, and the wrapping before any call is dropped. The marker that closed the
     /// region is not passed: it belongs to the region, not to the last call, and the engine
     /// drops it.
@@ -451,8 +453,10 @@ impl Assembler {
     /// member can be written for them. Outside a call, what was held, a name that never got its
     /// `(` or the list's wrapping, comes back as `Malformed { UnterminatedRegion }`. Under the
     /// bare list, content, a `[` no call followed yet and a list held after content come back as
-    /// the content they are, and the text after the list as what it was. The region's marker
-    /// inside a call is the model's own end and still reports what was held ([`Self::close`]).
+    /// the content they are, and the text after the list as what it was. The stream's end is a
+    /// cut by the token limit, an abort, or the model's own stop, which ends a pythonic call as a
+    /// cut does since its quotes and braces are the model's own (nothing closes for it either
+    /// way); the region's marker inside a call ([`Self::close`]) still reports what was held.
     pub fn finish(mut self, out: &mut Events) {
         match std::mem::replace(&mut self.stage, Stage::Between) {
             Stage::Prose | Stage::Opening { .. } | Stage::Holding(_) => self.release_content(out),
@@ -784,9 +788,12 @@ impl Assembler {
     /// the `=`, the value's bytes and the whitespace before them as its source: a string still
     /// open, in either quote, as an open JSON string holding its text so far ([`open_string`]); a
     /// value whole before the separator that never came (`"Paris"`, `3`, `None`) as it would
-    /// have been written ([`Self::whole_value`]); any other bytes, a number's digits, a word that
-    /// may still be `True`, a list or a dict still open, as written; a key with no byte of its
-    /// value yet as `"key": ` alone. Nothing is made up: no closing quote, bracket or brace.
+    /// have been written ([`Self::whole_value`]); a number's digits, the start of a word or a
+    /// list or a dict still open as the JSON they stand for so far ([`cut_word`], [`cut_json`]:
+    /// as written where that is a prefix of a JSON value, a string holding the text where it is
+    /// not); a key with no byte of its value yet as `"key": ` alone. Nothing is made up: no
+    /// closing quote, bracket or brace, and every fragment keeps the arguments a strict prefix of
+    /// a JSON value.
     fn cut_value(
         &mut self,
         key: &str,
@@ -804,9 +811,11 @@ impl Assembler {
             None if scan.depth == 0 => {
                 let text = raw.trim_end();
                 self.whole_value(text, kind)
-                    .unwrap_or_else(|| text.to_owned())
+                    .unwrap_or_else(|| cut_word(text))
             }
-            _ => raw.to_owned(),
+            // A list or a dict still open: as written where its spelling is JSON's so far, else
+            // a string holding it, since its JSON is not known until it closes.
+            _ => cut_json(raw),
         };
         self.push_member(key, &value, out);
     }
@@ -926,19 +935,35 @@ fn between_double_quotes(text: &str) -> Option<&str> {
     text.strip_prefix('"')?.strip_suffix('"')
 }
 
+/// A bare word or a number the end of the stream cut at the top of a value, as the JSON it
+/// stands for so far: the start of one of Python's words is the start of the JSON word it is
+/// written as (`Tr` is `tr`, `Non` is `nul`; the words are the same length), and anything else
+/// is the JSON its text stands for as far as it is known ([`cut_json`]): a number's digits or the
+/// start of a JSON word as written, other text as the opening of a string holding it.
+fn cut_word(text: &str) -> String {
+    for (word, json) in [("True", "true"), ("False", "false"), ("None", "null")] {
+        if !text.is_empty() && word.starts_with(text) {
+            return json[..text.len()].to_owned();
+        }
+    }
+    cut_json(text)
+}
+
 /// A string the end of the stream cut open, as the open JSON string the dialect would have
 /// written for its text so far: `inner`, the bytes after the opening `quote`, decoded as the
 /// dialect reads them and escaped as JSON requires, after the opening `"` and with no closing
 /// one. Under [`Values::Quoted`] nothing is decoded, so the text stands as written; under the
 /// other dialects the string is closed as the model would have closed it and read whole, the
-/// closing quote then taken off again, and an escape the cut left unfinished (a trailing
-/// backslash) is left out, since what it would have stood for is not known; text the literal
-/// reader cannot read even so stands as written.
+/// closing quote then taken off again, and when the cut left an escape unfinished (`\u00`) the
+/// text from the last backslash that begins an escape is left out, since what it would have
+/// stood for is not known, the escapes before it decoded as before; text the literal reader
+/// cannot read even so stands as written.
 fn open_string(inner: &str, quote: char, values: Values) -> String {
     if values != Values::Quoted {
-        let decoded = [inner, inner.strip_suffix('\\').unwrap_or(inner)]
+        let decoded = [Some(inner.len()), last_escape_start(inner)]
             .into_iter()
-            .find_map(|inner| python_literal(&format!("{quote}{inner}{quote}")));
+            .flatten()
+            .find_map(|end| python_literal(&format!("{quote}{}{quote}", &inner[..end])));
         if let Some(mut json) = decoded.filter(|json| json.starts_with('"') && json.len() > 1) {
             json.pop();
             return json;
@@ -948,6 +973,20 @@ fn open_string(inner: &str, quote: char, values: Values) -> String {
     json.push('"');
     push_escaped(&mut json, inner);
     json
+}
+
+/// Where the last escape of `text` begins: the byte of its last backslash that is not itself the
+/// character an earlier backslash escapes, if there is one.
+fn last_escape_start(text: &str) -> Option<usize> {
+    let mut start = None;
+    let mut bytes = text.bytes().enumerate();
+    while let Some((at, byte)) = bytes.next() {
+        if byte == b'\\' {
+            start = Some(at);
+            bytes.next();
+        }
+    }
+    start
 }
 
 impl crate::engine::CallAssembler for Assembler {
@@ -1518,7 +1557,7 @@ mod tests {
     /// one character at a time.
     #[test]
     fn a_member_the_stream_end_cuts_leaves_as_the_calls_own_fragment_and_nothing_as_content() {
-        let cases: [(Dialect, &str, &str, &[&str]); 27] = [
+        let cases: [(Dialect, &str, &str, &[&str]); 30] = [
             // JSON values: an open string, decoded and escaped as JSON.
             (
                 Dialect::OLMO3,
@@ -1532,11 +1571,18 @@ mod tests {
                 r#"{"city": "Pa\"r"#,
                 &[],
             ),
-            // An escape the cut left open is left out: what it stood for is not known.
+            // An escape the cut left open is left out, what it stood for not being known, and
+            // the escapes before it are still decoded.
             (
                 Dialect::OLMO3,
                 "get_weather(city=\"Pa\\",
                 r#"{"city": "Pa"#,
+                &[],
+            ),
+            (
+                Dialect::OLMO3,
+                "get_weather(city=\"caf\\u00e9 au lait\\u00",
+                r#"{"city": "café au lait"#,
                 &[],
             ),
             // A second member: a number's digits as written, after the first member whole.
@@ -1553,11 +1599,18 @@ mod tests {
                 r#"{"city": "Paris", "options": {"a": "b"#,
                 &[],
             ),
-            // A word that may still be a literal, and one whole before its separator.
+            // The start of a literal word, and one whole before its separator; a word that is
+            // no literal is a string's opening.
             (
                 Dialect::OLMO3,
-                "get_weather(detailed=tru",
-                r#"{"detailed": tru"#,
+                "get_weather(detailed=tr",
+                r#"{"detailed": tr"#,
+                &[],
+            ),
+            (
+                Dialect::OLMO3,
+                "get_weather(city=hel",
+                r#"{"city": "hel"#,
                 &[],
             ),
             (
@@ -1623,10 +1676,11 @@ mod tests {
                 r#"{"detailed": true"#,
                 &[],
             ),
+            // The start of a Python word is the start of its JSON word.
             (
                 Dialect::LFM2_5,
-                "[get_weather(detailed=Tru",
-                r#"{"detailed": Tru"#,
+                "[get_weather(detailed=Tr",
+                r#"{"detailed": tr"#,
                 &[],
             ),
             (
@@ -1637,8 +1691,16 @@ mod tests {
             ),
             (
                 Dialect::LFM2_5,
+                "[get_weather(city=Non",
+                r#"{"city": nul"#,
+                &[],
+            ),
+            // A dict still open, whose JSON is not known until it closes: a string holding its
+            // text, so that the arguments stay a strict prefix of a JSON value.
+            (
+                Dialect::LFM2_5,
                 "[get_weather(city='Paris', options={'a': 'b",
-                r#"{"city": "Paris", "options": {'a': 'b"#,
+                r#"{"city": "Paris", "options": "{'a': 'b"#,
                 &[],
             ),
             // Quoted values: the text between the quotes as written, nothing decoded; a value
@@ -1679,6 +1741,17 @@ mod tests {
                 let calls = calls(&events);
                 assert_eq!(calls.len(), 1, "{place}: {events:?}");
                 assert_eq!(calls[0].2, expected, "{place}: {events:?}");
+                // The contract of every fragment: the arguments so far are a strict prefix of a
+                // JSON value, one `serde_json` reads whole or stops reading only at its end.
+                let strict_prefix = match serde_json::from_str::<serde_json::Value>(&calls[0].2) {
+                    Ok(_) => true,
+                    Err(error) => error.is_eof(),
+                };
+                assert!(
+                    strict_prefix,
+                    "{place}: no JSON value begins with {:?}",
+                    calls[0].2
+                );
                 assert!(
                     shown_after_the_start(&events).is_empty(),
                     "{place}: nothing of the call is content: {events:?}"

@@ -477,15 +477,19 @@ What the syntax says, and what the assembler does with it:
   with an object the reader closed for it. What was held when the end came differs: at the
   close, the model's own end, the word carries it, a key, a value or a separator cut short, or
   no bytes when the cut came right after the `(`, and the engine names the reason for a region
-  a marker closed; at the stream's end, a cut by the token limit and not the model's end, the
-  word has no bytes and the call's bytes stay the call's, since a client reads the prefix as
-  written under `length` and never the call's bytes as the answer's prose: the member the cut
-  found inside its value leaves as the call's own fragment, its key and the JSON the assembler
-  would have written for the value as far as that is known (an open string in either quote as
-  an open JSON string holding its text so far, decoded as the dialect reads it, `{"city": "Par`;
-  a value whole before the separator that never came written whole, `"days": 3`; a number's
-  digits, a word that may still be a literal and a list or a dict still open as written; a key
-  and no byte of its value as `"key": ` alone), and a key or a separator the cut found open
+  a marker closed; at the stream's end (a cut by the token limit, an abort, or the model's own
+  stop, which ends a pythonic call as a cut does, as the stop rule above has it), the word has
+  no bytes and the call's bytes stay the call's, since a client reads the prefix as written
+  under `length` and never the call's bytes as the answer's prose: the member the cut found
+  inside its value leaves as the call's own fragment, its key and the JSON the assembler would
+  have written for the value as far as that is known (an open string in either quote as an open
+  JSON string holding its text so far, decoded as the dialect reads it, `{"city": "Par`, an
+  escape the cut left unfinished left out; a value whole before the separator that never came
+  written whole, `"days": 3`; a number's digits, the start of a literal word (`Tr` as `tr`)
+  and a list or a dict still open as the JSON they stand for so far, which is the text as
+  written where that is a prefix of a JSON value and a string holding the text where it is not,
+  so that every fragment keeps the arguments a strict prefix of a JSON value; a key and no byte
+  of its value as `"key": ` alone), and a key or a separator the cut found open
   leaves as the syntax's wrapping (`Dropped`), as a parameter tag the end cut short does under a
   tagged syntax, since no member can be written for it. Before this the held bytes left as the
   word's text at both ends, and a chat client read `city="Par` as content next to a call whose
