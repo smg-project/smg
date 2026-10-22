@@ -758,8 +758,14 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                     .map(String::as_str)
                     .zip(params.iter().copied())
                     .collect();
-                let stmt = conn.execute_named(&sql, &named).map_err(map_oracle_error)?;
-                stmt.row_count().map_err(map_oracle_error)
+                match conn.execute_named(&sql, &named) {
+                    Ok(stmt) => stmt.row_count().map_err(map_oracle_error),
+                    // ORA-00001: a concurrent create of the same id won the
+                    // insert between this MERGE's probe and its own insert;
+                    // the row under the id stands, as when the probe finds it.
+                    Err(err) if err.db_error().is_some_and(|db_err| db_err.code() == 1) => Ok(0),
+                    Err(err) => Err(map_oracle_error(err)),
+                }
             })
             .await
             .map_err(ConversationItemStorageError::from_failure)?;
