@@ -440,17 +440,19 @@ impl Assembler {
         }
         let source = Text::uncounted(std::mem::take(&mut self.object.carried));
         self.object.close(source, out);
-        out.push(Event::ToolCallEnd {
-            index: self.object.index,
-            source: Text::uncounted(terminal.to_owned()),
-        });
-        self.done = true;
+        // The tag the marker cut short came before the marker: it leaves before the call's end,
+        // which carries the marker's bytes, so every byte keeps its place.
         if let Some(tail) = cut_tag {
             out.push(Event::Dropped {
                 text: Text::uncounted(tail),
                 why: DropReason::Wrapper,
             });
         }
+        out.push(Event::ToolCallEnd {
+            index: self.object.index,
+            source: Text::uncounted(terminal.to_owned()),
+        });
+        self.done = true;
     }
 
     /// The stream was cut: nothing is closed, so arguments cut short never look complete to a
@@ -528,8 +530,10 @@ impl Assembler {
     /// value ended at its closer: the closer carried is the quote's source, and the start of a tag
     /// after it is the call's end's. A held tail that begins with one of the family's structural
     /// tokens is a tag the end cut short, never the model's text (the engine drops its own
-    /// terminals' held prefixes the same way): it is handed back to leave after the call, dropped
-    /// as the whole tag would have been, so every byte keeps its place. The string is closed: the
+    /// terminals' held prefixes the same way): it is handed back to leave in its place, dropped
+    /// as the whole tag would have been: before the call's end at a marker, whose bytes came after
+    /// it, and after the call at the stop, whose end carries no bytes, so every byte keeps its
+    /// place. The string is closed: the
     /// one word of no bytes (`why`: the end that closed it, [`left_open`](super::left_open)), then
     /// the closing quote. Nothing happens when no string is open.
     fn close_open_string(&mut self, why: MalformedReason, out: &mut Events) -> Option<String> {
@@ -1162,6 +1166,25 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// A streamed string still open at the invoke's own closing marker, with the start of a cut
+    /// tag held before it: the tag the marker cut short leaves before the call's end, as it came
+    /// in, so the event bytes read as the input did.
+    #[test]
+    fn a_tag_the_marker_cut_short_leaves_before_the_calls_end() {
+        let call = concat!(
+            "f\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"b\" type=\"string\"<|sep|>x<|close|>argument"
+        );
+        let events = run_with(Tags::XTML, &[call], false);
+        assert_eq!(arguments(&events), r#"{"b": "x"}"#);
+        assert_eq!(dropped(&events), vec!["<|close|>argument".to_string()]);
+        assert!(matches!(
+            events.last(),
+            Some(Event::ToolCallEnd { source, .. }) if source.text == Tags::XTML.invoke_close
+        ));
+        assert_eq!(bytes(&events), format!("{call}{}", Tags::XTML.invoke_close));
     }
 
     /// A recorded Kimi K3 call, from after `<|open|>call tool="`: a string, a number and an object.
