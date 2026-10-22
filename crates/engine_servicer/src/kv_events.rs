@@ -77,9 +77,9 @@
 //! complete from the publisher's first batch, a subscriber from zero gets
 //! the snapshot, and the snapshot's chunks carry `unknown_before` so the
 //! gateway marks the worker degraded instead of trusting a silently partial
-//! state. An `AllBlocksCleared` the engine publishes after the join ends
-//! the unknown stretch: nothing from before it is live, so the snapshots
-//! that follow are whole and say so.
+//! state. An `AllBlocksCleared` among the batches the relay records, live
+//! or from the replay, ends the unknown stretch: nothing from before it is
+//! live, so the snapshots that follow are whole and say so.
 //!
 //! A publisher restart is read the same way on every wire, from three signs
 //! (vLLM and SGLang count from 0 per process; SGLang's first batch after a
