@@ -1,5 +1,5 @@
 {
-  "ready": false,
+  "ready": true,
   "run_id": 39854981911,
   "run_attempt": 1,
   "producer_sha": "34ac557ba0775adda864e7d4446bf10127f6014c",
@@ -349,7 +349,7 @@
       }
     },
     "cairo_runtime_package": "libcairo2=1.16.0-5ubuntu2.1",
-    "prerequisite_accepted": false
+    "prerequisite_accepted": true
   },
   "consumer_test_harness_delta": {
     "preserved_PD_base": "67edd9d",
