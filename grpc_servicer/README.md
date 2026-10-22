@@ -386,13 +386,14 @@ engine's own settings bound the hold, and they work only together:
   new peer only for the peers that do not hold its memory: the leg whose
   memory a peer still holds fails its startup memory check before it
   handshakes anyone, so its own restart cannot run the sweep that would
-  release it. The heartbeat goes out on a known peer's requests as well, on
-  the first request after a gap longer than a sixth of the connector's lease
-  (five seconds at its default), and the peer that request reads from is
-  stamped active before the sweep, so a pair's own traffic never drops the
-  pair. A single pair whose prefill died sends no heartbeat either; its
+  release it. The heartbeat goes out on a known peer's requests as well, at
+  most once per sixth of the connector's lease (five seconds at its default)
+  while any request is waiting for its KV, so a busy decode runs the sweep
+  every few seconds; the peer a request reads from is stamped active before
+  the sweep, so a pair's own traffic never drops the pair. A single pair
+  whose prefill died sends no heartbeat either; its
   decode lets go of the dead leg's memory only when another peer turns up or
-  a request from a live peer runs the sweep. Dropping the peer releases its
+  a live peer's requests run the sweep. Dropping the peer releases its
   transfer state, the transfers that were in flight when it died included;
   with the cache off their mappings go with them, with the cache on the
   mappings outlive the peer either way.
