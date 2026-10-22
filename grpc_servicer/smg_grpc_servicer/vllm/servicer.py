@@ -568,7 +568,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
             # From here the engine owns the request: a caller that gives up
             # is answered by the engine's own abort, and the pre-admission
             # notice below must not be sent for an id the engine may still
-            # hold (see _notify_kv_transfer_rejected).
+            # hold (see _notify_kv_transfer_rejected). The one exception is
+            # a refusal generate() raises before the engine core holds the
+            # request, told apart in the except branch below.
             handed_to_engine = True
             async for output in self.engine.generate(
                 prompt=prompt,
@@ -579,16 +581,17 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 data_parallel_rank=pinned_rank,
             ):
                 if not engine_started:
-                    # The prompt's cached count is the reporting choice's
-                    # (the first output of an n > 1 request is whichever
-                    # choice stepped first).
+                    # The engine holds the request from its first output on
+                    # (a refusal below never gets here). The prompt's cached
+                    # count is the reporting choice's (the first output of an
+                    # n > 1 request is whichever choice stepped first).
+                    engine_started = True
                     self._loads.first_output(
                         request_id,
                         len(output.prompt_token_ids or ()),
                         getattr(output, "num_cached_tokens", 0) or 0,
                         rank=rank_of(output.outputs[0].index if output.outputs else 0),
                     )
-                engine_started = True
                 for completion in output.outputs:
                     self._loads.generated(len(completion.token_ids), rank=rank_of(completion.index))
                 # For streaming, send chunks for EACH completion output (n outputs)
@@ -649,8 +652,17 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 logger.exception("Error in Generate for request %s", request_id)
             else:
                 logger.warning("Generate request %s rejected (%s): %s", request_id, code.name, e)
+            # A ValueError before the first output is generate()'s refusal of
+            # the request's inputs (the prompt plus max_tokens over the model
+            # length, bad sampling params): add_request raises it before the
+            # engine core holds the request and generate() re-raises it with
+            # no abort, so no live id is left behind and the notice is still
+            # owed, as the Rust wire sends it when its generate call returns
+            # an error. Every other failure after the hand-over reaches here
+            # through the engine's own abort, which answers it.
+            refused = isinstance(e, ValueError) and not engine_started
             await self._notify_kv_transfer_rejected(
-                request_id, kv_transfer_params, handed_to_engine
+                request_id, kv_transfer_params, handed_to_engine and not refused
             )
             await context.abort(code, str(e))
         finally:
@@ -667,7 +679,9 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         Without this, the prefill engine keeps the blocks pinned until the NIXL
         lease expires (30s default).
 
-        Only a request the engine never received is notified. The notice is a
+        Only a request the engine never received is notified (a refusal
+        ``generate()`` raises before the engine core holds the request counts
+        as never received; the caller tells it apart). The notice is a
         second engine request under the same id, submitted pre-aborted so the
         connector's request_finished hook runs, and once ``engine.generate``
         has been entered it kills the engine either way: while the request's
