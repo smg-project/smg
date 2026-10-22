@@ -237,6 +237,10 @@ def test_snapshots_keep_exact_ids_and_primitives_without_retaining_request():
 
 def test_real_entry_module_keeps_both_native_parent_classes(monkeypatch):
     # Import the actual entry module against explicit contract stubs, not vLLM.
+    monkeypatch.setattr(
+        "infra.pd_scheduler_compat.require_installed_contract", lambda: {"stub": "cpu"}
+    )
+    monkeypatch.setattr("infra.pd_scheduler_compat.require_loaded_contract", lambda *args: None)
     for name, base in (("scheduler", NativeContract), ("async_scheduler", AsyncNativeContract)):
         module = ModuleType(f"vllm.v1.core.sched.{name}")
         setattr(module, "Scheduler" if name == "scheduler" else "AsyncScheduler", base)
@@ -246,10 +250,36 @@ def test_real_entry_module_keeps_both_native_parent_classes(monkeypatch):
     try:
         assert entry.ObservedScheduler.__mro__[2] is NativeContract
         assert entry.ObservedAsyncScheduler.__mro__[2] is AsyncNativeContract
-        assert entry.observer_class_for(False) is entry.ObservedScheduler
-        assert entry.observer_class_for(True) is entry.ObservedAsyncScheduler
-        for unresolved in (None, 0, 1, "true"):
+
+        class CustomAsync(AsyncNativeContract):
+            pass
+
+        for native, expected in (
+            (NativeContract, entry.ObservedScheduler),
+            (AsyncNativeContract, entry.ObservedAsyncScheduler),
+        ):
+            config = SimpleNamespace(
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=True, get_scheduler_cls=lambda: native
+                )
+            )
+            assert entry.observer_class_for_config(config) is expected
+        for unsupported in (None, False, True, "true", entry.ObservedScheduler, CustomAsync):
+            config = SimpleNamespace(
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=True, get_scheduler_cls=lambda: unsupported
+                )
+            )
             with pytest.raises(ValueError):
-                entry.observer_class_for(unresolved)
+                entry.observer_class_for_config(config)
+        for unresolved in (None, 0, 1, "true"):
+            config = SimpleNamespace(
+                scheduler_config=SimpleNamespace(
+                    async_scheduling=unresolved,
+                    get_scheduler_cls=lambda: pytest.fail("unresolved config must not call getter"),
+                )
+            )
+            with pytest.raises(ValueError, match="unresolved native scheduler configuration"):
+                entry.observer_class_for_config(config)
     finally:
         sys.modules.pop("infra.pd_vllm_scheduler", None)
