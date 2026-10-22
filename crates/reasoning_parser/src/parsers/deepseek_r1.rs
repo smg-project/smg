@@ -39,6 +39,10 @@ impl Default for DeepSeekR1Parser {
 }
 
 impl ReasoningParser for DeepSeekR1Parser {
+    fn token_counting_markers(&self) -> Option<(&str, &str)> {
+        self.base.token_counting_markers()
+    }
+
     fn detect_and_parse_reasoning(&mut self, text: &str) -> Result<ParserResult, ParseError> {
         self.base.detect_and_parse_reasoning(text)
     }

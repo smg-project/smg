@@ -37,6 +37,10 @@ impl Default for Glm45Parser {
 }
 
 impl ReasoningParser for Glm45Parser {
+    fn token_counting_markers(&self) -> Option<(&str, &str)> {
+        self.base.token_counting_markers()
+    }
+
     fn detect_and_parse_reasoning(&mut self, text: &str) -> Result<ParserResult, ParseError> {
         self.base.detect_and_parse_reasoning(text)
     }

@@ -77,6 +77,8 @@ pub(crate) struct ChatResponseSpec {
     /// validation selects it; picks provider-specific response behaviour.
     pub provider: ProviderProfile,
     pub separate_reasoning: bool,
+    /// Continued assistant prefixes lack the exact counter's initial span state.
+    pub continues_final_assistant: bool,
     pub tool_choice: Option<ToolChoice>,
     /// The tools the response is read against, shared with the readers that
     /// type its calls (one per choice) rather than copied into each.
@@ -125,6 +127,7 @@ impl From<&ChatCompletionRequest> for ChatResponseSpec {
         Self {
             provider,
             separate_reasoning: request.separate_reasoning,
+            continues_final_assistant: request.continues_final_assistant(),
             tool_choice: request.tool_choice.clone(),
             // Every tool the model may call, dynamic tools declared on messages
             // included: the request's own list shared, not copied (a new list
