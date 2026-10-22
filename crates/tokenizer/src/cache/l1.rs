@@ -63,9 +63,12 @@ pub(super) enum PrefixLookup {
     /// it ends at (its byte length and the special token there). The tokens
     /// are returned as `Arc<[TokenIdType]>` so a hit does not copy the (large)
     /// cached prefix; the caller splices the suffix into an exact-capacity
-    /// buffer. The last field is the input's deepest boundary when it lies
-    /// beyond the match, so the caller can cache it.
-    Hit(Arc<[TokenIdType]>, Seed, Option<Seed>),
+    /// buffer. The last field holds the input's boundaries deeper than the
+    /// match, in order (empty when the match is the deepest), so the caller
+    /// can cache every one of them on its way to the tail: the ones the input
+    /// shares with other inputs behind a shallow match (a system turn behind
+    /// the template's leading token) as much as its own deepest one.
+    Hit(Arc<[TokenIdType]>, Seed, PrefixSeeds),
     /// No cached prefix. Carries the seeds the failed search computed (empty
     /// when the input has no special-token boundaries) so the miss path can
     /// seed entries without recomputing them.
@@ -498,7 +501,7 @@ impl L1Cache {
         }
 
         // Search from the longest boundary to find the best match
-        for &seed in seeds.iter().rev() {
+        for (at, &seed) in seeds.iter().enumerate().rev() {
             let shard_idx = seed.digest[0] as usize % NUM_SHARDS;
 
             if let Some(entry) = self.shards[shard_idx].get(&seed.digest) {
@@ -508,11 +511,9 @@ impl L1Cache {
 
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 L1.hit(seed.end);
-                // Share the cached allocation instead of copying it on every hit.
-                let deeper = seeds
-                    .last()
-                    .copied()
-                    .filter(|deepest| deepest.end > seed.end);
+                // Share the cached allocation instead of copying it on every hit;
+                // the boundaries beyond the match go with it, for the caller to cache.
+                let deeper = seeds[at + 1..].to_vec();
                 return PrefixLookup::Hit(Arc::clone(&entry.tokens), seed, deeper);
             }
         }
