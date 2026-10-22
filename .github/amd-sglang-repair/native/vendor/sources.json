@@ -1,0 +1,22 @@
+[
+  {
+    "filename": "current_work_stream_gpu.py",
+    "url": "https://raw.githubusercontent.com/apache/tvm-ffi/3050b0a7bd48e04f853027c5fa1f5ab7bc20b856/tests/python/test_current_work_stream_gpu.py",
+    "path": "official-source/ffi012-current-work-stream.py",
+    "bytes": 3779,
+    "sha256": "78cd64cac8661186bfb6213dea7b6f03695816e0e28b78a5fba1ffc0f910c756"
+  },
+  {
+    "filename": "elementwise_add.py",
+    "url": "https://raw.githubusercontent.com/tile-ai/tilelang/a55a82302bf7f3c5af635b5c9146f728185cc900/examples/elementwise/example_elementwise_add.py",
+    "path": "official-source/tile-a55-elementwise-add.py",
+    "bytes": 2377,
+    "sha256": "d90fc2c2c5146c488d3cdcaf77e79edaa4e3a32f940e09f6384663c79bb6ce63"
+  },
+  {
+    "filename": "TILELANG_LICENSE",
+    "url": "https://raw.githubusercontent.com/tile-ai/tilelang/a55a82302bf7f3c5af635b5c9146f728185cc900/LICENSE",
+    "bytes": 1283,
+    "sha256": "f70e5cdc24c3797af741930440086f9a0ad36930b05a3dfc25b420936dc2cfa1"
+  }
+]
