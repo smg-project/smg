@@ -24,7 +24,7 @@ use tokio::sync::Notify;
 use super::worker::Worker;
 use super::worker::WorkerRoutingKeyLoad;
 
-/// Why the liveness tracker vetoes a worker (see [`super::liveness`]).
+/// Why the liveness tracker vetoes a worker (see the `liveness` module).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum StallReason {
@@ -937,7 +937,7 @@ impl WorkerRuntime {
     }
 
     /// Whether `place` may claim: no older place still waiting needs as few
-    /// rooms as it does, or fewer (see [`PdQueue::may_claim`]).
+    /// rooms as it does, or fewer (see `PdQueue::may_claim`).
     pub fn pd_may_claim(&self, place: u64) -> bool {
         self.pd_queue.lock().may_claim(place)
     }

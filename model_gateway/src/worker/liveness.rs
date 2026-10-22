@@ -549,7 +549,7 @@ fn thresholds() -> (Duration, Duration, Duration) {
 }
 
 /// The liveness budgets in force in this process: what a configuration set
-/// through [`configure_from`], or the defaults.
+/// through `configure_from`, or the defaults.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Budgets {
     /// A worker that has not answered a contact for this long is stalled.

@@ -1,7 +1,7 @@
 //! Logging infrastructure with non-blocking I/O for every sink.
 //!
 //! Each formatting layer hands its lines to a dedicated writer thread through
-//! a bounded, lossy channel ([`tracing_appender::non_blocking`]), so the tokio
+//! a bounded, lossy channel ([`tracing_appender::non_blocking`](mod@tracing_appender::non_blocking)), so the tokio
 //! runtime threads that emit the events never wait for the sink. That matters
 //! for stdout as much as for the log file: when stdout is redirected to a
 //! regular file, every `write(2)` is subject to the kernel's dirty-page

@@ -599,7 +599,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
 
     /// Record a load record pushed on the worker's own KV-event stream: from
     /// here on the worker is expected to be heard from at the stream's
-    /// cadence (see [`super::liveness`]).
+    /// cadence (see the `liveness` module).
     fn note_load_record(&self) {}
 
     /// Whether the worker's stream has ever pushed a load record.
@@ -608,8 +608,8 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     }
 
     /// Record whether the worker's latest load record reports its engine
-    /// silent on its in-flight requests for the wedge bound (see
-    /// [`super::liveness`]).
+    /// silent on its in-flight requests for the wedge bound (see the
+    /// `liveness` module).
     fn note_engine_stall(&self, _stalled: bool) {}
 
     /// Whether the latest load record reported the engine stalled.
@@ -770,7 +770,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// A decode side showed a handoff of this prefill worker's: on the
     /// parallel dispatch shape, its first output, which the decode engine
     /// produces from the KV the worker handed off. Evidence for
-    /// [`super::liveness::prefill_side_reprieve`] only: no prompt is released,
+    /// `liveness::prefill_side_reprieve` only: no prompt is released,
     /// nothing is timed, no run is answered.
     fn note_prefill_handoff(&self) {}
 
