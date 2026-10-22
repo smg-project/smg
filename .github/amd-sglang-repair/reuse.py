@@ -46,6 +46,12 @@ def check_metadata(meta, artifact, inputs):
     producer = meta["workflow_run"]
     require(meta["id"] == artifact["id"] and meta["name"] == artifact["name"], "artifact identity")
     require(not meta["expired"], "artifact expired")
+    require(meta["expires_at"] == artifact["expires_at"], "artifact expiry identity")
+    expiry = datetime.datetime.fromisoformat(meta["expires_at"].replace("Z", "+00:00"))
+    require(
+        expiry.tzinfo is not None and expiry > datetime.datetime.now(datetime.UTC),
+        "artifact expiry time",
+    )
     require(meta["size_in_bytes"] == artifact["bytes"], "artifact archive size")
     require(meta["digest"] == "sha256:" + artifact["sha256"], "artifact archive digest")
     require(producer["id"] == inputs["run_id"], "producer run")
@@ -96,7 +102,7 @@ def api_get(path):
         headers={
             "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
             "Accept": "application/vnd.github+json",
-            "User-Agent": "smg-vllm-repair",
+            "User-Agent": "smg-sglang-repair",
         },
     )
     return urllib.request.build_opener(NoRedirect()).open(request, timeout=30)
@@ -121,7 +127,7 @@ def archive_bytes(artifact):
 
 
 def consumer_budget():
-    require(os.environ["E2E_ENGINE"] == "vllm", "unknown gateway engine")
+    require(os.environ["E2E_ENGINE"] == "sglang", "unknown gateway engine")
     require(os.environ["RUNNER_NAME"] in ("amd-mi300x-1", "amd-mi300x-2"), "unexpected runner")
     with api_get(
         f"actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/{os.environ['GITHUB_RUN_ATTEMPT']}/jobs"
@@ -130,7 +136,7 @@ def consumer_budget():
     own = [
         j
         for j in consumer_jobs
-        if j["name"] == "vllm-repair"
+        if j["name"] == "sglang-repair"
         and j["runner_name"] == os.environ["RUNNER_NAME"]
         and j["status"] == "in_progress"
         and j["head_sha"] == os.environ["GITHUB_SHA"]
@@ -154,7 +160,7 @@ def consumer_budget():
 
 
 def load_budget():
-    budget = json.loads(Path(os.environ["SMG_VLLM_REPAIR_BUDGET_FILE"]).read_text())
+    budget = json.loads(Path(os.environ["SMG_SGLANG_REPAIR_BUDGET_FILE"]).read_text())
     require(
         all(
             budget[key] == os.environ[env]
@@ -212,10 +218,10 @@ def verify_cpu(files):
 
 def main():
     inputs = json.loads(INPUTS.read_text())
-    require(inputs.get("ready") is True, "vLLM repair diagnostic not admitted")
+    require(inputs.get("ready") is True, "SGLang repair diagnostic not admitted")
     require(
         inputs["producer_policy"]
-        == "successful_build_and_hosted_CPU_with_consumer_vllm_revalidation",
+        == "successful_build_and_hosted_CPU_with_consumer_sglang_revalidation",
         "unknown foundation reuse policy",
     )
     budget = load_budget()

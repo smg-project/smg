@@ -1,28 +1,31 @@
-name: AMD vLLM repair verification
+name: AMD SGLang repair verification
 on:
   workflow_dispatch:
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: amd-vllm-repair-e915
+  group: amd-sglang-repair-e915
   cancel-in-progress: false
 jobs:
-  vllm-repair:
-    name: vllm-repair
+  sglang-repair:
+    name: sglang-repair
     if: vars.SMG_RUN_AMD_LEGS == 'true'
     runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
     timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
     container:
-      image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
       options: --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models
     env:
-      E2E_ENGINE: vllm
-      E2E_RUNTIME: vllm
+      E2E_ENGINE: sglang
+      E2E_RUNTIME: sglang
       E2E_GPU_TIER: '1'
       E2E_GPU_VENDOR: amd
       E2E_MIN_SELECTED: '3'
-      E2E_VLLM_KV_BACKEND: nixl
+      E2E_VLLM_KV_BACKEND: ''
       E2E_CONNECTION_MODE: ''
       E2E_PARSER: ''
       E2E_SGLANG_SERVICER_IMPL: ''
@@ -38,30 +41,33 @@ jobs:
       E2E_LOG_DIR: e2e-logs
       PYTEST_ADDOPTS: ''
       PIP_RETRIES: '0'
+      MAX_JOBS: '2'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
       GIT_CONFIG_COUNT: '1'
       GIT_CONFIG_KEY_0: safe.directory
       GIT_CONFIG_VALUE_0: ${{ github.workspace }}
-      SMG_QA_IMAGE: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+      SMG_QA_IMAGE: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
     steps:
       - uses: actions/checkout@v7
       - name: Mark only this job's processes
-        run: echo "E2E_JOB_MARKER=vllm-repair-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
+        run: echo "E2E_JOB_MARKER=sglang-repair-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
       - name: Reuse, install and test within one absolute job budget
         timeout-minutes: 25
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 .github/amd-vllm-repair/budget.py
+        run: python3 .github/amd-sglang-repair/budget.py
       - name: Clean owned processes and record final dependency state
         if: always() && env.E2E_JOB_MARKER != ''
         timeout-minutes: 3
         run: |
           status=0
           python3 scripts/ci_reap_job_processes.py "$E2E_JOB_MARKER" || status=1
-          if test -f .venv/bin/activate; then source .venv/bin/activate; fi
-          if test -f diagnostic-results/install-complete; then
+          if test -f .venv/bin/activate; then . .venv/bin/activate; fi
+          if test -f diagnostic-results/install-started; then
             python3 -m pip check > diagnostic-results/pipcheck-after.txt 2>&1 || status=1
             python3 .github/amd-qa/closure_audit.py snapshot diagnostic-results/final.json || status=1
-            python3 .github/amd-vllm-repair/environment.py final || status=1
+            python3 .github/amd-sglang-repair/environment.py final || status=1
           fi
           exit "$status"
       - name: Preserve evidence even on failure
@@ -69,7 +75,7 @@ jobs:
         timeout-minutes: 2
         uses: actions/upload-artifact@v7
         with:
-          name: amd-vllm-repair-${{ github.run_id }}
+          name: amd-sglang-repair-${{ github.run_id }}
           path: |
             diagnostic-results/
             e2e-logs/

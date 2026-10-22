@@ -123,7 +123,7 @@
     ".github/workflows": "ffdd0ad39c40029fb10be8be462d5b25ed8183f0"
   },
   "explicit_consumer_only_paths": [
-    ".github/amd-vllm-repair/",
+    ".github/amd-sglang-repair/",
     ".github/workflows/pr-test-rust.yml"
   ],
   "producer_source_relabelled": false,
@@ -132,6 +132,10 @@
   "producer_full_closure_success_required": false,
   "producer_branch": "codex/amd-combined-closure-e915-20261022",
   "ready": false,
-  "producer_policy": "successful_build_and_hosted_CPU_with_consumer_vllm_revalidation",
-  "producer_run_conclusion_snapshot": "failure"
+  "producer_policy": "successful_build_and_hosted_CPU_with_consumer_sglang_revalidation",
+  "producer_run_conclusion_snapshot": "failure",
+  "own_paths": [
+    ".github/amd-sglang-repair",
+    ".github/workflows/pr-test-rust.yml"
+  ]
 }

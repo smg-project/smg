@@ -1,4 +1,4 @@
-"""Run one complete original vLLM suite using recorded cached inputs and terminal reports."""
+"""Run one complete original SGLang suite using recorded cached inputs and terminal reports."""
 
 import argparse
 import hashlib
@@ -101,8 +101,11 @@ class Reports:
         require(len(cases) == len(recipe["cases"]), "JUnit missing/duplicate cases")
         expected = {}
         for nodeid in recipe["cases"]:
-            module, cls, name = nodeid.split("::", 2)
-            key = (module.removesuffix(".py").replace("/", ".") + "." + cls, name)
+            parts = nodeid.split("::")
+            require(len(parts) in (2, 3), "unsupported case identity")
+            module = parts[0].removesuffix(".py").replace("/", ".")
+            classname = module + ("." + parts[1] if len(parts) == 3 else "")
+            key = (classname, parts[-1])
             expected[key] = self.items[nodeid][0]["outcome"] == "skipped"
         actual = {(c.get("classname"), c.get("name")) for c in cases}
         require(actual == set(expected), "JUnit case identity")
@@ -123,7 +126,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("suite", choices=["completions", "embeddings", "router"])
     args = parser.parse_args(argv)
-    require(os.environ["E2E_ENGINE"] == "vllm", "unexpected engine")
+    require(os.environ["E2E_ENGINE"] == "sglang", "unexpected engine")
     recipe = json.loads(CASES.read_text())[args.suite]
     os.environ["E2E_MIN_SELECTED"] = str(recipe["min_selected"])
     output = OUT / args.suite

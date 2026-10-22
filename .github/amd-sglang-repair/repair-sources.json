@@ -1,0 +1,24 @@
+{
+  "apache-tvm-ffi": {
+    "version": "0.1.12",
+    "files": {
+      "tvm_ffi/_optional_torch_c_dlpack.py": {
+        "bytes": 7697,
+        "sha256": "f507e145355e4a9000d727cc53fe8fb752c51361e30d0bfaecfb46fdc232a7f0"
+      }
+    }
+  },
+  "torch-c-dlpack-ext": {
+    "version": "0.1.5",
+    "files": {
+      "torch_c_dlpack_ext/__init__.py": {
+        "bytes": 839,
+        "sha256": "b583dbbec872c77eea2564f4216062cf324d8b0b7c93d5e77628bf9b46e6a13e"
+      },
+      "torch_c_dlpack_ext/core.py": {
+        "bytes": 2981,
+        "sha256": "5804ca0f3aa3fd8feaac429f57bfb5711c7ad4d988f03c21d2eee73c11d970ff"
+      }
+    }
+  }
+}

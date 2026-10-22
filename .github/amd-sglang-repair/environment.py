@@ -13,7 +13,7 @@ from pathlib import Path
 from reuse import require
 
 OUT = Path("diagnostic-results")
-NAMES = {"torch", "vllm", "pygobject"}
+NAMES = {"torch", "torchaudio", "torchvision", "sglang", "tilelang", "xgrammar"}
 
 
 def sha(data):
@@ -65,13 +65,16 @@ def snapshot(label):
 
 
 def validate(before, after):
-    require(before["records"] == after["records"], "engine/PyGObject versionbag or origin changed")
-    require(before["active"] == after["active"], "active engine/PyGObject metadata changed")
+    require(
+        before["records"] == after["records"],
+        "unchanged image package versionbag or origin changed",
+    )
+    require(before["active"] == after["active"], "active unchanged image package metadata changed")
 
 
 def runtime_pins(before):
     constraints = []
-    for name in ["torch", "vllm"]:
+    for name in sorted(NAMES):
         versions = {r["version"] for r in before["records"] if r["name"] == name}
         require(versions == {before["active"][name]["version"]}, "ambiguous engine versionbag")
         constraints.append(name + "==" + versions.pop())
@@ -81,6 +84,7 @@ def runtime_pins(before):
         raw = path.read_bytes()
         original.append({"path": str(path.resolve()), "sha256": sha(raw), "text": raw.decode()})
     (OUT / "original-constraints.json").write_text(json.dumps(original, indent=2) + "\n")
+    constraints += ["apache-tvm-ffi==0.1.12", "torch-c-dlpack-ext==0.1.5"]
     (OUT / "runtime-pins.txt").write_text("\n".join(constraints) + "\n")
 
 
@@ -104,6 +108,34 @@ def capture_generated(label):
     (OUT / ("generated-guards-" + label + ".json")).write_text(json.dumps(records, indent=2) + "\n")
 
 
+def repair_sources(label):
+    expected = json.loads(Path(__file__).with_name("repair-sources.json").read_text())
+    records = []
+    for name, repair in expected.items():
+        found = [
+            d
+            for d in metadata.distributions()
+            if re.sub(r"[-_.]+", "-", d.metadata["Name"]).lower() == name
+        ]
+        require(len(found) == 1 and found[0].version == repair["version"], "repair versionbag")
+        dist = metadata.distribution(name)
+        for filename, spec in repair["files"].items():
+            path = Path(dist.locate_file(filename))
+            raw = path.read_bytes()
+            require(
+                len(raw) == spec["bytes"] and sha(raw) == spec["sha256"], "installed repair source"
+            )
+            records.append(
+                {
+                    "package": name,
+                    "version": dist.version,
+                    "origin": str(path.resolve()),
+                    "sha256": sha(raw),
+                }
+            )
+    (OUT / ("repair-sources-" + label + ".json")).write_text(json.dumps(records, indent=2) + "\n")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=["before", "installed", "final"])
@@ -113,6 +145,14 @@ def main():
         runtime_pins(current)
     else:
         validate(json.loads((OUT / "origins-before.json").read_text()), current)
+        for record in json.loads((OUT / "original-constraints.json").read_text()):
+            require(
+                sha(Path(record["path"]).read_bytes()) == record["sha256"],
+                "image constraints changed",
+            )
+        require(metadata.version("apache-tvm-ffi") == "0.1.12", "FFI repair version")
+        require(metadata.version("torch-c-dlpack-ext") == "0.1.5", "addon requirement version")
+        repair_sources(args.mode)
         capture_generated(args.mode)
 
 

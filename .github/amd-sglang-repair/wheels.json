@@ -1,0 +1,14 @@
+[
+  {
+    "filename": "apache_tvm_ffi-0.1.12-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+    "url": "https://files.pythonhosted.org/packages/c8/2a/bff8d73841b49f196852edd8460241d3a363e6b0d64c3a9367542658394f/apache_tvm_ffi-0.1.12-cp312-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+    "archive_bytes": 2757612,
+    "archive_sha256": "817af52916ca9987e019ae9c811406835c7f26c590b2a7bcfa9db0e3809f4228"
+  },
+  {
+    "filename": "torch_c_dlpack_ext-0.1.5-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl",
+    "url": "https://files.pythonhosted.org/packages/e2/79/a914539b4785f3e44f891aa012a886edb8bc10fe081c440981c57543ce21/torch_c_dlpack_ext-0.1.5-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl",
+    "archive_bytes": 897846,
+    "archive_sha256": "e6f9da4bb9af70e27facc777458be62e10dbbbddda7672d16138db0553c5a524"
+  }
+]
