@@ -17,6 +17,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    ops::ControlFlow,
     sync::{
         atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering},
         Arc,
@@ -1571,6 +1572,175 @@ const ENGINE_INPUT_QUEUE_BYTES: usize = 32 << 20;
 /// hanging them.
 const MAX_CONSECUTIVE_DECODE_ERRORS: u32 = 3;
 
+/// The dispatcher's state between two arms of its loop ([`run_dispatcher`]):
+/// the client it serves and the run of undecodable outputs. Each arm of the
+/// loop is a method here, with the arm's statements in the arm's order; the
+/// loop joins them with the silence watchdog they re-arm.
+struct Dispatcher<P: EngineProtocol> {
+    inner: Arc<ClientInner<P>>,
+    /// Undecodable outputs in a row; a decoded batch starts the count over
+    /// (see [`MAX_CONSECUTIVE_DECODE_ERRORS`]).
+    consecutive_decode_errors: u32,
+}
+
+/// The silence watchdog's verdict at a tick ([`Dispatcher::watchdog_verdict`]).
+enum Verdict {
+    /// The engine is idle or its silence is explained: tick again at this
+    /// instant.
+    Keep(Instant),
+    /// A whole window of unexplained silence: the in-flight requests are
+    /// failed and the dispatcher ends.
+    Dead,
+}
+
+impl<P: EngineProtocol> Dispatcher<P> {
+    /// A busy period began. The engine has what is left of a window of
+    /// unexplained silence to answer in, past its prefill work in hand, not a
+    /// whole one: a tick that landed in the gap before this period waited a
+    /// whole window, and the sum of the periods before it must not be waited
+    /// out again. Returns the watchdog's next tick.
+    fn arm_window(&self, now: Instant) -> Instant {
+        self.inner.registry.lock().next_tick(now)
+    }
+
+    /// The engine sent something, a batch or bytes this client cannot read:
+    /// its silence ends at `now`. Returns the watchdog's next tick.
+    fn output_seen(&self, now: Instant) -> Instant {
+        let mut registry = self.inner.registry.lock();
+        registry.output_seen(now);
+        registry.next_tick(now)
+    }
+
+    /// Route a decoded batch: the rank's load and wave event to the client,
+    /// a utility reply to its caller, every output to its request's stream,
+    /// and the finished requests out of the registry and the rank's in-flight
+    /// set. Returns the watchdog's next tick, counted from the end of the
+    /// prefill work the batch left pending.
+    fn route_batch(&mut self, batch: EngineBatch<P::Output>) -> Instant {
+        self.consecutive_decode_errors = 0;
+        let inner = &self.inner;
+        inner.note_output();
+        if batch.outputs.is_empty() && batch.finished_request_ids.is_empty() && batch.load.is_some()
+        {
+            inner.steps_reported.store(true, Ordering::Relaxed);
+        }
+        if let Some(load) = batch.load {
+            inner.routing.lock().load.insert(batch.engine_index, load);
+        }
+        if let Some(event) = batch.wave {
+            inner.observe_wave(event, batch.engine_index);
+        }
+        // Unique finished ids: a terminal output and the out-of-band finished
+        // list may name the same request.
+        let mut finished: HashSet<String> = batch.finished_request_ids.into_iter().collect();
+        let mut registry = inner.registry.lock();
+        if let Some(reply) = batch.utility {
+            registry.resolve_utility(reply);
+        }
+        for output in batch.outputs {
+            if output.finished() {
+                finished.insert(output.request_id().to_string());
+            }
+            registry.route(output);
+        }
+        registry.remove_all(&finished);
+        // The work in hand is what the batch left pending; the watchdog counts
+        // from its end.
+        let now = Instant::now();
+        registry.work_resumes(now);
+        let next = registry.next_tick(now);
+        drop(registry);
+        inner.release(batch.engine_index, &finished);
+        next
+    }
+
+    /// The output loop reported an error. A transport failure or the dead
+    /// sentinel ends the client at once. A single undecodable output is
+    /// non-fatal; a run of [`MAX_CONSECUTIVE_DECODE_ERRORS`] means this client
+    /// cannot read the engine, so it fails the in-flight requests rather than
+    /// silently drop every output they wait for. `Break` once they are failed
+    /// and the dispatcher ends.
+    fn output_error(&mut self, error: Error) -> ControlFlow<()> {
+        if matches!(error, Error::EngineCoreDead | Error::Transport(_)) {
+            warn!(%error, "engine transport failed; failing all in-flight requests");
+            self.fail_all(error);
+            return ControlFlow::Break(());
+        }
+        self.consecutive_decode_errors += 1;
+        if self.consecutive_decode_errors >= MAX_CONSECUTIVE_DECODE_ERRORS {
+            warn!(
+                %error,
+                consecutive_decode_errors = self.consecutive_decode_errors,
+                "engine output undecodable repeatedly; failing all in-flight requests"
+            );
+            self.fail_all(error);
+            return ControlFlow::Break(());
+        }
+        warn!(%error, "ignoring undecodable engine output");
+        ControlFlow::Continue(())
+    }
+
+    /// A dropped stream's abort: retire the request here and forward the
+    /// abort to its engine. Queued, never awaited: the frame goes out in order
+    /// behind whatever the engine has not read yet, while the loop keeps
+    /// routing the output of every rank. The input writer reports a write
+    /// that failed.
+    fn forward_abort(&self, engine_id: EngineId, request_id: String) {
+        self.inner.registry.lock().remove_all([&request_id]);
+        self.inner.release_one(&engine_id, &request_id);
+        if let Err(error) = self.inner.queue_abort(&engine_id, &request_id) {
+            warn!(%error, %request_id, "failed to queue abort");
+        }
+    }
+
+    /// The watchdog's tick. The engine's unexplained silence is its in-flight
+    /// time since its last output, past the prefill work it was handed, over
+    /// the busy periods since. Short of a window it is a request still in its
+    /// first step (one registered just before this tick, say) or a prefill
+    /// still within its allowance; a whole window of it is a dead engine,
+    /// however many requests it was spread over and whether or not one is in
+    /// flight at this tick.
+    fn watchdog_verdict(&self, now: Instant) -> Verdict {
+        let mut registry = self.inner.registry.lock();
+        let window = registry.silence_window;
+        if registry.requests.is_empty() && registry.unanswered_before < window {
+            // Idle, the busy periods since the last output short of a window:
+            // silence is expected, keep waiting. The next busy period re-arms
+            // this tick for what is left of the window (`busy_started`), so a
+            // whole one here defers nothing.
+            return Verdict::Keep(now + window);
+        }
+        let unexplained = registry.unexplained_for(now);
+        if unexplained < window {
+            return Verdict::Keep(registry.next_tick(now));
+        }
+        self.inner.routing.lock().inflight.clear();
+        warn!(
+            prefill_pending_tokens = registry.prefill_pending_tokens(),
+            "no engine output through {unexplained:?} of in-flight requests past \
+             the prefill allowance for the prompt it was handed (the window: \
+             {window:?}); treating engine as dead"
+        );
+        registry.fail_all(Arc::new(Error::EngineCoreDead));
+        Verdict::Dead
+    }
+
+    /// The output stream ended: the output loop is gone, and with it every
+    /// answer the in-flight requests wait for.
+    fn stream_ended(&self) {
+        self.fail_all(Error::ClientClosed {
+            message: "engine output stream ended".to_string(),
+        });
+    }
+
+    /// Fail every in-flight request and pending utility call with `error`,
+    /// closing the registry, and forget the ranks' in-flight sets.
+    fn fail_all(&self, error: Error) {
+        self.inner.registry.lock().fail_all(Arc::new(error));
+        self.inner.routing.lock().inflight.clear();
+    }
+}
+
 /// Route decoded outputs to per-request streams and forward auto-abort requests
 /// to their engines. Runs until the output channel closes or the engine dies.
 async fn run_dispatcher<P: EngineProtocol>(
@@ -1578,7 +1748,6 @@ async fn run_dispatcher<P: EngineProtocol>(
     mut abort_rx: mpsc::UnboundedReceiver<(EngineId, String)>,
     inner: Arc<ClientInner<P>>,
 ) {
-    let mut consecutive_decode_errors = 0;
     // Positive-liveness watchdog: only output from the engine resets it. The
     // aborts this loop also handles are the client's own events and say
     // nothing about the engine; a steady trickle of them (a gateway retrying
@@ -1589,151 +1758,45 @@ async fn run_dispatcher<P: EngineProtocol>(
     };
     let watchdog = tokio::time::sleep_until(Instant::now() + window);
     tokio::pin!(watchdog);
+    let mut dispatcher = Dispatcher {
+        inner,
+        consecutive_decode_errors: 0,
+    };
     loop {
         tokio::select! {
             () = busy_started.notified() => {
-                // A busy period began. The engine has what is left of a window
-                // of unexplained silence to answer in, past its prefill work in
-                // hand, not a whole one: a tick that landed in the gap before
-                // this period waited a whole window, and the sum of the periods
-                // before it must not be waited out again.
-                let now = Instant::now();
-                let next = inner.registry.lock().next_tick(now);
+                let next = dispatcher.arm_window(Instant::now());
                 watchdog.as_mut().reset(next);
             }
             output = out_rx.recv() => {
-                if output.is_some() {
-                    let now = Instant::now();
-                    let mut registry = inner.registry.lock();
-                    registry.output_seen(now);
-                    watchdog.as_mut().reset(registry.next_tick(now));
-                }
+                let Some(output) = output else { break };
+                let next = dispatcher.output_seen(Instant::now());
+                watchdog.as_mut().reset(next);
                 match output {
-                    Some(Ok(batch)) => {
-                        consecutive_decode_errors = 0;
-                        inner.note_output();
-                        if batch.outputs.is_empty()
-                            && batch.finished_request_ids.is_empty()
-                            && batch.load.is_some()
-                        {
-                            inner.steps_reported.store(true, Ordering::Relaxed);
-                        }
-                        if let Some(load) = batch.load {
-                            inner.routing.lock().load.insert(batch.engine_index, load);
-                        }
-                        if let Some(event) = batch.wave {
-                            inner.observe_wave(event, batch.engine_index);
-                        }
-                        // Unique finished ids: a terminal output and the
-                        // out-of-band finished list may name the same request.
-                        let mut finished: HashSet<String> =
-                            batch.finished_request_ids.into_iter().collect();
-                        let mut registry = inner.registry.lock();
-                        if let Some(reply) = batch.utility {
-                            registry.resolve_utility(reply);
-                        }
-                        for output in batch.outputs {
-                            if output.finished() {
-                                finished.insert(output.request_id().to_string());
-                            }
-                            registry.route(output);
-                        }
-                        registry.remove_all(&finished);
-                        // The work in hand is what the batch left pending;
-                        // the watchdog counts from its end.
-                        let now = Instant::now();
-                        registry.work_resumes(now);
-                        let next = registry.next_tick(now);
-                        drop(registry);
+                    Ok(batch) => {
+                        let next = dispatcher.route_batch(batch);
                         watchdog.as_mut().reset(next);
-                        inner.release(batch.engine_index, &finished);
                     }
-                    Some(Err(error)) => {
-                        if matches!(error, Error::EngineCoreDead | Error::Transport(_)) {
-                            warn!(%error, "engine transport failed; failing all in-flight requests");
-                            inner.registry.lock().fail_all(Arc::new(error));
-                            inner.routing.lock().inflight.clear();
-                            return;
-                        }
-                        // A single decode error is non-fatal; a run of them means
-                        // this client cannot read the engine, so fail rather than
-                        // silently drop every output the requests are waiting for.
-                        consecutive_decode_errors += 1;
-                        if consecutive_decode_errors >= MAX_CONSECUTIVE_DECODE_ERRORS {
-                            warn!(
-                                %error,
-                                consecutive_decode_errors,
-                                "engine output undecodable repeatedly; failing all in-flight requests"
-                            );
-                            inner.registry.lock().fail_all(Arc::new(error));
-                            inner.routing.lock().inflight.clear();
-                            return;
-                        }
-                        warn!(%error, "ignoring undecodable engine output");
-                    }
-                    None => break,
+                    Err(error) => match dispatcher.output_error(error) {
+                        ControlFlow::Continue(()) => {}
+                        ControlFlow::Break(()) => return,
+                    },
                 }
             }
             abort = abort_rx.recv() => {
                 if let Some((engine_id, request_id)) = abort {
-                    inner.registry.lock().remove_all([&request_id]);
-                    inner.release_one(&engine_id, &request_id);
-                    // Queued, never awaited: the frame goes out in order behind
-                    // whatever the engine has not read yet, while this loop
-                    // keeps routing the output of every rank. The input writer
-                    // reports a write that failed.
-                    if let Err(error) = inner.queue_abort(&engine_id, &request_id) {
-                        warn!(%error, %request_id, "failed to queue abort");
-                    }
+                    dispatcher.forward_abort(engine_id, request_id);
                 }
             }
             () = &mut watchdog => {
-                let now = Instant::now();
-                let mut registry = inner.registry.lock();
-                let window = registry.silence_window;
-                if registry.requests.is_empty() && registry.unanswered_before < window {
-                    // Idle, the busy periods since the last output short of a
-                    // window: silence is expected, keep waiting. The next busy
-                    // period re-arms this tick for what is left of the window
-                    // (`busy_started`), so a whole one here defers nothing.
-                    drop(registry);
-                    watchdog.as_mut().reset(now + window);
-                    continue;
+                match dispatcher.watchdog_verdict(Instant::now()) {
+                    Verdict::Keep(next) => watchdog.as_mut().reset(next),
+                    Verdict::Dead => return,
                 }
-                // The engine's unexplained silence: its in-flight time since
-                // its last output, past the prefill work it was handed, over
-                // the busy periods since. Short of a window it is a request
-                // still in its first step (one registered just before this
-                // tick, say) or a prefill still within its allowance; a whole
-                // window of it is a dead engine, however many requests it was
-                // spread over and whether or not one is in flight at this
-                // tick.
-                let unexplained = registry.unexplained_for(now);
-                if unexplained < window {
-                    let next = registry.next_tick(now);
-                    drop(registry);
-                    watchdog.as_mut().reset(next);
-                    continue;
-                }
-                inner.routing.lock().inflight.clear();
-                warn!(
-                    prefill_pending_tokens = registry.prefill_pending_tokens(),
-                    "no engine output through {unexplained:?} of in-flight requests past \
-                     the prefill allowance for the prompt it was handed (the window: \
-                     {window:?}); treating engine as dead"
-                );
-                registry.fail_all(Arc::new(Error::EngineCoreDead));
-                return;
             }
         }
     }
-    inner
-        .registry
-        .lock()
-        .fail_all(Arc::new(Error::ClientClosed {
-            message: "engine output stream ended".to_string(),
-        }));
-    inner.routing.lock().inflight.clear();
+    dispatcher.stream_ended();
 }
 
 /// Admit frames to zeromq's local peer queue in FIFO order. Accepted frames
