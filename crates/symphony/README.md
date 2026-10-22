@@ -47,7 +47,7 @@ client that wants the raw text back can have it.
 ### The public types
 
 The surface is the crate root: the modules it declares public and the names it re-exports, which
-the gateway, the bindings and the tests build on (`tests/surface.rs` pins the list). The assemblers,
+the gateway, the bindings and the tests build on (`tests/parser/surface.rs` pins the list). The assemblers,
 the scanner and the token ledger are the engine's own.
 
 | Type or function | What it is |

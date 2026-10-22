@@ -33,13 +33,6 @@
 //! tokenization of each output. A subject joins the contract with one entry in [`FORMATS`], its
 //! constructor and its corpus.
 
-#[expect(
-    dead_code,
-    reason = "the integration tests share these helpers, and this one asks nothing of the fixture tree"
-)]
-mod common;
-
-use common::{bytes_of, chunkings, delta, prompt};
 use openai_protocol::common::{Function, Tool};
 use serde_json::json as value;
 use symphony::{
@@ -51,6 +44,11 @@ use symphony::{
     },
     CallSyntax, Declared, DropReason, Emits, Engine, EngineFinish, Event, Events, FinishReason,
     Format, Input, MalformedReason, ParseError, Parser, TokenSpan,
+};
+
+use crate::{
+    common,
+    common::{bytes_of, chunkings, delta, prompt},
 };
 
 /// A subject under test: how to make its parser, the outputs it is checked over, and the registry

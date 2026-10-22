@@ -25,24 +25,19 @@
 //! where the message shows the first twenty. A failure names the table, the variant, the seed and
 //! the output, so that it replays.
 
-#[expect(
-    dead_code,
-    reason = "the integration tests share these helpers, and this one takes the bytes of an event alone"
-)]
-mod common;
-
 use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use common::bytes_of;
 use openai_protocol::common::{Function, Tool};
 use serde_json::json as value;
 use symphony::{
     adapt, formats::Table, CallSyntax, Declared, DropReason, Engine, EngineFinish, Event, Events,
     FinishReason, Format, Input, MalformedReason, ParseError, Parser, TokenSpan,
 };
+
+use crate::{common, common::bytes_of};
 
 const CASES_ENV: &str = "SYMPHONY_SCRAMBLE_CASES";
 const SEED_ENV: &str = "SYMPHONY_SCRAMBLE_SEED";

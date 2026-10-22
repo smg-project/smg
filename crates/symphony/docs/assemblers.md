@@ -54,7 +54,7 @@ takes it. A value the outline ended and a strict reader does not take whole (a n
 object's brace stops, `"arguments": 12.}`) is said to be none by a `Malformed` event of no bytes
 before the call's end, as at the stream's end. The value reader (`json::arguments`) and the Mistral
 object reader (`json::named_arguments`) judge and say the same. The contract tests
-(`tests/contract.rs`) check both halves of the promise under every chunking: a fragment never takes
+(`tests/parser/contract.rs`) check both halves of the promise under every chunking: a fragment never takes
 a call's arguments past a prefix a strict reader accepts until the break is said, every fragment
 after it is the model's bytes as written, and a call that closed without a `Malformed` event has
 arguments a strict reader parses whole.

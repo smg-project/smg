@@ -16,7 +16,7 @@ use symphony::{
     shape::{Inferred, ValueRead},
 };
 
-const ROOT: &str = include_str!("../src/lib.rs");
+const ROOT: &str = include_str!("../../src/lib.rs");
 
 /// The modules the root declares public, in the root's order.
 const MODULES: [&str; 13] = [

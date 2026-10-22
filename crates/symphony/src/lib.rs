@@ -21,7 +21,7 @@
 //! table: the tables in [`formats`] are the families recorded so far, [`formats::for_model`] picks
 //! the one for a model id, and more follow. The crate's surface is this root: the modules it
 //! declares public and the names it re-exports, which the gateway, the bindings and the tests
-//! build on (`tests/surface.rs` pins the list). The assemblers, the scanner and the token ledger
+//! build on (`tests/parser/surface.rs` pins the list). The assemblers, the scanner and the token ledger
 //! are the engine's own.
 
 #![forbid(unsafe_code)]
