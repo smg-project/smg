@@ -3,6 +3,7 @@
 import json
 import os
 import uuid
+from enum import Enum
 from pathlib import Path
 
 
@@ -72,3 +73,28 @@ def nonnegative_int(value):
     if type(value) is not int or value < 0:
         raise ValueError("missing or invalid scheduler integer")
     return value
+
+
+def request_snapshot(request):
+    request_id = request.request_id
+    status = request.status
+    if not isinstance(request_id, str) or not request_id or not isinstance(status, Enum):
+        raise ValueError("missing scheduler request identity/status")
+    if type(request.abort_immediately) is not bool:
+        raise ValueError("missing cleanup-request flag")
+    return {
+        "request_id": request_id,
+        "status": status.name,
+        "abort_immediately": request.abort_immediately,
+        **{
+            key: nonnegative_int(getattr(request, key))
+            for key in (
+                "num_computed_tokens",
+                "num_output_tokens",
+                "num_prompt_tokens",
+                "num_output_placeholders",
+                "last_sched_seq",
+                "max_tokens",
+            )
+        },
+    }
