@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 from run_tests import Reports
+from runtime_identity import RuntimeIdentity
 
 TEST = ".github/amd-sglang-repair/native/test_sglang_native_controls.py"
 NAMES = [
@@ -20,7 +21,7 @@ def main():
     junit = out / "result.xml"
     result = pytest.main(
         ["--noconftest", TEST, "-p", "no:rerunfailures", "-s", "-vv", "--junitxml=" + str(junit)],
-        plugins=[reports],
+        plugins=[reports, RuntimeIdentity(out)],
     )
     reports.verify({"cases": [TEST + "::" + name for name in NAMES], "allowed_skips": {}}, junit)
     return int(result)
