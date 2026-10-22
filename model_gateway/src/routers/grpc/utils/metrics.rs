@@ -3,6 +3,7 @@
 use axum::response::Response;
 use http::StatusCode;
 
+use super::tonic_ext::CONSTRAINT_FAILED_CODE;
 use crate::{
     observability::metrics::metrics_labels,
     routers::{
@@ -74,8 +75,15 @@ const GATEWAY_REFUSAL_CODES: &[&str] = &[
 /// alike. The client's `error.type` is untouched: a 503 reads `server_error`
 /// as before.
 pub(crate) fn error_type_for_response(response: &Response) -> &'static str {
-    if GATEWAY_REFUSAL_CODES.contains(&extract_error_code_from_response(response)) {
+    let code = extract_error_code_from_response(response);
+    if GATEWAY_REFUSAL_CODES.contains(&code) {
         return metrics_labels::ERROR_UNAVAILABLE;
+    }
+    // The engine could not continue the request under its constraint: the
+    // request's outcome, counted on its own (see
+    // `TonicStatusExt::constraint_failure_response`).
+    if code == CONSTRAINT_FAILED_CODE {
+        return metrics_labels::ERROR_CONSTRAINT;
     }
     error_type_from_status(response.status())
 }
@@ -106,6 +114,24 @@ mod tests {
         ] {
             assert_eq!(error_type_from_status(status), error_type, "{status}");
         }
+    }
+
+    /// A worker's report that the engine could not continue the request under
+    /// its constraint counts as `constraint_error`, under the code the client
+    /// reads; a 422 of another making keeps the status's class.
+    #[test]
+    fn a_constraint_failure_counts_as_a_constraint_error() {
+        use smg_grpc_client::constraint_failed_status;
+
+        use crate::routers::{error, grpc::utils::tonic_ext::TonicStatusExt};
+
+        let response = constraint_failed_status("the scheduler aborted the request: Aborted")
+            .constraint_failure_response()
+            .expect("the report is answered");
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error_type_for_response(&response), "constraint_error");
+        let other = error::create_error(StatusCode::UNPROCESSABLE_ENTITY, "other", "other");
+        assert_eq!(error_type_for_response(&other), "internal_error");
     }
 
     /// A refusal the gateway answers on its own counts as `unavailable`,

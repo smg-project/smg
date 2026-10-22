@@ -86,34 +86,32 @@ fn deepseek_rejects_unsupported_thinking_and_effort() {
     }
 }
 
+/// A forced tool choice (a named function, `required`) validates in either
+/// thinking mode: a self-hosted engine serves the call after the model's
+/// thought, and the vendor's own API refuses the combination by itself where
+/// it does. `auto` and `none` validate as before.
 #[test]
-fn deepseek_forced_tools_require_non_thinking_mode() {
+fn deepseek_forced_tools_validate_in_either_thinking_mode() {
     for choice in [
         json!("required"),
         json!({"type": "function", "function": {"name": "weather"}}),
     ] {
-        for (mode, valid) in [
-            (json!({}), false),
-            (json!({"thinking": {"type": "enabled"}}), false),
-            (json!({"thinking": {"type": "disabled"}}), true),
-            (json!({"reasoning_effort": "none"}), true),
-            (json!({"reasoning_effort": "minimal"}), false),
-            (json!({"chat_template_kwargs": {"thinking": false}}), true),
-            (
-                json!({"chat_template_kwargs": {"enable_thinking": false}}),
-                true,
-            ),
-            (
-                json!({"chat_template_kwargs": {"reasoning_effort": "none"}}),
-                true,
-            ),
+        for mode in [
+            json!({}),
+            json!({"thinking": {"type": "enabled"}}),
+            json!({"thinking": {"type": "disabled"}}),
+            json!({"reasoning_effort": "none"}),
+            json!({"reasoning_effort": "minimal"}),
+            json!({"chat_template_kwargs": {"thinking": false}}),
+            json!({"chat_template_kwargs": {"enable_thinking": false}}),
+            json!({"chat_template_kwargs": {"reasoning_effort": "none"}}),
         ] {
             let mut extra = json!({"tools": [{"type": "function", "function": {"name": "weather", "parameters": {"type": "object", "properties": {}}}}], "tool_choice": choice});
             extra
                 .as_object_mut()
                 .unwrap()
                 .extend(mode.as_object().unwrap().clone());
-            assert_eq!(request(extra.clone()).validate().is_ok(), valid, "{extra}");
+            assert!(request(extra.clone()).validate().is_ok(), "{extra}");
         }
     }
     for choice in ["auto", "none"] {
@@ -171,15 +169,17 @@ fn deepseek_projects_one_thinking_decision_for_validation_and_rendering() {
     }
 }
 
+/// `allowed_tools` in `required` mode is a forced choice too, and validates in
+/// either thinking mode like the others.
 #[test]
-fn deepseek_required_allowed_tools_obeys_the_same_thinking_guard() {
+fn deepseek_required_allowed_tools_validate_in_either_thinking_mode() {
     for enabled in [true, false] {
         let req = request(json!({
             "thinking":{"type": if enabled {"enabled"} else {"disabled"}},
             "tools":[{"type":"function","function":{"name":"weather"}}],
             "tool_choice":{"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"weather"}]}
         }));
-        assert_eq!(req.validate().is_ok(), !enabled);
+        assert!(req.validate().is_ok(), "thinking enabled: {enabled}");
     }
 }
 
@@ -206,24 +206,98 @@ fn deepseek_rejects_ambiguous_template_thinking_overrides() {
 }
 
 #[test]
-fn deepseek_v41_preserves_native_xhigh_for_both_effort_fields() {
+fn deepseek_v41_preserves_native_medium_and_xhigh_for_both_effort_fields() {
     for model in [
         "deepseek-v4.1-flash",
         "deepseek-ai/DeepSeek-V4.1-Flash",
         "/models/DEEPSEEK-V4.1-FLASH",
         "deepseek-ai/DeepSeek-V4.1-Flash-1017",
     ] {
-        for extra in [
-            json!({"reasoning_effort":"xhigh"}),
-            json!({"thinking":{"effort":"xhigh"}}),
-        ] {
-            let mut extra = extra;
-            extra["model"] = json!(model);
-            let req = request(extra);
-            assert!(req.validate().is_ok());
-            assert_eq!(req.effective_reasoning_effort(), Some("xhigh"));
+        for effort in ["medium", "xhigh"] {
+            for extra in [
+                json!({"reasoning_effort": effort}),
+                json!({"thinking": {"effort": effort}}),
+            ] {
+                let mut extra = extra;
+                extra["model"] = json!(model);
+                let req = request(extra);
+                assert!(req.validate().is_ok(), "{model} {effort}");
+                assert_eq!(req.effective_reasoning_effort(), Some(effort), "{model}");
+            }
         }
     }
+}
+
+#[test]
+fn deepseek_v41_reads_a_template_kwarg_medium_as_a_level_of_its_own() {
+    // A `medium` template kwarg switches thinking on under V4.1 like its
+    // other levels; under V4 it stays an alias with no opinion on the mode,
+    // so the typed toggle decides.
+    for (model, enabled) in [
+        ("deepseek-ai/DeepSeek-V4.1-Flash", true),
+        ("deepseek-v4-pro", false),
+    ] {
+        let req = request(json!({
+            "model": model,
+            "thinking": {"type": "disabled"},
+            "chat_template_kwargs": {"reasoning_effort": "medium"},
+        }));
+        assert!(req.validate().is_ok(), "{model}");
+        assert_eq!(
+            req.chat_template_kwargs
+                .as_ref()
+                .and_then(|kwargs| kwargs.get("thinking")),
+            Some(&json!(enabled)),
+            "{model}"
+        );
+    }
+}
+
+#[test]
+fn deepseek_v41_forwards_the_vendors_reading_of_medium_to_an_upstream_renderer() {
+    // The gateway's own renderer takes V4.1's `medium` as the template's
+    // level; an upstream that renders itself gets the vendor's alias, `high`,
+    // in both top-level spellings.
+    let mut req = request(json!({
+        "model": "deepseek-v4.1-flash",
+        "reasoning_effort": "medium",
+        "thinking": {"effort": "medium"},
+    }));
+    assert_eq!(req.effective_reasoning_effort(), Some("medium"));
+    ProviderProfile::DeepSeek.normalize_chat_for_upstream(&mut req);
+    assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(
+        req.thinking
+            .as_ref()
+            .and_then(|thinking| thinking.effort.as_deref()),
+        Some("high")
+    );
+
+    // `xhigh` and a template kwarg go out as sent.
+    let mut req = request(json!({
+        "model": "deepseek-v4.1-flash",
+        "reasoning_effort": "xhigh",
+        "chat_template_kwargs": {"reasoning_effort": "medium"},
+    }));
+    ProviderProfile::DeepSeek.normalize_chat_for_upstream(&mut req);
+    assert_eq!(req.reasoning_effort.as_deref(), Some("xhigh"));
+    assert_eq!(
+        req.chat_template_kwargs
+            .as_ref()
+            .and_then(|kwargs| kwargs.get("reasoning_effort")),
+        Some(&json!("medium"))
+    );
+
+    // V4 aliased `medium` at normalization already; nothing more happens.
+    let mut req = request(json!({"model": "deepseek-v4-pro", "reasoning_effort": "medium"}));
+    assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
+    ProviderProfile::DeepSeek.normalize_chat_for_upstream(&mut req);
+    assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
+
+    // Another vendor's profile forwards the field as sent.
+    let mut req = request(json!({"model": "gpt-4o", "reasoning_effort": "medium"}));
+    ProviderProfile::for_model(&req.model).normalize_chat_for_upstream(&mut req);
+    assert_eq!(req.reasoning_effort.as_deref(), Some("medium"));
 }
 
 #[test]

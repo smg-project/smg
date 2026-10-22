@@ -45,8 +45,7 @@
 //! so its workers are new instances at the same addresses.
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
-    net::Ipv6Addr,
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -57,17 +56,17 @@ use async_trait::async_trait;
 use openai_protocol::worker::WorkerType;
 use serde::Deserialize;
 use tokio::{process::Command, task, time};
-use tracing::{info, warn};
+use tracing::info;
 
 use super::{
-    provider::{DiscoveredWorker, DiscoveryKind},
+    provider::{endpoint_at, DiscoveredWorker, DiscoveryKind},
     reconciler::DesiredState,
-    snapshot::{LastGood, SnapshotError},
+    snapshot::{LastGood, Skip, SkipLog, SnapshotError},
 };
 use crate::{
     app_context::AppContext,
     config::{ConfigError, ConfigResult, RoutingMode, SlurmDiscoveryConfig},
-    observability::metrics::{metrics_labels, Metrics},
+    observability::metrics::metrics_labels,
     worker::{endpoint::Endpoint, EndpointKey},
 };
 
@@ -266,14 +265,6 @@ struct PollOutcome {
     skipped: Vec<Skip>,
 }
 
-/// A job, or an address, a poll left out of an answer it otherwise applied.
-#[derive(Debug, Clone, PartialEq)]
-struct Skip {
-    /// The `reason` of `smg_discovery_skipped_total`.
-    reason: &'static str,
-    message: String,
-}
-
 impl Skip {
     fn job(job: &Job, why: impl std::fmt::Display) -> Self {
         Self {
@@ -437,12 +428,7 @@ fn node_endpoint(node: &Node, port: u16) -> Result<Endpoint, String> {
         .into_iter()
         .find(|host| !host.is_empty())
         .ok_or_else(|| format!("node {} has no address", node.name))?;
-    let authority = if host.parse::<Ipv6Addr>().is_ok() {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    };
-    Endpoint::parse(&authority).map_err(|error| {
+    endpoint_at(host, port).map_err(|error| {
         format!(
             "node {} has an address no worker can be reached at ({host}): {error}",
             node.name
@@ -829,8 +815,7 @@ struct SlurmDiscovery {
     app_context: Arc<AppContext>,
     client: Box<dyn SlurmClient>,
     last_good: LastGood,
-    /// What the last poll left out, so a skip that lasts is logged once.
-    skipped: HashSet<String>,
+    skipped: SkipLog,
 }
 
 impl SlurmDiscovery {
@@ -844,7 +829,7 @@ impl SlurmDiscovery {
             app_context,
             client,
             last_good: LastGood::new(DiscoveryKind::Slurm, "Slurm".to_string(), "job list"),
-            skipped: HashSet::new(),
+            skipped: SkipLog::new(DiscoveryKind::Slurm, "Slurm discovery"),
         }
     }
 
@@ -868,18 +853,7 @@ impl SlurmDiscovery {
         let read = poll(self.client.as_ref(), &self.config)
             .await
             .map(|outcome| {
-                let mut skipped = HashSet::new();
-                for skip in outcome.skipped {
-                    Metrics::record_discovery_skip(
-                        DiscoveryKind::Slurm.metric_label(),
-                        skip.reason,
-                    );
-                    if !self.skipped.contains(&skip.message) {
-                        warn!("Slurm discovery left out {}", skip.message);
-                    }
-                    skipped.insert(skip.message);
-                }
-                self.skipped = skipped;
+                self.skipped.record(outcome.skipped);
                 DesiredState::from_workers(outcome.workers)
             });
         self.last_good.update(read);

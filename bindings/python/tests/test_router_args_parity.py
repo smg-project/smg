@@ -25,9 +25,9 @@ PREFILL_DECODE = RouterArgs(
     prefill_urls=[("http://prefill:8000", None)],
     decode_urls=["http://decode:8000"],
 )
-# The file and Slurm providers are the cases where the launcher builds the
-# keyword-only ``discovery`` mapping; Kubernetes passes ``service_discovery``
-# and the selectors instead.
+# The file, Slurm and Consul providers are the cases where the launcher builds
+# the keyword-only ``discovery`` mapping; Kubernetes passes
+# ``service_discovery`` and the selectors instead.
 FILE_DISCOVERY = RouterArgs(
     worker_urls=[],
     discovery_provider="file",
@@ -39,6 +39,13 @@ SLURM_DISCOVERY = RouterArgs(
     discovery_provider="slurm",
     slurm_job_name=["smg-worker"],
     slurm_port=8000,
+    discovery_check_interval_secs=5,
+)
+CONSUL_DISCOVERY = RouterArgs(
+    worker_urls=[],
+    discovery_provider="consul",
+    consul_service="smg-worker",
+    consul_address="http://consul.internal:8500",
     discovery_check_interval_secs=5,
 )
 
@@ -56,8 +63,8 @@ def keywords_from_args(args: RouterArgs) -> set[str]:
 
 @pytest.mark.parametrize(
     "args",
-    [REGULAR, FILE_DISCOVERY, SLURM_DISCOVERY],
-    ids=["regular", "file-discovery", "slurm-discovery"],
+    [REGULAR, FILE_DISCOVERY, SLURM_DISCOVERY, CONSUL_DISCOVERY],
+    ids=["regular", "file-discovery", "slurm-discovery", "consul-discovery"],
 )
 def test_every_keyword_the_launcher_passes_is_a_constructor_parameter(args: RouterArgs):
     unknown = keywords_from_args(args) - constructor_parameters()
@@ -75,11 +82,11 @@ def test_every_constructor_parameter_is_set_by_the_launcher():
 
 @pytest.mark.parametrize(
     "args",
-    [REGULAR, PREFILL_DECODE, FILE_DISCOVERY, SLURM_DISCOVERY],
-    ids=["regular", "prefill-decode", "file-discovery", "slurm-discovery"],
+    [REGULAR, PREFILL_DECODE, FILE_DISCOVERY, SLURM_DISCOVERY, CONSUL_DISCOVERY],
+    ids=["regular", "prefill-decode", "file-discovery", "slurm-discovery", "consul-discovery"],
 )
 def test_the_launcher_builds_the_real_router(args: RouterArgs):
-    # The constructor only keeps the configuration (the file and Slurm
-    # providers' mappings are parsed, no file read and no command run); nothing
-    # is bound.
+    # The constructor only keeps the configuration (the file, Slurm and Consul
+    # providers' mappings are parsed, no file read, no command run and no
+    # request sent); nothing is bound.
     assert Router.from_args(args) is not None

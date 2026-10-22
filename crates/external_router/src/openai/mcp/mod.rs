@@ -3,6 +3,8 @@
 //! Contains tool loop orchestration and streaming tool call handling,
 //! extracted from `responses/` for separation of concerns.
 
+#[cfg(test)]
+pub(crate) mod test_support;
 mod tool_handler;
 mod tool_loop;
 

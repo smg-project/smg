@@ -392,7 +392,8 @@ fn parse<T: std::str::FromStr>(raw: String, flag: &str) -> Result<T, String> {
         .map_err(|_| format!("invalid value for {flag}: {raw}"))
 }
 
-fn usage() -> String {
+/// The flags, as `--help` prints them.
+pub fn usage() -> String {
     "mock-worker — multi-port mock HTTP/gRPC inference workers for SMG scale testing\n\n\
      Flags:\n\
        --host <addr>            bind address (default 127.0.0.1)\n\

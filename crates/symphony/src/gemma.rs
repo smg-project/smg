@@ -23,7 +23,9 @@
 //! piece's end, so a trailing start of it is held until the next bytes say. Every byte lands in one
 //! event: the `call:NAME{` header is the start's source, each fragment's bytes its own, the closing
 //! marker the end's. Text after the object closed and before the marker, which the template never
-//! writes, is reported; a header that is not `call:NAME{` is reported and no call starts.
+//! writes, is reported word by word with the model's whitespace between the words, the whitespace
+//! right after the object and before the marker being the template's; a header that is not
+//! `call:NAME{` is reported and no call starts.
 //!
 //! A member is written from its value's first byte: its key and colon are held until a value is
 //! there, since the template writes a member as a key, a colon and a value, never one without a
@@ -41,7 +43,7 @@
 //! [`formats::gemma4`]: crate::formats::gemma4()
 
 use crate::{
-    event::{runs, DropReason, Event, Events, MalformedReason, Text},
+    event::{release_between, runs, DropReason, Event, Events, MalformedReason, Text},
     json::PartialJson,
     tagged::assembler::{push_escaped, push_quoted},
 };
@@ -116,6 +118,11 @@ pub(crate) struct Assembler {
     skipping: Option<Skipped>,
     started: bool,
     done: bool,
+    /// Whether text after the arguments object was released as content: the whitespace after it
+    /// is the model's, between two pieces of its text, and leaves with the next piece
+    /// ([`release_between`]); before any, the whitespace after the object is the template's
+    /// spacing before the marker, dropped as it arrives.
+    released: bool,
     /// The template's string token and null word.
     spelling: Spelling,
 }
@@ -170,6 +177,7 @@ impl Assembler {
             skipping: None,
             started: false,
             done: false,
+            released: false,
             spelling,
         }
     }
@@ -192,7 +200,7 @@ impl Assembler {
                 Stage::Text => self.text(rest, out),
                 Stage::AfterValue => self.after_value(rest, out),
                 Stage::Refused => refused(rest, out),
-                Stage::Closed => after_the_object(rest, out),
+                Stage::Closed => self.after_the_object(rest, out),
             };
             if taken == 0 && self.stage == stage {
                 // What is left is held: a header, key or bare value still arriving, a start of
@@ -244,7 +252,14 @@ impl Assembler {
         self.end_skipped(out);
         let string_open = self.started && self.stage == Stage::Text;
         let held = self.take_held();
-        if !held.is_empty() || string_open {
+        if self.stage == Stage::Closed && !held.is_empty() {
+            // The whitespace held after the object: the template's, before a marker that never
+            // came.
+            out.push(Event::Dropped {
+                text: Text::uncounted(held),
+                why: DropReason::Wrapper,
+            });
+        } else if !held.is_empty() || string_open {
             out.push(Event::Malformed {
                 text: Text::uncounted(held),
                 why: MalformedReason::UnterminatedRegion,
@@ -658,6 +673,41 @@ impl Assembler {
         self.stage = Stage::Closed;
     }
 
+    /// Text after the arguments closed, before the call's end. Whitespace right after the object
+    /// is the template's spacing and is dropped as it arrives; a word is reported, with the
+    /// whitespace before it once a word was reported already, since that whitespace is the
+    /// model's, between two pieces of its text ([`release_between`]); the whitespace after the
+    /// last word is held, the next word's if one comes and the template's spacing before the
+    /// marker otherwise, which the end drops. The same text however the bytes are cut.
+    fn after_the_object(&mut self, text: &str, out: &mut Events) -> usize {
+        let kept = text.trim_end().len();
+        if kept == 0 {
+            if self.released {
+                return 0;
+            }
+            out.push(Event::Dropped {
+                text: Text::uncounted(text.to_owned()),
+                why: DropReason::Wrapper,
+            });
+            return text.len();
+        }
+        let mut before = String::new();
+        for (run, space) in runs(&text[..kept]) {
+            if space {
+                before.push_str(run);
+            } else {
+                release_between(
+                    &mut before,
+                    &mut self.released,
+                    run.to_owned().into(),
+                    MalformedReason::TextAfterTheArguments,
+                    out,
+                );
+            }
+        }
+        kept
+    }
+
     /// A fragment of the arguments; inside a skipped member, its bytes as `Malformed` with the
     /// member's reason instead, since nothing of that member is written.
     fn push_fragment<'d>(&self, json: String, source: Text<'d>, out: &mut Events<'d>) {
@@ -686,25 +736,6 @@ fn refused(text: &str, out: &mut Events) -> usize {
         out.push(Event::Malformed {
             text: Text::uncounted(text.to_owned()),
             why: MalformedReason::InvalidArguments,
-        });
-    }
-    text.len()
-}
-
-/// Text after the arguments closed, run by run: whitespace is dropped as the template's wrapping,
-/// anything else reported, so the events are the same however the bytes are cut.
-fn after_the_object(text: &str, out: &mut Events) -> usize {
-    for (run, space) in runs(text) {
-        out.push(if space {
-            Event::Dropped {
-                text: Text::uncounted(run.to_owned()),
-                why: DropReason::Wrapper,
-            }
-        } else {
-            Event::Malformed {
-                text: Text::uncounted(run.to_owned()),
-                why: MalformedReason::TextAfterTheArguments,
-            }
         });
     }
     text.len()
@@ -1466,6 +1497,72 @@ mod tests {
             )));
             assert_eq!(bytes(&tail), format!("call:f{{x:1}} trailing{CLOSE}"));
         }
+    }
+
+    /// Several words after the object: the space right after the object is the template's and
+    /// is dropped, the words keep the spaces between them (one event per word, the space before
+    /// it in the event), the space before the marker is the template's again; the same text
+    /// however the bytes are cut, and at a stream's end the held space is wrapping, not a cut.
+    #[test]
+    fn text_after_the_object_keeps_the_models_whitespace_between_its_words() {
+        let text = "call:f{x:1} please note this and that ";
+        let words = |events: &[Event]| -> Vec<(String, MalformedReason)> { malformed(events) };
+        let dropped = |events: &[Event]| -> Vec<String> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Dropped {
+                        text,
+                        why: DropReason::Wrapper,
+                    } => Some(text.text.to_string()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let expected: Vec<(String, MalformedReason)> =
+            ["please", " note", " this", " and", " that"]
+                .into_iter()
+                .map(|word| (word.to_string(), MalformedReason::TextAfterTheArguments))
+                .collect();
+        let whole = run(&[text], false);
+        assert_eq!(bytes(&whole), format!("{text}{CLOSE}"));
+        assert_eq!(arguments(&whole), r#"{"x": 1}"#);
+        assert_eq!(words(&whole), expected);
+        assert_eq!(dropped(&whole), [" ", " "]);
+        for cut in 1..text.len() {
+            let events = run(&[&text[..cut], &text[cut..]], false);
+            assert_eq!(bytes(&events), format!("{text}{CLOSE}"), "cut at {cut}");
+            assert_eq!(
+                words(&events)
+                    .iter()
+                    .map(|(word, _)| word.as_str())
+                    .collect::<String>(),
+                "please note this and that",
+                "cut at {cut}"
+            );
+            assert_eq!(dropped(&events), [" ", " "], "cut at {cut}");
+        }
+        let pieces: Vec<String> = text.chars().map(String::from).collect();
+        let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+        let events = run(&refs, false);
+        assert_eq!(bytes(&events), format!("{text}{CLOSE}"));
+        assert_eq!(dropped(&events), [" ", " "]);
+        assert_eq!(
+            words(&events)
+                .iter()
+                .map(|(word, _)| word.as_str())
+                .collect::<String>(),
+            "please note this and that"
+        );
+        // The stream cut after the prose: the held space is the template's, nothing is reported
+        // as cut, and the call still ends.
+        let events = run(&["call:f{x:1} please note "], true);
+        assert_eq!(bytes(&events), "call:f{x:1} please note ");
+        assert_eq!(words(&events), expected[..2].to_vec());
+        assert_eq!(dropped(&events), [" ", " "]);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, Event::ToolCallEnd { .. })));
     }
 
     #[test]

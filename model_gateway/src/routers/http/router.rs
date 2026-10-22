@@ -2122,8 +2122,13 @@ impl RouterTrait for Router {
         body: ChatCompletionRequest,
         model_id: &str,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
-            .await
+        self.route_typed_request(
+            headers,
+            super::chat_for_upstream(body),
+            "/v1/chat/completions",
+            model_id,
+        )
+        .await
     }
 
     async fn route_messages(

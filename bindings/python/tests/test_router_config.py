@@ -497,6 +497,20 @@ class TestDiscoveryMapping:
         with pytest.raises(ValueError, match="port"):
             _Router(worker_urls=[], discovery={"provider": "slurm", "job_names": ["w"]})
 
+    def test_consul_mapping_is_accepted(self):
+        _Router(
+            worker_urls=[],
+            discovery={
+                "provider": "consul",
+                "service": "smg-worker",
+                "address": "http://consul.internal:8500",
+            },
+        )
+
+    def test_consul_mapping_needs_a_service(self):
+        with pytest.raises(ValueError, match="service"):
+            _Router(worker_urls=[], discovery={"provider": "consul"})
+
     def test_mapping_and_service_discovery_conflict(self):
         with pytest.raises(ValueError, match="not both"):
             _Router(

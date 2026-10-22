@@ -6,6 +6,7 @@ use std::{error::Error, sync::Arc, time::Duration};
 use tokio::task;
 
 use super::{
+    consul::{self, ConsulProviderConfig},
     file::{self, FileProviderConfig},
     kubernetes::{self, ModelIdSource, ServiceDiscoveryConfig},
     slurm::{self, SlurmProviderConfig},
@@ -20,14 +21,11 @@ use crate::{
 /// `Option<RuntimeDiscoveryConfig>` is on versus off; a variant carries no
 /// `enabled` flag of its own.
 #[derive(Debug, Clone)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "one per router, built at startup; boxing the Kubernetes variant would complicate every construction and match to save a few hundred bytes"
-)]
 pub enum RuntimeDiscoveryConfig {
     Kubernetes(ServiceDiscoveryConfig),
     File(FileProviderConfig),
     Slurm(SlurmProviderConfig),
+    Consul(ConsulProviderConfig),
 }
 
 impl RuntimeDiscoveryConfig {
@@ -50,6 +48,9 @@ impl RuntimeDiscoveryConfig {
             )?)),
             DiscoveryConfig::Slurm(slurm) => {
                 Ok(Self::Slurm(SlurmProviderConfig::new(slurm, mode)?))
+            }
+            DiscoveryConfig::Consul(consul) => {
+                Ok(Self::Consul(ConsulProviderConfig::new(consul, mode)?))
             }
         }
     }
@@ -103,6 +104,9 @@ pub async fn start_service_discovery(
         RuntimeDiscoveryConfig::File(config) => Ok(file::start_file_discovery(config, app_context)),
         RuntimeDiscoveryConfig::Slurm(config) => {
             Ok(slurm::start_slurm_discovery(config, app_context))
+        }
+        RuntimeDiscoveryConfig::Consul(config) => {
+            Ok(consul::start_consul_discovery(config, app_context)?)
         }
     }
 }
@@ -220,6 +224,22 @@ mod tests {
             RuntimeDiscoveryConfig::from_config(&config, &regular())
         else {
             panic!("expected Slurm runtime discovery");
+        };
+        assert_eq!(runtime.check_interval, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn consul_settings_reach_the_runtime() {
+        let config = DiscoveryConfig::Consul(crate::config::ConsulDiscoveryConfig {
+            service: "smg-worker".to_string(),
+            address: Some("http://consul.internal:8500".to_string()),
+            datacenter: Some("dc2".to_string()),
+            check_interval_secs: 10,
+        });
+        let Ok(RuntimeDiscoveryConfig::Consul(runtime)) =
+            RuntimeDiscoveryConfig::from_config(&config, &regular())
+        else {
+            panic!("expected Consul runtime discovery");
         };
         assert_eq!(runtime.check_interval, Duration::from_secs(10));
     }

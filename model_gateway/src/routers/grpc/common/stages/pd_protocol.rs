@@ -40,17 +40,15 @@ pub(crate) enum PdRendezvous {
     None,
 }
 
-/// How a disaggregated engine learns each side's data-parallel placement.
+/// How DP placement constrains rendezvous construction; requests also carry rank pins.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DpPlacement {
     /// The engine honors the per-request `data_parallel_rank` pin field, set
     /// on each side from its selected dp-aware virtual worker.
     PinField,
-    /// The engine dispatches both sides by `bootstrap_room % dp_size` and
-    /// ignores the pin field (TokenSpeed — a mismatched decode-side pin spams
-    /// conflict warnings there). The rendezvous room is minted congruent to
-    /// the prefill worker's rank, so the room residue, not the pin, is the
-    /// placement carrier.
+    /// The room encodes the prefill rank so TokenSpeed's decode receiver can
+    /// locate its KV source. Each request also carries its selected rank pin;
+    /// TokenSpeed must support PD pins to honor independent decode placement.
     RoomResidue,
 }
 

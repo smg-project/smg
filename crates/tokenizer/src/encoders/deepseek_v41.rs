@@ -74,8 +74,10 @@ const DSML_TAGS: DsmlTags = DsmlTags {
 // ---------------------------------------------------------------------------
 // Reasoning effort
 // ---------------------------------------------------------------------------
-/// The effort names the Python encoder accepts (`REASONING_EFFORT_MAPPINGS`).
-pub const NATIVE_EFFORT_VALUES: &[&str] = &["low", "high", "xhigh", "max"];
+/// The effort names the renderer takes as levels: the checkpoint's chat
+/// template's (`low`/`medium`/`high`/`max`) and the `xhigh` of its first
+/// published encoder (`REASONING_EFFORT_MAPPINGS`).
+pub const NATIVE_EFFORT_VALUES: &[&str] = &["low", "medium", "high", "xhigh", "max"];
 
 /// What this renderer answers around a render (see [`RendererProfile`]).
 pub(crate) const PROFILE: RendererProfile = RendererProfile {
@@ -118,14 +120,16 @@ const DEFAULT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
 /// The first published encoder mapped low/high/xhigh/max to 25/50/75/100.
 /// The refresh that followed maps low/high/max to 50/75/100 and has no
 /// `xhigh`; the chat template the checkpoint ships since carries the same
-/// numbers. A checkpoint directory without its encoder (a tokenizer
-/// directory streamed from a worker carries none) gets the rescaled table,
-/// the one the checkpoint carries today.
+/// numbers and a `medium` of its own at 62. A checkpoint directory without
+/// its encoder (a tokenizer directory streamed from a worker carries none)
+/// gets the rescaled table, the one the checkpoint carries today.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum EffortTable {
-    /// low 25, high 50, xhigh 75, max 100.
+    /// low 25, high 50, xhigh 75, max 100; `medium`, which this encoder
+    /// has no budget for, renders `high`'s.
     Original,
-    /// low 50, high 75, max 100; `xhigh` renders `high`'s budget.
+    /// low 50, medium 62, high 75, max 100 (the chat template's numbers);
+    /// `xhigh` renders `high`'s budget.
     #[default]
     Rescaled,
 }
@@ -137,9 +141,10 @@ impl EffortTable {
             (_, ReasoningEffort::Budget(budget)) => budget,
             (_, ReasoningEffort::Max) => 100,
             (Self::Original, ReasoningEffort::Low) => 25,
-            (Self::Original, ReasoningEffort::High) => 50,
+            (Self::Original, ReasoningEffort::Medium | ReasoningEffort::High) => 50,
             (Self::Original, ReasoningEffort::XHigh) => 75,
             (Self::Rescaled, ReasoningEffort::Low) => 50,
+            (Self::Rescaled, ReasoningEffort::Medium) => 62,
             (Self::Rescaled, ReasoningEffort::High | ReasoningEffort::XHigh) => 75,
         }
     }
@@ -178,6 +183,7 @@ impl EffortTable {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReasoningEffort {
     Low,
+    Medium,
     High,
     XHigh,
     Max,
@@ -190,6 +196,7 @@ impl ReasoningEffort {
     fn from_native(value: &str) -> Option<Self> {
         match value {
             "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
             "xhigh" => Some(Self::XHigh),
             "max" => Some(Self::Max),
@@ -200,7 +207,7 @@ impl ReasoningEffort {
 
 /// Parse the request's `reasoning_effort` field.
 ///
-/// `None` = not present. Strings low/high/xhigh/max, integers 1..=100. The
+/// `None` = not present. Strings low/medium/high/xhigh/max, integers 1..=100. The
 /// thinking switch (`"none"`/`"minimal"`, see
 /// `openai_protocol::chat::thinking_from_reasoning_effort`) is handled by the
 /// caller — those mean "thinking off", not an effort level — so they land here
@@ -784,13 +791,16 @@ mod tests {
     #[test]
     fn effort_tiers_follow_the_checkpoints_table() {
         // The first published encoder's table and the rescaled one the
-        // checkpoint carries since (its chat template agrees); an integer
-        // budget renders as given under both.
+        // checkpoint carries since (its chat template agrees, and adds
+        // `medium` at 62; the first encoder has no `medium`, so it renders
+        // `high`'s budget there); an integer budget renders as given under
+        // both.
         for (table, tiers) in [
             (
                 EffortTable::Original,
                 [
                     (ReasoningEffort::Low, 25),
+                    (ReasoningEffort::Medium, 50),
                     (ReasoningEffort::High, 50),
                     (ReasoningEffort::XHigh, 75),
                     (ReasoningEffort::Max, 100),
@@ -801,6 +811,7 @@ mod tests {
                 EffortTable::Rescaled,
                 [
                     (ReasoningEffort::Low, 50),
+                    (ReasoningEffort::Medium, 62),
                     (ReasoningEffort::High, 75),
                     (ReasoningEffort::XHigh, 75),
                     (ReasoningEffort::Max, 100),
@@ -858,11 +869,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_effort_rejects_minimal_medium_floats_and_out_of_range() {
+    fn parse_effort_rejects_minimal_none_floats_and_out_of_range() {
         for bad in [
             json!("minimal"),
-            json!("medium"),
             json!("none"),
+            json!("turbo"),
             json!(0),
             json!(101),
             json!(1.5),
@@ -874,6 +885,11 @@ mod tests {
         assert_eq!(
             parse_reasoning_effort(&json!("xhigh")).unwrap(),
             Some(ReasoningEffort::XHigh)
+        );
+        // The chat template's own level.
+        assert_eq!(
+            parse_reasoning_effort(&json!("medium")).unwrap(),
+            Some(ReasoningEffort::Medium)
         );
         assert_eq!(
             parse_reasoning_effort(&json!(7)).unwrap(),

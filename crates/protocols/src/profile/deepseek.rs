@@ -5,13 +5,17 @@
 //! Older V3/R1 models and opaque aliases retain the baseline. This profile
 //! does not claim the vendor's context window, sampling behavior or JSON
 //! constraints for a self-hosted worker, nor enforce documented history and
-//! identifier restrictions the official API did not enforce in calibration.
+//! identifier restrictions the official API did not enforce in calibration,
+//! nor the vendor's refusal of a forced tool choice while thinking is on: a
+//! self-hosted engine serves that call (the gateway shapes the call's grammar
+//! for where the engine starts it, after the thought or around it), and the
+//! vendor's own API refuses it by itself where it still does.
 
 use serde_json::Value;
 
 use crate::{
     chat::{ChatCompletionRequest, ThinkingType},
-    common::{invalid, ToolChoice},
+    common::invalid,
 };
 
 const V41_MODELS: [&str; 2] = ["deepseek-v4.1-flash", "deepseek-v4.1-flash-1017"];
@@ -31,9 +35,20 @@ fn is_v41_model(model: &str) -> bool {
     })
 }
 
-pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
-    let is_v41 = is_v41_model(&req.model);
-    for effort in [
+/// The effort names the vendor's API documents as aliases of its levels:
+/// `minimal` means `low`; `medium` and `xhigh` mean `high`.
+fn vendor_alias(effort: &str) -> Option<&'static str> {
+    match effort {
+        "minimal" => Some("low"),
+        "medium" | "xhigh" => Some("high"),
+        _ => None,
+    }
+}
+
+/// The request's effort spellings, the top-level field and `thinking.effort`,
+/// whichever are present.
+fn effort_fields(req: &mut ChatCompletionRequest) -> impl Iterator<Item = &mut String> {
+    [
         req.reasoning_effort.as_mut(),
         req.thinking
             .as_mut()
@@ -41,13 +56,18 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
     ]
     .into_iter()
     .flatten()
-    {
-        match effort.as_str() {
-            "minimal" => *effort = "low".into(),
-            "medium" => *effort = "high".into(),
-            // V4.1 accepts xhigh natively (its renderer gives it a budget).
-            "xhigh" if !is_v41 => *effort = "high".into(),
-            _ => {}
+}
+
+pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
+    let is_v41 = is_v41_model(&req.model);
+    for effort in effort_fields(req) {
+        // V4.1 accepts medium and xhigh natively (its renderer gives each
+        // the budget of the checkpoint's own table).
+        if is_v41 && matches!(effort.as_str(), "medium" | "xhigh") {
+            continue;
+        }
+        if let Some(level) = vendor_alias(effort) {
+            *effort = level.into();
         }
     }
     // Native V4 and V4.1 renderers have different defaults and effort
@@ -57,6 +77,22 @@ pub(super) fn normalize_chat(req: &mut ChatCompletionRequest) {
     let kwargs = req.chat_template_kwargs.get_or_insert_default();
     if kwargs.get("thinking").is_none_or(Value::is_null) {
         kwargs.insert("thinking".into(), Value::Bool(enabled));
+    }
+}
+
+/// The vendor's reading of `medium` for a request the gateway forwards to an
+/// upstream that renders the prompt itself. [`normalize_chat`] keeps `medium`
+/// on V4.1 for the gateway's own renderer, which gives it the checkpoint
+/// template's budget; the vendor's API reads it as `high`, as the profile did
+/// before the renderer knew the level, and a server that renders with the
+/// model's own prompt encoder has no `medium` at all. `xhigh` goes out as
+/// sent, as it always did (those encoders have it), and a chat-template kwarg
+/// is the client's word to the upstream's template and goes out as sent.
+pub(super) fn alias_effort_for_upstream(req: &mut ChatCompletionRequest) {
+    for effort in effort_fields(req).filter(|effort| effort.as_str() == "medium") {
+        if let Some(level) = vendor_alias(effort) {
+            *effort = level.into();
+        }
     }
 }
 
@@ -121,23 +157,12 @@ pub(super) fn validate_chat(req: &ChatCompletionRequest) -> Result<(), validator
             return Err(invalid(
                 "reasoning_effort_not_allowed",
                 if is_v41 {
-                    "DeepSeek V4.1 reasoning effort must be none, low, high, xhigh, max or an integer budget from 1 to 100 (minimal and medium aliases are accepted)"
+                    "DeepSeek V4.1 reasoning effort must be none, low, medium, high, xhigh, max or an integer budget from 1 to 100 (the minimal alias is accepted)"
                 } else {
                     "DeepSeek V4 reasoning effort must be none, low, high or max (minimal, medium and xhigh aliases are accepted)"
                 },
             ));
         }
-    }
-    if thinking_enabled(req)
-        && req
-            .tool_choice
-            .as_ref()
-            .is_some_and(ToolChoice::forces_call)
-    {
-        return Err(invalid(
-            "tool_choice_not_supported",
-            "DeepSeek V4 requires thinking to be disabled for forced tool choice",
-        ));
     }
     Ok(())
 }
@@ -159,6 +184,9 @@ fn thinking_enabled(req: &ChatCompletionRequest) -> bool {
                 .and_then(|effort| match effort {
                     "none" | "minimal" => Some(false),
                     "low" | "high" | "xhigh" | "max" => Some(true),
+                    // A level of V4.1's own table; under V4 an alias the
+                    // renderer maps, with no opinion on the mode.
+                    "medium" if is_v41_model(&req.model) => Some(true),
                     _ => None,
                 })
         })

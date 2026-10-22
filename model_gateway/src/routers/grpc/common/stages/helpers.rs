@@ -400,13 +400,19 @@ pub(crate) trait TagForStart: fmt::Debug + Send + Sync {
 /// them for a start.
 #[derive(Clone, Debug)]
 pub(crate) enum ToolConstraintStamp {
-    /// A forced tool call's constraint as preparation built it, with the name
-    /// of the tool parser that shapes it (`utils::tool_constraints_for_worker`).
+    /// A forced tool call's constraint as preparation built it (the older
+    /// registry's, or the table's tag for the start the model's workers name
+    /// together), with the name of the tool parser that shapes the registry's
+    /// (`utils::tool_constraints_for_worker`).
     Registry {
         /// The `(kind, value)` pair preparation produced, before any worker shaped it.
         constraint: (String, String),
         /// The configured tool parser the shaping reads its reasoning prefix from.
         parser: Option<String>,
+        /// The table built the tag for an engine that starts the grammar at
+        /// the first token: the shaping leaves such a tag as it is, so every
+        /// retry says so with it (`regular::symphony::Prepared::Constraint`).
+        first_token: bool,
     },
     /// The table's tag the selected worker took, shaped for where its engine
     /// starts the grammar: the `auto` tag its policy chose, or a JSON
@@ -427,9 +433,12 @@ impl ToolConstraintStamp {
     /// shape to follow) or when the backend's builder let the request's
     /// `response_format` outrank the tool constraint (the request then
     /// carries a schema, grammar or regex, never a structural tag).
+    /// `first_token` says the table built the tag for an engine that starts
+    /// the grammar at the first token.
     pub(crate) fn capture(
         unshaped: Option<(String, String)>,
         parser: Option<&str>,
+        first_token: bool,
         request: &ProtoGenerateRequest,
     ) -> Option<Self> {
         let constraint = unshaped.filter(|(kind, _)| kind == "structural_tag")?;
@@ -437,6 +446,7 @@ impl ToolConstraintStamp {
         Some(Self::Registry {
             constraint,
             parser: parser.map(str::to_string),
+            first_token,
         })
     }
 
@@ -478,9 +488,18 @@ impl ToolConstraintStamp {
                 format!("Invalid tool constraint: {e}"),
             )
         };
-        match self {
-            Self::Registry { constraint, parser } => {
-                let shaped = utils::tool_constraints_for_worker(
+        // Whether the shape for this worker leads with the thought for an engine
+        // that starts the grammar at the first token, or the table built it so:
+        // the request says so where its dialect has a switch for the gate
+        // behind a reasoning parser, as the first attempt's build did
+        // (`GenerateRequestBuildOptions`).
+        let first_token = match self {
+            Self::Registry {
+                constraint,
+                parser,
+                first_token,
+            } => {
+                let (shaped, led) = utils::tool_constraints_for_worker(
                     tool_parser_factory,
                     parser.as_deref(),
                     Some(constraint.clone()),
@@ -490,10 +509,12 @@ impl ToolConstraintStamp {
                 if let Some((_, tag)) = shaped {
                     request.set_structural_tag(tag);
                 }
+                led || *first_token
             }
             Self::Table(tag) => {
                 let start = utils::WorkerDecoding::of(Some(workers)).start;
                 let shaped = tag.tag_for(start).map_err(failed)?;
+                let first_token = shaped.is_some() && start == GrammarStart::FirstToken;
                 match (shaped, tag.schema()) {
                     // A JSON answer's: the tag, or the request's own schema
                     // where the table gives this worker none, the one in the
@@ -507,8 +528,10 @@ impl ToolConstraintStamp {
                     (Some(tag), None) => request.restore_structural_tag(tag),
                     (None, None) => request.clear_structural_tag(),
                 }
+                first_token
             }
-        }
+        };
+        request.set_grammar_from_first_token(first_token);
         Ok(())
     }
 }
@@ -1737,11 +1760,16 @@ mod tool_constraint_restamp_tests {
     }
 
     fn plan_tag(plan: &ExecutionPlan) -> String {
+        plan_request(plan)
+            .structural_tag()
+            .expect("the plan keeps a structural tag")
+            .to_string()
+    }
+
+    /// The one generate request of a single plan.
+    fn plan_request(plan: &ExecutionPlan) -> &ProtoGenerateRequest {
         match plan {
-            ExecutionPlan::Single(ProtoRequest::Generate(request)) => request
-                .structural_tag()
-                .expect("the plan keeps a structural tag")
-                .to_string(),
+            ExecutionPlan::Single(ProtoRequest::Generate(request)) => request,
             _ => panic!("expected a single generate plan"),
         }
     }
@@ -1767,6 +1795,7 @@ mod tool_constraint_restamp_tests {
             Some(&after_reasoning),
         )
         .unwrap()
+        .0
         .unwrap();
         assert_eq!(shape_of(&built_tag), BARE_CALLS);
 
@@ -1779,6 +1808,7 @@ mod tool_constraint_restamp_tests {
                 tool_constraint: ToolConstraintStamp::capture(
                     Some(unshaped.clone()),
                     Some(PARSER),
+                    false,
                     &request,
                 ),
             };
@@ -1794,12 +1824,23 @@ mod tool_constraint_restamp_tests {
                 THOUGHT_THEN_CALLS,
                 "{backend}: a retry on an engine that starts the grammar at the first token"
             );
+            // The request says the grammar starts there, on the dialect with a
+            // switch for the gate behind a reasoning parser.
+            assert_eq!(
+                plan_request(&plan).grammar_from_first_token(),
+                backend == "vllm",
+                "{backend}: the led tag's start rides with it"
+            );
 
             restamp_plan_for_attempt(&mut plan, &stamp, &after_reasoning, &factory).unwrap();
             assert_eq!(
                 shape_of(&plan_tag(&plan)),
                 BARE_CALLS,
                 "{backend}: a retry back on an engine that starts it after the reasoning"
+            );
+            assert!(
+                !plan_request(&plan).grammar_from_first_token(),
+                "{backend}: the bare calls start where the engine does"
             );
 
             restamp_plan_for_attempt(&mut plan, &stamp, &silent, &factory).unwrap();
@@ -1808,6 +1849,45 @@ mod tool_constraint_restamp_tests {
                 unshaped.1,
                 "{backend}: a worker that does not say gets the shape that fits either"
             );
+            assert!(!plan_request(&plan).grammar_from_first_token(), "{backend}");
+        }
+    }
+
+    /// The table's forced-call tag, built for a pool whose engines start the
+    /// grammar at the first token, is no shape the registry rewrites: a retry
+    /// keeps it as built, and keeps saying the grammar starts there on the
+    /// dialect with a switch for the gate behind a reasoning parser, whatever
+    /// the retry's worker says of its start.
+    #[test]
+    fn a_table_tag_built_for_the_first_token_keeps_its_start_on_a_retry() {
+        let factory = ToolParserFactory::new();
+        let tag = r#"{"format":{"type":"triggered_tags","triggers":["<call>"],"tags":[],"at_least_one":true}}"#;
+        let first_token = worker(&[("constrained_decoding_start", "first_token")]);
+        let after_reasoning = worker(&[("constrained_decoding_start", "after_reasoning")]);
+        let silent = worker(&[]);
+        for (backend, request) in requests_with_tag(tag) {
+            let stamp = AttemptStamp {
+                id: IdStamp::Exact,
+                sampling_mask: None,
+                sampling_baseline: None,
+                inject_pd_metadata: false,
+                tool_constraint: ToolConstraintStamp::capture(
+                    Some(("structural_tag".to_string(), tag.to_string())),
+                    Some(PARSER),
+                    true,
+                    &request,
+                ),
+            };
+            let mut plan = ExecutionPlan::generate(ExecutionPlanKind::Single, request);
+            for retry in [&first_token, &after_reasoning, &silent] {
+                restamp_plan_for_attempt(&mut plan, &stamp, retry, &factory).unwrap();
+                assert_eq!(plan_tag(&plan), tag, "{backend}: the table's tag as built");
+                assert_eq!(
+                    plan_request(&plan).grammar_from_first_token(),
+                    backend == "vllm",
+                    "{backend}: the start the table built it for rides with it"
+                );
+            }
         }
     }
 
@@ -1829,13 +1909,19 @@ mod tool_constraint_restamp_tests {
             ..Default::default()
         }));
         let schema_constraint = ("json_schema".to_string(), schema.clone());
-        assert!(
-            ToolConstraintStamp::capture(Some(schema_constraint), Some(PARSER), &request).is_none()
-        );
+        assert!(ToolConstraintStamp::capture(
+            Some(schema_constraint),
+            Some(PARSER),
+            false,
+            &request
+        )
+        .is_none());
         // The forced call's tag that the backend dropped for the request's
         // response_format: the request carries the schema, not the tag.
         let unshaped = forced_call_on_a_thinking_prompt(&factory);
-        assert!(ToolConstraintStamp::capture(Some(unshaped), Some(PARSER), &request).is_none());
+        assert!(
+            ToolConstraintStamp::capture(Some(unshaped), Some(PARSER), false, &request).is_none()
+        );
 
         request.set_structural_tag("{}".to_string());
         assert_eq!(request.structural_tag(), None);

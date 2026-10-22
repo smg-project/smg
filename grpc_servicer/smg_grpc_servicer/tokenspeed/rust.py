@@ -69,6 +69,7 @@ from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
 from smg_grpc_servicer.tokenspeed.loads import running_window
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
+from smg_grpc_servicer.tokenspeed.warmup import WARMUP_ENV, warmup_inputs, warmup_wire
 
 logger = logging.getLogger(__name__)
 
@@ -524,6 +525,7 @@ class TokenSpeedLauncher(RustLauncher):
     startup_ceiling_secs_env = STARTUP_CEILING_SECS_ENV
     kv_events_env = KV_EVENTS_ENV
     without_tokenizer = "string stops will be refused"
+    warmup_env = WARMUP_ENV
     # TokenSpeed's ``ModelConfig`` for the served model, built on first use
     # and kept for the hooks after it: the KV-events default reads the cache's
     # layer labels off it, the facts the rest.
@@ -548,6 +550,12 @@ class TokenSpeedLauncher(RustLauncher):
 
     def launch(self, args: Any, handshake_port: int, facts: Mapping[str, Any]) -> Any:
         return launch_scheduler_ranks(headless_server_args(args, handshake_port=handshake_port))
+
+    def warmup_inputs(self, args: Any, facts: Mapping[str, Any]) -> Any:
+        return warmup_inputs(args, facts)
+
+    def warmup_wire(self, target: str) -> Any:
+        return warmup_wire(target)
 
 
 async def serve_rust(server_args: Any) -> int:

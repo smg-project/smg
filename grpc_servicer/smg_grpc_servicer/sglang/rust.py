@@ -63,6 +63,7 @@ from smg_grpc_servicer.rust_lifecycle import (  # noqa: F401
     servicer_switch,
 )
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
+from smg_grpc_servicer.sglang.warmup import WARMUP_ENV, warmup_inputs, warmup_wire
 
 logger = logging.getLogger(__name__)
 
@@ -419,6 +420,7 @@ class SglangLauncher(RustLauncher):
     kv_events_env = KV_EVENTS_ENV
     # The scheduler keeps its own tokenizer for stop strings.
     without_tokenizer = "GetTokenizer will be unavailable"
+    warmup_env = WARMUP_ENV
 
     def kv_events_default(self, args: Any) -> str | None:
         return default_kv_events_config(args)
@@ -431,6 +433,12 @@ class SglangLauncher(RustLauncher):
 
     def launch(self, args: Any, handshake_port: int, facts: Mapping[str, Any]) -> Any:
         return launch_scheduler_ranks(args, handshake_port=handshake_port)
+
+    def warmup_inputs(self, args: Any, facts: Mapping[str, Any]) -> Any:
+        return warmup_inputs(args, facts)
+
+    def warmup_wire(self, target: str) -> Any:
+        return warmup_wire(target)
 
 
 async def serve_rust(server_args: Any) -> int:

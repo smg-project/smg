@@ -291,6 +291,25 @@ impl ProviderProfile {
         }
     }
 
+    /// Shape a chat request for an upstream server that renders the prompt
+    /// itself, the way the HTTP routers forward it: a field the gateway's own
+    /// renderer and the vendor's API read differently goes out as the vendor
+    /// reads it. DeepSeek V4.1's `medium` effort is the one such field (the
+    /// checkpoint template's level for the gateway's renderer, the vendor's
+    /// alias of `high` for an upstream; the table lives with the profile);
+    /// every other profile forwards the request [`Self::normalize_chat`]
+    /// produced as it is.
+    pub fn normalize_chat_for_upstream(self, req: &mut ChatCompletionRequest) {
+        match self {
+            ProviderProfile::DeepSeek => deepseek::alias_effort_for_upstream(req),
+            ProviderProfile::Kimi
+            | ProviderProfile::Minimax
+            | ProviderProfile::Zai
+            | ProviderProfile::OpenAi
+            | ProviderProfile::Generic => {}
+        }
+    }
+
     /// The call id of a tool result the assistant turn right before it did
     /// not issue, under the contracts that refuse such a history (OpenAI's
     /// and DeepSeek's); `None` otherwise. The rule a history the gateway
@@ -639,6 +658,70 @@ mod tests {
                 "{model}"
             );
         }
+    }
+
+    /// A forced tool choice with thinking on is the engine's to serve for a
+    /// self-hosted DeepSeek V4 or V4.1 model (the gateway shapes the call's
+    /// grammar for where the engine starts it); the vendor's own API refuses
+    /// it by itself where it still does. The profile's other rules stay.
+    #[test]
+    fn a_forced_tool_choice_with_thinking_on_is_not_refused_for_deepseek_v4() {
+        let request = |model: &str,
+                       tool_choice: serde_json::Value,
+                       extra: serde_json::Value|
+         -> ChatCompletionRequest {
+            let mut body = serde_json::json!({
+                "model": model,
+                "messages": [{"role": "user", "content": "Weather in Paris?"}],
+                "tools": [{"type": "function", "function": {"name": "get_weather",
+                    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}}}],
+                "tool_choice": tool_choice,
+            });
+            body.as_object_mut()
+                .expect("object")
+                .extend(extra.as_object().cloned().unwrap_or_default());
+            serde_json::from_value(body).expect("request deserializes")
+        };
+        let code = |profile: ProviderProfile, req: &ChatCompletionRequest| {
+            profile
+                .validate_chat(req)
+                .err()
+                .map(|error| error.code.to_string())
+        };
+        let named = serde_json::json!({"type": "function", "function": {"name": "get_weather"}});
+        let thinking_on = [
+            serde_json::json!({}),
+            serde_json::json!({"thinking": {"type": "enabled"}}),
+            serde_json::json!({"chat_template_kwargs": {"thinking": true}}),
+            serde_json::json!({"reasoning_effort": "high"}),
+        ];
+        for model in [
+            "deepseek-v4.1-flash",
+            "deepseek-ai/DeepSeek-V4.1-Flash",
+            "deepseek-flash",
+            "deepseek-v4-pro",
+        ] {
+            let profile = ProviderProfile::for_model(model);
+            assert_eq!(profile, ProviderProfile::DeepSeek, "{model}");
+            for choice in [named.clone(), serde_json::json!("required")] {
+                for extra in &thinking_on {
+                    let mut req = request(model, choice.clone(), extra.clone());
+                    profile.normalize_chat(&mut req);
+                    assert_eq!(code(profile, &req), None, "{model} {choice} {extra}");
+                }
+            }
+        }
+        // The adaptive thinking type is still no DeepSeek V4 setting.
+        let mut req = request(
+            "deepseek-v4.1-flash",
+            named,
+            serde_json::json!({"thinking": {"type": "adaptive"}}),
+        );
+        ProviderProfile::DeepSeek.normalize_chat(&mut req);
+        assert_eq!(
+            code(ProviderProfile::DeepSeek, &req).as_deref(),
+            Some("thinking_type_not_supported")
+        );
     }
 
     /// A tool result no call of the assistant turn right before it issued is

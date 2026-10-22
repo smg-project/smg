@@ -50,6 +50,12 @@ class ServerArgsSection:
     attention_dp_size: int | None
     # The admission window, under TokenSpeed's spelling or the frontend's; 0 when unset.
     running_window: int
+    # The scheduler's step budget in prompt tokens, when the args carry one as
+    # a count: the chunk size under chunked prefill, else the prefill budget.
+    chunked_prefill_size: int | None
+    max_prefill_tokens: int | None
+    # The operator's context length when the args carry one, else ``None``.
+    max_model_len: int | None
     page_size: int
     max_total_num_tokens: int
     kv_events_config: Any
@@ -82,6 +88,9 @@ class ServerArgsSection:
                 or getattr(server_args, "max_running_requests", 0)
                 or 0
             ),
+            chunked_prefill_size=positive_int(getattr(server_args, "chunked_prefill_size", None)),
+            max_prefill_tokens=positive_int(getattr(server_args, "max_prefill_tokens", None)),
+            max_model_len=positive_int(getattr(server_args, "max_model_len", None)),
             page_size=int(getattr(server_args, "page_size", 0) or 0),
             max_total_num_tokens=int(getattr(server_args, "max_total_num_tokens", 0) or 0),
             kv_events_config=getattr(server_args, "kv_events_config", None),

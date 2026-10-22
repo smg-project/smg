@@ -246,6 +246,10 @@ pub mod metrics_labels {
     /// The engine itself reported that the request failed (its finish
     /// reason was `error`), as opposed to a failed call to the worker.
     pub const ERROR_ENGINE: &str = "engine_error";
+    /// The engine could not continue the request under the request's own
+    /// constraint (a grammar it could not keep to): the request's outcome,
+    /// not the worker's failure; the client reads a 422 `constraint_failed`.
+    pub const ERROR_CONSTRAINT: &str = "constraint_error";
 }
 
 /// Per-thread caches of the handles the per-request records go through.

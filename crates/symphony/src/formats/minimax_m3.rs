@@ -47,6 +47,7 @@ mod tests {
 
     use super::*;
     use crate::{
+        adapt::chat,
         engine::Engine,
         event::{DropReason, Event, MalformedReason, Text},
         testing::{arguments_of, bytes, content, drive, names, reasoning},
@@ -150,6 +151,161 @@ mod tests {
             text: Text::uncounted(text.to_owned()),
             why: DropReason::Wrapper,
         }
+    }
+
+    /// Prose where the invoke has tags, before its first child or after its last: the words
+    /// keep the whitespace between them, one `Malformed` event per word with the whitespace
+    /// before it, the newline after the tag the syntax read dropped as the template's; the chat
+    /// message's content and the stream's deltas are the model's words, whole, at every cut and
+    /// one character at a time alike.
+    #[test]
+    fn text_where_the_syntax_has_tags_keeps_the_models_whitespace_between_its_words() {
+        let prose = "please note this and that";
+        let declared = || {
+            declared(
+                "get_weather",
+                value!({"type": "object", "properties": {"city": {"type": "string"}}}),
+            )
+        };
+        let shown = |events: &[Event]| chat::message(0, events).message.content;
+        let streamed = |events: &[Event]| -> String {
+            chat::deltas(0, events)
+                .into_iter()
+                .filter_map(|choice| choice.delta.content)
+                .collect()
+        };
+        let words = |events: &[Event]| -> Vec<(String, MalformedReason)> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let dropped = |events: &[Event]| -> Vec<String> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Dropped { text, .. } => Some(text.text.to_string()),
+                    _ => None,
+                })
+                .collect()
+        };
+        for output in [
+            "<tool_call>\n<invoke name=\"get_weather\">\nplease note this and that\n<city>Paris</city>\n</invoke>\n</tool_call>",
+            "<tool_call>\n<invoke name=\"get_weather\">\n<city>Paris</city>\nplease note this and that\n</invoke>\n</tool_call>",
+        ] {
+            let whole = run_with(declared(), "", &[output]);
+            assert_eq!(bytes(&whole), output);
+            assert_eq!(arguments_of(&whole, 0), r#"{"city": "Paris"}"#);
+            let expected: Vec<(String, MalformedReason)> = ["please", " note", " this", " and", " that"]
+                .into_iter()
+                .map(|word| (word.to_string(), MalformedReason::TextBetweenTags))
+                .collect();
+            assert_eq!(words(&whole), expected, "{output:?}");
+            assert!(!dropped(&whole).contains(&" ".to_string()), "{output:?}");
+            assert_eq!(shown(&whole).as_deref(), Some(prose), "{output:?}");
+            assert_eq!(streamed(&whole), prose, "{output:?}");
+            // A word a delta boundary cuts leaves in two pieces: the same text, joined.
+            let joined = |events: &[Event]| -> String {
+                words(events)
+                    .into_iter()
+                    .map(|(word, why)| {
+                        assert_eq!(why, MalformedReason::TextBetweenTags);
+                        word
+                    })
+                    .collect()
+            };
+            for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
+                let events = run_with(declared(), "", &[&output[..cut], &output[cut..]]);
+                assert_eq!(bytes(&events), output, "cut at {cut}");
+                assert_eq!(joined(&events), prose, "cut at {cut}");
+                assert_eq!(shown(&events).as_deref(), Some(prose), "cut at {cut}");
+                assert_eq!(streamed(&events), prose, "cut at {cut}");
+            }
+            let pieces: Vec<&str> = output
+                .char_indices()
+                .map(|(at, c)| &output[at..at + c.len_utf8()])
+                .collect();
+            let events = run_with(declared(), "", &pieces);
+            assert_eq!(bytes(&events), output);
+            assert_eq!(joined(&events), prose);
+            assert_eq!(streamed(&events), prose);
+        }
+        // The template's separator inside the prose keeps its place and the words their spaces.
+        let output = "<tool_call><invoke name=\"get_weather\">please ]<]minimax[>[note this<city>Paris</city></invoke></tool_call>";
+        let events = run_with(declared(), "", &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(shown(&events).as_deref(), Some("please note this"));
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Paris"}"#);
+    }
+
+    /// Prose between two invokes, where the block's template only wraps: the chat message's
+    /// content and the stream's deltas are the model's words with the spaces between them, whole,
+    /// at every cut and one character at a time alike; both invokes are calls, and the newline
+    /// after the first invoke's close and the one before the next invoke are the template's.
+    #[test]
+    fn prose_between_two_invokes_reaches_the_client_as_the_model_wrote_it() {
+        let output = concat!(
+            "<tool_call>\n<invoke name=\"get_weather\">\n<city>Paris</city>\n</invoke>\n",
+            "and also this one\n",
+            "<invoke name=\"get_weather\">\n<city>Rome</city>\n</invoke>\n</tool_call>"
+        );
+        let prose = "and also this one";
+        let declared = || {
+            declared(
+                "get_weather",
+                value!({"type": "object", "properties": {"city": {"type": "string"}}}),
+            )
+        };
+        let shown = |events: &[Event]| chat::message(0, events).message.content;
+        let streamed = |events: &[Event]| -> String {
+            chat::deltas(0, events)
+                .into_iter()
+                .filter_map(|choice| choice.delta.content)
+                .collect()
+        };
+        let words = |events: &[Event]| -> Vec<(String, MalformedReason)> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Malformed { text, why } => Some((text.text.to_string(), *why)),
+                    _ => None,
+                })
+                .collect()
+        };
+        let whole = run_with(declared(), "", &[output]);
+        assert_eq!(bytes(&whole), output);
+        assert_eq!(names(&whole), ["get_weather", "get_weather"]);
+        assert_eq!(arguments_of(&whole, 0), r#"{"city": "Paris"}"#);
+        assert_eq!(arguments_of(&whole, 1), r#"{"city": "Rome"}"#);
+        let expected: Vec<(String, MalformedReason)> = ["and", " also", " this", " one"]
+            .into_iter()
+            .map(|word| (word.to_string(), MalformedReason::TextBetweenCalls))
+            .collect();
+        assert_eq!(words(&whole), expected);
+        assert_eq!(shown(&whole).as_deref(), Some(prose));
+        assert_eq!(streamed(&whole), prose);
+        for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
+            let events = run_with(declared(), "", &[&output[..cut], &output[cut..]]);
+            assert_eq!(bytes(&events), output, "cut at {cut}");
+            assert_eq!(
+                names(&events),
+                ["get_weather", "get_weather"],
+                "cut at {cut}"
+            );
+            assert_eq!(shown(&events).as_deref(), Some(prose), "cut at {cut}");
+            assert_eq!(streamed(&events), prose, "cut at {cut}");
+        }
+        let pieces: Vec<&str> = output
+            .char_indices()
+            .map(|(at, c)| &output[at..at + c.len_utf8()])
+            .collect();
+        let events = run_with(declared(), "", &pieces);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(shown(&events).as_deref(), Some(prose));
+        assert_eq!(streamed(&events), prose);
     }
 
     #[test]

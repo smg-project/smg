@@ -46,6 +46,7 @@ from sglang.utils import get_exception_traceback
 from smg_grpc_proto import sglang_scheduler_pb2, sglang_scheduler_pb2_grpc
 from smg_grpc_proto.generated import common_pb2
 
+from smg_grpc_servicer.engine_status import abort_for_constraint_failure
 from smg_grpc_servicer.health_probe import await_probe
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
@@ -62,6 +63,7 @@ from smg_grpc_servicer.sglang.request_manager import (
 )
 from smg_grpc_servicer.sglang.utils import (
     abort_code_from_output,
+    grammar_abort,
     scheduler_abort,
     to_token_id_array,
 )
@@ -130,6 +132,13 @@ def _compute_aggregate_protobuf(
         avg_token_usage=round(sum(load.token_usage for load in loads) / n, 4),
         avg_throughput=round(sum(load.gen_throughput for load in loads) / n, 2),
         avg_utilization=round(sum(load.utilization for load in loads) / n, 4),
+    )
+
+
+def _scheduler_abort_detail(finish_reason: dict) -> str:
+    """The engine's own account of an abort, for the constraint-failure status."""
+    return (
+        f"the scheduler aborted the request: {finish_reason.get('message') or 'no reason reported'}"
     )
 
 
@@ -235,6 +244,13 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                                 abort_code_from_output(batch_output),
                                 batch_output["error"],
                             )
+                        elif (grammar := grammar_abort(batch_output)) is not None:
+                            # The one abort the scheduler attributes to the
+                            # request's grammar (named before its status: a PD
+                            # decode side stamps a 500 on it too).
+                            await abort_for_constraint_failure(
+                                context, _scheduler_abort_detail(grammar)
+                            )
                         elif (aborted := scheduler_abort(batch_output)) is not None:
                             # The scheduler's own abort, with its status: the
                             # caller's error or the worker's, never a completion.
@@ -251,6 +267,16 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                         await context.abort(
                             abort_code_from_output(output),
                             output["error"],
+                        )
+                    elif (grammar := grammar_abort(output)) is not None:
+                        # The one abort the scheduler itself attributes to the
+                        # request's grammar (the plugin's name on its finish):
+                        # the constraint-failure status every wire shares,
+                        # never a `Complete(finish_reason = "abort")` a client
+                        # reads as an empty success. Named before its status:
+                        # a PD decode side stamps a 500 on it too.
+                        await abort_for_constraint_failure(
+                            context, _scheduler_abort_detail(grammar)
                         )
                     elif (aborted := scheduler_abort(output)) is not None:
                         # The scheduler's own abort, with its status (a 400 for

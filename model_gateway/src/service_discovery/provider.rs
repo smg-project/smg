@@ -1,15 +1,19 @@
 //! The contract between a worker-discovery provider and the shared reconciler.
 //!
-//! A provider turns its source — Kubernetes Pods, a JSON manifest or Slurm
-//! jobs today; Consul next — into these types and nothing else. The
-//! reconciler sees only these, so it never learns which kind of source
-//! produced a worker beyond the [`DiscoveryKind`] it is handed.
+//! A provider turns its source — Kubernetes Pods, a JSON manifest, Slurm jobs
+//! or a Consul service — into these types and nothing else. The reconciler
+//! sees only these, so it never learns which kind of source produced a worker
+//! beyond the [`DiscoveryKind`] it is handed.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, net::Ipv6Addr};
 
 use openai_protocol::worker::WorkerType;
 
-use crate::{observability::metrics::metrics_labels, worker::endpoint::Endpoint};
+use crate::{
+    config::RoutingMode,
+    observability::metrics::metrics_labels,
+    worker::{endpoint::Endpoint, EndpointError},
+};
 
 /// Which provider produced a snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -17,6 +21,7 @@ pub(super) enum DiscoveryKind {
     Kubernetes,
     File,
     Slurm,
+    Consul,
 }
 
 impl DiscoveryKind {
@@ -31,6 +36,7 @@ impl DiscoveryKind {
             DiscoveryKind::Kubernetes => "kubernetes",
             DiscoveryKind::File => "file",
             DiscoveryKind::Slurm => "slurm",
+            DiscoveryKind::Consul => "consul",
         }
     }
 
@@ -40,8 +46,73 @@ impl DiscoveryKind {
             DiscoveryKind::Kubernetes => metrics_labels::DISCOVERY_KUBERNETES,
             DiscoveryKind::File => metrics_labels::DISCOVERY_FILE,
             DiscoveryKind::Slurm => metrics_labels::DISCOVERY_SLURM,
+            DiscoveryKind::Consul => metrics_labels::DISCOVERY_CONSUL,
         }
     }
+}
+
+/// The worker types a routing mode accepts, for a provider whose records name
+/// their own type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Roles {
+    Regular,
+    PrefillDecode,
+    EncodePrefillDecode,
+}
+
+impl Roles {
+    /// `None` for a mode with no worker pools to fill.
+    pub(super) fn of(mode: &RoutingMode) -> Option<Self> {
+        match mode {
+            RoutingMode::Regular { .. } => Some(Self::Regular),
+            RoutingMode::PrefillDecode { .. } => Some(Self::PrefillDecode),
+            RoutingMode::EncodePrefillDecode { .. } => Some(Self::EncodePrefillDecode),
+            RoutingMode::OpenAI { .. }
+            | RoutingMode::Anthropic { .. }
+            | RoutingMode::Gemini { .. } => None,
+        }
+    }
+
+    pub(super) fn allows(self, worker_type: WorkerType) -> bool {
+        matches!(
+            (self, worker_type),
+            (Self::Regular, WorkerType::Regular)
+                | (
+                    Self::PrefillDecode,
+                    WorkerType::Prefill | WorkerType::Decode
+                )
+                | (
+                    Self::EncodePrefillDecode,
+                    WorkerType::Encode | WorkerType::Prefill | WorkerType::Decode
+                )
+        )
+    }
+
+    /// The type of a record that names none. Regular routing has only one; a
+    /// disaggregated record must say which pool it joins.
+    pub(super) fn default_type(self) -> Option<WorkerType> {
+        (self == Self::Regular).then_some(WorkerType::Regular)
+    }
+
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Regular => "regular",
+            Self::PrefillDecode => "prefill-decode",
+            Self::EncodePrefillDecode => "encode-prefill-decode",
+        }
+    }
+}
+
+/// The endpoint of a server on `host` (a name or an address, IPv6 bracketed
+/// or not) and `port`, with no scheme, so registration probes for HTTP and
+/// gRPC both.
+pub(super) fn endpoint_at(host: &str, port: u16) -> Result<Endpoint, EndpointError> {
+    let authority = if host.parse::<Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    Endpoint::parse(&authority)
 }
 
 /// One worker exactly as a provider describes it: the whole contract between a

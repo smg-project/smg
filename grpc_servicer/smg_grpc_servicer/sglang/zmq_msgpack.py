@@ -198,6 +198,11 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
     # A prefill-only score has one row even though output_ids is empty.
     output_token_ids_logprobs_val: list[list[list[float]]] | None = None
     output_token_ids_logprobs_idx: list[list[list[int]]] | None = None
+    # The scheduler's `err_type` of an abort (the name it gives the failure
+    # next to the message and the status; this package's plugin stamps the
+    # grammar's rejection of a sampled token with `GRAMMAR_REJECTED_ERR_TYPE`,
+    # see `zmq_plugin`); None for other finishes.
+    finished_err_types: list[str | None] | None = None
 
     @classmethod
     def from_full(
@@ -229,6 +234,10 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
         def status(reason):
             value = reason.get("status_code") if reason else None
             return int(value) if isinstance(value, int) else None
+
+        def err_type(reason):
+            value = reason.get("err_type") if reason else None
+            return str(value) if value is not None else None
 
         return cls(
             rids=list(out.rids or []),
@@ -284,6 +293,7 @@ class BatchTokenIDSlimOutput(msgspec.Struct, tag=True, array_like=True):
                 [list(step or []) for step in (v or [])]
                 for v in column(getattr(out, "output_token_ids_logprobs_idx", None), None)
             ],
+            finished_err_types=[err_type(r) for r in reasons],
         )
 
 

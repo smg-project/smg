@@ -74,6 +74,7 @@ mod tests {
         Engine::with_call_ids(Arc::new(format), declared, ids())
     }
     use crate::{
+        adapt::chat,
         engine::Engine,
         event::{DropReason, Event, Events, FinishReason, MalformedReason, Text},
         input::{EngineFinish, Input, TokenSpan},
@@ -1076,6 +1077,42 @@ mod tests {
         }
         parser.feed(Input::End { finish }, &mut out).expect("end");
         out.into_owned().drain()
+    }
+
+    /// A parameter written in XML-attribute style, `<parameter name="city">`, which the tagged
+    /// syntax has no tag for: the call is delivered with no arguments, and the chat message's
+    /// content is the model's lines, byte for byte, the whitespace between the words included,
+    /// whole, at every cut and in the stream's deltas alike.
+    #[test]
+    fn an_xml_attribute_parameter_reaches_the_client_as_the_model_wrote_it() {
+        let output = concat!(
+            "<tool_call>\n<function=get_weather>\n<parameter name=\"city\">Paris</parameter>\n",
+            "<parameter name=\"days\">three or four days</parameter>\n</function>\n</tool_call>"
+        );
+        let lines = concat!(
+            "<parameter name=\"city\">Paris</parameter>\n",
+            "<parameter name=\"days\">three or four days</parameter>"
+        );
+        let content = |events: &[Event]| chat::message(0, events).message.content;
+        let streamed = |events: &[Event]| -> String {
+            chat::deltas(0, events)
+                .into_iter()
+                .filter_map(|choice| choice.delta.content)
+                .collect()
+        };
+        let whole = run_tagged(&[output], EngineFinish::Stop);
+        let message = chat::message(0, &whole).message;
+        assert_eq!(message.content.as_deref(), Some(lines));
+        let calls = message.tool_calls.expect("a call");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert_eq!(calls[0].function.arguments.as_deref(), Some("{}"));
+        assert_eq!(streamed(&whole), lines);
+        for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
+            let events = run_tagged(&[&output[..cut], &output[cut..]], EngineFinish::Stop);
+            assert_eq!(content(&events).as_deref(), Some(lines), "cut at {cut}");
+            assert_eq!(streamed(&events), lines, "cut at {cut}");
+        }
     }
 
     #[test]

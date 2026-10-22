@@ -21,18 +21,22 @@
 //! refusal before the first token) is classed the same way, so the worker
 //! is charged for it, in the worker-error family, exactly when it would be
 //! for the same status after the first token (see
-//! [`UpstreamClass::account_dispatch_failure`]).
+//! [`UpstreamClass::account_dispatch_failure`]). A worker's report that the
+//! engine could not continue the request under its constraint is the
+//! request's outcome, counted under its own `error_type`, charged to no
+//! worker, and the event names it by the `code` the HTTP answer carries.
 
 use std::{fmt, sync::Arc};
 
 use axum::http::StatusCode;
+use smg_grpc_client::is_constraint_failure;
 use tracing::{error, warn};
 
 use super::{
-    chat_utils::{send_error_sse, SseSender},
+    chat_utils::{send_error_sse_with_code, SseSender},
     metrics::error_type_from_status,
     pd_bootstrap::{account_pd_side_failure, dead_rendezvous_of, DeadRendezvous},
-    tonic_ext::TonicStatusExt,
+    tonic_ext::{TonicStatusExt, CONSTRAINT_FAILED_CODE},
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
@@ -95,7 +99,9 @@ impl UpstreamClass {
     /// gateway before the first token as after it.
     pub(crate) fn of(status: &tonic::Status) -> Self {
         let http = status.http_status();
-        let error_type = if is_the_engines_own_report(status) {
+        let error_type = if is_constraint_failure(status) {
+            metrics_labels::ERROR_CONSTRAINT
+        } else if is_the_engines_own_report(status) {
             metrics_labels::ERROR_ENGINE
         } else {
             error_type_from_status(http)
@@ -258,6 +264,19 @@ impl StreamFailure {
         self.class().map_or(MESSAGES_API_ERROR_TYPE, |class| {
             class.client_type(MESSAGES_API_ERROR_TYPE)
         })
+    }
+
+    /// The `code` of the SSE error event that ends the response, when the
+    /// failure has one of its own: `constraint_failed` for a worker's report
+    /// that the engine could not continue the request under its constraint,
+    /// the code the HTTP answer to the same report carries. `None` otherwise.
+    pub(crate) fn code(&self) -> Option<&'static str> {
+        match self {
+            Self::Upstream { status, .. } if is_constraint_failure(status) => {
+                Some(CONSTRAINT_FAILED_CODE)
+            }
+            Self::Upstream { .. } | Self::Internal(_) => None,
+        }
     }
 }
 
@@ -483,7 +502,7 @@ pub(crate) async fn send_stream_failure(
             "Streaming response failed in the gateway: {message}"
         );
     }
-    send_error_sse(tx, failure, failure.error_type()).await;
+    send_error_sse_with_code(tx, failure, failure.error_type(), failure.code()).await;
 }
 
 #[cfg(test)]

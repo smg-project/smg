@@ -92,13 +92,28 @@ pub struct BatchTokenIDSlimOutput {
     /// Appended; absent from older plugins.
     pub output_token_ids_logprobs_val: Vec<Vec<Vec<f64>>>,
     pub output_token_ids_logprobs_idx: Vec<Vec<Vec<u32>>>,
+    /// The scheduler's `err_type` of an `abort` finish (the name it gives
+    /// the failure next to the message and the status; the plugin stamps
+    /// the grammar's rejection of a sampled token with its own, see the
+    /// adapter); `None` for other finishes. Appended; empty from a plugin
+    /// that predates the column.
+    pub finished_err_types: Vec<Option<String>>,
 }
 
 impl Serialize for BatchTokenIDSlimOutput {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
-        let has_selected = !self.output_token_ids_logprobs_val.is_empty()
+        let has_err_types = !self.finished_err_types.is_empty();
+        let has_selected = has_err_types
+            || !self.output_token_ids_logprobs_val.is_empty()
             || !self.output_token_ids_logprobs_idx.is_empty();
-        let mut tuple = serializer.serialize_tuple(if has_selected { 26 } else { 24 })?;
+        let len = if has_err_types {
+            27
+        } else if has_selected {
+            26
+        } else {
+            24
+        };
+        let mut tuple = serializer.serialize_tuple(len)?;
         tuple.serialize_element(BATCH_TOKEN_ID_SLIM_OUTPUT_TAG)?;
         tuple.serialize_element(&self.rids)?;
         tuple.serialize_element(&self.output_ids)?;
@@ -126,6 +141,9 @@ impl Serialize for BatchTokenIDSlimOutput {
         if has_selected {
             tuple.serialize_element(&self.output_token_ids_logprobs_val)?;
             tuple.serialize_element(&self.output_token_ids_logprobs_idx)?;
+        }
+        if has_err_types {
+            tuple.serialize_element(&self.finished_err_types)?;
         }
         tuple.end()
     }
@@ -207,6 +225,7 @@ fn read_token_batch_after_tag<'de, A: SeqAccess<'de>>(
         input_top_logprobs_idx: appended_column(seq)?,
         output_token_ids_logprobs_val: appended_column(seq)?,
         output_token_ids_logprobs_idx: appended_column(seq)?,
+        finished_err_types: appended_column(seq)?,
     };
     drain_trailing(seq)?;
     Ok(batch)
@@ -223,6 +242,8 @@ pub struct SglangOutput {
     pub finish_message: Option<String>,
     /// The HTTP status an abort carried, when the scheduler reported one.
     pub finish_status: Option<u16>,
+    /// The scheduler's `err_type` of an abort, when it named one.
+    pub finish_err_type: Option<String>,
     pub matched_stop: Option<MatchedStop>,
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -305,6 +326,7 @@ impl BatchTokenIDSlimOutput {
             ),
             ("input_top_logprobs_val", self.input_top_logprobs_val.len()),
             ("input_top_logprobs_idx", self.input_top_logprobs_idx.len()),
+            ("finished_err_types", self.finished_err_types.len()),
         ];
         if let Some((name, len)) = columns
             .iter()
@@ -324,6 +346,7 @@ impl BatchTokenIDSlimOutput {
         let mut finished_reasons = self.finished_reasons.into_iter();
         let mut finished_messages = self.finished_messages.into_iter();
         let mut finished_status = self.finished_status.into_iter();
+        let mut finished_err_types = self.finished_err_types.into_iter();
         let mut top_val = self.output_top_logprobs_val.into_iter();
         let mut top_idx = self.output_top_logprobs_idx.into_iter();
         let mut finished_matched = self.finished_matched.into_iter();
@@ -360,6 +383,7 @@ impl BatchTokenIDSlimOutput {
                     finish_reason: (!reason.is_empty()).then_some(reason),
                     finish_message: finished_messages.next().flatten(),
                     finish_status: finished_status.next().flatten(),
+                    finish_err_type: finished_err_types.next().flatten(),
                     matched_stop: finished_matched.next().flatten(),
                     prompt_tokens: prompt_tokens.next().unwrap_or(0),
                     completion_tokens: completion_tokens.next().unwrap_or(0),
@@ -658,6 +682,11 @@ mod tests {
     const PYTHON_EMBED: &str = "9db84261746368456d62656464696e67536c696d4f757470757491a265319192cb3fd0000000000000cbbfe00000000000009103910091a473746f7091c091c00100000000";
     /// The plugin's control reply for call 7: success, no message, engine 1.
     const PYTHON_CONTROL: &str = "95b0436f6e74726f6c5265706c79536c696d07c3c001";
+    /// The plugin's 27-element batch for rids a/b, both aborted: `a` with the
+    /// scheduler's bare `Aborted`, `b` with the grammar's rejection of a
+    /// sampled token named in the last column (`GrammarRejectedToken`), no
+    /// status on either, engine 1.
+    const PYTHON_SLIM27: &str = "dc001bb64261746368546f6b656e4944536c696d4f757470757492a161a16292910a92141592a561626f7274a561626f727492a741626f72746564d924746865206772616d6d61722072656a656374656420612073616d706c656420746f6b656e92c0c0920304920102920001929092cbbfe0000000000000cbbfd00000000000009290921415010000000092c0c092909192cbbfe0000000000000cbbff000000000000092909192151692000092909092909092909092909092909092909092c0b44772616d6d617252656a6563746564546f6b656e";
     /// The plugin's terminal abort for rid `x`: its `n=2` rejection, status 400.
     const PYTHON_ABORT: &str = "dc0013b64261746368546f6b656e4944536c696d4f757470757491a178919091a561626f727491d9396e3d32206973206e6f7420736572766564206f6e207468697320776972653b20534d472066616e73206f7574206e203e203120697473656c6691c091009100910091909190000000000091cd019091909190";
 
@@ -737,6 +766,62 @@ mod tests {
             decode_msgpack::<SglangWireOutput>(&hex(PYTHON_SLIM24)).unwrap(),
             SglangWireOutput::Tokens(_)
         ));
+    }
+
+    /// The scheduler's `err_type` of an abort rides the last appended column:
+    /// a batch that carries it encodes 27 elements and reads back the name
+    /// per request; the 24- and 26-element batches of earlier plugins decode
+    /// with no name, and re-encode as they came.
+    #[test]
+    fn the_abort_err_type_column_is_appended_and_optional() {
+        let mut batch: BatchTokenIDSlimOutput = decode_msgpack(&hex(PYTHON_SLIM24)).unwrap();
+        assert!(batch.finished_err_types.is_empty());
+        assert!(batch
+            .clone()
+            .into_outputs()
+            .unwrap()
+            .iter()
+            .all(|output| output.finish_err_type.is_none()));
+        batch.finished_reasons[1] = "abort".to_string();
+        batch.finished_messages[1] = Some("the grammar rejected a sampled token".to_string());
+        batch.finished_err_types = vec![None, Some("GrammarRejectedToken".to_string())];
+        let encoded = encode_msgpack(&batch).unwrap();
+        // The array header grows from 24 to 27 elements (one byte each way).
+        assert_eq!(encoded[0..3], [0xdc, 0x00, 0x1b]);
+        let decoded: BatchTokenIDSlimOutput = decode_msgpack(&encoded).unwrap();
+        assert_eq!(decoded, batch);
+        let outputs = decoded.into_outputs().unwrap();
+        assert_eq!(outputs[0].finish_err_type, None);
+        assert_eq!(
+            outputs[1].finish_err_type.as_deref(),
+            Some("GrammarRejectedToken")
+        );
+        assert_eq!(outputs[1].finish_reason.as_deref(), Some("abort"));
+        // A ragged column is a protocol bug, as for every other column.
+        let mut ragged = batch;
+        ragged.finished_err_types.pop();
+        let error = ragged.into_outputs().unwrap_err().to_string();
+        assert!(error.contains("finished_err_types"), "{error}");
+        // The plugin's own bytes for the two aborts: the name per request,
+        // and the re-encoding byte for byte.
+        let pinned: BatchTokenIDSlimOutput = decode_msgpack(&hex(PYTHON_SLIM27)).unwrap();
+        assert_eq!(
+            pinned.finished_err_types,
+            vec![None, Some("GrammarRejectedToken".to_string())]
+        );
+        assert_eq!(pinned.finished_status, vec![None, None]);
+        assert_eq!(encode_msgpack(&pinned).unwrap(), hex(PYTHON_SLIM27));
+        let outputs = pinned.into_outputs().unwrap();
+        assert_eq!(outputs[0].finish_message.as_deref(), Some("Aborted"));
+        assert_eq!(outputs[0].finish_err_type, None);
+        assert_eq!(
+            outputs[1].finish_message.as_deref(),
+            Some("the grammar rejected a sampled token")
+        );
+        assert_eq!(
+            outputs[1].finish_err_type.as_deref(),
+            Some("GrammarRejectedToken")
+        );
     }
 
     #[test]

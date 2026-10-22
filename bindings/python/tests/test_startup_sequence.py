@@ -302,15 +302,15 @@ class TestRouterInitialization:
         from_args to pass it on: that must not start the router without
         discovery.
         """
-        args = RouterArgs(discovery_provider="consul")
+        args = RouterArgs(discovery_provider="etcd")
 
         with (
             patch(
                 "smg.router_args.DISCOVERY_PROVIDER_CHOICES",
-                ["kubernetes", "file", "consul"],
+                ["kubernetes", "file", "slurm", "consul", "etcd"],
             ),
             patch("smg.router._Router") as rust_router,
-            pytest.raises(ValueError, match="cannot pass discovery provider 'consul'"),
+            pytest.raises(ValueError, match="cannot pass discovery provider 'etcd'"),
         ):
             Router.from_args(args)
 
@@ -423,6 +423,97 @@ class TestRouterInitialization:
 
         rust_router.assert_not_called()
 
+    def test_from_args_passes_the_consul_provider_as_a_discovery_mapping(self):
+        """The Consul provider reaches Rust through the tagged `discovery`
+        mapping, with only the settings that were given."""
+        args = RouterArgs(
+            discovery_provider="consul",
+            consul_service="smg-worker",
+            consul_datacenter="dc2",
+            discovery_check_interval_secs=10,
+            pd_disaggregation=True,
+        )
+
+        with patch("smg.router._Router") as rust_router:
+            Router.from_args(args)
+
+        kwargs = rust_router.call_args.kwargs
+        assert kwargs["discovery"] == {
+            "provider": "consul",
+            "service": "smg-worker",
+            "datacenter": "dc2",
+            "check_interval_secs": 10,
+        }
+        assert kwargs["service_discovery"] is False
+        for key in kwargs:
+            assert not key.startswith("consul_"), key
+
+    def test_from_args_passes_explicitly_empty_settings_on_for_rejection(self):
+        """An empty string is a value given, not an unset field: it reaches
+        Rust, whose validation refuses it, instead of falling back to a
+        default such as the agent's own datacenter."""
+        from smg.router import _discovery_arguments
+
+        consul = _discovery_arguments(
+            RouterArgs(
+                discovery_provider="consul",
+                consul_service="smg-worker",
+                consul_address="",
+                consul_datacenter="",
+            )
+        )
+        assert consul["discovery"] == {
+            "provider": "consul",
+            "service": "smg-worker",
+            "address": "",
+            "datacenter": "",
+        }
+        slurm = _discovery_arguments(
+            RouterArgs(
+                discovery_provider="slurm",
+                slurm_job_name=["w"],
+                slurm_port=8000,
+                slurm_user="",
+            )
+        )
+        assert slurm["discovery"]["user"] == ""
+        # An empty one given to another provider is misplaced, as any value.
+        with pytest.raises(ValueError, match="only to discovery_provider='consul'"):
+            _discovery_arguments(
+                RouterArgs(
+                    discovery_provider="file",
+                    discovery_file="/run/smg/workers.json",
+                    consul_datacenter="",
+                )
+            )
+
+    @pytest.mark.parametrize(
+        "args, message",
+        [
+            (RouterArgs(discovery_provider="consul"), "needs consul_service"),
+            (RouterArgs(consul_service="smg-worker"), "only to discovery_provider='consul'"),
+            (
+                RouterArgs(
+                    discovery_provider="slurm",
+                    slurm_job_name=["w"],
+                    slurm_port=8000,
+                    consul_address="http://consul:8500",
+                ),
+                "only to discovery_provider='consul'",
+            ),
+        ],
+    )
+    def test_from_args_rejects_misplaced_consul_settings(self, args, message):
+        """The Consul flags only configure the Consul provider, which needs a
+        service."""
+        with (
+            patch("smg.router._Router") as rust_router,
+            pytest.raises(ValueError, match=message),
+        ):
+            Router.from_args(args)
+
+        rust_router.assert_not_called()
+
     def test_every_discovery_field_is_routed(self):
         """A discovery field missing from from_args' table would reach _Router
         as an argument it does not take."""
@@ -431,7 +522,7 @@ class TestRouterInitialization:
         from smg.router import _DISCOVERY_FIELDS
 
         fields = {f.name for f in dataclasses.fields(RouterArgs)}
-        discovery = {f for f in fields if f.startswith(("slurm_", "discovery_"))}
+        discovery = {f for f in fields if f.startswith(("slurm_", "consul_", "discovery_"))}
         assert discovery == set(_DISCOVERY_FIELDS)
 
     @pytest.mark.parametrize(

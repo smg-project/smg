@@ -37,13 +37,23 @@ import time
 from collections.abc import Callable, Mapping, MutableMapping
 from typing import Any
 
-from smg_grpc_servicer.hostport import host_port
+from smg_grpc_servicer.hostport import host_port, loopback_target
 
 # The switch's flag and choices live with the plugins' registration (stdlib
 # only); re-exported here as this module's documented values.
 from smg_grpc_servicer.servicer_impl_flag import (  # noqa: F401
     IMPLS,
     SERVICER_IMPL_FLAG,
+)
+from smg_grpc_servicer.warmup import (
+    WarmupInputs,
+    WarmupPlan,
+    WarmupReport,
+    WarmupSetting,
+    WarmupWire,
+    parse_setting,
+    plan_for,
+    run_warmup,
 )
 
 logger = logging.getLogger(__name__)
@@ -266,6 +276,29 @@ def read_launcher_knobs(
             default_socket_dir(environ) if socket_dir is None else socket_dir
         ),
     )
+
+
+def read_warmup_setting(name: str, *, environ: Mapping[str, str] | None = None) -> WarmupSetting:
+    """The planned warm-up's setting from ``environ[name]``
+    (:func:`smg_grpc_servicer.warmup.parse_setting`); a value the knob does
+    not take is a :class:`ServicerConfigError` naming the variable, found with
+    the other knobs before the engine starts. A launcher without such a
+    variable (an empty ``name``) runs none."""
+    if not name:
+        return WarmupSetting(False)
+    source = os.environ if environ is None else environ
+    try:
+        return parse_setting(source.get(name), name=name)
+    except ValueError as error:
+        raise ServicerConfigError(str(error)) from None
+
+
+def servicer_loopback(address: str) -> str:
+    """The target to dial the Rust server's own listener from this process:
+    its bound ``host:port`` (a bracketed IPv6 literal included) with a
+    wildcard host mapped to its loopback address."""
+    host, _, port = address.rpartition(":")
+    return loopback_target(host, int(port))
 
 
 def configuration_exit(error: ServicerConfigError, log: logging.Logger = logger) -> SystemExit:
@@ -1046,6 +1079,33 @@ async def drain_server(server: Any, engine: Any, timeout: float, poll_secs: floa
         await asyncio.sleep(min(poll_secs, remaining))
 
 
+def hold_readiness(server: Any, ready: bool) -> None:
+    """Hold (``False``) or release (``True``) the server's health answer
+    alone, admission left open, so the servicer's own requests still reach
+    the engine while readiness is held (the planned warm-up runs over the
+    server's own port): ``set_ready`` where the server has it. ``set_serving``
+    is the drain switch (it closes admission as well, and would refuse the
+    warm-up's requests); a server without ``set_ready`` is an older binding
+    whose ``set_serving`` flipped health alone, and that is what it gets."""
+    setter = getattr(server, "set_ready", None)
+    if setter is None:
+        setter = server.set_serving
+    setter(ready)
+
+
+def _warmup_over(server: Any, task: asyncio.Task) -> None:
+    """The planned warm-up's task ended: the servicer is SERVING either way.
+    The engine connected and answers; a warm-up that failed is an error line
+    for the operator, not a worker kept out of rotation."""
+    try:
+        report = task.result()
+    except Exception:
+        logger.exception("The planned warm-up failed; the servicer is SERVING without it")
+    else:
+        logger.info("Warm-up over (%s); the servicer is SERVING", report.summary())
+    hold_readiness(server, True)
+
+
 async def supervise(
     server: Any,
     engine: Any,
@@ -1054,6 +1114,7 @@ async def supervise(
     stop_timeout: float = SERVER_STOP_SECS,
     stop_event: asyncio.Event | None = None,
     poll_secs: float = _POLL_SECS,
+    warmup: Callable[[], WarmupReport] | None = None,
 ) -> int:
     """Run until a shutdown signal, an engine exit, or a server failure.
 
@@ -1063,6 +1124,12 @@ async def supervise(
     from a living engine rather than time since the last handshake message.
     An engine that tracks its workers (``track``) gets one pass when the
     server first reports it connected, its start and its spawning over.
+
+    A ``warmup`` (the planned warm-up over the servicer's own port, blocking;
+    the caller held the server's health at NOT_SERVING with
+    :func:`hold_readiness`, admission open) runs on a thread the moment the
+    engine connected, with the engine polled meanwhile; the health flips to
+    SERVING when it returned, whatever it returned.
 
     Signals drain: health flips to NOT_SERVING at once (the Router stops
     routing here), in-flight streams get up to ``drain_secs`` to finish with the
@@ -1078,6 +1145,7 @@ async def supervise(
             loop.add_signal_handler(sig, stop_event.set)
     exit_code = 0
     announced_ready = False
+    warming: asyncio.Task | None = None
     try:
         while not stop_event.is_set():
             if not announced_ready and server.engine_ready:
@@ -1087,7 +1155,16 @@ async def supervise(
                 # counts as serving, whatever the interval's passes saw.
                 if track is not None:
                     track()
-                logger.info("Engine connected; the servicer is SERVING")
+                if warmup is None:
+                    logger.info("Engine connected; the servicer is SERVING")
+                else:
+                    logger.info(
+                        "Engine connected; the planned warm-up runs before the servicer is SERVING"
+                    )
+                    warming = asyncio.create_task(asyncio.to_thread(warmup))
+            if warming is not None and warming.done():
+                _warmup_over(server, warming)
+                warming = None
             error = server.last_error
             if error or not server.running:
                 logger.error("Rust servicer cannot serve: %s", error or "server exited")
@@ -1106,6 +1183,10 @@ async def supervise(
                 pass
     finally:
         mark_not_serving(server)
+        if warming is not None and not warming.done():
+            # The stop below cancels the streams the warm-up's thread waits
+            # on; the task itself is let go.
+            warming.cancel()
         try:
             if stop_event.is_set():
                 if not await drain_server(server, engine, drain_secs, poll_secs):
@@ -1157,10 +1238,36 @@ class RustLauncher:
     kv_events_env: str
     # What the servicer loses without a local tokenizer directory, for the warning.
     without_tokenizer: str
+    # The planned warm-up's knob (:mod:`smg_grpc_servicer.warmup`); a launcher
+    # that names none runs no warm-up.
+    warmup_env: str = ""
 
     def prepare(self, args: Any) -> None:
         """Engine-specific set-up after the knobs are read and the binding is
         imported, before the first log line (nothing by default)."""
+
+    def warmup_inputs(self, args: Any, facts: Mapping[str, Any]) -> WarmupInputs | None:
+        """What the planned warm-up is planned from: the engine's running
+        window, admission step, context and vocabulary, off its configuration
+        and the facts; ``None`` when this engine or model takes none
+        (nothing by default)."""
+        return None
+
+    def warmup_wire(self, target: str) -> WarmupWire:
+        """The wire the planned warm-up drives the engine through: this
+        servicer's own listener at ``target`` (a loopback ``host:port``), so
+        the pass covers the same path a client's request takes."""
+        raise NotImplementedError
+
+    def run_warmup(self, plan: WarmupPlan, setting: WarmupSetting, server: Any) -> WarmupReport:
+        """The planned warm-up over the servicer's own port (blocking:
+        ``supervise`` runs it on a thread once the engine connected)."""
+        wire = self.warmup_wire(servicer_loopback(server.address))
+        try:
+            return run_warmup(plan, wire, budget_secs=setting.budget_secs)
+        finally:
+            with contextlib.suppress(Exception):
+                wire.close()
 
     def kv_events_default(self, args: Any) -> Any | None:
         """Turn the engine's KV event publisher on when the launcher was given
@@ -1257,6 +1364,7 @@ class RustLauncher:
             startup_ceiling_secs_env=self.startup_ceiling_secs_env,
             socket_dir=default_socket_dir(),
         )
+        warmup_setting = read_warmup_setting(self.warmup_env)
         servicer = importlib.import_module("smg.servicer")
         self.prepare(args)
         servicer.init_servicer_tracing()
@@ -1266,6 +1374,9 @@ class RustLauncher:
         engine_count = facts["data_parallel_size"]
         tokenizer_dir = self.tokenizer_dir(args)
         self.announce_capabilities(facts, tokenizer_dir)
+        plan = None
+        if self.warmup_env:
+            plan = plan_for(warmup_setting, self.warmup_inputs(args, facts), knob=self.warmup_env)
         handshake_port = knobs.handshake_port or free_port()
         server = getattr(servicer, self.server_class)(
             bind_address=self.bind_address(args),
@@ -1280,7 +1391,15 @@ class RustLauncher:
             **self.server_extras(args, tokenizer_dir),
             **facts,
         )
+        supervision: dict[str, Any] = {}
+        if plan is not None:
+            # Readiness is held from the first probe: the health flips to
+            # SERVING once the warm-up ran over the connected engine
+            # (``supervise``), not when the engine connects. Admission stays
+            # open: the warm-up's own requests must reach the engine.
+            hold_readiness(server, False)
+            supervision["warmup"] = functools.partial(self.run_warmup, plan, warmup_setting, server)
         self.announce(server, knobs, handshake_port, engine_count)
         engine = await launch_or_stop(server, lambda: self.launch(args, handshake_port, facts))
         self.launched(engine)
-        return await supervise(server, engine, drain_secs=knobs.drain_secs)
+        return await supervise(server, engine, drain_secs=knobs.drain_secs, **supervision)

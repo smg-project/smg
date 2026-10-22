@@ -128,9 +128,10 @@ whitespace alone, as another call, and carries the family's call marker the outp
 (deciding at the first byte that is not whitespace, inside the marker, between objects, inside one,
 after the `]` or the lone object) and what they say of the bytes around the objects (the brackets,
 the commas, the `;` and the wrapping whitespace `Dropped`; text between objects `Malformed`, one run
-per event, a run ending at whitespace, a comma, a brace or the `]`; text after the list or the lone
-object `Malformed` with its whitespace, one event per piece once text follows) are the same under
-every framing.
+per event, a run ending at whitespace, a comma, a brace or the `]`, the wrapping between two runs
+the model's and in the second run's event (`event::release_between`); text after the list or the
+lone object `Malformed` with its whitespace, one event per piece once text follows) are the same
+under every framing.
 
 The JSON family so reads as one object reader with the framings around it, each stated once:
 none, where a table's markers frame one object (`CallSyntax::Json`, the JSON assembler itself); a
@@ -259,7 +260,9 @@ What the syntax says, and what the assembler does with it:
   opener and closer are the template's wrapping and go into the fragments' sources, not the
   value; the text between them is the value as it is, streamed as it arrives for a declared
   string, read whole at the closing tag for any other type. Text between `]]>` and the closing
-  tag, which the template never writes, is reported.
+  tag, which the template never writes, is reported; a value held whole for its close is written
+  at the first word of it, as the section has it, so that the report never takes the bytes it is
+  held in, and the closing tag then leaves as the syntax's wrapping (`Dropped { Wrapper }`).
 - **A value may stand on its own line** (`Tags::value_on_its_own_line`): dots3's template
   writes a newline after the parameter tag and one before its closing tag. Those two are the
   template's framing and go into the fragments' sources, not the value: the first byte of a
@@ -330,8 +333,10 @@ What the syntax says, and what the assembler does with it:
   `Malformed { UnterminatedRegion }` too.
 - **Every byte of the invoke lands in exactly one event**, with the tagged assemblers'
   accounting: the name's bytes in `ToolCallStart`, each tag's and value's bytes in the
-  fragments they produce, text where the syntax has tags as `Malformed` run by run with the
-  whitespace before it as `Dropped { Wrapper }`.
+  fragments they produce, text where the syntax has tags as `Malformed` run by run, the
+  whitespace right after a tag the syntax read as `Dropped { Wrapper }` before the first run and
+  the whitespace between two runs, the model's, in the second run's event
+  (`event::release_between`).
 
 ## The value reader (`tagged::value`)
 
@@ -474,5 +479,7 @@ What the syntax says, and what the assembler does with it:
   `Malformed { UnterminatedRegion }`, the containers close unless a string is open, and the call
   ends with no bytes of its own.
 - **Every byte lands in exactly one event**: the header, each fragment's bytes with the whitespace
-  before them, text after the object closed as `Malformed` run by run and the template's wrapping
-  there as `Dropped { Wrapper }`, the marker as the end's source.
+  before them, text after the object closed as `Malformed` run by run, the whitespace right after
+  the object and the run before the marker as the template's wrapping (`Dropped { Wrapper }`) and
+  the whitespace between two runs, the model's, in the second run's event
+  (`event::release_between`), the marker as the end's source.

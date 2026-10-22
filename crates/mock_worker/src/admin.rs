@@ -282,10 +282,11 @@ fn optional<T: std::str::FromStr>(
 /// `status=S` (0, or 400 to 599) answered instead of serving, for the next
 /// `count=N` requests or every request for `secs=T` (neither: until cleared),
 /// after a `stall_ms=M` hold; `after_tokens=K` serves K tokens first and cuts
-/// the stream with S. `finish=error` ends the stream as an engine that failed
-/// the request does, a `Complete` with finish reason `error` after K tokens
-/// (0 when unset), with no status needed. `status=0` alone clears; with
-/// `stall_ms` it stalls and then serves.
+/// the stream with S (on the gRPC wire, `status=422` is the engine's report
+/// that it could not continue the request under its constraint). `finish=error`
+/// ends the stream as an engine that failed the request does, a `Complete`
+/// with finish reason `error` after K tokens (0 when unset), with no status
+/// needed. `status=0` alone clears; with `stall_ms` it stalls and then serves.
 fn fail_query(q: &HashMap<String, String>) -> Result<Option<RequestFault>, String> {
     let status: u16 = optional(q, "status")?.unwrap_or(0);
     let count: Option<u32> = optional(q, "count")?;

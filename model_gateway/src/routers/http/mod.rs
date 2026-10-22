@@ -9,10 +9,25 @@ pub(crate) mod stream_failure;
 pub(crate) mod stream_relay;
 
 use axum::response::Response;
-use openai_protocol::messages::CreateMessageRequest;
+use openai_protocol::{
+    chat::ChatCompletionRequest, messages::CreateMessageRequest, profile::ProviderProfile,
+};
 use serde_json::Value;
 
 use crate::routers::error;
+
+/// The chat request as the upstream reads it. Both HTTP routers forward the
+/// typed request to a server that renders the prompt itself (the external
+/// OpenAI-compatible router does the same in its chat path), so the vendor
+/// profile's reading of a field the gateway's own renderer reads differently
+/// (a DeepSeek V4.1 `medium` effort: the template's level here, the vendor's
+/// `high` there) is applied once, where the request is committed to an HTTP
+/// upstream. The profile is the one request validation selected, from the
+/// model the client asked for.
+pub(crate) fn chat_for_upstream(mut body: ChatCompletionRequest) -> ChatCompletionRequest {
+    ProviderProfile::for_model(&body.model).normalize_chat_for_upstream(&mut body);
+    body
+}
 
 /// Rewrite the `model` field of an outbound request body.
 ///

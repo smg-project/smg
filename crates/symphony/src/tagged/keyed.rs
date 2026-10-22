@@ -34,7 +34,7 @@ use crate::{
     event::{runs, Event, Events, MalformedReason, Text},
     markers::{Piece, Scanner},
     tagged::{
-        drop_refused, end_cut_call, refuse,
+        drop_refused, end_cut_call, held_text, refuse,
         value::{json, Kind},
     },
     Declared,
@@ -484,7 +484,10 @@ impl Assembler {
             // An empty string: its opening and closing quotes come together.
             Mode::Streaming { opened: false } => self.object.member(&value.key, "\"\""),
             Mode::Whole | Mode::Undecided => {
-                let written = json(&self.object.carried[value.start..], value.kind);
+                let written = json(
+                    held_text(&self.object.carried, value.start, None),
+                    value.kind,
+                );
                 self.object.member(&value.key, &written)
             }
         };

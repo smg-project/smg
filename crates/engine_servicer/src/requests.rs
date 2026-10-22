@@ -113,6 +113,11 @@ impl RequestRegistry {
         self.draining.store(!accepting, Ordering::Release);
     }
 
+    /// Whether admission is open: no drain has closed it.
+    pub(crate) fn is_accepting(&self) -> bool {
+        !self.draining.load(Ordering::Acquire)
+    }
+
     /// Count request lifetimes, including aborted streams still unwinding.
     /// The cancellation map alone loses those entries before their cleanup.
     pub(crate) fn active(&self) -> usize {

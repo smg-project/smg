@@ -36,8 +36,9 @@ use crate::{
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{
-        http_client::build_client, liveness, KvEventMonitor, PrefillAdmission,
-        WorkerHttpClientCache, WorkerMonitor, WorkerRegistry, WorkerService,
+        http_client::{build_client, connect_timeout_secs_below, DEFAULT_CONNECT_TIMEOUT_SECS},
+        liveness, KvEventMonitor, PrefillAdmission, WorkerHttpClientCache, WorkerMonitor,
+        WorkerRegistry, WorkerService,
     },
     workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
@@ -687,7 +688,15 @@ impl AppContextBuilder {
                 .pool_idle_timeout(pool_idle_timeout)
                 .pool_max_idle_per_host(500)
                 .timeout(Duration::from_secs(timeout_secs))
-                .connect_timeout(Duration::from_secs(10))
+                // Below the request timeout, as the worker clients keep it
+                // (`worker::http_client::connect_timeout_secs_below`): a dark
+                // external host fails as a connect timeout, not as the
+                // request's own (except under a 1 s request timeout, where the
+                // two timers race).
+                .connect_timeout(Duration::from_secs(connect_timeout_secs_below(
+                    DEFAULT_CONNECT_TIMEOUT_SECS,
+                    timeout_secs,
+                )))
                 .tcp_nodelay(true)
                 .tcp_keepalive(Some(Duration::from_secs(30)));
             // Force rustls backend when TLS is configured

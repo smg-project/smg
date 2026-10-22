@@ -439,6 +439,33 @@ async fn health_follows_the_engine_link_and_the_drain_flag() {
         status(health.check(check.clone()).await.unwrap().into_inner()),
         ServingStatus::Serving as i32
     );
+    // Readiness held alone (the lifecycle owner's planned warm-up): health
+    // answers NOT_SERVING with its own message while admission stays open,
+    // then the release restores SERVING; the drain below closes admission.
+    server.set_ready(false);
+    let held = client
+        .health_check(sg::HealthCheckRequest {})
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!held.healthy);
+    assert_eq!(held.message, "Warming up");
+    let (admitted, _cancel) = server
+        .state
+        .registry
+        .register("held-probe")
+        .expect("admission stays open while readiness is held");
+    drop(admitted);
+    server.set_ready(true);
+    assert!(
+        client
+            .health_check(sg::HealthCheckRequest {})
+            .await
+            .unwrap()
+            .into_inner()
+            .healthy
+    );
+
     server.set_serving(false);
     assert_eq!(
         status(health.check(check).await.unwrap().into_inner()),
@@ -450,6 +477,10 @@ async fn health_follows_the_engine_link_and_the_drain_flag() {
         .unwrap()
         .into_inner();
     assert_eq!(draining.message, "Draining");
+    assert!(
+        server.state.registry.register("late").is_err(),
+        "the drain closes admission"
+    );
     server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 

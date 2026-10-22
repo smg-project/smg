@@ -385,7 +385,7 @@ fn build_zmq_request<B>(
         ZmqDialect::Vllm => {
             let vllm_mm = zmq_vllm_mm(options.multimodal_inputs)?;
             // The ZMQ wire carries one modality batch (see `zmq_vllm_mm`).
-            finish_vllm_request(vllm_mm.map(|mm| (mm, Vec::new())), |mm| {
+            let mut request = finish_vllm_request(vllm_mm.map(|mm| (mm, Vec::new())), |mm| {
                 vllm(
                     request_id,
                     body,
@@ -394,7 +394,9 @@ fn build_zmq_request<B>(
                     mm,
                     options.tool_constraints,
                 )
-            })
+            })?;
+            request.set_grammar_from_first_token(options.first_token_grammar);
+            Ok(request)
         }
         ZmqDialect::TokenSpeed => {
             let tokenspeed_mm = zmq_tokenspeed_mm(options.multimodal_inputs)?;
@@ -410,6 +412,13 @@ fn build_zmq_request<B>(
             })
         }
         // SGLang tensors ride inline (no SHM handles to release on failure).
+        // A grammar led with the thought for the first token needs no
+        // reasoning phase in front of it: the engine's grammar manager wraps
+        // its reasoner around a request's grammar only when the request asks
+        // for reasoning, and the gateway's own link cannot tell whether the
+        // engine runs one, so the request does not ask where the tag has the
+        // thought already. The engine's own reasoning-token count follows the
+        // flag; the gateway's parser fills in the count where it runs.
         ZmqDialect::Sglang => {
             let sglang_mm = zmq_sglang_mm(options.multimodal_inputs)?;
             let req = sglang(
@@ -420,7 +429,7 @@ fn build_zmq_request<B>(
                 SglangGenerateRequestOptions {
                     multimodal_inputs: sglang_mm,
                     tool_call_constraint: options.tool_constraints,
-                    require_reasoning: options.require_reasoning,
+                    require_reasoning: options.require_reasoning && !options.first_token_grammar,
                 },
             )?;
             Ok(ProtoGenerateRequest::Sglang(Box::new(req)))

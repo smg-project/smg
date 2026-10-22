@@ -18,10 +18,15 @@ const VIDEO: &str = "<|video|>";
 const BEGIN: &str = "<|begin_of_image|>";
 const END: &str = "<|end_of_image|>";
 /// The serving engine's default video loader keeps at most this many frames
-/// of a clip, spread from the first to the last, and its processor takes
-/// them as they come; a clip costs on this path what it costs on the
-/// engine's own server only when the frames are the same.
+/// of a clip, spread from the first to the last; its processor takes a
+/// longer clip's frames as they come and resamples a clip the loader kept
+/// whole. A clip costs on this path what it costs on the engine's own
+/// server only when the frames are the same.
 const LOADER_FRAMES: usize = 32;
+/// The reference video processor's (`Glm5NextVideoProcessor`) default
+/// sampling rate and frame cap, for a clip the loader kept whole.
+const PROCESSOR_FPS: f32 = 2.0;
+const PROCESSOR_MAX_FRAMES: usize = 2048;
 /// Frames per temporal group: the engine's timestamps take every second
 /// sampled frame, whatever the configured temporal patch size.
 const FRAMES_PER_GROUP: usize = 2;
@@ -295,11 +300,27 @@ impl ModelProcessorSpec for Glm53FlashSpec {
 
     /// The engine's own server takes a clip from its default video loader,
     /// which keeps at most `LOADER_FRAMES` frames spread from the first to
-    /// the last; the processor's own rate-based sampling never runs there.
+    /// the last; when that kept the whole clip, the reference processor
+    /// resamples it at its own rate, as the engine lets it.
     fn video_frame_sampling(&self) -> FrameSampling {
-        FrameSampling::UpTo {
+        FrameSampling::UpToThenRate {
             max_frames: LOADER_FRAMES,
+            rate_max_frames: PROCESSOR_MAX_FRAMES,
         }
+    }
+
+    /// The reference video processor's `fps`, which its resampling reads.
+    fn default_video_sample_fps(&self) -> Option<f32> {
+        Some(PROCESSOR_FPS)
+    }
+
+    fn default_video_sample_fps_with(&self, config: Option<&PreProcessorConfig>) -> Option<f32> {
+        Some(
+            config
+                .and_then(|config| config.get_extra::<f32>("fps"))
+                .filter(|fps| fps.is_finite() && *fps > 0.0)
+                .unwrap_or(PROCESSOR_FPS),
+        )
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
@@ -353,9 +374,19 @@ mod tests {
         let spec = registry.lookup(&metadata).unwrap();
         assert_eq!(
             spec.video_frame_sampling(),
-            FrameSampling::UpTo {
-                max_frames: LOADER_FRAMES
+            FrameSampling::UpToThenRate {
+                max_frames: LOADER_FRAMES,
+                rate_max_frames: PROCESSOR_MAX_FRAMES,
             }
+        );
+        let video_config = PreProcessorConfig::from_value(json!({"fps": 1})).unwrap();
+        assert_eq!(
+            spec.default_video_sample_fps_with(Some(&video_config)),
+            Some(1.0)
+        );
+        assert_eq!(
+            spec.default_video_sample_fps_with(None),
+            Some(PROCESSOR_FPS)
         );
 
         // Four temporal groups of two tokens each, from eight frames the

@@ -49,10 +49,13 @@ pub const REQUEST_TIMEOUT_CODE: &str = "call_upstream_timeout";
 ///
 /// A total timeout that runs out while the connect is still pending reads as
 /// the request's own as well (the client marks no phase): the budget is per
-/// attempt, and a replay could not fit in what is left of it. Keep the pool's
-/// connect timeout below the request timeout, as the defaults are (10 s
-/// against 1800 s), so a host that has gone dark fails as a connect timeout
-/// and is routed around.
+/// attempt, and a replay could not fit in what is left of it. The gateway's
+/// clients keep their connect timeout below the request timeout for that
+/// reason (the worker clients and the shared client its external providers
+/// send through, clamped where a configuration would not), so a host that has
+/// gone dark fails as a connect timeout and is routed around. Whole seconds
+/// cannot go below one: under a 1 s request timeout the two timers race, and a
+/// dark host may read as the request's own timeout instead.
 pub fn is_request_timeout(error: &reqwest::Error) -> bool {
     if !error.is_timeout() || error.is_connect() {
         return false;

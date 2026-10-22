@@ -132,9 +132,9 @@ message GenerateRequest {
   optional KvBootstrapInfo kv_bootstrap_info = 11;
 
   // Hard-pin to a specific attention-DP rank, bypassing load balancing.
-  // Disaggregation engines ignore a conflicting pin — the bootstrap_room
-  // residue (room % dp_size) stays the authoritative rank carrier. Only
-  // forwarded when the engine advertises attention-DP support (dp_size label).
+  // Each PD side carries its selected rank. The bootstrap_room still identifies
+  // the prefill KV source. Older engines without PD pin support ignore this
+  // field in disaggregation mode and dispatch by the room residue instead.
   optional int32 data_parallel_rank = 12;
 }
 

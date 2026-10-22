@@ -1,4 +1,5 @@
-//! Checkpoint-specific GLM behavior. A GLM MoE DSA checkpoint (`model_type`
+//! Checkpoint-specific GLM rendering and media behavior. A GLM MoE DSA
+//! checkpoint (`model_type`
 //! `glm_moe_dsa` with the `GlmMoeDsaForCausalLM` architecture, which the
 //! text-only GLM-5.2 and GLM-5.3 releases carry) opts out of media processing
 //! while its active template renders every media part as the official
@@ -9,34 +10,48 @@ use std::path::Path;
 
 use crate::{
     chat_template::{ChatTemplateContentFormat, ChatTemplateParams, ChatTemplateState},
+    encoders::glm53,
     traits::MediaHandling,
 };
 
-/// Presence identifies the GLM MoE DSA checkpoint family. Media reminders
+/// Presence identifies the GLM text or vision checkpoint family. Media reminders
 /// additionally require the active template to render them: the family's own
 /// templates do, a replacement template may not.
-pub(super) struct Checkpoint;
+pub(super) enum Checkpoint {
+    Text,
+    Flash,
+}
 
 impl Checkpoint {
     /// Recognize the checkpoint family from both model type and architecture.
     pub(super) fn load(dir: &Path) -> Option<Self> {
         let config: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join("config.json")).ok()?).ok()?;
-        if config.get("model_type")?.as_str()? != "glm_moe_dsa"
-            || !config
-                .get("architectures")?
-                .as_array()?
-                .iter()
-                .any(|arch| arch.as_str() == Some("GlmMoeDsaForCausalLM"))
-        {
-            return None;
+        let architectures = config.get("architectures")?.as_array()?;
+        let has = |name| architectures.iter().any(|arch| arch.as_str() == Some(name));
+        match config.get("model_type")?.as_str()? {
+            "glm_moe_dsa" if has("GlmMoeDsaForCausalLM") => Some(Self::Text),
+            "glm5_next" if has("Glm5NextForConditionalGeneration") => Some(Self::Flash),
+            _ => None,
         }
-        Some(Self)
+    }
+
+    /// Both identity and the active template must match: earlier GLM releases
+    /// share the text architecture, and overrides may have different behavior.
+    pub(super) fn renderer(&self, source: Option<&str>) -> Option<glm53::Template> {
+        let template = glm53::Template::detect(source?)?;
+        match (self, template) {
+            (Self::Text, glm53::Template::Text) | (Self::Flash, glm53::Template::Flash) => {
+                Some(template)
+            }
+            _ => None,
+        }
     }
 
     /// Opt out of preprocessing only when the active template preserves reminders.
-    pub(super) fn media_handling(template: &ChatTemplateState) -> MediaHandling {
-        if template.content_format() == ChatTemplateContentFormat::OpenAI
+    pub(super) fn media_handling(&self, template: &ChatTemplateState) -> MediaHandling {
+        if matches!(self, Self::Text)
+            && template.content_format() == ChatTemplateContentFormat::OpenAI
             && renders_media_reminders(template)
         {
             MediaHandling::TemplateText
@@ -89,11 +104,15 @@ mod tests {
 
     /// Load a minimal tokenizer with checkpoint metadata and the reference template.
     fn tokenizer(config: serde_json::Value) -> HuggingFaceTokenizer {
+        tokenizer_with_template(config, TEMPLATE)
+    }
+
+    fn tokenizer_with_template(config: serde_json::Value, source: &str) -> HuggingFaceTokenizer {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tokenizer.json");
         std::fs::write(&path, r#"{"version":"1.0","model":{"type":"WordLevel","vocab":{"[UNK]":0},"unk_token":"[UNK]"}}"#).unwrap();
         std::fs::write(dir.path().join("config.json"), config.to_string()).unwrap();
-        std::fs::write(dir.path().join("chat_template.jinja"), TEMPLATE).unwrap();
+        std::fs::write(dir.path().join("chat_template.jinja"), source).unwrap();
         HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap()
     }
 
@@ -197,5 +216,87 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(tokenizer.renderer_capabilities().media_handling, Preprocess);
+    }
+
+    #[test]
+    fn native_renderer_requires_checkpoint_and_known_template_and_refreshes_on_override() {
+        use super::super::Renderer;
+        const FLASH: &str = include_str!("../../tests/fixtures/glm53/chat_template_flash.jinja");
+        for (config, source, expected) in [
+            (
+                serde_json::json!({"model_type": "glm_moe_dsa", "architectures": ["GlmMoeDsaForCausalLM"]}),
+                TEMPLATE,
+                Some(glm53::Template::Text),
+            ),
+            (
+                serde_json::json!({"model_type": "glm5_next", "architectures": ["Glm5NextForConditionalGeneration"]}),
+                FLASH,
+                Some(glm53::Template::Flash),
+            ),
+            (
+                serde_json::json!({"model_type": "glm5_next", "architectures": ["Glm5NextForConditionalGeneration"]}),
+                TEMPLATE,
+                None,
+            ),
+            (
+                serde_json::json!({"model_type": "glm4v_moe", "architectures": ["Glm4vMoeForConditionalGeneration"]}),
+                FLASH,
+                None,
+            ),
+            (
+                serde_json::json!({"_name_or_path": "GLM-5.3"}),
+                TEMPLATE,
+                None,
+            ),
+        ] {
+            let mut tokenizer = tokenizer_with_template(config.clone(), source);
+            let selected = |tokenizer: &HuggingFaceTokenizer| match tokenizer.renderer {
+                Renderer::Glm53(template) => Some(template),
+                _ => None,
+            };
+            assert_eq!(selected(&tokenizer), expected, "{config}");
+            let kwargs = std::collections::HashMap::from([
+                (
+                    "messages".into(),
+                    serde_json::json!([{"role": "user", "content": "overridden"}]),
+                ),
+                ("add_generation_prompt".into(), serde_json::json!(true)),
+            ]);
+            let oracle = ChatTemplateState::new(Some(source.into())).unwrap();
+            let params = || ChatTemplateParams {
+                template_kwargs: Some(&kwargs),
+                ..Default::default()
+            };
+            assert_eq!(
+                tokenizer.apply_chat_template(&[], params()).unwrap(),
+                oracle.apply(&[], params()).unwrap()
+            );
+            assert!(tokenizer.set_chat_template("{{".into()).is_err());
+            assert_eq!(selected(&tokenizer), expected);
+            let custom = format!("{source}CUSTOM");
+            tokenizer.set_chat_template(custom).unwrap();
+            assert_eq!(selected(&tokenizer), None);
+            let messages = [serde_json::json!({"role": "user", "content": "hello"})];
+            assert!(tokenizer
+                .apply_chat_template(&messages, ChatTemplateParams::default())
+                .unwrap()
+                .ends_with("CUSTOM"));
+            tokenizer.set_chat_template(source.into()).unwrap();
+            assert_eq!(selected(&tokenizer), expected);
+            let oracle = ChatTemplateState::new(Some(source.into())).unwrap();
+            for continued in [false, true] {
+                let messages = [serde_json::json!({"role": "assistant", "content": " partial \n"})];
+                let params = || ChatTemplateParams {
+                    continue_final_message: continued,
+                    ..Default::default()
+                };
+                let expected = oracle.apply_with_continuation(&messages, params()).unwrap();
+                let actual = tokenizer
+                    .apply_chat_template_with_encoding(&messages, params(), Some("prefix"))
+                    .unwrap();
+                assert_eq!(actual.text, format!("{}prefix", expected.0));
+                assert_eq!(actual.continued_final_message, expected.1);
+            }
+        }
     }
 }

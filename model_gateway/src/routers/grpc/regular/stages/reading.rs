@@ -140,7 +140,7 @@ pub(crate) fn prepare(
     };
     let json_schema = matches!(
         &constraint,
-        Ok(symphony::Prepared::Constraint(c)) if c.is_json_schema()
+        Ok(symphony::Prepared::Constraint { constraint, .. }) if constraint.is_json_schema()
     );
     let keeps_special_tokens = match symphony::keeps_special_tokens(
         parser,
@@ -241,6 +241,12 @@ pub(crate) struct Decided {
     /// The constraint is the whole turn's grammar, which holds the request's
     /// own format: the engine's request carries none beside it.
     pub whole_turn: bool,
+    /// The constraint was shaped for an engine that starts the grammar at the
+    /// first generated token (the thought, closed, ahead of the answer or the
+    /// calls; the whole turn's grammar): the engine's request says so where
+    /// its dialect has a switch for the gate behind a reasoning parser
+    /// (`WorkerConstraint::first_token`).
+    pub first_token: bool,
     /// Symphony's assignment, for the response spec; `None` where the legacy
     /// parsers read the response.
     pub assignment: Option<Assignment>,
@@ -328,6 +334,7 @@ pub(crate) fn decide(
         table_tag: decided.table_tag,
         tool_constraints,
         whole_turn: decided.whole_turn,
+        first_token: decided.first_token,
         assignment,
     })
 }

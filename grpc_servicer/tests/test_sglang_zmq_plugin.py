@@ -19,12 +19,248 @@ def _fresh_state(monkeypatch):
     monkeypatch.setattr(zmq_plugin, "_state", zmq_plugin._State())
     monkeypatch.delenv(zmq_plugin.HANDSHAKE_ENV, raising=False)
     monkeypatch.delenv(zmq_plugin.ENGINE_INDEX_ENV, raising=False)
+    monkeypatch.delenv(zmq_plugin.GRAMMAR_ATTRIBUTION_ENV, raising=False)
 
 
 def test_register_is_inert_without_the_launcher_env():
     # No import of sglang, no hooks: a plain SGLang install stays untouched.
     assert zmq_plugin.active() is False
+    assert zmq_plugin.attributes_grammar_aborts() is False
     zmq_plugin.register()
+
+
+def test_grammar_attribution_registers_under_either_env(monkeypatch):
+    # The handshake implies it (the ZMQ wire carries the name); the Python
+    # servicer asks for it alone, for the finish dicts it reads.
+    monkeypatch.setenv(zmq_plugin.HANDSHAKE_ENV, "tcp://127.0.0.1:1")
+    assert zmq_plugin.attributes_grammar_aborts() is True
+    monkeypatch.delenv(zmq_plugin.HANDSHAKE_ENV)
+    monkeypatch.setenv(zmq_plugin.GRAMMAR_ATTRIBUTION_ENV, "1")
+    assert zmq_plugin.active() is False
+    assert zmq_plugin.attributes_grammar_aborts() is True
+    monkeypatch.setenv(zmq_plugin.GRAMMAR_ATTRIBUTION_ENV, "0")
+    assert zmq_plugin.attributes_grammar_aborts() is False
+
+
+class _Finish:
+    """A stand-in for the scheduler's ``FINISH_ABORT``: a message, a status
+    and the ``err_type`` its finish dict carries."""
+
+    def __init__(self, message="Aborted", status_code=None, err_type=None):
+        self.message = message
+        self.status_code = status_code
+        self.err_type = err_type
+
+
+class _Grammar:
+    def __init__(self, rejects: bool):
+        self.rejects = rejects
+        self.finished = False
+
+    def accept_token(self, token):
+        if self.rejects:
+            raise ValueError(f"Tokens not accepted: {token}")
+
+    def is_terminated(self):
+        return False
+
+
+class _Req:
+    def __init__(self, rid, grammar=None, to_finish=None):
+        self.rid = rid
+        self.grammar = grammar
+        self.to_finish = to_finish
+
+    def finished(self):
+        return self.to_finish is not None
+
+
+def _accept_as_the_scheduler_does(processor, req, tokens):
+    """The shape of the scheduler's own ``_accept_grammar_tokens``: a
+    rejection becomes a bare ``FINISH_ABORT()`` on the request."""
+    try:
+        req.grammar.accept_token(tokens)
+    except ValueError:
+        req.to_finish = _Finish()
+    return []
+
+
+def test_the_grammar_hook_names_only_the_finish_the_advance_set():
+    # A rejection: the bare abort gains the name and the message.
+    req = _Req("r1", _Grammar(rejects=True))
+    zmq_plugin.attribute_grammar_abort(_accept_as_the_scheduler_does, object(), req, [7])
+    assert req.to_finish.err_type == zmq_plugin.GRAMMAR_REJECTED_ERR_TYPE
+    assert req.to_finish.message == zmq_plugin.GRAMMAR_REJECTED_MESSAGE
+    assert req.to_finish.status_code is None
+    # An accepted token: nothing to name.
+    req = _Req("r2", _Grammar(rejects=False))
+    zmq_plugin.attribute_grammar_abort(_accept_as_the_scheduler_does, object(), req, [7])
+    assert req.to_finish is None
+    # A finish set before the advance (a length cap, an abort-all) is not the
+    # grammar's, even when the advance leaves it in place.
+    earlier = _Finish("Aborted")
+    req = _Req("r3", _Grammar(rejects=False), to_finish=earlier)
+    zmq_plugin.attribute_grammar_abort(_accept_as_the_scheduler_does, object(), req, [7])
+    assert req.to_finish is earlier and earlier.err_type is None
+    # The keyword form of the prefill path.
+    req = _Req("r4", _Grammar(rejects=True))
+
+    def apply_prefill(processor, *, req, next_token_id, already_advanced=False):
+        return _accept_as_the_scheduler_does(processor, req, next_token_id)
+
+    zmq_plugin.attribute_grammar_abort(apply_prefill, object(), req=req, next_token_id=9)
+    assert req.to_finish.err_type == zmq_plugin.GRAMMAR_REJECTED_ERR_TYPE
+    # A path that names the token itself keeps its own words and its status.
+    req = _Req("r5", _Grammar(rejects=True))
+
+    def decode_side(processor, req, tokens):
+        req.to_finish = _Finish("Grammar accept_token failed for req r5 with token 7", 500)
+
+    zmq_plugin.attribute_grammar_abort(decode_side, object(), req, [7])
+    assert req.to_finish.err_type == zmq_plugin.GRAMMAR_REJECTED_ERR_TYPE
+    assert req.to_finish.message == "Grammar accept_token failed for req r5 with token 7"
+    assert req.to_finish.status_code == 500
+
+
+def test_the_prebuilt_hook_names_the_grammar_requests_the_step_aborted():
+    rejected = _Req("a", _Grammar(rejects=True))
+    accepted = _Req("b", _Grammar(rejects=False))
+    plain = _Req("c")
+    batch = SimpleNamespace(reqs=[rejected, accepted, plain], has_grammar=True)
+
+    def process_prebuilt(batch, future_map):
+        for req in batch.reqs:
+            if req.grammar is not None:
+                try:
+                    req.grammar.accept_token(1)
+                except ValueError:
+                    req.to_finish = _Finish("Grammar accept_token failed for req a", 500)
+        # The step aborts a request without a grammar for its own reasons.
+        batch.reqs[2].to_finish = _Finish("Aborted")
+        return "prebuilt"
+
+    assert zmq_plugin.attribute_prebuilt_grammar_aborts(process_prebuilt, batch, None) == "prebuilt"
+    assert rejected.to_finish.err_type == zmq_plugin.GRAMMAR_REJECTED_ERR_TYPE
+    assert rejected.to_finish.status_code == 500
+    assert accepted.to_finish is None
+    assert plain.to_finish.err_type is None, "no grammar: not the grammar's abort"
+    # A batch without a grammar is not walked.
+    untouched = _Req("d")
+    batch = SimpleNamespace(reqs=[untouched], has_grammar=False)
+
+    def abort_all(batch, future_map):
+        batch.reqs[0].to_finish = _Finish("Aborted")
+
+    zmq_plugin.attribute_prebuilt_grammar_aborts(abort_all, batch, None)
+    assert untouched.to_finish.err_type is None
+
+
+def test_grammar_hooks_follow_the_registry_calling_convention(monkeypatch):
+    """AROUND on the three grammar paths, against the real registry on
+    stand-in classes: the positional, the keyword-only and the batch form."""
+    pytest.importorskip("sglang")
+    import sys
+    import types
+
+    from sglang.srt.plugins.hook_registry import HookRegistry
+
+    class SchedulerBatchResultProcessor:
+        def _accept_grammar_tokens(self, req, tokens):
+            return _accept_as_the_scheduler_does(self, req, tokens)
+
+        def _apply_prefill_grammar(self, *, req, next_token_id, already_advanced=False):
+            if not already_advanced:
+                _accept_as_the_scheduler_does(self, req, next_token_id)
+            req.grammar.finished = req.finished()
+
+    class ScheduleBatchDisaggregationDecodeMixin:
+        def process_prebuilt(self, future_map):
+            for req in self.reqs:
+                if req.grammar is not None:
+                    _accept_as_the_scheduler_does(self, req, 1)
+
+    class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+        def __init__(self, reqs):
+            self.reqs = reqs
+            self.has_grammar = any(req.grammar for req in reqs)
+
+    mod = types.ModuleType("smg_zmq_plugin_grammar_contract")
+    mod.SchedulerBatchResultProcessor = SchedulerBatchResultProcessor
+    mod.ScheduleBatchDisaggregationDecodeMixin = ScheduleBatchDisaggregationDecodeMixin
+    monkeypatch.setitem(sys.modules, mod.__name__, mod)
+    monkeypatch.setattr(
+        zmq_plugin, "_BATCH_RESULTS", f"{mod.__name__}.SchedulerBatchResultProcessor"
+    )
+    monkeypatch.setattr(
+        zmq_plugin, "_DECODE_BATCH", f"{mod.__name__}.ScheduleBatchDisaggregationDecodeMixin"
+    )
+    monkeypatch.setenv(zmq_plugin.GRAMMAR_ATTRIBUTION_ENV, "1")
+    HookRegistry.reset()
+    try:
+        zmq_plugin.register()
+        HookRegistry.apply_hooks()
+        processor = SchedulerBatchResultProcessor()
+        spec = _Req("spec", _Grammar(rejects=True))
+        assert processor._accept_grammar_tokens(spec, [1, 2]) == []
+        assert spec.to_finish.err_type == zmq_plugin.GRAMMAR_REJECTED_ERR_TYPE
+        prefill = _Req("prefill", _Grammar(rejects=True))
+        processor._apply_prefill_grammar(req=prefill, next_token_id=3)
+        assert prefill.to_finish.err_type == zmq_plugin.GRAMMAR_REJECTED_ERR_TYPE
+        assert prefill.grammar.finished is True
+        fine = _Req("fine", _Grammar(rejects=False))
+        processor._apply_prefill_grammar(req=fine, next_token_id=3, already_advanced=True)
+        assert fine.to_finish is None
+        decode = _Req("decode", _Grammar(rejects=True))
+        ScheduleBatch([decode, _Req("plain")]).process_prebuilt(None)
+        assert decode.to_finish.err_type == zmq_plugin.GRAMMAR_REJECTED_ERR_TYPE
+    finally:
+        HookRegistry.reset()
+
+
+def test_this_releases_grammar_paths_are_named():
+    """The hooks against the release's own result processor: its
+    ``_accept_grammar_tokens`` and ``_apply_prefill_grammar`` set the bare
+    ``FINISH_ABORT()`` when the grammar raises, and the hook names it. (The
+    PD decode path needs a device batch; its hook is covered above.)"""
+    pytest.importorskip("sglang")
+    import pkgutil
+
+    for target in (
+        f"{zmq_plugin._BATCH_RESULTS}._accept_grammar_tokens",
+        f"{zmq_plugin._BATCH_RESULTS}._apply_prefill_grammar",
+        f"{zmq_plugin._DECODE_BATCH}.process_prebuilt",
+    ):
+        assert zmq_plugin._resolves(target), target
+    assert not zmq_plugin._resolves(f"{zmq_plugin._BATCH_RESULTS}._no_such_grammar_path")
+    assert not zmq_plugin._resolves("smg_no_such_module.NoClass.method")
+
+    processor_cls = pkgutil.resolve_name(zmq_plugin._BATCH_RESULTS)
+    processor = processor_cls.__new__(processor_cls)  # the paths read nothing of self
+    spec = _Req("spec", _Grammar(rejects=True))
+    retained = zmq_plugin.attribute_grammar_abort(
+        processor_cls._accept_grammar_tokens, processor, spec, [11, 12]
+    )
+    assert retained == []
+    assert type(spec.to_finish).__name__ == "FINISH_ABORT"
+    assert spec.to_finish.err_type == zmq_plugin.GRAMMAR_REJECTED_ERR_TYPE
+    assert spec.to_finish.message == zmq_plugin.GRAMMAR_REJECTED_MESSAGE
+    assert spec.to_finish.status_code is None
+    assert spec.to_finish.to_json() == {
+        "type": "abort",
+        "message": zmq_plugin.GRAMMAR_REJECTED_MESSAGE,
+        "status_code": None,
+        "err_type": zmq_plugin.GRAMMAR_REJECTED_ERR_TYPE,
+    }
+    prefill = _Req("prefill", _Grammar(rejects=True))
+    zmq_plugin.attribute_grammar_abort(
+        processor_cls._apply_prefill_grammar, processor, req=prefill, next_token_id=3
+    )
+    assert prefill.to_finish.err_type == zmq_plugin.GRAMMAR_REJECTED_ERR_TYPE
+    accepted = _Req("accepted", _Grammar(rejects=False))
+    zmq_plugin.attribute_grammar_abort(
+        processor_cls._accept_grammar_tokens, processor, accepted, [11]
+    )
+    assert accepted.to_finish is None
 
 
 def test_engine_index_is_validated(monkeypatch):

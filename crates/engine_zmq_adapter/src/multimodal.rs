@@ -85,15 +85,15 @@ impl Decoded {
 }
 
 /// The raw bytes behind a `TensorData`, from whichever transport carries them:
-/// inline, or a `/dev/shm` file the Router wrote (read once and unlinked, as
-/// the Python servicer's `mm_shm` does). Remote handles are not implemented.
-fn payload_bytes(
-    name: &str,
-    payload: Option<vllm::tensor_data::Payload>,
-) -> Result<Vec<u8>, String> {
+/// inline (a view of the request's bytes, not a copy), or a `/dev/shm` file
+/// the Router wrote (read once and unlinked, as the Python servicer's
+/// `mm_shm` does). Remote handles are not implemented.
+fn payload_bytes(name: &str, payload: Option<vllm::tensor_data::Payload>) -> Result<Bytes, String> {
     match payload {
-        Some(vllm::tensor_data::Payload::Inline(data)) => Ok(Vec::from(data)),
-        Some(vllm::tensor_data::Payload::Shm(handle)) => read_shm_payload(name, &handle),
+        Some(vllm::tensor_data::Payload::Inline(data)) => Ok(data),
+        Some(vllm::tensor_data::Payload::Shm(handle)) => {
+            read_shm_payload(name, &handle).map(Bytes::from)
+        }
         Some(vllm::tensor_data::Payload::Remote(_)) => Err(format!(
             "multimodal tensor {name:?}: TensorData.remote payload is not implemented yet"
         )),
@@ -258,7 +258,7 @@ fn decode_tensor(
         let f32_bytes = if tensor.dtype == "float32" {
             data
         } else {
-            to_f32_bytes(name, &tensor.dtype, &data)?
+            Bytes::from(to_f32_bytes(name, &tensor.dtype, &data)?)
         };
         let cast = WireTensor::from_f32_bytes_cast(model_dtype, shape.clone(), &f32_bytes)?;
         let WireArrayData::RawView(bytes) = cast.data else {
@@ -273,7 +273,7 @@ fn decode_tensor(
     let decoded = Decoded {
         dtype: tensor.dtype,
         shape,
-        bytes: Bytes::from(data),
+        bytes: data,
     };
     // Guard against a truncated or oversized inline payload: the engine would
     // otherwise reinterpret the raw buffer against the declared shape.

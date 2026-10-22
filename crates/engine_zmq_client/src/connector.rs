@@ -4244,4 +4244,214 @@ mod tests {
              (after {elapsed:?}), not at a tick a whole window after the gap"
         );
     }
+
+    // ---- The other wire that carries typed tensors: the same regression
+    // cases with a large typed tensor on a client of the tagged-array
+    // protocol, whose engine resolves auxiliary frames the same way.
+
+    use crate::protocol::tokenspeed::request::TokenizedGenerateReqInput as TaggedWireRequest;
+
+    /// A client of that protocol over the same mock engine.
+    async fn connect_tagged() -> (TokenSpeedClient, MockEngine, IpcNamespace) {
+        let ns = IpcNamespace::new().unwrap();
+        let (handshake, input, output) = (
+            ns.handshake_endpoint(),
+            ns.input_endpoint(),
+            ns.output_endpoint(),
+        );
+        let (transport, engine) = tokio::join!(
+            connect_handshake(&handshake, 1, &input, &output, TIMEOUT),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        (
+            TokenSpeedClient::new(transport.unwrap()),
+            engine.unwrap(),
+            ns,
+        )
+    }
+
+    /// A request of that wire with a 64 MiB typed feature tensor.
+    fn large_tagged_request(request_id: &str) -> TaggedWireRequest {
+        use crate::{
+            codec::tensor::WireTensor,
+            protocol::tokenspeed::multimodal::{
+                mm_pad_value, TokenSpeedWireMmInputs, TokenSpeedWireMmItem, TokenSpeedWireModality,
+            },
+        };
+
+        let pad = mm_pad_value(TokenSpeedWireModality::Image, 1);
+        TaggedWireRequest {
+            rid: request_id.to_string(),
+            input_ids: vec![1, pad, 2],
+            input_ids_unpadded: Some(vec![1, 9, 2]),
+            multimodal_inputs: Some(TokenSpeedWireMmInputs {
+                mm_items: vec![TokenSpeedWireMmItem {
+                    modality: TokenSpeedWireModality::Image,
+                    hash: 1,
+                    pad_value: pad,
+                    offsets: vec![(1, 1)],
+                    feature: WireTensor::from_raw("uint8", vec![64 << 20], vec![0; 64 << 20]),
+                    model_specific_data: std::collections::BTreeMap::new(),
+                }],
+                im_token_id: Some(9),
+                video_token_id: None,
+            }),
+            ..TaggedWireRequest::default()
+        }
+    }
+
+    /// What the engine read on that wire: an add's request id, or an abort's
+    /// ids.
+    async fn recv_tagged(engine: &mut MockEngine) -> (&'static str, Vec<String>) {
+        let frames = engine.recv_request().await.unwrap();
+        match frames[0].as_ref() {
+            b"\x00" => {
+                let request: TaggedWireRequest = decode_msgpack(&frames[1]).unwrap();
+                ("add", vec![request.rid])
+            }
+            b"\x01" => ("abort", decode_msgpack(&frames[1]).unwrap()),
+            other => panic!("unexpected request type frame {other:?}"),
+        }
+    }
+
+    /// A typed tensor of the auxiliary size reaches the engine as its own
+    /// frame after the payload, which stays small and still decodes.
+    #[tokio::test]
+    async fn a_large_typed_tensor_reaches_the_engine_as_its_own_frame_on_the_tagged_wire() {
+        let (client, mut engine, _ns) = connect_tagged().await;
+        let _stream = client.submit(large_tagged_request("framed")).await.unwrap();
+        let frames = tokio::time::timeout(TIMEOUT, engine.recv_request())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frames.iter().map(Bytes::len).skip(2).collect::<Vec<_>>(),
+            vec![64 << 20],
+            "type, payload, one tensor frame: {} frames",
+            frames.len()
+        );
+        assert_eq!(frames[0].as_ref(), b"\x00");
+        assert!(
+            frames[1].len() < 1024,
+            "payload of {} bytes",
+            frames[1].len()
+        );
+        let decoded: TaggedWireRequest = decode_msgpack(&frames[1]).unwrap();
+        assert_eq!(decoded.rid, "framed");
+    }
+
+    /// Cancelled typed-tensor requests keep their transport credit until the
+    /// peer closes, as on the first wire.
+    #[tokio::test]
+    async fn cancelled_typed_tensor_requests_keep_their_credit_on_the_tagged_wire() {
+        let (client, engine, _ns) = connect_tagged().await;
+        let first = client.submit(large_tagged_request("first")).await.unwrap();
+        let second = client.submit(large_tagged_request("second")).await.unwrap();
+        let budget = client.inner.input_budget.clone();
+        assert!(budget.used.lock().bytes >= 64 << 20);
+        drop((first, second));
+        assert!(budget.used.lock().bytes >= 64 << 20);
+        drop(client);
+        drop(engine);
+        tokio::time::timeout(TIMEOUT, async {
+            while budget.used.lock().frames != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("peer close releases upstream payload owners");
+    }
+
+    /// A transport disconnect fails typed-tensor requests the local queue
+    /// already accepted.
+    #[tokio::test]
+    async fn a_peer_disconnect_fails_accepted_typed_tensor_requests_on_the_tagged_wire() {
+        let (client, engine, _ns) = connect_tagged().await;
+        let mut stream = client
+            .submit(large_tagged_request("disconnected"))
+            .await
+            .unwrap();
+        drop(engine);
+        assert!(tokio::time::timeout(TIMEOUT, stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+        assert!(!client.is_alive());
+    }
+
+    /// A typed-tensor submit its caller abandons while the frames wait for
+    /// the engine still aborts the request there, the abort behind the add.
+    #[tokio::test]
+    async fn an_abandoned_typed_tensor_submit_aborts_its_request_on_the_tagged_wire() {
+        let (client, mut engine, _ns) = connect_tagged().await;
+        client.set_send_timeout(SEND_WINDOW);
+        for _ in 0..3 {
+            let (payload, aux) =
+                TokenSpeedProtocol::encode_add(&large_tagged_request("queue-saturation")).unwrap();
+            client
+                .inner
+                .queue_frame(
+                    &EngineId::from_engine_index(0),
+                    TokenSpeedProtocol::add_frame(),
+                    payload,
+                    aux,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        tokio::time::timeout(TIMEOUT, async {
+            loop {
+                if client
+                    .inner
+                    .writing_since
+                    .lock()
+                    .is_some_and(|since| since.elapsed() >= Duration::from_millis(50))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("transport-owned payload budget becomes full");
+        let abandoned = tokio::time::timeout(
+            SEND_WINDOW / 3,
+            client.submit(large_tagged_request("req-large")),
+        )
+        .await;
+        assert!(
+            abandoned.is_err(),
+            "the engine is not reading frames this large"
+        );
+        let seen = tokio::time::timeout(TIMEOUT, async {
+            let mut seen = Vec::new();
+            loop {
+                let (kind, ids) = recv_tagged(&mut engine).await;
+                let done = kind == "abort" && ids.iter().any(|id| id == "req-large");
+                seen.extend(
+                    ids.into_iter()
+                        .filter(|id| id != "queue-saturation")
+                        .map(|id| (kind, id)),
+                );
+                if done {
+                    return seen;
+                }
+            }
+        })
+        .await
+        .expect("the abort of the abandoned add follows it");
+        assert_eq!(
+            seen,
+            vec![
+                ("add", "req-large".to_string()),
+                ("abort", "req-large".to_string())
+            ]
+        );
+    }
 }

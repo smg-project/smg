@@ -413,7 +413,13 @@ pub(crate) fn constraint(
             start,
             continues,
         )
-        .map(Prepared::from);
+        .map(|tag| match tag {
+            Some(constraint) => Prepared::Constraint {
+                constraint,
+                first_token: start == GrammarStart::FirstToken,
+            },
+            None => Prepared::None,
+        });
     }
     Ok(match asks.answer_schema() {
         Some(schema) => Prepared::Answer(Arc::new(AnswerTag {
@@ -502,7 +508,14 @@ pub(crate) enum Prepared {
     /// A constraint every worker takes as it is: a forced call's tag, the table's built for the
     /// start the model's workers name together ([`grammar_start_of`]) or the older registry's,
     /// which request building shapes for the worker (`utils::tool_constraints_for_worker`).
-    Constraint(ToolConstraint),
+    Constraint {
+        constraint: ToolConstraint,
+        /// The table built it for an engine that starts the grammar at the first token (the
+        /// thought, closed, ahead of the calls), the start the model's workers name together.
+        /// The older registry's is shaped for the worker at request building, which says then
+        /// whether it led the tag; here it is `false` ([`WorkerConstraint::first_token`]).
+        first_token: bool,
+    },
     /// A JSON answer's tag, which derives for the selected worker's own start as the `auto` tag
     /// does ([`AnswerTag`]): the schema alone behind a reasoning parser's gate or where the engine
     /// does not say, the closed thought then the schema from the first token. A pool whose
@@ -514,22 +527,29 @@ pub(crate) enum Prepared {
 
 impl Prepared {
     /// The constraint a worker whose engine starts the grammar at `start` takes: a JSON answer's
-    /// tag derived for it, what was found as it is otherwise.
+    /// tag derived for it, what was found as it is otherwise. The tests read what preparation
+    /// found through it; the decision ([`worker_constraint`]) reads each variant itself.
+    #[cfg(test)]
     pub(crate) fn for_start(
         self,
         start: GrammarStart,
     ) -> Result<Option<ToolConstraint>, SymphonyError> {
         match self {
             Self::None => Ok(None),
-            Self::Constraint(constraint) => Ok(Some(constraint)),
+            Self::Constraint { constraint, .. } => Ok(Some(constraint)),
             Self::Answer(answer) => answer.for_start(start),
         }
     }
 }
 
 impl From<Option<ToolConstraint>> for Prepared {
+    /// The older registry's constraint, as it built it: request building shapes it for the
+    /// worker and says whether it led the tag.
     fn from(constraint: Option<ToolConstraint>) -> Self {
-        constraint.map_or(Self::None, Self::Constraint)
+        constraint.map_or(Self::None, |constraint| Self::Constraint {
+            constraint,
+            first_token: false,
+        })
     }
 }
 
@@ -621,6 +641,15 @@ pub(crate) struct WorkerConstraint {
     /// ([`AnswerTag::for_start`]). The attempt stamp gives the worker a retry takes the shape its
     /// own start needs (`helpers::ToolConstraintStamp`).
     pub table_tag: Option<Arc<dyn TagForStart>>,
+    /// The constraint is shaped for an engine that starts the grammar at the first generated
+    /// token: the whole turn's grammar, a tag derived for [`GrammarStart::FirstToken`] (the
+    /// thought, closed, ahead of the answer or the calls), or the table's forced-call tag built
+    /// for a pool that starts there ([`Prepared::Constraint`]). The engine's request says so
+    /// where its dialect has a switch for the gate behind a reasoning parser, so an engine that
+    /// gates its grammars there starts this one at once; a constraint shaped for another start,
+    /// or none, starts where the engine does. Never the older registry's constraint: request
+    /// building shapes that one for the worker and says whether it led the tag.
+    pub first_token: bool,
 }
 
 /// The table's `auto` tag for a request, derived for where a worker's engine starts the grammar on
@@ -743,7 +772,7 @@ impl fmt::Debug for AutoTag {
 /// under PD the decode worker's). The one place a worker's policy decides:
 ///
 /// - `requested`, the default: what preparation found (`prepared`), its refusal included; a JSON
-///   answer's tag derived for the worker's start ([`Prepared::for_start`]).
+///   answer's tag derived for the worker's start ([`AnswerTag::for_start`]).
 /// - `always`, on an engine that starts the grammar at the first token: the whole turn's grammar
 ///   (`turn`, [`turn_constraint`]) where it starts; its refusal refuses the request.
 /// - `always` otherwise, or where the whole turn's grammar does not start: what preparation found,
@@ -767,29 +796,47 @@ pub(crate) fn worker_constraint(
                 whole_turn: true,
                 by_policy: true,
                 table_tag: None,
+                first_token: true,
             });
         }
     }
     let start = grammar_start_from(decoding.start);
-    let (constraint, by_policy, table_tag) = match prepared? {
+    // A tag derived here is shaped for the selected worker's start; a prepared constraint says
+    // for itself whether the table built it for the first token, and the older registry's is
+    // shaped and spoken for at request building (`utils::tool_constraints_for_worker`).
+    let derived_for_first_token =
+        |tag: &Option<ToolConstraint>| tag.is_some() && start == GrammarStart::FirstToken;
+    let (constraint, by_policy, table_tag, first_token) = match prepared? {
         Prepared::None if always => {
             let auto = auto();
             let tag = auto.for_start(start)?;
             let by_policy = tag.is_some();
+            let first_token = derived_for_first_token(&tag);
             let table_tag = by_policy.then(|| -> Arc<dyn TagForStart> { Arc::new(auto) });
-            (tag, by_policy, table_tag)
+            (tag, by_policy, table_tag, first_token)
         }
         Prepared::Answer(answer) => {
             let tag = answer.for_start(start)?;
-            (tag, false, Some(answer as Arc<dyn TagForStart>))
+            let first_token = derived_for_first_token(&tag);
+            (
+                tag,
+                false,
+                Some(answer as Arc<dyn TagForStart>),
+                first_token,
+            )
         }
-        prepared => (prepared.for_start(start)?, false, None),
+        Prepared::Constraint {
+            constraint,
+            first_token,
+        } => (Some(constraint), false, None, first_token),
+        Prepared::None => (None, false, None, false),
     };
     Ok(WorkerConstraint {
         constraint,
         whole_turn: false,
         by_policy,
         table_tag,
+        first_token,
     })
 }
 
@@ -928,7 +975,10 @@ mod tests {
         assert_eq!(first["format"]["elements"][1]["type"], "json_schema");
         let forced = request(json!({"tool_choice": "required"}));
         let call_of = |start| {
-            let Ok(Prepared::Constraint(ToolConstraint::StructuralTag(tag))) = super::constraint(
+            let Ok(Prepared::Constraint {
+                constraint: ToolConstraint::StructuralTag(tag),
+                first_token,
+            }) = super::constraint(
                 ParserChoice::Symphony,
                 &deepseek,
                 Asks::Chat(&forced),
@@ -937,9 +987,15 @@ mod tests {
                 false,
                 start,
                 &templates(),
-            ) else {
+            )
+            else {
                 panic!("a forced tag");
             };
+            assert_eq!(
+                first_token,
+                start == symphony::GrammarStart::FirstToken,
+                "{start:?}: built for the first token only there"
+            );
             serde_json::from_str::<Value>(&tag).expect("JSON")
         };
         assert_eq!(
@@ -973,7 +1029,10 @@ mod tests {
             "tool_choice": "required",
         }));
         for (asked, one_call) in [(&named, true), (&required, false)] {
-            let Ok(Prepared::Constraint(ToolConstraint::StructuralTag(tag))) = super::constraint(
+            let Ok(Prepared::Constraint {
+                constraint: ToolConstraint::StructuralTag(tag),
+                first_token,
+            }) = super::constraint(
                 ParserChoice::Symphony,
                 &kimi,
                 Asks::Chat(asked),
@@ -982,9 +1041,14 @@ mod tests {
                 false,
                 symphony::GrammarStart::AfterReasoning,
                 &templates(),
-            ) else {
+            )
+            else {
                 panic!("the table's tag, not the older registry's schema");
             };
+            assert!(
+                !first_token,
+                "built for the gate behind the reasoning parser"
+            );
             let format = serde_json::from_str::<Value>(&tag).expect("JSON");
             let format = &format["format"];
             assert_eq!(format["type"], "triggered_tags");
@@ -1040,7 +1104,10 @@ mod tests {
             "tool_choice": "required",
         }));
         for (asked, one_call) in [(&named, true), (&required, false)] {
-            let Ok(Prepared::Constraint(ToolConstraint::StructuralTag(tag))) = super::constraint(
+            let Ok(Prepared::Constraint {
+                constraint: ToolConstraint::StructuralTag(tag),
+                first_token,
+            }) = super::constraint(
                 ParserChoice::Symphony,
                 &deepseek,
                 Asks::Chat(asked),
@@ -1049,9 +1116,14 @@ mod tests {
                 false,
                 symphony::GrammarStart::AfterReasoning,
                 &templates(),
-            ) else {
+            )
+            else {
                 panic!("the table's tag, not the older registry's schema");
             };
+            assert!(
+                !first_token,
+                "built for the gate behind the reasoning parser"
+            );
             let format = serde_json::from_str::<Value>(&tag).expect("JSON");
             let format = &format["format"];
             assert_eq!(format["type"], "triggered_tags");
@@ -1869,6 +1941,76 @@ mod tests {
         );
     }
 
+    /// The decision says when its constraint is shaped for an engine that starts the grammar at
+    /// the first token: the `auto` tag derived for that start, and the whole turn's grammar; a tag
+    /// derived for another start, or no tag, is not.
+    #[test]
+    fn the_decision_says_when_its_constraint_starts_at_the_first_token() {
+        use ConstrainedDecoding::{Always, Requested};
+        use GrammarStart::{AfterReasoning, FirstToken, Unknown};
+
+        let templates = Arc::new(templates());
+        let auto_tag = || AutoTag {
+            parser: ParserChoice::Symphony,
+            labels: pair(Some("deepseek_v4"), Some("deepseek_v4")),
+            flags: Names::default(),
+            request: AutoRequest::Chat(Arc::new(request(json!({"tools": tools()})))),
+            reasoning_open: true,
+            thought_closed: false,
+            templates: Arc::clone(&templates),
+        };
+        let decided = |policy, start, turn: Option<ToolConstraint>| {
+            worker_constraint(
+                WorkerDecoding { policy, start },
+                Ok(Prepared::None),
+                || Ok(turn),
+                auto_tag,
+            )
+            .expect("decided")
+        };
+        for start in [FirstToken, AfterReasoning, Unknown] {
+            let auto = decided(Always, start, None);
+            assert!(auto.constraint.is_some(), "{start:?}: the auto tag");
+            assert_eq!(auto.first_token, start == FirstToken, "{start:?}");
+            let none = decided(Requested, start, None);
+            assert!(
+                none.constraint.is_none() && !none.first_token,
+                "{start:?}: nothing shaped"
+            );
+        }
+        let turn = decided(
+            Always,
+            FirstToken,
+            Some(ToolConstraint::StructuralTag("turn".to_string())),
+        );
+        assert!(turn.whole_turn && turn.first_token);
+        // A prepared constraint speaks for itself, whatever the worker's start: the table's
+        // forced-call tag built for a pool that starts at the first token says so; the older
+        // registry's says nothing here, since request building shapes it and speaks for it.
+        for start in [FirstToken, AfterReasoning, Unknown] {
+            for built_for_first_token in [true, false] {
+                let prepared = worker_constraint(
+                    WorkerDecoding {
+                        policy: Requested,
+                        start,
+                    },
+                    Ok(Prepared::Constraint {
+                        constraint: ToolConstraint::StructuralTag("prepared".to_string()),
+                        first_token: built_for_first_token,
+                    }),
+                    || Ok(None),
+                    auto_tag,
+                )
+                .expect("decided");
+                assert!(prepared.constraint.is_some(), "{start:?}: kept as it is");
+                assert_eq!(
+                    prepared.first_token, built_for_first_token,
+                    "{start:?}: as the table built it, not as the worker starts"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_selected_workers_policy_decides_once() {
         use ConstrainedDecoding::{Always, Requested};
@@ -1938,7 +2080,10 @@ mod tests {
                 decide(
                     Requested,
                     start,
-                    Ok(Prepared::Constraint(tag("prepared"))),
+                    Ok(Prepared::Constraint {
+                        constraint: tag("prepared"),
+                        first_token: false,
+                    }),
                     Ok(Some(tag("turn")))
                 ),
                 (found("prepared"), vec![])
@@ -1989,7 +2134,10 @@ mod tests {
             decide(
                 Always,
                 FirstToken,
-                Ok(Prepared::Constraint(tag("prepared"))),
+                Ok(Prepared::Constraint {
+                    constraint: tag("prepared"),
+                    first_token: false,
+                }),
                 Ok(None)
             ),
             (found("prepared"), vec!["turn"])
@@ -2014,7 +2162,10 @@ mod tests {
                 decide(
                     Always,
                     start,
-                    Ok(Prepared::Constraint(tag("prepared"))),
+                    Ok(Prepared::Constraint {
+                        constraint: tag("prepared"),
+                        first_token: false,
+                    }),
                     Ok(Some(tag("turn")))
                 ),
                 (found("prepared"), vec![])
@@ -2135,7 +2286,10 @@ mod tests {
         assert_eq!(stamp.schema(), Some(&schema));
         // The forced call's tag keeps the pool's start: the prefix that fits either kind.
         let forced = request(json!({"tool_choice": "required"}));
-        let Ok(Prepared::Constraint(ToolConstraint::StructuralTag(call))) = super::constraint(
+        let Ok(Prepared::Constraint {
+            constraint: ToolConstraint::StructuralTag(call),
+            first_token,
+        }) = super::constraint(
             ParserChoice::Symphony,
             &deepseek,
             Asks::Chat(&forced),
@@ -2144,11 +2298,16 @@ mod tests {
             false,
             grammar_start_of(&pool),
             &templates(),
-        ) else {
+        )
+        else {
             panic!("a forced tag");
         };
         let call: Value = serde_json::from_str(&call).expect("JSON");
         assert_eq!(call["format"]["elements"][0]["type"], "any_text", "{call}");
+        assert!(
+            !first_token,
+            "the pool's start is either: not built for the first token"
+        );
     }
 
     /// The request's `auto` tag derives again for where another worker's engine starts the

@@ -190,8 +190,9 @@ pub(super) struct State {
     pub(super) tokenizer_dir: Option<String>,
     pub(super) engine: EngineLink,
     pub(super) registry: Arc<RequestRegistry>,
-    /// Cleared by the lifecycle owner to drain: health flips to NOT_SERVING
-    /// while in-flight streams finish.
+    /// Cleared by the lifecycle owner to drain (`set_serving`, admission
+    /// closed with it) or to hold readiness alone (`set_ready`, admission
+    /// open): health answers NOT_SERVING either way.
     pub(super) serving: AtomicBool,
     pub(super) started: Instant,
     pub(super) started_at: SystemTime,
@@ -221,7 +222,13 @@ impl State {
 
     pub(super) fn health_message(&self) -> &'static str {
         if !self.serving.load(Ordering::Acquire) {
-            return "Draining";
+            // Admission still open: the lifecycle owner holds readiness for
+            // its own requests (the planned warm-up); closed: it drains.
+            return if self.registry.is_accepting() {
+                "Warming up"
+            } else {
+                "Draining"
+            };
         }
         match (self.engine.client.get(), self.engine.error()) {
             (Some(client), _) if client.is_alive() => "healthy",
@@ -405,6 +412,14 @@ impl SglangServicerServer {
     pub fn set_serving(&self, serving: bool) {
         self.state.registry.set_accepting(serving);
         self.state.serving.store(serving, Ordering::Release);
+    }
+
+    /// Hold (`false`) or release (`true`) readiness alone: health flips as
+    /// with `set_serving`, admission stays open, so the lifecycle owner's own
+    /// requests (its planned warm-up before SERVING) still reach the engine.
+    /// `set_serving(false)` is the drain switch and closes admission as well.
+    pub fn set_ready(&self, ready: bool) {
+        self.state.serving.store(ready, Ordering::Release);
     }
 
     /// Admitted requests still preprocessing, streaming, or unwinding an abort.

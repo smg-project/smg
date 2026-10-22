@@ -1,7 +1,8 @@
 //! The snapshot a provider that reads its whole source at once keeps between
-//! reads, shared by the file and Slurm providers.
+//! reads, shared by the file, Slurm and Consul providers, and what such a read
+//! left out.
 
-use std::{fmt::Display, sync::Arc};
+use std::{collections::HashSet, fmt::Display, sync::Arc};
 
 use tokio::time::Instant;
 use tracing::{info, warn};
@@ -11,6 +12,47 @@ use super::{
     reconciler::{self, DesiredState},
 };
 use crate::{app_context::AppContext, observability::metrics::Metrics};
+
+/// A record a read left out of an answer it otherwise applied.
+#[derive(Debug, Clone, PartialEq)]
+pub(super) struct Skip {
+    /// The `reason` of `smg_discovery_skipped_total`.
+    pub(super) reason: &'static str,
+    pub(super) message: String,
+}
+
+/// What reads leave out: counted on every read, and logged when it first
+/// appears, so a skip that lasts is logged once.
+pub(super) struct SkipLog {
+    kind: DiscoveryKind,
+    /// How logs name the provider.
+    provider: &'static str,
+    /// What the last read left out.
+    last: HashSet<String>,
+}
+
+impl SkipLog {
+    pub(super) fn new(kind: DiscoveryKind, provider: &'static str) -> Self {
+        Self {
+            kind,
+            provider,
+            last: HashSet::new(),
+        }
+    }
+
+    /// Take what one read left out.
+    pub(super) fn record(&mut self, skipped: Vec<Skip>) {
+        let mut last = HashSet::new();
+        for skip in skipped {
+            Metrics::record_discovery_skip(self.kind.metric_label(), skip.reason);
+            if !self.last.contains(&skip.message) {
+                warn!("{} left out {}", self.provider, skip.message);
+            }
+            last.insert(skip.message);
+        }
+        self.last = last;
+    }
+}
 
 /// Why a read produced no snapshot.
 pub(super) trait SnapshotError: Display {

@@ -31,7 +31,9 @@ use crate::{
         ChatTemplateState, ThinkingKeyName, ThinkingToggle,
     },
     encode_path::{self, EncodePath},
-    encoders::{deepseek_v32, deepseek_v4, deepseek_v41, marks, PromptSegment, RendererProfile},
+    encoders::{
+        deepseek_v32, deepseek_v4, deepseek_v41, glm53, marks, PromptSegment, RendererProfile,
+    },
     native::{AddedTokens, NativeEncoder},
     traits::{
         ChatTemplateOutput, DecodeStep, Decoder, EncodeJob, Encoder, Encoding, IncrementalDecoder,
@@ -49,6 +51,7 @@ enum Renderer {
     DeepseekV32,
     DeepseekV4(deepseek_v4::EffortEncoding),
     DeepseekV41(deepseek_v41::EffortTable),
+    Glm53(glm53::Template),
 }
 
 impl Renderer {
@@ -56,7 +59,8 @@ impl Renderer {
     /// [`RendererProfile`]); the Jinja renderer answers from the template.
     fn profile(self) -> Option<RendererProfile> {
         match self {
-            Self::Jinja => None,
+            // GLM keeps the active template's switchless thinking contract.
+            Self::Jinja | Self::Glm53(_) => None,
             Self::DeepseekV32 => Some(deepseek_v32::PROFILE),
             Self::DeepseekV4(encoding) => Some(encoding.profile()),
             Self::DeepseekV41(_) => Some(deepseek_v41::PROFILE),
@@ -662,10 +666,15 @@ impl HuggingFaceTokenizer {
         let tokenizer = HfTokenizer::from(tokenizer);
         let has_byte_fallback = tokenizer.get_decoder().is_some_and(has_byte_fallback);
         let byte_fallback_values = byte_fallback_values(&reverse_vocab, has_byte_fallback);
-        let chat_template = ChatTemplateState::new(chat_template_str)?;
         let glm = tokenizer_path.parent().and_then(glm::Checkpoint::load);
-        let media_handling = glm.as_ref().map_or_else(Default::default, |_| {
-            glm::Checkpoint::media_handling(&chat_template)
+        let renderer = glm
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.renderer(chat_template_str.as_deref()))
+            .map(Renderer::Glm53)
+            .unwrap_or(renderer);
+        let chat_template = ChatTemplateState::new(chat_template_str)?;
+        let media_handling = glm.as_ref().map_or_else(Default::default, |checkpoint| {
+            checkpoint.media_handling(&chat_template)
         });
         let deepseek_v31 = tokenizer_path
             .parent()
@@ -982,6 +991,25 @@ impl HuggingFaceTokenizer {
             .flatten();
         let messages = with_block.as_deref().unwrap_or(messages);
         self.chat_template.apply_with_continuation(messages, params)
+    }
+
+    fn apply_glm53(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+        template: glm53::Template,
+    ) -> Result<(String, bool)> {
+        // MiniJinja permits kwargs to replace the base context. Preserve that
+        // uncommon API escape hatch rather than silently ignoring an override.
+        if params.template_kwargs.is_some_and(|kwargs| {
+            ["messages", "tools", "add_generation_prompt"]
+                .iter()
+                .any(|key| kwargs.contains_key(*key))
+        }) {
+            self.apply_jinja(messages, params)
+        } else {
+            glm53::render(messages, params, template)
+        }
     }
 }
 
@@ -1524,11 +1552,47 @@ impl HuggingFaceTokenizer {
         params: ChatTemplateParams,
     ) -> Result<String> {
         match self.renderer {
-            Renderer::Jinja => Err(Error::msg("the Jinja renderer renders no marked prompt")),
+            Renderer::Jinja | Renderer::Glm53(_) => Err(Error::msg(
+                "the Jinja and GLM renderers render no marked prompt",
+            )),
             Renderer::DeepseekV32 => apply_deepseek_v32(messages, &params),
             Renderer::DeepseekV4(encoding) => apply_deepseek_v4(messages, &params, encoding),
             Renderer::DeepseekV41(table) => apply_deepseek_v41(messages, &params, table),
         }
+    }
+
+    /// The prompt of a renderer with an encoder of its own, encoded by
+    /// segments (see `apply_chat_template_with_encoding`).
+    fn apply_marked_with_encoding(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+        assistant_prefix: Option<&str>,
+    ) -> Result<ChatTemplateOutput> {
+        // The native encoders continue the final message whenever they are
+        // asked to (V4.1) or are never asked.
+        let continue_final_message = params.continue_final_message;
+        let mut marked = self.render_marked(messages, params)?;
+        if let Some(prefix) = assistant_prefix {
+            // Request text: a mark a client wrote into it is no mark.
+            marked.push_str(&marks::strip(prefix));
+        }
+        let (text, controls) = marks::flatten(&marked)?;
+        let encoding = if self.core.flat_encode_is_segment_encode(&text, &controls) {
+            PromptEncoding::FromText
+        } else {
+            let segments = marks::segments(&marked)?;
+            let core = Arc::clone(&self.core);
+            PromptEncoding::Deferred(EncodeJob::new(move || {
+                core.encode_segments(&segments).map(Encoding::Plain)
+            }))
+        };
+        Ok(ChatTemplateOutput {
+            text,
+            encoding,
+            unbilled_prompt_tokens: 0,
+            continued_final_message: continue_final_message,
+        })
     }
 }
 
@@ -1588,13 +1652,16 @@ impl TokenizerTrait for HuggingFaceTokenizer {
     ) -> Result<String> {
         match self.renderer {
             Renderer::Jinja => self.apply_jinja(messages, params).map(|(text, _)| text),
+            Renderer::Glm53(template) => self
+                .apply_glm53(messages, params, template)
+                .map(|(text, _)| text),
             _ => self
                 .render_marked(messages, params)
                 .map(|marked| marks::strip(&marked).into_owned()),
         }
     }
 
-    /// The Jinja renderer encodes from its text. A renderer with an encoder
+    /// The Jinja and GLM renderers encode from their text. A renderer with an encoder
     /// of its own renders its control tokens marked (see `encoders::marks`)
     /// and the prompt is encoded by segments, so that a control-token
     /// spelling typed in a message stays text: as text all the same when the
@@ -1607,45 +1674,23 @@ impl TokenizerTrait for HuggingFaceTokenizer {
         params: ChatTemplateParams,
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
-        // The Jinja template says whether it continued the final message or
-        // appended its text after the generation prompt; the native encoders
-        // continue it whenever they are asked to (V4.1) or are never asked.
-        let continue_final_message = params.continue_final_message;
-        if matches!(self.renderer, Renderer::Jinja) {
-            let (mut text, continued_final_message) = self.apply_jinja(messages, params)?;
-            if let Some(prefix) = assistant_prefix {
-                text.push_str(prefix);
-            }
-            return Ok(ChatTemplateOutput {
-                text,
-                encoding: PromptEncoding::FromText,
-                unbilled_prompt_tokens: 0,
-                continued_final_message,
-            });
-        }
-        let mut marked = self.render_marked(messages, params)?;
-        if let Some(prefix) = assistant_prefix {
-            // Request text: a mark a client wrote into it is no mark.
-            marked.push_str(&marks::strip(prefix));
-        }
-        let (text, controls) = marks::flatten(&marked)?;
-        let encoding = if self.core.flat_encode_is_segment_encode(&text, &controls) {
-            PromptEncoding::FromText
-        } else {
-            let segments = marks::segments(&marked)?;
-            let core = Arc::clone(&self.core);
-            PromptEncoding::Deferred(EncodeJob::new(move || {
-                core.encode_segments(&segments).map(Encoding::Plain)
-            }))
+        // The Jinja and GLM renderers say whether they continued the final
+        // message or appended its text after the generation prompt.
+        let (mut text, continued_final_message) = match self.renderer {
+            Renderer::Jinja => self.apply_jinja(messages, params)?,
+            Renderer::Glm53(template) => self.apply_glm53(messages, params, template)?,
+            _ => return self.apply_marked_with_encoding(messages, params, assistant_prefix),
         };
+        if let Some(prefix) = assistant_prefix {
+            text.push_str(prefix);
+        }
         Ok(ChatTemplateOutput {
             text,
-            encoding,
+            encoding: PromptEncoding::FromText,
             unbilled_prompt_tokens: 0,
-            continued_final_message: continue_final_message,
+            continued_final_message,
         })
     }
-
     fn chat_template_content_format(&self) -> ChatTemplateContentFormat {
         self.profile
             .and_then(|profile| profile.content_format)
@@ -1725,10 +1770,21 @@ impl TokenizerTrait for HuggingFaceTokenizer {
     /// Refresh media handling and the tools block only after a replacement
     /// template compiles successfully.
     fn set_chat_template(&mut self, template: String) -> Result<()> {
+        let glm_renderer = self
+            .glm
+            .as_ref()
+            .and_then(|checkpoint| checkpoint.renderer(Some(&template)));
         self.chat_template.set(template)?;
-        self.media_handling = self.glm.as_ref().map_or_else(Default::default, |_| {
-            glm::Checkpoint::media_handling(&self.chat_template)
-        });
+        if self.glm.is_some() {
+            self.renderer = glm_renderer.map_or(Renderer::Jinja, Renderer::Glm53);
+            self.profile = self.renderer.profile();
+        }
+        self.media_handling = self
+            .glm
+            .as_ref()
+            .map_or_else(Default::default, |checkpoint| {
+                checkpoint.media_handling(&self.chat_template)
+            });
         self.tools_block = self.deepseek_v31.is_some()
             && deepseek_v31::Checkpoint::renders_tools_block(&self.chat_template);
         Ok(())
@@ -2078,8 +2134,8 @@ fn restore_integer_reasoning_effort(value: &serde_json::Value) -> Option<serde_j
 /// 1. an explicit `template_kwargs["thinking"]` boolean decides;
 /// 2. else the `reasoning_effort` kwarg: `"none"`/`"minimal"` (the gateway's
 ///    thinking switch, `thinking_from_reasoning_effort`) switch thinking off,
-///    a native effort name (`low`/`high`/`xhigh`/`max`) switches it on, and
-///    an integer budget has no opinion;
+///    a native effort name (`low`/`medium`/`high`/`xhigh`/`max`) switches it
+///    on, and an integer budget has no opinion;
 /// 3. else `params.thinking` (the gateway's projection of the typed
 ///    `thinking.type` toggle, else `Some(false)` for a `none`/`minimal`
 ///    effective `reasoning_effort`);

@@ -35,7 +35,7 @@ use crate::{
     ids::CallIds,
     markers::{Piece, Scanner},
     tagged::{
-        end_cut_call,
+        end_cut_call, held_text,
         value::{json, Kind, NULL_WORDS},
     },
     Declared,
@@ -99,6 +99,12 @@ pub struct Assembler {
     ended: bool,
     /// Where the template puts a value: whether a newline on either side of it is the template's.
     placement: Placement,
+    /// Whether text between tags was released as content since the last tag the syntax read: a
+    /// word where the syntax has tags, a tag out of its place, a tag reported with its bytes. The
+    /// whitespace carried after it is the model's, between two pieces of its text, and leaves with
+    /// the next piece; before any, the whitespace after a tag is the template's, dropped before a
+    /// report or carried into the next event's source.
+    released: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -153,6 +159,7 @@ impl Assembler {
             written: 0,
             ended: false,
             placement,
+            released: false,
         }
     }
 
@@ -254,9 +261,12 @@ impl Assembler {
     /// The whitespace the block ends with after its last call, which the engine drops as the
     /// region's wrapping: taken from the block, so that neither ending says it again. Nothing while
     /// a call is open or before the block's first; what the scanner holds as the start of a tag
-    /// stays for the ending to report.
+    /// stays for the ending to report, and after text released since the last call the whitespace
+    /// before such a tag is the model's ([`Self::release`]) and stays with it for the ending too.
     pub fn trailing_whitespace(&mut self) -> String {
-        if matches!(self.stage, Stage::AfterCall) {
+        if matches!(self.stage, Stage::AfterCall)
+            && !(self.released && !self.scanner.held().is_empty())
+        {
             std::mem::take(&mut self.carried)
         } else {
             String::new()
@@ -286,6 +296,7 @@ impl Assembler {
         self.written = 0;
         self.ended = true;
         self.stage = Stage::AfterCall;
+        self.released = false;
     }
 
     fn open_string(&self) -> bool {
@@ -298,7 +309,8 @@ impl Assembler {
         )
     }
 
-    /// The carried bytes as `Malformed`, when there are any.
+    /// The carried bytes as `Malformed`, when there are any: released, so the whitespace after
+    /// them is the model's.
     fn leftover(&mut self, why: MalformedReason, out: &mut Events) {
         let text = std::mem::take(&mut self.carried);
         if !text.is_empty() {
@@ -306,12 +318,18 @@ impl Assembler {
                 text: Text::uncounted(text),
                 why,
             });
+            self.released = true;
         }
     }
 
     /// A tag that is reported, with the carried bytes: the whitespace before it is the template's
-    /// and is dropped, the tag's own bytes come back as `Malformed`.
+    /// and is dropped, the tag's own bytes come back as `Malformed`; after text released since the
+    /// last tag the syntax read, the whitespace is the model's and stays with the tag.
     fn report_tag(&mut self, why: MalformedReason, out: &mut Events) {
+        if self.released {
+            self.leftover(why, out);
+            return;
+        }
         let text = std::mem::take(&mut self.carried);
         let tag_at = text
             .char_indices()
@@ -328,11 +346,13 @@ impl Assembler {
                 text: Text::uncounted(text[tag_at..].to_owned()),
                 why,
             });
+            self.released = true;
         }
     }
 
-    /// The carried bytes as the template's wrapper, when there are any: they come before text
-    /// that is reported on its own, so they cannot wait for a later event's source.
+    /// The carried bytes as the template's wrapper, when there are any: the whitespace after a
+    /// tag the syntax read, before text that is released ([`Self::release`]), which cannot wait
+    /// for a later event's source.
     fn drop_carried(&mut self, out: &mut Events) {
         let text = std::mem::take(&mut self.carried);
         if !text.is_empty() {
@@ -409,13 +429,7 @@ impl Assembler {
                 self.carried.push_str(bytes);
                 self.leftover(MalformedReason::CallWithoutFunctionTag, out);
             }
-            _ => {
-                self.drop_carried(out);
-                out.push(Event::Malformed {
-                    text: Text::uncounted(bytes),
-                    why: MalformedReason::TagOutOfPlace,
-                });
-            }
+            _ => self.release(bytes, MalformedReason::TagOutOfPlace, out),
         }
     }
 
@@ -449,20 +463,31 @@ impl Assembler {
         }
     }
 
-    /// Text where the syntax has tags, or the block's next call: whitespace is the template's,
-    /// anything else is reported with `why`.
+    /// Text where the syntax has tags, or the block's next call: whitespace is carried, since
+    /// whose it is depends on what follows ([`Self::release`]), anything else is released with
+    /// `why`.
     fn text_between(&mut self, text: &str, why: MalformedReason, out: &mut Events) {
         for (run, space) in runs(text) {
             if space {
                 self.carried.push_str(run);
             } else {
-                self.drop_carried(out);
-                out.push(Event::Malformed {
-                    text: Text::uncounted(run.to_owned()),
-                    why,
-                });
+                self.release(run, why, out);
             }
         }
+    }
+
+    /// `text` the syntax has no place for (a word between tags, a tag out of its place), released
+    /// as `Malformed` with `why`, which the chat surface shows as content. The whitespace carried
+    /// before it is the template's after a tag the syntax read, and is dropped so the report holds
+    /// the model's text alone; after text released already it is the model's, between two pieces
+    /// of its text, and leaves with this one, so that a client reads what the model wrote, byte
+    /// for byte, however the bytes were cut.
+    fn release(&mut self, text: &str, why: MalformedReason, out: &mut Events) {
+        if !self.released {
+            self.drop_carried(out);
+        }
+        self.carried.push_str(text);
+        self.leftover(why, out);
     }
 
     /// The function tag is whole: the call starts, unless the name is empty or a call has started
@@ -487,6 +512,7 @@ impl Assembler {
             });
             self.function = Some(name);
             self.stage = Stage::Between;
+            self.released = false;
         }
     }
 
@@ -520,6 +546,7 @@ impl Assembler {
             leading: self.placement == Placement::OwnLine,
             mode,
         });
+        self.released = false;
     }
 
     /// `{"key": "` or `, "key": "`, with the carried bytes as its source.
@@ -643,12 +670,13 @@ impl Assembler {
         source.push_str(tag);
         self.push_fragment(fragment, Text::uncounted(source), out);
         self.stage = Stage::Between;
+        self.released = false;
     }
 
     /// The text of a value written whole: what came after the tag and its newline, less the
     /// newline the template writes before `</parameter>`, where the template writes one.
     fn whole_text(&self, start: usize) -> &str {
-        let text = &self.carried[start..];
+        let text = held_text(&self.carried, start, None);
         match self.placement {
             Placement::OwnLine => text.strip_suffix('\n').unwrap_or(text),
             Placement::Direct => text,
@@ -1184,11 +1212,11 @@ mod tests {
             malformed(&events),
             vec![
                 ("stray".to_string(), MalformedReason::TextBetweenCalls),
-                ("words".to_string(), MalformedReason::TextBetweenCalls),
-                ("<fun".to_string(), MalformedReason::TagCutShort),
+                (" words".to_string(), MalformedReason::TextBetweenCalls),
+                ("\n<fun".to_string(), MalformedReason::TagCutShort),
             ]
         );
-        assert_eq!(dropped(&events), vec!["\n", " ", "\n"]);
+        assert_eq!(dropped(&events), vec!["\n"]);
         assert_eq!(bytes(&events), block);
         nothing_empty(&events);
         // The stream cut after the last call: the newline is the template's, a cut tag is what
@@ -1216,12 +1244,12 @@ mod tests {
             malformed(&events),
             vec![
                 ("</function>".to_string(), MalformedReason::TagOutOfPlace),
-                ("<parameter=".to_string(), MalformedReason::TagOutOfPlace),
+                ("\n<parameter=".to_string(), MalformedReason::TagOutOfPlace),
                 ("x>y".to_string(), MalformedReason::TextBetweenCalls),
                 ("</parameter>".to_string(), MalformedReason::TagOutOfPlace),
             ]
         );
-        assert_eq!(dropped(&events), vec!["\n", "\n"]);
+        assert_eq!(dropped(&events), vec!["\n"]);
         assert_eq!(ends(&events), 1);
     }
 
@@ -1256,6 +1284,51 @@ mod tests {
         assert_eq!(assembler.trailing_whitespace(), "");
     }
 
+    /// After text released since the last call, the whitespace before a tag the ending cut short
+    /// is the model's and is not handed back: it leaves with the tag's report through either
+    /// ending, as the engine ends a region (`trailing_whitespace` first, then the ending). With no
+    /// tag held, the whitespace before the region's end is the template's and is handed back.
+    #[test]
+    fn after_released_text_the_whitespace_before_a_cut_tag_stays_with_it_for_the_ending() {
+        let declared = declared();
+        for (ending, why) in [Assembler::close, Assembler::finish].into_iter().zip([
+            MalformedReason::TagCutShort,
+            MalformedReason::UnterminatedRegion,
+        ]) {
+            let mut assembler = Assembler::new(0, ids(), Placement::OwnLine);
+            let mut out = Events::new();
+            assembler.feed(
+                "<function=f>\n</function>\nstray words\n<fun",
+                &declared,
+                &mut out,
+            );
+            assert_eq!(assembler.trailing_whitespace(), "");
+            ending(assembler, &mut out);
+            let events = out.drain();
+            assert_eq!(
+                malformed(&events),
+                vec![
+                    ("stray".to_string(), MalformedReason::TextBetweenCalls),
+                    (" words".to_string(), MalformedReason::TextBetweenCalls),
+                    ("\n<fun".to_string(), why),
+                ]
+            );
+            assert_eq!(dropped(&events), vec!["\n"]);
+            assert_eq!(ends(&events), 1);
+        }
+        let mut assembler = Assembler::new(0, ids(), Placement::OwnLine);
+        let mut out = Events::new();
+        assembler.feed(
+            "<function=f>\n</function>\nstray words\n",
+            &declared,
+            &mut out,
+        );
+        assert_eq!(assembler.trailing_whitespace(), "\n");
+        let before = out.len();
+        assembler.close(&mut out);
+        assert_eq!(out.len(), before, "{:?}", out.as_slice());
+    }
+
     #[test]
     fn a_close_before_the_first_function_tag_leaves_the_block_open_for_its_call() {
         let block = "</function>\n<function=f>\n</function>";
@@ -1273,9 +1346,23 @@ mod tests {
         assert_eq!(bytes(&events), block);
     }
 
+    /// The content a chat client reads: every content and malformed text, in order, as the chat
+    /// adapter folds it.
+    fn shown(events: &[Event]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Content(text) | Event::Malformed { text, .. } => Some(&*text.text),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn text_between_tags_is_malformed_and_the_whitespace_before_it_is_dropped() {
-        // A parameter tag the model misspelt is reported, not read as a parameter and not hidden.
+    fn text_between_tags_keeps_the_models_whitespace_and_loses_the_templates_newline_before_it() {
+        // A parameter tag the model misspelt is reported, not read as a parameter and not hidden:
+        // the newline after the function tag is the template's and is dropped, the whitespace
+        // between the words is the model's and stays with them, up to the stray close.
         let call = concat!(
             "<function=f>\n<parameter city>\nParis\n</parameter>",
             "\n<parameter=limit>\n5\n</parameter>\n</function>"
@@ -1286,27 +1373,29 @@ mod tests {
             malformed(&events),
             vec![
                 ("<parameter".to_string(), MalformedReason::TextBetweenTags),
-                ("city>".to_string(), MalformedReason::TextBetweenTags),
-                ("Paris".to_string(), MalformedReason::TextBetweenTags),
-                ("</parameter>".to_string(), MalformedReason::TagOutOfPlace),
+                (" city>".to_string(), MalformedReason::TextBetweenTags),
+                ("\nParis".to_string(), MalformedReason::TextBetweenTags),
+                ("\n</parameter>".to_string(), MalformedReason::TagOutOfPlace),
             ]
         );
-        assert_eq!(dropped(&events), vec!["\n", " ", "\n", "\n"]);
+        assert_eq!(shown(&events), "<parameter city>\nParis\n</parameter>");
+        assert_eq!(dropped(&events), vec!["\n"]);
         assert_eq!(bytes(&events), call);
         nothing_empty(&events);
-        // Prose before the function tag is reported too; the whitespace before the tag stays its
-        // source.
+        // Prose before the function tag is reported too, with the spaces between its words; the
+        // whitespace before the tag stays its source.
         let events = finished(&["I will call it now <function=f>\n</function>"]);
         assert_eq!(
             malformed(&events),
             vec![
                 ("I".to_string(), MalformedReason::TextBetweenTags),
-                ("will".to_string(), MalformedReason::TextBetweenTags),
-                ("call".to_string(), MalformedReason::TextBetweenTags),
-                ("it".to_string(), MalformedReason::TextBetweenTags),
-                ("now".to_string(), MalformedReason::TextBetweenTags),
+                (" will".to_string(), MalformedReason::TextBetweenTags),
+                (" call".to_string(), MalformedReason::TextBetweenTags),
+                (" it".to_string(), MalformedReason::TextBetweenTags),
+                (" now".to_string(), MalformedReason::TextBetweenTags),
             ]
         );
+        assert_eq!(shown(&events), "I will call it now");
         assert_eq!(
             events
                 .iter()
@@ -1322,6 +1411,50 @@ mod tests {
             bytes(&events),
             "I will call it now <function=f>\n</function>"
         );
+    }
+
+    /// A parameter written in XML-attribute style, `<parameter name="city">`, which the syntax has
+    /// no tag for: the call is read with no arguments, and its lines reach the client as content,
+    /// byte for byte as the model wrote them, the whitespace between the words and the newline
+    /// between the lines included, the same however the bytes are cut. The template's newline
+    /// after the function tag is dropped, and the one before its close is the object's source.
+    #[test]
+    fn text_between_tags_reaches_the_client_as_the_model_wrote_it_however_the_bytes_are_cut() {
+        let call = concat!(
+            "<function=f>\n<parameter name=\"city\">Paris</parameter>\n",
+            "<parameter name=\"limit\">three or four days</parameter>\n</function>"
+        );
+        let lines = concat!(
+            "<parameter name=\"city\">Paris</parameter>\n",
+            "<parameter name=\"limit\">three or four days</parameter>"
+        );
+        let whole = finished(&[call]);
+        assert_eq!(name_of(&whole), Some("f"));
+        assert_eq!(arguments(&whole), "{}");
+        assert_eq!(ends(&whole), 1);
+        assert_eq!(shown(&whole), lines);
+        assert_eq!(dropped(&whole), vec!["\n"]);
+        assert_eq!(bytes(&whole), call);
+        nothing_empty(&whole);
+        // At every two-way cut and one character at a time the events differ, the bytes a client
+        // reads do not.
+        let mut cuts: Vec<Vec<&str>> = (1..call.len())
+            .filter(|&cut| call.is_char_boundary(cut))
+            .map(|cut| vec![&call[..cut], &call[cut..]])
+            .collect();
+        cuts.push(
+            call.char_indices()
+                .map(|(at, c)| &call[at..at + c.len_utf8()])
+                .collect(),
+        );
+        for pieces in cuts {
+            let events = finished(&pieces);
+            assert_eq!(shown(&events), lines, "{pieces:?}");
+            assert_eq!(arguments(&events), "{}", "{pieces:?}");
+            assert_eq!(dropped(&events), vec!["\n"], "{pieces:?}");
+            assert_eq!(bytes(&events), call, "{pieces:?}");
+            nothing_empty(&events);
+        }
     }
 
     #[test]
@@ -1381,11 +1514,11 @@ mod tests {
             malformed(&events),
             vec![
                 ("<parameter=>".to_string(), MalformedReason::EmptyName),
-                ("x".to_string(), MalformedReason::TextBetweenTags),
-                ("</parameter>".to_string(), MalformedReason::TagOutOfPlace),
+                ("\nx".to_string(), MalformedReason::TextBetweenTags),
+                ("\n</parameter>".to_string(), MalformedReason::TagOutOfPlace),
             ]
         );
-        assert_eq!(dropped(&events), vec!["\n", "\n", "\n"]);
+        assert_eq!(dropped(&events), vec!["\n"]);
         assert_eq!(bytes(&events), call);
     }
 
@@ -1609,18 +1742,19 @@ mod tests {
 
     #[test]
     fn a_block_without_a_function_tag_reports_every_byte() {
-        // A JSON object where tags were expected: its words are text between tags, the whitespace
-        // around them the wrapper, and what is left at the end never closed.
+        // A JSON object where tags were expected: its words are text between tags with the space
+        // between them, the newline before them the wrapper, and what is left at the end never
+        // closed.
         let events = finished(&["\n{\"name\": \"f\"}\n"]);
         assert_eq!(
             malformed(&events),
             vec![
                 ("{\"name\":".to_string(), MalformedReason::TextBetweenTags),
-                ("\"f\"}".to_string(), MalformedReason::TextBetweenTags),
+                (" \"f\"}".to_string(), MalformedReason::TextBetweenTags),
                 ("\n".to_string(), MalformedReason::UnterminatedRegion),
             ]
         );
-        assert_eq!(dropped(&events), vec!["\n", " "]);
+        assert_eq!(dropped(&events), vec!["\n"]);
         assert_eq!(ends(&events), 0);
         assert_eq!(bytes(&events), "\n{\"name\": \"f\"}\n");
         // A function tag cut short by the end of the stream.
@@ -1639,7 +1773,7 @@ mod tests {
             vec![
                 ("<parameter=".to_string(), MalformedReason::TagOutOfPlace),
                 ("city>".to_string(), MalformedReason::TextBetweenTags),
-                ("Paris".to_string(), MalformedReason::TextBetweenTags),
+                ("\nParis".to_string(), MalformedReason::TextBetweenTags),
                 ("\n".to_string(), MalformedReason::CallWithoutFunctionTag),
             ]
         );

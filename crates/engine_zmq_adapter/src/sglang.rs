@@ -17,7 +17,7 @@ use engine_zmq_client::{
     },
 };
 use futures::Stream;
-use smg_grpc_client::{sglang_proto, vllm_proto as vllm};
+use smg_grpc_client::{constraint_failed_status, sglang_proto, vllm_proto as vllm};
 use tracing::warn;
 
 use crate::{
@@ -353,7 +353,15 @@ impl MappedGenerateStream for SglangGenerateStream {
         // status (400 when the request is at fault). The frontend never asked
         // for it (its own aborts drop the stream first), so it is an error to
         // the caller, not an empty success, with the status mapped by the one
-        // table the engine's front ends share (`scheduler_abort_status`).
+        // table the engine's front ends share (`scheduler_abort_status`). The
+        // one abort the scheduler itself attributes to the request's grammar
+        // (the plugin's `err_type` stamp on the scheduler's own grammar
+        // failure, see `GRAMMAR_REJECTED_ERR_TYPE`) is the constraint failing
+        // the request: the constraint-failure status every wire ends such a
+        // request with, which a router answers for the constraint and never
+        // replays. Every other abort, a status-less one included (the
+        // scheduler aborts every running request the same bare way on an
+        // abort-all), keeps the table's status: the wire does not say more.
         if output.finish_reason.as_deref() == Some("abort") {
             let message = format!(
                 "the scheduler aborted the request: {}",
@@ -362,6 +370,9 @@ impl MappedGenerateStream for SglangGenerateStream {
                     .as_deref()
                     .unwrap_or("no reason reported")
             );
+            if output.finish_err_type.as_deref() == Some(GRAMMAR_REJECTED_ERR_TYPE) {
+                return Err(constraint_failed_status(message));
+            }
             return Err(scheduler_abort_status(output.finish_status, message));
         }
         let finish = output.finish_reason.map(|reason| {
@@ -689,6 +700,14 @@ pub(crate) fn constraint_ref(sp: &sglang_proto::SamplingParams) -> Option<Constr
         Constraint::StructuralTag(tag) => ConstraintRef::StructuralTag(tag),
     })
 }
+
+/// The `err_type` the plugin stamps on the scheduler's abort of a request
+/// whose grammar rejected a sampled token (`req.grammar.accept_token` raised
+/// in the scheduler's own grammar paths; the scheduler leaves that finish a
+/// bare `FINISH_ABORT()` that nothing on the wire tells from an abort-all).
+/// One name on both sides of the wire: the plugin's `GRAMMAR_REJECTED_ERR_TYPE`
+/// (`smg_grpc_servicer.sglang`) stamps it, this wire reads it.
+pub(crate) const GRAMMAR_REJECTED_ERR_TYPE: &str = "GrammarRejectedToken";
 
 /// The gRPC status for a request the scheduler aborted with an HTTP-style
 /// status: the table the engine's Python servicer uses for the same status,
@@ -1263,6 +1282,139 @@ mod tests {
             assert!(
                 error.message().contains("input_ids are required"),
                 "{error}"
+            );
+        }
+        engine_task.await.unwrap();
+    }
+
+    /// The scheduler's own attribution decides what an abort of a constrained
+    /// request is: the abort the plugin stamped as the grammar's rejection of
+    /// a sampled token (`GRAMMAR_REJECTED_ERR_TYPE`, bare as the scheduler's
+    /// main grammar paths leave it, or with the 500 its PD decode path adds)
+    /// is the constraint-failure status every wire ends such a request with,
+    /// the scheduler's words kept. The same bare abort without the stamp (an
+    /// abort-all, a session's end, a plugin that predates the column) stays
+    /// the internal error it was, and an abort with a status and another name
+    /// keeps the status table's entry.
+    #[tokio::test]
+    async fn only_the_abort_the_scheduler_attributes_to_the_grammar_is_the_constraint_failing() {
+        use smg_grpc_client::is_constraint_failure;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let (client, engine) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                1,
+                "m".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::Sglang,
+                Duration::from_secs(10)
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        let (client, engine) = (client.unwrap(), engine.unwrap());
+        // (rid, the plugin's err_type column, the status, the message, the code)
+        let cases = [
+            (
+                "r4",
+                Some(Some(GRAMMAR_REJECTED_ERR_TYPE)),
+                None,
+                "the grammar rejected a sampled token",
+                tonic::Code::FailedPrecondition,
+            ),
+            (
+                "r5",
+                Some(Some(GRAMMAR_REJECTED_ERR_TYPE)),
+                Some(500),
+                "Grammar accept_token failed for req r5 with token 7: Tokens not accepted: 7",
+                tonic::Code::FailedPrecondition,
+            ),
+            // The bare abort of an abort-all, from a plugin without the column.
+            ("r6", None, None, "Aborted", tonic::Code::Internal),
+            // The same bare abort, the column present and empty for it.
+            ("r7", Some(None), None, "Aborted", tonic::Code::Internal),
+            (
+                "r8",
+                Some(Some("BadRequestError")),
+                Some(400),
+                "invalid stop_regex",
+                tonic::Code::InvalidArgument,
+            ),
+        ];
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "engine task ends after responding"
+        )]
+        let engine_task = tokio::spawn(async move {
+            let (mut input, mut output) = engine.split();
+            for (rid, err_type, status, message, _) in cases {
+                let _ = input.recv_frames().await.unwrap();
+                let aborted = BatchTokenIDSlimOutput {
+                    rids: vec![rid.into()],
+                    output_ids: vec![vec![]],
+                    finished_reasons: vec!["abort".into()],
+                    finished_messages: vec![Some(message.into())],
+                    finished_matched: vec![None],
+                    prompt_tokens: vec![3],
+                    completion_tokens: vec![0],
+                    cached_tokens: vec![0],
+                    output_token_logprobs_val: vec![vec![]],
+                    output_token_logprobs_idx: vec![vec![]],
+                    finished_status: vec![status],
+                    finished_err_types: err_type
+                        .map(|name| vec![name.map(str::to_string)])
+                        .unwrap_or_default(),
+                    ..Default::default()
+                };
+                output
+                    .send_frames(vec![bytes::Bytes::from(encode_msgpack(&aborted).unwrap())])
+                    .await
+                    .unwrap();
+            }
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
+        });
+        for (rid, _, _, message, code) in cases {
+            let req = sglang_proto::GenerateRequest {
+                request_id: rid.to_string(),
+                tokenized: Some(sglang_proto::TokenizedInput {
+                    input_ids: vec![1, 2, 3],
+                    original_text: String::new(),
+                }),
+                sampling_params: Some(sglang_proto::SamplingParams {
+                    max_new_tokens: Some(8),
+                    constraint: Some(sglang_proto::sampling_params::Constraint::JsonSchema(
+                        r#"{"type":"object"}"#.to_string(),
+                    )),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut stream = client.generate_sglang(req).await.expect("generate");
+            let error = stream.next().await.expect("an item").expect_err("an error");
+            assert_eq!(error.code(), code, "{rid}");
+            let constraint = code == tonic::Code::FailedPrecondition;
+            assert_eq!(is_constraint_failure(&error), constraint, "{rid}: {error}");
+            assert!(
+                error
+                    .message()
+                    .ends_with(&format!("the scheduler aborted the request: {message}")),
+                "{rid}: {error}"
+            );
+            assert_eq!(
+                error.message().starts_with(
+                    "the engine could not continue the request under its constraint: "
+                ),
+                constraint,
+                "{rid}: {error}"
             );
         }
         engine_task.await.unwrap();

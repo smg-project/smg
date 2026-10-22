@@ -20,6 +20,16 @@ async fn main() -> ExitCode {
         .with_max_level(tracing::Level::INFO)
         .init();
 
+    // Help goes to stdout and succeeds, so `mock-worker --help` also shows
+    // that the binary runs.
+    if std::env::args()
+        .skip(1)
+        .any(|arg| arg == "-h" || arg == "--help")
+    {
+        println!("{}", mock_worker::config::usage());
+        return ExitCode::SUCCESS;
+    }
+
     let cfg = match Config::from_args() {
         Ok(cfg) => Arc::new(cfg),
         Err(message) => {

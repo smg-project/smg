@@ -1968,14 +1968,17 @@ mod request_release_tests {
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
     use futures::Stream;
     use llm_tokenizer::{
-        traits::Tokenizer, HuggingFaceTokenizer, MockTokenizer, TokenizerRegistry,
+        traits::{Decoder, Tokenizer},
+        HuggingFaceTokenizer, MockTokenizer, TokenizerRegistry,
     };
     use metrics_exporter_prometheus::PrometheusBuilder;
     use openai_protocol::{
         completion::CompletionRequest, model_card::ModelCard, worker::HealthCheckConfig,
     };
     use portpicker::pick_unused_port;
-    use smg_grpc_client::{common_proto as common, tokenspeed_proto as ts, vllm_proto};
+    use smg_grpc_client::{
+        common_proto as common, constraint_failed_status, tokenspeed_proto as ts, vllm_proto,
+    };
     use tokio::sync::mpsc;
     use tokio_stream::wrappers::ReceiverStream;
     use tonic::{transport::Server, Request as TonicRequest, Response as TonicResponse, Status};
@@ -2041,7 +2044,10 @@ mod request_release_tests {
     /// `fail_always` fails every call, `fail_internal` answers every call with
     /// INTERNAL (an engine that took the request and failed on it),
     /// `fail_mid_stream` ends the stream with the engine's own error after
-    /// its first frame, and
+    /// its first frame, `fail_constraint` admits the request and ends the
+    /// stream with the engine's report that it could not continue the
+    /// request under its constraint, `fail_engine_report` admits it and ends
+    /// the stream with the engine's own report before any frame, and
     /// `answer_after` stalls the generate RPC, standing in for an engine that
     /// answers only at its own deadline; `frame_gap` paces the response frames,
     /// for a stream that outlasts its dispatch. Every call's input token ids,
@@ -2056,6 +2062,8 @@ mod request_release_tests {
         fail_always: bool,
         fail_internal: bool,
         fail_mid_stream: bool,
+        fail_constraint: bool,
+        fail_engine_report: bool,
         answer_after: Option<Duration>,
         frame_gap: Option<Duration>,
         calls: Arc<AtomicUsize>,
@@ -2165,6 +2173,23 @@ mod request_release_tests {
             }
             if self.fail_internal {
                 return Err(Status::internal("release-test induced engine failure"));
+            }
+            if self.fail_constraint {
+                // The engine admitted the request and could not continue it
+                // under its constraint: the call succeeds and the stream ends
+                // with the report before any frame, as the wires end it.
+                let items: Vec<Result<ts::GenerateResponse, Status>> = vec![Err(
+                    constraint_failed_status("release-test induced grammar failure"),
+                )];
+                return Ok(TonicResponse::new(Box::pin(futures::stream::iter(items))));
+            }
+            if self.fail_engine_report {
+                // The engine failed the request and named no cause: the
+                // report the ZMQ wires end their streams with for an `error`
+                // finish, before any frame.
+                let items: Vec<Result<ts::GenerateResponse, Status>> =
+                    vec![Err(Status::internal(ENGINE_ERROR_MESSAGE))];
+                return Ok(TonicResponse::new(Box::pin(futures::stream::iter(items))));
             }
             if let Some(delay) = self.answer_after {
                 tokio::time::sleep(delay).await;
@@ -3697,9 +3722,18 @@ mod request_release_tests {
         components: Arc<SharedComponents>,
         retry: &RetryConfig,
     ) -> Response {
+        run_completion_of(pipeline, components, retry, completion_request(false)).await
+    }
+
+    async fn run_completion_of(
+        pipeline: RequestPipeline,
+        components: Arc<SharedComponents>,
+        retry: &RetryConfig,
+        request: Arc<CompletionRequest>,
+    ) -> Response {
         pipeline
             .execute_completion(
-                completion_request(false),
+                request,
                 None,
                 MODEL.to_string(),
                 components,
@@ -3708,6 +3742,19 @@ mod request_release_tests {
                 Some(retry),
             )
             .await
+    }
+
+    /// The completion with a constraint on its output (a JSON schema).
+    fn constrained_completion_request() -> Arc<CompletionRequest> {
+        Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "model": MODEL,
+                "prompt": "Hello world",
+                "stream": false,
+                "json_schema": "{\"type\":\"object\"}",
+            }))
+            .expect("constrained completion request"),
+        )
     }
 
     fn calls_seen(ids: &Mutex<Vec<String>>) -> usize {
@@ -3775,6 +3822,93 @@ mod request_release_tests {
         );
         assert!(!is_retryable_response(&response));
         assert_eq!(worker.circuit_breaker_state(), CircuitState::Closed);
+    }
+
+    /// A worker's report that the engine could not continue the request under
+    /// its constraint is the request's answer, a 422 `constraint_failed`: one
+    /// call on the worker and none elsewhere (the same tokens fail the same
+    /// way on a replay, each replay a prefill), terminal for the retry layer,
+    /// and no breaker sample against a worker that is healthy.
+    #[tokio::test]
+    async fn a_constraint_failure_is_answered_once_and_never_replayed() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let port = spawn_stub(GatedScheduler {
+            fail_constraint: true,
+            seen_request_ids: Arc::clone(&seen),
+            ..Default::default()
+        })
+        .await;
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let worker = register_worker_with_breaker(&worker_registry, port, 1);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let components = components(worker_registry).await;
+
+        let response = run_completion(pipeline, components, &fast_retry_config(5)).await;
+
+        assert_eq!(response.status(), http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            "constraint_failed"
+        );
+        assert_eq!(calls_seen(&seen), 1, "the answer is final for this request");
+        assert!(!is_retryable_response(&response));
+        assert_eq!(
+            worker.circuit_breaker_state(),
+            CircuitState::Closed,
+            "a healthy worker takes no sample"
+        );
+    }
+
+    /// The engine's own report on a constrained request (an `error` finish
+    /// that names no cause: a failed KV handoff or a pause as often as a
+    /// grammar rejection) is answered exactly as on a request without a
+    /// constraint: the same status and code (the engine's error, a 500, never
+    /// the constraint's 422, which only a worker's own attribution produces),
+    /// the same calls on the worker (the retry layer replaying it as before)
+    /// and the same breaker state.
+    #[tokio::test]
+    async fn an_engines_unattributed_report_on_a_constrained_request_keeps_its_shape() {
+        let mut outcomes = Vec::new();
+        for request in [completion_request(false), constrained_completion_request()] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let port = spawn_stub(GatedScheduler {
+                fail_engine_report: true,
+                seen_request_ids: Arc::clone(&seen),
+                ..Default::default()
+            })
+            .await;
+
+            let worker_registry = Arc::new(WorkerRegistry::new());
+            let worker = register_worker_with_breaker(&worker_registry, port, 1);
+            let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+            let components = components(worker_registry).await;
+
+            let response =
+                run_completion_of(pipeline, components, &fast_retry_config(2), request).await;
+            outcomes.push((
+                response.status(),
+                error::extract_error_code_from_response(&response).to_string(),
+                calls_seen(&seen),
+                worker.circuit_breaker_state(),
+            ));
+        }
+
+        let (plain, constrained) = (&outcomes[0], &outcomes[1]);
+        assert_eq!(plain.0, http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_ne!(
+            constrained.1, "constraint_failed",
+            "no attribution, no constraint failure"
+        );
+        assert!(
+            plain.2 >= 2,
+            "the engine's error is replayed as before ({} calls)",
+            plain.2
+        );
+        assert_eq!(
+            constrained, plain,
+            "a constraint changes nothing about the engine's own report"
+        );
     }
 
     /// A smaller engine is not an alternative to the engine that returned a
@@ -4427,7 +4561,7 @@ mod request_release_tests {
             serde_json::json!({
                 "model": MODEL,
                 "messages": [{"role": "user", "content": "Hi"}],
-                "reasoning_effort": "medium",
+                "reasoning_effort": "turbo",
                 "max_tokens": 1,
             }),
             false,
@@ -4437,6 +4571,50 @@ mod request_release_tests {
         assert_eq!(status, http::StatusCode::BAD_REQUEST, "{body}");
         assert!(body.contains("Invalid reasoning effort"), "{body}");
         assert!(ids.is_empty(), "nothing must reach the worker");
+    }
+
+    /// `medium` is a level of the checkpoint's own chat template (budget
+    /// 62): the top-level field and the template kwarg both render it
+    /// instead of refusing the request.
+    #[tokio::test]
+    async fn deepseek_v41_medium_effort_renders_the_checkpoints_budget() {
+        let Some(dir) = deepseek_v41_model_dir() else {
+            skip_no_tokenizer();
+            return;
+        };
+        let tokenizer = HuggingFaceTokenizer::from_file(
+            dir.join("tokenizer.json")
+                .to_str()
+                .expect("utf-8 tokenizer path"),
+        )
+        .expect("load the DeepSeek-V4.1 tokenizer");
+        for request in [
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "reasoning_effort": "medium",
+                "max_tokens": 1,
+            }),
+            serde_json::json!({
+                "model": MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "chat_template_kwargs": {"reasoning_effort": "medium"},
+                "max_tokens": 1,
+            }),
+        ] {
+            let (status, body, ids, _) = v41_run_chat(&dir, request.clone(), false).await;
+            assert_eq!(
+                status,
+                http::StatusCode::OK,
+                "{request}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let prompt = tokenizer.decode(&ids[0], false).expect("decode the prompt");
+            assert!(
+                prompt.contains("Reasoning Effort: 62 (range"),
+                "{request}: {prompt}"
+            );
+        }
     }
 
     /// One image expands to exactly the reference span: `<｜deepseek_image｜>`

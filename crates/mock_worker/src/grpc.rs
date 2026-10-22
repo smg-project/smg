@@ -12,7 +12,9 @@ use std::{
 };
 
 use futures::{stream, Stream, StreamExt};
-use smg_grpc_client::{common_proto as common, tokenspeed_scheduler::tokenspeed_proto as ts};
+use smg_grpc_client::{
+    common_proto as common, constraint_failed_status, tokenspeed_scheduler::tokenspeed_proto as ts,
+};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::{mpsc, watch},
@@ -541,8 +543,10 @@ impl TokenSpeedScheduler for MockScheduler {
 /// chosen so the gateway's mapping of codes to HTTP statuses gives that status
 /// back where it can: 408 reads back as 504 and 502 as 503 (both still
 /// retryable), 499 as 502 (`cancelled`: the worker's side ending the call,
-/// retryable and charged to the worker), any other 4xx as 400 (not
-/// retryable, as on the HTTP worker), any other 5xx as 500.
+/// retryable and charged to the worker), 422 as the engine's report that it
+/// could not continue the request under its constraint (a 422
+/// `constraint_failed` at the gateway, never replayed), any other 4xx as 400
+/// (not retryable, as on the HTTP worker), any other 5xx as 500.
 fn injected_status(status: u16) -> Status {
     const MESSAGE: &str = "injected";
     match status {
@@ -552,6 +556,7 @@ fn injected_status(status: u16) -> Status {
         404 => Status::not_found(MESSAGE),
         408 | 504 => Status::deadline_exceeded(MESSAGE),
         409 => Status::aborted(MESSAGE),
+        422 => constraint_failed_status(MESSAGE),
         429 => Status::resource_exhausted(MESSAGE),
         // The call the worker's side ended: what a connection that closed
         // under it produces at the gateway.
@@ -1282,6 +1287,11 @@ mod tests {
         // 499 as 502) and a 4xx without its own code (read back as 400).
         assert_eq!(injected_status(408).code(), tonic::Code::DeadlineExceeded);
         assert_eq!(injected_status(502).code(), tonic::Code::Unavailable);
-        assert_eq!(injected_status(422).code(), tonic::Code::InvalidArgument);
+        assert_eq!(injected_status(418).code(), tonic::Code::InvalidArgument);
+        // 422 is the engine's report that it could not continue the request
+        // under its constraint, which the gateway reads back as its 422.
+        let constraint = injected_status(422);
+        assert_eq!(constraint.code(), tonic::Code::FailedPrecondition);
+        assert!(smg_grpc_client::is_constraint_failure(&constraint));
     }
 }

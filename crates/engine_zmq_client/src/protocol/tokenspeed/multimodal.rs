@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use serde::{ser::SerializeTuple, Serialize, Serializer};
 
-use crate::codec::tensor::WireTensor;
+use crate::codec::tensor::{TensorFields, WireArrayData, WireTensor};
 
 /// Engine-side modality discriminants (`inputs.py::Modality`).
 ///
@@ -113,6 +113,19 @@ impl Serialize for TokenSpeedWireMmItem {
     }
 }
 
+impl TensorFields for TokenSpeedWireMmItem {
+    /// The feature, then the side tensors in key order: the slot order.
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        self.feature.for_each_tensor(visit);
+        self.model_specific_data.for_each_tensor(visit);
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        self.feature.for_each_tensor_mut(visit);
+        self.model_specific_data.for_each_tensor_mut(visit);
+    }
+}
+
 /// Request-level multimodal payload — `MultimodalInputs`, a 7-slot positional
 /// array: `[mm_items, im_token_id, video_token_id, mrope_positions,
 /// mrope_position_delta, mrope_position_delta_scalar, <reserved>]`.
@@ -135,6 +148,16 @@ impl Serialize for TokenSpeedWireMmInputs {
         tuple.serialize_element(&NIL)?; // mrope_position_delta_scalar
         tuple.serialize_element(&NIL)?; // reserved trailing slot
         tuple.end()
+    }
+}
+
+impl TensorFields for TokenSpeedWireMmInputs {
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        self.mm_items.for_each_tensor(visit);
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        self.mm_items.for_each_tensor_mut(visit);
     }
 }
 

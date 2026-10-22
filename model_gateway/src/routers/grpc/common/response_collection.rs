@@ -197,12 +197,20 @@ fn merge_prefill_logprobs(
 /// The client's answer when `side`'s stream ended with `status` before its
 /// `Complete`: the status's own HTTP class with the wording clients know,
 /// under the code and with the words that name the dead rendezvous port when
-/// the gateway found one behind the failure.
+/// the gateway found one behind the failure; a worker's report that the
+/// engine could not continue the request under its constraint is answered
+/// for the constraint.
 fn stream_failed(
     side: &str,
     status: &tonic::Status,
     rendezvous: Option<&DeadRendezvous>,
 ) -> Response {
+    // The engine could not continue the request under its constraint: the
+    // request's answer, under its own code, final for the retry layer (see
+    // `TonicStatusExt::constraint_failure_response`).
+    if let Some(response) = status.constraint_failure_response() {
+        return response;
+    }
     match rendezvous {
         Some(rendezvous) => status.to_http_error(
             "pd_rendezvous_failed",
