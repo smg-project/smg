@@ -312,6 +312,13 @@ jobs:
           if [ -n "$IMPL" ]; then
             SUFFIX="${SUFFIX}-${IMPL}-servicer"
           fi
+          # Parser and multi-engine variants share the same suite and GPU tier.
+          if [ -n "${{ inputs.parser }}" ]; then
+            SUFFIX="${SUFFIX}-parser-${{ inputs.parser }}"
+          fi
+          if [ -n "${{ inputs.zmq_engine_count }}" ]; then
+            SUFFIX="${SUFFIX}-engines-${{ inputs.zmq_engine_count }}"
+          fi
           ARTIFACT="e2e-worker-logs-${{ inputs.engine }}-gpu${{ inputs.gpu_tier }}-${LABEL}${SUFFIX}"
           bash scripts/ci_dump_worker_logs.sh e2e-logs "$ARTIFACT"
           echo "artifact=${ARTIFACT}" >> "$GITHUB_OUTPUT"
