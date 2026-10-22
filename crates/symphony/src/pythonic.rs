@@ -64,9 +64,13 @@ pub enum Values {
     Json,
     /// `"Paris"`, `"3"`, `"True"`, `"['a', 'b']"`: every value as `"%s"` of it, the quotes
     /// carrying no type and the text between them the value's characters as they are, no escape
-    /// among them. A value between double quotes reads as written, by the kind the request's tool
-    /// declares for its parameter, by its text where none is declared; a value the model writes
-    /// bare, a single-quoted string included, reads as Python's.
+    /// among them, so the next `"` ends the value whatever stands before it (a value that ends
+    /// in a backslash closes at its quote), save that a `"` right after a backslash is the model's
+    /// own escaped quote (`5\" screen`, which the family's own readers decode) unless the value's
+    /// end follows it. A value between double quotes reads as written, by
+    /// the kind the request's tool declares for its parameter, by its text where none is
+    /// declared; a value the model writes bare, a single-quoted string included and the strings
+    /// inside a bare list or object, reads as Python's, escapes and all.
     Quoted,
 }
 
@@ -168,19 +172,63 @@ enum Stage {
 }
 
 /// Where a value ends: at a `,` or `)` outside every string and bracket.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct Extent {
     depth: u32,
     quote: Option<char>,
     escaped: bool,
+    /// Under [`Values::Quoted`]: a double-quoted string at the value's top level is the
+    /// template's text as it stands, so no backslash in it escapes the `"` that ends it; a string
+    /// inside a list or an object the model writes bare is Python's, escapes and all.
+    verbatim: bool,
+    /// Whether a backslash escapes the next character in the open string: Python's rule, off in
+    /// the template's own quotes, where `escaped` only remembers that a backslash came last.
+    escapes: bool,
+    /// In the template's own quotes: a `"` came right after a backslash, which is the value's end
+    /// if `,` or `)` follows it, whitespace aside, and the model's own escaped quote otherwise,
+    /// after which the string goes on.
+    tentative: bool,
 }
 
 impl Extent {
+    /// The extent of a value under `values`, before its first character.
+    fn new(values: Values) -> Self {
+        Self {
+            depth: 0,
+            quote: None,
+            escaped: false,
+            verbatim: values == Values::Quoted,
+            escapes: true,
+            tentative: false,
+        }
+    }
+
     /// Reads one character and says whether it ends the value (it is then not the value's).
     fn ends_at(&mut self, c: char) -> bool {
         if let Some(quote) = self.quote {
-            if self.escaped {
+            if self.tentative {
+                if c.is_whitespace() {
+                    return false;
+                }
+                self.tentative = false;
+                if c == ',' || c == ')' {
+                    self.quote = None;
+                    return true;
+                }
+                // The quote was the model's own escaped one: the string goes on, and `c` is its.
+                self.escaped = c == '\\';
+                if c == quote {
+                    self.quote = None;
+                }
+            } else if self.escaped {
                 self.escaped = false;
+                if !self.escapes {
+                    if c == quote {
+                        self.tentative = true;
+                    } else if c == '\\' {
+                        self.escaped = true;
+                    }
+                }
             } else if c == '\\' {
                 self.escaped = true;
             } else if c == quote {
@@ -189,7 +237,10 @@ impl Extent {
             return false;
         }
         match c {
-            '\'' | '"' => self.quote = Some(c),
+            '\'' | '"' => {
+                self.quote = Some(c);
+                self.escapes = !(self.verbatim && c == '"' && self.depth == 0);
+            }
             '(' | '[' | '{' => self.depth += 1,
             ')' | ']' | '}' if self.depth > 0 => self.depth -= 1,
             ',' | ')' if self.depth == 0 => return true,
@@ -206,15 +257,25 @@ struct ListExtent {
     depth: u32,
     quote: Option<char>,
     escaped: bool,
+    /// As [`Extent::verbatim`]: a double-quoted string at a value's top level, inside the list's
+    /// `[` and the call's `(` and nothing else, takes no escape under [`Values::Quoted`].
+    verbatim: bool,
+    /// As [`Extent::escapes`].
+    escapes: bool,
+    /// As [`Extent::tentative`].
+    tentative: bool,
 }
 
 impl ListExtent {
-    /// The extent after the list's `[`.
-    fn opened() -> Self {
+    /// The extent after the list's `[`, under `values`.
+    fn opened(values: Values) -> Self {
         Self {
             depth: 1,
             quote: None,
             escaped: false,
+            verbatim: values == Values::Quoted,
+            escapes: true,
+            tentative: false,
         }
     }
 
@@ -222,8 +283,29 @@ impl ListExtent {
     /// closed by another bracket, which no list of calls writes.
     fn read(&mut self, c: char) -> ListEnd {
         if let Some(quote) = self.quote {
-            if self.escaped {
+            if self.tentative {
+                if c.is_whitespace() {
+                    return ListEnd::Open;
+                }
+                self.tentative = false;
+                if c == ',' || c == ')' {
+                    // The value's end: the string is closed, and the character reads outside it.
+                    self.quote = None;
+                    return self.read(c);
+                }
+                self.escaped = c == '\\';
+                if c == quote {
+                    self.quote = None;
+                }
+            } else if self.escaped {
                 self.escaped = false;
+                if !self.escapes {
+                    if c == quote {
+                        self.tentative = true;
+                    } else if c == '\\' {
+                        self.escaped = true;
+                    }
+                }
             } else if c == '\\' {
                 self.escaped = true;
             } else if c == quote {
@@ -232,7 +314,10 @@ impl ListExtent {
             return ListEnd::Open;
         }
         match c {
-            '\'' | '"' => self.quote = Some(c),
+            '\'' | '"' => {
+                self.quote = Some(c);
+                self.escapes = !(self.verbatim && c == '"' && self.depth == 2);
+            }
             '(' | '[' | '{' => self.depth += 1,
             ')' | ']' | '}' => {
                 self.depth -= 1;
@@ -434,7 +519,7 @@ impl Assembler {
                     // `[Authorize(`), so it is content from its `(`, and the stream goes on.
                     let name = self.carried[1..].trim();
                     self.stage = if declared.declares(name) {
-                        Stage::Holding(ListExtent::opened())
+                        Stage::Holding(ListExtent::opened(self.values))
                     } else {
                         Stage::Prose
                     };
@@ -558,7 +643,7 @@ impl Assembler {
                     self.stage = Stage::Value {
                         key,
                         start,
-                        scan: Extent::default(),
+                        scan: Extent::new(self.values),
                     };
                 }
                 c => {
@@ -750,7 +835,8 @@ fn reads_back(json: &str) -> bool {
 
 /// A value under [`Values::Quoted`]: between double quotes, the text inside them as it stands,
 /// since the template writes the string's characters as they are and decodes no escape (a
-/// backslash and an `r` in a value are those two characters, not a carriage return), typed by
+/// backslash and an `r` in a value are those two characters, not a carriage return, and a
+/// backslash at the value's end is the value's last character, before the quote that ends it), typed by
 /// `kind`, the one the request's tool declares for the parameter, or by its text where none is
 /// declared; a value the model wrote bare, a single-quoted Python string included, reads as a
 /// Python literal, and any other text as the tagged tables read theirs.
@@ -891,6 +977,210 @@ mod tests {
         assert_eq!(content(&events), text);
         assert!(calls(&events).is_empty());
         assert_eq!(malformed(&events), "");
+    }
+
+    /// Under the quoted dialect a double-quoted value is the template's text as it stands: a
+    /// backslash before the closing quote is the value's last character, not an escape, so the
+    /// value closes at its quote, whole and at every cut, in the turn's list and in a list held
+    /// after content alike; a single-quoted value is the model's Python, escapes and all, and the
+    /// Python dialect keeps the escape in a double-quoted value too.
+    #[test]
+    fn a_quoted_value_ending_in_a_backslash_closes_at_its_quote() {
+        let output = "[get_weather(city=\"dir C:\\\", unit=\"N/A\")]";
+        let expected = vec![(
+            0,
+            "get_weather".to_string(),
+            "{\"city\": \"dir C:\\\\\", \"unit\": \"N/A\"}".to_string(),
+        )];
+        assert_eq!(calls(&run_bare(&tools(), &[output])), expected);
+        for at in 1..output.len() {
+            let events = run_bare(&tools(), &[&output[..at], &output[at..]]);
+            assert_eq!(calls(&events), expected, "cut at {at}");
+            assert_eq!(malformed(&events), "", "cut at {at}");
+        }
+        let held = format!("Let me check.{output}");
+        let events = run_bare(&tools(), &[&held]);
+        assert_eq!(content(&events), "Let me check.");
+        assert_eq!(calls(&events), expected);
+        // A list the model writes bare is Python's: the quote inside its string is escaped, and
+        // stays so in the turn's list and in a list held after content.
+        let bare = "[get_weather(tags=[\"a\\\"b\", \"c\"], unit=\"N/A\")]";
+        let expected = vec![(
+            0,
+            "get_weather".to_string(),
+            "{\"tags\": [\"a\\\"b\", \"c\"], \"unit\": \"N/A\"}".to_string(),
+        )];
+        assert_eq!(calls(&run_bare(&tools(), &[bare])), expected);
+        let held = format!("Let me check.{bare}");
+        let events = run_bare(&tools(), &[&held]);
+        assert_eq!(content(&events), "Let me check.");
+        assert_eq!(calls(&events), expected);
+        let events = run_bare(&tools(), &["[get_weather(city='it\\'s', unit=\"N/A\")]"]);
+        assert_eq!(
+            calls(&events),
+            [(
+                0,
+                "get_weather".to_string(),
+                "{\"city\": \"it's\", \"unit\": \"N/A\"}".to_string()
+            )]
+        );
+        let events = run_with(
+            Dialect::LFM2_5,
+            &tools(),
+            &["[get_weather(city=\"a\\\"b\", unit=\"N/A\")]"],
+        );
+        assert_eq!(
+            calls(&events),
+            [(
+                0,
+                "get_weather".to_string(),
+                "{\"city\": \"a\\\"b\", \"unit\": \"N/A\"}".to_string()
+            )]
+        );
+    }
+
+    /// The quoted dialect's rule on every shape of backslash a value may hold, as the recorded
+    /// benchmark sets write them: a double-quoted value is the template's bytes as they stand, so
+    /// a backslash inside it is one of the value's characters, however many stand before the
+    /// closing quote and whatever follows one, and the next `"` ends the value, save that a `"`
+    /// right after a backslash is the model's own escaped quote unless the value's end follows
+    /// it. Each shape whole, at every cut, in the turn's list and in a list held after content.
+    #[test]
+    fn a_quoted_values_backslashes_are_its_characters_wherever_they_stand() {
+        let declared = Declared::of(&[tool(
+            "cmd_controller_execute",
+            value!({"type": "object", "properties": {
+                "command": {"type": "string"},
+                "unit": {"type": "string"},
+            }}),
+        )]);
+        let shapes: &[(&str, &str)] = &[
+            // one backslash before the closing quote, an argument after it and as the last
+            (
+                "[cmd_controller_execute(command=\"dir C:\\\", unit=\"N/A\")]",
+                "{\"command\": \"dir C:\\\\\", \"unit\": \"N/A\"}",
+            ),
+            (
+                "[cmd_controller_execute(command=\"dir C:\\\")]",
+                "{\"command\": \"dir C:\\\\\"}",
+            ),
+            // two, and three
+            (
+                "[cmd_controller_execute(command=\"dir C:\\\\\", unit=\"N/A\")]",
+                "{\"command\": \"dir C:\\\\\\\\\", \"unit\": \"N/A\"}",
+            ),
+            (
+                "[cmd_controller_execute(command=\"dir C:\\\\\\\")]",
+                "{\"command\": \"dir C:\\\\\\\\\\\\\"}",
+            ),
+            // a backslash with text after it, which no escape decodes (`\x` is not one here)
+            (
+                "[cmd_controller_execute(command=\"C:\\x\", unit=\"N/A\")]",
+                "{\"command\": \"C:\\\\x\", \"unit\": \"N/A\"}",
+            ),
+            // a backslash before a comma inside the value, and before a single quote
+            (
+                "[cmd_controller_execute(command=\"a\\, b\\'c\", unit=\"N/A\")]",
+                "{\"command\": \"a\\\\, b\\\\'c\", \"unit\": \"N/A\"}",
+            ),
+            // two calls, the first ending in a backslash
+            (
+                "[cmd_controller_execute(command=\"dir C:\\\"), cmd_controller_execute(unit=\"N/A\")]",
+                "",
+            ),
+            // whitespace between the quote and the value's end
+            (
+                "[cmd_controller_execute(command=\"dir C:\\\" , unit=\"N/A\" )]",
+                "{\"command\": \"dir C:\\\\\", \"unit\": \"N/A\"}",
+            ),
+            // a quote the model escaped Python's way, inside the value: the value's end does not
+            // follow it, so the string goes on and the backslash is kept, as the family's own
+            // readers keep the quote; once, twice, and right before the closing quote
+            (
+                "[cmd_controller_execute(command=\"5\\\" screen\", unit=\"N/A\")]",
+                "{\"command\": \"5\\\\\\\" screen\", \"unit\": \"N/A\"}",
+            ),
+            (
+                "[cmd_controller_execute(command=\"say \\\"hi\\\" now\", unit=\"N/A\")]",
+                "{\"command\": \"say \\\\\\\"hi\\\\\\\" now\", \"unit\": \"N/A\"}",
+            ),
+            (
+                "[cmd_controller_execute(command=\"say \\\"hi\\\"\", unit=\"N/A\")]",
+                "{\"command\": \"say \\\\\\\"hi\\\\\\\"\", \"unit\": \"N/A\"}",
+            ),
+            (
+                "[cmd_controller_execute(command=\"a\\\"b\", unit=\"N/A\")]",
+                "{\"command\": \"a\\\\\\\"b\", \"unit\": \"N/A\"}",
+            ),
+        ];
+        for (output, arguments) in shapes {
+            let expected: Vec<(u32, String, String)> = if arguments.is_empty() {
+                vec![
+                    (
+                        0,
+                        "cmd_controller_execute".to_string(),
+                        "{\"command\": \"dir C:\\\\\"}".to_string(),
+                    ),
+                    (
+                        1,
+                        "cmd_controller_execute".to_string(),
+                        "{\"unit\": \"N/A\"}".to_string(),
+                    ),
+                ]
+            } else {
+                vec![(
+                    0,
+                    "cmd_controller_execute".to_string(),
+                    arguments.to_string(),
+                )]
+            };
+            let whole = run_bare(&declared, &[output]);
+            assert_eq!(calls(&whole), expected, "{output}");
+            assert_eq!(malformed(&whole), "", "{output}");
+            assert_eq!(bytes(&whole), *output, "{output}");
+            for at in 1..output.len() {
+                let events = run_bare(&declared, &[&output[..at], &output[at..]]);
+                assert_eq!(calls(&events), expected, "{output} cut at {at}");
+                assert_eq!(malformed(&events), "", "{output} cut at {at}");
+                assert_eq!(bytes(&events), *output, "{output} cut at {at}");
+            }
+            let held = format!("Listing the directory.{output}");
+            let whole = run_bare(&declared, &[&held]);
+            assert_eq!(content(&whole), "Listing the directory.", "{held}");
+            assert_eq!(calls(&whole), expected, "{held}");
+            assert_eq!(bytes(&whole), held, "{held}");
+            for at in 1..held.len() {
+                let events = run_bare(&declared, &[&held[..at], &held[at..]]);
+                assert_eq!(
+                    content(&events),
+                    "Listing the directory.",
+                    "{held} cut at {at}"
+                );
+                assert_eq!(calls(&events), expected, "{held} cut at {at}");
+                assert_eq!(bytes(&events), held, "{held} cut at {at}");
+            }
+        }
+        // A quote the model escaped right before the value's end is read as the template writes
+        // it: the value ends there, with the backslash as its last character, and what follows
+        // is no argument, so the turn's list ends open and says so with no arguments made up, and
+        // a list held after content is content.
+        let output = "[cmd_controller_execute(command=\"say \\\"hi\\\", ok\", unit=\"N/A\")]";
+        let events = run_bare(&declared, &[output]);
+        let read = calls(&events);
+        assert_eq!(read.len(), 1);
+        assert!(
+            read[0]
+                .2
+                .starts_with("{\"command\": \"say \\\\\\\"hi\\\\\""),
+            "{}",
+            read[0].2
+        );
+        assert_ne!(malformed(&events), "");
+        assert_eq!(bytes(&events), output);
+        let held = format!("Listing the directory.{output}");
+        let events = run_bare(&declared, &[&held]);
+        assert_eq!(content(&events), held);
+        assert!(calls(&events).is_empty());
     }
 
     fn run_bare(declared: &Declared, pieces: &[&str]) -> Vec<Event<'static>> {
