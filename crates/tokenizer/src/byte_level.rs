@@ -133,7 +133,7 @@ impl ByteLevelTable {
         let mut table = ByteLevelTableBuilder::with_capacity(count);
         let mut bytes = Vec::new();
         for id in 0..count {
-            match tokenizer.id_to_token(id as u32) {
+            match token_content(tokenizer, id as u32) {
                 Some(token) => {
                     bytes.clear();
                     push_token_bytes(&token, &mut bytes);
@@ -176,6 +176,26 @@ impl ByteLevelTable {
         let bytes = &self.bytes[self.offsets[id]..self.offsets[id + 1]];
         Some((bytes, kind == Kind::Special))
     }
+}
+
+/// The string `id` decodes from: an added token's content when the id is
+/// one (before a model piece that shares the id), else the model's piece.
+///
+/// Not `id_to_token`: for an added token with `normalized` set, that gives
+/// the string the encoder matched, the content run through the normalizer,
+/// and keeps it apart from the content only to find the token in normalized
+/// text. Decoded, the token stands for its content: under a normalizer that
+/// prepends the word marker (U+2581), a marker such as `</think>` would
+/// otherwise come back with the marker in front and render with a space the
+/// text never held, and a special token so normalized would no longer be
+/// recognized as one.
+pub(crate) fn token_content(tokenizer: &HfTokenizer, id: TokenIdType) -> Option<String> {
+    tokenizer
+        .get_added_vocabulary()
+        .get_added_tokens_decoder()
+        .get(&id)
+        .map(|token| token.content.clone())
+        .or_else(|| tokenizer.id_to_token(id))
 }
 
 /// The bytes a token string stands for: its chars mapped through the
@@ -310,8 +330,9 @@ mod tests {
     use tokenizers::{
         decoders::{byte_level::ByteLevel as ByteLevelDecoder, metaspace::Metaspace},
         models::bpe::{Merges, Vocab, BPE},
+        normalizers::Lowercase,
         pre_tokenizers::byte_level::ByteLevel as ByteLevelPreTokenizer,
-        AddedToken,
+        AddedToken, NormalizerWrapper,
     };
 
     use super::*;
@@ -666,5 +687,44 @@ mod tests {
         let mut skip = ByteLevelIncremental::new(table, true, UnknownId::Drop);
         assert_eq!(skip.step(special).expect("step"), "");
         assert_eq!(skip.step(added).expect("step"), ADDED);
+    }
+
+    /// Under a normalizer that changes an added token's content, the loader
+    /// keeps the normalized content for the decode; the table reads the
+    /// content, and a special token added that way stays special.
+    #[test]
+    fn an_added_token_decodes_as_its_content_not_its_normalized_form() {
+        let mut tokenizer = byte_level_tokenizer();
+        tokenizer
+            .with_normalizer(Some(Lowercase))
+            .expect("normalizer");
+        tokenizer
+            .add_tokens([AddedToken::from("<TOOL>", false).normalized(true)])
+            .expect("add token");
+        tokenizer
+            .add_special_tokens([AddedToken::from("<|END|>", true).normalized(true)])
+            .expect("add special token");
+        let tool = tokenizer.token_to_id("<TOOL>").expect("tool id");
+        let end = tokenizer.token_to_id("<|END|>").expect("end id");
+        let h = tokenizer.token_to_id("h").expect("h");
+        // The premise: the loader hands out the normalized content.
+        assert_eq!(tokenizer.id_to_token(tool).as_deref(), Some("<tool>"));
+        let table = ByteLevelTable::build(&tokenizer).expect("table");
+        let (steps, pending) = stream(&table, &[h, tool, end], false);
+        assert!(pending.is_empty());
+        assert_eq!(steps, ["h", "<TOOL>", "<|END|>"]);
+        let (steps, _) = stream(&table, &[h, tool, end], true);
+        assert_eq!(steps, ["h", "<TOOL>", ""]);
+        // The oracle: the loader's own decode once the normalizer is gone.
+        let mut plain = tokenizer.clone();
+        plain
+            .with_normalizer(None::<NormalizerWrapper>)
+            .expect("no normalizer");
+        for skip in [false, true] {
+            assert_eq!(
+                stream(&table, &[h, tool, end], skip).0.concat(),
+                plain.decode(&[h, tool, end], skip).expect("decode")
+            );
+        }
     }
 }

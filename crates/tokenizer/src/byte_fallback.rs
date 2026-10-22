@@ -15,7 +15,7 @@ use std::sync::Arc;
 
 use tokenizers::Tokenizer as HfTokenizer;
 
-use crate::traits::TokenIdType;
+use crate::{byte_level::token_content, traits::TokenIdType};
 
 /// What an id contributes to a decode.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -70,9 +70,10 @@ impl PieceTable {
             [b, c, d] if *b == byte_fallback && *c == fuse && *d == strip => true,
             _ => return None,
         };
-        // Each id through the lookups the decode uses: `id_to_token` (an added
-        // token before a model piece that shares its id) and the added
-        // vocabulary's own notion of special, as the byte-level table does.
+        // Each id through the lookups the decode uses: an added token's
+        // content before a model piece that shares its id (see
+        // `token_content`) and the added vocabulary's own notion of special,
+        // as the byte-level table does.
         let max_id = tokenizer.get_vocab(true).values().copied().max()?;
         let added = tokenizer.get_added_vocabulary();
         let ids = max_id as usize + 1;
@@ -81,7 +82,7 @@ impl PieceTable {
         let mut text = Vec::with_capacity(ids * 4);
         let mut piece = Vec::with_capacity(ids);
         for id in 0..=max_id {
-            let kind = match tokenizer.id_to_token(id) {
+            let kind = match token_content(tokenizer, id) {
                 None => Piece::Absent,
                 Some(token) => match byte_token(&token) {
                     Some(byte) => Piece::Byte(byte),
@@ -195,8 +196,8 @@ pub(crate) mod tests {
             strip::Strip,
         },
         models::bpe::{Merges, Vocab, BPE},
-        normalizers::Replace,
-        AddedToken, DecoderWrapper, Tokenizer as HfTokenizer,
+        normalizers::{Prepend, Replace, Sequence as NormalizerSequence},
+        AddedToken, DecoderWrapper, NormalizerWrapper, Tokenizer as HfTokenizer,
     };
 
     use super::*;
@@ -374,6 +375,157 @@ pub(crate) mod tests {
         assert!(
             PieceTable::build(&tokenizer).is_none(),
             "a byte-level decoder"
+        );
+    }
+
+    /// [`synthetic`] with a normalizer that prepends the word marker and
+    /// markers added as `normalized` tokens, the way some checkpoints add
+    /// theirs: the loader keeps such a token's normalized content for the
+    /// decode (`\u{2581}</think>`), which the chain would render with a space
+    /// in front. One marker also strips whitespace around itself, and one
+    /// plain added token strips on its left: neither flag bears on the decode.
+    fn with_normalized_markers() -> HfTokenizer {
+        let mut tokenizer = synthetic(true);
+        tokenizer
+            .with_normalizer(Some(NormalizerSequence::new(vec![
+                Prepend::new("\u{2581}".into()).into(),
+                Replace::new(" ", "\u{2581}").expect("replace").into(),
+            ])))
+            .expect("normalizer");
+        tokenizer
+            .add_tokens([
+                AddedToken::from("</think>", false).normalized(true),
+                AddedToken::from("<tool_call>", false)
+                    .normalized(true)
+                    .lstrip(true)
+                    .rstrip(true),
+                AddedToken::from("<tool_response>", false).lstrip(true),
+            ])
+            .expect("markers");
+        tokenizer
+            .add_special_tokens([AddedToken::from("<|im_end|>", true).normalized(true)])
+            .expect("end marker");
+        tokenizer
+    }
+
+    #[test]
+    fn an_added_token_renders_as_its_content_not_its_normalized_form() {
+        let tokenizer = with_normalized_markers();
+        let id = |token: &str| tokenizer.token_to_id(token).expect("token");
+        let (think, call, response, end) = (
+            id("</think>"),
+            id("<tool_call>"),
+            id("<tool_response>"),
+            id("<|im_end|>"),
+        );
+        let (hello, he, marker, world) = (
+            id("\u{2581}hello"),
+            id("he"),
+            id("\u{2581}"),
+            id("\u{2581}world"),
+        );
+        // The premise: the loader hands out the normalized content of such a
+        // token, and its own decode renders the marker's space.
+        assert_eq!(
+            tokenizer.id_to_token(think).as_deref(),
+            Some("\u{2581}</think>")
+        );
+        assert_eq!(
+            tokenizer.decode(&[he, think], false).expect("decode"),
+            "he </think>"
+        );
+        let table = PieceTable::build(&tokenizer).expect("table");
+        // The token's text is its content, wherever it stands.
+        assert_eq!(table.plain_text(think, false), Some("</think>"));
+        assert_eq!(table.plain_text(call, false), Some("<tool_call>"));
+        assert_eq!(table.plain_text(response, false), Some("<tool_response>"));
+        assert_eq!(table.render(&[he, think], false), "he</think>");
+        assert_eq!(
+            table.render(&[hello, think, world], false),
+            "hello</think> world"
+        );
+        assert_eq!(table.render(&[think, hello], false), "</think> hello");
+        assert_eq!(table.render(&[he, marker, call], false), "he <tool_call>");
+        // A special token added that way is still special: the skip strips it.
+        assert_eq!(table.render(&[hello, end], false), "hello<|im_end|>");
+        assert_eq!(table.render(&[hello, end], true), "hello");
+        assert_eq!(table.plain_text(end, true), None);
+        // The oracle: the loader's own decode once the normalizer is gone,
+        // which is how the reference loads such a checkpoint.
+        let mut plain = tokenizer.clone();
+        plain
+            .with_normalizer(None::<NormalizerWrapper>)
+            .expect("no normalizer");
+        let cases: [&[u32]; 6] = [
+            &[he, think],
+            &[hello, think, world],
+            &[think, hello],
+            &[he, marker, call],
+            &[hello, end],
+            &[hello, response, world],
+        ];
+        for ids in cases {
+            for skip in [false, true] {
+                assert_eq!(
+                    table.render(ids, skip),
+                    plain.decode(ids, skip).expect("decode"),
+                    "ids {ids:?} skip {skip}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_stream_gives_an_added_token_as_its_content() {
+        let tokenizer = with_normalized_markers();
+        let id = |token: &str| tokenizer.token_to_id(token).expect("token");
+        // A marker after a word piece, after a byte run, and a special one.
+        let ids = [
+            id("\u{2581}hello"),
+            id("he"),
+            id("</think>"),
+            id("\u{2581}world"),
+            id("<0xE6>"),
+            id("<0x97>"),
+            id("<0xA5>"),
+            id("<tool_call>"),
+            id("<|im_end|>"),
+        ];
+        let smg: Arc<dyn crate::traits::Tokenizer> =
+            Arc::new(crate::HuggingFaceTokenizer::from_tokenizer(tokenizer));
+        let pieces = |skip: bool| -> Vec<String> {
+            let mut stream = crate::Sequence::new_with_options(Arc::clone(&smg), skip);
+            ids.iter()
+                .map(|&id| stream.append_token(id).expect("step"))
+                .collect()
+        };
+        assert_eq!(
+            pieces(false),
+            [
+                "hello",
+                "he",
+                "</think>",
+                " world",
+                "",
+                "",
+                "日",
+                "<tool_call>",
+                "<|im_end|>"
+            ]
+        );
+        assert_eq!(
+            pieces(true),
+            [
+                "hello",
+                "he",
+                "</think>",
+                " world",
+                "",
+                "",
+                "日",
+                "<tool_call>",
+                ""
+            ]
         );
     }
 }
