@@ -173,25 +173,33 @@ def derive_capture_cap(
     cap = ceiling if max_num_batched_tokens is None else min(max_num_batched_tokens, ceiling)
     step = "unset" if max_num_batched_tokens is None else str(max_num_batched_tokens)
     # The engine's own default is twice the window, at most 512, or at most
-    # 1024 on one platform the launch cannot tell apart: a derived cap raises
-    # the former and never lowers the latter. Without a window flag the
-    # engine's window defaults reach both ceilings.
+    # 1024 on one platform the launch cannot tell apart, each as the engine's
+    # list ends it (the step size where that fits under it, else the grid): a
+    # derived cap raises the former and never lowers the latter. Without a
+    # window flag the engine's window defaults reach both ceilings.
     if max_num_seqs is None:
-        low, high = ENGINE_DEFAULT_CEILING, ENGINE_PLATFORM_CEILING
+        low_raw, high_raw = ENGINE_DEFAULT_CEILING, ENGINE_PLATFORM_CEILING
         source = "window"
-        engine_default = (
-            f"{low} or {high} by platform (--max-num-seqs unset: the engine's window defaults "
-            "reach the default ceiling)"
-        )
+        origin = "--max-num-seqs unset: the engine's window defaults reach the default ceiling"
     else:
-        low = min(2 * max_num_seqs, ENGINE_DEFAULT_CEILING)
-        high = min(2 * max_num_seqs, ENGINE_PLATFORM_CEILING)
+        low_raw = min(2 * max_num_seqs, ENGINE_DEFAULT_CEILING)
+        high_raw = min(2 * max_num_seqs, ENGINE_PLATFORM_CEILING)
         source = "default"
+        origin = f"twice --max-num-seqs {max_num_seqs}"
+    low = _engine_default(low_raw, max_num_batched_tokens)
+    high = _engine_default(high_raw, max_num_batched_tokens)
+    if max_num_batched_tokens is not None and max_num_batched_tokens <= low_raw:
+        origin += ", at most the admission step"
+    elif low != low_raw or high != high_raw:
+        origin += ", on the capture grid"
+    if low == high:
+        engine_default = f"{low} ({origin})"
+    elif max_num_seqs is None:
+        engine_default = f"{low} or {high} by platform ({origin})"
+    else:
         engine_default = (
-            f"{low} (twice --max-num-seqs {max_num_seqs})"
-            if low == high
-            else f"{low} or {high} by platform (twice --max-num-seqs {max_num_seqs}, at most "
-            f"{ENGINE_DEFAULT_CEILING} or {ENGINE_PLATFORM_CEILING})"
+            f"{low} or {high} by platform ({origin}, at most {ENGINE_DEFAULT_CEILING} or "
+            f"{ENGINE_PLATFORM_CEILING})"
         )
     if cap <= low:
         return CaptureCap(
@@ -216,6 +224,17 @@ def derive_capture_cap(
         f"keeps the engine's default, a number is another ceiling, {CAP_FLAGS} set the cap "
         "outright",
     )
+
+
+def _engine_default(raw: int, step: int | None) -> int:
+    """The cap the engine's own default comes out at, for the raw default
+    ``raw`` (twice the window under a ceiling): the engine clamps it to the
+    step size and appends the step to its list where that fits, so the step
+    is the cap then; else the list ends at the grid value under ``raw`` and
+    the cap is truncated to it."""
+    if step is not None and step <= raw:
+        return step
+    return grid_floor(raw)
 
 
 def _is_none_mode(mode: Any) -> bool:

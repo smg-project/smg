@@ -517,9 +517,10 @@ truncates.
 | `--max-num-seqs 32 --max-num-batched-tokens 300` | 64 | 300 |
 | `--max-num-seqs 32`, step size unset | 64 | 512 |
 | `--max-num-seqs 32 --max-num-batched-tokens 48` | 48 | the engine's |
-| `--max-num-seqs 256` or more | 512 | the engine's |
-| `--max-num-seqs` unset | 512 (the engine's window defaults) | the engine's |
-| `--max-num-seqs` unset, `--max-num-batched-tokens 16384`, `SMG_VLLM_CUDAGRAPH_CAPTURE_CAP=2048` | 512 (the engine's window defaults) | 2048 |
+| `--max-num-seqs 256` | 512 | the engine's |
+| `--max-num-seqs` above 256 | 512, or twice the window up to 1024 on one platform | the engine's |
+| `--max-num-seqs` unset | 512 or 1024 by platform (the engine's window defaults) | the engine's |
+| `--max-num-seqs` unset, `--max-num-batched-tokens 16384`, `SMG_VLLM_CUDAGRAPH_CAPTURE_CAP=2048` | 512 or 1024 by platform | 2048 |
 
 Kept as given: an explicit `--max-cudagraph-capture-size`,
 `--cudagraph-capture-sizes` or the same keys of `--compilation-config`;
@@ -532,11 +533,13 @@ explicit cap drops); an HTTP `vllm serve`, which is not this package's launch.
 positive integer, the ceiling in place of 512, rounded down to the capture
 grid. A ceiling applies only where it raises the engine's default on every
 platform (twice the window, at most 512, or at most 1024 on one newer GPU
-platform the launch cannot tell apart): with `--max-num-seqs` left to the
-engine, or set to more than 256, a ceiling of 1024 or more applies and a
-smaller one is kept out, the line saying why. Each captured size costs
-capture time at start and graph memory per rank: 11 sizes at the engine's
-64, 51 at 512, 83 at 1024, 147 at 2048.
+platform the launch cannot tell apart, each as the engine's list ends it):
+with `--max-num-seqs` left to the engine or set to 512 or more, a ceiling of
+1024 or more applies; for a window between 257 and 511, a ceiling of twice
+the window (on the capture grid) or more applies; a smaller one is kept out,
+the line saying why. Each captured size costs capture time at start and
+graph memory per rank: 11 sizes at the engine's 64, 51 at 512, 83 at 1024,
+147 at 2048.
 
 ##### Per recipe: what a ceiling above 512 buys, and what it costs
 
