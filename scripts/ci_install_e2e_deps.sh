@@ -25,20 +25,8 @@ if [ $# -gt 0 ]; then
     $RETRY 3 10 python3 -m pip --no-cache-dir install --upgrade "$@"
 fi
 
-# Pin the grpcio generated-code companions to the protobuf-6 stable line.
-#
-# Engine setup (sglang's `uv pip install --prerelease=allow` in
-# ci_install_sglang.sh) can pull prerelease grpcio wheels such as
-# grpcio-health-checking / grpcio-reflection ==1.82.0rc1, whose bundled protobuf
-# gencode (7.x) is newer than the protobuf 6.x runtime the engine stack pins.
-# Anything that then loads those modules dies with "Detected incompatible
-# Protobuf Gencode/Runtime versions ... gencode 7.x runtime 6.x" — e2e workers at
-# `import grpc_health.v1.health_pb2`, and the sglang gRPC server at
-# `grpc_reflection/v1alpha/reflection.proto`. The 1.81.x line caps protobuf<7 and
-# ships the 6.x gencode, so it stays compatible. This runs last to override
-# whatever engine/extra-dep installs selected. (grpcio core has no generated
-# protobuf, so it is left at the engine-selected version.) Drop the cap once the
-# stack moves to a protobuf 7 runtime.
-$RETRY 3 10 python3 -m pip install "grpcio-health-checking==1.81.*" "grpcio-reflection==1.81.*"
+# Match the released generator's runtime floor without replacing the image engine.
+# These companions retain a protobuf-6 runtime, including ROCm vLLM's pins.
+$RETRY 3 10 python3 -m pip install "grpcio-health-checking==1.78.0" "grpcio-reflection==1.78.0"
 
 echo "E2E test dependencies installed"

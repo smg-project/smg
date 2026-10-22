@@ -10,7 +10,7 @@ without committing generated code:
     python3 grpc_servicer/scripts/gen_proto_stubs.py /tmp/smg-proto-gen
     SMG_GRPC_PROTO_PATH=/tmp/smg-proto-gen pytest -q grpc_servicer/tests
 
-Requires ``grpcio-tools`` (the release caps it below 1.82 for protobuf 6).
+Use ``grpcio-tools==1.78.0`` to match the released package's generated runtime floor.
 """
 
 from __future__ import annotations
