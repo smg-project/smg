@@ -1,5 +1,7 @@
 """Delegation hooks; CPU tests use contract stubs, not a running vLLM backend."""
 
+import os
+
 from .pd_scheduler_trace import (
     SchedulerTrace,
     deferred_snapshot,
@@ -21,6 +23,11 @@ class SchedulerObserverMixin:
             self._smg_pd_trace = SchedulerTrace(None, {})
             self._smg_pd_trace.mark_unknown("setup", exc)
         self._smg_pd_scheduled = set()
+        self._smg_local_kv = None
+        if os.environ.get("SMG_PD_TRACE_LOCAL_KV") == "1":
+            from .pd_local_kv_tracker import LocalKVTracker
+
+            self._smg_local_kv = LocalKVTracker(self)
         super().__init__(*args, **kwargs)
 
         def startup():
@@ -52,6 +59,22 @@ class SchedulerObserverMixin:
             "request": request_snapshot(request),
             "registered": self.requests.get(request.request_id) is request,
         }
+
+    def _local_kv(self, method, *args):
+        tracker = self._smg_local_kv
+        if tracker is None or tracker.unknown:
+            return None
+        try:
+            return getattr(tracker, method)(*args)
+        except Exception as exc:
+            tracker.unknown = True
+            tracker.pending.clear()
+            self._smg_pd_trace.emit("local_kv_unknown", phase=method, error=type(exc).__name__)
+            return None
+
+    def _local_kv_records(self, method, *args):
+        for fields in self._local_kv(method, *args) or ():
+            self._smg_pd_trace.emit("local_kv_return", **fields)
 
     def add_request(self, request):
         result = super().add_request(request)
@@ -108,8 +131,10 @@ class SchedulerObserverMixin:
         return result
 
     def _free_request_blocks(self, request):
+        local = self._local_kv("before_free", request)
         before = self._capture("free_request_blocks_before", lambda: deferred_snapshot(self))
         result = super()._free_request_blocks(request)
+        self._local_kv_records("after_free", local)
 
         def after():
             if before is None:
@@ -128,8 +153,10 @@ class SchedulerObserverMixin:
         return result
 
     def _drain_deferred_frees(self):
+        local = self._local_kv("before_drain")
         before = self._capture("drain_before", lambda: deferred_snapshot(self))
         result = super()._drain_deferred_frees()
+        self._local_kv_records("after_drain", local or ())
         if before:
             self._observe(
                 "drain_deferred_return",

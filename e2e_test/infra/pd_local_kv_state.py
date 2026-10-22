@@ -51,6 +51,7 @@ def block_snapshot(pool, blocks):
     records = []
     for identity, block in unique.items():
         require(block.pool is pool and block.is_null is False, "unsupported pool or null block")
+        require(pool.blocks[nonnegative_int(block.block_id)] is block, "block object was replaced")
         refs = nonnegative_int(block.ref_cnt)
         records.append(
             {
@@ -84,6 +85,7 @@ def capture(scheduler, request):
 
 
 def released(scheduler, state, phase, ticket, fence=None):
+    require(scheduler.kv_cache_manager.block_pool is state["pool"], "pool identity changed")
     require(not held_blocks(scheduler, state["request_id"]), "request still holds KV blocks")
     after = block_snapshot(state["pool"], state["blocks"])
     exclusive = []
