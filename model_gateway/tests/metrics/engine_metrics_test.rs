@@ -11,6 +11,8 @@
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
 use smg::observability::{metrics::Metrics, metrics_server::start_metrics_server};
 
+const WORKER: &str = "grpc://prefill-0:30000";
+
 #[tokio::test]
 async fn engine_pd_gauge_appears_on_metrics_endpoint() {
     // The binary's recorder, installed once; port 0 binds an ephemeral port
@@ -35,7 +37,7 @@ async fn engine_pd_gauge_appears_on_metrics_endpoint() {
         }],
         ..Default::default()
     };
-    Metrics::record_engine_load("grpc://prefill-0:30000", "test-model", &response);
+    Metrics::record_engine_load(WORKER, "test-model", &response);
 
     let body = smg::clients::http_client()
         .get(format!("http://{addr}/metrics"))
@@ -47,10 +49,12 @@ async fn engine_pd_gauge_appears_on_metrics_endpoint() {
         .expect("metrics body");
 
     // Match the metric name AND its labels on the SAME rendered line, so the
-    // name and the role/dp_rank labels can't be satisfied by different samples.
+    // name and the role/dp_rank labels can't be satisfied by different samples;
+    // the worker label keeps the samples of the binary's other tests out.
+    let worker = format!("worker=\"{WORKER}\"");
     let pd_latency_line = body
         .lines()
-        .find(|l| l.starts_with("smg_engine_pd_kv_transfer_latency_ms{"))
+        .find(|l| l.starts_with("smg_engine_pd_kv_transfer_latency_ms{") && l.contains(&worker))
         .unwrap_or_else(|| panic!("PD KV transfer latency sample missing from /metrics:\n{body}"));
     assert!(
         pd_latency_line.contains("role=\"prefill\"") && pd_latency_line.contains("dp_rank=\"0\""),
@@ -58,7 +62,7 @@ async fn engine_pd_gauge_appears_on_metrics_endpoint() {
     );
     assert!(
         body.lines()
-            .any(|l| l.starts_with("smg_engine_running_requests{")),
+            .any(|l| l.starts_with("smg_engine_running_requests{") && l.contains(&worker)),
         "core engine sample missing from /metrics:\n{body}"
     );
     assert!(

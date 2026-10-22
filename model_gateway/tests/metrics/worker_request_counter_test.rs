@@ -62,17 +62,20 @@ async fn scrape(addr: SocketAddr) -> String {
 }
 
 /// The value of the worker's request counter in a scrape, if the series exists.
+///
+/// The series is the one carrying both of this test's labels: the binary's
+/// other tests leave the series of their own workers in the shared recorder,
+/// and an ephemeral port can come round again.
 fn requests_total(body: &str, worker_url: &str) -> Option<u64> {
-    let label = format!("worker=\"{worker_url}\"");
+    let worker = format!("worker=\"{worker_url}\"");
+    let model = format!("model=\"{MODEL}\"");
     body.lines()
-        .find(|line| line.starts_with("smg_worker_requests_total{") && line.contains(&label))
-        .map(|line| {
-            assert!(
-                line.contains(&format!("model=\"{MODEL}\"")),
-                "counter without the model label: {line}"
-            );
-            line.rsplit(' ').next().unwrap().parse().unwrap()
+        .find(|line| {
+            line.starts_with("smg_worker_requests_total{")
+                && line.contains(&worker)
+                && line.contains(&model)
         })
+        .map(|line| line.rsplit(' ').next().unwrap().parse().unwrap())
 }
 
 /// An HTTP upstream that answers every `/generate` with a completion.
