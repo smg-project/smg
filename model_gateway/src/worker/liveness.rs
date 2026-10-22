@@ -622,12 +622,15 @@ pub(crate) fn is_connection_code(code: tonic::Code) -> bool {
 /// A successful interaction over the transport (a poll answered, an event
 /// batch, a response): the worker is reachable, so an unreachable veto ends
 /// here. A worker the health checker demoted while it was gone (its probes
-/// failed with its transport) is promoted now rather than at its next
-/// scheduled probe; any other demotion is the health checker's to lift, at
-/// its success threshold. A reachable transport is not health: an engine
-/// whose `/health` answers 503 while it drains still relays KV batches and
-/// answers `GetLoads`, and promoting it on each of those would flap it back
-/// to Ready within milliseconds of every demotion.
+/// failed with its transport) is signalled to the manager, which probes it
+/// now rather than at its next scheduled probe and promotes it on what the
+/// probe reads (a ZMQ worker outright: its handshake is its health read);
+/// any other demotion is the health checker's to lift, at its success
+/// threshold. A reachable transport is not health: an engine whose
+/// `/health` answers 503 while it drains, or a servicer whose health is held
+/// through a warm-up, still relays KV batches and answers `GetLoads`, and a
+/// worker promoted on one of those takes requests its engine is not ready
+/// for.
 pub(crate) fn on_contact(worker: &Arc<dyn Worker>) {
     worker.note_contact();
     if worker.stall_reason() != Some(StallReason::Unreachable) {

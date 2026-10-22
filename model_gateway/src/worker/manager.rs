@@ -794,14 +794,24 @@ async fn apply_connect_signal_and_refresh(
     }
 }
 
-/// Promote a worker whose backend handshake just completed, or that the
-/// health checker demoted and that has just answered a contact (see
-/// `worker::liveness::on_contact`), without waiting for its next scheduled
-/// poll. Resolves the URL to a live worker id and flips the status through the
-/// revision-checked setter, so a signal that lost a race with a same-URL
-/// replacement — or a worker already removed — is discarded. Returns the
-/// worker the signal moved into service, for what follows a transition
-/// (the label refresh); `None` when nothing moved.
+/// Act on a connect signal: a backend handshake that just completed, or a
+/// contact from a worker the health checker demoted while its transport was
+/// gone (see `worker::liveness::on_contact`). Resolves the URL to a live
+/// worker id; a signal that lost a race with a same-URL replacement, or
+/// names a worker already removed, is discarded.
+///
+/// A contact is not a health read. A servicer answers its load poll and
+/// relays KV events through a warm-up whose health it holds at not-serving,
+/// and an engine whose `/health` answers 503 while it drains still answers
+/// `GetLoads`; a worker promoted on that contact takes requests its engine is
+/// not ready for. So where the worker has a health probe, the probe decides:
+/// the signal moves it to now (one round trip instead of up to an interval
+/// of waiting) and the state machine promotes on its success threshold, as
+/// for any demoted worker. The signal flips the status itself only where it
+/// is the health read: a ZMQ handshake (there is no health RPC on that wire;
+/// the handshake is what its probe reads), or a worker whose checks are off
+/// (nothing to read). Returns the worker the signal moved into service, for
+/// what follows a transition (the label refresh); `None` when nothing moved.
 fn apply_connect_signal(
     registry: &Arc<WorkerRegistry>,
     connected: WorkerConnected,
@@ -813,18 +823,36 @@ fn apply_connect_signal(
         debug!(worker_url = %url, "Connect signal for an unknown worker; ignoring");
         return None;
     };
+    let Some(worker) = registry.get(&worker_id) else {
+        debug!(worker_url = %url, "Connect signal for a removed worker; ignoring");
+        return None;
+    };
+    let slot = ProbeSlot::of_worker(
+        registry,
+        &worker_id,
+        worker.as_ref(),
+        worker.status(),
+        config,
+    );
     // A Failed worker under removal is on its way out: the contact that
     // signalled it was a last poll, not a return.
-    if registry.get(&worker_id).is_some_and(|worker| {
-        ProbeSlot::of_worker(
-            registry,
-            &worker_id,
-            worker.as_ref(),
-            worker.status(),
-            config,
-        ) == ProbeSlot::Removal
-    }) {
+    if slot == ProbeSlot::Removal {
         debug!(worker_url = %url, "Connect signal for a worker being removed; ignoring");
+        return None;
+    }
+    if matches!(slot, ProbeSlot::Probe(_)) && *worker.connection_mode() != ConnectionMode::Zmq {
+        if worker.revision() != revision {
+            debug!(worker_url = %url, "Connect signal for a replaced worker; ignoring");
+            return None;
+        }
+        debug!(worker_url = %url, "Contact from a demoted worker: its health probe runs now");
+        schedule_at(
+            next_check,
+            worker_id,
+            slot,
+            tokio::time::Instant::now(),
+            true,
+        );
         return None;
     }
     match registry.transition_status_if_revision(&worker_id, revision, WorkerStatus::Ready) {
@@ -1469,7 +1497,7 @@ mod tests {
     use std::{
         collections::HashMap,
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc,
         },
     };
@@ -1648,17 +1676,24 @@ mod tests {
     /// a transport with metadata endpoints; a mesh import carries its owner's
     /// labels and a ZMQ engine reports its geometry at the handshake.
     fn discovered_worker(url: &str) -> Arc<dyn Worker> {
+        discovered_worker_with(
+            url,
+            HealthCheckConfig {
+                success_threshold: 1,
+                failure_threshold: 1,
+                timeout_secs: 1,
+                check_interval_secs: 1,
+                disable_health_check: false,
+                drain_settle_secs: 0,
+            },
+        )
+    }
+
+    fn discovered_worker_with(url: &str, health: HealthCheckConfig) -> Arc<dyn Worker> {
         Arc::new(
             BasicWorkerBuilder::new(url)
                 .worker_type(WorkerType::Regular)
-                .health_config(HealthCheckConfig {
-                    success_threshold: 1,
-                    failure_threshold: 1,
-                    timeout_secs: 1,
-                    check_interval_secs: 1,
-                    disable_health_check: false,
-                    drain_settle_secs: 0,
-                })
+                .health_config(health)
                 .labels(HashMap::from([(
                     "max_num_seqs".to_string(),
                     "256".to_string(),
@@ -1802,6 +1837,71 @@ mod tests {
                 .connection_mode(ConnectionMode::Zmq)
                 .build(),
         )
+    }
+
+    /// A worker with a health probe on the given wire, an hour between
+    /// probes: the probes a test sees are the ones it brings forward.
+    fn probed_worker(url: &str, connection_mode: ConnectionMode) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(connection_mode)
+                .health_config(HealthCheckConfig {
+                    success_threshold: 1,
+                    failure_threshold: 1,
+                    timeout_secs: 1,
+                    check_interval_secs: 3600,
+                    disable_health_check: false,
+                    drain_settle_secs: 0,
+                })
+                .build(),
+        )
+    }
+
+    /// A worker whose health checks are off: its contacts are all the
+    /// gateway will hear from it.
+    fn unprobed_worker(url: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..HealthCheckConfig::default()
+                })
+                .build(),
+        )
+    }
+
+    /// A `/health` that answers 200 while `serving` is set and 503 otherwise,
+    /// counting its hits; returns its base URL.
+    async fn start_health_stub(serving: Arc<AtomicBool>, hits: Arc<AtomicUsize>) -> String {
+        let app = axum::Router::new().route(
+            "/health",
+            axum::routing::get(move || {
+                let serving = serving.clone();
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    if serving.load(Ordering::SeqCst) {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let addr = listener.local_addr().expect("stub address");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test stub server lives for the duration of the test process"
+        )]
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("stub serve");
+        });
+        format!("http://{addr}")
     }
 
     #[tokio::test]
@@ -1985,8 +2085,8 @@ mod tests {
     /// A mesh import that the local probes took to Failed is owner-managed:
     /// `--remove-unhealthy-workers` never removes it, so it must keep its
     /// probe slot (the reconcile and the due-probe pass alike), take no
-    /// removal, and answer its connect signal, or it stays Failed and
-    /// unroutable on this node until its owner re-publishes it.
+    /// removal, and answer its connect signal with a probe now, or it stays
+    /// Failed and unroutable on this node until its owner re-publishes it.
     #[tokio::test]
     async fn a_failed_mesh_import_under_removal_keeps_its_probe_slot() {
         let registry = Arc::new(WorkerRegistry::new());
@@ -2035,6 +2135,7 @@ mod tests {
             "the due pass probes the import and re-arms its slot"
         );
 
+        let before = tokio::time::Instant::now();
         apply_connect_signal(
             &registry,
             WorkerConnected {
@@ -2046,15 +2147,23 @@ mod tests {
         );
         assert_eq!(
             registry.get(&worker_id).unwrap().status(),
-            WorkerStatus::Ready,
-            "a contact from the import promotes it: it is not being removed"
+            WorkerStatus::Failed,
+            "a contact is not a health read: the import stays Failed until its probe passes"
+        );
+        let due = next_check
+            .get(&worker_id)
+            .copied()
+            .expect("the import keeps its slot");
+        assert!(
+            due >= before && due <= tokio::time::Instant::now(),
+            "the contact is not a last poll: the import's probe runs now"
         );
     }
 
     #[test]
     fn apply_connect_signal_promotes_pending_worker() {
         let registry = Arc::new(WorkerRegistry::new());
-        let worker = make_worker("http://w:1", 2, 3);
+        let worker = make_zmq_worker("ipc:///tmp/w.ipc");
         assert_eq!(worker.status(), WorkerStatus::Pending);
         let revision = worker.revision();
         registry.register(worker.clone()).unwrap();
@@ -2063,7 +2172,7 @@ mod tests {
         apply_connect_signal(
             &registry,
             WorkerConnected {
-                url: "http://w:1".to_string(),
+                url: "ipc:///tmp/w.ipc".to_string(),
                 revision,
             },
             &mut next_check,
@@ -2073,8 +2182,189 @@ mod tests {
         assert_eq!(
             worker.status(),
             WorkerStatus::Ready,
-            "a matching connect signal must promote a Pending worker immediately"
+            "a matching handshake must promote a Pending ZMQ worker immediately"
         );
+    }
+
+    /// A worker with a health probe is not promoted by its contact: a
+    /// servicer answers its load poll and relays KV events through a warm-up
+    /// whose health it holds at not-serving, and a worker promoted on that
+    /// contact took requests before its engine served (forty seconds before,
+    /// on the bed the defect was found on). The signal moves the probe to
+    /// now and leaves the status to it, on every wire with a health probe.
+    #[test]
+    fn a_contact_from_a_demoted_probed_worker_moves_its_probe_to_now_and_promotes_nothing() {
+        for (url, connection_mode, demoted) in [
+            ("grpc://w:1", ConnectionMode::Grpc, WorkerStatus::Failed),
+            ("grpc://w:1", ConnectionMode::Grpc, WorkerStatus::NotReady),
+            ("http://w:1", ConnectionMode::Http, WorkerStatus::NotReady),
+        ] {
+            let registry = Arc::new(WorkerRegistry::new());
+            let worker = probed_worker(url, connection_mode);
+            worker.set_status(demoted);
+            let revision = worker.revision();
+            let worker_id = registry.register(worker.clone()).unwrap();
+
+            let mut next_check = HashMap::new();
+            let before = tokio::time::Instant::now();
+            let moved = apply_connect_signal(
+                &registry,
+                WorkerConnected {
+                    url: url.to_string(),
+                    revision,
+                },
+                &mut next_check,
+                &test_config(),
+            );
+
+            assert!(
+                moved.is_none(),
+                "{connection_mode:?}: nothing moves into service on a contact"
+            );
+            assert_eq!(
+                worker.status(),
+                demoted,
+                "{connection_mode:?}: the status is the probe's to change"
+            );
+            let due = next_check
+                .get(&worker_id)
+                .copied()
+                .expect("the probe is on the schedule");
+            assert!(
+                due >= before && due <= tokio::time::Instant::now(),
+                "{connection_mode:?}: the probe is due now, not after its interval"
+            );
+        }
+    }
+
+    /// A signal from a replaced worker moves nothing: not the replacement's
+    /// status and not its probe.
+    #[test]
+    fn a_stale_contact_moves_no_probe_of_the_replacement() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = probed_worker("http://w:1", ConnectionMode::Http);
+        worker.set_status(WorkerStatus::NotReady);
+        let stale_revision = worker.revision();
+        let worker_id = registry.register(worker).unwrap();
+        let replacement = probed_worker("http://w:1", ConnectionMode::Http);
+        assert!(registry.replace(&worker_id, replacement));
+
+        let mut next_check = HashMap::new();
+        apply_connect_signal(
+            &registry,
+            WorkerConnected {
+                url: "http://w:1".to_string(),
+                revision: stale_revision,
+            },
+            &mut next_check,
+            &test_config(),
+        );
+
+        assert!(
+            next_check.is_empty(),
+            "a stale signal schedules no probe of the replacement"
+        );
+        assert_eq!(
+            registry.get(&worker_id).unwrap().status(),
+            WorkerStatus::NotReady,
+            "the replacement keeps the status it inherited: nothing promoted it"
+        );
+    }
+
+    /// The signal promotes outright where it is all the gateway will hear: a
+    /// worker whose health checks are off has nothing to read.
+    #[test]
+    fn a_contact_promotes_a_worker_without_health_checks_outright() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = unprobed_worker("http://u:1");
+        worker.set_status(WorkerStatus::NotReady);
+        let revision = worker.revision();
+        let worker_id = registry.register(worker.clone()).unwrap();
+
+        let mut next_check = HashMap::new();
+        let moved = apply_connect_signal(
+            &registry,
+            WorkerConnected {
+                url: "http://u:1".to_string(),
+                revision,
+            },
+            &mut next_check,
+            &test_config(),
+        );
+
+        assert!(moved.is_some_and(|(id, _)| id == worker_id));
+        assert_eq!(worker.status(), WorkerStatus::Ready);
+        assert!(
+            next_check.is_empty(),
+            "a worker without health checks holds no probe slot"
+        );
+    }
+
+    /// Through the running loop, against a `/health` that is held: the probe
+    /// the contact brings forward reads the hold and the worker stays
+    /// demoted; once the health answers, the probe a contact brings forward
+    /// promotes it. The transport says the same thing both times.
+    #[tokio::test]
+    async fn a_demoted_worker_returns_on_the_health_read_its_contact_brings_forward() {
+        let serving = Arc::new(AtomicBool::new(false));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = start_health_stub(serving.clone(), hits.clone()).await;
+        let registry = Arc::new(WorkerRegistry::new());
+        // An hour between probes: the probes this test sees are the ones the
+        // signals bring forward.
+        let worker = probed_worker(&url, ConnectionMode::Http);
+        worker.set_status(WorkerStatus::NotReady);
+        let revision = worker.revision();
+        registry.register(worker.clone()).unwrap();
+
+        let mut manager = WorkerManager::maybe_start(
+            registry.clone(),
+            WorkerManagerConfig {
+                default_check_interval_secs: 3600,
+                remove_unhealthy: false,
+            },
+            None,
+            true,
+            false,
+        )
+        .expect("health checks on: the manager runs");
+        let signal = || WorkerConnected {
+            url: url.clone(),
+            revision,
+        };
+
+        registry.connect_signal_sender().send(signal()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while hits.load(Ordering::SeqCst) == 0 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the contact's probe did not read the health in time"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            worker.status(),
+            WorkerStatus::NotReady,
+            "a held health keeps the worker demoted whatever its transport says"
+        );
+
+        serving.store(true, Ordering::SeqCst);
+        registry.connect_signal_sender().send(signal()).unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while worker.status() != WorkerStatus::Ready {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the probe that read the health did not promote the worker in time"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            hits.load(Ordering::SeqCst) >= 2,
+            "two probes: the hold and the pass"
+        );
+
+        manager.shutdown().await;
     }
 
     #[test]
@@ -2083,7 +2373,7 @@ mod tests {
         // late handshake promotes it to Ready, so it must re-enter the probe
         // schedule — otherwise it would serve traffic unmonitored forever.
         let registry = Arc::new(WorkerRegistry::new());
-        let worker = make_worker("http://w:1", 2, 3);
+        let worker = make_zmq_worker("ipc:///tmp/w.ipc");
         worker.set_status(WorkerStatus::Failed);
         let revision = worker.revision();
         let worker_id = registry.register(worker.clone()).unwrap();
@@ -2092,7 +2382,7 @@ mod tests {
         apply_connect_signal(
             &registry,
             WorkerConnected {
-                url: "http://w:1".to_string(),
+                url: "ipc:///tmp/w.ipc".to_string(),
                 revision,
             },
             &mut next_check,
@@ -2112,7 +2402,7 @@ mod tests {
     #[test]
     fn apply_connect_signal_reports_the_promoted_worker() {
         let registry = Arc::new(WorkerRegistry::new());
-        let worker = make_worker("http://w:1", 2, 3);
+        let worker = unprobed_worker("http://w:1");
         worker.set_status(WorkerStatus::NotReady);
         let revision = worker.revision();
         let worker_id = registry.register(worker.clone()).unwrap();
@@ -2124,7 +2414,7 @@ mod tests {
 
         let (promoted_id, promoted) =
             apply_connect_signal(&registry, signal(), &mut next_check, &test_config())
-                .expect("a NotReady worker answering a contact is promoted");
+                .expect("a NotReady worker without health checks answering a contact is promoted");
         assert!(promoted_id == worker_id);
         assert_eq!(promoted.url(), "http://w:1");
         assert!(
@@ -2157,7 +2447,13 @@ mod tests {
         let registry = Arc::clone(&app_context.worker_registry);
         let job_queue = JobQueue::new(JobQueueConfig::default(), Arc::downgrade(&app_context));
 
-        let worker = discovered_worker("http://local:11");
+        let worker = discovered_worker_with(
+            "http://local:11",
+            HealthCheckConfig {
+                disable_health_check: true,
+                ..HealthCheckConfig::default()
+            },
+        );
         worker.set_status(WorkerStatus::NotReady);
         let revision = worker.revision();
         registry.register(worker.clone()).unwrap();
@@ -2184,13 +2480,13 @@ mod tests {
     #[test]
     fn apply_connect_signal_ignores_stale_revision() {
         let registry = Arc::new(WorkerRegistry::new());
-        let worker = make_worker("http://w:1", 2, 3);
+        let worker = make_zmq_worker("ipc:///tmp/w.ipc");
         let stale_revision = worker.revision();
         let worker_id = registry.register(worker).unwrap();
 
         // A same-URL replace bumps the revision; a handshake that started
         // against the old worker must not promote its replacement.
-        let replacement = make_worker("http://w:1", 2, 3);
+        let replacement = make_zmq_worker("ipc:///tmp/w.ipc");
         assert!(registry.replace(&worker_id, replacement));
         let current = registry.get(&worker_id).unwrap();
         assert_eq!(current.revision(), stale_revision + 1);
@@ -2199,7 +2495,7 @@ mod tests {
         apply_connect_signal(
             &registry,
             WorkerConnected {
-                url: "http://w:1".to_string(),
+                url: "ipc:///tmp/w.ipc".to_string(),
                 revision: stale_revision,
             },
             &mut HashMap::new(),
