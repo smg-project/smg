@@ -761,11 +761,20 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// its first token (or, for a non-streaming generation, its one answer):
     /// the worker's latest first response, the evidence that it answers at
     /// all. `None` for a worker that has answered none since the gateway
-    /// started, or does not track it. A handoff is not an answer (see
+    /// started, or does not track it. A decode side's first token is an
+    /// answer ([`Self::note_answered`]); a handoff is not (see
     /// [`Self::prefill_handed_off_ago`]).
     fn prefill_answered_ago(&self) -> Option<Duration> {
         None
     }
+
+    /// A decode side dispatched to this worker got its first token. The
+    /// side's prompt is the prefill worker's work (nothing is booked here
+    /// for it, nothing timed), but its first token is this worker's latest
+    /// first response for [`Self::prefill_answered_ago`]: the evidence a
+    /// sequential decode side past its bound is reprieved on (see
+    /// [`super::liveness::decode_side_reprieve`]).
+    fn note_answered(&self) {}
 
     /// A decode side showed a handoff of this prefill worker's: on the
     /// parallel dispatch shape, its first output, which the decode engine
@@ -2032,6 +2041,10 @@ impl Worker for BasicWorker {
 
     fn prefill_answered_ago(&self) -> Option<Duration> {
         self.runtime.load().prefill_answered_ago()
+    }
+
+    fn note_answered(&self) {
+        self.runtime.load().note_answered();
     }
 
     fn note_prefill_handoff(&self) {
