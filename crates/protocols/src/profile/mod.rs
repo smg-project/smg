@@ -39,18 +39,23 @@ use crate::{
 /// V4.1) goes through the same record ([`served_under`]), so a request under
 /// an opaque alias of a versioned model is read as that model.
 enum Registered {
-    /// A configured alias: the served model id it resolves to, and that
-    /// model's profile, recorded so a request under the alias finds it in
-    /// one step.
+    /// A configured alias: the served model id it resolves to, that model's
+    /// profile, recorded so a request under the alias finds it in one step,
+    /// and whether the alias's own name names a vendor (such an alias is
+    /// read as its own name, the way a request naming it always was; an
+    /// opaque alias is read as its served model).
     Alias {
         served: Arc<str>,
         profile: ProviderProfile,
+        vendor_named: bool,
     },
     /// A served model whose own name selects no vendor contract and which
     /// takes one from the vendor-named aliases it is served under: the
-    /// profile, and every alias of that vendor (a version read from the
-    /// name consults them all, so the reading does not depend on the order
-    /// the aliases were configured in).
+    /// profile, and every alias of that vendor. A version read from the name
+    /// consults them all and holds only when they agree, so the reading does
+    /// not depend on the order the aliases were configured in, and an
+    /// ambiguous configuration (one checkpoint under the names of two
+    /// versions) leaves the opaque name the reading it had before any alias.
     Contract {
         profile: ProviderProfile,
         vendor_names: Vec<Arc<str>>,
@@ -64,25 +69,28 @@ fn registry() -> &'static RwLock<HashMap<String, Registered>> {
     REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Whether `model` is served under a name that satisfies `names`: for a
-/// registered alias, the names of the served model it resolves to; for a
-/// served model that takes its contract from vendor-named aliases, those
-/// aliases; else the model id itself. A profile reads a version from the
-/// model name through this, so a request under an opaque alias of a
-/// versioned model is read as that model, a served model under a versioned
-/// alias as that version whichever of its names the request carries, and a
-/// versioned alias of another model as the model it reaches.
+/// Whether `model` is served under a name that satisfies `names`. A name
+/// the table does not know, and an alias whose own name names a vendor, are
+/// read as they are: a request naming them is read the way it always was.
+/// An opaque alias is read as the served model it resolves to, and an opaque
+/// served model as the vendor-named aliases it is served under, all of which
+/// have to agree. A profile reads a version from the model name through
+/// this, so a request under an opaque alias of a versioned model is read as
+/// that model, and a served model under one version's names as that version
+/// whichever of its names the request carries.
 fn served_under(model: &str, names: impl Fn(&str) -> bool) -> bool {
     let registry = registry().read().unwrap_or_else(|e| e.into_inner());
-    let (served, registered) = match registry.get(model) {
-        Some(Registered::Alias { served, .. }) => (served.as_ref(), registry.get(served.as_ref())),
-        registered => (model, registered),
-    };
-    match registered {
-        Some(Registered::Contract { vendor_names, .. }) => {
-            vendor_names.iter().any(|name| names(name))
-        }
-        _ => names(served),
+    let agree = |vendor_names: &[Arc<str>]| vendor_names.iter().all(|name| names(name));
+    match registry.get(model) {
+        None
+        | Some(Registered::Alias {
+            vendor_named: true, ..
+        }) => names(model),
+        Some(Registered::Alias { served, .. }) => match registry.get(served.as_ref()) {
+            Some(Registered::Contract { vendor_names, .. }) => agree(vendor_names),
+            _ => names(served),
+        },
+        Some(Registered::Contract { vendor_names, .. }) => agree(vendor_names),
     }
 }
 
@@ -204,8 +212,9 @@ impl ProviderProfile {
     ///
     /// The record also keeps which names carry a model's contract (the
     /// vendor-named aliases of a served model whose own name selects none),
-    /// so a profile that reads a version from the model name reads it the
-    /// same way under every name the model is served under.
+    /// so a profile that reads a version from the model name reads an
+    /// opaque name as the vendor names behind it ([`served_under`]); a
+    /// vendor-named alias is read as its own name, as it always was.
     pub fn register_model_aliases<'a>(aliases: impl IntoIterator<Item = (&'a str, &'a str)>) {
         let aliases: Vec<(&str, &str)> = aliases.into_iter().collect();
         let mut map = registry().write().unwrap_or_else(|e| e.into_inner());
@@ -264,6 +273,7 @@ impl ProviderProfile {
                 Registered::Alias {
                     served: Arc::from(*canonical),
                     profile,
+                    vendor_named: Self::from_model_segments(alias).is_vendor_contract(),
                 },
             );
         }
@@ -641,7 +651,7 @@ mod tests {
                 "opaque-served-model-under-vendor-names",
             ),
         ]);
-        // An alias of a vendor-named served model is read as that model.
+        // An opaque alias of a vendor-named served model is read as that model.
         assert!(served_under(
             "opaque-alias-of-a-vendor-named-model",
             |name| name == "kimi-k3-vendor-named-served-model"
@@ -650,26 +660,29 @@ mod tests {
             "opaque-alias-of-a-vendor-named-model",
             |name| name == "opaque-alias-of-a-vendor-named-model"
         ));
-        // An opaque served model is read as every vendor name it is served
-        // under, whichever of its names the request carries.
+        // An opaque served model, and an opaque alias of it, are read as the
+        // vendor names it is served under, which have to agree; a
+        // vendor-named alias is read as its own name.
         for model in [
             "opaque-served-model-under-vendor-names",
-            "MiniMax-M3-first-public-name",
-            "MiniMax-M3-second-public-name",
             "opaque-alias-of-the-opaque-served-model",
         ] {
             assert_eq!(ProviderProfile::for_model(model), ProviderProfile::Minimax);
-            for vendor_name in [
-                "MiniMax-M3-first-public-name",
-                "MiniMax-M3-second-public-name",
-            ] {
-                assert!(served_under(model, |name| name == vendor_name), "{model}");
-            }
             assert!(
-                !served_under(model, |name| name
-                    == "opaque-alias-of-the-opaque-served-model"),
+                served_under(model, |name| name.starts_with("MiniMax-M3-")),
                 "{model}"
             );
+            assert!(
+                !served_under(model, |name| name == "MiniMax-M3-first-public-name"),
+                "{model}: the second public name disagrees"
+            );
+        }
+        for model in [
+            "MiniMax-M3-first-public-name",
+            "MiniMax-M3-second-public-name",
+        ] {
+            assert_eq!(ProviderProfile::for_model(model), ProviderProfile::Minimax);
+            assert!(served_under(model, |name| name == model), "{model}");
         }
         // A name the table does not know is read as itself.
         assert!(served_under("unregistered-model", |name| name == "unregistered-model"));

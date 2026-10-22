@@ -36,13 +36,12 @@ fn is_v41_name(model: &str) -> bool {
     })
 }
 
-/// Whether `model` is served as V4.1: by a name that carries its contract
-/// (an opaque alias of a V4.1 served model is V4.1, and so is an opaque
-/// served model under a V4.1-named alias, whichever name the request
-/// carries; a V4.1-named alias of a V4 served model is not), else by its own
-/// name. Every reader of the version goes through here, so normalization,
-/// the thinking toggle and validation agree with each other and with the
-/// renderer the served model has.
+/// Whether `model` is served as V4.1: an opaque alias of a V4.1 served
+/// model is, and so is an opaque served model whose vendor-named aliases
+/// are all V4.1 names, whichever name the request carries; a vendor-named
+/// alias and an unregistered name are read as they are. Every reader of the
+/// version goes through here, so normalization, the thinking toggle and
+/// validation agree with each other.
 fn is_v41_model(model: &str) -> bool {
     super::served_under(model, is_v41_name)
 }

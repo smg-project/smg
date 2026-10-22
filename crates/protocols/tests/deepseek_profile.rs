@@ -404,21 +404,51 @@ fn deepseek_v41_keeps_its_reading_under_a_registered_alias() {
 }
 
 #[test]
-fn deepseek_v41_is_read_from_the_name_that_carries_the_contract() {
+fn deepseek_v41_is_read_from_the_names_that_carry_the_contract() {
     // A served model with an opaque name takes V4.1 from the V4.1-named
-    // alias it is served under, whichever name the request carries; a
-    // V4.1-named alias of a V4 served model does not make that model V4.1.
+    // alias it is served under, whichever name the request carries.
     const SERVED: &str = "served-model-under-a-v41-name";
     const V41_NAME: &str = "alias-test/deepseek-v4.1-flash";
-    const V41_NAME_OF_A_V4_MODEL: &str = "alias-test-v4/deepseek-v4.1-flash";
-    ProviderProfile::register_model_aliases([
-        (V41_NAME, SERVED),
-        (V41_NAME_OF_A_V4_MODEL, "deepseek-v4-pro"),
-    ]);
+    ProviderProfile::register_model_aliases([(V41_NAME, SERVED)]);
     for model in [SERVED, V41_NAME] {
         let req = request(json!({"model": model, "reasoning_effort": "medium"}));
         assert_eq!(req.effective_reasoning_effort(), Some("medium"), "{model}");
     }
-    let req = request(json!({"model": V41_NAME_OF_A_V4_MODEL, "reasoning_effort": "medium"}));
+
+    // A vendor-named alias is read as its own name, as a request naming it
+    // always was: under a V4 name the vendor alias of `medium` applies, under
+    // a V4.1 name the level is kept, whatever the served model's own name.
+    const V4_NAME_OF_A_V41_MODEL: &str = "alias-test-v4/deepseek-v4-flash";
+    const V41_NAME_OF_A_V4_MODEL: &str = "alias-test-v41/deepseek-v4.1-flash";
+    ProviderProfile::register_model_aliases([
+        (V4_NAME_OF_A_V41_MODEL, "deepseek-v4.1-flash"),
+        (V41_NAME_OF_A_V4_MODEL, "deepseek-v4-pro"),
+    ]);
+    let req = request(json!({"model": V4_NAME_OF_A_V41_MODEL, "reasoning_effort": "medium"}));
     assert_eq!(req.effective_reasoning_effort(), Some("high"));
+    let req = request(json!({"model": V41_NAME_OF_A_V4_MODEL, "reasoning_effort": "medium"}));
+    assert_eq!(req.effective_reasoning_effort(), Some("medium"));
+}
+
+#[test]
+fn an_opaque_model_under_the_names_of_two_versions_keeps_the_v4_reading() {
+    // One checkpoint served under a V4 name and a V4.1 name is an ambiguous
+    // configuration: each public name is read as itself, and the opaque name
+    // keeps the reading it had before any alias (V4: the vendor alias of
+    // `medium`, no integer budgets) instead of taking V4.1 from one of them.
+    const SERVED: &str = "served-model-under-two-versions";
+    const V4_NAME: &str = "two-versions/deepseek-v4-flash";
+    const V41_NAME: &str = "two-versions/deepseek-v4.1-flash";
+    ProviderProfile::register_model_aliases([(V4_NAME, SERVED), (V41_NAME, SERVED)]);
+    for (model, effort) in [(SERVED, "high"), (V4_NAME, "high"), (V41_NAME, "medium")] {
+        let req = request(json!({"model": model, "reasoning_effort": "medium"}));
+        assert_eq!(ProviderProfile::for_model(model), ProviderProfile::DeepSeek);
+        assert_eq!(req.effective_reasoning_effort(), Some(effort), "{model}");
+    }
+    assert!(request(json!({"model": SERVED, "reasoning_effort": 62}))
+        .validate()
+        .is_err());
+    assert!(request(json!({"model": V41_NAME, "reasoning_effort": 62}))
+        .validate()
+        .is_ok());
 }
