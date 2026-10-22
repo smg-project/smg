@@ -218,6 +218,9 @@ PLATFORM_PAIR = "512 or 1024 by platform (--max-num-seqs unset"
         # The step under the default ceiling: the engine's own cap is the step.
         (300, "2048", None, "default 300 (--max-num-seqs unset"),
         (300, "2048", None, "at most the admission step) covers the admission step"),
+        # The step between the two platform defaults: the 1024 one is the step.
+        (700, "2048", 700, "512 or 700 by platform (--max-num-seqs unset"),
+        (700, "2048", 700, "reach the default ceiling, at most the admission step)"),
         # A ceiling at or under the engine's default ceiling raises nothing.
         (16384, "512", None, f"default {PLATFORM_PAIR}"),
         (16384, "auto", None, f"default {PLATFORM_PAIR}"),
@@ -239,6 +242,18 @@ def test_a_recipes_ceiling_applies_when_the_window_is_left_to_the_engine(
     else:
         assert decision.source == "derived"
         assert str(cap) in decision.detail
+
+
+def test_a_step_between_the_two_platform_defaults_is_named_as_the_step():
+    """A window of 300 with a step of 550: 512, or 550 on the 1024 platform
+    (the engine ends its list at the step there); a ceiling of 540 is kept and
+    the line names the step, not the grid."""
+    decision = derive_capture_cap(max_num_seqs=300, max_num_batched_tokens=550, setting="540")
+    assert decision.cap is None
+    assert "512 or 550 by platform (twice --max-num-seqs 300, at most the admission step" in (
+        decision.detail
+    )
+    assert "on the capture grid" not in decision.detail
 
 
 @pytest.mark.parametrize(

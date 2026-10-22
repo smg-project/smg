@@ -188,7 +188,7 @@ def derive_capture_cap(
         origin = f"twice --max-num-seqs {max_num_seqs}"
     low = _engine_default(low_raw, max_num_batched_tokens)
     high = _engine_default(high_raw, max_num_batched_tokens)
-    if max_num_batched_tokens is not None and max_num_batched_tokens <= low_raw:
+    if max_num_batched_tokens is not None and max_num_batched_tokens <= high_raw:
         origin += ", at most the admission step"
     elif low != low_raw or high != high_raw:
         origin += ", on the capture grid"
