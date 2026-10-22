@@ -1,4 +1,5 @@
 //! The binary's command line, by concern: `url_port` is what the gateway
-//! reads before clap sees it.
+//! reads before clap sees it, `value` the parsers of the flags' values.
 
 pub(crate) mod url_port;
+pub(crate) mod value;
