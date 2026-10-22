@@ -350,3 +350,75 @@ fn deepseek_rejects_invalid_or_non_v41_budgets() {
             .is_err());
     }
 }
+
+#[test]
+fn deepseek_v41_keeps_its_reading_under_a_registered_alias() {
+    // An opaque alias of a V4.1 served model is judged as that model: the
+    // profile reads V4.1 from the name the alias resolves to, not from the
+    // name as sent, so a request normalizes and validates the same way under
+    // either name. Names unique to this test: the alias table is process-wide.
+    const ALIAS: &str = "chat-large-under-an-opaque-alias";
+    ProviderProfile::register_model_aliases([(ALIAS, "deepseek-ai/DeepSeek-V4.1-Flash")]);
+    assert_eq!(ProviderProfile::for_model(ALIAS), ProviderProfile::DeepSeek);
+
+    // `medium` and `xhigh` stay what the client asked, in both spellings;
+    // the vendor's `minimal` alias still resolves to `low`.
+    for effort in ["medium", "xhigh"] {
+        for extra in [
+            json!({"model": ALIAS, "reasoning_effort": effort}),
+            json!({"model": ALIAS, "thinking": {"effort": effort}}),
+        ] {
+            let req = request(extra);
+            assert!(req.validate().is_ok(), "{effort}");
+            assert_eq!(req.effective_reasoning_effort(), Some(effort));
+        }
+    }
+    let req = request(json!({"model": ALIAS, "reasoning_effort": "minimal"}));
+    assert_eq!(req.effective_reasoning_effort(), Some("low"));
+
+    // A template kwarg `medium` is a level of V4.1's own table: thinking on,
+    // ahead of the typed toggle.
+    let req = request(json!({
+        "model": ALIAS,
+        "thinking": {"type": "disabled"},
+        "chat_template_kwargs": {"reasoning_effort": "medium"},
+    }));
+    assert!(req.validate().is_ok());
+    assert_eq!(
+        req.chat_template_kwargs
+            .as_ref()
+            .and_then(|kwargs| kwargs.get("thinking")),
+        Some(&json!(true))
+    );
+
+    // An integer budget is V4.1's extension and validates under the alias.
+    let req = request(json!({"model": ALIAS, "reasoning_effort": 62}));
+    assert!(req.validate().is_ok());
+    assert_eq!(req.effective_reasoning_effort(), Some("62"));
+
+    // An upstream that renders the prompt itself still gets the vendor's
+    // reading of `medium`.
+    let mut req = request(json!({"model": ALIAS, "reasoning_effort": "medium"}));
+    ProviderProfile::for_model(&req.model).normalize_chat_for_upstream(&mut req);
+    assert_eq!(req.reasoning_effort.as_deref(), Some("high"));
+}
+
+#[test]
+fn deepseek_v41_is_read_from_the_name_that_carries_the_contract() {
+    // A served model with an opaque name takes V4.1 from the V4.1-named
+    // alias it is served under, whichever name the request carries; a
+    // V4.1-named alias of a V4 served model does not make that model V4.1.
+    const SERVED: &str = "served-model-under-a-v41-name";
+    const V41_NAME: &str = "alias-test/deepseek-v4.1-flash";
+    const V41_NAME_OF_A_V4_MODEL: &str = "alias-test-v4/deepseek-v4.1-flash";
+    ProviderProfile::register_model_aliases([
+        (V41_NAME, SERVED),
+        (V41_NAME_OF_A_V4_MODEL, "deepseek-v4-pro"),
+    ]);
+    for model in [SERVED, V41_NAME] {
+        let req = request(json!({"model": model, "reasoning_effort": "medium"}));
+        assert_eq!(req.effective_reasoning_effort(), Some("medium"), "{model}");
+    }
+    let req = request(json!({"model": V41_NAME_OF_A_V4_MODEL, "reasoning_effort": "medium"}));
+    assert_eq!(req.effective_reasoning_effort(), Some("high"));
+}

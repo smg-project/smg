@@ -14,7 +14,7 @@ use axum::{
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
 };
-use openai_protocol::model_card::ModelCard;
+use openai_protocol::{model_card::ModelCard, profile::ProviderProfile};
 use serde_json::{json, Value};
 use smg::{config::RouterConfig, worker::BasicWorkerBuilder};
 use tower::ServiceExt;
@@ -35,11 +35,20 @@ mod upstream_effort_alias_tests {
     /// re-registered under the DeepSeek model ids so a request for them
     /// selects the vendor profile and routes to it.
     fn serve_deepseek_models(ctx: &AppTestContext, url: &str) {
+        serve_models(
+            ctx,
+            url,
+            vec![ModelCard::new(V41_MODEL), ModelCard::new(V4_MODEL)],
+        );
+    }
+
+    /// Re-register the started worker at `url` under `models`.
+    fn serve_models(ctx: &AppTestContext, url: &str, models: Vec<ModelCard>) {
         let registry = &ctx.app_context.worker_registry;
         let worker_id = registry.get_id_by_url(url).unwrap();
         let worker = registry.get(&worker_id).unwrap();
         let mut spec = worker.metadata().spec.as_ref().clone();
-        spec.models = vec![ModelCard::new(V41_MODEL), ModelCard::new(V4_MODEL)].into();
+        spec.models = models.into();
         let replacement = BasicWorkerBuilder::from_spec(spec)
             .health_config(worker.metadata().health_config.clone())
             .health_endpoint(&worker.metadata().health_endpoint)
@@ -181,6 +190,62 @@ mod upstream_effort_alias_tests {
                 body["chat_template_kwargs"]["reasoning_effort"], "medium",
                 "{side}: {body}"
             );
+        }
+
+        ctx.shutdown().await;
+    }
+
+    /// A registered alias of a V4.1 model: the profile reads the request as
+    /// the model the alias resolves to, so what the router forwards under
+    /// the alias is what it forwards under the model's own name.
+    #[tokio::test]
+    async fn regular_router_forwards_a_v41_alias_like_the_model_itself() {
+        const V41_ALIAS: &str = "company-chat-large";
+        let recorder = RequestRecorder::new();
+        set_request_recorder(19873, Arc::clone(&recorder));
+        let ctx = AppTestContext::new(vec![TestWorkerConfig::healthy(19873)]).await;
+        let app = ctx.create_app();
+        ProviderProfile::register_model_aliases([(V41_ALIAS, V41_MODEL)]);
+        serve_models(
+            &ctx,
+            ctx.worker_url_for(19873),
+            vec![ModelCard::new(V41_MODEL).with_alias(V41_ALIAS)],
+        );
+
+        for request in [
+            // A template kwarg `medium` is a level of V4.1's own table: it
+            // switches thinking on ahead of the typed toggle.
+            json!({
+                "messages": [{"role": "user", "content": "Hello"}],
+                "reasoning_effort": "medium",
+                "thinking": {"type": "disabled"},
+                "chat_template_kwargs": {"reasoning_effort": "medium"},
+                "stream": false
+            }),
+            // An integer budget is V4.1's extension.
+            json!({
+                "messages": [{"role": "user", "content": "Hello"}],
+                "reasoning_effort": 62,
+                "stream": false
+            }),
+        ] {
+            let mut under_alias = request.clone();
+            under_alias["model"] = json!(V41_ALIAS);
+            let mut under_name = request;
+            under_name["model"] = json!(V41_MODEL);
+            let alias_body = forwarded(&app, &recorder, under_alias).await;
+            let name_body = forwarded(&app, &recorder, under_name).await;
+            for field in [
+                "model",
+                "reasoning_effort",
+                "thinking",
+                "chat_template_kwargs",
+            ] {
+                assert_eq!(
+                    alias_body[field], name_body[field],
+                    "{field}: {alias_body} vs {name_body}"
+                );
+            }
         }
 
         ctx.shutdown().await;
