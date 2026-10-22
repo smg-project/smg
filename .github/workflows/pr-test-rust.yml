@@ -15,6 +15,9 @@ jobs:
     env:
       HF_HUB_OFFLINE: '1'
       TRANSFORMERS_OFFLINE: '1'
+      MAX_JOBS: '2'
+      OMP_NUM_THREADS: '1'
+      MKL_NUM_THREADS: '1'
     steps:
       - name: Verify runner placement and device isolation
         run: |
