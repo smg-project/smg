@@ -304,7 +304,7 @@ fn check_batch(processor: &Qwen3AudioProcessor, case: &Case) {
 #[test]
 fn qwen3_audio_log_mel_matches_transformers_golden() {
     let golden: AudioMelGolden =
-        serde_json::from_str(include_str!("fixtures/golden/audio_mel_reference.json"))
+        serde_json::from_str(include_str!("../fixtures/golden/audio_mel_reference.json"))
             .expect("invalid checked-in audio mel golden fixture");
 
     assert_eq!(golden.generator, "generate_audio_mel_golden.py");

@@ -7,7 +7,7 @@ use llm_multimodal::{
 };
 use tempfile::tempdir;
 
-mod common;
+use crate::common;
 
 const TINY_PNG_BASE64: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNgYAAAAAMAASsJTYQAAAAASUVORK5CYII=";

@@ -18,7 +18,7 @@ use llm_multimodal::{
 };
 use serde::Deserialize;
 
-const GOLDEN: &str = include_str!("fixtures/golden/muse_spark_audio_fingerprints.json");
+const GOLDEN: &str = include_str!("../fixtures/golden/muse_spark_audio_fingerprints.json");
 
 #[derive(Deserialize)]
 struct Golden {

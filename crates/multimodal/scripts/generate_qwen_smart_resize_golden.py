@@ -13,7 +13,7 @@ revision, passed with ``--minimax-m3-image-processor``) floors each rounded
 side to one factor first. Both are recorded with their provenance.
 
 Output: ``tests/fixtures/golden/qwen_smart_resize.json``, read by
-``tests/qwen_smart_resize_golden.rs``.
+``tests/preprocess/qwen_smart_resize_golden.rs``.
 """
 
 import argparse

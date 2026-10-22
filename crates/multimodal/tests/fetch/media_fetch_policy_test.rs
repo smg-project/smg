@@ -23,7 +23,7 @@ use llm_multimodal::{
     MediaSource,
 };
 
-mod common;
+use crate::common;
 
 const TINY_PNG_B64: &str =
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";

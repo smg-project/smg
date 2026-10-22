@@ -82,8 +82,10 @@ struct Case {
 }
 
 fn golden() -> Golden {
-    serde_json::from_str(include_str!("fixtures/golden/qwen3_vl_video_prompt.json"))
-        .expect("golden JSON")
+    serde_json::from_str(include_str!(
+        "../fixtures/golden/qwen3_vl_video_prompt.json"
+    ))
+    .expect("golden JSON")
 }
 
 /// The replacement's text: markers by name, everything else by byte.

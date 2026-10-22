@@ -16,7 +16,7 @@ use llm_multimodal::{
     ImageFetchConfig, MediaConnector, MediaConnectorConfig, MediaFault, MediaSource,
 };
 
-mod common;
+use crate::common;
 
 /// One HTTP/1.1 answer for the first connection, after `header_delay`:
 /// `status` with `body` under `content_type`, declared as `declared` bytes

@@ -20,7 +20,7 @@ use llm_multimodal::{
 };
 use serde_json::{json, Value};
 
-mod common;
+use crate::common;
 
 const GOLDEN: &str = "tests/fixtures/golden/qwen3_vl_video.json";
 

@@ -121,7 +121,7 @@ fn fnv1a_i32(values: &[f32]) -> String {
 
 fn load_golden() -> GoldenDocument {
     serde_json::from_str(include_str!(
-        "fixtures/golden/inkling_preprocess_fingerprints.json"
+        "../fixtures/golden/inkling_preprocess_fingerprints.json"
     ))
     .expect("invalid checked-in Inkling golden fixture")
 }

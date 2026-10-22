@@ -156,7 +156,7 @@ fn check_video_case(processor: &Qwen3VLProcessor, case: &GoldenVideoCase) {
 #[test]
 fn qwen_preprocessing_matches_huggingface_golden() {
     let golden: GoldenDocument = serde_json::from_str(include_str!(
-        "fixtures/golden/qwen_preprocess_fingerprints.json"
+        "../fixtures/golden/qwen_preprocess_fingerprints.json"
     ))
     .expect("invalid checked-in Qwen golden fixture");
     assert_eq!(golden.generator, "generate_qwen_preprocess_fingerprints.py");

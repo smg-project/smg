@@ -18,7 +18,7 @@ use llm_multimodal::{
 };
 use tokio::process::Command;
 
-mod common;
+use crate::common;
 
 /// One HTTP/1.1 response for the first connection: the headers after
 /// `header_delay`, then `first` bytes of the body, then the rest after

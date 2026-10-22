@@ -47,7 +47,7 @@ enum Source {
     File { file: String },
 }
 
-const GOLDEN: &str = include_str!("fixtures/golden/deepseek_v41_preprocess_fingerprints.json");
+const GOLDEN: &str = include_str!("../fixtures/golden/deepseek_v41_preprocess_fingerprints.json");
 
 /// The seeded pattern shared with the other preprocessing goldens and the
 /// generator: `R=(x*7+y*3)%256`, `G=(x*5+y*11)%256`, `B=(x+y*2)%256`, each

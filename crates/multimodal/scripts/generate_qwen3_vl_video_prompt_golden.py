@@ -9,7 +9,7 @@ into one stamped, marker-wrapped block per temporal group
 (``replace_video_token``). Nothing is downloaded: both processors are
 built locally from the family's preprocessor values, with a tokenizer that
 knows only the marker tokens. The Rust test
-``tests/qwen3_vl_video_prompt_golden.rs`` checks the media connector's frame
+``tests/video/qwen3_vl_video_prompt_golden.rs`` checks the media connector's frame
 picks and the spec's prompt replacement against the JSON this writes.
 
 Usage (from the repository root):

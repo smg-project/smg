@@ -31,7 +31,7 @@ const IMAGE_TOL: f64 = 1e-5;
 /// Log-mel features: pure-Rust `rustfft` against the torch STFT.
 const AUDIO_TOL: f64 = 2e-3;
 
-const GOLDEN: &str = include_str!("fixtures/golden/nemotron_omni_preprocess.json");
+const GOLDEN: &str = include_str!("../fixtures/golden/nemotron_omni_preprocess.json");
 
 #[derive(Deserialize)]
 struct Golden {
