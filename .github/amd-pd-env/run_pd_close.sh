@@ -25,7 +25,7 @@ python3 .github/amd-pd-env/runtime_environment.py installed
 python3 .github/amd-pd-env/native_wheel.py
 python3 -m pip check > diagnostic-results/pip-check-before.txt 2>&1
 cat diagnostic-results/pip-check-before.txt
-python3 -c 'import torch, vllm, nixl, smg_grpc_servicer; assert torch.version.hip; print("vllm", vllm.__version__, "HIP", torch.version.hip)'
+python3 .github/amd-pd-env/nixl_canary.py
 python3 .github/amd-pd-env/probe_evidence.py preflight
 python3 -m pytest e2e_test/router/test_pd_topologies.py -k TestPDDecodeAbortProbe \
   --reruns 0 -o addopts='' -p no:cacheprovider -s -vv \
