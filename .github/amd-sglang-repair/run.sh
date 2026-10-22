@@ -16,6 +16,7 @@ touch diagnostic-results/install-complete
 python3 .github/amd-qa/closure_audit.py snapshot diagnostic-results/installed.json
 python3 .github/amd-sglang-repair/environment.py installed
 python3 -m pip check > diagnostic-results/pipcheck-before.txt 2>&1
+python3 .github/amd-sglang-repair/tvm_slots.py
 python3 .github/amd-sglang-repair/run_native.py
 python3 -m pytest -q grpc_servicer/tests -p no:cacheprovider -rs --junitxml=diagnostic-results/servicer-engine.xml
 python3 -m pip freeze > diagnostic-results/pip-freeze.txt

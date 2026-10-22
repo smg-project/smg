@@ -19,9 +19,9 @@ def apply(source, output):
     if sha(original) != ORIGINAL_SHA:
         raise ValueError("TVM support source differs from exact unmodified image")
     needle = (
-        '    class TVMDerivedObject(metadata["cls"]):  # type: ignore\n'
-        '        """The derived object to avoid cyclic dependency."""\n\n'
-    ).encode()
+        b'    class TVMDerivedObject(metadata["cls"]):  # type: ignore\n'
+        b'        """The derived object to avoid cyclic dependency."""\n\n'
+    )
     if original.count(needle) != 1:
         raise ValueError("missing exact upstream slots patch context")
     fixed = original.replace(

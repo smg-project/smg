@@ -7,6 +7,8 @@ import os
 import sys
 from pathlib import Path
 
+from tvm_slots import verify_loaded as verify_tvm_support
+
 ENV = (
     "LD_LIBRARY_PATH",
     "LD_PRELOAD",
@@ -30,6 +32,7 @@ MODULES = (
     "tvm_ffi.libinfo",
     "tvm",
     "tvm._ffi.base",
+    "tvm.runtime.support",
     "tilelang",
     "xgrammar",
 )
@@ -162,3 +165,5 @@ class RuntimeIdentity:
             installed = value["installed_registry"]
             if loaded.get("sha256") != fixed or loaded != installed:
                 raise RuntimeError("actual imported registry differs from installed candidate")
+
+            verify_tvm_support(value["loaded_modules"].get("tvm.runtime.support", {}))
