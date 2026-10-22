@@ -772,13 +772,28 @@ def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False) -> dict:
     """``serve_rust`` against a recording fake server, the scheduler launch and
     the supervisor stubbed; the keywords the server was constructed with. With
     ``real_facts`` the launcher's own fact producers run, over a fake model
-    config, as at a real start."""
+    config, as at a real start: the facts then carry a vocabulary and a
+    context, so a warm-up is planned and readiness held, as at a real start.
+    The fake carries both readiness setters of the binding (``set_ready``, the
+    health-only hold; ``set_serving``, the drain switch) and records their
+    calls; ``_run_serve_rust.recorded`` holds the server and the keywords the
+    supervisor got."""
     created: dict = {}
+    recorded: dict = {}
 
     class FakeServer:
         def __init__(self, **kwargs):
             created.update(kwargs)
             self.address = kwargs["bind_address"]
+            self.serving: list[bool] = []
+            self.ready: list[bool] = []
+            recorded["server"] = self
+
+        def set_serving(self, serving: bool) -> None:
+            self.serving.append(serving)
+
+        def set_ready(self, ready: bool) -> None:
+            self.ready.append(ready)
 
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
@@ -795,12 +810,33 @@ def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False) -> dict:
         rust, "launch_scheduler_ranks", lambda server_args, *, handshake_port: "engine"
     )
 
-    async def fake_supervise(server, engine, *, drain_secs, **_kwargs):
+    async def fake_supervise(server, engine, *, drain_secs, **kwargs):
+        recorded["supervise_kwargs"] = kwargs
         return 0
 
     monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     assert asyncio.run(rust.serve_rust(_server_args())) == 0
+    _run_serve_rust.recorded = recorded
     return created
+
+
+def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_path):
+    """With a warm-up planned (the default knob, a generation model whose
+    facts carry a vocabulary and a context), the server's readiness is held
+    before the scheduler starts through the health-only setter (admission
+    stays open for the pass's own requests; the drain switch is never
+    touched) and the supervisor is handed the pass, which flips SERVING when
+    it ran; with the knob off, neither happens."""
+    _run_serve_rust(monkeypatch, tmp_path, real_facts=True)
+    recorded = _run_serve_rust.recorded
+    assert recorded["server"].ready == [False] and recorded["server"].serving == []
+    assert callable(recorded["supervise_kwargs"]["warmup"])
+
+    monkeypatch.setenv(rust.WARMUP_ENV, "off")
+    _run_serve_rust(monkeypatch, tmp_path, real_facts=True)
+    recorded = _run_serve_rust.recorded
+    assert recorded["server"].ready == [] and recorded["server"].serving == []
+    assert recorded["supervise_kwargs"] == {}
 
 
 def test_serve_rust_hands_the_server_both_startup_bounds(monkeypatch, tmp_path):

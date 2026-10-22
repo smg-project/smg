@@ -50,11 +50,17 @@ def nothing_of_the_launchers_in_the_environment():
     to every test after it the same way, whatever it stubbed. The shell's own
     exports are set aside for the same reason: a unit test is not the launcher
     the guard protects, and a test that wants a value makes it itself
-    (``monkeypatch.setenv``). The restore is by hand because
+    (``monkeypatch.setenv``); the planned warm-up's knob of each launcher is
+    among them, so a shell that turns the warm-up off for its own servers
+    does not turn it off under a test that expects a plan. The restore is by
+    hand because
     ``monkeypatch.delenv`` of a name that is absent records nothing, and a
     write-back after it would survive the test.
     """
     from smg_grpc_servicer import sglang, tokenspeed, vllm
+    from smg_grpc_servicer.sglang import warmup as sglang_warmup
+    from smg_grpc_servicer.tokenspeed import warmup as tokenspeed_warmup
+    from smg_grpc_servicer.vllm import warmup as vllm_warmup
 
     names = (
         vllm.SERVICER_IMPL_ENV,
@@ -63,6 +69,9 @@ def nothing_of_the_launchers_in_the_environment():
         sglang.HANDSHAKE_ENV,
         sglang.ENGINE_INDEX_ENV,
         vllm.MULTIPROC_METHOD_ENV,
+        vllm_warmup.WARMUP_ENV,
+        sglang_warmup.WARMUP_ENV,
+        tokenspeed_warmup.WARMUP_ENV,
     )
     before = {name: os.environ.pop(name, None) for name in names}
     try:

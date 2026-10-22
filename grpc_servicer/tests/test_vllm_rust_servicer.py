@@ -1277,6 +1277,51 @@ def test_serve_rust_constructs_the_server_with_keywords_the_binding_takes(monkey
     signature.bind(**kwargs)
 
 
+def test_serve_rust_holds_readiness_for_the_planned_warm_up(monkeypatch, tmp_path):
+    """With a warm-up planned (the default knob, a generation model whose
+    resolved config carries a running window and an admission step), the
+    server's readiness is held before the engine cores start through the
+    health-only setter (admission stays open for the pass's own requests; the
+    drain switch is never touched) and the supervisor is handed the pass,
+    which flips SERVING when it ran; with the knob off, neither happens."""
+    config = _config()
+    config.scheduler_config = SimpleNamespace(max_num_seqs=8, max_num_batched_tokens=512)
+    engine_args = SimpleNamespace(
+        create_engine_config=lambda usage_context: config, disable_log_stats=False
+    )
+    _stub_frontend_args(monkeypatch)
+    _stub_engine_exceptions(monkeypatch)
+    _install(
+        monkeypatch,
+        "vllm.engine.arg_utils",
+        AsyncEngineArgs=SimpleNamespace(from_cli_args=lambda args: engine_args),
+    )
+    _install(monkeypatch, "vllm.usage.usage_lib", UsageContext=SimpleNamespace(OPENAI_API_SERVER=1))
+    _install_fake_servicer(monkeypatch, FakeServer)
+    monkeypatch.setattr(rust, "launch_engine_cores", lambda ns: FakeEngine())
+    monkeypatch.setattr(rust, "resolve_tokenizer_dir", lambda *a, **k: str(tmp_path))
+    monkeypatch.setattr(rust_lifecycle, "free_port", lambda: 24321)
+    monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
+    recorded: dict = {}
+
+    async def fake_supervise(server, engine, *, drain_secs, **kwargs):
+        recorded["server"], recorded["supervise_kwargs"] = server, kwargs
+        return 0
+
+    monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
+    args = argparse.Namespace(
+        model_tag="org/m", model="org/m", grpc=True, host=None, port=50051, max_model_len=4096
+    )
+    assert asyncio.run(rust.serve_rust(args)) == 0
+    assert recorded["server"].events == ["ready:False"]
+    assert callable(recorded["supervise_kwargs"]["warmup"])
+
+    monkeypatch.setenv(rust.WARMUP_ENV, "off")
+    assert asyncio.run(rust.serve_rust(args)) == 0
+    assert recorded["server"].events == []
+    assert recorded["supervise_kwargs"] == {}
+
+
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
@@ -1297,6 +1342,9 @@ class FakeServer:
 
     def set_serving(self, serving: bool) -> None:
         self.events.append(f"serving:{serving}")
+
+    def set_ready(self, ready: bool) -> None:
+        self.events.append(f"ready:{ready}")
 
     def stop(self, timeout: float) -> None:
         self.events.append(f"stop:{timeout}")
