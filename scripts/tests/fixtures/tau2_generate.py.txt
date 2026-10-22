@@ -1,0 +1,117 @@
+# MIT (tau2_generate.LICENSE); sierra-research/tau2-bench@5bfa7e37b36656b37dc6d022156be6563c1007f3
+# src/tau2/utils/llm_utils.py:355-469, preserved verbatim for offline hook tests.
+def generate(
+    model: str,
+    messages: list[Message],
+    tools: Optional[list[Tool]] = None,
+    tool_choice: Optional[str] = None,
+    call_name: Optional[str] = None,
+    **kwargs: Any,
+) -> UserMessage | AssistantMessage:
+    """
+    Generate a response from the model.
+
+    Args:
+        model: The model to use.
+        messages: The messages to send to the model.
+        tools: The tools to use.
+        tool_choice: The tool choice to use.
+        call_name: Optional name identifying the purpose of this LLM call
+                   (e.g., "detect_interrupt", "generate_agent_message").
+                   Used for logging and debugging.
+        **kwargs: Additional arguments to pass to the model.
+
+    Returns: A tuple containing the message and the cost.
+    """
+    validate_message_history(messages)
+    if kwargs.get("num_retries") is None:
+        kwargs["num_retries"] = DEFAULT_MAX_RETRIES
+
+    # Vertex AI Gemini 3 models require VERTEXAI_LOCATION="global"
+    if model.startswith("vertex_ai/gemini-3") and not os.environ.get(
+        "VERTEXAI_LOCATION"
+    ):
+        os.environ["VERTEXAI_LOCATION"] = "global"
+
+    litellm_messages = to_litellm_messages(messages)
+    tools_schema = [tool.openai_schema for tool in tools] if tools else None
+    if tools_schema and tool_choice is None:
+        tool_choice = "auto"
+
+    # Prepare request data for logging
+    formatted_messages = _format_messages_for_logging(litellm_messages)
+    request_data = {
+        "model": model,
+        "messages": formatted_messages,
+        "tools": tools_schema,
+        "tool_choice": tool_choice,
+        "kwargs": {
+            k: str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v
+            for k, v in kwargs.items()
+        },
+    }
+    request_timestamp = datetime.now().isoformat()
+
+    start_time = time.perf_counter()
+    try:
+        response = completion(
+            model=model,
+            messages=litellm_messages,
+            tools=tools_schema,
+            tool_choice=tool_choice,
+            **kwargs,
+        )
+    except Exception as e:
+        logger.error(e)
+        raise e
+    generation_time_seconds = time.perf_counter() - start_time
+    cost = get_response_cost(response)
+    usage = get_response_usage(response)
+
+    response_choice = response.choices[0]
+    try:
+        finish_reason = response_choice.finish_reason
+        if finish_reason == "length":
+            logger.warning("Output might be incomplete due to token limit!")
+    except Exception as e:
+        logger.error(e)
+        raise e
+    assert response_choice.message.role == "assistant", (
+        "The response should be an assistant message"
+    )
+    content = response_choice.message.content
+    raw_tool_calls = response_choice.message.tool_calls or []
+    tool_calls = [
+        ToolCall(
+            id=tool_call.id,
+            name=tool_call.function.name,
+            arguments=json.loads(tool_call.function.arguments),
+        )
+        for tool_call in raw_tool_calls
+    ]
+    tool_calls = tool_calls or None
+
+    message = AssistantMessage(
+        role="assistant",
+        content=content,
+        tool_calls=tool_calls,
+        cost=cost,
+        usage=usage,
+        raw_data=response.to_dict(),
+        generation_time_seconds=generation_time_seconds,
+    )
+
+    # Log complete LLM call (request + response)
+    response_data = {
+        "timestamp": datetime.now().isoformat(),
+        "content": content,
+        "tool_calls": [tc.model_dump() for tc in tool_calls] if tool_calls else None,
+        "cost": cost,
+        "usage": usage,
+        "generation_time_seconds": generation_time_seconds,
+    }
+    # Add timestamp to request data
+    request_data["timestamp"] = request_timestamp
+    _write_llm_log(request_data, response_data, call_name=call_name)
+
+    return message
