@@ -2,7 +2,7 @@
  "recorded": "transformers' whole-text reading of each session: parse_response(output + stop, template, prefix=prompt, tools=tools). `streamed` adds transformers' streaming reading when `output` is fed in chunks that end at the listed offsets (or one character per chunk), with the stop joined to the last chunk.",
  "transformers": "5.18.0",
  "transformers_tag": "v5.18.0",
- "regex": "2026.9.10",
+ "regex": "2026.9.29",
  "python": "3.12",
  "unicodedata": "15.0.0",
  "inputs": {
@@ -18,7 +18,7 @@
   "CohereLabs/North-Micro-Vision-Instruct@fa548d9aa62c1220bfd21fc6cfc465f1bd2a1a40/tokenizer_config.json": "kjzqzqwjvhpyxxhq",
   "huggingface/trl@d9b9f39b54324b272df051de7852e18761040edd/trl/chat_template_utils.py": "nystwqjpkjvsmjvg"
  },
- "generator": "wrkrxrzzsytphygw",
+ "generator": "zmhnwvrprtsshgqy",
  "counts": {
   "templates": 8,
   "sessions": 239,
