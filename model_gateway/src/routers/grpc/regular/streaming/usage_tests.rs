@@ -23,7 +23,7 @@ use smg_grpc_client::{
     },
     vllm_engine::{proto, proto::generate_response::Response as GenerationEvent},
 };
-use tokio::task::JoinHandle;
+use tokio::{sync::oneshot, task::JoinHandle};
 
 use super::{
     eof_tests::{
@@ -1046,11 +1046,12 @@ fn a_collected_answer_records_its_token_and_generation_families() {
     }
 }
 
-/// The engine's terminal frame read and the client gone before the terminal
-/// sends: the first chunk reached the client, the client dropped the
-/// response, then the engine's `Complete` arrived. The sends fail on the
-/// closed sender and the path returns that failure, after the reservation
-/// was settled with the engine's counts: nothing is closed as reserved-only.
+/// An unwatched stream whose sender closed after the read: the first chunk
+/// reached the client, the client dropped the response, and the engine's
+/// `Complete` was read (nothing watched the client, so the read went on to
+/// it). The terminal sends fail on the closed sender and the path returns
+/// that failure, after the reservation was settled with the engine's
+/// counts: nothing is closed as reserved-only.
 #[tokio::test]
 async fn a_chat_stream_whose_client_left_before_the_terminal_sends_settles_the_engines_counts() {
     let request: ChatCompletionRequest = serde_json::from_value(json!({
@@ -1058,7 +1059,7 @@ async fn a_chat_stream_whose_client_left_before_the_terminal_sends_settles_the_e
         "stream_options": {"include_usage": true},
     }))
     .expect("chat request");
-    let (release, gate) = tokio::sync::oneshot::channel();
+    let (release, gate) = oneshot::channel();
     let mut frames = choice_frames(0, &["hi"], SETTLED);
     let complete = frames.pop().expect("the terminal frame");
     let (stream, server) = gated_stream(frames, gate, vec![complete], "0").await;
@@ -1103,7 +1104,7 @@ async fn a_chat_stream_whose_client_left_before_the_terminal_sends_settles_the_e
 #[tokio::test]
 async fn a_messages_stream_whose_client_left_before_the_terminal_sends_settles_the_engines_counts()
 {
-    let (release, gate) = tokio::sync::oneshot::channel();
+    let (release, gate) = oneshot::channel();
     let mut frames = choice_frames(0, &["hi"], SETTLED);
     let complete = frames.pop().expect("the terminal frame");
     let (stream, server) = gated_stream(frames, gate, vec![complete], "0").await;
@@ -1145,4 +1146,73 @@ async fn a_messages_stream_whose_client_left_before_the_terminal_sends_settles_t
         }]
     );
     assert_eq!(backend.closes(), 0);
+}
+
+/// The same two paths over the stream as production reads it, watched for
+/// the client's leaving (`until_client_gone`): the client's drop ends the
+/// read before the engine's `Complete`, so the path sends nothing more and
+/// returns `Ok`, and the reservation, with no terminal frame read, is closed
+/// as reserved-only, not settled.
+#[tokio::test]
+async fn a_watched_stream_whose_client_leaves_sends_nothing_more_and_closes_its_reservation() {
+    let request: ChatCompletionRequest = serde_json::from_value(json!({
+        "model": "eof-test", "messages": [], "stream": true,
+        "stream_options": {"include_usage": true},
+    }))
+    .expect("chat request");
+    for messages in [false, true] {
+        let (release, gate) = oneshot::channel();
+        let mut frames = choice_frames(0, &["hi"], SETTLED);
+        let complete = frames.pop().expect("the terminal frame");
+        let (stream, server) = gated_stream(frames, gate, vec![complete], "0").await;
+        let (tx, mut rx) = sse_channel();
+        let stream = stream.until_client_gone(&tx, "chatcmpl-eof");
+        let (handle, backend) = RecordingBackend::reservation();
+        let processor = processor(false);
+        let streamed = async {
+            if messages {
+                processor
+                    .process_messages_streaming_chunks(
+                        stream,
+                        dispatch(),
+                        tokenizer(),
+                        (None, None, false, false, false),
+                        messages_spec(false),
+                        &tx,
+                        Some(handle),
+                    )
+                    .await
+            } else {
+                processor
+                    .process_streaming_chunks(
+                        stream,
+                        dispatch(),
+                        tokenizer(),
+                        (None, None, false, false, false),
+                        ChatResponseSpec::from(&request),
+                        &tx,
+                        Some(handle),
+                    )
+                    .await
+            }
+        };
+        let client = async {
+            let mut text = String::new();
+            while !text.contains("hi") {
+                let frame = rx.recv().await.expect("the first delta reaches the client");
+                text.push_str(std::str::from_utf8(&frame.expect("an SSE write")).expect("UTF-8"));
+            }
+            drop(rx);
+            release.send(()).expect("the gate is waited on");
+        };
+        let (result, ()) = tokio::join!(streamed, client);
+        server.abort();
+        assert!(result.is_ok(), "messages {messages}: {result:?}");
+        assert!(
+            backend.settlements().is_empty(),
+            "messages {messages}: no terminal frame was read: {:?}",
+            backend.settlements()
+        );
+        assert_eq!(backend.closes(), 1, "messages {messages}");
+    }
 }
