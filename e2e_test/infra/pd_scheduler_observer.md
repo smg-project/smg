@@ -7,10 +7,16 @@ The CPU tests use explicit contract stubs, not a vLLM installation or running en
 The source contract is the installed vLLM 0.31.0 ROCm image
 `sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f`.
 Its scheduler interface is not stable. The two entry classes preserve the actual
-`Scheduler` and `AsyncScheduler` parents. `observer_class_for` mirrors the native
-default choice only after `VllmConfig` has resolved `async_scheduling` to a bool;
-it does not resolve auto configuration or support a different custom scheduler.
+`Scheduler` and `AsyncScheduler` parents. Explicit entry-module import first checks
+the hashes of ten installed source files before importing backend classes.
+Already-loaded critical modules must match that root through both file and spec
+origins; both parent classes must belong to their exact native modules.
+`observer_class_for_config` calls the actual native class selector after full
+configuration/platform resolution, then matches exact class identity. Custom and
+diffusion schedulers are unsupported; an input bool is not selection evidence.
 The constructor marks a class/config mismatch unknown without changing that config.
+No worker uses this helper yet. Passing a custom scheduler CLI flag too early
+would suppress native diffusion selection, so it is not an integration shortcut.
 
 Each hook delegates once, returns the native result and propagates native errors.
 `finish_requests_return` records only the returned requests' actual statuses.
@@ -41,6 +47,13 @@ For a future explicitly configured worker, the JSONL sink needs an existing
 variables (each prefixed with `SMG_PD_TRACE_`; role is prefill or decode).
 Files are unique per scheduler process/instance. No default directory is created.
 Synchronous trace I/O has not been measured against real scheduling races.
+
+`RequestIdentity` creates one explicit client header per request. Its admission
+matcher binds run/attempt and an actual worker/role/instance, preserves the full
+internal ID, and requires the pinned single-prompt chat suffix format. P/D IDs and
+retry IDs remain separate. This helper neither proves all workers/attempts were
+observed nor accepts cancellation; multi-prompt, n>1 and disabled randomization
+are outside its contract. No existing request, worker environment or PYTHONPATH is changed.
 
 Before fixture integration: verify the exact source hashes and child import path,
 the original resolved scheduler class/config, per-worker trace completeness and

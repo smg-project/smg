@@ -30,6 +30,7 @@ class SchedulerObserverMixin:
             return {
                 "async_scheduling": actual,
                 "mro": [f"{cls.__module__}.{cls.__qualname__}" for cls in type(self).__mro__],
+                "source_contract": getattr(self, "_observer_source_contract", None),
             }
 
         self._observe("startup", startup)
