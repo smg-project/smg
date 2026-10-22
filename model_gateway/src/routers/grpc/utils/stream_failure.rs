@@ -1411,9 +1411,10 @@ mod tests {
         assert_eq!(failure.error_type(), INTERNAL_ERROR_TYPE);
         assert_eq!(failure.messages_error_type(), MESSAGES_API_ERROR_TYPE);
         assert_eq!(failure.code(), Some(READER_PANICKED_CODE));
+        // The client's text names the failure; the message is the log line's.
         assert_eq!(
             failure.to_string(),
-            "the gateway's reader of the response panicked: the reader slipped"
+            "the gateway's reader of the response panicked"
         );
         assert!(failure.class().is_none());
         // Accounted: the table's outcome, nothing of the worker's record.

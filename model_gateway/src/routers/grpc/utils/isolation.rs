@@ -21,7 +21,12 @@
 //! quotes the bytes it indexed (`byte index 7 is out of bounds of `...``),
 //! which are model output and may carry the user's data, so every span
 //! between backticks is elided and the message is cut to
-//! [`MESSAGE_SHOWN`] bytes. The hook's line on stderr keeps the full text,
+//! [`MESSAGE_SHOWN`] bytes. The sanitization is best effort: it knows the
+//! shapes the standard library's panics have, and the line is the
+//! operator's log, never the client's. The text a client reads, on the HTTP
+//! error body and on the SSE error event alike, says only that the
+//! gateway's reader of the response panicked, under the code; nothing of
+//! the message reaches it. The hook's line on stderr keeps the full text,
 //! as it did.
 //!
 //! The cost in the common case: one landing pad per request (a whole
@@ -49,7 +54,9 @@ const MESSAGE_SHOWN: usize = 256;
 /// process; unset in every other one.
 pub(crate) const TEST_TRAP_VAR: &str = "SMG_TEST_READER_PANIC_ON";
 
-/// A request whose reading panicked, caught at the request's boundary.
+/// A request whose reading panicked, caught at the request's boundary. Its
+/// `Display` is the text a client reads: the failure named, without the
+/// panic's message, which is the log line's ([`Panicked::record`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Panicked {
     /// The panic's message, sanitized ([`sanitized`]).
@@ -101,11 +108,7 @@ impl Panicked {
 
 impl fmt::Display for Panicked {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "the gateway's reader of the response panicked: {}",
-            self.message
-        )
+        f.write_str("the gateway's reader of the response panicked")
     }
 }
 
@@ -288,12 +291,11 @@ mod tests {
             "{}",
             panicked.message()
         );
+        // The client's text names the failure alone; the message is the log
+        // line's.
         assert_eq!(
             panicked.to_string(),
-            format!(
-                "the gateway's reader of the response panicked: {}",
-                panicked.message()
-            )
+            "the gateway's reader of the response panicked"
         );
     }
 }

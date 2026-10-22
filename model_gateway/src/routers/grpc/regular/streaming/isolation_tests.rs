@@ -68,8 +68,9 @@ async fn sse_payloads(body: Body) -> Vec<String> {
         .collect()
 }
 
-/// The JSON body of a 500 under `reader_panicked`, with the message in words;
-/// the answer is final (the pipeline retries it on no worker).
+/// The JSON body of a 500 under `reader_panicked`, the failure named and
+/// nothing of the panic's message in it; the answer is final (the pipeline
+/// retries it on no worker).
 async fn reader_panicked_body(response: Response) -> Value {
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert!(
@@ -81,11 +82,9 @@ async fn reader_panicked_body(response: Response) -> Value {
         .expect("the body");
     let body: Value = serde_json::from_slice(&bytes).expect("a JSON body");
     assert_eq!(body["error"]["code"], READER_PANICKED_CODE, "{body}");
-    let message = body["error"]["message"].as_str().expect("a message");
-    assert!(
-        message.starts_with("the gateway's reader of the response panicked: ")
-            && !message.contains(MARKER),
-        "{message}"
+    assert_eq!(
+        body["error"]["message"], "the gateway's reader of the response panicked",
+        "{body}"
     );
     body
 }
@@ -143,11 +142,10 @@ async fn a_reader_panic_ends_the_chat_stream_with_an_error_event_and_done() {
     let error: Value = serde_json::from_str(error).expect("the error event");
     assert_eq!(error["error"]["type"], "internal_error", "{error}");
     assert_eq!(error["error"]["code"], READER_PANICKED_CODE, "{error}");
-    let message = error["error"]["message"].as_str().expect("a message");
-    assert!(
-        message.starts_with("the gateway's reader of the response panicked: ")
-            && !message.contains(MARKER),
-        "{message}"
+    // The event names the failure; the panic's message is the log line's.
+    assert_eq!(
+        error["error"]["message"], "the gateway's reader of the response panicked",
+        "{error}"
     );
     assert_counted_once(&scrape);
     assert!(logs_contain(
@@ -192,6 +190,7 @@ async fn a_reader_panic_answers_the_whole_chat_with_a_500_under_its_code() {
     assert!(!logs_contain(MARKER));
 }
 
+#[tracing_test::traced_test]
 #[tokio::test]
 async fn a_reader_panic_ends_the_messages_stream_with_its_error_event() {
     arm_test_trap(MARKER);
@@ -222,13 +221,14 @@ async fn a_reader_panic_ends_the_messages_stream_with_its_error_event() {
         serde_json::from_str(payloads.last().expect("an event")).expect("the error event");
     assert_eq!(last["type"], "error", "{last}");
     assert_eq!(last["error"]["type"], "api_error", "{last}");
-    let message = last["error"]["message"].as_str().expect("a message");
-    assert!(
-        message.starts_with("the gateway's reader of the response panicked: ")
-            && !message.contains(MARKER),
-        "{message}"
+    // The event names the failure; the panic's message is the log line's.
+    assert_eq!(
+        last["error"]["message"], "the gateway's reader of the response panicked",
+        "{last}"
     );
     assert_counted_once(&scrape);
+    assert!(logs_contain("panic.message="));
+    assert!(!logs_contain(MARKER));
 }
 
 #[tokio::test]
