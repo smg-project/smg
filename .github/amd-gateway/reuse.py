@@ -181,6 +181,7 @@ def load_budget():
 
 def main():
     inputs = json.loads(INPUTS.read_text())
+    require(inputs["ready"], "gateway diagnostic not admitted")
     budget = load_budget()
     require(
         inputs["artifacts_pinned"] and len(inputs["artifacts"]) == 4, "fresh artifacts not pinned"

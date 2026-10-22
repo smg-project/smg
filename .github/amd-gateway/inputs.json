@@ -3,8 +3,69 @@
   "run_attempt": 1,
   "producer_sha": "34ac557ba0775adda864e7d4446bf10127f6014c",
   "build_job_id": 120090754433,
-  "artifacts_pinned": false,
-  "artifacts": [],
+  "artifacts_pinned": true,
+  "artifacts": [
+    {
+      "id": 12460934881,
+      "name": "build-provenance",
+      "bytes": 1247,
+      "sha256": "c13bb82ab7accad1a5837c96545274a8790f7a2ebfce15166ae22e9183ca8310",
+      "expires_at": "2026-10-29T21:52:16Z",
+      "destination": "diagnostic-results",
+      "files": {
+        "build-provenance.json": {
+          "bytes": 2220,
+          "sha256": "440235ed88917afed9f8720a38b22ed94b3dced2821382cbfcf1064e5183f6a2"
+        }
+      }
+    },
+    {
+      "id": 12460804756,
+      "name": "smg-wheel",
+      "bytes": 52324704,
+      "sha256": "f052605ff74c1081ff5325eae9efb8ee19f0747afa1f304ccec620d643e02523",
+      "expires_at": "2026-10-23T21:50:58Z",
+      "destination": "wheel",
+      "files": {
+        "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
+          "bytes": 52466364,
+          "sha256": "55df4228c9bdd5c1f0a3ff72c7895782fe8621fa58a083ebd452a027c7ab6394"
+        }
+      }
+    },
+    {
+      "id": 12460738509,
+      "name": "python-client-types",
+      "bytes": 34373,
+      "sha256": "99aa694c021c5ad94c8cc1bd86486401339c0408417d8a259afd14cc106e317f",
+      "expires_at": "2026-10-23T21:51:02Z",
+      "destination": "clients/python/smg_client/types",
+      "files": {
+        "_generated.py": {
+          "bytes": 187180,
+          "sha256": "581f029ca2b6f903ef7b58f6221579e8fc9b22bff52595152a9656565e5d84aa"
+        }
+      }
+    },
+    {
+      "id": 12461751486,
+      "name": "wasm-test-fixtures",
+      "bytes": 56596,
+      "sha256": "bdb1c8b94c845ec7d6afb51508e7678dbade5e76ba85ffe42f4a46835c6ab95b",
+      "expires_at": "2026-10-23T21:51:03Z",
+      "destination": "crates/wasm/tests/fixtures",
+      "files": {
+        "storage_hook_guest.wasm": {
+          "bytes": 80680,
+          "sha256": "f7ab4cb2fefa9384f80b3332baa8b3120ca19a994edb1ea3ef50ccf7b76c2117"
+        },
+        "storage_hook_passthrough.wasm": {
+          "bytes": 79153,
+          "sha256": "6481ba6c503dba3a23d38a46cc4387fa16c457131c2072fa660e68112e936a78"
+        }
+      }
+    }
+  ],
   "source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
     "Cargo.toml": "7acfd64653b69c8db7490ae1fc42ce48a3053801",
@@ -51,5 +112,6 @@
   "consumer_setup_core_minutes": 25,
   "cleanup_reserved_minutes": 5,
   "producer_full_closure_success_required": true,
-  "producer_branch": "codex/amd-combined-closure-e915-20261022"
+  "producer_branch": "codex/amd-combined-closure-e915-20261022",
+  "ready": false
 }
