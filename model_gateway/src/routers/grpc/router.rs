@@ -154,9 +154,8 @@ impl GrpcRouter {
             ctx.rate_limit_manager.clone(),
             queue_timeout,
         );
-        // Deps for the parser-free endpoints (completion/embeddings/classify).
-        // Only completion's stage list actually reads `rate_limit_manager`;
-        // embeddings/classify never insert `RateLimitReserveStage`.
+        // Deps for the parser-free endpoints (completion/embeddings/classify/
+        // decisions/transcription).
         let pair_deps = PipelineDeps::pair(
             worker_registry.clone(),
             policy_registry.clone(),
@@ -295,9 +294,9 @@ impl GrpcRouter {
     /// model's retry config (keyed by the canonical id, see
     /// [`Self::resolve_retry_config_for_canonical`]), `run` with those and
     /// the id, then the close of a reservation a non-2xx answer never
-    /// settled. The routes that reserve nothing call their pipelines
-    /// directly; the reserve stage's doc (`common/stages/rate_limit.rs`)
-    /// names the endpoints that opt in and the ones that do not.
+    /// settled. Every typed route runs its pipeline through here; the
+    /// Responses iterations, which reserve nothing today, call theirs
+    /// directly (see `common/stages/rate_limit.rs`).
     async fn execute_reserved<Fut>(
         &self,
         model_id: String,
@@ -713,15 +712,24 @@ impl GrpcRouter {
         };
         debug!("Processing embedding request for model: {}", model_id);
 
-        embedding_pipeline
-            .execute_embeddings(
-                Arc::new(body),
-                headers.cloned(),
-                model_id.to_string(),
-                self.shared_components.clone(),
-                Some(tenant_meta.clone()),
-            )
-            .await
+        // One dispatch, no retry loop, as before: the retry config the
+        // reserved execution resolves is not read here.
+        self.execute_reserved(
+            model_id.to_string(),
+            |model_id, rate_limit_cell, _retry_config| async move {
+                embedding_pipeline
+                    .execute_embeddings(
+                        Arc::new(body),
+                        headers.cloned(),
+                        model_id,
+                        self.shared_components.clone(),
+                        Some(tenant_meta.clone()),
+                        Some(rate_limit_cell),
+                    )
+                    .await
+            },
+        )
+        .await
     }
 
     /// Main route_messages implementation
@@ -1081,15 +1089,23 @@ impl GrpcRouter {
         };
         debug!("Processing classify request for model: {}", model_id);
 
-        classify_pipeline
-            .execute_classify(
-                Arc::new(body),
-                headers.cloned(),
-                model_id.to_string(),
-                self.shared_components.clone(),
-                Some(tenant_meta.clone()),
-            )
-            .await
+        // One dispatch, no retry loop, as before.
+        self.execute_reserved(
+            model_id.to_string(),
+            |model_id, rate_limit_cell, _retry_config| async move {
+                classify_pipeline
+                    .execute_classify(
+                        Arc::new(body),
+                        headers.cloned(),
+                        model_id,
+                        self.shared_components.clone(),
+                        Some(tenant_meta.clone()),
+                        Some(rate_limit_cell),
+                    )
+                    .await
+            },
+        )
+        .await
     }
 }
 
@@ -1233,16 +1249,24 @@ impl RouterTrait for GrpcRouter {
                 "Audio transcriptions not implemented",
             );
         };
-        pipeline
-            .execute_transcription(
-                Arc::new(body.clone()),
-                Arc::new(audio),
-                headers.cloned(),
-                model_id.to_string(),
-                Arc::clone(&self.shared_components),
-                Some(tenant_meta.clone()),
-            )
-            .await
+        // One dispatch, no retry loop, as before.
+        self.execute_reserved(
+            model_id.to_string(),
+            |model_id, rate_limit_cell, _retry_config| async move {
+                pipeline
+                    .execute_transcription(
+                        Arc::new(body.clone()),
+                        Arc::new(audio),
+                        headers.cloned(),
+                        model_id,
+                        Arc::clone(&self.shared_components),
+                        Some(tenant_meta.clone()),
+                        Some(rate_limit_cell),
+                    )
+                    .await
+            },
+        )
+        .await
     }
 
     async fn route_completion(

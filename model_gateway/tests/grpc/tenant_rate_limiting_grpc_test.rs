@@ -22,17 +22,31 @@
 use std::{sync::Arc, time::Duration};
 
 use common::grpc_harness::{
-    build_grpc_router, grpc_router_config, grpc_worker, serve_canned_worker, Canned,
+    grpc_router, grpc_router_config, grpc_test_context_with_tokenizer, grpc_worker,
+    serve_canned_worker, serve_engine, Canned,
+};
+use llm_tokenizer::{
+    traits::{MediaHandling, RendererCapabilities, Tokenizer},
+    MockTokenizer,
 };
 use openai_protocol::{
-    completion::CompletionRequest, generate::GenerateRequest, model_card::ModelCard,
+    classify::ClassifyRequest,
+    completion::CompletionRequest,
+    embedding::EmbeddingRequest,
+    generate::GenerateRequest,
+    model_card::ModelCard,
+    transcription::{AudioFile, TranscriptionRequest},
 };
 use smg::{
+    config::RouterConfig,
     middleware::TenantRequestMeta,
     routers::RouterTrait,
     tenant::TenantKey,
-    worker::{RuntimeType, WorkerType},
+    worker::{RuntimeType, Worker, WorkerType},
 };
+use smg_grpc_client::vllm_proto as proto;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::{Request, Response, Status};
 
 use crate::common;
 
@@ -54,19 +68,17 @@ async fn start_mock_grpc_worker(output_tokens: u32) -> u16 {
     .await
 }
 
-/// Build a real gRPC router with tenant rate limiting configured against a
-/// tiny in-memory budget, and a real mock gRPC worker registered. Returns
-/// the router and the config's backing tempdir (must outlive the call --
-/// the YAML is read synchronously during router construction, but keeping
-/// it bound for the caller's whole test avoids any doubt about timing).
+/// The router configuration of these tests: tenant rate limiting against a
+/// tiny in-memory budget when `tokens_per_minute` is given (1000 requests
+/// per minute, so the token budget alone decides), none otherwise. Returns
+/// the config and its backing tempdir (must outlive the call -- the YAML is
+/// read synchronously during router construction, but keeping it bound for
+/// the caller's whole test avoids any doubt about timing).
 #[expect(
     clippy::unwrap_used,
     reason = "test helper - panicking on failure is intentional"
 )]
-async fn build_router(
-    tokens_per_minute: Option<u32>,
-    grpc_port: u16,
-) -> (Box<dyn RouterTrait>, Option<tempfile::TempDir>) {
+fn router_config(tokens_per_minute: Option<u32>) -> (RouterConfig, Option<tempfile::TempDir>) {
     let mut builder = grpc_router_config()
         .regular_mode(vec![])
         .random_policy()
@@ -91,8 +103,28 @@ async fn build_router(
     } else {
         None
     };
+    (builder.build_unchecked(), dir)
+}
 
-    let config = builder.build_unchecked();
+/// A real gRPC router over `worker`, serving `model` with `tokenizer`, under
+/// [`router_config`].
+async fn build_router_over(
+    tokens_per_minute: Option<u32>,
+    worker: Arc<dyn Worker>,
+    model: &str,
+    tokenizer: Arc<dyn Tokenizer>,
+) -> (Box<dyn RouterTrait>, Option<tempfile::TempDir>) {
+    let (config, dir) = router_config(tokens_per_minute);
+    let app_context = grpc_test_context_with_tokenizer(config, model, tokenizer).await;
+    (grpc_router(&app_context, vec![worker]).await, dir)
+}
+
+/// Build a real gRPC router with tenant rate limiting configured against a
+/// tiny in-memory budget, and a real mock gRPC worker registered.
+async fn build_router(
+    tokens_per_minute: Option<u32>,
+    grpc_port: u16,
+) -> (Box<dyn RouterTrait>, Option<tempfile::TempDir>) {
     let worker = grpc_worker(
         grpc_port,
         WorkerType::Regular,
@@ -100,8 +132,13 @@ async fn build_router(
         ModelCard::new(MODEL),
     )
     .build();
-    let router = build_grpc_router(config, MODEL, vec![Arc::new(worker)]).await;
-    (router, dir)
+    build_router_over(
+        tokens_per_minute,
+        Arc::new(worker),
+        MODEL,
+        Arc::new(MockTokenizer::new()),
+    )
+    .await
 }
 
 #[expect(
@@ -277,5 +314,400 @@ async fn completion_denial_reaches_the_client() {
         response.status(),
         http::StatusCode::TOO_MANY_REQUESTS,
         "RateLimitReserveStage must be reachable through route_completion, not just route_generate"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Embeddings, classification and transcription take the same reservation.
+// ---------------------------------------------------------------------------
+
+/// An engine on the vLLM wire whose `Embed` answers every request with a
+/// two-dimensional vector and reports `prompt_tokens` -- or fails it with
+/// INTERNAL when `fail` is set. The generate side is unused.
+#[derive(Clone)]
+struct EmbedEngine {
+    prompt_tokens: u32,
+    fail: bool,
+}
+
+#[tonic::async_trait]
+impl proto::vllm_engine_server::VllmEngine for EmbedEngine {
+    type GenerateStream = ReceiverStream<Result<proto::GenerateResponse, Status>>;
+
+    async fn generate(
+        &self,
+        _request: Request<proto::GenerateRequest>,
+    ) -> Result<Response<Self::GenerateStream>, Status> {
+        Err(Status::unimplemented("unused in this test"))
+    }
+
+    async fn embed(
+        &self,
+        _request: Request<proto::EmbedRequest>,
+    ) -> Result<Response<proto::EmbedResponse>, Status> {
+        if self.fail {
+            return Err(Status::internal("embed-test induced engine failure"));
+        }
+        Ok(Response::new(proto::EmbedResponse {
+            embedding: vec![0.25, 0.75],
+            prompt_tokens: self.prompt_tokens,
+            embedding_dim: 2,
+        }))
+    }
+
+    async fn abort(
+        &self,
+        _request: Request<proto::AbortRequest>,
+    ) -> Result<Response<proto::AbortResponse>, Status> {
+        Ok(Response::new(proto::AbortResponse::default()))
+    }
+
+    async fn flush_cache(
+        &self,
+        _request: Request<smg_grpc_client::common_proto::FlushCacheRequest>,
+    ) -> Result<Response<smg_grpc_client::common_proto::FlushCacheResponse>, Status> {
+        Ok(Response::new(
+            smg_grpc_client::common_proto::FlushCacheResponse::default(),
+        ))
+    }
+
+    async fn health_check(
+        &self,
+        _request: Request<proto::HealthCheckRequest>,
+    ) -> Result<Response<proto::HealthCheckResponse>, Status> {
+        Ok(Response::new(proto::HealthCheckResponse {
+            healthy: true,
+            ..Default::default()
+        }))
+    }
+
+    async fn get_model_info(
+        &self,
+        _request: Request<proto::GetModelInfoRequest>,
+    ) -> Result<Response<proto::GetModelInfoResponse>, Status> {
+        Ok(Response::new(proto::GetModelInfoResponse::default()))
+    }
+
+    async fn get_server_info(
+        &self,
+        _request: Request<proto::GetServerInfoRequest>,
+    ) -> Result<Response<proto::GetServerInfoResponse>, Status> {
+        Ok(Response::new(proto::GetServerInfoResponse::default()))
+    }
+
+    async fn get_loads(
+        &self,
+        _request: Request<proto::GetLoadsRequest>,
+    ) -> Result<Response<proto::GetLoadsResponse>, Status> {
+        Ok(Response::new(proto::GetLoadsResponse::default()))
+    }
+
+    type GetTokenizerStream =
+        ReceiverStream<Result<smg_grpc_client::common_proto::GetTokenizerChunk, Status>>;
+
+    async fn get_tokenizer(
+        &self,
+        _request: Request<smg_grpc_client::common_proto::GetTokenizerRequest>,
+    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
+        Err(Status::unimplemented("unused in this test"))
+    }
+
+    type SubscribeKvEventsStream =
+        ReceiverStream<Result<smg_grpc_client::common_proto::KvEventBatch, Status>>;
+
+    async fn subscribe_kv_events(
+        &self,
+        _request: Request<smg_grpc_client::common_proto::SubscribeKvEventsRequest>,
+    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
+        Err(Status::unimplemented("unused in this test"))
+    }
+}
+
+/// A router over one [`EmbedEngine`] serving [`MODEL`] on the vLLM wire.
+async fn build_embed_router(
+    tokens_per_minute: Option<u32>,
+    engine: EmbedEngine,
+) -> (Box<dyn RouterTrait>, Option<tempfile::TempDir>) {
+    let port = serve_engine(proto::vllm_engine_server::VllmEngineServer::new(engine)).await;
+    let worker = grpc_worker(
+        port,
+        WorkerType::Regular,
+        RuntimeType::Vllm,
+        ModelCard::new(MODEL),
+    )
+    .build();
+    build_router_over(
+        tokens_per_minute,
+        Arc::new(worker),
+        MODEL,
+        Arc::new(MockTokenizer::new()),
+    )
+    .await
+}
+
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn embeddings_request() -> EmbeddingRequest {
+    serde_json::from_value(serde_json::json!({
+        "model": MODEL,
+        "input": PROMPT_TEXT,
+    }))
+    .unwrap()
+}
+
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+fn classify_request() -> ClassifyRequest {
+    serde_json::from_value(serde_json::json!({
+        "model": MODEL,
+        "input": PROMPT_TEXT,
+    }))
+    .unwrap()
+}
+
+/// The model id of the transcription cases: a name the one transcription
+/// family recognises, served by the canned mock worker (a transcription is a
+/// chat-shaped generation to the engine).
+const ASR_MODEL: &str = "qwen3-asr-tenant-rl-test-model";
+
+/// A router over the canned mock worker serving [`ASR_MODEL`]. Its mock
+/// tokenizer renders media as template text, so the audio turn needs no
+/// media processing and the rendered prompt's tokens are the words of the
+/// caller's prompt: "Hello world" = the 2-token reserve estimate again. The
+/// canned answer's ids (100 up) are given words, so the transcript is text.
+async fn build_transcription_router(
+    tokens_per_minute: Option<u32>,
+    output_tokens: u32,
+) -> (Box<dyn RouterTrait>, Option<tempfile::TempDir>) {
+    let port = serve_canned_worker(Canned {
+        model: ASR_MODEL,
+        gen_delay: Duration::ZERO,
+        output_tokens,
+    })
+    .await;
+    let worker = grpc_worker(
+        port,
+        WorkerType::Regular,
+        RuntimeType::TokenSpeed,
+        ModelCard::new(ASR_MODEL),
+    )
+    .build();
+    let tokenizer = MockTokenizer::new()
+        .with_renderer_capabilities(RendererCapabilities {
+            media_handling: MediaHandling::TemplateText,
+            ..RendererCapabilities::default()
+        })
+        .with_tokens(&[
+            ("spoken", 100),
+            ("words", 101),
+            ("heard", 102),
+            ("here", 103),
+        ]);
+    build_router_over(
+        tokens_per_minute,
+        Arc::new(worker),
+        ASR_MODEL,
+        Arc::new(tokenizer),
+    )
+    .await
+}
+
+/// The status of `response` and, for the failure message, its body.
+async fn status_and_body(response: axum::response::Response) -> (http::StatusCode, String) {
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap_or_default();
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// One transcription of a few bytes of audio, with [`PROMPT_TEXT`] as the
+/// caller's prompt.
+async fn transcribe(router: &dyn RouterTrait) -> axum::response::Response {
+    let request = TranscriptionRequest {
+        model: ASR_MODEL.to_string(),
+        prompt: Some(PROMPT_TEXT.to_string()),
+        ..Default::default()
+    };
+    let audio = AudioFile {
+        bytes: bytes::Bytes::from_static(b"not real audio"),
+        file_name: "clip.wav".to_string(),
+        content_type: Some("audio/wav".to_string()),
+    };
+    router
+        .route_audio_transcriptions(None, &fresh_tenant(), &request, audio, ASR_MODEL)
+        .await
+}
+
+/// The impossible-budget proof of `completion_denial_reaches_the_client`
+/// through the embeddings endpoint: the reserve stage is live on it.
+#[tokio::test]
+async fn embeddings_denial_reaches_the_client() {
+    let (router, _dir) = build_embed_router(
+        Some(1),
+        EmbedEngine {
+            prompt_tokens: 1,
+            fail: false,
+        },
+    )
+    .await;
+
+    let response = router
+        .route_embeddings(None, &fresh_tenant(), embeddings_request(), MODEL)
+        .await;
+    assert_eq!(
+        response.status(),
+        http::StatusCode::TOO_MANY_REQUESTS,
+        "RateLimitReserveStage must be reachable through route_embeddings"
+    );
+}
+
+/// The same through the classification endpoint.
+#[tokio::test]
+async fn classify_denial_reaches_the_client() {
+    let (router, _dir) = build_embed_router(
+        Some(1),
+        EmbedEngine {
+            prompt_tokens: 1,
+            fail: false,
+        },
+    )
+    .await;
+
+    let response = router
+        .route_classify(None, &fresh_tenant(), classify_request(), MODEL)
+        .await;
+    assert_eq!(
+        response.status(),
+        http::StatusCode::TOO_MANY_REQUESTS,
+        "RateLimitReserveStage must be reachable through route_classify"
+    );
+}
+
+/// The same through the transcription endpoint.
+#[tokio::test]
+async fn transcription_denial_reaches_the_client() {
+    let (router, _dir) = build_transcription_router(Some(1), 4).await;
+
+    let response = transcribe(router.as_ref()).await;
+    assert_eq!(
+        response.status(),
+        http::StatusCode::TOO_MANY_REQUESTS,
+        "RateLimitReserveStage must be reachable through route_audio_transcriptions"
+    );
+}
+
+/// An embeddings answer settles the prompt count the engine reports, as a
+/// generate answer settles its usage. Budget 6: the request reserves its
+/// 2-token estimate and settles to the engine's 5, leaving 1; the second
+/// request's 2-token reserve is denied. Had the settlement not run, 4 would
+/// remain and the second request would be admitted.
+#[tokio::test]
+async fn embeddings_settle_the_engine_prompt_count() {
+    let (router, _dir) = build_embed_router(
+        Some(6),
+        EmbedEngine {
+            prompt_tokens: 5,
+            fail: false,
+        },
+    )
+    .await;
+
+    let first = router
+        .route_embeddings(None, &fresh_tenant(), embeddings_request(), MODEL)
+        .await;
+    assert_eq!(first.status(), http::StatusCode::OK);
+
+    let second = router
+        .route_embeddings(None, &fresh_tenant(), embeddings_request(), MODEL)
+        .await;
+    assert_eq!(
+        second.status(),
+        http::StatusCode::TOO_MANY_REQUESTS,
+        "the first answer's 5 prompt tokens must have been settled, not the 2-token estimate"
+    );
+}
+
+/// The same settlement through the classification endpoint.
+#[tokio::test]
+async fn classify_settles_the_engine_prompt_count() {
+    let (router, _dir) = build_embed_router(
+        Some(6),
+        EmbedEngine {
+            prompt_tokens: 5,
+            fail: false,
+        },
+    )
+    .await;
+
+    let first = router
+        .route_classify(None, &fresh_tenant(), classify_request(), MODEL)
+        .await;
+    assert_eq!(first.status(), http::StatusCode::OK);
+
+    let second = router
+        .route_classify(None, &fresh_tenant(), classify_request(), MODEL)
+        .await;
+    assert_eq!(
+        second.status(),
+        http::StatusCode::TOO_MANY_REQUESTS,
+        "the first answer's 5 prompt tokens must have been settled, not the 2-token estimate"
+    );
+}
+
+/// A transcription settles the engine's counts of its generation, as a chat
+/// answer does: the canned worker reports prompt_tokens 1 and 4 completion
+/// tokens, so budget 6 holds the first request (reserve 2, settle 5, 1 left)
+/// and refuses the second.
+#[tokio::test]
+async fn transcription_settles_the_engine_counts() {
+    let (router, _dir) = build_transcription_router(Some(6), 4).await;
+
+    let (status, body) = status_and_body(transcribe(router.as_ref()).await).await;
+    assert_eq!(status, http::StatusCode::OK, "{body}");
+
+    let second = transcribe(router.as_ref()).await;
+    assert_eq!(
+        second.status(),
+        http::StatusCode::TOO_MANY_REQUESTS,
+        "the transcript's 1 + 4 tokens must have been settled, not the 2-token estimate"
+    );
+}
+
+/// An embeddings request the engine fails keeps its reservation's debit, as
+/// a failed chat request does (the router closes the reservation unsettled).
+/// Budget 3: the failed request's 2-token estimate stays debited, so the
+/// second request's 2-token reserve is denied; a refund would admit it.
+#[tokio::test]
+async fn a_failed_embeddings_request_keeps_its_reservation_debit() {
+    let (router, _dir) = build_embed_router(
+        Some(3),
+        EmbedEngine {
+            prompt_tokens: 1,
+            fail: true,
+        },
+    )
+    .await;
+
+    let first = router
+        .route_embeddings(None, &fresh_tenant(), embeddings_request(), MODEL)
+        .await;
+    assert!(
+        first.status().is_server_error(),
+        "the engine's failure reaches the client, got {}",
+        first.status()
+    );
+
+    let second = router
+        .route_embeddings(None, &fresh_tenant(), embeddings_request(), MODEL)
+        .await;
+    assert_eq!(
+        second.status(),
+        http::StatusCode::TOO_MANY_REQUESTS,
+        "a failed request's reservation keeps its debit"
     );
 }

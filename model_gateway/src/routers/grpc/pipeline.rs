@@ -121,8 +121,8 @@ pub(crate) struct PipelineDeps {
     reasoning_parser_factory: ReasoningParserFactory,
     configured_tool_parser: Option<String>,
     configured_reasoning_parser: Option<String>,
-    /// `None` when tenant rate limiting is disabled; read only by the
-    /// endpoints that insert `RateLimitReserveStage` (chat/messages/completion/harmony).
+    /// `None` when tenant rate limiting is disabled; read by the
+    /// `RateLimitReserveStage` of every endpoint.
     rate_limit_manager: Option<Arc<RateLimitManager>>,
     /// `--queue-timeout-secs`: a request still ahead of worker selection this
     /// long after the gateway accepted it is refused instead of dispatched.
@@ -256,9 +256,9 @@ impl PipelineDeps {
 /// process stage on the request-free [`DispatchContext`].
 struct PipelineStages {
     preparation: Box<dyn PipelineStage>,
-    /// `None` for endpoints that haven't opted into tenant rate limiting
-    /// (embeddings/classify).
-    rate_limit: Option<RateLimitReserveStage>,
+    /// The tenant's reservation, taken once per logical request by every
+    /// endpoint (a no-op while tenant rate limiting is off).
+    rate_limit: RateLimitReserveStage,
     worker_selection: WorkerSelectionStage,
     /// EPD-only encode planning/staging.
     encode: Option<EncodeStage>,
@@ -317,7 +317,7 @@ impl RequestPipeline {
         let plan_kind = mode.plan_kind();
         let inject_pd_metadata = mode.inject_pd_metadata();
         let encode = matches!(mode, Mode::EncodePrefillDecode).then(EncodeStage::new);
-        let rate_limit = || RateLimitReserveStage::new(deps.rate_limit_manager.clone());
+        let rate_limit = RateLimitReserveStage::new(deps.rate_limit_manager.clone());
 
         let stages = match endpoint {
             Endpoint::Decisions => {
@@ -326,7 +326,7 @@ impl RequestPipeline {
                 }
                 PipelineStages {
                     preparation: Box::new(DecisionsPreparationStage),
-                    rate_limit: Some(rate_limit()),
+                    rate_limit,
                     worker_selection,
                     encode: None,
                     request_building: Box::new(DecisionsRequestBuildingStage),
@@ -339,7 +339,7 @@ impl RequestPipeline {
                     preparation: Box::new(ChatGeneratePreparationStage::new(
                         mode.multimodal_wire_pools(),
                     )),
-                    rate_limit: Some(rate_limit()),
+                    rate_limit,
                     worker_selection,
                     encode,
                     request_building: Box::new(ChatGenerateRequestBuildingStage::new(
@@ -358,7 +358,7 @@ impl RequestPipeline {
                     preparation: Box::new(MessagePreparationStage::new(
                         mode.multimodal_wire_pools(),
                     )),
-                    rate_limit: Some(rate_limit()),
+                    rate_limit,
                     worker_selection,
                     encode,
                     request_building: Box::new(MessageRequestBuildingStage::new(
@@ -376,7 +376,7 @@ impl RequestPipeline {
                 let (processor, streaming_processor) = PipelineDeps::default_processors(backend);
                 PipelineStages {
                     preparation: Box::new(CompletionPreparationStage),
-                    rate_limit: Some(rate_limit()),
+                    rate_limit,
                     worker_selection,
                     encode,
                     request_building: Box::new(CompletionRequestBuildingStage::new(
@@ -396,7 +396,7 @@ impl RequestPipeline {
                 }
                 PipelineStages {
                     preparation: Box::new(harmony::stages::HarmonyPreparationStage::new()),
-                    rate_limit: Some(rate_limit()),
+                    rate_limit,
                     worker_selection,
                     encode: None,
                     request_building: Box::new(harmony::stages::HarmonyRequestBuildingStage::new(
@@ -415,7 +415,7 @@ impl RequestPipeline {
                 }
                 PipelineStages {
                     preparation: Box::new(EmbeddingPreparationStage::new()),
-                    rate_limit: None,
+                    rate_limit,
                     worker_selection,
                     encode: None,
                     request_building: Box::new(EmbeddingRequestBuildingStage::new()),
@@ -429,7 +429,7 @@ impl RequestPipeline {
                 }
                 PipelineStages {
                     preparation: Box::new(EmbeddingPreparationStage::new()),
-                    rate_limit: None,
+                    rate_limit,
                     worker_selection,
                     encode: None,
                     request_building: Box::new(EmbeddingRequestBuildingStage::new()),
@@ -445,9 +445,7 @@ impl RequestPipeline {
                 let (processor, _streaming) = PipelineDeps::default_processors(backend);
                 PipelineStages {
                     preparation: Box::new(TranscriptionPreparationStage),
-                    // Whole-file transcription was never tenant rate-limited on
-                    // the old wrapping path; keep that.
-                    rate_limit: None,
+                    rate_limit,
                     worker_selection,
                     encode: None,
                     // Regular-only: no PD metadata, single-plan (see the stage).
@@ -504,9 +502,10 @@ impl RequestPipeline {
             stages.preparation.name(),
             stages.preparation.execute(ctx).await
         )?;
-        if let Some(rate_limit) = &stages.rate_limit {
-            step!(rate_limit.name(), rate_limit.execute(ctx).await)?;
-        }
+        step!(
+            stages.rate_limit.name(),
+            stages.rate_limit.execute(ctx).await
+        )?;
         step!(
             stages.worker_selection.name(),
             stages.worker_selection.execute(ctx).await
@@ -1017,25 +1016,15 @@ impl RequestPipeline {
     pub(in crate::routers::grpc) fn generate_settlement(
         responses: &[GenerateResponse],
     ) -> UsageSettlement {
+        TokenCounts::of_generated(responses).settlement()
+    }
+
+    /// The settlement of an embeddings or classification answer: the prompt
+    /// tokens the engine counted, no completion.
+    pub(in crate::routers::grpc) fn prompt_only_settlement(prompt_tokens: u32) -> UsageSettlement {
         UsageSettlement {
-            actual_input_tokens: responses
-                .iter()
-                .map(|r| r.meta_info.prompt_tokens)
-                .max()
-                .unwrap_or(0),
-            completion_tokens: responses
-                .iter()
-                .map(|r| r.meta_info.completion_tokens)
-                .sum(),
-            cached_input_tokens: responses
-                .iter()
-                .map(|r| r.meta_info.cached_tokens)
-                .max()
-                .unwrap_or(0),
-            reasoning_tokens: responses
-                .iter()
-                .map(|r| r.meta_info.reasoning_tokens.unwrap_or(0))
-                .sum(),
+            actual_input_tokens: prompt_tokens,
+            ..UsageSettlement::default()
         }
     }
 
@@ -1341,17 +1330,26 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_EMBEDDINGS;
         let run = {
             let mut ctx = RequestContext::for_embedding(request, headers, model_id, components);
             ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), None)
         };
         match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Embedding(response)) => {
+                    // The prompt tokens the engine counted; an embedding has
+                    // no completion.
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        Self::prompt_only_settlement(response.usage.prompt_tokens),
+                    )
+                    .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
@@ -1369,6 +1367,10 @@ impl RequestPipeline {
     }
 
     /// Execute the complete pipeline for an audio transcription request.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "matches the rate-limited endpoint entry contract"
+    )]
     pub async fn execute_transcription(
         &self,
         request: Arc<openai_protocol::transcription::TranscriptionRequest>,
@@ -1377,6 +1379,7 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
     ) -> Response {
         // Same label the HTTP layer records for /v1/audio/transcriptions, so
         // the endpoint's metrics don't split across backends.
@@ -1385,12 +1388,20 @@ impl RequestPipeline {
             let mut ctx =
                 RequestContext::for_transcription(request, audio, headers, model_id, components);
             ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), None)
         };
         match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Transcription { text, format }) => {
+                    // The engine's counts of the transcript's generation, as
+                    // the response stage recorded them.
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        Self::recorded_settlement(&dctx.response),
+                    )
+                    .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(
                         &dctx,
@@ -1420,17 +1431,26 @@ impl RequestPipeline {
         model_id: String,
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
+        rate_limit_cell: Option<Arc<RateLimitCell>>,
     ) -> Response {
         const ENDPOINT: &str = metrics_labels::ENDPOINT_CLASSIFY;
         let run = {
             let mut ctx = RequestContext::for_classify(request, headers, model_id, components);
             ctx.input.tenant_request_meta = tenant_request_meta;
+            ctx.input.rate_limit_cell = rate_limit_cell;
             self.run(ctx, Some(ENDPOINT), None)
         };
         match run.await {
             Ok(RunOutcome::Early(response)) => response,
             Ok(RunOutcome::Final(mut dctx, start)) => match dctx.response.final_response.take() {
                 Some(FinalResponse::Classify(response)) => {
+                    // The prompt tokens the engine counted; a classification
+                    // has no completion.
+                    Self::settle_reservation(
+                        dctx.rate_limit_cell.as_deref(),
+                        Self::prompt_only_settlement(response.usage.prompt_tokens),
+                    )
+                    .await;
                     self.record_duration(ENDPOINT, &dctx.model_id, start);
                     Self::routed_response(&dctx, axum::Json(response).into_response())
                 }
@@ -1721,9 +1741,8 @@ impl RequestPipeline {
     /// per-mode args and optional stages need freezing.
     fn signature(&self) -> String {
         format!(
-            "{}|rate_limit={}|encode={}|{}",
+            "{}|encode={}|{}",
             self.stages.worker_selection.signature(),
-            self.stages.rate_limit.is_some(),
             self.stages.encode.is_some(),
             self.stages.request_building.signature(),
         )
@@ -1771,16 +1790,10 @@ mod build_parity_tests {
             Endpoint::Transcription => "TranscriptionRequestBuildingStage".to_string(),
             Endpoint::Decisions => "DecisionsRequestBuildingStage".to_string(),
         };
-        let rate_limit = !matches!(
-            endpoint,
-            Endpoint::Embeddings | Endpoint::Classify | Endpoint::Transcription
-        );
         // Harmony never carries the encode stage.
         let encode = encode && !matches!(endpoint, Endpoint::Harmony);
         (
-            format!(
-                "WorkerSelectionStage({selection})|rate_limit={rate_limit}|encode={encode}|{build}"
-            ),
+            format!("WorkerSelectionStage({selection})|encode={encode}|{build}"),
             backend,
         )
     }
@@ -4996,10 +5009,13 @@ mod request_release_tests {
 
 #[cfg(test)]
 mod rate_limit_reserve_tests {
+    use bytes::Bytes;
+    use llm_multimodal::registry::transcription::FAMILIES;
     use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
     use openai_protocol::{
         decisions::{DecisionInputTokensDetails, DecisionOutputTokensDetails},
         generate::{GenerateFinishReason, GenerateFinishType, GenerateMetaInfo, GenerateRequest},
+        transcription::{AudioFile, TranscriptionRequest},
     };
     use serde_json::json;
 
@@ -5007,7 +5023,10 @@ mod rate_limit_reserve_tests {
     use crate::{
         config::types::RouterConfig,
         rate_limit::{RateLimitManager, Reservation, ReserveRequest},
-        routers::grpc::regular::symphony::template::Templates,
+        routers::grpc::{
+            regular::symphony::template::Templates, spec::TranscriptionResponseFormat,
+            ProcessedMessages,
+        },
         tenant::TenantKey,
     };
 
@@ -5130,7 +5149,7 @@ mod rate_limit_reserve_tests {
 
     #[tokio::test]
     async fn endpoint_without_a_cell_is_a_no_op() {
-        // Responses/embeddings/classify don't set rate_limit_cell today.
+        // The Responses iterations set no rate_limit_cell.
         let manager = manager_with_tokens_per_minute(6);
         let components = test_components().await;
         let mut ctx = ctx_with_tokens(components, 5);
@@ -5327,6 +5346,154 @@ mod rate_limit_reserve_tests {
         assert_eq!(
             RequestPipeline::decisions_settlement(&beyond).actual_input_tokens,
             u32::MAX
+        );
+    }
+
+    fn with_tenant_and_cell(mut ctx: RequestContext) -> RequestContext {
+        ctx.input.tenant_request_meta = Some(TenantRequestMeta::new(TenantKey::new("test-tenant")));
+        ctx.input.rate_limit_cell = Some(Arc::new(RateLimitCell::new()));
+        ctx
+    }
+
+    /// An embeddings request after its preparation: `num_tokens` input tokens.
+    fn embedding_ctx(components: Arc<SharedComponents>, num_tokens: usize) -> RequestContext {
+        let request: EmbeddingRequest =
+            serde_json::from_value(json!({"model": MODEL, "input": "Hello"})).unwrap();
+        let mut ctx =
+            RequestContext::for_embedding(Arc::new(request), None, MODEL.to_string(), components);
+        ctx.state.preparation = Some(PreparationOutput::Embedding {
+            original_text: "Hello".to_string(),
+            token_ids: vec![0; num_tokens],
+        });
+        with_tenant_and_cell(ctx)
+    }
+
+    /// A classification request after its preparation, which it shares with
+    /// embeddings: `num_tokens` input tokens.
+    fn classify_ctx(components: Arc<SharedComponents>, num_tokens: usize) -> RequestContext {
+        let request: ClassifyRequest =
+            serde_json::from_value(json!({"model": MODEL, "input": "Hello"})).unwrap();
+        let mut ctx =
+            RequestContext::for_classify(Arc::new(request), None, MODEL.to_string(), components);
+        ctx.state.preparation = Some(PreparationOutput::Embedding {
+            original_text: "Hello".to_string(),
+            token_ids: vec![0; num_tokens],
+        });
+        with_tenant_and_cell(ctx)
+    }
+
+    /// A transcription request after its preparation: the chat-shaped
+    /// request the family's convention made, rendered to `num_tokens` tokens.
+    fn transcription_ctx(components: Arc<SharedComponents>, num_tokens: usize) -> RequestContext {
+        let request = TranscriptionRequest {
+            model: MODEL.to_string(),
+            ..Default::default()
+        };
+        let audio = AudioFile {
+            bytes: Bytes::from_static(b"not audio"),
+            file_name: "clip.wav".to_string(),
+            content_type: None,
+        };
+        let chat_request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": MODEL,
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .unwrap();
+        let mut ctx = RequestContext::for_transcription(
+            Arc::new(request),
+            Arc::new(audio),
+            None,
+            MODEL.to_string(),
+            components,
+        );
+        ctx.state.preparation = Some(PreparationOutput::Transcription {
+            token_ids: vec![0; num_tokens],
+            processed_messages: ProcessedMessages {
+                text: String::new(),
+                unbilled_prompt_tokens: 0,
+                continued_final_message: false,
+            },
+            chat_request: Arc::new(chat_request),
+            format: TranscriptionResponseFormat::Json,
+            family: FAMILIES[0],
+        });
+        with_tenant_and_cell(ctx)
+    }
+
+    /// The reservation of `endpoint`, as the chat endpoint takes it: the
+    /// estimate is the preparation's input token count; a budget that cannot
+    /// hold it refuses with the chat endpoint's 429, a budget that holds it
+    /// once admits the first request and refuses the second.
+    async fn assert_reserves_like_chat(
+        endpoint: &str,
+        make: fn(Arc<SharedComponents>, usize) -> RequestContext,
+    ) {
+        let components = test_components().await;
+
+        // Too small for one 5-token reservation.
+        let stage = RateLimitReserveStage::new(Some(manager_with_tokens_per_minute(3)));
+        let mut ctx = make(components.clone(), 5);
+        let response = stage.execute(&mut ctx).await.expect_err(endpoint);
+        assert_eq!(
+            response.status(),
+            http::StatusCode::TOO_MANY_REQUESTS,
+            "{endpoint}"
+        );
+        assert!(
+            matches!(
+                ctx.input.rate_limit_cell.as_ref().unwrap().peek(),
+                Some(RateLimitOutcome::Denied)
+            ),
+            "{endpoint}: the denial is cached on the cell"
+        );
+
+        // Room for one 5-token reservation, not two (5 + 5 > 6).
+        let stage = RateLimitReserveStage::new(Some(manager_with_tokens_per_minute(6)));
+        let mut first = make(components.clone(), 5);
+        assert!(stage.execute(&mut first).await.is_ok(), "{endpoint}");
+        assert!(
+            matches!(
+                first.input.rate_limit_cell.as_ref().unwrap().peek(),
+                Some(RateLimitOutcome::Admitted(_))
+            ),
+            "{endpoint}: the admission is cached on the cell"
+        );
+        let mut second = make(components, 5);
+        let response = stage.execute(&mut second).await.expect_err(endpoint);
+        assert_eq!(
+            response.status(),
+            http::StatusCode::TOO_MANY_REQUESTS,
+            "{endpoint}: the first request's tokens are debited"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_embeddings_request_reserves_its_input_tokens_like_a_chat_request() {
+        assert_reserves_like_chat("embeddings", embedding_ctx).await;
+    }
+
+    #[tokio::test]
+    async fn a_classify_request_reserves_its_input_tokens_like_a_chat_request() {
+        assert_reserves_like_chat("classify", classify_ctx).await;
+    }
+
+    #[tokio::test]
+    async fn a_transcription_request_reserves_its_prompt_tokens_like_a_chat_request() {
+        assert_reserves_like_chat("transcription", transcription_ctx).await;
+    }
+
+    /// Embeddings and classification settle the prompt tokens the engine
+    /// counted and nothing else.
+    #[test]
+    fn prompt_only_settlement_charges_the_prompt_alone() {
+        assert_eq!(
+            RequestPipeline::prompt_only_settlement(7),
+            UsageSettlement {
+                actual_input_tokens: 7,
+                completion_tokens: 0,
+                cached_input_tokens: 0,
+                reasoning_tokens: 0,
+            }
         );
     }
 }

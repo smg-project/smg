@@ -114,9 +114,9 @@ impl Drop for RateLimitCell {
 }
 
 /// Reserve tenant rate-limit budget once per logical request. No-ops when
-/// the feature is disabled (`manager: None`) or the calling endpoint hasn't
-/// opted in (`ctx.input.rate_limit_cell: None` -- Responses/embeddings/classify
-/// today).
+/// the feature is disabled (`manager: None`) or the caller set no cell
+/// (`ctx.input.rate_limit_cell: None` -- the Responses iterations today;
+/// every typed route sets one).
 pub(crate) struct RateLimitReserveStage {
     manager: Option<Arc<RateLimitManager>>,
 }
