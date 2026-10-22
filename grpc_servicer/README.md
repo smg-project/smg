@@ -440,13 +440,15 @@ prompt length up to the step, last, in an order whose every prefix is a
 uniform spread of the range, so a budget cut leaves an even coverage. Every
 request carries its own token ids, so prefix caching never hides a prefill,
 and the engine's prefix cache is flushed at the end. One INFO line per shape
-with its time; readiness (the gRPC health service, so the startup and
+with its time (a chunk remainder's at DEBUG, with an INFO progress line every
+500 remainders and one at their end); readiness (the gRPC health service, so the startup and
 readiness probes) stays NOT_SERVING until the pass ran, and flips SERVING
 whatever the pass returned (a failed request is a logged line, never a worker
 kept out of rotation). `SMG_VLLM_SERVICER_WARMUP` = `full` (the default:
 every 128-token class; about a minute on a 16k step), `fast` (the tuners'
 bucket grid only: seconds), `off`, a budget in seconds (`120`) or
-`<level>:<seconds>` (`fast:30`); the budget (default 900 s) bounds the pass:
+`<level>:<seconds>` (`fast:30`); the budget (default 300 s; 900 s for
+TokenSpeed, whose plan holds the chunk remainders, below) bounds the pass:
 it ends between shapes, the remaining ones named in the log, and each
 request's timeout is clamped to what is left of it (one second at least), so
 a shape that hangs cannot hold readiness past the budget. On the Rust path the
@@ -808,11 +810,15 @@ and loads on first use, and such a first use during serving, with the
 overlapped previous chunk's TP collective in flight, has deadlocked the
 forward; at a 4,096-token chunk that is 4,042 one-token requests after the
 ladder's 54, about 0.17 s each on a four-GPU node (692 s measured for the
-whole pass, inside the 900 s default budget); the Python servicer runs the
-same plan over its own port after its first warm-up request, and both skip it on a
+whole pass, inside this engine's 900 s default budget; with no chunk size set
+the engine's default step of 8,192 tokens gives about 8,140 remainders, about
+1,380 s, which the budget cuts about halfway, evenly: set a chunk size or a
+larger budget to cover every count); the Python servicer runs the same plan
+over its own port after its first warm-up request, and both skip it on a
 disaggregation role; under attention data parallelism the servicer routes a
-request by load, not by rank, so each prefill shape warms one rank and the
-log says so),
+request by load, not by rank, so each prefill shape, the chunk remainders
+included, warms one rank and the log says so: there the remainder hazard
+stays open on the ranks a count did not reach until the wire can pin a rank),
 `SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
 `SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
 bounds as for vLLM above: the launcher reports the scheduler process alive each

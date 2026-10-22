@@ -47,6 +47,7 @@ from smg_grpc_servicer.servicer_impl_flag import (  # noqa: F401
     SERVICER_IMPL_FLAG,
 )
 from smg_grpc_servicer.warmup import (
+    DEFAULT_BUDGET_SECS,
     WarmupInputs,
     WarmupPlan,
     WarmupReport,
@@ -415,17 +416,23 @@ def read_launcher_knobs(
     )
 
 
-def read_warmup_setting(name: str, *, environ: Mapping[str, str] | None = None) -> WarmupSetting:
+def read_warmup_setting(
+    name: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+    default_budget_secs: float = DEFAULT_BUDGET_SECS,
+) -> WarmupSetting:
     """The planned warm-up's setting from ``environ[name]``
-    (:func:`smg_grpc_servicer.warmup.parse_setting`); a value the knob does
-    not take is a :class:`ServicerConfigError` naming the variable, found with
-    the other knobs before the engine starts. A launcher without such a
-    variable (an empty ``name``) runs none."""
+    (:func:`smg_grpc_servicer.warmup.parse_setting`, under the launcher's
+    ``default_budget_secs``); a value the knob does not take is a
+    :class:`ServicerConfigError` naming the variable, found with the other
+    knobs before the engine starts. A launcher without such a variable (an
+    empty ``name``) runs none."""
     if not name:
         return WarmupSetting(False)
     source = os.environ if environ is None else environ
     try:
-        return parse_setting(source.get(name), name=name)
+        return parse_setting(source.get(name), name=name, default_budget_secs=default_budget_secs)
     except ValueError as error:
         raise ServicerConfigError(str(error)) from None
 
@@ -1434,6 +1441,9 @@ class RustLauncher:
     # The planned warm-up's knob (:mod:`smg_grpc_servicer.warmup`); a launcher
     # that names none runs no warm-up.
     warmup_env: str = ""
+    # The pass's default budget in seconds when the knob names none: the
+    # shared default, or an engine module's own for a longer plan.
+    warmup_default_budget_secs: float = DEFAULT_BUDGET_SECS
 
     def prepare(self, args: Any) -> None:
         """Engine-specific set-up after the knobs are read and the binding is
@@ -1586,7 +1596,9 @@ class RustLauncher:
             prefill_tokens_per_sec_env=self.prefill_tokens_per_sec_env,
             socket_dir=default_socket_dir(),
         )
-        warmup_setting = read_warmup_setting(self.warmup_env)
+        warmup_setting = read_warmup_setting(
+            self.warmup_env, default_budget_secs=self.warmup_default_budget_secs
+        )
         servicer = importlib.import_module("smg.servicer")
         self.prepare(args)
         servicer.init_servicer_tracing()

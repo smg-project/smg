@@ -32,7 +32,12 @@ from smg_grpc_servicer.tokenspeed.health_servicer import TokenSpeedHealthService
 from smg_grpc_servicer.tokenspeed.rust import KV_EVENTS_ENV, default_kv_events_config
 from smg_grpc_servicer.tokenspeed.scheduler_launcher import launch_engine
 from smg_grpc_servicer.tokenspeed.servicer import TokenSpeedSchedulerServicer
-from smg_grpc_servicer.tokenspeed.warmup import WARMUP_ENV, warmup_inputs, warmup_wire
+from smg_grpc_servicer.tokenspeed.warmup import (
+    DEFAULT_BUDGET_SECS,
+    WARMUP_ENV,
+    warmup_inputs,
+    warmup_wire,
+)
 from smg_grpc_servicer.warmup import parse_setting, plan_for, run_warmup
 
 logger = logging.getLogger(__name__)
@@ -429,7 +434,9 @@ def planned_warmup(server_args: Any, model_info: Any, channel: Any) -> Any:
 
 def _planned_warmup(server_args: Any, model_info: Any, channel: Any) -> Any:
     try:
-        setting = parse_setting(os.environ.get(WARMUP_ENV), name=WARMUP_ENV)
+        setting = parse_setting(
+            os.environ.get(WARMUP_ENV), name=WARMUP_ENV, default_budget_secs=DEFAULT_BUDGET_SECS
+        )
     except ValueError as error:
         logger.warning("%s; the planned warm-up is skipped", error)
         return None

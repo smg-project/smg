@@ -21,6 +21,11 @@ driver's module load, the collective waiting for them). Every count used
 once before SERVING, with nothing else in flight, leaves no first use to
 serving. The remainders run last, in an order whose every prefix is a
 uniform spread of the range, so the budget cuts evenly if it cuts at all.
+
+Under attention data parallelism the servicer routes by load and the wire
+pins no rank, so a remainder, like every prefill shape, reaches one rank: the
+hazard stays open on the other ranks there until the wire can pin a rank (the
+warning at planning says so).
 """
 
 from __future__ import annotations
@@ -38,6 +43,15 @@ WARMUP_ENV = "SMG_TOKENSPEED_SERVICER_WARMUP"
 #: The engine's own prefill budget when the arguments carry neither a chunk
 #: size nor a prefill budget as a count.
 DEFAULT_STEP_TOKENS = 8192
+#: This engine's default budget for the pass, in place of the shared
+#: :data:`smg_grpc_servicer.warmup.DEFAULT_BUDGET_SECS` (300 s, which the
+#: other engines keep): room for the chunk remainders at a 4,096-token chunk,
+#: 4,042 one-token requests at about 0.17 s each on a four-GPU node (692 s
+#: measured for the whole pass). At the engine's default step of 8,192
+#: tokens (no chunk size set) the remainders are about 8,140, about 1,380 s,
+#: and the budget cuts the pass about halfway, evenly (the spread order): a
+#: chunk size, or a larger budget on the knob, covers every count.
+DEFAULT_BUDGET_SECS = 900.0
 _MAX_MESSAGE_BYTES = 1024 * 1024 * 256
 
 
@@ -59,7 +73,10 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
         logger.warning(
             "The engine runs %d scheduler ranks and the servicer routes a warm-up request to the "
             "least-loaded one: each prefill shape of the planned warm-up reaches one rank; the "
-            "other ranks pay its first-time cost at their first request of that shape",
+            "other ranks pay its first-time cost at their first request of that shape, and the "
+            "chunk remainders reach one rank each too, so the hazard they answer (a count's "
+            "first use during serving) stays open on the other ranks until the wire can pin a "
+            "rank",
             ranks,
         )
     step = args.chunked_prefill_size or args.max_prefill_tokens or DEFAULT_STEP_TOKENS

@@ -67,10 +67,15 @@ LEVEL_FULL = "full"
 LEVELS = (LEVEL_FAST, LEVEL_FULL)
 DEFAULT_LEVEL = LEVEL_FULL
 #: The whole pass is bounded by this many seconds unless the knob says
-#: otherwise: room for a pass over every count of a 4,096-token step (the
-#: chunk remainders: 4,042 one-token requests, about 0.17 s each on a
-#: four-GPU node, 692 s measured).
-DEFAULT_BUDGET_SECS = 900.0
+#: otherwise. An engine module whose plan is longer (the chunk remainders)
+#: states a default of its own through :func:`parse_setting`'s
+#: ``default_budget_secs``; the engines that plan the length classes alone
+#: keep this one.
+DEFAULT_BUDGET_SECS = 300.0
+#: How many chunk remainders go by between the INFO lines that report their
+#: progress (each remainder's own line is DEBUG: thousands of one-token
+#: requests at a fraction of a second each say little one by one).
+REMAINDER_PROGRESS_EVERY = 500
 #: The values of the knob that run no warm-up.
 OFF_VALUES = ("off", "0", "false", "no", "none")
 #: The width of a prefill length class the ``full`` level covers one by one:
@@ -120,21 +125,24 @@ class WarmupSetting:
         return f"{self.level}:{self.budget_secs:g}"
 
 
-def parse_setting(text: str | None, *, name: str) -> WarmupSetting:
+def parse_setting(
+    text: str | None, *, name: str, default_budget_secs: float = DEFAULT_BUDGET_SECS
+) -> WarmupSetting:
     """The setting a value of the knob ``name`` stands for: unset or empty is
-    the default (``full``, :data:`DEFAULT_BUDGET_SECS`); one of
-    :data:`OFF_VALUES` runs none; ``fast`` or ``full`` picks the level under
-    the default budget; a number of seconds is the budget at the default
-    level; ``<level>:<seconds>`` sets both. Anything else is a ``ValueError``
-    naming the variable and the value."""
+    the default (``full``, ``default_budget_secs``: :data:`DEFAULT_BUDGET_SECS`
+    unless the engine module states its own); one of :data:`OFF_VALUES` runs
+    none; ``fast`` or ``full`` picks the level under the default budget; a
+    number of seconds is the budget at the default level;
+    ``<level>:<seconds>`` sets both. Anything else is a ``ValueError`` naming
+    the variable and the value."""
     raw = (text or "").strip().lower()
     if not raw:
-        return WarmupSetting(True)
+        return WarmupSetting(True, DEFAULT_LEVEL, default_budget_secs)
     if raw in OFF_VALUES:
         return WarmupSetting(False)
     level, separator, budget = raw.partition(":")
     if level in LEVELS and not separator:
-        return WarmupSetting(True, level)
+        return WarmupSetting(True, level, default_budget_secs)
     if not separator and level not in LEVELS:
         level, budget = DEFAULT_LEVEL, level
     if level in LEVELS:
@@ -146,7 +154,7 @@ def parse_setting(text: str | None, *, name: str) -> WarmupSetting:
             return WarmupSetting(True, level, secs)
     raise ValueError(
         f"{name}={text!r}: expected one of {', '.join(OFF_VALUES[:1] + LEVELS)}, a budget in "
-        f"seconds, or <level>:<seconds> (the default is {DEFAULT_LEVEL}:{DEFAULT_BUDGET_SECS:g})"
+        f"seconds, or <level>:<seconds> (the default is {DEFAULT_LEVEL}:{default_budget_secs:g})"
     )
 
 
@@ -505,6 +513,10 @@ class _Pass:
         self.report = WarmupReport(plan)
         self._started = time.monotonic()
         self._failed_in_a_row = 0
+        self._remainders = sum(1 for step in plan.steps if step.kind == "remainder")
+        self._remainders_done = 0
+        self._remainder_secs = 0.0
+        self._remainder_failures = 0
         log.info(
             "Planned warm-up starts (%s; budget %.0f s%s): readiness is held until it ran",
             plan.describe(),
@@ -539,6 +551,7 @@ class _Pass:
     def record(self, step: WarmupStep, secs: float, errors: list[BaseException]) -> None:
         self.report.results.append(StepResult(step, secs, len(errors)))
         index = len(self.report.results)
+        remainder = step.kind == "remainder"
         if errors:
             self._failed_in_a_row += 1 if len(errors) == len(step.requests) else 0
             self.log.warning(
@@ -551,15 +564,50 @@ class _Pass:
                 secs * 1000,
                 errors[0],
             )
-            return
-        self._failed_in_a_row = 0
+        else:
+            self._failed_in_a_row = 0
+            # A chunk remainder is one of thousands of one-token requests: its
+            # own line is DEBUG, and the remainders' progress is one INFO line
+            # every so many (:data:`REMAINDER_PROGRESS_EVERY`) and at their end.
+            self.log.log(
+                logging.DEBUG if remainder else logging.INFO,
+                "Warm-up step %d/%d %s: %.0f ms",
+                index,
+                len(self.plan.steps),
+                step.name,
+                secs * 1000,
+            )
+        if remainder:
+            self._remainder_done(secs, bool(errors))
+
+    def _remainder_done(self, secs: float, failed: bool) -> None:
+        self._remainders_done += 1
+        self._remainder_secs += secs
+        self._remainder_failures += 1 if failed else 0
+        done = self._remainders_done
+        if done % REMAINDER_PROGRESS_EVERY == 0 or done == self._remainders:
+            self._remainder_progress()
+
+    def _remainder_progress(self) -> None:
+        done = self._remainders_done
         self.log.info(
-            "Warm-up step %d/%d %s: %.0f ms", index, len(self.plan.steps), step.name, secs * 1000
+            "Warm-up chunk remainders: %d of %d done in %.0f s (%.0f ms each, %d failed)%s",
+            done,
+            self._remainders,
+            self._remainder_secs,
+            self._remainder_secs * 1000 / done,
+            self._remainder_failures,
+            " (every count up to the step used once)" if done == self._remainders else "",
         )
 
     def finish(self, flushed: bool | None) -> WarmupReport:
         self.report.secs = time.monotonic() - self._started
         self.report.flushed = flushed
+        # The remainders the budget or a stop cut short: their last partial
+        # batch reported once, as the periodic line would have.
+        done = self._remainders_done
+        if done and done != self._remainders and done % REMAINDER_PROGRESS_EVERY:
+            self._remainder_progress()
         self.log.info("Planned warm-up over: %s", self.report.summary())
         return self.report
 

@@ -89,6 +89,29 @@ def test_a_value_the_knob_does_not_take_names_the_variable(text):
     assert "SMG_X_SERVICER_WARMUP" in str(caught.value) and repr(text) in str(caught.value)
 
 
+def test_an_engine_module_may_state_its_own_default_budget():
+    knob = "SMG_X_SERVICER_WARMUP"
+    assert parse_setting(None, name=knob, default_budget_secs=900.0).budget_secs == 900.0
+    assert parse_setting("fast", name=knob, default_budget_secs=900.0).budget_secs == 900.0
+    assert parse_setting("120", name=knob, default_budget_secs=900.0).budget_secs == 120.0
+    assert parse_setting(None, name=knob).budget_secs == DEFAULT_BUDGET_SECS == 300.0
+    with pytest.raises(ValueError) as caught:
+        parse_setting("warm", name=knob, default_budget_secs=900.0)
+    assert "full:900" in str(caught.value)
+    read = rust_lifecycle.read_warmup_setting(knob, environ={}, default_budget_secs=900.0)
+    assert read.budget_secs == 900.0
+    # TokenSpeed's plan holds the chunk remainders: its module states 900 s;
+    # the other engines keep the shared default.
+    assert tokenspeed_warmup.DEFAULT_BUDGET_SECS == 900.0
+    assert rust_lifecycle.RustLauncher.warmup_default_budget_secs == DEFAULT_BUDGET_SECS
+
+
+def test_the_tokenspeed_launcher_states_its_own_default_budget():
+    # The launcher module needs the engine extra's wire packages.
+    tokenspeed_rust = pytest.importorskip("smg_grpc_servicer.tokenspeed.rust")
+    assert tokenspeed_rust.TokenSpeedLauncher.warmup_default_budget_secs == 900.0
+
+
 def test_read_warmup_setting_is_a_configuration_error_before_the_port():
     with pytest.raises(rust_lifecycle.ServicerConfigError) as caught:
         rust_lifecycle.read_warmup_setting(
@@ -436,6 +459,55 @@ def test_the_pass_runs_the_steps_in_order_with_a_steps_requests_together_and_one
     assert any(
         m.startswith("Planned warm-up over: ") for m in (r.getMessage() for r in caplog.records)
     )
+
+
+def test_the_chunk_remainders_log_at_debug_with_a_progress_line_every_so_many_and_at_their_end(
+    caplog, monkeypatch
+):
+    caplog.set_level(logging.DEBUG, logger="smg_grpc_servicer.warmup")
+    monkeypatch.setattr(warmup, "REMAINDER_PROGRESS_EVERY", 4)
+    plan = plan_warmup(dataclasses.replace(SMALL, every_prefill_length=True), "fast")
+    remainders = [s for s in plan.steps if s.kind == "remainder"]
+    assert len(remainders) > 8 and len(remainders) % 4
+    report = run_warmup(plan, _Wire(), budget_secs=30)
+    assert report.covered == len(plan.steps) and report.errors == 0
+    steps = [r for r in caplog.records if r.getMessage().startswith("Warm-up step ")]
+    assert len(steps) == len(plan.steps)
+    assert [r.levelno for r in steps if "(chunk remainder)" in r.getMessage()] == [
+        logging.DEBUG
+    ] * len(remainders)
+    assert all(
+        r.levelno == logging.INFO for r in steps if "(chunk remainder)" not in r.getMessage()
+    )
+    progress = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("Warm-up chunk remainders: ")
+    ]
+    assert [int(m.split(" ")[3]) for m in progress] == [
+        *range(4, len(remainders), 4),
+        len(remainders),
+    ]
+    assert all(r.levelno == logging.INFO for r in caplog.records if r.getMessage() in progress)
+    assert progress[-1].startswith(
+        f"Warm-up chunk remainders: {len(remainders)} of {len(remainders)} done in "
+    ) and progress[-1].endswith("0 failed) (every count up to the step used once)")
+
+    # A pass that stops among the remainders (three failed steps in a row)
+    # reports the ones it ran once more, failures counted, not as complete.
+    caplog.clear()
+    first = sum(len(s.requests) for s in plan.steps[: plan.steps.index(remainders[0])])
+    seen: list = []
+    wire = _Wire(fail=lambda request: seen.append(request) or len(seen) > first + 4)
+    report = run_warmup(plan, wire, budget_secs=30)
+    assert report.stopped and report.errors == 3
+    progress = [
+        r.getMessage()
+        for r in caplog.records
+        if r.getMessage().startswith("Warm-up chunk remainders: ")
+    ]
+    assert [int(m.split(" ")[3]) for m in progress] == [4, 7]
+    assert progress[-1].endswith("3 failed)") and "used once" not in progress[-1]
 
 
 def test_the_budget_ends_the_pass_between_steps_and_the_report_says_where():
@@ -833,6 +905,9 @@ def test_the_sglang_and_tokenspeed_inputs_say_when_the_pass_spreads_over_ranks(c
         "The engine runs 4",
         "The engine runs 2",
     ]
+    # TokenSpeed's remainders answer a hazard, and reach one rank each too.
+    assert "chunk remainders reach one rank each too" in spread[1]
+    assert "chunk remainders" not in spread[0]
     caplog.clear()
     sglang_warmup.warmup_inputs(SimpleNamespace(max_running_requests=64), facts)
     tokenspeed_warmup.warmup_inputs(SimpleNamespace(), facts)
