@@ -516,6 +516,19 @@ impl SglangServicerServer {
         self.state.serving.store(ready, Ordering::Release);
     }
 
+    /// Whether the KV-event relay's subscriptions have reached the scheduler's
+    /// publishers, or there is none to wait for (events off, a relay told to
+    /// start lazily, one that gave up). The lifecycle owner holds its planned
+    /// warm-up until then, so the warm-up's batches start the relay's
+    /// history and a gateway that subscribes later gets the scheduler's whole
+    /// life.
+    pub fn kv_relay_subscribed(&self) -> bool {
+        self.state
+            .kv_relay
+            .as_ref()
+            .is_none_or(|relay| relay.subscribed())
+    }
+
     /// Admitted requests still preprocessing, streaming, or unwinding an abort.
     pub fn active_requests(&self) -> usize {
         self.state.registry.active()

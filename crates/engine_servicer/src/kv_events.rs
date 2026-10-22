@@ -25,7 +25,14 @@
 //! batch, and a servicer that outlives a gateway outage or restarts beside a
 //! warm engine is not blind until eviction; `SMG_KV_EVENT_RELAY_START=lazy`
 //! defers the subscription to the first `SubscribeKvEvents` for a
-//! memory-constrained host), keeps what it relays in a bounded [`History`]
+//! memory-constrained host). The servicer starts minutes before the engine
+//! binds its publisher, so the relay knocks on the endpoint's port every
+//! second ([`DIAL_INTERVAL`], a plain connect) until it is bound, then joins
+//! over ZMQ, and the subscription lands within a second of the bind, before
+//! the engine's handshake; the lifecycle owner
+//! reads [`KvEventRelay::subscribed`] and holds its planned warm-up until
+//! then, so the warm-up's batches are the first the history records. The
+//! relay keeps what it relays in a bounded [`History`]
 //! (the last
 //! `SMG_KV_EVENT_HISTORY_BATCHES` batches, 10,000 by default like the
 //! engines' own `buffer_steps`, within `SMG_KV_EVENT_HISTORY_BYTES`, 256 MiB
@@ -140,7 +147,7 @@ use tonic::Status;
 use tracing::{debug, info, warn};
 use zeromq::{
     prelude::{Socket, SocketRecv, SocketSend},
-    DealerSocket, SocketOptions, SubSocket, ZmqError, ZmqMessage,
+    DealerSocket, Endpoint, SocketOptions, SubSocket, ZmqError, ZmqMessage,
 };
 
 use crate::{
@@ -176,6 +183,22 @@ const DEFAULT_REPLAY_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often the start replay is retried while the engine's replay socket
 /// does not answer yet.
 const PRIME_RETRY: Duration = Duration::from_secs(1);
+/// How often the relay knocks on a publisher's port that nobody has bound
+/// yet. The relay dials at the servicer's start, minutes before the engine
+/// binds its publisher, and the ZMQ crate retries a refused port with a
+/// back-off that grows to 30 s: longer than a planned warm-up, so left to it
+/// the subscription would land at a random point of that cadence and miss
+/// the warm-up's batches and its closing clear. Knocking every second (a
+/// plain connect, no ZMQ handshake) and joining as soon as the port answers,
+/// the subscription lands within a second of the bind.
+const DIAL_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a publisher whose port answered may take to complete the ZMQ
+/// handshake (the crate's own default); a slower one is logged and dialled
+/// again, so a starved or distant publisher is visible, never silently
+/// re-dialled.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A debug line every this many knocks on a port nobody has bound.
+const KNOCKS_PER_LOG: u64 = 60;
 /// Live batches a slow subscriber may fall behind before it is refilled from
 /// the history.
 const LIVE_CHANNEL: usize = 4_096;
@@ -411,6 +434,8 @@ struct Shared {
     event_id: u64,
     /// Why a publisher task gave up, when one did.
     failed: Option<String>,
+    /// Ranks whose subscription reached its publisher.
+    subscribed: usize,
 }
 
 /// How the publisher task classified a sequence against the cursor.
@@ -631,6 +656,7 @@ impl KvEventRelay {
                 wire: vec![WireCounts::default(); config.sources.len()],
                 event_id: 0,
                 failed: None,
+                subscribed: 0,
             })),
             config: Arc::new(config),
             live,
@@ -720,6 +746,25 @@ impl KvEventRelay {
                 "{RELAY_START_ENV}=lazy: the KV event relay subscribes at the first SubscribeKvEvents"
             );
         }
+    }
+
+    /// Whether every rank's subscription has reached its publisher, or there
+    /// is nothing to wait for: a relay not started ([`RELAY_START_ENV`] is
+    /// `lazy`) or one that gave up. The lifecycle owner holds its planned
+    /// warm-up until this says so, so the warm-up's batches start the
+    /// history instead of being published to nobody.
+    pub fn subscribed(&self) -> bool {
+        let started = self
+            .tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|task| !task.is_finished());
+        if !started {
+            return true;
+        }
+        let shared = lock(&self.shared);
+        shared.failed.is_some() || shared.subscribed == self.config.sources.len()
     }
 
     /// Subscribe to every rank's publisher if not yet subscribed. Called at
@@ -1284,7 +1329,10 @@ async fn run(
 ) {
     let source = &config.sources[index];
     let mut socket = match connect(&source.endpoint, &config.topic).await {
-        Ok(socket) => socket,
+        Ok(socket) => {
+            lock(&shared).subscribed += 1;
+            socket
+        }
         Err(status) => {
             lock(&shared).failed = Some(status.message().to_string());
             return;
@@ -1760,27 +1808,87 @@ async fn replay(
     }
 }
 
+/// Whether `endpoint`'s port (or socket path) answers a plain connect, which
+/// is the publisher being bound; no ZMQ handshake, so the knock's cadence
+/// alone decides how soon after the bind the join lands.
+async fn port_answers(endpoint: &Endpoint) -> bool {
+    match endpoint {
+        Endpoint::Tcp(host, port) => {
+            let connect = tokio::net::TcpStream::connect((host.to_string(), *port));
+            tokio::time::timeout(DIAL_INTERVAL, connect)
+                .await
+                .is_ok_and(|connected| connected.is_ok())
+        }
+        #[cfg(unix)]
+        Endpoint::Ipc(Some(path)) => tokio::net::UnixStream::connect(path).await.is_ok(),
+        // Nothing to knock on (the enum is non-exhaustive): the ZMQ connect
+        // below says what is wrong.
+        _ => true,
+    }
+}
+
 /// A SUB socket subscribed to `topic` and connected to `endpoint`. The
 /// subscription is recorded first and sent on connect (and on the crate's
-/// reconnects), as libzmq does; a refused publisher is retried until the
-/// socket is dropped, as libzmq's background connect would.
+/// reconnects), as libzmq does. A publisher not bound yet (the engine is
+/// still starting) is knocked on every [`DIAL_INTERVAL`] until its port
+/// answers, then joined under [`HANDSHAKE_TIMEOUT`], so the join follows the
+/// bind within a second instead of the crate's own back-off, which reaches
+/// 30 s; a handshake that does not complete in time is logged and the dial
+/// starts over; any other failure is final.
 async fn connect(endpoint: &str, topic: &str) -> Result<SubSocket, Status> {
-    let mut options = SocketOptions::default();
-    options.no_connect_timeout();
-    let mut socket = SubSocket::with_options(options);
+    let started = Instant::now();
     let failed = |step: &str, error: ZmqError| {
         Status::internal(format!("SubscribeKvEvents: {step} {endpoint}: {error}"))
     };
-    socket
-        .subscribe(topic)
-        .await
-        .map_err(|error| failed("could not subscribe to", error))?;
-    socket
-        .connect(endpoint)
-        .await
-        .map_err(|error| failed("could not connect to", error))?;
-    info!(%endpoint, "SubscribeKvEvents: connected to ZMQ endpoint");
-    Ok(socket)
+    let parsed: Endpoint = endpoint
+        .parse()
+        .map_err(|error| failed("could not dial", ZmqError::Endpoint(error)))?;
+    let mut knocks: u64 = 0;
+    let mut handshakes_timed_out: u64 = 0;
+    loop {
+        while !port_answers(&parsed).await {
+            knocks += 1;
+            if knocks.is_multiple_of(KNOCKS_PER_LOG) {
+                debug!(
+                    %endpoint,
+                    knocks,
+                    waited_secs = started.elapsed().as_secs(),
+                    "SubscribeKvEvents: the publisher's port is not bound yet; still dialling"
+                );
+            }
+            tokio::time::sleep(DIAL_INTERVAL).await;
+        }
+        let mut options = SocketOptions::default();
+        options.connect_timeout(HANDSHAKE_TIMEOUT);
+        let mut socket = SubSocket::with_options(options);
+        socket
+            .subscribe(topic)
+            .await
+            .map_err(|error| failed("could not subscribe to", error))?;
+        match socket.connect(endpoint).await {
+            Ok(()) => {
+                info!(
+                    %endpoint,
+                    knocks,
+                    handshakes_timed_out,
+                    dialled_secs = started.elapsed().as_secs_f64(),
+                    "SubscribeKvEvents: connected to ZMQ endpoint"
+                );
+                return Ok(socket);
+            }
+            Err(ZmqError::ConnectTimeout(budget)) => {
+                handshakes_timed_out += 1;
+                warn!(
+                    %endpoint,
+                    ?budget,
+                    handshakes_timed_out,
+                    "SubscribeKvEvents: the publisher's port answered but the ZMQ handshake did \
+                     not complete in time; dialling again"
+                );
+            }
+            Err(error) => return Err(failed("could not connect to", error)),
+        }
+    }
 }
 
 /// A publisher message's `[topic, sequence, payload, ...]` as the sequence
@@ -1884,6 +1992,92 @@ mod tests {
         assert!(starts_at_boot(Some("eager")));
         assert!(!starts_at_boot(Some("lazy")));
         assert!(!starts_at_boot(Some(" Lazy ")));
+    }
+
+    fn relay_dialling(endpoint: &str) -> Arc<KvEventRelay> {
+        KvEventRelay::new(RelayConfig {
+            sources: vec![RankSource {
+                rank: 0,
+                endpoint: endpoint.to_string(),
+                replay_endpoint: None,
+            }],
+            topic: "kv".to_string(),
+            history_batches: 100,
+            history_bytes: 64 << 20,
+            replay_timeout: Duration::from_secs(2),
+            load_tick: DEFAULT_LOAD_TICK,
+            heartbeat_interval: DEFAULT_HEARTBEAT_INTERVAL,
+            heartbeat_backoff: DEFAULT_HEARTBEAT_BACKOFF,
+        })
+    }
+
+    /// The relay dials at the servicer's start, minutes before the engine
+    /// binds its publisher: a publisher bound seconds later is joined within
+    /// a second of the bind (the relay's own knock every second), not at the
+    /// ZMQ crate's own back-off (50 ms doubling to 30 s), which would put the
+    /// join after a planned warm-up.
+    #[tokio::test]
+    async fn a_publisher_bound_after_the_relays_start_is_joined_within_a_second() {
+        let endpoint = format!(
+            "tcp://127.0.0.1:{}",
+            portpicker::pick_unused_port().expect("a free publisher port")
+        );
+        let relay = relay_dialling(&endpoint);
+        assert!(relay.subscribed(), "nothing to wait for before the start");
+        relay.start();
+        assert!(!relay.subscribed(), "dialling a port nobody has bound");
+        // The engine's start: by now the crate's own back-off would be
+        // sleeping for seconds between dials.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(!relay.subscribed(), "still nobody bound");
+        let mut publisher = PubSocket::new();
+        publisher.bind(&endpoint).await.expect("publisher binds");
+        let bound = Instant::now();
+        while !relay.subscribed() {
+            assert!(
+                bound.elapsed() < Duration::from_millis(1_500),
+                "the relay took {:?} to join a publisher bound after its start",
+                bound.elapsed()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The subscription is live: the publisher's first batch is relayed.
+        let batch1 = golden::bytes(golden::BATCH1);
+        for _ in 0..250 {
+            publisher
+                .send(golden::frame(b"kv", 0, &batch1))
+                .await
+                .expect("publish");
+            if relay.counts().relayed >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(relay.counts().relayed, 1, "the first batch after the join");
+    }
+
+    /// A relay whose dial fails for good (an endpoint no transport serves)
+    /// has nothing a warm-up should wait for; its subscriptions say why.
+    #[tokio::test]
+    async fn a_relay_that_gave_up_has_nothing_to_wait_for() {
+        let relay = relay_dialling("bogus://nowhere");
+        relay.start();
+        for _ in 0..250 {
+            if relay.subscribed() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(relay.subscribed(), "the task gave up and said so");
+        let refused = relay
+            .subscribe(common::SubscribeKvEventsRequest {
+                start_sequence_number: 0,
+                load_records_before_first_batch: false,
+            })
+            .err()
+            .expect("a down relay refuses");
+        assert_eq!(refused.code(), tonic::Code::Internal);
+        assert!(refused.message().contains("is down"), "{refused}");
     }
 
     #[test]

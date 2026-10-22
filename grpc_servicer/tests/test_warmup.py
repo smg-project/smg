@@ -769,6 +769,7 @@ def test_the_sglang_and_tokenspeed_inputs_say_when_the_pass_spreads_over_ranks(c
 class _ServerOf:
     def __init__(self):
         self.engine_ready = False
+        self.kv_relay_subscribed = True
         self.last_error = None
         self.running = True
         self.address = "0.0.0.0:50051"
@@ -807,8 +808,20 @@ class _EngineOf:
         return 0
 
 
-def _supervised(warmup_fn, *, ready_after: float = 0.03, stop_after: float = 0.25):
-    server, engine = _ServerOf(), _EngineOf()
+def _supervised(
+    warmup_fn,
+    *,
+    ready_after: float = 0.03,
+    stop_after: float = 0.25,
+    relay_joins_after: float | None = None,
+    server: _ServerOf | None = None,
+):
+    """``supervise`` over a fake server and engine: the engine connects
+    ``ready_after`` seconds in; with ``relay_joins_after`` the server's
+    KV-event relay reports its subscription only that long after the
+    connect (``None``: it is subscribed from the start, or the server says
+    nothing about it)."""
+    server, engine = server or _ServerOf(), _EngineOf()
     stop_event_holder = {}
 
     async def run():
@@ -827,6 +840,9 @@ def _supervised(warmup_fn, *, ready_after: float = 0.03, stop_after: float = 0.2
         )
         await asyncio.sleep(ready_after)
         server.engine_ready = True
+        if relay_joins_after is not None:
+            await asyncio.sleep(relay_joins_after)
+            server.kv_relay_subscribed = True
         await asyncio.sleep(stop_after)
         stop_event.set()
         return await task
@@ -881,6 +897,76 @@ def test_without_a_warm_up_the_servicer_serves_at_the_handshake(caplog):
     assert any(
         r.getMessage() == "Engine connected; the servicer is SERVING" for r in caplog.records
     )
+
+
+def _warm_up_noting(server_holder: dict, seen: list):
+    """A warm-up that records whether the relay was subscribed when it ran."""
+
+    def warm():
+        seen.append(server_holder["server"].kv_relay_subscribed)
+        return warmup.WarmupReport(plan_warmup(SMALL, "fast"), secs=0.0)
+
+    return warm
+
+
+def test_the_planned_warm_up_waits_for_the_relay_to_join_the_publisher(caplog):
+    """The engine connects before the KV-event relay's subscription reached
+    its publisher: the warm-up (whose batches are the engine's first) starts
+    only once the server reports the subscription, so the relay's history
+    begins with them; readiness stays held meanwhile and flips after the
+    pass as before."""
+    caplog.set_level(logging.INFO, logger="smg_grpc_servicer.rust_lifecycle")
+    server = _ServerOf()
+    server.kv_relay_subscribed = False
+    holder, seen = {"server": server}, []
+    code, server, _ = _supervised(
+        _warm_up_noting(holder, seen), relay_joins_after=0.1, server=server
+    )
+    assert code == 0
+    assert seen == [True], "the warm-up ran before the relay joined"
+    assert server.events == ["ready:True", "serving:False", "stop"]
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith("KV event relay has not joined") and "waits" in m for m in messages)
+    assert any(
+        m.startswith("KV event relay joined the engine's publisher")
+        and m.endswith("the planned warm-up starts")
+        for m in messages
+    )
+
+
+def test_the_planned_warm_up_starts_without_the_relay_after_the_grace(monkeypatch, caplog):
+    """A relay that never joins (its publisher never comes up) holds the
+    warm-up for the grace and no longer: the pass runs, the servicer serves,
+    one warning says what the relay will miss."""
+    caplog.set_level(logging.INFO, logger="smg_grpc_servicer.rust_lifecycle")
+    monkeypatch.setattr(rust_lifecycle, "RELAY_JOIN_GRACE_SECS", 0.05)
+    server = _ServerOf()
+    server.kv_relay_subscribed = False
+    holder, seen = {"server": server}, []
+    code, server, _ = _supervised(_warm_up_noting(holder, seen), server=server)
+    assert code == 0
+    assert seen == [False]
+    assert server.events == ["ready:True", "serving:False", "stop"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and warnings[0].startswith("KV event relay has not joined")
+    assert "the planned warm-up starts without it" in warnings[0]
+
+
+def test_a_server_that_says_nothing_about_its_relay_warms_up_at_the_handshake(caplog):
+    """An older binding without ``kv_relay_subscribed`` is not held."""
+    caplog.set_level(logging.INFO, logger="smg_grpc_servicer.rust_lifecycle")
+    server = _ServerOf()
+    del server.kv_relay_subscribed
+    ran = threading.Event()
+
+    def warm():
+        ran.set()
+        return warmup.WarmupReport(plan_warmup(SMALL, "fast"), secs=0.0)
+
+    code, server, _ = _supervised(warm, server=server)
+    assert code == 0 and ran.is_set()
+    assert server.events == ["ready:True", "serving:False", "stop"]
+    assert not any("KV event relay" in r.getMessage() for r in caplog.records)
 
 
 def test_the_hold_flips_health_alone_and_falls_back_on_an_older_binding():

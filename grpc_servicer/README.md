@@ -394,8 +394,14 @@ it ends between shapes, the remaining ones named in the log, and each
 request's timeout is clamped to what is left of it (one second at least), so
 a shape that hangs cannot hold readiness past the budget. On the Rust path the
 pass runs over the servicer's own gRPC port between the engine's handshake and
-SERVING; the Python servicer runs it over its in-process engine with its
-health service holding NOT_SERVING meanwhile. Under data parallelism every
+SERVING, once the KV-event relay's subscription has reached the engine's
+publisher (the warm-up's batches are the engine's first, and a subscription
+that landed after them would leave the relay's history starting late for the
+engine's life; the relay dials the publisher every second from the servicer's
+start, so the subscription is normally in place before the handshake, and the
+wait is bounded at 30 s with a logged fall-through); the Python servicer runs
+it over its in-process engine with its health service holding NOT_SERVING
+meanwhile. Under data parallelism every
 rank is a scheduler of its own: the plan runs the staircase once per rank and
 every prefill shape on every rank at once, each request pinned to its rank
 (`data_parallel_rank`), so the log's step count is per rank.
@@ -844,7 +850,11 @@ port ranges if multiple DP ranks publish events. The Rust servicer's relay
 uses the same replay endpoint (the vLLM, SGLang and TokenSpeed launchers all
 pass `replay_endpoint` from the engine's kv-events config) for gaps in flight
 and for the batches published before its subscription joined the publisher;
-without one those are counted as lost or unknown, never silently skipped.
+without one those are counted as lost or unknown, never silently skipped. The
+relay dials the publisher every second from the servicer's start, so its
+subscription lands within a second of the engine binding the socket, and the
+launcher starts its planned warm-up only after that, so the warm-up's batches
+(the engine's first) are the first the relay's history records.
 
 Without replay, or when history is expired, empty, malformed, or unavailable
 (timeout: five seconds), the bridge reports `OUT_OF_RANGE` before streaming or

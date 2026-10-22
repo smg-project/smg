@@ -91,6 +91,17 @@ DEFAULT_SILENCE_TIMEOUT_SECS = 300.0
 # how fast it does. 0 allows nothing.
 DEFAULT_PREFILL_TOKENS_PER_SEC = 2000
 _POLL_SECS = 0.5
+# How long the planned warm-up waits, once the engine connected, for the
+# KV-event relay's subscription to reach the engine's publisher (the server's
+# ``kv_relay_subscribed``). The warm-up's batches are the first the engine
+# publishes, and a subscription that lands after them leaves the relay's
+# history starting late for the engine's life (every gateway that subscribes
+# later is served a snapshot marked degraded). The relay dials the publisher
+# every second from the servicer's start and the engines bind it before their
+# handshake, so the subscription has normally landed before this wait begins;
+# a publisher that never comes up holds readiness no longer than this, and
+# the warm-up runs without the relay.
+RELAY_JOIN_GRACE_SECS = 30.0
 # Grace a scheduler process this process started gets between SIGTERM and
 # SIGKILL at shutdown, and how long the kill is waited for.
 SCHEDULER_GRACE_SECS = 10.0
@@ -1219,6 +1230,49 @@ def hold_readiness(server: Any, ready: bool) -> None:
     setter(ready)
 
 
+class _WarmupHold:
+    """The planned warm-up, held after the engine connected until the
+    KV-event relay's subscription reached the engine's publisher, so the
+    warm-up's batches start the relay's history and a gateway that subscribes
+    later gets the engine's whole life; released after
+    :data:`RELAY_JOIN_GRACE_SECS` without it, with a warning. A server that
+    says nothing about its relay (an older binding) is not held."""
+
+    def __init__(self, warmup: Callable[[], WarmupReport], connected_at: float) -> None:
+        self.warmup = warmup
+        self.connected_at = connected_at
+        self.waiting = False
+
+    def released(self, server: Any, now: float) -> bool:
+        waited = now - self.connected_at
+        if getattr(server, "kv_relay_subscribed", True):
+            if self.waiting:
+                logger.info(
+                    "KV event relay joined the engine's publisher %.1f s after the engine "
+                    "connected; the planned warm-up starts",
+                    waited,
+                )
+            return True
+        if waited >= RELAY_JOIN_GRACE_SECS:
+            logger.warning(
+                "KV event relay has not joined the engine's publisher %.0f s after the engine "
+                "connected; the planned warm-up starts without it (its batches reach the relay "
+                "only through the engine's replay; without one the relay's history starts late "
+                "and its snapshots say so)",
+                waited,
+            )
+            return True
+        if not self.waiting:
+            self.waiting = True
+            logger.info(
+                "KV event relay has not joined the engine's publisher yet; the planned warm-up "
+                "waits for the subscription (%.0f s at most) so its batches start the relay's "
+                "history",
+                RELAY_JOIN_GRACE_SECS,
+            )
+        return False
+
+
 def _warmup_over(server: Any, task: asyncio.Task) -> None:
     """The planned warm-up's task ended: the servicer is SERVING either way.
     The engine connected and answers; a warm-up that failed is an error line
@@ -1253,9 +1307,12 @@ async def supervise(
 
     A ``warmup`` (the planned warm-up over the servicer's own port, blocking;
     the caller held the server's health at NOT_SERVING with
-    :func:`hold_readiness`, admission open) runs on a thread the moment the
-    engine connected, with the engine polled meanwhile; the health flips to
-    SERVING when it returned, whatever it returned.
+    :func:`hold_readiness`, admission open) runs on a thread once the engine
+    connected and the KV-event relay's subscription reached the engine's
+    publisher (``kv_relay_subscribed``, waited for up to
+    :data:`RELAY_JOIN_GRACE_SECS` so the warm-up's batches start the relay's
+    history), with the engine polled meanwhile; the health flips to SERVING
+    when it returned, whatever it returned.
 
     Signals drain: health flips to NOT_SERVING at once (the Router stops
     routing here), in-flight streams get up to ``drain_secs`` to finish with the
@@ -1271,6 +1328,7 @@ async def supervise(
             loop.add_signal_handler(sig, stop_event.set)
     exit_code = 0
     announced_ready = False
+    held: _WarmupHold | None = None
     warming: asyncio.Task | None = None
     try:
         while not stop_event.is_set():
@@ -1287,7 +1345,10 @@ async def supervise(
                     logger.info(
                         "Engine connected; the planned warm-up runs before the servicer is SERVING"
                     )
-                    warming = asyncio.create_task(asyncio.to_thread(warmup))
+                    held = _WarmupHold(warmup, loop.time())
+            if held is not None and held.released(server, loop.time()):
+                warming = asyncio.create_task(asyncio.to_thread(held.warmup))
+                held = None
             if warming is not None and warming.done():
                 _warmup_over(server, warming)
                 warming = None

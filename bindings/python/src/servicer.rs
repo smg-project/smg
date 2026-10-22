@@ -921,6 +921,16 @@ impl PyVllmGrpcServer {
         self.inner.set_ready(ready);
     }
 
+    /// Whether the KV-event relay's subscriptions have reached the engine's
+    /// publishers (`True` as well when there is none to wait for: events
+    /// off, a lazy relay start, a relay that gave up). The launcher holds
+    /// its planned warm-up until then, so the warm-up's batches are the
+    /// first the relay's history records.
+    #[getter]
+    fn kv_relay_subscribed(&self) -> bool {
+        self.inner.kv_relay_subscribed()
+    }
+
     /// Stop the server: open streams are cancelled, connections get most of
     /// `timeout_secs` to close, then the listener thread is joined.
     #[pyo3(signature = (timeout_secs = 5.0))]
@@ -1139,6 +1149,16 @@ impl PyTokenSpeedGrpcServer {
         self.inner.set_ready(ready);
     }
 
+    /// Whether the KV-event relay's subscriptions have reached the engine's
+    /// publishers (`True` as well when there is none to wait for: events
+    /// off, a lazy relay start, a relay that gave up). The launcher holds
+    /// its planned warm-up until then, so the warm-up's batches are the
+    /// first the relay's history records.
+    #[getter]
+    fn kv_relay_subscribed(&self) -> bool {
+        self.inner.kv_relay_subscribed()
+    }
+
     /// Stop the server: open streams are cancelled, connections get most of
     /// `timeout_secs` to close, then the listener thread is joined.
     #[pyo3(signature = (timeout_secs = 5.0))]
@@ -1349,6 +1369,16 @@ impl PySglangGrpcServer {
     /// (its planned warm-up); `set_serving(False)` is the drain switch.
     fn set_ready(&self, ready: bool) {
         self.inner.set_ready(ready);
+    }
+
+    /// Whether the KV-event relay's subscriptions have reached the engine's
+    /// publishers (`True` as well when there is none to wait for: events
+    /// off, a lazy relay start, a relay that gave up). The launcher holds
+    /// its planned warm-up until then, so the warm-up's batches are the
+    /// first the relay's history records.
+    #[getter]
+    fn kv_relay_subscribed(&self) -> bool {
+        self.inner.kv_relay_subscribed()
     }
 
     /// Stop the server: open streams are cancelled, connections get most of
