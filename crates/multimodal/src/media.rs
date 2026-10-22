@@ -2008,7 +2008,8 @@ fn glm5_next_frame_indices(
 /// / count)`. Each distinct pick once, ascending: the loader reads a frame
 /// once however often the rule names it (the reference's repeat of an odd
 /// last pick included), and the processor pads an odd count itself. Empty
-/// when the rule picks nothing (a clip shorter than half a sampling interval)
+/// when the rule picks nothing (a clip shorter than one sampling interval,
+/// `1 / rate` s: `trunc(duration x rate)` is then 0)
 /// or the clip's rate is unusable.
 fn rate_walk_frame_indices(
     total_frames: usize,
@@ -2244,11 +2245,11 @@ fn opencv_decode_error(err: opencv::Error) -> MediaConnectorError {
 }
 
 /// Why a probed clip is refused before any decode: the rate walk picks no
-/// frame of a clip shorter than half a sampling interval (nor of a container
-/// claiming no frames at a low rate), and the engine's own loader hands its
-/// processor no frame of such a clip either, so the generic resampler must
-/// not stand in for the family's rule. `None` under any other rule, when the
-/// probe stated no rate, and whenever the rule picks a frame.
+/// frame of a clip shorter than one sampling interval, `1 / rate` s (nor of
+/// a container claiming no frames at a low rate), and the engine's own
+/// loader hands its processor no frame of such a clip either, so the generic
+/// resampler must not stand in for the family's rule. `None` under any other
+/// rule, when the probe stated no rate, and whenever the rule picks a frame.
 fn refused_by_the_familys_rule(metadata: VideoMetadata, cfg: VideoFetchConfig) -> Option<String> {
     if !matches!(cfg.sampling, FrameSampling::RateWalk { .. }) {
         return None;
@@ -2257,13 +2258,24 @@ fn refused_by_the_familys_rule(metadata: VideoMetadata, cfg: VideoFetchConfig) -
     let claimed = metadata.container_frames.unwrap_or(0);
     let visible = metadata.total_frames.unwrap_or(claimed);
     let (total_frames, picks) = loader_frames(claimed, visible, source_fps, cfg);
-    picks.is_empty().then(|| {
-        format!(
-            "the model's video sampling picks no frame of a clip of {total_frames} frames at \
-             {source_fps} fps: shorter than half a sampling interval at {} frames a second",
-            cfg.sample_fps
-        )
-    })
+    picks
+        .is_empty()
+        .then(|| the_familys_rule_picks_nothing(total_frames, source_fps, cfg))
+}
+
+/// The refusal's text: the clip, and the length the rule needs, `1 / rate` s
+/// at the rule's rate, so the client can see how long a clip has to be.
+fn the_familys_rule_picks_nothing(
+    total_frames: usize,
+    source_fps: f64,
+    cfg: VideoFetchConfig,
+) -> String {
+    let rate = f64::from(cfg.sample_fps);
+    format!(
+        "the model's video sampling picks no frame of a clip of {total_frames} frames at \
+         {source_fps} fps: shorter than one sampling interval at {rate} frames a second ({:.3} s)",
+        1.0 / rate
+    )
 }
 
 async fn decode_video_with_ffmpeg(
@@ -2377,30 +2389,42 @@ async fn decode_video_with_ffmpeg(
     // selection short. The engine's loader then sizes the clip by the frames
     // it can see; the rate-based samplings resample instead.
     if cfg.sampling.follows_the_loader() {
-        if let Some(resized) = probe_decoded_frame_count(input_path)
-            .await
-            .ok()
-            .and_then(|visible| selection.sized_to_visible(visible, cfg))
-        {
-            match decode_video_with_ffmpeg_runners(
-                input_path,
-                input_bytes,
-                cfg,
-                Some(probed),
-                Some(&resized),
-            )
-            .await
-            {
-                Ok(decoded) => return Ok(decoded),
-                Err(error) => {
-                    if log_video_decode_timing_enabled() {
-                        info!(
-                            error = %error,
-                            "smg_mm_timing video_decode_ffmpeg_resize_fallback"
-                        );
+        let resized = match probe_decoded_frame_count(input_path).await {
+            Ok(visible) => selection.sized_to_visible(visible, cfg),
+            Err(_) => Resized::Unchanged,
+        };
+        match resized {
+            // The visible clip is one the family's rule picks nothing of: the
+            // engine's loader hands its processor no frame, so the refusal a
+            // probe of the true length gives stands here too, and no generic
+            // resampler takes the clip instead.
+            Resized::Empty { total_frames } => {
+                return Err(MediaConnectorError::VideoDecode(
+                    the_familys_rule_picks_nothing(total_frames, selection.source_fps, cfg),
+                ));
+            }
+            Resized::Selection(resized) => {
+                match decode_video_with_ffmpeg_runners(
+                    input_path,
+                    input_bytes,
+                    cfg,
+                    Some(probed),
+                    Some(&resized),
+                )
+                .await
+                {
+                    Ok(decoded) => return Ok(decoded),
+                    Err(error) => {
+                        if log_video_decode_timing_enabled() {
+                            info!(
+                                error = %error,
+                                "smg_mm_timing video_decode_ffmpeg_resize_fallback"
+                            );
+                        }
                     }
                 }
             }
+            Resized::Unchanged => {}
         }
     }
     // A probed frame count past the stream's end leaves the selection short; resample by rate.
@@ -3564,6 +3588,18 @@ const FFMPEG_MAX_SELECT_TERMS: usize = 100;
 /// rate-based selection ends on the clip's last frame, one past its spread).
 const FFMPEG_SPREAD_EXTRA_TERMS: usize = 8;
 
+/// What the stream's visible frame count makes of a loader-following
+/// selection ([`FrameSelection::sized_to_visible`]).
+#[derive(Debug, PartialEq)]
+enum Resized {
+    /// Nothing changes: the picks stand, or the sampling is rate-based.
+    Unchanged,
+    /// The family's rule picks no frame of the visible clip of `total_frames`.
+    Empty { total_frames: usize },
+    /// The selection over the visible frames.
+    Selection(FrameSelection),
+}
+
 /// Exact source frames for an ffmpeg decode, sampled the way the OpenCV path samples.
 #[derive(Debug, Clone, PartialEq)]
 struct FrameSelection {
@@ -3613,18 +3649,28 @@ impl FrameSelection {
         }
     }
 
-    /// The selection once the stream turns out to hold `visible` frames,
-    /// `None` when that changes nothing or the sampling is rate-based.
-    fn sized_to_visible(&self, visible: usize, cfg: VideoFetchConfig) -> Option<Self> {
+    /// The selection once the stream turns out to hold `visible` frames:
+    /// unchanged when that changes nothing or the sampling is rate-based;
+    /// empty when the rate walk picks no frame of the visible clip (the
+    /// engine's loader hands its processor none either, so the caller refuses
+    /// as it would have before any decode instead of resampling by rate).
+    fn sized_to_visible(&self, visible: usize, cfg: VideoFetchConfig) -> Resized {
         if !cfg.sampling.follows_the_loader() {
-            return None;
+            return Resized::Unchanged;
         }
         let (total_frames, frame_indices) =
             loader_frames(self.total_frames, visible, self.source_fps, cfg);
-        if frame_indices.is_empty() || frame_indices == self.frame_indices {
-            return None;
+        if frame_indices.is_empty() {
+            return if matches!(cfg.sampling, FrameSampling::RateWalk { .. }) {
+                Resized::Empty { total_frames }
+            } else {
+                Resized::Unchanged
+            };
         }
-        Some(Self::new(self.source_fps, total_frames, frame_indices))
+        if frame_indices == self.frame_indices {
+            return Resized::Unchanged;
+        }
+        Resized::Selection(Self::new(self.source_fps, total_frames, frame_indices))
     }
 
     fn unique_count(&self) -> usize {
@@ -5222,7 +5268,7 @@ mod video_sampling_tests {
             // under-collects and is re-spread onto its one frame.
             (20, 3.0, 0.3, 2048, &[0, 19]),
             (20, 30.0, 5.0, 2048, &[0]),
-            // A clip shorter than half a sampling interval picks nothing.
+            // A clip shorter than one sampling interval (1 / rate s) picks nothing.
             (5, 24.0, 2.0, 2048, &[]),
             (1, 30.0, 2.0, 2048, &[]),
             // A container claiming no frames: the reference's one-second
@@ -5562,14 +5608,37 @@ mod video_sampling_tests {
         let claimed = FrameSelection::from_metadata(metadata(Some(30.0), Some(58)), cfg)
             .expect("frame rate and count");
         assert_eq!(claimed.frame_indices, spread_evenly(58, 32));
-        let resized = claimed
-            .sized_to_visible(40, cfg)
-            .expect("shorter than claimed");
+        let Resized::Selection(resized) = claimed.sized_to_visible(40, cfg) else {
+            panic!("shorter than claimed: a selection over the visible frames");
+        };
         assert_eq!(resized.total_frames, 40);
         assert_eq!(resized.frame_indices, spread_evenly(40, 32));
         assert_eq!(resized.unique_count(), 32);
-        assert_eq!(claimed.sized_to_visible(58, cfg), None);
-        assert_eq!(claimed.sized_to_visible(0, cfg), None);
+        assert_eq!(claimed.sized_to_visible(58, cfg), Resized::Unchanged);
+        assert_eq!(claimed.sized_to_visible(0, cfg), Resized::Unchanged);
+        // The rate walk: a visible clip shorter than one sampling interval is
+        // empty, told apart from unchanged, so the decode refuses it the way a
+        // probe of the true length would instead of resampling it by rate.
+        let walk = VideoFetchConfig {
+            sampling: FrameSampling::RateWalk {
+                max_frames: 2048,
+                temporal_patch_size: 2,
+            },
+            sample_fps: 2.0,
+            ..cfg
+        };
+        let walked = FrameSelection::from_metadata(metadata(Some(30.0), Some(300)), walk)
+            .expect("frame rate and count");
+        assert_eq!(
+            walked.sized_to_visible(10, walk),
+            Resized::Empty { total_frames: 10 },
+            "10 frames at 30 fps is 0.33 s, under the 0.5 s interval at 2 fps"
+        );
+        assert!(matches!(
+            walked.sized_to_visible(60, walk),
+            Resized::Selection(_)
+        ));
+        assert!(the_familys_rule_picks_nothing(10, 30.0, walk).ends_with("(0.500 s)"));
         // The rate-based samplings keep needing a count and are never resized.
         assert_eq!(
             FrameSelection::from_metadata(
@@ -5584,7 +5653,7 @@ mod video_sampling_tests {
         );
         let even = FrameSelection::from_metadata(metadata(Some(30.0), Some(60)), self::cfg())
             .expect("frame rate and count");
-        assert_eq!(even.sized_to_visible(40, self::cfg()), None);
+        assert_eq!(even.sized_to_visible(40, self::cfg()), Resized::Unchanged);
     }
 
     #[test]
