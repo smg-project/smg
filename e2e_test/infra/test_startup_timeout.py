@@ -44,9 +44,11 @@ def test_default_bound_is_the_engine_start_plus_the_servicer_warmup_budget():
 
 
 def test_a_spec_that_raises_the_bound_keeps_the_warm_up_budget():
-    """A spec's ``startup_timeout`` replaces the default, so one sized for the
-    engine's start alone would lose the warm-up headroom: every spec that sets
-    one is its engine-start bound plus the budget, never below the default."""
+    """A spec's ``startup_timeout`` replaces the default, so a value sized for
+    the engine's start alone, at or under the default, would lose the warm-up
+    headroom: every spec that sets one raises the default. That the budget is
+    part of the value is said at the spec itself, as
+    ``X + SERVICER_WARMUP_BUDGET_SECS``; no bound here can tell."""
     overrides = {
         name: spec["startup_timeout"]
         for name, spec in MODEL_SPECS.items()
@@ -54,8 +56,7 @@ def test_a_spec_that_raises_the_bound_keeps_the_warm_up_budget():
     }
     assert overrides
     for name, bound in overrides.items():
-        assert bound >= DEFAULT_STARTUP_TIMEOUT, name
-        assert bound - SERVICER_WARMUP_BUDGET_SECS >= ENGINE_START_SECS, name
+        assert bound > DEFAULT_STARTUP_TIMEOUT, name
 
 
 def test_unset_env_leaves_the_per_model_bound(monkeypatch):
