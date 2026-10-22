@@ -360,6 +360,14 @@ pub enum ConversationItemStorageError {
 
 #[async_trait]
 pub trait ConversationItemStorage: Send + Sync + 'static {
+    /// Store `item` under its id (`item.id`, or a fresh one made for its
+    /// type) and answer it as stored. An item the store already holds under
+    /// that id is kept as it is and answered, neither replaced nor merged: a
+    /// stored item is written once and has no update path, and a caller that
+    /// creates under an existing id means the stored item (the response
+    /// persist, for a turn whose input echoes an item of an earlier response
+    /// with the id it came with; the Conversations API, for an item added
+    /// under its own id). The same answer on every backend.
     async fn create_item(
         &self,
         item: NewConversationItem,

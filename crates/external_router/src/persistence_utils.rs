@@ -142,7 +142,10 @@ pub fn split_stored_message_content(raw: Value) -> (Value, Option<MessagePhase>)
 // ============================================================================
 
 /// Create a conversation item and optionally link it to a conversation.
-/// Sets default "completed" status if not provided.
+/// Sets default "completed" status if not provided. An item the store
+/// already holds under the id (a turn whose input echoes an item of an
+/// earlier response, with the id it came with) is the stored item, linked at
+/// its new place; every backend answers it so.
 /// `added_at` stamps the link; a caller linking several items takes the stamps from one
 /// [`AddedAtSequence`], so the conversation lists them in the order they were linked.
 pub async fn create_and_link_item(
