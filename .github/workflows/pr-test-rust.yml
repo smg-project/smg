@@ -1,236 +1,95 @@
-name: AMD dependency closure diagnostic
-'on':
-  workflow_dispatch: null
+name: AMD gateway diagnostic
+on:
+  workflow_dispatch:
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: amd-closure-e915-${{ github.ref }}
+  group: amd-gateway-e915
   cancel-in-progress: false
-env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: 'true'
-  GENAI_BENCH_IMAGE: ghcr.io/moirai-internal/genai-bench:0.0.4
 jobs:
-  build-wheel:
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-    steps:
-    - uses: actions/checkout@v7
-    - name: Record hosted build resources
-      run: |
-        df -h .
-        free -h
-        nproc
-    - name: Setup Rust
-      uses: ./.github/actions/setup-rust
-    - name: Build Python wheel and Go FFI library
-      run: |
-        rm -rf bindings/python/dist/
-        bash scripts/ci_setup_python_venv.sh
-        bash scripts/ci_build_wheel.sh
-    - name: Generate Python client types
-      run: |
-        source "$HOME/.cargo/env"
-        mkdir -p clients/openapi
-        cargo run -p openapi-gen -- clients/openapi/smg-openapi.yaml
-        pip install 'datamodel-code-generator==0.54.0'
-        datamodel-codegen \
-          --input clients/openapi/smg-openapi.yaml \
-          --input-file-type openapi \
-          --output clients/python/smg_client/types/_generated.py \
-          --output-model-type pydantic_v2.BaseModel \
-          --use-annotated \
-          --field-constraints \
-          --target-python-version 3.10 \
-          --collapse-root-models \
-          --use-standard-collections \
-          --use-union-operator
-        sed -i 's/class \(.*\)(Enum):/class \1(str, Enum):/' clients/python/smg_client/types/_generated.py
-    - name: Build WASM test fixtures
-      run: |
-        source "$HOME/.cargo/env"
-        bash crates/wasm/tests/fixtures/build_fixtures.sh
-    - name: Upload wheel artifact
-      uses: actions/upload-artifact@v7
-      with:
-        name: smg-wheel
-        path: bindings/python/dist/*.whl
-        retention-days: 1
-        if-no-files-found: error
-    - name: Upload Go FFI library artifact
-      uses: actions/upload-artifact@v7
-      with:
-        name: go-ffi-library
-        path: bindings/golang/target/release/libsmg_go.*
-        retention-days: 1
-    - name: Upload Python client types
-      uses: actions/upload-artifact@v7
-      with:
-        name: python-client-types
-        path: clients/python/smg_client/types/_generated.py
-        retention-days: 1
-        if-no-files-found: error
-    - name: Upload WASM test fixtures
-      uses: actions/upload-artifact@v7
-      with:
-        name: wasm-test-fixtures
-        path: crates/wasm/tests/fixtures/*.wasm
-        retention-days: 1
-        if-no-files-found: error
-    - name: Show sccache stats
-      if: always()
-      run: sccache --show-stats
-    - name: Set up Python
-      uses: actions/setup-python@v7
-      with:
-        python-version: '3.12'
-    - name: Test wheel install
-      run: |
-        pip install bindings/python/dist/*.whl
-        python3 -c "import smg; print('Python package: OK')"
-        python3 -c "from smg.smg_rs import Router; print('Rust extension: OK')"
-        python3 -m smg.launch_router --help > /dev/null && echo "Entry point: OK"
-    - name: Record current build provenance
-      run: |
-        python3 - <<'PY'
-        import hashlib, json, os, subprocess
-        from pathlib import Path
-        groups = ["bindings/python/dist/*.whl", "bindings/golang/target/release/libsmg_go.*",
-                  "clients/python/smg_client/types/_generated.py", "crates/wasm/tests/fixtures/*.wasm"]
-        files = []
-        for pattern in groups:
-            matches = sorted(Path(".").glob(pattern))
-            if not matches:
-                raise SystemExit("Missing build output: " + pattern)
-            for path in matches:
-                files.append(dict(path=str(path), bytes=path.stat().st_size,
-                                  sha256=hashlib.file_digest(path.open("rb"), "sha256").hexdigest()))
-        source_paths = [".cargo", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "Makefile",
-                        "bindings", "clients", "crates", "model_gateway", "grpc_servicer",
-                        "e2e_test", "scripts", ".github/actions", ".github/amd-qa", ".github/workflows"]
-        trees = {p: subprocess.check_output(["git", "rev-parse", "HEAD:" + p], text=True).strip()
-                 for p in source_paths}
-        record = dict(source_sha=os.environ["GITHUB_SHA"], run_id=os.environ["GITHUB_RUN_ID"],
-                      run_attempt=os.environ["GITHUB_RUN_ATTEMPT"], source_trees=trees, files=files)
-        Path("build-provenance.json").write_text(json.dumps(record, indent=2) + "\n")
-        PY
-    - name: Set up Python for CPU regression
-      uses: actions/setup-python@v7
-      with:
-        python-version: '3.13'
-    - name: Install CPU regression dependencies
-      run: python -m pip install bindings/python/dist/*.whl pytest pytest-asyncio
-    - name: Run grpc_servicer unit tests
-      run: |
-        rm -f crates/grpc_client/python/smg_grpc_proto/proto
-        mkdir -p crates/grpc_client/python/smg_grpc_proto/proto
-        cp crates/grpc_client/proto/*.proto crates/grpc_client/python/smg_grpc_proto/proto/
-        # msgspec and pydantic gate the sidecar-protocol, fake-redis and
-        # limit-options tests; numpy gates the Rust servicer's media bridge
-        # tests (it lends tensor buffers as numpy views). Modules gated on
-        # zmq or vllm still skip here (-rs lists them): the zmq ones import
-        # engine servicers that need torch, and the vllm cases run on the
-        # vLLM e2e lane.
-        pip install ./crates/grpc_client/python msgspec pydantic numpy pyzmq
-        pytest -q grpc_servicer/tests -rs --junitxml=servicer-cpu.xml
-    - name: Run focused closure CPU controls
-      env:
-        PYTHONPATH: e2e_test
-      run: |
-        python -m pip install ./e2e_test
-        python -m pip check
-        python -m pytest -q --noconftest e2e_test/infra/test_mock_mcp_server.py scripts/test_grpc_ci_dependencies.py --junitxml=closure-cpu.xml
-    - name: Upload CPU test results
-      if: always()
-      uses: actions/upload-artifact@v7
-      with:
-        name: servicer-cpu-results
-        path: |
-          servicer-cpu.xml
-          closure-cpu.xml
-        if-no-files-found: warn
-        retention-days: 7
-    - name: Upload build provenance
-      if: always() && hashFiles('build-provenance.json') != ''
-      uses: actions/upload-artifact@v7
-      with:
-        name: build-provenance
-        path: build-provenance.json
-        if-no-files-found: error
-        retention-days: 7
-    timeout-minutes: 60
-    env:
-      CARGO_BUILD_JOBS: '2'
-      GIT_CONFIG_COUNT: '1'
-      GIT_CONFIG_KEY_0: safe.directory
-      GIT_CONFIG_VALUE_0: ${{ github.workspace }}
-  amd-closure:
-    name: amd-closure (${{ matrix.id }})
-    needs: build-wheel
-    if: always() && !cancelled() && needs.build-wheel.result == 'success' && vars.SMG_RUN_AMD_LEGS == 'true'
+  gateway:
+    name: amd-gateway (${{ matrix.engine }})
+    if: vars.SMG_RUN_AMD_LEGS == 'true'
+    runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       max-parallel: 2
       matrix:
         include:
-        - id: vllm-completions
-          engine: vllm
-          test_dirs: e2e_test/completions
-          min_selected: 15
-          container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
-          extra_deps: ''
-          servicer_unit_tests: true
-        - id: vllm-embeddings
-          engine: vllm
-          test_dirs: e2e_test/embeddings
-          min_selected: 20
-          container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
-          extra_deps: sentence-transformers
-          servicer_unit_tests: false
-        - id: sglang-completions
-          engine: sglang
-          test_dirs: e2e_test/completions
-          min_selected: 15
-          container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
-          extra_deps: ''
-          servicer_unit_tests: false
-        - id: sglang-embeddings
-          engine: sglang
-          test_dirs: e2e_test/embeddings
-          min_selected: 18
-          container_image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
-          extra_deps: sentence-transformers
-          servicer_unit_tests: false
-    uses: ./.github/workflows/e2e-gpu-job.yml
-    with:
-      engine: ${{ matrix.engine }}
-      gpu_tier: '1'
-      runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
-      timeout: 30
-      test_timeout: 20
-      test_dirs: ${{ matrix.test_dirs }}
-      min_selected: ${{ matrix.min_selected }}
-      gpu_vendor: amd
-      container_image: ${{ matrix.container_image }}
-      container_options: ${{ vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add
-        video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN' }}
-      extra_deps: ${{ matrix.extra_deps }}
-      servicer_unit_tests: ${{ matrix.servicer_unit_tests }}
-    secrets: inherit
+          - engine: vllm
+            min_selected: 3
+            image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
+          - engine: sglang
+            min_selected: 23
+            image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
+    container:
+      image: ${{ matrix.image }}
+      options: --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models
+    env:
+      E2E_ENGINE: ${{ matrix.engine }}
+      E2E_RUNTIME: ${{ matrix.engine }}
+      E2E_GPU_TIER: '1'
+      E2E_GPU_VENDOR: amd
+      E2E_MIN_SELECTED: ${{ matrix.min_selected }}
+      E2E_VLLM_KV_BACKEND: nixl
+      E2E_CONNECTION_MODE: ''
+      E2E_PARSER: ''
+      E2E_SGLANG_SERVICER_IMPL: ''
+      E2E_VLLM_SERVICER_IMPL: ''
+      BRAVE_MCP_HOST: ''
+      HF_HOME: /models
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+      ROUTER_LOCAL_MODEL_PATH: /models
+      PYTHONPATH: e2e_test
+      SHOW_WORKER_LOGS: '0'
+      SHOW_ROUTER_LOGS: '1'
+      E2E_LOG_DIR: e2e-logs
+      PYTEST_ADDOPTS: ''
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: ${{ github.workspace }}
+      SMG_QA_IMAGE: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Mark only this job's processes
+        run: echo "E2E_JOB_MARKER=gateway-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
+      - name: Reuse, install and test within one absolute job budget
+        timeout-minutes: 25
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 .github/amd-gateway/budget.py
+      - name: Clean owned processes and record final dependency state
+        if: always() && env.E2E_JOB_MARKER != ''
+        timeout-minutes: 3
+        run: |
+          status=0
+          python3 scripts/ci_reap_job_processes.py "$E2E_JOB_MARKER" || status=1
+          if test -f diagnostic-results/install-complete; then
+            python3 -m pip check > diagnostic-results/pipcheck-after.txt 2>&1 || status=1
+            python3 .github/amd-qa/closure_audit.py snapshot diagnostic-results/final.json || status=1
+          fi
+          exit "$status"
+      - name: Preserve evidence even on failure
+        if: always()
+        timeout-minutes: 2
+        uses: actions/upload-artifact@v7
+        with:
+          name: amd-gateway-${{ matrix.engine }}-${{ github.run_id }}
+          path: |
+            diagnostic-results/
+            e2e-logs/
+          if-no-files-found: error
+          retention-days: 7
   finish:
-    needs:
-    - build-wheel
-    - amd-closure
+    needs: gateway
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-    - name: Require build and all four suites to succeed
-      env:
-        BUILD: ${{ needs.build-wheel.result }}
-        GPU: ${{ needs.amd-closure.result }}
-      run: |-
-        test "$BUILD" = success
-        test "$GPU" = success
+      - name: Require both complete gateway jobs
+        env:
+          GPU: ${{ needs.gateway.result }}
+        run: test "$GPU" = success
