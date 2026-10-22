@@ -65,6 +65,8 @@ jobs:
           python3 scripts/ci_reap_job_processes.py "$E2E_JOB_MARKER" || status=1
           if test -f .venv/bin/activate; then . .venv/bin/activate; fi
           if test -f diagnostic-results/install-started; then
+            test -f diagnostic-results/runtime-pins.txt || status=1
+            export PIP_CONSTRAINT="${PIP_CONSTRAINT:+$PIP_CONSTRAINT }$PWD/diagnostic-results/runtime-pins.txt"
             python3 -m pip check > diagnostic-results/pipcheck-after.txt 2>&1 || status=1
             python3 .github/amd-qa/closure_audit.py snapshot diagnostic-results/final.json || status=1
             python3 .github/amd-sglang-repair/environment.py final || status=1

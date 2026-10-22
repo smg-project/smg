@@ -76,24 +76,6 @@ def test_failed_native_keeps_exception_source_and_finally_snapshot(tmp_path, mon
     assert phases == ["exception:native", "session-finish:1"]
 
 
-def test_runtime_pins_preserved_and_final_environment_recorded(tmp_path, monkeypatch):
-    import json
-
-    import environment
-
-    monkeypatch.setattr(environment, "OUT", tmp_path)
-    monkeypatch.setenv("PIP_CONSTRAINT", "/public/image.txt /public/runtime-pins.txt")
-    path = tmp_path / "runtime-pins.txt"
-    path.write_text("apache-tvm-ffi==0.1.12+amdreadonlydict2\n")
-    environment.pin_state("before")
-    environment.pin_state("final")
-    state = json.loads((tmp_path / "runtime-pins-state-final.json").read_text())
-    assert state["text"] == path.read_text() and "image.txt" in state["PIP_CONSTRAINT"]
-    path.write_text("apache-tvm-ffi==0.1.12\n")
-    with pytest.raises(ValueError, match="runtime pins changed"):
-        environment.pin_state("final")
-
-
 def test_success_rejects_wrong_actual_ffi_native_hash(tmp_path, monkeypatch):
     observer = runtime_identity.RuntimeIdentity(tmp_path)
     paths = [

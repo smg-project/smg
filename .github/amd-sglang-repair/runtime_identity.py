@@ -156,3 +156,9 @@ class RuntimeIdentity:
                 ]
                 if len(found) != 1 or found[0]["sha256"] != digest:
                     raise RuntimeError("loaded FFI native identity differs: " + name)
+
+            fixed = "68e9cd4017191fb00bf9193e751b0d79b27047005dea5c01ff2babd7a527f902"
+            loaded = value["loaded_modules"].get("tvm_ffi.registry", {})
+            installed = value["installed_registry"]
+            if loaded.get("sha256") != fixed or loaded != installed:
+                raise RuntimeError("actual imported registry differs from installed candidate")

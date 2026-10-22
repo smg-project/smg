@@ -92,16 +92,30 @@ def runtime_pins(before):
 def pin_state(label):
     path = OUT / "runtime-pins.txt"
     raw = path.read_bytes()
-    if label != "before":
-        previous = json.loads((OUT / "runtime-pins-state-before.json").read_text())
-        require(sha(raw) == previous["sha256"], "runtime pins changed")
+    actual = []
+    for filename in os.environ.get("PIP_CONSTRAINT", "").split():
+        file = Path(filename)
+        data = file.read_bytes()
+        actual.append({"path": str(file.resolve()), "sha256": sha(data), "text": data.decode()})
     value = {
         "path": str(path.resolve()),
         "sha256": sha(raw),
         "text": raw.decode(),
         "PIP_CONSTRAINT": os.environ.get("PIP_CONSTRAINT"),
+        "constraints": actual,
     }
     (OUT / ("runtime-pins-state-" + label + ".json")).write_text(json.dumps(value, indent=2) + "\n")
+    if label == "before":
+        return
+    previous = json.loads((OUT / "runtime-pins-state-before.json").read_text())
+    require(sha(raw) == previous["sha256"], "runtime pins changed")
+    expected = json.loads((OUT / "original-constraints.json").read_text()) + [
+        {key: value[key] for key in ("path", "sha256", "text")}
+    ]
+    require(actual == expected, "constraint environment omitted/reordered/changed")
+    snapshot = json.loads((OUT / (label + ".json")).read_text())["constraints"]
+    snapshot = [dict(item, path=str(Path(item["path"]).resolve())) for item in snapshot]
+    require(snapshot == actual, "closure snapshot constraint path/hash/text/order differs")
 
 
 def capture_generated(label):
