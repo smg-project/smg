@@ -28,9 +28,16 @@ pub(crate) enum Template {
 
 impl Template {
     pub(crate) fn detect(source: &str) -> Option<Self> {
-        // The shared .jinja loader trims the file and expands literal \n.
-        // tokenizer_config.json and set_chat_template retain the original.
-        let matches = |known: &str| source == known || source == known.trim().replace("\\n", "\n");
+        // The shared .jinja loader reads the file as written but expands
+        // literal \n; tokenizer_config.json and set_chat_template retain the
+        // original. One trailing newline of a source never reaches the prompt
+        // (minijinja drops it, as Jinja2 does), so a copy with or without it
+        // renders alike and takes the native path alike.
+        let body = |text: &str| text.strip_suffix('\n').unwrap_or(text).to_owned();
+        let matches = |known: &str| {
+            let source = body(source);
+            source == body(known) || source == body(&known.replace("\\n", "\n"))
+        };
         if matches(TEXT_TEMPLATE) {
             Some(Self::Text)
         } else if matches(FLASH_TEMPLATE) {
@@ -448,13 +455,15 @@ mod tests {
             "../../tests/fixtures/glm53/render_fixtures.json"
         ))
         .unwrap();
-        let loaded_text = TEXT_TEMPLATE.trim().replace("\\n", "\n");
-        let loaded_flash = FLASH_TEMPLATE.trim().replace("\\n", "\n");
+        let loaded_text = TEXT_TEMPLATE.replace("\\n", "\n");
+        let loaded_flash = FLASH_TEMPLATE.replace("\\n", "\n");
+        let stripped_text = TEXT_TEMPLATE.strip_suffix('\n').unwrap();
         for (source, template) in [
             (TEXT_TEMPLATE, Template::Text),
             (FLASH_TEMPLATE, Template::Flash),
             (loaded_text.as_str(), Template::Text),
             (loaded_flash.as_str(), Template::Flash),
+            (stripped_text, Template::Text),
         ] {
             assert_eq!(Template::detect(source), Some(template));
             let jinja = ChatTemplateState::new(Some(source.into())).unwrap();

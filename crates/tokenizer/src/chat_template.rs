@@ -2316,9 +2316,15 @@ pub fn load_chat_template_from_file(template_path: &str) -> Result<Option<String
         ));
     }
 
-    // Plain .jinja file
-    let template = content.trim().replace("\\n", "\n");
-    Ok(Some(template))
+    // A plain .jinja file is the template as written: transformers' tokenizer
+    // reads a checkpoint's `chat_template.jinja` whole, and so does the
+    // `--chat-template` loader of the engine the render fixtures are recorded
+    // against, so a newline the template opens with reaches the prompt
+    // (`\n<|im_start|>system`). An engine's own HTTP server may load an
+    // operator-supplied file with a loader of its own; this renderer follows
+    // transformers. The template engine drops exactly one trailing newline of
+    // the source, as Jinja2 does.
+    Ok(Some(content.replace("\\n", "\n")))
 }
 
 /// The chat templates a `tokenizer_config.json` `chat_template` value holds:
@@ -3107,6 +3113,37 @@ mod tests {
         })
         .unwrap();
         assert!(!plain.raw_tool_call_arguments());
+    }
+
+    /// A template file is read as written: a newline before its first block
+    /// is the template's and reaches the prompt, as it does through the
+    /// engine's chat utils, which read the file whole; exactly one trailing
+    /// newline of the source is dropped, as Jinja2 drops it.
+    #[test]
+    fn a_template_file_keeps_the_newline_it_opens_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let render = |source: &str| {
+            let path = dir.path().join("chat_template.jinja");
+            fs::write(&path, source).unwrap();
+            let template = load_chat_template_from_file(path.to_str().unwrap())
+                .unwrap()
+                .unwrap();
+            let state = ChatTemplateState::new(Some(template)).unwrap();
+            state
+                .apply(
+                    &[serde_json::json!({"role": "user", "content": "Hi"})],
+                    ChatTemplateParams::default(),
+                )
+                .unwrap()
+        };
+        // Text around the blocks, as the templates of the record open (a `{%-`
+        // tag strips the whitespace before it, and `trim_blocks` the newline
+        // after a tag, in both engines alike).
+        let body = "<s>{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}</s>";
+        assert_eq!(render(&format!("\n{body}")), "\n<s><|user|>Hi</s>");
+        assert_eq!(render(&format!("\n{body}\n")), "\n<s><|user|>Hi</s>");
+        assert_eq!(render(&format!("\n{body}\n\n")), "\n<s><|user|>Hi</s>\n");
+        assert_eq!(render(&format!("  {body}  ")), "  <s><|user|>Hi</s>  ");
     }
 
     /// The rewrite keeps each tag's whitespace modifiers and leaves a template
