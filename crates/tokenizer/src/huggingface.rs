@@ -8,9 +8,12 @@ use std::{
 use anyhow::{Error, Result};
 use serde::{Deserialize, Serialize};
 use tokenizers::{
-    decoders::DecoderWrapper,
+    decoders::{
+        byte_fallback::ByteFallback, fuse::Fuse, sequence::Sequence as DecoderSequence,
+        strip::Strip, DecoderWrapper,
+    },
     models::{bpe::BPE, ModelWrapper},
-    normalizers::{unicode::NFC, NormalizerWrapper},
+    normalizers::{unicode::NFC, NormalizerWrapper, Replace},
     pre_tokenizers::{
         byte_level::ByteLevel,
         metaspace::{Metaspace, PrependScheme},
@@ -22,7 +25,7 @@ use tokenizers::{
     tokenizer::{SplitDelimiterBehavior, Tokenizer as HfTokenizer},
     AddedToken, AddedVocabulary, Model,
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::{
     byte_fallback::PieceTable,
@@ -788,7 +791,6 @@ impl HuggingFaceTokenizer {
         })
     }
 
-    /// Check if the tokenizer's post_processor adds special tokens (e.g., BOS)
     /// Encodes a Llama-class checkpoint as its reference class does.
     ///
     /// `transformers` builds the tokenizer of a checkpoint whose
@@ -804,11 +806,13 @@ impl HuggingFaceTokenizer {
     /// normalizer, which puts the word marker before every split (after
     /// every special token too) and into the pattern of every added token
     /// matched after normalization, so that a marker such as `</think>` is
-    /// found only behind a space, and takes the space with it. For a file
-    /// of that legacy shape the loader installs the class's pipeline over
-    /// the file's vocabulary, added tokens, decoder and post-processor;
-    /// any other file, and any other model type (which `transformers`
-    /// reads as its file), stays as it is.
+    /// found only behind a space, and takes the space with it. For a file of
+    /// that legacy shape the loader installs the class's pipeline (no
+    /// normalizer, the `Metaspace` pre-tokenizer, and the class's decoder,
+    /// which strips the one leading space of the decoded text only where the
+    /// marker is prepended) over the file's vocabulary, added tokens and
+    /// post-processor; any other file, and any other model type (which
+    /// `transformers` reads as its file), stays as it is.
     fn llama_class_pipeline(
         tokenizer: &mut LoadingTokenizer,
         dir: Option<&Path>,
@@ -828,25 +832,49 @@ impl HuggingFaceTokenizer {
         {
             return;
         }
-        let scheme = match (
-            config.add_prefix_space.unwrap_or(true),
-            config.legacy.unwrap_or(false),
-        ) {
+        let add_prefix_space = config.add_prefix_space.unwrap_or(true);
+        let scheme = match (add_prefix_space, config.legacy.unwrap_or(false)) {
             (false, _) => PrependScheme::Never,
             (true, true) => PrependScheme::Always,
             (true, false) => PrependScheme::First,
         };
+        let class = config.tokenizer_class.as_deref().unwrap_or_default();
+        // The class's decoder: the word marker as a space, the byte pieces,
+        // the pieces fused, and the one leading space of the whole text off
+        // only where the pre-tokenizer prepended the marker. A legacy file's
+        // chain always ends in that `Strip`, which with `add_prefix_space:
+        // false` would take the space a text starts with.
+        let marker = match Replace::new("\u{2581}", " ") {
+            Ok(marker) => marker,
+            Err(error) => {
+                warn!(class, %error, "the file's pipeline stays: the class's decoder did not build");
+                return;
+            }
+        };
+        let mut decoder: Vec<DecoderWrapper> = vec![
+            marker.into(),
+            ByteFallback::new().into(),
+            Fuse::new().into(),
+        ];
+        if add_prefix_space {
+            decoder.push(Strip::new(' ', 1, 0).into());
+        }
+        // A failure here leaves the checkpoint on the legacy file pipeline,
+        // which this function exists to replace: said at `warn!`.
         if let Err(error) = tokenizer.with_normalizer(None::<NormalizerWrapper>) {
-            debug!(%error, "the file's normalizer stays: the added vocabulary did not refresh without it");
+            warn!(class, %error, "the file's pipeline stays: the added vocabulary did not refresh without the normalizer");
             return;
         }
         tokenizer.with_pre_tokenizer(Some(Metaspace::new('\u{2581}', scheme, false)));
+        tokenizer.with_decoder(Some(DecoderSequence::new(decoder)));
         debug!(
             ?scheme,
-            "Llama-class pipeline: no normalizer, a Metaspace pre-tokenizer"
+            add_prefix_space,
+            "Llama-class pipeline: no normalizer, a Metaspace pre-tokenizer, the class's decoder"
         );
     }
 
+    /// Check if the tokenizer's post_processor adds special tokens (e.g., BOS)
     fn tokenizer_adds_special_tokens<M: Model>(tokenizer: &TokenizerOf<M>) -> bool {
         tokenizer
             .encode("", true)
@@ -2714,6 +2742,16 @@ mod tests {
         assert_eq!(ids_of(&never, "<|im_start|>a"), [3, 7]);
         assert_eq!(ids_of(&never, "ab<|im_end|>"), [7, 8, 4]);
         assert_eq!(ids_of(&never, " a"), [6, 7]);
+        // The class's decoder strips no leading space where no marker is
+        // prepended, so a text that starts with a space round-trips; the
+        // file's chain (kept before) ended in the `Strip` and gave `a`. With
+        // the marker prepended the one space goes, as the class's does.
+        assert_eq!(never.decode(&[6, 7], false).unwrap(), " a");
+        assert_eq!(
+            never.decode(&[7, 6, 5, 6, 8], false).unwrap(),
+            "a </think> b"
+        );
+        assert_eq!(always.decode(&[6, 7], false).unwrap(), "a");
 
         let temp = TempDir::new().unwrap();
         let path = llama_style_checkpoint(temp.path(), "LlamaTokenizerFast", None, None, "llama");
