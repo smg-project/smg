@@ -41,11 +41,23 @@ pub(crate) const SHUTDOWN_MESSAGE: &str =
     "servicer shutting down: the engine went away before the request completed";
 
 /// The request-id prefix of the lifecycle owner's own requests: its planned
-/// warm-up names them `smg-warmup-<n>` and sends them over the servicer's own
-/// port, from the process that holds readiness. While readiness is held,
-/// these are the only requests admitted; anything else the gateway forwards
-/// in that window would share the engine's steps with the warm-up's.
+/// warm-up names them `smg-warmup-<n>` (the Python servicer package's
+/// `warmup.py` builds them; its tests pin the form) and sends them over the
+/// servicer's own port, from the process that holds readiness. While
+/// readiness is held, these are the only requests admitted; anything else
+/// the gateway forwards in that window would share the engine's steps with
+/// the warm-up's.
 pub(crate) const WARMUP_REQUEST_ID_PREFIX: &str = "smg-warmup-";
+
+/// Whether `request_id` has the exact form of a warm-up request, the prefix
+/// followed by the request's ordinal and nothing else. The gateway derives a
+/// request's id from a caller's `x-request-id` with a suffix of its own, so
+/// an id a client chose to start with the prefix does not take this form.
+pub(crate) fn is_warmup_request_id(request_id: &str) -> bool {
+    request_id
+        .strip_prefix(WARMUP_REQUEST_ID_PREFIX)
+        .is_some_and(|ordinal| !ordinal.is_empty() && ordinal.bytes().all(|b| b.is_ascii_digit()))
+}
 
 /// Registered in-flight requests. The generation disambiguates an id reused
 /// after an abort from the stream that registered it.
@@ -106,8 +118,7 @@ impl RequestRegistry {
         if self.draining.load(Ordering::Acquire) {
             return Err(Status::unavailable("servicer is draining"));
         }
-        if self.warming.load(Ordering::Acquire) && !request_id.starts_with(WARMUP_REQUEST_ID_PREFIX)
-        {
+        if self.warming.load(Ordering::Acquire) && !is_warmup_request_id(request_id) {
             return Err(Status::unavailable("servicer is warming up"));
         }
         entries.insert(request_id.to_string(), (generation, cancel_tx));
@@ -275,6 +286,20 @@ mod tests {
             .expect("the warm-up's own request passes");
         assert_eq!(registry.active(), 1);
         drop(own);
+        // The prefix alone is not the form: a caller's id the gateway stamped
+        // with its own suffix, or the bare prefix, is a foreign request.
+        for crafted in [
+            "smg-warmup-x-01a16586-c52f-76e8-bb8f-9f407fd9f836",
+            "smg-warmup-1-01a16586-c52f-76e8-bb8f-9f407fd9f836",
+            "smg-warmup-",
+            "SMG-WARMUP-1",
+        ] {
+            let refused = registry
+                .register(crafted)
+                .err()
+                .expect("an id that only starts with the prefix is refused");
+            assert_eq!(refused.message(), "servicer is warming up", "{crafted}");
+        }
 
         registry.set_accepting(false);
         let drained = registry

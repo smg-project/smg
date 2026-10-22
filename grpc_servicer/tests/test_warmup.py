@@ -9,6 +9,7 @@ import asyncio
 import dataclasses
 import importlib.util
 import logging
+import re
 import sys
 import threading
 import time
@@ -227,6 +228,16 @@ def test_every_request_of_a_plan_has_its_own_tokens():
     assert len(heads) == len(set(heads))
     ids = [request.request_id for step in plan.steps for request in step.requests]
     assert len(ids) == len(set(ids))
+
+
+def test_every_request_id_has_the_form_the_servicer_admits_while_readiness_is_held():
+    # The Rust servicers admit only `smg-warmup-<ordinal>` while readiness is
+    # held for the warm-up (WARMUP_REQUEST_ID_PREFIX / is_warmup_request_id in
+    # the engine servicer crate's request registry): a rename on either side
+    # would have every warm-up request refused and the pass count only errors.
+    plan = plan_warmup(ISSUE, "full")
+    ids = [request.request_id for step in plan.steps for request in step.requests]
+    assert ids and all(re.fullmatch(r"smg-warmup-[0-9]+", request_id) for request_id in ids)
 
 
 def test_a_prompt_never_exceeds_the_step_nor_the_context_less_its_output():
