@@ -29,6 +29,7 @@ use crate::{
                 mooncake_prefill_params, KvConnectorMode, NIXL_PREFILL_KV_PARAMS,
             },
             pd_admission,
+            pd_failure::{PdSide, SidePhase},
             retry::mark_non_retryable,
         },
         error,
@@ -65,45 +66,6 @@ type StreamResult = Result<ProtoStream, tonic::Status>;
 /// selection) so the side still in flight when its partner fails can be moved
 /// off the request path — see [`retire_pd_side`].
 type SideDispatch = Pin<Box<dyn Future<Output = StreamResult> + Send>>;
-
-/// Which side of a disaggregated dispatch a result belongs to. The error code
-/// and message are part of the client contract, so they live per side here
-/// rather than being reconstructed at each call site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PdSide {
-    Prefill,
-    Decode,
-}
-
-impl PdSide {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Prefill => metrics_labels::WORKER_PREFILL,
-            Self::Decode => metrics_labels::WORKER_DECODE,
-        }
-    }
-
-    fn error_code(self) -> &'static str {
-        match self {
-            Self::Prefill => "prefill_worker_failed_to_start",
-            Self::Decode => "decode_worker_failed_to_start",
-        }
-    }
-
-    fn error_message(self) -> &'static str {
-        match self {
-            Self::Prefill => "Prefill worker failed to start",
-            Self::Decode => "Decode worker failed to start",
-        }
-    }
-
-    fn partner(self) -> Self {
-        match self {
-            Self::Prefill => Self::Decode,
-            Self::Decode => Self::Prefill,
-        }
-    }
-}
 
 /// How the two parallel sides resolved.
 #[expect(
@@ -1383,8 +1345,8 @@ fn pd_side_error(
     start_failure_response(
         error,
         "execute_parallel_pd",
-        side.error_message(),
-        side.error_code(),
+        side.description(SidePhase::Start),
+        side.code(SidePhase::Start),
     )
 }
 
@@ -1723,9 +1685,10 @@ fn is_decode_silence(status: &tonic::Status) -> bool {
 /// alone (the prefill stays selectable) and the answer stands when no other
 /// decode worker is available.
 fn decode_silence_response(status: &tonic::Status, decode: &Arc<dyn Worker>) -> Response {
-    let mut response = error::gateway_timeout(
-        "decode_worker_silent",
-        format!("Decode worker silent: {}", status.message()),
+    let mut response = PdSide::Decode.answer(
+        SidePhase::Silent,
+        http::StatusCode::GATEWAY_TIMEOUT,
+        status.message(),
     );
     mark_failed_side(&mut response, decode.as_ref());
     response
@@ -1784,9 +1747,10 @@ fn record_silence_outcome(
 /// stays selectable) and the answer stands when no other prefill worker is
 /// available (see `attempt_ledger::FailedSide`).
 fn prefill_silence_response(status: &tonic::Status, prefill: &Arc<dyn Worker>) -> Response {
-    let mut response = error::gateway_timeout(
-        "prefill_worker_silent",
-        format!("Prefill worker silent: {}", status.message()),
+    let mut response = PdSide::Prefill.answer(
+        SidePhase::Silent,
+        http::StatusCode::GATEWAY_TIMEOUT,
+        status.message(),
     );
     mark_failed_side(&mut response, prefill.as_ref());
     response
@@ -2130,8 +2094,8 @@ fn sequential_decode_failure(
     start_failure_response(
         e,
         "execute_sequential_pd",
-        PdSide::Decode.error_message(),
-        PdSide::Decode.error_code(),
+        PdSide::Decode.description(SidePhase::Start),
+        PdSide::Decode.code(SidePhase::Start),
     )
 }
 
@@ -2157,8 +2121,8 @@ fn sequential_prefill_failure(
     start_failure_response(
         e,
         "execute_sequential_pd",
-        PdSide::Prefill.error_message(),
-        PdSide::Prefill.error_code(),
+        PdSide::Prefill.description(SidePhase::Start),
+        PdSide::Prefill.code(SidePhase::Start),
     )
 }
 
@@ -2639,9 +2603,10 @@ async fn sequential_prefill_side(
                 );
                 account_pd_side_failure(metrics_labels::WORKER_PREFILL, &e);
                 error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
-                return Err(e.to_http_error(
-                    "prefill_stream_error",
-                    format!("Prefill stream error: {}", e.message()),
+                return Err(PdSide::Prefill.answer(
+                    SidePhase::Stream,
+                    e.http_status(),
+                    e.message(),
                 ));
             }
         }
@@ -3116,8 +3081,8 @@ mod tests {
         let cancelled = start_failure_response(
             &tonic::Status::cancelled("operation was canceled"),
             "execute_sequential_pd",
-            PdSide::Decode.error_message(),
-            PdSide::Decode.error_code(),
+            PdSide::Decode.description(SidePhase::Start),
+            PdSide::Decode.code(SidePhase::Start),
         );
         assert_eq!(cancelled.status(), http::StatusCode::BAD_GATEWAY);
         assert_eq!(
@@ -3147,8 +3112,8 @@ mod tests {
             let failed = start_failure_response(
                 &status,
                 "execute_parallel_pd",
-                PdSide::Prefill.error_message(),
-                PdSide::Prefill.error_code(),
+                PdSide::Prefill.description(SidePhase::Start),
+                PdSide::Prefill.code(SidePhase::Start),
             );
             assert_eq!(failed.status(), http::StatusCode::BAD_GATEWAY, "{reason:?}");
             assert!(is_retryable_response(&failed), "{reason:?}");
