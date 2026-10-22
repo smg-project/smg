@@ -1548,7 +1548,7 @@ async fn remote_kv_waiting_load_is_reported_per_rank() {
     let mut model = model_info();
     model.data_parallel_size = 2;
     let (mut h, _rank1_in, mut rank1_out) = two_rank_harness(model).await;
-    let source = LoadFromState(Arc::downgrade(&h.server.state));
+    let source = kv_events::LoadFromState(Arc::downgrade(&h.server.state));
     for (runnable, deferred) in [(0_u64, 4_u64), (3, 4), (0, 0)] {
         let expected_total = i32::try_from(runnable + deferred).unwrap();
         let expected_record_total = u32::try_from(expected_total).unwrap();
@@ -1637,7 +1637,7 @@ async fn a_second_rank_reports_its_own_hit_rate_and_throughput() {
     );
     // Rank 0 has not reported a scheduler step: a batch of its gets no
     // record rather than rank 1's figures.
-    let source = LoadFromState(Arc::downgrade(&h.server.state));
+    let source = kv_events::LoadFromState(Arc::downgrade(&h.server.state));
     assert!(kv_events::LoadSource::load(&source, Some(0)).is_none());
     // Then rank 0 reports an idle step.
     h.engine_out

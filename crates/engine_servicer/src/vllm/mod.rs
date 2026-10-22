@@ -200,12 +200,9 @@ impl std::fmt::Debug for VllmServicerConfig {
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
 /// attaches to every batch it streams.
-struct LoadFromState(std::sync::Weak<State>);
-
-impl crate::kv_events::LoadSource for LoadFromState {
-    fn load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
-        let state = self.0.upgrade()?;
-        let response = info::loads(&state).ok()?;
+impl crate::kv_events::RankLoads for State {
+    fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
+        let response = info::loads(self).ok()?;
         let load = match dp_rank {
             // A rank the report has no entry for (it has not reported a
             // scheduler step while another rank has) gets no record rather
@@ -222,10 +219,11 @@ impl crate::kv_events::LoadSource for LoadFromState {
         let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
         record.waiting_uncached_tokens =
             Some(u32::try_from(load.num_waiting_uncached_tokens).unwrap_or(0));
-        record.engine_silence_ms = state.engine.output_silence_ms();
-        record.engine_reports_steps = state.engine.reports_steps();
-        record.prefill_pending_tokens = state.engine.prefill_pending_tokens();
         Some(record)
+    }
+
+    fn engine_link(&self) -> &EngineLink {
+        &self.engine
     }
 }
 
@@ -402,7 +400,9 @@ impl VllmServicerServer {
             media: config.media_processor.map(MediaGate::new),
         });
         if let Some(relay) = &state.kv_relay {
-            relay.set_load_source(Arc::new(LoadFromState(Arc::downgrade(&state))));
+            relay.set_load_source(Arc::new(crate::kv_events::LoadFromState(Arc::downgrade(
+                &state,
+            ))));
         }
         if let Some(tokenizer) = tokenizer {
             let _ = state.tokenizer.set(Some(tokenizer));

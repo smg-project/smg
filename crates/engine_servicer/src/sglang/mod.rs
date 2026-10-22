@@ -180,20 +180,18 @@ pub struct SglangServicerConfig {
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
 /// attaches to every batch it streams.
-struct LoadFromState(std::sync::Weak<State>);
-
-impl crate::kv_events::LoadSource for LoadFromState {
-    fn load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
-        let state = self.0.upgrade()?;
-        let response = info::loads(&state, dp_rank).ok()?;
-        let load = response.loads.first()?;
+impl crate::kv_events::RankLoads for State {
+    fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
+        let response = info::loads(self, dp_rank).ok()?;
         // The engine reports no queued token-work on this wire yet: the
         // record's `waiting_uncached_tokens` stays unset.
-        let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
-        record.engine_silence_ms = state.engine.output_silence_ms();
-        record.engine_reports_steps = state.engine.reports_steps();
-        record.prefill_pending_tokens = state.engine.prefill_pending_tokens();
-        Some(record)
+        Some(smg_grpc_client::common_proto::EngineLoad::from(
+            response.loads.first()?,
+        ))
+    }
+
+    fn engine_link(&self) -> &EngineLink {
+        &self.engine
     }
 }
 
@@ -352,7 +350,9 @@ impl SglangServicerServer {
             started_at: SystemTime::now(),
         });
         if let Some(relay) = &state.kv_relay {
-            relay.set_load_source(Arc::new(LoadFromState(Arc::downgrade(&state))));
+            relay.set_load_source(Arc::new(crate::kv_events::LoadFromState(Arc::downgrade(
+                &state,
+            ))));
         }
         // The metrics listener binds beside the gRPC listener, before the
         // scheduler connects: a scrape during its start answers.

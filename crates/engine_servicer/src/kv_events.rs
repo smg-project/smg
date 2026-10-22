@@ -128,7 +128,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     ops::RangeInclusive,
-    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError},
+    sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -144,6 +144,7 @@ use zeromq::{
 };
 
 use crate::{
+    engine_link::EngineLink,
     kv_history::{History, Window},
     kv_state::{LiveState, RankCut, Snapshot, SnapshotChunks},
     kv_wire::{low64_big_endian, Counts as WireCounts, Normalizer, WireBatch, WireEvent},
@@ -279,6 +280,37 @@ pub(crate) trait LoadSource: Send + Sync {
     /// is known (the engine is not up yet). `sample` and `load_only` are the
     /// relay's to set.
     fn load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad>;
+}
+
+/// A servicer state's own `GetLoads` figures, the half of a load record that
+/// differs by wire; [`LoadFromState`] adds the half every wire shares.
+pub(crate) trait RankLoads: Send + Sync {
+    /// The record for `dp_rank` (`None`: a publisher that names no rank)
+    /// without the engine link's liveness fields, or `None` while the engine
+    /// has reported nothing.
+    fn rank_load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad>;
+
+    /// The engine link whose liveness the record carries.
+    fn engine_link(&self) -> &EngineLink;
+}
+
+/// The relay's load source over a servicer state, held weakly (the relay
+/// outlives the state's last strong holder by nothing it should keep): the
+/// state's [`RankLoads::rank_load`] with the engine link's output silence,
+/// step reporting and prefill backlog on the record, the same way on every
+/// wire.
+pub(crate) struct LoadFromState<S>(pub(crate) Weak<S>);
+
+impl<S: RankLoads> LoadSource for LoadFromState<S> {
+    fn load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad> {
+        let state = self.0.upgrade()?;
+        let mut record = state.rank_load(dp_rank)?;
+        let engine = state.engine_link();
+        record.engine_silence_ms = engine.output_silence_ms();
+        record.engine_reports_steps = engine.reports_steps();
+        record.prefill_pending_tokens = engine.prefill_pending_tokens();
+        Some(record)
+    }
 }
 
 /// Whether a record moved enough from `last` to be worth a `load_only`
@@ -1844,6 +1876,67 @@ mod tests {
 
     use super::{golden, *};
     use crate::kv_wire::WireBatch;
+
+    /// A state the relay reads loads from: one rank's fixed record and a
+    /// fresh engine link (nothing reported yet).
+    struct FixedLoads {
+        rank: i32,
+        record: common::EngineLoad,
+        engine: EngineLink,
+    }
+
+    impl RankLoads for FixedLoads {
+        fn rank_load(&self, dp_rank: Option<i32>) -> Option<common::EngineLoad> {
+            (dp_rank.is_none() || dp_rank == Some(self.rank)).then(|| self.record.clone())
+        }
+
+        fn engine_link(&self) -> &EngineLink {
+            &self.engine
+        }
+    }
+
+    #[test]
+    fn load_from_state_adds_the_links_liveness_and_ends_with_the_state() {
+        // The state's record carries stale figures in the three liveness
+        // fields; the link has reported nothing, so the source must replace
+        // them with its `None`s.
+        let state = Arc::new(FixedLoads {
+            rank: 1,
+            record: common::EngineLoad {
+                running_requests: 3,
+                engine_silence_ms: Some(7),
+                engine_reports_steps: Some(true),
+                prefill_pending_tokens: Some(11),
+                ..common::EngineLoad::default()
+            },
+            engine: EngineLink::default(),
+        });
+        assert_eq!(state.engine.output_silence_ms(), None, "a fresh link");
+        let source = LoadFromState(Arc::downgrade(&state));
+        let record = source.load(Some(1)).expect("the state's record");
+        assert_eq!(record.running_requests, 3);
+        assert_eq!(
+            record.engine_silence_ms, None,
+            "the link's silence, not the stale figure"
+        );
+        assert_eq!(
+            record.engine_reports_steps, None,
+            "the link's step reporting"
+        );
+        assert_eq!(
+            record.prefill_pending_tokens, None,
+            "the link's prefill backlog"
+        );
+        assert!(
+            source.load(Some(0)).is_none(),
+            "a rank the state has no record for"
+        );
+        drop(state);
+        assert!(
+            source.load(None).is_none(),
+            "nothing after the state is gone"
+        );
+    }
 
     fn decode(hex: &str) -> WireBatch {
         rmp_serde::from_slice::<TrailingTolerant<WireBatch>>(&golden::bytes(hex))
