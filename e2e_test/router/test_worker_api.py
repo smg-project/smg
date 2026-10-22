@@ -20,7 +20,15 @@ import time
 
 import httpx
 import pytest
-from infra import ConnectionMode, Gateway, start_workers, stop_workers
+from infra import (
+    DEFAULT_STARTUP_TIMEOUT,
+    ConnectionMode,
+    Gateway,
+    effective_startup_timeout,
+    start_workers,
+    stop_workers,
+)
+from infra.model_specs import get_model_spec
 
 logger = logging.getLogger(__name__)
 
@@ -368,6 +376,19 @@ class TestIGWMixedWorkerClassification:
             stop_workers(http_workers)
             raise
         all_local_workers = http_workers + grpc_workers
+        # A worker added while it still loads is registered once its health
+        # answers, which a gRPC servicer does only after its planned warm-up,
+        # after the engine's start; the gateway polls it for
+        # --worker-startup-timeout-secs after the add. That bound, and the
+        # test's own wait for the registrations below, is the one the harness
+        # gives these workers to start (what start_workers waits: the model's
+        # startup_timeout or the default, floored by E2E_STARTUP_TIMEOUT).
+        startup_wait = max(
+            effective_startup_timeout(
+                get_model_spec(w.model_id).get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
+            )
+            for w in all_local_workers
+        )
 
         try:
             # Start gateway in IGW mode FIRST with extended startup timeout
@@ -375,7 +396,7 @@ class TestIGWMixedWorkerClassification:
             gateway = Gateway()
             gateway.start(
                 igw_mode=True,
-                extra_args=["--worker-startup-timeout-secs", "300"],
+                extra_args=["--worker-startup-timeout-secs", str(startup_wait)],
             )
 
             try:
@@ -424,7 +445,7 @@ class TestIGWMixedWorkerClassification:
                 # Local backends need time to load models (especially gRPC/DeepSeek).
                 # External workers are instant with disable_health_check.
                 expected_workers = 6  # 2 HTTP + 2 gRPC + OpenAI + xAI
-                deadline = time.perf_counter() + 300
+                deadline = time.perf_counter() + startup_wait
                 while time.perf_counter() < deadline:
                     workers = gateway.list_workers()
                     healthy = sum(1 for w in workers if w.status == "healthy")
