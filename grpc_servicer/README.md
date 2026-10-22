@@ -800,9 +800,10 @@ free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
 `SMG_TOKENSPEED_SERVICER_WARMUP` (the planned warm-up before SERVING, as for
 vLLM above: `full` by default, `fast`, `off`, a budget in seconds or
 `<level>:<seconds>`; planned from `--max-num-seqs` and the chunk size or
-`--max-prefill-tokens`; this engine's plan also visits every prompt length
-up to the chunk size the class ladder leaves out, last, in an order whose
-every prefix is a uniform spread: a chunked prefill's last chunk is any count
+`--max-prefill-tokens`; at the `full` level this engine's plan also visits
+every prompt length up to the chunk size the class ladder leaves out, last,
+in an order whose every prefix is a uniform spread (`fast` plans the classes
+alone and leaves the hazard below open, which the start log says): a chunked prefill's last chunk is any count
 below the chunk size, a prefill chunk reaches two cuBLAS GEMMs here (the
 compressor's fp32 router projection above 32 tokens, the grouped output
 projection's batched GEMM) whose kernels the library picks per token count

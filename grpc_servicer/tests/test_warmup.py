@@ -354,6 +354,23 @@ def test_an_engine_that_asks_for_every_prefill_length_gets_the_remainders_last_i
     assert not any(s.kind == "remainder" for s in fast.steps)
     assert "remainder" not in fast.describe()
     assert [s.kind for s in fast.steps] == [s.kind for s in plan_warmup(SMALL, "fast").steps]
+
+
+def test_a_fast_start_on_an_engine_that_asks_for_every_length_warns_that_the_hazard_stays(caplog):
+    caplog.set_level(logging.WARNING, logger="smg_grpc_servicer.warmup")
+    asks = dataclasses.replace(SMALL, every_prefill_length=True)
+    plan = warmup.plan_for(warmup.WarmupSetting(True, "fast"), asks, knob="K")
+    assert plan is not None and not any(s.kind == "remainder" for s in plan.steps)
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warned) == 1 and warned[0].startswith(
+        "Planned warm-up at the fast level plans the length classes alone and leaves out the "
+        "chunk remainders this engine asks for"
+    )
+    caplog.clear()
+    # The full level runs them, and an engine that does not ask gets no warning at either level.
+    assert warmup.plan_for(warmup.WarmupSetting(True, "full"), asks, knob="K") is not None
+    assert warmup.plan_for(warmup.WarmupSetting(True, "fast"), SMALL, knob="K") is not None
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]
     # Without the ask, the plan reads as before.
     before = plan_warmup(SMALL, "full")
     assert not any(s.kind == "remainder" for s in before.steps)
@@ -907,7 +924,7 @@ def test_the_sglang_and_tokenspeed_inputs_say_when_the_pass_spreads_over_ranks(c
         "The engine runs 2",
     ]
     # TokenSpeed's remainders answer a hazard, and reach one rank each too.
-    assert "chunk remainders reach one rank each too" in spread[1]
+    assert "chunk remainders, when the plan runs them (the full level), reach one rank" in spread[1]
     assert "chunk remainders" not in spread[0]
     caplog.clear()
     sglang_warmup.warmup_inputs(SimpleNamespace(max_running_requests=64), facts)

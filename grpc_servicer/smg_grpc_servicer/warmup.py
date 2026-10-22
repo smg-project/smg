@@ -28,14 +28,17 @@ flips, so the first-time costs are paid while nothing is routed here:
 - a **second pass** over the bucket grid, whose timings show what the first
   pass paid;
 - the **chunk remainders**, when the engine module asks for them
-  (:attr:`WarmupInputs.every_prefill_length`): every prompt length up to the
-  step the ladder left out, last, in an order whose every prefix is a uniform
-  spread of the range (:func:`spread_order`), so a budget cut leaves an even
-  coverage rather than a missing tail. A chunked prefill's last chunk is any
-  count below the step, and an engine whose kernel choice at a prefill length
-  comes from a library it reaches lazily loads a never-used kernel on that
-  count's first use; during serving, with a collective of the overlapped
-  previous chunk still in flight, that load has deadlocked the forward.
+  (:attr:`WarmupInputs.every_prefill_length`) and the level is ``full``:
+  every prompt length up to the step the ladder left out, last, in an order
+  whose every prefix is a uniform spread of the range (:func:`spread_order`),
+  so a budget cut leaves an even coverage rather than a missing tail. A
+  chunked prefill's last chunk is any count below the step, and an engine
+  whose kernel choice at a prefill length comes from a library it reaches
+  lazily loads a never-used kernel on that count's first use; during serving,
+  with a collective of the overlapped previous chunk still in flight, that
+  load has deadlocked the forward. The ``fast`` level plans none of them and
+  leaves that hazard open (the start log says so): it is for a test leg or a
+  quick restart, and the shipped default is ``full``.
 
 Every request carries its own token ids (no two requests share a prefix
 block), so prefix caching never turns a planned prefill into a hit, and the
@@ -192,7 +195,9 @@ class WarmupInputs:
     #: engine's kernel choice at a prefill length comes from a library the
     #: servicer cannot bucket and a first use during serving is a hazard, so
     #: every length is used once here, before anything is routed (a chunked
-    #: prefill's last chunk is any count below the step).
+    #: prefill's last chunk is any count below the step). Honoured at the
+    #: ``full`` level alone: a ``fast`` start plans the classes and leaves the
+    #: hazard open, and :func:`plan_for` warns so.
     every_prefill_length: bool = False
 
 
@@ -710,6 +715,13 @@ def plan_for(
         log.info("Planned warm-up: none for this engine or model")
         return None
     plan = plan_warmup(inputs, setting.level)
+    if inputs.every_prefill_length and setting.level != LEVEL_FULL:
+        log.warning(
+            "Planned warm-up at the %s level plans the length classes alone and leaves out the "
+            "chunk remainders this engine asks for: a prompt length's first use during serving "
+            "stays a hazard until a start at the full level",
+            setting.level,
+        )
     if not plan.steps:
         log.info(
             "Planned warm-up: nothing to plan (window %d, step %d, context %d, vocabulary %d)",

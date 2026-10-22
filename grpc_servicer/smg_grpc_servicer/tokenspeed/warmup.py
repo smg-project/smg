@@ -21,6 +21,9 @@ driver's module load, the collective waiting for them). Every count used
 once before SERVING, with nothing else in flight, leaves no first use to
 serving. The remainders run last, in an order whose every prefix is a
 uniform spread of the range, so the budget cuts evenly if it cuts at all.
+They run at the ``full`` level alone (the shipped default): a start at
+``fast`` takes the length classes and leaves the hazard open, which the
+start log says.
 
 Under attention data parallelism the servicer routes by load and the wire
 pins no rank, so a remainder, like every prefill shape, reaches one rank: the
@@ -74,9 +77,9 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
             "The engine runs %d scheduler ranks and the servicer routes a warm-up request to the "
             "least-loaded one: each prefill shape of the planned warm-up reaches one rank; the "
             "other ranks pay its first-time cost at their first request of that shape, and the "
-            "chunk remainders reach one rank each too, so the hazard they answer (a count's "
-            "first use during serving) stays open on the other ranks until the wire can pin a "
-            "rank",
+            "chunk remainders, when the plan runs them (the full level), reach one rank each "
+            "too, so the hazard they answer (a count's first use during serving) stays open on "
+            "the other ranks until the wire can pin a rank",
             ranks,
         )
     step = args.chunked_prefill_size or args.max_prefill_tokens or DEFAULT_STEP_TOKENS
