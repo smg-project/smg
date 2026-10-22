@@ -1,6 +1,6 @@
 """CPU checks for HTTP scheduler observations; no workers are launched."""
 
-from contextlib import contextmanager
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -182,6 +182,23 @@ def test_overflowed_scheduler_total_fails(monkeypatch):
 
 
 @pytest.mark.parametrize(
+    "backend,moriio,skipped",
+    [
+        ("pd_http", False, True),
+        ("pd_http", True, False),
+        ("pd_grpc", False, False),
+        ("pd_grpc", True, False),
+    ],
+)
+def test_only_mori_http_workers_have_an_idle_observer(backend, moriio, skipped):
+    if skipped:
+        with pytest.raises(pytest.skip.Exception, match="load reports need gRPC workers"):
+            metrics.require_load_reports(backend, moriio=moriio)
+    else:
+        metrics.require_load_reports(backend, moriio=moriio)
+
+
+@pytest.mark.parametrize(
     "lines",
     [
         [],
@@ -209,59 +226,52 @@ def test_stream_waits_past_role_chunk_for_generated_text(key):
     )
 
 
-@pytest.mark.parametrize("runtime", ["vllm", "sglang"])
+def _buffered_stream(events, status=200, done=True):
+    lines = [
+        "data: " + (event if isinstance(event, str) else json.dumps(event)) for event in events
+    ]
+    if done:
+        lines.append("data: [DONE]")
+    return httpx.Response(status, text="\n\n".join(lines))
+
+
+@pytest.mark.parametrize("key", ["content", "reasoning_content", "reasoning"])
+@pytest.mark.parametrize("reason", ["stop", "length"])
+def test_buffered_prefill_stream_accepts_fast_success(key, reason):
+    metrics.assert_completed_text_stream(
+        _buffered_stream([{"choices": [{"delta": {key: "text"}, "finish_reason": reason}]}])
+    )
+
+
+@pytest.mark.parametrize("status", [400, 500])
+def test_buffered_prefill_stream_rejects_http_error(status):
+    with pytest.raises(AssertionError):
+        metrics.assert_completed_text_stream(_buffered_stream([], status=status))
+
+
 @pytest.mark.parametrize(
-    "method",
-    ["test_abandoned_streams_free_both_sides", "test_aborts_during_prefill_free_both_sides"],
-)
-def test_ordinary_http_cancellation_remains_skipped(monkeypatch, runtime, method):
-    from router import test_pd_topologies as topology
-
-    monkeypatch.setattr(topology, "get_runtime", lambda: runtime)
-    monkeypatch.setattr(topology, "_moriio_lane", lambda: False)
-    with pytest.raises(pytest.skip.Exception, match="load reports need gRPC workers"):
-        getattr(topology.TestPDTopology(), method)(("pd_http", "model", None, None))
-
-
-@pytest.mark.parametrize(
-    "kind,status,generated",
+    "events,done",
     [
-        ("stream", 200, True),
-        ("stream", 200, False),
-        ("stream", 500, True),
-        ("prefill", 200, True),
-        ("prefill", 400, True),
-        ("prefill", 500, True),
+        ([], True),
+        ([{"error": {"message": "failed"}}], True),
+        ([{"choices": [{"delta": {"role": "assistant"}, "finish_reason": "stop"}]}], True),
+        ([{"choices": [{"delta": {"content": "text"}}]}], True),
+        ([{"choices": [{"delta": {"content": "text"}, "finish_reason": "length"}]}], False),
+        ([{"choices": [{"delta": {"content": "text"}, "finish_reason": "error"}]}], True),
+        ([{"choices": [{"delta": {"content": "text"}}]}, {"error": {}}], True),
+        (
+            [
+                {"choices": [{"delta": {"content": "text"}, "finish_reason": "stop"}]},
+                {"error": {"message": "late"}},
+            ],
+            True,
+        ),
+        ([{"choices": [{"delta": {"content": "text"}}]}, "malformed"], True),
+        ([{"choices": "invalid"}], True),
+        ([{"choices": [{"delta": "invalid"}]}], True),
+        (["[DONE]", {"error": {"message": "late"}}], False),
     ],
 )
-def test_cancel_test_rejects_unstarted_or_http_error_requests(monkeypatch, kind, status, generated):
-    from router import test_pd_topologies as topology
-
-    checks = []
-    monkeypatch.setattr(topology, "_assert_fleet_idle_within", lambda *a: checks.append("idle"))
-    monkeypatch.setattr(topology, "_wait_until_served", lambda *a, **k: checks.append("served"))
-    if kind == "stream":
-
-        @contextmanager
-        def stream(*args, **kwargs):
-            data = '{"choices":[{"delta":{"content":"token"}}]}' if generated else "[DONE]"
-            yield httpx.Response(status, text=f"data: {data}\n\n")
-
-        monkeypatch.setattr(topology.httpx, "stream", stream)
-        method = "test_abandoned_streams_free_both_sides"
-    else:
-        monkeypatch.setattr(
-            topology.httpx,
-            "post",
-            lambda *a, **k: httpx.Response(status, text="response"),
-        )
-        method = "test_aborts_during_prefill_free_both_sides"
-    run = getattr(topology.TestPDTopology(), method)
-    setup = ("pd_grpc", "model", None, SimpleNamespace(base_url="http://gateway"))
-    if status == 200 and generated:
-        run(setup)
-        assert checks == ["idle", "served"]
-    else:
-        with pytest.raises(AssertionError, match="failed before they could be abandoned"):
-            run(setup)
-        assert checks == []
+def test_buffered_prefill_stream_checks_all_events(events, done):
+    with pytest.raises((AssertionError, ValueError)):
+        metrics.assert_completed_text_stream(_buffered_stream(events, done=done))
