@@ -41,7 +41,7 @@ pub(super) async fn generate(
 ) -> Result<BoxStream<vllm::GenerateResponse>, Status> {
     // The request's arrival, the instant its latencies are measured from.
     let arrival = Instant::now();
-    let client = state.engine()?;
+    let client = state.shared.engine()?;
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
     }
@@ -133,15 +133,20 @@ async fn submit(
     let request_id = req.request_id.clone();
     // Register before anything slow: an `Abort` landing while the media is
     // processed must find the entry, and a duplicate id is refused up front.
-    let (registration, cancel) = state.registry.register(&request_id).inspect_err(|error| {
-        // The id names a request that is still live; a notice under it would
-        // reuse it (and, past an `n > 1` fan-out, get in and free the live
-        // side's blocks). Only a drain refusal proves admission is closed;
-        // a poisoned registry cannot establish whether the id is live.
-        if error.code() != tonic::Code::Unavailable {
-            notice.disarm();
-        }
-    })?;
+    let (registration, cancel) =
+        state
+            .shared
+            .registry
+            .register(&request_id)
+            .inspect_err(|error| {
+                // The id names a request that is still live; a notice under it would
+                // reuse it (and, past an `n > 1` fan-out, get in and free the live
+                // side's blocks). Only a drain refusal proves admission is closed;
+                // a poisoned registry cannot establish whether the id is live.
+                if error.code() != tonic::Code::Unavailable {
+                    notice.disarm();
+                }
+            })?;
     // Worker-side media: the request's references become engine features
     // and its prompt the expanded one, before the frontend duties below.
     let (processed_media, media_identity) = match process_media_refs(state, &mut req).await? {
@@ -210,7 +215,7 @@ async fn submit(
         state: Arc::clone(state),
         request_id: request_id.clone(),
     };
-    let metrics = state.metrics.request(
+    let metrics = state.shared.metrics.request(
         arrival,
         u32::try_from(rank).ok(),
         prompt_tokens,

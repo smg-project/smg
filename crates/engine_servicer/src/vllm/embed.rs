@@ -14,7 +14,7 @@ pub(super) async fn embed(
     state: &Arc<State>,
     req: vllm::EmbedRequest,
 ) -> Result<vllm::EmbedResponse, Status> {
-    let client = state.engine()?;
+    let client = state.shared.engine()?;
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
     }
@@ -32,7 +32,7 @@ pub(super) async fn embed(
     // Registered like a generate stream, so an `Abort` (or the drain on
     // shutdown) ends the wait: dropping the in-flight call drops its engine
     // stream, which aborts the engine-side request.
-    let (_registration, cancel) = state.registry.register(&req.request_id)?;
+    let (_registration, cancel) = state.shared.registry.register(&req.request_id)?;
     let request_id = req.request_id.clone();
     tokio::select! {
         result = client.embed(req, pooler) => result,

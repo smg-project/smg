@@ -35,6 +35,7 @@ mod metrics;
 mod proto_json;
 mod requests;
 mod server;
+mod servicer;
 mod servicer_config;
 pub mod sglang;
 mod stop_match;

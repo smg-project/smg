@@ -7,14 +7,14 @@ use prost_types::Timestamp;
 use smg_grpc_client::tokenspeed_proto as ts;
 use tonic::Status;
 
-use super::State;
+use super::{State, HEALTHY};
 use crate::proto_json::{number, struct_from_json};
 
 /// `HealthCheck`: SERVING only with the engine link up and no drain announced.
 pub(super) fn health_check(state: &State) -> ts::HealthCheckResponse {
     ts::HealthCheckResponse {
-        healthy: state.is_serving(),
-        message: state.health_message().to_string(),
+        healthy: state.shared.is_serving(),
+        message: state.shared.health_message(HEALTHY).to_string(),
     }
 }
 
@@ -23,6 +23,7 @@ pub(super) fn health_check(state: &State) -> ts::HealthCheckResponse {
 pub(super) fn model_info(state: &State) -> ts::GetModelInfoResponse {
     let model = &state.model;
     let ready = state
+        .shared
         .engine
         .client
         .get()
@@ -70,6 +71,7 @@ pub(super) fn model_info(state: &State) -> ts::GetModelInfoResponse {
 pub(super) fn server_info(state: &State) -> ts::GetServerInfoResponse {
     let model = &state.model;
     let ready = state
+        .shared
         .engine
         .client
         .get()
@@ -78,6 +80,7 @@ pub(super) fn server_info(state: &State) -> ts::GetServerInfoResponse {
     let mut scheduler_info = struct_from_json(&model.scheduler_info_json);
     if let Some(ready) = ready {
         let epochs = state
+            .shared
             .engine
             .client
             .get()
@@ -127,12 +130,12 @@ pub(super) fn server_info(state: &State) -> ts::GetServerInfoResponse {
     ts::GetServerInfoResponse {
         server_args: Some(struct_from_json(&model.server_args_json)),
         scheduler_info: Some(scheduler_info),
-        active_requests: i32::try_from(state.registry.len()).unwrap_or(i32::MAX),
+        active_requests: i32::try_from(state.shared.registry.len()).unwrap_or(i32::MAX),
         is_paused: false,
-        uptime_seconds: state.started.elapsed().as_secs_f64(),
+        uptime_seconds: state.shared.started.elapsed().as_secs_f64(),
         max_total_num_tokens,
         tokenspeed_version: version,
-        start_time: Some(Timestamp::from(state.started_at)),
+        start_time: Some(Timestamp::from(state.shared.started_at)),
         constrained_decoding: model.constrained_decoding.clone(),
     }
 }
@@ -141,7 +144,7 @@ pub(super) fn server_info(state: &State) -> ts::GetServerInfoResponse {
 /// response shape the Python servicer derives from the scheduler's load
 /// replies: pages in use become tokens, running is total minus waiting.
 pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsResponse, Status> {
-    let client = state.engine()?;
+    let client = state.shared.engine()?;
     let ready = client.ready_response();
     let max_total_num_tokens = max_total_num_tokens(state);
     let max_running_requests = max_running_requests(state);
@@ -211,6 +214,7 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsR
 /// The KV capacity in tokens, from the handshake; 0 before the engines are up.
 fn max_total_num_tokens(state: &State) -> i32 {
     state
+        .shared
         .engine
         .client
         .get()
@@ -226,6 +230,7 @@ fn max_running_requests(state: &State) -> i32 {
         return state.model.max_running_requests;
     }
     state
+        .shared
         .engine
         .client
         .get()

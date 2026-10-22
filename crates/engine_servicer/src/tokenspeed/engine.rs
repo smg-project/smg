@@ -69,7 +69,7 @@ pub(super) async fn connect_engine(
         StartupBudget {
             silence: startup_timeout,
             ceiling: startup_ceiling,
-            liveness: Some(state.engine.liveness.clone()),
+            liveness: Some(state.shared.engine.liveness.clone()),
         },
     )
     .await
@@ -85,7 +85,7 @@ pub(super) async fn connect_engine(
                 prefill_tokens_per_sec = silence.prefill_tokens_per_sec,
                 "TokenSpeed scheduler connected"
             );
-            let _ = state.engine.client.set(client);
+            let _ = state.shared.engine.client.set(client);
         }
         Err(connect_error) => {
             let ceiling = startup_ceiling
@@ -95,7 +95,7 @@ pub(super) async fn connect_engine(
                  {startup_timeout:?} without a sign of life from the scheduler, ceiling {ceiling})"
             );
             error!(%message);
-            state.engine.fail(message.clone());
+            state.shared.engine.fail(message.clone());
             record_error(&last_error, message);
         }
     }

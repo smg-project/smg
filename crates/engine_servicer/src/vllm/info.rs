@@ -9,7 +9,7 @@ use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
 use tracing::info;
 
-use super::{State, SERVER_TYPE};
+use super::{State, HEALTHY, SERVER_TYPE};
 
 /// How often the engine stats line is logged (vLLM's `VLLM_LOG_STATS_INTERVAL`
 /// default).
@@ -26,11 +26,11 @@ pub(super) async fn log_engine_stats(state: Arc<State>) {
     let mut idle_logged = false;
     loop {
         ticker.tick().await;
-        let Some(client) = state.engine.client.get() else {
+        let Some(client) = state.shared.engine.client.get() else {
             continue;
         };
-        let prompt = state.metrics.prompt_tokens_total();
-        let generation = state.metrics.generation_tokens_total();
+        let prompt = state.shared.metrics.prompt_tokens_total();
+        let generation = state.shared.metrics.generation_tokens_total();
         let prompt_delta = prompt.saturating_sub(last_prompt);
         let generation_delta = generation.saturating_sub(last_generation);
         (last_prompt, last_generation) = (prompt, generation);
@@ -69,8 +69,8 @@ pub(super) async fn log_engine_stats(state: Arc<State>) {
 /// `HealthCheck`: SERVING only with the engine link up and no drain announced.
 pub(super) fn health_check(state: &State) -> vllm::HealthCheckResponse {
     vllm::HealthCheckResponse {
-        healthy: state.is_serving(),
-        message: state.health_message().to_string(),
+        healthy: state.shared.is_serving(),
+        message: state.shared.health_message(HEALTHY).to_string(),
     }
 }
 
@@ -83,6 +83,7 @@ pub(super) fn model_info(state: &State) -> vllm::GetModelInfoResponse {
     let mut max_context_length = model.max_context_length;
     if max_context_length == 0 {
         if let Some(ready) = state
+            .shared
             .engine
             .client
             .get()
@@ -132,6 +133,7 @@ pub(super) async fn server_info(state: &State) -> vllm::GetServerInfoResponse {
 
 fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
     let ready = state
+        .shared
         .engine
         .client
         .get()
@@ -155,7 +157,7 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
         .unwrap_or_default();
     vllm::GetServerInfoResponse {
         active_requests: state.active_requests(),
-        uptime_seconds: state.started.elapsed().as_secs_f64(),
+        uptime_seconds: state.shared.started.elapsed().as_secs_f64(),
         server_type: SERVER_TYPE.to_string(),
         data_parallel_size,
         kv_connector: model.kv_connector.clone(),
@@ -188,6 +190,7 @@ fn max_num_seqs(state: &State) -> i32 {
         return state.model.max_num_seqs;
     }
     state
+        .shared
         .engine
         .client
         .get()
@@ -203,7 +206,7 @@ fn max_num_seqs(state: &State) -> i32 {
 /// carry, each rank's own: the servicer picks the rank a request goes to
 /// and sees what that rank cached and streamed for it.
 pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
-    let client = state.engine()?;
+    let client = state.shared.engine()?;
     let ready = client.ready_response();
     let max_running_requests = max_num_seqs(state);
     let max_total_num_tokens = ready

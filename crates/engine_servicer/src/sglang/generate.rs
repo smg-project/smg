@@ -37,14 +37,14 @@ pub(super) async fn generate(
 ) -> Result<BoxStream<sg::GenerateResponse>, Status> {
     // The request's arrival, the instant its latencies are measured from.
     let arrival = Instant::now();
-    let client = state.engine()?;
+    let client = state.shared.engine()?;
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
     }
     let request_id: Arc<str> = Arc::from(req.request_id.as_str());
     // Register before the submit: an `Abort` landing in the gap must find the
     // entry, and a duplicate id is refused up front.
-    let (registration, cancel) = state.registry.register(&request_id)?;
+    let (registration, cancel) = state.shared.registry.register(&request_id)?;
     let streaming = req.stream;
     let prompt_tokens = req.tokenized.as_ref().map_or(0, |tokenized| {
         u32::try_from(tokenized.input_ids.len()).unwrap_or(u32::MAX)
@@ -56,7 +56,7 @@ pub(super) async fn generate(
     let subs = client
         .generate_sglang_streams_with_trace(req, trace_headers)
         .await?;
-    let metrics = state.metrics.request(
+    let metrics = state.shared.metrics.request(
         arrival,
         subs.first().and_then(SglangGenerateStream::engine_index),
         prompt_tokens,

@@ -27,7 +27,7 @@ pub(super) async fn flush_cache(
             "timeout_s must be finite and non-negative",
         ));
     }
-    let engine = state.engine()?;
+    let engine = state.shared.engine()?;
     let started = Instant::now();
     let immediate = timeout_s == 0.0;
     // A deadline too far out to represent is no deadline at all.

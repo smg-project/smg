@@ -25,7 +25,7 @@ pub(super) async fn flush_cache(
             "timeout_s must be finite and non-negative",
         ));
     }
-    let engine = state.engine()?;
+    let engine = state.shared.engine()?;
     // The scheduler itself waits up to `timeout_s` for an idle moment (a
     // zero flushes at once or refuses); the reply wait is that plus slack,
     // the Python servicer's `max(30, timeout_s + 10)`.
@@ -53,7 +53,7 @@ pub(super) async fn start_profile(
     state: &State,
     request: common::StartProfileRequest,
 ) -> Result<common::ProfileResponse, Status> {
-    let engine = state.engine()?;
+    let engine = state.shared.engine()?;
     let start = SglangProfileStart {
         output_dir: request.output_dir,
         start_step: request.start_step.map(i64::from),
@@ -71,7 +71,7 @@ pub(super) async fn start_profile(
 }
 
 pub(super) async fn stop_profile(state: &State) -> Result<common::ProfileResponse, Status> {
-    let engine = state.engine()?;
+    let engine = state.shared.engine()?;
     profile(
         engine.profile_sglang(None, PROFILE_WAIT).await,
         "Stop profiling",

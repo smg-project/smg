@@ -7,14 +7,14 @@ use prost_types::Timestamp;
 use smg_grpc_client::sglang_proto as sg;
 use tonic::Status;
 
-use super::State;
+use super::{State, HEALTHY};
 use crate::proto_json::{boolean, number, struct_from_json};
 
 /// `HealthCheck`: SERVING only with the engine link up and no drain announced.
 pub(super) fn health_check(state: &State) -> sg::HealthCheckResponse {
     sg::HealthCheckResponse {
-        healthy: state.is_serving(),
-        message: state.health_message().to_string(),
+        healthy: state.shared.is_serving(),
+        message: state.shared.health_message(HEALTHY).to_string(),
     }
 }
 
@@ -23,6 +23,7 @@ pub(super) fn health_check(state: &State) -> sg::HealthCheckResponse {
 pub(super) fn model_info(state: &State) -> sg::GetModelInfoResponse {
     let model = &state.model;
     let ready = state
+        .shared
         .engine
         .client
         .get()
@@ -74,6 +75,7 @@ pub(super) fn model_info(state: &State) -> sg::GetModelInfoResponse {
 pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
     let model = &state.model;
     let ready = state
+        .shared
         .engine
         .client
         .get()
@@ -109,15 +111,15 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
     sg::GetServerInfoResponse {
         server_args: Some(server_args),
         scheduler_info: Some(scheduler_info),
-        active_requests: i32::try_from(state.registry.len()).unwrap_or(i32::MAX),
+        active_requests: i32::try_from(state.shared.registry.len()).unwrap_or(i32::MAX),
         is_paused: false,
         last_receive_timestamp: 0.0,
-        uptime_seconds: state.started.elapsed().as_secs_f64(),
+        uptime_seconds: state.shared.started.elapsed().as_secs_f64(),
         sglang_version: sglang_version(state),
         // The Router strips this label; the two implementations serve the
         // same contract and are not told apart by it.
         server_type: "grpc".to_string(),
-        start_time: Some(Timestamp::from(state.started_at)),
+        start_time: Some(Timestamp::from(state.shared.started_at)),
         max_total_num_tokens,
     }
 }
@@ -126,7 +128,7 @@ pub(super) fn server_info(state: &State) -> sg::GetServerInfoResponse {
 /// response shape the Python servicer derives from the scheduler's load
 /// snapshots. The `include` sections have no source on this wire.
 pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<sg::GetLoadsResponse, Status> {
-    let client = state.engine()?;
+    let client = state.shared.engine()?;
     let ready = client.ready_response();
     let max_total_num_tokens = max_total_num_tokens(state);
     let max_running_requests = max_running_requests(state);
@@ -197,6 +199,7 @@ fn sglang_version(state: &State) -> String {
         .filter(|version| !version.is_empty())
         .or_else(|| {
             state
+                .shared
                 .engine
                 .client
                 .get()
@@ -216,6 +219,7 @@ fn sglang_version(state: &State) -> String {
 /// The KV capacity in tokens, from the handshake; 0 before the engines are up.
 fn max_total_num_tokens(state: &State) -> i32 {
     state
+        .shared
         .engine
         .client
         .get()
@@ -232,6 +236,7 @@ fn max_running_requests(state: &State) -> i32 {
         return state.model.max_running_requests;
     }
     state
+        .shared
         .engine
         .client
         .get()
