@@ -52,7 +52,8 @@ pub(crate) const WARMUP_REQUEST_ID_PREFIX: &str = "smg-warmup-";
 /// Whether `request_id` has the exact form of a warm-up request, the prefix
 /// followed by the request's ordinal and nothing else. The gateway derives a
 /// request's id from a caller's `x-request-id` with a suffix of its own, so
-/// an id a client chose to start with the prefix does not take this form.
+/// that path cannot take this form; a body `rid` outside PD is forwarded as
+/// sent and still can (a per-process nonce in the id would close that).
 pub(crate) fn is_warmup_request_id(request_id: &str) -> bool {
     request_id
         .strip_prefix(WARMUP_REQUEST_ID_PREFIX)
