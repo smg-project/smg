@@ -95,7 +95,7 @@ def wait_for_generated_text(lines: Iterable[str]) -> None:
         data = line[5:].strip()
         assert data != "[DONE]", "stream completed without generated text"
         event = json.loads(data)
-        assert isinstance(event, dict) and not event.get("error"), f"stream error: {event}"
+        assert isinstance(event, dict) and "error" not in event, f"stream error: {event}"
         for choice in event.get("choices", []):
             delta = choice.get("delta", {})
             if any(
