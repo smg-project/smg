@@ -780,6 +780,9 @@ def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False) -> dict:
             created.update(kwargs)
             self.address = kwargs["bind_address"]
 
+        def set_ready(self, ready: bool) -> None:
+            self.ready = ready
+
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
     monkeypatch.setenv("SMG_ZMQ_SOCKET_DIR", str(tmp_path))
@@ -796,6 +799,8 @@ def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False) -> dict:
     )
 
     async def fake_supervise(server, engine, *, drain_secs, **_kwargs):
+        if "warmup" in _kwargs:
+            assert server.ready is False
         return 0
 
     monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
