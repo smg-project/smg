@@ -1071,8 +1071,16 @@ jobs:
       engine: vllm
       gpu_tier: "1"
       runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
-      timeout: 50
-      test_timeout: 30
+      # Measured on the AMD runner: the suite's eight vLLM workers took 18:52
+      # to come up and the step 21:58 end to end before the servicers'
+      # planned warm-up; with it (the default level, up to 300 s per worker)
+      # the seven workers before gpt-oss-20b took 20:08 to come up, and
+      # gpt-oss-20b's own start (engine 2:36 + warm-up ~2:45) ran into the
+      # 30-minute step cap. The slowest composition seen (the earlier run's
+      # engine starts + the later run's warm-ups) projects to ~34 minutes;
+      # 45 keeps the ~30 % headroom the CUDA vLLM row keeps over its 24.
+      timeout: 60
+      test_timeout: 45
       test_dirs: e2e_test/chat_completions
       min_selected: 202 # the vLLM row's floor: both rows select the same cases
       servicer_unit_tests: true
