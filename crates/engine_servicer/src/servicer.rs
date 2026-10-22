@@ -7,7 +7,6 @@
 //! and the stop path are written here once.
 
 use std::{
-    net::SocketAddr,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -198,8 +197,9 @@ impl Server {
     /// scrape during the engine's start answers; the KV-event relay reads its
     /// load records off `state` and follows the publisher from the start.
     /// `on_serve` runs on the server runtime once the listener is bound, with
-    /// the bound address and the server's last-error slot: the wire's engine
-    /// connect, and whatever else lives as long as the runtime.
+    /// the bound address as the engines log it (the listener's `local_addr`,
+    /// empty when the read fails) and the server's last-error slot: the
+    /// wire's engine connect, and whatever else lives as long as the runtime.
     pub(crate) fn start<S, F>(
         thread_name: &str,
         bind_address: &str,
@@ -211,7 +211,7 @@ impl Server {
     ) -> Result<Self, ServicerError>
     where
         S: WireState + RankLoads,
-        F: FnOnce(SocketAddr, SharedError) + Send + 'static,
+        F: FnOnce(String, SharedError) + Send + 'static,
     {
         let shared = state.shared();
         if let Some(relay) = &shared.kv_relay {
@@ -248,9 +248,13 @@ impl Server {
                 if let Some(relay) = &kv_relay {
                     relay.start_at_boot();
                 }
+                // The address as the engines logged it before the start
+                // moved here: a failed read leaves it empty rather than ending
+                // the server thread (`ServerThread::start` read it once already).
                 let address = listener
                     .local_addr()
-                    .map_err(|error| format!("failed to read listener address: {error}"))?;
+                    .map(|address| address.to_string())
+                    .unwrap_or_default();
                 on_serve(address, last_error);
                 // Graceful first: stop accepting, let open streams finish. A
                 // connected client's idle keepalive connection would hold a
