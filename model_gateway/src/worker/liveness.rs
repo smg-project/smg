@@ -123,9 +123,9 @@
 //!   theirs is its token progress, the wedged rule's own clock; a first
 //!   token is also the answer the verdict names, though nothing is booked
 //!   or timed for it) is backed up, not frozen, up to a ceiling of the
-//!   side's bound or the wedge cap from the side's dispatch, past which a
-//!   side whose own handoff is stuck is given up on whatever the worker
-//!   produces for the rest.
+//!   wedge cap past the side's own bound, counted from its dispatch, past
+//!   which a side whose own handoff is stuck is given up on whatever the
+//!   worker produces for the rest.
 //!
 //! - **stale records** (an unreachable veto by another rule): a worker whose
 //!   KV-event stream has pushed load records is heard from every few
@@ -390,7 +390,10 @@ pub(crate) fn prefill_side_reprieve(
 /// side, and are nothing for a worker no prompt is booked on.
 ///
 /// The reprieve has a ceiling of its own, counted from the side's dispatch:
-/// the side's bound or [`WEDGE_BOUND_CAP`], whichever is longer. The rule
+/// the wedge cap past the side's own bound ([`WEDGE_BOUND_CAP`] after the
+/// bound, so a side whose bound already stands at the cap, a long prompt's
+/// estimate or a wedge threshold at the cap, is reprieved like any other,
+/// for a cap's worth). The rule
 /// judges the worker, not the side, so a side whose own handoff is stuck
 /// while its worker keeps producing for its other sides (the prefill engine
 /// stalled right after answering it, or the decode engine lost its transfer
@@ -411,7 +414,7 @@ pub(crate) fn decode_side_reprieve(
     backlog: &OnceLock<Duration>,
 ) -> SideReprieve {
     let produced_ago = worker.token_progress_age();
-    let ceiling = bound.max(WEDGE_BOUND_CAP);
+    let ceiling = bound.saturating_add(WEDGE_BOUND_CAP);
     let Some(to_ceiling) = ceiling
         .checked_sub(dispatched_ago)
         .filter(|left| !left.is_zero())
@@ -1525,12 +1528,14 @@ mod tests {
     }
 
     /// The reprieve's ceiling: a side whose own handoff is stuck on a worker
-    /// that keeps producing for its other sides is given up on at the later
-    /// of its bound and the wedge cap, counted from its dispatch, whatever
-    /// the worker produces; the verdict names the ceiling as its window and
-    /// the age of the worker's latest token as its silence. Before the
-    /// ceiling a producing worker reprieves the side, by at most what is
-    /// left to the ceiling.
+    /// that keeps producing for its other sides is given up on a wedge cap
+    /// past its own bound, counted from its dispatch, whatever the worker
+    /// produces; the verdict names the ceiling as its window and the age of
+    /// the worker's latest token as its silence. Before the ceiling a
+    /// producing worker reprieves the side, by at most what is left to the
+    /// ceiling: a side whose bound stands at the cap or above it (a long
+    /// prompt's estimate, a wedge threshold at the cap) is reprieved past
+    /// its bound like any other.
     #[test]
     fn a_decode_side_is_given_up_on_at_the_ceiling_however_its_worker_produces() {
         let w = worker();
@@ -1539,16 +1544,17 @@ mod tests {
         for bound in [
             Duration::from_millis(100),
             DEFAULT_WEDGE,
+            WEDGE_BOUND_CAP,
             WEDGE_BOUND_CAP * 2,
         ] {
-            let ceiling = bound.max(WEDGE_BOUND_CAP);
+            let ceiling = bound + WEDGE_BOUND_CAP;
             // The worker produces for another side the whole time: a token
             // just now at every check; this side's stream stays empty.
             w.note_token_progress();
-            let standing = decode_side_reprieve(&w, bound, ceiling / 2, &none);
+            let standing = decode_side_reprieve(&w, bound, bound + step, &none);
             assert!(
                 matches!(standing, SideReprieve::WithinBound(left) if !left.is_zero() && left <= bound),
-                "{bound:?}: halfway to the ceiling: a bound's reprieve: {standing:?}"
+                "{bound:?}: a step past the bound: a bound's reprieve: {standing:?}"
             );
             w.note_token_progress();
             let standing = decode_side_reprieve(&w, bound, ceiling - step, &none);
