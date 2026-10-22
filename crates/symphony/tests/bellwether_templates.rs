@@ -1639,7 +1639,26 @@ fn qwen3_5s_tags_take_what_its_chat_template_writes() {
     // the call's marker, so a second call cannot pass as text.
     assert_eq!(one.payload()["format"]["type"], "triggered_tags");
     assert!(!accepts(&one, QWEN3_5_CALLS_THINKING), "one call");
-    assert!(accepts(&answer, QWEN3_5_ANSWER_THINKING));
+    // With the thought open and no word from the engine on where its grammar starts, the answer
+    // is the schema alone, applied where the engine starts it: an engine that gates the grammar
+    // behind its reasoning parser applies it after the model's own close. One that starts at the
+    // first token is told so and gets the thought, closed by its own marker, before the schema;
+    // the template's blank line after the close is the whitespace the engine's JSON grammar
+    // admits before a value, which this walker reads with no space at the value's edges.
+    assert!(accepts(&answer, "{\"probe\": 1}"));
+    assert!(
+        !accepts(&answer, QWEN3_5_ANSWER_THINKING),
+        "the schema alone"
+    );
+    let led = format
+        .answer_grammar_for(&json!({"type": "object"}), true, GrammarStart::FirstToken)
+        .expect("an answer tag");
+    led.check().expect("a tag the engines take");
+    assert!(accepts(&led, "\n</think>{\"probe\": 1}"));
+    assert!(
+        !accepts(&led, "{\"probe\": 1}"),
+        "the thought's close first"
+    );
     let thought = format!("Probe thought.{QWEN3_5_CALLS_THINKING}");
     assert!(accepts(&required, &thought), "the thought before its close");
     // With thinking off, the prompt closed the thought: the calls start at once.
