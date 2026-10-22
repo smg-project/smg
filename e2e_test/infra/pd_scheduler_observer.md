@@ -8,7 +8,7 @@ The source contract is the installed vLLM 0.31.0 ROCm image
 `sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f`.
 Its scheduler interface is not stable. The two entry classes preserve the actual
 `Scheduler` and `AsyncScheduler` parents. Explicit entry-module import first checks
-the hashes of ten installed source files before importing backend classes.
+the hashes of eleven installed source files before importing backend classes.
 Already-loaded critical modules must match that root through both file and spec
 origins; both parent classes must belong to their exact native modules.
 `observer_class_for_config` calls the actual native class selector after full
@@ -17,6 +17,24 @@ diffusion schedulers are unsupported; an input bool is not selection evidence.
 The constructor marks a class/config mismatch unknown without changing that config.
 No worker uses this helper yet. Passing a custom scheduler CLI flag too early
 would suppress native diffusion selection, so it is not an integration shortcut.
+
+The separate `smg_pd_observer` general-plugin adapter is also unused by fixtures.
+Its child environment helper requires explicit opt-in and context, prepends two
+absolute paths without changing the parent environment, preserves an unset
+VLLM_PLUGINS (load all), and appends only this plugin to an existing allowlist.
+The nested metadata directory is discovered only when added to child PYTHONPATH.
+Apply the helper after Worker builds its GPU-specific environment; the result is
+a complete child-process environment, rather than an extra_env override mapping.
+Importing the lightweight callback with its flag absent loads neither infra nor vLLM.
+
+The callback delegates the original getter once. Only the verified EngineCore
+constructor's code object triggers lazy observer selection; other callers retain
+the native result and emit an unknown diagnostic. Replaced constructors/getters
+and unsupported actual classes fail. No scheduler_cls/async field is overridden.
+Registration is not an enabled/complete verdict; trace completeness is still absent.
+The loader hash is from official db9527a, not an actual-image read. Runtime must
+match that hash and module origins; actual-image loader compatibility, real child
+startup and backend fork/spawn behavior remain unverified. No GPU trial is enabled.
 
 Each hook delegates once, returns the native result and propagates native errors.
 `finish_requests_return` records only the returned requests' actual statuses.

@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+smg_pd_scheduler_observer = smg_pd_observer:register

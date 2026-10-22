@@ -27,7 +27,12 @@ def observer_class_for_config(vllm_config):
     config = vllm_config.scheduler_config
     if type(getattr(config, "async_scheduling", None)) is not bool:
         raise ValueError("unresolved native scheduler configuration")
-    native = config.get_scheduler_cls()
+    return observer_class_for_native(config.get_scheduler_cls(), config)
+
+
+def observer_class_for_native(native, config):
+    if type(getattr(config, "async_scheduling", None)) is not bool:
+        raise ValueError("unresolved native scheduler configuration")
     if native is Scheduler:
         return ObservedScheduler
     if native is AsyncScheduler:
