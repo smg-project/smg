@@ -270,19 +270,19 @@ What the syntax says, and what the assembler does with it:
   fragment keeps the arguments a strict JSON prefix; a start of a tag held behind the value is
   its text too where the two together are still such a prefix (`{"q": "a <`) or where the
   value opens as a string anyway (`hel<`), and leaves after the call's end as wrapping where
-  the text alone is the prefix (`12</arg_v`); a streamed string keeps its fragments, a held
-  tag start its text; a string whose key came and no byte of it opens,
-  `{"key": "`; a key whose two tags came and whose value tag did not opens its member,
-  `"key": `, and a start of the value tag leaves after the call's end as the syntax's wrapping;
-  a key tag the cut found open and the template's whitespace between pairs leave as wrapping
-  too (`Dropped { Wrapper }`, never `MalformedCall`: a cut is not a failed call). A started
-  call then ends as the Qwen assembler's does, after one `Malformed { UnterminatedRegion }`
-  event of no bytes that says its arguments are no whole value (`tagged::end_cut_call`); a
-  block that named no call has what it held refused. `Assembler::stop` is the stream's stop,
-  the model's own end: the call ends as the marker would end it, a call not yet named is named
-  from its text, a streamed string still open is closed first, with the start of a tag held as
-  its text, and the one `Malformed { OpenAtTheStop }` event says so (the third ending of the
-  Qwen assembler, above).
+  the text alone is a JSON prefix or a complete Python literal (`12</arg_v`, `True</arg_v`); a
+  streamed string keeps its fragments, a held tag start its text; a string whose key came and
+  no byte of it opens, `{"key": "`; a key whose two tags came and whose value tag did not
+  opens its member, `"key": `, and a start of the value tag leaves after the call's end as the
+  syntax's wrapping; a key tag the cut found open and the template's whitespace between pairs
+  leave as wrapping too (`Dropped { Wrapper }`, never `MalformedCall`: a cut is not a failed
+  call). A started call then ends as the Qwen assembler's does, after one `Malformed {
+  UnterminatedRegion }` event of no bytes that says its arguments are no whole value
+  (`tagged::end_cut_call`); a block that named no call has what it held refused.
+  `Assembler::stop` is the stream's stop, the model's own end: the call ends as the marker
+  would end it, a call not yet named is named from its text, a streamed string still open is
+  closed first, with the start of a tag held as its text, and the one `Malformed {
+  OpenAtTheStop }` event says so (the third ending of the Qwen assembler, above).
 - **Nothing the syntax cannot read is content** (`tagged::refuse`). The block's markers and its
   four tags are the format's own tokens, and the text between them where the syntax has no place
   for text (a value whose key never opened, a tag written twice, a name that is prose, Python or

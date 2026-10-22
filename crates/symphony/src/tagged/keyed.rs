@@ -34,7 +34,7 @@ use crate::{
     event::{runs, DropReason, Event, Events, MalformedReason, Text},
     markers::{Piece, Scanner},
     tagged::{
-        drop_refused, end_cut_call, held_text, refuse,
+        end_cut_call, held_text, refuse,
         value::{cut as cut_json, cut_opens_a_string, json, json_prefix, Kind},
     },
     Declared,
@@ -305,24 +305,24 @@ impl Assembler {
     }
 
     /// The stream was cut: nothing is closed, so arguments cut short never look complete to a
-    /// client, and the call's bytes stay the call's. A streamed string's open fragment stays
-    /// open, the bytes the scanner held as a start of a tag its text, since no tag followed; a
-    /// value held for its close leaves as the call's own fragment, its key and its bytes as the
-    /// model wrote them (`, "prefs": {"size": "large", "temp`) where they are a strict prefix of
-    /// a JSON value and as the opening of a string holding them where they are not
-    /// ([`cut_json`]), since a client reads the prefix as written under `length`, the member is
-    /// never lost and every fragment keeps the arguments a strict JSON prefix; a start of a tag
-    /// held behind the value is its text too where the two together are still such a prefix
-    /// (`{"q": "a <`) or where the value opens as a string anyway (`hel<`), and leaves after
-    /// the call's end as the syntax's wrapping where the text alone is the prefix
-    /// (`12</arg_v`); a string whose key came and no byte of it opens, `{"key": "`; a key
-    /// whose two tags came and whose value tag did not opens its member, `"key": `, and a start
-    /// of the value tag leaves after the call's end as the syntax's wrapping; a key tag the cut
-    /// found open and the template's whitespace between pairs leave as wrapping too
-    /// ([`DropReason::Wrapper`]). A call that started still ends, with no bytes of its own, as
-    /// every assembler ends one, after the one `Malformed { UnterminatedRegion }` event of no
-    /// bytes that says that its arguments are no whole value ([`end_cut_call`]); what a block
-    /// that named no call held is refused as `UnterminatedRegion`.
+    /// client, and the call's bytes stay the call's. A streamed string's open fragment stays open,
+    /// the bytes the scanner held as a start of a tag its text, since no tag followed; a value held
+    /// for its close leaves as the call's own fragment, its key and its bytes as the model wrote
+    /// them (`, "prefs": {"size": "large", "temp`) where they are a strict prefix of a JSON value
+    /// and as the opening of a string holding them where they are not ([`cut_json`]), since a
+    /// client reads the prefix as written under `length`, the member is never lost and every
+    /// fragment keeps the arguments a strict JSON prefix; a start of a tag held behind the value is
+    /// its text too where the two together are still such a prefix (`{"q": "a <`) or where the
+    /// value opens as a string anyway (`hel<`), and leaves after the call's end as the syntax's
+    /// wrapping where the text alone is a JSON prefix or a complete Python literal (`12</arg_v`,
+    /// `True</arg_v`); a string whose key came and no byte of it opens, `{"key": "`; a key whose
+    /// two tags came and whose value tag did not opens its member, `"key": `, and a start of the
+    /// value tag leaves after the call's end as the syntax's wrapping; a key tag the cut found open
+    /// and the template's whitespace between pairs leave as wrapping too ([`DropReason::Wrapper`]).
+    /// A call that started still ends, with no bytes of its own, as every assembler ends one, after
+    /// the one `Malformed { UnterminatedRegion }` event of no bytes that says that its arguments
+    /// are no whole value ([`end_cut_call`]); what a block that named no call held is refused as
+    /// `UnterminatedRegion`.
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
@@ -355,8 +355,9 @@ impl Assembler {
                         // A start of a tag held behind the value is the value's own text where
                         // the two together are still a strict prefix of a JSON value
                         // (`{"q": "a <`) and where the value opens as a string anyway (`hel<`),
-                        // as it is in a streamed string; where the text alone is the prefix
-                        // (`12</arg_v`) the tail leaves after the call's end as wrapping.
+                        // as it is in a streamed string; where the text alone is a JSON prefix
+                        // or a complete Python literal (`12</arg_v`, `True</arg_v`) the tail
+                        // leaves after the call's end as wrapping.
                         let joined = format!("{text}{tail}");
                         let kept =
                             !tail.is_empty() && (json_prefix(&joined) || cut_opens_a_string(text));
@@ -945,7 +946,7 @@ mod tests {
     /// and one character at a time.
     #[test]
     fn a_value_the_stream_end_cuts_leaves_as_the_calls_own_bytes_and_nothing_is_lost() {
-        let cases: [(&str, &str, &[&str]); 20] = [
+        let cases: [(&str, &str, &[&str]); 21] = [
             // A declared string: streamed as it came, a held start of a tag its text.
             ("f<arg_key>s</arg_key><arg_value>Pa", r#"{"s": "Pa"#, &[]),
             ("f<arg_key>s</arg_key><arg_value>Pa<", r#"{"s": "Pa<"#, &[]),
@@ -986,6 +987,13 @@ mod tests {
                 "f<arg_key>x</arg_key><arg_value>hel</arg_v",
                 r#"{"x": "hel</arg_v"#,
                 &[],
+            ),
+            // A complete Python literal reads as the close reads it; the tag start behind it
+            // is wrapping, since keeping it would change the value's type.
+            (
+                "f<arg_key>x</arg_key><arg_value>True</arg_v",
+                r#"{"x": true"#,
+                &["</arg_v"],
             ),
             ("f<arg_key>n</arg_key><arg_value>", r#"{"n": "#, &[]),
             (
