@@ -540,4 +540,30 @@ mod tests {
             Ok(())
         );
     }
+
+    #[test]
+    fn another_vendors_name_for_a_glm53_model_takes_its_rules() {
+        // A Kimi-named alias of a GLM-5.3 model takes the z.ai profile from
+        // the model it reaches, and the series with it: its own name carries
+        // no contract here.
+        const ALIAS: &str = "kimi-k2-name-of-a-glm53-model";
+        ProviderProfile::register_model_aliases([(ALIAS, "zai-org/GLM-5.3-Flash")]);
+        assert_eq!(ProviderProfile::for_model(ALIAS), ProviderProfile::Zai);
+
+        let mut req = request(json!({"model": ALIAS}));
+        ProviderProfile::for_model(&req.model).normalize_chat(&mut req);
+        assert_eq!(req.temperature, Some(DEFAULT_TEMPERATURE));
+        assert_eq!(
+            validate(&request(
+                json!({"model": ALIAS, "thinking": {"type": "disabled"}})
+            )),
+            Err("thinking_disabled_not_supported".into())
+        );
+        assert_eq!(
+            validate(&request(
+                json!({"model": ALIAS, "reasoning_effort": "medium"})
+            )),
+            Err("reasoning_effort_not_allowed".into())
+        );
+    }
 }

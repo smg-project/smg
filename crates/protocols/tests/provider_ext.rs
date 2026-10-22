@@ -1816,3 +1816,23 @@ fn a_registered_alias_of_kimi_k3_takes_its_sampling_rules() {
         "the K3 temperature pin applies under the alias"
     );
 }
+
+#[test]
+fn another_vendors_name_for_kimi_k3_takes_its_sampling_rules() {
+    use openai_protocol::{profile::ProviderProfile, validated::Normalizable};
+    // A GLM-named alias of `kimi-k3` takes the Kimi profile from the model it
+    // reaches, and K3's pins with it: its own name carries no contract here.
+    const ALIAS: &str = "glm-5-name-of-a-k3-model";
+    ProviderProfile::register_model_aliases([(ALIAS, "kimi-k3")]);
+    assert_eq!(ProviderProfile::for_model(ALIAS), ProviderProfile::Kimi);
+
+    let mut req = sampling_request(ALIAS, json!({}));
+    req.normalize();
+    assert_eq!(req.temperature, Some(1.0));
+    let mut req = sampling_request(ALIAS, json!({"temperature": 0.3}));
+    req.normalize();
+    assert_eq!(
+        error_codes(&req),
+        vec!["temperature_not_allowed".to_string()]
+    );
+}
