@@ -118,7 +118,7 @@ dominated by model-load time, serialized by a host lock, so a PR run is not fast
 
 ## Validation status — ran end-to-end ✅
 
-Brought up end-to-end on an 8×B200 box (`moirai-b200`), **`Qwen/Qwen3.6-27B` at TP=1 per arm** (the 183 GB Blackwell cards fit the 27B model on a single GPU), user-sim **`gpt-5.2`** at temp 0. Stack: vLLM 0.24.0 (CUDA 13.0, Blackwell sm_100), smg 1.7.0, tau2-bench 1.0.0.
+Brought up end-to-end on one node, **`Qwen/Qwen3.6-27B` at TP=1 per arm** (the 27B model fits on a single GPU), user-sim **`gpt-5.2`** at temp 0. Stack: vLLM 0.24.0 (CUDA 13.0), smg 1.7.0, tau2-bench 1.0.0.
 
 **FC confirmed on both arms** — identical `get_weather(city="Paris")` tool call, `finish_reason=tool_calls`. One frontend delta observed: the pure-vLLM arm returned empty `reasoning_content` while the SMG arm populated it (a reasoning-parse/template difference; the tool call itself is identical).
 
