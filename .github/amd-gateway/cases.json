@@ -1,0 +1,89 @@
+{
+  "vllm": {
+    "product_head": "9a5c23d632a5e9e7430155b36727892776a66a73",
+    "min_selected": 3,
+    "models": [
+      "meta-llama/Llama-3.1-8B-Instruct"
+    ],
+    "cases": [
+      "router/test_worker_api.py::TestDisableHealthCheck::test_disable_health_check_gateway_starts_without_health_checker",
+      "router/test_worker_api.py::TestDisableHealthCheck::test_disable_health_check_workers_immediately_healthy",
+      "router/test_admin_ops.py::TestFlushCacheVllm::test_flush_cache_full_cycle[grpc]",
+      "router/test_loads.py::TestWorkerLoadReports::test_every_worker_reports_load[grpc]",
+      "router/test_loads.py::TestWorkerLoadReports::test_report_reflects_in_flight_requests[grpc]",
+      "router/test_mmlu.py::TestMMLUGrpc::test_mmlu_basic[grpc]",
+      "router/test_context_length.py::TestRegularContextLength::test_over_long_prompt_is_a_400_context_length_exceeded[grpc]",
+      "router/test_context_length.py::TestRegularContextLength::test_over_long_streaming_prompt_is_a_json_400[grpc]",
+      "router/test_context_length.py::TestRegularContextLength::test_prompt_within_the_window_is_served[grpc]",
+      "router/test_context_length.py::TestRegularContextLength::test_workers_still_healthy_after_rejection[grpc]"
+    ],
+    "allowed_skips": {
+      "router/test_worker_api.py::TestDisableHealthCheck::test_disable_health_check_gateway_starts_without_health_checker": "vLLM does not support HTTP mode",
+      "router/test_worker_api.py::TestDisableHealthCheck::test_disable_health_check_workers_immediately_healthy": "vLLM does not support HTTP mode"
+    }
+  },
+  "sglang": {
+    "product_head": "33d760e5716ae4903ef1197c11917b1eb82cc2d3",
+    "min_selected": 23,
+    "models": [
+      "Qwen/Qwen3-4B-Instruct-2507",
+      "meta-llama/Llama-3.1-8B-Instruct"
+    ],
+    "cases": [
+      "router/test_worker_api.py::TestDisableHealthCheck::test_disable_health_check_gateway_starts_without_health_checker",
+      "router/test_worker_api.py::TestDisableHealthCheck::test_disable_health_check_workers_immediately_healthy",
+      "router/test_worker_api.py::TestIGWMode::test_igw_add_and_remove_worker",
+      "router/test_worker_api.py::TestIGWMode::test_igw_add_worker",
+      "router/test_worker_api.py::TestIGWMode::test_igw_start_empty",
+      "router/test_worker_api.py::TestWorkerAPIRestSemantics::test_patch_partial_update",
+      "router/test_worker_api.py::TestWorkerAPIRestSemantics::test_post_duplicate_url_returns_409",
+      "router/test_worker_api.py::TestWorkerAPIRestSemantics::test_put_full_replace",
+      "router/test_worker_api.py::TestWorkerAPIRestSemantics::test_put_url_mismatch_returns_400",
+      "router/test_admin_ops.py::TestAdminOps::test_flush_cache_full_cycle[grpc]",
+      "router/test_admin_ops.py::TestAdminOps::test_profile_url_filter_without_match_returns_404[grpc]",
+      "router/test_admin_ops.py::TestAdminOps::test_start_and_stop_profile_produces_traces[grpc]",
+      "router/test_admin_ops.py::TestAdminOps::test_start_profile_rejects_malformed_json[grpc]",
+      "router/test_loads.py::TestWorkerLoadReports::test_every_worker_reports_load[grpc]",
+      "router/test_loads.py::TestWorkerLoadReports::test_report_reflects_in_flight_requests[grpc]",
+      "router/test_mmlu.py::TestMMLUGrpc::test_mmlu_basic[grpc]",
+      "router/test_worker_api.py::TestWorkerAPI::test_health_endpoint[grpc]",
+      "router/test_worker_api.py::TestWorkerAPI::test_list_models[grpc]",
+      "router/test_worker_api.py::TestWorkerAPI::test_list_workers[grpc]",
+      "router/test_decisions.py::TestDecisions::test_all_question_types_order_names_and_prefill_usage[grpc]",
+      "router/test_decisions.py::TestDecisions::test_invalid_or_unsupported_requests_are_client_errors[image-grpc]",
+      "router/test_decisions.py::TestDecisions::test_invalid_or_unsupported_requests_are_client_errors[missing_model-grpc]",
+      "router/test_decisions.py::TestDecisions::test_invalid_or_unsupported_requests_are_client_errors[numeric_choice-grpc]",
+      "router/test_decisions.py::TestDecisions::test_invalid_or_unsupported_requests_are_client_errors[unknown_type-grpc]",
+      "router/test_decisions.py::TestDecisions::test_ordered_user_messages_are_accepted[grpc]",
+      "router/test_context_length.py::TestRegularContextLength::test_over_long_prompt_is_a_400_context_length_exceeded[grpc]",
+      "router/test_context_length.py::TestRegularContextLength::test_over_long_streaming_prompt_is_a_json_400[grpc]",
+      "router/test_context_length.py::TestRegularContextLength::test_prompt_within_the_window_is_served[grpc]",
+      "router/test_context_length.py::TestRegularContextLength::test_workers_still_healthy_after_rejection[grpc]",
+      "router/test_admin_ops.py::TestAdminOps::test_flush_cache_full_cycle[http]",
+      "router/test_admin_ops.py::TestAdminOps::test_profile_url_filter_without_match_returns_404[http]",
+      "router/test_admin_ops.py::TestAdminOps::test_start_and_stop_profile_produces_traces[http]",
+      "router/test_admin_ops.py::TestAdminOps::test_start_profile_rejects_malformed_json[http]",
+      "router/test_rl_control_plane.py::TestRlControlPlaneDisabled::test_v1_rl_is_404_without_flag[http]",
+      "router/test_rl_control_plane.py::TestRlControlPlaneSglang::test_discovery_reports_engine_topology_and_control_endpoint[http]",
+      "router/test_rl_control_plane.py::TestRlControlPlaneSglang::test_fanout_flush_cache[http]",
+      "router/test_rl_control_plane.py::TestRlControlPlaneSglang::test_pause_then_continue_keeps_serving[http]",
+      "router/test_rl_control_plane.py::TestRlControlPlaneSglang::test_refit_from_disk_is_visible_on_the_next_generate[http]",
+      "router/test_rl_control_plane.py::TestRlControlPlaneSglang::test_single_worker_proxy_server_info[http]",
+      "router/test_worker_api.py::TestWorkerAPI::test_health_endpoint[http]",
+      "router/test_worker_api.py::TestWorkerAPI::test_list_models[http]",
+      "router/test_worker_api.py::TestWorkerAPI::test_list_workers[http]",
+      "router/test_decisions.py::TestDecisions::test_all_question_types_order_names_and_prefill_usage[http]",
+      "router/test_decisions.py::TestDecisions::test_invalid_or_unsupported_requests_are_client_errors[image-http]",
+      "router/test_decisions.py::TestDecisions::test_invalid_or_unsupported_requests_are_client_errors[missing_model-http]",
+      "router/test_decisions.py::TestDecisions::test_invalid_or_unsupported_requests_are_client_errors[numeric_choice-http]",
+      "router/test_decisions.py::TestDecisions::test_invalid_or_unsupported_requests_are_client_errors[unknown_type-http]",
+      "router/test_decisions.py::TestDecisions::test_ordered_user_messages_are_accepted[http]",
+      "router/test_systemone.py::TestSystemOne::test_backend_rejects_unknown_nested_question_field[http]",
+      "router/test_systemone.py::TestSystemOne::test_missing_model_is_a_client_error[http]",
+      "router/test_systemone.py::TestSystemOne::test_native_question_ids_answers_criteria_and_prefill_usage[http]",
+      "router/test_systemone.py::TestSystemOne::test_structured_state_is_accepted[array-http]",
+      "router/test_systemone.py::TestSystemOne::test_structured_state_is_accepted[object-http]"
+    ],
+    "allowed_skips": {}
+  }
+}
