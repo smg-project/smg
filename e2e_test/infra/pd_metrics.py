@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Iterable
 
 import httpx
 
@@ -77,3 +78,23 @@ def vllm_work_snapshot(gateway) -> tuple[bool, list[dict]]:
         math.isfinite(s[key]) for s in states for key in ("num_running_reqs", "num_waiting_reqs")
     ), f"non-finite scheduler totals: {states}"
     return all(s["num_running_reqs"] == s["num_waiting_reqs"] == 0 for s in states), states
+
+
+def wait_for_generated_text(lines: Iterable[str]) -> None:
+    """A role chunk, error or completed empty stream is not a generated token."""
+    for line in lines:
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        assert data != "[DONE]", "stream completed without generated text"
+        event = json.loads(data)
+        assert isinstance(event, dict) and not event.get("error"), f"stream error: {event}"
+        for choice in event.get("choices", []):
+            delta = choice.get("delta", {})
+            if any(
+                isinstance(delta.get(key), str) and delta[key]
+                for key in ("content", "reasoning_content", "reasoning")
+            ):
+                assert choice.get("finish_reason") is None, "generation already finished"
+                return
+    raise AssertionError("stream ended without generated text")

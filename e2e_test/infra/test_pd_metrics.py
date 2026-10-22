@@ -1,5 +1,6 @@
 """CPU checks for HTTP scheduler observations; no workers are launched."""
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import httpx
@@ -180,6 +181,34 @@ def test_overflowed_scheduler_total_fails(monkeypatch):
         metrics.vllm_work_snapshot(SimpleNamespace(prefill_workers=[], decode_workers=[_worker()]))
 
 
+@pytest.mark.parametrize(
+    "lines",
+    [
+        [],
+        ["data: [DONE]"],
+        ['data: {"error":{"message":"bad"}}'],
+        ['data: {"choices":[{"delta":{"role":"assistant"}}]}'],
+        ['data: {"choices":[{"delta":{"content":""}}]}'],
+        ['data: {"choices":[{"delta":{"content":"done"},"finish_reason":"length"}]}'],
+        ["data: malformed"],
+    ],
+)
+def test_stream_without_unfinished_generated_text_fails(lines):
+    with pytest.raises((AssertionError, ValueError)):
+        metrics.wait_for_generated_text(lines)
+
+
+@pytest.mark.parametrize("key", ["content", "reasoning_content", "reasoning"])
+def test_stream_waits_past_role_chunk_for_generated_text(key):
+    metrics.wait_for_generated_text(
+        [
+            ": heartbeat",
+            'data: {"choices":[{"delta":{"role":"assistant"}}]}',
+            f'data: {{"choices":[{{"delta":{{"{key}":"one token"}}}}]}}',
+        ]
+    )
+
+
 @pytest.mark.parametrize("runtime", ["vllm", "sglang"])
 @pytest.mark.parametrize(
     "method",
@@ -192,3 +221,47 @@ def test_ordinary_http_cancellation_remains_skipped(monkeypatch, runtime, method
     monkeypatch.setattr(topology, "_moriio_lane", lambda: False)
     with pytest.raises(pytest.skip.Exception, match="load reports need gRPC workers"):
         getattr(topology.TestPDTopology(), method)(("pd_http", "model", None, None))
+
+
+@pytest.mark.parametrize(
+    "kind,status,generated",
+    [
+        ("stream", 200, True),
+        ("stream", 200, False),
+        ("stream", 500, True),
+        ("prefill", 200, True),
+        ("prefill", 400, True),
+        ("prefill", 500, True),
+    ],
+)
+def test_cancel_test_rejects_unstarted_or_http_error_requests(monkeypatch, kind, status, generated):
+    from router import test_pd_topologies as topology
+
+    checks = []
+    monkeypatch.setattr(topology, "_assert_fleet_idle_within", lambda *a: checks.append("idle"))
+    monkeypatch.setattr(topology, "_wait_until_served", lambda *a, **k: checks.append("served"))
+    if kind == "stream":
+
+        @contextmanager
+        def stream(*args, **kwargs):
+            data = '{"choices":[{"delta":{"content":"token"}}]}' if generated else "[DONE]"
+            yield httpx.Response(status, text=f"data: {data}\n\n")
+
+        monkeypatch.setattr(topology.httpx, "stream", stream)
+        method = "test_abandoned_streams_free_both_sides"
+    else:
+        monkeypatch.setattr(
+            topology.httpx,
+            "post",
+            lambda *a, **k: httpx.Response(status, text="response"),
+        )
+        method = "test_aborts_during_prefill_free_both_sides"
+    run = getattr(topology.TestPDTopology(), method)
+    setup = ("pd_grpc", "model", None, SimpleNamespace(base_url="http://gateway"))
+    if status == 200 and generated:
+        run(setup)
+        assert checks == ["idle", "served"]
+    else:
+        with pytest.raises(AssertionError, match="failed before they could be abandoned"):
+            run(setup)
+        assert checks == []
