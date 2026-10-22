@@ -2270,7 +2270,7 @@ fn the_familys_rule_picks_nothing(
     source_fps: f64,
     cfg: VideoFetchConfig,
 ) -> String {
-    let rate = f64::from(cfg.sample_fps);
+    let rate = cfg.sample_fps;
     format!(
         "the model's video sampling picks no frame of a clip of {total_frames} frames at \
          {source_fps} fps: shorter than one sampling interval at {rate} frames a second ({:.3} s)",
@@ -3661,7 +3661,10 @@ impl FrameSelection {
         let (total_frames, frame_indices) =
             loader_frames(self.total_frames, visible, self.source_fps, cfg);
         if frame_indices.is_empty() {
-            return if matches!(cfg.sampling, FrameSampling::RateWalk { .. }) {
+            // A probe that decoded no frame at all says nothing about the clip's length: the
+            // decode goes on as before and reports its own errors; only a visible clip the
+            // rate walk picks nothing of is empty.
+            return if visible > 0 && matches!(cfg.sampling, FrameSampling::RateWalk { .. }) {
                 Resized::Empty { total_frames }
             } else {
                 Resized::Unchanged
@@ -5638,7 +5641,21 @@ mod video_sampling_tests {
             walked.sized_to_visible(60, walk),
             Resized::Selection(_)
         ));
+        // A probe that decoded no frame says nothing about the length: unchanged, so the
+        // decode reports its own errors instead of a length refusal.
+        assert_eq!(walked.sized_to_visible(0, walk), Resized::Unchanged);
         assert!(the_familys_rule_picks_nothing(10, 30.0, walk).ends_with("(0.500 s)"));
+        // The rate is shown as configured, not widened.
+        let tenth = VideoFetchConfig {
+            sample_fps: 0.3,
+            ..walk
+        };
+        assert!(
+            the_familys_rule_picks_nothing(10, 30.0, tenth)
+                .contains("at 0.3 frames a second (3.333 s)"),
+            "{}",
+            the_familys_rule_picks_nothing(10, 30.0, tenth)
+        );
         // The rate-based samplings keep needing a count and are never resized.
         assert_eq!(
             FrameSelection::from_metadata(
