@@ -1385,6 +1385,15 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
     // Python spells it.
     env.add_filter("string", python_string_filter);
     env.add_filter("trim", python_trim_filter);
+    // So do `join` (of every item), `replace`, `upper` and `lower`. The `~`
+    // operator concatenates inside the engine (minijinja's own spelling of a
+    // list or a dict) and cannot be hooked from here; `format` reads its
+    // format string, a string in any template that uses it, and writes its
+    // arguments inside the engine too.
+    env.add_filter("join", python_join_filter);
+    env.add_filter("replace", python_replace_filter);
+    env.add_filter("upper", python_upper_filter);
+    env.add_filter("lower", python_lower_filter);
     env.add_function("raise_exception", raise_exception);
     // Jinja2's dict() also builds a map from key/value pairs; minijinja's takes a mapping only
     env.add_function("dict", dict_function);
@@ -1442,6 +1451,38 @@ fn python_trim_filter(value: Value, chars: Option<Cow<'_, str>>) -> String {
         }
         None => text.trim().to_string(),
     }
+}
+
+/// Jinja2's `join` filter, `joiner.join(str(item) for item in value)`: an
+/// item that is not a string goes through the same `str`.
+fn python_join_filter(
+    value: Value,
+    joiner: Option<Cow<'_, str>>,
+) -> std::result::Result<String, MinijinjaError> {
+    let joiner = joiner.as_deref().unwrap_or_default();
+    let mut text = String::new();
+    for (index, item) in value.try_iter()?.enumerate() {
+        if index > 0 {
+            text.push_str(joiner);
+        }
+        text.push_str(&python_str(&item));
+    }
+    Ok(text)
+}
+
+/// Jinja2's `replace` filter, `str(value).replace(old, new)`.
+fn python_replace_filter(value: Value, old: Cow<'_, str>, new: Cow<'_, str>) -> String {
+    python_str(&value).replace(&*old, &new)
+}
+
+/// Jinja2's `upper` filter, `str(value).upper()`.
+fn python_upper_filter(value: Value) -> String {
+    python_str(&value).to_uppercase()
+}
+
+/// Jinja2's `lower` filter, `str(value).lower()`.
+fn python_lower_filter(value: Value) -> String {
+    python_str(&value).to_lowercase()
 }
 
 /// The output formatter of `{{ }}`: a sequence, a map or a float is written
@@ -2713,6 +2754,38 @@ mod tests {
         assert_eq!(
             rendered,
             "[{'type': 'text', 'text': 'Hi'}]|[{'type': 'text', 'text': 'Hi'}]|x|b|7|1e-05"
+        );
+    }
+
+    /// The string filters Jinja2 starts with `str(value)` write a list or a
+    /// dict as Python does, like `string` and `trim`: `join` of every item,
+    /// `replace`, `upper`, `lower`; a string and an integer are untouched.
+    #[test]
+    fn the_string_filters_start_with_python_s_str() {
+        let state = ChatTemplateState::new(Some(
+            "{{ messages[0].content | join(' + ') }}|\
+             {{ messages[0].content | replace('text', 'T') }}|\
+             {{ messages[0].content | upper }}|{{ messages[0].content[0] | lower }}|\
+             {{ ['a', 'b'] | join(', ') }}|{{ 'Ab' | upper }}|{{ 7 | lower }}|\
+             {{ 1.5 | replace('.', ',') }}|{{ 'x.y' | replace('.', '') }}"
+                .to_string(),
+        ))
+        .unwrap();
+        let rendered = state
+            .apply(
+                &[serde_json::json!({"role": "user", "content": [
+                    {"type": "text", "text": "Hi"},
+                    {"type": "text", "text": "Yo"}
+                ]})],
+                ChatTemplateParams::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "{'type': 'text', 'text': 'Hi'} + {'type': 'text', 'text': 'Yo'}|\
+             [{'type': 'T', 'T': 'Hi'}, {'type': 'T', 'T': 'Yo'}]|\
+             [{'TYPE': 'TEXT', 'TEXT': 'HI'}, {'TYPE': 'TEXT', 'TEXT': 'YO'}]|\
+             {'type': 'text', 'text': 'hi'}|a, b|AB|7|1,5|xy"
         );
     }
 
