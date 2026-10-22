@@ -628,7 +628,9 @@ impl Tally {
     }
 }
 
-/// Records an output the table refused (`ParseError`): the request fails with it.
+/// Records an output the reader could not read whole, which the request fails with: the table
+/// refused it (`ParseError`), or the decoder refused a token or the text it held (the reader's
+/// `failed`).
 pub(crate) fn record_failed(table: &'static str) {
     increment(&series(table).outputs[FAILED], 1);
 }

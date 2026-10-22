@@ -343,7 +343,7 @@ impl Reader {
         let mut stopped = false;
         for &token_id in token_ids {
             let output = decoder.process_token(token_id).map_err(|e| {
-                SymphonyError::Read(format!(
+                self.failed(format!(
                     "Stop decoder failed to process token {token_id}: {e}"
                 ))
             })?;
@@ -484,6 +484,16 @@ impl Reader {
         self.ended
     }
 
+    /// The error of an output the reader could not read whole, which the request fails with:
+    /// the decoder refused a token or the text it held, or the table refused the output
+    /// ([`Self::feed`]). The output is recorded as failed for the table and is over: its end
+    /// counts nothing more.
+    pub(crate) fn failed(&mut self, why: String) -> SymphonyError {
+        self.ended = true;
+        telemetry::record_failed(self.table);
+        SymphonyError::Read(why)
+    }
+
     /// Feeds `input` to the engine, its events into `out` after the ones already there: the
     /// reader's one way in. The events this step added are tallied, and limited to the first
     /// call where the request asks. An output the engine refuses is recorded as failed for the
@@ -492,8 +502,7 @@ impl Reader {
         let before = out.len();
         let last = out.as_slice().last().map_or(0, telemetry::bytes_of);
         self.engine.feed(input, out).map_err(|e| {
-            telemetry::record_failed(self.table);
-            SymphonyError::Read(format!(
+            self.failed(format!(
                 "Symphony failed to read the output with the {} table: {e}",
                 self.table
             ))
@@ -1927,6 +1936,54 @@ mod tests {
             .end(EngineFinish::Stop, who(), &mut again)
             .expect("ended");
         assert!(again.is_empty());
+    }
+
+    #[test]
+    fn a_token_the_decoder_refuses_fails_the_output_and_counts_it_once() {
+        let assignment = Assignment {
+            format: Arc::new(qwen3(CallSyntax::Json)),
+            prompt: String::new(),
+        };
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(Refusing::default());
+        let mut decoder = StopSequenceDecoder::new(
+            tokenizer,
+            llm_tokenizer::StopSequenceConfig::default(),
+            false,
+        );
+        let scrape = rendered(|| {
+            let mut events = Events::new();
+            let mut reader =
+                Reader::new(&assignment, tools().into(), &mut events).expect("a reader");
+            let mut delta = Delta::default();
+            let tokens = [u32::from('H'), Refusing::REFUSED];
+            let error = reader
+                .read(&mut decoder, &tokens, &mut delta, &mut events)
+                .expect_err("the token no character carries");
+            assert!(
+                matches!(&error, SymphonyError::Read(why)
+                    if why.contains("Stop decoder failed to process token 55296")),
+                "{error}"
+            );
+            // The output is over: its end counts nothing more.
+            assert!(reader.ended());
+            let mut again = Events::new();
+            reader
+                .end(EngineFinish::Stop, who(), &mut again)
+                .expect("ended");
+            assert!(again.is_empty());
+        });
+        let outputs = line_with(
+            &scrape,
+            "smg_symphony_outputs_total",
+            &["table=\"qwen3\"", "outcome=\"failed\""],
+        )
+        .expect("the failed count");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        assert_eq!(
+            scrape.matches("smg_symphony_outputs_total{").count(),
+            1,
+            "{scrape}"
+        );
     }
 
     #[tokio::test]

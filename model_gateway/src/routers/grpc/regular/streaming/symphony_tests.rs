@@ -32,7 +32,7 @@ use crate::{
         proto_wrapper::ProtoGenerateComplete,
         regular::{
             processor::ResponseProcessor,
-            symphony::{assign, template::Templates, Asks, Assignment},
+            symphony::{assign, template::Templates, testing::Refusing, Asks, Assignment},
         },
         utils::ModelNames,
     },
@@ -56,13 +56,29 @@ async fn stream_events(
     with_tools: bool,
     spec: ChatResponseSpec,
 ) -> (Result<(), utils::StreamFailure>, Vec<Value>) {
+    stream_events_through(
+        Arc::new(CharacterTokenizer::default()),
+        responses,
+        with_tools,
+        spec,
+    )
+    .await
+}
+
+/// [`stream_events`] decoding through `tokenizer`.
+async fn stream_events_through(
+    tokenizer: Arc<dyn Tokenizer>,
+    responses: Vec<proto::GenerateResponse>,
+    with_tools: bool,
+    spec: ChatResponseSpec,
+) -> (Result<(), utils::StreamFailure>, Vec<Value>) {
     let (stream, server) = scripted_stream(responses, "0").await;
     let (tx, rx) = sse_channel();
     let result = processor(with_tools)
         .process_streaming_chunks(
             stream,
             dispatch(),
-            Arc::new(CharacterTokenizer::default()),
+            tokenizer,
             (None, None, false, false, false),
             spec,
             &tx,
@@ -348,7 +364,23 @@ async fn fold(output: &str) -> (ChatChoice, u32) {
 
 /// [`fold`] over `format` after `prompt`.
 async fn fold_with(output: &str, format: Format, prompt: &str) -> (ChatChoice, u32) {
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    fold_through(
+        Arc::new(CharacterTokenizer::default()),
+        output,
+        format,
+        prompt,
+    )
+    .await
+    .expect("a choice")
+}
+
+/// [`fold_with`] decoding through `tokenizer`, with the unary path's own verdict.
+async fn fold_through(
+    tokenizer: Arc<dyn Tokenizer>,
+    output: &str,
+    format: Format,
+    prompt: &str,
+) -> Result<(ChatChoice, u32), String> {
     let output_ids: Vec<u32> = output.chars().map(u32::from).collect();
     let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
         output_ids: output_ids.clone(),
@@ -384,7 +416,6 @@ async fn fold_with(output: &str, format: Format, prompt: &str) -> (ChatChoice, u
             None,
         )
         .await
-        .expect("a choice")
 }
 
 /// The tokens whose logprobs the choice kept, joined.
@@ -516,6 +547,22 @@ pub(super) async fn message_events(
     spec: MessagesResponseSpec,
     stop: Option<&str>,
 ) -> (Result<(), utils::StreamFailure>, Vec<Value>) {
+    message_events_through(
+        Arc::new(CharacterTokenizer::default()),
+        responses,
+        spec,
+        stop,
+    )
+    .await
+}
+
+/// [`message_events`] decoding through `tokenizer`.
+async fn message_events_through(
+    tokenizer: Arc<dyn Tokenizer>,
+    responses: Vec<proto::GenerateResponse>,
+    spec: MessagesResponseSpec,
+    stop: Option<&str>,
+) -> (Result<(), utils::StreamFailure>, Vec<Value>) {
     let (stream, server) = scripted_stream(responses, "0").await;
     let (tx, rx) = sse_channel();
     let stop = stop.map(|stop| StringOrArray::String(stop.to_string()));
@@ -523,7 +570,7 @@ pub(super) async fn message_events(
         .process_messages_streaming_chunks(
             stream,
             dispatch(),
-            Arc::new(CharacterTokenizer::default()),
+            tokenizer,
             (stop, None, false, false, false),
             spec,
             &tx,
@@ -1554,4 +1601,124 @@ async fn a_stream_whose_text_ends_in_a_python_call_in_the_tag_carries_the_block_
     .expect("the reason counter");
     assert!(reason.ends_with(" 1"), "{reason}");
     assert!(logs_contain(&format!("released_bytes={}", released.len())));
+}
+
+/// The scrape of an output whose decoder failed: counted `failed` for the table, once, and under
+/// no other outcome.
+fn counted_failed_once(scrape: &str) {
+    let outputs = series_line(
+        scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"failed\""],
+    )
+    .expect("the failed count");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert_eq!(
+        scrape.matches("smg_symphony_outputs_total{").count(),
+        1,
+        "{scrape}"
+    );
+}
+
+/// The frames of an output whose decoder's end comes at the engine's `Complete`, and of one
+/// whose end comes with the transport's, without a `Complete`.
+fn ends_of(output: &str) -> [Vec<proto::GenerateResponse>; 2] {
+    [
+        vec![chunk(0, output), complete(0, "stop")],
+        vec![chunk(0, output)],
+    ]
+}
+
+#[tokio::test]
+async fn a_decoders_end_that_fails_counts_the_output_as_failed_on_the_chat_paths() {
+    let format = || qwen3(CallSyntax::Json);
+    let prompt = "<|im_start|>assistant\n";
+    // The whole response: the request's error names the decoder's end.
+    let (result, scrape) = scraped(fold_through(
+        Arc::new(Refusing::the_end()),
+        "Hello",
+        format(),
+        prompt,
+    ))
+    .await;
+    let error = result.expect_err("the decoder's end");
+    assert!(
+        error.contains("Failed to finish token decoding") && error.contains("refused"),
+        "{error}"
+    );
+    counted_failed_once(&scrape);
+    // The stream: the decoder's end at the engine's Complete, and at the transport's end.
+    for frames in ends_of("Hello") {
+        let ((result, _), scrape) = scraped(stream_events_through(
+            Arc::new(Refusing::the_end()),
+            frames,
+            true,
+            assigned(chat_spec(true), format(), prompt),
+        ))
+        .await;
+        let error = result.expect_err("the decoder's end");
+        assert!(format!("{error:?}").contains("refused"), "{error:?}");
+        counted_failed_once(&scrape);
+    }
+}
+
+#[tokio::test]
+async fn a_decoders_end_that_fails_counts_the_output_as_failed_on_the_messages_paths() {
+    let spec = || assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    // The whole message: a 500 under the read failure's code.
+    let mut frame = complete(0, "stop");
+    if let Some(proto::generate_response::Response::Complete(complete)) = &mut frame.response {
+        complete.output_ids = "Hello".chars().map(u32::from).collect();
+        complete.completion_tokens = complete.output_ids.len() as u32;
+    }
+    let (stream, server) = scripted_stream(vec![frame], "0").await;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(Refusing::the_end());
+    let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
+    let (result, scrape) = scraped(
+        ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        )
+        .process_non_streaming_messages_response(
+            context::ExecutionResult::Single { stream },
+            spec(),
+            dispatch(),
+            tokenizer,
+            &mut decoder,
+        ),
+    )
+    .await;
+    server.abort();
+    let response = match result {
+        Ok((message, _)) => panic!("a message with {:?}", message.content),
+        Err(response) => response,
+    };
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 65536),
+    )
+    .await
+    .expect("the body in time")
+    .expect("the body");
+    let body = String::from_utf8(body.to_vec()).expect("text");
+    assert!(
+        body.contains("symphony_read_failed") && body.contains("Failed to finish token decoding"),
+        "{body}"
+    );
+    counted_failed_once(&scrape);
+    // The stream: the decoder's end at the engine's Complete, and at the transport's end.
+    for frames in ends_of("Hello") {
+        let ((result, _), scrape) = scraped(message_events_through(
+            Arc::new(Refusing::the_end()),
+            frames,
+            spec(),
+            None,
+        ))
+        .await;
+        let error = result.expect_err("the decoder's end");
+        assert!(format!("{error:?}").contains("refused"), "{error:?}");
+        counted_failed_once(&scrape);
+    }
 }

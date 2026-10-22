@@ -251,7 +251,7 @@ impl ResponseProcessor {
         // on the older path; the text it releases is the last token's.
         let tail = stop_decoder
             .finish()
-            .map_err(|e| format!("Failed to finish token decoding: {e}"))?;
+            .map_err(|e| reader.failed(format!("Failed to finish token decoding: {e}")))?;
         utils::warn_detokenize_recoveries(request_id, index as u32, stop_decoder);
         if let SequenceDecoderOutput::Text(text) | SequenceDecoderOutput::StoppedWithText(text) =
             tail
@@ -327,7 +327,7 @@ impl ResponseProcessor {
         let stopped = reader.read(stop_decoder, complete.output_ids(), &mut delta, &mut events)?;
         let tail = stop_decoder
             .finish()
-            .map_err(|e| SymphonyError::Read(format!("Failed to finish token decoding: {e}")))?;
+            .map_err(|e| reader.failed(format!("Failed to finish token decoding: {e}")))?;
         utils::warn_detokenize_recoveries(&dispatch.request_id, 0, stop_decoder);
         if let SequenceDecoderOutput::Text(text) | SequenceDecoderOutput::StoppedWithText(text) =
             tail

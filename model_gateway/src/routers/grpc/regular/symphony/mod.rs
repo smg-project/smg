@@ -57,7 +57,7 @@ mod reader;
 pub(crate) mod telemetry;
 pub(crate) mod template;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 
 use axum::http::HeaderMap;
 pub(crate) use symphony::event::reasoning_text_tokens;

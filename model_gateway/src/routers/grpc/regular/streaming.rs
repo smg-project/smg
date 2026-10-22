@@ -2274,6 +2274,18 @@ enum StreamEnd {
 /// encoder and buffer the chunks leave through. Each phase of the stream is
 /// a method; `StreamingProcessor::process_streaming_chunks_inner` runs them
 /// in order.
+/// The failure of a choice's decoder: where Symphony reads the choice, the reader's failed
+/// output, counted as such; the error's text either way.
+fn decoding_failed(
+    reader: Option<&mut Reader>,
+    error: impl std::fmt::Display,
+) -> utils::StreamFailure {
+    match reader {
+        Some(reader) => reader.failed(error.to_string()).into(),
+        None => utils::StreamFailure::from(error.to_string()),
+    }
+}
+
 struct ChatStream<'a> {
     processor: &'a StreamingProcessor,
     spec: &'a ChatResponseSpec,
@@ -2829,7 +2841,9 @@ impl<'a> ChatStream<'a> {
         // same reasoning/tool parsers as ordinary chunks.
         let flushed = match self.stop_decoders.get_mut(&index) {
             Some(decoder) => {
-                let tail = decoder.finish().map_err(|e| e.to_string())?;
+                let tail = decoder
+                    .finish()
+                    .map_err(|e| decoding_failed(self.readers.get_mut(&index), e))?;
                 utils::warn_detokenize_recoveries(request_id, index, decoder);
                 if decoder.is_stopped() {
                     self.stopped_indices.insert(index);
@@ -3052,7 +3066,7 @@ impl<'a> ChatStream<'a> {
             let mut delta = std::mem::take(&mut self.delta);
             let mut events: Events<'_> = std::mem::take(&mut self.spare);
             if let Some(decoder) = self.stop_decoders.get_mut(&index) {
-                let tail = decoder.finish().map_err(|e| e.to_string())?;
+                let tail = decoder.finish().map_err(|e| reader.failed(e.to_string()))?;
                 utils::warn_detokenize_recoveries(request_id, index, decoder);
                 if decoder.is_stopped() {
                     self.stopped_indices.insert(index);
@@ -4117,7 +4131,10 @@ impl<'a> MessagesStream<'a> {
         &mut self,
         complete: ProtoGenerateComplete,
     ) -> Result<Option<MessagesPendingText>, utils::StreamFailure> {
-        let tail = self.stop_decoder.finish().map_err(|e| e.to_string())?;
+        let tail = self
+            .stop_decoder
+            .finish()
+            .map_err(|e| decoding_failed(self.symphony.as_mut().map(|(reader, _)| reader), e))?;
         utils::warn_detokenize_recoveries(&self.dispatch.request_id, 0, &self.stop_decoder);
         if self.stop_decoder.is_stopped() {
             self.note_local_stop();
@@ -4174,7 +4191,10 @@ impl<'a> MessagesStream<'a> {
     /// engine sent `Complete`.
     async fn read_end(&mut self) -> Result<Option<MessagesPendingText>, utils::StreamFailure> {
         self.decoder_finished_at_eof = true;
-        let tail = self.stop_decoder.finish().map_err(|e| e.to_string())?;
+        let tail = self
+            .stop_decoder
+            .finish()
+            .map_err(|e| decoding_failed(self.symphony.as_mut().map(|(reader, _)| reader), e))?;
         utils::warn_detokenize_recoveries(&self.dispatch.request_id, 0, &self.stop_decoder);
         if self.stop_decoder.is_stopped() {
             self.note_local_stop();
