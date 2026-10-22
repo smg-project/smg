@@ -15,7 +15,7 @@ use openai_protocol::{
 use serde_json::{json, Value};
 use smg_grpc_client::{tokenspeed_proto::GenerateComplete, vllm_engine::proto};
 use symphony::{
-    formats::{deepseek_v4, deepseek_v4_1, glm, plain, qwen3},
+    formats::{deepseek_v4, deepseek_v4_1, glm, llama4, plain, qwen3},
     CallSyntax, Format,
 };
 
@@ -1842,5 +1842,83 @@ async fn a_decoders_end_that_fails_counts_the_output_as_failed_on_the_messages_p
         let error = result.expect_err("the decoder's end");
         assert!(format!("{error:?}").contains("refused"), "{error:?}");
         counted_failed_once(&scrape);
+    }
+}
+
+/// The generation prompt's tail of a table whose calls are a bare Python list.
+const PYTHONIC_PROMPT: &str = "<|header_start|>assistant<|header_end|>\n\n";
+
+/// A pythonic call the token limit cut, the shape of a tool request whose `max_tokens` is below
+/// the call's length: the declared `lookup` tool, cut inside its first quoted value and inside a
+/// second one; the arguments a client reads for each are the prefix as the model wrote it, the
+/// cut member's key and its open string included.
+const PYTHONIC_CUT_CALLS: [(&str, &str); 2] = [
+    ("[lookup(city=\"Par", r#"{"city": "Par"#),
+    (
+        "[lookup(city=\"Paris\", days=\"3",
+        r#"{"city": "Paris", "days": "3"#,
+    ),
+];
+
+#[tokio::test]
+async fn a_streamed_pythonic_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length(
+) {
+    for (output, arguments) in PYTHONIC_CUT_CALLS {
+        // Chunked before the cut member's key and inside its value, then the engine's `length`.
+        let at = output.rfind(", ").map_or(8, |at| at + 2);
+        let spec = assigned(chat_spec(true), llama4(), PYTHONIC_PROMPT);
+        let responses = vec![
+            chunk(0, &output[..at]),
+            chunk(0, &output[at..output.len() - 2]),
+            chunk(0, &output[output.len() - 2..]),
+            complete(0, "length"),
+        ];
+        let (result, events) = stream_events(responses, true, spec).await;
+        assert!(result.is_ok(), "{output:?}: {result:?}");
+        let calls = tool_call_deltas(&events);
+        assert_eq!(
+            calls[0]["function"]["name"], "lookup",
+            "{output:?}: {events:#?}"
+        );
+        let streamed: String = calls
+            .iter()
+            .filter_map(|call| call["function"]["arguments"].as_str())
+            .collect();
+        assert_eq!(streamed, arguments, "{output:?}: {events:#?}");
+        assert_eq!(
+            chat_text(&events, 0, "content"),
+            "",
+            "nothing of the call is content: {output:?}: {events:#?}"
+        );
+        let finish = events
+            .iter()
+            .find_map(|event| event["choices"][0]["finish_reason"].as_str())
+            .expect("a finish chunk");
+        assert_eq!(finish, "length", "{output:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_whole_pythonic_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length()
+{
+    for (output, arguments) in PYTHONIC_CUT_CALLS {
+        let (choice, _) = fold_finished(output, llama4(), PYTHONIC_PROMPT, "length").await;
+        let calls = choice.message.tool_calls.as_ref().expect("the call");
+        assert_eq!(calls.len(), 1, "{output:?}");
+        assert_eq!(calls[0].function.name, "lookup");
+        assert_eq!(
+            calls[0].function.arguments.as_deref(),
+            Some(arguments),
+            "{output:?}: {choice:?}"
+        );
+        assert_eq!(
+            choice.message.content, None,
+            "nothing of the call is content: {output:?}: {choice:?}"
+        );
+        assert_eq!(
+            choice.finish_reason.as_deref(),
+            Some("length"),
+            "{output:?}"
+        );
     }
 }

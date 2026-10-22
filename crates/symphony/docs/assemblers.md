@@ -468,18 +468,31 @@ What the syntax says, and what the assembler does with it:
   what makes every chunking say the same.
 - **Every byte lands in exactly one event**, as in the other assemblers: the key, the `=`, the
   value and the separator after it in the fragment they produce.
-- **Two endings, one rule for a cut call.** `Assembler::close` is the region's closing marker
-  (or the next opener); `Assembler::finish` is a stream that was cut. A call still open at
-  either is one the model never finished, since every template writes the call's `)` before
+- **Two endings, and a cut call closes at neither.** `Assembler::close` is the region's closing
+  marker (or the next opener); `Assembler::finish` is a stream that was cut. A call still open
+  at either is one the model never finished, since every template writes the call's `)` before
   the marker: nothing is closed for it, the fragments it sent stand, and it ends, with no bytes
   of its own, after the one `Malformed` event that says its arguments are no whole value
-  (`tagged::end_cut_call`), carrying what was held, a key, a value or a separator cut short, or
-  no bytes when the cut came right after the `(`; so a cut call is never handed over as finished
-  without a word, nor with an object the reader closed for it. The reason is
-  `UnterminatedRegion` at the stream's end, and the engine names it for a region a marker
-  closed. Outside a call the two endings differ: at the close a name that never got its `(`
-  comes back as `Malformed` with its own reason and the list's wrapping before any call is
-  dropped; at the stream's end what was held comes back as `Malformed { UnterminatedRegion }`.
+  (`tagged::end_cut_call`); so a cut call is never handed over as finished without a word, nor
+  with an object the reader closed for it. What was held when the end came differs: at the
+  close, the model's own end, the word carries it, a key, a value or a separator cut short, or
+  no bytes when the cut came right after the `(`, and the engine names the reason for a region
+  a marker closed; at the stream's end, a cut by the token limit and not the model's end, the
+  word has no bytes and the call's bytes stay the call's, since a client reads the prefix as
+  written under `length` and never the call's bytes as the answer's prose: the member the cut
+  found inside its value leaves as the call's own fragment, its key and the JSON the assembler
+  would have written for the value as far as that is known (an open string in either quote as
+  an open JSON string holding its text so far, decoded as the dialect reads it, `{"city": "Par`;
+  a value whole before the separator that never came written whole, `"days": 3`; a number's
+  digits, a word that may still be a literal and a list or a dict still open as written; a key
+  and no byte of its value as `"key": ` alone), and a key or a separator the cut found open
+  leaves as the syntax's wrapping (`Dropped`), as a parameter tag the end cut short does under a
+  tagged syntax, since no member can be written for it. Before this the held bytes left as the
+  word's text at both ends, and a chat client read `city="Par` as content next to a call whose
+  arguments stopped at the member before. Outside a call the two endings differ: at the close a
+  name that never got its `(` comes back as `Malformed` with its own reason and the list's
+  wrapping before any call is dropped; at the stream's end what was held comes back as
+  `Malformed { UnterminatedRegion }`.
 - **Python's whitespace is allowed** between a name and its `(`, around the `=`, and around a
   value, as the old parser's regular expression allowed it; a name or a key is the text less
   that whitespace.
