@@ -8,8 +8,8 @@
 //! on the gRPC path; this drives both through the real routers against
 //! in-process upstreams and reads the counter from the metrics endpoint.
 //!
-//! This file is its own test binary (process), so installing the global
-//! Prometheus recorder here is safe and does not collide with other suites.
+//! The recorder is this binary's, installed once for all its tests (see
+//! `recorder()` in the group's `mod.rs`).
 
 #![expect(
     clippy::unwrap_used,
@@ -17,9 +17,6 @@
     clippy::disallowed_methods,
     reason = "test failures should panic; the upstream tasks live for the test process"
 )]
-
-#[path = "common/mod.rs"]
-mod common;
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
@@ -30,20 +27,11 @@ use axum::{
     routing::post,
     Json, Router,
 };
-use common::{
-    grpc_harness::{
-        build_grpc_router, grpc_router_config, health_checks_off, serve_canned_worker, Canned,
-    },
-    test_app::{create_test_app_context, create_test_app_with_context},
-};
 use openai_protocol::{completion::CompletionRequest, model_card::ModelCard};
 use serde_json::json;
 use smg::{
     middleware::TenantRequestMeta,
-    observability::{
-        metrics::{start_prometheus, PrometheusConfig},
-        metrics_server::start_metrics_server,
-    },
+    observability::metrics_server::start_metrics_server,
     routers::{
         factory::router_ids, gateway::Gateway, http::router::Router as HttpRouter, RouterTrait,
     },
@@ -52,6 +40,13 @@ use smg::{
 };
 use tokio::net::TcpListener;
 use tower::ServiceExt;
+
+use crate::common::{
+    grpc_harness::{
+        build_grpc_router, grpc_router_config, health_checks_off, serve_canned_worker, Canned,
+    },
+    test_app::{create_test_app_context, create_test_app_with_context},
+};
 
 const MODEL: &str = "counter-test-model";
 
@@ -161,11 +156,7 @@ fn completion() -> CompletionRequest {
 
 #[tokio::test]
 async fn every_dispatch_moves_the_worker_request_counter() {
-    let handle = start_prometheus(PrometheusConfig {
-        port: 0,
-        host: "127.0.0.1".to_string(),
-        duration_buckets: None,
-    });
+    let handle = crate::metrics::recorder();
     let (metrics_addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
         .await
         .expect("metrics server binds an ephemeral port");

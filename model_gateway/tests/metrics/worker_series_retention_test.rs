@@ -8,18 +8,15 @@
 //! is a new address, so without this the scrape grew by one worker's set of
 //! series per replacement.
 //!
-//! This file is its own test binary (process), so installing the global
-//! Prometheus recorder here is safe and does not collide with other suites.
+//! The recorder is this binary's, installed once for all its tests (see
+//! `recorder()` in the group's `mod.rs`).
 
 #![expect(clippy::expect_used, reason = "test failures should panic")]
 
 use std::{net::SocketAddr, sync::Arc};
 
 use smg::{
-    observability::{
-        metrics::{start_prometheus, Metrics, PrometheusConfig},
-        metrics_server::start_metrics_server,
-    },
+    observability::{metrics::Metrics, metrics_server::start_metrics_server},
     worker::{BasicWorkerBuilder, Worker, WorkerRegistry, WorkerType},
 };
 
@@ -56,11 +53,7 @@ fn worker() -> Arc<dyn Worker> {
 
 #[tokio::test]
 async fn removed_worker_series_leave_the_scrape() {
-    let handle = start_prometheus(PrometheusConfig {
-        port: 0,
-        host: "127.0.0.1".to_string(),
-        duration_buckets: None,
-    });
+    let handle = crate::metrics::recorder();
     let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
         .await
         .expect("metrics server binds an ephemeral port");

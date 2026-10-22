@@ -5,23 +5,19 @@
 //! the engines are idle, and land in the same `smg_engine_*` gauges a poll
 //! fills.
 
-mod common;
-
 use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use common::grpc_harness::{grpc_test_context, grpc_worker, serve_mock_worker_with};
 use openai_protocol::worker::{RuntimeType, WorkerType};
 use smg::{
     config::RouterConfig,
-    observability::{
-        metrics::{start_prometheus, PrometheusConfig},
-        metrics_server::start_metrics_server,
-    },
+    observability::metrics_server::start_metrics_server,
     worker::{KvEventMonitor, ModelCard},
 };
+
+use crate::common::grpc_harness::{grpc_test_context, grpc_worker, serve_mock_worker_with};
 
 const MODEL: &str = "mock-model";
 const WORKERS: usize = 8;
@@ -49,11 +45,7 @@ async fn start_realistic_worker() -> u16 {
 
 #[tokio::test]
 async fn eight_workers_loads_reach_the_gateway_through_the_event_streams() {
-    let handle = start_prometheus(PrometheusConfig {
-        port: 0,
-        host: "127.0.0.1".to_string(),
-        duration_buckets: None,
-    });
+    let handle = crate::metrics::recorder();
     let (metrics_addr, _metrics_server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
         .await
         .expect("metrics server binds an ephemeral port");

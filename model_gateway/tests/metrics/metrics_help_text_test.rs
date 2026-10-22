@@ -6,15 +6,12 @@
 //! serves the scrape, and a sample of families from every layer is recorded
 //! before the scrape is parsed.
 //!
-//! This file is its own test binary (process), so installing the global
-//! Prometheus recorder here does not collide with other suites.
+//! The recorder is this binary's, installed once for all its tests (see
+//! `recorder()` in the group's `mod.rs`).
 
 use std::collections::BTreeSet;
 
-use smg::observability::{
-    metrics::{start_prometheus, Metrics, PrometheusConfig},
-    metrics_server::start_metrics_server,
-};
+use smg::observability::{metrics::Metrics, metrics_server::start_metrics_server};
 
 /// Names of the `smg_` families announced by `# <marker> <name> ...` lines.
 fn families(body: &str, marker: &str) -> BTreeSet<String> {
@@ -28,11 +25,7 @@ fn families(body: &str, marker: &str) -> BTreeSet<String> {
 
 #[tokio::test]
 async fn every_smg_family_has_help_text() {
-    let handle = start_prometheus(PrometheusConfig {
-        port: 0,
-        host: "127.0.0.1".to_string(),
-        duration_buckets: None,
-    });
+    let handle = crate::metrics::recorder();
     let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
         .await
         .expect("metrics server binds an ephemeral port");
@@ -55,7 +48,8 @@ async fn every_smg_family_has_help_text() {
     Metrics::set_worker_health(worker, true);
     Metrics::set_worker_cb_state(worker, 0);
     Metrics::record_worker_cb_transition(worker, "closed", "open");
-    Metrics::record_kv_event_lag(worker, 0.004);
+    // A worker of its own: the lag histogram test counts the samples on the workers it names.
+    Metrics::record_kv_event_lag("grpc://worker-help:50051", 0.004);
 
     let body = smg::clients::http_client()
         .get(format!("http://{addr}/metrics"))

@@ -1,21 +1,17 @@
 //! `smg_worker_retry_backoff_seconds` is exported as a histogram, not a summary.
 //!
 //! Drives the recorder `start_prometheus` installs, so the bucket matchers
-//! under test are the production ones. This file is its own test binary
-//! (process), so installing the global Prometheus recorder here does not
-//! collide with other suites.
+//! under test are the production ones. The recorder is this binary's,
+//! installed once for all its tests (see `recorder()` in the group's
+//! `mod.rs`).
 
 use std::time::Duration;
 
-use smg::observability::metrics::{start_prometheus, Metrics, PrometheusConfig};
+use smg::observability::metrics::Metrics;
 
 #[test]
 fn worker_retry_backoff_renders_histogram_buckets() {
-    let handle = start_prometheus(PrometheusConfig {
-        port: 0,
-        host: "127.0.0.1".to_string(),
-        duration_buckets: None,
-    });
+    let handle = crate::metrics::recorder();
 
     Metrics::record_worker_retry_backoff(1, Duration::from_millis(60));
     Metrics::record_worker_retry_backoff(4, Duration::from_secs(2));

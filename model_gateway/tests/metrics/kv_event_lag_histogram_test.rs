@@ -2,22 +2,15 @@
 //!
 //! Drives the recorder `start_prometheus` installs and scrapes the metrics
 //! HTTP server, so the bucket matchers under test are the production ones
-//! and the per-worker series render as they do for `/metrics`. This file is
-//! its own test binary (process), so installing the global Prometheus
-//! recorder here does not collide with other suites.
+//! and the per-worker series render as they do for `/metrics`. The recorder
+//! is this binary's, installed once for all its tests (see `recorder()` in
+//! the group's `mod.rs`).
 
-use smg::observability::{
-    metrics::{start_prometheus, Metrics, PrometheusConfig},
-    metrics_server::start_metrics_server,
-};
+use smg::observability::{metrics::Metrics, metrics_server::start_metrics_server};
 
 #[tokio::test]
 async fn kv_event_lag_renders_histogram_buckets() {
-    let handle = start_prometheus(PrometheusConfig {
-        port: 0,
-        host: "127.0.0.1".to_string(),
-        duration_buckets: None,
-    });
+    let handle = crate::metrics::recorder();
     let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
         .await
         .expect("metrics server binds an ephemeral port");

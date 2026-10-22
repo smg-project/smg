@@ -5,25 +5,17 @@
 //! recorded through the same `Metrics::record_engine_load` call the load
 //! monitor makes, then scraped over HTTP to assert the PD gauge is exposed.
 //!
-//! This file is its own test binary (process), so installing the global
-//! Prometheus recorder here is safe and does not collide with other suites.
+//! The recorder is this binary's, installed once for all its tests (see
+//! `recorder()` in the group's `mod.rs`).
 
 use openai_protocol::worker::{SchedulerLoadSnapshot, WorkerLoadResponse};
-use smg::observability::{
-    metrics::{start_prometheus, Metrics, PrometheusConfig},
-    metrics_server::start_metrics_server,
-};
+use smg::observability::{metrics::Metrics, metrics_server::start_metrics_server};
 
 #[tokio::test]
 async fn engine_pd_gauge_appears_on_metrics_endpoint() {
-    // The recorder is global and may only be installed once per process;
-    // `start_prometheus` does that install and hands back the handle the
-    // server renders. Port 0 binds an ephemeral port with no reservation race.
-    let handle = start_prometheus(PrometheusConfig {
-        port: 0,
-        host: "127.0.0.1".to_string(),
-        duration_buckets: None,
-    });
+    // The binary's recorder, installed once; port 0 binds an ephemeral port
+    // with no reservation race.
+    let handle = crate::metrics::recorder();
     let (addr, _server) = start_metrics_server(handle, "127.0.0.1".to_string(), 0)
         .await
         .expect("metrics server binds an ephemeral port");
