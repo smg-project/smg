@@ -1,15 +1,15 @@
-name: AMD vLLM repair verification
+name: AMD vLLM worker multimodal verification
 on:
   workflow_dispatch:
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: amd-vllm-repair-e915
+  group: amd-vllm-mm-worker-e915
   cancel-in-progress: false
 jobs:
-  vllm-repair:
-    name: vllm-repair
+  vllm-mm-worker:
+    name: vllm-mm-worker
     if: vars.SMG_RUN_AMD_LEGS == 'true'
     runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
     timeout-minutes: 30
@@ -21,7 +21,9 @@ jobs:
       E2E_RUNTIME: vllm
       E2E_GPU_TIER: '1'
       E2E_GPU_VENDOR: amd
-      E2E_MIN_SELECTED: '3'
+      E2E_MIN_SELECTED: '5'
+      E2E_MM_PROCESSING: worker
+      E2E_VLLM_MM_PROCESSOR: inprocess
       E2E_VLLM_KV_BACKEND: nixl
       E2E_CONNECTION_MODE: ''
       E2E_PARSER: ''
@@ -45,12 +47,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Mark only this job's processes
-        run: echo "E2E_JOB_MARKER=vllm-repair-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
+        run: echo "E2E_JOB_MARKER=vllm-mm-worker-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
       - name: Reuse, install and test within one absolute job budget
         timeout-minutes: 25
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 .github/amd-vllm-repair/budget.py
+        run: python3 .github/amd-vllm-mm-worker/budget.py
       - name: Clean owned processes and record final dependency state
         shell: bash
         if: always() && env.E2E_JOB_MARKER != ''
@@ -62,7 +64,7 @@ jobs:
           if test -f diagnostic-results/install-complete; then
             python3 -m pip check > diagnostic-results/pipcheck-after.txt 2>&1 || status=1
             python3 .github/amd-qa/closure_audit.py snapshot diagnostic-results/final.json || status=1
-            python3 .github/amd-vllm-repair/environment.py final || status=1
+            python3 .github/amd-vllm-mm-worker/environment.py final || status=1
           fi
           exit "$status"
       - name: Preserve evidence even on failure
@@ -70,7 +72,7 @@ jobs:
         timeout-minutes: 2
         uses: actions/upload-artifact@v7
         with:
-          name: amd-vllm-repair-${{ github.run_id }}
+          name: amd-vllm-mm-worker-${{ github.run_id }}
           path: |
             diagnostic-results/
             e2e-logs/
