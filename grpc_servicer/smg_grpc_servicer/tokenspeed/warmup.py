@@ -6,6 +6,21 @@ TokenSpeed captures its decode graphs at start and tunes its attention and
 MoE kernels per shape as the shapes arrive; the first request at a token count
 pays the selection. The plan visits the counts before the health flips, under
 ``SMG_TOKENSPEED_SERVICER_WARMUP``.
+
+The plan here also visits every prompt length up to the chunk size, not only
+the length classes (:attr:`WarmupInputs.every_prefill_length`). A prefill
+chunk reaches two cuBLAS GEMMs in this engine (the compressor's fp32 router
+projection falls back to cuBLAS above 32 tokens; the grouped output
+projection is a batched GEMM), whose kernels the library picks per token
+count and loads on first use. A chunked prefill's last chunk is any count
+below the chunk size, so a long turn's second chunk is a count the engine has
+not seen; under the overlap schedule its forward is launched while the first
+chunk's TP collective is still in flight, and the lazy kernel load inside
+that forward has deadlocked every rank (the forward threads inside the
+driver's module load, the collective waiting for them). Every count used
+once before SERVING, with nothing else in flight, leaves no first use to
+serving. The remainders run last, in an order whose every prefix is a
+uniform spread of the range, so the budget cuts evenly if it cuts at all.
 """
 
 from __future__ import annotations
@@ -54,6 +69,8 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
         max_model_len=args.max_model_len or int(facts.get("max_context_length") or 0),
         vocab_size=int(facts.get("vocab_size") or 0),
         source="window and step from the server arguments (the engine's default step when unset)",
+        # Every count a chunk can hold, once, before serving (the module's doc).
+        every_prefill_length=True,
     )
 
 

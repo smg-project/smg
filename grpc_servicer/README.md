@@ -433,8 +433,11 @@ warm-up over the engine before they report SERVING: a decode staircase (as
 many concurrent requests as the running window holds, each asking for one more
 token than the last, so every running-batch size runs once), a prefill ladder
 (one request per 128-token length class up to `--max-num-batched-tokens`, the
-graph-capture sizes, lengths one above the tuners' bucket grid), and a second
-pass over the bucket grid whose timings show what the first pass paid. Every
+graph-capture sizes, lengths one above the tuners' bucket grid), a second
+pass over the bucket grid whose timings show what the first pass paid, and,
+where the engine's module asks for it (TokenSpeed, below), every remaining
+prompt length up to the step, last, in an order whose every prefix is a
+uniform spread of the range, so a budget cut leaves an even coverage. Every
 request carries its own token ids, so prefix caching never hides a prefill,
 and the engine's prefix cache is flushed at the end. One INFO line per shape
 with its time; readiness (the gRPC health service, so the startup and
@@ -443,7 +446,7 @@ whatever the pass returned (a failed request is a logged line, never a worker
 kept out of rotation). `SMG_VLLM_SERVICER_WARMUP` = `full` (the default:
 every 128-token class; about a minute on a 16k step), `fast` (the tuners'
 bucket grid only: seconds), `off`, a budget in seconds (`120`) or
-`<level>:<seconds>` (`fast:30`); the budget (default 300 s) bounds the pass:
+`<level>:<seconds>` (`fast:30`); the budget (default 900 s) bounds the pass:
 it ends between shapes, the remaining ones named in the log, and each
 request's timeout is clamped to what is left of it (one second at least), so
 a shape that hangs cannot hold readiness past the budget. On the Rust path the
@@ -795,10 +798,21 @@ free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
 `SMG_TOKENSPEED_SERVICER_WARMUP` (the planned warm-up before SERVING, as for
 vLLM above: `full` by default, `fast`, `off`, a budget in seconds or
 `<level>:<seconds>`; planned from `--max-num-seqs` and the chunk size or
-`--max-prefill-tokens`; the Python servicer runs the same plan over its own
-port after its first warm-up request, and both skip it on a disaggregation
-role; under attention data parallelism the servicer routes a request by load,
-not by rank, so each prefill shape warms one rank and the log says so),
+`--max-prefill-tokens`; this engine's plan also visits every prompt length
+up to the chunk size the class ladder leaves out, last, in an order whose
+every prefix is a uniform spread: a chunked prefill's last chunk is any count
+below the chunk size, a prefill chunk reaches two cuBLAS GEMMs here (the
+compressor's fp32 router projection above 32 tokens, the grouped output
+projection's batched GEMM) whose kernels the library picks per token count
+and loads on first use, and such a first use during serving, with the
+overlapped previous chunk's TP collective in flight, has deadlocked the
+forward; at a 4,096-token chunk that is 4,042 one-token requests after the
+ladder's 54, about 0.17 s each on a four-GPU node (692 s measured for the
+whole pass, inside the 900 s default budget); the Python servicer runs the
+same plan over its own port after its first warm-up request, and both skip it on a
+disaggregation role; under attention data parallelism the servicer routes a
+request by load, not by rank, so each prefill shape warms one rank and the
+log says so),
 `SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
 `SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
 bounds as for vLLM above: the launcher reports the scheduler process alive each

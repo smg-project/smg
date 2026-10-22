@@ -292,6 +292,84 @@ def test_plan_for_says_why_nothing_is_planned(caplog):
     assert any("nothing to plan" in m for m in messages)
 
 
+def test_the_spread_order_visits_every_count_once_and_every_prefix_is_a_uniform_spread():
+    order = warmup.spread_order(64)
+    assert sorted(order) == list(range(1, 65))
+    assert order[:4] == [64, 32, 16, 48]
+    assert set(order[:8]) == set(range(8, 65, 8))
+    assert set(order[:16]) == set(range(4, 65, 4))
+    assert set(order[:32]) == set(range(2, 65, 2))
+    # A count off a power of two: every count once, the top power of two first.
+    assert sorted(warmup.spread_order(100)) == list(range(1, 101))
+    assert warmup.spread_order(100)[:3] == [64, 32, 96]
+    assert warmup.spread_order(1) == [1] and warmup.spread_order(0) == []
+
+
+def test_an_engine_that_asks_for_every_prefill_length_gets_the_remainders_last_in_spread_order():
+    plan = plan_warmup(dataclasses.replace(SMALL, every_prefill_length=True), "full")
+    ladder = [s.requests[0].prompt_tokens for s in plan.steps if s.kind == "prefill"]
+    remainders = [s for s in plan.steps if s.kind == "remainder"]
+    lengths = [s.requests[0].prompt_tokens for s in remainders]
+    # Every count up to the step is a prefill shape of the plan, exactly once ...
+    assert sorted(ladder + lengths) == list(range(1, 65))
+    # ... the remainders after the measured second pass, in the spread order ...
+    last_again = max(i for i, s in enumerate(plan.steps) if s.kind == "again")
+    assert plan.steps.index(remainders[0]) == last_again + 1
+    assert lengths == [n for n in warmup.spread_order(64) if n not in ladder]
+    assert lengths[:4] == [48, 40, 24, 56]
+    # ... each a one-token request of exactly that length, named as such.
+    assert all(s.requests[0].max_tokens == 1 for s in remainders)
+    assert len(remainders[0].requests[0].token_ids) == 48  # the ids, drawn when read
+    assert [s.name for s in remainders[:2]] == [
+        "prefill 48 tokens (chunk remainder)",
+        "prefill 40 tokens (chunk remainder)",
+    ]
+    assert "9 prefill shapes, 7 measured again, 55 chunk remainders)" in plan.describe()
+    # The fast level keeps them: they answer a hazard, not a stall.
+    fast = plan_warmup(dataclasses.replace(SMALL, every_prefill_length=True), "fast")
+    assert {
+        s.requests[0].prompt_tokens for s in fast.steps if s.kind in ("prefill", "remainder")
+    } == set(range(1, 65))
+    # Without the ask, the plan reads as before.
+    before = plan_warmup(SMALL, "full")
+    assert not any(s.kind == "remainder" for s in before.steps)
+    assert "remainder" not in before.describe()
+
+
+def test_the_remainders_cover_the_counts_a_chunked_prefills_last_chunk_can_take():
+    # A 4,096-token chunk under an 8-request window: the class ladder visits
+    # 54 of the 4,096 counts a step can hold; the last chunk of a longer
+    # prefill is any of the rest (two of them hung an engine at first use).
+    chunk = WarmupInputs(
+        max_num_seqs=8, max_num_batched_tokens=4096, max_model_len=1 << 20, vocab_size=129280
+    )
+    ladder = {s.requests[0].prompt_tokens for s in plan_warmup(chunk).steps if s.kind == "prefill"}
+    assert len(ladder) == 54 and not {3024, 1853} & ladder
+    full = plan_warmup(dataclasses.replace(chunk, every_prefill_length=True))
+    covered = {
+        s.requests[0].prompt_tokens for s in full.steps if s.kind in ("prefill", "remainder")
+    }
+    assert covered == set(range(1, 4097))
+    remainders = [s.requests[0].prompt_tokens for s in full.steps if s.kind == "remainder"]
+    assert len(remainders) == 4096 - 54
+    # The run's every prefix is a spread: its first 94 counts sit on a 32-token
+    # pace, the first 31 of them on a 64-token one.
+    assert all(n % 64 == 0 for n in remainders[:31]) and all(n % 32 == 0 for n in remainders[:94])
+    assert full.prompt_tokens - plan_warmup(chunk).prompt_tokens == sum(range(1, 4097)) - sum(
+        ladder
+    )
+
+
+def test_under_data_parallelism_every_rank_gets_every_remainder():
+    two = plan_warmup(dataclasses.replace(SMALL, every_prefill_length=True, data_parallel_size=2))
+    remainders = [s for s in two.steps if s.kind == "remainder"]
+    assert len(remainders) == 55
+    for step in remainders:
+        assert [r.data_parallel_rank for r in step.requests] == [0, 1]
+        assert len({r.prompt_tokens for r in step.requests}) == 1  # the same count on every rank
+        assert len({r.token_ids for r in step.requests}) == 2  # its own tokens on each
+
+
 # ---------------------------------------------------------------------------
 # The pass
 # ---------------------------------------------------------------------------
@@ -652,9 +730,9 @@ def test_a_wire_over_a_borrowed_channel_leaves_it_open():
     try:
         channel = grpc.insecure_channel(target)
         wire = sglang_warmup.warmup_wire("", channel=channel)
-        wire.generate(warmup.WarmupRequest("r", (5, 6, 7), 2), 10)
+        wire.generate(warmup.WarmupRequest("r", 3, 2, seed=0, vocab_size=100), 10)
         wire.close()
-        wire.generate(warmup.WarmupRequest("r2", (5, 6, 7, 8), 1), 10)  # still open
+        wire.generate(warmup.WarmupRequest("r2", 4, 1, seed=1, vocab_size=100), 10)  # still open
         channel.close()
     finally:
         server.stop(0)
@@ -759,6 +837,26 @@ def test_the_sglang_and_tokenspeed_inputs_say_when_the_pass_spreads_over_ranks(c
     sglang_warmup.warmup_inputs(SimpleNamespace(max_running_requests=64), facts)
     tokenspeed_warmup.warmup_inputs(SimpleNamespace(), facts)
     assert not caplog.records
+
+
+def test_only_the_tokenspeed_inputs_ask_for_every_prefill_length():
+    facts = {"is_generation": True, "max_context_length": 32768, "vocab_size": 151936}
+    args = SimpleNamespace(max_num_seqs=8, chunked_prefill_size=4096)
+    assert tokenspeed_warmup.warmup_inputs(args, facts).every_prefill_length is True
+    assert sglang_warmup.warmup_inputs(args, facts).every_prefill_length is False
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            model="m", max_model_len=4096, get_vocab_size=lambda: 32000, runner_type="generate"
+        ),
+        scheduler_config=SimpleNamespace(max_num_seqs=16, max_num_batched_tokens=2048),
+        compilation_config=SimpleNamespace(cudagraph_capture_sizes=[8]),
+    )
+    assert vllm_warmup.warmup_inputs_from_config(config).every_prefill_length is False
+    # The plan the launcher runs for this engine covers every count of its chunk.
+    plan = plan_warmup(tokenspeed_warmup.warmup_inputs(args, facts))
+    assert {
+        s.requests[0].prompt_tokens for s in plan.steps if s.kind in ("prefill", "remainder")
+    } == set(range(1, 4097))
 
 
 # ---------------------------------------------------------------------------
