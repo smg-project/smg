@@ -216,5 +216,7 @@ def test_an_http_worker_that_dies_during_the_wait_ends_it_within_seconds(tmp_pat
     started = time.perf_counter()
     text = _death_text(worker, timeout=30)
     elapsed = time.perf_counter() - started
-    assert 1 <= elapsed < 10, elapsed
+    # The floor only shows the process was alive when the wait began; a busy
+    # runner may start the stub's sleep late, so it leaves room for that.
+    assert 0.5 <= elapsed < 10, elapsed
     assert '(exit status 2); the log says: "RuntimeError: the model path is unreadable"' in text
