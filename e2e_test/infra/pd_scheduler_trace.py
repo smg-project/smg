@@ -21,6 +21,8 @@ class SchedulerTrace:
             for key in ("run", "attempt", "worker", "role")
         }
         context.update(pid=os.getpid(), instance=uuid.uuid4().hex)
+        if "SMG_PD_TRACE_WORKER_INSTANCE" in os.environ:
+            context["worker_instance"] = os.environ["SMG_PD_TRACE_WORKER_INSTANCE"]
         trace = cls(None, context)
         try:
             if any(
@@ -30,6 +32,8 @@ class SchedulerTrace:
                 raise ValueError("missing trace identity")
             if context["role"] not in ("prefill", "decode"):
                 raise ValueError("unknown worker role")
+            if "worker_instance" in context and not context["worker_instance"]:
+                raise ValueError("missing worker launch instance")
             directory = Path(os.environ["SMG_PD_TRACE_DIR"])
             path = directory / f"scheduler-{context['pid']}-{context['instance']}.jsonl"
             path.touch(exist_ok=False)
