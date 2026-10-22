@@ -13,7 +13,7 @@ global:
   image:
     registry: docker.io
     repository: lightseekorg/smg
-    tag: "1.3.3"
+    tag: "1.13.0"
 
 huggingface:
   token: ""  # set via --set huggingface.token=hf_xxx
@@ -34,7 +34,7 @@ workers:
     gpu:
       count: 1
     image:
-      tag: "1.3.3-vllm-v0.18.0"
+      tag: "1.13.0-vllm-v0.31.0"
     resources:
       requests:
         cpu: "4"
@@ -48,7 +48,7 @@ workers:
     gpu:
       count: 1
     image:
-      tag: "1.3.3-sglang-v0.5.9"
+      tag: "1.13.0-sglang-v0.5.21"
     resources:
       requests:
         cpu: "4"

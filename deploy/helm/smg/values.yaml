@@ -337,6 +337,8 @@ workers: []
 #       count: 1                        # GPUs per replica (tensor parallel size)
 #       type: nvidia.com/gpu            # resource name (default)
 #     image:
+#       registry: ghcr.io               # default
+#       repository: smg-project/smg     # default: the path the engine images are published under
 #       tag: ""                         # engine-specific image tag (required)
 #     port: 8000                        # worker serving port
 #     resources: {}

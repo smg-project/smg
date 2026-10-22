@@ -449,9 +449,9 @@ Expects a dict with keys: worker, global, chart, defaults
 {{- $workerRepository = .worker.image.repository | default "" -}}
 {{- $workerTag = .worker.image.tag | default "" -}}
 {{- end -}}
-{{/* Engine images default to ghcr.io (gateway image is on docker.io) */}}
+{{/* Engine images are published under ghcr.io/smg-project/smg (the gateway image is on docker.io) */}}
 {{- $registry := $workerRegistry | default "ghcr.io" -}}
-{{- $repository := $workerRepository | default .global.image.repository -}}
+{{- $repository := $workerRepository | default "smg-project/smg" -}}
 {{- $tag := $workerTag | default (.global.image.tag | default .chart.AppVersion) -}}
 {{- printf "%s/%s:%s" $registry $repository $tag -}}
 {{- end }}

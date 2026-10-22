@@ -40,12 +40,12 @@ The gateway image is on Docker Hub, engine images are on GitHub Container Regist
 
 | Component | Registry | Image |
 |-----------|----------|-------|
-| Gateway | `docker.io` | `lightseekorg/smg:1.3.3` |
-| vLLM worker | `ghcr.io` | `lightseekorg/smg:1.3.3-vllm-v0.18.0` |
-| TRT-LLM worker | `ghcr.io` | `lightseekorg/smg:1.3.3-trtllm-1.3.0rc8` |
-| SGLang worker | `ghcr.io` | `lightseekorg/smg:1.3.3-sglang-v0.5.9` |
+| Gateway | `docker.io` | `lightseekorg/smg:1.13.0` |
+| vLLM worker | `ghcr.io` | `smg-project/smg:1.13.0-vllm-v0.31.0` |
+| TRT-LLM worker | `ghcr.io` | `smg-project/smg:1.13.0-trtllm-1.3.0rc24` |
+| SGLang worker | `ghcr.io` | `smg-project/smg:1.13.0-sglang-v0.5.21` |
 
-Worker images default to `ghcr.io`. Set `workers[].image.tag` to the engine-specific tag.
+Worker images default to `ghcr.io/smg-project/smg`. Set `workers[].image.tag` to the engine-specific tag; `workers[].image.registry` and `workers[].image.repository` override the path.
 
 ## Configuration
 
@@ -82,7 +82,7 @@ workers:
     gpu:
       count: 1                        # GPUs per replica (tensor parallel)
     image:
-      tag: "1.3.3-vllm-v0.18.0"      # engine image tag
+      tag: "1.13.0-vllm-v0.31.0"     # engine image tag
 ```
 
 Workers are automatically wired to the router via `--worker-urls`. The URL scheme (`http://` or `grpc://`) is set based on `connectionMode`.
