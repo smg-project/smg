@@ -268,9 +268,10 @@ What the syntax says, and what the assembler does with it:
   them (`, "new_preferences": {"size": "large", "temp`) where they are a strict prefix of a
   JSON value and as the opening of a string holding them where they are not, so that every
   fragment keeps the arguments a strict JSON prefix; a start of a tag held behind the value is
-  its text too where the two together are still such a prefix (`{"q": "a <`), and leaves after
-  the call's end as wrapping where they are not (`12</arg_v`); a streamed string keeps its
-  fragments, a held tag start its text; a string whose key came and no byte of it opens,
+  its text too where the two together are still such a prefix (`{"q": "a <`) or where the
+  value opens as a string anyway (`hel<`), and leaves after the call's end as wrapping where
+  the text alone is the prefix (`12</arg_v`); a streamed string keeps its fragments, a held
+  tag start its text; a string whose key came and no byte of it opens,
   `{"key": "`; a key whose two tags came and whose value tag did not opens its member,
   `"key": `, and a start of the value tag leaves after the call's end as the syntax's wrapping;
   a key tag the cut found open and the template's whitespace between pairs leave as wrapping

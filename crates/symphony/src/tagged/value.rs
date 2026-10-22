@@ -686,7 +686,7 @@ fn string(text: &str) -> String {
 /// that a client that reads the arguments as they arrive is never handed bytes no JSON value
 /// begins with, and a cut that lands after a whole literal agrees with the close on its type.
 pub(crate) fn cut(text: &str) -> String {
-    if json_prefix(text) {
+    if !cut_opens_a_string(text) {
         return text.to_owned();
     }
     if let Some(json) = python_literal(text.trim()).filter(|json| reads_back_as_an_argument(json)) {
@@ -696,6 +696,13 @@ pub(crate) fn cut(text: &str) -> String {
     json.push('"');
     push_escaped(&mut json, text);
     json
+}
+
+/// Whether [`cut`] writes `text` as the opening of a JSON string rather than as written: the
+/// text is no strict prefix of a JSON value. Bytes held behind such a text (a start of a tag
+/// the cut left short) belong in that string, as they would in a streamed one.
+pub(crate) fn cut_opens_a_string(text: &str) -> bool {
+    !json_prefix(text)
 }
 
 /// Whether `text` is a strict prefix of a JSON value: one `serde_json` reads whole, or one it
