@@ -2201,6 +2201,58 @@ pub fn load_chat_template_from_file(template_path: &str) -> Result<Option<String
     Ok(Some(template))
 }
 
+/// The chat templates a `tokenizer_config.json` `chat_template` value holds:
+/// a string is the one template; a list of named templates (`[{"name":
+/// "default", "template": ...}, {"name": "tool_use", "template": ...}]`) is
+/// read as transformers reads it into a dict, and the engine's chat utils
+/// take `tool_use` when the request declares tools and `default` otherwise
+/// (`get_chat_template`). A later entry of a name replaces an earlier one;
+/// any other value is no template.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ConfigChatTemplates {
+    pub default: Option<String>,
+    pub tool_use: Option<String>,
+}
+
+impl ConfigChatTemplates {
+    pub fn read(value: Option<&serde_json::Value>) -> Self {
+        match value {
+            Some(serde_json::Value::String(template)) => Self {
+                default: Some(template.clone()),
+                tool_use: None,
+            },
+            Some(serde_json::Value::Array(entries)) => {
+                let mut templates = Self::default();
+                for entry in entries {
+                    let name = entry.get("name").and_then(serde_json::Value::as_str);
+                    let template = entry.get("template").and_then(serde_json::Value::as_str);
+                    match (name, template) {
+                        (Some("default"), Some(template)) => {
+                            templates.default = Some(template.to_string());
+                        }
+                        (Some("tool_use"), Some(template)) => {
+                            templates.tool_use = Some(template.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+                templates
+            }
+            _ => Self::default(),
+        }
+    }
+
+    /// Whether the value names a template at all.
+    pub fn is_some(&self) -> bool {
+        self.default.is_some() || self.tool_use.is_some()
+    }
+
+    /// Whether the value names no template.
+    pub fn is_none(&self) -> bool {
+        !self.is_some()
+    }
+}
+
 /// Chat template state that can be embedded in any tokenizer struct.
 /// Eliminates duplicated apply/set/format methods across tokenizer backends.
 ///
@@ -2237,6 +2289,11 @@ pub struct ChatTemplateState {
     /// Whether the template writes a history tool call's `arguments` as the
     /// text the request sent (see [`Self::raw_tool_call_arguments`]).
     raw_tool_call_arguments: bool,
+    /// The `tool_use` template of a configuration that names its templates
+    /// (see [`ConfigChatTemplates`]), rendered in place of the default one
+    /// when the request declares tools, as the engine's chat utils render.
+    /// The accessors answer for the default template.
+    tool_use: Option<Box<ChatTemplateState>>,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -2246,6 +2303,7 @@ impl std::fmt::Debug for ChatTemplateState {
             .field("content_format", &self.content_format)
             .field("thinking_toggle", &self.thinking_toggle)
             .field("think_in_prefill", &self.think_in_prefill)
+            .field("has_tool_use", &self.tool_use.is_some())
             .finish()
     }
 }
@@ -2274,8 +2332,46 @@ impl ChatTemplateState {
             developer_role_supported,
             root_role_supported,
             raw_tool_call_arguments: false,
+            tool_use: None,
         };
         state.raw_tool_call_arguments = state.writes_tool_call_arguments_as_text();
+        Ok(state)
+    }
+
+    /// The templates of a configuration (see [`ConfigChatTemplates`]): the
+    /// default one, and the `tool_use` one for requests that declare tools.
+    pub fn from_config(templates: ConfigChatTemplates) -> Result<Self> {
+        let mut state = Self::new(templates.default)?;
+        if let Some(template) = templates.tool_use {
+            let tool_use = Self::new(Some(template))?;
+            // A request is prepared (its content shape, its thinking switch)
+            // and its answer read (the prefill's think block) by the default
+            // template's answers before the template is chosen; a pair that
+            // disagrees on them is prepared for the wrong one when tools are
+            // declared, so say so once at load, naming every answer tested.
+            if tool_use.content_format != state.content_format
+                || tool_use.thinking_toggle != state.thinking_toggle
+                || tool_use.thinking_key_name != state.thinking_key_name
+                || tool_use.think_in_prefill != state.think_in_prefill
+                || tool_use.prefill_opens_think_block != state.prefill_opens_think_block
+            {
+                tracing::warn!(
+                    default_content_format = ?state.content_format,
+                    tool_use_content_format = ?tool_use.content_format,
+                    default_thinking_toggle = ?state.thinking_toggle,
+                    tool_use_thinking_toggle = ?tool_use.thinking_toggle,
+                    default_thinking_key_name = ?state.thinking_key_name,
+                    tool_use_thinking_key_name = ?tool_use.thinking_key_name,
+                    default_think_in_prefill = state.think_in_prefill,
+                    tool_use_think_in_prefill = tool_use.think_in_prefill,
+                    default_prefill_opens_think_block = state.prefill_opens_think_block,
+                    tool_use_prefill_opens_think_block = tool_use.prefill_opens_think_block,
+                    "the named chat templates disagree on how a request is prepared; \
+                     requests are prepared by the default template's answers"
+                );
+            }
+            state.tool_use = Some(Box::new(tool_use));
+        }
         Ok(state)
     }
 
@@ -2294,6 +2390,7 @@ impl ChatTemplateState {
             developer_role_supported: true,
             root_role_supported: true,
             raw_tool_call_arguments: false,
+            tool_use: None,
         }
     }
 
@@ -2312,6 +2409,25 @@ impl ChatTemplateState {
     /// after the generation prompt (see
     /// [`ChatTemplateParams::continue_final_message`]).
     pub fn apply_with_continuation(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+    ) -> Result<(String, bool)> {
+        self.template_for(&params)
+            .render_with_continuation(messages, params)
+    }
+
+    /// The template a request renders through: the `tool_use` one of a
+    /// configuration that names it when the request declares tools, else
+    /// this one.
+    fn template_for(&self, params: &ChatTemplateParams) -> &Self {
+        match &self.tool_use {
+            Some(tool_use) if params.tools.is_some() => tool_use,
+            _ => self,
+        }
+    }
+
+    fn render_with_continuation(
         &self,
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
@@ -2435,6 +2551,8 @@ impl ChatTemplateState {
         self.think_in_prefill = think_in_prefill;
         self.prefill_opens_think_block = prefill_opens_think_block;
         self.env = Some(env);
+        // A replacement template stands alone, as a template file does.
+        self.tool_use = None;
         self.raw_tool_call_arguments = self.writes_tool_call_arguments_as_text();
         Ok(())
     }
@@ -2487,7 +2605,15 @@ impl ChatTemplateState {
     /// written. Resolved when the template is bound (see
     /// [`Self::writes_tool_call_arguments_as_text`]).
     pub fn raw_tool_call_arguments(&self) -> bool {
-        self.raw_tool_call_arguments
+        // In a named pair the `tool_use` template is the one with the
+        // tool-call branch, and every request that renders a tool call goes
+        // through it; the default template (plain chat, as a rule) has no
+        // answer of its own.
+        self.tool_use
+            .as_ref()
+            .map_or(self.raw_tool_call_arguments, |tool_use| {
+                tool_use.raw_tool_call_arguments
+            })
     }
 
     /// Decide [`Self::raw_tool_call_arguments`] by the template's behaviour,
@@ -2740,6 +2866,82 @@ mod tests {
             rendered,
             "<|system|>\n[{'type': 'text', 'text': 'You are a terse assistant.'}]<|user|>Hello."
         );
+    }
+
+    /// A configuration that ships its templates as a named list is read as
+    /// transformers reads it: `default` renders a plain request, `tool_use`
+    /// one that declares tools; a string stays the one template; a replacement
+    /// template drops the pair.
+    #[test]
+    fn a_named_template_list_renders_tool_use_for_a_request_with_tools() {
+        let config = serde_json::json!([
+            {"name": "default", "template": "default:{{ messages | length }}"},
+            {"name": "tool_use", "template": "tool_use:{{ tools | length }}"}
+        ]);
+        let templates = ConfigChatTemplates::read(Some(&config));
+        assert_eq!(
+            templates,
+            ConfigChatTemplates {
+                default: Some("default:{{ messages | length }}".to_string()),
+                tool_use: Some("tool_use:{{ tools | length }}".to_string()),
+            }
+        );
+        let mut state = ChatTemplateState::from_config(templates).unwrap();
+        let messages = [serde_json::json!({"role": "user", "content": "Hi"})];
+        let tools = [serde_json::json!({"type": "function", "function": {"name": "f"}})];
+        let with_tools = ChatTemplateParams {
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        assert_eq!(
+            state
+                .apply(&messages, ChatTemplateParams::default())
+                .unwrap(),
+            "default:1"
+        );
+        assert_eq!(state.apply(&messages, with_tools).unwrap(), "tool_use:1");
+
+        state.set("alone:{{ tools is none }}".to_string()).unwrap();
+        let with_tools = ChatTemplateParams {
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        assert_eq!(state.apply(&messages, with_tools).unwrap(), "alone:False");
+
+        assert_eq!(
+            ConfigChatTemplates::read(Some(&serde_json::json!("one"))),
+            ConfigChatTemplates {
+                default: Some("one".to_string()),
+                tool_use: None,
+            }
+        );
+        assert!(
+            !ConfigChatTemplates::read(Some(&serde_json::json!({"name": "default"}))).is_some()
+        );
+        assert!(!ConfigChatTemplates::read(None).is_some());
+    }
+
+    /// The answer to how a history tool call's arguments are written comes
+    /// from the `tool_use` template of a named pair: the default one has no
+    /// tool-call branch to ask.
+    #[test]
+    fn a_named_pair_answers_tool_call_arguments_from_the_tool_use_template() {
+        let concatenating = "{% for m in messages %}{% for c in m.tool_calls or [] %}\
+                             {{ 'args=' + c.function.arguments }}{% endfor %}{% endfor %}";
+        let alone = ChatTemplateState::new(Some(concatenating.to_string())).unwrap();
+        assert!(alone.raw_tool_call_arguments());
+        let pair = ChatTemplateState::from_config(ConfigChatTemplates {
+            default: Some("{{ messages | length }}".to_string()),
+            tool_use: Some(concatenating.to_string()),
+        })
+        .unwrap();
+        assert!(pair.raw_tool_call_arguments());
+        let plain = ChatTemplateState::from_config(ConfigChatTemplates {
+            default: Some("{{ messages | length }}".to_string()),
+            tool_use: Some("{{ tools | tojson }}".to_string()),
+        })
+        .unwrap();
+        assert!(!plain.raw_tool_call_arguments());
     }
 
     /// The rewrite keeps each tag's whitespace modifiers and leaves a template

@@ -28,7 +28,7 @@ use crate::{
     byte_level::{ByteLevelIncremental, ByteLevelTable, UnknownId},
     chat_template::{
         load_chat_template_from_file, ChatTemplateContentFormat, ChatTemplateParams,
-        ChatTemplateState, ThinkingKeyName, ThinkingToggle,
+        ChatTemplateState, ConfigChatTemplates, ThinkingKeyName, ThinkingToggle,
     },
     encode_path::{self, EncodePath},
     encoders::{
@@ -607,6 +607,7 @@ impl HuggingFaceTokenizer {
         // Load tokenizer_config.json once for chat template, add_bos/eos, and special tokens
         let config_result = Self::load_chat_template_and_config(&tokenizer_path.to_string_lossy());
         let mut chat_template_str = config_result.chat_template;
+        let mut tool_use_template = config_result.tool_use_chat_template;
         let response_template = config_result.response_template;
         let add_bos_token = config_result.add_bos_token;
         let add_eos_token = config_result.add_eos_token;
@@ -616,6 +617,9 @@ impl HuggingFaceTokenizer {
 
         if let Some(template_path) = chat_template_path {
             chat_template_str = load_chat_template_from_file(template_path)?;
+            // A template file stands alone: transformers' `chat_template.jinja`
+            // replaces the configuration's templates, named ones included.
+            tool_use_template = None;
         }
 
         // The configuration's special tokens on request (the rule is on
@@ -672,7 +676,10 @@ impl HuggingFaceTokenizer {
             .and_then(|checkpoint| checkpoint.renderer(chat_template_str.as_deref()))
             .map(Renderer::Glm53)
             .unwrap_or(renderer);
-        let chat_template = ChatTemplateState::new(chat_template_str)?;
+        let chat_template = ChatTemplateState::from_config(ConfigChatTemplates {
+            default: chat_template_str,
+            tool_use: tool_use_template,
+        })?;
         let media_handling = glm.as_ref().map_or_else(Default::default, |checkpoint| {
             checkpoint.media_handling(&chat_template)
         });
@@ -939,11 +946,8 @@ impl HuggingFaceTokenizer {
             let content = std::fs::read_to_string(&config_path).ok()?;
             let config: serde_json::Value = serde_json::from_str(&content).ok()?;
 
-            // Extract chat template directly from parsed config (avoid re-reading the file)
-            let chat_template = config
-                .get("chat_template")
-                .and_then(|v| v.as_str())
-                .map(String::from);
+            // The chat template(s) from the parsed config (avoid re-reading the file)
+            let templates = ConfigChatTemplates::read(config.get("chat_template"));
             // Kept raw; parser selection validates it.
             let response_template = config.get("response_template").cloned();
 
@@ -958,7 +962,8 @@ impl HuggingFaceTokenizer {
             };
 
             Some(TokenizerConfigResult {
-                chat_template,
+                chat_template: templates.default,
+                tool_use_chat_template: templates.tool_use,
                 response_template,
                 add_bos_token,
                 add_eos_token,
@@ -1068,6 +1073,8 @@ impl ConfigToken {
 #[derive(Default)]
 struct TokenizerConfigResult {
     chat_template: Option<String>,
+    /// The `tool_use` entry of a named-template list (see `ConfigChatTemplates`).
+    tool_use_chat_template: Option<String>,
     response_template: Option<serde_json::Value>,
     add_bos_token: Option<bool>,
     add_eos_token: Option<bool>,
@@ -2573,6 +2580,65 @@ mod tests {
                 )
                 .unwrap(),
             "<user>Hi"
+        );
+    }
+
+    /// The loader reads a configuration's named templates: `default` renders
+    /// a plain request, `tool_use` one that declares tools; a template file
+    /// beside the checkpoint (or the operator's) stands alone for both.
+    #[test]
+    fn the_loader_reads_a_named_template_list_and_a_template_file_stands_alone() {
+        let temp = TempDir::new().unwrap();
+        let tokenizer_path = temp.path().join("tokenizer.json");
+        fs::write(&tokenizer_path, MIN_TOKENIZER_JSON).unwrap();
+        fs::write(
+            temp.path().join("tokenizer_config.json"),
+            json!({"chat_template": [
+                {"name": "default", "template": "d"},
+                {"name": "tool_use", "template": "t"}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let messages = [json!({"role": "user", "content": "Hi"})];
+        let tools: [serde_json::Value; 0] = [];
+        let with_tools = || ChatTemplateParams {
+            tools: Some(&tools),
+            ..Default::default()
+        };
+
+        let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            tokenizer
+                .apply_chat_template(&messages, ChatTemplateParams::default())
+                .unwrap(),
+            "d"
+        );
+        assert_eq!(
+            tokenizer
+                .apply_chat_template(&messages, with_tools())
+                .unwrap(),
+            "t"
+        );
+
+        let file = temp.path().join("own.jinja");
+        fs::write(&file, "f").unwrap();
+        let tokenizer = HuggingFaceTokenizer::from_file_with_chat_template(
+            tokenizer_path.to_str().unwrap(),
+            file.to_str(),
+        )
+        .unwrap();
+        assert_eq!(
+            tokenizer
+                .apply_chat_template(&messages, ChatTemplateParams::default())
+                .unwrap(),
+            "f"
+        );
+        assert_eq!(
+            tokenizer
+                .apply_chat_template(&messages, with_tools())
+                .unwrap(),
+            "f"
         );
     }
 
