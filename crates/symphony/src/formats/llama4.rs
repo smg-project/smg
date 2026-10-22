@@ -219,12 +219,12 @@ mod tests {
         calls: &'static [(&'static str, &'static str)],
     }
 
-    /// The turns bellwether's common set records for `llama-4-scout-17b-16e-instruct`, less the
-    /// nested one (its template writes a quote inside a quoted value without escaping it, which
-    /// no reader can take back; `docs/tables.md`): one call, a call with no arguments, three calls,
-    /// a call after content, non-ASCII values with a list, a value that ends in a backslash
-    /// (`dir C:\`, as the recorded benchmark sets write it) alone and after content, and content
-    /// alone; then the probes.
+    /// The turns bellwether's common set records for `llama-4-scout-17b-16e-instruct`: one call, a
+    /// call with no arguments, three calls, a call after content, non-ASCII values with a list,
+    /// the nested one (a quote inside a quoted value, which the template writes without escaping
+    /// it and the table reads since the quotes inside pair up, and a value that ends in a
+    /// backslash; `docs/tables.md`), a value that ends in a backslash (`dir C:\`, as the recorded
+    /// benchmark sets write it) alone and after content, and content alone; then the probes.
     const TURNS: &[Turn] = &[
         Turn {
             output: "[get_weather(city=\"Paris\")]",
@@ -256,6 +256,14 @@ mod tests {
             calls: &[(
                 "save_note",
                 "{\"title\": \"計画\", \"body\": \"今日は晴れ 🌤️ — très bien\", \"tags\": [\"日本語\"]}",
+            )],
+        },
+        Turn {
+            output: "[save_note(title=\"Plan\", body=\"Line one\nLine two with \"quotes\" and a backslash \\\", tags=\"['a', 'b']\", meta=\"{'nested': {'deep': [1, 2.5, True, None]}}\")]",
+            content: "",
+            calls: &[(
+                "save_note",
+                "{\"title\": \"Plan\", \"body\": \"Line one\\nLine two with \\\"quotes\\\" and a backslash \\\\\", \"tags\": [\"a\", \"b\"], \"meta\": {\"nested\": {\"deep\": [1, 2.5, true, null]}}}",
             )],
         },
         Turn {

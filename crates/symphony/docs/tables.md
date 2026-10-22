@@ -599,11 +599,15 @@ list and nothing after it; no thought. What the table says beyond the others:
   model writes bare (`days=3`, `detailed=False`, `city='Paris'`), the spelling its model card and
   the family's parsers take, reads as Python's, a single-quoted string with its escapes. The
   structural tags write Python's values, the spelling the model is told to write.
-- **A quote inside a quoted value is the template's loss.** The template does not escape a `"`
-  inside a string it quotes, so the bytes it writes for such a value cannot be read back by any
-  reader, this one included; the recorded sets hold a few such cases (five in a hundred thousand
-  of Scout's), and the corpus replay counts them apart, by the reference that holds the quote,
-  rather than against the table. A string that holds a newline or a backslash reads as written.
+- **A quote inside a quoted value is ambiguous.** The template does not escape a `"` inside a
+  string it quotes, so the bytes it writes for such a value do not say where the value ends. The
+  table reads the value whole when the quotes inside it pair up and nothing between the two of a
+  pair would end or reopen the value in the reader's eyes: no `,` or `)`, no `'` and no opening
+  bracket (the recorded cases are written so: a word in quotes, a JSON object, a command line);
+  it cannot otherwise, since the bytes alone do not say which reading the model meant. The
+  recorded sets hold a few such cases (five in a hundred thousand of Scout's), the recorder
+  refuses the class, and the corpus replay counts a reference that holds the quote apart from the
+  differences. A string that holds a newline or a backslash reads as written.
 - **`<|python_start|>` and `<|python_end|>` are wrapping wherever they stand.** The family's
   earlier template wrote a tool turn's content between them, and the model may write them around
   its code or its list; the table ignores both terminals, so the text between them reads as what

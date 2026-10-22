@@ -628,9 +628,11 @@ impl Recorded for Table {
     }
 
     /// Whether the table's template writes every value between double quotes without escaping
-    /// a quote inside it (Llama 4's `"%s"`): a string argument that holds a `"` cannot be read
-    /// back from what the template wrote, by this parser or any other, so a case whose reference
-    /// holds one is counted apart from the differences (`docs/tables.md`).
+    /// a quote inside it (Llama 4's `"%s"`): what the template wrote for a string argument that
+    /// holds a `"` does not say where the value ends, so the parser reads it back only when the
+    /// quotes inside pair up with nothing between a pair that would end or reopen the value, and
+    /// a case that differs and whose reference holds one is counted apart from the differences
+    /// (`docs/tables.md`).
     fn quotes_values(self) -> bool {
         matches!(self, Self::Llama4)
     }

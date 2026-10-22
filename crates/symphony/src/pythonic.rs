@@ -987,6 +987,119 @@ mod tests {
         );
     }
 
+    /// The quoted dialect's rule on every shape of backslash a value may hold, as the recorded
+    /// benchmark sets write them: a double-quoted value is the template's bytes as they stand, so
+    /// a backslash inside it is one of the value's characters, however many stand before the
+    /// closing quote and whatever follows one, and the next `"` ends the value. Each shape whole,
+    /// at every cut, in the turn's list and in a list held after content. A backslash before a
+    /// quote inside the value is the template's loss still: the value ends at that quote, so the
+    /// turn's list ends open and says so with no arguments made up, and a list held after content
+    /// is content, as the family's own reader gives it.
+    #[test]
+    fn a_quoted_values_backslashes_are_its_characters_wherever_they_stand() {
+        let declared = Declared::of(&[tool(
+            "cmd_controller_execute",
+            value!({"type": "object", "properties": {
+                "command": {"type": "string"},
+                "unit": {"type": "string"},
+            }}),
+        )]);
+        let shapes: &[(&str, &str)] = &[
+            // one backslash before the closing quote, an argument after it and as the last
+            (
+                "[cmd_controller_execute(command=\"dir C:\\\", unit=\"N/A\")]",
+                "{\"command\": \"dir C:\\\\\", \"unit\": \"N/A\"}",
+            ),
+            (
+                "[cmd_controller_execute(command=\"dir C:\\\")]",
+                "{\"command\": \"dir C:\\\\\"}",
+            ),
+            // two, and three
+            (
+                "[cmd_controller_execute(command=\"dir C:\\\\\", unit=\"N/A\")]",
+                "{\"command\": \"dir C:\\\\\\\\\", \"unit\": \"N/A\"}",
+            ),
+            (
+                "[cmd_controller_execute(command=\"dir C:\\\\\\\")]",
+                "{\"command\": \"dir C:\\\\\\\\\\\\\"}",
+            ),
+            // a backslash with text after it, which no escape decodes (`\x` is not one here)
+            (
+                "[cmd_controller_execute(command=\"C:\\x\", unit=\"N/A\")]",
+                "{\"command\": \"C:\\\\x\", \"unit\": \"N/A\"}",
+            ),
+            // a backslash before a comma inside the value, and before a single quote
+            (
+                "[cmd_controller_execute(command=\"a\\, b\\'c\", unit=\"N/A\")]",
+                "{\"command\": \"a\\\\, b\\\\'c\", \"unit\": \"N/A\"}",
+            ),
+            // two calls, the first ending in a backslash
+            (
+                "[cmd_controller_execute(command=\"dir C:\\\"), cmd_controller_execute(unit=\"N/A\")]",
+                "",
+            ),
+        ];
+        for (output, arguments) in shapes {
+            let expected: Vec<(u32, String, String)> = if arguments.is_empty() {
+                vec![
+                    (
+                        0,
+                        "cmd_controller_execute".to_string(),
+                        "{\"command\": \"dir C:\\\\\"}".to_string(),
+                    ),
+                    (
+                        1,
+                        "cmd_controller_execute".to_string(),
+                        "{\"unit\": \"N/A\"}".to_string(),
+                    ),
+                ]
+            } else {
+                vec![(
+                    0,
+                    "cmd_controller_execute".to_string(),
+                    arguments.to_string(),
+                )]
+            };
+            let whole = run_bare(&declared, &[output]);
+            assert_eq!(calls(&whole), expected, "{output}");
+            assert_eq!(malformed(&whole), "", "{output}");
+            assert_eq!(bytes(&whole), *output, "{output}");
+            for at in 1..output.len() {
+                let events = run_bare(&declared, &[&output[..at], &output[at..]]);
+                assert_eq!(calls(&events), expected, "{output} cut at {at}");
+                assert_eq!(malformed(&events), "", "{output} cut at {at}");
+                assert_eq!(bytes(&events), *output, "{output} cut at {at}");
+            }
+            let held = format!("Listing the directory.{output}");
+            let whole = run_bare(&declared, &[&held]);
+            assert_eq!(content(&whole), "Listing the directory.", "{held}");
+            assert_eq!(calls(&whole), expected, "{held}");
+            assert_eq!(bytes(&whole), held, "{held}");
+            for at in 1..held.len() {
+                let events = run_bare(&declared, &[&held[..at], &held[at..]]);
+                assert_eq!(
+                    content(&events),
+                    "Listing the directory.",
+                    "{held} cut at {at}"
+                );
+                assert_eq!(calls(&events), expected, "{held} cut at {at}");
+                assert_eq!(bytes(&events), held, "{held} cut at {at}");
+            }
+        }
+        let output = "[cmd_controller_execute(command=\"a\\\"b\", unit=\"N/A\")]";
+        let events = run_bare(&declared, &[output]);
+        assert_eq!(
+            calls(&events),
+            [(0, "cmd_controller_execute".to_string(), String::new())]
+        );
+        assert_eq!(malformed(&events), "command=\"a\\\"b\", unit=\"N/A\")]");
+        assert_eq!(bytes(&events), output);
+        let held = format!("Listing the directory.{output}");
+        let events = run_bare(&declared, &[&held]);
+        assert_eq!(content(&events), held);
+        assert!(calls(&events).is_empty());
+    }
+
     fn run_bare(declared: &Declared, pieces: &[&str]) -> Vec<Event<'static>> {
         let mut assembler = Assembler::bare(0, ids(), Dialect::LLAMA4);
         let mut out = Events::new();

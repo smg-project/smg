@@ -189,9 +189,10 @@ fn value(schema: &Value, definitions: Definitions<'_>, values: Values) -> Gramma
 
 /// An `enum` value as the dialect quotes it: in either quote under Python, each with its own
 /// escaping; under the quoted dialect the double-quoted form is the option as written, since
-/// the reader keeps the text between double quotes as it stands and decodes no escape there, and
-/// it is offered only when the option holds no double quote, the single-quoted form (a Python
-/// literal, escapes decoded) standing for every option; as the one JSON string under JSON.
+/// the reader keeps the text between double quotes as it stands and decodes no escape there
+/// (a backslash is a character of the option, wherever it stands), and it is offered only when
+/// the option holds no double quote, the single-quoted form (a Python literal, escapes decoded)
+/// standing for every option; as the one JSON string under JSON.
 fn quoted(option: &str, values: Values) -> Vec<Grammar> {
     match values {
         Values::Python => vec![
@@ -200,7 +201,7 @@ fn quoted(option: &str, values: Values) -> Vec<Grammar> {
         ],
         Values::Quoted => {
             let mut forms = Vec::with_capacity(2);
-            if !option.contains('"') && !ends_in_an_odd_run_of_backslashes(option) {
+            if !option.contains('"') {
                 forms.push(Grammar::ConstString(format!("\"{option}\"")));
             }
             forms.push(Grammar::ConstString(format!("'{}'", escape(option, '\''))));
@@ -219,18 +220,11 @@ fn python_string() -> Grammar {
 }
 
 /// A string under the quoted dialect: between double quotes any text but a double quote, as the
-/// reader takes it (no escape is decoded there, so none is written), and no backslash right
-/// before the closing quote, since the scanner that finds the string's end pairs a backslash with
-/// the character after it in either quote; or a single-quoted Python string, which the reader
-/// decodes.
+/// reader takes it (no escape is decoded there, so none is written, and a backslash stands
+/// anywhere, right before the closing quote included); or a single-quoted Python string, which
+/// the reader decodes.
 fn quoted_string() -> Grammar {
-    Grammar::Regex(r#""([^"\\]|\\[^"])*"|'([^'\\]|\\.)*'"#.to_string())
-}
-
-/// Whether `text` ends in an odd run of backslashes: written raw between double quotes, the last
-/// one would pair with the closing quote in the scanner's eyes and the string would never end.
-fn ends_in_an_odd_run_of_backslashes(text: &str) -> bool {
-    text.chars().rev().take_while(|&c| c == '\\').count() % 2 == 1
+    Grammar::Regex(r#""[^"]*"|'([^'\\]|\\.)*'"#.to_string())
 }
 
 /// A JSON string, as `tojson` writes one.
@@ -568,9 +562,9 @@ mod tests {
     }
 
     /// The quoted dialect writes what its reader reads: between double quotes the text as it
-    /// stands (the reader decodes no escape there), so an option with a quote or a backslash is
-    /// written raw or only in the single-quoted form, and a free string allows no escape between
-    /// double quotes.
+    /// stands (the reader decodes no escape there), so an option with a backslash is written raw,
+    /// one with a double quote only in the single-quoted form, and a free string allows any text
+    /// but a double quote between double quotes, a backslash before the closing quote included.
     #[test]
     fn the_quoted_dialect_writes_strings_as_its_reader_reads_them() {
         let root = value!({});
@@ -602,14 +596,14 @@ mod tests {
         );
         assert_eq!(
             value(&value!({"type": "string"}), definitions, Values::Quoted).to_json(),
-            value!({"type": "regex", "pattern": r#""([^"\\]|\\[^"])*"|'([^'\\]|\\.)*'"#})
+            value!({"type": "regex", "pattern": r#""[^"]*"|'([^'\\]|\\.)*'"#})
         );
-        // An option ending in an odd run of backslashes: raw between double quotes its last
-        // backslash would pair with the closing quote, so the single-quoted form alone; an even
-        // run stays raw.
+        // An option ending in a backslash, one or two: raw between double quotes, where the reader
+        // takes a backslash before the closing quote as the value's last character.
         assert_eq!(
             value(&value!({"enum": ["C:\\"]}), definitions, Values::Quoted).to_json(),
             value!({"type": "or", "elements": [
+                {"type": "const_string", "value": "\"C:\\\""},
                 {"type": "const_string", "value": "'C:\\\\'"},
             ]})
         );
