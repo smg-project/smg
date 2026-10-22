@@ -2053,7 +2053,7 @@ mod tests {
             // A string that may be null, while the word fits.
             (Tags::MINIMAX_M2, "f\">\n<parameter name=\"ns\">nu", r#"{"ns": nu"#, &[]),
             // A key no tool declares, written whole: its text so far.
-            (Tags::MINIMAX_M2, "f\">\n<parameter name=\"x\">tru", r#"{"x": tru"#, &[]),
+            (Tags::MINIMAX_M2, "f\">\n<parameter name=\"x\">fal", r#"{"x": fal"#, &[]),
             // The key came and no byte of its value.
             (Tags::MINIMAX_M2, "f\">\n<parameter name=\"o\">", r#"{"o": "#, &[]),
             // The key of a string came and no byte of it: the string opens.
