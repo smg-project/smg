@@ -185,11 +185,17 @@ fn on_role(code: &'static str, role: &str, rule: &str) -> validator::ValidationE
 }
 
 /// Whether a model id names Kimi K3, the only Kimi model with pinned sampling and thinking rules.
-fn is_k3(model: &str) -> bool {
+fn is_k3_name(model: &str) -> bool {
     model.split('/').any(|segment| {
         super::starts_with_ignore_ascii_case(segment, "kimi-k3")
             || super::starts_with_ignore_ascii_case(segment, "kimi_k3")
     })
+}
+
+/// Whether `model` is served as Kimi K3: by a name that carries its contract
+/// (an opaque alias of a K3 served model is K3), else by its own name.
+fn is_k3(model: &str) -> bool {
+    super::served_under(model, is_k3_name)
 }
 
 /// Immutable sampling parameters: the contract fixes them, so any other value

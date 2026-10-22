@@ -1787,3 +1787,32 @@ fn declares_tools_resolves_conflicting_declarations_as_effective_tools_does() {
         ]
     })));
 }
+
+#[test]
+fn a_registered_alias_of_kimi_k3_takes_its_sampling_rules() {
+    use openai_protocol::{profile::ProviderProfile, validated::Normalizable};
+    // K3 is read from the names the served model is served under, not from
+    // the name as sent: an opaque alias of a K3 model gets the contract's
+    // sampling defaults and pins. Names unique to this test: the alias table
+    // is process-wide.
+    const ALIAS: &str = "chat-under-an-opaque-alias-of-k3";
+    ProviderProfile::register_model_aliases([(ALIAS, "kimi-k3")]);
+    assert_eq!(ProviderProfile::for_model(ALIAS), ProviderProfile::Kimi);
+
+    let mut req = sampling_request(ALIAS, json!({}));
+    req.normalize();
+    assert_eq!(req.temperature, Some(1.0));
+    assert_eq!(req.top_p, Some(0.95));
+    assert_eq!(req.presence_penalty, Some(0.0));
+    assert_eq!(req.frequency_penalty, Some(0.0));
+    assert_eq!(req.n, Some(1));
+    assert!(req.validate().is_ok(), "defaults must satisfy the pins");
+
+    let mut req = sampling_request(ALIAS, json!({"temperature": 0.3}));
+    req.normalize();
+    assert_eq!(
+        error_codes(&req),
+        vec!["temperature_not_allowed".to_string()],
+        "the K3 temperature pin applies under the alias"
+    );
+}
