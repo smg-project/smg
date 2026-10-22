@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import signal
 import subprocess
 import tempfile
@@ -57,6 +58,19 @@ from .process_utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+# How much of a log line the failure text of a dead worker quotes.
+LOG_EXCERPT_CHARS = 300
+# An exception a process printed (`ValueError: ...`, `torch.OutOfMemoryError: ...`).
+_EXCEPTION_LINE = re.compile(r"(?:Error|Exception): ")
+# A log line at error level, or a Rust panic, when nothing printed an exception.
+_ERROR_LEVEL_LINE = re.compile(r"\b(?:ERROR|CRITICAL|FATAL)\b|panicked at ")
+
+
+def _excerpt(line: str) -> str:
+    if len(line) <= LOG_EXCERPT_CHARS:
+        return line
+    return line[: LOG_EXCERPT_CHARS - 3] + "..."
 
 
 def rotate_previous_log(log_path: str) -> str | None:
@@ -941,6 +955,42 @@ class Worker:
         with open(self.log_path, encoding="utf-8", errors="replace") as log:
             return log.read()
 
+    def _death_report(self) -> str:
+        """The failure text of a worker that exited before it reported SERVING:
+        who died with what exit status, what its log says went wrong, and the
+        log's path relative to the log directory (the one a CI job uploads).
+
+        The log speaks through its first and last exception lines (the first is
+        the root cause of a cause chain, the last the final symptom), else its
+        last error-level line, else its last non-empty line, each bounded to
+        ``LOG_EXCERPT_CHARS``. An empty log leaves the exit status alone.
+        """
+        pid = self.process.pid if self.process else "unknown"
+        code = self.process.returncode if self.process else None
+        status = f"exit status {code}"
+        if code is not None and code < 0:
+            try:
+                status = f"signal {signal.Signals(-code).name}"
+            except ValueError:
+                status = f"signal {-code}"
+        report = f"Worker {self.model_id} (PID {pid}) died during startup ({status})"
+        lines = [line.rstrip() for line in self.read_log().splitlines() if line.strip()]
+        if not lines:
+            return report
+        exceptions = [line for line in lines if _EXCEPTION_LINE.search(line)]
+        errors = [line for line in lines if _ERROR_LEVEL_LINE.search(line)]
+        if exceptions:
+            picked = [exceptions[0]]
+            if exceptions[-1] != exceptions[0]:
+                picked.append(exceptions[-1])
+        else:
+            picked = [errors[-1] if errors else lines[-1]]
+        said = " ... ".join(f'"{_excerpt(line)}"' for line in picked)
+        path = self.log_path or ""
+        if self.log_dir:
+            path = os.path.relpath(path, self.log_dir)
+        return f"{report}; the log says: {said}; log file {path}"
+
     def _spawn_process(self, cmd: list[str], env: dict[str, str]) -> subprocess.Popen:
         """Spawn the worker subprocess with output routing."""
         show_output = os.environ.get(ENV_SHOW_WORKER_LOGS, "0") == "1"
@@ -1019,8 +1069,7 @@ class Worker:
         start = time.perf_counter()
         while time.perf_counter() - start < timeout:
             if not self.is_alive():
-                pid = self.process.pid if self.process else "unknown"
-                raise RuntimeError(f"Worker {self.model_id} (PID {pid}) died during startup")
+                raise RuntimeError(self._death_report())
             if self.grpc_serving():
                 return
             time.sleep(HEALTH_CHECK_INTERVAL)
