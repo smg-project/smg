@@ -4317,6 +4317,10 @@ mod request_release_tests {
         );
         assert!(body.contains(NO_PROGRESS_ERROR_CODE), "{body}");
         assert!(
+            body.contains(&format!("\"code\":\"{NO_PROGRESS_ERROR_CODE}\"")),
+            "the error event carries the code a collected answer gets: {body}"
+        );
+        assert!(
             body.contains("after 1 responses"),
             "the budget ran from the first response: {body}"
         );

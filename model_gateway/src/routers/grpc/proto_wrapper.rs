@@ -3103,8 +3103,8 @@ pub(crate) mod constraint_kind {
 }
 
 /// The error code of a stream cut at the no-progress budget, as the client
-/// reads it: the `code` of a collected answer's 504, the first words of a
-/// streamed answer's error event.
+/// reads it: the `code` of a collected answer's 504 and of a streamed
+/// answer's error event, whose message also starts with it.
 pub(crate) const NO_PROGRESS_ERROR_CODE: &str = "constrained_no_progress";
 
 /// The metadata key the status of a no-progress cut carries (its value the
@@ -5223,7 +5223,10 @@ mod no_progress_tests {
         NO_PROGRESS_ERROR_CODE,
     };
     use crate::{
-        routers::grpc::regular::streaming::eof_tests::{chunk, complete, gated_stream},
+        routers::grpc::{
+            regular::streaming::eof_tests::{chunk, complete, gated_stream},
+            utils::stream_failure::StreamFailure,
+        },
         worker::{BasicWorkerBuilder, Worker},
     };
 
@@ -5276,6 +5279,11 @@ mod no_progress_tests {
             cut.message().contains("json_schema-constrained"),
             "{}",
             cut.message()
+        );
+        assert_eq!(
+            StreamFailure::upstream(cut.clone(), 1).code(),
+            Some(NO_PROGRESS_ERROR_CODE),
+            "a streamed answer's error event names the same code"
         );
         assert!(stream.next().await.is_none(), "nothing after the cut");
         let rendered = handle.render();

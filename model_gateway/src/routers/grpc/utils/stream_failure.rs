@@ -44,7 +44,7 @@ use crate::{
         error::error_type_for_status,
         grpc::{
             context::{DispatchMetadata, WorkerSelection},
-            proto_wrapper::ENGINE_ERROR_MESSAGE,
+            proto_wrapper::{is_no_progress_cut, ENGINE_ERROR_MESSAGE, NO_PROGRESS_ERROR_CODE},
         },
     },
     worker::{worker::WorkerTypeExt, ConnectionModeExt, Worker},
@@ -267,13 +267,18 @@ impl StreamFailure {
     }
 
     /// The `code` of the SSE error event that ends the response, when the
-    /// failure has one of its own: `constraint_failed` for a worker's report
-    /// that the engine could not continue the request under its constraint,
-    /// the code the HTTP answer to the same report carries. `None` otherwise.
+    /// failure has one of its own, the code the HTTP answer to the same
+    /// failure carries: `constraint_failed` for a worker's report that the
+    /// engine could not continue the request under its constraint,
+    /// `constrained_no_progress` for a stream the gateway itself cut at the
+    /// no-progress budget of a constrained generation. `None` otherwise.
     pub(crate) fn code(&self) -> Option<&'static str> {
         match self {
             Self::Upstream { status, .. } if is_constraint_failure(status) => {
                 Some(CONSTRAINT_FAILED_CODE)
+            }
+            Self::Upstream { status, .. } if is_no_progress_cut(status) => {
+                Some(NO_PROGRESS_ERROR_CODE)
             }
             Self::Upstream { .. } | Self::Internal(_) => None,
         }
