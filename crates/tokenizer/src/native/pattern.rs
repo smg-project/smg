@@ -453,8 +453,9 @@ fn compile(node: &Node, program: &mut Vec<Op>, firsts: &mut Vec<First>) {
             firsts: sets,
         } => {
             // The sets are filled by `first_sets` before the compile; an
-            // alternation without them would get no split and match nothing.
-            debug_assert_eq!(sets.len(), alternatives.len());
+            // alternation without them would compile to no ops and match
+            // empty. Once per pattern, so the check stays in release builds.
+            assert_eq!(sets.len(), alternatives.len());
             let mut previous_split = None;
             let mut jumps = Vec::new();
             for (index, (alternative, first)) in alternatives.iter().zip(sets).enumerate() {
@@ -1311,6 +1312,36 @@ mod tests {
                 "{pattern:?} can match empty and must be declined"
             );
         }
+    }
+
+    #[test]
+    fn the_choice_stack_holds_a_pattern_at_its_limit_and_declines_one_past_it() {
+        // Every optional class leaves one choice on the stack while the rest
+        // of the pattern runs: a pattern of MAX_CHOICES of them fills the
+        // stack exactly at the match, one more is declined at parse time.
+        // (A text of a's with no b would back off through every one of the
+        // 2^MAX_CHOICES ways, in this matcher and in the engine alike.)
+        let at_limit = "a?".repeat(MAX_CHOICES) + "b";
+        let parsed = Pattern::parse(&at_limit).expect("parses at the limit");
+        for text in [
+            "a".repeat(MAX_CHOICES) + "b",
+            "a".repeat(MAX_CHOICES - 1) + "b",
+            "ab b".into(),
+        ] {
+            assert_eq!(
+                parsed.find_iter(&text).collect::<Vec<_>>(),
+                oracle_matches(&at_limit, &text),
+                "{text:?}"
+            );
+        }
+        assert!(Pattern::parse(&("a?".repeat(MAX_CHOICES + 1) + "b")).is_none());
+        // The bound counts the deepest path, not the whole tree: an
+        // alternation of MAX_CHOICES such runs needs two choices.
+        let wide = (0..MAX_CHOICES)
+            .map(|_| "a?b")
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(Pattern::parse(&wide).is_some());
     }
 
     #[test]
