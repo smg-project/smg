@@ -154,6 +154,22 @@ def handoff_capture_cap(parser: argparse.ArgumentParser, parsed: Any) -> Any | N
     return cap
 
 
+def handoff_nixl_defaults(parser: argparse.ArgumentParser, parsed: Any) -> Any | None:
+    """After a parse that launches an engine for gRPC: a NIXL prefill/decode
+    side gets the launch defaults that bound how long a dead peer's memory
+    stays held (``UCX_CUDA_IPC_CACHE`` in the environment, ``engine_ttl`` in
+    the connector's extra config) where the operator set none, and one line
+    says what applies. Returns the decision, ``None`` for any other launch."""
+    if not launches_engine(parser, parsed):
+        return None
+    from smg_grpc_servicer.vllm.nixl_defaults import apply_nixl_defaults, log_nixl_defaults
+
+    defaults = apply_nixl_defaults(parsed)
+    if defaults is not None:
+        log_nixl_defaults(defaults)
+    return defaults
+
+
 def check_servicer_impl(parser: argparse.ArgumentParser, parsed: Any) -> str | None:
     """After a parse that serves gRPC (a gRPC launcher's parser, with
     ``--grpc`` given where the parser has the flag): the implementation the
@@ -232,6 +248,9 @@ def register() -> None:
         # A launch that builds an engine for gRPC: the capture cap the
         # engine would default below the admission step is derived here.
         handoff_capture_cap(self, parsed)
+        # A NIXL prefill/decode side: the defaults that bound how long a dead
+        # peer's memory stays held, where the operator set none.
+        handoff_nixl_defaults(self, parsed)
         return parsed, extras
 
     FlexibleArgumentParser.parse_known_args = parse_known_args  # type: ignore[method-assign]
