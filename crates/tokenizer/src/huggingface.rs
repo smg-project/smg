@@ -611,7 +611,7 @@ impl HuggingFaceTokenizer {
         let add_bos_token = config_result.add_bos_token;
         let add_eos_token = config_result.add_eos_token;
 
-        // Extract special tokens — config values override vocab pattern matching
+        // Special tokens: the config's (a null is none), else a guess among the added special tokens
         let special_tokens = Self::extract_special_tokens(&tokenizer, &config_result.config_tokens);
 
         if let Some(template_path) = chat_template_path {
