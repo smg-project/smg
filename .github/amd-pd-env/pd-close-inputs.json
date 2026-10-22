@@ -127,9 +127,229 @@
     "job_id": 120134570199,
     "job_name": "vllm-repair",
     "image": "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f",
-    "artifacts_pinned": false,
-    "artifact": null,
-    "cairo_runtime_package": null
+    "artifacts_pinned": true,
+    "artifact": {
+      "name": "amd-vllm-repair-39867879364",
+      "id": 12464644741,
+      "bytes": 2476907,
+      "sha256": "bf26e4cc57af3c7fef982c77d18eb2f06e4c48eb3edaee283239fb0b7e22a315",
+      "expires_at": "2026-10-29T23:05:51Z",
+      "destination": "diagnostic-results/environment-producer",
+      "evidence_prefix": "diagnostic-results/",
+      "wheel_path": "diagnostic-results/pycairo/wheel/pycairo-1.29.2-cp312-cp312-linux_x86_64.whl",
+      "files": {
+        "diagnostic-results/artifact-reuse.json": {
+          "bytes": 1741,
+          "sha256": "b23a4d173dc71f69af32fd9278dad18c83a57997e7ce95a08d362ba13f341919"
+        },
+        "diagnostic-results/completions/case-reports.jsonl": {
+          "bytes": 9510,
+          "sha256": "b037829d5a94a58fcbccb28a55131900c3cd93be0387ddfbff68dd1ceb185923"
+        },
+        "diagnostic-results/completions/models.json": {
+          "bytes": 441,
+          "sha256": "7612547d578a1a8911c66bac97d26acdc9c1be55815db46a308a2280de2592f2"
+        },
+        "diagnostic-results/build-provenance.json": {
+          "bytes": 2220,
+          "sha256": "440235ed88917afed9f8720a38b22ed94b3dced2821382cbfcf1064e5183f6a2"
+        },
+        "diagnostic-results/completions/result.xml": {
+          "bytes": 3003,
+          "sha256": "e636847eae971e8a54162f73cd0360d4701e0f6c13fbb148574422d9efdb68d5"
+        },
+        "diagnostic-results/embeddings/case-reports.jsonl": {
+          "bytes": 12096,
+          "sha256": "c6739e820aa198122a89c23d09a3d0c8ebbe3cbd368055c7b3e4b9521b539e61"
+        },
+        "diagnostic-results/embeddings/models.json": {
+          "bytes": 293,
+          "sha256": "000514d98068ca9d148b0163837ae3708f9fb50e9cf0ed6998d6ebe4ba225680"
+        },
+        "diagnostic-results/embeddings/result.xml": {
+          "bytes": 3214,
+          "sha256": "03ac8649658019212c71fc87b74648a29b83959c254a21a14f8f694e194c57f9"
+        },
+        "diagnostic-results/generated-guards-final.json": {
+          "bytes": 104927,
+          "sha256": "63b16d57081e1844175408cdf9b02c98912f3b501e7382eb15787e20ad0139fd"
+        },
+        "diagnostic-results/final.json": {
+          "bytes": 170011,
+          "sha256": "72d9ef255945054aeaabc5b63766d80477673ae1391fe03164323ada9037e944"
+        },
+        "diagnostic-results/generated-guards-installed.json": {
+          "bytes": 104927,
+          "sha256": "63b16d57081e1844175408cdf9b02c98912f3b501e7382eb15787e20ad0139fd"
+        },
+        "diagnostic-results/image-before.json": {
+          "bytes": 145212,
+          "sha256": "6bd5b59bd4494c3351c6b71054fdcb9bb6077641ee017576f8fb78f781731f82"
+        },
+        "diagnostic-results/installed.json": {
+          "bytes": 170241,
+          "sha256": "2c2bd48363c22f35a190fc4f0e55213b9944869da474df76478dfe14549f3a75"
+        },
+        "diagnostic-results/install-complete": {
+          "bytes": 0,
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "diagnostic-results/job-budget.json": {
+          "bytes": 311,
+          "sha256": "72f8c994ee21c173725fd9e3402e630b4d4a3c2bea1096530d393cc1dc82120a"
+        },
+        "diagnostic-results/original-constraints.json": {
+          "bytes": 3,
+          "sha256": "37517e5f3dc66819f61f5a7bb8ace1921282415f10551d2defa5c3eb0985b570"
+        },
+        "diagnostic-results/origins-before.json": {
+          "bytes": 1338,
+          "sha256": "1f80afcfe66820e59432bdf6e9c980e1893c875176c1ff788c579ad92383f35c"
+        },
+        "diagnostic-results/origins-final.json": {
+          "bytes": 1352,
+          "sha256": "883b07a1ca8e7c615363999705477c93fea54a6c474a715149a2274dbc2b9932"
+        },
+        "diagnostic-results/origins-installed.json": {
+          "bytes": 1352,
+          "sha256": "883b07a1ca8e7c615363999705477c93fea54a6c474a715149a2274dbc2b9932"
+        },
+        "diagnostic-results/pipcheck-after.txt": {
+          "bytes": 30,
+          "sha256": "9261363b733079a641c2e4cc9bc46ffa1d8336945a87f807b6cf68847dbc9b09"
+        },
+        "diagnostic-results/pipcheck-before.txt": {
+          "bytes": 295,
+          "sha256": "6996cd166e2622cfb9bee00f36e1998108edf8aeef140831bfde01df70f72ef6"
+        },
+        "diagnostic-results/pip-freeze.txt": {
+          "bytes": 7608,
+          "sha256": "c003fd656165a57e821f3385225f797126862dea9b5d9b91e620a6f41d509b96"
+        },
+        "diagnostic-results/producer-cpu/closure-cpu.xml": {
+          "bytes": 2061,
+          "sha256": "371b028aa823e17d2d087d767fbc2112be7a297315e96b212b6aa8f70a9e7f02"
+        },
+        "diagnostic-results/producer-cpu/servicer-cpu.xml": {
+          "bytes": 241606,
+          "sha256": "fec29d37846f592ebc7ed9c9452f06ae38166e5c95bbf36ead8022b877e29863"
+        },
+        "diagnostic-results/pycairo/build.log": {
+          "bytes": 1460,
+          "sha256": "8d83fe2bf200df19ee74e87d2139e6333aa2c042cdf3c5c7562c9bf7d19b078e"
+        },
+        "diagnostic-results/pycairo/install.log": {
+          "bytes": 545,
+          "sha256": "92795e052bd639c97f5183a71c50b657e7e9d0cc3d13d0cdfff2751c93981f6f"
+        },
+        "diagnostic-results/pycairo/installed-RECORD.txt": {
+          "bytes": 928,
+          "sha256": "b8c760b060d9dbc48a2c8cc68e4fdd49349485e963378fe25766aea19ef6efed"
+        },
+        "diagnostic-results/pycairo/native-2x2.png": {
+          "bytes": 97,
+          "sha256": "94b4151e64e2410ffc925d314f01b8d15401e270cc5b96d5718a1802fcb81c51"
+        },
+        "diagnostic-results/pycairo/native-proof.json": {
+          "bytes": 18988,
+          "sha256": "4cce0bbb2899e592a37a8f5a2a9b31030498567cfadf92dedf0b3dc1d1a10855"
+        },
+        "diagnostic-results/pycairo/preflight.json": {
+          "bytes": 110637,
+          "sha256": "2f8a1b369fb979db81435cdd4008c5bd359ebbec241a46364ea693532c1aed34"
+        },
+        "diagnostic-results/pycairo/wheel/pycairo-1.29.2-cp312-cp312-linux_x86_64.whl": {
+          "bytes": 132355,
+          "sha256": "ab107079d848c44dce683828f3e2c2dd761e4a8eba9ed47a0736a88db7a164ce"
+        },
+        "diagnostic-results/raw-metadata-before/0-pygobject.METADATA": {
+          "bytes": 1555,
+          "sha256": "cf33444d10b94ba62a43f5e3f28a9975065243618b4569deeac31a6b649ac04b"
+        },
+        "diagnostic-results/raw-metadata-before/1-torch.METADATA": {
+          "bytes": 38016,
+          "sha256": "527c5f7a748bd211f51ec68580682f1d04241900d3d9aea0b46598ab96d878da"
+        },
+        "diagnostic-results/raw-metadata-final/0-pygobject.METADATA": {
+          "bytes": 1555,
+          "sha256": "cf33444d10b94ba62a43f5e3f28a9975065243618b4569deeac31a6b649ac04b"
+        },
+        "diagnostic-results/raw-metadata-before/2-vllm.METADATA": {
+          "bytes": 11610,
+          "sha256": "114515e76f3938f4fab7d95d36dd3e122cb91ae0249b881fb91265a9ad4a0587"
+        },
+        "diagnostic-results/raw-metadata-final/1-torch.METADATA": {
+          "bytes": 38016,
+          "sha256": "527c5f7a748bd211f51ec68580682f1d04241900d3d9aea0b46598ab96d878da"
+        },
+        "diagnostic-results/raw-metadata-final/2-vllm.METADATA": {
+          "bytes": 11610,
+          "sha256": "114515e76f3938f4fab7d95d36dd3e122cb91ae0249b881fb91265a9ad4a0587"
+        },
+        "diagnostic-results/raw-metadata-installed/0-pygobject.METADATA": {
+          "bytes": 1555,
+          "sha256": "cf33444d10b94ba62a43f5e3f28a9975065243618b4569deeac31a6b649ac04b"
+        },
+        "diagnostic-results/raw-metadata-installed/1-torch.METADATA": {
+          "bytes": 38016,
+          "sha256": "527c5f7a748bd211f51ec68580682f1d04241900d3d9aea0b46598ab96d878da"
+        },
+        "diagnostic-results/raw-metadata-installed/2-vllm.METADATA": {
+          "bytes": 11610,
+          "sha256": "114515e76f3938f4fab7d95d36dd3e122cb91ae0249b881fb91265a9ad4a0587"
+        },
+        "diagnostic-results/router/case-reports.jsonl": {
+          "bytes": 5248,
+          "sha256": "2aabfb5f5107cb7e8c7962de2584d1ec6f3b3a06a11b401871b034b82f9a1066"
+        },
+        "diagnostic-results/router/mmlu-input.json": {
+          "bytes": 171,
+          "sha256": "941aa896b45a5d0c443e08fae6c6888aac4b6be4addd8620bb146eef6ef4ae8b"
+        },
+        "diagnostic-results/router/mmlu.csv": {
+          "bytes": 6667575,
+          "sha256": "15b6785d49e0012602e089558a7a0dfb916baf97e9295aa25b48062f13c6afbb"
+        },
+        "diagnostic-results/router/models.json": {
+          "bytes": 441,
+          "sha256": "7612547d578a1a8911c66bac97d26acdc9c1be55815db46a308a2280de2592f2"
+        },
+        "diagnostic-results/router/result.xml": {
+          "bytes": 2019,
+          "sha256": "60b92b5a01f3ab4c0ff9d31201593b4ed437bcd5bc14ebd195d39a280ccbee98"
+        },
+        "diagnostic-results/runtime-pins.txt": {
+          "bytes": 46,
+          "sha256": "5f8e4272726f4ec64d7e7da266fa8dff1d88d1fd14fe9a246d7c91e7d8a3f1c3"
+        },
+        "diagnostic-results/servicer-engine.xml": {
+          "bytes": 240658,
+          "sha256": "ea9960ebcb7dfb38d1ef41eb29af0b166a634ad39c73803c7696ab6032e0886d"
+        },
+        "e2e-logs/worker-Qwen__Qwen3-Embedding-0.6B_vllm_grpc_33127.log": {
+          "bytes": 34411,
+          "sha256": "311f3fdd06145ae91cd6b66da1f42b68cb2ed5ed9596373fe789f6b8a3e04e7f"
+        },
+        "e2e-logs/worker-Qwen__Qwen3-Embedding-0.6B_vllm_http_37283.log": {
+          "bytes": 25131,
+          "sha256": "638c677c42f3983be812475a1caf6efcbccc3eb6c0a216e99b9e0c862c1faac2"
+        },
+        "e2e-logs/worker-meta-llama__Llama-3.1-8B-Instruct_vllm_grpc_37119.log": {
+          "bytes": 82286,
+          "sha256": "0532a19223f159b1068ac505922cf3511ac24730f8ae7b31a5f2c85dd24cbc18"
+        },
+        "e2e-logs/worker-meta-llama__Llama-3.1-8B-Instruct_vllm_grpc_43763.log": {
+          "bytes": 63911,
+          "sha256": "3553e9b03da2eb2d496be3a4764147cca3ad1b2eecfb5ec86ec076be1c612a0c"
+        },
+        "e2e-logs/worker-meta-llama__Llama-3.1-8B-Instruct_vllm_grpc_44111.log": {
+          "bytes": 43584,
+          "sha256": "e6f0f7d07c254d731ec068fdebe9ef8f77e73ad12814371dce71dbbb42ae3542"
+        }
+      }
+    },
+    "cairo_runtime_package": "libcairo2=1.16.0-5ubuntu2.1",
+    "prerequisite_accepted": false
   },
   "consumer_test_harness_delta": {
     "preserved_PD_base": "67edd9d",

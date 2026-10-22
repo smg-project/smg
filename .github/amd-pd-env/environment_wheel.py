@@ -65,8 +65,18 @@ def validate(files, environment):
             "producer engine/PyGObject metadata changed",
         )
     for name in ["pipcheck-before.txt", "pipcheck-after.txt"]:
+        lines = get(name).decode().splitlines()
+        cache_warning = (
+            "WARNING: The directory '/github/home/.cache/pip' or its parent directory is not owned "
+            "or is not writable by the current user. The cache has been disabled. Check the permissions "
+            "and owner of that directory. If executing pip with sudo, you should use sudo's -H flag."
+        )
         require(
-            get(name).decode().strip() == "No broken requirements found.",
+            lines
+            in [
+                ["No broken requirements found."],
+                [cache_warning, "No broken requirements found."],
+            ],
             "environment pipcheck failed",
         )
     for suite, count, skipped in [("completions", 19, 2), ("embeddings", 24, 0), ("router", 10, 2)]:

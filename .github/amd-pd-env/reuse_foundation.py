@@ -217,6 +217,9 @@ def verify_cpu(files):
 def verify_environment_job(inputs):
     environment = inputs["environment_prerequisite"]
     require(
+        environment.get("prerequisite_accepted") is True, "environment prerequisite not accepted"
+    )
+    require(
         environment["artifacts_pinned"] and isinstance(environment["artifact"], dict),
         "target-built environment artifact is not pinned",
     )
