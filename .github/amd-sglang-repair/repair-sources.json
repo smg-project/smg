@@ -1,10 +1,14 @@
 {
   "apache-tvm-ffi": {
-    "version": "0.1.12",
+    "version": "0.1.12+amdreadonlydict2",
     "files": {
       "tvm_ffi/_optional_torch_c_dlpack.py": {
         "bytes": 7697,
         "sha256": "f507e145355e4a9000d727cc53fe8fb752c51361e30d0bfaecfb46fdc232a7f0"
+      },
+      "tvm_ffi/registry.py": {
+        "bytes": 15429,
+        "sha256": "68e9cd4017191fb00bf9193e751b0d79b27047005dea5c01ff2babd7a527f902"
       }
     }
   },

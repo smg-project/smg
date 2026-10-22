@@ -43,7 +43,7 @@ def test_01_ffi_native_api_and_current_stream():
     import torch
 
     gfx942(torch)
-    assert importlib.metadata.version("apache-tvm-ffi") == "0.1.12"
+    assert importlib.metadata.version("apache-tvm-ffi") == "0.1.12+amdreadonlydict2"
     assert importlib.metadata.version("torch-c-dlpack-ext") == "0.1.5"
     native = torch.Tensor.__dlpack_c_exchange_api__
     static = inspect.getattr_static(torch.Tensor, "__dlpack_c_exchange_api__")

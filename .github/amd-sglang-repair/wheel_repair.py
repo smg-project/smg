@@ -1,4 +1,4 @@
-"""Install only the two byte-pinned official repairs under unchanged engine constraints."""
+"""Install the audited registry code variant and unchanged official addon."""
 
 import json
 import subprocess
@@ -7,6 +7,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+from repack_ffi import repack
 from reuse import digest, require
 
 HERE = Path(__file__).parent
@@ -32,6 +33,7 @@ def main():
     directory = Path("diagnostic-results/repair-wheels")
     directory.mkdir()
     paths = [fetch(wheel, directory) for wheel in wheels]
+    paths[0] = repack(paths[0], directory)
     subprocess.run(
         [sys.executable, "-m", "pip", "install", "--retries", "0", *map(str, paths)],
         check=True,

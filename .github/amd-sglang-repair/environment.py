@@ -10,6 +10,7 @@ import re
 import sys
 from pathlib import Path
 
+from repack_ffi import VERSION
 from reuse import require
 
 OUT = Path("diagnostic-results")
@@ -84,8 +85,23 @@ def runtime_pins(before):
         raw = path.read_bytes()
         original.append({"path": str(path.resolve()), "sha256": sha(raw), "text": raw.decode()})
     (OUT / "original-constraints.json").write_text(json.dumps(original, indent=2) + "\n")
-    constraints += ["apache-tvm-ffi==0.1.12", "torch-c-dlpack-ext==0.1.5"]
+    constraints += ["apache-tvm-ffi==" + VERSION, "torch-c-dlpack-ext==0.1.5"]
     (OUT / "runtime-pins.txt").write_text("\n".join(constraints) + "\n")
+
+
+def pin_state(label):
+    path = OUT / "runtime-pins.txt"
+    raw = path.read_bytes()
+    if label != "before":
+        previous = json.loads((OUT / "runtime-pins-state-before.json").read_text())
+        require(sha(raw) == previous["sha256"], "runtime pins changed")
+    value = {
+        "path": str(path.resolve()),
+        "sha256": sha(raw),
+        "text": raw.decode(),
+        "PIP_CONSTRAINT": os.environ.get("PIP_CONSTRAINT"),
+    }
+    (OUT / ("runtime-pins-state-" + label + ".json")).write_text(json.dumps(value, indent=2) + "\n")
 
 
 def capture_generated(label):
@@ -143,6 +159,7 @@ def main():
     current = snapshot(args.mode)
     if args.mode == "before":
         runtime_pins(current)
+        pin_state("before")
     else:
         validate(json.loads((OUT / "origins-before.json").read_text()), current)
         for record in json.loads((OUT / "original-constraints.json").read_text()):
@@ -150,8 +167,9 @@ def main():
                 sha(Path(record["path"]).read_bytes()) == record["sha256"],
                 "image constraints changed",
             )
-        require(metadata.version("apache-tvm-ffi") == "0.1.12", "FFI repair version")
+        require(metadata.version("apache-tvm-ffi") == VERSION, "FFI repair version")
         require(metadata.version("torch-c-dlpack-ext") == "0.1.5", "addon requirement version")
+        pin_state(args.mode)
         repair_sources(args.mode)
         capture_generated(args.mode)
 
