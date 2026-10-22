@@ -92,6 +92,17 @@ impl RedisStore {
     fn retention_seconds(&self) -> Option<u64> {
         self.retention_days.map(|days| days * 24 * 60 * 60)
     }
+
+    /// Appends to `pipe` the expiry of an index key that lists records (a
+    /// conversation's items, a safety identifier's responses): the
+    /// retention, counted from this write, as the records' own. The index
+    /// lives as long as the newest record it lists could and then goes by
+    /// itself. Nothing when records are kept for good.
+    fn expire_index(&self, pipe: &mut redis::Pipeline, key: &str) {
+        if let Some(seconds) = self.retention_seconds() {
+            pipe.expire(key, seconds as i64).ignore();
+        }
+    }
 }
 
 impl Clone for RedisStore {
@@ -581,7 +592,11 @@ impl ConversationItemStorage for RedisConversationItemStorage {
             .get()
             .await
             .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
-        conn.zadd::<_, _, _, ()>(&key, iid, score)
+        // The link and the index's expiry in the one round trip.
+        let mut pipe = redis::pipe();
+        pipe.zadd(&key, iid, score).ignore();
+        self.store.expire_index(&mut pipe, &key);
+        pipe.query_async::<()>(&mut *conn)
             .await
             .map_err(ConversationItemStorageError::from_redis)?;
 
@@ -612,6 +627,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
             let score = link_score(*added_at);
             pipe.zadd(&key, item_id.0.as_str(), score).ignore();
         }
+        self.store.expire_index(&mut pipe, &key);
         pipe.query_async::<()>(&mut *conn)
             .await
             .map_err(ConversationItemStorageError::from_redis)?;
@@ -974,20 +990,47 @@ impl RedisResponseStorage {
             .map_err(ResponseStorageError::from_redis)
     }
 
-    /// Index the response by its safety identifier, if it has one.
-    async fn index_by_identifier(
-        &self,
-        conn: &mut Connection,
-        response: &StoredResponse,
-    ) -> ResponseResult<()> {
+    /// Appends to `pipe` the response's entry in the index of its safety
+    /// identifier, if it has one, and the index's expiry (the retention, as
+    /// the record's). Nothing when the schema skips the identifier.
+    fn index_by_identifier(&self, pipe: &mut redis::Pipeline, response: &StoredResponse) {
         let sr = &self.store.schema.responses;
         if sr.is_skipped("safety_identifier") {
-            return Ok(());
+            return;
         }
         if let Some(safety) = &response.safety_identifier {
             let safety_key = self.safety_key(safety);
             let score = response.created_at.timestamp_millis() as f64;
-            conn.zadd::<_, _, _, ()>(safety_key, response.id.0.as_str(), score)
+            pipe.zadd(&safety_key, response.id.0.as_str(), score)
+                .ignore();
+            self.store.expire_index(pipe, &safety_key);
+        }
+    }
+
+    /// Pushes the expiry of the identifier index forward with the record's,
+    /// after a write that moved the record's expiry without re-indexing it (a
+    /// status transition's object update): the identifier is read from the
+    /// hash, since the index key depends on it and cannot be declared to the
+    /// write's script up front. Nothing without a retention, under a schema
+    /// that skips the identifier, or for a record without one.
+    async fn refresh_identifier_index(
+        &self,
+        conn: &mut Connection,
+        key: &str,
+    ) -> ResponseResult<()> {
+        let sr = &self.store.schema.responses;
+        let Some(seconds) = self.store.retention_seconds() else {
+            return Ok(());
+        };
+        if sr.is_skipped("safety_identifier") {
+            return Ok(());
+        }
+        let safety: Option<String> = conn
+            .hget(key, sr.col("safety_identifier"))
+            .await
+            .map_err(ResponseStorageError::from_redis)?;
+        if let Some(safety) = safety {
+            conn.expire::<_, ()>(self.safety_key(&safety), seconds as i64)
                 .await
                 .map_err(ResponseStorageError::from_redis)?;
         }
@@ -1136,15 +1179,17 @@ impl ResponseStorage for RedisResponseStorage {
             .await
             .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
 
+        // The hash, the keys that go with it and the identifier's index
+        // entry in the one round trip.
         let mut pipe = redis::pipe();
         for (field, value) in &fields {
             pipe.hset(&key, *field, value);
         }
         self.index_writes(&mut pipe, &key, &response);
+        self.index_by_identifier(&mut pipe, &response);
         pipe.query_async::<()>(&mut conn)
             .await
             .map_err(ResponseStorageError::from_redis)?;
-        self.index_by_identifier(&mut conn, &response).await?;
 
         Ok(response_id)
     }
@@ -1180,8 +1225,17 @@ impl ResponseStorage for RedisResponseStorage {
             "stored" => {
                 // A repeat of the entry the record's first store made (the
                 // identifier does not change between the writes of one
-                // response), so a failure here loses nothing.
-                self.index_by_identifier(&mut conn, &response).await?;
+                // response) with the index's expiry afresh, as the script
+                // refreshed the record's. A failure here fails the call and
+                // leaves the index with its earlier expiry, which the next
+                // write under the identifier moves on.
+                let mut pipe = redis::pipe();
+                self.index_by_identifier(&mut pipe, &response);
+                if !pipe.is_empty() {
+                    pipe.query_async::<()>(&mut conn)
+                        .await
+                        .map_err(ResponseStorageError::from_redis)?;
+                }
                 Ok(ConditionalStore::Stored)
             }
             "closed" => {
@@ -1226,7 +1280,13 @@ impl ResponseStorage for RedisResponseStorage {
             )
             .await?;
         match outcome.as_str() {
-            "stored" => Ok(ConditionalStore::Stored),
+            "stored" => {
+                // The script moved the record's expiry; the identifier's
+                // index follows, so the record is listed under it for as long
+                // as it exists.
+                self.refresh_identifier_index(&mut conn, &key).await?;
+                Ok(ConditionalStore::Stored)
+            }
             "closed" => {
                 drop(conn);
                 Ok(match self.get_response(id).await? {
