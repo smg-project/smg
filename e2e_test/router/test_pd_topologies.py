@@ -1209,3 +1209,98 @@ class TestPDAssembledAtRuntime:
             gateway.shutdown()
             stop_workers(prefill + decode)
             logger.info("router logs kept at %s", _LOG_DIR)
+
+
+@pytest.mark.engine("vllm")
+@pytest.mark.gpu(4)
+@pytest.mark.e2e
+@pytest.mark.model(_MODEL)
+@pytest.mark.gateway(log_level="debug", log_dir=str(_LOG_DIR), extra_args=_GATEWAY_ARGS)
+@pytest.mark.flaky(reruns=0)
+@pytest.mark.parametrize("setup_backend", [("pd_http", (1, 1))], indirect=True)
+class TestPDSchedulerObserverProbe:
+    """Temporary explicit startup/admission probe; never parity acceptance."""
+
+    @pytest.fixture(scope="class", autouse=True)
+    @classmethod
+    def _explicit_observer(cls, request):
+        from infra.pd_probe import explicit_context
+        from infra.pd_probe_prefix import export_prefix
+
+        context, expected_root = explicit_context(request)
+        state = dict(
+            files={},
+            error="probe did not complete",
+            request_id=None,
+            workers=[],
+            run=context["run"],
+            actions_attempt=context["attempt"],
+            sha=os.environ["GITHUB_SHA"],
+            job=os.environ["E2E_JOB_MARKER"],
+            backend=os.environ["E2E_VLLM_KV_BACKEND"],
+            expected_root=expected_root,
+        )
+        request.cls._probe = (context, state, expected_root)
+        try:
+            yield
+        finally:
+            state["nodeids"] = [
+                item.nodeid
+                for item in request.session.items
+                if item.getparent(pytest.Class) is request.node
+            ]
+            export_prefix(
+                {key: value for key, value in state.items() if key != "files"}, state["files"]
+            )
+
+    def test_real_startup_and_admission(self, setup_backend):
+        from infra.pd_probe import observe_request
+        from infra.pd_request_identity import RequestIdentity
+
+        _, model, _, gateway = setup_backend
+        context, state, expected_root = self._probe
+        workers = [*gateway.prefill_workers, *gateway.decode_workers]
+        assert len(gateway.prefill_workers) == len(gateway.decode_workers) == 1
+        from infra.constants import get_gpu_offset
+
+        offset = get_gpu_offset()
+        assert [worker.gpu_ids for worker in workers] == [[offset], [offset + 1]]
+        contexts = [worker.scheduler_observation for worker in workers]
+        assert {ctx.run for ctx in contexts} == {context["run"]}
+        assert len({ctx.attempt for ctx in contexts}) == 1
+        assert re.fullmatch(rf"{context['attempt']}-fixture-[0-9a-f]{{32}}", contexts[0].attempt)
+        assert {ctx.trace_dir for ctx in contexts} == {context["trace_dir"]}
+        state["workers"] = [
+            dict(
+                run=ctx.run,
+                attempt=ctx.attempt,
+                worker=ctx.worker,
+                role=w.worker_type.value,
+                worker_instance=w.observer_instance,
+                gpu_ids=w.gpu_ids,
+            )
+            for ctx, w in zip(contexts, workers, strict=True)
+        ]
+        identity = RequestIdentity.new(contexts[0].run, contexts[0].attempt)
+        state["request_id"] = identity.request_id
+        response = httpx.post(
+            f"{gateway.base_url}/v1/chat/completions",
+            headers=identity.headers,
+            json={
+                "model": model,
+                "messages": [{"role": "user", "content": "Say hello."}],
+                "temperature": 0,
+                "max_tokens": 8,
+                "n": 1,
+                "stream": False,
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        body = response.json()
+        assert response.status_code == 200 and "error" not in body
+        assert body["choices"][0]["message"]["content"].strip()
+        state["files"] = observe_request(
+            context["trace_dir"], workers, identity, state, expected_root
+        )
+        state["error"] = None
