@@ -911,9 +911,12 @@ class Worker:
             if self.log_dir:
                 os.makedirs(self.log_dir, exist_ok=True)
                 log_path = os.path.join(self.log_dir, f"worker-{safe_name}.log")
+                # The run's own directory: a relaunch on this port keeps the
+                # previous engine's log beside the new one. The temp fallback
+                # below is shared across sessions and stays overwrite-only.
+                rotate_previous_log(log_path)
             else:
                 log_path = os.path.join(tempfile.gettempdir(), f"smg-worker-{safe_name}.log")
-            rotate_previous_log(log_path)
             self._log_file = open(log_path, "w", encoding="utf-8")
             self.log_path = log_path
             stdout_target = self._log_file

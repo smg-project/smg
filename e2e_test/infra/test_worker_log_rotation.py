@@ -70,6 +70,21 @@ def test_a_relaunch_on_the_same_port_keeps_the_previous_log(monkeypatch, tmp_pat
     assert sorted(p.name for p in tmp_path.glob("worker-*.log")) == [live.name]
 
 
+def test_the_temp_fallback_without_a_log_dir_is_overwritten_not_rotated(monkeypatch, tmp_path):
+    """The shared temp path (no E2E_LOG_DIR) keeps one file per worker across sessions."""
+    monkeypatch.setattr(worker_module.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(worker_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setenv(ENV_SHOW_WORKER_LOGS, "0")
+    worker = Worker(model_id="m", engine="vllm", port=50112, gpu_ids=[0], mode=ConnectionMode.GRPC)
+
+    _spawn(worker, "one")
+    _end_run(worker, "EngineCore died: the trace")
+    _spawn(worker, "two")
+
+    assert sorted(os.listdir(tmp_path)) == ["smg-worker-m_vllm_grpc_50112.log"]
+    assert (tmp_path / "smg-worker-m_vllm_grpc_50112.log").read_text() == "engine two starting\n"
+
+
 def test_an_empty_or_absent_previous_log_is_not_rotated(tmp_path):
     path = tmp_path / "worker-x.log"
     assert rotate_previous_log(str(path)) is None

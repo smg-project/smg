@@ -238,8 +238,9 @@ def _logs_since(log_dir: Path, sizes: dict[Path, int]) -> str:
         if not path.is_file():
             continue
         with path.open("rb") as fh:
-            # A restart truncates the log (mode "w"): a stale offset past EOF
-            # would silently read nothing, so fall back to the whole file.
+            # A restart moves the previous log aside and reopens the path at
+            # 0 bytes: a stale offset past EOF would silently read nothing, so
+            # fall back to the whole file.
             start = sizes.get(path, 0)
             fh.seek(start if start <= path.stat().st_size else 0)
             parts.append(fh.read().decode("utf-8", errors="replace"))
