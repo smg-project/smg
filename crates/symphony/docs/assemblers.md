@@ -548,13 +548,24 @@ What the syntax says, and what the assembler does with it:
   its next member first, as the tagged assemblers leave a parameter without a name; a list item
   missing before a comma the same. Nothing is made up for such a member: no empty key, no empty
   string.
-- **Two endings.** `Assembler::close` is the call's closing marker: a key or a bare value cut
-  short, and the key held for a value that never came, come back as `Malformed` with the cut's
-  reason before the end, every open container is closed and the arguments are whole; a string left
-  open stays open, the fragments stand, and a `Malformed` event of no bytes says that the arguments
-  are no whole value. `Assembler::finish` is a stream that was cut: what was held comes back as
-  `Malformed { UnterminatedRegion }`, the containers close unless a string is open, and the call
-  ends with no bytes of its own.
+- **Two endings.** `Assembler::close` is the call's closing marker, the model's own end: a key or
+  a bare value cut short, and the key held for a value that never came, come back as `Malformed`
+  with the cut's reason before the end, every open container is closed and the arguments are
+  whole; a string left open stays open, the fragments stand, and a `Malformed` event of no bytes
+  says that the arguments are no whole value. `Assembler::finish` is a stream that was cut, by
+  the token limit and not by the model: nothing closes, as under every other syntax, since a
+  closing brace the model never wrote would hand the client arguments that read as whole, and
+  the call's bytes stay the call's, since a client reads the prefix as written under `length`
+  and never the call's bytes as the answer's prose. The member the cut found where its value
+  stands leaves as the call's own fragment, its key and its bare value as far as it went (`,
+  "n": 1`) or the key alone (`, "n": `); a string's text so far, the bytes held as a start of
+  its closing token included, is the string's, as at the marker; a key cut short, the whitespace
+  held after a value and a start of the string token held after a key leave as the syntax's
+  wrapping (`Dropped`), since no member can be written for them; the one `Malformed {
+  UnterminatedRegion }` event of no bytes stands before the call's end, which carries no bytes.
+  An object the model closed before the cut is whole and needs no word. Before this the
+  assembler closed the containers at the stream's end and reported what it held, so a client read
+  `{"artist": "Taylor"}` beside `n:1` as content for a call cut inside its second member.
 - **Every byte lands in exactly one event**: the header, each fragment's bytes with the whitespace
   before them, text after the object closed as `Malformed` run by run, the whitespace right after
   the object and the run before the marker as the template's wrapping (`Dropped { Wrapper }`) and

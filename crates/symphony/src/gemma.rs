@@ -33,9 +33,11 @@
 //! (a colon where a key should stand) or without a value (a comma or a close where the value
 //! should start) is reported and not written, every byte of it under the one reason, the comma
 //! after it included, and the object closes whole without it, as the tagged assemblers leave such
-//! a member; a list item missing before a comma the same. A member the call's end cuts after its
-//! colon is the cut call's: the key held for the value comes back with the end's reason, nothing
-//! is made up for the value that never came, and the object closes whole without the member. Nesting
+//! a member; a list item missing before a comma the same. A member the call's marker cuts after
+//! its colon is the cut call's: the key held for the value comes back with the end's reason,
+//! nothing is made up for the value that never came, and the object closes whole without the
+//! member; at the stream's end the key opens the member instead, nothing closes, and the call's
+//! bytes stay the call's ([`Assembler::finish`]). Nesting
 //! past the prefix parser's bound ([`DEEPEST`]) in what is written is reported from the bracket
 //! that passes it, with the key held for it, so that the fragments stay a prefix that parser
 //! takes, as the JSON syntax keeps them, and the object closes whole without the member.
@@ -45,7 +47,10 @@
 use crate::{
     event::{release_between, runs, DropReason, Event, Events, MalformedReason, Text},
     json::PartialJson,
-    tagged::assembler::{push_escaped, push_quoted},
+    tagged::{
+        assembler::{push_escaped, push_quoted},
+        end_cut_call,
+    },
 };
 
 /// How a template spells the syntax: the token around a string's text, and the word for a null
@@ -238,43 +243,121 @@ impl Assembler {
         self.done = true;
     }
 
-    /// The stream was cut: what was held comes back as `Malformed { UnterminatedRegion }`, the
-    /// key held for a value that never came among it, an object still open is closed for the
-    /// client, whole, and a call that started still ends, with no bytes of its own, as every
-    /// assembler ends one. A string left open stays open, since nothing is made up for a value
-    /// the model never finished: no closing token, and no closing brace inside it; the fragments
-    /// stand, and the one `Malformed` event, with the bytes held as a start of the string token
-    /// or none, says that the arguments are no whole value.
+    /// The stream was cut: nothing is closed, so arguments cut short never look complete to a
+    /// client, and the call's bytes stay the call's. A call that started still ends, with no
+    /// bytes of its own, as every assembler ends one, after the one `Malformed {
+    /// UnterminatedRegion }` event of no bytes that says that its arguments are no whole value
+    /// (`tagged::end_cut_call`); no container closes, not even an object the cut found between
+    /// two members, since a closing brace the model never wrote would hand the client arguments
+    /// that read as whole. Before the end, what the cut found open leaves as the call's own: a
+    /// string's text so far, the bytes held as a start of its closing token included, as the
+    /// marker reads them; the member whose key came, with its bare value as far as it went
+    /// (`"n": 1`) or the key alone (`"n": `) when no byte of the value came yet
+    /// ([`Self::cut_member`]); a start of the string token held after the key leaves after the
+    /// call's end as the syntax's wrapping. A key cut short and the whitespace held after a
+    /// value leave as wrapping too, since no member can be written for them. An object the model
+    /// closed before the cut is whole: the whitespace held after it is the template's, and the
+    /// call ends with no word. A member the template never writes still comes back under its
+    /// reason, and a header the cut found before its `{` as `Malformed { UnterminatedRegion }`,
+    /// since no call started.
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
         }
         self.end_skipped(out);
-        let string_open = self.started && self.stage == Stage::Text;
+        if !self.started {
+            let held = self.take_held();
+            if !held.is_empty() {
+                out.push(Event::Malformed {
+                    text: Text::uncounted(held),
+                    why: MalformedReason::UnterminatedRegion,
+                });
+            }
+            self.done = true;
+            return;
+        }
+        let cut_token = match self.stage {
+            Stage::Closed => {
+                self.drop_held(out);
+                out.push(Event::ToolCallEnd {
+                    index: self.index,
+                    source: Text::default(),
+                });
+                self.done = true;
+                return;
+            }
+            Stage::Text => {
+                let held = self.take_held();
+                if !held.is_empty() {
+                    let mut json = String::with_capacity(held.len());
+                    push_escaped(&mut json, &held);
+                    self.push_fragment(json, Text::uncounted(held), out);
+                }
+                None
+            }
+            Stage::Value => self.cut_member(out),
+            Stage::Header | Stage::Key | Stage::AfterValue | Stage::Refused => {
+                self.drop_held(out);
+                None
+            }
+        };
+        end_cut_call(self.index, String::new(), "", out);
+        if let Some(token) = cut_token {
+            out.push(Event::Dropped {
+                text: Text::uncounted(token),
+                why: DropReason::Wrapper,
+            });
+        }
+        self.done = true;
+    }
+
+    /// The bytes held, dropped as the syntax's wrapping; nothing when none.
+    fn drop_held(&mut self, out: &mut Events) {
         let held = self.take_held();
-        if self.stage == Stage::Closed && !held.is_empty() {
-            // The whitespace held after the object: the template's, before a marker that never
-            // came.
+        if !held.is_empty() {
             out.push(Event::Dropped {
                 text: Text::uncounted(held),
                 why: DropReason::Wrapper,
             });
-        } else if !held.is_empty() || string_open {
-            out.push(Event::Malformed {
-                text: Text::uncounted(held),
-                why: MalformedReason::UnterminatedRegion,
-            });
         }
-        if self.started {
-            if !string_open {
-                self.close_open_containers(out);
+    }
+
+    /// The member the end of the stream cut where its value stands ([`Self::finish`]): the key
+    /// held for the value, when one is, opens the member, `"key": `, and a bare value's bytes
+    /// after it follow as written, the digits of a number, a word that may still be `true`, so
+    /// that the arguments carry the prefix the model wrote; in a list the bytes are the next
+    /// element's, after the separator. The bytes held as a start of the string token are no
+    /// value yet: they are returned, a token the cut left short, to leave after the call's end
+    /// as the syntax's wrapping. Whitespace alone where no key is held is wrapping too.
+    fn cut_member(&mut self, out: &mut Events) -> Option<String> {
+        let key = self.key.unwrap_or(0);
+        let held = self.take_held();
+        let text = held[key..].trim_start();
+        let cut_token =
+            (!text.is_empty() && self.spelling.string.starts_with(text)).then(|| text.to_owned());
+        let value = if cut_token.is_some() {
+            ""
+        } else {
+            text.trim_end()
+        };
+        let source = &held[..held.len() - cut_token.as_ref().map_or(0, String::len)];
+        if key == 0 && value.is_empty() {
+            if !source.is_empty() {
+                out.push(Event::Dropped {
+                    text: Text::uncounted(source.to_owned()),
+                    why: DropReason::Wrapper,
+                });
             }
-            out.push(Event::ToolCallEnd {
-                index: self.index,
-                source: Text::default(),
-            });
+            return cut_token;
         }
-        self.done = true;
+        let mut json = self.separator();
+        if key > 0 {
+            push_quoted(&mut json, held[..key - 1].trim());
+            json.push_str(": ");
+        }
+        json.push_str(value);
+        self.push_fragment(json, Text::uncounted(source.to_owned()), out);
+        cut_token
     }
 
     /// `call:NAME{`: the start, once the `{` arrives. Anything else up to the `{` is reported.
@@ -1098,19 +1181,29 @@ mod tests {
     }
 
     #[test]
-    fn no_arguments_is_an_empty_object_and_a_cut_stream_closes_the_containers_it_can() {
+    fn no_arguments_is_an_empty_object_and_a_cut_stream_closes_nothing() {
         let none = run(&["call:ping{}"], false);
         assert_eq!(arguments(&none), "{}");
         assert!(malformed(&none).is_empty());
-        // Cut after a list's comma: the list and the object close, whole, with no word.
+        // Cut after a list's comma: neither the list nor the object closes, and the one word of
+        // no bytes says that the arguments are no whole value.
         let cut = run(&["call:f{tags:[<|\"|>a<|\"|>,"], true);
-        assert_eq!(arguments(&cut), r#"{"tags": ["a"]}"#);
+        assert_eq!(arguments(&cut), r#"{"tags": ["a""#);
+        assert_eq!(
+            malformed(&cut),
+            vec![(String::new(), MalformedReason::UnterminatedRegion)]
+        );
         assert!(cut.iter().any(
             |event| matches!(event, Event::ToolCallEnd { source, .. } if source.text.is_empty())
         ));
+        // Cut inside a key: the key's bytes are the syntax's wrapping, and the object stays open.
         let cut_in_key = run(&["call:f{ci"], true);
-        assert_eq!(arguments(&cut_in_key), "{}");
+        assert_eq!(arguments(&cut_in_key), "{");
         assert_eq!(bytes(&cut_in_key), "call:f{ci");
+        assert!(cut_in_key.iter().any(|event| matches!(
+            event,
+            Event::Dropped { text, why: DropReason::Wrapper } if text.text == "ci"
+        )));
     }
 
     /// A member without a key (`{:1}`): the template writes none, so the colon and the value that
@@ -1175,26 +1268,29 @@ mod tests {
             ("call:f{:{:1", true),
         ] {
             let events = run(&[output], cut);
-            assert_eq!(arguments(&events), "{}", "{output:?} cut {cut}");
+            // At the marker the object closes whole without the member; at the stream's end
+            // nothing closes, and the one word of no bytes says so.
+            assert_eq!(
+                arguments(&events),
+                if cut { "{" } else { "{}" },
+                "{output:?} cut {cut}"
+            );
             assert_eq!(
                 skipped(&events),
                 &output["call:f{".len()..],
                 "{output:?} cut {cut}"
             );
-            assert!(
-                malformed(&events)
-                    .iter()
-                    .all(|(_, why)| *why == MalformedReason::EmptyKey),
-                "{output:?} cut {cut}: {events:?}"
-            );
-            assert!(
-                !events.iter().any(|event| matches!(
-                    event,
-                    Event::Malformed {
-                        why: MalformedReason::UnterminatedRegion,
-                        ..
-                    }
-                )),
+            let others: Vec<(String, MalformedReason)> = malformed(&events)
+                .into_iter()
+                .filter(|(_, why)| *why != MalformedReason::EmptyKey)
+                .collect();
+            assert_eq!(
+                others,
+                if cut {
+                    vec![(String::new(), MalformedReason::UnterminatedRegion)]
+                } else {
+                    Vec::new()
+                },
                 "{output:?} cut {cut}: {events:?}"
             );
         }
@@ -1204,8 +1300,8 @@ mod tests {
     /// closing token and no closing brace are made up, and one `Malformed` event of no bytes
     /// before the call's end says that the arguments are no whole value, with the value's reason
     /// at the marker and as the cut region at the end; a string nested in a list the same. Bytes
-    /// held as a possible start of the string token are the string's text at the marker and the
-    /// cut region's at the end. A string the model closed needs no word.
+    /// held as a possible start of the string token are the string's text at either end. A
+    /// string the model closed needs no word.
     #[test]
     fn a_string_cut_by_the_calls_end_stays_open_and_nothing_is_made_up() {
         for (output, expected) in [
@@ -1250,11 +1346,11 @@ mod tests {
             vec![(String::new(), MalformedReason::ValueCutShort)]
         );
         let held = run(&["call:f{city:<|\"|>Par<|"], true);
-        assert_eq!(arguments(&held), r#"{"city": "Par"#);
-        assert!(held.iter().any(|event| matches!(
-            event,
-            Event::Malformed { text, why: MalformedReason::UnterminatedRegion } if text.text == "<|"
-        )));
+        assert_eq!(arguments(&held), r#"{"city": "Par<|"#);
+        assert_eq!(
+            malformed(&held),
+            vec![(String::new(), MalformedReason::UnterminatedRegion)]
+        );
         let whole = run(&["call:f{city:<|\"|>Paris<|\"|>"], false);
         assert_eq!(arguments(&whole), r#"{"city": "Paris"}"#);
         assert!(malformed(&whole).is_empty());
@@ -1262,10 +1358,11 @@ mod tests {
 
     /// A member the call's end cuts between its colon and its value is the cut call's case, not
     /// a member without a value: the key held for the value comes back as `Malformed` before the
-    /// call's end, at the closing marker with the value's reason and at the end of the stream as
-    /// the cut region it is, nothing is made up for the value, and the object closes whole
-    /// without the member. A list closed where a value may come is an empty list, and an object
-    /// closed after a comma is whole: no word for those.
+    /// call's end at the closing marker, with the value's reason, nothing is made up for the
+    /// value, and the object closes whole without the member; at the end of the stream the key
+    /// opens the member, nothing closes, and the one word of no bytes says so. A list closed
+    /// where a value may come is an empty list, and an object closed after a comma is whole: no
+    /// word for those at the marker, and at the stream's end they stay open with the word.
     #[test]
     fn a_member_cut_before_its_value_is_reported_and_nothing_is_made_up() {
         let closed = run(&["call:get_weather{city:"], false);
@@ -1298,35 +1395,42 @@ mod tests {
             malformed(&spaced),
             vec![("city: ".to_string(), MalformedReason::ValueCutShort)]
         );
+        // At the stream's end the key held for the value opens the member, nothing is made up
+        // for the value, and the object stays open: the one word of no bytes says so.
         let cut = run(&["call:get_weather{city:"], true);
-        assert_eq!(arguments(&cut), "{}");
-        assert!(cut.iter().any(|event| matches!(
-            event,
-            Event::Malformed { text, why: MalformedReason::UnterminatedRegion } if text.text == "city:"
-        )));
+        assert_eq!(arguments(&cut), r#"{"city": "#);
+        assert_eq!(
+            malformed(&cut),
+            vec![(String::new(), MalformedReason::UnterminatedRegion)]
+        );
         assert_eq!(bytes(&cut), "call:get_weather{city:");
-        for (output, expected) in [
-            ("call:f{tags:[", r#"{"tags": []}"#),
-            ("call:f{a:1,", r#"{"a": 1}"#),
-            ("call:f{", "{}"),
+        for (output, closed, open) in [
+            ("call:f{tags:[", r#"{"tags": []}"#, r#"{"tags": ["#),
+            ("call:f{a:1,", r#"{"a": 1}"#, r#"{"a": 1"#),
+            ("call:f{", "{}", "{"),
         ] {
-            for cut in [false, true] {
-                let events = run(&[output], cut);
-                assert_eq!(arguments(&events), expected, "{output:?} cut {cut}");
-                assert!(
-                    !events
-                        .iter()
-                        .any(|event| matches!(event, Event::Malformed { .. })),
-                    "{output:?} cut {cut}: {events:?}"
-                );
-            }
+            let events = run(&[output], false);
+            assert_eq!(arguments(&events), closed, "{output:?}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::Malformed { .. })),
+                "{output:?}: {events:?}"
+            );
+            let events = run(&[output], true);
+            assert_eq!(arguments(&events), open, "{output:?} cut");
+            assert_eq!(
+                malformed(&events),
+                vec![(String::new(), MalformedReason::UnterminatedRegion)],
+                "{output:?} cut"
+            );
         }
     }
 
     /// A container opened past the prefix parser's depth bound: the fragments stop where the
     /// parser still takes them, the bytes from that bracket to the call's end are reported as
-    /// invalid arguments, and the end closes what is open, whole and in pieces alike. Nesting
-    /// up to the bound reads as before.
+    /// invalid arguments, and the marker closes what is open (the stream's end leaves it open),
+    /// whole and in pieces alike. Nesting up to the bound reads as before.
     #[test]
     fn nesting_past_the_prefix_parsers_bound_is_reported_from_the_bracket_that_passes_it() {
         let deep = |levels: usize| {
@@ -1373,14 +1477,16 @@ mod tests {
                 PartialJson::default().parse(&json, false).is_ok(),
                 "objects cut {cut}: a prefix the parser takes: {json}"
             );
+            let written = format!("{{{}", "\"a\": {".repeat(DEEPEST - 1));
             assert_eq!(
                 json,
-                format!(
-                    "{{{}{}",
-                    "\"a\": {".repeat(DEEPEST - 1),
-                    "}".repeat(DEEPEST)
-                ),
-                "objects cut {cut}: the objects close whole, the refused member not written"
+                if cut {
+                    written.clone()
+                } else {
+                    format!("{written}{}", "}".repeat(DEEPEST))
+                },
+                "objects cut {cut}: the refused member not written; the objects close whole at \
+                 the marker and stay open at the stream's end"
             );
             let reported: String = events
                 .iter()
@@ -1411,9 +1517,11 @@ mod tests {
                     PartialJson::default().parse(&json, false).is_ok(),
                     "{how} cut {cut}: the fragments stay a value the prefix parser takes: {json}"
                 );
-                assert!(
+                assert_eq!(
                     serde_json::from_str::<serde_json::Value>(&json).is_ok(),
-                    "{how} cut {cut}: the end closes what is open: {json}"
+                    !cut,
+                    "{how} cut {cut}: the marker closes what is open, the stream's end does \
+                     not: {json}"
                 );
                 let reported: String = events
                     .iter()
@@ -1591,5 +1699,152 @@ mod tests {
     fn a_bare_value_that_is_no_literal_is_kept_as_a_string() {
         let events = run(&["call:f{mode:fast,n:12}"], false);
         assert_eq!(arguments(&events), r#"{"mode": "fast", "n": 12}"#);
+    }
+
+    /// A call the end of the stream cut inside a bare value, after a key, inside a key, between
+    /// members, inside a nested object or a list, inside a string and right after the opening
+    /// brace: what the model wrote of the member leaves as the call's own fragment, its key and
+    /// its bytes as written; a key cut short, the whitespace after a value and a start of the
+    /// string token after a key leave as wrapping; no container closes; nothing of the call
+    /// reaches a chat client as content; and the one `Malformed` event of no bytes still says
+    /// that the arguments are no whole value before the call's end; whole and one character at
+    /// a time.
+    #[test]
+    fn a_member_the_stream_end_cuts_leaves_as_the_calls_own_bytes_and_nothing_closes() {
+        let cases: [(&str, &str, &[&str]); 17] = [
+            // A bare value: the digits so far, a word that may still be a literal.
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|>,n:1",
+                r#"{"artist": "Taylor", "n": 1"#,
+                &[],
+            ),
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|>,n:12",
+                r#"{"artist": "Taylor", "n": 12"#,
+                &[],
+            ),
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|>,n:tru",
+                r#"{"artist": "Taylor", "n": tru"#,
+                &[],
+            ),
+            // The key and its colon came, and no byte of the value.
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|>,n:",
+                r#"{"artist": "Taylor", "n": "#,
+                &[],
+            ),
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|>,n: ",
+                r#"{"artist": "Taylor", "n": "#,
+                &[],
+            ),
+            // A key cut short: wrapping.
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|>,n",
+                r#"{"artist": "Taylor""#,
+                &["n"],
+            ),
+            // Between members, after a value, and the whitespace held after one.
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|>,",
+                r#"{"artist": "Taylor""#,
+                &[],
+            ),
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|>",
+                r#"{"artist": "Taylor""#,
+                &[],
+            ),
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|> ",
+                r#"{"artist": "Taylor""#,
+                &[" "],
+            ),
+            // Inside a string, with and without a start of the closing token held.
+            ("call:play{artist:<|\"|>Tay", r#"{"artist": "Tay"#, &[]),
+            ("call:play{artist:<|\"|>Tay<|", r#"{"artist": "Tay<|"#, &[]),
+            // A start of the string token after the key: the member opens, the token leaves
+            // after the call's end.
+            ("call:play{artist:<|\"", r#"{"artist": "#, &["<|\""]),
+            // Nested: a string and a bare value inside an object, a bare value in a list.
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|>,prefs:{size:<|\"|>lar",
+                r#"{"artist": "Taylor", "prefs": {"size": "lar"#,
+                &[],
+            ),
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|>,prefs:{size:2",
+                r#"{"artist": "Taylor", "prefs": {"size": 2"#,
+                &[],
+            ),
+            (
+                "call:play{tags:[<|\"|>a<|\"|>,1",
+                r#"{"tags": ["a", 1"#,
+                &[],
+            ),
+            ("call:play{tags:[", r#"{"tags": ["#, &[]),
+            // Right after the opening brace.
+            ("call:play{", "{", &[]),
+        ];
+        for (call, expected, wrapping) in cases {
+            let characters: Vec<&str> = call
+                .char_indices()
+                .map(|(at, c)| &call[at..at + c.len_utf8()])
+                .collect();
+            for (how, pieces) in [("whole", vec![call]), ("by character", characters)] {
+                let events = run(&pieces, true);
+                assert_eq!(bytes(&events), call, "{call:?} {how}");
+                assert_eq!(arguments(&events), expected, "{call:?} {how}: {events:?}");
+                assert_eq!(
+                    malformed(&events),
+                    vec![(String::new(), MalformedReason::UnterminatedRegion)],
+                    "{call:?} {how}: {events:?}"
+                );
+                let ended = events
+                    .iter()
+                    .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+                    .expect("the call ends");
+                assert!(
+                    matches!(
+                        &events[ended - 1..],
+                        [Event::Malformed { .. }, Event::ToolCallEnd { source, .. }]
+                            | [
+                                Event::Malformed { .. },
+                                Event::ToolCallEnd { source, .. },
+                                Event::Dropped { why: DropReason::Wrapper, .. }
+                            ] if source.text.is_empty()
+                    ),
+                    "{call:?} {how}: {events:?}"
+                );
+                let dropped_after_the_start: Vec<&str> = events
+                    .iter()
+                    .skip_while(|event| !matches!(event, Event::ToolCallStart { .. }))
+                    .filter_map(|event| match event {
+                        Event::Dropped { text, .. } => Some(&*text.text),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    dropped_after_the_start, wrapping,
+                    "{call:?} {how}: {events:?}"
+                );
+            }
+        }
+        // An object the model closed before the cut is whole: no word, and the whitespace after
+        // it is the template's.
+        let closed = run(&["call:play{artist:<|\"|>Taylor<|\"|>} "], true);
+        assert_eq!(arguments(&closed), r#"{"artist": "Taylor"}"#);
+        assert!(malformed(&closed).is_empty(), "{closed:?}");
+        // A header the cut found before its brace: no call started, and its bytes come back as
+        // the cut region's, as every assembler reports a block that named no call.
+        let header = run(&["call:pl"], true);
+        assert_eq!(
+            malformed(&header),
+            vec![("call:pl".to_string(), MalformedReason::UnterminatedRegion)]
+        );
+        assert!(!header
+            .iter()
+            .any(|event| matches!(event, Event::ToolCallStart { .. })));
     }
 }

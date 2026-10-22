@@ -15,7 +15,7 @@ use openai_protocol::{
 use serde_json::{json, Value};
 use smg_grpc_client::{tokenspeed_proto::GenerateComplete, vllm_engine::proto};
 use symphony::{
-    formats::{deepseek_v4, deepseek_v4_1, glm, llama4, plain, qwen3},
+    formats::{deepseek_v4, deepseek_v4_1, gemma4, glm, llama4, plain, qwen3},
     CallSyntax, Format,
 };
 
@@ -1903,6 +1903,89 @@ async fn a_whole_pythonic_call_the_token_limit_cut_keeps_its_bytes_in_the_call_a
 {
     for (output, arguments) in PYTHONIC_CUT_CALLS {
         let (choice, _) = fold_finished(output, llama4(), PYTHONIC_PROMPT, "length").await;
+        let calls = choice.message.tool_calls.as_ref().expect("the call");
+        assert_eq!(calls.len(), 1, "{output:?}");
+        assert_eq!(calls[0].function.name, "lookup");
+        assert_eq!(
+            calls[0].function.arguments.as_deref(),
+            Some(arguments),
+            "{output:?}: {choice:?}"
+        );
+        assert_eq!(
+            choice.message.content, None,
+            "nothing of the call is content: {output:?}: {choice:?}"
+        );
+        assert_eq!(
+            choice.finish_reason.as_deref(),
+            Some("length"),
+            "{output:?}"
+        );
+    }
+}
+
+/// The generation prompt's tail of the Gemma 4 table: the model's turn opened.
+const GEMMA_PROMPT: &str = "<|turn>model\n";
+
+/// A Gemma 4 call the token limit cut, the shape of a tool request whose `max_tokens` is below
+/// the call's length: the declared `lookup` tool, cut inside a bare member after a string member
+/// and cut inside its first string; the arguments a client reads for each are the prefix as the
+/// model wrote it, the cut member's key and bytes included and no closing brace.
+const GEMMA_CUT_CALLS: [(&str, &str); 2] = [
+    (
+        "<|tool_call>call:lookup{artist:<|\"|>Taylor<|\"|>,n:1",
+        r#"{"artist": "Taylor", "n": 1"#,
+    ),
+    (
+        "<|tool_call>call:lookup{artist:<|\"|>Tay",
+        r#"{"artist": "Tay"#,
+    ),
+];
+
+#[tokio::test]
+async fn a_streamed_gemma_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length()
+{
+    for (output, arguments) in GEMMA_CUT_CALLS {
+        // Chunked before the cut member and inside it, then the engine's `length`.
+        let spec = assigned(chat_spec(true), gemma4(), GEMMA_PROMPT);
+        let responses = vec![
+            chunk(0, &output[..output.len() - 4]),
+            chunk(0, &output[output.len() - 4..output.len() - 1]),
+            chunk(0, &output[output.len() - 1..]),
+            complete(0, "length"),
+        ];
+        let (result, events) = stream_events(responses, true, spec).await;
+        assert!(result.is_ok(), "{output:?}: {result:?}");
+        let calls = tool_call_deltas(&events);
+        assert_eq!(
+            calls[0]["function"]["name"], "lookup",
+            "{output:?}: {events:#?}"
+        );
+        let streamed: String = calls
+            .iter()
+            .filter_map(|call| call["function"]["arguments"].as_str())
+            .collect();
+        assert_eq!(streamed, arguments, "{output:?}: {events:#?}");
+        assert!(
+            serde_json::from_str::<Value>(&streamed).is_err(),
+            "the arguments stay cut: {streamed:?}"
+        );
+        assert_eq!(
+            chat_text(&events, 0, "content"),
+            "",
+            "nothing of the call is content: {output:?}: {events:#?}"
+        );
+        let finish = events
+            .iter()
+            .find_map(|event| event["choices"][0]["finish_reason"].as_str())
+            .expect("a finish chunk");
+        assert_eq!(finish, "length", "{output:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_whole_gemma_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
+    for (output, arguments) in GEMMA_CUT_CALLS {
+        let (choice, _) = fold_finished(output, gemma4(), GEMMA_PROMPT, "length").await;
         let calls = choice.message.tool_calls.as_ref().expect("the call");
         assert_eq!(calls.len(), 1, "{output:?}");
         assert_eq!(calls[0].function.name, "lookup");
