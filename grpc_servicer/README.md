@@ -380,27 +380,32 @@ engine's own settings bound the hold, and they work only together:
 - `UCX_CUDA_IPC_CACHE=n` in the engine's environment: a mapping ends with its
   transfer instead of staying cached.
 - `kv_connector_extra_config.engine_ttl` (seconds) in `--kv-transfer-config`:
-  how long a peer may stay idle before the connector forgets it (an hour by
-  the connector's default). Forgetting the peer releases its transfer state,
-  the transfers that were in flight when it died included; with the cache
-  off their mappings go with them, with the cache on the mappings outlive the
-  peer either way.
+  a peer idle longer than this is dropped the next time the connector
+  handshakes a new peer (a restarted leg counts) or sends a heartbeat; an
+  hour by the connector's default, and a known peer's own requests never run
+  the sweep. Dropping the peer releases its transfer state, the transfers
+  that were in flight when it died included; with the cache off their
+  mappings go with them, with the cache on the mappings outlive the peer
+  either way.
 
 Neither is free, which is why the servicer does not set them for you. With
 the cache off, every request's transfer opens and closes each of the peer's
 allocations it touches (about one per layer, the way the engine allocates its
-KV cache): a first-token cost worth measuring on a latency-sensitive same-host
-pair. With a short TTL, a healthy pair that was idle longer than the TTL pays
-a full handshake on its next request (the peer's metadata plus a descriptor
-list over every one of its KV blocks: seconds on a large cache), and with P
-prefill legs a decode leg sees each one P times less often than it sees
-requests. Legs on different hosts are not affected: over TCP or RDMA nothing
-of the peer's memory is imported, and a restart passes the memory check at
-once. The repository's end-to-end harness runs its NIXL pairs with the cache
-off and a TTL of 3 s because it restarts legs on purpose; a production pair
-on one host wants a TTL of a few minutes, long enough that no busy pair idles
-through it, short enough that a crashed leg restarts within the pod's own
-back-off instead of an hour.
+KV cache). Measured on one host, two tensor-parallel-2 legs over CUDA IPC,
+prompts of about 5100 tokens, 40 sequential requests per arm: the first token
+came 2 % later at the median (885 to 903 ms) and 5 % later at the 90th
+percentile (900 to 943 ms), with one three-second outlier in forty. A short
+TTL costs a quiet pair nothing by itself, since the sweep only runs when a
+new peer turns up; when one does, a healthy pair that had been idle longer
+than the TTL is dropped with the dead ones and runs its handshake again on
+its next request (the peer's metadata plus a descriptor list over every one
+of its KV blocks: seconds on a large cache). Legs on different hosts are not
+affected: over TCP or RDMA nothing of the peer's memory is imported, and a
+restart passes the memory check at once. The repository's end-to-end harness
+runs its NIXL pairs with the cache off and a TTL of 3 s because it restarts
+legs on purpose; a production pair on one host wants a TTL of a few minutes,
+longer than any gap a busy pair leaves, shorter than the restart back-off a
+crashed leg would otherwise sit through.
 
 ##### Planned warm-up before SERVING (`SMG_VLLM_SERVICER_WARMUP`)
 
