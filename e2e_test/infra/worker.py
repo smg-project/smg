@@ -58,6 +58,31 @@ from .process_utils import (
 logger = logging.getLogger(__name__)
 
 
+def rotate_previous_log(log_path: str) -> str | None:
+    """Move a previous engine's log aside before a new one writes to its path.
+
+    Worker logs are named by port, and a worker is relaunched on its port by
+    the restart tests. Opening the same file again with mode "w" erased the
+    previous engine's output, which is the one trace a crash investigation
+    needs: the nightly PD sweep lost a decode engine's death this way, twice.
+    A non-empty file moves to ``<log>.1`` (then ``.2``, ...): the suffix keeps
+    it out of the ``worker-*.log`` globs the transfer assertions read and
+    inside the directory CI uploads. Returns the rotated path, or ``None``
+    when there was nothing to keep.
+    """
+    try:
+        if os.path.getsize(log_path) == 0:
+            return None
+    except OSError:
+        return None
+    n = 1
+    while os.path.exists(f"{log_path}.{n}"):
+        n += 1
+    rotated = f"{log_path}.{n}"
+    os.replace(log_path, rotated)
+    return rotated
+
+
 @dataclass
 class Worker:
     """A single inference worker process."""
@@ -888,6 +913,7 @@ class Worker:
                 log_path = os.path.join(self.log_dir, f"worker-{safe_name}.log")
             else:
                 log_path = os.path.join(tempfile.gettempdir(), f"smg-worker-{safe_name}.log")
+            rotate_previous_log(log_path)
             self._log_file = open(log_path, "w", encoding="utf-8")
             self.log_path = log_path
             stdout_target = self._log_file
