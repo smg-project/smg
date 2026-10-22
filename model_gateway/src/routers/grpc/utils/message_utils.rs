@@ -1674,7 +1674,7 @@ mod tests {
         );
     }
 
-    /// The K3 stand-in vocabulary of the kit test (`tests/kimi_k3_tool_choice_none.rs`):
+    /// The K3 stand-in vocabulary of the kit test (`tests/grpc/kimi_k3_tool_choice_none.rs`):
     /// byte-level ranks plus the K3 control tokens, under the config that
     /// selects the renderer, so the rendering reads back as text.
     fn k3_stand_in_dir() -> tempfile::TempDir {

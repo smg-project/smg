@@ -1,8 +1,8 @@
 //! The launcher the gateway's start-up tests share: the built binary on
 //! fresh loopback ports, run until it exits, a watched port is bound or its
 //! health route answers, within a deadline; what became of it is read from
-//! [`Launch`]. Included by path from the start-up tests, which need nothing
-//! else of this directory, and as `common::gateway_launch` elsewhere.
+//! [`Launch`]. Reached as `crate::common::gateway_launch` by the start-up
+//! group's tests and as `common::gateway_launch` elsewhere.
 #![allow(
     dead_code,
     clippy::unwrap_used,
