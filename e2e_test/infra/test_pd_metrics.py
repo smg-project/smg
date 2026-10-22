@@ -180,15 +180,18 @@ def test_overflowed_scheduler_total_fails(monkeypatch):
         metrics.vllm_work_snapshot(SimpleNamespace(prefill_workers=[], decode_workers=[_worker()]))
 
 
-@pytest.mark.parametrize("runtime", ["vllm", "sglang"])
 @pytest.mark.parametrize(
-    "method",
-    ["test_abandoned_streams_free_both_sides", "test_aborts_during_prefill_free_both_sides"],
+    "backend,moriio,skipped",
+    [
+        ("pd_http", False, True),
+        ("pd_http", True, False),
+        ("pd_grpc", False, False),
+        ("pd_grpc", True, False),
+    ],
 )
-def test_ordinary_http_cancellation_remains_skipped(monkeypatch, runtime, method):
-    from router import test_pd_topologies as topology
-
-    monkeypatch.setattr(topology, "get_runtime", lambda: runtime)
-    monkeypatch.setattr(topology, "_moriio_lane", lambda: False)
-    with pytest.raises(pytest.skip.Exception, match="load reports need gRPC workers"):
-        getattr(topology.TestPDTopology(), method)(("pd_http", "model", None, None))
+def test_only_mori_http_workers_have_an_idle_observer(backend, moriio, skipped):
+    if skipped:
+        with pytest.raises(pytest.skip.Exception, match="load reports need gRPC workers"):
+            metrics.require_load_reports(backend, moriio=moriio)
+    else:
+        metrics.require_load_reports(backend, moriio=moriio)

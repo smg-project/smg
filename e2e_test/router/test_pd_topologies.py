@@ -68,6 +68,7 @@ from infra.pd_logs import (
     worker_log_dir,
 )
 from infra.pd_metrics import (
+    require_load_reports,
     vllm_work_snapshot,
     worker_metrics,
 )
@@ -423,15 +424,6 @@ def _fleet_idle(gateway: Gateway) -> tuple[bool, list[dict]]:
     return (not busy, loads)
 
 
-def _require_load_reports(backend: str) -> None:
-    """The idle check reads /loads; HTTP workers report none.
-
-    A MoRI-IO lane reads its engines' own metrics instead (see ``_fleet_idle``).
-    """
-    if backend == "pd_http" and not _moriio_lane():
-        pytest.skip("load reports need gRPC workers")
-
-
 def _assert_fleet_idle_within(gateway: Gateway, timeout: float) -> None:
     started = time.monotonic()
     deadline = started + timeout
@@ -674,7 +666,7 @@ class TestPDTopology:
 
     def test_abandoned_streams_free_both_sides(self, setup_backend):
         backend, model, client, gateway = setup_backend
-        _require_load_reports(backend)
+        require_load_reports(backend, moriio=_moriio_lane())
         body = {
             "model": model,
             "messages": [{"role": "user", "content": "Write a very long story about the sea."}],
@@ -702,7 +694,7 @@ class TestPDTopology:
     def test_aborts_during_prefill_free_both_sides(self, setup_backend):
         """Clients that give up before the first token leave no room behind."""
         backend, model, _, gateway = setup_backend
-        _require_load_reports(backend)
+        require_load_reports(backend, moriio=_moriio_lane())
         body = {
             "model": model,
             "messages": [{"role": "user", "content": _long_prompt("22222")}],

@@ -7,6 +7,7 @@ import math
 import re
 
 import httpx
+import pytest
 
 _LABEL = re.compile(r'\s*([a-zA-Z_][a-zA-Z_0-9]*)=("(?:[^"\\]|\\[\\"n])*")\s*(?:,|$)')
 _NUMBER = r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
@@ -77,3 +78,9 @@ def vllm_work_snapshot(gateway) -> tuple[bool, list[dict]]:
         math.isfinite(s[key]) for s in states for key in ("num_running_reqs", "num_waiting_reqs")
     ), f"non-finite scheduler totals: {states}"
     return all(s["num_running_reqs"] == s["num_waiting_reqs"] == 0 for s in states), states
+
+
+def require_load_reports(backend: str, *, moriio: bool) -> None:
+    """Ordinary HTTP workers lack load reports; MoRI uses its own metrics."""
+    if backend == "pd_http" and not moriio:
+        pytest.skip("load reports need gRPC workers")
