@@ -1394,7 +1394,7 @@ class RustLauncher:
             self.counted,
         )
         logger.info(
-            "%s startup bounds: %.0fs without a sign of life (%s), ceiling %s (%s); "
+            "%s startup bounds: %gs without a sign of life (%s), ceiling %s (%s); "
             "the handshake waits while the %s process is alive",
             self.started.capitalize(),
             knobs.startup_timeout_secs,
@@ -1404,7 +1404,7 @@ class RustLauncher:
             self.started,
         )
         logger.info(
-            "%s silence bound once connected: %.0fs without an output while requests are in "
+            "%s silence bound once connected: %gs without an output while requests are in "
             "flight (%s), plus the prompt pending prefill at %d tokens/s (%s)",
             self.started.capitalize(),
             knobs.silence_timeout_secs,
