@@ -21,9 +21,9 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex,
+        mpsc, Arc, Condvar, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use tracing::{warn, Level};
@@ -139,14 +139,54 @@ fn truthy(value: Option<&OsStr>) -> bool {
 /// [`close_logging`] flushes and stops the writers at process exit.
 pub struct LogGuard(());
 
-/// One writer thread: its handle, and the count of lines its lossy queue
-/// dropped.
+/// One writer thread: its handle, the count of lines its lossy queue
+/// dropped, and the signal its end raises.
 struct Sink {
     name: &'static str,
     counter: ErrorCounter,
     /// The count at the last report, for the delta.
     reported: usize,
+    /// Raised when the thread has dropped its `Batched`, its last act.
+    ended: Arc<Ended>,
     _guard: WorkerGuard,
+}
+
+/// Raised by a writer thread's [`Batched`] when it is dropped, which is the
+/// thread's last act after its final flush: whoever waits on it knows the
+/// thread has written everything it will ever write.
+#[derive(Default)]
+struct Ended {
+    ended: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl Ended {
+    fn set(&self) {
+        *self
+            .ended
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        self.changed.notify_all();
+    }
+
+    /// Wait until set, or until `deadline`; whether it was set.
+    fn wait_until(&self, deadline: Instant) -> bool {
+        let mut ended = self
+            .ended
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while !*ended {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                break;
+            };
+            ended = self
+                .changed
+                .wait_timeout(ended, left)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+        *ended
+    }
 }
 
 /// The writer threads of every sink installed in this process.
@@ -178,6 +218,18 @@ const BATCH_WINDOW: Duration = Duration::from_millis(5);
 /// speed in writes of this size, and the buffer stays this small.
 const BATCH_BYTES: usize = 64 * 1024;
 
+/// How long [`close_logging`] waits for the writer threads past the moment
+/// each guard's drop gives them (about a second): a thread held in a write
+/// the kernel is throttling, or left unscheduled on a loaded host, still
+/// finishes its last batch within it. An idle writer ends inside the
+/// guard's handshake, and the wait is over the instant the last thread has.
+const CLOSE_WAIT: Duration = Duration::from_secs(5);
+
+/// How long the close waits for its own stderr line about a writer that
+/// missed [`CLOSE_WAIT`]: long enough for a terminal or a file, short enough
+/// that a stderr sharing a stuck pipe does not hold the exit.
+const STDERR_WAIT: Duration = Duration::from_millis(100);
+
 /// A sink that takes the writer thread's lines in batches.
 ///
 /// [`tracing_appender`]'s writer thread hands its sink one whole line per
@@ -193,7 +245,8 @@ const BATCH_BYTES: usize = 64 * 1024;
 /// [`BATCH_BYTES`] is written at once and the drain goes on without another
 /// wait; the flush at shutdown (the worker guard's drop in
 /// [`close_logging`]) writes whatever is buffered, so a clean exit loses
-/// nothing.
+/// nothing. The writer thread owns the adapter and drops it as its last act,
+/// which raises `ended`: [`close_logging`] waits on it.
 struct Batched<W> {
     sink: W,
     buf: Vec<u8>,
@@ -201,6 +254,7 @@ struct Batched<W> {
     cap: usize,
     /// A window is open: the next line does not wait for one again.
     open: bool,
+    ended: Arc<Ended>,
 }
 
 impl<W: Write> Batched<W> {
@@ -215,6 +269,7 @@ impl<W: Write> Batched<W> {
             window,
             cap,
             open: false,
+            ended: Arc::default(),
         }
     }
 
@@ -231,6 +286,12 @@ impl<W: Write> Batched<W> {
             self.buf.shrink_to(self.cap);
         }
         written
+    }
+}
+
+impl<W> Drop for Batched<W> {
+    fn drop(&mut self) {
+        self.ended.set();
     }
 }
 
@@ -264,16 +325,11 @@ impl<W: Write> Write for Batched<W> {
 /// batches, and return the writer for a subscriber layer. The thread is
 /// counted among the sinks whose dropped lines the reporter publishes.
 fn install<W: Write + Send + 'static>(sink: W, name: &'static str) -> NonBlocking {
-    let (writer, guard) = non_blocking(Batched::new(sink), name);
+    let (writer, sink) = start_sink(Batched::new(sink), name);
     let mut sinks = SINKS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    sinks.sinks.push(Sink {
-        name,
-        counter: writer.error_counter(),
-        reported: 0,
-        _guard: guard,
-    });
+    sinks.sinks.push(sink);
     if !sinks.reporter_started {
         sinks.reporter_started = std::thread::Builder::new()
             .name("smg-log-dropped".to_string())
@@ -347,7 +403,56 @@ pub fn close_logging() {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .sinks,
     );
+    if !close_sinks(sinks) {
+        // The writers are closed: stderr is the one channel left. Written off
+        // this thread with a short wait: a stderr that shares the stuck
+        // stdout pipe (`2>&1`, a journal stream) would block this write too,
+        // and the exit behind it; a write error (a reader gone) is not a
+        // panic on the way out.
+        let (written, wait) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = writeln!(
+                io::stderr(),
+                "[logging] a log writer was still writing {CLOSE_WAIT:?} after the close; \
+                 its last lines may be lost"
+            );
+            let _ = written.send(());
+        });
+        let _ = wait.recv_timeout(STDERR_WAIT);
+    }
+}
+
+/// Stop the writer threads of `sinks` and wait for them. Each guard's drop
+/// queues the shutdown message and waits a bounded moment for the flush
+/// that answers it; a thread that misses the moment (its write held by the
+/// kernel, or itself unscheduled on a loaded host) goes on detached and
+/// writes after the drop has returned. So the threads themselves are waited
+/// for, up to [`CLOSE_WAIT`] in all, and the lines logged before the close
+/// are in their files when this returns. Whether every thread ended in time.
+fn close_sinks(sinks: Vec<Sink>) -> bool {
+    let ended: Vec<Arc<Ended>> = sinks.iter().map(|sink| Arc::clone(&sink.ended)).collect();
     drop(sinks);
+    let deadline = Instant::now() + CLOSE_WAIT;
+    ended.iter().all(|ended| ended.wait_until(deadline))
+}
+
+/// `batched` on its own writer thread behind a bounded, lossy channel, and
+/// the record of that thread: its guard, its dropped-line counter and the
+/// signal its end raises, for [`close_sinks`].
+fn start_sink<W: Write + Send + 'static>(
+    batched: Batched<W>,
+    name: &'static str,
+) -> (NonBlocking, Sink) {
+    let ended = Arc::clone(&batched.ended);
+    let (writer, guard) = non_blocking(batched, name);
+    let sink = Sink {
+        name,
+        counter: writer.error_counter(),
+        reported: 0,
+        ended,
+        _guard: guard,
+    };
+    (writer, sink)
 }
 
 /// Move `sink` to its own thread behind a bounded, lossy channel.
@@ -993,6 +1098,92 @@ mod writer_tests {
         assert!(
             ended.load(Ordering::SeqCst),
             "the writer thread ended after the guard dropped (the drop took {dropped_in:?})"
+        );
+    }
+
+    /// A sink whose first write takes `delay`: a file write the kernel holds
+    /// for longer than the guard's moment.
+    struct SlowFirstWrite {
+        delay: Option<Duration>,
+        sink: RecordingSink,
+    }
+
+    impl Write for SlowFirstWrite {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(delay) = self.delay.take() {
+                thread::sleep(delay);
+            }
+            self.sink.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The close waits for a writer whose last write outlasts the guard's
+    /// moment (about a second): the line logged before the close is in the
+    /// sink when the close returns, not written after it.
+    #[test]
+    fn the_close_waits_for_a_writer_held_past_the_guards_moment() {
+        let recording = RecordingSink::default();
+        let (mut writer, sink) = start_sink(
+            Batched::with(
+                SlowFirstWrite {
+                    delay: Some(Duration::from_millis(1_500)),
+                    sink: recording.clone(),
+                },
+                Duration::ZERO,
+                BATCH_BYTES,
+            ),
+            "test-log-close-waits",
+        );
+        let line = b"a line logged before the close\n".to_vec();
+        writer
+            .write_all(&line)
+            .expect("a lossy writer reports every line as written");
+        // The writer thread is inside its slow write when the close begins.
+        thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        let all_ended = close_sinks(vec![sink]);
+        let took = started.elapsed();
+        assert!(
+            all_ended,
+            "the writer thread ended within the close's wait (the close took {took:?})"
+        );
+        assert_eq!(
+            recording.writes(),
+            vec![line],
+            "the line is in the sink when the close returns"
+        );
+    }
+
+    /// A writer with nothing left to write ends inside the guard's handshake:
+    /// the close costs no wait after it. The bound is half of [`CLOSE_WAIT`]:
+    /// a close that waited the whole of it for a writer already ended would
+    /// fail, while a guard handshake that runs out its own second on a busy
+    /// runner (the idle writer thread scheduled late) would not. The time is
+    /// the output, for the record (`--nocapture`).
+    #[test]
+    #[expect(clippy::print_stdout, reason = "the measurement is the output")]
+    fn the_close_returns_as_soon_as_an_idle_writer_has_ended() {
+        let recording = RecordingSink::default();
+        let (mut writer, sink) = start_sink(
+            Batched::with(recording.clone(), Duration::ZERO, BATCH_BYTES),
+            "test-log-close-idle",
+        );
+        let line = b"a line written long before the close\n".to_vec();
+        writer
+            .write_all(&line)
+            .expect("a lossy writer reports every line as written");
+        assert_eq!(recording.writes_of(line.len()), vec![line]);
+        let started = Instant::now();
+        assert!(close_sinks(vec![sink]), "an idle writer ends in time");
+        let took = started.elapsed();
+        println!("idle close took {took:?}");
+        assert!(
+            took < CLOSE_WAIT / 2,
+            "an idle writer ends inside the guard's handshake, with no wait after it: {took:?}"
         );
     }
 
