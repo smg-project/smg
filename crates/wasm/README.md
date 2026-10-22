@@ -24,8 +24,8 @@ crates/wasm/src/
 ├── module_manager.rs   # Module lifecycle management (add/remove/list)
 ├── runtime.rs          # WASM execution engine and thread pool
 ├── spec.rs             # WASM interface types bindings and type conversions
-├── storage_spec.rs     # Interface bindings for the storage hooks (generated at compile time)
-├── storage_hook.rs     # Storage hook bridge: wraps a component that exports the `storage-hook` world
+├── storage_spec.rs     # Interface bindings for the storage hooks (generated at compile time; `storage-hooks` feature)
+├── storage_hook.rs     # Storage hook bridge: wraps a component that exports the `storage-hook` world (`storage-hooks` feature)
 ├── types.rs            # Generic input/output types
 ├── errors.rs           # Error definitions
 ├── config.rs           # Runtime configuration
@@ -213,7 +213,7 @@ Define your component using the WASM interface from `src/interface/spec.wit`:
 
 ```rust
 wit_bindgen::generate!({
-    path: "../../../wasm/src/interface",
+    path: "../../../crates/wasm/src/interface",
     world: "smg",
 });
 
