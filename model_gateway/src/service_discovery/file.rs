@@ -137,6 +137,11 @@ impl ManifestWorker {
                 .ok_or_else(|| format!("worker_type is required in {} routing", roles.name()))?,
         };
 
+        // Port 0 is no port, as static configuration and Kubernetes
+        // annotations already refuse it.
+        if self.bootstrap_port == Some(0) {
+            return Err("bootstrap_port must be between 1 and 65535".to_string());
+        }
         if self.bootstrap_port.is_some()
             && !matches!(worker_type, WorkerType::Encode | WorkerType::Prefill)
         {
@@ -629,7 +634,7 @@ mod tests {
     /// the problem.
     #[test]
     fn malformed_manifests_are_rejected_with_the_reason() {
-        let cases: [(&str, String, Roles, &str); 15] = [
+        let cases: [(&str, String, Roles, &str); 16] = [
             ("bad JSON", "{".to_string(), Roles::Regular, "EOF"),
             (
                 "missing version",
@@ -678,6 +683,14 @@ mod tests {
                 manifest(r#"{"url": "10.0.0.11:8000"}"#),
                 Roles::PrefillDecode,
                 "worker_type is required in prefill-decode routing",
+            ),
+            (
+                "bootstrap port 0",
+                manifest(
+                    r#"{"url": "10.0.0.11:8000", "worker_type": "prefill", "bootstrap_port": 0}"#,
+                ),
+                Roles::PrefillDecode,
+                "bootstrap_port must be between 1 and 65535",
             ),
             (
                 "bootstrap port on a decode worker",
