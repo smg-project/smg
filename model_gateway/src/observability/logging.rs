@@ -410,14 +410,20 @@ pub fn close_logging() {
         // and the exit behind it; a write error (a reader gone) is not a
         // panic on the way out.
         let (written, wait) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = writeln!(
-                io::stderr(),
-                "[logging] a log writer was still writing {CLOSE_WAIT:?} after the close; \
-                 its last lines may be lost"
-            );
-            let _ = written.send(());
-        });
+        // `Builder::spawn`, as the reporter thread: a spawn the OS refuses
+        // (a pids limit, memory pressure) drops the closure and `written`
+        // with it, the wait ends at once and the close goes on without the
+        // line, instead of the panic `thread::spawn` would raise here.
+        let _ = std::thread::Builder::new()
+            .name("smg-log-close".to_string())
+            .spawn(move || {
+                let _ = writeln!(
+                    io::stderr(),
+                    "[logging] a log writer was still writing {CLOSE_WAIT:?} after the close; \
+                     its last lines may be lost"
+                );
+                let _ = written.send(());
+            });
         let _ = wait.recv_timeout(STDERR_WAIT);
     }
 }
