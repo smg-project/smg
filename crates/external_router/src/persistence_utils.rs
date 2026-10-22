@@ -866,9 +866,6 @@ mod tests {
         );
     }
 
-    /// A background record closed with the object this persist writes (the
-    /// status and the output items) holds an earlier attempt's write that
-    /// landed while its answer was lost: the persist goes on to link the
     /// A turn that echoes an item id held by another tenant links nothing: the
     /// item under the id is that tenant's, and the link would read it through
     /// this conversation. The item's own tenant links it, as the contract says.
@@ -912,6 +909,9 @@ mod tests {
             .unwrap();
     }
 
+    /// A background record closed with the object this persist writes (the
+    /// status and the output items) holds an earlier attempt's write that
+    /// landed while its answer was lost: the persist goes on to link the
     /// items, for a result and for the run's own `failed` object alike. A
     /// record closed with anything else (a cancel from elsewhere, another
     /// status, other items, a `failed` without items that could be a failure
