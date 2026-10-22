@@ -77,7 +77,9 @@
 //! complete from the publisher's first batch, a subscriber from zero gets
 //! the snapshot, and the snapshot's chunks carry `unknown_before` so the
 //! gateway marks the worker degraded instead of trusting a silently partial
-//! state.
+//! state. An `AllBlocksCleared` the engine publishes after the join ends
+//! the unknown stretch: nothing from before it is live, so the snapshots
+//! that follow are whole and say so.
 //!
 //! A publisher restart is read the same way on every wire, from three signs
 //! (vLLM and SGLang count from 0 per process; SGLang's first batch after a
@@ -388,8 +390,13 @@ struct RankRecord {
     /// restarted) after the publisher tells a resume from before its time.
     started_at: Option<u64>,
     /// Sequences of this incarnation before the record that even the
-    /// engine's replay no longer had: what a snapshot cannot cover.
+    /// engine's replay no longer had: what a snapshot cannot cover, as
+    /// counted; [`Self::unknown_before`] is what a snapshot reports.
     unknown_before: u64,
+    /// Whether a relayed batch of this incarnation carried the engine's
+    /// `AllBlocksCleared`: nothing from before it is live, so the sequences
+    /// before the record no longer matter to a snapshot.
+    cleared: bool,
 }
 
 /// The state the publisher tasks and the subscribers share.
@@ -452,6 +459,18 @@ impl RankRecord {
             cursor: None,
             started_at: None,
             unknown_before: 0,
+            cleared: false,
+        }
+    }
+
+    /// Publisher sequences before the record that a snapshot cannot cover:
+    /// what even the engine's replay did not give, until the engine clears
+    /// its cache.
+    fn unknown_before(&self) -> u64 {
+        if self.cleared {
+            0
+        } else {
+            self.unknown_before
         }
     }
 
@@ -494,6 +513,7 @@ impl Shared {
         record.cursor = None;
         record.started_at = None;
         record.unknown_before = 0;
+        record.cleared = false;
         self.state.clear_rank(dp_rank);
         self.counts.publisher_restarts += 1;
         self.generation
@@ -537,7 +557,7 @@ impl Shared {
     }
 
     fn unknown_before(&self) -> u64 {
-        self.ranks.iter().map(|record| record.unknown_before).sum()
+        self.ranks.iter().map(RankRecord::unknown_before).sum()
     }
 
     fn oldest(&self) -> Option<u64> {
@@ -704,6 +724,9 @@ impl KvEventRelay {
                 record.started_at = Some(sequence);
             }
             record.cursor = Some(sequence);
+            if clears_rank(&batch) {
+                record.cleared = true;
+            }
             shared.state.apply(&batch);
             shared.counts.relayed += 1;
         }
@@ -798,7 +821,7 @@ impl KvEventRelay {
                                 Some(source.rank),
                                 RankCut {
                                     through,
-                                    unknown_before: record.unknown_before,
+                                    unknown_before: record.unknown_before(),
                                 },
                             ))
                         })
@@ -1406,6 +1429,15 @@ async fn run(
     }
 }
 
+/// Whether `batch` carries the engine's `AllBlocksCleared`: once it is
+/// relayed, nothing stored before it is live on its rank.
+fn clears_rank(batch: &common::KvEventBatch) -> bool {
+    batch
+        .events
+        .iter()
+        .any(|event| matches!(event.data, Some(common::kv_cache_event::Data::Cleared(_))))
+}
+
 /// Whether the first batch of an incarnation shows the relay joined after the
 /// publisher's start: the publishers count from 0 (vLLM, SGLang) or 1 (the
 /// mock engine), and a batch carrying the engine's startup clear needs
@@ -1474,6 +1506,14 @@ impl Relaying<'_> {
                 record.started_at = Some(sequence);
             }
             record.cursor = Some(sequence);
+            if clears_rank(&batch) {
+                // The engine's cache is empty: nothing the batches before
+                // the record stored is live, so the snapshots cover the
+                // rank whole from here on (a flag, not a reset of the count:
+                // the replay paths settle the count after relaying what the
+                // replay gave, a clear among those batches included).
+                record.cleared = true;
+            }
             shared.state.apply(&batch);
             shared.counts.relayed += 1;
             if undecodable {
@@ -2844,6 +2884,7 @@ mod tests {
             cursor: Some(500),
             started_at: Some(0),
             unknown_before: 0,
+            cleared: false,
         };
         let restart = |reason| Admission::Restart { reason, last: 500 };
         assert_eq!(record.admit(501, false), Admission::Accept);
@@ -3100,6 +3141,86 @@ mod tests {
         assert_eq!(read(&mut resumed).await.sequence_number, 6);
         assert_eq!(read(&mut fresh).await.sequence_number, 6);
         assert_eq!(late.relay.counts().out_of_range, 0);
+    }
+
+    /// The batches before a late join matter until the engine clears its
+    /// cache: nothing from before a clear is live, so a snapshot taken after
+    /// one is whole and says so, while the lifetime counter keeps the late
+    /// start on record.
+    #[tokio::test]
+    async fn a_clear_after_a_late_join_ends_the_unknown_stretch() {
+        let mut late = start_lab(100, false).await;
+        let batch2 = golden::bytes(golden::BATCH2);
+        for _ in 0..250 {
+            late.publish(5, &batch2).await;
+            if late.relay.counts().relayed >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(late.relay.counts().unknown_before_start, 5);
+        // The engine resets its cache: BATCH1 ends with its clear.
+        late.publish(6, &golden::bytes(golden::BATCH1)).await;
+        late.wait_relayed(2).await;
+        let mut fresh = late.subscribe(0).expect("a snapshot");
+        let chunk = read(&mut fresh).await;
+        assert_eq!((chunk.sequence_number, chunk.dp_rank), (6, Some(0)));
+        assert_eq!(
+            chunk.snapshot,
+            Some(common::KvSnapshotChunk {
+                index: 0,
+                count: 1,
+                blocks: 0,
+                unknown_before: 0,
+            }),
+            "nothing from before the join is live any more"
+        );
+        assert_eq!(chunk.events.len(), 1);
+        assert!(is_cleared(&chunk.events[0]));
+        assert_eq!(late.relay.counts().unknown_before_start, 5);
+        late.publish(7, &batch2).await;
+        assert_eq!(read(&mut fresh).await.sequence_number, 7);
+    }
+
+    /// The same when the clear comes back from the engine's replay: a replay
+    /// that starts past 0 leaves the earlier sequences unknown, but a clear
+    /// among the batches it gave makes them irrelevant to a snapshot.
+    #[tokio::test]
+    async fn a_clear_among_the_replayed_batches_ends_the_unknown_stretch_too() {
+        let mut lab = start_lab(100, true).await;
+        let batch2 = golden::bytes(golden::BATCH2);
+        let request = lab.publish_until_replay_requested(7, &batch2, 0).await;
+        lab.send_replay(
+            &request,
+            &[
+                (5, batch2.clone()),
+                (6, golden::bytes(golden::BATCH1)),
+                (7, batch2.clone()),
+            ],
+        )
+        .await;
+        lab.wait_relayed(3).await;
+        let counts = lab.relay.counts();
+        assert_eq!(
+            (counts.gap_batches_lost, counts.unknown_before_start),
+            (5, 5),
+            "{counts:?}"
+        );
+        let mut fresh = lab.subscribe(0).expect("a snapshot");
+        let chunk = read(&mut fresh).await;
+        assert_eq!(chunk.sequence_number, 7);
+        assert_eq!(
+            chunk.snapshot,
+            Some(common::KvSnapshotChunk {
+                index: 0,
+                count: 1,
+                blocks: 1,
+                unknown_before: 0,
+            }),
+            "sequence 6 cleared the cache: only 7's block is live and nothing before the \
+             record matters"
+        );
+        assert_eq!(stored_hashes(&chunk), vec![(Some(41), vec![42])]);
     }
 
     /// A publisher that counts from 1 (the mock engine) or whose first batch
