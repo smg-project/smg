@@ -397,16 +397,25 @@ impl StreamingProcessor {
         // The stream's verdict, before the engine side is released.
         let client_left = grpc_stream.client_left();
         stream.release_engine(grpc_stream, metrics_labels::ENDPOINT_CHAT);
-        let usage = stream.usage_snapshot();
-        stream.flush_parsers(usage.as_ref()).await?;
-        let final_usage = stream.final_usage();
-        stream
-            .send_finish_chunks(final_usage.as_ref(), usage.as_ref())
-            .await?;
-        stream.send_usage_chunk(final_usage).await?;
+        // The terminal sends fail on the sender a leaving client closed: the
+        // reservation is settled with the stream's actual usage either way,
+        // before the failure is returned. A failed terminal send records no
+        // completion metric; the caller records the failure.
+        let terminal = async {
+            let usage = stream.usage_snapshot();
+            stream.flush_parsers(usage.as_ref()).await?;
+            let final_usage = stream.final_usage();
+            stream
+                .send_finish_chunks(final_usage.as_ref(), usage.as_ref())
+                .await?;
+            stream.send_usage_chunk(final_usage).await
+        }
+        .await;
 
-        stream.settle_and_record(reservation, client_left).await;
-        Ok(())
+        stream
+            .settle_and_record(reservation, client_left || terminal.is_err())
+            .await;
+        terminal
     }
 
     /// Process prefill/decode streaming chunks (prefill + decode) - PD mode
@@ -1781,13 +1790,20 @@ impl StreamingProcessor {
         // The stream's verdict, before the engine side is released.
         let client_left = grpc_stream.client_left();
         stream.release_engine(grpc_stream);
-        stream.flush_parsers().await?;
-        stream.close_open_blocks().await?;
-        stream.send_message_delta().await?;
-        stream.send_message_stop().await?;
+        // As for chat: the terminal sends fail on a closed sender, and the
+        // settlement with the actual usage comes first.
+        let terminal = async {
+            stream.flush_parsers().await?;
+            stream.close_open_blocks().await?;
+            stream.send_message_delta().await?;
+            stream.send_message_stop().await
+        }
+        .await;
 
-        stream.settle_and_record(reservation, client_left).await;
-        Ok(())
+        stream
+            .settle_and_record(reservation, client_left || terminal.is_err())
+            .await;
+        terminal
     }
 
     /// Process prefill/decode streaming chunks for Messages API (PD mode).

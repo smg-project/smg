@@ -1499,6 +1499,14 @@ impl ChatDecode {
             }
         }
 
+        // The read ended with the client's leaving, not with the engine's end:
+        // no usage chunk on the sender it closed, and no terminal router metric
+        // for it, as the HTTP router has none for a disconnect (neither a
+        // completed request nor a failure).
+        if self.client_left {
+            return Ok(());
+        }
+
         // Emit final usage if requested
         if let Some(true) = original_request
             .stream_options
@@ -1514,13 +1522,6 @@ impl ChatDecode {
                 &mut self.encoder,
             )
             .await?;
-        }
-
-        // The read ended with the client's leaving, not with the engine's end:
-        // no terminal router metric for it, as the HTTP router has none for a
-        // disconnect (neither a completed request nor a failure).
-        if self.client_left {
-            return Ok(());
         }
         // Record streaming metrics
         Metrics::record_streaming_metrics(StreamingMetricsParams {
