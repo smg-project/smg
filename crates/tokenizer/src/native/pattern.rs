@@ -282,9 +282,14 @@ impl Pattern {
                 alternatives,
                 firsts,
             } => match next_char(text, pos) {
-                Some((c, _)) => alternatives.iter().zip(firsts).any(|(alternative, first)| {
-                    first.may_start(c) && self.step(alternative, text, pos, k)
-                }),
+                Some((c, _)) => {
+                    // The sets are filled by `first_sets` at parse time; an
+                    // alternation without them would match nothing here.
+                    debug_assert_eq!(firsts.len(), alternatives.len());
+                    alternatives.iter().zip(firsts).any(|(alternative, first)| {
+                        first.may_start(c) && self.step(alternative, text, pos, k)
+                    })
+                }
                 None => alternatives
                     .iter()
                     .any(|alternative| self.step(alternative, text, pos, k)),
