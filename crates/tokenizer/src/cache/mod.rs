@@ -281,14 +281,18 @@ impl Encoder for CachedTokenizer {
                         // deepest alone left a shared prefix behind a shallow match unlearned
                         // (every request matched the leading token and re-encoded the rest);
                         // caching every boundary of every input copied a dozen prefixes per
-                        // request into entries nothing else matches.
+                        // request into entries nothing else matches. Once the shared prefix
+                        // is learned to its end, the next boundary is the request's own: it
+                        // enters as a speculation the eviction sampler takes first, so it
+                        // never displaces a deepest entry a next turn is waiting for.
                         let mut tokens = buffer(&prefix_tokens, hit.end);
                         let mut from = hit;
                         let mut spliced = Ok(());
-                        let mut learn = Vec::with_capacity(2);
-                        learn.extend(deeper.first().copied());
-                        learn.extend(deeper.last().copied().filter(|_| deeper.len() > 1));
-                        for seed in learn {
+                        let learn = [(deeper.next, true), (deeper.deepest, false)];
+                        for (seed, speculative) in learn
+                            .into_iter()
+                            .filter_map(|(seed, speculative)| seed.map(|seed| (seed, speculative)))
+                        {
                             spliced = self.special_tokens.encode_segment_into(
                                 &from,
                                 input,
@@ -299,7 +303,15 @@ impl Encoder for CachedTokenizer {
                             if spliced.is_err() {
                                 break;
                             }
-                            l1.insert_prefix(seed.digest, seed.end, &tokens[head..]);
+                            if speculative {
+                                l1.insert_prefix_speculative(
+                                    seed.digest,
+                                    seed.end,
+                                    &tokens[head..],
+                                );
+                            } else {
+                                l1.insert_prefix(seed.digest, seed.end, &tokens[head..]);
+                            }
                             from = seed;
                         }
                         let spliced = spliced.and_then(|()| {

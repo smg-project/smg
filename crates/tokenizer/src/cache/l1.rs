@@ -57,18 +57,43 @@ pub(super) struct Seed {
 /// The boundaries of an input, in order.
 pub(super) type PrefixSeeds = Vec<Seed>;
 
+/// The boundaries deeper than a match that the caller learns on its way to
+/// the tail: the next one, so a prefix many inputs share behind a shallow
+/// match is learned one boundary per request, and the input's deepest one,
+/// so its next turn matches there. `next` is `None` when it would be the
+/// deepest; both are `None` when the match is the deepest boundary.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Deeper {
+    pub(super) next: Option<Seed>,
+    pub(super) deepest: Option<Seed>,
+}
+
+impl Deeper {
+    fn of(deeper: &[Seed]) -> Self {
+        match deeper {
+            [] => Self::default(),
+            [deepest] => Self {
+                next: None,
+                deepest: Some(*deepest),
+            },
+            [next, .., deepest] => Self {
+                next: Some(*next),
+                deepest: Some(*deepest),
+            },
+        }
+    }
+}
+
 /// Outcome of [`L1Cache::lookup_with_seeds`].
 pub(super) enum PrefixLookup {
     /// Longest cached prefix: the shared token allocation plus the boundary
     /// it ends at (its byte length and the special token there). The tokens
     /// are returned as `Arc<[TokenIdType]>` so a hit does not copy the (large)
     /// cached prefix; the caller splices the suffix into an exact-capacity
-    /// buffer. The last field holds the input's boundaries deeper than the
-    /// match, in order (empty when the match is the deepest), so the caller
-    /// can cache every one of them on its way to the tail: the ones the input
-    /// shares with other inputs behind a shallow match (a system turn behind
-    /// the template's leading token) as much as its own deepest one.
-    Hit(Arc<[TokenIdType]>, Seed, PrefixSeeds),
+    /// buffer. The last field names the boundaries deeper than the match that
+    /// the caller caches on its way to the tail: the next one and the input's
+    /// deepest one (see [`Deeper`]).
+    Hit(Arc<[TokenIdType]>, Seed, Deeper),
     /// No cached prefix. Carries the seeds the failed search computed (empty
     /// when the input has no special-token boundaries) so the miss path can
     /// seed entries without recomputing them.
@@ -325,6 +350,20 @@ impl SpecialTokenBoundaries {
     }
 }
 
+/// The access timestamp of an entry nothing has matched yet: below every
+/// timestamp the counter issues, so the eviction sampler takes such an entry
+/// before any other it sees.
+const STALE: u64 = 0;
+
+/// How an inserted prefix enters the LRU order.
+#[derive(Clone, Copy)]
+enum Recency {
+    /// As the most recently used entry: the request that inserted it used it.
+    Fresh,
+    /// As the least recently used entry ([`STALE`]): a speculation.
+    Stale,
+}
+
 /// A cached prefix entry
 /// Uses Arc<[TokenIdType]> for zero-copy access to tokens
 #[derive(Debug, Clone)]
@@ -506,15 +545,19 @@ impl L1Cache {
 
             if let Some(entry) = self.shards[shard_idx].get(&seed.digest) {
                 // Update last accessed timestamp for LRU
-                let timestamp = self.access_counter.fetch_add(1, Ordering::Relaxed);
-                entry.last_accessed.store(timestamp, Ordering::Relaxed);
+                entry
+                    .last_accessed
+                    .store(self.next_timestamp(), Ordering::Relaxed);
 
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 L1.hit(seed.end);
                 // Share the cached allocation instead of copying it on every hit;
                 // the boundaries beyond the match go with it, for the caller to cache.
-                let deeper = seeds[at + 1..].to_vec();
-                return PrefixLookup::Hit(Arc::clone(&entry.tokens), seed, deeper);
+                return PrefixLookup::Hit(
+                    Arc::clone(&entry.tokens),
+                    seed,
+                    Deeper::of(&seeds[at + 1..]),
+                );
             }
         }
 
@@ -683,6 +726,35 @@ impl L1Cache {
         boundary_pos: usize,
         tokens: &[TokenIdType],
     ) {
+        self.insert_prefix_with(hash_bytes, boundary_pos, tokens, Recency::Fresh);
+    }
+
+    /// Like [`Self::insert_prefix`], for a prefix one request speculates
+    /// others share (the boundary right after its match). The entry enters as
+    /// the oldest the eviction sampler can find, so it never costs an entry a
+    /// request has matched; the first lookup or insert that meets it again
+    /// makes it as fresh as any.
+    pub(super) fn insert_prefix_speculative(
+        &self,
+        hash_bytes: Blake3Hash,
+        boundary_pos: usize,
+        tokens: &[TokenIdType],
+    ) {
+        self.insert_prefix_with(hash_bytes, boundary_pos, tokens, Recency::Stale);
+    }
+
+    /// The next access timestamp: above [`STALE`] from the first one on.
+    fn next_timestamp(&self) -> u64 {
+        self.access_counter.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn insert_prefix_with(
+        &self,
+        hash_bytes: Blake3Hash,
+        boundary_pos: usize,
+        tokens: &[TokenIdType],
+        recency: Recency,
+    ) {
         let Some(size_bytes) = tokens
             .len()
             .checked_mul(size_of::<TokenIdType>())
@@ -700,10 +772,9 @@ impl L1Cache {
         // An existing hash already represents the same prefix. Avoid copying
         // or evicting it merely because another miss encoded it concurrently.
         if let Some(cached) = self.shards[shard_idx].get(&hash_bytes) {
-            cached.last_accessed.store(
-                self.access_counter.load(Ordering::Relaxed),
-                Ordering::Relaxed,
-            );
+            cached
+                .last_accessed
+                .store(self.next_timestamp(), Ordering::Relaxed);
             return;
         }
         let current = self.current_memory.load(Ordering::Relaxed) as usize;
@@ -711,9 +782,13 @@ impl L1Cache {
         if size_bytes > available {
             self.evict_lru(size_bytes - available);
         }
+        let last_accessed = match recency {
+            Recency::Fresh => self.next_timestamp(),
+            Recency::Stale => STALE,
+        };
         let cached = CachedPrefix {
             tokens: tokens.into(),
-            last_accessed: Arc::new(AtomicU64::new(self.access_counter.load(Ordering::Relaxed))),
+            last_accessed: Arc::new(AtomicU64::new(last_accessed)),
             size_bytes,
         };
         self.shards[shard_idx].insert(hash_bytes, cached);
@@ -850,6 +925,46 @@ mod tests {
     use crate::*;
 
     /// Oversized prefixes must be rejected without displacing useful entries.
+    #[test]
+    fn a_speculative_entry_goes_before_the_ones_requests_matched() {
+        // Three entries fill the cache (one per shard: the sampler reads one
+        // entry per shard); the middle one is a speculation. The fourth needs
+        // the room of one, and it is the speculation that goes.
+        let tokens = [7u32; 100];
+        let size = 10 + tokens.len() * size_of::<TokenIdType>();
+        let cache = L1Cache::new(3 * size);
+        let hash = |first: u8| {
+            let mut hash = [0u8; 32];
+            hash[0] = first;
+            hash
+        };
+        cache.insert_prefix(hash(0), 10, &tokens);
+        cache.insert_prefix_speculative(hash(1), 10, &tokens);
+        cache.insert_prefix(hash(2), 10, &tokens);
+        assert_eq!(cache.len(), 3);
+        cache.insert_prefix(hash(3), 10, &tokens);
+        assert_eq!(cache.len(), 3);
+        assert!(
+            cache.shards[1].get(&hash(1)).is_none(),
+            "the speculation went"
+        );
+        for first in [0, 2, 3] {
+            assert!(
+                cache.shards[first as usize].get(&hash(first)).is_some(),
+                "entry {first} stays"
+            );
+        }
+        // A speculation an insert meets again is as fresh as any: the next
+        // eviction takes an older matched entry instead.
+        cache.insert_prefix_speculative(hash(4), 10, &tokens);
+        cache.insert_prefix(hash(4), 10, &tokens);
+        cache.insert_prefix(hash(5), 10, &tokens);
+        assert!(
+            cache.shards[4].get(&hash(4)).is_some(),
+            "the met speculation stays"
+        );
+    }
+
     #[test]
     fn budget_rejects_oversized_prefix() {
         let cache = L1Cache::new(128);
