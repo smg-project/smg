@@ -1692,9 +1692,6 @@ mod tests {
         );
     }
 
-    /// The raw-RGB video resizer must be byte-for-byte identical to the
-    /// DynamicImage PIL-bicubic resizer used for images. Guards the video resize
-    /// path used by `preprocess_video_rgb`.
     /// A deterministic RGB pattern of the given size.
     fn gradient(w: usize, h: usize, seed: usize) -> Vec<u8> {
         let mut data = vec![0u8; w * h * 3];
@@ -1887,6 +1884,9 @@ mod tests {
         }
     }
 
+    /// The raw-RGB video resizer must be byte-for-byte identical to the
+    /// DynamicImage PIL-bicubic resizer used for images. Guards the video resize
+    /// path used by `preprocess_video_rgb`.
     #[test]
     fn resize_bicubic_pil_rgb_matches_dynamic_path() {
         let (src_w, src_h) = (37u32, 23u32); // non-aligned source, non-trivial ratios
