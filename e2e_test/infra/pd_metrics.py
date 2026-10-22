@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from collections.abc import Iterable
 
 import httpx
 import pytest
@@ -84,3 +85,53 @@ def require_load_reports(backend: str, *, moriio: bool) -> None:
     """Ordinary HTTP workers lack load reports; MoRI uses its own metrics."""
     if backend == "pd_http" and not moriio:
         pytest.skip("load reports need gRPC workers")
+
+
+def wait_for_generated_text(lines: Iterable[str]) -> None:
+    """A role chunk, error or completed empty stream is not a generated token."""
+    for line in lines:
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        assert data != "[DONE]", "stream completed without generated text"
+        event = json.loads(data)
+        assert isinstance(event, dict) and "error" not in event, f"stream error: {event}"
+        for choice in event.get("choices", []):
+            delta = choice.get("delta", {})
+            if any(
+                isinstance(delta.get(key), str) and delta[key]
+                for key in ("content", "reasoning_content", "reasoning")
+            ):
+                assert choice.get("finish_reason") is None, "generation already finished"
+                return
+    raise AssertionError("stream ended without generated text")
+
+
+def assert_completed_text_stream(response: httpx.Response) -> None:
+    """A buffered HTTP 200 can still contain an SSE error after its text."""
+    assert response.status_code == 200, response.text[:200]
+    text_seen = finished = done = False
+    for line in response.iter_lines():
+        if not line.startswith("data:"):
+            continue
+        assert not done, "data after stream completion"
+        data = line[5:].strip()
+        if data == "[DONE]":
+            done = True
+            continue
+        event = json.loads(data)
+        assert isinstance(event, dict) and "error" not in event, f"stream error: {event}"
+        choices = event.get("choices")
+        assert isinstance(choices, list), f"invalid stream event: {event}"
+        for choice in choices:
+            assert isinstance(choice, dict), f"invalid stream choice: {choice}"
+            reason = choice.get("finish_reason")
+            assert reason in (None, "stop", "length"), f"stream failed: {reason}"
+            finished |= reason is not None
+            delta = choice.get("delta", {})
+            assert isinstance(delta, dict), f"invalid stream delta: {delta}"
+            text_seen |= any(
+                isinstance(delta.get(key), str) and bool(delta[key])
+                for key in ("content", "reasoning_content", "reasoning")
+            )
+    assert text_seen and finished and done, "stream did not complete with generated text"

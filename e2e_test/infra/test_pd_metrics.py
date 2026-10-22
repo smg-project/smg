@@ -1,5 +1,6 @@
 """CPU checks for HTTP scheduler observations; no workers are launched."""
 
+import json
 from types import SimpleNamespace
 
 import httpx
@@ -195,3 +196,83 @@ def test_only_mori_http_workers_have_an_idle_observer(backend, moriio, skipped):
             metrics.require_load_reports(backend, moriio=moriio)
     else:
         metrics.require_load_reports(backend, moriio=moriio)
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [
+        [],
+        ["data: [DONE]"],
+        ['data: {"error":{"message":"bad"}}'],
+        ['data: {"error":{},"choices":[{"delta":{"content":"text"}}]}'],
+        ['data: {"choices":[{"delta":{"role":"assistant"}}]}'],
+        ['data: {"choices":[{"delta":{"content":""}}]}'],
+        ['data: {"choices":[{"delta":{"content":"done"},"finish_reason":"length"}]}'],
+        ["data: malformed"],
+    ],
+)
+def test_stream_without_unfinished_generated_text_fails(lines):
+    with pytest.raises((AssertionError, ValueError)):
+        metrics.wait_for_generated_text(lines)
+
+
+@pytest.mark.parametrize("key", ["content", "reasoning_content", "reasoning"])
+def test_stream_waits_past_role_chunk_for_generated_text(key):
+    metrics.wait_for_generated_text(
+        [
+            ": heartbeat",
+            'data: {"choices":[{"delta":{"role":"assistant"}}]}',
+            f'data: {{"choices":[{{"delta":{{"{key}":"one token"}}}}]}}',
+        ]
+    )
+
+
+def _buffered_stream(events, status=200, done=True):
+    lines = [
+        "data: " + (event if isinstance(event, str) else json.dumps(event)) for event in events
+    ]
+    if done:
+        lines.append("data: [DONE]")
+    return httpx.Response(status, text="\n\n".join(lines))
+
+
+@pytest.mark.parametrize("key", ["content", "reasoning_content", "reasoning"])
+@pytest.mark.parametrize("reason", ["stop", "length"])
+def test_buffered_prefill_stream_accepts_fast_success(key, reason):
+    metrics.assert_completed_text_stream(
+        _buffered_stream([{"choices": [{"delta": {key: "text"}, "finish_reason": reason}]}])
+    )
+
+
+@pytest.mark.parametrize("status", [400, 500])
+def test_buffered_prefill_stream_rejects_http_error(status):
+    with pytest.raises(AssertionError):
+        metrics.assert_completed_text_stream(_buffered_stream([], status=status))
+
+
+@pytest.mark.parametrize(
+    "events,done",
+    [
+        ([], True),
+        ([{"error": {"message": "failed"}}], True),
+        ([{"choices": [{"delta": {"role": "assistant"}, "finish_reason": "stop"}]}], True),
+        ([{"choices": [{"delta": {"content": "text"}}]}], True),
+        ([{"choices": [{"delta": {"content": "text"}, "finish_reason": "length"}]}], False),
+        ([{"choices": [{"delta": {"content": "text"}, "finish_reason": "error"}]}], True),
+        ([{"choices": [{"delta": {"content": "text"}}]}, {"error": {}}], True),
+        (
+            [
+                {"choices": [{"delta": {"content": "text"}, "finish_reason": "stop"}]},
+                {"error": {"message": "late"}},
+            ],
+            True,
+        ),
+        ([{"choices": [{"delta": {"content": "text"}}]}, "malformed"], True),
+        ([{"choices": "invalid"}], True),
+        ([{"choices": [{"delta": "invalid"}]}], True),
+        (["[DONE]", {"error": {"message": "late"}}], False),
+    ],
+)
+def test_buffered_prefill_stream_checks_all_events(events, done):
+    with pytest.raises((AssertionError, ValueError)):
+        metrics.assert_completed_text_stream(_buffered_stream(events, done=done))
