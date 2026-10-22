@@ -105,7 +105,6 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
         enable_thinking_alias: true,
         native_assistant_continuation: true,
         raw_tool_call_arguments: true,
-        declares_tools_under_tool_choice_none: false,
         ..RendererProfile::NO_CAPABILITIES
     },
     thinking_mode: None,
