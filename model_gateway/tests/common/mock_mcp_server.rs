@@ -1,9 +1,14 @@
 // tests/common/mock_mcp_server.rs - Mock MCP server for testing
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, Mutex, PoisonError,
 };
 
+use axum::{
+    extract::{Request, State},
+    middleware::Next,
+    response::Response,
+};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::*,
@@ -102,6 +107,7 @@ impl Drop for MockServerHarness {
 pub struct MockMCPServer {
     harness: MockServerHarness,
     calls: Arc<AtomicUsize>,
+    tool_calls: Arc<Mutex<Vec<String>>>,
 }
 
 /// Mock MCP server that always fails tool execution with a caller-provided marker.
@@ -287,8 +293,32 @@ impl ServerHandler for MockSearchServer {
     }
 }
 
+/// Notes the tool each `tools/call` request names, whether or not the server
+/// has a tool of that name, before the request reaches the MCP service.
+async fn note_tool_call(
+    State(tool_calls): State<Arc<Mutex<Vec<String>>>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let bytes = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .unwrap_or_default();
+    if let Ok(message) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+        if message["method"] == "tools/call" {
+            if let Some(name) = message["params"]["name"].as_str() {
+                tool_calls
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(name.to_string());
+            }
+        }
+    }
+    next.run(Request::from_parts(parts, bytes.into())).await
+}
+
 impl MockMCPServer {
-    fn router(calls: Arc<AtomicUsize>) -> axum::Router {
+    fn router(calls: Arc<AtomicUsize>, tool_calls: Arc<Mutex<Vec<String>>>) -> axum::Router {
         let service = StreamableHttpService::new(
             move || {
                 Ok(MockSearchServer {
@@ -300,20 +330,37 @@ impl MockMCPServer {
             Default::default(),
         );
 
-        axum::Router::new().nest_service("/mcp", service)
+        axum::Router::new().nest_service("/mcp", service).layer(
+            axum::middleware::from_fn_with_state(tool_calls, note_tool_call),
+        )
     }
 
     /// Start a mock MCP server on an available port
     pub async fn start() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let calls = Arc::default();
+        let tool_calls = Arc::default();
         Ok(Self {
-            harness: MockServerHarness::start(Self::router(Arc::clone(&calls))).await?,
+            harness: MockServerHarness::start(Self::router(
+                Arc::clone(&calls),
+                Arc::clone(&tool_calls),
+            ))
+            .await?,
             calls,
+            tool_calls,
         })
     }
 
     pub fn call_count(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+
+    /// The tool every `tools/call` request the server has received names, in
+    /// order, including a name it has no tool for.
+    pub fn tool_calls(&self) -> Vec<String> {
+        self.tool_calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     pub fn port(&self) -> u16 {

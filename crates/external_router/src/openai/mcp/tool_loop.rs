@@ -47,6 +47,9 @@ pub(crate) struct ToolLoopState {
     pub existing_mcp_list_tools_labels: HashSet<String>,
     /// Transformed output items (mcp_call, web_search_call, etc.) - stored to avoid reconstruction
     pub mcp_call_items: Vec<Value>,
+    /// The `mcp_list_tools` items the stream announced: the final response
+    /// carries them as they were announced, ids included.
+    pub mcp_list_tools_items: Vec<Value>,
 }
 
 impl ToolLoopState {
@@ -61,6 +64,7 @@ impl ToolLoopState {
             conversation_history: Vec::new(),
             existing_mcp_list_tools_labels: known_labels,
             mcp_call_items: Vec::new(),
+            mcp_list_tools_items: Vec::new(),
         }
     }
 
@@ -298,9 +302,10 @@ pub(crate) async fn execute_streaming_tool_calls(
     true
 }
 
-/// The calls of a batch beyond the request's tool-call allowance: none runs.
-/// Each is closed on the wire under the type the stream announced for it,
-/// with the item the non-streamed loop renders for the same call
+/// Calls the loop does not run (beyond the request's tool-call allowance, or
+/// left when the upstream ended its turn short of a whole batch), `error`
+/// saying why. Each is closed on the wire under the type the stream announced
+/// for it, with the item the non-streamed loop renders for the same call
 /// ([`not_executed_tool_call_item`]): an `mcp_call` gets
 /// `response.mcp_call.failed` and then its `response.output_item.done`; a
 /// call in a hosted format gets its `response.output_item.done` alone (the
@@ -315,6 +320,7 @@ pub(crate) async fn skip_streaming_tool_calls(
     tx: &SseSender,
     state: &mut ToolLoopState,
     sequence_number: &mut u64,
+    error: &str,
 ) -> bool {
     for call in skipped {
         let response_format =
@@ -332,6 +338,7 @@ pub(crate) async fn skip_streaming_tool_calls(
             &server_label,
             &call.name,
             arguments,
+            error,
         );
         if let Some(obj) = item.as_object_mut() {
             obj.insert("id".to_string(), Value::String(item_id.clone()));
@@ -489,7 +496,8 @@ pub(crate) fn build_resume_payload(
     Ok(payload)
 }
 
-/// Send mcp_list_tools events to client at the start of streaming
+/// Send mcp_list_tools events to client at the start of streaming, the item
+/// announced kept in `announced`
 /// Returns false if client disconnected
 pub(crate) async fn send_mcp_list_tools_events(
     tx: &SseSender,
@@ -498,6 +506,7 @@ pub(crate) async fn send_mcp_list_tools_events(
     output_index: usize,
     sequence_number: &mut u64,
     server_key: &str,
+    announced: &mut Vec<Value>,
 ) -> bool {
     let tools_item_full = openai_bridge::mcp_list_tools_json(session, server_label, server_key);
     let item_id = tools_item_full
@@ -575,6 +584,7 @@ pub(crate) async fn send_mcp_list_tools_events(
         OutputItemEvent::DONE,
         event4_payload
     );
+    announced.push(tools_item_full);
     tx.send(Ok(Bytes::from(event4))).await.is_ok()
 }
 
@@ -721,6 +731,22 @@ pub(crate) fn mcp_list_tools_bindings_to_emit(
         .collect()
 }
 
+/// The `mcp_list_tools` item of a binding in the final response: the one the
+/// stream announced, ids included, or a new one where it announced none.
+fn mcp_list_tools_item(
+    state: &ToolLoopState,
+    session: &McpToolSession<'_>,
+    server_label: &str,
+    server_key: &str,
+) -> Value {
+    state
+        .mcp_list_tools_items
+        .iter()
+        .find(|item| item["server_label"] == server_label)
+        .cloned()
+        .unwrap_or_else(|| openai_bridge::mcp_list_tools_json(session, server_label, server_key))
+}
+
 /// Inject MCP metadata into a streaming response
 pub(crate) fn inject_mcp_metadata_streaming(
     response: &mut Value,
@@ -740,7 +766,8 @@ pub(crate) fn inject_mcp_metadata_streaming(
         let mut prefix = Vec::with_capacity(list_tools_bindings.len() + state.mcp_call_items.len());
         for (server_label, server_key) in &list_tools_bindings {
             if !session.is_internal_server_label(server_label) {
-                prefix.push(openai_bridge::mcp_list_tools_json(
+                prefix.push(mcp_list_tools_item(
+                    state,
                     session,
                     server_label,
                     server_key,
@@ -759,7 +786,8 @@ pub(crate) fn inject_mcp_metadata_streaming(
         let mut output_items = Vec::new();
         for (server_label, server_key) in &list_tools_bindings {
             if !session.is_internal_server_label(server_label) {
-                output_items.push(openai_bridge::mcp_list_tools_json(
+                output_items.push(mcp_list_tools_item(
+                    state,
                     session,
                     server_label,
                     server_key,
@@ -1003,12 +1031,15 @@ pub(crate) const TOOL_CALL_LIMIT_REASON: &str = "max_tool_calls";
 /// allowance was spent before it, in both modes.
 pub(crate) const NOT_EXECUTED_AT_TOOL_CALL_LIMIT: &str =
     "Not executed - response stopped due to limit";
+/// The error of a call the streamed loop did not run because the upstream
+/// ended its turn before every call of it was whole.
+pub(crate) const NOT_EXECUTED_AT_UPSTREAM_END: &str =
+    "Not executed - response ended before its calls were complete";
 
-/// The item of a call the loop did not run because the request's tool-call
-/// allowance was spent before it, in the call's own format, in both modes:
-/// an `mcp_call` that `failed` with [`NOT_EXECUTED_AT_TOOL_CALL_LIMIT`], or,
-/// for a tool answered in a hosted format, the item type the stream announces
-/// for the call (`web_search_call`, ...) with the status `failed`. The id is
+/// The item of a call the loop did not run, `error` saying why, in the call's
+/// own format, in both modes: an `mcp_call` that `failed` with it, or, for a
+/// tool answered in a hosted format, the item type the stream announces for
+/// the call (`web_search_call`, ...) with the status `failed`. The id is
 /// derived from the call's, as an executed call's is.
 fn not_executed_tool_call_item(
     response_format: ResponseFormat,
@@ -1016,16 +1047,11 @@ fn not_executed_tool_call_item(
     server_label: &str,
     tool_name: &str,
     arguments: &str,
+    error: &str,
 ) -> Value {
     if response_format == ResponseFormat::Passthrough {
-        let mut item = build_mcp_call_item(
-            tool_name,
-            arguments,
-            "",
-            server_label,
-            false,
-            Some(NOT_EXECUTED_AT_TOOL_CALL_LIMIT),
-        );
+        let mut item =
+            build_mcp_call_item(tool_name, arguments, "", server_label, false, Some(error));
         if let Some(obj) = item.as_object_mut() {
             obj.insert(
                 "id".to_string(),
@@ -1035,7 +1061,7 @@ fn not_executed_tool_call_item(
         return item;
     }
     let mut item = build_transformed_mcp_call_item(
-        &json!({ "error": NOT_EXECUTED_AT_TOOL_CALL_LIMIT }),
+        &json!({ "error": error }),
         response_format,
         item_id_source,
         server_label,
@@ -1340,6 +1366,7 @@ fn build_incomplete_response(
                     &resolved_label,
                     tool_name,
                     args,
+                    NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
                 ));
             }
         }
@@ -1566,6 +1593,7 @@ mod tests {
             "mock",
             "brave_web_search",
             "{}",
+            NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
         );
         assert_eq!(plain["type"], "mcp_call");
         assert_eq!(plain["status"], "failed");
@@ -1584,6 +1612,7 @@ mod tests {
             "mock",
             "brave_web_search",
             r#"{"query":"q"}"#,
+            NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
         );
         assert_eq!(hosted["type"], "web_search_call");
         assert_eq!(hosted["status"], "failed");
@@ -1887,6 +1916,7 @@ mod tests {
             output_index: 0,
             last_obfuscation: None,
             assigned_output_index: Some(0),
+            arguments_concluded: true,
         };
 
         let tool_call_item = json!({
@@ -1945,6 +1975,7 @@ mod tests {
             output_index: 0,
             last_obfuscation: None,
             assigned_output_index: Some(0),
+            arguments_concluded: true,
         };
 
         let tool_call_item = json!({
@@ -2002,6 +2033,7 @@ mod tests {
             output_index: 0,
             last_obfuscation: None,
             assigned_output_index: Some(0),
+            arguments_concluded: true,
         };
 
         let tool_call_item = json!({
@@ -2071,6 +2103,7 @@ mod tests {
             output_index: 0,
             last_obfuscation: None,
             assigned_output_index: Some(0),
+            arguments_concluded: true,
         };
 
         let tool_call_item = json!({

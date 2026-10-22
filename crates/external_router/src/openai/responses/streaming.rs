@@ -56,7 +56,8 @@ use crate::{
             build_resume_payload, execute_streaming_tool_calls, inject_mcp_metadata_streaming,
             mcp_list_tools_bindings_to_emit, prepare_mcp_tools_as_functions, retained_output_items,
             send_mcp_list_tools_events, skip_streaming_tool_calls, StreamAction,
-            StreamingToolHandler, ToolLoopState, TOOL_CALL_LIMIT_REASON,
+            StreamingToolHandler, ToolLoopState, NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
+            NOT_EXECUTED_AT_UPSTREAM_END, TOOL_CALL_LIMIT_REASON,
         },
     },
     persistence_utils::persist_conversation_items,
@@ -520,6 +521,9 @@ async fn maybe_inject_tool_in_progress(
 pub(super) enum ToolLoopEnd {
     Answered,
     ToolCallLimit,
+    /// Neither: the upstream ended its turn on this terminal
+    /// (`response.incomplete` or `response.failed`), and so does the stream.
+    UpstreamTerminal(&'static str),
 }
 
 /// What the non-streamed loop does to a response it ended at the request's
@@ -543,27 +547,18 @@ fn end_at_tool_call_limit(response: &mut Value, original_request: &ResponsesRequ
     );
 }
 
-/// Send the `response.completed` event that ends the tool loop's stream:
-/// the final response built from the handler's snapshot, the loop's items
-/// in place, the client's view of the tools, the request's metadata, and
-/// the note of a loop stopped at its tool-call allowance.
-/// Returns false if client disconnected
-pub(super) async fn send_final_response_event(
+/// The response that ends the tool loop's stream, built once for its
+/// terminal event and its record alike: the handler's snapshot, the loop's
+/// items in place, the client's view of the tools, the request's metadata,
+/// and the note of a loop stopped at its tool-call allowance. Its status is
+/// `completed`, unless the upstream ended its turn on a terminal of its own.
+pub(super) fn final_response(
     handler: &StreamingToolHandler,
-    tx: &SseSender,
-    enc: &mut SseEncoder,
-    sequence_number: &mut u64,
     state: &ToolLoopState,
     ctx: &StreamingEventContext<'_>,
     end: ToolLoopEnd,
-) -> bool {
-    let mut final_response = match handler.snapshot_final_response() {
-        Some(resp) => resp,
-        None => {
-            warn!("Final response snapshot unavailable; skipping synthetic completion event");
-            return true;
-        }
-    };
+) -> Option<Value> {
+    let mut final_response = handler.snapshot_final_response()?;
 
     if let Some(original_id) = handler.original_response_id() {
         if let Some(obj) = final_response.as_object_mut() {
@@ -575,10 +570,8 @@ pub(super) async fn send_final_response_event(
         inject_mcp_metadata_streaming(&mut final_response, state, session);
     }
 
-    // With the session, the wire hides what the record hides: the internal
-    // servers' items and the calls to their tools. The asks for the session's
-    // exposed tools that a limit stop leaves beside their not-executed items
-    // are dropped by `end_at_tool_call_limit` below.
+    // With the session, the response hides the internal servers' items and
+    // the calls to their tools.
     restore_original_tools(&mut final_response, ctx.original_request, ctx.session);
     patch_response_with_request_metadata(
         &mut final_response,
@@ -586,30 +579,56 @@ pub(super) async fn send_final_response_event(
         ctx.previous_response_id,
     );
 
-    if let Some(obj) = final_response.as_object_mut() {
-        obj.insert("status".to_string(), Value::String("completed".to_string()));
+    // A run the loop ends itself is `completed`, whatever the last upstream
+    // turn it ran calls of ended as, and carries no error of that turn.
+    if !matches!(end, ToolLoopEnd::UpstreamTerminal(_)) {
+        if let Some(obj) = final_response.as_object_mut() {
+            obj.insert("status".to_string(), Value::String("completed".to_string()));
+            if obj.get("error").is_some_and(|error| !error.is_null()) {
+                obj.insert("error".to_string(), Value::Null);
+            }
+        }
     }
     if end == ToolLoopEnd::ToolCallLimit {
         end_at_tool_call_limit(&mut final_response, ctx.original_request);
+    } else if let Some(output) = final_response
+        .get_mut("output")
+        .and_then(Value::as_array_mut)
+    {
+        // The asks for server calls leave as at the limit: each call ran, or
+        // was closed as not executed, and has its own item.
+        *output = retained_output_items(output, ctx.original_request);
     }
+    Some(final_response)
+}
 
-    let completed_payload = json!({
-        "type": ResponseEvent::COMPLETED,
+/// Send the terminal event carrying `final_response`: `response.completed`,
+/// or the kind of the upstream's own terminal.
+/// Returns false if client disconnected
+pub(super) async fn send_final_response_event(
+    tx: &SseSender,
+    enc: &mut SseEncoder,
+    sequence_number: &mut u64,
+    final_response: &Value,
+    end: ToolLoopEnd,
+) -> bool {
+    let terminal = match end {
+        ToolLoopEnd::UpstreamTerminal(terminal) => terminal,
+        ToolLoopEnd::Answered | ToolLoopEnd::ToolCallLimit => ResponseEvent::COMPLETED,
+    };
+    let payload = json!({
+        "type": terminal,
         "sequence_number": *sequence_number,
         "response": final_response
     });
     *sequence_number += 1;
 
-    match enc.encode_event(ResponseEvent::COMPLETED, &completed_payload) {
+    match enc.encode_event(terminal, &payload) {
         Ok(bytes) => tx.send(Ok(bytes)).await.is_ok(),
         Err(e) => {
-            warn!("failed to encode response.completed via SseEncoder, falling back: {e}");
-            let completed_event = format!(
-                "event: {}\ndata: {}\n\n",
-                ResponseEvent::COMPLETED,
-                completed_payload
-            );
-            tx.send(Ok(Bytes::from(completed_event))).await.is_ok()
+            warn!("failed to encode {terminal} via SseEncoder, falling back: {e}");
+            let event = format!("event: {terminal}\ndata: {payload}\n\n");
+            tx.send(Ok(Bytes::from(event))).await.is_ok()
         }
     }
 }
@@ -837,6 +856,19 @@ pub(super) fn handle_streaming_with_tool_interception(
         let provider = ApiProvider::from_url(&url_clone);
         let auth_header =
             provider.extract_auth_header(headers_opt.as_ref(), worker_api_key.as_ref());
+        // A call to a function the request declares is the client's to run:
+        // the loop does not run it or count it, never turns it into an
+        // `mcp_call`, and the response keeps it as the client's
+        // `function_call`. Every other call is the loop's, to run or to close
+        // as not executed. The set must be exactly the one
+        // `retained_output_items` keeps, the request's `function` tools: a
+        // call the loop declines and the response drops would be lost.
+        let is_client_function = |name: &str| {
+            original_request.tools.iter().flatten().any(|tool| {
+                matches!(tool, ResponseTool::Function(function_tool)
+                    if function_tool.function.name == name)
+            })
+        };
 
         let (handler, end) = loop {
             // Make streaming request
@@ -877,6 +909,7 @@ pub(super) fn handle_streaming_with_tool_interception(
             }
             let mut chunk_processor = ChunkProcessor::new();
             let mut tool_calls_detected = false;
+            let mut upstream_terminal = None;
             let mut seen_in_progress = false;
 
             while let Some(chunk_result) = upstream_stream.next().await {
@@ -896,12 +929,14 @@ pub(super) fn handle_streaming_with_tool_interception(
                             let action = handler.process_event(event_name, data.as_ref());
 
                             match action {
-                                StreamAction::Forward => {
+                                StreamAction::Forward | StreamAction::ForwardError => {
                                     // Parse data once and reuse for skip check, forwarding, and in_progress check
                                     let parsed = serde_json::from_str::<Value>(data.as_ref()).ok();
 
                                     // Skip response.created and response.in_progress on subsequent iterations
-                                    let should_skip = if is_first_iteration {
+                                    let should_skip = if is_first_iteration
+                                        || action == StreamAction::ForwardError
+                                    {
                                         false
                                     } else {
                                         parsed.as_ref().is_some_and(|v| {
@@ -914,7 +949,8 @@ pub(super) fn handle_streaming_with_tool_interception(
                                     };
 
                                     // Check in_progress before moving parsed into SseEventData
-                                    let is_in_progress = !seen_in_progress
+                                    let is_in_progress = action == StreamAction::Forward
+                                        && !seen_in_progress
                                         && parsed.as_ref().is_some_and(|v| {
                                             v.get("type").and_then(|t| t.as_str())
                                                 == Some(ResponseEvent::IN_PROGRESS)
@@ -954,6 +990,7 @@ pub(super) fn handle_streaming_with_tool_interception(
                                                     list_tools_index,
                                                     &mut sequence_number,
                                                     server_key,
+                                                    &mut state.mcp_list_tools_items,
                                                 )
                                                 .await
                                                 {
@@ -964,9 +1001,17 @@ pub(super) fn handle_streaming_with_tool_interception(
                                             mcp_list_tools_sent = true;
                                         }
                                     }
+
+                                    // An upstream error ends the stream as the loop's own
+                                    // errors do: no call runs, no record, nothing after it.
+                                    if action == StreamAction::ForwardError {
+                                        return;
+                                    }
                                 }
                                 StreamAction::Buffer => {
-                                    // Don't forward, just buffer
+                                    // Don't forward, just buffer (a tracked call's
+                                    // umbrella too: the tool loop emits it after
+                                    // `response.<tool>.completed`).
                                 }
                                 StreamAction::Drop => {
                                     // R6.7c native passthrough: upstream
@@ -984,43 +1029,25 @@ pub(super) fn handle_streaming_with_tool_interception(
                                     // kick the tool loop — there is no
                                     // dispatched call to finish.
                                 }
-                                StreamAction::ExecuteTools {
-                                    forward_triggering_event,
-                                } => {
-                                    // When the upstream signals tool completion via
-                                    // `output_item.done` (instead of a preceding
-                                    // `function_call_arguments.done`), forwarding the
-                                    // event here would emit an umbrella
-                                    // `response.output_item.done` BEFORE
-                                    // `response.<tool>.completed`, violating spec
-                                    // sub-event ordering. The tool loop emits its own
-                                    // `output_item.done` at the correct position after
-                                    // the `.completed` sub-event; suppress here.
-                                    if forward_triggering_event
-                                        && !forward_streaming_event(
-                                            SseEventData {
-                                                raw_block: &raw_block,
-                                                event_name,
-                                                data: data.as_ref(),
-                                                pre_parsed: None,
-                                            },
-                                            &mut handler,
-                                            &tx,
-                                            &mut sse_encoder,
-                                            &streaming_ctx,
-                                            &mut sequence_number,
-                                        )
-                                        .await
-                                    {
-                                        return;
-                                    }
+                                StreamAction::EndTurn(terminal) => {
+                                    // Not forwarded: the loop ends the stream on a
+                                    // terminal of this kind, nothing more of the body read.
+                                    upstream_terminal = Some(terminal);
+                                    break;
+                                }
+                                StreamAction::ExecuteTools => {
+                                    // The upstream ended its turn holding calls. A
+                                    // turn of parallel calls streams them one after
+                                    // another, so only now is every call of the turn
+                                    // read; the terminal itself is not forwarded (the
+                                    // loop ends the client's stream with its own).
                                     tool_calls_detected = true;
                                     break; // Exit stream processing to execute tools
                                 }
                             }
                         }
 
-                        if tool_calls_detected {
+                        if tool_calls_detected || upstream_terminal.is_some() {
                             break;
                         }
                     }
@@ -1044,13 +1071,44 @@ pub(super) fn handle_streaming_with_tool_interception(
                 preserved_response_id = Some(id);
             }
 
-            // The model answered without asking for a tool: the loop's end.
-            if !tool_calls_detected {
-                break (handler, ToolLoopEnd::Answered);
+            // The model answered without asking for a tool, or the upstream
+            // ended its turn on its own terminal: the loop's end. A body that
+            // closed before its terminal event ends the turn too, and its
+            // calls run all the same if each of them is whole. Calls that do
+            // not run are closed as not executed, their items the response's.
+            if upstream_terminal.is_some()
+                || (!tool_calls_detected && !handler.has_runnable_calls())
+            {
+                // The client's own calls stay in the response as they are.
+                let unrun = handler
+                    .take_pending_calls()
+                    .into_iter()
+                    .filter(|call| !is_client_function(&call.name))
+                    .collect();
+                if !skip_streaming_tool_calls(
+                    unrun,
+                    &session,
+                    &format_registry,
+                    &tx,
+                    &mut state,
+                    &mut sequence_number,
+                    NOT_EXECUTED_AT_UPSTREAM_END,
+                )
+                .await
+                {
+                    return;
+                }
+                let end =
+                    upstream_terminal.map_or(ToolLoopEnd::Answered, ToolLoopEnd::UpstreamTerminal);
+                break (handler, end);
             }
 
-            // Execute tools
-            let mut pending_calls = handler.take_pending_calls();
+            // Execute tools: every call but the client's own, which neither
+            // runs nor counts against the allowance below.
+            let (client_calls, mut pending_calls): (Vec<_>, Vec<_>) = handler
+                .take_pending_calls()
+                .into_iter()
+                .partition(|call| is_client_function(&call.name));
 
             // Check iteration limit
             state.iteration += 1;
@@ -1103,12 +1161,28 @@ pub(super) fn handle_streaming_with_tool_interception(
                     &tx,
                     &mut state,
                     &mut sequence_number,
+                    NOT_EXECUTED_AT_TOOL_CALL_LIMIT,
                 )
                 .await
                 {
                     return;
                 }
                 break (handler, ToolLoopEnd::ToolCallLimit);
+            }
+
+            // Only the client can answer its own calls, so the upstream turn
+            // cannot resume without them: the loop ends, on the upstream's
+            // own terminal if it ended the turn `incomplete` or `failed`.
+            if !client_calls.is_empty() {
+                let status = handler
+                    .snapshot_final_response()
+                    .map(|response| response["status"].clone());
+                let end = match status.as_ref().and_then(Value::as_str) {
+                    Some("incomplete") => ToolLoopEnd::UpstreamTerminal(ResponseEvent::INCOMPLETE),
+                    Some("failed") => ToolLoopEnd::UpstreamTerminal(ResponseEvent::FAILED),
+                    _ => ToolLoopEnd::Answered,
+                };
+                break (handler, end);
             }
 
             // Build resume payload
@@ -1137,46 +1211,27 @@ pub(super) fn handle_streaming_with_tool_interception(
             }
         };
 
-        // The loop's end, answered or stopped at the tool-call allowance: the
-        // terminal event, the record, the sentinel.
-        if !send_final_response_event(
-            &handler,
-            &tx,
-            &mut sse_encoder,
-            &mut sequence_number,
-            &state,
-            &streaming_ctx,
-            end,
-        )
-        .await
-        {
-            return;
+        // The loop's end, answered, stopped at the tool-call allowance or on
+        // the upstream's terminal: the terminal event, the record (the same
+        // response), the sentinel.
+        let final_response = final_response(&handler, &state, &streaming_ctx, end);
+        if let Some(response) = &final_response {
+            if !send_final_response_event(
+                &tx,
+                &mut sse_encoder,
+                &mut sequence_number,
+                response,
+                end,
+            )
+            .await
+            {
+                return;
+            }
+        } else {
+            warn!("Final response snapshot unavailable; skipping synthetic completion event");
         }
 
-        let final_response_json = if should_store {
-            handler.accumulator.into_final_response()
-        } else {
-            None
-        };
-
-        if let Some(mut response_json) = final_response_json {
-            if let Some(ref id) = preserved_response_id {
-                if let Some(obj) = response_json.as_object_mut() {
-                    obj.insert("id".to_string(), Value::String(id.clone()));
-                }
-            }
-            inject_mcp_metadata_streaming(&mut response_json, &state, &session);
-
-            restore_original_tools(&mut response_json, &original_request, Some(&session));
-            patch_response_with_request_metadata(
-                &mut response_json,
-                &original_request,
-                previous_response_id.as_deref(),
-            );
-            if end == ToolLoopEnd::ToolCallLimit {
-                end_at_tool_call_limit(&mut response_json, &original_request);
-            }
-
+        if let Some(response_json) = final_response.filter(|_| should_store) {
             // Always persist conversation items and response (even without conversation)
             if let Err(err) = persist_conversation_items(
                 storage.conversation.clone(),
@@ -1311,17 +1366,10 @@ mod tests {
             let (tx, mut rx) = sse_channel();
             let mut enc = SseEncoder::new();
             let mut sequence_number = 7;
+            let response = final_response(&handler, &state, &ctx, end).expect("a response");
             assert!(
-                send_final_response_event(
-                    &handler,
-                    &tx,
-                    &mut enc,
-                    &mut sequence_number,
-                    &state,
-                    &ctx,
-                    end,
-                )
-                .await
+                send_final_response_event(&tx, &mut enc, &mut sequence_number, &response, end)
+                    .await
             );
             drop(tx);
             assert_eq!(sequence_number, 8, "{end:?}");
@@ -1351,6 +1399,115 @@ mod tests {
             .expect("an object")
             .remove("incomplete_details");
         assert_eq!(answered, limited, "the note is the only difference");
+    }
+
+    /// A turn of parallel calls as a Responses upstream streams it: one item
+    /// after another, each call complete before the next is added, then the
+    /// turn's terminal event. The loop leaves the upstream body when the
+    /// handler answers `ExecuteTools` and runs the calls it holds then; a call
+    /// read after that point is never run, never in the history, never on the
+    /// wire. So the loop leaves at the terminal and no sooner, with every call
+    /// of the turn in the batch, in order, each with its own arguments,
+    /// whether a call completes with its arguments events or with its
+    /// `output_item.done` alone.
+    #[test]
+    fn a_turn_of_parallel_calls_is_read_to_its_terminal_before_its_calls_run() {
+        let call_events = |index: usize, id: &str, with_arguments_events: bool| {
+            let arguments = format!("{{\"query\":\"{id}\"}}");
+            let item = |arguments: &str, status: &str| {
+                json!({
+                    "id": format!("fc_{id}"), "type": "function_call",
+                    "call_id": format!("call_{id}"), "name": "search",
+                    "arguments": arguments, "status": status
+                })
+            };
+            let mut events = vec![json!({
+                "type": "response.output_item.added", "output_index": index,
+                "item": item("", "in_progress")
+            })];
+            if with_arguments_events {
+                events.push(json!({
+                    "type": "response.function_call_arguments.delta", "output_index": index,
+                    "item_id": format!("fc_{id}"), "delta": arguments
+                }));
+                events.push(json!({
+                    "type": "response.function_call_arguments.done", "output_index": index,
+                    "item_id": format!("fc_{id}"), "arguments": arguments
+                }));
+            }
+            events.push(json!({
+                "type": "response.output_item.done", "output_index": index,
+                "item": item(&arguments, "completed")
+            }));
+            events
+        };
+
+        let mut got = Vec::new();
+        for (shape, with_arguments_events) in [
+            ("output_item.done alone", false),
+            ("arguments events", true),
+        ] {
+            let response = |status: &str| {
+                json!({
+                    "id": "resp_turn", "object": "response", "status": status, "output": []
+                })
+            };
+            let mut events = vec![
+                json!({"type": "response.created", "response": response("in_progress")}),
+                json!({"type": "response.in_progress", "response": response("in_progress")}),
+            ];
+            events.extend(call_events(0, "a", with_arguments_events));
+            events.extend(call_events(1, "b", with_arguments_events));
+            events.push(json!({"type": "response.completed", "response": response("completed")}));
+            let body: String = events
+                .iter()
+                .map(|event| {
+                    format!(
+                        "event: {}\ndata: {event}\n\n",
+                        event["type"].as_str().unwrap_or_default()
+                    )
+                })
+                .collect();
+
+            // What the loop does with the body: each block through the
+            // handler, until the handler answers `ExecuteTools`.
+            let mut handler = StreamingToolHandler::with_starting_index(0);
+            let mut chunks = ChunkProcessor::new();
+            chunks.push_chunk(body.as_bytes());
+            let mut left_at = None;
+            while let Some(block) = chunks.next_block() {
+                let (event_name, data) = parse_sse_block(&block);
+                let action = handler.process_event(event_name, &data);
+                if matches!(action, StreamAction::ExecuteTools) {
+                    left_at = event_name.map(str::to_string);
+                    break;
+                }
+            }
+            let batch: Vec<(String, String)> = handler
+                .take_pending_calls()
+                .into_iter()
+                .map(|call| (call.call_id, call.arguments_buffer))
+                .collect();
+            got.push((shape, left_at, batch));
+        }
+
+        let call = |id: &str| (format!("call_{id}"), format!("{{\"query\":\"{id}\"}}"));
+        let read_to_the_terminal = |shape| {
+            (
+                shape,
+                Some("response.completed".to_string()),
+                vec![call("a"), call("b")],
+            )
+        };
+        assert_eq!(
+            got,
+            [
+                read_to_the_terminal("output_item.done alone"),
+                read_to_the_terminal("arguments events"),
+            ],
+            "(shape, the event the loop leaves the upstream turn at, the calls it runs with \
+             their arguments)"
+        );
     }
 
     /// The error event that ends a failed stream is the frame every router
