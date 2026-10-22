@@ -157,7 +157,18 @@ jobs:
       E2E_TOKENSPEED_SERVICER_IMPL: ${{ inputs.engine == 'tokenspeed' && inputs.servicer_impl || '' }}
       TOKENSPEED_PREBUILT_IMAGE: ${{ inputs.tokenspeed_prebuilt_image }}
       ROUTER_LOCAL_MODEL_PATH: /models
+      GIT_CONFIG_COUNT: '1'
+      GIT_CONFIG_KEY_0: safe.directory
+      GIT_CONFIG_VALUE_0: ${{ github.workspace }}
+      SMG_QA_IMAGE: ${{ inputs.container_image }}
     steps:
+      - name: Require owned AMD runner
+        run: |
+          case "$RUNNER_NAME" in
+            amd-mi300x-1|amd-mi300x-2) ;;
+            *) echo "Unexpected runner: $RUNNER_NAME" >&2; exit 1 ;;
+          esac
+
       - name: Checkout code
         uses: actions/checkout@v7
 
@@ -181,6 +192,9 @@ jobs:
           git config --global \
             url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf \
             "https://github.com/"
+
+      - name: Record image package metadata before setup
+        run: python3 .github/amd-qa/closure_audit.py snapshot dependency-closure/before.json
 
       # Engine-specific setup
       - name: Setup SGLang backend
@@ -220,10 +234,22 @@ jobs:
 
       # Install
       - name: Install wheel and test dependencies
+        id: install
         run: |
           pip uninstall -y smg || true
           pip install wheel/*.whl
           bash scripts/ci_install_e2e_deps.sh ${{ inputs.extra_deps }}
+          python3 -m pip install pytest-asyncio
+
+      - name: Require clean dependency closure before engine tests
+        run: |
+          python3 .github/amd-qa/closure_audit.py snapshot dependency-closure/installed.json
+          if python3 -m pip check > dependency-closure/pip-check-before.txt 2>&1; then
+            cat dependency-closure/pip-check-before.txt
+          else
+            cat dependency-closure/pip-check-before.txt >&2
+            exit 1
+          fi
 
       # The servicer's engine-gated unit tests (importorskip("vllm"),
       # importorskip("sglang") for the SGLang ZMQ wire pins) only meet a real
@@ -232,8 +258,8 @@ jobs:
         if: inputs.servicer_unit_tests
         run: |
           python3 -c "import ${{ inputs.engine }}, msgspec, zmq"  # the gates these tests importorskip on
-          pip install pytest-asyncio  # runs the @pytest.mark.asyncio cases; pytest>=8.4 fails them without a plugin
-          pytest -q grpc_servicer/tests -p no:cacheprovider -rs
+          pytest -q grpc_servicer/tests -p no:cacheprovider -rs --junitxml=servicer-engine.xml
+          python3 .github/amd-qa/closure_audit.py require-vllm servicer-engine.xml
 
       - name: Setup Oracle
         if: inputs.setup_agentic_deps
@@ -275,7 +301,7 @@ jobs:
             --ignore=e2e_test/bindings_go \
             ${{ inputs.test_filter }} \
             --reruns 2 --reruns-delay 5 \
-            -s -vv
+            -s -vv --junitxml=e2e-results.xml
 
       - name: Worker failure diagnostics
         if: failure() || cancelled()
@@ -325,6 +351,29 @@ jobs:
           path: e2e-logs/
           retention-days: 7
           if-no-files-found: ignore
+
+      - name: Require clean final dependency closure
+        if: always() && steps.install.outcome == 'success'
+        run: |
+          python3 .github/amd-qa/closure_audit.py snapshot dependency-closure/final.json
+          if python3 -m pip check > dependency-closure/pip-check-final.txt 2>&1; then
+            cat dependency-closure/pip-check-final.txt
+          else
+            cat dependency-closure/pip-check-final.txt >&2
+            exit 1
+          fi
+
+      - name: Upload closure and test evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: closure-${{ inputs.engine }}-${{ inputs.test_dirs == 'e2e_test/completions' && 'completions' || 'embeddings' }}
+          path: |
+            dependency-closure/
+            servicer-engine.xml
+            e2e-results.xml
+          retention-days: 7
+          if-no-files-found: error
 
       # Whatever the job started and did not stop ends here, found by the
       # marker in its environment: an engine or gateway that outlived a
