@@ -750,8 +750,9 @@ struct WorkerArgs {
     /// handoff and the first decode step) and the same reprieve: it waits
     /// on while its decode worker produces tokens for any side (handoffs
     /// completing one after another on a slow transport, its running
-    /// generations stepping), and is given up on only once the worker has
-    /// produced nothing for the threshold. On the parallel
+    /// generations stepping), for at most 120 seconds past its bound, and is
+    /// given up on sooner once the worker has produced nothing for the
+    /// threshold. On the parallel
     /// dispatch shape a prefill side's first response also waits for the
     /// decode side (its bootstrap, and KV pre-allocation under decode
     /// pressure), so the threshold must cover that wait for a prefill
