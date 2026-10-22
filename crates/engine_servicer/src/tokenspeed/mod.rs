@@ -325,10 +325,13 @@ impl TokenSpeedServicerServer {
     }
 
     /// Hold (`false`) or release (`true`) readiness alone: health flips as
-    /// with `set_serving`, admission stays open, so the lifecycle owner's own
-    /// requests (its planned warm-up before SERVING) still reach the engine.
-    /// `set_serving(false)` is the drain switch and closes admission as well.
+    /// with `set_serving`, admission stays open to the lifecycle owner's own
+    /// requests (its planned warm-up before SERVING, `smg-warmup-<n>`) and to
+    /// nothing else, so the warm-up's steps share the engine with no client
+    /// request. `set_serving(false)` is the drain switch and closes admission
+    /// as well.
     pub fn set_ready(&self, ready: bool) {
+        self.state.shared.registry.set_warming(!ready);
         self.state.shared.set_ready(ready);
     }
 

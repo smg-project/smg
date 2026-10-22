@@ -1,8 +1,11 @@
 //! In-flight request registry: the cancellation handles of the `Abort` RPC
 //! and of shutdown, keyed by request id. Engine-neutral; every servicer
-//! registers its streams here. A cancellation names its cause
-//! ([`CancelReason`]), so a stream can end a caller's abort as a completion
-//! and a shutdown under an open request as the failure it is.
+//! registers its streams here, so the registry is also the admission gate:
+//! a drain closes it, and a readiness hold (the lifecycle owner's planned
+//! warm-up before SERVING) closes it to every request but the warm-up's own.
+//! A cancellation names its cause ([`CancelReason`]), so a stream can end a
+//! caller's abort as a completion and a shutdown under an open request as
+//! the failure it is.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -37,6 +40,13 @@ pub(crate) enum CancelReason {
 pub(crate) const SHUTDOWN_MESSAGE: &str =
     "servicer shutting down: the engine went away before the request completed";
 
+/// The request-id prefix of the lifecycle owner's own requests: its planned
+/// warm-up names them `smg-warmup-<n>` and sends them over the servicer's own
+/// port, from the process that holds readiness. While readiness is held,
+/// these are the only requests admitted; anything else the gateway forwards
+/// in that window would share the engine's steps with the warm-up's.
+pub(crate) const WARMUP_REQUEST_ID_PREFIX: &str = "smg-warmup-";
+
 /// Registered in-flight requests. The generation disambiguates an id reused
 /// after an abort from the stream that registered it.
 #[derive(Default)]
@@ -44,6 +54,9 @@ pub(crate) struct RequestRegistry {
     entries: Mutex<HashMap<String, (u64, oneshot::Sender<CancelReason>)>>,
     generation: AtomicU64,
     draining: AtomicBool,
+    /// Readiness held for the planned warm-up: admission is the warm-up's
+    /// own requests only.
+    warming: AtomicBool,
     active: AtomicUsize,
 }
 
@@ -93,6 +106,10 @@ impl RequestRegistry {
         if self.draining.load(Ordering::Acquire) {
             return Err(Status::unavailable("servicer is draining"));
         }
+        if self.warming.load(Ordering::Acquire) && !request_id.starts_with(WARMUP_REQUEST_ID_PREFIX)
+        {
+            return Err(Status::unavailable("servicer is warming up"));
+        }
         entries.insert(request_id.to_string(), (generation, cancel_tx));
         self.active.fetch_add(1, Ordering::AcqRel);
         drop(entries);
@@ -116,6 +133,16 @@ impl RequestRegistry {
     /// Whether admission is open: no drain has closed it.
     pub(crate) fn is_accepting(&self) -> bool {
         !self.draining.load(Ordering::Acquire)
+    }
+
+    /// Serialize admission with the warm-up boundary: while readiness is
+    /// held (`true`), only the lifecycle owner's own requests (the planned
+    /// warm-up's, by their id) are admitted, so nothing else reaches the
+    /// engine beside the warm-up's steps; released (`false`), every request
+    /// is admitted again.
+    pub(crate) fn set_warming(&self, warming: bool) {
+        let _entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        self.warming.store(warming, Ordering::Release);
     }
 
     /// Count request lifetimes, including aborted streams still unwinding.
@@ -226,6 +253,43 @@ mod tests {
         assert_eq!(registry.active(), 0);
         registry.set_accepting(true);
         assert!(registry.register("resumed").is_ok());
+    }
+
+    /// While readiness is held for the planned warm-up, the warm-up's own
+    /// requests are admitted and every other id is refused as not serving;
+    /// the drain refuses the warm-up's own as well; the release admits all.
+    #[test]
+    fn a_readiness_hold_admits_only_the_warm_ups_own_requests() {
+        let registry = Arc::new(RequestRegistry::default());
+        registry.set_warming(true);
+        assert!(registry.is_accepting(), "a hold is not a drain");
+        let refused = registry
+            .register("chatcmpl-1")
+            .err()
+            .expect("a foreign request is refused");
+        assert_eq!(refused.code(), tonic::Code::Unavailable);
+        assert_eq!(refused.message(), "servicer is warming up");
+        assert_eq!(registry.active(), 0, "a refused request has no lifetime");
+        let (own, _cancel) = registry
+            .register(&format!("{WARMUP_REQUEST_ID_PREFIX}7"))
+            .expect("the warm-up's own request passes");
+        assert_eq!(registry.active(), 1);
+        drop(own);
+
+        registry.set_accepting(false);
+        let drained = registry
+            .register(&format!("{WARMUP_REQUEST_ID_PREFIX}8"))
+            .err()
+            .expect("a drain closes admission to the warm-up as well");
+        assert_eq!(drained.message(), "servicer is draining");
+        registry.set_accepting(true);
+
+        registry.set_warming(false);
+        let (late, _cancel) = registry
+            .register("chatcmpl-1")
+            .expect("the release admits every request");
+        drop(late);
+        assert_eq!(registry.active(), 0);
     }
 
     /// A choice as the shutdown sees it, in the shape of the servicers' own:

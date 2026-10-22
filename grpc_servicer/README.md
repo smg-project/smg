@@ -274,8 +274,9 @@ tokens, and the time-to-first-token, inter-token, per-request-mean and
 end-to-end latency histograms (vLLM's own bucket edges), plus the servicer's
 lifecycle state and start time. The listener binds beside the gRPC one, before
 the engine connects (a scrape during the engine's start answers
-`smg_servicer_state{state="starting"} 1`; a readiness hold with admission open
-reads `warming_up`, a drain `draining`), runs on its own thread, and closes
+`smg_servicer_state{state="starting"} 1`; a readiness hold (admission open to
+the warm-up's own requests only) reads `warming_up`, a drain `draining`), runs
+on its own thread, and closes
 with the servicer; a port equal to `--port` is refused before the engine
 starts, and the flag needs `--servicer-impl rust` (the Python servicer exposes
 no endpoint). A planned warm-up's own requests go through the request path
