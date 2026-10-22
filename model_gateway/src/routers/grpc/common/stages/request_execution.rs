@@ -3695,12 +3695,16 @@ mod tests {
     async fn a_prefill_dispatch_on_a_frozen_worker_is_given_up_on_once_its_backlog_had_its_time() {
         let workers = tokenspeed_pair();
         let prefill = Arc::clone(workers.prefill_worker().expect("a pair"));
+        // Taken before the run's first prompt is booked: the rule counts
+        // its window on the worker's clock, in whole milliseconds from
+        // that booking, so real time since here reads up to a millisecond
+        // short of the window when the verdict is given.
+        let started = Instant::now();
         for _ in 0..2 {
             prefill.note_prefill_started(10_000, true);
         }
         let bound = Duration::from_secs(1);
         let backlog = Duration::from_secs(2);
-        let started = Instant::now();
         let arrivals = async {
             tokio::time::sleep(bound + Duration::from_millis(500)).await;
             loop {
@@ -3721,18 +3725,20 @@ mod tests {
             () = arrivals => unreachable!("the arrivals never end on their own"),
         };
         let elapsed = started.elapsed();
-        // The window is counted on the worker's clock, in whole
-        // milliseconds from the run's first prompt, which was booked
-        // before `started`: the run's silence is read where the rule
-        // read it, and the test's own clock bounds it from above.
+        // The run's silence as the rule read it, on the worker's clock;
+        // real time since before the first booking bounds the verdict from
+        // below, a millisecond of the worker's clock allowed, and from
+        // above.
         let silent = prefill
             .prefill_unanswered_run()
             .expect("the run never answered");
         let status = failure(result);
         assert!(is_prefill_silence(&status), "{status:?}");
         assert!(
-            silent >= backlog && elapsed < backlog + bound,
-            "given up on once the backlog had its time, no later than a bound after: silent {silent:?}, {elapsed:?} since the dispatch"
+            silent >= backlog
+                && elapsed + Duration::from_millis(1) >= backlog
+                && elapsed < backlog + bound,
+            "given up on once the backlog had its time, no later than a bound after: silent {silent:?}, {elapsed:?} since before the first prompt"
         );
         assert!(
             status.message().contains("of a 2.0s window"),
