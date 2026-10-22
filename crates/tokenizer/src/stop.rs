@@ -114,6 +114,11 @@ pub struct StopSequenceDecoder {
     /// True when there are no string stop sequences (only token-level stops).
     /// In this mode the jail buffer is bypassed entirely for lower overhead.
     token_only: bool,
+    /// The config's hidden stop token ids, sorted: every token is checked
+    /// against them, and a search of a few sorted ids costs no hashing.
+    hidden_stop_ids: StopIds,
+    /// The config's visible stop token ids, sorted.
+    visible_stop_ids: StopIds,
 }
 
 impl StopSequenceDecoder {
@@ -191,6 +196,8 @@ impl StopSequenceDecoder {
         };
 
         let token_only = aho_corasick.is_none();
+        let hidden_stop_ids = StopIds::new(&config.stop_tokens);
+        let visible_stop_ids = StopIds::new(&config.visible_stop_tokens);
 
         StopSequenceDecoder {
             sequence,
@@ -201,6 +208,8 @@ impl StopSequenceDecoder {
             stopped: false,
             matched_stop: None,
             token_only,
+            hidden_stop_ids,
+            visible_stop_ids,
         }
     }
 
@@ -250,8 +259,8 @@ impl StopSequenceDecoder {
     pub fn process_token(&mut self, token_id: TokenIdType) -> Result<SequenceDecoderOutput> {
         if !self.stopped
             && self.token_only
-            && !self.config.stop_tokens.contains(&token_id)
-            && !self.config.visible_stop_tokens.contains(&token_id)
+            && !self.hidden_stop_ids.contains(token_id)
+            && !self.visible_stop_ids.contains(token_id)
         {
             // The common path of the appending form, in its owned shape: the
             // decoder's own string for the token (one exact allocation, as
@@ -286,8 +295,8 @@ impl StopSequenceDecoder {
             return Ok(SequenceDecoderStep::Stopped);
         }
 
-        let hidden_stop = self.config.stop_tokens.contains(&token_id);
-        let visible_stop = self.config.visible_stop_tokens.contains(&token_id);
+        let hidden_stop = self.hidden_stop_ids.contains(token_id);
+        let visible_stop = self.visible_stop_ids.contains(token_id);
         if self.token_only && !hidden_stop && !visible_stop {
             // The common path: no string stops and not a stop token, so the
             // decoded text goes out as it is, with no jail to run.
@@ -487,6 +496,48 @@ impl StopSequenceDecoder {
     }
 }
 
+/// How many stop token ids a decoder keeps inline: the vocabulary's
+/// end-of-sequence ids and a request's stop token ids are a handful.
+const INLINE_STOP_IDS: usize = 8;
+
+/// A set of token ids kept sorted, for a membership check per generated
+/// token without hashing; a handful of ids live inline, more on the heap.
+enum StopIds {
+    Inline {
+        len: usize,
+        ids: [TokenIdType; INLINE_STOP_IDS],
+    },
+    Heap(Box<[TokenIdType]>),
+}
+
+impl StopIds {
+    fn new(ids: &HashSet<TokenIdType>) -> Self {
+        if ids.len() <= INLINE_STOP_IDS {
+            let mut inline = [0; INLINE_STOP_IDS];
+            for (slot, &id) in inline.iter_mut().zip(ids) {
+                *slot = id;
+            }
+            inline[..ids.len()].sort_unstable();
+            Self::Inline {
+                len: ids.len(),
+                ids: inline,
+            }
+        } else {
+            let mut sorted: Vec<TokenIdType> = ids.iter().copied().collect();
+            sorted.sort_unstable();
+            Self::Heap(sorted.into_boxed_slice())
+        }
+    }
+
+    fn contains(&self, id: TokenIdType) -> bool {
+        let ids = match self {
+            Self::Inline { len, ids } => &ids[..*len],
+            Self::Heap(ids) => &ids[..],
+        };
+        ids.binary_search(&id).is_ok()
+    }
+}
+
 /// Builder for StopSequenceDecoder
 pub struct StopSequenceDecoderBuilder {
     tokenizer: Arc<dyn traits::Tokenizer>,
@@ -535,9 +586,9 @@ impl StopSequenceDecoderBuilder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::HashSet, sync::Arc};
 
-    use super::{SequenceDecoderStep, StopSequenceDecoderBuilder};
+    use super::{SequenceDecoderStep, StopIds, StopSequenceDecoderBuilder, INLINE_STOP_IDS};
     use crate::{
         mock::MockTokenizer, SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder,
     };
@@ -1180,5 +1231,24 @@ mod tests {
             assert_eq!(appended, owned_text, "{config:?}: after finish");
             assert_eq!(appending.matched_stop(), owned.matched_stop(), "{config:?}");
         }
+    }
+
+    #[test]
+    fn stop_ids_answer_membership_inline_and_on_the_heap() {
+        let few: HashSet<u32> = [7, 3, 11].into_iter().collect();
+        let ids = StopIds::new(&few);
+        assert!(matches!(ids, StopIds::Inline { len: 3, .. }));
+        assert!(ids.contains(3) && ids.contains(7) && ids.contains(11));
+        assert!(!ids.contains(0) && !ids.contains(5) && !ids.contains(12));
+
+        let none = StopIds::new(&HashSet::new());
+        assert!(matches!(none, StopIds::Inline { len: 0, .. }));
+        assert!(!none.contains(0));
+
+        let many: HashSet<u32> = (0..=INLINE_STOP_IDS as u32).map(|i| i * 10).collect();
+        let ids = StopIds::new(&many);
+        assert!(matches!(ids, StopIds::Heap(_)));
+        assert!(ids.contains(0) && ids.contains(INLINE_STOP_IDS as u32 * 10));
+        assert!(!ids.contains(5));
     }
 }
