@@ -183,6 +183,20 @@ pub enum FrameSampling {
         max_frames: usize,
         rate_max_frames: usize,
     },
+    /// `trunc(duration x rate)` frames, at most `max_frames`, by a walk over
+    /// the clip that takes one frame each time the stream's clock reaches the
+    /// next instant `1 / (temporal_patch_size x rate)` seconds on, up to the
+    /// clip's whole seconds, re-spread by `numpy.linspace(0, n - 1, count)`
+    /// truncated to integers where the walk took too many (the usual case) or
+    /// by `linspace(first, last, count)` where too few; a clip with fewer
+    /// frames than the count takes `floor(i x n / count)`; each distinct pick
+    /// once, in order ([`rate_walk_frame_indices`]). The rule of the GLM-5
+    /// family's own video loader, which samples a clip before its processor
+    /// sees it; the processor pads an odd count by repeating the last frame.
+    RateWalk {
+        max_frames: usize,
+        temporal_patch_size: usize,
+    },
     /// `trunc(duration x rate)` frames, at most `max_frames` and never more
     /// than the clip has, aligned down to a multiple of `frame_factor` (and
     /// never below it unless the clip is shorter), at the positions of
@@ -203,7 +217,8 @@ impl FrameSampling {
     /// place of its own constant, so a clip costs what it costs on the
     /// engine's own server; `0` is every frame, as vLLM reads a non-positive
     /// count. The rate-based samplers are not the loader's and keep their
-    /// rule; `None` leaves the spec's choice.
+    /// rule, and the rate walk's loader reads no frame budget; `None` leaves
+    /// the spec's choice.
     pub fn with_frame_budget(self, budget: Option<usize>) -> Self {
         match (self, budget) {
             (Self::UpTo { .. }, Some(0)) => Self::UpTo {
@@ -230,6 +245,16 @@ impl FrameSampling {
             },
             (sampling, _) => sampling,
         }
+    }
+
+    /// Whether the rule samples the way the engine's loader does, over the
+    /// length the container claims (cut to the stream's own where that runs
+    /// shorter) rather than over the decoded frame count.
+    pub(crate) fn follows_the_loader(self) -> bool {
+        matches!(
+            self,
+            Self::UpTo { .. } | Self::UpToThenRate { .. } | Self::RateWalk { .. }
+        )
     }
 }
 
@@ -1728,6 +1753,16 @@ pub fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfi
             fps,
             cfg,
         ),
+        FrameSampling::RateWalk {
+            max_frames,
+            temporal_patch_size,
+        } => rate_walk_frame_indices(
+            total_frames,
+            fps,
+            cfg.sample_fps,
+            max_frames,
+            temporal_patch_size,
+        ),
         _ if total_frames == 0 => Vec::new(),
         FrameSampling::Even => even_frame_indices(total_frames, fps, cfg),
         FrameSampling::EvenRounded => even_rounded_frame_indices(total_frames, fps, cfg),
@@ -1821,14 +1856,62 @@ fn loader_frame_total(claimed: usize, visible: usize) -> usize {
 /// The loader's picks for such a container: its rule over the length it
 /// works with, less the frames past the end its sequential read never gets.
 fn loader_frame_indices(claimed: usize, visible: usize, max_frames: usize) -> Vec<usize> {
-    let indices = up_to_frame_indices(loader_frame_total(claimed, visible), max_frames);
+    read_before_the_end(
+        up_to_frame_indices(loader_frame_total(claimed, visible), max_frames),
+        claimed,
+        visible,
+    )
+}
+
+/// `picks` less the frames past the end a loader's read never gets, for a
+/// container claiming `claimed` frames of which `visible` can be read.
+fn read_before_the_end(picks: Vec<usize>, claimed: usize, visible: usize) -> Vec<usize> {
     if visible >= claimed {
-        return indices;
+        return picks;
     }
-    indices
-        .into_iter()
-        .filter(|index| *index < visible)
-        .collect()
+    picks.into_iter().filter(|index| *index < visible).collect()
+}
+
+/// The frames the engine's loader hands its processor for such a container
+/// under `cfg`'s rule ([`FrameSampling::follows_the_loader`]): the length the
+/// loader works with and the rule's picks over it, less the frames past the
+/// end; any other rule's picks over that length.
+fn loader_frames(
+    claimed: usize,
+    visible: usize,
+    fps: f64,
+    cfg: VideoFetchConfig,
+) -> (usize, Vec<usize>) {
+    let total_frames = loader_frame_total(claimed, visible);
+    let picks = match cfg.sampling {
+        FrameSampling::RateWalk {
+            max_frames,
+            temporal_patch_size,
+        } => read_before_the_end(
+            rate_walk_frame_indices(
+                total_frames,
+                fps,
+                cfg.sample_fps,
+                max_frames,
+                temporal_patch_size,
+            ),
+            claimed,
+            visible,
+        ),
+        FrameSampling::UpTo { max_frames } | FrameSampling::UpToThenRate { max_frames, .. } => {
+            resampled_after_loader(
+                loader_frame_indices(claimed, visible, max_frames),
+                total_frames,
+                fps,
+                cfg,
+            )
+        }
+        FrameSampling::Even
+        | FrameSampling::EvenRounded
+        | FrameSampling::Interval
+        | FrameSampling::TemporalGroups { .. } => sampled_frame_indices(total_frames, fps, cfg),
+    };
+    (total_frames, picks)
 }
 
 /// The loader's `picks` of a clip of `total_frames` at `fps`, resampled by
@@ -1909,6 +1992,93 @@ fn glm5_next_frame_indices(
         picks.push(last_pick);
     }
     Some(picks)
+}
+
+/// The GLM-5 family's own video loader rule over a clip of `total_frames` at
+/// `fps`, at `rate` frames a second, at most `max_frames`, with the clip's
+/// duration taken as `total_frames / fps` as the loader reports it (a clip
+/// claiming no frames is given `round(-1 / fps) + 1` seconds, ties to even,
+/// as the reference falls back): `trunc(duration x rate)` frames; a walk that
+/// takes one frame each time the stream's clock, `index x (1 / fps)`, reaches
+/// the next instant `1 / (temporal_patch_size x rate)` seconds on, until the
+/// instant reaches the clip's whole seconds; then numpy's `linspace(0, n - 1,
+/// count)` truncated to integers where the walk took too many (the usual
+/// case: it runs at a multiple of the rate), `linspace(first, last, count)`
+/// where too few; a clip with fewer frames than the count takes `floor(i x n
+/// / count)`. Each distinct pick once, ascending: the loader reads a frame
+/// once however often the rule names it (the reference's repeat of an odd
+/// last pick included), and the processor pads an odd count itself. Empty
+/// when the rule picks nothing (a clip shorter than half a sampling interval)
+/// or the clip's rate is unusable.
+fn rate_walk_frame_indices(
+    total_frames: usize,
+    fps: f64,
+    rate: f64,
+    max_frames: usize,
+    temporal_patch_size: usize,
+) -> Vec<usize> {
+    if !(fps.is_finite() && fps > 0.0)
+        || !(rate.is_finite() && rate > 0.0)
+        || temporal_patch_size == 0
+    {
+        return Vec::new();
+    }
+    let last = total_frames.saturating_sub(1) as f64;
+    let mut duration = total_frames as f64 / fps;
+    if duration == 0.0 {
+        duration = ((total_frames as f64 - 1.0) / fps).round_ties_even() + 1.0;
+    }
+    let count = ((duration * rate) as usize).min(max_frames);
+    let duration_per_frame = 1.0 / fps;
+    let max_second = duration.trunc();
+    let mut picks: Vec<usize> = if total_frames < count {
+        (0..count)
+            .map(|index| index * total_frames / count)
+            .collect()
+    } else {
+        let interval = 1.0 / (temporal_patch_size as f64 * rate);
+        let mut current_second = 0.0;
+        let mut picks = Vec::new();
+        // The reference scans every frame for the first whose clock reads
+        // `current_second` or later. The clock, `index x duration_per_frame`,
+        // is monotone in the index, so that frame is found from the index the
+        // division names, stepped to the exact predicate, and the walk costs
+        // its picks rather than the frames a container claims (billions, for
+        // a forged header). Once it holds more picks than the count the
+        // outcome is decided (the re-spread below), so it ends there too.
+        let mut index = 0;
+        while index < total_frames {
+            let mut pick = ((current_second / duration_per_frame) as usize).max(index);
+            while pick > index && (pick - 1) as f64 * duration_per_frame >= current_second {
+                pick -= 1;
+            }
+            while pick < total_frames && (pick as f64) * duration_per_frame < current_second {
+                pick += 1;
+            }
+            if pick >= total_frames {
+                break;
+            }
+            current_second += interval;
+            picks.push(pick);
+            if current_second >= max_second || picks.len() > count {
+                break;
+            }
+            index = pick + 1;
+        }
+        picks
+    };
+    if picks.len() < count {
+        let (start, end) = match (picks.first(), picks.last()) {
+            (Some(&start), Some(&end)) => (start as f64, end as f64),
+            _ => (0.0, last),
+        };
+        picks = numpy_linspace_indices(start, end, count);
+    } else if picks.len() > count {
+        picks = numpy_linspace_indices(0.0, last, count);
+    }
+    picks.sort_unstable();
+    picks.dedup();
+    picks
 }
 
 /// `numpy.linspace(start, end, count, dtype=int)`: `i * step`, then `+ start`
@@ -2073,6 +2243,29 @@ fn opencv_decode_error(err: opencv::Error) -> MediaConnectorError {
     MediaConnectorError::VideoDecode(format!("OpenCV video decode failed: {err}"))
 }
 
+/// Why a probed clip is refused before any decode: the rate walk picks no
+/// frame of a clip shorter than half a sampling interval (nor of a container
+/// claiming no frames at a low rate), and the engine's own loader hands its
+/// processor no frame of such a clip either, so the generic resampler must
+/// not stand in for the family's rule. `None` under any other rule, when the
+/// probe stated no rate, and whenever the rule picks a frame.
+fn refused_by_the_familys_rule(metadata: VideoMetadata, cfg: VideoFetchConfig) -> Option<String> {
+    if !matches!(cfg.sampling, FrameSampling::RateWalk { .. }) {
+        return None;
+    }
+    let source_fps = metadata.source_fps?;
+    let claimed = metadata.container_frames.unwrap_or(0);
+    let visible = metadata.total_frames.unwrap_or(claimed);
+    let (total_frames, picks) = loader_frames(claimed, visible, source_fps, cfg);
+    picks.is_empty().then(|| {
+        format!(
+            "the model's video sampling picks no frame of a clip of {total_frames} frames at \
+             {source_fps} fps: shorter than half a sampling interval at {} frames a second",
+            cfg.sample_fps
+        )
+    })
+}
+
 async fn decode_video_with_ffmpeg(
     input_path: &Path,
     input_bytes: usize,
@@ -2081,6 +2274,9 @@ async fn decode_video_with_ffmpeg(
     // A probe that fails leaves the clip to the metadata-less runner, which
     // reads the stream as it comes.
     let metadata = probe_video_metadata(input_path).await.ok();
+    if let Some(reason) = metadata.and_then(|probed| refused_by_the_familys_rule(probed, cfg)) {
+        return Err(MediaConnectorError::VideoDecode(reason));
+    }
     let Some((mut probed, selection)) = metadata.and_then(|probed| {
         FrameSelection::from_metadata(probed, cfg).map(|selection| (probed, selection))
     }) else {
@@ -2180,10 +2376,7 @@ async fn decode_video_with_ffmpeg(
     // A container claiming more frames than its stream holds leaves the
     // selection short. The engine's loader then sizes the clip by the frames
     // it can see; the rate-based samplings resample instead.
-    if matches!(
-        cfg.sampling,
-        FrameSampling::UpTo { .. } | FrameSampling::UpToThenRate { .. }
-    ) {
+    if cfg.sampling.follows_the_loader() {
         if let Some(resized) = probe_decoded_frame_count(input_path)
             .await
             .ok()
@@ -3385,37 +3578,24 @@ struct FrameSelection {
 
 impl FrameSelection {
     /// `None` unless ffprobe reported a frame rate and, for the rate-based
-    /// samplings, a frame count. `UpTo` follows the engine's loader instead:
-    /// the frames the container claims, cut down to the stream's own length
-    /// where the container runs longer, and the first frame alone when the
-    /// container claims none.
+    /// samplings, a frame count. A rule that follows the engine's loader reads
+    /// the container instead: the frames it claims, cut down to the stream's
+    /// own length where the container runs longer, and, for the generic
+    /// loader, the first frame alone when the container claims none; `None`
+    /// as well when the rate walk picks nothing, which its decode refuses
+    /// beforehand ([`refused_by_the_familys_rule`]).
     fn from_metadata(metadata: VideoMetadata, cfg: VideoFetchConfig) -> Option<Self> {
         let source_fps = metadata.source_fps?;
-        let (total_frames, frame_indices) = match cfg.sampling {
-            FrameSampling::UpTo { max_frames } | FrameSampling::UpToThenRate { max_frames, .. } => {
-                let claimed = metadata.container_frames.unwrap_or(0);
-                let visible = metadata.total_frames.unwrap_or(claimed);
-                let total_frames = loader_frame_total(claimed, visible);
-                (
-                    total_frames,
-                    resampled_after_loader(
-                        loader_frame_indices(claimed, visible, max_frames),
-                        total_frames,
-                        source_fps,
-                        cfg,
-                    ),
-                )
-            }
-            FrameSampling::Even
-            | FrameSampling::EvenRounded
-            | FrameSampling::Interval
-            | FrameSampling::TemporalGroups { .. } => {
-                let total_frames = metadata.total_frames.filter(|total| *total > 0)?;
-                (
-                    total_frames,
-                    sampled_frame_indices(total_frames, source_fps, cfg),
-                )
-            }
+        let (total_frames, frame_indices) = if cfg.sampling.follows_the_loader() {
+            let claimed = metadata.container_frames.unwrap_or(0);
+            let visible = metadata.total_frames.unwrap_or(claimed);
+            loader_frames(claimed, visible, source_fps, cfg)
+        } else {
+            let total_frames = metadata.total_frames.filter(|total| *total > 0)?;
+            (
+                total_frames,
+                sampled_frame_indices(total_frames, source_fps, cfg),
+            )
         };
         if frame_indices.is_empty() {
             return None;
@@ -3436,18 +3616,11 @@ impl FrameSelection {
     /// The selection once the stream turns out to hold `visible` frames,
     /// `None` when that changes nothing or the sampling is rate-based.
     fn sized_to_visible(&self, visible: usize, cfg: VideoFetchConfig) -> Option<Self> {
-        let (FrameSampling::UpTo { max_frames } | FrameSampling::UpToThenRate { max_frames, .. }) =
-            cfg.sampling
-        else {
+        if !cfg.sampling.follows_the_loader() {
             return None;
-        };
-        let total_frames = loader_frame_total(self.total_frames, visible);
-        let frame_indices = resampled_after_loader(
-            loader_frame_indices(self.total_frames, visible, max_frames),
-            total_frames,
-            self.source_fps,
-            cfg,
-        );
+        }
+        let (total_frames, frame_indices) =
+            loader_frames(self.total_frames, visible, self.source_fps, cfg);
         if frame_indices.is_empty() || frame_indices == self.frame_indices {
             return None;
         }
@@ -4985,6 +5158,156 @@ mod video_sampling_tests {
                 max_frames: 16,
                 rate_max_frames: 2048
             }
+        );
+    }
+
+    fn rate_walk_cfg(sample_fps: f64, max_frames: usize) -> VideoFetchConfig {
+        VideoFetchConfig {
+            sample_fps,
+            sampling: FrameSampling::RateWalk {
+                max_frames,
+                temporal_patch_size: 2,
+            },
+            ..VideoFetchConfig::default()
+        }
+    }
+
+    /// The GLM-5 family's own loader rule: the expected picks are the engine's
+    /// own sampler's for each clip (`total_frames`, `fps`, rate, cap), each
+    /// distinct pick once as its read hands them on. The first three are the
+    /// clips measured against the engine's own server.
+    #[test]
+    fn rate_walk_picks_what_the_familys_loader_picks() {
+        let cases: &[(usize, f64, f64, usize, &[usize])] = &[
+            (32, 8.0, 2.0, 2048, &[0, 4, 8, 13, 17, 22, 26, 31]),
+            (50, 10.0, 2.0, 2048, &[0, 5, 10, 16, 21, 27, 32, 38, 43, 49]),
+            (36, 12.0, 2.0, 2048, &[0, 7, 14, 21, 28, 35]),
+            (
+                278,
+                30.0,
+                2.0,
+                2048,
+                &[
+                    0, 16, 32, 48, 65, 81, 97, 114, 130, 146, 162, 179, 195, 211, 228, 244, 260,
+                    277,
+                ],
+            ),
+            // Fewer frames than the count: `floor(i x n / count)`, every frame
+            // once; and a source at the rate itself, where the walk takes each
+            // frame.
+            (7, 1.0, 2.0, 2048, &[0, 1, 2, 3, 4, 5, 6]),
+            (3, 1.0, 2.0, 2048, &[0, 1, 2]),
+            (12, 2.0, 2.0, 2048, &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]),
+            (2, 2.0, 2.0, 2048, &[0, 1]),
+            // An odd count stays odd (the reference's repeat of the last pick
+            // never reaches the processor, which pads it).
+            (28, 8.0, 2.0, 2048, &[0, 4, 9, 13, 18, 22, 27]),
+            // Non-integer source rates.
+            (58, 29.97, 2.0, 2048, &[0, 28, 57]),
+            (24, 23.976, 2.0, 2048, &[0, 23]),
+            (30, 30.0, 2.0, 2048, &[0, 29]),
+            (300, 29.97, 0.7, 2048, &[0, 49, 99, 149, 199, 249, 299]),
+            // The cap on the count: 32 frames at 1 fps ask for 64, 16 of them
+            // by `linspace(0, 31, 16)`; 60 at 30 fps ask for 4 under a cap of 8.
+            (
+                32,
+                1.0,
+                2.0,
+                16,
+                &[0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 31],
+            ),
+            (60, 30.0, 2.0, 8, &[0, 19, 39, 59]),
+            // Request rates: a walk at 1 / (2 x 0.3) seconds over 20 frames
+            // at 3 fps, re-spread to two; a sub-second clip at 5 a second
+            // under-collects and is re-spread onto its one frame.
+            (20, 3.0, 0.3, 2048, &[0, 19]),
+            (20, 30.0, 5.0, 2048, &[0]),
+            // A clip shorter than half a sampling interval picks nothing.
+            (5, 24.0, 2.0, 2048, &[]),
+            (1, 30.0, 2.0, 2048, &[]),
+            // A container claiming no frames: the reference's one-second
+            // fallback picks the first frame; at 1 fps it picks nothing.
+            (0, 8.0, 2.0, 2048, &[0]),
+            (0, 1.0, 2.0, 2048, &[]),
+        ];
+        for &(total, fps, rate, cap, expected) in cases {
+            assert_eq!(
+                sampled_frame_indices(total, fps, rate_walk_cfg(rate, cap)),
+                expected,
+                "{total} frames at {fps} fps, sampled at {rate}, at most {cap}"
+            );
+        }
+        assert!(rate_walk_frame_indices(32, 0.0, 2.0, 2048, 2).is_empty());
+        assert!(rate_walk_frame_indices(32, 8.0, 0.0, 2048, 2).is_empty());
+        assert!(rate_walk_frame_indices(32, 8.0, 2.0, 2048, 0).is_empty());
+        // A forged header claiming billions of frames costs the picks, not
+        // the frames: at 1 fps every frame passes the walk, which ends once
+        // it holds more picks than the count; at a billion fps the walk jumps
+        // a quarter of a billion frames per pick. Both answer in microseconds.
+        let started = Instant::now();
+        let forged = rate_walk_frame_indices(u32::MAX as usize, 1.0, 2.0, 2048, 2);
+        assert_eq!(
+            forged,
+            numpy_linspace_indices(0.0, (u32::MAX - 1) as f64, 2048)
+        );
+        assert_eq!(forged.len(), 2048);
+        assert_eq!(
+            rate_walk_frame_indices(4_000_000_000, 1.0e9, 2.0, 2048, 2),
+            numpy_linspace_indices(0.0, 3_999_999_999.0, 8)
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // The loader's frame budget is not a factor for this rule.
+        let walk = FrameSampling::RateWalk {
+            max_frames: 2048,
+            temporal_patch_size: 2,
+        };
+        assert_eq!(walk.with_frame_budget(Some(16)), walk);
+        assert_eq!(walk.with_frame_budget(Some(0)), walk);
+        assert!(walk.follows_the_loader());
+        assert!(!FrameSampling::EvenRounded.follows_the_loader());
+    }
+
+    /// A clip the family's rule picks nothing of is refused before any
+    /// decode, with the clip's numbers in the reason; a clip it samples, a
+    /// clip whose rate the probe did not state, and any other rule pass.
+    #[test]
+    fn a_clip_the_rate_walk_picks_nothing_of_is_refused_before_the_decode() {
+        let probed = |fps, frames| VideoMetadata {
+            width: 64,
+            height: 48,
+            duration_seconds: None,
+            source_fps: fps,
+            total_frames: frames,
+            container_frames: frames,
+            from_container: false,
+        };
+        let reason =
+            refused_by_the_familys_rule(probed(Some(24.0), Some(5)), rate_walk_cfg(2.0, 2048))
+                .expect("refused");
+        assert!(reason.contains("5 frames at 24 fps"), "{reason}");
+        assert!(
+            refused_by_the_familys_rule(probed(Some(1.0), Some(0)), rate_walk_cfg(2.0, 2048))
+                .is_some()
+        );
+        assert_eq!(
+            refused_by_the_familys_rule(probed(Some(8.0), Some(32)), rate_walk_cfg(2.0, 2048)),
+            None
+        );
+        assert_eq!(
+            refused_by_the_familys_rule(probed(Some(8.0), Some(0)), rate_walk_cfg(2.0, 2048)),
+            None
+        );
+        assert_eq!(
+            refused_by_the_familys_rule(probed(None, Some(5)), rate_walk_cfg(2.0, 2048)),
+            None
+        );
+        let even_rounded = VideoFetchConfig {
+            sampling: FrameSampling::EvenRounded,
+            ..VideoFetchConfig::default()
+        };
+        assert_eq!(
+            refused_by_the_familys_rule(probed(Some(24.0), Some(5)), even_rounded),
+            None
         );
     }
 

@@ -140,6 +140,14 @@ pub fn hash_video_with_sampling(
             hasher.update(&(max_frames as u64).to_le_bytes());
             hasher.update(&(rate_max_frames as u64).to_le_bytes());
         }
+        FrameSampling::RateWalk {
+            max_frames,
+            temporal_patch_size,
+        } => {
+            hasher.update(&[6]);
+            hasher.update(&(max_frames as u64).to_le_bytes());
+            hasher.update(&(temporal_patch_size as u64).to_le_bytes());
+        }
     }
     hasher.finalize().to_hex().to_string()
 }
@@ -262,6 +270,28 @@ mod video_sampling_hash_tests {
             hash_video_with_sampling(CLIP, 2.0, None, FrameSampling::Interval)
         );
         assert_eq!(up_to(32), up_to(32));
+    }
+
+    #[test]
+    fn the_rate_walk_hashes_apart_from_the_loader_budget_sharing_its_count() {
+        let walk = |max_frames, temporal_patch_size| {
+            hash_video_with_sampling(
+                CLIP,
+                2.0,
+                None,
+                FrameSampling::RateWalk {
+                    max_frames,
+                    temporal_patch_size,
+                },
+            )
+        };
+        assert_ne!(
+            walk(32, 2),
+            hash_video_with_sampling(CLIP, 2.0, None, FrameSampling::UpTo { max_frames: 32 })
+        );
+        assert_ne!(walk(2048, 2), walk(16, 2));
+        assert_ne!(walk(2048, 2), walk(2048, 1));
+        assert_eq!(walk(2048, 2), walk(2048, 2));
     }
 
     #[test]
