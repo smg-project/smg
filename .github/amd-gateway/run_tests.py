@@ -97,12 +97,20 @@ class Reports:
                 require(all(r["outcome"] == "passed" for r in reports), "case failure")
         cases = list(ET.parse(junit).getroot().iter("testcase"))
         require(len(cases) == len(recipe["cases"]), "JUnit missing/duplicate cases")
-        expected = set()
+        expected = {}
         for nodeid in recipe["cases"]:
             module, cls, name = nodeid.split("::", 2)
-            expected.add((module.removesuffix(".py").replace("/", ".") + "." + cls, name))
+            key = (module.removesuffix(".py").replace("/", ".") + "." + cls, name)
+            expected[key] = self.items[nodeid][0]["outcome"] == "skipped"
         actual = {(c.get("classname"), c.get("name")) for c in cases}
-        require(actual == expected, "JUnit case identity")
+        require(actual == set(expected), "JUnit case identity")
+        require(
+            all(
+                (c.find("skipped") is not None) == expected[(c.get("classname"), c.get("name"))]
+                for c in cases
+            ),
+            "JUnit skip status differs from terminal reports",
+        )
         require(
             not any(c.find("failure") is not None or c.find("error") is not None for c in cases),
             "JUnit failure",
