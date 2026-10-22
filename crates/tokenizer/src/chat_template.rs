@@ -846,7 +846,7 @@ pub struct ChatTemplateParams<'a> {
     pub thinking: Option<bool>,
     /// The instant the template's `strftime_now` writes, for a render that
     /// must come out the same each time; `None` is the clock (see
-    /// [`render_instant`]).
+    /// `render_instant`).
     pub now: Option<DateTime<FixedOffset>>,
     /// Leave the final message open for the model to continue, as
     /// transformers' `continue_final_message` does: the conversation is

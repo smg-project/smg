@@ -1413,11 +1413,11 @@ impl Decoder for HuggingFaceTokenizer {
     }
 
     /// Native incremental decode (the raw step: a recovery here is not counted,
-    /// see [`Self::step_decode_lenient`]): the algorithm of the HF `step_decode_stream`
+    /// see `Self::step_decode_lenient`): the algorithm of the HF `step_decode_stream`
     /// (hold while the decode ends in an incomplete character, emit what grew
     /// beyond the emitted prefix), run through the concrete `TokenizerImpl`
     /// rather than `dyn Decoder` dispatch, and lenient when the decoder chain
-    /// rewrites text already emitted (see [`Self::step_decode_lenient`]).
+    /// rewrites text already emitted (see `Self::step_decode_lenient`).
     ///
     /// A ByteFallback vocabulary streams the complete characters of a byte run
     /// as they close, like the serving engines' own detokenizers; only an

@@ -524,7 +524,7 @@ impl L1Cache {
 
     /// Insert prefix entries at all special token boundaries (incremental hashing
     /// and tokenization, O(N)). The miss path of [`super::CachedTokenizer`] instead
-    /// uses [`Self::populate_with_seeds`], which reuses this per-segment work to also
+    /// uses `Self::populate_with_seeds`, which reuses this per-segment work to also
     /// return the full encoding.
     pub fn insert_at_boundaries<E: Encoder + ?Sized>(
         &self,
@@ -550,7 +550,7 @@ impl L1Cache {
     /// to an uncached `encode(input, add_special_tokens)`: the segments are
     /// encoded in context and the frame the flag adds goes around the whole.
     /// A request with the flag is served by the plain encode, uncached, when
-    /// the frame cannot be read off the tokenizer ([`SpecialTokenFrame::probe`]).
+    /// the frame cannot be read off the tokenizer (`SpecialTokenFrame::probe`).
     pub fn populate_and_encode<E: Encoder + ?Sized>(
         &self,
         input: &str,

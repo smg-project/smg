@@ -778,7 +778,7 @@ impl Decoder for TiktokenTokenizer {
     /// pending-bytes buffer: no window re-decoded per token, and a character
     /// that merely spans tokens is held back, not a decode failure. An id the
     /// vocabulary lacks fails the stream, as `decode` fails on it. A
-    /// vocabulary without the table (see [`MAX_BYTE_LEVEL_TABLE_IDS`]) streams
+    /// vocabulary without the table (see `MAX_BYTE_LEVEL_TABLE_IDS`) streams
     /// through the generic decoder.
     fn incremental_decoder(
         &self,
