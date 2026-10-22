@@ -19,6 +19,6 @@ python3 -c 'import vllm, msgspec, zmq, torch; assert torch.version.hip; print(vl
 python3 -m pytest -q grpc_servicer/tests -p no:cacheprovider -rs --junitxml=diagnostic-results/servicer-engine.xml
 python3 .github/amd-qa/closure_audit.py require-vllm diagnostic-results/servicer-engine.xml
 python3 -m pip freeze > diagnostic-results/pip-freeze.txt
-for suite in completions embeddings router; do
-    python3 .github/amd-vllm-mm-worker/run_tests.py "$suite"
-done
+python3 .github/amd-vllm-mm-worker/preflight.py
+# The 15-second kill grace is inside the original 20-minute test limit.
+timeout --signal=INT --kill-after=15s 1185s python3 .github/amd-vllm-mm-worker/run_tests.py

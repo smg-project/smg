@@ -1,89 +1,18 @@
 {
-  "completions": {
-    "min_selected": 15,
+  "multimodal": {
     "models": [
-      "meta-llama/Llama-3.1-8B-Instruct"
+      "Qwen/Qwen3-VL-8B-Instruct"
     ],
+    "test_dir": "e2e_test/chat_completions/test_multimodal.py",
+    "min_selected": 5,
     "cases": [
-      "completions/test_basic.py::TestCompletionBasic::test_non_streaming_basic[grpc]",
-      "completions/test_basic.py::TestCompletionBasic::test_non_streaming_echo[grpc]",
-      "completions/test_basic.py::TestCompletionBasic::test_non_streaming_echo_max_tokens_zero[grpc]",
-      "completions/test_basic.py::TestCompletionBasic::test_non_streaming_max_tokens[grpc]",
-      "completions/test_basic.py::TestCompletionBasic::test_non_streaming_parallel_sampling[1-grpc]",
-      "completions/test_basic.py::TestCompletionBasic::test_non_streaming_parallel_sampling[2-grpc]",
-      "completions/test_basic.py::TestCompletionBasic::test_non_streaming_stop_sequence[grpc]",
-      "completions/test_basic.py::TestCompletionBasic::test_non_streaming_suffix[grpc]",
-      "completions/test_basic.py::TestCompletionBasic::test_non_streaming_usage[grpc]",
-      "completions/test_basic.py::TestCompletionBasic::test_rid_becomes_response_id[grpc]",
-      "completions/test_basic.py::TestCompletionBatch::test_batch_echo_maps_prompts_to_choices[grpc]",
-      "completions/test_basic.py::TestCompletionBatch::test_batch_non_streaming[grpc]",
-      "completions/test_basic.py::TestCompletionBatch::test_batch_non_streaming_with_n[grpc]",
-      "completions/test_basic.py::TestCompletionBatch::test_batch_rid_is_shared_response_id[grpc]",
-      "completions/test_basic.py::TestCompletionBatch::test_batch_streaming[grpc]",
-      "completions/test_basic.py::TestCompletionStreaming::test_streaming_basic[grpc]",
-      "completions/test_basic.py::TestCompletionStreaming::test_streaming_collects_full_text[grpc]",
-      "completions/test_basic.py::TestCompletionStreaming::test_streaming_echo_max_tokens_zero[grpc]",
-      "completions/test_basic.py::TestCompletionStreaming::test_streaming_stop_sequence[grpc]"
-    ],
-    "allowed_skips": {
-      "completions/test_basic.py::TestCompletionBasic::test_non_streaming_echo_max_tokens_zero[grpc]": "vLLM rejects max_tokens=0",
-      "completions/test_basic.py::TestCompletionStreaming::test_streaming_echo_max_tokens_zero[grpc]": "vLLM rejects max_tokens=0"
-    }
-  },
-  "embeddings": {
-    "min_selected": 20,
-    "models": [
-      "Qwen/Qwen3-Embedding-0.6B"
-    ],
-    "cases": [
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_batch[openai-grpc]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_batch[smg-grpc]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_dimensions_consistent[openai-grpc]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_dimensions_consistent[smg-grpc]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_empty_string[openai-grpc]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_empty_string[smg-grpc]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_single[openai-grpc]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_single[smg-grpc]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_unicode[openai-grpc]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_unicode[smg-grpc]",
-      "embeddings/test_correctness.py::TestEmbeddingCorrectness::test_relevance_scores[grpc]",
-      "embeddings/test_correctness.py::TestEmbeddingCorrectness::test_semantic_similarity[grpc]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_batch[openai-http]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_batch[smg-http]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_dimensions_consistent[openai-http]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_dimensions_consistent[smg-http]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_empty_string[openai-http]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_empty_string[smg-http]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_single[openai-http]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_single[smg-http]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_unicode[openai-http]",
-      "embeddings/test_basic.py::TestEmbeddingBasic::test_embedding_unicode[smg-http]",
-      "embeddings/test_correctness.py::TestEmbeddingCorrectness::test_relevance_scores[http]",
-      "embeddings/test_correctness.py::TestEmbeddingCorrectness::test_semantic_similarity[http]"
+      "chat_completions/test_multimodal.py::TestMultimodalQwen3VL::test_multi_images_mixed[grpc]",
+      "chat_completions/test_multimodal.py::TestMultimodalQwen3VL::test_processing_location_matches_lane[grpc]",
+      "chat_completions/test_multimodal.py::TestMultimodalQwen3VL::test_single_image_base64[non_streaming-grpc]",
+      "chat_completions/test_multimodal.py::TestMultimodalQwen3VL::test_single_image_base64[streaming-grpc]",
+      "chat_completions/test_multimodal.py::TestMultimodalQwen3VL::test_single_image_url[non_streaming-grpc]",
+      "chat_completions/test_multimodal.py::TestMultimodalQwen3VL::test_single_image_url[streaming-grpc]"
     ],
     "allowed_skips": {}
-  },
-  "router": {
-    "product_head": "9a5c23d632a5e9e7430155b36727892776a66a73",
-    "min_selected": 3,
-    "models": [
-      "meta-llama/Llama-3.1-8B-Instruct"
-    ],
-    "cases": [
-      "router/test_worker_api.py::TestDisableHealthCheck::test_disable_health_check_gateway_starts_without_health_checker",
-      "router/test_worker_api.py::TestDisableHealthCheck::test_disable_health_check_workers_immediately_healthy",
-      "router/test_admin_ops.py::TestFlushCacheVllm::test_flush_cache_full_cycle[grpc]",
-      "router/test_loads.py::TestWorkerLoadReports::test_every_worker_reports_load[grpc]",
-      "router/test_loads.py::TestWorkerLoadReports::test_report_reflects_in_flight_requests[grpc]",
-      "router/test_mmlu.py::TestMMLUGrpc::test_mmlu_basic[grpc]",
-      "router/test_context_length.py::TestRegularContextLength::test_over_long_prompt_is_a_400_context_length_exceeded[grpc]",
-      "router/test_context_length.py::TestRegularContextLength::test_over_long_streaming_prompt_is_a_json_400[grpc]",
-      "router/test_context_length.py::TestRegularContextLength::test_prompt_within_the_window_is_served[grpc]",
-      "router/test_context_length.py::TestRegularContextLength::test_workers_still_healthy_after_rejection[grpc]"
-    ],
-    "allowed_skips": {
-      "router/test_worker_api.py::TestDisableHealthCheck::test_disable_health_check_gateway_starts_without_health_checker": "vLLM does not support HTTP mode",
-      "router/test_worker_api.py::TestDisableHealthCheck::test_disable_health_check_workers_immediately_healthy": "vLLM does not support HTTP mode"
-    }
   }
 }

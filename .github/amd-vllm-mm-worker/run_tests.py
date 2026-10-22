@@ -1,12 +1,7 @@
-"""Run one complete original vLLM suite using recorded cached inputs and terminal reports."""
+"""Run every original worker-side multimodal case and verify all terminal phases."""
 
-import argparse
-import hashlib
-import importlib
 import json
 import os
-import re
-import urllib.request
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -16,55 +11,6 @@ from reuse import require
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "diagnostic-results"
 CASES = Path(__file__).with_name("cases.json")
-DATA_URL = "https://openaipublic.blob.core.windows.net/simple-evals/mmlu.csv"
-
-
-def cached_models(specs, cache):
-    records = []
-    for name, resolved in specs.items():
-        directory = cache / ("models--" + name.replace("/", "--"))
-        revision = (directory / "refs/main").read_text().strip()
-        require(re.fullmatch(r"[0-9a-f]{40}", revision), "unknown model revision")
-        snapshot = directory / "snapshots" / revision
-        require(resolved == name or Path(resolved).resolve() == snapshot.resolve(), "model path")
-        config = snapshot / "config.json"
-        index = snapshot / "model.safetensors.index.json"
-        names = (
-            set(json.loads(index.read_text())["weight_map"].values())
-            if index.is_file()
-            else {"model.safetensors"}
-        )
-        require(names and all(Path(n).name == n for n in names), "unsafe/empty model shard list")
-        for path in [config, *(snapshot / name for name in names)]:
-            require(path.is_file() and path.stat().st_size > 0, "missing cached model file")
-            require(path.resolve().is_relative_to(cache.resolve()), "model file escapes cache")
-        records.append(
-            {
-                "model": name,
-                "snapshot": revision,
-                "shards": sorted(names),
-                "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
-                "full_weight_hashes_verified": False,
-            }
-        )
-    return records
-
-
-def cache_dataset(module, output=None):
-    output = OUT if output is None else output
-    require(module.MMLU_DATASET_URL == DATA_URL, "MMLU source URL changed")
-    with urllib.request.urlopen(DATA_URL, timeout=60) as response:
-        data = response.read(64 * 1024 * 1024 + 1)
-    require(0 < len(data) <= 64 * 1024 * 1024, "MMLU dataset size")
-    path = output / "mmlu.csv"
-    path.write_bytes(data)
-    (output / "mmlu-input.json").write_text(
-        json.dumps(
-            {"url": DATA_URL, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
-        )
-    )
-    # MMLUEval's existing filename input accepts this exact downloaded CSV.
-    module.MMLU_DATASET_URL = str(path)
 
 
 class Reports:
@@ -119,36 +65,23 @@ class Reports:
         )
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("suite", choices=["completions", "embeddings", "router"])
-    args = parser.parse_args(argv)
+def main():
     require(os.environ["E2E_ENGINE"] == "vllm", "unexpected engine")
-    recipe = json.loads(CASES.read_text())[args.suite]
+    require(os.environ["E2E_MM_PROCESSING"] == "worker", "wrong processing location")
+    require(os.environ["E2E_VLLM_MM_PROCESSOR"] == "inprocess", "wrong media processor")
+    recipe = json.loads(CASES.read_text())["multimodal"]
     os.environ["E2E_MIN_SELECTED"] = str(recipe["min_selected"])
-    output = OUT / args.suite
+    output = OUT / "multimodal"
     output.mkdir()
-
-    from infra.model_specs import get_model_spec
-
-    models = cached_models(
-        {name: get_model_spec(name)["model"] for name in recipe["models"]},
-        Path(os.environ["HF_HOME"]) / "hub",
-    )
-    (output / "models.json").write_text(json.dumps(models, indent=2) + "\n")
-    if args.suite == "router":
-        cache_dataset(importlib.import_module("infra.run_eval"), output)
     reports = Reports(output / "case-reports.jsonl")
     junit = output / "result.xml"
     result = pytest.main(
         [
-            "e2e_test/" + args.suite,
+            recipe["test_dir"],
             "--ignore=e2e_test/benchmarks",
             "--ignore=e2e_test/bindings_go",
-            "-p",
-            "no:rerunfailures",
-            "-s",
-            "-vv",
+            "--reruns", "0",
+            "-s", "-vv",
             "--junitxml=" + str(junit),
         ],
         plugins=[reports],
