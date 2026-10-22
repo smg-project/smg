@@ -10,9 +10,10 @@ use serde::{Deserialize, Serialize};
 use tokenizers::{
     decoders::DecoderWrapper,
     models::{bpe::BPE, ModelWrapper},
-    normalizers::unicode::NFC,
+    normalizers::{unicode::NFC, NormalizerWrapper},
     pre_tokenizers::{
         byte_level::ByteLevel,
+        metaspace::{Metaspace, PrependScheme},
         sequence::Sequence,
         split::{Split, SplitPattern},
         PreTokenizerWrapper,
@@ -275,6 +276,11 @@ struct EncoderCore {
     /// plain segments the direct path declines are encoded by it, every
     /// spelling in them as text.
     plain: OnceLock<HfTokenizer>,
+    /// [`Self::plain`] for a plain segment after a control, under a
+    /// `Metaspace` pre-tokenizer that prepends the word marker at the start
+    /// of the text only: the same pipeline with the scheme `never`, built on
+    /// first use (see [`Self::plain_tokenizer`]).
+    plain_after_control: OnceLock<HfTokenizer>,
 }
 
 impl EncoderCore {
@@ -284,6 +290,7 @@ impl EncoderCore {
             native,
             added: OnceLock::new(),
             plain: OnceLock::new(),
+            plain_after_control: OnceLock::new(),
         }
     }
 
@@ -337,7 +344,7 @@ impl EncoderCore {
             match control {
                 Some(id) => {
                     if !plain.is_empty() {
-                        self.encode_plain(&plain, &mut ids)?;
+                        self.encode_plain(&plain, ids.is_empty(), &mut ids)?;
                         plain.clear();
                     }
                     ids.push(id);
@@ -351,7 +358,7 @@ impl EncoderCore {
             }
         }
         if !plain.is_empty() {
-            self.encode_plain(&plain, &mut ids)?;
+            self.encode_plain(&plain, ids.is_empty(), &mut ids)?;
         }
         Ok(ids)
     }
@@ -359,8 +366,10 @@ impl EncoderCore {
     /// Appends the ids of `text` with every spelling in it encoded as text:
     /// the direct path without its added-token cut, else (an input it
     /// declines, or no direct path) `tokenizers` without the added
-    /// vocabulary. The opt-in v1 pipeline has no such mode and is passed by.
-    fn encode_plain(&self, text: &str, ids: &mut Vec<u32>) -> Result<()> {
+    /// vocabulary, as the region at the start of the prompt (`at_start`) or
+    /// after a control. The opt-in v1 pipeline has no such mode and is
+    /// passed by.
+    fn encode_plain(&self, text: &str, at_start: bool, ids: &mut Vec<u32>) -> Result<()> {
         if let Some(native) = &self.native {
             match native.encode_plain(self.tokenizer.get_model(), text) {
                 Ok(plain) => {
@@ -371,20 +380,45 @@ impl EncoderCore {
             }
         }
         let encoding = self
-            .plain_tokenizer()
+            .plain_tokenizer(at_start)
             .encode(text, false)
             .map_err(|e| Error::msg(format!("Encoding failed: {e}")))?;
         ids.extend_from_slice(encoding.get_ids());
         Ok(())
     }
 
-    /// The pipeline without its added vocabulary, cloned once on first use.
-    fn plain_tokenizer(&self) -> &HfTokenizer {
-        self.plain.get_or_init(|| {
+    /// The pipeline without its added vocabulary, cloned once on first use:
+    /// as loaded for a region at the start of the prompt; for a region after
+    /// a control, under a `Metaspace` pre-tokenizer that prepends the word
+    /// marker at the start of the text only (the scheme `first`), the same
+    /// with the scheme `never`, which is how the flat encode treats a split
+    /// that does not start the text.
+    fn plain_tokenizer(&self, at_start: bool) -> &HfTokenizer {
+        let plain_of = || {
             let mut plain = self.tokenizer.clone();
             plain.with_added_vocabulary(AddedVocabulary::new());
             plain
-        })
+        };
+        let after_control = match self.tokenizer.get_pre_tokenizer() {
+            Some(PreTokenizerWrapper::Metaspace(metaspace))
+                if !at_start && metaspace.get_prepend_scheme() == PrependScheme::First =>
+            {
+                Some(Metaspace::new(
+                    metaspace.get_replacement(),
+                    PrependScheme::Never,
+                    metaspace.get_split(),
+                ))
+            }
+            _ => None,
+        };
+        match after_control {
+            None => self.plain.get_or_init(plain_of),
+            Some(never) => self.plain_after_control.get_or_init(|| {
+                let mut plain = plain_of();
+                plain.with_pre_tokenizer(Some(never));
+                plain
+            }),
+        }
     }
 }
 
@@ -606,6 +640,10 @@ impl HuggingFaceTokenizer {
 
         // Load tokenizer_config.json once for chat template, add_bos/eos, and special tokens
         let config_result = Self::load_chat_template_and_config(&tokenizer_path.to_string_lossy());
+        // The class the configuration names decides the pipeline of a
+        // Llama-class checkpoint (the rule is on `llama_class_pipeline`).
+        Self::llama_class_pipeline(&mut tokenizer, tokenizer_path.parent(), &config_result);
+
         let mut chat_template_str = config_result.chat_template;
         let response_template = config_result.response_template;
         let add_bos_token = config_result.add_bos_token;
@@ -751,6 +789,64 @@ impl HuggingFaceTokenizer {
     }
 
     /// Check if the tokenizer's post_processor adds special tokens (e.g., BOS)
+    /// Encodes a Llama-class checkpoint as its reference class does.
+    ///
+    /// `transformers` builds the tokenizer of a checkpoint whose
+    /// `tokenizer_config.json` names `LlamaTokenizer` (or the `Fast`
+    /// spelling) and whose `config.json` says model type `llama` from the
+    /// file's vocabulary and merges with a pipeline of its own: no
+    /// normalizer, and a `Metaspace` pre-tokenizer whose prepend scheme the
+    /// configuration selects (`add_prefix_space: false`: the word marker is
+    /// prepended nowhere; `legacy: true`: before every split; otherwise at
+    /// the start of the text only). The serving engines load their
+    /// tokenizer through that class, so those are the ids a prompt gets. A
+    /// `tokenizer.json` converted the legacy way keeps instead a `Prepend`
+    /// normalizer, which puts the word marker before every split (after
+    /// every special token too) and into the pattern of every added token
+    /// matched after normalization, so that a marker such as `</think>` is
+    /// found only behind a space, and takes the space with it. For a file
+    /// of that legacy shape the loader installs the class's pipeline over
+    /// the file's vocabulary, added tokens, decoder and post-processor;
+    /// any other file, and any other model type (which `transformers`
+    /// reads as its file), stays as it is.
+    fn llama_class_pipeline(
+        tokenizer: &mut LoadingTokenizer,
+        dir: Option<&Path>,
+        config: &TokenizerConfigResult,
+    ) {
+        if !matches!(
+            config.tokenizer_class.as_deref(),
+            Some("LlamaTokenizer" | "LlamaTokenizerFast")
+        ) {
+            return;
+        }
+        if dir.and_then(model_type_from_config).as_deref() != Some("llama") {
+            return;
+        }
+        if tokenizer.get_pre_tokenizer().is_some()
+            || !is_legacy_prepend_normalizer(tokenizer.get_normalizer())
+        {
+            return;
+        }
+        let scheme = match (
+            config.add_prefix_space.unwrap_or(true),
+            config.legacy.unwrap_or(false),
+        ) {
+            (false, _) => PrependScheme::Never,
+            (true, true) => PrependScheme::Always,
+            (true, false) => PrependScheme::First,
+        };
+        if let Err(error) = tokenizer.with_normalizer(None::<NormalizerWrapper>) {
+            debug!(%error, "the file's normalizer stays: the added vocabulary did not refresh without it");
+            return;
+        }
+        tokenizer.with_pre_tokenizer(Some(Metaspace::new('\u{2581}', scheme, false)));
+        debug!(
+            ?scheme,
+            "Llama-class pipeline: no normalizer, a Metaspace pre-tokenizer"
+        );
+    }
+
     fn tokenizer_adds_special_tokens<M: Model>(tokenizer: &TokenizerOf<M>) -> bool {
         tokenizer
             .encode("", true)
@@ -943,6 +1039,12 @@ impl HuggingFaceTokenizer {
 
             let add_bos_token = config.get("add_bos_token").and_then(|v| v.as_bool());
             let add_eos_token = config.get("add_eos_token").and_then(|v| v.as_bool());
+            let tokenizer_class = config
+                .get("tokenizer_class")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let legacy = config.get("legacy").and_then(|v| v.as_bool());
+            let add_prefix_space = config.get("add_prefix_space").and_then(|v| v.as_bool());
 
             // Extract special token strings (handles both "string" and {"content": "string"})
             let get_token = |key: &str| -> Option<String> {
@@ -965,6 +1067,9 @@ impl HuggingFaceTokenizer {
                 response_template,
                 add_bos_token,
                 add_eos_token,
+                tokenizer_class,
+                legacy,
+                add_prefix_space,
                 config_tokens,
             })
         })()
@@ -1029,7 +1134,34 @@ struct TokenizerConfigResult {
     response_template: Option<serde_json::Value>,
     add_bos_token: Option<bool>,
     add_eos_token: Option<bool>,
+    /// The `transformers` class the checkpoint names for its tokenizer.
+    tokenizer_class: Option<String>,
+    /// The Llama classes' `legacy` flag (the prepend scheme of their
+    /// pre-tokenizer).
+    legacy: Option<bool>,
+    /// `add_prefix_space`, when the configuration sets it.
+    add_prefix_space: Option<bool>,
     config_tokens: ConfigTokens,
+}
+
+/// `model_type` of the checkpoint's `config.json` in `dir`, if the file is
+/// there and says one.
+fn model_type_from_config(dir: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    value.get("model_type")?.as_str().map(String::from)
+}
+
+/// Whether `normalizer` is the one a legacy conversion of a sentencepiece
+/// vocabulary writes: a sequence that prepends the word marker U+2581 and
+/// then only replaces (spaces by the marker).
+fn is_legacy_prepend_normalizer(normalizer: Option<&NormalizerWrapper>) -> bool {
+    let Some(NormalizerWrapper::Sequence(sequence)) = normalizer else {
+        return false;
+    };
+    let mut steps = sequence.as_ref().iter();
+    matches!(steps.next(), Some(NormalizerWrapper::Prepend(prepend)) if prepend.prepend == "\u{2581}")
+        && steps.all(|step| matches!(step, NormalizerWrapper::Replace(_)))
 }
 
 impl Encoder for HuggingFaceTokenizer {
@@ -2239,8 +2371,10 @@ mod tests {
 
     use super::derive_thinking_mode;
     use crate::{
-        chat_template::ChatTemplateParams, encoders::deepseek_v32::ThinkingMode,
-        traits::Tokenizer as _, HuggingFaceTokenizer,
+        chat_template::ChatTemplateParams,
+        encoders::deepseek_v32::ThinkingMode,
+        traits::{Decoder as _, Encoder as _, Tokenizer as _},
+        HuggingFaceTokenizer,
     };
 
     const MIN_TOKENIZER_JSON: &str = r#"{
@@ -2444,6 +2578,227 @@ mod tests {
 
     fn thinking_kwargs(value: bool) -> HashMap<String, serde_json::Value> {
         HashMap::from([("thinking".to_string(), serde_json::Value::Bool(value))])
+    }
+
+    /// A Llama-style checkpoint as a legacy conversion writes it: a
+    /// single-character vocabulary with byte fallback, the `Prepend` +
+    /// `Replace` normalizer and no pre-tokenizer, two special tokens matched
+    /// raw and a marker added as a normalized token.
+    const LLAMA_STYLE_TOKENIZER_JSON: &str = r#"{
+        "version": "1.0", "truncation": null, "padding": null,
+        "added_tokens": [
+            {"id": 3, "content": "<|im_start|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+            {"id": 4, "content": "<|im_end|>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+            {"id": 5, "content": "</think>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": true, "special": false}],
+        "normalizer": {"type": "Sequence", "normalizers": [
+            {"type": "Prepend", "prepend": "▁"},
+            {"type": "Replace", "pattern": {"String": " "}, "content": "▁"}]},
+        "pre_tokenizer": null, "post_processor": null,
+        "decoder": {"type": "Sequence", "decoders": [
+            {"type": "Replace", "pattern": {"String": "▁"}, "content": " "},
+            {"type": "ByteFallback"}, {"type": "Fuse"}, {"type": "Strip", "content": " ", "start": 1, "stop": 0}]},
+        "model": {"type": "BPE", "dropout": null, "unk_token": "<unk>", "continuing_subword_prefix": null,
+            "end_of_word_suffix": null, "fuse_unk": true, "byte_fallback": true, "ignore_merges": false,
+            "vocab": {"<unk>": 0, "<s>": 1, "</s>": 2, "<|im_start|>": 3, "<|im_end|>": 4, "</think>": 5, "▁": 6,
+                "a": 7, "b": 8, "<": 9, "/": 10, ">": 11, "t": 12, "h": 13, "i": 14, "n": 15, "k": 16, "<0x0A>": 17},
+            "merges": []}
+    }"#;
+
+    /// Writes [`LLAMA_STYLE_TOKENIZER_JSON`] with a `tokenizer_config.json`
+    /// naming `class` and the two flags (absent when `None`) and a
+    /// `config.json` of `model_type`; returns the tokenizer file's path.
+    fn llama_style_checkpoint(
+        dir: &std::path::Path,
+        class: &str,
+        legacy: Option<bool>,
+        add_prefix_space: Option<bool>,
+        model_type: &str,
+    ) -> String {
+        let tokenizer_path = dir.join("tokenizer.json");
+        fs::write(&tokenizer_path, LLAMA_STYLE_TOKENIZER_JSON).unwrap();
+        let mut config = json!({
+            "tokenizer_class": class, "bos_token": "<s>", "eos_token": "</s>", "unk_token": "<unk>",
+            "add_bos_token": false, "add_eos_token": false, "clean_up_tokenization_spaces": false,
+        });
+        if let Some(legacy) = legacy {
+            config["legacy"] = json!(legacy);
+        }
+        if let Some(add_prefix_space) = add_prefix_space {
+            config["add_prefix_space"] = json!(add_prefix_space);
+        }
+        fs::write(dir.join("tokenizer_config.json"), config.to_string()).unwrap();
+        fs::write(
+            dir.join("config.json"),
+            json!({"model_type": model_type, "architectures": ["LlamaForCausalLM"]}).to_string(),
+        )
+        .unwrap();
+        tokenizer_path.to_string_lossy().into_owned()
+    }
+
+    fn ids_of(tokenizer: &HuggingFaceTokenizer, text: &str) -> Vec<u32> {
+        tokenizer.encode(text, false).unwrap().token_ids().to_vec()
+    }
+
+    /// The expected ids below are the reference class's (transformers 5.17
+    /// `LlamaTokenizer` over this checkpoint, which loads it with no
+    /// normalizer and `Metaspace(prepend_scheme=first, split=False)`); the
+    /// file's own pipeline gives the ids in the comments.
+    #[test]
+    fn a_llama_class_checkpoint_encodes_as_its_reference_class_not_as_its_file() {
+        let temp = TempDir::new().unwrap();
+        let path = llama_style_checkpoint(
+            temp.path(),
+            "LlamaTokenizer",
+            Some(false),
+            Some(true),
+            "llama",
+        );
+        let tokenizer = HuggingFaceTokenizer::from_file(&path).unwrap();
+        assert!(tokenizer.tokenizers_pipeline().get_normalizer().is_none());
+        // A space before a normalized marker is its own piece and the marker
+        // is matched (file: [6, 7, 5, 6, 8], the marker's pattern took the
+        // space).
+        assert_eq!(ids_of(&tokenizer, "a </think> b"), [6, 7, 6, 5, 6, 8]);
+        // The marker is matched after a newline and between letters too
+        // (file: the marker's characters, [.., 9, 10, 12, 13, 14, 15, 16, 11]).
+        assert_eq!(ids_of(&tokenizer, "a\n</think>"), [6, 7, 17, 5]);
+        assert_eq!(ids_of(&tokenizer, "a</think>b"), [6, 7, 5, 8]);
+        // Text after a special token is not prefixed with the word marker
+        // (file: [3, 6, 7]); text at the start is.
+        assert_eq!(ids_of(&tokenizer, "<|im_start|>a"), [3, 7]);
+        assert_eq!(ids_of(&tokenizer, "<|im_start|> b"), [3, 6, 8]);
+        assert_eq!(ids_of(&tokenizer, "ab<|im_end|>"), [6, 7, 8, 4]);
+        // A text that starts with a space gets one word marker, not two
+        // (file: [6, 6, 7]).
+        assert_eq!(ids_of(&tokenizer, " a"), [6, 7]);
+        assert_eq!(ids_of(&tokenizer, "a  b"), [6, 7, 6, 6, 8]);
+        assert_eq!(ids_of(&tokenizer, ""), [0u32; 0]);
+        // The marker decodes as its content: the loader keeps no normalized
+        // form of it once the normalizer is gone.
+        assert_eq!(
+            tokenizer.decode(&[7, 6, 5, 6, 8], false).unwrap(),
+            "a </think> b"
+        );
+    }
+
+    /// `legacy: true` prepends the word marker before every split, as the
+    /// file does, and `add_prefix_space: false` nowhere; the marker's match
+    /// and the space before it are the class's in both. The `Fast` spelling
+    /// of the class and absent flags read as the class's defaults.
+    #[test]
+    fn the_llama_class_flags_pick_the_prepend_scheme() {
+        let temp = TempDir::new().unwrap();
+        let path = llama_style_checkpoint(
+            temp.path(),
+            "LlamaTokenizer",
+            Some(true),
+            Some(true),
+            "llama",
+        );
+        let always = HuggingFaceTokenizer::from_file(&path).unwrap();
+        assert_eq!(ids_of(&always, "a </think> b"), [6, 7, 6, 5, 6, 8]);
+        assert_eq!(ids_of(&always, "<|im_start|>a"), [3, 6, 7]);
+        assert_eq!(ids_of(&always, "a</think>b"), [6, 7, 5, 6, 8]);
+        assert_eq!(ids_of(&always, " a"), [6, 7]);
+
+        let temp = TempDir::new().unwrap();
+        let path = llama_style_checkpoint(
+            temp.path(),
+            "LlamaTokenizer",
+            Some(false),
+            Some(false),
+            "llama",
+        );
+        let never = HuggingFaceTokenizer::from_file(&path).unwrap();
+        assert_eq!(ids_of(&never, "a </think> b"), [7, 6, 5, 6, 8]);
+        assert_eq!(ids_of(&never, "<|im_start|>a"), [3, 7]);
+        assert_eq!(ids_of(&never, "ab<|im_end|>"), [7, 8, 4]);
+        assert_eq!(ids_of(&never, " a"), [6, 7]);
+
+        let temp = TempDir::new().unwrap();
+        let path = llama_style_checkpoint(temp.path(), "LlamaTokenizerFast", None, None, "llama");
+        let first = HuggingFaceTokenizer::from_file(&path).unwrap();
+        assert_eq!(ids_of(&first, "a </think> b"), [6, 7, 6, 5, 6, 8]);
+        assert_eq!(ids_of(&first, "<|im_start|>a"), [3, 7]);
+    }
+
+    /// A checkpoint of another model type keeps its file's pipeline (the
+    /// reference reads those as their file), and so does one whose
+    /// configuration names another class or is missing.
+    #[test]
+    fn other_checkpoints_keep_their_file_pipeline() {
+        let temp = TempDir::new().unwrap();
+        let path = llama_style_checkpoint(
+            temp.path(),
+            "LlamaTokenizer",
+            Some(false),
+            Some(true),
+            "phi3",
+        );
+        let other_model_type = HuggingFaceTokenizer::from_file(&path).unwrap();
+        assert!(other_model_type
+            .tokenizers_pipeline()
+            .get_normalizer()
+            .is_some());
+        assert_eq!(ids_of(&other_model_type, "a </think> b"), [6, 7, 5, 6, 8]);
+        assert_eq!(ids_of(&other_model_type, "<|im_start|>a"), [3, 6, 7]);
+
+        let temp = TempDir::new().unwrap();
+        let path =
+            llama_style_checkpoint(temp.path(), "PreTrainedTokenizerFast", None, None, "llama");
+        let other_class = HuggingFaceTokenizer::from_file(&path).unwrap();
+        assert_eq!(ids_of(&other_class, "<|im_start|>a"), [3, 6, 7]);
+
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("tokenizer.json");
+        fs::write(&path, LLAMA_STYLE_TOKENIZER_JSON).unwrap();
+        let no_configuration = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
+        assert_eq!(ids_of(&no_configuration, "<|im_start|>a"), [3, 6, 7]);
+    }
+
+    /// A prompt rendered by segments encodes as its flat text does: the plain
+    /// region after a control is not prefixed with the word marker, the one
+    /// at the start of the prompt is.
+    #[test]
+    fn a_llama_class_prompt_rendered_by_segments_agrees_with_its_flat_encode() {
+        use crate::encoders::PromptSegment;
+        let temp = TempDir::new().unwrap();
+        let path = llama_style_checkpoint(
+            temp.path(),
+            "LlamaTokenizer",
+            Some(false),
+            Some(true),
+            "llama",
+        );
+        let tokenizer = HuggingFaceTokenizer::from_file(&path).unwrap();
+        let after_control = [
+            PromptSegment::control("<|im_start|>"),
+            PromptSegment::text("a b"),
+        ];
+        assert_eq!(
+            tokenizer.core.encode_segments(&after_control).unwrap(),
+            [3, 7, 6, 8]
+        );
+        assert_eq!(ids_of(&tokenizer, "<|im_start|>a b"), [3, 7, 6, 8]);
+        let at_start = [
+            PromptSegment::text("a b"),
+            PromptSegment::control("<|im_end|>"),
+        ];
+        assert_eq!(
+            tokenizer.core.encode_segments(&at_start).unwrap(),
+            [6, 7, 6, 8, 4]
+        );
+        assert_eq!(ids_of(&tokenizer, "a b<|im_end|>"), [6, 7, 6, 8, 4]);
+        let two_regions = [
+            PromptSegment::text(" a"),
+            PromptSegment::control("<|im_end|>"),
+            PromptSegment::text(" b"),
+        ];
+        assert_eq!(
+            tokenizer.core.encode_segments(&two_regions).unwrap(),
+            [6, 7, 4, 6, 8]
+        );
+        assert_eq!(ids_of(&tokenizer, " a<|im_end|> b"), [6, 7, 4, 6, 8]);
     }
 
     #[test]
@@ -2696,7 +3051,7 @@ mod segment_tests {
         // The message is its plain encode, in place, and the text round-trips.
         let plain = tok
             .core
-            .plain_tokenizer()
+            .plain_tokenizer(false)
             .encode(typed, false)
             .expect("plain encode");
         assert_eq!(&ids[2..ids.len() - 2], plain.get_ids());
@@ -2803,7 +3158,7 @@ mod segment_tests {
             .expect("the segment encode");
         let plain = |text: &str| {
             tok.core
-                .plain_tokenizer()
+                .plain_tokenizer(false)
                 .encode(text, false)
                 .expect("plain encode")
                 .get_ids()
@@ -2972,7 +3327,7 @@ mod segment_tests {
             assert_eq!(count(&ids, id(&tok, typed)), structural, "{typed}");
             let plain = tok
                 .core
-                .plain_tokenizer()
+                .plain_tokenizer(false)
                 .encode(typed_text.as_str(), false)
                 .expect("plain encode");
             assert_eq!(&ids[2..ids.len() - 2], plain.get_ids(), "{typed}");

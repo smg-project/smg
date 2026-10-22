@@ -114,7 +114,23 @@ const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 /// pre-tokenizer for instance, and is held to the rule an id is: the run
 /// fails when no loaded case under it differs any more, and when no loaded
 /// case is under it at all.
-const KNOWN_DIFFERENCES: &[(&str, &str)] = &[];
+/// The reason of the render sets recorded from a Llama-class checkpoint's
+/// `tokenizer.json` read as a file, where the loader now runs the reference
+/// class's pipeline (see `huggingface::HuggingFaceTokenizer::llama_class_pipeline`).
+const LEGACY_FILE_PIPELINE: &str = "render ids recorded with the checkpoint's legacy file pipeline (a word marker after every special token, a normalized marker matched only behind a space, which it takes); the loader encodes such a checkpoint as its reference class does since the Llama-class pipeline change; to be re-recorded with the class backend";
+
+const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
+    ("nanbeige4-3b-thinking-2510/render/*", LEGACY_FILE_PIPELINE),
+    ("nanbeige4-3b-thinking-2511/render/*", LEGACY_FILE_PIPELINE),
+    ("nanbeige4.1-3b/render/*", LEGACY_FILE_PIPELINE),
+    ("nanollama/render/*", LEGACY_FILE_PIPELINE),
+    (
+        "spec-decoding-subfolder-fixture/render/*",
+        LEGACY_FILE_PIPELINE,
+    ),
+    ("tinyllama-1.1b-chat-v1.0/render/*", LEGACY_FILE_PIPELINE),
+    ("toolmind-web-3b/render/*", LEGACY_FILE_PIPELINE),
+];
 
 /// Models whose tokenizer is known not to load, with the reason and where it
 /// is tracked, so the run compares the others: an unlisted model that does
