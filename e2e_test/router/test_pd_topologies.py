@@ -67,6 +67,11 @@ from infra.pd_logs import (
     read_logs,
     worker_log_dir,
 )
+from infra.pd_metrics import (
+    require_load_reports,
+    vllm_work_snapshot,
+    worker_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -391,42 +396,16 @@ def _launched_transport(worker) -> str:
     return f"moriio-{vllm_moriio_mode()}" if backend == "moriio" else backend
 
 
-def _metric_samples(text: str, name: str, **labels: str) -> list[float]:
-    """Values of a Prometheus metric's samples that carry ``labels``."""
-    samples = []
-    for line in text.splitlines():
-        rest = line[len(name) :] if line.startswith(name) else None
-        if rest is None or (rest and rest[0] not in " {"):
-            continue  # another metric, or a longer name with this prefix
-        if all(f'{k}="{v}"' in rest for k, v in labels.items()):
-            samples.append(float(line.rsplit(" ", 1)[1]))
-    return samples
-
-
 def _worker_metric(worker, name: str, **labels: str) -> float:
     """Sum of one vLLM worker's samples of a metric that carry ``labels``, from
     its /metrics. vLLM exports the series this file reads from start-up, so a
     worker without one fails the test instead of reading as zero."""
-    response = httpx.get(f"{worker.http_url}/metrics", timeout=5.0)
-    response.raise_for_status()
-    samples = _metric_samples(response.text, name, **labels)
-    where = f" with {labels}" if labels else ""
-    assert samples, f"{worker.base_url} exports no {name} sample{where}"
-    return sum(samples)
+    return sum(worker_metrics(worker, name, **labels)[name].values())
 
 
 def _engines_idle(gateway: Gateway) -> tuple[bool, list[dict]]:
-    """The idle check from each vLLM worker's own /metrics, for workers without load reports."""
-    states = [
-        {
-            "worker": w.base_url,
-            "num_running_reqs": _worker_metric(w, "vllm:num_requests_running"),
-            "num_waiting_reqs": _worker_metric(w, "vllm:num_requests_waiting"),
-        }
-        for w in gateway.prefill_workers + gateway.decode_workers
-    ]
-    busy = [s for s in states if s["num_running_reqs"] + s["num_waiting_reqs"] > 0]
-    return (not busy, states)
+    """Scheduler work from each vLLM worker's metrics, not KV memory lifetime."""
+    return vllm_work_snapshot(gateway)
 
 
 def _fleet_idle(gateway: Gateway) -> tuple[bool, list[dict]]:
@@ -443,15 +422,6 @@ def _fleet_idle(gateway: Gateway) -> tuple[bool, list[dict]]:
         return (False, loads)
     busy = [e for e in loads if e.get("num_running_reqs", 0) + e.get("num_waiting_reqs", 0) > 0]
     return (not busy, loads)
-
-
-def _require_load_reports(backend: str) -> None:
-    """The idle check reads /loads; HTTP SGLang workers report none without metrics.
-
-    A MoRI-IO lane reads its engines' own metrics instead (see ``_fleet_idle``).
-    """
-    if backend == "pd_http" and not _moriio_lane():
-        pytest.skip("load reports need gRPC workers")
 
 
 def _assert_fleet_idle_within(gateway: Gateway, timeout: float) -> None:
@@ -696,7 +666,7 @@ class TestPDTopology:
 
     def test_abandoned_streams_free_both_sides(self, setup_backend):
         backend, model, client, gateway = setup_backend
-        _require_load_reports(backend)
+        require_load_reports(backend, moriio=_moriio_lane())
         body = {
             "model": model,
             "messages": [{"role": "user", "content": "Write a very long story about the sea."}],
@@ -724,7 +694,7 @@ class TestPDTopology:
     def test_aborts_during_prefill_free_both_sides(self, setup_backend):
         """Clients that give up before the first token leave no room behind."""
         backend, model, _, gateway = setup_backend
-        _require_load_reports(backend)
+        require_load_reports(backend, moriio=_moriio_lane())
         body = {
             "model": model,
             "messages": [{"role": "user", "content": _long_prompt("22222")}],
