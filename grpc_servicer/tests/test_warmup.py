@@ -348,11 +348,12 @@ def test_an_engine_that_asks_for_every_prefill_length_gets_the_remainders_last_i
         "prefill 40 tokens (chunk remainder)",
     ]
     assert "9 prefill shapes, 7 measured again, 55 chunk remainders)" in plan.describe()
-    # The fast level keeps them: they answer a hazard, not a stall.
+    # The fast level leaves them: a test leg or a quick start takes the merged
+    # ladder alone, and the shipped default (full) carries the hazard's answer.
     fast = plan_warmup(dataclasses.replace(SMALL, every_prefill_length=True), "fast")
-    assert {
-        s.requests[0].prompt_tokens for s in fast.steps if s.kind in ("prefill", "remainder")
-    } == set(range(1, 65))
+    assert not any(s.kind == "remainder" for s in fast.steps)
+    assert "remainder" not in fast.describe()
+    assert [s.kind for s in fast.steps] == [s.kind for s in plan_warmup(SMALL, "fast").steps]
     # Without the ask, the plan reads as before.
     before = plan_warmup(SMALL, "full")
     assert not any(s.kind == "remainder" for s in before.steps)
@@ -466,7 +467,7 @@ def test_the_chunk_remainders_log_at_debug_with_a_progress_line_every_so_many_an
 ):
     caplog.set_level(logging.DEBUG, logger="smg_grpc_servicer.warmup")
     monkeypatch.setattr(warmup, "REMAINDER_PROGRESS_EVERY", 4)
-    plan = plan_warmup(dataclasses.replace(SMALL, every_prefill_length=True), "fast")
+    plan = plan_warmup(dataclasses.replace(SMALL, every_prefill_length=True), "full")
     remainders = [s for s in plan.steps if s.kind == "remainder"]
     assert len(remainders) > 8 and len(remainders) % 4
     report = run_warmup(plan, _Wire(), budget_secs=30)

@@ -362,9 +362,10 @@ def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
     decode staircase first (cheap, and every ramp's first shapes), then the
     prefill shapes by length, the odd variants, the second pass, and, when
     the inputs ask for every prefill length, the chunk remainders in
-    :func:`spread_order` (at both levels: they answer a hazard, not a
-    stall). A prompt never exceeds the admission step nor the context less
-    its output. Under data parallelism (``inputs.data_parallel_size`` above
+    :func:`spread_order` at the ``full`` level (the ``fast`` level keeps the
+    merged ladder: a test leg or a quick start takes the classes alone, and
+    the shipped default is ``full``). A prompt never exceeds the admission
+    step nor the context less its output. Under data parallelism (``inputs.data_parallel_size`` above
     one) the staircase runs once per rank and every prefill shape goes to
     every rank at once, each request pinned to its rank."""
     if level not in LEVELS:
@@ -426,7 +427,7 @@ def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
                 requests=tuple(requests.one(length, 1, rank) for rank in ranks),
             )
         )
-    if inputs.every_prefill_length:
+    if inputs.every_prefill_length and level == LEVEL_FULL:
         for length in spread_order(limit):
             if length in lengths:
                 continue
