@@ -47,6 +47,8 @@ The gateway image is on Docker Hub, engine images are on GitHub Container Regist
 
 Worker images default to `ghcr.io/smg-project/smg`. Set `workers[].image.tag` to the engine-specific tag; `workers[].image.registry` and `workers[].image.repository` override the path.
 
+The TRT-LLM image is published, but the chart does not template `engine: trtllm` yet: `engineDefaults` knows `vllm` and `sglang`.
+
 ## Configuration
 
 See [`values.yaml`](values.yaml) for the full list of configurable parameters.
