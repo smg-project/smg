@@ -27,7 +27,7 @@ const END: &str = "<|end_of_image|>";
 const LOADER_FRAMES: usize = 32;
 /// The reference video processor's (`Glm5NextVideoProcessor`) default
 /// sampling rate and frame cap, for a clip the loader kept whole.
-const PROCESSOR_FPS: f32 = 2.0;
+const PROCESSOR_FPS: f64 = 2.0;
 const PROCESSOR_MAX_FRAMES: usize = 2048;
 /// Frames per temporal group: the engine's timestamps take every second
 /// sampled frame, whatever the configured temporal patch size.
@@ -335,14 +335,14 @@ impl ModelProcessorSpec for Glm53FlashSpec {
     }
 
     /// The reference video processor's `fps`, which its resampling reads.
-    fn default_video_sample_fps(&self) -> Option<f32> {
+    fn default_video_sample_fps(&self) -> Option<f64> {
         Some(PROCESSOR_FPS)
     }
 
-    fn default_video_sample_fps_with(&self, config: Option<&PreProcessorConfig>) -> Option<f32> {
+    fn default_video_sample_fps_with(&self, config: Option<&PreProcessorConfig>) -> Option<f64> {
         Some(
             config
-                .and_then(|config| config.get_extra::<f32>("fps"))
+                .and_then(|config| config.get_extra::<f64>("fps"))
                 .filter(|fps| fps.is_finite() && *fps > 0.0)
                 .unwrap_or(PROCESSOR_FPS),
         )

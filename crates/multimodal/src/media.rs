@@ -237,7 +237,10 @@ impl FrameSampling {
 pub struct VideoFetchConfig {
     pub min_frames: usize,
     pub max_frames: usize,
-    pub sample_fps: f32,
+    /// Frames a second to sample at, the double the model's reference
+    /// processor computes with: a rate binary32 cannot hold would move the
+    /// picks.
+    pub sample_fps: f64,
     /// MiniMax-M3 extension: cap each decoded frame's long side.
     pub max_long_side_pixel: Option<u32>,
     pub sampling: FrameSampling,
@@ -1058,12 +1061,12 @@ pub fn audio_max_input_bytes() -> usize {
 enum DecodedVideoFrames {
     Images {
         frames: Vec<image::DynamicImage>,
-        sample_fps: f32,
+        sample_fps: f64,
         sampling: Option<VideoSamplingInfo>,
     },
     Rgb {
         video: DecodedRgbVideo,
-        sample_fps: f32,
+        sample_fps: f64,
         sampling: Option<VideoSamplingInfo>,
     },
 }
@@ -1752,7 +1755,7 @@ pub fn sampled_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfi
 fn temporal_group_frame_indices(
     total_frames: usize,
     fps: f64,
-    sample_fps: f32,
+    sample_fps: f64,
     frame_factor: usize,
     max_frames: usize,
 ) -> Vec<usize> {
@@ -1763,7 +1766,7 @@ fn temporal_group_frame_indices(
     } else {
         ASSUMED_FPS
     };
-    let by_rate = (total_frames as f64 * f64::from(sample_fps) / fps) as usize;
+    let by_rate = (total_frames as f64 * sample_fps / fps) as usize;
     let count = by_rate.min(max_frames).min(total_frames);
     let count = (count / factor * factor).max(factor).min(total_frames);
     torch_linspace_indices(total_frames, count)
@@ -1862,13 +1865,12 @@ fn resampled_after_loader(
 fn glm5_next_frame_indices(
     total_frames: usize,
     fps: f64,
-    target_fps: f32,
+    target_fps: f64,
     max_frames: usize,
 ) -> Option<Vec<usize>> {
     if total_frames == 0 || !(fps.is_finite() && fps > 0.0) {
         return None;
     }
-    let target_fps = f64::from(target_fps);
     let duration = total_frames as f64 / fps;
     let max_seconds = duration.trunc();
     let extract = ((duration * target_fps) as usize).min(max_frames);
@@ -1935,7 +1937,7 @@ fn numpy_linspace_indices(start: f64, end: f64, count: usize) -> Vec<usize> {
 fn even_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
     let mut target_frames = if fps.is_finite() && fps > 0.0 {
         let duration = total_frames as f64 / fps;
-        (duration * cfg.sample_fps as f64).round() as usize
+        (duration * cfg.sample_fps).round() as usize
     } else {
         cfg.max_frames
     };
@@ -1961,7 +1963,7 @@ fn spread_evenly(total_frames: usize, count: usize) -> Vec<usize> {
 /// temporal group, which the processor's own temporal padding does here.
 fn even_rounded_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) -> Vec<usize> {
     let target_frames = if fps.is_finite() && fps > 0.0 {
-        (total_frames as f64 / fps * f64::from(cfg.sample_fps)).trunc() as usize
+        (total_frames as f64 / fps * cfg.sample_fps).trunc() as usize
     } else {
         cfg.max_frames
     };
@@ -1999,7 +2001,7 @@ fn interval_frame_indices(total_frames: usize, fps: f64, cfg: VideoFetchConfig) 
         return even_frame_indices(total_frames, fps, cfg);
     }
     const EPS: f64 = 1e-4;
-    let interval = 1.0 / cfg.sample_fps as f64;
+    let interval = 1.0 / cfg.sample_fps;
     let last_index = total_frames - 1;
 
     let mut indices: Vec<usize> = Vec::new();
@@ -2811,7 +2813,7 @@ async fn decode_video_with_ffmpeg_png(
     cfg: VideoFetchConfig,
     metadata: Option<VideoMetadata>,
     selection: Option<&FrameSelection>,
-) -> Result<(Vec<image::DynamicImage>, f32), MediaConnectorError> {
+) -> Result<(Vec<image::DynamicImage>, f64), MediaConnectorError> {
     let (frame_args, sample_fps) = match selection.zip(metadata) {
         Some((selection, metadata)) => (
             FfmpegFrameArgs::selected(selection).await,
@@ -3337,7 +3339,7 @@ fn fps_filter_for_metadata(metadata: VideoMetadata, cfg: VideoFetchConfig) -> St
 fn expected_sampled_frame_count(metadata: VideoMetadata, cfg: VideoFetchConfig) -> usize {
     if let Some(duration) = metadata.duration_seconds {
         if duration.is_finite() && duration > 0.0 {
-            return (duration * cfg.sample_fps as f64)
+            return (duration * cfg.sample_fps)
                 .round()
                 .clamp(cfg.min_frames as f64, cfg.max_frames as f64) as usize;
         }
@@ -3345,14 +3347,14 @@ fn expected_sampled_frame_count(metadata: VideoMetadata, cfg: VideoFetchConfig) 
     cfg.max_frames
 }
 
-fn effective_sample_fps(duration_seconds: Option<f64>, cfg: VideoFetchConfig) -> f32 {
+fn effective_sample_fps(duration_seconds: Option<f64>, cfg: VideoFetchConfig) -> f64 {
     duration_seconds
         .filter(|duration| duration.is_finite() && *duration > 0.0)
         .map(|duration| {
-            let target_frames = (duration * cfg.sample_fps as f64)
+            let target_frames = (duration * cfg.sample_fps)
                 .round()
                 .clamp(cfg.min_frames as f64, cfg.max_frames as f64);
-            (target_frames / duration) as f32
+            target_frames / duration
         })
         .filter(|fps| fps.is_finite() && *fps > 0.0)
         .unwrap_or(cfg.sample_fps)
@@ -3784,14 +3786,14 @@ fn fps_filter_for_duration(duration: f64, cfg: VideoFetchConfig) -> Option<Strin
     if !duration.is_finite() || duration <= 0.0 {
         return None;
     }
-    let target_frames = (duration * cfg.sample_fps as f64)
+    let target_frames = (duration * cfg.sample_fps)
         .round()
         .clamp(cfg.min_frames as f64, cfg.max_frames as f64);
     let fps = (target_frames / duration).max(f64::EPSILON);
     Some(format!("fps={fps:.6}"))
 }
 
-async fn sampling_filter_for_video(input_path: &Path, cfg: VideoFetchConfig) -> (String, f32) {
+async fn sampling_filter_for_video(input_path: &Path, cfg: VideoFetchConfig) -> (String, f64) {
     if let Ok(duration) = probe_video_duration_seconds(input_path).await {
         if let Some(filter) = fps_filter_for_duration(duration, cfg) {
             return (filter, effective_sample_fps(Some(duration), cfg));
@@ -4764,7 +4766,7 @@ mod video_sampling_tests {
         }
     }
 
-    fn interval_cfg(sample_fps: f32, max_frames: usize) -> VideoFetchConfig {
+    fn interval_cfg(sample_fps: f64, max_frames: usize) -> VideoFetchConfig {
         VideoFetchConfig {
             min_frames: 1,
             max_frames,
@@ -4797,7 +4799,7 @@ mod video_sampling_tests {
         );
     }
 
-    fn up_to_then_rate_cfg(sample_fps: f32) -> VideoFetchConfig {
+    fn up_to_then_rate_cfg(sample_fps: f64) -> VideoFetchConfig {
         VideoFetchConfig {
             sample_fps,
             sampling: FrameSampling::UpToThenRate {
@@ -4808,6 +4810,103 @@ mod video_sampling_tests {
         }
     }
 
+    /// A rate binary32 cannot hold (0.3, 0.7, 0.9 or 3.3 frames a second, from
+    /// a request or a checkpoint's video processor config) reaches the pick
+    /// arithmetic as the double the model's reference processor computes
+    /// with. The expected picks are the reference formulas evaluated in
+    /// double precision; every case picks differently once the rate is
+    /// narrowed to binary32 and widened back (20 frames at 3 fps sampled at
+    /// 0.3: `[0, 10]` instead of the reference's `[0, 11]`).
+    #[test]
+    fn a_rate_binary32_cannot_hold_picks_the_references_frames() {
+        let loader_then_rate = |max_frames| FrameSampling::UpToThenRate {
+            max_frames,
+            rate_max_frames: 2048,
+        };
+        let temporal_groups = FrameSampling::TemporalGroups {
+            frame_factor: 2,
+            max_frames: 96,
+        };
+        let cases: &[(FrameSampling, usize, f64, f64, &[usize])] = &[
+            // The GLM-5-Next rule over a clip the loader kept whole.
+            (loader_then_rate(32), 20, 3.0, 0.3, &[0, 11]),
+            (loader_then_rate(32), 21, 3.0, 0.3, &[0, 11]),
+            (loader_then_rate(32), 30, 3.0, 0.3, &[0, 11, 21, 21]),
+            (
+                loader_then_rate(32),
+                30,
+                3.0,
+                0.7,
+                &[0, 5, 9, 13, 18, 22, 26, 26],
+            ),
+            (loader_then_rate(32), 10, 3.0, 0.9, &[0, 4, 7, 7]),
+            (loader_then_rate(32), 21, 3.0, 0.9, &[0, 4, 8, 12, 16, 20]),
+            (loader_then_rate(2048), 80, 12.0, 0.3, &[0, 41]),
+            (
+                loader_then_rate(2048),
+                80,
+                8.0,
+                0.7,
+                &[0, 12, 23, 35, 46, 58, 69, 69],
+            ),
+            (loader_then_rate(2048), 40, 12.0, 0.9, &[0, 14, 27, 27]),
+            (
+                loader_then_rate(2048),
+                40,
+                12.0,
+                3.3,
+                &[0, 3, 6, 9, 13, 16, 19, 23, 26, 29, 33, 33],
+            ),
+            // The connector's even rule.
+            (FrameSampling::Even, 55, 3.0, 0.3, &[0, 13, 27, 40, 54]),
+            (FrameSampling::Even, 15, 3.0, 0.9, &[0, 3, 7, 10, 14]),
+            (FrameSampling::Even, 5, 3.0, 3.3, &[0, 0, 1, 2, 3, 4]),
+            // The rounded even rule.
+            (
+                FrameSampling::EvenRounded,
+                70,
+                3.0,
+                0.3,
+                &[0, 14, 28, 41, 55, 69],
+            ),
+            (
+                FrameSampling::EvenRounded,
+                30,
+                3.0,
+                0.7,
+                &[0, 5, 10, 14, 19, 24, 29],
+            ),
+            (
+                FrameSampling::EvenRounded,
+                20,
+                3.0,
+                0.9,
+                &[0, 4, 8, 11, 15, 19],
+            ),
+            // The temporal-group rule.
+            (temporal_groups, 20, 3.0, 0.9, &[0, 3, 7, 11, 15, 19]),
+            (
+                temporal_groups,
+                60,
+                3.0,
+                0.7,
+                &[0, 4, 9, 13, 18, 22, 27, 31, 36, 40, 45, 49, 54, 59],
+            ),
+        ];
+        for (sampling, total_frames, fps, sample_fps, expected) in cases {
+            let cfg = VideoFetchConfig {
+                sample_fps: *sample_fps,
+                sampling: *sampling,
+                ..VideoFetchConfig::default()
+            };
+            assert_eq!(
+                sampled_frame_indices(*total_frames, *fps, cfg),
+                *expected,
+                "{total_frames} frames at {fps} fps sampled at {sample_fps} under {sampling:?}"
+            );
+        }
+    }
+
     /// A clip the loader keeps whole is resampled by the GLM-5-Next reference
     /// processor's `sample_frames`; the expected picks are transformers' own
     /// for each clip (`total_frames`, `fps`, sampling rate). A longer clip
@@ -4815,7 +4914,7 @@ mod video_sampling_tests {
     /// interval, which the reference refuses, keeps the loader's frames.
     #[test]
     fn up_to_then_rate_resamples_a_clip_the_loader_kept_whole() {
-        let cases: &[(usize, f64, f32, &[usize])] = &[
+        let cases: &[(usize, f64, f64, &[usize])] = &[
             (32, 8.0, 2.0, &[0, 4, 8, 12, 16, 20, 24, 28]),
             (30, 30.0, 2.0, &[0, 15]),
             (17, 8.0, 2.0, &[0, 4, 8, 12]),

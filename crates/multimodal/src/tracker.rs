@@ -76,7 +76,7 @@ pub struct AsyncMultiModalTracker {
     first_slot: HashMap<FetchKey, Bucket>,
     /// Frame rate to sample a video at when the request names none; `None`
     /// keeps the connector default.
-    default_video_sample_fps: Option<f32>,
+    default_video_sample_fps: Option<f64>,
     video_frame_sampling: FrameSampling,
     /// The policy the fetched image frames decode an alpha channel under (see
     /// [`TransparencyPolicy`]); `KeepAlpha` unless the request's processing
@@ -106,7 +106,7 @@ impl AsyncMultiModalTracker {
 
     /// Sample videos that name no `fps` at this rate (the model's reference
     /// default) instead of the connector default.
-    pub fn with_default_video_sample_fps(mut self, fps: Option<f32>) -> Self {
+    pub fn with_default_video_sample_fps(mut self, fps: Option<f64>) -> Self {
         self.default_video_sample_fps = fps;
         self
     }
@@ -369,7 +369,7 @@ fn media_url_source(url: String, canonical_data_prefix: &str) -> MediaSource {
 fn video_fetch_config(
     fps: Option<f64>,
     max_long_side_pixel: Option<u32>,
-    default_sample_fps: Option<f32>,
+    default_sample_fps: Option<f64>,
     sampling: FrameSampling,
 ) -> MultiModalResult<VideoFetchConfig> {
     let mut cfg = VideoFetchConfig {
@@ -377,11 +377,10 @@ fn video_fetch_config(
         ..VideoFetchConfig::default()
     };
     match fps {
-        Some(fps) => cfg.sample_fps = validate_sample_fps(fps)? as f32,
+        Some(fps) => cfg.sample_fps = validate_sample_fps(fps)?,
         None => {
             if let Some(default) = default_sample_fps {
-                validate_sample_fps(f64::from(default))?;
-                cfg.sample_fps = default;
+                cfg.sample_fps = validate_sample_fps(default)?;
             }
         }
     }
@@ -435,6 +434,7 @@ fn validate_video_long_side_cap(value: u32) -> MultiModalResult<()> {
 #[cfg(test)]
 mod video_param_tests {
     use super::*;
+    use crate::media::sampled_frame_indices;
 
     #[test]
     fn a_request_fps_wins_then_the_model_default_then_the_connector_default() {
@@ -458,12 +458,28 @@ mod video_param_tests {
         // right up to the edge of it: nothing reaches sampling unchecked just
         // because the model named it rather than the caller.
         assert!(video_fetch_config(Some(100.0), None, Some(1.0), FrameSampling::Even).is_err());
-        for bad_default in [100.0, 5.1, 0.19, 0.0, -1.0, f32::NAN, f32::INFINITY] {
+        for bad_default in [100.0, 5.1, 0.19, 0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert!(
                 video_fetch_config(None, None, Some(bad_default), FrameSampling::Even).is_err(),
                 "{bad_default}"
             );
         }
+    }
+
+    /// The rate a request names, and the model's own default, reach the picks
+    /// as the doubles they are: 0.3 frames a second over 20 frames at 3 fps
+    /// picks the reference's `[0, 11]`, not the `[0, 10]` of the rate narrowed
+    /// to binary32 on the way.
+    #[test]
+    fn the_rate_reaches_the_picks_as_the_double_it_is() {
+        let sampling = FrameSampling::UpToThenRate {
+            max_frames: 32,
+            rate_max_frames: 2048,
+        };
+        let requested = video_fetch_config(Some(0.3), None, Some(2.0), sampling).unwrap();
+        assert_eq!(sampled_frame_indices(20, 3.0, requested), [0, 11]);
+        let model_default = video_fetch_config(None, None, Some(0.3), sampling).unwrap();
+        assert_eq!(sampled_frame_indices(20, 3.0, model_default), [0, 11]);
     }
 
     #[test]

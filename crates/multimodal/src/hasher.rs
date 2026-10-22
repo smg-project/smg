@@ -89,13 +89,15 @@ pub fn hash_video(raw_bytes: &[u8]) -> String {
 /// fps, or capped to a different long side, yields different frames, and both
 /// the gateway's cache and the backend's `mm_hashes` key off this value.
 /// Default sampling keeps the plain byte hash so existing entries stay valid.
+/// The rate is absorbed as the 8 bytes of the double the picks are computed
+/// with, so two rates that pick differently never share a digest.
 pub fn hash_video_with_sampling(
     raw_bytes: &[u8],
-    sample_fps: f32,
+    sample_fps: f64,
     max_long_side_pixel: Option<u32>,
     sampling: FrameSampling,
 ) -> String {
-    const DEFAULT_SAMPLE_FPS: f32 = 2.0;
+    const DEFAULT_SAMPLE_FPS: f64 = 2.0;
     if max_long_side_pixel.is_none()
         && sample_fps == DEFAULT_SAMPLE_FPS
         && sampling == FrameSampling::default()
@@ -270,6 +272,16 @@ mod video_sampling_hash_tests {
         );
     }
 
+    /// Two rates binary32 cannot tell apart pick different frames, so they are
+    /// different clips to the caches.
+    #[test]
+    fn rates_binary32_cannot_tell_apart_hash_differently() {
+        assert_ne!(
+            hash_video_with_sampling(CLIP, 0.3, None, FrameSampling::Even),
+            hash_video_with_sampling(CLIP, 0.300_000_011_920_928_96, None, FrameSampling::Even)
+        );
+    }
+
     /// The concatenation collision the review described: a clip carrying the
     /// parameter suffix as trailing bytes must not alias a genuine
     /// (clip, params) pair.
@@ -277,7 +289,7 @@ mod video_sampling_hash_tests {
     fn crafted_trailing_bytes_do_not_collide() {
         let mut forged = CLIP.to_vec();
         forged.extend_from_slice(b"sample_fps=");
-        forged.extend_from_slice(&1.0f32.to_le_bytes());
+        forged.extend_from_slice(&1.0f64.to_le_bytes());
 
         assert_ne!(
             hash_video_with_sampling(CLIP, 1.0, None, FrameSampling::Even),

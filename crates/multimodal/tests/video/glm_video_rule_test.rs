@@ -233,3 +233,29 @@ fn a_clip_the_loader_keeps_whole_is_resampled_at_the_processors_rate() {
         stamped_prompt(&tokenizer, &["0.0", "1.0", "2.0", "3.0"], 37 * 61)
     );
 }
+
+/// The rate the checkpoint's video processor config carries reaches the picks
+/// as the double the reference reads: a config naming 0.3 frames a second
+/// picks `[0, 11]` of 20 frames at 3 fps, as the reference's `sample_frames`
+/// does, not the `[0, 10]` of the rate narrowed to binary32 on the way.
+#[test]
+fn the_configs_rate_reaches_the_picks_as_the_double_the_reference_reads() {
+    let tokenizer = MarkerTokenizer;
+    let model_config = serde_json::json!({"model_type": "glm53_flash", "image_token_id": IMAGE_ID});
+    let metadata = ModelMetadata {
+        model_id: "zai-org/GLM-5.3-Flash",
+        tokenizer: &tokenizer,
+        config: &model_config,
+    };
+    let registry = ModelRegistry::new();
+    let spec = registry.lookup(&metadata).expect("the family's spec");
+    let config = PreProcessorConfig::from_json(r#"{"fps":0.3}"#).expect("video processor config");
+    let sampling = VideoFetchConfig {
+        sample_fps: spec
+            .default_video_sample_fps_with(Some(&config))
+            .expect("the config's rate"),
+        sampling: spec.video_frame_sampling_with(Some(&config)),
+        ..VideoFetchConfig::default()
+    };
+    assert_eq!(sampled_frame_indices(20, 3.0, sampling), [0, 11]);
+}
