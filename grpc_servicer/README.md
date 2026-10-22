@@ -531,13 +531,14 @@ explicit cap drops); an HTTP `vllm serve`, which is not this package's launch.
 `SMG_VLLM_CUDAGRAPH_CAPTURE_CAP` is the knob: `auto` (the default), `engine`
 (the opt-out: the engine's own default, as before this derivation), or a
 positive integer, the ceiling in place of 512, rounded down to the capture
-grid. A ceiling applies only where it raises the engine's default on every
-platform (twice the window, at most 512, or at most 1024 on one newer GPU
+grid. A ceiling applies only where it does not lower the engine's default on
+any platform (twice the window, at most 512, or at most 1024 on one newer GPU
 platform the launch cannot tell apart, each as the engine's list ends it):
 with `--max-num-seqs` left to the engine or set to 512 or more, a ceiling of
-1024 or more applies; for a window between 257 and 511, a ceiling of twice
-the window (on the capture grid) or more applies; a smaller one is kept out,
-the line saying why. Each captured size costs capture time at start and
+1024 or more applies (it raises the 512 default and, on the platform whose
+default is already 1024, matches it); for a window between 257 and 511, a
+ceiling of twice the window (on the capture grid) or more applies; a smaller
+one is kept out, the line saying why. Each captured size costs capture time at start and
 graph memory per rank: 11 sizes at the engine's 64, 51 at 512, 83 at 1024,
 147 at 2048.
 
@@ -562,6 +563,16 @@ container memory at the ramp's end, start-up time):
 | `--max-num-seqs 32 --max-num-batched-tokens 16384`, a 1M-context model (the engine's own 64); 8k prompts, 4k shared prefix | SLO-1 12, SLO-2 11 | SLO-1 12, SLO-2 8; -0.5 % KV, +2.0 GiB, +45 s | SLO-1 12, SLO-2 10; -1.5 % KV, +6.1 GiB, +93 s |
 | `--max-num-seqs 128 --max-num-batched-tokens 16384`, a sparse-attention MoE (the engine's own 256); 4k prompts, 1k shared prefix | SLO-1 28-34, SLO-2 20-22; collapses from 36 | SLO-1 40 (the ramp's top), SLO-2 24; -0.3 % KV, +1.7 GiB, +38 s | SLO-1 38, SLO-2 28; -0.9 % KV, +4.9 GiB, +126 s |
 | `--max-num-seqs 256 --max-num-batched-tokens 16384`, a 3B-active MoE (the engine's own 512: the derivation changes nothing); 8k prompts, 4k shared prefix | SLO-1 11-12, SLO-2 5-6 | SLO-1 13-14, SLO-2 7-8; -0.15 % KV, +1.5 GiB, +27 s | SLO-1 20 (the ramp's top), SLO-2 14; -0.5 % KV, +4.7 GiB, +60 s |
+
+The rows are same-build pairs on the engine release before the shipped one.
+On the shipped release the 128-sequence recipe was run at 1024 only: SLO-1 24
+req/s (22.9 achieved, TTFT p99 394 ms, TPOT p99 38 ms), no SLO-2, a collapse
+from 28 with the running window full and the decode step near 75 ms at 127
+running. That release's step at a full window bounds the bed below the
+previous release's 512 knee, and without a 512 arm on it the ceiling's own
+effect on the shipped release is not separated from the release's step time
+(that arm is owed); the rows above are the measured basis of the rule, not a
+reading of the shipped release.
 
 The cap that captures a recipe's gain follows its running window (about eight
 times `--max-num-seqs` on these three), not one ceiling: with a window of 128,
