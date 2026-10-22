@@ -74,7 +74,7 @@ use crate::{
         common::realtime::ws::RealtimeQueryParams,
         error as route_error,
         gateway::Gateway,
-        grpc::common::responses::spawn_unstored_sweeper,
+        grpc::common::responses::{spawn_reaper, spawn_unstored_sweeper},
         http::router::{stream_eligible_request_bodies, StreamBodyState},
         RouterTrait,
     },
@@ -2146,6 +2146,16 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // material, the apps and the listener addresses can still fail the start
     // after this point, with these two bound.
     let probe_state = start_observability(&config, &app_context, metrics_handle).await?;
+
+    // The reaper of the background responses a gateway that is gone left
+    // open: one per gateway process, whatever the number of routers this
+    // gateway builds (none when background mode or the lease is off).
+    spawn_reaper(
+        app_context.response_storage.clone(),
+        None,
+        config.router_config.max_background_responses,
+        Duration::from_secs(config.router_config.background_lease_ttl_secs),
+    );
 
     let app_state = Arc::new(AppState {
         router,

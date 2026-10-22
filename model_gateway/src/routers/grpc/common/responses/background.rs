@@ -17,8 +17,8 @@
 //!
 //! The stored record is the shared truth, also between gateways that share a
 //! store: a status only moves forward ([`set_stored_status`] never rewrites a
-//! terminal record: every transition is one conditional write of the stored
-//! object alone,
+//! terminal record: every transition and the lease renewal are one
+//! conditional write of the stored object alone,
 //! `ResponseStorage::update_response_object_if_open`, and the terminal
 //! object the work persists one conditional write of the row,
 //! `ResponseStorage::store_response_if_open`, both refused once the record
@@ -34,10 +34,22 @@
 //! poll it, as the public API keeps such a response for roughly ten minutes;
 //! then the gateway that closed it deletes it ([`finish_unstored`]). Nothing
 //! of it reaches the conversation and history side.
+//!
+//! A gateway that dies mid-run leaves no such record, so every open record
+//! carries a lease ([`Lease`]: the owning registry's id and an expiry), set
+//! when the record is stored, renewed while the work runs, and read by the
+//! reaper every gateway sharing the store runs ([`reap_expired`]): a record
+//! whose lease has expired is closed as `failed` with an error naming the
+//! lost gateway. The lease lives under a private key of the stored object,
+//! which is served without it ([`public_object`]).
 
 use std::{
-    any::Any, collections::HashMap, future::Future, panic::AssertUnwindSafe, sync::Arc,
-    time::Duration,
+    any::Any,
+    collections::HashMap,
+    future::Future,
+    panic::AssertUnwindSafe,
+    sync::Arc,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -52,11 +64,13 @@ use parking_lot::Mutex;
 use serde_json::{json, Value};
 use smg_data_connector::{
     with_request_context, ConditionalStore, RequestContext as StorageRequestContext, ResponseId,
-    ResponseStorage, ResponseStorageError, StoredResponse, TERMINAL_RESPONSE_STATUSES,
+    ResponseStorage, ResponseStorageError, StoredResponse, BACKGROUND_LEASE_KEY,
+    TERMINAL_RESPONSE_STATUSES,
 };
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 use super::ResponsesContext;
 use crate::routers::{
@@ -123,10 +137,26 @@ fn is_result(status: &str) -> bool {
     persistence_utils::is_result_status(status)
 }
 
-/// The in-flight background responses of this gateway.
+/// The key under which an open background record carries its [`Lease`]
+/// inside the stored Response object (the store keeps no other field per
+/// record); the object is served without it and a terminal write drops it.
+/// The store knows the key too: its listing of the open records is of the
+/// leased ones.
+const LEASE_KEY: &str = BACKGROUND_LEASE_KEY;
+
+/// The most open records one reaper pass reads.
+const REAP_BATCH: usize = 1024;
+
+/// The in-flight background responses of this gateway, and the lease it
+/// holds on their records.
 pub(crate) struct BackgroundResponses {
     running: Mutex<HashMap<String, Entry>>,
     max_in_flight: usize,
+    /// This registry's id, the owner of the leases it writes.
+    owner: String,
+    /// How long a lease stays valid without a renewal; zero switches the
+    /// lease and the reaper off.
+    lease_ttl: Duration,
 }
 
 struct Entry {
@@ -136,12 +166,36 @@ struct Entry {
 
 impl BackgroundResponses {
     /// `max_in_flight` background responses at once; 0 switches the mode off
-    /// (see [`Self::enabled`]).
-    pub fn new(max_in_flight: usize) -> Self {
+    /// (see [`Self::enabled`]). `lease_ttl` is how long the lease on a record
+    /// this gateway runs stays valid without a renewal; zero writes no lease
+    /// and runs no reaper.
+    pub fn new(max_in_flight: usize, lease_ttl: Duration) -> Self {
         Self {
             running: Mutex::new(HashMap::new()),
             max_in_flight,
+            owner: format!("gw_{}", Uuid::now_v7()),
+            lease_ttl,
         }
+    }
+
+    /// The id this registry writes as the owner of its leases.
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    /// A fresh lease of this registry, valid for its TTL from now; `None`
+    /// when leases are off.
+    pub fn lease(&self) -> Option<Lease> {
+        (!self.lease_ttl.is_zero()).then(|| Lease {
+            owner: self.owner.clone(),
+            expires_at: chrono::Utc::now().timestamp() + self.lease_ttl.as_secs() as i64,
+        })
+    }
+
+    /// How often the runner renews the lease on a record it runs: a third of
+    /// the TTL, so two renewals can be lost before the lease expires.
+    pub fn renew_every(&self) -> Duration {
+        (self.lease_ttl / 3).max(Duration::from_secs(1))
     }
 
     /// Whether `background: true` runs in the background here at all; off,
@@ -211,6 +265,16 @@ impl BackgroundSlot {
     pub fn cancel_token(&self) -> CancellationToken {
         self.cancel.clone()
     }
+
+    /// A fresh lease of the registry this slot belongs to (`None` when
+    /// leases are off).
+    pub fn lease(&self) -> Option<Lease> {
+        self.registry.lease()
+    }
+
+    fn registry(&self) -> &BackgroundResponses {
+        &self.registry
+    }
 }
 
 impl Drop for BackgroundSlot {
@@ -248,12 +312,13 @@ pub(crate) fn queued_response(id: &str, request: &ResponsesRequest) -> Responses
 /// Stores `response` under its id with the request's input items, as the
 /// terminal record will carry them, so `GET /v1/responses/{id}` and its
 /// `input_items` answer from the first poll; the record is scoped to the
-/// caller's `tenant`.
+/// caller's `tenant`, under `lease` when this gateway writes one.
 pub(crate) async fn store_record(
     storage: &Arc<dyn ResponseStorage>,
     response: &ResponsesResponse,
     request: &ResponsesRequest,
     tenant: Option<&str>,
+    lease: Option<&Lease>,
     request_context: Option<StorageRequestContext>,
 ) -> Result<(), ResponseStorageError> {
     let raw = serde_json::to_value(response)?;
@@ -262,18 +327,25 @@ pub(crate) async fn store_record(
         extract_input_items(&request.input).map_err(ResponseStorageError::StorageError)?,
     );
     stored.tenant = tenant.map(str::to_string);
+    if let Some(lease) = lease {
+        with_lease(&mut stored.raw_response, lease);
+    }
     let store = async { storage.store_response(stored).await.map(|_| ()) };
     under_context(request_context, store).await
 }
 
 /// The stored Response object moved to `status`: a terminal status stamps
-/// `completed_at`, a failure carries its `error`.
+/// `completed_at` and drops the lease (a closed record needs none), a
+/// failure carries its `error`.
 pub(crate) fn with_status(mut raw: Value, status: &str, error: Option<Value>) -> Value {
     let terminal = is_terminal(status);
     if let Some(object) = raw.as_object_mut() {
         object.insert("status".into(), json!(status));
-        if terminal && object.get("completed_at").is_none_or(Value::is_null) {
-            object.insert("completed_at".into(), json!(chrono::Utc::now().timestamp()));
+        if terminal {
+            object.remove(LEASE_KEY);
+            if object.get("completed_at").is_none_or(Value::is_null) {
+                object.insert("completed_at".into(), json!(chrono::Utc::now().timestamp()));
+            }
         }
         if let Some(error) = error {
             object.insert("error".into(), error);
@@ -294,7 +366,8 @@ pub(crate) enum Transition {
     Missing,
 }
 
-/// Moves the record stored under `id` to `status`. A status only moves forward: a
+/// Moves the record stored under `id` to `status`, under `lease` when the
+/// gateway moving it runs the response. A status only moves forward: a
 /// record that is already terminal is left as it is (so a `cancelled`
 /// record is written once, and a result that arrives after a cancel does
 /// not revive the response), whichever gateway wrote it. The record is read
@@ -305,10 +378,15 @@ pub(crate) async fn set_stored_status(
     id: &str,
     status: &str,
     error: Option<Value>,
+    lease: Option<&Lease>,
     request_context: Option<StorageRequestContext>,
 ) -> Result<Transition, ResponseStorageError> {
     transition(storage, id, request_context, |raw| {
-        with_status(raw, status, error)
+        let mut raw = with_status(raw, status, error);
+        if let Some(lease) = lease {
+            with_lease(&mut raw, lease);
+        }
+        raw
     })
     .await
 }
@@ -523,7 +601,16 @@ pub(crate) async fn set_stored_status_retrying(
     let deadline = tokio::time::Instant::now() + window;
     let mut attempts = 0u32;
     loop {
-        match set_stored_status(storage, id, status, error.clone(), request_context.clone()).await {
+        match set_stored_status(
+            storage,
+            id,
+            status,
+            error.clone(),
+            None,
+            request_context.clone(),
+        )
+        .await
+        {
             Ok(transition) => return Ok(transition),
             Err(e) if tokio::time::Instant::now() < deadline => {
                 if attempts == 0 {
@@ -554,7 +641,7 @@ async fn close(
     error: Option<Value>,
     request_context: Option<StorageRequestContext>,
 ) -> Result<Transition, ResponseStorageError> {
-    let outcome = set_stored_status(storage, id, status, error, request_context).await;
+    let outcome = set_stored_status(storage, id, status, error, None, request_context).await;
     match &outcome {
         Ok(Transition::Moved(_)) => {}
         Ok(Transition::Terminal(raw)) => debug!(
@@ -782,6 +869,7 @@ pub(crate) async fn drive_watching<F>(
         &id,
         "in_progress",
         None,
+        slot.lease().as_ref(),
         request_context.clone(),
     )
     .await
@@ -805,8 +893,14 @@ pub(crate) async fn drive_watching<F>(
             false
         }
     };
-    let closed_elsewhere =
-        watch_stored_status(&storage, &id, request_context.clone(), watch, record_seen);
+    let closed_elsewhere = watch_stored_status(
+        &storage,
+        &id,
+        request_context.clone(),
+        watch,
+        record_seen,
+        slot.registry(),
+    );
     let work = AssertUnwindSafe(work).catch_unwind();
     tokio::select! {
         biased;
@@ -882,21 +976,29 @@ pub(crate) const DELETED: &str = "deleted";
 /// missed the items. The watch keeps reading for the terminal write window
 /// from that first read (a delete meanwhile still ends the run) and resolves
 /// with the result only once the window has passed, so the run ends with the
-/// work in the meantime.
+/// work in the meantime. While the record is open, the watch renews
+/// `registry`'s lease on it every [`BackgroundResponses::renew_every`] (a
+/// renewal that fails is retried at the next read; a lease left to expire
+/// lets the reaper close the record, which this watch then reads); a record
+/// read in a result is closed already and is not renewed, and a renewal the
+/// work's own result refused is read as that result.
 async fn watch_stored_status(
     storage: &Arc<dyn ResponseStorage>,
     id: &str,
     request_context: Option<StorageRequestContext>,
     every: Duration,
     mut record_seen: bool,
+    registry: &BackgroundResponses,
 ) -> String {
     let mut result_read_at: Option<tokio::time::Instant> = None;
+    let renew_every = registry.renew_every();
+    let mut renewed = Instant::now();
     loop {
         tokio::time::sleep(every).await;
         let read = async { storage.get_response(&ResponseId::from(id)).await };
         let stored = under_context(request_context.clone(), read).await;
         match stored {
-            Ok(Some(stored)) => {
+            Ok(Some(mut stored)) => {
                 record_seen = true;
                 let status = stored.raw_response["status"].as_str().unwrap_or("");
                 if is_terminal(status) {
@@ -906,6 +1008,43 @@ async fn watch_stored_status(
                     let read_at = *result_read_at.get_or_insert_with(tokio::time::Instant::now);
                     if read_at.elapsed() >= terminal_write_window(every) {
                         return status.to_string();
+                    }
+                    // The work's own result: a closed record, nothing to renew.
+                    continue;
+                }
+                let Some(lease) = registry.lease() else {
+                    continue;
+                };
+                if renewed.elapsed() < renew_every {
+                    continue;
+                }
+                with_lease(&mut stored.raw_response, &lease);
+                let write = async {
+                    storage
+                        .update_response_object_if_open(&ResponseId::from(id), stored.raw_response)
+                        .await
+                };
+                let written = under_context(request_context.clone(), write).await;
+                match written {
+                    Ok(ConditionalStore::Stored) => renewed = Instant::now(),
+                    // Closed between the read and the write. A close from
+                    // elsewhere ends the run with the status it closed with;
+                    // the work's own result (it landed between the read and
+                    // the renewal) is the work finishing, as a result read at
+                    // the top of the loop is: it opens the terminal write
+                    // window, and the next read goes through that path.
+                    Ok(ConditionalStore::Closed(current)) => {
+                        let status = current.raw_response["status"].as_str().unwrap_or("");
+                        if !is_result(status) {
+                            return status.to_string();
+                        }
+                        result_read_at.get_or_insert_with(tokio::time::Instant::now);
+                    }
+                    Ok(ConditionalStore::Missing) => {
+                        debug!(response_id = %id, "Background response record gone while its work runs");
+                    }
+                    Err(e) => {
+                        debug!(response_id = %id, error = %e, "Failed to renew the lease on the background response record");
                     }
                 }
             }
@@ -920,6 +1059,257 @@ async fn watch_stored_status(
             }
         }
     }
+}
+
+// ============================================================================
+// Leases and the reaper
+// ============================================================================
+
+/// The lease a gateway holds on an open background record: the id of the
+/// registry running the response and the time (unix seconds) the lease
+/// expires at unless it is renewed. A record whose lease has expired belongs
+/// to a gateway that stopped, and the reaper of any gateway sharing the
+/// store closes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Lease {
+    pub owner: String,
+    pub expires_at: i64,
+}
+
+impl Lease {
+    /// The lease a stored object carries, if any (a record written before
+    /// leases existed carries none).
+    pub fn of(raw: &Value) -> Option<Self> {
+        let lease = raw.get(LEASE_KEY)?;
+        Some(Self {
+            owner: lease["owner"].as_str()?.to_string(),
+            expires_at: lease["expires_at"].as_i64()?,
+        })
+    }
+
+    /// Whether the lease has run out at `now` (unix seconds).
+    pub fn expired_at(&self, now: i64) -> bool {
+        self.expires_at <= now
+    }
+}
+
+/// Stamps `lease` on the stored object.
+fn with_lease(raw: &mut Value, lease: &Lease) {
+    if let Some(object) = raw.as_object_mut() {
+        object.insert(
+            LEASE_KEY.into(),
+            json!({ "owner": lease.owner, "expires_at": lease.expires_at }),
+        );
+    }
+}
+
+/// The stored object as a client sees it: without the gateway's lease.
+pub(crate) fn public_object(mut raw: Value) -> Value {
+    if let Some(object) = raw.as_object_mut() {
+        object.remove(LEASE_KEY);
+    }
+    raw
+}
+
+/// The `error` of a record closed by the reaper.
+fn lost_gateway_error(lease: &Lease) -> Value {
+    json!({
+        "code": "gateway_lost",
+        "message": format!(
+            "The gateway running this background response (lease owner {}) stopped renewing its lease (expired at {} unix seconds) and is presumed lost; the response was abandoned.",
+            lease.owner, lease.expires_at
+        ),
+    })
+}
+
+/// What the reaper found when it went to close a record of its listing.
+#[derive(Debug)]
+enum Lost {
+    /// The record, re-read, was still open under a lease expired at the
+    /// pass's clock: closed as `failed` under that lease, as the object
+    /// written.
+    Closed(Lease, Value),
+    /// The record, re-read, is open under a lease that has not expired (its
+    /// owner renewed it after the listing) or under none: left alone.
+    Renewed,
+    /// The record closed meanwhile, or is gone.
+    Gone,
+}
+
+/// Closes the record under `id` as `failed` with [`lost_gateway_error`] if,
+/// re-read now, it is still open under a lease expired at `now`: the listing
+/// the reaper works from is a snapshot, and an owner whose renewal landed
+/// between the listing and this re-read keeps its response. The write is the
+/// conditional one of every transition, refused if the record closed
+/// meanwhile; a renewal that lands between the re-read and the write (one
+/// store round trip, by an owner already more than two thirds of the TTL
+/// late) is overwritten by the close, which is what the lease promises.
+async fn close_lost(
+    storage: &Arc<dyn ResponseStorage>,
+    id: &str,
+    now: i64,
+    request_context: Option<StorageRequestContext>,
+) -> Result<Lost, ResponseStorageError> {
+    let update = async {
+        let Some(stored) = storage.get_response(&ResponseId::from(id)).await? else {
+            return Ok(Lost::Gone);
+        };
+        if is_terminal(stored.raw_response["status"].as_str().unwrap_or("")) {
+            return Ok(Lost::Gone);
+        }
+        let Some(lease) = Lease::of(&stored.raw_response).filter(|lease| lease.expired_at(now))
+        else {
+            return Ok(Lost::Renewed);
+        };
+        let raw = with_status(
+            stored.raw_response,
+            "failed",
+            Some(lost_gateway_error(&lease)),
+        );
+        match storage
+            .update_response_object_if_open(&ResponseId::from(id), raw.clone())
+            .await?
+        {
+            ConditionalStore::Stored => Ok(Lost::Closed(lease, raw)),
+            ConditionalStore::Closed(_) | ConditionalStore::Missing => Ok(Lost::Gone),
+        }
+    };
+    let lost: Result<Lost, ResponseStorageError> =
+        under_context(request_context.clone(), update).await;
+    let lost = lost?;
+    if let Lost::Closed(_, raw) = &lost {
+        // An unstored (`store: false`) record the reaper closed is retired
+        // after its polling window, as one its own gateway closes is.
+        retire_unstored(storage, request_context, id, raw);
+    }
+    Ok(lost)
+}
+
+/// What one reaper pass found and did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Reaped {
+    /// Open background records read.
+    pub open: usize,
+    /// Those whose lease had expired.
+    pub expired: usize,
+    /// Those this pass closed as `failed`.
+    pub closed: usize,
+}
+
+/// One reaper pass at `now` (unix seconds): reads the open background
+/// records of the store (the leased ones: a record without a lease, written
+/// by a gateway running without leases, is left to a client's cancel) and
+/// closes each whose lease has expired as `failed` with
+/// [`lost_gateway_error`] ([`close_lost`]: the record is re-read first, and
+/// one renewed since the listing, closed meanwhile or gone is left as it is).
+pub(crate) async fn reap_expired(
+    storage: &Arc<dyn ResponseStorage>,
+    request_context: Option<StorageRequestContext>,
+    now: i64,
+) -> Result<Reaped, ResponseStorageError> {
+    let list = async { storage.list_open_background_responses(REAP_BATCH).await };
+    let open = under_context(request_context.clone(), list).await?;
+    let mut reaped = Reaped {
+        open: open.len(),
+        ..Reaped::default()
+    };
+    for stored in open {
+        let id = stored.id.0;
+        let Some(lease) = Lease::of(&stored.raw_response) else {
+            debug!(response_id = %id, "Open background response record without a lease; left to a cancel");
+            continue;
+        };
+        if !lease.expired_at(now) {
+            continue;
+        }
+        reaped.expired += 1;
+        match close_lost(storage, &id, now, request_context.clone()).await {
+            Ok(Lost::Closed(lease, _)) => {
+                reaped.closed += 1;
+                warn!(
+                    response_id = %id,
+                    owner = %lease.owner,
+                    expired_at = lease.expires_at,
+                    "Background response abandoned by a lost gateway; closed as failed"
+                );
+            }
+            Ok(Lost::Renewed) => {
+                debug!(response_id = %id, "Background response lease renewed since the listing; left running");
+            }
+            Ok(Lost::Gone) => {}
+            Err(e) => warn!(
+                response_id = %id,
+                error = %e,
+                "Failed to close the background response record of a lost gateway"
+            ),
+        }
+    }
+    Ok(reaped)
+}
+
+/// How often a reaper reads the open records on a gateway whose cap on
+/// background responses is `max_in_flight` and whose lease is `lease_ttl`:
+/// half the TTL, so a record of a lost gateway is closed within one and a
+/// half TTLs of its last renewal; `None` when background mode or the lease
+/// is off.
+pub(crate) fn reap_every(max_in_flight: usize, lease_ttl: Duration) -> Option<Duration> {
+    (max_in_flight > 0 && !lease_ttl.is_zero()).then(|| (lease_ttl / 2).max(Duration::from_secs(1)))
+}
+
+/// Runs [`reap_expired`] every [`reap_every`] for as long as the gateway
+/// runs: one reaper per gateway process, spawned at the server's start-up
+/// whatever the number of routers the gateway builds (each router's registry
+/// writes its own leases; the reaper closes any gateway's expired records);
+/// nothing when background mode or the lease is off.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the reaper is a maintenance loop of the gateway; it writes nothing a shutdown has to wait for"
+)]
+pub(crate) fn spawn_reaper(
+    storage: Arc<dyn ResponseStorage>,
+    request_context: Option<StorageRequestContext>,
+    max_in_flight: usize,
+    lease_ttl: Duration,
+) {
+    let Some(every) = reap_every(max_in_flight, lease_ttl) else {
+        return;
+    };
+    info!(
+        lease_ttl_secs = lease_ttl.as_secs(),
+        every_secs = every.as_secs_f64(),
+        "Background response reaper started"
+    );
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(every).await;
+            match reap_expired(
+                &storage,
+                request_context.clone(),
+                chrono::Utc::now().timestamp(),
+            )
+            .await
+            {
+                Ok(reaped) if reaped.closed > 0 => {
+                    info!(
+                        open = reaped.open,
+                        expired = reaped.expired,
+                        closed = reaped.closed,
+                        "Background response reaper pass"
+                    );
+                }
+                Ok(reaped) => {
+                    debug!(
+                        open = reaped.open,
+                        expired = reaped.expired,
+                        "Background response reaper pass"
+                    );
+                }
+                Err(e) => {
+                    warn!(error = %e, "Background response reaper could not read the open records");
+                }
+            }
+        }
+    });
 }
 
 /// The text of a panic's payload.
@@ -1053,7 +1443,15 @@ pub(crate) async fn cancel_with(
     let background = raw["background"].as_bool().unwrap_or(false);
     match raw["status"].as_str().unwrap_or("unknown") {
         "queued" | "in_progress" if background => {
-            match set_stored_status(storage, response_id, "cancelled", None, request_context).await
+            match set_stored_status(
+                storage,
+                response_id,
+                "cancelled",
+                None,
+                None,
+                request_context,
+            )
+            .await
             {
                 Ok(Transition::Moved(raw)) => {
                     info!(
@@ -1147,6 +1545,33 @@ mod tests {
         Arc::new(MemoryResponseStorage::new())
     }
 
+    const LEASE: Duration = Duration::from_secs(30);
+
+    fn lease(owner: &str, expires_at: i64) -> Lease {
+        Lease {
+            owner: owner.to_string(),
+            expires_at,
+        }
+    }
+
+    async fn store_queued_with_lease(
+        storage: &Arc<dyn ResponseStorage>,
+        id: &str,
+        lease: Option<&Lease>,
+    ) {
+        let request = request();
+        store_record(
+            storage,
+            &queued_response(id, &request),
+            &request,
+            None,
+            lease,
+            None,
+        )
+        .await
+        .unwrap();
+    }
+
     async fn stored_status(storage: &Arc<dyn ResponseStorage>, id: &str) -> Value {
         stored_raw(storage, id).await["status"].clone()
     }
@@ -1175,6 +1600,7 @@ mod tests {
             &queued_response(id, &request),
             &request,
             tenant,
+            None,
             None,
         )
         .await
@@ -1494,7 +1920,7 @@ mod tests {
         let flaky = Arc::new(FlakyStorage::new());
         let storage: Arc<dyn ResponseStorage> = flaky.clone();
         store_queued(&storage, "resp_1").await;
-        let registry = Arc::new(BackgroundResponses::new(4));
+        let registry = Arc::new(BackgroundResponses::new(4, LEASE));
         let slot = registry.admit("resp_1").unwrap();
         // The store refuses the next three calls: the in_progress write, then
         // the terminal close's read; a work that stored nothing (its own
@@ -1608,7 +2034,7 @@ mod tests {
         let response = completed_after_queued("resp_1", &request);
         // The record is cancelled (by a client, through another gateway) while
         // the store refuses this gateway's calls.
-        set_stored_status(&storage, "resp_1", "cancelled", None, None)
+        set_stored_status(&storage, "resp_1", "cancelled", None, None, None)
             .await
             .unwrap();
         let landed_before = flaky.stores_landed();
@@ -1666,7 +2092,7 @@ mod tests {
     async fn a_cancel_from_another_tenant_answers_not_found_and_stops_nothing() {
         let storage = storage();
         store_queued_for(&storage, "resp_1", Some("header:tenant-a")).await;
-        let registry = Arc::new(BackgroundResponses::new(4));
+        let registry = Arc::new(BackgroundResponses::new(4, LEASE));
         let slot = registry.admit("resp_1").unwrap();
         let token = slot.cancel_token();
 
@@ -1714,7 +2140,7 @@ mod tests {
         let counting = Arc::new(CountingStorage::new());
         let direct: Arc<dyn ResponseStorage> = counting.clone();
         store_queued(&direct, "resp_1").await;
-        set_stored_status(&direct, "resp_1", "in_progress", None, None)
+        set_stored_status(&direct, "resp_1", "in_progress", None, None, None)
             .await
             .unwrap();
         let gated = Arc::new(GatedStorage {
@@ -1730,7 +2156,7 @@ mod tests {
             reason = "the test awaits the task it spawns"
         )]
         let x = tokio::spawn(async move {
-            set_stored_status(&through_gate, "resp_1", "completed", None, None)
+            set_stored_status(&through_gate, "resp_1", "completed", None, None, None)
                 .await
                 .unwrap()
         });
@@ -1738,9 +2164,10 @@ mod tests {
         gated.reached.notified().await;
 
         // Y's cancel lands first.
-        let Transition::Moved(raw) = set_stored_status(&direct, "resp_1", "cancelled", None, None)
-            .await
-            .unwrap()
+        let Transition::Moved(raw) =
+            set_stored_status(&direct, "resp_1", "cancelled", None, None, None)
+                .await
+                .unwrap()
         else {
             panic!("the open record is cancelled");
         };
@@ -1760,9 +2187,122 @@ mod tests {
         );
     }
 
+    /// A store whose listing renews the lease of every record it lists right
+    /// after reading it: the owner's renewal landing between the reaper's
+    /// listing and its close.
+    struct RenewingStorage {
+        inner: Arc<dyn ResponseStorage>,
+        renew: Lease,
+    }
+
+    #[async_trait]
+    impl ResponseStorage for RenewingStorage {
+        async fn store_response(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ResponseId, ResponseStorageError> {
+            self.inner.store_response(response).await
+        }
+
+        async fn store_response_if_open(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            self.inner.store_response_if_open(response).await
+        }
+
+        async fn update_response_object_if_open(
+            &self,
+            id: &ResponseId,
+            raw_response: Value,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            self.inner
+                .update_response_object_if_open(id, raw_response)
+                .await
+        }
+
+        async fn get_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<Option<StoredResponse>, ResponseStorageError> {
+            self.inner.get_response(response_id).await
+        }
+
+        async fn delete_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<(), ResponseStorageError> {
+            self.inner.delete_response(response_id).await
+        }
+
+        async fn list_open_background_responses(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
+            let listed = self.inner.list_open_background_responses(limit).await?;
+            for stored in &listed {
+                let mut renewed = stored.clone();
+                with_lease(&mut renewed.raw_response, &self.renew);
+                self.inner.store_response(renewed).await?;
+            }
+            Ok(listed)
+        }
+
+        async fn list_identifier_responses(
+            &self,
+            identifier: &str,
+            tenant: Option<&str>,
+            limit: Option<usize>,
+        ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
+            self.inner
+                .list_identifier_responses(identifier, tenant, limit)
+                .await
+        }
+
+        async fn delete_identifier_responses(
+            &self,
+            identifier: &str,
+            tenant: Option<&str>,
+        ) -> Result<usize, ResponseStorageError> {
+            self.inner
+                .delete_identifier_responses(identifier, tenant)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn the_reaper_leaves_a_record_whose_lease_was_renewed_after_the_listing() {
+        let now = 1_700_000_000;
+        let inner = storage();
+        store_queued_with_lease(&inner, "resp_1", Some(&lease("gw_slow", now - 1))).await;
+        let storage: Arc<dyn ResponseStorage> = Arc::new(RenewingStorage {
+            inner: inner.clone(),
+            renew: lease("gw_slow", now + 30),
+        });
+
+        // Listed as expired, renewed before the close: left running.
+        let reaped = reap_expired(&storage, None, now).await.unwrap();
+        assert_eq!(
+            reaped,
+            Reaped {
+                open: 1,
+                expired: 1,
+                closed: 0
+            }
+        );
+        let raw = stored_raw(&inner, "resp_1").await;
+        assert_eq!(raw["status"], "queued");
+        assert_eq!(Lease::of(&raw), Some(lease("gw_slow", now + 30)));
+
+        // Once that lease has run out too, the record is closed.
+        let later = reap_expired(&inner, None, now + 30).await.unwrap();
+        assert_eq!(later.closed, 1);
+        assert_eq!(stored_status(&inner, "resp_1").await, "failed");
+    }
+
     #[test]
     fn the_registry_admits_up_to_its_cap_and_frees_a_dropped_slot() {
-        let registry = Arc::new(BackgroundResponses::new(2));
+        let registry = Arc::new(BackgroundResponses::new(2, LEASE));
         assert!(registry.enabled());
         let first = registry.admit("resp_1").expect("first");
         let second = registry.admit("resp_2").expect("second");
@@ -1773,12 +2313,12 @@ mod tests {
         let third = registry.admit("resp_3").expect("freed place");
         drop((second, third));
         assert_eq!(registry.in_flight(), 0);
-        assert!(!BackgroundResponses::new(0).enabled());
+        assert!(!BackgroundResponses::new(0, LEASE).enabled());
     }
 
     #[tokio::test]
     async fn cancel_fires_the_token_and_the_receiver_settles_when_the_slot_drops() {
-        let registry = Arc::new(BackgroundResponses::new(8));
+        let registry = Arc::new(BackgroundResponses::new(8, LEASE));
         assert!(registry.cancel("resp_unknown").is_none());
         let slot = registry.admit("resp_1").unwrap();
         let token = slot.cancel_token();
@@ -1819,6 +2359,246 @@ mod tests {
         assert_eq!(failed["error"]["code"], "x");
     }
 
+    #[test]
+    fn a_terminal_status_drops_the_lease_and_the_public_object_never_shows_it() {
+        let mut raw = json!({"id": "resp_1", "status": "queued", "background": true});
+        with_lease(&mut raw, &lease("gw_a", 1_700_000_000));
+        assert_eq!(
+            Lease::of(&raw),
+            Some(lease("gw_a", 1_700_000_000)),
+            "the lease is read back from the stored object"
+        );
+        let served = public_object(raw.clone());
+        assert!(served.get(LEASE_KEY).is_none(), "{served}");
+        assert_eq!(served["status"], "queued");
+
+        let in_progress = with_status(raw.clone(), "in_progress", None);
+        assert!(
+            Lease::of(&in_progress).is_some(),
+            "an open record keeps its lease"
+        );
+        let completed = with_status(raw, "completed", None);
+        assert!(
+            Lease::of(&completed).is_none(),
+            "a closed record needs none"
+        );
+        assert!(Lease::of(&json!({"status": "queued"})).is_none());
+        assert!(lease("gw_a", 10).expired_at(10));
+        assert!(!lease("gw_a", 11).expired_at(10));
+    }
+
+    #[test]
+    fn the_registry_derives_its_lease_and_its_periods_from_the_ttl() {
+        let registry = BackgroundResponses::new(4, Duration::from_secs(30));
+        let lease = registry.lease().expect("leases are on");
+        assert_eq!(lease.owner, registry.owner());
+        let now = chrono::Utc::now().timestamp();
+        assert!(
+            (now + 29..=now + 31).contains(&lease.expires_at),
+            "{lease:?}"
+        );
+        assert_eq!(registry.renew_every(), Duration::from_secs(10));
+        assert_ne!(
+            BackgroundResponses::new(4, LEASE).owner(),
+            registry.owner(),
+            "every registry is its own owner"
+        );
+
+        let short = BackgroundResponses::new(4, Duration::from_millis(1500));
+        assert_eq!(short.renew_every(), Duration::from_secs(1));
+
+        let off = BackgroundResponses::new(4, Duration::ZERO);
+        assert!(off.lease().is_none());
+
+        // The reaper's period comes from the cap and the TTL alone (the
+        // server spawns it without a registry): half the TTL, at least a
+        // second; none without background mode or without a lease.
+        assert_eq!(
+            reap_every(4, Duration::from_secs(30)),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            reap_every(4, Duration::from_millis(1500)),
+            Some(Duration::from_secs(1))
+        );
+        assert!(
+            reap_every(4, Duration::ZERO).is_none(),
+            "no lease, no reaper"
+        );
+        assert!(
+            reap_every(0, LEASE).is_none(),
+            "background mode off, no reaper"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_queued_record_carries_the_lease_through_in_progress_and_the_runner_renews_it() {
+        let storage = storage();
+        let registry = Arc::new(BackgroundResponses::new(4, Duration::from_secs(3)));
+        let first = registry.lease().unwrap();
+        store_queued_with_lease(&storage, "resp_1", Some(&first)).await;
+        assert_eq!(
+            Lease::of(&stored_raw(&storage, "resp_1").await),
+            Some(first.clone())
+        );
+
+        let slot = registry.admit("resp_1").unwrap();
+        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+        let flag = DropFlag(Some(dropped_tx));
+        let work = async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let task = tokio::spawn(drive_watching(
+            storage.clone(),
+            None,
+            slot,
+            work,
+            Duration::from_millis(20),
+        ));
+        wait_for_status(&storage, "resp_1", "in_progress").await;
+        let in_progress = Lease::of(&stored_raw(&storage, "resp_1").await).expect("leased");
+        assert_eq!(in_progress.owner, registry.owner());
+
+        // The watch renews the lease every third of the TTL (1 s here).
+        let renewed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let now = Lease::of(&stored_raw(&storage, "resp_1").await).expect("leased");
+                if now.expires_at > in_progress.expires_at {
+                    return now;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("the lease is renewed while the work runs");
+        assert_eq!(renewed.owner, registry.owner());
+
+        registry.cancel("resp_1").expect("running");
+        task.await.unwrap();
+        dropped_rx.await.expect("the work was dropped");
+        let raw = stored_raw(&storage, "resp_1").await;
+        assert_eq!(raw["status"], "cancelled");
+        assert!(
+            Lease::of(&raw).is_none(),
+            "the closed record dropped its lease: {raw}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reaper_closes_the_records_of_an_expired_lease_as_failed() {
+        let storage = storage();
+        let now = 1_700_000_000;
+        store_queued_with_lease(&storage, "resp_lost", Some(&lease("gw_gone", now - 1))).await;
+        set_stored_status(
+            &storage,
+            "resp_lost",
+            "in_progress",
+            None,
+            Some(&lease("gw_gone", now - 1)),
+            None,
+        )
+        .await
+        .unwrap();
+        store_queued_with_lease(&storage, "resp_live", Some(&lease("gw_here", now + 20))).await;
+        store_queued_with_lease(&storage, "resp_old", None).await;
+        store_queued_with_lease(&storage, "resp_done", Some(&lease("gw_gone", now - 1))).await;
+        set_stored_status(&storage, "resp_done", "completed", None, None, None)
+            .await
+            .unwrap();
+
+        let reaped = reap_expired(&storage, None, now).await.unwrap();
+        assert_eq!(
+            reaped,
+            Reaped {
+                open: 2,
+                expired: 1,
+                closed: 1
+            },
+            "two leased records listed (the one without a lease is not), one expired and closed"
+        );
+        let lost = stored_raw(&storage, "resp_lost").await;
+        assert_eq!(lost["status"], "failed");
+        assert_eq!(lost["error"]["code"], "gateway_lost");
+        assert!(
+            lost["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("gw_gone")),
+            "{lost}"
+        );
+        assert!(lost["completed_at"].is_i64());
+        assert!(Lease::of(&lost).is_none());
+        assert_eq!(stored_status(&storage, "resp_live").await, "queued");
+        assert_eq!(
+            stored_status(&storage, "resp_old").await,
+            "queued",
+            "a record without a lease is left to a cancel"
+        );
+        assert_eq!(stored_status(&storage, "resp_done").await, "completed");
+
+        // The next pass finds nothing to do; the live lease expires later.
+        assert_eq!(
+            reap_expired(&storage, None, now).await.unwrap(),
+            Reaped {
+                open: 1,
+                expired: 0,
+                closed: 0
+            }
+        );
+        let later = reap_expired(&storage, None, now + 20).await.unwrap();
+        assert_eq!(later.closed, 1);
+        assert_eq!(stored_status(&storage, "resp_live").await, "failed");
+    }
+
+    #[tokio::test]
+    async fn a_reaped_record_stops_the_gateway_that_still_runs_it() {
+        // The owner renews its lease, but the reaper (with a clock far
+        // ahead, as after a long stall of the owner) closes the record: the
+        // owner reads the closed record and drops its work.
+        let storage = storage();
+        let owner = Arc::new(BackgroundResponses::new(4, LEASE));
+        store_queued_with_lease(&storage, "resp_1", owner.lease().as_ref()).await;
+        let slot = owner.admit("resp_1").unwrap();
+        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+        let flag = DropFlag(Some(dropped_tx));
+        let work = async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let task = tokio::spawn(drive_watching(
+            storage.clone(),
+            None,
+            slot,
+            work,
+            Duration::from_millis(20),
+        ));
+        wait_for_status(&storage, "resp_1", "in_progress").await;
+
+        let far_ahead = chrono::Utc::now().timestamp() + 3600;
+        let reaped = reap_expired(&storage, None, far_ahead).await.unwrap();
+        assert_eq!(reaped.closed, 1);
+
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the owner stops within its watch interval")
+            .unwrap();
+        dropped_rx.await.expect("the work was dropped");
+        let raw = stored_raw(&storage, "resp_1").await;
+        assert_eq!(raw["status"], "failed");
+        assert_eq!(raw["error"]["code"], "gateway_lost");
+        assert_eq!(owner.in_flight(), 0);
+    }
+
     #[tokio::test]
     async fn the_queued_record_is_stored_before_the_work_and_moves_through_its_states() {
         let storage = storage();
@@ -1833,7 +2613,7 @@ mod tests {
         assert_eq!(stored.safety_identifier.as_deref(), Some("user-1"));
 
         let Transition::Moved(raw) =
-            set_stored_status(&storage, "resp_1", "in_progress", None, None)
+            set_stored_status(&storage, "resp_1", "in_progress", None, None, None)
                 .await
                 .unwrap()
         else {
@@ -1842,7 +2622,7 @@ mod tests {
         assert_eq!(raw["status"], "in_progress");
         assert_eq!(stored_status(&storage, "resp_1").await, "in_progress");
         assert!(matches!(
-            set_stored_status(&storage, "resp_404", "cancelled", None, None)
+            set_stored_status(&storage, "resp_404", "cancelled", None, None, None)
                 .await
                 .unwrap(),
             Transition::Missing
@@ -1853,9 +2633,10 @@ mod tests {
     async fn a_terminal_record_is_never_rewritten() {
         let storage = storage();
         store_queued(&storage, "resp_1").await;
-        let Transition::Moved(raw) = set_stored_status(&storage, "resp_1", "cancelled", None, None)
-            .await
-            .unwrap()
+        let Transition::Moved(raw) =
+            set_stored_status(&storage, "resp_1", "cancelled", None, None, None)
+                .await
+                .unwrap()
         else {
             panic!("a queued record is cancelled");
         };
@@ -1864,7 +2645,7 @@ mod tests {
         for status in ["failed", "in_progress", "completed", "cancelled"] {
             let error = (status == "failed").then(|| json!({"code": "x", "message": "y"}));
             let Transition::Terminal(raw) =
-                set_stored_status(&storage, "resp_1", status, error, None)
+                set_stored_status(&storage, "resp_1", status, error, None, None)
                     .await
                     .unwrap()
             else {
@@ -1877,7 +2658,7 @@ mod tests {
         assert!(raw["error"].is_null(), "{raw}");
         // A record that is gone takes no write: nothing is written under it.
         assert!(matches!(
-            set_stored_status(&storage, "resp_404", "completed", None, None)
+            set_stored_status(&storage, "resp_404", "completed", None, None, None)
                 .await
                 .unwrap(),
             Transition::Missing
@@ -1888,7 +2669,7 @@ mod tests {
     async fn a_cancel_marks_the_record_cancelled_and_drops_the_work() {
         let storage = storage();
         store_queued(&storage, "resp_1").await;
-        let registry = Arc::new(BackgroundResponses::new(4));
+        let registry = Arc::new(BackgroundResponses::new(4, LEASE));
         let slot = registry.admit("resp_1").unwrap();
         let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
         let flag = DropFlag(Some(dropped_tx));
@@ -1918,7 +2699,7 @@ mod tests {
     async fn a_record_deleted_while_the_work_runs_drops_the_work_and_stays_deleted() {
         let storage = storage();
         store_queued(&storage, "resp_1").await;
-        let registry = Arc::new(BackgroundResponses::new(4));
+        let registry = Arc::new(BackgroundResponses::new(4, LEASE));
         let slot = registry.admit("resp_1").unwrap();
         let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
         let flag = DropFlag(Some(dropped_tx));
@@ -1966,7 +2747,7 @@ mod tests {
         let storage: Arc<dyn ResponseStorage> = flaky.clone();
         store_queued(&storage, "resp_1").await;
         flaky.hide_records();
-        let registry = Arc::new(BackgroundResponses::new(4));
+        let registry = Arc::new(BackgroundResponses::new(4, LEASE));
         let slot = registry.admit("resp_1").unwrap();
         let (done_tx, done_rx) = oneshot::channel::<()>();
         let work = async move {
@@ -1989,7 +2770,7 @@ mod tests {
         let flaky = Arc::new(FlakyStorage::new());
         let storage: Arc<dyn ResponseStorage> = flaky.clone();
         store_queued(&storage, "resp_1").await;
-        let registry = Arc::new(BackgroundResponses::new(4));
+        let registry = Arc::new(BackgroundResponses::new(4, LEASE));
         let slot = registry.admit("resp_1").unwrap();
         let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
         let flag = DropFlag(Some(dropped_tx));
@@ -2045,23 +2826,23 @@ mod tests {
         let storage = storage();
         store_queued(&storage, "resp_open").await;
         assert!(matches!(
-            set_stored_status(&storage, "resp_open", "in_progress", None, None)
+            set_stored_status(&storage, "resp_open", "in_progress", None, None, None)
                 .await
                 .unwrap(),
             Transition::Moved(_)
         ));
-        set_stored_status(&storage, "resp_open", "cancelled", None, None)
+        set_stored_status(&storage, "resp_open", "cancelled", None, None, None)
             .await
             .unwrap();
         assert!(matches!(
-            set_stored_status(&storage, "resp_open", "completed", None, None)
+            set_stored_status(&storage, "resp_open", "completed", None, None, None)
                 .await
                 .unwrap(),
             Transition::Terminal(_)
         ));
         assert!(
             matches!(
-                set_stored_status(&storage, "resp_gone", "completed", None, None)
+                set_stored_status(&storage, "resp_gone", "completed", None, None, None)
                     .await
                     .unwrap(),
                 Transition::Missing
@@ -2074,13 +2855,13 @@ mod tests {
         store_queued(&flaky_storage, "resp_1").await;
         flaky.fail_next(1);
         assert!(
-            set_stored_status(&flaky_storage, "resp_1", "in_progress", None, None)
+            set_stored_status(&flaky_storage, "resp_1", "in_progress", None, None, None)
                 .await
                 .is_err(),
             "a store that cannot be read refuses the write and decides nothing"
         );
         assert!(matches!(
-            set_stored_status(&flaky_storage, "resp_1", "in_progress", None, None)
+            set_stored_status(&flaky_storage, "resp_1", "in_progress", None, None, None)
                 .await
                 .unwrap(),
             Transition::Moved(_)
@@ -2091,7 +2872,7 @@ mod tests {
     async fn a_failed_work_leaves_a_failed_record_with_its_error() {
         let storage = storage();
         store_queued(&storage, "resp_1").await;
-        let registry = Arc::new(BackgroundResponses::new(4));
+        let registry = Arc::new(BackgroundResponses::new(4, LEASE));
         let slot = registry.admit("resp_1").unwrap();
         drive(storage.clone(), None, slot, async {
             Err(json!({"code": "model_not_found", "message": "no such model"}))
@@ -2107,11 +2888,11 @@ mod tests {
     async fn a_work_that_stored_its_result_is_left_as_it_ended() {
         let storage = storage();
         store_queued(&storage, "resp_1").await;
-        let registry = Arc::new(BackgroundResponses::new(4));
+        let registry = Arc::new(BackgroundResponses::new(4, LEASE));
         let slot = registry.admit("resp_1").unwrap();
         let store = storage.clone();
         drive(storage.clone(), None, slot, async move {
-            set_stored_status(&store, "resp_1", "completed", None, None)
+            set_stored_status(&store, "resp_1", "completed", None, None, None)
                 .await
                 .unwrap();
             Ok(())
@@ -2126,7 +2907,7 @@ mod tests {
     async fn a_work_that_ends_without_a_stored_result_leaves_a_failed_record() {
         let storage = storage();
         store_queued(&storage, "resp_1").await;
-        let registry = Arc::new(BackgroundResponses::new(4));
+        let registry = Arc::new(BackgroundResponses::new(4, LEASE));
         let slot = registry.admit("resp_1").unwrap();
         // A stream whose transform ended without a terminal event and object.
         drive(storage.clone(), None, slot, async { Ok(()) }).await;
@@ -2145,7 +2926,7 @@ mod tests {
     async fn a_panicking_work_leaves_a_failed_record() {
         let storage = storage();
         store_queued(&storage, "resp_1").await;
-        let registry = Arc::new(BackgroundResponses::new(4));
+        let registry = Arc::new(BackgroundResponses::new(4, LEASE));
         let slot = registry.admit("resp_1").unwrap();
         drive(storage.clone(), None, slot, async { explode() }).await;
         let raw = stored_raw(&storage, "resp_1").await;
@@ -2172,8 +2953,8 @@ mod tests {
         let counting = Arc::new(CountingStorage::new());
         let storage: Arc<dyn ResponseStorage> = counting.clone();
         store_queued(&storage, "resp_1").await;
-        let owner = Arc::new(BackgroundResponses::new(4));
-        let other = Arc::new(BackgroundResponses::new(4));
+        let owner = Arc::new(BackgroundResponses::new(4, LEASE));
+        let other = Arc::new(BackgroundResponses::new(4, LEASE));
         let slot = owner.admit("resp_1").unwrap();
         let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
         let flag = DropFlag(Some(dropped_tx));
@@ -2198,9 +2979,10 @@ mod tests {
         // The cancel on the other gateway: no task there, the record is closed.
         assert!(other.cancel("resp_1").is_none());
         let writes = counting.stores();
-        let Transition::Moved(raw) = set_stored_status(&storage, "resp_1", "cancelled", None, None)
-            .await
-            .unwrap()
+        let Transition::Moved(raw) =
+            set_stored_status(&storage, "resp_1", "cancelled", None, None, None)
+                .await
+                .unwrap()
         else {
             panic!("the in-flight record is closed");
         };
@@ -2221,10 +3003,10 @@ mod tests {
     async fn a_record_closed_before_the_work_starts_is_not_run() {
         let storage = storage();
         store_queued(&storage, "resp_1").await;
-        set_stored_status(&storage, "resp_1", "cancelled", None, None)
+        set_stored_status(&storage, "resp_1", "cancelled", None, None, None)
             .await
             .unwrap();
-        let registry = Arc::new(BackgroundResponses::new(4));
+        let registry = Arc::new(BackgroundResponses::new(4, LEASE));
         let slot = registry.admit("resp_1").unwrap();
         let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
         let flag = DropFlag(Some(dropped_tx));
@@ -2418,6 +3200,7 @@ mod tests {
             &request,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -2426,7 +3209,7 @@ mod tests {
         assert_eq!(raw["background"], true);
         assert_eq!(raw["store"], false);
 
-        let registry = Arc::new(BackgroundResponses::new(4));
+        let registry = Arc::new(BackgroundResponses::new(4, LEASE));
         let slot = registry.admit("resp_u").unwrap();
         let store = storage.clone();
         drive(storage.clone(), None, slot, async move {
@@ -2482,6 +3265,7 @@ mod tests {
                 &request,
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -2489,16 +3273,17 @@ mod tests {
         store_queued(&storage, "resp_stored").await;
 
         for id in ["resp_cancelled", "resp_stored"] {
-            let Transition::Moved(raw) = set_stored_status(&storage, id, "cancelled", None, None)
-                .await
-                .unwrap()
+            let Transition::Moved(raw) =
+                set_stored_status(&storage, id, "cancelled", None, None, None)
+                    .await
+                    .unwrap()
             else {
                 panic!("{id} is closed");
             };
             assert_eq!(raw["status"], "cancelled");
         }
         assert!(matches!(
-            set_stored_status(&storage, "resp_running", "in_progress", None, None)
+            set_stored_status(&storage, "resp_running", "in_progress", None, None, None)
                 .await
                 .unwrap(),
             Transition::Moved(_)
@@ -2539,7 +3324,7 @@ mod tests {
     async fn a_work_finishes_its_linking_after_the_watch_reads_its_own_result() {
         let storage = storage();
         let request = store_queued(&storage, "resp_1").await;
-        let registry = Arc::new(BackgroundResponses::new(4));
+        let registry = Arc::new(BackgroundResponses::new(4, LEASE));
         let slot = registry.admit("resp_1").unwrap();
         // The linking waits at this gate until the watch has read the result.
         let (gate_tx, gate_rx) = oneshot::channel::<()>();
@@ -2551,6 +3336,7 @@ mod tests {
                     &storage,
                     &completed_after_queued("resp_1", &request),
                     &request,
+                    None,
                     None,
                     None,
                 )
@@ -2588,7 +3374,7 @@ mod tests {
     async fn a_work_that_never_ends_after_its_result_is_dropped_at_the_windows_end() {
         let storage = storage();
         let request = store_queued(&storage, "resp_1").await;
-        let registry = Arc::new(BackgroundResponses::new(4));
+        let registry = Arc::new(BackgroundResponses::new(4, LEASE));
         let slot = registry.admit("resp_1").unwrap();
         let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
         let flag = DropFlag(Some(dropped_tx));
@@ -2600,6 +3386,7 @@ mod tests {
                     &storage,
                     &completed_after_queued("resp_1", &request),
                     &request,
+                    None,
                     None,
                     None,
                 )
@@ -2708,7 +3495,7 @@ mod tests {
         let response = completed_after_queued("resp_1", &request);
         // Cancelled through another gateway; this gateway's reads fail from
         // here on.
-        set_stored_status(&direct, "resp_1", "cancelled", None, None)
+        set_stored_status(&direct, "resp_1", "cancelled", None, None, None)
             .await
             .unwrap();
         let writes = counting.stores();
@@ -2770,7 +3557,7 @@ mod tests {
         let storage: Arc<dyn ResponseStorage> = flaky.clone();
         let request = store_queued(&storage, "resp_1").await;
         let response = completed_after_queued("resp_1", &request);
-        set_stored_status(&storage, "resp_1", "cancelled", None, None)
+        set_stored_status(&storage, "resp_1", "cancelled", None, None, None)
             .await
             .unwrap();
         let landed_before = flaky.stores_landed();
@@ -2804,5 +3591,193 @@ mod tests {
             .unwrap()
             .expect("the record is still there");
         assert_eq!(stored.raw_response["status"], "cancelled");
+    }
+
+    /// A store whose first lease renewal meets a record that closed between
+    /// the watch's read and its write: `close_with` is stored under the id
+    /// right before the renewal is forwarded (the work's own result, or a
+    /// close from elsewhere), so the inner store refuses the renewal as
+    /// `Closed` with that object. The renewal is the second `in_progress`
+    /// write of the object; the first is the transition out of `queued`.
+    struct ClosedBeforeRenewalStorage {
+        inner: Arc<dyn ResponseStorage>,
+        close_with: Value,
+        in_progress_writes: AtomicUsize,
+        raced: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl ResponseStorage for ClosedBeforeRenewalStorage {
+        async fn store_response(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ResponseId, ResponseStorageError> {
+            self.inner.store_response(response).await
+        }
+
+        async fn store_response_if_open(
+            &self,
+            response: StoredResponse,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            self.inner.store_response_if_open(response).await
+        }
+
+        async fn update_response_object_if_open(
+            &self,
+            id: &ResponseId,
+            raw_response: Value,
+        ) -> Result<ConditionalStore, ResponseStorageError> {
+            if raw_response["status"] == "in_progress"
+                && self.in_progress_writes.fetch_add(1, Ordering::SeqCst) == 1
+            {
+                self.inner
+                    .update_response_object_if_open(id, self.close_with.clone())
+                    .await?;
+                self.raced.notify_one();
+            }
+            self.inner
+                .update_response_object_if_open(id, raw_response)
+                .await
+        }
+
+        async fn get_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<Option<StoredResponse>, ResponseStorageError> {
+            self.inner.get_response(response_id).await
+        }
+
+        async fn delete_response(
+            &self,
+            response_id: &ResponseId,
+        ) -> Result<(), ResponseStorageError> {
+            self.inner.delete_response(response_id).await
+        }
+
+        async fn list_identifier_responses(
+            &self,
+            identifier: &str,
+            tenant: Option<&str>,
+            limit: Option<usize>,
+        ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
+            self.inner
+                .list_identifier_responses(identifier, tenant, limit)
+                .await
+        }
+
+        async fn delete_identifier_responses(
+            &self,
+            identifier: &str,
+            tenant: Option<&str>,
+        ) -> Result<usize, ResponseStorageError> {
+            self.inner
+                .delete_identifier_responses(identifier, tenant)
+                .await
+        }
+    }
+
+    /// The renewal's write can meet the work's own result: the watch read the
+    /// record `in_progress`, the work stored `completed` before the renewal
+    /// landed, and the conditional write answers `Closed` with the result.
+    /// That is the work finishing, as a result read at the top of the loop
+    /// is: the run stays open for the terminal write window and the linking
+    /// after the result's write runs to its end.
+    #[tokio::test]
+    async fn a_work_finishes_its_linking_after_its_result_refuses_the_renewal() {
+        let inner = storage();
+        let request = store_queued(&inner, "resp_1").await;
+        let result = serde_json::to_value(completed_after_queued("resp_1", &request)).unwrap();
+        let racing = Arc::new(ClosedBeforeRenewalStorage {
+            inner: inner.clone(),
+            close_with: result,
+            in_progress_writes: AtomicUsize::new(0),
+            raced: tokio::sync::Notify::new(),
+        });
+        let storage: Arc<dyn ResponseStorage> = racing.clone();
+        // A short lease: the first renewal comes a third of it after the start.
+        let registry = Arc::new(BackgroundResponses::new(4, Duration::from_secs(3)));
+        let slot = registry.admit("resp_1").unwrap();
+        // The result is stored by the race, on the work's behalf; the linking
+        // that follows it waits at this gate.
+        let (gate_tx, gate_rx) = oneshot::channel::<()>();
+        let (linked_tx, linked_rx) = oneshot::channel::<()>();
+        let work = async move {
+            if gate_rx.await.is_ok() {
+                let _ = linked_tx.send(());
+            }
+            Ok(())
+        };
+        let watch = Duration::from_millis(20);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let task = tokio::spawn(drive_watching(storage.clone(), None, slot, work, watch));
+        tokio::time::timeout(Duration::from_secs(5), racing.raced.notified())
+            .await
+            .expect("the first renewal met the result");
+        // Several watch ticks read the result before the linking goes on.
+        tokio::time::sleep(watch * 4).await;
+        let _ = gate_tx.send(());
+        task.await.unwrap();
+        assert!(
+            linked_rx.await.is_ok(),
+            "the linking after the result's write ran to its end"
+        );
+        assert_eq!(stored_status(&storage, "resp_1").await, "completed");
+        assert_eq!(registry.in_flight(), 0);
+    }
+
+    /// A renewal refused because the record closed meanwhile from elsewhere
+    /// (a cancel on another gateway, the reaper's close once the lease had
+    /// run out) ends the run with that status: the work is dropped and the
+    /// close stands.
+    #[tokio::test]
+    async fn a_renewal_refused_by_a_close_from_elsewhere_ends_the_run() {
+        let inner = storage();
+        store_queued(&inner, "resp_1").await;
+        let closed = with_status(
+            stored_raw(&inner, "resp_1").await,
+            "failed",
+            Some(
+                json!({"code": "gateway_lost", "message": "the gateway running this response stopped"}),
+            ),
+        );
+        let racing = Arc::new(ClosedBeforeRenewalStorage {
+            inner: inner.clone(),
+            close_with: closed,
+            in_progress_writes: AtomicUsize::new(0),
+            raced: tokio::sync::Notify::new(),
+        });
+        let storage: Arc<dyn ResponseStorage> = racing.clone();
+        let registry = Arc::new(BackgroundResponses::new(4, Duration::from_secs(3)));
+        let slot = registry.admit("resp_1").unwrap();
+        let (dropped_tx, dropped_rx) = oneshot::channel::<()>();
+        let flag = DropFlag(Some(dropped_tx));
+        let work = async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+            Ok(())
+        };
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test awaits the task it spawns"
+        )]
+        let task = tokio::spawn(drive_watching(
+            storage.clone(),
+            None,
+            slot,
+            work,
+            Duration::from_millis(20),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the run ends once the renewal is refused")
+            .unwrap();
+        dropped_rx.await.expect("the work was dropped");
+        let raw = stored_raw(&storage, "resp_1").await;
+        assert_eq!(raw["status"], "failed");
+        assert_eq!(raw["error"]["code"], "gateway_lost");
+        assert_eq!(registry.in_flight(), 0);
     }
 }

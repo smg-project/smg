@@ -507,7 +507,7 @@ impl ResponseStorage for HookedResponseStorage {
     /// A status transition: the store hooks run as for a store, the
     /// after-hook only when the object was written, with the id as its
     /// result; the record's other columns are not rewritten, so a hook that
-    /// supplies none (a transition under no request) resets nothing.
+    /// supplies none (the reaper runs under no request) resets nothing.
     async fn update_response_object_if_open(
         &self,
         id: &ResponseId,
@@ -665,6 +665,16 @@ impl ResponseStorage for HookedResponseStorage {
         .await;
 
         Ok(result)
+    }
+
+    /// The gateway's own maintenance read (the records whose running gateway
+    /// may be gone), not a client operation: no hook runs for it. The close
+    /// that follows is a store and runs the hooks as every store does.
+    async fn list_open_background_responses(
+        &self,
+        limit: usize,
+    ) -> ResponseResult<Vec<StoredResponse>> {
+        self.inner.list_open_background_responses(limit).await
     }
 
     async fn list_identifier_responses(
@@ -1622,6 +1632,27 @@ mod tests {
             Some("user-1"),
             "the rest of the record stays"
         );
+    }
+
+    #[tokio::test]
+    async fn hooked_response_lists_open_background_responses_without_a_hook_round() {
+        let inner = Arc::new(MemoryResponseStorage::new());
+        let hook = Arc::new(MockHook::new());
+        let hooked = HookedResponseStorage::new(inner, hook.clone());
+
+        let mut open = StoredResponse::new(None);
+        open.raw_response = json!({"background": true, "status": "in_progress", "_lease": {"owner": "gw_a", "expires_at": 1}});
+        let open_id = hooked.store_response(open).await.unwrap();
+        let mut closed = StoredResponse::new(None);
+        closed.raw_response = json!({"background": true, "status": "completed"});
+        hooked.store_response(closed).await.unwrap();
+        assert_eq!(hook.before_calls(), 2);
+
+        let listed = hooked.list_open_background_responses(10).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, open_id);
+        assert_eq!(hook.before_calls(), 2, "a maintenance read runs no hook");
+        assert_eq!(hook.after_calls(), 2);
     }
 
     #[tokio::test]

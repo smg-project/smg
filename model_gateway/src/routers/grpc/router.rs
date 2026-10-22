@@ -198,8 +198,15 @@ impl GrpcRouter {
             // one place a cancel looks a running id up.
             let background_responses = Arc::new(BackgroundResponses::new(
                 ctx.router_config.max_background_responses,
+                Duration::from_secs(ctx.router_config.background_lease_ttl_secs),
             ));
-
+            // The owner id this registry writes into its leases: the one the
+            // `gateway_lost` errors of this gateway's responses name.
+            tracing::info!(
+                owner = background_responses.owner(),
+                lease_ttl_secs = ctx.router_config.background_lease_ttl_secs,
+                "Background response registry started"
+            );
             // Helper closure to create responses context with a given pipeline
             let create_responses_context = |pipeline: &RequestPipeline| {
                 ResponsesContext::new(
@@ -610,6 +617,7 @@ impl GrpcRouter {
             &queued,
             &request,
             crate::tenant::storage_tenant(tenant_meta).as_deref(),
+            ctx.background.lease().as_ref(),
             ctx.request_context.clone(),
         )
         .await

@@ -37,7 +37,8 @@ pub use core::{
     Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemStorage,
     ConversationItemStorageError, ConversationStorage, ConversationStorageError, Failure,
     ListParams, NewConversation, NewConversationItem, ResponseId, ResponseStorage,
-    ResponseStorageError, SortOrder, StorageFailure, StoredResponse, TERMINAL_RESPONSE_STATUSES,
+    ResponseStorageError, SortOrder, StorageFailure, StoredResponse, BACKGROUND_LEASE_KEY,
+    TERMINAL_RESPONSE_STATUSES,
 };
 
 pub use config::{HistoryBackend, MemoryConfig, OracleConfig, PostgresConfig, RedisConfig};
