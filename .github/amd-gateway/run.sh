@@ -3,7 +3,10 @@ set -euo pipefail
 python3 .github/amd-gateway/reuse.py
 python3 .github/amd-qa/closure_audit.py snapshot diagnostic-results/image-before.json
 case "$E2E_ENGINE" in
-  vllm) bash scripts/ci_setup_vllm_rocm_image.sh ;;
+  vllm)
+    source scripts/ci_setup_vllm_rocm_image.sh
+    export SMG_CI_GRPC_COMPANION_VERSION
+    ;;
   sglang) bash scripts/ci_setup_sglang_rocm_image.sh ;;
   *) exit 1 ;;
 esac

@@ -48,6 +48,7 @@ jobs:
       SHOW_ROUTER_LOGS: '1'
       E2E_LOG_DIR: e2e-logs
       PYTEST_ADDOPTS: ''
+      PIP_RETRIES: '0'
       GIT_CONFIG_COUNT: '1'
       GIT_CONFIG_KEY_0: safe.directory
       GIT_CONFIG_VALUE_0: ${{ github.workspace }}
