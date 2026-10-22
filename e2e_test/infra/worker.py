@@ -936,8 +936,10 @@ class Worker:
                 self._log_file = None
             raise
 
-    def _wait_grpc_healthy(self, timeout: float) -> None:
-        """Wait for a gRPC worker to become healthy."""
+    def grpc_serving(self, timeout: float = 5.0) -> bool:
+        """One health answer of a gRPC worker: ``True`` on SERVING (or, from a
+        server without the health service, on a ready channel), ``False`` on
+        anything else, a refused connection and a NOT_SERVING included."""
         try:
             import grpc
             from grpc_health.v1 import health_pb2, health_pb2_grpc
@@ -946,34 +948,38 @@ class Worker:
                 "gRPC health check requires grpcio and grpcio-health-checking packages"
             )
 
-        start = time.perf_counter()
         channel = grpc.insecure_channel(host_port(DEFAULT_HOST, self.port))
         try:
-            while time.perf_counter() - start < timeout:
-                if not self.is_alive():
-                    pid = self.process.pid if self.process else "unknown"
-                    raise RuntimeError(f"Worker {self.model_id} (PID {pid}) died during startup")
-                try:
-                    stub = health_pb2_grpc.HealthStub(channel)
-                    request = health_pb2.HealthCheckRequest(service="")
-                    response = stub.Check(request, timeout=5.0)
-                    if response.status == health_pb2.HealthCheckResponse.SERVING:
-                        return
-                except grpc.RpcError as e:
-                    # UNIMPLEMENTED means server is up but doesn't have health service;
-                    # fall back to channel connectivity check
-                    if hasattr(e, "code") and e.code() == grpc.StatusCode.UNIMPLEMENTED:
-                        try:
-                            grpc.channel_ready_future(channel).result(timeout=5.0)
-                            return
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-                time.sleep(HEALTH_CHECK_INTERVAL)
+            try:
+                stub = health_pb2_grpc.HealthStub(channel)
+                request = health_pb2.HealthCheckRequest(service="")
+                response = stub.Check(request, timeout=timeout)
+                return response.status == health_pb2.HealthCheckResponse.SERVING
+            except grpc.RpcError as e:
+                # UNIMPLEMENTED means server is up but doesn't have health service;
+                # fall back to channel connectivity check
+                if hasattr(e, "code") and e.code() == grpc.StatusCode.UNIMPLEMENTED:
+                    try:
+                        grpc.channel_ready_future(channel).result(timeout=timeout)
+                        return True
+                    except Exception:
+                        return False
+                return False
+            except Exception:
+                return False
         finally:
             channel.close()
+
+    def _wait_grpc_healthy(self, timeout: float) -> None:
+        """Wait for a gRPC worker to become healthy."""
+        start = time.perf_counter()
+        while time.perf_counter() - start < timeout:
+            if not self.is_alive():
+                pid = self.process.pid if self.process else "unknown"
+                raise RuntimeError(f"Worker {self.model_id} (PID {pid}) died during startup")
+            if self.grpc_serving():
+                return
+            time.sleep(HEALTH_CHECK_INTERVAL)
 
         raise TimeoutError(
             f"gRPC worker {self.model_id} on port {self.port} "

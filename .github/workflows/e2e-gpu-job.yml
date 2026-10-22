@@ -260,6 +260,22 @@ jobs:
           E2E_LOG_DIR: e2e-logs
           E2E_MIN_SELECTED: ${{ inputs.min_selected }}
           BRAVE_MCP_HOST: ${{ inputs.setup_agentic_deps && 'brave-search-mcp' || '' }}
+          # Every gRPC servicer runs a planned warm-up before it reports
+          # SERVING (grpc_servicer/smg_grpc_servicer/warmup.py). At its default
+          # level, full (one request per 128-token prefill class), it cost
+          # 26-114 s per worker start on the AMD chat row (8:47 over the seven
+          # workers before gpt-oss-20b) and +4:13 of pytest on the CUDA vLLM
+          # chat row, once per worker start, eight per chat leg. The legs'
+          # workers run it at the fast level instead: the decode staircase and
+          # the engines' bucket grid (62 of 175 steps and 12 % of the prefill
+          # tokens for a 16k-token step), so every start still exercises the
+          # path. The full level stays covered once per engine and run by
+          # e2e_test/chat_completions/test_servicer_warmup.py, whose one worker
+          # sets its knob back to full. The harness copies this environment
+          # into every worker it starts (a worker's own extra_env wins).
+          SMG_VLLM_SERVICER_WARMUP: fast
+          SMG_SGLANG_SERVICER_WARMUP: fast
+          SMG_TOKENSPEED_SERVICER_WARMUP: fast
         run: |
           if [ "${{ inputs.gpu_vendor }}" = amd ]; then
             bash scripts/ci_killall_sglang.sh rocm  # the default mode reads nvidia-smi
