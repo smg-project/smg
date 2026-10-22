@@ -141,6 +141,7 @@ def unchanged(before, after):
 
 
 def native():
+    devices("native-before")
     import torch
 
     require(not torch.cuda.is_initialized(), "GPU initialized before native probe")

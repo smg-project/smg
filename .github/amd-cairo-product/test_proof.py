@@ -84,10 +84,26 @@ def test_actual_metadata_files_and_constraint_changes(output, tmp_path, monkeypa
 
 
 def test_native_probe_rejects_initialized_gpu_before_cairo_import(output, monkeypatch):
+    monkeypatch.setattr(proof, "devices", lambda label: None)
     monkeypatch.setitem(
         sys.modules, "torch", SimpleNamespace(cuda=SimpleNamespace(is_initialized=lambda: True))
     )
     with pytest.raises(ValueError, match="GPU initialized before"):
+        proof.native()
+
+
+def test_native_device_failure_precedes_torch_access(output, monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(cuda=SimpleNamespace(is_initialized=lambda: pytest.fail("Torch queried"))),
+    )
+
+    def blocked(label):
+        raise ValueError("GPU devices visible")
+
+    monkeypatch.setattr(proof, "devices", blocked)
+    with pytest.raises(ValueError, match="GPU devices visible"):
         proof.native()
 
 
