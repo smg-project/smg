@@ -3721,11 +3721,18 @@ mod tests {
             () = arrivals => unreachable!("the arrivals never end on their own"),
         };
         let elapsed = started.elapsed();
+        // The window is counted on the worker's clock, in whole
+        // milliseconds from the run's first prompt, which was booked
+        // before `started`: the run's silence is read where the rule
+        // read it, and the test's own clock bounds it from above.
+        let silent = prefill
+            .prefill_unanswered_run()
+            .expect("the run never answered");
         let status = failure(result);
         assert!(is_prefill_silence(&status), "{status:?}");
         assert!(
-            elapsed >= backlog && elapsed < backlog + bound,
-            "given up on once the backlog had its time: {elapsed:?}"
+            silent >= backlog && elapsed < backlog + bound,
+            "given up on once the backlog had its time, no later than a bound after: silent {silent:?}, {elapsed:?} since the dispatch"
         );
         assert!(
             status.message().contains("of a 2.0s window"),
