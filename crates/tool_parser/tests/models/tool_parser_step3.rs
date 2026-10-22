@@ -1,8 +1,8 @@
 //! Step3 Parser Integration Tests
-mod common;
 
-use common::create_test_tools;
 use tool_parser::{Step3Parser, ToolParser};
+
+use crate::common::create_test_tools;
 
 #[tokio::test]
 async fn test_step3_complete_parsing() {

@@ -24,13 +24,13 @@
 //!    without arguments would reach the client as an unusable tool call.
 //! 5. A complete call without arguments streams `{}`, as the non-streaming
 //!    parse returns, rather than a name alone.
-mod common;
 
-use common::{create_test_tools, streaming_helpers};
 use tool_parser::{
     types::ToolCallItem, CohereParser, JsonParser, LlamaParser, MistralParser, QwenParser,
     ToolParser,
 };
+
+use crate::common::{create_test_tools, streaming_helpers};
 
 /// Representative Llama-3.2-1B output for "What's the weather in Tokyo?" with
 /// declared tools: `{`-prefixed JSON that never becomes a valid declared tool

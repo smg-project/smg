@@ -1,7 +1,6 @@
 //! Partial JSON Parser Tests
 //!
 //! Tests for the partial JSON parser with allow_partial_strings flag behavior
-mod common;
 
 use tool_parser::partial_json::PartialJson;
 

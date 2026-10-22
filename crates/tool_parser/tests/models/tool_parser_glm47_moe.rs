@@ -1,9 +1,9 @@
 //! GLM-4.7 MoE Parser Integration Tests
-mod common;
 
-use common::create_test_tools;
 use openai_protocol::common::{ToolChoice, ToolChoiceValue};
 use tool_parser::{Glm4MoeParser, GrammarStart, ParserFactory, ToolConstraint, ToolParser};
+
+use crate::common::create_test_tools;
 
 #[tokio::test]
 async fn test_glm47_complete_parsing() {

@@ -1,8 +1,8 @@
 //! GLM-4 MoE Parser Integration Tests
-mod common;
 
-use common::create_test_tools;
 use tool_parser::{Glm4MoeParser, ToolParser};
+
+use crate::common::create_test_tools;
 
 #[tokio::test]
 async fn test_glm4_complete_parsing() {

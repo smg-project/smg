@@ -1,8 +1,8 @@
 //! DeepSeek V3 Parser Integration Tests
-mod common;
 
-use common::create_test_tools;
 use tool_parser::{DeepSeekParser, ToolParser};
+
+use crate::common::create_test_tools;
 
 #[tokio::test]
 async fn test_deepseek_complete_parsing() {

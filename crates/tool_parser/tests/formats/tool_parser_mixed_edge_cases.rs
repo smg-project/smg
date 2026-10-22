@@ -1,11 +1,11 @@
 //! Mixed Format and Additional Edge Case Tests
 //!
 //! Tests for edge cases across parsers and mixed format scenarios
-mod common;
 
-use common::create_test_tools;
 use serde_json::json;
 use tool_parser::{JsonParser, LlamaParser, MistralParser, PythonicParser, QwenParser, ToolParser};
+
+use crate::common::create_test_tools;
 
 #[tokio::test]
 async fn test_mixed_formats_in_text() {

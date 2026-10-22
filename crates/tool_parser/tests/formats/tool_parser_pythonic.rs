@@ -1,11 +1,11 @@
 //! Pythonic Parser Integration Tests
 //!
 //! Tests for the Pythonic parser which handles Python function call syntax
-mod common;
 
-use common::create_test_tools;
 use serde_json::json;
 use tool_parser::{PythonicParser, ToolParser};
+
+use crate::common::create_test_tools;
 
 #[tokio::test]
 async fn test_pythonic_single_function() {

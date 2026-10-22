@@ -1,10 +1,10 @@
 //! Llama Parser Integration Tests
 //!
 //! Tests for the Llama parser which handles <|python_tag|> format and plain JSON
-mod common;
 
-use common::{create_test_tools, streaming_helpers};
 use tool_parser::{LlamaParser, ToolParser};
+
+use crate::common::{create_test_tools, streaming_helpers};
 
 #[tokio::test]
 async fn test_llama_python_tag_format() {

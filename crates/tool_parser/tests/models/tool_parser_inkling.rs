@@ -1,8 +1,7 @@
-mod common;
-
-use common::create_test_tools;
 use serde_json::json;
 use tool_parser::{InklingParser, ParserFactory, ToolParser};
+
+use crate::common::create_test_tools;
 
 #[tokio::test]
 async fn test_inkling_complete_parsing() {

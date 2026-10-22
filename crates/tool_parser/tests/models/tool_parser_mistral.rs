@@ -1,11 +1,11 @@
 //! Mistral Parser Integration Tests
 //!
 //! Tests for the Mistral parser which handles [TOOL_CALLS] format
-mod common;
-
 use openai_protocol::common::ToolChoice;
 use serde_json::json;
 use tool_parser::{MistralParser, ParserFactory, ToolConstraint, ToolParser};
+
+use crate::common;
 
 #[test]
 fn test_mistral_structural_tag_call_cardinality() {

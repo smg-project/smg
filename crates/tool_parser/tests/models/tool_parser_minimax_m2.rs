@@ -1,10 +1,10 @@
 //! MiniMax M2 Parser Integration Tests
-mod common;
 
-use common::create_test_tools;
 use openai_protocol::common::{Function, Tool};
 use serde_json::json;
 use tool_parser::{MinimaxM2Parser, ToolParser};
+
+use crate::common::create_test_tools;
 
 /// Tools matching issue #1743: `update_task(taskId: string, subject: string)`.
 fn update_task_tools() -> Vec<Tool> {

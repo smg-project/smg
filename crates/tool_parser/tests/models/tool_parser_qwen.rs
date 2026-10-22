@@ -1,11 +1,11 @@
 //! Qwen Parser Integration Tests
 //!
 //! Tests for the Qwen parser which handles <tool_call>...</tool_call> format
-mod common;
 
-use common::{create_test_tools, streaming_helpers};
 use serde_json::json;
 use tool_parser::{QwenParser, ToolParser};
+
+use crate::common::{create_test_tools, streaming_helpers};
 
 #[tokio::test]
 async fn test_qwen_single_tool() {

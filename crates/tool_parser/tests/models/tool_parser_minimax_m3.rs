@@ -1,10 +1,10 @@
 //! MiniMax M3 Parser Integration Tests
-mod common;
 
-use common::create_test_tools;
 use openai_protocol::common::{Function, Tool, ToolChoice, ToolChoiceValue};
 use serde_json::json;
 use tool_parser::{GrammarStart, MinimaxM3Parser, ParserFactory, ToolConstraint, ToolParser};
+
+use crate::common::create_test_tools;
 
 const NS: &str = "]<]minimax[>[";
 

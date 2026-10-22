@@ -1,8 +1,8 @@
 //! Kimi K2 Parser Integration Tests
-mod common;
 
-use common::create_test_tools;
 use tool_parser::{KimiK2Parser, ToolParser};
+
+use crate::common::create_test_tools;
 
 #[tokio::test]
 async fn test_kimik2_complete_parsing() {

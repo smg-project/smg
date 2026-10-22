@@ -2,10 +2,10 @@
 //!
 //! Tests for the Cohere parser which handles <|START_ACTION|>...<|END_ACTION|> format
 
-mod common;
-
 use serde_json::json;
 use tool_parser::{CohereParser, ToolParser};
+
+use crate::common;
 
 #[tokio::test]
 async fn test_cohere_single_tool() {

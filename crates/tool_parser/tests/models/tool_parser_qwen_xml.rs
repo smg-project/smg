@@ -2,11 +2,11 @@
 //!
 //! Tests for the Qwen XML parser which handles XML format:
 //! <tool_call>\n<function=name>\n<parameter=key>value</parameter>\n</function>\n</tool_call>
-mod common;
 
-use common::{create_test_tools, streaming_helpers};
 use serde_json::json;
 use tool_parser::{parsers::QwenXmlParser, traits::ToolParser};
+
+use crate::common::{create_test_tools, streaming_helpers};
 
 // Exercise the same terminal getters as the gRPC streaming caller. Fixtures are synthetic.
 #[expect(clippy::unwrap_used, reason = "assertions in a shared test helper")]

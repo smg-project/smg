@@ -1,8 +1,8 @@
 //! DeepSeek DSML Parser Integration Tests (V3.2 + V4)
-mod common;
 
-use common::create_test_tools;
 use tool_parser::{DeepSeekDsmlParser, ToolParser};
+
+use crate::common::create_test_tools;
 
 #[tokio::test]
 async fn test_deepseek32_complete_single_tool() {

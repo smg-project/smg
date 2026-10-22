@@ -1,10 +1,10 @@
 //! Edge Cases and Error Handling Tests
 //!
 //! Tests for malformed input, edge cases, and error recovery
-mod common;
 
-use common::create_test_tools;
 use tool_parser::{JsonParser, MistralParser, PythonicParser, QwenParser, ToolParser};
+
+use crate::common::create_test_tools;
 
 #[tokio::test]
 async fn test_empty_input() {

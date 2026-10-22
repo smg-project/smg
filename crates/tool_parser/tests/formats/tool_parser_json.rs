@@ -1,11 +1,11 @@
 //! JSON Parser Integration Tests
 //!
 //! Tests for the JSON parser which handles OpenAI, Claude, and generic JSON formats
-mod common;
 
-use common::{create_test_tools, streaming_helpers};
 use serde_json::json;
 use tool_parser::{JsonParser, ToolParser};
+
+use crate::common::{create_test_tools, streaming_helpers};
 
 #[tokio::test]
 async fn test_simple_json_tool_call() {
