@@ -280,3 +280,32 @@ def test_the_health_wait_ends_on_its_bound_and_on_a_dead_worker(monkeypatch):
     monkeypatch.setattr(Worker, "is_alive", lambda self: False)
     with pytest.raises(RuntimeError, match="died during startup"):
         worker._wait_grpc_healthy(timeout=5)
+
+
+def test_a_pass_that_ran_every_step_with_a_failed_request_is_described_as_such():
+    """A step with a failed request is not covered, so the pass is not complete
+    though nothing ended it early: the description says what happened instead
+    of an early end without a reason."""
+    from infra.servicer_warmup import WarmupEnd, WarmupOutcome, WarmupStart
+
+    start = WarmupStart("full", 10, 300.0)
+    failed = WarmupOutcome(
+        start,
+        WarmupEnd(
+            covered=8, planned=10, secs=12.0, failed_requests=3, budget_hit=False, stopped=False
+        ),
+        6.0,
+        0.0,
+    )
+    assert not failed.end.complete
+    assert "ran every step, 2 with failed requests" in failed.describe()
+    assert "ended early" not in failed.describe()
+    budget = WarmupOutcome(
+        start,
+        WarmupEnd(
+            covered=8, planned=10, secs=12.0, failed_requests=0, budget_hit=True, stopped=False
+        ),
+        6.0,
+        0.0,
+    )
+    assert "ended early on the budget" in budget.describe()

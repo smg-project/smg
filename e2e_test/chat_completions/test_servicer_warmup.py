@@ -79,7 +79,9 @@ class TestFullWarmupBeforeServing:
             f"the worker's own {knob}={LEVEL_FULL} did not win over the job's level: "
             f"{outcome.describe()}"
         )
-        assert outcome.end.complete, f"the pass did not run to its end: {outcome.describe()}"
+        # A failed request leaves its step uncovered, so the pass would read as
+        # not complete too: the failures are named first.
         assert outcome.end.failed_requests == 0, (
             f"the pass had failed requests: {outcome.describe()}"
         )
+        assert outcome.end.complete, f"the pass did not run to its end: {outcome.describe()}"

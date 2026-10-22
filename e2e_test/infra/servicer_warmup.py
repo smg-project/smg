@@ -122,13 +122,18 @@ class WarmupOutcome:
 
     def describe(self) -> str:
         budget = f"under a {self.start.budget_secs:g} s budget"
-        ended = (
-            "ran to its end"
-            if self.end.complete
-            else "ended early"
-            + (" on the budget" if self.end.budget_hit else "")
-            + (" on a failure streak" if self.end.stopped else "")
-        )
+        if self.end.complete:
+            ended = "ran to its end"
+        elif self.end.budget_hit or self.end.stopped:
+            ended = (
+                "ended early"
+                + (" on the budget" if self.end.budget_hit else "")
+                + (" on a failure streak" if self.end.stopped else "")
+            )
+        else:
+            # The servicer counts a step as covered only when none of its requests
+            # failed: every step ran, and the uncovered ones had a failed request.
+            ended = f"ran every step, {self.end.planned - self.end.covered} with failed requests"
         return (
             f"level {self.start.level}: {self.end.covered} of {self.end.planned} steps in "
             f"{self.end.secs:.1f} s {budget}, {self.end.failed_requests} failed requests, "
