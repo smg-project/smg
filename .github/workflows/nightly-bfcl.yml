@@ -1,7 +1,7 @@
 # Nightly BFCL A/B — official Berkeley Function Calling Leaderboard run comparing
 # SMG's parsing frontend (SMG -> vLLM gRPC) against pure vLLM, same model/engine/
-# checkpoint/sampling. Track B of docs/proposals/2026-06-10-bfcl-nightly-parser-
-# verification.md. Informational/non-blocking — never a merge gate.
+# checkpoint/sampling. Track B of the parser-verification proposal.
+# Informational/non-blocking — never a merge gate.
 #
 # Runs weekly (Mondays 07:17 UTC) over non_live + live + multi_turn (static,
 # reproducible; excludes the agentic/executable categories that need

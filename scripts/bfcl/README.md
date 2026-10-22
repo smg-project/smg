@@ -1,6 +1,6 @@
 # BFCL nightly A/B — `scripts/bfcl/`
 
-**Track B** of the parser-verification proposal: run the **official** Berkeley Function Calling Leaderboard (`bfcl-eval`) against two serving "arms" and diff the scores. The companion **Track A** (offline, deterministic parser-conformance gate) lives in `crates/parser_conformance/`.
+**Track B** of the parser-verification proposal: run the **official** Berkeley Function Calling Leaderboard (`bfcl-eval`) against two serving "arms" and diff the scores. The companion **Track A** (an offline, deterministic parser-conformance gate) is proposed but not yet built.
 
 ## The experiment
 
@@ -179,4 +179,4 @@ Run on a dev H100 box, **`Qwen/Qwen3.6-27B` at TP=2** (one arm per GPU pair), th
 
 So SMG's Rust frontend is **at parity** with vLLM's native parser across the full non-live set — marginally ahead overall (+0.18pp), and never worse than −0.25pp on any category. Both arms reasoning-parse `<think>` into `reasoning_content` and emit native `tool_calls` (FC confirmed end to end). The low java/js numbers are the *model's* non-Python ability (identical on both arms) — confirming the A/B isolates the frontend, not model quality. (An earlier `simple_python`-only run on Qwen3-4B gave 95.50 vs 95.25, same parity story.)
 
-Scope note: the table above is the `non_live` slice. The **nightly** runs the broader reproducible set — **`non_live` + `live` + `multi_turn`** (17 categories; `live` is real-user data, `multi_turn` is state-based simulation — both static, no internet). It excludes the agentic/executable categories (`web_search_*`, `memory_*`, `exec_*`) that need web-search/memory/sandbox infra. **PRs** that touch the pipeline run only a quick non-live sanity subset (`simple_python,irrelevance`); per-PR correctness is the cheap CPU Track-A parser-conformance gate (`crates/parser_conformance`). Scale to multiple runs × the five target models for tight confidence intervals.
+Scope note: the table above is the `non_live` slice. The **nightly** runs the broader reproducible set — **`non_live` + `live` + `multi_turn`** (17 categories; `live` is real-user data, `multi_turn` is state-based simulation — both static, no internet). It excludes the agentic/executable categories (`web_search_*`, `memory_*`, `exec_*`) that need web-search/memory/sandbox infra. **PRs** that touch the pipeline run only a quick non-live sanity subset (`simple_python,irrelevance`); per-PR correctness is the job of the Track-A parser-conformance gate, which is proposed but not yet built. Scale to multiple runs × the five target models for tight confidence intervals.

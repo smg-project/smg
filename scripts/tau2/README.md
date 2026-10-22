@@ -1,6 +1,6 @@
 # τ²-bench nightly A/B — `scripts/tau2/`
 
-**Track B** of the multi-turn parser-verification suite: run **τ²-bench** (`tau2-bench`) against two serving "arms" and diff pass^1 and pass^k. The companion **Track A** (an offline, deterministic parser-conformance gate) is proposed but not yet built — see the parser-verification proposal in `docs/proposals/`.
+**Track B** of the multi-turn parser-verification suite: run **τ²-bench** (`tau2-bench`) against two serving "arms" and diff pass^1 and pass^k. The companion **Track A** (an offline, deterministic parser-conformance gate) is proposed but not yet built.
 
 ## The experiment
 
