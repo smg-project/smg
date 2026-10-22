@@ -1,7 +1,9 @@
 """CPU contract-stub checks; these do not import or execute the vLLM backend."""
 
+import importlib
 import json
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 from infra.pd_scheduler_observer import SchedulerObserverMixin
@@ -231,3 +233,23 @@ def test_snapshots_keep_exact_ids_and_primitives_without_retaining_request():
     assert all(json.loads(line)["attempt"] == "1" for line in records)
     assert all("accepted" not in json.loads(line) for line in records)
     assert trace.unknown is None
+
+
+def test_real_entry_module_keeps_both_native_parent_classes(monkeypatch):
+    # Import the actual entry module against explicit contract stubs, not vLLM.
+    for name, base in (("scheduler", NativeContract), ("async_scheduler", AsyncNativeContract)):
+        module = ModuleType(f"vllm.v1.core.sched.{name}")
+        setattr(module, "Scheduler" if name == "scheduler" else "AsyncScheduler", base)
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    sys.modules.pop("infra.pd_vllm_scheduler", None)
+    entry = importlib.import_module("infra.pd_vllm_scheduler")
+    try:
+        assert entry.ObservedScheduler.__mro__[2] is NativeContract
+        assert entry.ObservedAsyncScheduler.__mro__[2] is AsyncNativeContract
+        assert entry.observer_class_for(False) is entry.ObservedScheduler
+        assert entry.observer_class_for(True) is entry.ObservedAsyncScheduler
+        for unresolved in (None, 0, 1, "true"):
+            with pytest.raises(ValueError):
+                entry.observer_class_for(unresolved)
+    finally:
+        sys.modules.pop("infra.pd_vllm_scheduler", None)
