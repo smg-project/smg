@@ -687,6 +687,15 @@ pub(crate) fn init_metrics() {
         "Blocks of the parent-less stores, by worker"
     );
     describe_counter!(
+        "smg_kv_event_sub_block_stores_total",
+        "Stores of blocks narrower than the worker's block of record (a hybrid engine's \
+         prefix entries at its hash granularity), left out of the index, by worker"
+    );
+    describe_counter!(
+        "smg_kv_event_sub_block_blocks_total",
+        "Blocks of the sub-block stores, by worker"
+    );
+    describe_counter!(
         "smg_kv_event_blocks_total",
         "Blocks named by applied KV events, by worker and op (stored, removed; snapshot: \
          the live set a relay state snapshot listed)"
@@ -2427,6 +2436,10 @@ impl Metrics {
             .increment(0);
         counter!("smg_kv_event_parentless_blocks_total", "worker" => Arc::clone(&worker))
             .increment(0);
+        counter!("smg_kv_event_sub_block_stores_total", "worker" => Arc::clone(&worker))
+            .increment(0);
+        counter!("smg_kv_event_sub_block_blocks_total", "worker" => Arc::clone(&worker))
+            .increment(0);
         gauge!("smg_kv_event_degraded_ranks", "worker" => worker).set(0.0);
     }
 
@@ -2544,6 +2557,15 @@ impl Metrics {
         counter!("smg_kv_event_parentless_stores_total", "worker" => worker.clone())
             .increment(stores);
         counter!("smg_kv_event_parentless_blocks_total", "worker" => worker).increment(blocks);
+    }
+
+    /// Count the stores a batch left out of the index as narrower than the
+    /// worker's block of record, and the blocks they carried.
+    pub fn record_kv_event_sub_block(worker_url: &str, stores: u64, blocks: u64) {
+        let worker = intern_string(worker_url);
+        counter!("smg_kv_event_sub_block_stores_total", "worker" => worker.clone())
+            .increment(stores);
+        counter!("smg_kv_event_sub_block_blocks_total", "worker" => worker).increment(blocks);
     }
 
     /// Time to apply one batch to the index.
