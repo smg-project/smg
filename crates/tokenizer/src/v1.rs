@@ -25,8 +25,6 @@ pub(crate) struct V1Encoder {
     encode_special_tokens: bool,
 }
 
-// rc.2's reader can accept a Split without a usable regex engine. Check the
-// constructed pipeline, including its fused DeepSeek sequence, before selecting it.
 /// Whether `pre` is a `Metaspace` pre-tokenizer, alone or in a sequence.
 fn has_metaspace(pre: Option<&PreTokenizerWrapper>) -> bool {
     match pre {
@@ -39,6 +37,8 @@ fn has_metaspace(pre: Option<&PreTokenizerWrapper>) -> bool {
     }
 }
 
+// rc.2's reader can accept a Split without a usable regex engine. Check the
+// constructed pipeline, including its fused DeepSeek sequence, before selecting it.
 fn supported_splits(pre: &PipelinePreTokenizer) -> bool {
     match pre {
         PipelinePreTokenizer::Split(split) => {
@@ -100,11 +100,13 @@ impl V1Encoder {
         // engine has no `Metaspace` pre-tokenizer), and a normalizer runs
         // before the added tokens matched after normalization are cut, where
         // `tokenizers` runs the pre-tokenizer after that cut, on each split
-        // with its offset. The two agree until such a token meets the word
+        // with its offset. The two disagree where such a token meets the word
         // marker the scheme prepends: at the start of the text (`first`: a
         // marker piece before the token), after every such token (`always`:
-        // no marker piece after it). Those vocabularies keep the established
-        // implementation.
+        // no marker piece after it); and, under any scheme (`never` too), the
+        // lowered normalizer has already turned the spaces of such a token's
+        // text into the marker, so a token with a space in it stops matching.
+        // Those vocabularies keep the established implementation.
         if has_metaspace(tokenizer.get_pre_tokenizer())
             && tokenizer
                 .get_added_vocabulary()
