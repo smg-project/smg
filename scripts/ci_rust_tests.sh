@@ -143,7 +143,10 @@ commands_of() {
     local shard=$1
     case "$shard" in
         gateway-unit)
-            echo "-p smg --lib --bins"
+            # The lib's unit tests and the smg binary's. The alias binary amg is the same
+            # source (its manifest entry says test = false); an explicit --bins would build
+            # and run its harness anyway, so the binary is named.
+            echo "-p smg --lib --bin smg"
             echo "-p smg --doc" ;;
         gateway-[0-9]*)
             local index=${shard#gateway-} selectors

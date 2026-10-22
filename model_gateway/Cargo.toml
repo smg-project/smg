@@ -53,6 +53,8 @@ path = "src/main.rs"
 [[bin]]
 name = "amg"
 path = "src/main.rs"
+# The same source as `smg`: its unit tests run in the `smg` binary's test harness, so this one builds none.
+test = false
 
 [dependencies]
 # Workspace dependencies (simple)
