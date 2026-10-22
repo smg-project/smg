@@ -5,10 +5,12 @@ redirection, lets it exit, and reads the error the start-up wait raises.
 """
 
 import os
+import socket
 import sys
+import time
 
 import pytest
-from infra.constants import ENV_SHOW_WORKER_LOGS, ConnectionMode
+from infra.constants import DEFAULT_HOST, ENV_SHOW_WORKER_LOGS, ConnectionMode
 from infra.worker import LOG_EXCERPT_CHARS, Worker
 
 pytest.importorskip("grpc")
@@ -46,26 +48,46 @@ sys.exit(1)
 """
 
 
-def _dead_worker(tmp_path, monkeypatch, script: str) -> Worker:
-    """A gRPC worker whose process, a stub running ``script``, has already exited."""
+def _spawned_worker(tmp_path, monkeypatch, script: str, mode: ConnectionMode, port: int) -> Worker:
+    """A worker whose process is a stub running ``script``."""
     monkeypatch.setenv(ENV_SHOW_WORKER_LOGS, "0")
     worker = Worker(
         model_id="org/model",
         engine="vllm",
-        port=31001,
+        port=port,
         gpu_ids=[0],
-        mode=ConnectionMode.GRPC,
+        mode=mode,
         log_dir=str(tmp_path / "e2e-logs"),
     )
     worker.process = worker._spawn_process([sys.executable, "-c", script], env=dict(os.environ))
+    return worker
+
+
+def _dead_worker(
+    tmp_path,
+    monkeypatch,
+    script: str,
+    mode: ConnectionMode = ConnectionMode.GRPC,
+    port: int = 31001,
+) -> Worker:
+    """A worker whose process, a stub running ``script``, has already exited."""
+    worker = _spawned_worker(tmp_path, monkeypatch, script, mode, port)
     worker.process.wait(timeout=30)
     return worker
 
 
-def _death_text(worker: Worker) -> str:
+def _refused_port() -> int:
+    """A port nobody listens on: an HTTP health check there is refused at once."""
+    family = socket.AF_INET6 if ":" in DEFAULT_HOST else socket.AF_INET
+    with socket.socket(family, socket.SOCK_STREAM) as probe:
+        probe.bind((DEFAULT_HOST, 0))
+        return probe.getsockname()[1]
+
+
+def _death_text(worker: Worker, timeout: int = 5) -> str:
     try:
         with pytest.raises(RuntimeError, match="died during startup") as raised:
-            worker.wait_ready(timeout=5)
+            worker.wait_ready(timeout=timeout)
     finally:
         if worker._log_file is not None:
             worker._log_file.close()
@@ -171,3 +193,28 @@ def test_a_signal_death_names_the_signal(tmp_path, monkeypatch):
     script = "import os, signal; print('INFO loading weights', flush=True); os.kill(os.getpid(), signal.SIGKILL)"
     text = _death_text(_dead_worker(tmp_path, monkeypatch, script))
     assert "died during startup (signal SIGKILL); the log says:" in text
+
+
+def test_an_http_worker_that_died_gets_the_same_report_at_once(tmp_path, monkeypatch):
+    worker = _dead_worker(
+        tmp_path, monkeypatch, NIGHTLY_SHAPE, mode=ConnectionMode.HTTP, port=_refused_port()
+    )
+    started = time.perf_counter()
+    text = _death_text(worker, timeout=30)
+    # The exit ends the wait, not the bound; the text is the gRPC branch's.
+    assert time.perf_counter() - started < 10
+    assert text == worker._death_report()
+    assert "ValueError: Free memory on device cuda:0" in text
+
+
+def test_an_http_worker_that_dies_during_the_wait_ends_it_within_seconds(tmp_path, monkeypatch):
+    script = (
+        "import sys, time; time.sleep(1);"
+        " print('RuntimeError: the model path is unreadable'); sys.exit(2)"
+    )
+    worker = _spawned_worker(tmp_path, monkeypatch, script, ConnectionMode.HTTP, _refused_port())
+    started = time.perf_counter()
+    text = _death_text(worker, timeout=30)
+    elapsed = time.perf_counter() - started
+    assert 1 <= elapsed < 10, elapsed
+    assert '(exit status 2); the log says: "RuntimeError: the model path is unreadable"' in text

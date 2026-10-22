@@ -44,6 +44,7 @@ from .constants import (
 )
 from .model_specs import get_model_spec
 from .process_utils import (
+    ProcessExitedError,
     detect_ib_device,
     detect_rdma_fabric_devices,
     get_open_port,
@@ -248,11 +249,17 @@ class Worker:
         if self.mode == ConnectionMode.GRPC:
             self._wait_grpc_healthy(timeout)
         else:
-            wait_for_health(
-                self.http_url,
-                timeout=timeout,
-                check_interval=HEALTH_CHECK_INTERVAL,
-            )
+            try:
+                wait_for_health(
+                    self.http_url,
+                    timeout=timeout,
+                    check_interval=HEALTH_CHECK_INTERVAL,
+                    process=self.process,
+                )
+            except ProcessExitedError:
+                # The worker exited before it answered: the same report as the
+                # gRPC branch raises, instead of the wait running to its bound.
+                raise RuntimeError(self._death_report()) from None
 
         logger.info(
             "Worker %s healthy at %s (PID %d)",
