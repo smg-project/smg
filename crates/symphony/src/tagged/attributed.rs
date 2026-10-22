@@ -60,7 +60,7 @@ use crate::{
     markers::{Piece, Scanner},
     tagged::{
         end_cut_call, held_text,
-        value::{json, Kind},
+        value::{cut as cut_json, json, Kind},
     },
     Declared,
 };
@@ -519,10 +519,13 @@ impl Assembler {
     /// so that every byte keeps its place; a newline held as the template's framing before a
     /// closing tag that never came stays the template's. Then by the value's mode: a streamed
     /// string's fragments stand; a string whose key came and no byte opens, `{"key": "`; a value
-    /// held for its close is written as one fragment, its key and its bytes as written, or whole
-    /// where its section closed, with the bytes carried as its source. Whatever is still carried
-    /// after that (the framing's newline, the whitespace after a member written at its section's
-    /// close) is the syntax's wrapping.
+    /// held for its close is written as one fragment, its key and its bytes as the JSON they
+    /// stand for so far ([`cut_json`]: as written where they are a strict prefix of a JSON value,
+    /// `{"size": "large", "temp`, `12`, `nu`, and the opening of a JSON string holding them where
+    /// they are not, `"None]`, `"<![CD`, so that every fragment keeps the arguments a strict JSON
+    /// prefix, which is the crate's contract), or whole where its section closed, with the bytes
+    /// carried as its source. Whatever is still carried after that (the framing's newline, the
+    /// whitespace after a member written at its section's close) is the syntax's wrapping.
     fn cut_value(&mut self, out: &mut Events) -> Option<String> {
         let Stage::Value(value) = &mut self.stage else {
             return None;
@@ -572,7 +575,7 @@ impl Assembler {
                 let written = if section_closed {
                     json(raw, value.kind)
                 } else {
-                    raw.to_owned()
+                    cut_json(raw)
                 };
                 Some(self.object.member(&value.key, &written))
             }
@@ -2040,7 +2043,7 @@ mod tests {
     /// arguments are no whole value before the call's end; whole and one character at a time.
     #[test]
     fn a_value_the_end_cut_leaves_as_the_calls_own_bytes_and_nothing_as_content() {
-        let cases: [(Tags, &str, &str, &[&str]); 15] = [
+        let cases: [(Tags, &str, &str, &[&str]); 17] = [
             // Typed by the tools: an object cut inside a nested string.
             (
                 Tags::MINIMAX_M2,
@@ -2052,8 +2055,16 @@ mod tests {
             (Tags::MINIMAX_M2, "f\">\n<parameter name=\"n\">12", r#"{"n": 12"#, &[]),
             // A string that may be null, while the word fits.
             (Tags::MINIMAX_M2, "f\">\n<parameter name=\"ns\">nu", r#"{"ns": nu"#, &[]),
-            // A key no tool declares, written whole: its text so far.
+            // A key no tool declares, written whole: its text so far where that is the start of
+            // a JSON value, else the opening of the string it would be written as.
             (Tags::MINIMAX_M2, "f\">\n<parameter name=\"x\">fal", r#"{"x": fal"#, &[]),
+            (Tags::MINIMAX_M2, "f\">\n<parameter name=\"x\">hel", r#"{"x": "hel"#, &[]),
+            (
+                Tags::MINIMAX_M2,
+                "f\">\n<parameter name=\"o\">None]",
+                r#"{"o": "None]"#,
+                &[],
+            ),
             // The key came and no byte of its value.
             (Tags::MINIMAX_M2, "f\">\n<parameter name=\"o\">", r#"{"o": "#, &[]),
             // The key of a string came and no byte of it: the string opens.
@@ -2132,6 +2143,16 @@ mod tests {
                 let events = run_with(tags, &pieces, true);
                 assert_eq!(bytes(&events), call, "{call:?} {how}");
                 assert_eq!(arguments(&events), expected, "{call:?} {how}: {events:?}");
+                // The contract of every fragment: the arguments so far are a strict prefix of a
+                // JSON value, one `serde_json` reads whole or stops reading only at its end.
+                let strict_prefix = match serde_json::from_str::<serde_json::Value>(expected) {
+                    Ok(_) => true,
+                    Err(error) => error.is_eof(),
+                };
+                assert!(
+                    strict_prefix,
+                    "{call:?}: no JSON value begins with {expected:?}"
+                );
                 assert!(shown(&events).is_empty(), "{call:?} {how}: {events:?}");
                 assert_eq!(
                     malformed(&events),
