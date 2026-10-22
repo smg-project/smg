@@ -1012,7 +1012,8 @@ impl RedisResponseStorage {
     /// status transition's object update): the identifier is read from the
     /// hash, since the index key depends on it and cannot be declared to the
     /// write's script up front. Nothing without a retention, under a schema
-    /// that skips the identifier, or for a record without one.
+    /// that skips the identifier, or for a record without one. The callers
+    /// treat an error as bookkeeping left undone, not as a failed write.
     async fn refresh_identifier_index(
         &self,
         conn: &mut Connection,
@@ -1226,15 +1227,21 @@ impl ResponseStorage for RedisResponseStorage {
                 // A repeat of the entry the record's first store made (the
                 // identifier does not change between the writes of one
                 // response) with the index's expiry afresh, as the script
-                // refreshed the record's. A failure here fails the call and
-                // leaves the index with its earlier expiry, which the next
-                // write under the identifier moves on.
+                // refreshed the record's. The script has committed the write
+                // by now: a failure here is bookkeeping, logged, and leaves
+                // the index with its earlier expiry, which the next write
+                // under the identifier moves on; the caller is told what was
+                // written.
                 let mut pipe = redis::pipe();
                 self.index_by_identifier(&mut pipe, &response);
                 if !pipe.is_empty() {
-                    pipe.query_async::<()>(&mut conn)
-                        .await
-                        .map_err(ResponseStorageError::from_redis)?;
+                    if let Err(e) = pipe.query_async::<()>(&mut conn).await {
+                        tracing::warn!(
+                            response_id = %response.id.0,
+                            error = %e,
+                            "the record was stored; its identifier index keeps its earlier expiry"
+                        );
+                    }
                 }
                 Ok(ConditionalStore::Stored)
             }
@@ -1283,8 +1290,17 @@ impl ResponseStorage for RedisResponseStorage {
             "stored" => {
                 // The script moved the record's expiry; the identifier's
                 // index follows, so the record is listed under it for as long
-                // as it exists.
-                self.refresh_identifier_index(&mut conn, &key).await?;
+                // as it exists. The write is committed by now: a failure of
+                // the refresh is logged and the caller is told what was
+                // written (the index keeps its earlier expiry, which the next
+                // write under the identifier moves on).
+                if let Err(e) = self.refresh_identifier_index(&mut conn, &key).await {
+                    tracing::warn!(
+                        response_id = %id.0,
+                        error = %e,
+                        "the record moved; its identifier index keeps its earlier expiry"
+                    );
+                }
                 Ok(ConditionalStore::Stored)
             }
             "closed" => {
