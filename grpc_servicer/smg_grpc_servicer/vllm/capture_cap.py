@@ -25,7 +25,8 @@ is kept as given, and the engine's default stays where it is the better one:
 ``--enforce-eager`` (no graphs), a ``cudagraph_mode`` of NONE, speculative
 decoding (the engine's default adds the uniform-decode sizes an explicit cap
 drops), or no ``--max-num-seqs`` (the engine's own window defaults reach the
-ceiling already).
+default ceiling already; a ceiling above it, set in the knob, still applies:
+the engine's default cap is at most 512 whatever its window).
 
 :data:`CAPTURE_CAP_ENV` is the knob: ``auto`` (the default), ``engine`` (the
 opt-out: the engine's default, as before this derivation), or a positive
@@ -166,30 +167,45 @@ def derive_capture_cap(
             "the engine's own default under speculative decoding (it adds the uniform-decode "
             "sizes an explicit cap drops)",
         )
-    if max_num_seqs is None:
-        return CaptureCap(
-            None,
-            "window",
-            "the engine's own default (--max-num-seqs unset: the engine's window defaults "
-            f"reach a cap of {ENGINE_DEFAULT_CEILING} or more)",
-        )
-    engine_default = min(2 * max_num_seqs, ENGINE_DEFAULT_CEILING)
     cap = ceiling if max_num_batched_tokens is None else min(max_num_batched_tokens, ceiling)
     step = "unset" if max_num_batched_tokens is None else str(max_num_batched_tokens)
-    if cap <= engine_default:
-        return CaptureCap(
-            None,
-            "default",
-            f"the engine's own default {engine_default} (twice --max-num-seqs {max_num_seqs}) "
-            f"covers the admission step (--max-num-batched-tokens {step}, ceiling {ceiling})",
+    if max_num_seqs is None:
+        # The engine's window default differs by platform, and its default cap
+        # is at most the default ceiling whatever the window: the default
+        # ceiling raises nothing there, a recipe's own ceiling above it does.
+        window_default = (
+            "the engine's own default (--max-num-seqs unset: the engine's window defaults "
+            f"reach a cap of {ENGINE_DEFAULT_CEILING} or more)"
         )
+        if ceiling <= ENGINE_DEFAULT_CEILING:
+            return CaptureCap(None, "window", window_default)
+        if cap <= ENGINE_DEFAULT_CEILING:
+            return CaptureCap(
+                None,
+                "window",
+                f"{window_default} covers the admission step (--max-num-batched-tokens {step}, "
+                f"ceiling {ceiling})",
+            )
+        engine_default = (
+            f"at most {ENGINE_DEFAULT_CEILING} (--max-num-seqs unset: the engine's window defaults)"
+        )
+    else:
+        default = min(2 * max_num_seqs, ENGINE_DEFAULT_CEILING)
+        if cap <= default:
+            return CaptureCap(
+                None,
+                "default",
+                f"the engine's own default {default} (twice --max-num-seqs {max_num_seqs}) "
+                f"covers the admission step (--max-num-batched-tokens {step}, ceiling {ceiling})",
+            )
+        engine_default = f"{default} (twice --max-num-seqs {max_num_seqs})"
     return CaptureCap(
         cap,
         "derived",
         f"{cap}, derived from the admission step (--max-num-batched-tokens {step}, ceiling "
-        f"{ceiling}); the engine's own default was {engine_default} (twice --max-num-seqs "
-        f"{max_num_seqs}). {CAPTURE_CAP_ENV}={ENGINE} keeps the engine's default, a number is "
-        f"another ceiling, {CAP_FLAGS} set the cap outright",
+        f"{ceiling}); the engine's own default was {engine_default}. {CAPTURE_CAP_ENV}={ENGINE} "
+        f"keeps the engine's default, a number is another ceiling, {CAP_FLAGS} set the cap "
+        "outright",
     )
 
 

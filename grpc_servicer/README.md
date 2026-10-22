@@ -519,6 +519,7 @@ truncates.
 | `--max-num-seqs 32 --max-num-batched-tokens 48` | 48 | the engine's |
 | `--max-num-seqs 256` or more | 512 | the engine's |
 | `--max-num-seqs` unset | 512 (the engine's window defaults) | the engine's |
+| `--max-num-seqs` unset, `--max-num-batched-tokens 16384`, `SMG_VLLM_CUDAGRAPH_CAPTURE_CAP=2048` | 512 (the engine's window defaults) | 2048 |
 
 Kept as given: an explicit `--max-cudagraph-capture-size`,
 `--cudagraph-capture-sizes` or the same keys of `--compilation-config`;
@@ -529,8 +530,48 @@ explicit cap drops); an HTTP `vllm serve`, which is not this package's launch.
 `SMG_VLLM_CUDAGRAPH_CAPTURE_CAP` is the knob: `auto` (the default), `engine`
 (the opt-out: the engine's own default, as before this derivation), or a
 positive integer, the ceiling in place of 512, rounded down to the capture
-grid. Each captured size costs capture time at start and graph memory per
-rank: 11 sizes at the engine's 64, 51 at 512, 83 at 1024.
+grid; a ceiling above 512 applies with `--max-num-seqs` left to the engine
+as well (its default cap is at most 512 whatever its window). Each captured
+size costs capture time at start and graph memory per rank: 11 sizes at the
+engine's 64, 51 at 512, 83 at 1024, 147 at 2048.
+
+##### Per recipe: what a ceiling above 512 buys, and what it costs
+
+The ceiling of 512 is the engine's own default ceiling, so the launch default
+never spends more on graphs than the engine does for itself at a large window,
+and it is the right cap where the admitted step stays under it. Under
+open-loop arrivals with chunked prefill and prefix caching, the step that
+decides capacity holds up to `--max-num-seqs` decode tokens plus the prefill
+chunks admitted beside them, so on a large running window that step is above
+512 and runs eagerly at every arrival. Measured on three recipes (the same
+build and recipe on both arms, one engine per arm, open-loop Poisson ramps of
+150 s per step; SLO-1 = TTFT p99 under 1 s at goodput >= 0.9, SLO-2 = TTFT
+p99 under 400 ms and TPOT p99 under 25 ms at goodput >= 0.95; capacity = the
+highest offered rate at which the SLO holds, in requests per second per
+engine; the costs are per engine against the 512 arm: KV-cache tokens,
+container memory at the ramp's end, start-up time):
+
+| recipe | 512 (the launch default) | 1024 | 2048 |
+|---|---|---|---|
+| `--max-num-seqs 32 --max-num-batched-tokens 16384`, a 1M-context model (the engine's own 64); 8k prompts, 4k shared prefix | SLO-1 12, SLO-2 11 | SLO-1 12, SLO-2 8; -0.5 % KV, +2.0 GiB, +45 s | SLO-1 12, SLO-2 10; -1.5 % KV, +6.1 GiB, +93 s |
+| `--max-num-seqs 128 --max-num-batched-tokens 16384`, a sparse-attention MoE (the engine's own 256); 4k prompts, 1k shared prefix | SLO-1 28-34, SLO-2 20-22; collapses from 36 | SLO-1 40 (the ramp's top), SLO-2 24; -0.3 % KV, +1.7 GiB, +38 s | SLO-1 38, SLO-2 28; -0.9 % KV, +4.9 GiB, +126 s |
+| `--max-num-seqs 256 --max-num-batched-tokens 16384`, a 3B-active MoE (the engine's own 512: the derivation changes nothing); 8k prompts, 4k shared prefix | SLO-1 11-12, SLO-2 5-6 | SLO-1 13-14, SLO-2 7-8; -0.15 % KV, +1.5 GiB, +27 s | SLO-1 20 (the ramp's top), SLO-2 14; -0.5 % KV, +4.7 GiB, +60 s |
+
+The cap that captures a recipe's gain follows its running window (about eight
+times `--max-num-seqs` on these three), not one ceiling: with a window of 128,
+1024 buys the whole of 2048's gain at a third of the memory; with 256 the gain
+needs 2048; with 32 nothing above the launch default buys anything (on the
+128-window recipe, 8k prompts at a 94 % cache hit held the ramp's top on 512
+and 2048 alike: that shape's knee lay above the ramp, which is why the wide
+shape is the one in the table). The launch default therefore stays at the
+memory-neutral 512, and a recipe whose class gains sets its own cap: the
+engine's own `--max-cudagraph-capture-size N` among the recipe's flags (it
+travels with the command line to every rank of a multi-node engine), or
+`SMG_VLLM_CUDAGRAPH_CAPTURE_CAP=N` in the environment of every rank's process,
+a ceiling the derivation still bounds by the admission step and applies where
+it raises the engine's default. Graph memory per captured size was
+0.011-0.021 GiB per rank on these three models, which is how the KV-cache
+cost above scales with the capture list.
 
 #### Multi-node engines: the worker pod's liveness
 

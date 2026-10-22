@@ -163,6 +163,37 @@ def test_no_window_leaves_the_engines_default():
 
 
 @pytest.mark.parametrize(
+    ("step", "setting", "cap"),
+    [
+        (16384, "2048", 2048),
+        (16384, "1024", 1024),
+        (16384, "1000", 992),
+        (None, "2048", 2048),
+        # The step bounds the ceiling under what the engine's default covers.
+        (300, "2048", None),
+        # A ceiling at or under the engine's default ceiling raises nothing.
+        (16384, "512", None),
+        (16384, "auto", None),
+        (16384, None, None),
+    ],
+)
+def test_a_recipes_ceiling_applies_when_the_window_is_left_to_the_engine(step, setting, cap):
+    """A recipe that leaves --max-num-seqs to the engine still gets the ceiling
+    it set: the engine's own default cap is at most 512 whatever its window
+    default, so a ceiling above 512 raises it; `auto` keeps the engine's default
+    as before."""
+    decision = derive_capture_cap(max_num_seqs=None, max_num_batched_tokens=step, setting=setting)
+    assert decision.cap == cap
+    if cap is None:
+        assert decision.source == "window"
+        assert "--max-num-seqs unset" in decision.detail
+    else:
+        assert decision.source == "derived"
+        assert str(cap) in decision.detail
+        assert "at most 512 (--max-num-seqs unset" in decision.detail
+
+
+@pytest.mark.parametrize(
     ("kwargs", "source", "mentions"),
     [
         ({"explicit_cap": 128}, "operator", "max_cudagraph_capture_size=128"),
@@ -458,6 +489,28 @@ def test_a_ceiling_in_the_variable_bounds_the_derived_cap(parser_class, monkeypa
     monkeypatch.setenv(CAPTURE_CAP_ENV, "1000")
     parsed = _serve_parser(parser_class).parse_args(["--grpc", *DRILL])
     assert parsed.max_cudagraph_capture_size == 992
+
+
+def test_a_recipe_without_the_window_flag_gets_the_ceiling_it_set(
+    parser_class, monkeypatch, caplog
+):
+    """The recipe's ceiling is applied with --max-num-seqs left to the engine,
+    and the line says what the engine's default was bounded by."""
+    monkeypatch.setenv(CAPTURE_CAP_ENV, "2048")
+    with caplog.at_level(logging.INFO, logger="smg_grpc_servicer"):
+        parsed = _serve_parser(parser_class).parse_args(
+            ["--grpc", "m", "--max-num-batched-tokens", "16384"]
+        )
+    assert parsed.max_cudagraph_capture_size == 2048
+    lines = [
+        record.getMessage() for record in caplog.records if "capture cap" in record.getMessage()
+    ]
+    assert len(lines) == 1
+    assert (
+        "2048, derived from the admission step (--max-num-batched-tokens 16384, ceiling 2048)"
+        in lines[0]
+    )
+    assert "at most 512 (--max-num-seqs unset" in lines[0]
 
 
 def test_a_bad_variable_value_is_a_usage_error_that_names_it(parser_class, monkeypatch, capsys):
