@@ -128,10 +128,60 @@ class TestResolvePdConnector:
             "parent-engine",
         )
 
-    def test_store_only_multi_connector_is_not_projected(self):
+    # A store child is the mover when no P2P child is configured: the sides
+    # meet in the store, and the router's store profile (no bootstrap port, no
+    # tagging) applies only when it sees the store's name, not the wrapper's.
+    @pytest.mark.parametrize(
+        "connectors",
+        [
+            [{"kv_connector": "MooncakeStoreConnector"}],
+            [{"kv_connector": "MooncakeStoreConnector"}, {"kv_connector": "OffloadingConnector"}],
+            [{"kv_connector": "OffloadingConnector"}, {"kv_connector": "MooncakeStoreConnector"}],
+            [
+                {"kv_connector": "OffloadingConnector"},
+                {"kv_connector": "MooncakeStoreConnector"},
+                {"kv_connector": "LMCacheConnectorV1"},
+            ],
+        ],
+        ids=["alone", "first", "last", "middle"],
+    )
+    def test_projects_a_lone_store_child_in_any_position(self, connectors):
+        config = _kv_config("MultiConnector", extra={"connectors": connectors})
+
+        assert kv_transfer.resolve_pd_connector(config) == (
+            "MooncakeStoreConnector",
+            "parent-engine",
+        )
+
+    def test_projects_a_store_child_with_its_own_engine_id(self):
         config = _kv_config(
             "MultiConnector",
-            extra={"connectors": [{"kv_connector": "MooncakeStoreConnector"}]},
+            extra={
+                "connectors": [
+                    {"kv_connector": "OffloadingConnector"},
+                    {"kv_connector": "SharedStorageConnector", "engine_id": "child-engine"},
+                ]
+            },
+        )
+
+        assert kv_transfer.resolve_pd_connector(config) == (
+            "SharedStorageConnector",
+            "child-engine",
+        )
+
+    @pytest.mark.parametrize("connector", ["FlexKVConnectorV1", "HF3FSConnector"])
+    def test_store_families_are_recognised_by_prefix(self, connector):
+        config = _kv_config(
+            "MultiConnector",
+            extra={"connectors": [{"kv_connector": connector}, {"kv_connector": "Other"}]},
+        )
+
+        assert kv_transfer.resolve_pd_connector(config) == (connector, "parent-engine")
+
+    def test_empty_store_child_engine_id_is_not_projected(self):
+        config = _kv_config(
+            "MultiConnector",
+            extra={"connectors": [{"kv_connector": "MooncakeStoreConnector", "engine_id": ""}]},
         )
 
         assert kv_transfer.resolve_pd_connector(config) == (
@@ -139,16 +189,98 @@ class TestResolvePdConnector:
             "parent-engine",
         )
 
-    def test_multiple_pd_children_are_not_projected(self):
+    # The P2P child the router drives carries the pair's handoff wherever it
+    # sits in the list, whatever rides along (a store, an offloading tier, a
+    # connector this projection does not know); the store child is not the
+    # mover beside it.
+    @pytest.mark.parametrize("mover", ["NixlConnector", "MooncakeConnector"])
+    @pytest.mark.parametrize("position", [0, 1, 2], ids=["first", "middle", "last"])
+    def test_projects_the_p2p_child_in_any_position(self, mover, position):
+        riders = [
+            {"kv_connector": "MooncakeStoreConnector"},
+            {"kv_connector": "UnknownThirdConnector"},
+        ]
+        connectors = list(riders)
+        connectors.insert(position, {"kv_connector": mover, "engine_id": "child-engine"})
+        config = _kv_config("MultiConnector", extra={"connectors": connectors})
+
+        assert kv_transfer.resolve_pd_connector(config) == (mover, "child-engine")
+
+    # A MoRI-IO child is projected when nothing else moves the KV (the gRPC
+    # router then refuses the pair explicitly instead of a silent recompute),
+    # in any position among connectors this projection does not know.
+    @pytest.mark.parametrize("position", [0, 1, 2], ids=["first", "middle", "last"])
+    def test_projects_a_moriio_child_without_a_store_in_any_position(self, position):
+        connectors = [
+            {"kv_connector": "OffloadingConnector"},
+            {"kv_connector": "UnknownThirdConnector"},
+        ]
+        connectors.insert(
+            position, {"kv_connector": "MoRIIOConnector", "engine_id": "child-engine"}
+        )
+        config = _kv_config("MultiConnector", extra={"connectors": connectors})
+
+        assert kv_transfer.resolve_pd_connector(config) == ("MoRIIOConnector", "child-engine")
+
+    # Beside exactly one store child a MoRI-IO child steps aside for the
+    # store: the gRPC router refuses a disaggregated request on a MoRI-IO
+    # worker, while the store served the pair when the wrapper passed through.
+    @pytest.mark.parametrize(
+        "connectors",
+        [
+            [{"kv_connector": "MooncakeStoreConnector"}, {"kv_connector": "MoRIIOConnector"}],
+            [{"kv_connector": "MoRIIOConnector"}, {"kv_connector": "MooncakeStoreConnector"}],
+            [
+                {"kv_connector": "MoRIIOConnector", "engine_id": "moriio-engine"},
+                {"kv_connector": "OffloadingConnector"},
+                {"kv_connector": "MooncakeStoreConnector"},
+            ],
+        ],
+        ids=["store-first", "moriio-first", "with-a-rider"],
+    )
+    def test_a_moriio_child_steps_aside_for_the_one_store_child(self, connectors):
+        config = _kv_config("MultiConnector", extra={"connectors": connectors})
+
+        assert kv_transfer.resolve_pd_connector(config) == (
+            "MooncakeStoreConnector",
+            "parent-engine",
+        )
+
+    def test_a_moriio_child_beside_two_store_children_keeps_the_wrapper(self):
         config = _kv_config(
             "MultiConnector",
             extra={
                 "connectors": [
-                    {"kv_connector": "MooncakeConnector"},
-                    {"kv_connector": "NixlConnector"},
+                    {"kv_connector": "MoRIIOConnector"},
+                    {"kv_connector": "MooncakeStoreConnector"},
+                    {"kv_connector": "SharedStorageConnector"},
                 ]
             },
         )
+
+        assert kv_transfer.resolve_pd_connector(config) == (
+            "MultiConnector",
+            "parent-engine",
+        )
+
+    @pytest.mark.parametrize(
+        "connectors",
+        [
+            # Two P2P children: which one hands off is not the servicer's guess.
+            [{"kv_connector": "MooncakeConnector"}, {"kv_connector": "NixlConnector"}],
+            # Two store children: the same.
+            [
+                {"kv_connector": "MooncakeStoreConnector"},
+                {"kv_connector": "SharedStorageConnector"},
+            ],
+            # No child this projection knows as a mover.
+            [{"kv_connector": "OffloadingConnector"}, {"kv_connector": "ExampleConnector"}],
+            [],
+        ],
+        ids=["two-p2p", "two-store", "no-mover", "no-children"],
+    )
+    def test_ambiguous_or_unrecognised_children_keep_the_wrapper(self, connectors):
+        config = _kv_config("MultiConnector", extra={"connectors": connectors})
 
         assert kv_transfer.resolve_pd_connector(config) == (
             "MultiConnector",

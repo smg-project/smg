@@ -780,6 +780,43 @@ def test_model_info_carries_the_pooler_config():
     assert info["pooler_use_activation"] is None and info["pooler_dimensions"] is None
 
 
+def test_model_info_projects_a_multi_connector_onto_the_child_that_moves_the_kv():
+    """The Rust servicer reports the connector the launcher hands it, so the
+    launcher hands it the wrapper's mover: the one P2P child whatever rides
+    along, else the one store child; the child's engine id when it names one,
+    the parent's otherwise."""
+    config = _config()
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MultiConnector",
+        kv_role="kv_producer",
+        engine_id="eng-a",
+        kv_connector_extra_config={
+            "connectors": [
+                {"kv_connector": "MooncakeStoreConnector"},
+                {"kv_connector": "NixlConnector", "engine_id": "child-engine"},
+            ]
+        },
+    )
+    info = rust.model_info_from_config(config)
+    assert (info["kv_connector"], info["kv_role"], info["kv_engine_id"]) == (
+        "NixlConnector",
+        "kv_producer",
+        "child-engine",
+    )
+    config.kv_transfer_config.kv_connector_extra_config = {
+        "connectors": [
+            {"kv_connector": "OffloadingConnector"},
+            {"kv_connector": "MooncakeStoreConnector"},
+        ]
+    }
+    info = rust.model_info_from_config(config)
+    assert (info["kv_connector"], info["kv_role"], info["kv_engine_id"]) == (
+        "MooncakeStoreConnector",
+        "kv_producer",
+        "eng-a",
+    )
+
+
 def test_model_info_reports_the_pd_identity_and_pairing_facts():
     config = _config(dtype="torch.bfloat16")
     config.kv_transfer_config = SimpleNamespace(

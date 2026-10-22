@@ -10,7 +10,24 @@ from smg_grpc_servicer.vllm.config_view import EngineConfigView
 logger = logging.getLogger(__name__)
 
 _MULTI_CONNECTOR = "MultiConnector"
-_SUPPORTED_PD_CONNECTORS = frozenset({"MooncakeConnector", "NixlConnector"})
+# The connectors that hand a request's KV to the one partner the router names
+# (a rendezvous or side channel per pair): the router tags both sides of such
+# a pair, so the child that carries the handoff is the one it must see.
+_P2P_CONNECTORS = frozenset({"MooncakeConnector", "NixlConnector", "MoRIIOConnector"})
+# The P2P connector whose handoff the gRPC router does not drive (its pipeline
+# refuses a disaggregated request on a worker that names it): beside exactly
+# one store child the store is the mover the router can serve, as it was when
+# the wrapper passed through unprojected.
+_MORIIO_CONNECTOR = "MoRIIOConnector"
+# The connectors whose sides meet in a store the deployment shares, by exact
+# name or family prefix: the router's store profile (no side tagged, no
+# bootstrap port handed or probed) applies to a worker that names one of them.
+# The router's table (`model_gateway/src/worker/pd_pairing.rs`,
+# `STORE_CONNECTORS` / `STORE_CONNECTOR_FAMILIES`) is the reference; a name
+# listed there and not here is reported as the wrapper, which the router
+# handles as an unknown connector.
+_STORE_CONNECTORS = frozenset({"MooncakeStoreConnector", "SharedStorageConnector"})
+_STORE_CONNECTOR_FAMILIES = ("FlexKV", "HF3FS")
 
 
 def pairing_fields(vllm_config: object) -> dict:
@@ -36,12 +53,27 @@ def pairing_fields(vllm_config: object) -> dict:
     return fields
 
 
+def _is_store_connector(connector: str) -> bool:
+    return connector in _STORE_CONNECTORS or connector.startswith(_STORE_CONNECTOR_FAMILIES)
+
+
 def resolve_pd_connector(config: object) -> tuple[str, str]:
     """Resolve the connector and engine id that SMG should report for PD.
 
-    MultiConnector is only projected when its config has exactly one supported
-    PD child. Invalid or ambiguous wrapper configs are returned unchanged so the
-    router does not guess which transfer protocol to use.
+    A ``MultiConnector`` is projected onto the child that moves the KV between
+    the prefill and the decode: its one P2P child (Mooncake, NIXL, MoRI-IO),
+    which carries the pair's handoff whatever rides along (a store, an
+    offloading tier, a connector this projection does not know); else its one
+    store child, which the sides meet in when no P2P child is configured. A
+    MoRI-IO child is the exception: the gRPC router refuses a disaggregated
+    request on a worker that names it, so beside store children it steps
+    aside, for the one store child when there is exactly one (the store moved
+    the KV while the wrapper passed through unprojected) and for the wrapper
+    when there are more. The child's engine id is reported, the parent's when
+    the child names none, as the engine itself resolves it. Wrapper configs
+    that are malformed, that name no such child, or that name two of a kind
+    are returned unchanged so the router does not guess which transfer
+    protocol to use.
     """
     connector = getattr(config, "kv_connector", None) or ""
     engine_id = getattr(config, "engine_id", None) or ""
@@ -55,24 +87,34 @@ def resolve_pd_connector(config: object) -> tuple[str, str]:
     if not isinstance(children, list):
         return connector, engine_id
 
-    pd_children = []
+    p2p_children = []
+    store_children = []
     for child in children:
         if not isinstance(child, dict):
             return connector, engine_id
         child_connector = child.get("kv_connector")
         if not isinstance(child_connector, str) or not child_connector:
             return connector, engine_id
-        if child_connector in _SUPPORTED_PD_CONNECTORS:
-            pd_children.append(child)
+        if child_connector in _P2P_CONNECTORS:
+            p2p_children.append(child)
+        elif _is_store_connector(child_connector):
+            store_children.append(child)
 
-    if len(pd_children) != 1:
+    if len(p2p_children) == 1:
+        mover = p2p_children[0]
+        if mover["kv_connector"] == _MORIIO_CONNECTOR and store_children:
+            if len(store_children) != 1:
+                return connector, engine_id
+            mover = store_children[0]
+    elif not p2p_children and len(store_children) == 1:
+        mover = store_children[0]
+    else:
         return connector, engine_id
 
-    child = pd_children[0]
-    child_engine_id = child.get("engine_id", engine_id)
-    if not isinstance(child_engine_id, str) or not child_engine_id:
+    mover_engine_id = mover.get("engine_id", engine_id)
+    if not isinstance(mover_engine_id, str) or not mover_engine_id:
         return connector, engine_id
-    return child["kv_connector"], child_engine_id
+    return mover["kv_connector"], mover_engine_id
 
 
 def params_from_request(

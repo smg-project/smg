@@ -245,6 +245,33 @@ def test_server_facts_build_the_proto_as_they_are(monkeypatch):
     vllm_engine_pb2.GetServerInfoResponse(**facts)
 
 
+def test_server_facts_project_a_multi_connector_onto_the_child_that_moves_the_kv():
+    """A wrapper around a store child and an offloading tier is reported as the
+    store child, the parent's engine id and role kept: the router pairs and
+    serves the deployment under the store's profile, not as an unknown
+    connector named ``MultiConnector``."""
+    config = SimpleNamespace(
+        model_config=_model_config(dtype="torch.bfloat16"),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MultiConnector",
+            kv_role="kv_producer",
+            engine_id="eng-a",
+            kv_connector_extra_config={
+                "connectors": [
+                    {"kv_connector": "MooncakeStoreConnector"},
+                    {"kv_connector": "OffloadingConnector"},
+                ]
+            },
+        ),
+    )
+    facts = model_info.server_facts(config)
+    response = vllm_engine_pb2.GetServerInfoResponse(**facts)
+    assert response.kv_connector == "MooncakeStoreConnector"
+    assert response.kv_role == "kv_producer"
+    assert response.kv_engine_id == "eng-a"
+
+
 def test_server_facts_carry_the_running_window():
     config = SimpleNamespace(
         model_config=_model_config(),
