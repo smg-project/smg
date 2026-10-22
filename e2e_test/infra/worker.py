@@ -65,6 +65,9 @@ LOG_EXCERPT_CHARS = 300
 _EXCEPTION_LINE = re.compile(r"(?:Error|Exception): ")
 # A log line at error level, or a Rust panic, when nothing printed an exception.
 _ERROR_LEVEL_LINE = re.compile(r"\b(?:ERROR|CRITICAL|FATAL)\b|panicked at ")
+# A line logged below error level: a warning that names an exception (a missing
+# optional import, say) is not the cause of the death.
+_BELOW_ERROR_LEVEL_LINE = re.compile(r"\b(?:DEBUG|INFO|WARNING|WARN)\b")
 
 
 def _excerpt(line: str) -> str:
@@ -961,9 +964,11 @@ class Worker:
         log's path relative to the log directory (the one a CI job uploads).
 
         The log speaks through its first and last exception lines (the first is
-        the root cause of a cause chain, the last the final symptom), else its
-        last error-level line, else its last non-empty line, each bounded to
-        ``LOG_EXCERPT_CHARS``. An empty log leaves the exit status alone.
+        the root cause of a cause chain, the last the final symptom; a line
+        logged below error level does not count, a warning that names an
+        exception is not the cause), else its last error-level line, else its
+        last non-empty line, each bounded to ``LOG_EXCERPT_CHARS``. An empty
+        log leaves the exit status alone.
         """
         pid = self.process.pid if self.process else "unknown"
         code = self.process.returncode if self.process else None
@@ -977,7 +982,11 @@ class Worker:
         lines = [line.rstrip() for line in self.read_log().splitlines() if line.strip()]
         if not lines:
             return report
-        exceptions = [line for line in lines if _EXCEPTION_LINE.search(line)]
+        exceptions = [
+            line
+            for line in lines
+            if _EXCEPTION_LINE.search(line) and not _BELOW_ERROR_LEVEL_LINE.search(line)
+        ]
         errors = [line for line in lines if _ERROR_LEVEL_LINE.search(line)]
         if exceptions:
             picked = [exceptions[0]]

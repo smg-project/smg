@@ -12,6 +12,7 @@ from infra.constants import ENV_SHOW_WORKER_LOGS, ConnectionMode
 from infra.worker import LOG_EXCERPT_CHARS, Worker
 
 pytest.importorskip("grpc")
+pytest.importorskip("grpc_health")
 
 # The shape of an engine log whose core died at a start-up check: the core's
 # traceback at error level, the bare multiprocessing copy, then the server's
@@ -22,6 +23,8 @@ core = "(EngineCore pid=2) ERROR 10-22 11:03:45 [core.py:1433] "
 main = "(MainProcess pid=1) ERROR 10-22 11:03:45 [server.py:204] "
 guard = "ValueError: Free memory on device cuda:0 (25.2/79.18 GiB) on startup is less than desired (0.9, 71.26 GiB)."
 lines = [
+    "(MainProcess pid=1) WARNING 10-22 11:03:40 [platforms.py:31] Failed to import flashinfer:"
+    " ModuleNotFoundError: No module named 'flashinfer'",
     "(MainProcess pid=1) INFO 10-22 11:03:41 [server.py:72] transfer backend is available",
     core + "EngineCore failed to start.",
     core + "Traceback (most recent call last):",
@@ -80,8 +83,16 @@ def test_the_text_names_the_first_and_last_error_of_the_log_and_its_path(tmp_pat
         "RuntimeError: Engine core initialization failed"
     )
     assert text.count("ValueError: Free memory") == 1
-    # Frames, messages at error level and the server's own lines are not quoted.
-    for noise in ('File "', "EngineCore failed to start.", "Failed to start gRPC server", "INFO"):
+    # Frames, messages at error level, the server's own lines and the warning
+    # that names an exception (a missing optional import) are not quoted.
+    for noise in (
+        'File "',
+        "EngineCore failed to start.",
+        "Failed to start gRPC server",
+        "INFO",
+        "ModuleNotFoundError",
+        "WARNING",
+    ):
         assert noise not in text
     # The path is the one inside the uploaded log directory, not the absolute one.
     assert text.endswith("; log file worker-org__model_vllm_grpc_31001.log")
