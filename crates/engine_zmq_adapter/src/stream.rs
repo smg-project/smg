@@ -27,7 +27,7 @@ use crate::{
 /// still-running engine-side sub-requests, so no explicit abort or
 /// `mark_completed` is required. Which variant is active is fixed by the
 /// backend protocol chosen at connect time. A request deadline
-/// ([`Self::with_deadline`]) ends a stream still waiting on the engine the
+/// (`Self::with_deadline`) ends a stream still waiting on the engine the
 /// same way from the inside.
 pub struct ZmqGenerateStream {
     subs: SubStreams,

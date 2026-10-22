@@ -392,7 +392,7 @@ impl ZmqEngineClient {
     /// the backend of its first structured request for its life. A connection
     /// nobody configures (the gateway's own worker link) keeps what its wire
     /// ran before this support existed
-    /// ([`default_structured_outputs_support`]). The first call wins.
+    /// (`default_structured_outputs_support`). The first call wins.
     pub fn set_structured_outputs_support(&self, support: StructuredOutputsSupport) {
         let _ = self.meta.structured_outputs.set(support);
     }
@@ -426,7 +426,7 @@ impl ZmqEngineClient {
     /// The engine was started to cut a long prompt down to its own bound
     /// instead of refusing it, as the launcher that started it knows: the
     /// prompt admission applies no upper bound on this connection from now
-    /// (an empty prompt is still refused; see [`crate::context_window`]).
+    /// (an empty prompt is still refused; see the `context_window` module).
     /// Set once: a later call changes nothing.
     pub fn note_engine_truncates_long_prompts(&self) {
         let _ = self.meta.engine_truncates_long_prompts.set(());
@@ -588,7 +588,7 @@ impl ZmqEngineClient {
         epochs
     }
 
-    /// The vLLM half of [`Self::generate`] as one stream per choice: the
+    /// The unmerged half of [`Self::generate_vllm`], one stream per choice: the
     /// `n > 1` fan-out submitted to the engine, each sub tagged with its proto
     /// `index`, left unmerged so a caller can end one choice without the
     /// others (the gRPC servicer matches string stops per choice). vLLM
@@ -764,7 +764,7 @@ impl ZmqEngineClient {
     /// Over gRPC the engine-side frontend (e.g. vLLM's AsyncLLM) fans `n` out
     /// itself and multiplexes the choices onto one stream. The raw ZMQ wire has
     /// no such frontend, so `n > 1` is fanned out HERE into `n` independent
-    /// single-sample engine requests (see [`fan_out_requests`]); their outputs
+    /// single-sample engine requests (see `fan_out_requests`); their outputs
     /// are merged back into one stream with each sub tagged via the proto
     /// `index` field, exactly like the gRPC contract.
     pub async fn generate_vllm(

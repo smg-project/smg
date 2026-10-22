@@ -106,7 +106,7 @@ pub(crate) fn zmq_socket_addresses(
 
 /// The TCP handshake address a ZMQ worker will bind.
 ///
-/// Carries [`zmq_socket_addresses`]'s error verbatim rather than flattening it
+/// Carries `zmq_socket_addresses`'s error verbatim rather than flattening it
 /// to "no address": an unusable `ipc://` base or a non-`tcp://` override is a
 /// misconfiguration registration must reject, not a value to skip past and
 /// rediscover at every later connect attempt.
