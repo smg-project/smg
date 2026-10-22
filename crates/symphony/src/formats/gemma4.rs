@@ -311,6 +311,30 @@ mod tests {
         }
     }
 
+    /// The model's own end of output inside a call, before its closing marker: the table has no
+    /// stop row, so the engine ends the call as a cut ends it (the braces and tokens are the
+    /// model's own), and the call stays open, where it used to be closed with a brace the model
+    /// never wrote; whole, a character at a time and at every two-way cut.
+    #[test]
+    fn a_call_the_model_leaves_open_at_its_own_end_stays_open_too() {
+        let output = "<|tool_call>call:play{artist:<|\"|>Taylor<|\"|>,n:1";
+        let said = the_same_at_every_cut(|pieces| run(PROMPT, pieces), output);
+        assert_eq!(
+            said.calls,
+            vec![(
+                "play".to_string(),
+                r#"{"artist": "Taylor", "n": 1"#.to_string()
+            )]
+        );
+        assert!(matches!(said.finish, Some((_, 1))), "{said:?}");
+        assert_eq!(said.content, "");
+        let events = run(PROMPT, &[output]);
+        assert!(
+            malformed(&events).iter().all(String::is_empty),
+            "nothing of the call is content: {events:?}"
+        );
+    }
+
     #[test]
     fn the_table_validates() {
         gemma4().validate().expect("a valid table");

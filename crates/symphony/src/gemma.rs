@@ -50,6 +50,7 @@ use crate::{
     tagged::{
         assembler::{push_escaped, push_quoted},
         end_cut_call,
+        value::cut as cut_json,
     },
 };
 
@@ -243,13 +244,16 @@ impl Assembler {
         self.done = true;
     }
 
-    /// The stream was cut: nothing is closed, so arguments cut short never look complete to a
-    /// client, and the call's bytes stay the call's. A call that started still ends, with no
-    /// bytes of its own, as every assembler ends one, after the one `Malformed {
-    /// UnterminatedRegion }` event of no bytes that says that its arguments are no whole value
-    /// (`tagged::end_cut_call`); no container closes, not even an object the cut found between
-    /// two members, since a closing brace the model never wrote would hand the client arguments
-    /// that read as whole. Before the end, what the cut found open leaves as the call's own: a
+    /// The stream's end inside the call: a cut by the token limit, an abort, or the model's own
+    /// end of output before the closing marker, which ends a Gemma call as a cut does since its
+    /// braces and tokens are the model's own (the table has no stop row; `engine::CallAssembler::stop`).
+    /// Nothing is closed, so arguments cut short never look complete to a client, and the
+    /// call's bytes stay the call's. A call that started still ends, with no bytes of its own,
+    /// as every assembler ends one, after the one `Malformed { UnterminatedRegion }` event of no
+    /// bytes that says that its arguments are no whole value (`tagged::end_cut_call`); no
+    /// container closes, not even an object the end found between two members, since a closing
+    /// brace the model never wrote would hand the client arguments that read as whole. Before
+    /// the end, what the cut found open leaves as the call's own: a
     /// string's text so far, the bytes held as a start of its closing token included, as the
     /// marker reads them; the member whose key came, with its bare value as far as it went
     /// (`"n": 1`) or the key alone (`"n": `) when no byte of the value came yet
@@ -265,6 +269,20 @@ impl Assembler {
             return;
         }
         self.end_skipped(out);
+        if self.stage == Stage::Closed {
+            // The object closed before the cut, or a header that was no call's (its text after
+            // it released as it came): the whitespace held after them is the template's, before
+            // a marker that never came, and a started call is whole and ends with no word.
+            self.drop_held(out);
+            if self.started {
+                out.push(Event::ToolCallEnd {
+                    index: self.index,
+                    source: Text::default(),
+                });
+            }
+            self.done = true;
+            return;
+        }
         if !self.started {
             let held = self.take_held();
             if !held.is_empty() {
@@ -277,15 +295,6 @@ impl Assembler {
             return;
         }
         let cut_token = match self.stage {
-            Stage::Closed => {
-                self.drop_held(out);
-                out.push(Event::ToolCallEnd {
-                    index: self.index,
-                    source: Text::default(),
-                });
-                self.done = true;
-                return;
-            }
             Stage::Text => {
                 let held = self.take_held();
                 if !held.is_empty() {
@@ -296,7 +305,8 @@ impl Assembler {
                 None
             }
             Stage::Value => self.cut_member(out),
-            Stage::Header | Stage::Key | Stage::AfterValue | Stage::Refused => {
+            // `Closed` returned above; the others hold a key cut short or whitespace.
+            Stage::Closed | Stage::Header | Stage::Key | Stage::AfterValue | Stage::Refused => {
                 self.drop_held(out);
                 None
             }
@@ -324,11 +334,14 @@ impl Assembler {
 
     /// The member the end of the stream cut where its value stands ([`Self::finish`]): the key
     /// held for the value, when one is, opens the member, `"key": `, and a bare value's bytes
-    /// after it follow as written, the digits of a number, a word that may still be `true`, so
-    /// that the arguments carry the prefix the model wrote; in a list the bytes are the next
-    /// element's, after the separator. The bytes held as a start of the string token are no
-    /// value yet: they are returned, a token the cut left short, to leave after the call's end
-    /// as the syntax's wrapping. Whitespace alone where no key is held is wrapping too.
+    /// after it follow as the JSON they stand for so far, the digits of a number or the start
+    /// of a literal word as written, the start of the spelling's null word as the start of
+    /// `null`, and a word that is no literal as the opening of the string it would be written
+    /// as ([`cut_json`]), so that the arguments carry the prefix the model wrote and stay a
+    /// strict prefix of a JSON value; in a list the bytes are the next element's, after the
+    /// separator. The bytes held as a start of the string token are no value yet: they are
+    /// returned, a token the cut left short, to leave after the call's end as the syntax's
+    /// wrapping. Whitespace alone where no key is held is wrapping too.
     fn cut_member(&mut self, out: &mut Events) -> Option<String> {
         let key = self.key.unwrap_or(0);
         let held = self.take_held();
@@ -355,7 +368,11 @@ impl Assembler {
             push_quoted(&mut json, held[..key - 1].trim());
             json.push_str(": ");
         }
-        json.push_str(value);
+        if !value.is_empty() && self.spelling.null.starts_with(value) {
+            json.push_str(&"null"[..value.len()]);
+        } else {
+            json.push_str(&cut_json(value));
+        }
         self.push_fragment(json, Text::uncounted(source.to_owned()), out);
         cut_token
     }
@@ -1711,7 +1728,7 @@ mod tests {
     /// a time.
     #[test]
     fn a_member_the_stream_end_cuts_leaves_as_the_calls_own_bytes_and_nothing_closes() {
-        let cases: [(&str, &str, &[&str]); 17] = [
+        let cases: [(&str, &str, &[&str]); 18] = [
             // A bare value: the digits so far, a word that may still be a literal.
             (
                 "call:play{artist:<|\"|>Taylor<|\"|>,n:1",
@@ -1724,8 +1741,14 @@ mod tests {
                 &[],
             ),
             (
-                "call:play{artist:<|\"|>Taylor<|\"|>,n:tru",
-                r#"{"artist": "Taylor", "n": tru"#,
+                "call:play{artist:<|\"|>Taylor<|\"|>,n:tr",
+                r#"{"artist": "Taylor", "n": tr"#,
+                &[],
+            ),
+            // A word that is no literal: the opening of the string it would be written as.
+            (
+                "call:play{artist:<|\"|>Taylor<|\"|>,n:hel",
+                r#"{"artist": "Taylor", "n": "hel"#,
                 &[],
             ),
             // The key and its colon came, and no byte of the value.
@@ -1796,6 +1819,16 @@ mod tests {
                 let events = run(&pieces, true);
                 assert_eq!(bytes(&events), call, "{call:?} {how}");
                 assert_eq!(arguments(&events), expected, "{call:?} {how}: {events:?}");
+                // The contract of every fragment: the arguments so far are a strict prefix of a
+                // JSON value, one `serde_json` reads whole or stops reading only at its end.
+                let strict_prefix = match serde_json::from_str::<serde_json::Value>(expected) {
+                    Ok(_) => true,
+                    Err(error) => error.is_eof(),
+                };
+                assert!(
+                    strict_prefix,
+                    "{call:?}: no JSON value begins with {expected:?}"
+                );
                 assert_eq!(
                     malformed(&events),
                     vec![(String::new(), MalformedReason::UnterminatedRegion)],
@@ -1836,6 +1869,36 @@ mod tests {
         let closed = run(&["call:play{artist:<|\"|>Taylor<|\"|>} "], true);
         assert_eq!(arguments(&closed), r#"{"artist": "Taylor"}"#);
         assert!(malformed(&closed).is_empty(), "{closed:?}");
+        // The start of the spelling's null word is the start of `null`, under either spelling.
+        let mut none = Assembler::new(0, "call_0", Spelling::FUNCTION_GEMMA);
+        let mut out = Events::new();
+        none.feed("call:f{n:No", &mut out);
+        none.finish(&mut out);
+        let none = out.drain();
+        assert_eq!(arguments(&none), r#"{"n": nu"#, "{none:?}");
+        let null = run(&["call:f{n:nul"], true);
+        assert_eq!(arguments(&null), r#"{"n": nul"#, "{null:?}");
+        // A header that was no call's, its text after it released as it came: the whitespace
+        // held at the end is the template's, as at the marker, never shown.
+        let rejected = run(&["cal:x{ hello  "], true);
+        assert_eq!(bytes(&rejected), "cal:x{ hello  ");
+        assert!(
+            !rejected.iter().any(|event| matches!(
+                event,
+                Event::Malformed {
+                    why: MalformedReason::UnterminatedRegion,
+                    ..
+                }
+            )),
+            "{rejected:?}"
+        );
+        assert!(
+            rejected.iter().any(|event| matches!(
+                event,
+                Event::Dropped { text, why: DropReason::Wrapper } if text.text == "  "
+            )),
+            "{rejected:?}"
+        );
         // A header the cut found before its brace: no call started, and its bytes come back as
         // the cut region's, as every assembler reports a block that named no call.
         let header = run(&["call:pl"], true);

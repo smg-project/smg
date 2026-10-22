@@ -552,13 +552,18 @@ What the syntax says, and what the assembler does with it:
   a bare value cut short, and the key held for a value that never came, come back as `Malformed`
   with the cut's reason before the end, every open container is closed and the arguments are
   whole; a string left open stays open, the fragments stand, and a `Malformed` event of no bytes
-  says that the arguments are no whole value. `Assembler::finish` is a stream that was cut, by
-  the token limit and not by the model: nothing closes, as under every other syntax, since a
+  says that the arguments are no whole value. `Assembler::finish` is the stream's end inside the
+  call: a cut by the token limit, an abort, or the model's own end of output before the closing
+  marker, which ends a Gemma call as a cut does since its braces and tokens are the model's own
+  (the stop rule above; neither Gemma table has a stop row), so a call the model left open at
+  its own end stays open too, where it used to be closed. Nothing closes, as under every other syntax, since a
   closing brace the model never wrote would hand the client arguments that read as whole, and
   the call's bytes stay the call's, since a client reads the prefix as written under `length`
   and never the call's bytes as the answer's prose. The member the cut found where its value
   stands leaves as the call's own fragment, its key and its bare value as far as it went (`,
-  "n": 1`) or the key alone (`, "n": `); a string's text so far, the bytes held as a start of
+  "n": 1`; a word that is no literal as the opening of the string it would be written as, so
+  that every fragment keeps the arguments a strict prefix of a JSON value) or the key alone (`,
+  "n": `); a string's text so far, the bytes held as a start of
   its closing token included, is the string's, as at the marker; a key cut short, the whitespace
   held after a value and a start of the string token held after a key leave as the syntax's
   wrapping (`Dropped`), since no member can be written for them; the one `Malformed {
