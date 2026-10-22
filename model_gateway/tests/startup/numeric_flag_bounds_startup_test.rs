@@ -20,6 +20,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::common::gateway_launch::serial;
+
 const IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// How long the gateway gets to refuse or to serve; one that does neither is
 /// killed at this deadline.
@@ -51,7 +53,7 @@ fn launch(args: &[&str], log_path: &Path) -> Launch {
     // The binary's launches run one at a time: the ports picked here are
     // released for the gateway to bind, and another test's pick or listener
     // must not take one meanwhile.
-    let _serial = crate::common::gateway_launch::serial();
+    let _serial = serial();
     let [port, metrics_port] = free_ports();
     let ip = IP.to_string();
     let log = File::create(log_path).expect("log file");
