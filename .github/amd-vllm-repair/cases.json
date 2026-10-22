@@ -1,0 +1,25 @@
+{
+  "vllm": {
+    "product_head": "9a5c23d632a5e9e7430155b36727892776a66a73",
+    "min_selected": 3,
+    "models": [
+      "meta-llama/Llama-3.1-8B-Instruct"
+    ],
+    "cases": [
+      "router/test_worker_api.py::TestDisableHealthCheck::test_disable_health_check_gateway_starts_without_health_checker",
+      "router/test_worker_api.py::TestDisableHealthCheck::test_disable_health_check_workers_immediately_healthy",
+      "router/test_admin_ops.py::TestFlushCacheVllm::test_flush_cache_full_cycle[grpc]",
+      "router/test_loads.py::TestWorkerLoadReports::test_every_worker_reports_load[grpc]",
+      "router/test_loads.py::TestWorkerLoadReports::test_report_reflects_in_flight_requests[grpc]",
+      "router/test_mmlu.py::TestMMLUGrpc::test_mmlu_basic[grpc]",
+      "router/test_context_length.py::TestRegularContextLength::test_over_long_prompt_is_a_400_context_length_exceeded[grpc]",
+      "router/test_context_length.py::TestRegularContextLength::test_over_long_streaming_prompt_is_a_json_400[grpc]",
+      "router/test_context_length.py::TestRegularContextLength::test_prompt_within_the_window_is_served[grpc]",
+      "router/test_context_length.py::TestRegularContextLength::test_workers_still_healthy_after_rejection[grpc]"
+    ],
+    "allowed_skips": {
+      "router/test_worker_api.py::TestDisableHealthCheck::test_disable_health_check_gateway_starts_without_health_checker": "vLLM does not support HTTP mode",
+      "router/test_worker_api.py::TestDisableHealthCheck::test_disable_health_check_workers_immediately_healthy": "vLLM does not support HTTP mode"
+    }
+  }
+}

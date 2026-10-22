@@ -1,38 +1,27 @@
-name: AMD gateway diagnostic
+name: AMD vLLM repair verification
 on:
   workflow_dispatch:
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: amd-gateway-e915
+  group: amd-vllm-repair-e915
   cancel-in-progress: false
 jobs:
-  gateway:
-    name: amd-gateway (${{ matrix.engine }})
+  vllm-repair:
+    name: vllm-repair
     if: vars.SMG_RUN_AMD_LEGS == 'true'
     runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      max-parallel: 2
-      matrix:
-        include:
-          - engine: vllm
-            min_selected: 3
-            image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
-          - engine: sglang
-            min_selected: 23
-            image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
     container:
-      image: ${{ matrix.image }}
+      image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
       options: --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models
     env:
-      E2E_ENGINE: ${{ matrix.engine }}
-      E2E_RUNTIME: ${{ matrix.engine }}
+      E2E_ENGINE: vllm
+      E2E_RUNTIME: vllm
       E2E_GPU_TIER: '1'
       E2E_GPU_VENDOR: amd
-      E2E_MIN_SELECTED: ${{ matrix.min_selected }}
+      E2E_MIN_SELECTED: '3'
       E2E_VLLM_KV_BACKEND: nixl
       E2E_CONNECTION_MODE: ''
       E2E_PARSER: ''
@@ -52,16 +41,16 @@ jobs:
       GIT_CONFIG_COUNT: '1'
       GIT_CONFIG_KEY_0: safe.directory
       GIT_CONFIG_VALUE_0: ${{ github.workspace }}
-      SMG_QA_IMAGE: ${{ matrix.image }}
+      SMG_QA_IMAGE: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
     steps:
       - uses: actions/checkout@v7
       - name: Mark only this job's processes
-        run: echo "E2E_JOB_MARKER=gateway-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
+        run: echo "E2E_JOB_MARKER=vllm-repair-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
       - name: Reuse, install and test within one absolute job budget
         timeout-minutes: 25
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 .github/amd-gateway/budget.py
+        run: python3 .github/amd-vllm-repair/budget.py
       - name: Clean owned processes and record final dependency state
         if: always() && env.E2E_JOB_MARKER != ''
         timeout-minutes: 3
@@ -78,19 +67,9 @@ jobs:
         timeout-minutes: 2
         uses: actions/upload-artifact@v7
         with:
-          name: amd-gateway-${{ matrix.engine }}-${{ github.run_id }}
+          name: amd-vllm-repair-${{ github.run_id }}
           path: |
             diagnostic-results/
             e2e-logs/
           if-no-files-found: error
           retention-days: 7
-  finish:
-    needs: gateway
-    if: always()
-    runs-on: ubuntu-24.04
-    timeout-minutes: 5
-    steps:
-      - name: Require both complete gateway jobs
-        env:
-          GPU: ${{ needs.gateway.result }}
-        run: test "$GPU" = success

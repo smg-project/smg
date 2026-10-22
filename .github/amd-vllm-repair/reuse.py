@@ -95,7 +95,7 @@ def api_get(path):
         headers={
             "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
             "Accept": "application/vnd.github+json",
-            "User-Agent": "smg-gateway-diagnostic",
+            "User-Agent": "smg-vllm-repair",
         },
     )
     return urllib.request.build_opener(NoRedirect()).open(request, timeout=30)
@@ -120,7 +120,7 @@ def archive_bytes(artifact):
 
 
 def consumer_budget():
-    require(os.environ["E2E_ENGINE"] in ("vllm", "sglang"), "unknown gateway engine")
+    require(os.environ["E2E_ENGINE"] == "vllm", "unknown gateway engine")
     require(os.environ["RUNNER_NAME"] in ("amd-mi300x-1", "amd-mi300x-2"), "unexpected runner")
     with api_get(
         f"actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/{os.environ['GITHUB_RUN_ATTEMPT']}/jobs"
@@ -129,7 +129,7 @@ def consumer_budget():
     own = [
         j
         for j in consumer_jobs
-        if j["name"] == f"amd-gateway ({os.environ['E2E_ENGINE']})"
+        if j["name"] == "vllm-repair"
         and j["runner_name"] == os.environ["RUNNER_NAME"]
         and j["status"] == "in_progress"
         and j["head_sha"] == os.environ["GITHUB_SHA"]
@@ -153,7 +153,7 @@ def consumer_budget():
 
 
 def load_budget():
-    budget = json.loads(Path(os.environ["SMG_GATEWAY_BUDGET_FILE"]).read_text())
+    budget = json.loads(Path(os.environ["SMG_VLLM_REPAIR_BUDGET_FILE"]).read_text())
     require(
         all(
             budget[key] == os.environ[env]
