@@ -656,7 +656,7 @@ impl HuggingFaceTokenizer {
         // Detect a custom Python-encoder model from config.json::architectures.
         let renderer = tokenizer_path
             .parent()
-            .map(detect_renderer_from_config)
+            .map(|dir| detect_renderer_from_config(dir, chat_template_str.is_some()))
             .unwrap_or(Renderer::Jinja);
 
         let encoders = DirectEncoders::choose(&tokenizer);
@@ -1797,8 +1797,13 @@ impl TokenizerTrait for HuggingFaceTokenizer {
 /// Inspect the sibling `config.json` to decide which chat-template renderer to
 /// use. A missing or malformed file falls back to [`Renderer::Jinja`] without
 /// erroring (debug-logged), preserving backward compatibility for every model
-/// not in the architecture list.
-fn detect_renderer_from_config(dir: &Path) -> Renderer {
+/// not in the architecture list. `has_chat_template` says whether the
+/// checkpoint (its configuration or a template file) or the operator gave a
+/// chat template: the DeepSeek V4 port stands in for the encoder module those
+/// checkpoints ship in place of one, so a checkpoint of that architecture
+/// with a template renders through the template, as the engine's own
+/// renderer does.
+fn detect_renderer_from_config(dir: &Path, has_chat_template: bool) -> Renderer {
     let path = dir.join("config.json");
     if !path.exists() {
         return Renderer::Jinja;
@@ -1834,6 +1839,13 @@ fn detect_renderer_from_config(dir: &Path) -> Renderer {
         return Renderer::DeepseekV41(table);
     }
     if arch_strs.contains(&"DeepseekV4ForCausalLM") {
+        if has_chat_template {
+            debug!(
+                ?path,
+                "DeepseekV4 architecture with a chat template of its own; using Jinja renderer"
+            );
+            return Renderer::Jinja;
+        }
         let encoding = detect_dsv4_effort_encoding(dir);
         debug!(
             ?path,
@@ -2237,7 +2249,7 @@ mod tests {
     use serde_json::json;
     use tempfile::TempDir;
 
-    use super::derive_thinking_mode;
+    use super::{derive_thinking_mode, detect_renderer_from_config, Renderer};
     use crate::{
         chat_template::ChatTemplateParams, encoders::deepseek_v32::ThinkingMode,
         traits::Tokenizer as _, HuggingFaceTokenizer,
@@ -2479,6 +2491,47 @@ mod tests {
 
         let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
         assert_eq!(tokenizer.response_template(), None);
+    }
+
+    /// The DeepSeek V4 encoder port stands in for the encoder module those
+    /// checkpoints ship in place of a chat template. A checkpoint of the
+    /// architecture that ships a template of its own renders through the
+    /// template, as the engine's own renderer does.
+    #[test]
+    fn a_v4_architecture_checkpoint_with_its_own_template_renders_through_it() {
+        let temp = TempDir::new().unwrap();
+        let tokenizer_path = temp.path().join("tokenizer.json");
+        fs::write(&tokenizer_path, MIN_TOKENIZER_JSON).unwrap();
+        fs::write(
+            temp.path().join("config.json"),
+            json!({"architectures": ["DeepseekV4ForCausalLM"], "model_type": "deepseek_v4"})
+                .to_string(),
+        )
+        .unwrap();
+        assert!(matches!(
+            detect_renderer_from_config(temp.path(), false),
+            Renderer::DeepseekV4(_)
+        ));
+        assert!(matches!(
+            detect_renderer_from_config(temp.path(), true),
+            Renderer::Jinja
+        ));
+
+        fs::write(
+            temp.path().join("chat_template.jinja"),
+            "{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}",
+        )
+        .unwrap();
+        let tokenizer = HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            tokenizer
+                .apply_chat_template(
+                    &[json!({"role": "user", "content": "Hi"})],
+                    ChatTemplateParams::default()
+                )
+                .unwrap(),
+            "<user>Hi"
+        );
     }
 
     // Regression: DeepSeek V3.2/V4 bypass ChatTemplateState::apply, so the
