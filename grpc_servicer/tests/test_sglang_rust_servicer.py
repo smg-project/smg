@@ -768,7 +768,9 @@ def test_serve_rust_wires_the_server_the_scheduler_and_the_supervisor(monkeypatc
     assert published["endpoint"].startswith("tcp://*:") and published["endpoint"] != "tcp://*:5557"
 
 
-def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False) -> dict:
+def _run_serve_rust(
+    monkeypatch, tmp_path, *, real_facts: bool = False, recorded: dict | None = None
+) -> dict:
     """``serve_rust`` against a recording fake server, the scheduler launch and
     the supervisor stubbed; the keywords the server was constructed with. With
     ``real_facts`` the launcher's own fact producers run, over a fake model
@@ -779,6 +781,11 @@ def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False) -> dict:
         def __init__(self, **kwargs):
             created.update(kwargs)
             self.address = kwargs["bind_address"]
+            if recorded is not None:
+                recorded["server"] = self
+
+        def set_ready(self, ready: bool) -> None:
+            self.ready = ready
 
     _install_fake_servicer(monkeypatch, FakeServer)
     monkeypatch.setenv(rust.HANDSHAKE_PORT_ENV, "24321")
@@ -795,12 +802,30 @@ def _run_serve_rust(monkeypatch, tmp_path, *, real_facts: bool = False) -> dict:
         rust, "launch_scheduler_ranks", lambda server_args, *, handshake_port: "engine"
     )
 
-    async def fake_supervise(server, engine, *, drain_secs, **_kwargs):
+    async def fake_supervise(server, engine, *, drain_secs, **kwargs):
+        if recorded is not None:
+            recorded["supervise_kwargs"] = kwargs
         return 0
 
     monkeypatch.setattr(rust_lifecycle, "supervise", fake_supervise)
     assert asyncio.run(rust.serve_rust(_server_args())) == 0
     return created
+
+
+def test_serve_rust_holds_readiness_for_planned_warmup(monkeypatch, tmp_path):
+    monkeypatch.delenv(rust.WARMUP_ENV, raising=False)
+    recorded = {}
+    _run_serve_rust(monkeypatch, tmp_path, real_facts=True, recorded=recorded)
+    assert recorded["server"].ready is False
+    assert callable(recorded["supervise_kwargs"]["warmup"])
+
+
+def test_serve_rust_leaves_readiness_unchanged_without_warmup(monkeypatch, tmp_path):
+    monkeypatch.setenv(rust.WARMUP_ENV, "off")
+    recorded = {}
+    _run_serve_rust(monkeypatch, tmp_path, real_facts=True, recorded=recorded)
+    assert not hasattr(recorded["server"], "ready")
+    assert "warmup" not in recorded["supervise_kwargs"]
 
 
 def test_serve_rust_hands_the_server_both_startup_bounds(monkeypatch, tmp_path):
