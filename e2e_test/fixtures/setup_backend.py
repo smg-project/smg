@@ -77,6 +77,7 @@ _WORKER_DEFAULTS = {
     "extra_engine_args": None,
     # PD only: spawn every prefill/decode worker first and wait afterwards.
     "parallel_start": True,
+    "scheduler_observation": None,
 }
 
 # Track worker startup failures — fail fast after repeated failures
@@ -284,6 +285,11 @@ def setup_backend(request: pytest.FixtureRequest):
         model_id = os.environ.get(ENV_MODEL, DEFAULT_MODEL)
 
     gateway_config = get_marker_kwargs(request, "gateway", defaults=_GW_DEFAULTS)
+    workers_config = get_marker_kwargs(request, "workers", defaults=_WORKER_DEFAULTS)
+    if workers_config.get("scheduler_observation") is not None and not backend_name.startswith(
+        "pd_"
+    ):
+        raise ValueError("scheduler observation requires a PD fixture")
 
     # Cloud backends (no local workers)
     if backend_name in THIRD_PARTY_MODELS:
@@ -303,7 +309,6 @@ def setup_backend(request: pytest.FixtureRequest):
     engine = get_runtime()
     _validate_connection_mode(connection_mode, engine)
     model_path = get_model_spec(model_id)["model"]
-    workers_config = get_marker_kwargs(request, "workers", defaults=_WORKER_DEFAULTS)
     if is_pd and pool_counts is not None:
         # ``("pd_grpc", (n_prefill, n_decode))`` lets one class sweep PD
         # topologies; setup_backend is class-scoped, so counts ride in the param.
@@ -337,6 +342,11 @@ def setup_backend(request: pytest.FixtureRequest):
         for key in ("prefill_args", "decode_args"):
             if key in pool_options:
                 workers_config = {**workers_config, key: list(pool_options[key])}
+        if "scheduler_observation" in pool_options:
+            workers_config = {
+                **workers_config,
+                "scheduler_observation": pool_options["scheduler_observation"],
+            }
     log_dir = os.environ.get("E2E_LOG_DIR") or gateway_config.get("log_dir")
 
     fail_count = _worker_start_failures.get(engine, 0)
@@ -562,8 +572,13 @@ def _start_pd_pool(
     kv_backends: list[str] | None,
     extra_engine_args: list[str] | None = None,
     extra_env: dict[str, str] | None = None,
+    scheduler_observations: list | None = None,
 ) -> list:
     """Start one PD pool; a per-worker KV backend list starts the workers one by one."""
+    if scheduler_observations is not None:
+        from infra.pd_worker_observation import validate_contexts
+
+        validate_contexts(scheduler_observations, count, engine, mode, worker_type)
     if kv_backends is None and not wait_ready:
         return _start_workers_tracked(
             model_id=model_id,
@@ -577,6 +592,11 @@ def _start_pd_pool(
             tp=tp,
             extra_engine_args=extra_engine_args,
             extra_env=extra_env,
+            **(
+                {"scheduler_observations": scheduler_observations}
+                if scheduler_observations is not None
+                else {}
+            ),
         )
     spec_tp = tp or get_model_spec(model_id).get("tp", 1)
     workers: list = []
@@ -596,6 +616,11 @@ def _start_pd_pool(
                     kv_backend=backend,
                     extra_engine_args=extra_engine_args,
                     extra_env=extra_env,
+                    **(
+                        {"scheduler_observations": scheduler_observations[i : i + 1]}
+                        if scheduler_observations is not None
+                        else {}
+                    ),
                 )
             )
     except Exception:
@@ -675,6 +700,13 @@ def _setup_pd(
     )
 
     parallel_start = bool(workers_config.get("parallel_start"))
+    if workers_config.get("scheduler_observation") is not None:
+        for key in ("extra_engine_args", "prefill_args", "decode_args"):
+            value = workers_config.get(key)
+            if value is not None and (
+                not isinstance(value, list) or any(not isinstance(arg, str) for arg in value)
+            ):
+                raise ValueError("observed fixture engine arguments require string lists")
     # The class marker's engine flags (a decode window, a context length)
     # reach every pool, as they do for regular workers. The ``prefill_args`` /
     # ``decode_args`` pool options add flags to one pool only (a
@@ -682,6 +714,34 @@ def _setup_pd(
     extra_engine_args = workers_config.get("extra_engine_args")
     prefill_engine_args = _merge_engine_args(extra_engine_args, workers_config.get("prefill_args"))
     decode_engine_args = _merge_engine_args(extra_engine_args, workers_config.get("decode_args"))
+    observations = {}
+    if workers_config.get("scheduler_observation") is not None:
+        from infra.pd_fixture_observation import fixture_observations
+
+        observations = fixture_observations(
+            workers_config["scheduler_observation"],
+            model_id=model_id,
+            engine=engine,
+            mode=connection_mode,
+            pools=[
+                (
+                    WorkerType.PREFILL,
+                    num_prefill,
+                    prefill_tp or spec.get("tp", 1),
+                    prefill_kv or [vllm_kv_backend()] * num_prefill,
+                    prefill_engine_args,
+                    workers_config.get("prefill_env"),
+                ),
+                (
+                    WorkerType.DECODE,
+                    num_decode,
+                    decode_tp or spec.get("tp", 1),
+                    decode_kv or [vllm_kv_backend()] * num_decode,
+                    decode_engine_args,
+                    workers_config.get("decode_env"),
+                ),
+            ],
+        )
     all_workers: list = []
     try:
         prefill_workers = _start_pd_pool(
@@ -697,6 +757,9 @@ def _setup_pd(
             kv_backends=prefill_kv,
             extra_engine_args=prefill_engine_args,
             extra_env=workers_config.get("prefill_env"),
+            **(
+                {"scheduler_observations": observations[WorkerType.PREFILL]} if observations else {}
+            ),
         )
         all_workers.extend(prefill_workers)
 
@@ -715,6 +778,7 @@ def _setup_pd(
             kv_backends=decode_kv,
             extra_engine_args=decode_engine_args,
             extra_env=workers_config.get("decode_env"),
+            **({"scheduler_observations": observations[WorkerType.DECODE]} if observations else {}),
         )
         all_workers.extend(decode_workers)
         if parallel_start:

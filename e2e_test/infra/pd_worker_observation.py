@@ -25,7 +25,7 @@ class WorkerObservation:
         if not path.is_absolute() or not path.is_dir():
             raise ValueError("observer trace directory must exist and be absolute")
 
-    def child_environment(self, base, *, engine, mode, worker_type, command):
+    def validate_launch(self, *, engine, mode, worker_type, command):
         if engine != "vllm" or mode != ConnectionMode.HTTP:
             raise ValueError("observer launch supports vLLM HTTP only")
         roles = {WorkerType.PREFILL: "kv_producer", WorkerType.DECODE: "kv_consumer"}
@@ -57,6 +57,9 @@ class WorkerObservation:
         config = json.loads(configs[0])
         if not isinstance(config, dict) or config.get("kv_role") != roles[worker_type]:
             raise ValueError("worker KV role does not match observation role")
+
+    def child_environment(self, base, *, engine, mode, worker_type, command):
+        self.validate_launch(engine=engine, mode=mode, worker_type=worker_type, command=command)
         from smg_pd_observer import child_environment
 
         env = dict(base)
@@ -69,3 +72,22 @@ class WorkerObservation:
             SMG_PD_TRACE_WORKER_INSTANCE=uuid.uuid4().hex,
         )
         return child_environment(env, enabled=True)
+
+
+def validate_contexts(contexts, count, engine, mode, worker_type):
+    if (
+        type(count) is not int
+        or count < 1
+        or not isinstance(contexts, list)
+        or len(contexts) != count
+        or not contexts
+        or any(not isinstance(context, WorkerObservation) for context in contexts)
+        or engine != "vllm"
+        or mode != ConnectionMode.HTTP
+        or worker_type not in (WorkerType.PREFILL, WorkerType.DECODE)
+    ):
+        raise ValueError("observation contexts require one entry per vLLM HTTP PD worker")
+    if len({(context.run, context.attempt) for context in contexts}) != 1 or len(
+        {context.worker for context in contexts}
+    ) != len(contexts):
+        raise ValueError("inconsistent or duplicate worker observation identities")

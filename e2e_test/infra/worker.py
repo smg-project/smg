@@ -994,6 +994,7 @@ def start_workers(
     tp: int | None = None,
     kv_backend: str | None = None,
     extra_env: dict[str, str] | None = None,
+    scheduler_observations: list | None = None,
 ) -> list[Worker]:
     """Start N workers for a model. GPU IDs assigned sequentially.
 
@@ -1019,6 +1020,11 @@ def start_workers(
     Returns:
         List of started Worker instances.
     """
+    if scheduler_observations is not None:
+        from .pd_worker_observation import validate_contexts
+
+        engine = engine or get_runtime()
+        validate_contexts(scheduler_observations, count, engine, mode, worker_type)
     # The lane's GPU slice: every worker shifts by E2E_GPU_OFFSET.
     gpu_offset += get_gpu_offset()
     if log_dir is None:
@@ -1082,6 +1088,11 @@ def start_workers(
                 tp=tp,
                 kv_backend=kv_backend,
                 extra_env=extra_env,
+                **(
+                    {"scheduler_observation": scheduler_observations[i]}
+                    if scheduler_observations is not None
+                    else {}
+                ),
             )
 
             # Stagger launches to avoid resource contention

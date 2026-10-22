@@ -35,7 +35,7 @@ ordinary launches keep their existing parsing.
 Every launch exposes `Worker.observer_instance` and records `worker_instance` in
 the trace, separately from each scheduler's generated `instance`. Parent/global
 environment does not opt other Workers in; no observation field means disabled.
-Fixtures/start_workers do not yet allocate these contexts, and no HTTP skip is
+Fixtures support explicit workers(scheduler_observation={run,attempt,trace_dir}); no HTTP skip is
 removed. Request-ID forwarding, all retries/ranks and trace completeness still
 need their own integration and GPU controls. CPU child metadata/context tests do
 not execute the actual vLLM plugin loader or scheduler.
