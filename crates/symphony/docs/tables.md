@@ -493,6 +493,11 @@ render no tool call at all. What the table says beyond the others:
   at every cut; bellwether's hand-written sets record them for the family once its recorder has a
   rule for call ids (the template requires one of nine letters or digits, and a corpus case's
   calls carry none).
+- **A request with tools takes a template an operator supplies.** A checkpoint whose own chat
+  template renders no tool call (Mistral Small 3 and 3.1, Devstral Small 2505) never shows the
+  model the request's tools through it, so such a request is served through a template that
+  renders them, handed to the gateway as `--chat-template`; the engine's own HTTP server has the
+  same limit, and its example template for the family writes the list the table reads.
 - **7B v0.3's template writes a space before the assistant's text** (`[/INST] Hello!</s>`), and
   none before `[TOOL_CALLS]`; the table reads the space as the model's bytes, as the v13 table
   reads what its template writes around the content, and the module tests expect it. Whether
