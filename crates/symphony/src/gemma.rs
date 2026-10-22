@@ -336,8 +336,9 @@ impl Assembler {
     /// held for the value, when one is, opens the member, `"key": `, and a bare value's bytes
     /// after it follow as the JSON they stand for so far, the digits of a number or the start
     /// of a literal word as written, the start of the spelling's null word as the start of
-    /// `null`, and a word that is no literal as the opening of the string it would be written
-    /// as ([`cut_json`]), so that the arguments carry the prefix the model wrote and stay a
+    /// `null`, and a word that is no literal (the JSON word `null` is one only where it is the
+    /// spelling's) as the opening of the string it would be written as ([`cut_json`]), so that
+    /// the arguments carry the prefix the model wrote and stay a
     /// strict prefix of a JSON value; in a list the bytes are the next element's, after the
     /// separator. The bytes held as a start of the string token are no value yet: they are
     /// returned, a token the cut left short, to leave after the call's end as the syntax's
@@ -370,6 +371,12 @@ impl Assembler {
         }
         if !value.is_empty() && self.spelling.null.starts_with(value) {
             json.push_str(&"null"[..value.len()]);
+        } else if !value.is_empty() && self.spelling.null != "null" && "null".starts_with(value) {
+            // Under a spelling whose null word is another, a bare `null` is text the template
+            // never writes, a string once the member closes ([`push_bare`]): the cut opens that
+            // string, where [`cut_json`] would keep the start of the JSON word as written.
+            json.push('"');
+            push_escaped(&mut json, value);
         } else {
             json.push_str(&cut_json(value));
         }
@@ -1869,13 +1876,21 @@ mod tests {
         let closed = run(&["call:play{artist:<|\"|>Taylor<|\"|>} "], true);
         assert_eq!(arguments(&closed), r#"{"artist": "Taylor"}"#);
         assert!(malformed(&closed).is_empty(), "{closed:?}");
-        // The start of the spelling's null word is the start of `null`, under either spelling.
-        let mut none = Assembler::new(0, "call_0", Spelling::FUNCTION_GEMMA);
-        let mut out = Events::new();
-        none.feed("call:f{n:No", &mut out);
-        none.finish(&mut out);
-        let none = out.drain();
-        assert_eq!(arguments(&none), r#"{"n": nu"#, "{none:?}");
+        // The start of the spelling's null word is the start of `null`, under either spelling;
+        // the start of the JSON word `null` is one only where it is the spelling's: under
+        // FunctionGemma a whole `null` is a string, so its cut opens that string, as `n:hel`
+        // does, and the value's type is the one the member closes with.
+        let function_gemma = |call: &str| {
+            let mut assembler = Assembler::new(0, "call_0", Spelling::FUNCTION_GEMMA);
+            let mut out = Events::new();
+            assembler.feed(call, &mut out);
+            assembler.finish(&mut out);
+            arguments(&out.drain())
+        };
+        assert_eq!(function_gemma("call:f{n:No"), r#"{"n": nu"#);
+        assert_eq!(function_gemma("call:f{n:nul"), r#"{"n": "nul"#);
+        assert_eq!(function_gemma("call:f{n:null"), r#"{"n": "null"#);
+        assert_eq!(function_gemma("call:f{n:"), r#"{"n": "#);
         let null = run(&["call:f{n:nul"], true);
         assert_eq!(arguments(&null), r#"{"n": nul"#, "{null:?}");
         // A header that was no call's, its text after it released as it came: the whitespace
