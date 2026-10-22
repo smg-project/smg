@@ -1320,19 +1320,33 @@ impl Said {
         }
     }
 
-    /// Whether a call's arguments hold a string, at any depth, with a `"` in it: what a template
-    /// that quotes every value without escaping it cannot write readably.
+    /// Whether a call's arguments hold a string, at any depth, with a `"` in it, or a string
+    /// inside a list or an object with a `'` in it, the keys of a nested object included: what
+    /// a template that writes every value between double quotes without escaping cannot write
+    /// readably. A nested value is Python's repr between the template's quotes, and repr quotes
+    /// an element, or a key, that holds an apostrophe with `"`, so the apostrophe puts a `"`
+    /// inside the value just the same; a top-level key is the argument's name, written bare. The
+    /// recorder refuses every form by one rule, on the bytes the template writes for the argument.
     fn holds_a_quote_in_a_string(&self) -> bool {
-        fn quoted(value: &serde_json::Value) -> bool {
+        fn quoted(value: &serde_json::Value, nested: bool) -> bool {
+            let unreadable =
+                |text: &str, nested: bool| text.contains('"') || (nested && text.contains('\''));
             match value {
-                serde_json::Value::String(text) => text.contains('"'),
-                serde_json::Value::Array(items) => items.iter().any(quoted),
-                serde_json::Value::Object(members) => members.values().any(quoted),
+                serde_json::Value::String(text) => unreadable(text, nested),
+                serde_json::Value::Array(items) => items.iter().any(|item| quoted(item, true)),
+                // An object here is an argument's value or deeper, so its keys are nested.
+                serde_json::Value::Object(members) => members
+                    .iter()
+                    .any(|(key, member)| unreadable(key, true) || quoted(member, true)),
                 _ => false,
             }
         }
         self.calls.iter().any(|(_, arguments)| {
-            serde_json::from_str::<serde_json::Value>(arguments).is_ok_and(|value| quoted(&value))
+            serde_json::from_str::<serde_json::Value>(arguments).is_ok_and(|value| {
+                value
+                    .as_object()
+                    .is_some_and(|arguments| arguments.values().any(|v| quoted(v, false)))
+            })
         })
     }
 
@@ -1874,8 +1888,9 @@ fn parity(
             respelled += 1;
             "respelled arguments (the template re-serializes them)"
         } else if quotes_values && expected.holds_a_quote_in_a_string() {
-            // The template wrote the quote unescaped, so where the string ends is anyone's guess
-            // and what follows it may land anywhere: the case is counted apart as a whole.
+            // The template wrote the quote unescaped (the value's own, or repr's around a nested
+            // element with an apostrophe), so where the string ends is anyone's guess and what
+            // follows it may land anywhere: the case is counted apart as a whole.
             unreadable += 1;
             "unreadable: a quote inside a quoted value"
         } else if holds_a_list_after_content
@@ -3142,6 +3157,32 @@ fn the_common_set_is_replayed_whole_whatever_the_step() {
     let parse = std::path::Path::new("fixtures/qwen3-8b/parse");
     assert_eq!(step_for(&parse.join("common.jsonl"), 10), 1);
     assert_eq!(step_for(&parse.join("gsm8k-test-content.jsonl"), 10), 10);
+}
+
+#[test]
+fn a_reference_is_unreadable_between_quotes_by_a_quote_at_any_depth_or_a_nested_apostrophe() {
+    let said = |arguments: &str| Said {
+        content: None,
+        reasoning: None,
+        calls: vec![("save_note".to_string(), arguments.to_string())],
+        finish: "tool_calls".to_string(),
+    };
+    // A `"` in a string, at the top or inside a list or an object.
+    assert!(said(r#"{"body": "a \"quoted\" word"}"#).holds_a_quote_in_a_string());
+    assert!(said(r#"{"tags": ["a", "the \"b\""]}"#).holds_a_quote_in_a_string());
+    assert!(said(r#"{"meta": {"deep": {"word": "\""}}}"#).holds_a_quote_in_a_string());
+    // An apostrophe inside a list or an object: repr writes `"O'Brien"` between the template's `"`.
+    assert!(said(r#"{"tags": ["a", "O'Brien"]}"#).holds_a_quote_in_a_string());
+    assert!(said(r#"{"meta": {"name": "O'Brien"}}"#).holds_a_quote_in_a_string());
+    // A nested object's key is quoted by repr as its values are.
+    assert!(said(r#"{"meta": {"O'Brien": 1}}"#).holds_a_quote_in_a_string());
+    assert!(said(r#"{"meta": {"deep": {"a\"b": 1}}}"#).holds_a_quote_in_a_string());
+    // A top-level string's apostrophe stands between the template's `"` as it is, and so does a
+    // backslash at the value's end; a list without one is repr's own quotes alone.
+    assert!(!said(r#"{"city": "O'Brien's"}"#).holds_a_quote_in_a_string());
+    assert!(!said(r#"{"command": "dir C:\\"}"#).holds_a_quote_in_a_string());
+    assert!(!said(r#"{"tags": ["a", "b"], "days": 3}"#).holds_a_quote_in_a_string());
+    assert!(!said("not json").holds_a_quote_in_a_string());
 }
 
 #[test]
