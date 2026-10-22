@@ -117,8 +117,67 @@ def archive_bytes(artifact):
         return response.read(artifact["bytes"] + 1)
 
 
+def consumer_budget():
+    with api_get(
+        f"actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/{os.environ['GITHUB_RUN_ATTEMPT']}/jobs"
+    ) as response:
+        consumer_jobs = json.load(response)["jobs"]
+    own = [
+        j
+        for j in consumer_jobs
+        if j["name"] == "qwen-vision-diagnostic"
+        and j["runner_name"] == os.environ["RUNNER_NAME"]
+        and j["status"] == "in_progress"
+        and j["head_sha"] == os.environ["GITHUB_SHA"]
+    ]
+    require(len(own) == 1, "consumer job identity ambiguous")
+    started = datetime.datetime.fromisoformat(own[0]["started_at"].replace("Z", "+00:00"))
+    now = datetime.datetime.now(datetime.UTC).timestamp()
+    require(started.tzinfo is not None and started.timestamp() <= now, "consumer start time")
+    deadline = started.timestamp() + 15 * 60 - 15
+    require(deadline > now, "diagnostic budget elapsed")
+    return {
+        "consumer_job": own[0]["id"],
+        "consumer_started_at": own[0]["started_at"],
+        "consumer_sha": os.environ["GITHUB_SHA"],
+        "consumer_run": os.environ["GITHUB_RUN_ID"],
+        "consumer_attempt": os.environ["GITHUB_RUN_ATTEMPT"],
+        "diagnostic_deadline_epoch": deadline,
+        "cleanup_reserve_minutes": 5,
+        "kill_grace_seconds": 15,
+    }
+
+
+def load_budget():
+    budget = json.loads(Path(os.environ["QWEN_DIAG_BUDGET_FILE"]).read_text())
+    require(
+        all(
+            budget[key] == os.environ[env]
+            for key, env in (
+                ("consumer_sha", "GITHUB_SHA"),
+                ("consumer_run", "GITHUB_RUN_ID"),
+                ("consumer_attempt", "GITHUB_RUN_ATTEMPT"),
+            )
+        ),
+        "budget consumer identity",
+    )
+    started = datetime.datetime.fromisoformat(budget["consumer_started_at"].replace("Z", "+00:00"))
+    require(
+        budget["diagnostic_deadline_epoch"] == started.timestamp() + 15 * 60 - 15
+        and budget["cleanup_reserve_minutes"] == 5
+        and budget["kill_grace_seconds"] == 15,
+        "budget policy",
+    )
+    require(
+        budget["diagnostic_deadline_epoch"] > datetime.datetime.now(datetime.UTC).timestamp(),
+        "diagnostic budget elapsed",
+    )
+    return budget
+
+
 def main():
     inputs = json.loads(INPUTS.read_text())
+    budget = load_budget()
     check_source(inputs)
     with api_get(f"actions/runs/{inputs['run_id']}") as response:
         run = json.load(response)
@@ -138,26 +197,6 @@ def main():
         and job["conclusion"] == "success",
         "producer build job not successful",
     )
-    with api_get(
-        f"actions/runs/{os.environ['GITHUB_RUN_ID']}/attempts/{os.environ['GITHUB_RUN_ATTEMPT']}/jobs"
-    ) as response:
-        consumer_jobs = json.load(response)["jobs"]
-    own = [
-        j
-        for j in consumer_jobs
-        if j["name"] == "qwen-vision-diagnostic"
-        and j["runner_name"] == os.environ["RUNNER_NAME"]
-        and j["status"] == "in_progress"
-        and j["head_sha"] == os.environ["GITHUB_SHA"]
-    ]
-    require(len(own) == 1, "consumer job identity ambiguous")
-    started = datetime.datetime.fromisoformat(own[0]["started_at"].replace("Z", "+00:00"))
-    deadline = int(started.timestamp()) + 15 * 60 - 15
-    require(
-        deadline > int(datetime.datetime.now(datetime.UTC).timestamp()), "diagnostic budget elapsed"
-    )
-    with open(os.environ["GITHUB_ENV"], "a") as env:
-        env.write(f"QWEN_DIAG_DEADLINE={deadline}\n")
     verified = []
     for artifact in inputs["artifacts"]:
         with api_get(f"actions/artifacts/{artifact['id']}") as response:
@@ -199,10 +238,7 @@ def main():
                 "consumer_run": os.environ["GITHUB_RUN_ID"],
                 "artifacts": verified,
                 "producer_relabelled": False,
-                "consumer_job": own[0]["id"],
-                "consumer_started_at": own[0]["started_at"],
-                "diagnostic_deadline_epoch": deadline,
-                "cleanup_reserve_minutes": 5,
+                **budget,
             },
             indent=2,
         )

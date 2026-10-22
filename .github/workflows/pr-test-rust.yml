@@ -36,31 +36,11 @@ jobs:
       - name: Mark owned processes
         run: echo "E2E_JOB_MARKER=qwen-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
 
-      - name: Verify and reuse fixed producer artifacts
-        timeout-minutes: 3
+      - name: Reuse, install, and compare within one absolute job budget
+        timeout-minutes: 15
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 .github/amd-diagnostics/reuse_foundation.py
-
-      - name: Install the original SGLang test dependencies once
-        timeout-minutes: 3
-        run: |
-          python3 -m pip install --retries 0 -e crates/grpc_client/python/ -e grpc_servicer/
-          python3 -m pip uninstall -y smg
-          python3 -m pip install --retries 0 wheel/*.whl e2e_test/ clients/python/
-          python3 -m pip install --retries 0 'grpcio-health-checking==1.81.*' 'grpcio-reflection==1.81.*'
-          python3 -c "import torch, sglang, mooncake, smg_grpc_servicer; assert torch.version.hip; assert sglang.__version__ == '0.5.21'; print('sglang', sglang.__version__, 'HIP', torch.version.hip)"
-          python3 -m pip freeze > diagnostic-results/pip-freeze.txt
-
-      - name: Compare twelve requests without retries
-        timeout-minutes: 15
-        run: |
-          remaining=$((QWEN_DIAG_DEADLINE - $(date +%s)))
-          test "$remaining" -gt 0
-          timeout --signal=INT --kill-after=15s "${remaining}s" \
-            python3 -m pytest .github/amd-diagnostics/test_qwen_vision_routes.py \
-            --confcutdir=.github/amd-diagnostics -o addopts='' -p no:rerunfailures \
-            -s -vv --junitxml=diagnostic-results/diagnostic.xml
+        run: python3 .github/amd-diagnostics/diagnostic_budget.py
 
       - name: Reap only processes from this job
         if: always() && env.E2E_JOB_MARKER != ''
