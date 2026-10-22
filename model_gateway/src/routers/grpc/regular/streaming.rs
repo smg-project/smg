@@ -410,20 +410,25 @@ impl StreamingProcessor {
         // The stream's verdict, before the engine side is released.
         let client_left = grpc_stream.client_left();
         stream.release_engine(grpc_stream, metrics_labels::ENDPOINT_CHAT);
-        // The terminal sends fail on the sender a leaving client closed: the
-        // reservation is settled with the stream's actual usage either way,
-        // before the failure is returned. A failed terminal send records no
-        // completion metric; the caller records the failure.
-        let terminal = async {
-            let usage = stream.usage_snapshot();
-            stream.flush_parsers(usage.as_ref()).await?;
-            let final_usage = stream.final_usage();
-            stream
-                .send_finish_chunks(final_usage.as_ref(), usage.as_ref())
-                .await?;
-            stream.send_usage_chunk(final_usage).await
-        }
-        .await;
+        // Nothing reaches a client that left, so its read ends with `Ok`
+        // here; a sender closed between the read and the sends fails them.
+        // Either way the reservation is settled with the stream's actual
+        // usage first, and a failed terminal send records no completion
+        // metric (the caller records the failure).
+        let terminal = if client_left {
+            Ok(())
+        } else {
+            async {
+                let usage = stream.usage_snapshot();
+                stream.flush_parsers(usage.as_ref()).await?;
+                let final_usage = stream.final_usage();
+                stream
+                    .send_finish_chunks(final_usage.as_ref(), usage.as_ref())
+                    .await?;
+                stream.send_usage_chunk(final_usage).await
+            }
+            .await
+        };
 
         stream
             .settle_and_record(reservation, client_left || terminal.is_err())
@@ -1813,15 +1818,19 @@ impl StreamingProcessor {
         // The stream's verdict, before the engine side is released.
         let client_left = grpc_stream.client_left();
         stream.release_engine(grpc_stream);
-        // As for chat: the terminal sends fail on a closed sender, and the
-        // settlement with the actual usage comes first.
-        let terminal = async {
-            stream.flush_parsers().await?;
-            stream.close_open_blocks().await?;
-            stream.send_message_delta().await?;
-            stream.send_message_stop().await
-        }
-        .await;
+        // As for chat: nothing for a client that left, the settlement with
+        // the actual usage before a failed send is returned.
+        let terminal = if client_left {
+            Ok(())
+        } else {
+            async {
+                stream.flush_parsers().await?;
+                stream.close_open_blocks().await?;
+                stream.send_message_delta().await?;
+                stream.send_message_stop().await
+            }
+            .await
+        };
 
         stream
             .settle_and_record(reservation, client_left || terminal.is_err())
