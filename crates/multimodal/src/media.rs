@@ -175,7 +175,7 @@ pub enum FrameSampling {
     /// [`Self::UpTo`], then, when that kept every frame of the clip, the
     /// GLM-5-Next reference video processor's own `sample_frames` at the
     /// configured rate over those frames, at most `rate_max_frames` of them
-    /// ([`glm5_next_frame_indices`]): vLLM hands that processor the loader's
+    /// (`glm5_next_frame_indices`): vLLM hands that processor the loader's
     /// frames and lets it resample exactly when the loader took them all
     /// (`do_sample_frames`), and keeps a longer clip's loader picks as they
     /// are.

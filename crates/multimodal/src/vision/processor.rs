@@ -30,8 +30,8 @@ fn dim_for_ndim(
 impl PreprocessedEncoderInputs {
     /// Get the number of channels.
     ///
-    /// For 4D tensors [B, C, H, W], returns shape[1].
-    /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[2].
+    /// For 4D tensors `[B, C, H, W]`, returns `shape[1]`.
+    /// For 5D tensors `[B, N, C, H, W]` (Phi3-Vision), returns `shape[2]`.
     ///
     /// # Errors
     /// Returns `TransformError::InvalidShape` if encoder_input is not 4D or 5D.
@@ -41,8 +41,8 @@ impl PreprocessedEncoderInputs {
 
     /// Get the height of processed images.
     ///
-    /// For 4D tensors [B, C, H, W], returns shape[2].
-    /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[3].
+    /// For 4D tensors `[B, C, H, W]`, returns `shape[2]`.
+    /// For 5D tensors `[B, N, C, H, W]` (Phi3-Vision), returns `shape[3]`.
     ///
     /// # Errors
     /// Returns `TransformError::InvalidShape` if encoder_input is not 4D or 5D.
@@ -52,8 +52,8 @@ impl PreprocessedEncoderInputs {
 
     /// Get the width of processed images.
     ///
-    /// For 4D tensors [B, C, H, W], returns shape[3].
-    /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[4].
+    /// For 4D tensors `[B, C, H, W]`, returns `shape[3]`.
+    /// For 5D tensors `[B, N, C, H, W]` (Phi3-Vision), returns `shape[4]`.
     ///
     /// # Errors
     /// Returns `TransformError::InvalidShape` if encoder_input is not 4D or 5D.
