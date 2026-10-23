@@ -1231,14 +1231,29 @@ fn model_type_from_config(dir: &Path) -> Option<String> {
 
 /// Whether `normalizer` is the one a legacy conversion of a sentencepiece
 /// vocabulary writes: a sequence that prepends the word marker U+2581 and
-/// then only replaces (spaces by the marker).
+/// then only replaces the space by that marker. A file that replaces
+/// anything else is not that conversion, and keeps its own pipeline.
 fn is_legacy_prepend_normalizer(normalizer: Option<&NormalizerWrapper>) -> bool {
     let Some(NormalizerWrapper::Sequence(sequence)) = normalizer else {
         return false;
     };
     let mut steps = sequence.as_ref().iter();
     matches!(steps.next(), Some(NormalizerWrapper::Prepend(prepend)) if prepend.prepend == "\u{2581}")
-        && steps.all(|step| matches!(step, NormalizerWrapper::Replace(_)))
+        && steps.all(is_legacy_space_replace)
+}
+
+/// Whether `step` is the legacy conversion's `Replace`: the one space by the
+/// word marker. `tokenizers` keeps the pattern private, so it is read through
+/// the step's own serialized form (`{"String": " "}`), once, at load time.
+fn is_legacy_space_replace(step: &NormalizerWrapper) -> bool {
+    let NormalizerWrapper::Replace(replace) = step else {
+        return false;
+    };
+    replace.content == "\u{2581}"
+        && serde_json::to_value(replace)
+            .ok()
+            .and_then(|value| value.get("pattern").cloned())
+            .is_some_and(|pattern| pattern == serde_json::json!({"String": " "}))
 }
 
 impl Encoder for HuggingFaceTokenizer {
@@ -2853,6 +2868,27 @@ mod tests {
         fs::write(&path, LLAMA_STYLE_TOKENIZER_JSON).unwrap();
         let no_configuration = HuggingFaceTokenizer::from_file(path.to_str().unwrap()).unwrap();
         assert_eq!(ids_of(&no_configuration, "<|im_start|>a"), [3, 6, 7]);
+    }
+
+    /// A Llama-class file whose normalizer replaces something other than the
+    /// space is not the legacy conversion: it keeps its own pipeline, so the
+    /// replacement it names is applied (`ba` reads `▁b▁`, not the class's
+    /// `▁ba`), as the reference applies the file as written.
+    #[test]
+    fn a_llama_class_file_replacing_more_than_the_space_keeps_its_own_pipeline() {
+        let temp = TempDir::new().unwrap();
+        let path = llama_style_checkpoint(temp.path(), "LlamaTokenizer", None, None, "llama");
+        fs::write(
+            &path,
+            LLAMA_STYLE_TOKENIZER_JSON.replace(
+                r#"{"type": "Replace", "pattern": {"String": " "}, "content": "▁"}"#,
+                r#"{"type": "Replace", "pattern": {"String": "a"}, "content": "▁"}"#,
+            ),
+        )
+        .unwrap();
+        let tokenizer = HuggingFaceTokenizer::from_file(&path).unwrap();
+        assert_eq!(ids_of(&tokenizer, "ba"), [6, 8, 6]);
+        assert!(tokenizer.core.tokenizer.get_normalizer().is_some());
     }
 
     /// A prompt rendered by segments encodes as its flat text does: the plain
