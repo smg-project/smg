@@ -1,10 +1,13 @@
 """Translate a router-selected E→P assignment into scheduler receive fields."""
 
+import os
 from urllib.parse import urlsplit
 
 
 def apply_encoder_handoff(request, tokenized, server_args, image_modality):
     handoff = request.encode_handoff
+    if os.environ.get("SGLANG_ENCODER_MM_RECEIVER_MODE") != "grpc":
+        raise ValueError("encoder handoff requires SGLANG_ENCODER_MM_RECEIVER_MODE=grpc")
     if not (
         server_args.language_only
         and server_args.disaggregation_mode == "prefill"

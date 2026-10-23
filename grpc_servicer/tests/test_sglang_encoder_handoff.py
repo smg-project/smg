@@ -20,6 +20,7 @@ servicer_mod = test_sglang_server_info.servicer_mod
 def service(servicer_mod, monkeypatch):
     # Only the unavailable engine's constructor/imports are stand-ins. The whole
     # SMG constructor, converter, Generate handler and protobufs are production code.
+    monkeypatch.setenv("SGLANG_ENCODER_MM_RECEIVER_MODE", "grpc")
     monkeypatch.setattr(servicer_mod, "TokenizedGenerateReqInput", SimpleNamespace)
     monkeypatch.setattr(servicer_mod, "Modality", SimpleNamespace(IMAGE="image"))
     args = SimpleNamespace(
@@ -148,7 +149,27 @@ def test_scheduler_id_mismatch_and_zero_assignment_are_not_silently_replaced(ser
         service._handle_epd_disaggregation_encode_request(value, tokenized)
 
 
-def test_no_envelope_retains_normal_vision_conversion(service):
+@pytest.mark.parametrize("mode", [None, "http"])
+def test_external_handoff_requires_explicit_grpc_receiver_mode(service, monkeypatch, mode):
+    if mode is None:
+        monkeypatch.delenv("SGLANG_ENCODER_MM_RECEIVER_MODE")
+    else:
+        monkeypatch.setenv("SGLANG_ENCODER_MM_RECEIVER_MODE", mode)
+    context = SimpleNamespace(abort=AsyncMock(side_effect=grpc.aio.AbortError()))
+
+    async def run():
+        with pytest.raises(grpc.aio.AbortError):
+            async for _ in service.Generate(request(), context):
+                pytest.fail("wrong-mode handoff yielded a completion")
+
+    asyncio.run(run())
+    assert context.abort.call_args.args[0] == grpc.StatusCode.INVALID_ARGUMENT
+    service.request_manager.generate_request.assert_not_called()
+    assert service.mm_receiver is None
+
+
+def test_no_envelope_retains_normal_vision_conversion(service, monkeypatch):
+    monkeypatch.delenv("SGLANG_ENCODER_MM_RECEIVER_MODE")
     value = request()
     value.ClearField("encode_handoff")
     value.mm_inputs.pixel_values.SetInParent()
