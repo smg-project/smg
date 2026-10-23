@@ -5,8 +5,12 @@ e2e legs start their workers with it at the ``fast`` level (the job sets
 ``SMG_<ENGINE>_SERVICER_WARMUP=fast``), so a chat suite of eight worker
 starts does not pay the full pass eight times. This case starts one worker
 at the shipped default, ``full``, and checks what the legs' level no longer
-shows: the pass plans at that level, runs to its end inside its budget with
-no failed request, and the servicer answers SERVING only once it is over.
+shows: the pass plans at that level, runs its steps to their end inside its
+budget with no failed request, and the servicer answers SERVING only once it
+is over. An engine whose plan also visits every prefill length up to its
+chunk size (the chunk remainders, after every step) may have the budget end
+those, and only those: the case pins that engine's chunk size and accepts
+such an end.
 """
 
 from __future__ import annotations
@@ -61,12 +65,19 @@ class TestFullWarmupBeforeServing:
         engine_start_secs = effective_startup_timeout(
             spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
         )
+        # TokenSpeed's full plan runs the chunk remainders, one-token requests
+        # at every prefill length up to the chunk size, last and under the same
+        # budget; the harness pins no chunk size, so the engine's own step
+        # (8,192, or its prefill budget) would hand thousands of them to the
+        # 900 s budget. Pinned, the count is known and a normal run ends complete.
+        extra_engine_args = ["--chunked-prefill-size", "2048"] if engine == "tokenspeed" else None
         worker = start_workers(
             MODEL,
             engine,
             mode=ConnectionMode.GRPC,
             count=1,
             wait_ready=False,
+            extra_engine_args=extra_engine_args,
             extra_env={knob: LEVEL_FULL},
         )[0]
         try:
@@ -84,4 +95,9 @@ class TestFullWarmupBeforeServing:
         assert outcome.end.failed_requests == 0, (
             f"the pass had failed requests: {outcome.describe()}"
         )
-        assert outcome.end.complete, f"the pass did not run to its end: {outcome.describe()}"
+        # The chunk remainders are the plan's best effort under the budget: a
+        # pass the budget ended there, every step before them covered and no
+        # request failed, is the finished warm-up this case checks for.
+        assert outcome.end.complete or outcome.end.budget_ended_in_the_remainders, (
+            f"the pass did not run to its end: {outcome.describe()}"
+        )

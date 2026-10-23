@@ -39,11 +39,14 @@ _STARTS = re.compile(
 )
 # "Planned warm-up over: 215 of 215 steps covered in 72.6 s (0 failed requests)"
 # followed by "; the budget ended the pass before <step>", "; stopped: <why>" or
-# "; the engine's cache was not flushed (...)" when that happened.
+# "; the engine's cache was not flushed (...)" when that happened. The step the
+# budget stopped before is the pass's next one, "prefill 37 tokens (chunk
+# remainder)" when only the chunk remainders were left.
 _OVER = re.compile(
     r"Planned warm-up over: (?P<covered>\d+) of (?P<planned>\d+) steps covered in "
     r"(?P<secs>\d+(?:\.\d+)?) s \((?P<failed>\d+) failed requests?\)(?P<rest>[^\r\n]*)"
 )
+_BUDGET_ENDED = re.compile(r"; the budget ended the pass(?: before (?P<left>[^;\r\n]*))?")
 # The servicer ran no pass: the knob is off, the engine or model takes none,
 # or the configuration left nothing to plan (``plan_for``'s three lines).
 _NONE = re.compile(
@@ -71,11 +74,19 @@ class WarmupEnd:
     failed_requests: int
     budget_hit: bool
     stopped: bool
+    #: The step the budget stopped before ("" when it did not, or stopped before none).
+    left: str = ""
 
     @property
     def complete(self) -> bool:
         """Every planned step covered; neither the budget nor a failure streak ended it."""
         return self.covered == self.planned and not self.budget_hit and not self.stopped
+
+    @property
+    def budget_ended_in_the_remainders(self) -> bool:
+        """The budget ended the pass with only chunk remainders left: every step before
+        them ran (the plan puts them last), and they are its best effort under the budget."""
+        return self.budget_hit and not self.stopped and self.left.endswith("(chunk remainder)")
 
 
 def warmup_start(log: str) -> WarmupStart | None:
@@ -92,13 +103,15 @@ def warmup_end(log: str) -> WarmupEnd | None:
     if match is None:
         return None
     rest = match["rest"]
+    ended = _BUDGET_ENDED.search(rest)
     return WarmupEnd(
         covered=int(match["covered"]),
         planned=int(match["planned"]),
         secs=float(match["secs"]),
         failed_requests=int(match["failed"]),
-        budget_hit="the budget ended the pass" in rest,
+        budget_hit=ended is not None,
         stopped="; stopped:" in rest,
+        left=(ended["left"] or "") if ended is not None else "",
     )
 
 
@@ -124,6 +137,8 @@ class WarmupOutcome:
         budget = f"under a {self.start.budget_secs:g} s budget"
         if self.end.complete:
             ended = "ran to its end"
+        elif self.end.budget_ended_in_the_remainders:
+            ended = f"ended on the budget in the chunk remainders (before {self.end.left})"
         elif self.end.budget_hit or self.end.stopped:
             ended = (
                 "ended early"

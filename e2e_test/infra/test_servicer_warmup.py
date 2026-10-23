@@ -65,25 +65,45 @@ def test_the_end_line_gives_the_coverage_and_a_complete_pass():
 
 
 @pytest.mark.parametrize(
-    ("rest", "covered", "failed", "budget_hit", "stopped"),
+    ("rest", "covered", "failed", "budget_hit", "stopped", "left"),
     [
-        ("; the budget ended the pass before prefill 16384 tokens again", 202, 0, True, False),
-        ("; the budget ended the pass", 243, 0, True, False),
-        ("; stopped: 3 steps failed in a row", 40, 3, False, True),
+        (
+            "; the budget ended the pass before prefill 16384 tokens again",
+            202,
+            0,
+            True,
+            False,
+            "prefill 16384 tokens again",
+        ),
+        ("; the budget ended the pass", 243, 0, True, False, ""),
+        (
+            "; the budget ended the pass before prefill 37 tokens (chunk remainder)",
+            230,
+            0,
+            True,
+            False,
+            "prefill 37 tokens (chunk remainder)",
+        ),
+        ("; stopped: 3 steps failed in a row", 40, 3, False, True, ""),
         (
             "; the engine's cache was not flushed (the warm-up's blocks stay cached)",
             243,
             0,
             False,
             False,
+            "",
         ),
     ],
 )
-def test_an_early_or_unflushed_end_is_told_apart(rest, covered, failed, budget_hit, stopped):
+def test_an_early_or_unflushed_end_is_told_apart(rest, covered, failed, budget_hit, stopped, left):
     line = f"Planned warm-up over: {covered} of 243 steps covered in 300.4 s ({failed} failed requests){rest}"
     end = warmup_end(line)
-    assert end == WarmupEnd(covered, 243, 300.4, failed, budget_hit=budget_hit, stopped=stopped)
+    assert end == WarmupEnd(
+        covered, 243, 300.4, failed, budget_hit=budget_hit, stopped=stopped, left=left
+    )
     assert end.complete is (covered == 243 and not budget_hit and not stopped)
+    # Only the chunk remainders left: the plan's steps before them all ran.
+    assert end.budget_ended_in_the_remainders is (budget_hit and left.endswith("(chunk remainder)"))
 
 
 @pytest.mark.parametrize(
@@ -309,3 +329,41 @@ def test_a_pass_that_ran_every_step_with_a_failed_request_is_described_as_such()
         0.0,
     )
     assert "ended early on the budget" in budget.describe()
+
+
+def test_a_pass_the_budget_ended_in_the_chunk_remainders_is_described_as_such():
+    """An engine that plans every prefill length runs the chunk remainders last,
+    under the same budget: a pass the budget ends there covered every step before
+    them, and the description names the remainder it stopped before."""
+    from infra.servicer_warmup import WarmupEnd, WarmupOutcome, WarmupStart
+
+    start = WarmupStart("full", 8355, 900.0)
+    cut = WarmupOutcome(
+        start,
+        WarmupEnd(
+            covered=6210,
+            planned=8355,
+            secs=900.2,
+            failed_requests=0,
+            budget_hit=True,
+            stopped=False,
+            left="prefill 5996 tokens (chunk remainder)",
+        ),
+        912.0,
+        0.0,
+    )
+    assert not cut.end.complete
+    assert cut.end.budget_ended_in_the_remainders
+    assert "ended on the budget in the chunk remainders (before prefill 5996 tokens" in (
+        cut.describe()
+    )
+    before = WarmupEnd(
+        covered=200,
+        planned=8355,
+        secs=900.2,
+        failed_requests=0,
+        budget_hit=True,
+        stopped=False,
+        left="prefill 16384 tokens again",
+    )
+    assert not before.budget_ended_in_the_remainders
