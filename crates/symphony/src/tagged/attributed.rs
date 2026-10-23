@@ -1673,6 +1673,38 @@ mod tests {
         );
     }
 
+    /// An invoke the cut found before it named a call (its name's quote never came): what it
+    /// held is refused as `UnterminatedRegion`, as the keyed assembler refuses it, after whatever
+    /// its syntax refused inside it; nothing is shown, and no `Malformed` event carries bytes,
+    /// since one would end the gateway reader's release of a refused output that made no call.
+    #[test]
+    fn an_invoke_the_cut_found_unnamed_is_refused_whole() {
+        for input in ["fo", "f<parameter name=\"s\">x\n"] {
+            let events = run(&[input], true);
+            assert_eq!(bytes(&events), input, "{input:?}");
+            assert_eq!(shown(&events), "", "{input:?}: {events:?}");
+            let reported = malformed(&events);
+            assert!(
+                reported.iter().all(|(text, _)| text.is_empty()),
+                "{input:?}: {reported:?}"
+            );
+            assert_eq!(
+                reported.last().map(|(_, why)| *why),
+                Some(MalformedReason::UnterminatedRegion),
+                "{input:?}: {reported:?}"
+            );
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, Event::ToolCallStart { .. })),
+                "{input:?}"
+            );
+            // Every byte is refused or dropped as the syntax's wrapping; none is content.
+            let accounted: usize = refused(&events).iter().map(String::len).sum::<usize>()
+                + dropped(&events).iter().map(String::len).sum::<usize>();
+            assert_eq!(accounted, input.len(), "{input:?}: {events:?}");
+        }
+    }
     #[test]
     fn a_nullable_string_is_null_or_the_string() {
         let as_null = run(&["f\">\n<parameter name=\"ns\">null</parameter>\n"], false);

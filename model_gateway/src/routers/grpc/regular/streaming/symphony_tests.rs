@@ -548,6 +548,29 @@ async fn a_whole_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finish
     }
 }
 
+/// A DSML block the token limit cut before its invoke named a call, after a refusal inside it (a
+/// parameter tag where the name's quote should have come, and the text after it): no call, so the
+/// reader releases the output's own slice from the invoke's opener as the content at the end, the
+/// held newline the cut found included, where a `Malformed` event with bytes at the cut ended that
+/// release and left the client the newline alone. The `calls` marker before it is the table's
+/// framing, dropped as always.
+#[tokio::test]
+async fn a_block_the_token_limit_cut_before_a_call_was_named_is_released_whole_as_content() {
+    let invoke = "<｜DSML｜ invoke name=\"f<｜DSML｜ parameter name=\"s\" string=\"true\">x\n";
+    let output = format!("</think>\n\n<｜DSML｜ calls>\n{invoke}");
+    let (choice, _) = fold_finished(&output, deepseek_v4_1(), "<think>", "length").await;
+    assert!(choice.message.tool_calls.is_none(), "{choice:?}");
+    assert_eq!(
+        choice.message.content.as_deref(),
+        Some(invoke),
+        "the slice from the invoke's opener, whole: {choice:?}"
+    );
+    assert_eq!(
+        choice.finish_reason.as_deref(),
+        Some("length"),
+        "{choice:?}"
+    );
+}
 #[tokio::test]
 async fn a_refused_block_released_as_the_answer_keeps_its_tokens_logprobs() {
     // The whole answer after the thought is a call written as Python inside the call tag: the

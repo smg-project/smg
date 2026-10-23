@@ -341,7 +341,9 @@ What the syntax says, and what the assembler does with it:
   `ToolCallEnd`, whose bytes came after it (at the stop, whose end carries no bytes, it is
   dropped after the call, as above); `Assembler::finish` is a stream that was cut, and closes
   nothing: a started call ends after the one `Malformed { UnterminatedRegion }` event that says
-  its arguments are no whole value (`tagged::end_cut_call`).
+  its arguments are no whole value (`tagged::end_cut_call`), and an invoke the cut found before
+  it named a call is refused whole as `UnterminatedRegion`, as the keyed one is, so that the
+  reader's release of a refused output that made no call takes the whole slice.
 - **Every byte of the call lands in exactly one event.**
 
 ## The XML assembler (`tagged::xml`)
