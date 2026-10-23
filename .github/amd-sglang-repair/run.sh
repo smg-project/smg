@@ -12,6 +12,7 @@ source scripts/ci_setup_sglang_rocm_image.sh
 python3 -m pip uninstall -y smg
 python3 -m pip install --retries 0 wheel/*.whl
 bash scripts/ci_install_e2e_deps.sh sentence-transformers
+python3 -m pip install --retries 0 --no-deps pytest-asyncio==1.4.0
 touch diagnostic-results/install-complete
 python3 .github/amd-qa/closure_audit.py snapshot diagnostic-results/installed.json
 python3 .github/amd-sglang-repair/environment.py installed
