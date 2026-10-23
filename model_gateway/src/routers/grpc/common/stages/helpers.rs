@@ -983,6 +983,12 @@ pub(crate) fn finish_generate_request(
                 .set_encode_bootstrap_info(std::mem::take(bootstrap_info))
                 .map_err(|message| error::bad_request("encode_handoff_mismatch", message))?,
             EncodeOutputs::Sglang(_) => {
+                if proto_request.sampling_n() != 1 {
+                    return Err(error::bad_request(
+                        "sglang_encode_n_unsupported",
+                        "SGLang external encoding requires n = 1",
+                    ));
+                }
                 let assignments = ctx
                     .state
                     .workers
