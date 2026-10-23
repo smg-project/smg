@@ -1042,6 +1042,16 @@ def _require_rust_servicer_hook() -> None:
     require_upstream_hook()
 
 
+def worker_startup_timeout(model_id: str, timeout: int = DEFAULT_STARTUP_TIMEOUT) -> int:
+    """The bound the harness gives a worker of ``model_id`` to start: its spec's
+    ``startup_timeout`` (else ``timeout``), raised to the ``E2E_STARTUP_TIMEOUT``
+    floor. ``start_workers`` waits this long for the worker's health; a gateway
+    that registers the same worker needs the same bound for its own wait, so
+    both read it here and a term added to one reaches the other.
+    """
+    return effective_startup_timeout(get_model_spec(model_id).get("startup_timeout", timeout))
+
+
 def start_workers(
     model_id: str,
     engine: str | None = None,
@@ -1105,7 +1115,7 @@ def start_workers(
                 f"launcher (vllm or tokenspeed); got engine={engine!r}"
             )
         gpus_per_worker *= zmq_engine_count
-    timeout = effective_startup_timeout(spec.get("startup_timeout", timeout))
+    timeout = worker_startup_timeout(model_id, timeout)
 
     # Detect IB device for PD workers
     has_pd = worker_type in (WorkerType.PREFILL, WorkerType.DECODE)

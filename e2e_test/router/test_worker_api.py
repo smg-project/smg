@@ -21,14 +21,12 @@ import time
 import httpx
 import pytest
 from infra import (
-    DEFAULT_STARTUP_TIMEOUT,
     ConnectionMode,
     Gateway,
-    effective_startup_timeout,
     start_workers,
     stop_workers,
+    worker_startup_timeout,
 )
-from infra.model_specs import get_model_spec
 
 logger = logging.getLogger(__name__)
 
@@ -381,14 +379,10 @@ class TestIGWMixedWorkerClassification:
         # after the engine's start; the gateway polls it for
         # --worker-startup-timeout-secs after the add. That bound, and the
         # test's own wait for the registrations below, is the one the harness
-        # gives these workers to start (what start_workers waits: the model's
-        # startup_timeout or the default, floored by E2E_STARTUP_TIMEOUT).
-        startup_wait = max(
-            effective_startup_timeout(
-                get_model_spec(w.model_id).get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
-            )
-            for w in all_local_workers
-        )
+        # gives these workers to start: worker_startup_timeout, the bound
+        # start_workers itself waits (the model's startup_timeout or the
+        # default, floored by E2E_STARTUP_TIMEOUT).
+        startup_wait = max(worker_startup_timeout(w.model_id) for w in all_local_workers)
 
         try:
             # Start gateway in IGW mode FIRST with extended startup timeout

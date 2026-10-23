@@ -5,6 +5,7 @@ import ast
 from pathlib import Path
 
 import pytest
+from infra import worker as worker_module
 from infra.constants import (
     DEFAULT_STARTUP_TIMEOUT,
     ENGINE_START_SECS,
@@ -14,6 +15,7 @@ from infra.constants import (
     get_startup_timeout,
 )
 from infra.model_specs import MODEL_SPECS
+from infra.worker import worker_startup_timeout
 
 _SERVICER_WARMUP = (
     Path(__file__).resolve().parents[2] / "grpc_servicer" / "smg_grpc_servicer" / "warmup.py"
@@ -78,3 +80,22 @@ def test_non_positive_values_are_rejected(monkeypatch):
     monkeypatch.setenv(ENV_STARTUP_TIMEOUT, "0")
     with pytest.raises(ValueError, match=ENV_STARTUP_TIMEOUT):
         get_startup_timeout()
+
+
+def test_a_workers_bound_is_its_specs_timeout_or_the_default(monkeypatch):
+    monkeypatch.delenv(ENV_STARTUP_TIMEOUT, raising=False)
+    specs = {"slow": {"startup_timeout": 900}, "plain": {}}
+    monkeypatch.setattr(worker_module, "get_model_spec", lambda model_id: specs[model_id])
+    assert worker_startup_timeout("slow") == 900
+    assert worker_startup_timeout("plain") == DEFAULT_STARTUP_TIMEOUT
+    assert worker_startup_timeout("plain", timeout=450) == 450
+    # the spec's own bound wins over a caller's default
+    assert worker_startup_timeout("slow", timeout=450) == 900
+
+
+def test_a_workers_bound_takes_the_env_floor(monkeypatch):
+    monkeypatch.setenv(ENV_STARTUP_TIMEOUT, "1800")
+    specs = {"slow": {"startup_timeout": 900}, "slower": {"startup_timeout": 3600}}
+    monkeypatch.setattr(worker_module, "get_model_spec", lambda model_id: specs[model_id])
+    assert worker_startup_timeout("slow") == 1800
+    assert worker_startup_timeout("slower") == 3600
