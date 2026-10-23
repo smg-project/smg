@@ -730,4 +730,54 @@ mod tests {
         assert_eq!(content(&cut), "Pong.<|close|>think", "{cut:?}");
         assert_eq!(bytes(&cut), "Pong.<|close|>think");
     }
+
+    /// A call whose arguments the model wrote as JSON and closed with a `json` region of its own
+    /// (seen live): the call is read with no arguments, and the JSON with the region's tags is
+    /// refused as the model's failed call, counted and never content, where `{…}<|close|>json
+    /// <|sep|>` reached the client as content before.
+    #[test]
+    fn arguments_written_as_json_in_a_region_of_the_models_own_are_refused_never_content() {
+        const OUTPUT: &str = concat!(
+            "Noise.<|close|>think<|sep|><|open|>tools<|sep|>",
+            "<|open|>call tool=\"get_law_categories\" index=\"0\"<|sep|>",
+            "{\"country\":\"United States\",\"law_type\":\"noise\"}<|close|>json<|sep|>",
+            "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+        );
+        const SLIP: &str =
+            "{\"country\":\"United States\",\"law_type\":\"noise\"}<|close|>json<|sep|>";
+        for pieces in [vec![OUTPUT], OUTPUT.split_inclusive(',').collect()] {
+            let events = run(PROMPT, &pieces);
+            assert_eq!(bytes(&events), OUTPUT, "{pieces:?}");
+            assert_eq!(arguments_of(&events, 0), "{}", "{pieces:?}");
+            let shown: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Content(text) | Event::Malformed { text, .. } => Some(&*text.text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(shown, "", "{pieces:?}: {events:?}");
+            let refused: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Dropped {
+                        text,
+                        why: DropReason::MalformedCall,
+                    } => Some(&*text.text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(refused, SLIP, "{pieces:?}");
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    Event::Malformed {
+                        why: MalformedReason::TagOutOfPlace,
+                        ..
+                    }
+                )),
+                "{pieces:?}"
+            );
+        }
+    }
 }
