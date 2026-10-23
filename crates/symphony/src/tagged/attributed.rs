@@ -294,7 +294,7 @@ pub struct Assembler {
     /// The function's name once its tag is whole, which is when `ToolCallStart` was pushed.
     function: Option<String>,
     /// Whether text between tags was refused since the last tag the syntax read: a word where
-    /// the syntax has tags, a tag out of its place, a tag reported with its bytes. The
+    /// the syntax has tags, a tag out of its place, a tag refused with its bytes. The
     /// whitespace carried after it is the model's, between two pieces of its text, and leaves with
     /// the next piece; before any, the whitespace after a tag is the template's, dropped before a
     /// report or carried into the next event's source.
@@ -695,7 +695,7 @@ impl Assembler {
             Stage::Value(_) if tag == CLOSE => self.close_value(bytes, out),
             // Inside a value, the other tags are the value's text.
             Stage::Value(_) => self.text(bytes, declared, out),
-            // A tag cuts a name or a tag's tail short: the bytes so far are reported, and the tag
+            // A tag cuts a name or a tag's tail short: the bytes so far are refused, and the tag
             // is read where they began.
             _ => {
                 self.report(MalformedReason::TagCutShort, out);
@@ -1038,9 +1038,9 @@ impl Assembler {
     }
 
     /// Text after a CDATA section closed, where only the closing tag should follow: whitespace
-    /// is carried, a word is text between tags ([`Self::text_between`]), reported with the
+    /// is carried, a word is text between tags ([`Self::text_between`]), refused with the
     /// whitespace before it dropped. A value held whole for its close is written before the
-    /// first word ([`Self::write_held_value`]): the report would take the carried bytes, and the
+    /// first word ([`Self::write_held_value`]): the refusal would take the carried bytes, and the
     /// value is among them.
     fn after_the_section(&mut self, text: &str, out: &mut Events) {
         if runs(text).any(|(_, space)| !space) {
@@ -1403,7 +1403,7 @@ mod tests {
     }
 
     #[test]
-    fn an_xtml_type_the_syntax_lacks_and_a_tail_that_is_no_index_are_reported() {
+    fn an_xtml_type_the_syntax_lacks_and_a_tail_that_is_no_index_are_refused() {
         let call = concat!(
             "f\" index=\"x\"<|sep|>",
             "<|open|>argument key=\"a\" type=\"date\"<|sep|>2026<|close|>argument<|sep|>",
@@ -1700,7 +1700,7 @@ mod tests {
     }
 
     #[test]
-    fn a_parameter_tag_with_a_tail_is_no_parameter_and_the_text_is_reported() {
+    fn a_parameter_tag_with_a_tail_is_no_parameter_and_the_text_is_refused() {
         let text = "f\">\n<parameter name=\"n\" type=\"int\">1</parameter>\n";
         let events = run(&[text], false);
         assert_eq!(
@@ -1933,7 +1933,7 @@ mod tests {
     }
 
     #[test]
-    fn text_after_a_cdata_closer_is_reported_and_a_cut_section_keeps_its_held_bytes() {
+    fn text_after_a_cdata_closer_is_refused_and_a_cut_section_keeps_its_held_bytes() {
         let events = run_with(
             Tags::MINICPM5,
             &["f\"><param name=\"s\"><![CDATA[x]]>tail</param>"],
@@ -1975,7 +1975,7 @@ mod tests {
     /// every cut and one character at a time. (The word used to drop the carried value as the
     /// template's spacing, and the closing tag then sliced past the carried bytes.)
     #[test]
-    fn a_whole_value_in_a_cdata_section_followed_by_a_word_is_written_and_the_word_reported() {
+    fn a_whole_value_in_a_cdata_section_followed_by_a_word_is_written_and_the_word_refused() {
         for (call, expected, word) in [
             (
                 "f\"><param name=\"o\"><![CDATA[{\"k\": 1}]]>tail</param>",

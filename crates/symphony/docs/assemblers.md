@@ -324,8 +324,8 @@ What the syntax says, and what the assembler does with it:
   opener and closer are the template's wrapping and go into the fragments' sources, not the
   value; the text between them is the value as it is, streamed as it arrives for a declared
   string, read whole at the closing tag for any other type. Text between `]]>` and the closing
-  tag, which the template never writes, is reported; a value held whole for its close is written
-  at the first word of it, as the section has it, so that the report never takes the bytes it is
+  tag, which the template never writes, is refused; a value held whole for its close is written
+  at the first word of it, as the section has it, so that the refusal never takes the bytes it is
   held in, and the closing tag then leaves as the syntax's wrapping (`Dropped { Wrapper }`).
 - **A value may stand on its own line** (`Tags::value_on_its_own_line`): dots3's template
   writes a newline after the parameter tag and one before its closing tag. Those two are the
