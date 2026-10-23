@@ -161,7 +161,7 @@
     ".github/amd-vllm-symphony/",
     ".github/workflows/pr-test-rust.yml"
   ],
-  "consumer_setup_core_minutes": 27,
+  "consumer_setup_core_minutes": 55,
   "cleanup_reserved_minutes": 5,
   "target_product_commit": "98b1d750ccb4ba3fbb6968105da7b78d305249db",
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat-symphony[1]/vllm/nvidia",

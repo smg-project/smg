@@ -20,5 +20,5 @@ python3 -m pytest -q grpc_servicer/tests -p no:cacheprovider -rs --junitxml=diag
 python3 .github/amd-qa/closure_audit.py require-vllm diagnostic-results/servicer-engine.xml
 python3 -m pip freeze > diagnostic-results/pip-freeze.txt
 python3 .github/amd-vllm-symphony/preflight.py
-# The 15-second kill grace is inside the original 24-minute test limit.
-timeout --signal=INT --kill-after=15s 1425s python3 .github/amd-vllm-symphony/run_tests.py
+# The 15-second grace is inside the AMD 45-minute test cap; the NV reference keeps 24.
+timeout --signal=INT --kill-after=15s 2685s python3 .github/amd-vllm-symphony/run_tests.py

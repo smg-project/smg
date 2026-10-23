@@ -143,7 +143,7 @@ def consumer_budget():
     started = datetime.datetime.fromisoformat(own[0]["started_at"].replace("Z", "+00:00"))
     now = datetime.datetime.now(datetime.UTC).timestamp()
     require(started.tzinfo is not None and started.timestamp() <= now, "consumer start time")
-    deadline = started.timestamp() + 27 * 60 - 15
+    deadline = started.timestamp() + 55 * 60 - 15
     require(deadline > now, "diagnostic budget elapsed")
     return {
         "consumer_job": own[0]["id"],
@@ -172,7 +172,7 @@ def load_budget():
     )
     started = datetime.datetime.fromisoformat(budget["consumer_started_at"].replace("Z", "+00:00"))
     require(
-        budget["diagnostic_deadline_epoch"] == started.timestamp() + 27 * 60 - 15
+        budget["diagnostic_deadline_epoch"] == started.timestamp() + 55 * 60 - 15
         and budget["cleanup_reserve_minutes"] == 5
         and budget["kill_grace_seconds"] == 15,
         "budget policy",

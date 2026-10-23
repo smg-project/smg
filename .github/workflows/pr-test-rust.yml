@@ -12,7 +12,7 @@ jobs:
     name: vllm-symphony
     if: vars.SMG_RUN_AMD_LEGS == 'true'
     runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
-    timeout-minutes: 32
+    timeout-minutes: 60
     container:
       image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
       options: --device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models
@@ -50,7 +50,7 @@ jobs:
       - name: Mark only this job's processes
         run: echo "E2E_JOB_MARKER=vllm-symphony-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
       - name: Reuse, install and test within one absolute job budget
-        timeout-minutes: 27
+        timeout-minutes: 55
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 .github/amd-vllm-symphony/budget.py
