@@ -15,6 +15,7 @@ use std::{
 };
 
 use engine_zmq_adapter::ZmqEngineClient;
+use engine_zmq_client::protocol::handshake::EngineCoreReadyResponse;
 use futures::FutureExt;
 use tokio::net::TcpListener;
 use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
@@ -85,6 +86,64 @@ impl Shared {
             Some(error) => Status::unavailable(format!("engine connection failed: {error}")),
             None => Status::unavailable("engine is still connecting"),
         })
+    }
+
+    /// The engine's handshake answer, once the link is up.
+    pub(crate) fn ready(&self) -> Option<&EngineCoreReadyResponse> {
+        self.engine
+            .client
+            .get()
+            .and_then(ZmqEngineClient::ready_response)
+    }
+
+    /// The KV capacity in tokens, from the handshake; 0 before the engine is
+    /// up.
+    pub(crate) fn kv_capacity_tokens(&self) -> i32 {
+        self.ready()
+            .and_then(|ready| ready.kv_cache_size_tokens)
+            .map(|tokens| i32::try_from(tokens).unwrap_or(i32::MAX))
+            .unwrap_or(0)
+    }
+
+    /// The scheduler's running window: the launcher's figure when it reported
+    /// one, else the handshake's; 0 before the engine is up on a launcher that
+    /// reported none.
+    pub(crate) fn running_window(&self, launcher: i32) -> i32 {
+        if launcher > 0 {
+            return launcher;
+        }
+        self.ready()
+            .map(|ready| i32::try_from(ready.max_num_seqs).unwrap_or(i32::MAX))
+            .unwrap_or(0)
+    }
+
+    /// The engine version to report: the launcher's, else the handshake's
+    /// with the wire's `prefix` stripped, else `unknown`.
+    pub(crate) fn engine_version(&self, launcher: &str, prefix: &str) -> String {
+        Some(launcher.to_string())
+            .filter(|version| !version.is_empty())
+            .or_else(|| {
+                self.ready().map(|ready| {
+                    ready
+                        .vllm_version
+                        .strip_prefix(prefix)
+                        .unwrap_or(&ready.vllm_version)
+                        .to_string()
+                })
+            })
+            .filter(|version| !version.is_empty())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+
+    /// The data-parallel rank count a zero-filled load report covers: the
+    /// handshake's, else the launcher's, else one.
+    pub(crate) fn rank_count(&self, launcher: i32) -> usize {
+        self.ready()
+            .and_then(|ready| usize::try_from(ready.data_parallel_size).ok())
+            .filter(|&ranks| ranks > 0)
+            .or_else(|| usize::try_from(launcher).ok())
+            .unwrap_or(1)
+            .max(1)
     }
 
     /// Whether the engine handshake completed.
@@ -374,6 +433,23 @@ mod tests {
         )
         .expect("metrics without a listener");
         Shared::new(None, metrics, None)
+    }
+
+    /// Before the engine is up every reader answers from the launcher's
+    /// figures alone: no capacity, the launcher's window or none, the
+    /// launcher's version or `unknown`, the launcher's ranks or one.
+    #[test]
+    fn the_handshake_readers_fall_back_to_the_launcher_before_the_engine_is_up() {
+        let shared = shared();
+        assert!(shared.ready().is_none());
+        assert_eq!(shared.kv_capacity_tokens(), 0);
+        assert_eq!(shared.running_window(64), 64);
+        assert_eq!(shared.running_window(0), 0);
+        assert_eq!(shared.engine_version("0.5.1", "wire-"), "0.5.1");
+        assert_eq!(shared.engine_version("", "wire-"), "unknown");
+        assert_eq!(shared.rank_count(4), 4);
+        assert_eq!(shared.rank_count(0), 1);
+        assert_eq!(shared.rank_count(-2), 1);
     }
 
     /// The drain switch closes admission with health; the readiness switch

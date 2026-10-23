@@ -31,6 +31,7 @@ pub mod kv_events;
 pub mod kv_history;
 pub mod kv_state;
 pub mod kv_wire;
+mod load_report;
 mod load_tracker;
 mod metrics;
 mod proto_json;
