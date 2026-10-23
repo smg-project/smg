@@ -23,7 +23,7 @@ def process_identity(process, title=None):
     require(overwritten or argv == launch, "actual process argv differs from harness launch")
     marker = ("E2E_JOB_MARKER=" + os.environ["E2E_JOB_MARKER"]).encode()
     visible = marker in (root / "environ").read_bytes().split(b"\0")
-    require(visible or overwritten, "process belongs to another job")
+    require(visible, "process job marker is missing or differs")
     return {
         "pid": process.pid,
         "parent_pid": int(fields[1]),
@@ -32,7 +32,7 @@ def process_identity(process, title=None):
         "launch_argv": launch,
         "marker_visible_in_proc": visible,
         "ownership": "live fixture Popen child + kernel PPid + start ticks",
-        "title_overwrote_initial_argv_and_environment": overwritten,
+        "title_overwrote_initial_argv": overwritten,
     }
 
 

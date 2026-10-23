@@ -39,6 +39,7 @@ jobs:
       PYTHONPATH: e2e_test
       SHOW_WORKER_LOGS: '0'
       SHOW_ROUTER_LOGS: '0'
+      SPT_NOENV: '1'
       RUST_LOG: warn,engine_zmq_adapter::client=info,engine_zmq_client::transport=info
       E2E_LOG_DIR: e2e-logs
       PYTEST_ADDOPTS: ''
