@@ -3194,11 +3194,6 @@ mod tests {
         assert_eq!(render(&format!("  {body}  ")), "  <s><|user|>Hi</s>  ");
     }
 
-    /// A backslash followed by an `n` in a template file's text is the two
-    /// characters it is, as the engine's chat utils read the file (a file
-    /// that is one escaped line renders as that line); inside a Jinja string
-    /// literal the template engine's own escape makes a newline of it, in
-    /// both engines alike.
     /// The load warning counts a backslash-n in the template's text, not one
     /// inside a tag (a string literal the template engine's escape turns into a
     /// newline), and a real newline is no such pair.
@@ -3216,6 +3211,11 @@ mod tests {
         assert!(!text_outside_tags_holds_backslash_n("line one\nline two\n"));
     }
 
+    /// A backslash followed by an `n` in a template file's text is the two
+    /// characters it is, as the engine's chat utils read the file (a file
+    /// that is one escaped line renders as that line); inside a Jinja string
+    /// literal the template engine's own escape makes a newline of it, in
+    /// both engines alike.
     #[test]
     fn a_template_file_s_backslash_n_stays_the_two_characters_it_is() {
         let dir = tempfile::tempdir().unwrap();
