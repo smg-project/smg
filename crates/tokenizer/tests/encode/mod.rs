@@ -8,6 +8,7 @@ mod native_special_tokens_request;
 mod one_shot_decode_parity;
 mod qwen2_vocab_merges;
 mod qwen3_asr_bpe_parity;
+mod special_tokens_from_config;
 mod tiktoken_integration;
 mod tokenizer_integration;
 mod vocab_merges_parity;
