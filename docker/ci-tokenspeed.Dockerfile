@@ -6,8 +6,8 @@
 # in e2e-gpu-job.yml resolves to "no container"). This image is therefore a
 # CARRIER, not a job container: at job time
 # scripts/ci_fetch_tokenspeed_prebuilt.sh pulls it and docker-cp's the baked
-# payload onto the runner, where scripts/ci_install_tokenspeed.sh upgrades
-# TokenSpeed from the nightly index.
+# payload onto the runner, where scripts/ci_install_tokenspeed.sh finds the
+# pinned TokenSpeed nightly installed and adds the per-PR SMG glue.
 #
 # Portability contract with the runner (Ubuntu 24.04 pods):
 #   - base is ubuntu:24.04 so the baked venv's interpreter symlink resolves
@@ -19,7 +19,7 @@
 #     payload; the install script apt-installs them on the runner when
 #     missing.
 #
-# Built by ci-tokenspeed-image.yml using the published nightly version date.
+# Built by ci-tokenspeed-image.yml for the pinned nightly version's date.
 # CUDA tooling supports runtime JIT; wheel installation needs no GPU.
 
 ARG BASE_IMAGE=ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
@@ -43,7 +43,7 @@ RUN bash scripts/ci_apt_mirror.sh \
     && rm -rf /var/lib/apt/lists/*
 
 COPY scripts/ci_setup_python_venv.sh scripts/ci_install_tokenspeed.sh scripts/ci_tokenspeed_scheduler_pin.py scripts/ci_install_flashinfer.py scripts/ci_ensure_python_headers.sh scripts/
-COPY .github/versions/tokenspeed.ref .github/versions/tokenspeed.ref
+COPY .github/versions/tokenspeed.ref .github/versions/tokenspeed-nightly.txt .github/versions/
 
 ARG TOKENSPEED_VERSION
 

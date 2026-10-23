@@ -181,7 +181,7 @@ jobs:
             TOKENSPEED_VERSION="$(bash scripts/ci_tokenspeed_image_tag.sh --version)"
             BASE_IMAGE_REF="ghcr.io/${OWNER}/smg:ci-tokenspeed-${TOKENSPEED_VERSION##*post}"
             ENGINE_BASE_STAGE=tokenspeed-nightly-base
-            # Never fall back to an older engine when today's carrier is not ready.
+            # Never fall back to another engine when the pinned carrier is not ready.
             docker manifest inspect "${BASE_IMAGE_REF}" > /dev/null
           fi
           echo "engine_base_stage=${ENGINE_BASE_STAGE}" >> "$GITHUB_OUTPUT"
