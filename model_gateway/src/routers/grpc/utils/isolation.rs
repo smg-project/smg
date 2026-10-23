@@ -45,7 +45,7 @@ use crate::routers::grpc::regular::symphony::telemetry;
 /// error body and on the SSE error event alike.
 pub(crate) const READER_PANICKED_CODE: &str = "reader_panicked";
 
-/// The bytes of a panic's message the line and the error carry at most.
+/// The bytes of a panic's message the log line carries at most.
 const MESSAGE_SHOWN: usize = 256;
 
 /// The environment variable that arms the test trap: the text a response
