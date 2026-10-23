@@ -91,7 +91,7 @@ use crate::{
                 serialize_request_body, serialize_request_body_preserving_fields, RequestBodyError,
             },
             request_stream::{CappedBodyStream, StreamProgress},
-            stream_failure::{head_success_recorded, RelaySource},
+            stream_failure::{cause, head_success_recorded, RelaySource},
             stream_relay::{relay_streaming_body, ChunkMode, Relay},
         },
         BodyPolicy, RouterTrait,
@@ -256,7 +256,7 @@ impl Router {
                             }
                             Err(e) => error::internal_error(
                                 "read_response_failed",
-                                format!("Failed to read response: {e}"),
+                                format!("Failed to read response: {}", cause(&e)),
                             ),
                         }
                     }
@@ -880,7 +880,7 @@ impl Router {
                         Err(e) => {
                             last_response = Some(error::internal_error(
                                 "read_response_failed",
-                                format!("Failed to read response: {e}"),
+                                format!("Failed to read response: {}", cause(&e)),
                             ));
                         }
                     }
@@ -1120,13 +1120,14 @@ impl Router {
                 Ok(chunk) => chunk,
                 Err(e) if is_request_timeout(&e) => {
                     return Err(request_timeout_response(format!(
-                        "Failed to get response body: {e}"
+                        "Failed to get response body: {}",
+                        cause(&e)
                     )));
                 }
                 Err(e) => {
                     return Err(error::internal_error(
                         "read_response_body_failed",
-                        format!("Failed to get response body: {e}"),
+                        format!("Failed to get response body: {}", cause(&e)),
                     ));
                 }
             };
@@ -1690,7 +1691,7 @@ fn relay_transcription_stream(
                     }
                     Some(Err(e)) => {
                         stream_failed = true;
-                        let _ = tx.send(Err(format!("Stream error: {e}"))).await;
+                        let _ = tx.send(Err(format!("Stream error: {}", cause(&e)))).await;
                         break;
                     }
                     None => break,
@@ -1822,11 +1823,9 @@ pub(crate) async fn send_with_stale_conn_retry(
 }
 
 fn convert_reqwest_error(e: reqwest::Error) -> Response {
-    let url = e
-        .url()
-        .map(|u| u.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    let message = format!("{e}. URL: {url}");
+    // The error's words and its causes, without the URL reqwest puts in them:
+    // the worker's address is logged by the caller and is not the client's.
+    let message = cause(&e);
 
     // The request's own timeout (the client's budget: `--request-timeout-secs`
     // or the worker's `timeout_secs`), before the head or while the body is
@@ -4623,6 +4622,36 @@ mod tests {
             "call_upstream_timeout"
         );
         assert!(is_retryable_response(&response));
+    }
+
+    /// The answer to a call that never reached its worker tells the client
+    /// the reason and not the worker's address: reqwest puts the URL in the
+    /// outer error, and the converter leaves it out.
+    #[tokio::test]
+    async fn an_upstream_failures_answer_names_the_reason_and_not_the_worker() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let err = crate::clients::http_client_builder()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/generate"))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(err.url().is_some(), "reqwest attaches the URL to the error");
+
+        let response = convert_reqwest_error(err);
+        assert_eq!(
+            response.headers()[error::HEADER_X_SMG_ERROR_CODE],
+            "call_upstream_connection_failed"
+        );
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        let message = body["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("error sending request: "), "{message}");
+        assert!(!message.contains(&addr.to_string()), "{message}");
+        assert!(!message.contains("URL"), "{message}");
     }
 
     #[tokio::test]
