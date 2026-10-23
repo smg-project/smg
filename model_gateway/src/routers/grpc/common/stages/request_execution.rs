@@ -2947,6 +2947,58 @@ mod tests {
     }
 
     #[test]
+    fn encode_handoff_sglang_is_prefill_only_on_actual_parallel_pd_split() {
+        let worker = |url, role| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(role)
+                    .runtime_type(RuntimeType::Sglang)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .build(),
+            )
+        };
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: worker("grpc://prefill:30000", WorkerType::Prefill),
+            decode: worker("grpc://decode:30000", WorkerType::Decode),
+            runtime_type: RuntimeType::Sglang,
+        };
+        let mut request = ProtoGenerateRequest::Sglang(Box::new(sglang::GenerateRequest {
+            request_id: "original-rid".to_string(),
+            disaggregated_params: Some(sglang::DisaggregatedParams {
+                bootstrap_host: "prefill".to_string(),
+                bootstrap_port: 8998,
+                bootstrap_room: 42,
+            }),
+            ..Default::default()
+        }));
+        let handoff = sglang::EncodeHandoff {
+            request_id: "original-rid".to_string(),
+            encoder_urls: vec!["grpc://e0:5001".to_string(), "grpc://e1:5002".to_string()],
+            num_items_assigned: vec![1, 0],
+        };
+        request.set_encode_bootstrap_info(handoff.clone()).unwrap();
+        let (prefill, decode) = parallel_pd_requests(request, &workers);
+        assert_eq!(prefill.request_id(), "original-rid");
+        assert_eq!(decode.request_id(), "original-rid");
+        assert_eq!(prefill.as_sglang().encode_handoff, Some(handoff));
+        assert!(decode.as_sglang().encode_handoff.is_none());
+        assert_eq!(
+            prefill.as_sglang().disaggregated_params,
+            decode.as_sglang().disaggregated_params
+        );
+        assert_eq!(
+            decode
+                .as_sglang()
+                .disaggregated_params
+                .as_ref()
+                .unwrap()
+                .bootstrap_room,
+            42
+        );
+    }
+
+    #[test]
     fn tokenspeed_parallel_pd_forwards_selected_ranks_without_changing_the_room() {
         for (p_rank, p_size, d_rank, d_size) in [
             (Some(0), 1, Some(7), 16),

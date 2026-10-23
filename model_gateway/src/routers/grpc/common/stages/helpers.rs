@@ -972,7 +972,9 @@ pub(crate) fn finish_generate_request(
     }
 
     if let Some(outputs) = ctx.state.encode_outputs.as_mut() {
-        proto_request.set_encode_bootstrap_info(std::mem::take(&mut outputs.bootstrap_info));
+        proto_request
+            .set_encode_bootstrap_info(std::mem::take(&mut outputs.bootstrap_info))
+            .map_err(|message| error::bad_request("encode_handoff_mismatch", message))?;
     }
 
     if let Some(workers) = ctx.state.workers.as_ref() {
@@ -2252,12 +2254,14 @@ mod epd_restamp_tests {
     #[test]
     fn epd_restamp_remints_pd_room_and_keeps_encode_rooms() {
         let mut request = ProtoGenerateRequest::TokenSpeed(Box::default());
-        request.set_encode_bootstrap_info(vec![EncodeItemBootstrapInfo {
-            item_index: 0,
-            bootstrap_host: "encode-worker".to_string(),
-            bootstrap_port: 9000,
-            bootstrap_room: 41,
-        }]);
+        request
+            .set_encode_bootstrap_info(vec![EncodeItemBootstrapInfo {
+                item_index: 0,
+                bootstrap_host: "encode-worker".to_string(),
+                bootstrap_port: 9000,
+                bootstrap_room: 41,
+            }])
+            .unwrap();
         request.set_kv_bootstrap_info("attempt1-prefill".to_string(), 8998, 42);
         let mut plan = ExecutionPlan::generate(ExecutionPlanKind::EncodePrefillDecode, request);
 

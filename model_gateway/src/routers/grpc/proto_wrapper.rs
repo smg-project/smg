@@ -93,6 +93,23 @@ pub(crate) struct EncodeItemBootstrapInfo {
     pub bootstrap_room: i64,
 }
 
+pub(crate) enum EncodeBootstrapInfo {
+    TokenSpeed(Vec<EncodeItemBootstrapInfo>),
+    Sglang(sglang::EncodeHandoff),
+}
+
+impl From<Vec<EncodeItemBootstrapInfo>> for EncodeBootstrapInfo {
+    fn from(items: Vec<EncodeItemBootstrapInfo>) -> Self {
+        Self::TokenSpeed(items)
+    }
+}
+
+impl From<sglang::EncodeHandoff> for EncodeBootstrapInfo {
+    fn from(handoff: sglang::EncodeHandoff) -> Self {
+        Self::Sglang(handoff)
+    }
+}
+
 // =====================
 // Multimodal Data
 // =====================
@@ -1622,11 +1639,13 @@ impl ProtoGenerateRequest {
         }
     }
 
-    /// Set encode->prefill bootstrap info for backends that receive multimodal embeddings
-    /// out-of-band from encode workers.
-    pub(crate) fn set_encode_bootstrap_info(&mut self, items: Vec<EncodeItemBootstrapInfo>) {
-        match self {
-            Self::TokenSpeed(req) => {
+    /// Attach the backend's own encode-to-prefill rendezvous format.
+    pub(crate) fn set_encode_bootstrap_info(
+        &mut self,
+        info: impl Into<EncodeBootstrapInfo>,
+    ) -> Result<(), &'static str> {
+        match (self, info.into()) {
+            (Self::TokenSpeed(req), EncodeBootstrapInfo::TokenSpeed(items)) => {
                 let items = items
                     .into_iter()
                     .map(|item| tokenspeed::EncodeItemBootstrapInfo {
@@ -1638,19 +1657,28 @@ impl ProtoGenerateRequest {
                     .collect();
                 req.encode_bootstrap_info = Some(tokenspeed::EncodeBootstrapInfo { items });
             }
-            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => {
-                tracing::warn!(
-                    "set_encode_bootstrap_info called on a backend without encode bootstrap info, ignoring"
-                );
+            (Self::Sglang(req), EncodeBootstrapInfo::Sglang(handoff)) => {
+                if req.request_id.is_empty() || handoff.request_id != req.request_id {
+                    return Err("SGLang encoder handoff request ID differs from Generate");
+                }
+                if handoff.encoder_urls.is_empty()
+                    || handoff.encoder_urls.len() != handoff.num_items_assigned.len()
+                {
+                    return Err("SGLang encoder handoff needs one assignment per encoder URL");
+                }
+                req.encode_handoff = Some(handoff);
             }
+            _ => return Err("encoder handoff payload does not match the request backend"),
         }
+        Ok(())
     }
 
-    /// Clear prefill-only encode bootstrap info from the decode-side request.
+    /// Clear prefill-only encode metadata from the decode-side request.
     pub(crate) fn clear_encode_bootstrap_info(&mut self) {
         match self {
             Self::TokenSpeed(req) => req.encode_bootstrap_info = None,
-            Self::Sglang(_) | Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => {}
+            Self::Sglang(req) => req.encode_handoff = None,
+            Self::Vllm(_) | Self::Trtllm(_) | Self::Mlx(_) => {}
         }
     }
 
@@ -3997,6 +4025,85 @@ mod engine_error_tests {
 #[cfg(test)]
 mod tests {
     use prost::Message;
+
+    fn sglang_encode_handoff() -> sglang::EncodeHandoff {
+        sglang::EncodeHandoff {
+            request_id: "epd-original".to_string(),
+            encoder_urls: vec![
+                "grpc://encoder-b:5002".to_string(),
+                "grpc://encoder-a:5001".to_string(),
+            ],
+            num_items_assigned: vec![2, 0],
+        }
+    }
+
+    #[test]
+    fn encode_handoff_sglang_roundtrip_preserves_id_order_and_zero_assignment() {
+        let mut request = ProtoGenerateRequest::Sglang(Box::new(sglang::GenerateRequest {
+            request_id: "epd-original".to_string(),
+            tokenized: Some(sglang::TokenizedInput {
+                original_text: "two images".to_string(),
+                input_ids: vec![1, 2],
+            }),
+            ..Default::default()
+        }));
+        let handoff = sglang_encode_handoff();
+        request.set_encode_bootstrap_info(handoff.clone()).unwrap();
+        let decoded =
+            sglang::GenerateRequest::decode(request.as_sglang().encode_to_vec().as_slice())
+                .unwrap();
+        assert_eq!(decoded.request_id, "epd-original");
+        assert_eq!(decoded.encode_handoff, Some(handoff));
+        assert_eq!(decoded.tokenized.unwrap().input_ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn encode_handoff_rejects_mismatched_id_and_assignment_shape_without_mutation() {
+        let mut request = ProtoGenerateRequest::Sglang(Box::new(sglang::GenerateRequest {
+            request_id: "epd-original".to_string(),
+            ..Default::default()
+        }));
+        request
+            .set_encode_bootstrap_info(sglang_encode_handoff())
+            .unwrap();
+        let before = request.as_sglang().encode_to_vec();
+        let mut wrong_id = sglang_encode_handoff();
+        wrong_id.request_id = "another".to_string();
+        assert!(request.set_encode_bootstrap_info(wrong_id).is_err());
+        let mut wrong_shape = sglang_encode_handoff();
+        wrong_shape.num_items_assigned.pop();
+        assert!(request.set_encode_bootstrap_info(wrong_shape).is_err());
+        assert_eq!(request.as_sglang().encode_to_vec(), before);
+    }
+
+    #[test]
+    fn encode_handoff_keeps_tokenspeed_rooms_and_rejects_cross_backend_payloads() {
+        let mut tokenspeed = ProtoGenerateRequest::TokenSpeed(Box::default());
+        let item = EncodeItemBootstrapInfo {
+            item_index: 4,
+            bootstrap_host: "ts-encoder".to_string(),
+            bootstrap_port: 9000,
+            bootstrap_room: 17,
+        };
+        tokenspeed
+            .set_encode_bootstrap_info(vec![item.clone()])
+            .unwrap();
+        let rooms = tokenspeed.as_tokenspeed().encode_bootstrap_info.clone();
+        assert_eq!(rooms.as_ref().unwrap().items[0].bootstrap_room, 17);
+        assert!(tokenspeed
+            .set_encode_bootstrap_info(sglang_encode_handoff())
+            .is_err());
+        assert_eq!(tokenspeed.as_tokenspeed().encode_bootstrap_info, rooms);
+        let mut sglang = ProtoGenerateRequest::Sglang(Box::default());
+        assert!(sglang.set_encode_bootstrap_info(vec![item]).is_err());
+        assert!(sglang.as_sglang().encode_handoff.is_none());
+        tokenspeed.clear_encode_bootstrap_info();
+        assert!(tokenspeed.as_tokenspeed().encode_bootstrap_info.is_none());
+        let mut vllm = ProtoGenerateRequest::Vllm(Box::default());
+        assert!(vllm
+            .set_encode_bootstrap_info(sglang_encode_handoff())
+            .is_err());
+    }
 
     #[test]
     fn inline_bytes_counts_every_inline_tensor_and_raw_image() {
