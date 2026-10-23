@@ -127,9 +127,9 @@ const LEGACY_FILE_PIPELINE: &str = "the render ids of this Llama-class checkpoin
 /// for one that covers a hand-written case across the models, and each is held
 /// to the rule an id is: the run fails
 /// when no loaded case under it differs any more (a differing case counts for
-/// the one entry that lists it, its own id else the first that covers it, so
-/// an entry does not outlive its cause while a case another entry names
-/// still differs under it), and when the tree holds its
+/// the entry of its own id, else for the one entry that covers it and for
+/// none when several do, so an entry does not outlive its cause on the cases
+/// another entry names), and when the tree holds its
 /// set and no loaded case is under it; the entries of a benchmark set the
 /// tree omits (`bellwether unpack --sample-sets` writes every Nth) are left
 /// alone, an id of one of its cases among them.
@@ -676,28 +676,32 @@ const KNOWN_UNLOADED: &[(&str, &str)] = &[
 /// that is the id itself, else the first entry that covers it; none when the
 /// case is not listed.
 fn known_reason<'a>(known: &BTreeMap<&'a str, &'a str>, id: &str, set: &str) -> Option<&'a str> {
-    known_entry(known, id, set).map(|(_, reason)| reason)
+    known.get(id).copied().or_else(|| {
+        known
+            .iter()
+            .find(|(entry, _)| Listed::of(entry).covers(id, set))
+            .map(|(_, reason)| *reason)
+    })
 }
 
-/// The entry of `known` that lists the case `id` of the set `set`, and its
-/// reason: the entry that is the id itself, else the first that covers it;
-/// none when the case is not listed. A differing case counts for this entry
-/// alone when the list is held to its rule, so that an entry heals once every
-/// case it is the entry of matches, whatever its other entries still cover.
-fn known_entry<'a>(
-    known: &BTreeMap<&'a str, &'a str>,
-    id: &str,
-    set: &str,
-) -> Option<(&'a str, &'a str)> {
-    known
-        .get_key_value(id)
-        .map(|(entry, reason)| (*entry, *reason))
-        .or_else(|| {
-            known
-                .iter()
-                .find(|(entry, _)| Listed::of(entry).covers(id, set))
-                .map(|(entry, reason)| (*entry, *reason))
-        })
+/// The entry of `known` a differing case `id` of the set `set` counts for
+/// when the list is held to its rule: the entry that is the id itself, else
+/// the one entry that covers it; none when the case is not listed, and none
+/// when two or more entries cover it, since such a case differs for either
+/// entry's cause and must keep neither alive (a model whose whole render side
+/// is listed has its `no-generation-prompt` case under the case-name entry as
+/// well: the header the gateway appends and the model's own cause both stand
+/// in it, so it says nothing about which of the two causes is gone).
+fn counting_entry<'a>(known: &BTreeMap<&'a str, &'a str>, id: &str, set: &str) -> Option<&'a str> {
+    if let Some((entry, _)) = known.get_key_value(id) {
+        return Some(*entry);
+    }
+    let mut covering = known
+        .keys()
+        .copied()
+        .filter(|entry| Listed::of(entry).covers(id, set));
+    let first = covering.next()?;
+    covering.next().is_none().then_some(first)
 }
 
 /// What an entry of the list stands for: one fixture id; a prefix, the part
@@ -1103,16 +1107,18 @@ impl Report {
     }
 
     /// The entries of `known` whose compared cases all match the reference
-    /// now: the entries no differing case counts for, where a case counts for
-    /// the one entry that lists it ([`known_entry`]), so that a prefix, a set
-    /// or a suffix heals once every case under it that no entry of its own
-    /// names matches, instead of outliving its cause for as long as a case
-    /// another entry lists still differs under it.
+    /// now: the entries no differing case counts for ([`counting_entry`]: a
+    /// case with an entry of its own id counts for that entry, otherwise for
+    /// the one entry that covers it and for none when several do), so that a
+    /// prefix heals once every case under it that no other entry names
+    /// matches, and a case-name entry heals once its case matches on every
+    /// model that has no whole-side entry, whatever the whole-side models'
+    /// cases do; an entry is live while one differing case counts for it.
     fn healed<'k>(&self, known: &BTreeMap<&'k str, &'k str>) -> Vec<&'k str> {
         let live: BTreeSet<&str> = self
             .differences
             .keys()
-            .filter_map(|id| known_entry(known, id, self.set_of(id)).map(|(entry, _)| entry))
+            .filter_map(|id| counting_entry(known, id, self.set_of(id)))
             .collect();
         known
             .keys()
@@ -1430,15 +1436,16 @@ where
     report
         .mismatches
         .extend(set_mismatches(slug, &read, &listed));
-    // The entries scoped to this model; the ones that span models (`*/...`)
-    // are judged once, on the merged report.
+    // The model's own stale entries, judged with the whole list so that a case
+    // counts as it does on the merged report; the entries that span models
+    // (`*/...`) are judged once, there.
     let own_prefix = format!("{slug}/");
-    let own: BTreeMap<&str, &str> = known
-        .iter()
-        .filter(|(entry, _)| entry.starts_with(&own_prefix))
-        .map(|(entry, reason)| (*entry, *reason))
-        .collect();
-    tally.stale = report.healed(&own).len() + report.gone(&own).len();
+    tally.stale = report
+        .healed(known)
+        .into_iter()
+        .chain(report.gone(known))
+        .filter(|entry| entry.starts_with(&own_prefix))
+        .count();
     Ok(Compared {
         lines,
         summary: format!("{slug}: {tally}"),
@@ -2056,45 +2063,54 @@ fn a_prefix_entry_heals_when_only_cases_listed_by_their_own_id_still_differ() {
     );
 }
 
+/// Two models for the tests of entries that share a case: "m", whose whole
+/// render side an entry covers, with common-0 differing and common-2 as
+/// `m_common_2` says; "n", with no entry of its own, with common-0 as
+/// `n_common_0` says. The case-name entry `*/render/common-0` names common-0
+/// of both.
+fn two_models(
+    m_common_2: fn(&str, &str) -> String,
+    n_common_0: fn(&str, &str) -> String,
+) -> io::Result<tempfile::TempDir> {
+    tree(&[
+        ("m/manifest.toml", &manifest("org/m")),
+        ("m/sets.toml", &sets_toml(&[("render/common", 3)])),
+        (
+            "m/render/common.jsonl",
+            &(differing_line("m/render/common-0", "org/m")
+                + &render_line("m/render/common-1", "org/m")
+                + &m_common_2("m/render/common-2", "org/m")),
+        ),
+        ("n/manifest.toml", &manifest("org/n")),
+        ("n/sets.toml", &sets_toml(&[("render/common", 2)])),
+        (
+            "n/render/common.jsonl",
+            &(n_common_0("n/render/common-0", "org/n")
+                + &render_line("n/render/common-1", "org/n")),
+        ),
+    ])
+}
+
 #[test]
-fn a_prefix_entry_heals_when_only_the_case_a_suffix_entry_names_still_differs() {
-    let model = "org/m";
-    // The suffix entry names common-0 of every model, the prefix the model's
-    // whole render side; with common-2 differing too, the prefix is live.
+fn a_prefix_entry_heals_when_only_the_cases_a_suffix_entry_names_still_differ() {
     let listed = BTreeMap::from([
         ("*/render/common-0", "the header the gateway always appends"),
         ("m/render/*", "recorded with another pipeline"),
     ]);
-    let root = tree(&[
-        ("m/manifest.toml", &manifest(model)),
-        ("m/sets.toml", &sets_toml(&[("render/common", 3)])),
-        (
-            "m/render/common.jsonl",
-            &(differing_line("m/render/common-0", model)
-                + &render_line("m/render/common-1", model)
-                + &differing_line("m/render/common-2", model)),
-        ),
-    ])
-    .unwrap();
+    // m's common-2 and n's common-0 differ: each entry has a case of its own
+    // (m's common-0, which both cover, counts for neither), nothing fails.
+    let root = two_models(differing_line, differing_line).unwrap();
     let manifests = read_manifests(root.path()).unwrap();
     let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    assert_eq!(report.differences.len(), 3, "{:#?}", report.differences);
     assert_eq!(
         report.failures(root.path(), &listed, &BTreeMap::new()),
         Vec::<String>::new()
     );
-    // With common-0 the only difference left, it counts for the suffix entry
-    // that names it: the prefix has healed and must go, the suffix stays.
-    let root = tree(&[
-        ("m/manifest.toml", &manifest(model)),
-        ("m/sets.toml", &sets_toml(&[("render/common", 3)])),
-        (
-            "m/render/common.jsonl",
-            &(differing_line("m/render/common-0", model)
-                + &render_line("m/render/common-1", model)
-                + &render_line("m/render/common-2", model)),
-        ),
-    ])
-    .unwrap();
+    // m's common-2 matches: the one difference left under the prefix is a
+    // case the suffix entry names too, so the prefix has healed and must go,
+    // while the suffix lives on n's case.
+    let root = two_models(render_line, differing_line).unwrap();
     let manifests = read_manifests(root.path()).unwrap();
     let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
     let failures = report.failures(root.path(), &listed, &BTreeMap::new());
@@ -2102,6 +2118,28 @@ fn a_prefix_entry_heals_when_only_the_case_a_suffix_entry_names_still_differs() 
     assert!(
         failures[0].contains("matching the reference now")
             && failures[0].ends_with("remove: m/render/*"),
+        "{failures:#?}"
+    );
+}
+
+#[test]
+fn a_suffix_entry_heals_when_its_only_differing_case_sits_under_a_whole_side_prefix() {
+    let listed = BTreeMap::from([
+        ("*/render/common-0", "the header the gateway always appends"),
+        ("m/render/*", "recorded with another pipeline"),
+    ]);
+    // n's common-0 matches: the suffix entry's one difference left is m's
+    // common-0, which the prefix covers too, so the suffix has healed and
+    // must go, while the prefix lives on m's common-2.
+    let root = two_models(differing_line, render_line).unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    assert_eq!(report.differences.len(), 2, "{:#?}", report.differences);
+    let failures = report.failures(root.path(), &listed, &BTreeMap::new());
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0].contains("matching the reference now")
+            && failures[0].ends_with("remove: */render/common-0"),
         "{failures:#?}"
     );
 }
