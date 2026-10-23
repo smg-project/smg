@@ -13,12 +13,10 @@ use tokio::sync::mpsc;
 use super::{
     circuit_breaker::{CircuitBreaker, CircuitBreakerConfig},
     event::WorkerConnected,
+    http_client::LazyHttpClient,
     overload::OverloadThresholds,
     resilience::ResolvedResilience,
-    worker::{
-        BasicWorker, ConnectionMode, LazyHttpClient, RuntimeType, WorkerMetadata, WorkerRuntime,
-        WorkerType,
-    },
+    worker::{BasicWorker, ConnectionMode, RuntimeType, WorkerMetadata, WorkerRuntime, WorkerType},
 };
 use crate::{
     config::types::DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS, observability::metrics::Metrics,
