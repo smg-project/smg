@@ -273,7 +273,7 @@ workers:
       failureThreshold: 60
 ```
 
-Size the budget past the longest load you expect: a startup probe that fails for its whole budget restarts the worker, and the load starts over. The worker Deployment's rollout deadline follows the budget (`initialDelaySeconds + failureThreshold * periodSeconds`, plus 120 s for the image pull and container start, never below the Kubernetes default of 600 s), so `kubectl rollout status`, Argo CD, Flux and `helm --wait` do not report a worker still loading within its budget as a failed rollout; `progressDeadlineSeconds` on the worker entry overrides it.
+Size the budget past the longest load you expect: a startup probe that fails for its whole budget restarts the worker, and the load starts over. The worker Deployment's rollout deadline follows the budget (`initialDelaySeconds + failureThreshold * periodSeconds`, plus 600 s for what runs on the rollout's clock before the probe's starts: the node's provisioning, the image pull, the container start; never below the Kubernetes default of 600 s), so `kubectl rollout status`, Argo CD, Flux and `helm --wait` do not report a worker still loading within its budget as a failed rollout. On an autoscaled GPU pool or with a cold image cache, where the node and a multi-GB pull can take longer than that margin, set `progressDeadlineSeconds` on the worker entry past them; it overrides the default.
 
 ## Examples
 

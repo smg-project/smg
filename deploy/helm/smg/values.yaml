@@ -427,7 +427,7 @@ workers: []
 #       initialDelaySeconds: 60
 #       periodSeconds: 10
 #       failureThreshold: 30
-#     progressDeadlineSeconds: 600      # rollout deadline; default: the startup probe's budget + 120 s, at least 600
+#     progressDeadlineSeconds: 600      # rollout deadline; default: the startup probe's budget + 600 s, at least 600
 
 # Engine default ports (used when worker.port is not set)
 engineDefaults:
