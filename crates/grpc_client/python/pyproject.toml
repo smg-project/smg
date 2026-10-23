@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smg-grpc-proto"
-version = "0.4.28"
+version = "0.4.29"
 description = "SMG gRPC proto definitions for vLLM, TRT-LLM, MLX, TokenSpeed, and SGLang"
 requires-python = ">=3.10"
 dependencies = [

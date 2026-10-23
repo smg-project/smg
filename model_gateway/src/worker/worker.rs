@@ -2035,6 +2035,47 @@ impl Worker for BasicWorker {
 
     async fn grpc_health_check(&self) -> WorkerResult<bool> {
         let timeout = Duration::from_secs(self.metadata.health_config.timeout_secs);
+        if self.metadata.spec.runtime_type == RuntimeType::Sglang
+            && *self.worker_type() == WorkerType::Encode
+            && *self.connection_mode() == ConnectionMode::Grpc
+        {
+            use tonic_health::pb::{
+                health_check_response::ServingStatus, health_client::HealthClient,
+                HealthCheckRequest,
+            };
+
+            let probe = async {
+                let channel = smg_grpc_client::channel::connect_channel_with_timeout(
+                    self.base_url(),
+                    timeout,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                let mut request = tonic::Request::new(HealthCheckRequest {
+                    service: "sglang.grpc.encoder.SglangEncoder".to_string(),
+                });
+                request.set_timeout(timeout);
+                let response = HealthClient::new(channel)
+                    .check(request)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                Ok::<_, String>(response.into_inner().status == ServingStatus::Serving as i32)
+            };
+            return match time::timeout(timeout, probe).await {
+                Ok(Ok(serving)) => Ok(serving),
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        "SGLang encoder health RPC error for {}: {error}",
+                        self.url()
+                    );
+                    Ok(false)
+                }
+                Err(_) => {
+                    tracing::warn!("SGLang encoder health timed out for {}", self.url());
+                    Ok(false)
+                }
+            };
+        }
         let maybe = self.get_backend_client().await?;
         let Some(backend_client) = maybe else {
             tracing::error!(
@@ -2174,6 +2215,10 @@ pub fn worker_to_info(worker: &Arc<dyn Worker>) -> WorkerInfo {
         job_status: None,
     }
 }
+
+#[cfg(test)]
+#[path = "encoder_health_tests.rs"]
+mod encoder_health_tests;
 
 #[cfg(test)]
 mod tests {

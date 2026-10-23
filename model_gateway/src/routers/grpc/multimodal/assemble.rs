@@ -308,6 +308,7 @@ fn assemble_sglang(
     let mm_placeholders = placeholders_for_bindings(&intermediate.bindings, true)?;
 
     Ok(SglangMultimodalData {
+        encoder_image_urls: None,
         image_data,
         pixel_values,
         pixel_values_shape,

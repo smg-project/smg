@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import pytest
+from infra import worker as worker_module
 from infra.constants import ConnectionMode, WorkerType
 from infra.gateway import build_epd_mode_args
 from infra.model_specs import get_model_spec
@@ -14,6 +15,53 @@ from infra.worker import Worker
 def test_worker_type_encode_exists():
     assert WorkerType.ENCODE == "encode"
     assert WorkerType.ENCODE.value == "encode"
+
+
+@pytest.mark.parametrize(
+    "engine,mode",
+    [
+        (engine, mode)
+        for engine in ("sglang", "vllm")
+        for mode in ConnectionMode
+        if (engine, mode) != ("sglang", ConnectionMode.GRPC)
+    ]
+    + [(engine, ConnectionMode.GRPC) for engine in ("trtllm", "mlx", "mock")]
+    + [("tokenspeed", mode) for mode in (ConnectionMode.HTTP, ConnectionMode.ZMQ)],
+)
+def test_unsupported_encode_fails_before_worker_start(monkeypatch, engine, mode):
+    worker = Worker(
+        model_id="Qwen/Qwen3.5-9B",
+        engine=engine,
+        port=50104,
+        gpu_ids=[0],
+        mode=mode,
+        worker_type=WorkerType.ENCODE,
+    )
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("unsupported encoder reached worker preparation")
+
+    monkeypatch.setattr(worker_module, "get_model_spec", unexpected)
+    monkeypatch.setattr(worker_module, "gpu_memory_used_mib", unexpected)
+    monkeypatch.setattr(worker, "_build_env", unexpected)
+    monkeypatch.setattr(worker, "_spawn_process", unexpected)
+    with pytest.raises(ValueError, match="EPD encode.*TokenSpeed over gRPC"):
+        worker.start(wait_ready=False)
+    assert worker.process is None
+
+
+@pytest.mark.parametrize("engine", ["sglang", "vllm"])
+@pytest.mark.parametrize("role", [WorkerType.REGULAR, WorkerType.PREFILL, WorkerType.DECODE])
+def test_other_roles_still_build_commands(engine, role):
+    worker = Worker(
+        model_id="meta-llama/Llama-3.1-8B-Instruct",
+        engine=engine,
+        port=50104,
+        gpu_ids=[0],
+        mode=ConnectionMode.GRPC,
+        worker_type=role,
+    )
+    assert worker._build_cmd()[0] == "python3"
 
 
 _TS_MODEL = "Qwen/Qwen3-VL-8B-Instruct"  # any tokenspeed-launchable spec at HEAD

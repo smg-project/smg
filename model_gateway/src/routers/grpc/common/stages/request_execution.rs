@@ -37,8 +37,8 @@ use crate::{
             backend_client::BackendClient,
             common::stages::encode::EncodeDispatchPlan,
             context::{
-                stage_output, ClientSelection, DispatchContext, ExecutionPlan, ExecutionPlanKind,
-                ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
+                stage_output, ClientSelection, DispatchContext, EncodeOutputs, ExecutionPlan,
+                ExecutionPlanKind, ExecutionResult, LoadGuards, PdTiming, WorkerSelection,
             },
             multimodal::worker_language_model_only,
             proto_wrapper::{
@@ -294,7 +294,14 @@ pub(crate) async fn execute_plan(
     // consumed it). Taking it transfers the encode jobs' SHM Drop guards
     // here: dispatch consumes them, while an early error before dispatch
     // drops them and reclaims the SHM.
-    let encode_dispatch = ctx.encode_outputs.take().map(|o| o.dispatch);
+    let encode_dispatch = if matches!(ctx.encode_outputs, Some(EncodeOutputs::Sglang(_))) {
+        None
+    } else {
+        ctx.encode_outputs.take().and_then(|outputs| match outputs {
+            EncodeOutputs::TokenSpeed { dispatch, .. } => Some(dispatch),
+            EncodeOutputs::Sglang(_) => None,
+        })
+    };
 
     let clients = stage_output(ctx.clients.as_mut(), "execute_plan")?;
 
@@ -621,6 +628,19 @@ async fn execute_epd_dispatch(
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
 ) -> Result<ExecutionResult, Response> {
+    if matches!(&proto_request, ProtoGenerateRequest::Sglang(_))
+        && workers.encode_assignments().is_some_and(|a| !a.is_empty())
+    {
+        return execute_sglang_epd_dispatch(
+            proto_request,
+            clients,
+            workers,
+            model,
+            prefill_guard,
+            ledger,
+        )
+        .await;
+    }
     if let Some(encode_dispatch) = encode_dispatch {
         spawn_encode_dispatch(encode_dispatch);
     }
@@ -633,6 +653,60 @@ async fn execute_epd_dispatch(
         prefill_guard,
         ledger,
     )
+    .await
+}
+
+async fn execute_sglang_epd_dispatch(
+    mut request: ProtoGenerateRequest,
+    clients: &mut ClientSelection,
+    workers: &WorkerSelection,
+    model: &str,
+    prefill_guard: PrefillLoadGuard,
+    ledger: &AttemptLedger,
+) -> Result<ExecutionResult, Response> {
+    if request.as_sglang().encode_handoff.is_none() {
+        return Err(error::bad_request(
+            "sglang_encode_handoff_missing",
+            "SGLang EPD needs its typed handoff",
+        ));
+    }
+    let assignments = workers.encode_assignments().ok_or_else(|| {
+        error::internal_error(
+            "encode_assignments_missing",
+            "SGLang encoder selection missing",
+        )
+    })?;
+    let handoff = super::sglang_encode::handoff(request.request_id(), assignments)
+        .map_err(|e| error::bad_request("sglang_encode_assignment_invalid", e.to_string()))?;
+    request
+        .set_encode_bootstrap_info(handoff.clone())
+        .map_err(|e| error::bad_request("sglang_encode_handoff_invalid", e))?;
+    let timeout = workers
+        .prefill_worker()
+        .and_then(|w| w.metadata().zmq_request_timeout)
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| {
+            error::bad_request(
+                "sglang_encode_timeout_missing",
+                "SGLang EPD requires a finite registered request timeout",
+            )
+        })?;
+    let ProtoGenerateRequest::Sglang(request) = request else {
+        return Err(error::bad_request(
+            "sglang_encode_backend_invalid",
+            "SGLang EPD requires a SGLang request",
+        ));
+    };
+    super::sglang_encode::dispatch(*request, timeout, |prefill| {
+        execute_pd_dispatch(
+            ProtoGenerateRequest::Sglang(Box::new(prefill)),
+            clients,
+            workers,
+            model,
+            prefill_guard,
+            ledger,
+        )
+    })
     .await
 }
 
@@ -2943,6 +3017,162 @@ mod tests {
             prefill: worker("grpc://prefill:30000", WorkerType::Prefill),
             decode: worker("grpc://decode:30000", WorkerType::Decode),
             runtime_type: RuntimeType::TokenSpeed,
+        }
+    }
+
+    #[test]
+    fn epd_sglang_handoff_and_media_are_prefill_only_on_actual_parallel_pd_split() {
+        let worker = |url, role| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(role)
+                    .runtime_type(RuntimeType::Sglang)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .build(),
+            )
+        };
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: worker("grpc://prefill:30000", WorkerType::Prefill),
+            decode: worker("grpc://decode:30000", WorkerType::Decode),
+            runtime_type: RuntimeType::Sglang,
+        };
+        let mut request = ProtoGenerateRequest::Sglang(Box::new(sglang::GenerateRequest {
+            request_id: "original-rid".to_string(),
+            mm_inputs: Some(sglang::MultimodalInputs {
+                image_urls: vec!["data:image/png;base64,original-inline-bytes".to_string()],
+                ..Default::default()
+            }),
+            disaggregated_params: Some(sglang::DisaggregatedParams {
+                bootstrap_host: "prefill".to_string(),
+                bootstrap_port: 8998,
+                bootstrap_room: 42,
+            }),
+            ..Default::default()
+        }));
+        let handoff = sglang::EncodeHandoff {
+            request_id: "original-rid".to_string(),
+            encoder_urls: vec!["grpc://e0:5001".to_string(), "grpc://e1:5002".to_string()],
+            num_items_assigned: vec![1, 0],
+        };
+        request.set_encode_bootstrap_info(handoff.clone()).unwrap();
+        let (prefill, decode) = parallel_pd_requests(request, &workers);
+        assert_eq!(prefill.request_id(), "original-rid");
+        assert_eq!(decode.request_id(), "original-rid");
+        assert_eq!(prefill.as_sglang().encode_handoff, Some(handoff));
+        assert!(decode.as_sglang().encode_handoff.is_none());
+        assert_eq!(
+            prefill.as_sglang().mm_inputs.as_ref().unwrap().image_urls,
+            ["data:image/png;base64,original-inline-bytes"]
+        );
+        assert!(
+            decode.as_sglang().mm_inputs.is_none(),
+            "decode cannot trigger legacy auto-encoding"
+        );
+        assert_eq!(
+            prefill.as_sglang().disaggregated_params,
+            decode.as_sglang().disaggregated_params
+        );
+        assert_eq!(
+            decode
+                .as_sglang()
+                .disaggregated_params
+                .as_ref()
+                .unwrap()
+                .bootstrap_room,
+            42
+        );
+    }
+
+    #[test]
+    fn epd_restamp_sglang_keeps_handoff_ids_and_clears_the_decode_copy() {
+        use tool_parser::ParserFactory as ToolParserFactory;
+
+        use crate::routers::grpc::{
+            common::stages::helpers::{restamp_plan_for_attempt, IdStamp},
+            context::AttemptStamp,
+        };
+
+        let worker = |url, role| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(role)
+                    .runtime_type(RuntimeType::Sglang)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .build(),
+            )
+        };
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: worker("grpc://retry-prefill:30000", WorkerType::Prefill),
+            decode: worker("grpc://decode:30000", WorkerType::Decode),
+            runtime_type: RuntimeType::Sglang,
+        };
+        let urls = vec![
+            "grpc://encoder0:5001".to_string(),
+            "grpc://encoder1:5002".to_string(),
+            "grpc://encoder2:5003".to_string(),
+        ];
+        for id in [
+            IdStamp::Exact,
+            IdStamp::Suffixed { base: "rid".into() },
+            IdStamp::Minted {
+                prefix: "chatcmpl-",
+            },
+        ] {
+            let exact = matches!(id, IdStamp::Exact);
+            let mut request = ProtoGenerateRequest::Sglang(Box::new(sglang::GenerateRequest {
+                request_id: "first-attempt".into(),
+                ..Default::default()
+            }));
+            request
+                .set_encode_bootstrap_info(sglang::EncodeHandoff {
+                    request_id: request.request_id().to_string(),
+                    encoder_urls: urls.clone(),
+                    num_items_assigned: vec![1, 0, 2],
+                })
+                .unwrap();
+            let mut plan = ExecutionPlan::generate(ExecutionPlanKind::EncodePrefillDecode, request);
+            let stamp = AttemptStamp {
+                id,
+                sampling_mask: None,
+                sampling_baseline: None,
+                inject_pd_metadata: true,
+                tool_constraint: None,
+            };
+            for _ in 0..2 {
+                let previous = plan.clone();
+                restamp_plan_for_attempt(&mut plan, &stamp, &workers, &ToolParserFactory::new())
+                    .unwrap();
+                let ExecutionPlan::EncodePrefillDecode { request } = &plan else {
+                    panic!("expected an EPD plan");
+                };
+                assert_eq!(request.request_id() == previous.request_id(), exact);
+                let handoff = request.as_sglang().encode_handoff.as_ref().unwrap();
+                assert_eq!(handoff.request_id, request.request_id());
+                assert_eq!(handoff.encoder_urls, urls);
+                assert_eq!(handoff.num_items_assigned, [1, 0, 2]);
+                let (mut prefill, decode) = parallel_pd_requests(request.clone(), &workers);
+                assert_eq!(prefill.request_id(), decode.request_id());
+                assert_eq!(prefill.as_sglang().encode_handoff.as_ref(), Some(handoff));
+                assert!(decode.as_sglang().encode_handoff.is_none());
+                prefill.clear_encode_bootstrap_info();
+                assert!(prefill.as_sglang().encode_handoff.is_none());
+                assert!(request.as_sglang().encode_handoff.is_some());
+                let ExecutionPlan::EncodePrefillDecode { request } = previous else {
+                    panic!("expected the retained EPD plan");
+                };
+                assert_eq!(
+                    request
+                        .as_sglang()
+                        .encode_handoff
+                        .as_ref()
+                        .unwrap()
+                        .request_id,
+                    request.request_id(),
+                    "restamping cannot mutate another attempt's cloned request"
+                );
+            }
         }
     }
 

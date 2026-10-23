@@ -22,15 +22,17 @@ use crate::{
         grpc::{
             backend_client::BackendClient,
             context::{
-                stage_output, AttemptStamp, ClientSelection, ExecutionPlan, RequestContext,
-                RequestType, WorkerSelection,
+                stage_output, AttemptStamp, ClientSelection, EncodeOutputs, ExecutionPlan,
+                RequestContext, RequestType, WorkerSelection,
             },
             multimodal::{
                 assemble_media_refs, assemble_multimodal_data,
                 assemble_multimodal_data_after_encode, assembly_error_response,
                 reserve_multimodal_inflight,
             },
-            proto_wrapper::{AnswerConstraint, MultimodalData, ProtoGenerateRequest},
+            proto_wrapper::{
+                AnswerConstraint, MultimodalData, ProtoGenerateRequest, SglangMultimodalData,
+            },
             utils,
         },
     },
@@ -925,7 +927,11 @@ pub(crate) async fn assemble_prompt_media(
     };
     let builder = builder_client(ctx.state.clients.as_ref(), function)?;
     // `encode_outputs` set by EncodeStage selects the pixel-drop assembly path.
-    let assembled = if ctx.state.encode_outputs.is_some() {
+    let assembled = if let Some(EncodeOutputs::Sglang(plan)) = &ctx.state.encode_outputs {
+        Ok(MultimodalData::Sglang(SglangMultimodalData::for_encoder(
+            plan.images.to_vec(),
+        )))
+    } else if ctx.state.encode_outputs.is_some() {
         assemble_multimodal_data_after_encode(intermediate, builder, ctx.state.workers.as_ref())
             .await
     } else {
@@ -972,7 +978,36 @@ pub(crate) fn finish_generate_request(
     }
 
     if let Some(outputs) = ctx.state.encode_outputs.as_mut() {
-        proto_request.set_encode_bootstrap_info(std::mem::take(&mut outputs.bootstrap_info));
+        match outputs {
+            EncodeOutputs::TokenSpeed { bootstrap_info, .. } => proto_request
+                .set_encode_bootstrap_info(std::mem::take(bootstrap_info))
+                .map_err(|message| error::bad_request("encode_handoff_mismatch", message))?,
+            EncodeOutputs::Sglang(_) => {
+                if proto_request.sampling_n() != 1 {
+                    return Err(error::bad_request(
+                        "sglang_encode_n_unsupported",
+                        "SGLang external encoding requires n = 1",
+                    ));
+                }
+                let assignments = ctx
+                    .state
+                    .workers
+                    .as_ref()
+                    .and_then(WorkerSelection::encode_assignments)
+                    .ok_or_else(|| {
+                        error::internal_error(
+                            "encode_assignments_missing",
+                            "SGLang encoder assignments missing",
+                        )
+                    })?;
+                let handoff =
+                    super::sglang_encode::handoff(proto_request.request_id(), assignments)
+                        .map_err(|e| error::bad_request("encode_handoff_invalid", e.to_string()))?;
+                proto_request
+                    .set_encode_bootstrap_info(handoff)
+                    .map_err(|message| error::bad_request("encode_handoff_mismatch", message))?;
+            }
+        }
     }
 
     if let Some(workers) = ctx.state.workers.as_ref() {
@@ -2252,12 +2287,14 @@ mod epd_restamp_tests {
     #[test]
     fn epd_restamp_remints_pd_room_and_keeps_encode_rooms() {
         let mut request = ProtoGenerateRequest::TokenSpeed(Box::default());
-        request.set_encode_bootstrap_info(vec![EncodeItemBootstrapInfo {
-            item_index: 0,
-            bootstrap_host: "encode-worker".to_string(),
-            bootstrap_port: 9000,
-            bootstrap_room: 41,
-        }]);
+        request
+            .set_encode_bootstrap_info(vec![EncodeItemBootstrapInfo {
+                item_index: 0,
+                bootstrap_host: "encode-worker".to_string(),
+                bootstrap_port: 9000,
+                bootstrap_room: 41,
+            }])
+            .unwrap();
         request.set_kv_bootstrap_info("attempt1-prefill".to_string(), 8998, 42);
         let mut plan = ExecutionPlan::generate(ExecutionPlanKind::EncodePrefillDecode, request);
 
