@@ -11,9 +11,6 @@
 //! the worker has shown (the mock's pause hook) is still vetoed within the
 //! budget, and re-admitted when it produces again.
 
-#[path = "common/mod.rs"]
-mod common;
-
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -28,6 +25,7 @@ use smg::{
     tenant::TenantKey,
     worker::{KvEventMonitor, RuntimeType, Worker, WorkerType},
 };
+use smg_test_harness as common;
 use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
 const MODEL: &str = "cold-shape-test-model";

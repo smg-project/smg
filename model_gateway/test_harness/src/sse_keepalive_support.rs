@@ -20,7 +20,7 @@ use smg::{
 use tokio::{net::TcpListener, task::JoinHandle};
 use tower::ServiceExt;
 
-use crate::{common, held_worker::HeldWorker};
+use crate::held_worker::HeldWorker;
 
 pub const MODEL: &str = "sse-keepalive-test-model";
 
@@ -71,12 +71,12 @@ pub async fn app(
     }
     let mut config = builder.build_unchecked();
     config.health_check.disable_health_check = true;
-    let context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
+    let context = crate::create_test_context_with_mock_tokenizer(config, MODEL).await;
     context.worker_registry.register(worker).unwrap();
     let router = RouterFactory::create_router(&context)
         .await
         .expect("gRPC router");
-    let app = common::test_app::create_test_app_with_context(Arc::from(router), context);
+    let app = crate::test_app::create_test_app_with_context(Arc::from(router), context);
     (app, server)
 }
 

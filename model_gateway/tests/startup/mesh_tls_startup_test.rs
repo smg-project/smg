@@ -19,13 +19,13 @@ use std::{
     time::{Duration, Instant},
 };
 
-use common::{
-    gateway_launch::{base_args, free_ports, launch_with, serial, Until, EXIT_TIMEOUT},
-    test_certs::TestCertificates,
-};
+use common::test_certs::TestCertificates;
 use openssl::ssl::{HandshakeError, SslConnector, SslFiletype, SslMethod};
 
-use crate::common;
+use crate::{
+    common,
+    gateway_launch::{base_args, free_ports, launch_with, serial, Until, EXIT_TIMEOUT},
+};
 
 const IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// The bound on every wait on a socket (connect, read, write): a peer that

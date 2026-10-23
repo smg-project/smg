@@ -1,12 +1,15 @@
 // These modules are used by tests and benchmarks
 #![allow(dead_code, clippy::allow_attributes, clippy::large_futures)]
 
-pub mod gateway_launch;
 pub mod grpc_harness;
+pub mod held_worker;
 pub mod mock_mcp_server;
 #[cfg(feature = "provider-openai")]
 pub mod mock_openai_server;
 pub mod mock_worker;
+pub mod scripted_tokenizer;
+pub mod scripted_worker;
+pub mod sse_keepalive_support;
 pub mod streaming_helpers;
 pub mod test_app;
 pub mod test_certs;

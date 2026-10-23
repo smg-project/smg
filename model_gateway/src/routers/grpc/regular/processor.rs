@@ -1637,7 +1637,7 @@ mod responses_finish_reason_tests {
     mod scripted_tokenizer {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/common/scripted_tokenizer.rs"
+            "/test_harness/src/scripted_tokenizer.rs"
         ));
     }
 

@@ -20,7 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::common::gateway_launch::serial;
+use crate::gateway_launch::serial;
 
 const IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
 /// How long the gateway gets to refuse or to serve; one that does neither is

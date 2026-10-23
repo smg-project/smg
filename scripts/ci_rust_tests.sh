@@ -68,7 +68,8 @@ shard_row() {
 # The packages a shard tests (static: no cargo needed).
 packages_of() {
     case "$1" in
-        gateway-unit|gateway-[0-9]*) echo smg ;;
+        gateway-unit) echo smg smg-test-harness ;;
+        gateway-[0-9]*) echo smg ;;
         bindings)   echo smg-python smg-golang ;;
         tokenizer)  echo llm-tokenizer ;;
         multimodal) echo llm-multimodal ;;
@@ -146,7 +147,9 @@ commands_of() {
             # The lib's unit tests and the smg binary's. The alias binary amg is the same
             # source (its manifest entry says test = false); an explicit --bins would build
             # and run its harness anyway, so the binary is named.
-            echo "-p smg --lib --bin smg"
+            # One invocation for both packages: on its own, the harness's `-p` would unify the gateway
+            # down to the harness's feature set and build the gateway lib a second time.
+            echo "-p smg -p smg-test-harness --lib --bin smg"
             echo "-p smg --doc" ;;
         gateway-[0-9]*)
             local index=${shard#gateway-} selectors

@@ -1,6 +1,7 @@
 //! Start-up integration tests: the gateway binary, started with a configuration, accepts or refuses it
 
-#[path = "common/mod.rs"]
-pub mod common;
+pub use smg_test_harness as common;
+#[path = "common/gateway_launch.rs"]
+pub mod gateway_launch;
 
 mod startup;

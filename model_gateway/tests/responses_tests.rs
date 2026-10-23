@@ -1,8 +1,6 @@
 //! Responses API integration tests
 
-#[path = "common/mod.rs"]
-pub mod common;
-#[path = "common/scripted_worker.rs"]
-mod scripted_worker;
+pub use smg_test_harness as common;
+use smg_test_harness::scripted_worker;
 
 mod responses;

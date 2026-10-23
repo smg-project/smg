@@ -2,12 +2,6 @@
 //! worker connection. Responses streams end with a JSON terminal event, rather
 //! than the Chat Completions `[DONE]` sentinel.
 
-use crate::{common, scripted_worker};
-
-#[expect(dead_code, reason = "a shared fixture; this test uses part of it")]
-#[path = "../common/scripted_tokenizer.rs"]
-mod scripted_tokenizer;
-
 use std::{error::Error, sync::Arc, time::Duration};
 
 use axum::{body::to_bytes, http::StatusCode};
@@ -21,7 +15,10 @@ use smg::{
     tenant::TenantKey,
     worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
 };
+use smg_test_harness::scripted_tokenizer;
 use tokio::{net::TcpListener, time::timeout};
+
+use crate::{common, scripted_worker};
 
 const MODEL: &str = "responses-stream-contract-model";
 

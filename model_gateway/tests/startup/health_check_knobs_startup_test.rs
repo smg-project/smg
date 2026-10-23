@@ -8,7 +8,7 @@
 
 use gateway_launch::{launch, Until, EXIT_TIMEOUT};
 
-use crate::common::gateway_launch;
+use crate::gateway_launch;
 
 /// Each knob at 0 is refused before anything listens, with the field in the
 /// error and no panic.

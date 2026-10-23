@@ -7767,6 +7767,7 @@ dependencies = [
  "smg-response-template",
  "smg-rl",
  "smg-symphony",
+ "smg-test-harness",
  "smg-wasm",
  "str0m",
  "tempfile",
@@ -8095,6 +8096,42 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "smg-test-harness"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "axum-server",
+ "data-connector",
+ "futures",
+ "futures-util",
+ "http",
+ "http-body-util",
+ "llm-tokenizer",
+ "mock-worker",
+ "openai-protocol",
+ "openssl",
+ "rand 0.10.2",
+ "reasoning-parser",
+ "reqwest 0.13.4",
+ "rmcp",
+ "rustls",
+ "rustls-pemfile",
+ "serde_json",
+ "smg",
+ "smg-auth",
+ "smg-grpc-client",
+ "smg-mcp",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tool-parser",
+ "tower",
+ "uuid",
 ]
 
 [[package]]

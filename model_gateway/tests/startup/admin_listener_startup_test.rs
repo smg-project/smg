@@ -25,7 +25,7 @@ use gateway_launch::{
     base_args, free_ports, launch, log_with_line, serial, Until, EXIT_TIMEOUT, IP,
 };
 
-use crate::common::gateway_launch;
+use crate::gateway_launch;
 
 /// A running gateway, killed when dropped.
 struct Gateway {

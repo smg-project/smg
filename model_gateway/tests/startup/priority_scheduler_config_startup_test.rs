@@ -10,7 +10,7 @@ use std::fs;
 
 use gateway_launch::{launch, Until, EXIT_TIMEOUT};
 
-use crate::common::gateway_launch;
+use crate::gateway_launch;
 
 /// A path that does not exist and a file that is not YAML: both are refused
 /// before anything listens, with the field and the file in the error.

@@ -5,7 +5,7 @@
 //!
 //! Calls `RouterTrait` methods directly, mirroring
 //! `routers/grpc/router.rs`'s own `pd_tests` module, rather than going
-//! through the full HTTP app: `tests/common/test_app.rs`'s lightweight test
+//! through the full HTTP app: `test_harness/src/test_app.rs`'s lightweight test
 //! app doesn't wire the tenant-resolution middleware that would otherwise
 //! populate `tenant_request_meta`, so a real per-request tenant identity is
 //! constructed here directly, same as the real middleware would produce.

@@ -7,7 +7,7 @@
 
 use gateway_launch::{launch, Until, EXIT_TIMEOUT};
 
-use crate::common::gateway_launch;
+use crate::gateway_launch;
 
 /// A listener address that is not an IP address is refused before anything
 /// listens, with the field and the value in the error and without a panic.

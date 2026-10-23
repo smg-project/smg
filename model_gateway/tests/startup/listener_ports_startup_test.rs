@@ -17,7 +17,7 @@ use std::{fs, net::TcpListener};
 
 use gateway_launch::{base_args, free_ports, launch_with, serial, Launch, Until, EXIT_TIMEOUT, IP};
 
-use crate::common::gateway_launch;
+use crate::gateway_launch;
 
 /// The mesh server on `mesh_port`, bound and advertised on the loopback.
 fn mesh_args(mesh_port: u16) -> Vec<String> {

@@ -1,14 +1,6 @@
 //! gRPC router integration tests
 
-#[path = "common/mod.rs"]
-pub mod common;
-#[path = "common/scripted_tokenizer.rs"]
-#[expect(
-    dead_code,
-    reason = "a shared fixture; the tests of this binary use part of it"
-)]
-mod scripted_tokenizer;
-#[path = "common/scripted_worker.rs"]
-mod scripted_worker;
+pub use smg_test_harness as common;
+use smg_test_harness::{scripted_tokenizer, scripted_worker};
 
 mod grpc;
