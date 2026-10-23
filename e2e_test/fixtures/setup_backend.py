@@ -44,6 +44,7 @@ from infra import (
 )
 from infra.constants import vllm_kv_backend
 from infra.model_specs import get_model_spec
+from infra.process_utils import wait_for_workers_ready
 from infra.worker import stop_workers
 from infra.worker_pool import get_pool
 
@@ -766,6 +767,51 @@ def _setup_pd(
 # ---------------------------------------------------------------------------
 
 
+def _register_sglang_epd_encoders(gateway, workers, model_id, model_path, timeout):
+    """Register native encoders, which expose no scheduler discovery RPCs."""
+    for worker in workers:
+        if (
+            worker.engine != "sglang"
+            or worker.mode != ConnectionMode.GRPC
+            or worker.model_id != model_id
+            or get_model_spec(worker.model_id)["model"] != model_path
+        ):
+            raise ValueError("SG EPD workers must use the same configured model and gRPC runtime")
+        if worker.worker_type == WorkerType.ENCODE:
+            cmd = worker._build_cmd()
+            paths = [i for i, arg in enumerate(cmd) if arg == "--model-path"]
+            if (
+                len(paths) != 1
+                or cmd[paths[0] + 1] != model_path
+                or any(arg.startswith("--model-path=") for arg in cmd)
+            ):
+                raise ValueError("SG encoder command must use the configured EPD model path")
+    for worker in workers:
+        if worker.worker_type == WorkerType.ENCODE:
+            ok, detail = gateway.add_worker(
+                worker.base_url,
+                worker_type="encode",
+                bootstrap_port=worker.bootstrap_port,
+                labels={"model_path": model_path},
+                spec={
+                    "connection_mode": "grpc",
+                    "runtime_type": "sglang",
+                    "models": [{"id": model_path}],
+                },
+                ready_timeout=timeout,
+            )
+            if not ok:
+                raise RuntimeError(f"Registering SG encoder {worker.base_url} failed: {detail}")
+    wait_for_workers_ready(
+        gateway.base_url,
+        len(workers),
+        timeout=timeout,
+        process=gateway.process,
+        expected_urls=[worker.base_url for worker in workers],
+        workers=workers,
+    )
+
+
 def _setup_epd(
     model_id,
     model_path,
@@ -844,10 +890,15 @@ def _setup_epd(
         _start_gateway(
             gateway,
             gateway_config,
-            encode_workers=encode_workers,
+            encode_workers=[] if engine == "sglang" else encode_workers,
             prefill_workers=prefill_workers,
             decode_workers=decode_workers,
         )
+        if engine == "sglang":
+            _register_sglang_epd_encoders(
+                gateway, all_workers, model_id, model_path, gateway_config["timeout"]
+            )
+            gateway.encode_workers = list(encode_workers)
         logger.info("%s EPD backend ready at %s", runtime_label, gateway.base_url)
         yield backend_name, model_path, _make_openai_client(gateway), gateway
     finally:

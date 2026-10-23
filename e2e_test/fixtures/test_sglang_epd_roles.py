@@ -34,12 +34,20 @@ def fleet(monkeypatch):
     monkeypatch.setattr(Worker, "start", construct)
     monkeypatch.setattr(Worker, "wait_ready", lambda *a: None)
     monkeypatch.setattr(setup, "_start_gateway", lambda *a, **kw: None)
+    monkeypatch.setattr(setup, "_register_sglang_epd_encoders", lambda *a: None)
     monkeypatch.setattr(setup, "_make_openai_client", lambda _: None)
     gateway = SimpleNamespace(base_url="http://not-started", shutdown=lambda: None)
 
     def create(engine, topology=(1, 1, 1)):
         backend = setup._setup_epd(
-            MODEL, MODEL, engine, ConnectionMode.GRPC, topology, {}, gateway, None
+            MODEL,
+            MODEL,
+            engine,
+            ConnectionMode.GRPC,
+            topology,
+            dict(setup._GW_DEFAULTS),
+            gateway,
+            None,
         )
         try:
             next(backend)
