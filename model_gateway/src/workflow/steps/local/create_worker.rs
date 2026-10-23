@@ -19,8 +19,11 @@ use crate::{
             mm_settings, pool_processes_media_refs, registration_lacks_media_processing,
             SUPPORTS_VISION_LABEL,
         },
-        regular::symphony::{check_names, labels_select_nothing, set_aside_by_the_registry},
-        utils::Names,
+        regular::symphony::{
+            check_names, labels_select_nothing, set_aside_by_the_registry, table_label_read,
+            telemetry,
+        },
+        utils::{ModelNames, Names},
         zmq_client::zmq_handshake_address,
     },
     worker::{
@@ -134,18 +137,28 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         // worker whose labels select no reader, whatever the gateway's flags
         // name (`regular::symphony::names::reads`): the model's first such worker
         // says so.
+        let flags = Names {
+            tool: app_context.router_config.tool_call_parser.clone(),
+            reasoning: app_context.router_config.reasoning_parser.clone(),
+        };
         if let Some(message) = registry_reads_over_the_flags(
             &model_card,
             &config.url,
             app_context.router_config.parser,
-            &Names {
-                tool: app_context.router_config.tool_call_parser.clone(),
-                reasoning: app_context.router_config.reasoning_parser.clone(),
-            },
+            &flags,
             &app_context.worker_registry,
         ) {
             warn!(model = %model_card.id, worker = %config.url, "{message}");
         }
+        // Under Symphony the failure classes of the table that reads the model
+        // exist at zero from the model's first worker, so a dashboard finds
+        // `failed` and `malformed` before the first such output.
+        publish_symphony_series(
+            &model_card,
+            app_context.router_config.parser,
+            &flags,
+            &app_context.worker_registry,
+        );
 
         let runtime_type = match context.data.detected_runtime_type.as_deref() {
             Some(s) => s.parse::<RuntimeType>().unwrap_or(config.runtime_type),
@@ -539,6 +552,31 @@ pub(super) fn validate_parser_overrides(
             card.id
         )
     })
+}
+
+/// Under `--parser symphony`, publish at zero the Symphony series of the table that reads `card`'s
+/// model when the model's first worker registers (`registry` has none of its workers yet), so
+/// `failed`, `malformed` and the rest exist before the first such output
+/// (`regular::symphony::telemetry::init_table_series`). A later worker of the model, the legacy
+/// parser choice and a model the legacy parsers read publish nothing (the fallback series of such
+/// a model, under `none`, exist from start-up). Workers of one model registering at the same
+/// moment may each publish, which sets nothing twice.
+pub(super) fn publish_symphony_series(
+    card: &ModelCard,
+    parser: ParserChoice,
+    flags: &Names,
+    registry: &WorkerRegistry,
+) {
+    if parser != ParserChoice::Symphony || !registry.get_by_model(&card.id).is_empty() {
+        return;
+    }
+    let labels = Names {
+        tool: card.tool_parser.clone(),
+        reasoning: card.reasoning_parser.clone(),
+    };
+    if let Some(table) = table_label_read(&ModelNames { labels, flags }, &card.id) {
+        telemetry::init_table_series(table);
+    }
 }
 
 /// Under `--parser symphony`, the registry's table reads a model it knows for every worker whose
@@ -1097,6 +1135,69 @@ fn validate_zmq_dp(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Under `--parser symphony`, the registration of a model's first worker publishes the
+    /// failure classes of the table that reads the model at zero; the model's next worker and the
+    /// legacy parser choice publish nothing.
+    #[test]
+    fn a_models_first_registration_publishes_its_tables_failure_classes_at_zero() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let known = ModelCard::new("Qwen/Qwen3-8B");
+        let registry = WorkerRegistry::new();
+        let publish = |parser, registry: &WorkerRegistry| {
+            metrics::with_local_recorder(&recorder, || {
+                publish_symphony_series(&known, parser, &Names::default(), registry);
+            });
+            handle.render()
+        };
+        assert!(
+            !publish(ParserChoice::Legacy, &registry).contains("smg_symphony_"),
+            "the legacy parsers publish no table"
+        );
+        let scrape = publish(ParserChoice::Symphony, &registry);
+        let zero = |name: &str, labels: [&str; 2]| {
+            scrape
+                .lines()
+                .find(|line| {
+                    line.starts_with(name) && labels.iter().all(|label| line.contains(label))
+                })
+                .is_some_and(|line| line.ends_with(" 0"))
+        };
+        assert!(
+            zero(
+                "smg_symphony_outputs_total",
+                ["table=\"qwen3\"", "outcome=\"failed\""]
+            ),
+            "{scrape}"
+        );
+        assert!(
+            zero(
+                "smg_symphony_malformed_total",
+                ["table=\"qwen3\"", "reason=\"unterminated_region\""]
+            ),
+            "{scrape}"
+        );
+        registry
+            .register(Arc::new(
+                BasicWorkerBuilder::new("grpc://a:1")
+                    .model(known.clone())
+                    .build(),
+            ))
+            .expect("register");
+        // The model's next worker finds the series published and sets nothing
+        // (the exporter orders families as it pleases: compare the lines).
+        let lines = |scrape: &str| {
+            scrape
+                .lines()
+                .map(str::to_owned)
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        assert_eq!(
+            lines(&publish(ParserChoice::Symphony, &registry)),
+            lines(&scrape)
+        );
+    }
 
     /// Under `--parser symphony`, the registration of a model's first worker whose labels select
     /// no reader (none, or a reasoning name no table answers to) says that the registry's table
