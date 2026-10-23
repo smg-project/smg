@@ -78,7 +78,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Rebuild on tooling changes even when today's nightly already exists.
+      # A push to `main` that touches a listed path rebuilds the pinned tag in
+      # place (`no-cache`), so the carrier behind the pin moves with the tooling;
+      # a rebuild only when the tag is missing or forced (or an input-hash tag)
+      # is owed, with the carrier's unbounded dependencies pinned.
       - name: Check for existing image
         id: exists
         env:

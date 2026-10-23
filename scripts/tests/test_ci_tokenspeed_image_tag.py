@@ -37,7 +37,9 @@ def test_version_prints_the_pin_itself(tmp_path):
     assert result.stdout == "0.1.1.post20261021\n"
 
 
-@pytest.mark.parametrize("content", ["", "latest\n", "0.1.1\n", "0.1.1.post2026102\n", "dd70f5dce4372d64\n"])
+@pytest.mark.parametrize(
+    "content", ["", "latest\n", "0.1.1\n", "0.1.1.post2026102\n", "dd70f5dce4372d64\n"]
+)
 def test_anything_but_a_dated_nightly_is_refused(tmp_path, content):
     pin = tmp_path / "pin"
     pin.write_text(content)
