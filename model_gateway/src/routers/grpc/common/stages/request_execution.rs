@@ -3000,6 +3000,8 @@ mod tests {
 
     #[test]
     fn epd_restamp_sglang_keeps_handoff_ids_and_clears_the_decode_copy() {
+        use tool_parser::ParserFactory as ToolParserFactory;
+
         use crate::routers::grpc::{
             common::stages::helpers::{restamp_plan_for_attempt, IdStamp},
             context::AttemptStamp,
