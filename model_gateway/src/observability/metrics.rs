@@ -76,6 +76,8 @@ mod handles {
         keep_handles, nested, recorder_installed, with_handle, with_model_handle, ByLabels,
     };
 
+    use super::RouterStage;
+
     /// Handles by the matched path (the only label a request computes).
     pub(super) type ByPath<H> = HashMap<String, H>;
     /// Handles by method, then matched path.
@@ -183,6 +185,8 @@ mod handles {
         pub(super) static HTTP_CONNECTIONS_ACTIVE: RefCell<Option<Gauge>> = const { RefCell::new(None) };
         /// The stream-timing set by its static labels, then the model.
         pub(super) static STREAMS: RefCell<ByLabels<StreamLabels, StreamHandles>> = RefCell::new(HashMap::new());
+        /// `smg_router_stage_seconds` by stage, at the stage's index.
+        pub(super) static STAGES: RefCell<[Option<Histogram>; RouterStage::COUNT]> = const { RefCell::new([const { None }; RouterStage::COUNT]) };
         /// `smg_worker_requests_total`.
         pub(super) static WORKER_REQUESTS: RefCell<WorkerRequests> = RefCell::new(WorkerRequests::default());
         /// `smg_worker_requests_active`.
@@ -200,6 +204,7 @@ mod handles {
         HTTP_DURATIONS.with_borrow_mut(HashMap::clear);
         HTTP_RESPONSES.with_borrow_mut(HashMap::clear);
         HTTP_RATE_LIMITS.with_borrow_mut(HashMap::clear);
+        STAGES.with_borrow_mut(|kept| *kept = [const { None }; RouterStage::COUNT]);
         HTTP_CONNECTIONS_ACTIVE.set(None);
         STREAMS.with_borrow_mut(HashMap::clear);
         WORKER_REQUESTS.with_borrow_mut(|kept| *kept = WorkerRequests::default());
@@ -540,6 +545,10 @@ pub(crate) fn init_metrics() {
     describe_histogram!(
         "smg_router_ttft_seconds",
         "Time to first token by router_type, backend_type, model, endpoint (gRPC only)"
+    );
+    describe_histogram!(
+        "smg_router_stage_seconds",
+        "Time a request spent in a stage of the pipeline, from the previous stage's end, by stage: preparation (the parse, the tokenizer and the template), rate_limit (the tenant reservation), worker_selection (the policy, the index lookup and the selection queue), client_acquisition (the context-length and output-budget checks and the client pool), encode (the multimodal encode step, where one runs), request_building, reselection (a retry's selection), execute (the admission wait, the send and the engine's acceptance, per attempt) and response_processing (the answer's processing to the response); one observation per stage crossed, a refused or failed stage included, so the stage series sum to the requests' time in the pipeline"
     );
     describe_histogram!(
         "smg_router_tpot_seconds",
@@ -1456,6 +1465,43 @@ pub struct StreamingMetricsParams<'a> {
     pub output_tokens: u64,
 }
 
+/// A stage of the request pipeline, the `stage` label of
+/// `smg_router_stage_seconds`, in the order a request crosses them (the
+/// words of the pipeline's trace spans).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouterStage {
+    Preparation,
+    RateLimit,
+    WorkerSelection,
+    ClientAcquisition,
+    Encode,
+    RequestBuilding,
+    Reselection,
+    Execute,
+    ResponseProcessing,
+}
+
+impl RouterStage {
+    /// How many stages there are: the kept handles are one per stage, at
+    /// the stage's index.
+    pub(crate) const COUNT: usize = Self::ResponseProcessing as usize + 1;
+
+    /// The stage's `stage` label value.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Preparation => "preparation",
+            Self::RateLimit => "rate_limit",
+            Self::WorkerSelection => "worker_selection",
+            Self::ClientAcquisition => "client_acquisition",
+            Self::Encode => "encode",
+            Self::RequestBuilding => "request_building",
+            Self::Reselection => "reselection",
+            Self::Execute => "execute",
+            Self::ResponseProcessing => "response_processing",
+        }
+    }
+}
+
 impl Metrics {
     pub fn record_router_request(
         router_type: &'static str,
@@ -1846,6 +1892,23 @@ impl Metrics {
             "endpoint" => endpoint
         )
         .increment(tail_tokens);
+    }
+
+    /// One stage of the request pipeline done for one request: `elapsed`
+    /// under `smg_router_stage_seconds{stage}`, through this thread's kept
+    /// handle for the stage (built on first sight) or a key built per call
+    /// when handles are not kept.
+    pub fn record_stage_duration(stage: RouterStage, elapsed: Duration) {
+        let build = || histogram!("smg_router_stage_seconds", "stage" => stage.label());
+        if !handles::keep_handles() {
+            build().record(elapsed.as_secs_f64());
+            return;
+        }
+        handles::STAGES.with_borrow_mut(|kept| {
+            kept[stage as usize]
+                .get_or_insert_with(build)
+                .record(elapsed.as_secs_f64());
+        });
     }
 
     /// Record an answer's token and latency families in a single batch call:

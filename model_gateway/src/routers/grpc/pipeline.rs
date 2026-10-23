@@ -78,7 +78,7 @@ use crate::{
     middleware::{ReportedRefusal, TenantRequestMeta},
     observability::{
         cache_trace,
-        metrics::{bool_to_static_str, metrics_labels, Metrics},
+        metrics::{bool_to_static_str, metrics_labels, Metrics, RouterStage},
     },
     policies::PolicyRegistry,
     rate_limit::{RateLimitManager, UsageSettlement},
@@ -296,6 +296,15 @@ enum RunOutcome {
 /// context moves in (see [`RequestPipeline::run`]).
 type RunFuture<'a> = Pin<Box<dyn Future<Output = Result<RunOutcome, Response>> + Send + 'a>>;
 
+/// The time since `mark`, which moves to now: the pipeline's stage clock,
+/// one read per stage boundary.
+fn lap(mark: &mut Instant) -> Duration {
+    let now = Instant::now();
+    let elapsed = now.duration_since(*mark);
+    *mark = now;
+    elapsed
+}
+
 impl RequestPipeline {
     /// Build the pipeline for `endpoint` in the given disaggregation `mode`,
     /// mapping `mode` to the per-stage worker-selection, execution-plan, and
@@ -469,9 +478,23 @@ impl RequestPipeline {
     }
 
     /// Ingress phase: run the request-owning stages through request building.
-    async fn run_ingress(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
+    /// Every step is timed under its `smg_router_stage_seconds` stage from
+    /// the previous boundary (`started` for the first), a refusal or a
+    /// failure included: the time was spent.
+    async fn run_ingress(
+        &self,
+        ctx: &mut RequestContext,
+        started: Instant,
+    ) -> Result<BuildOutput, Response> {
+        let mut mark = started;
         macro_rules! step {
-            ($stage:expr, $result:expr) => {
+            ($stage:expr, $name:expr, $result:expr) => {{
+                let output = $result;
+                Metrics::record_stage_duration($stage, lap(&mut mark));
+                step!($name, output)
+            }};
+            // A check inside a stage's time (its clock is not read).
+            ($name:expr, $result:expr) => {{
                 $result.map_err(|response: Response| {
                     // A refusal the failing stage did not report itself (the
                     // preparation stage's 404 for a model nobody serves)
@@ -488,27 +511,30 @@ impl RequestPipeline {
                         // (rate-limited, with the pool's state).
                         debug!(
                             "Stage {} refused the request with status {}",
-                            $stage,
+                            $name,
                             response.status()
                         );
                     } else {
-                        error!("Stage {} failed with status {}", $stage, response.status());
+                        error!("Stage {} failed with status {}", $name, response.status());
                     }
                     response
                 })
-            };
+            }};
         }
 
         let stages = &self.stages;
         step!(
+            RouterStage::Preparation,
             stages.preparation.name(),
             stages.preparation.execute(ctx).await
         )?;
         step!(
+            RouterStage::RateLimit,
             stages.rate_limit.name(),
             stages.rate_limit.execute(ctx).await
         )?;
         step!(
+            RouterStage::WorkerSelection,
             stages.worker_selection.name(),
             stages.worker_selection.execute(ctx).await
         )?;
@@ -526,6 +552,7 @@ impl RequestPipeline {
             enforce_output_budget(&ctx.input.request_type, workers, &ctx.input.model_id)
         )?;
         ctx.state.clients = Some(step!(
+            RouterStage::ClientAcquisition,
             "ClientAcquisition",
             acquire_clients(
                 workers,
@@ -535,9 +562,14 @@ impl RequestPipeline {
             .await
         )?);
         if let Some(encode) = &stages.encode {
-            step!(encode.name(), encode.execute(ctx).await)?;
+            step!(
+                RouterStage::Encode,
+                encode.name(),
+                encode.execute(ctx).await
+            )?;
         }
         step!(
+            RouterStage::RequestBuilding,
             stages.request_building.name(),
             stages.request_building.build(ctx).await
         )
@@ -555,6 +587,7 @@ impl RequestPipeline {
         last_attempt: bool,
     ) -> Result<Option<Response>, Response> {
         dctx.attempt = attempt;
+        let mut mark = Instant::now();
         let consumed = || {
             error!(function = "run_attempt", "Execution plan already consumed");
             error::internal_error("execution_plan_consumed", "Execution plan already consumed")
@@ -564,7 +597,9 @@ impl RequestPipeline {
             // re-stamped (engine ids, sampling defaults, the forced tool
             // call's shape, PD rooms) for the new workers. Buffered decode
             // state from the failed attempt is reset.
-            self.stages.worker_selection.reselect(dctx).await?;
+            let reselected = self.stages.worker_selection.reselect(dctx).await;
+            Metrics::record_stage_duration(RouterStage::Reselection, lap(&mut mark));
+            reselected?;
             let workers = stage_output(dctx.workers.as_ref(), "run_attempt")?;
             dctx.clients = Some(
                 acquire_clients(
@@ -603,18 +638,22 @@ impl RequestPipeline {
             dctx.workers.as_ref(),
         ));
 
-        execute_plan(dctx, attempt_plan, last_attempt).await?;
-        self.stages
+        let executed = execute_plan(dctx, attempt_plan, last_attempt).await;
+        Metrics::record_stage_duration(RouterStage::Execute, lap(&mut mark));
+        executed?;
+        let processed = self
+            .stages
             .response_processing
             .process(dctx, attempt_spec)
-            .await
-            .inspect_err(|response| {
-                error!(
-                    "Stage {} failed with status {}",
-                    self.stages.response_processing.name(),
-                    response.status()
-                );
-            })
+            .await;
+        Metrics::record_stage_duration(RouterStage::ResponseProcessing, lap(&mut mark));
+        processed.inspect_err(|response| {
+            error!(
+                "Stage {} failed with status {}",
+                self.stages.response_processing.name(),
+                response.status()
+            );
+        })
     }
 
     /// Full two-phase run. `metrics_endpoint` enables per-attempt
@@ -667,7 +706,7 @@ impl RequestPipeline {
                 self.record_request(endpoint, &ctx.input.model_id, ctx.is_streaming());
             }
 
-            let build = match self.run_ingress(&mut ctx).await {
+            let build = match self.run_ingress(&mut ctx, attempt_start).await {
                 Ok(build) => build,
                 Err(response) => {
                     self.record_error(metrics_endpoint, &ctx.input.model_id, &response);
@@ -3451,6 +3490,56 @@ mod request_release_tests {
             released.load(Ordering::SeqCst),
             "the parsed request must be freed before the decode side answers"
         );
+    }
+
+    /// `smg_router_stage_seconds`: a request that ran to its answer observed
+    /// every stage it crossed once under the stage's label, and no other (no
+    /// encode step without media, no reselection without a retry), so the
+    /// stage series of a scrape sum to the requests' time in the pipeline.
+    #[test]
+    fn a_request_observes_every_stage_it_crossed_once() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(async {
+                let port = spawn_stub(GatedScheduler::default()).await;
+                let worker_registry = Arc::new(WorkerRegistry::new());
+                register_worker(&worker_registry, port, WorkerType::Regular);
+                let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+                let components = components(worker_registry).await;
+                let response = run_completion(pipeline, components, &fast_retry_config(1)).await;
+                assert_eq!(response.status(), http::StatusCode::OK);
+            });
+        });
+        let rendered = handle.render();
+        let mut counts: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("smg_router_stage_seconds_count{"))
+            .collect();
+        counts.sort_unstable();
+        let mut expected: Vec<String> = [
+            RouterStage::Preparation,
+            RouterStage::RateLimit,
+            RouterStage::WorkerSelection,
+            RouterStage::ClientAcquisition,
+            RouterStage::RequestBuilding,
+            RouterStage::Execute,
+            RouterStage::ResponseProcessing,
+        ]
+        .iter()
+        .map(|stage| {
+            format!(
+                "smg_router_stage_seconds_count{{stage=\"{}\"}} 1",
+                stage.label()
+            )
+        })
+        .collect();
+        expected.sort_unstable();
+        assert_eq!(counts, expected, "{rendered}");
     }
 
     /// The one `smg_worker_errors_total` sample of the gRPC workers of

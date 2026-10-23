@@ -1035,6 +1035,35 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
     }
 }
 
+/// A stage's time renders under its label, the same through a kept handle
+/// and through a key built per record, one observation per record.
+#[test]
+fn a_stage_duration_renders_under_its_stage_label() {
+    let records = || {
+        Metrics::record_stage_duration(RouterStage::Preparation, Duration::from_millis(250));
+        Metrics::record_stage_duration(RouterStage::Preparation, Duration::from_millis(500));
+        Metrics::record_stage_duration(RouterStage::Execute, Duration::from_millis(125));
+    };
+    let built = render_with_recorder(records);
+    let kept = render_with_recorder(|| {
+        handles::force_on_this_thread(Some(true));
+        records();
+        handles::reset();
+    });
+    assert_eq!(sorted_series(&kept), sorted_series(&built));
+    for expected in [
+        "smg_router_stage_seconds_count{stage=\"preparation\"} 2",
+        "smg_router_stage_seconds_sum{stage=\"preparation\"} 0.75",
+        "smg_router_stage_seconds_sum{stage=\"execute\"} 0.125",
+        "smg_router_stage_seconds_count{stage=\"execute\"} 1",
+    ] {
+        assert!(
+            kept.lines().any(|line| line == expected),
+            "missing {expected} in:\n{kept}"
+        );
+    }
+}
+
 /// The kept worker counters follow the worker set: a removal drops the
 /// address's series and the handles kept to them, so a write after the
 /// removal lands nowhere, and a re-registration starts the counter over
