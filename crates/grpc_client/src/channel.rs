@@ -139,9 +139,13 @@ fn configured_endpoint(
 /// that into an I/O error of its own, with the `io::Error` behind it and no
 /// `h2::Error` left in the chain, and tonic, which has no code for it,
 /// answers `Unknown` with the words "transport error". That `hyper::Error`
-/// over an `io::Error` is the second shape read here. A dial that fails is
-/// tonic's own `UNAVAILABLE`, with an `io::Error` under its connect error
-/// and no `hyper::Error`: not a failure under a call.
+/// over an `io::Error` is the second shape read here. A dial the peer
+/// resets during the HTTP/2 handshake, after the connect, ends the same
+/// way: the channel dials under the call, and tonic reports it with the
+/// same `Unknown` "transport error" over hyper's I/O error, so it reads as
+/// a transport failure too (a test below dials such a peer). A dial the
+/// peer refuses is tonic's own `UNAVAILABLE`, with an `io::Error` under
+/// its connect error and no `hyper::Error`: not a failure under a call.
 ///
 /// The gateway's liveness asks a different question of the ends of its
 /// polls and streams, whether the peer is reachable for work, and answers
@@ -729,6 +733,88 @@ mod tests {
             "{status:?}"
         );
         assert!(!is_transport_failure(&status), "{status:?}");
+    }
+
+    /// A loopback peer that accepts the connect, reads the client's
+    /// connection preface and resets the socket without answering it: the
+    /// TCP connect and the handshake's write complete, the handshake's read
+    /// fails. A dying engine whose accept queue is reset looks like this
+    /// from the client.
+    async fn a_peer_that_resets_the_handshake() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port of the system's choice");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("the bound address")
+        );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only peer; it ends with the test's runtime"
+        )]
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut preface = [0u8; 24];
+                stream
+                    .read_exact(&mut preface)
+                    .await
+                    .expect("the client's connection preface");
+                stream.set_zero_linger().expect("a zero linger");
+                drop(stream);
+            }
+        });
+        url
+    }
+
+    /// Whether a `hyper::Error` sits in `status`'s source chain.
+    fn hyper_error_in(status: &tonic::Status) -> bool {
+        let mut source = std::error::Error::source(status);
+        while let Some(error) = source {
+            if error.is::<hyper::Error>() {
+                return true;
+            }
+            source = error.source();
+        }
+        false
+    }
+
+    /// A dial the peer resets during the HTTP/2 handshake, after the connect,
+    /// is reported like the reset under a call: the channel dials under the
+    /// call, and tonic answers `Unknown` "transport error" with hyper's I/O
+    /// error as the source (the `hyper::Error` in the chain is asserted, so
+    /// the test pins that shape and not a reset at the TCP connect, which
+    /// tonic reports as `UNAVAILABLE` under its connect error). It is the
+    /// worker's connection going away under the call: a transport failure.
+    #[tokio::test]
+    async fn a_dial_the_peer_resets_during_the_handshake_is_a_transport_failure() {
+        let url = a_peer_that_resets_the_handshake().await;
+        let channel = configured_endpoint(&url, DEFAULT_CONNECT_TIMEOUT)
+            .expect("endpoint")
+            .connect_lazy();
+        let mut client =
+            tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient::new(channel);
+        let status = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.health_check(tonic::Request::new(tokenspeed_proto::HealthCheckRequest {})),
+        )
+        .await
+        .expect("the dial ends with the reset")
+        .expect_err("the peer answers no handshake");
+        assert_eq!(status.code(), tonic::Code::Unknown, "{status:?}");
+        assert_eq!(status.message(), "transport error", "{status:?}");
+        assert!(
+            hyper_error_in(&status),
+            "hyper's error in the chain: {status:?}"
+        );
+        assert!(
+            matches!(
+                io_error_kind_in(&status),
+                Some(io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe)
+            ),
+            "{status:?}"
+        );
+        assert!(is_transport_failure(&status), "{status:?}");
     }
 
     // --- late frames on forgotten streams ------------------------------------
