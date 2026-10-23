@@ -1082,6 +1082,7 @@ mod tests {
                     "smg_kv_index_runs_live",
                     "smg_kv_index_arena_bytes",
                     "smg_kv_index_slab_bytes",
+                    "smg_kv_block_size_tokens",
                 ] {
                     assert_eq!(gauge(&handle, name, UNKNOWN_MODEL_ID), Some(0.0), "{name}");
                 }
