@@ -1,5 +1,5 @@
 {
-  "ready": false,
+  "ready": true,
   "run_id": 39854981911,
   "run_attempt": 1,
   "producer_sha": "34ac557ba0775adda864e7d4446bf10127f6014c",
@@ -365,7 +365,7 @@
   "local_kv_pilot": {
     "opt_in": "SMG_PD_TRACE_LOCAL_KV=1",
     "default_enabled": false,
-    "new_GPU_admitted": false,
+    "new_GPU_admitted": true,
     "source_contract": "infra/pd_local_kv_compat.py",
     "additional_allocator_files": 5,
     "three_public_source_files_not_yet_captured_in_actual_image": true,
