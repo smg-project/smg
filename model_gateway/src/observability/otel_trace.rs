@@ -22,6 +22,7 @@ use tonic::metadata::{MetadataKey, MetadataMap, MetadataValue};
 use tracing::{Metadata, Subscriber};
 use tracing_opentelemetry::{self, OpenTelemetrySpanExt};
 use tracing_subscriber::{
+    filter::LevelFilter,
     layer::{Context, Filter},
     Layer,
 };
@@ -49,14 +50,21 @@ fn get_allowed_targets() -> &'static [&'static str; 3] {
     })
 }
 
-/// Filter that only allows specific module targets to be exported to OTEL.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct CustomOtelFilter;
+/// The trace layer's own filter: the trace targets alone, at the layer's own level, so the
+/// log filter never gates what the layer exports.
+#[derive(Clone, Copy)]
+pub(crate) struct CustomOtelFilter {
+    level: LevelFilter,
+}
 
 impl CustomOtelFilter {
+    /// The filter beside a log filter at `log_level`: the spans at INFO whatever the log level
+    /// is, and the finer events of the trace targets when the log level asks for them.
     #[inline]
-    pub const fn new() -> Self {
-        Self
+    pub fn with_log_level(log_level: LevelFilter) -> Self {
+        Self {
+            level: log_level.max(LevelFilter::INFO),
+        }
     }
 
     #[inline]
@@ -73,16 +81,21 @@ where
 {
     #[inline]
     fn enabled(&self, meta: &Metadata<'_>, _cx: &Context<'_, S>) -> bool {
-        Self::is_allowed(meta.target())
+        Self::is_allowed(meta.target()) && meta.level() <= &self.level
     }
 
     #[inline]
     fn callsite_enabled(&self, meta: &'static Metadata<'static>) -> tracing::subscriber::Interest {
-        if Self::is_allowed(meta.target()) {
+        if Self::is_allowed(meta.target()) && meta.level() <= &self.level {
             tracing::subscriber::Interest::always()
         } else {
             tracing::subscriber::Interest::never()
         }
+    }
+
+    #[inline]
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(self.level)
     }
 }
 
@@ -163,6 +176,17 @@ pub fn get_otel_layer<S>() -> Result<Box<dyn Layer<S> + Send + Sync + 'static>>
 where
     S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync,
 {
+    get_otel_layer_at(LevelFilter::INFO)
+}
+
+/// The layer beside a log filter at `log_level`, behind its own filter (the trace targets, at
+/// INFO and whatever more the log level asks for): the log level never gates the spans.
+pub fn get_otel_layer_at<S>(
+    log_level: LevelFilter,
+) -> Result<Box<dyn Layer<S> + Send + Sync + 'static>>
+where
+    S: Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a> + Send + Sync,
+{
     if !is_otel_enabled() {
         anyhow::bail!("OpenTelemetry is not enabled");
     }
@@ -174,7 +198,7 @@ where
 
     let layer = tracing_opentelemetry::layer()
         .with_tracer(tracer)
-        .with_filter(CustomOtelFilter::new());
+        .with_filter(CustomOtelFilter::with_log_level(log_level));
 
     Ok(Box::new(layer))
 }
@@ -340,5 +364,69 @@ impl smg_grpc_client::TraceInjector for OtelTraceInjector {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         inject_trace_context_grpc(metadata);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use tracing::{Level, Subscriber};
+    use tracing_subscriber::{filter::LevelFilter, layer::SubscriberExt, Layer};
+
+    use super::CustomOtelFilter;
+
+    /// The trace layer's level is the more verbose of INFO and the log level: the spans export
+    /// at `--log-level warn` and `error`, and a finer log level reaches the trace targets' events.
+    #[test]
+    fn the_trace_filter_sits_at_info_or_finer_with_the_log_level() {
+        for (log_level, expected) in [
+            (LevelFilter::ERROR, LevelFilter::INFO),
+            (LevelFilter::WARN, LevelFilter::INFO),
+            (LevelFilter::INFO, LevelFilter::INFO),
+            (LevelFilter::DEBUG, LevelFilter::DEBUG),
+            (LevelFilter::TRACE, LevelFilter::TRACE),
+        ] {
+            assert_eq!(
+                CustomOtelFilter::with_log_level(log_level).level,
+                expected,
+                "log level {log_level}"
+            );
+        }
+    }
+
+    /// A layer that records the level of every event it is handed.
+    struct Recorder(Arc<Mutex<Vec<Level>>>);
+
+    impl<S: Subscriber> Layer<S> for Recorder {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0.lock().unwrap().push(*event.metadata().level());
+        }
+    }
+
+    /// Behind the filter at `--log-level warn`, an INFO event of a trace target reaches the
+    /// layer and a DEBUG one does not; at `--log-level debug` the DEBUG one does too.
+    #[test]
+    fn the_filter_admits_the_trace_targets_at_its_own_level() {
+        let seen = |log_level: LevelFilter| {
+            let levels = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::registry().with(
+                Recorder(Arc::clone(&levels))
+                    .with_filter(CustomOtelFilter::with_log_level(log_level)),
+            );
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(target: "smg::otel-trace", "an info event of a trace target");
+                tracing::debug!(target: "smg::otel-trace", "a debug event of a trace target");
+                tracing::info!(target: "smg::elsewhere", "an info event of another target");
+            });
+            let levels = levels.lock().unwrap().clone();
+            levels
+        };
+        assert_eq!(seen(LevelFilter::WARN), vec![Level::INFO]);
+        assert_eq!(seen(LevelFilter::DEBUG), vec![Level::INFO, Level::DEBUG]);
     }
 }

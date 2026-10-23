@@ -35,13 +35,14 @@ use tracing_log::{AsLog, LogTracer};
 use tracing_subscriber::{
     filter::{LevelFilter, Targets},
     layer::SubscriberExt,
+    registry::LookupSpan,
     util::SubscriberInitExt,
     EnvFilter, Layer, Registry,
 };
 
 use super::{
     log_format::{JsonLine, SpanFields, TextFields, TextLine, UtcSeconds},
-    otel_trace::get_otel_layer,
+    otel_trace::get_otel_layer_at,
 };
 use crate::{config::TraceConfig, observability::metrics::Metrics};
 
@@ -581,34 +582,32 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
 
     // RUST_LOG takes precedence (as `EnvFilter::try_from_default_env` did); an unset,
     // empty, or invalid value falls through to the configured level/targets.
-    let filter_layer = std::env::var(EnvFilter::DEFAULT_ENV)
+    let directives = std::env::var(EnvFilter::DEFAULT_ENV)
         .ok()
-        .filter(|directives| !directives.trim().is_empty())
-        .and_then(|directives| build_filter_layer(&directives))
-        .unwrap_or_else(|| {
-            let filter_string = match &config.log_targets {
-                Some(targets) if !targets.is_empty() => build_filter_string(targets, level_filter),
-                _ => {
-                    // Default: external deps at WARN, all workspace crates at configured level.
-                    // This ensures logs from imported crates (tool_parser, kv_index, etc.)
-                    // are visible while suppressing noisy external deps (hyper, h2, tonic, etc.).
-                    build_workspace_filter(level_filter)
-                }
-            };
-            build_filter_layer(&filter_string)
-                .unwrap_or_else(|| Box::new(EnvFilter::new(filter_string)))
+        .filter(|directives| {
+            !directives.trim().is_empty() && EnvFilter::try_new(directives).is_ok()
+        })
+        .unwrap_or_else(|| match &config.log_targets {
+            Some(targets) if !targets.is_empty() => build_filter_string(targets, level_filter),
+            _ => {
+                // Default: external deps at WARN, all workspace crates at configured level.
+                // This ensures logs from imported crates (tool_parser, kv_index, etc.)
+                // are visible while suppressing noisy external deps (hyper, h2, tonic, etc.).
+                build_workspace_filter(level_filter)
+            }
         });
+    let filter_layer =
+        build_filter_layer(&directives).unwrap_or_else(|| Box::new(EnvFilter::new(&directives)));
 
     // Cap the `log` facade at the filter's most verbose level. A bare
     // `LogTracer::init()` leaves `log::max_level()` at TRACE, so every
     // `log::trace!`/`debug!` in a dependency (the `tokenizers` normalizer and
     // pre-tokenizer emit them on each encode) builds a record and round-trips
     // through the tracing dispatcher only to be dropped there.
-    let log_max_level = filter_layer
-        .max_level_hint()
-        .unwrap_or(LevelFilter::TRACE)
-        .as_log();
-    let _ = LogTracer::builder().with_max_level(log_max_level).init();
+    let log_level = filter_layer.max_level_hint().unwrap_or(LevelFilter::TRACE);
+    let _ = LogTracer::builder()
+        .with_max_level(log_level.as_log())
+        .init();
 
     let mut layers = Vec::with_capacity(3);
 
@@ -699,29 +698,55 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
         }
     }
 
-    if let Some(otel_layer_config) = &otel_layer_config {
-        if otel_layer_config.enable_trace {
-            match get_otel_layer() {
-                Ok(otel_layer) => {
-                    layers.push(otel_layer);
+    let otel_layer: Option<FilterLayer> = otel_layer_config
+        .filter(|otel_layer_config| otel_layer_config.enable_trace)
+        .and_then(|_| match get_otel_layer_at(log_level) {
+            Ok(otel_layer) => Some(otel_layer),
+            Err(e) => {
+                // Logger may not be fully initialized yet; use stderr as fallback
+                #[expect(clippy::print_stderr)]
+                {
+                    eprintln!("Failed to initialize OpenTelemetry: {e}");
                 }
-                Err(e) => {
-                    // Logger may not be fully initialized yet; use stderr as fallback
-                    #[expect(clippy::print_stderr)]
-                    {
-                        eprintln!("Failed to initialize OpenTelemetry: {e}");
-                    }
-                }
+                None
             }
-        }
-    }
+        });
 
-    let _ = tracing_subscriber::registry()
-        .with(filter_layer)
-        .with(layers)
-        .try_init();
+    let _ = match otel_layer {
+        // The log filter is the log layers' own, and the trace layer sits behind its own: the
+        // tracer's spans export at every log level (one global filter gated them too, and at
+        // `--log-level warn`/`error` `--enable-trace` exported nothing).
+        Some(otel_layer) => tracing_subscriber::registry()
+            .with(otel_layer)
+            .with(filtered_by(layers, &directives))
+            .try_init(),
+        // Without tracing the one global filter, as before: nothing is filtered per layer.
+        None => tracing_subscriber::registry()
+            .with(filter_layer)
+            .with(layers)
+            .try_init(),
+    };
 
     LogGuard(())
+}
+
+/// The log layers behind the log filter as their own: one filter over the group, read as the
+/// global one is (`Targets` when `EnvFilter` accepts the directives and they read the same both
+/// ways, else `EnvFilter`, lenient on a string it rejects, as [`init_logging`] falls back).
+fn filtered_by<S>(
+    layers: Vec<Box<dyn Layer<S> + Send + Sync + 'static>>,
+    directives: &str,
+) -> Box<dyn Layer<S> + Send + Sync + 'static>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a> + Send + Sync + 'static,
+{
+    match EnvFilter::try_new(directives)
+        .ok()
+        .and_then(|_| targets_for(directives))
+    {
+        Some(targets) => Box::new(layers.with_filter(targets)),
+        None => Box::new(layers.with_filter(EnvFilter::new(directives))),
+    }
 }
 
 /// Logging helpers for tests elsewhere in the crate.
