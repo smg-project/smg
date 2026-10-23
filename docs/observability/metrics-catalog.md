@@ -25,7 +25,7 @@ Groups and when a deployment has them:
 | [KV index](#kv-index) | 11 | cache-aware routing on a KV-event fleet |
 | [Cache-aware policy](#cache-aware-policy) | 7 | the cache-aware policy |
 | [Other policies](#other-policies) | 6 | the named policy |
-| [Prefill/decode](#prefill-decode) | 15 | prefill/decode (PD, EPD) deployments |
+| [Prefill/decode](#prefilldecode) | 15 | prefill/decode (PD, EPD) deployments |
 | [Symphony tables](#symphony-tables) | 6 | gRPC backends reading tool calls and reasoning through a Symphony table |
 | [Tokenizer](#tokenizer) | 6 | gRPC backends (the gateway tokenizes) |
 | [Multimodal](#multimodal) | 11 | gateways that process media (images, video, audio) |
@@ -248,9 +248,9 @@ Groups and when a deployment has them:
 | `smg_mm_pixel_cache_hits_total` | counter | `model` | `record_mm_pixel_cache_lookup` (observability/metrics.rs) ← `routers/grpc/multimodal/process.rs` | Pixel cache lookups that found the image's preprocessed encoder input, by model |
 | `smg_mm_pixel_cache_misses_total` | counter | `model` | `record_mm_pixel_cache_lookup` (observability/metrics.rs) ← `routers/grpc/multimodal/process.rs` | Pixel cache lookups that had to preprocess the image, by model |
 | `smg_mm_processing_total` | counter | `mode`, `model`, `reason` | `record_mm_processing` (observability/metrics.rs) ← `routers/grpc/multimodal/refs.rs` | Multimodal requests by processing location (router/worker) and resolution reason |
-| `smg_mm_shm_write_failures_total` | counter | `runtime` | `record_mm_shm_write_failure` (observability/metrics.rs) ← `routers/grpc/multimodal/serialize.rs`, `routers/grpc/proto_wrapper.rs` | SHM tensor write attempts that failed and fell back to inline, by runtime |
-| `smg_mm_tensor_bytes_total` | counter | `path`, `runtime` | `record_mm_tensor` (observability/metrics.rs) ← `routers/grpc/proto_wrapper.rs` | Multimodal tensor bytes sent, by runtime and transport path (shm/inline) |
-| `smg_mm_tensors_total` | counter | `path`, `runtime` | `record_mm_tensor` (observability/metrics.rs) ← `routers/grpc/proto_wrapper.rs` | Multimodal tensors sent, by runtime and transport path (shm/inline) |
+| `smg_mm_shm_write_failures_total` | counter | `runtime` | `record_mm_shm_write_failure` (observability/metrics.rs) ← `routers/grpc/multimodal/serialize.rs`, `routers/grpc/proto_wrapper/multimodal.rs` | SHM tensor write attempts that failed and fell back to inline, by runtime |
+| `smg_mm_tensor_bytes_total` | counter | `path`, `runtime` | `record_mm_tensor` (observability/metrics.rs) ← `routers/grpc/proto_wrapper/multimodal.rs` | Multimodal tensor bytes sent, by runtime and transport path (shm/inline) |
+| `smg_mm_tensors_total` | counter | `path`, `runtime` | `record_mm_tensor` (observability/metrics.rs) ← `routers/grpc/proto_wrapper/multimodal.rs` | Multimodal tensors sent, by runtime and transport path (shm/inline) |
 | `smg_mm_turbojpeg_available` | gauge | — | `set_mm_turbojpeg_available` (observability/metrics.rs) ← `routers/grpc/multimodal/mod.rs` | 1 when JPEGs decode through libjpeg-turbo (PIL's pixels), 0 through the pure-Rust fallback |
 | `smg_mm_webp_available` | gauge | — | `set_mm_webp_available` (observability/metrics.rs) ← `routers/grpc/multimodal/mod.rs` | 1 when WebP files decode through libwebp, 0 through the pure-Rust fallback |
 

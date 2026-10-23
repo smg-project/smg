@@ -1002,7 +1002,8 @@ def render_catalog(
 
 
 def anchor(title: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    """GitHub's heading anchor: lower-case, punctuation other than `-` and `_` removed, spaces to hyphens."""
+    return re.sub(r"[^a-z0-9 _-]", "", title.lower()).replace(" ", "-")
 
 
 def render_recorders(f: Family, callers: dict[str, list[str]]) -> str:
