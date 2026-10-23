@@ -22,7 +22,7 @@
 //! [`formats::minimax_m3`]: crate::formats::minimax_m3()
 
 use crate::{
-    event::{release_between, runs, Event, Events, MalformedReason, Text},
+    event::{runs, DropReason, Event, Events, MalformedReason, Text},
     tagged::{
         assembler::{push_escaped, push_quoted},
         end_cut_call,
@@ -59,11 +59,11 @@ pub struct Assembler {
     /// Whether the last bytes taken were the table's ignored terminal: the separator the
     /// template writes before every tag, and never inside a value.
     after_separator: bool,
-    /// Whether text where the syntax has tags was released as content since the last tag the
-    /// syntax read (a word between tags, a tag out of its place, a tag reported with its bytes):
-    /// the whitespace carried after it is the model's, between two pieces of its text, and leaves
-    /// with the next piece ([`release_between`]); before any, the whitespace after a tag is the
-    /// template's, dropped before a report or carried into the next event's source.
+    /// Whether text where the syntax has tags was refused since the last tag the syntax read (a
+    /// word between tags, a tag out of its place, a tag refused with its bytes): the whitespace
+    /// carried after it is the model's, between two pieces of its text, and leaves with the next
+    /// piece ([`Self::refuse_between`]); before any, the whitespace after a tag is the template's,
+    /// dropped before a refusal or carried into the next event's source.
     released: bool,
     done: bool,
 }
@@ -169,11 +169,11 @@ impl Assembler {
 
     /// The call's end: `terminal` is the closing marker the engine read (its bytes go into
     /// `ToolCallEnd`), or nothing when the block ended another way. Every open container is
-    /// closed, a leaf never written is reported, the object is closed; inside a streamed string
-    /// nothing is closed, since nothing is made up for a value the model never finished: the
-    /// fragments stand, and one `Malformed` event with what was held, or no bytes, says that the
-    /// arguments are no whole value before the call's end ([`end_cut_call`]); an invoke whose
-    /// name never closed, or that had none, has its bytes reported.
+    /// closed, a leaf never written is refused, the object is closed; inside a streamed string
+    /// the string is closed first ([`Self::close_open_string`]), since the model ended the call
+    /// and its bytes are the value whole, under one `Malformed { OpenAtTheMarker }` event of no
+    /// bytes, and the containers above it close as after any leaf; an invoke whose name never
+    /// closed, or that had none, has its bytes refused.
     pub fn close(mut self, terminal: &str, out: &mut Events) {
         if self.done {
             return;
@@ -184,21 +184,7 @@ impl Assembler {
             self.report(MalformedReason::CallWithoutName, out);
             return;
         }
-        if let Some(Element {
-            shape:
-                Shape::Leaf(Leaf {
-                    mode: Mode::Streaming,
-                    ..
-                }),
-            ..
-        }) = self.open.last()
-        {
-            // Inside a streamed string nothing is closed, neither the string nor the containers
-            // above it; the one word before the end carries the start of a tag held, or no bytes.
-            end_cut_call(self.index, std::mem::take(&mut self.carried), terminal, out);
-            self.done = true;
-            return;
-        }
+        self.close_open_string(MalformedReason::OpenAtTheMarker, out);
         while let Some(element) = self.open.last() {
             match element.shape {
                 Shape::Object => {
@@ -210,7 +196,7 @@ impl Assembler {
                     self.push_fragment("]".to_string(), source, out);
                 }
                 // A value never written, or an element the end cut before its first child: its
-                // bytes are reported, and its member is never written.
+                // bytes are refused, and its member is never written.
                 Shape::Leaf(_) | Shape::Open => {
                     self.value.clear();
                     self.report(MalformedReason::TagCutShort, out);
@@ -231,8 +217,9 @@ impl Assembler {
     /// client. A streamed string's open fragment stays open; a call that started still ends, with
     /// no bytes of its own, as every assembler ends one, after the one `Malformed {
     /// UnterminatedRegion }` event that carries everything held and says that its arguments are
-    /// no whole value ([`end_cut_call`]); what a block that named no call held comes back as
-    /// `Malformed { UnterminatedRegion }` too.
+    /// no whole value ([`end_cut_call`]); what a block that named no call held is refused as
+    /// `UnterminatedRegion` too, as the keyed assembler refuses it, so that the reader's release
+    /// of a refused output that made no call takes the whole slice.
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
@@ -240,21 +227,17 @@ impl Assembler {
         self.hold_tag();
         if self.started() {
             end_cut_call(self.index, std::mem::take(&mut self.carried), "", out);
-        } else if !self.carried.is_empty() {
-            out.push(Event::Malformed {
-                text: Text::uncounted(std::mem::take(&mut self.carried)),
-                why: MalformedReason::UnterminatedRegion,
-            });
+        } else {
+            self.report(MalformedReason::UnterminatedRegion, out);
         }
     }
 
     /// The stream's stop inside the invoke: the model's own end of output, not a cut. The call
     /// ends as its closing tag would end it, with no bytes for the end ([`Self::close`]): every
     /// open container is closed, a leaf never written and an element without a child are
-    /// reported, the object is closed, an invoke whose name never closed has its bytes reported.
-    /// A streamed string still open is closed first: the model wrote nothing after its bytes, so
-    /// they are the value whole, and the start of a tag held is its text too, since no tag
-    /// followed. One `Malformed { OpenAtTheStop }` event of no bytes stands before the fragment
+    /// refused, the object is closed, an invoke whose name never closed has its bytes refused.
+    /// A streamed string still open is closed first ([`Self::close_open_string`]), under the
+    /// stop's word. One `Malformed { OpenAtTheStop }` event of no bytes stands before the fragment
     /// that closes what was open ([`open_at_the_stop`](super::open_at_the_stop)): for a string
     /// the stop closed under any table, and for the call itself where the table has no stop row
     /// (`as_marker`), since there the template writes the marker the model skipped.
@@ -263,7 +246,21 @@ impl Assembler {
             return;
         }
         self.hold_tag();
-        let string_open = matches!(
+        let string_closed = self.close_open_string(MalformedReason::OpenAtTheStop, out);
+        if !string_closed && self.started() && !as_marker {
+            super::open_at_the_stop(out);
+        }
+        self.close("", out);
+    }
+
+    /// A streamed string still open when the call ends, at its closing marker or at the stream's
+    /// stop: the model wrote nothing more of the value after the call's end, so its bytes are the
+    /// value whole, and the start of a tag held is its text too, since no tag followed. The string
+    /// is closed: the one word of no bytes (`why`: the end that closed it,
+    /// [`left_open`](super::left_open)), then the closing quote; the containers above it are the
+    /// ending's to close. Says whether a string was open; nothing happens otherwise.
+    fn close_open_string(&mut self, why: MalformedReason, out: &mut Events) -> bool {
+        if !matches!(
             self.open.last(),
             Some(Element {
                 shape: Shape::Leaf(Leaf {
@@ -272,20 +269,18 @@ impl Assembler {
                 }),
                 ..
             })
-        );
-        if string_open {
-            let held = std::mem::take(&mut self.carried);
-            if !held.is_empty() {
-                self.leaf_text(&held, out);
-            }
-            super::open_at_the_stop(out);
-            self.open.pop();
-            self.value.clear();
-            self.push_fragment("\"".to_string(), Text::default(), out);
-        } else if self.started() && !as_marker {
-            super::open_at_the_stop(out);
+        ) {
+            return false;
         }
-        self.close("", out);
+        let held = std::mem::take(&mut self.carried);
+        if !held.is_empty() {
+            self.leaf_text(&held, out);
+        }
+        super::left_open(why, out);
+        self.open.pop();
+        self.value.clear();
+        self.push_fragment("\"".to_string(), Text::default(), out);
+        true
     }
 
     /// Reads as much of `text` as one step takes and returns the rest.
@@ -321,8 +316,8 @@ impl Assembler {
     }
 
     /// The invoke tag is whole: the call starts with the name's bytes and its quote as the start's
-    /// source; a tail between the quote and `>` is reported; the `>` is carried into the next
-    /// source. An invoke with no name starts no call, and the tag's bytes are reported.
+    /// source; a tail between the quote and `>` is refused; the `>` is carried into the next
+    /// source. An invoke with no name starts no call, and the tag's bytes are refused.
     fn start_call(&mut self, out: &mut Events) {
         let name = std::mem::take(&mut self.value);
         self.stage = Stage::Body;
@@ -343,12 +338,7 @@ impl Assembler {
         });
         self.function = Some(name);
         self.released = false;
-        if !tail_bytes.is_empty() {
-            out.push(Event::Malformed {
-                text: Text::uncounted(tail_bytes),
-                why: MalformedReason::TagTail,
-            });
-        }
+        super::refuse(tail_bytes, MalformedReason::TagTail, out);
         self.carried.push('>');
     }
 
@@ -414,13 +404,7 @@ impl Assembler {
             return;
         }
         if !self.started() {
-            release_between(
-                &mut self.carried,
-                &mut self.released,
-                bytes.into(),
-                MalformedReason::TagOutOfPlace,
-                out,
-            );
+            self.refuse_between(&bytes, MalformedReason::TagOutOfPlace, out);
             return;
         }
         if closing {
@@ -468,7 +452,7 @@ impl Assembler {
     }
 
     /// A closing tag: it closes the innermost element when it names it; inside a leaf, or under
-    /// an element with no child yet, any other closing tag is text; elsewhere it is reported.
+    /// an element with no child yet, any other closing tag is text; elsewhere it is refused.
     fn close_tag(&mut self, name: &str, bytes: &str, declared: &Declared, out: &mut Events) {
         match self.open.last() {
             Some(element) if element.key == name => self.close_element(bytes, declared, out),
@@ -476,13 +460,7 @@ impl Assembler {
                 shape: Shape::Leaf(_) | Shape::Open,
                 ..
             }) => self.text(bytes, declared, out),
-            Some(_) | None => release_between(
-                &mut self.carried,
-                &mut self.released,
-                bytes.to_owned().into(),
-                MalformedReason::TagOutOfPlace,
-                out,
-            ),
+            Some(_) | None => self.refuse_between(bytes, MalformedReason::TagOutOfPlace, out),
         }
     }
 
@@ -553,20 +531,14 @@ impl Assembler {
     }
 
     /// Text where the syntax has tags: whitespace is carried, since whose it is depends on what
-    /// follows, anything else is released with the whitespace before it when text was released
-    /// since the last tag the syntax read, after it dropped otherwise ([`release_between`]).
+    /// follows, anything else is refused with the whitespace before it when text was refused
+    /// since the last tag the syntax read, after it dropped otherwise ([`Self::refuse_between`]).
     fn text_between(&mut self, text: &str, out: &mut Events) {
         for (run, space) in runs(text) {
             if space {
                 self.carried.push_str(run);
             } else {
-                release_between(
-                    &mut self.carried,
-                    &mut self.released,
-                    run.to_owned().into(),
-                    MalformedReason::TextBetweenTags,
-                    out,
-                );
+                self.refuse_between(run, MalformedReason::TextBetweenTags, out);
             }
         }
     }
@@ -716,17 +688,31 @@ impl Assembler {
         self.released = false;
     }
 
-    /// Reports the carried bytes as `Malformed` with `why`, whitespace included: released, so the
-    /// whitespace after them is the model's.
+    /// Refuses the carried bytes with `why`, whitespace included ([`refuse`](super::refuse)): the
+    /// failure counted by a `Malformed` event of no bytes, the bytes dropped as a malformed call's,
+    /// never shown; released, so the whitespace after them is the model's.
     fn report(&mut self, why: MalformedReason, out: &mut Events) {
         if self.carried.is_empty() {
             return;
         }
-        out.push(Event::Malformed {
-            text: Text::uncounted(std::mem::take(&mut self.carried)),
-            why,
-        });
+        super::refuse(std::mem::take(&mut self.carried), why, out);
         self.released = true;
+    }
+
+    /// `text` the syntax has no place for (a word between tags, a tag out of its place), refused
+    /// with `why` ([`Self::report`]) under the whitespace rule of text between tags: the whitespace
+    /// carried before it is the template's after a tag the syntax read, and is dropped on its own
+    /// as the wrapper's, so the refused bytes are the model's text alone; after text refused since
+    /// that tag, the whitespace is the model's and leaves with this text.
+    fn refuse_between(&mut self, text: &str, why: MalformedReason, out: &mut Events) {
+        if !self.released && !self.carried.is_empty() {
+            out.push(Event::Dropped {
+                text: Text::uncounted(std::mem::take(&mut self.carried)),
+                why: DropReason::Wrapper,
+            });
+        }
+        self.carried.push_str(text);
+        self.report(why, out);
     }
 
     /// `}` or `{}`, with `source` as its bytes.
@@ -756,7 +742,7 @@ impl crate::engine::CallAssembler for Assembler {
 
     /// Only the invoke's closing tag is a started call's end; the next invoke's opening and the
     /// block's close end the call too, as the region's. An invoke that named no call takes
-    /// whichever terminal ended it, so that it is reported the same way however it ended.
+    /// whichever terminal ended it, so that it is refused the same way however it ended.
     fn close(self: Box<Self>, terminal: &str, out: &mut Events) -> bool {
         if terminal == INVOKE_CLOSE || !self.started() {
             (*self).close(terminal, out);

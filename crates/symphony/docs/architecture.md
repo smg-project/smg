@@ -87,7 +87,8 @@ reasons.
 **The assemblers.** Each turns one call syntax into call events with the same accounting: every
 byte of the call in exactly one event (the name's in the start, each tag's and value's in the
 fragment it produces, the template's whitespace between tags in the next event's source, anything
-else between tags as `Malformed` run by run so that where the chunks were cut changes nothing).
+else between tags refused run by run, a `Malformed` event of no bytes and the bytes as `Dropped {
+MalformedCall }`, so that where the chunks were cut changes nothing and no slip reads as the answer).
 Two endings: `close` for a call the model ended (its closing marker, the next call's opener or the
 block's close), which closes the object for the client; `finish` for a stream that was cut, which
 closes nothing. A value's type comes from the request's tools (`Declared`) where the syntax writes
@@ -161,9 +162,10 @@ Three tiers, two of them at run time:
   references get wrong. Each run counts them on its diagnostic line.
 
 The adapters show malformed text as content and drop nothing, so a client never loses the bytes a
-parser hands back with the event; the keyed syntax, whose block is never prose, hands them back as
-`Dropped { MalformedCall }` behind an event of no bytes instead, so that the failure is counted and
-the format's own tags never reach the answer (`docs/assemblers.md`). The reason is for the
+parser hands back with the event; the keyed, attributed, Qwen-tagged and XML assemblers hand them
+back as `Dropped { MalformedCall }` behind an event of no bytes instead, so that the failure is
+counted and the format's own tags never reach the answer
+(`docs/assemblers.md`). The reason is for the
 operator. The set is closed and `Copy` so that a reader can count malformed
 regions by table and reason as a bounded label, log a sample with the table, the reason and the
 bytes' length, and mark the request's span; how a gateway surfaces that (metric, log, span event,

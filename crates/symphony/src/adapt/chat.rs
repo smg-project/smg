@@ -9,7 +9,10 @@
 //! Notes on what this module decides, and on what it leaves open: `docs/adapters.md`.
 
 use openai_protocol::{
-    chat::{ChatChoice, ChatCompletionMessage, ChatMessageDelta, ChatStreamChoice},
+    chat::{
+        ChatChoice, ChatCompletionMessage, ChatMessageDelta, ChatMessageDeltaRef, ChatStreamChoice,
+        ChatStreamChoiceRef,
+    },
     common::{FunctionCallDelta, FunctionCallResponse, ToolCall, ToolCallDelta},
 };
 
@@ -69,6 +72,42 @@ pub fn into_delta_without_role(choice: u32, event: Event<'_>) -> Option<ChatStre
         | Event::ReasoningEnd
         | Event::ToolCallEnd { .. }
         | Event::Dropped { .. } => None,
+    }
+}
+
+/// [`into_delta_without_role`] with the choice borrowing the event's text where the event borrows
+/// it (a [`ChatStreamChoiceRef`], the same bytes on the wire): a stream that writes each delta once
+/// makes no copy of its text. A tool call's start, its arguments and the finish are owned either
+/// way and come through [`into_delta_without_role`].
+pub fn into_delta_ref(choice: u32, event: Event<'_>) -> Option<ChatStreamChoiceRef<'_>> {
+    match event {
+        Event::Content(text) | Event::Malformed { text, .. } => {
+            (!text.text.is_empty()).then(|| ChatStreamChoiceRef {
+                index: choice,
+                delta: ChatMessageDeltaRef {
+                    role: None,
+                    content: Some(text.text),
+                    tool_calls: None,
+                    reasoning_content: None,
+                },
+                logprobs: None,
+                finish_reason: None,
+                matched_stop: None,
+            })
+        }
+        Event::Reasoning(text) => (!text.text.is_empty()).then(|| ChatStreamChoiceRef {
+            index: choice,
+            delta: ChatMessageDeltaRef {
+                role: None,
+                content: None,
+                tool_calls: None,
+                reasoning_content: Some(text.text),
+            },
+            logprobs: None,
+            finish_reason: None,
+            matched_stop: None,
+        }),
+        event => into_delta_without_role(choice, event).map(Into::into),
     }
 }
 
@@ -586,6 +625,54 @@ mod tests {
             reason,
             tool_calls,
             reasoning_tokens: 0,
+        }
+    }
+
+    #[test]
+    fn the_borrowed_delta_serializes_as_the_owned_one_and_borrows_the_text() {
+        let events = || {
+            [
+                Event::Content(Text::uncounted("Hello")),
+                Event::Reasoning(Text::uncounted("because")),
+                Event::Content(Text::uncounted("")),
+                Event::ToolCallStart {
+                    index: 0,
+                    id: "call_1".to_string(),
+                    name: "lookup".to_string(),
+                    source: Text::uncounted(""),
+                },
+                Event::ToolCallArguments {
+                    index: 0,
+                    json: "{\"q\":1}".to_string(),
+                    source: Text::uncounted(""),
+                },
+                Event::ToolCallEnd {
+                    index: 0,
+                    source: Text::uncounted(""),
+                },
+                finish(FinishReason::Stop, 1),
+            ]
+        };
+        for (owned, borrowed) in events().into_iter().zip(events()) {
+            let owned = into_delta_without_role(2, owned);
+            let borrowed = into_delta_ref(2, borrowed);
+            assert_eq!(owned.is_some(), borrowed.is_some());
+            let (Some(owned), Some(borrowed)) = (owned, borrowed) else {
+                continue;
+            };
+            assert_eq!(
+                serde_json::to_string(&borrowed).unwrap(),
+                serde_json::to_string(&owned).unwrap()
+            );
+            for text in [&borrowed.delta.content, &borrowed.delta.reasoning_content]
+                .into_iter()
+                .flatten()
+            {
+                assert!(
+                    matches!(text, std::borrow::Cow::Borrowed(_)),
+                    "{text:?} was copied"
+                );
+            }
         }
     }
 

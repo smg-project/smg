@@ -976,6 +976,8 @@ mod tests {
                         "smg_kv_event_parentless_blocks_total",
                         vec![("worker", url)],
                     ),
+                    ("smg_kv_event_sub_block_stores_total", vec![("worker", url)]),
+                    ("smg_kv_event_sub_block_blocks_total", vec![("worker", url)]),
                     ("smg_kv_event_degraded_ranks", vec![("worker", url)]),
                     (
                         "smg_kv_index_moved_hashes",

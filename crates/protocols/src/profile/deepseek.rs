@@ -1,6 +1,6 @@
 //! Bounded DeepSeek V4 / V4.1 Chat dialect, calibrated by
 //! smg-project/deepseek-provider-verifier against deepseek-flash and deepseek-v4-pro.
-//! See https://api-docs.deepseek.com/api/create-chat-completion/.
+//! See <https://api-docs.deepseek.com/api/create-chat-completion/>.
 //!
 //! Older V3/R1 models and opaque aliases retain the baseline. This profile
 //! does not claim the vendor's context window, sampling behavior or JSON

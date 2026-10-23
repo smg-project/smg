@@ -1,7 +1,7 @@
 {
  "transformers": "5.18.0",
  "transformers_tag": "v5.18.0",
- "regex": "2026.9.10",
+ "regex": "2026.9.29",
  "python": "3.12",
  "unicodedata": "15.0.0",
  "inputs": {
@@ -11,7 +11,7 @@
   "src/transformers/utils/chat_parsing/content_parsers.py": "txykwyvwvyssgxvy",
   "tests/utils/test_chat_parsing.py": "hmqypkhjnjkrkkjy"
  },
- "generator": "wrkrxrzzsytphygw",
+ "generator": "zmhnwvrprtsshgqy",
  "hf_test_run": {
   "tests_run": 69,
   "tests_excluded": [

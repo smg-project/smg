@@ -19,7 +19,7 @@ pub const STREAM_CHUNK_OVERHEAD_MARGIN: usize = 64 * 1024;
 
 /// Maximum payload bytes per stream chunk after reserving envelope
 /// headroom. Senders MUST split values larger than this into multiple
-/// chunks via [`crate::chunking::chunk_value`].
+/// chunks via `chunk_value` in the transport's chunking module.
 pub const MAX_STREAM_CHUNK_BYTES: usize = MAX_MESSAGE_SIZE - STREAM_CHUNK_OVERHEAD_MARGIN;
 
 /// Default cap on how many chunk entries a single `StreamBatch`

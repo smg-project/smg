@@ -1147,14 +1147,159 @@ pub struct ChatStreamChoice {
     pub matched_stop: Option<Value>,
 }
 
+/// [`ChatMessageDelta`] over text it may borrow: the same fields, attributes
+/// and bytes on the wire, for a stream that writes each delta once and need
+/// not copy its text out of the buffer the delta was read into.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatMessageDeltaRef<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<Cow<'a, str>>,
+}
+
+/// [`ChatStreamChoice`] with a [`ChatMessageDeltaRef`]: the same bytes on the
+/// wire as the owned choice.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatStreamChoiceRef<'a> {
+    pub index: u32,
+    pub delta: ChatMessageDeltaRef<'a>,
+    pub logprobs: Option<ChatLogProbs>,
+    pub finish_reason: Option<Cow<'a, str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_stop: Option<Value>,
+}
+
+impl<'a> From<ChatStreamChoice> for ChatStreamChoiceRef<'a> {
+    /// The owned choice's text as its own (an owned [`Cow`] each). The owned
+    /// types are taken apart field by field with no rest pattern, so a field
+    /// added to either of them is a compile error here until the borrowed
+    /// type carries it too.
+    fn from(choice: ChatStreamChoice) -> Self {
+        let ChatStreamChoice {
+            index,
+            delta,
+            logprobs,
+            finish_reason,
+            matched_stop,
+        } = choice;
+        let ChatMessageDelta {
+            role,
+            content,
+            tool_calls,
+            reasoning_content,
+        } = delta;
+        ChatStreamChoiceRef {
+            index,
+            delta: ChatMessageDeltaRef {
+                role: role.map(Cow::Owned),
+                content: content.map(Cow::Owned),
+                tool_calls,
+                reasoning_content: reasoning_content.map(Cow::Owned),
+            },
+            logprobs,
+            finish_reason: finish_reason.map(Cow::Owned),
+            matched_stop,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        thinking_from_reasoning_effort, ChatCompletionRequest, GenerationRequest, ThinkingParam,
-        ThinkingType,
+        thinking_from_reasoning_effort, ChatCompletionRequest, ChatMessageDelta,
+        ChatMessageDeltaRef, ChatStreamChoice, ChatStreamChoiceRef, GenerationRequest,
+        ThinkingParam, ThinkingType,
     };
+    use crate::common::{FunctionCallDelta, ToolCallDelta};
+
+    /// The borrowed stream choice serializes to the bytes of the owned one, shape for shape:
+    /// text deltas, a reasoning delta, a tool call's start and arguments, the finishing choice,
+    /// a role, a matched stop.
+    #[test]
+    fn borrowed_stream_choice_serializes_as_the_owned_one() {
+        let delta = |role: Option<&str>,
+                     content: Option<&str>,
+                     reasoning: Option<&str>,
+                     tool_calls: Option<Vec<ToolCallDelta>>| ChatMessageDelta {
+            role: role.map(str::to_string),
+            content: content.map(str::to_string),
+            tool_calls,
+            reasoning_content: reasoning.map(str::to_string),
+        };
+        let call = |id: Option<&str>, name: Option<&str>, arguments: Option<&str>| {
+            vec![ToolCallDelta {
+                index: 1,
+                id: id.map(str::to_string),
+                tool_type: id.map(|_| "function".to_string()),
+                function: Some(FunctionCallDelta {
+                    name: name.map(str::to_string),
+                    arguments: arguments.map(str::to_string),
+                }),
+            }]
+        };
+        let shapes = [
+            (
+                delta(None, Some("Hello, \"world\" \u{1f600}"), None, None),
+                None,
+                None,
+            ),
+            (delta(None, None, Some("let me think"), None), None, None),
+            (
+                delta(
+                    None,
+                    None,
+                    None,
+                    Some(call(Some("call_1"), Some("lookup"), None)),
+                ),
+                None,
+                None,
+            ),
+            (
+                delta(None, None, None, Some(call(None, None, Some("{\"q\":")))),
+                None,
+                None,
+            ),
+            (delta(None, None, None, None), Some("tool_calls"), None),
+            (delta(Some("assistant"), Some(""), None, None), None, None),
+            (
+                delta(None, Some("done"), None, None),
+                Some("stop"),
+                Some(json!("</s>")),
+            ),
+        ];
+        for (delta, finish_reason, matched_stop) in shapes {
+            let owned = ChatStreamChoice {
+                index: 3,
+                delta,
+                logprobs: None,
+                finish_reason: finish_reason.map(str::to_string),
+                matched_stop,
+            };
+            let expected = serde_json::to_string(&owned).unwrap();
+            let borrowed = ChatStreamChoiceRef {
+                index: owned.index,
+                delta: ChatMessageDeltaRef {
+                    role: owned.delta.role.as_deref().map(Into::into),
+                    content: owned.delta.content.as_deref().map(Into::into),
+                    tool_calls: owned.delta.tool_calls.clone(),
+                    reasoning_content: owned.delta.reasoning_content.as_deref().map(Into::into),
+                },
+                logprobs: None,
+                finish_reason: owned.finish_reason.as_deref().map(Into::into),
+                matched_stop: owned.matched_stop.clone(),
+            };
+            assert_eq!(serde_json::to_string(&borrowed).unwrap(), expected);
+            let from_owned: ChatStreamChoiceRef<'static> = owned.into();
+            assert_eq!(serde_json::to_string(&from_owned).unwrap(), expected);
+        }
+    }
 
     /// `parallel_tool_calls: false` asks for one call; `true` and absent do not.
     #[test]

@@ -6,7 +6,7 @@
 //! per pair of markers as the template writes it and several in one as a model may write a
 //! parallel answer. Qwen 3.5 puts the
 //! value on a line of its own and MiMo writes it between the tags directly, which the syntax's
-//! [`Placement`](crate::tagged::Placement) says.
+//! [`Placement`] says.
 //!
 //! The table carries the one part of its chat template's layout the tags write: after the
 //! thought's close the Qwen3 and Qwen 3.5 templates write two newlines before the content or the
@@ -1080,11 +1080,11 @@ mod tests {
     }
 
     /// A parameter written in XML-attribute style, `<parameter name="city">`, which the tagged
-    /// syntax has no tag for: the call is delivered with no arguments, and the chat message's
-    /// content is the model's lines, byte for byte, the whitespace between the words included,
-    /// whole, at every cut and in the stream's deltas alike.
+    /// syntax has no tag for: the call is delivered with no arguments, and the model's lines are
+    /// refused, byte for byte, the whitespace between the words included, never the chat
+    /// message's content nor a delta, at every cut alike.
     #[test]
-    fn an_xml_attribute_parameter_reaches_the_client_as_the_model_wrote_it() {
+    fn an_xml_attribute_parameter_is_refused_never_content() {
         let output = concat!(
             "<tool_call>\n<function=get_weather>\n<parameter name=\"city\">Paris</parameter>\n",
             "<parameter name=\"days\">three or four days</parameter>\n</function>\n</tool_call>"
@@ -1100,18 +1100,32 @@ mod tests {
                 .filter_map(|choice| choice.delta.content)
                 .collect()
         };
+        let refused = |events: &[Event]| -> String {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Dropped {
+                        text,
+                        why: DropReason::MalformedCall,
+                    } => Some(&*text.text),
+                    _ => None,
+                })
+                .collect()
+        };
         let whole = run_tagged(&[output], EngineFinish::Stop);
         let message = chat::message(0, &whole).message;
-        assert_eq!(message.content.as_deref(), Some(lines));
+        assert_eq!(message.content, None);
         let calls = message.tool_calls.expect("a call");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].function.name, "get_weather");
         assert_eq!(calls[0].function.arguments.as_deref(), Some("{}"));
-        assert_eq!(streamed(&whole), lines);
+        assert_eq!(streamed(&whole), "");
+        assert_eq!(refused(&whole), lines);
         for cut in (1..output.len()).filter(|&cut| output.is_char_boundary(cut)) {
             let events = run_tagged(&[&output[..cut], &output[cut..]], EngineFinish::Stop);
-            assert_eq!(content(&events).as_deref(), Some(lines), "cut at {cut}");
-            assert_eq!(streamed(&events), lines, "cut at {cut}");
+            assert_eq!(content(&events), None, "cut at {cut}");
+            assert_eq!(streamed(&events), "", "cut at {cut}");
+            assert_eq!(refused(&events), lines, "cut at {cut}");
         }
     }
 
@@ -1309,22 +1323,27 @@ mod tests {
     }
 
     #[test]
-    fn a_tagged_block_its_marker_closes_inside_a_string_leaves_it_open_and_so_does_a_cut_stream() {
-        // The block's closing marker arrives before `</function>`, inside a string: nothing is
-        // closed for a value the model never finished, and one `Malformed` event of no bytes,
-        // under the engine's name for a block a marker closed, says so before the call's end.
+    fn a_tagged_block_its_marker_closes_inside_a_string_closes_it_there_and_a_cut_stream_does_not()
+    {
+        // The block's closing marker arrives before `</function>`, inside a string: the model
+        // ended the call, so the string is closed with the value's bytes whole, under one
+        // `Malformed { OpenAtTheMarker }` event of no bytes right before the closing quote, and
+        // the arguments read as JSON.
         let output = "<tool_call>\n<function=get_weather>\n<parameter=city>\nPar</tool_call>";
         let events = run_tagged(&[output], EngineFinish::Stop);
-        assert_eq!(arguments_of(&events, 0), r#"{"city": "Par"#);
+        assert_eq!(arguments_of(&events, 0), r#"{"city": "Par"}"#);
         assert_eq!(bytes(&events), output);
-        let ended = events
+        let at = events
             .iter()
-            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
-            .expect("the call ends");
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the one word");
         assert!(
             matches!(
-                &events[ended - 1],
-                Event::Malformed { text, .. } if text.text.is_empty()
+                &events[at..at + 2],
+                [
+                    Event::Malformed { text, why: MalformedReason::OpenAtTheMarker },
+                    Event::ToolCallArguments { json, .. }
+                ] if text.text.is_empty() && json == "\""
             ),
             "{events:#?}"
         );

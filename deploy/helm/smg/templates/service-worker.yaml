@@ -1,6 +1,7 @@
 {{- range $i, $worker := .Values.workers }}
 {{- $defaults := index $.Values.engineDefaults $worker.engine }}
 {{- $port := $worker.port | default $defaults.port }}
+{{- $metricsPort := include "smg.workerMetricsPort" (dict "worker" $worker) }}
 ---
 apiVersion: v1
 kind: Service
@@ -17,6 +18,12 @@ spec:
       targetPort: serve
       protocol: TCP
       name: serve
+    {{- if $metricsPort }}
+    - port: {{ $metricsPort }}
+      targetPort: metrics
+      protocol: TCP
+      name: metrics
+    {{- end }}
   selector:
     {{- include "smg.selectorLabels" $ | nindent 4 }}
     app.kubernetes.io/component: worker

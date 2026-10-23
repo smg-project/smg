@@ -66,7 +66,7 @@ pub struct RoutingState {
     pub processed: usize,
     /// Absolute overload veto, set by the load monitor at ingestion time.
     pub overloaded: bool,
-    /// Liveness veto: unreachable or wedged (see [`super::liveness`]).
+    /// Liveness veto: unreachable or wedged (see the `liveness` module).
     pub stalled: bool,
 }
 

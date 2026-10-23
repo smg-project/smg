@@ -305,6 +305,8 @@ mod tests {
         content: String,
         reasoning: String,
         malformed: Vec<(String, MalformedReason)>,
+        /// The bytes refused as a malformed call's, joined.
+        refused: String,
         finish: Option<(FinishReason, u32)>,
     }
 
@@ -315,6 +317,7 @@ mod tests {
         let events = drive(&mut parser, "", pieces);
         let mut calls: Vec<(u32, String, String, String)> = Vec::new();
         let mut malformed: Vec<(String, MalformedReason)> = Vec::new();
+        let mut refused = String::new();
         let mut finish = None;
         for event in &events {
             match event {
@@ -330,6 +333,10 @@ mod tests {
                     Some((joined, last)) if last == why => joined.push_str(&text.text),
                     _ => malformed.push((text.text.to_string(), *why)),
                 },
+                Event::Dropped {
+                    text,
+                    why: DropReason::MalformedCall,
+                } => refused.push_str(&text.text),
                 Event::Finish {
                     reason, tool_calls, ..
                 } => finish = Some((reason.clone(), *tool_calls)),
@@ -341,6 +348,7 @@ mod tests {
             content: content(&events),
             reasoning: reasoning(&events),
             malformed,
+            refused,
             finish,
         }
     }
@@ -420,6 +428,7 @@ mod tests {
                     content: String::new(),
                     reasoning: String::new(),
                     malformed: vec![],
+                    refused: String::new(),
                     finish: Some((FinishReason::Stop, 3)),
                 },
             ),
@@ -441,6 +450,7 @@ mod tests {
                     content: "Sure.\n".to_string(),
                     reasoning: "plan".to_string(),
                     malformed: vec![],
+                    refused: String::new(),
                     finish: Some((FinishReason::Stop, 2)),
                 },
             ),
@@ -453,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn text_between_a_regions_blocks_is_reported_and_the_calls_around_it_are_read() {
+    fn text_between_a_regions_blocks_is_refused_and_the_calls_around_it_are_read() {
         const BETWEEN: &str = concat!(
             "<seed:tool_call>\n<function=european_history_get_monarchs>\n",
             "<parameter=country>France</parameter>\n</function>\nthen\n",
@@ -475,7 +485,8 @@ mod tests {
             ],
             content: String::new(),
             reasoning: String::new(),
-            malformed: vec![("then".to_string(), MalformedReason::TextBetweenCalls)],
+            malformed: vec![(String::new(), MalformedReason::TextBetweenCalls)],
+            refused: "then".to_string(),
             finish: Some((FinishReason::Stop, 2)),
         };
         for pieces in cuts(BETWEEN) {

@@ -1,6 +1,6 @@
 //! The pattern syntax of the `regex` module as transformers compiles it
 //! (`regex.compile(pattern, regex.DOTALL)`, version 0 behaviour), ported from
-//! the parser in `_regex_core.py` (`regex` 2026.9.10). Every construct is read
+//! the parser in `_regex_core.py` (`regex` 2026.9.29). Every construct is read
 //! into a [`Node`] tree, also those this crate's matcher does not run; the
 //! matcher refuses those when it compiles a tree ([`Pattern::new`]).
 //!

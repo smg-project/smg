@@ -1,5 +1,3 @@
-mod common;
-
 use std::{
     pin::Pin,
     sync::{
@@ -27,6 +25,7 @@ use smg::{
     workflow::Job,
 };
 use smg_grpc_client::{common_proto, tokenspeed_proto as ts};
+use smg_test_harness as common;
 use tokio::sync::oneshot;
 use tonic::{metadata::MetadataMap, transport::Server, Request as TonicRequest, Response, Status};
 use tower::ServiceExt;

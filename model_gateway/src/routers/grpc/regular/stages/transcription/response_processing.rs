@@ -10,7 +10,7 @@ use tracing::error;
 use crate::routers::{
     error,
     grpc::{
-        common::stages::ProcessStage,
+        common::{response_formatting::TokenCounts, stages::ProcessStage},
         context::{DispatchContext, FinalResponse},
         regular::processor,
         spec::ResponseSpec,
@@ -106,6 +106,9 @@ impl ProcessStage for TranscriptionResponseProcessingStage {
             })?;
 
         let text = spec.family.parse_transcript(raw);
+        // The transcript, and the engine's counters for the settlement: the
+        // answer itself carries no usage.
+        ctx.response.engine_counts = Some(TokenCounts::of_generated(&responses));
         ctx.response.final_response = Some(FinalResponse::Transcription {
             text,
             format: spec.format,

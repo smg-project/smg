@@ -7,7 +7,7 @@ use std::{fmt, sync::Arc};
 
 // The stream is named only by the doc links of this module.
 #[cfg(doc)]
-use super::worker::GuardedStream;
+use super::stream::GuardedStream;
 use super::worker::Worker;
 use crate::{observability::metrics::Metrics, routers::common::header_utils::extract_routing_key};
 

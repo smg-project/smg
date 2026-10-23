@@ -328,7 +328,9 @@ fn kv_load(token_usage: f64) -> WorkerLoadResponse {
 }
 
 /// Single-DP snapshot used to make live request count and LeastLoad's
-/// expected-wait score disagree deterministically.
+/// expected-wait score disagree deterministically. A request is running, so
+/// the rate gauge counts as live (and the scorer prices that request at the
+/// mean prefill, the same for every worker).
 fn expected_wait_load(
     queued_tokens: i32,
     token_usage: f64,
@@ -336,6 +338,7 @@ fn expected_wait_load(
 ) -> WorkerLoadResponse {
     WorkerLoadResponse {
         loads: vec![SchedulerLoadSnapshot {
+            num_running_reqs: 1,
             num_waiting_uncached_tokens: queued_tokens,
             token_usage,
             gen_throughput,
@@ -622,28 +625,28 @@ fn cache_aware_load_update_resets_atomic_inflight_credit() {
 
 #[test]
 fn a_miss_avoids_the_worker_whose_report_hides_the_requests_the_router_holds() {
-    // `w2` holds five requests the router dispatched while its fresh
+    // `w2` holds six requests the router dispatched while its fresh
     // report shows an idle engine: dispatches still in transit, the
     // backlog that herded a fleet onto its emptiest-looking workers. `w1`
-    // reports one queued request of 10 tokens. Read from the reports
-    // alone, `w2` is the emptier worker and takes the miss; charged five
-    // mean prefills (51.2 s at 100 tokens/s) for the requests its report
-    // hides, it loses every miss to `w1` until `w1`'s own credit has
-    // grown to as much.
+    // reports one running request and one queued request of 10 tokens.
+    // Read from the reports alone, `w2` is the emptier worker and takes
+    // the miss; charged six mean prefills (61.44 s at 100 tokens/s, `w1`'s
+    // live rate standing in for its idle gauge) for the requests its
+    // report hides, it loses every miss to `w1` until `w1`'s own credit
+    // has grown to as much.
     let policy = CacheAwarePolicy::with_config(test_config());
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     policy.init_workers(&workers);
-    for _ in 0..5 {
+    for _ in 0..6 {
         workers[1].increment_load();
     }
     let mut one_queued = expected_wait_load(10, 0.1, 100.0);
     one_queued.loads[0].num_waiting_reqs = 1;
+    let mut idle = expected_wait_load(0, 0.1, 100.0);
+    idle.loads[0].num_running_reqs = 0;
     TestFeed::attached_to(&policy).publish(&HashMap::from([
         (workers[0].url().to_string(), one_queued),
-        (
-            workers[1].url().to_string(),
-            expected_wait_load(0, 0.1, 100.0),
-        ),
+        (workers[1].url().to_string(), idle),
     ]));
     for text in ["alpha", "bravo", "charlie", "delta", "echo"] {
         assert_eq!(
@@ -661,8 +664,10 @@ fn a_miss_avoids_the_worker_whose_report_hides_the_requests_the_router_holds() {
 fn a_request_the_report_already_counts_is_not_priced_again() {
     // `w1` holds three requests and its report counts them as running:
     // three mean prefills at 100 tokens/s = 30.72 s, nothing more. `w2`
-    // holds nothing and reports 3,100 queued tokens = 31 s. Charged a
-    // second time for the three, `w1` would read as 61.44 s and lose.
+    // holds nothing, reports nothing running and 3,100 queued tokens =
+    // 31 s at `w1`'s live rate (its own idle gauge does not count).
+    // Charged a second time for the three, `w1` would read as 61.44 s
+    // and lose.
     let policy = CacheAwarePolicy::with_config(test_config());
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     policy.init_workers(&workers);
@@ -671,18 +676,19 @@ fn a_request_the_report_already_counts_is_not_priced_again() {
     }
     let mut running = expected_wait_load(0, 0.1, 100.0);
     running.loads[0].num_running_reqs = 3;
+    let mut queued = expected_wait_load(3_100, 0.1, 100.0);
+    queued.loads[0].num_running_reqs = 0;
     TestFeed::attached_to(&policy).publish(&HashMap::from([
         (workers[0].url().to_string(), running),
-        (
-            workers[1].url().to_string(),
-            expected_wait_load(3_100, 0.1, 100.0),
-        ),
+        (workers[1].url().to_string(), queued),
     ]));
     assert_eq!(route_text(&policy, &workers, "alpha"), Some(0));
 
     // The same three requests dispatched after `w1`'s report: the
     // since-poll credit carries them (3 × 1024 tokens = 30.72 s), and
-    // nothing is charged on top of the credit either.
+    // nothing is charged on top of the credit either. Both reports carry
+    // the fixture's one running request (10.24 s each), so it cancels:
+    // 40.96 s against `w2`'s 41.24 s.
     let policy = CacheAwarePolicy::with_config(test_config());
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     policy.init_workers(&workers);
@@ -3695,6 +3701,153 @@ fn test_empty_indexer_falls_through_to_token_tree() {
 }
 
 // ---- hash placement index (cache_index = hash) ----
+
+/// Two busy, empty-queued workers whose live rates differ so much that
+/// expected wait alone would send every miss to w1.
+fn skewed_rate_loads(workers: &[Arc<dyn Worker>]) -> HashMap<String, WorkerLoadResponse> {
+    HashMap::from([
+        (
+            workers[0].url().to_string(),
+            expected_wait_load(0, 0.1, 10_000.0),
+        ),
+        (
+            workers[1].url().to_string(),
+            expected_wait_load(0, 0.1, 100.0),
+        ),
+    ])
+}
+
+/// Gate at the mean (no margins), so an above-mean worker sits out.
+fn gate_at_mean(config: CacheAwareConfig) -> CacheAwareConfig {
+    CacheAwareConfig {
+        balance_abs_threshold: 0,
+        balance_rel_threshold: 1.0,
+        ..config
+    }
+}
+
+/// A request at or below `cache_threshold` has no holder to spill from,
+/// and expected wait alone keeps no count bound: its queue and rate
+/// signals are a poll old, so a burst of misses followed one worker
+/// while the other had free slots. Misses route among the workers under
+/// the same count-pressure gate a hit spills at.
+#[test]
+fn miss_burst_is_bounded_by_the_count_pressure_gate() {
+    let policy = CacheAwarePolicy::with_config(gate_at_mean(test_config()));
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    TestFeed::attached_to(&policy).publish(&skewed_rate_loads(&workers));
+
+    let mut picks = [0usize; 2];
+    for i in 0..8 {
+        let text = format!("{i} novel prompt with nothing in common");
+        let idx = route_text(&policy, &workers, &text).unwrap();
+        // The router counts the dispatch in flight; the gate reads it.
+        workers[idx].increment_load();
+        picks[idx] += 1;
+    }
+    assert_eq!(picks, [4, 4]);
+}
+
+#[test]
+fn event_miss_burst_is_bounded_by_the_count_pressure_gate() {
+    let policy = CacheAwarePolicy::with_config(gate_at_mean(test_config()));
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    TestFeed::attached_to(&policy).publish(&skewed_rate_loads(&workers));
+    let monitor = Arc::new(KvEventMonitor::new());
+    monitor.indexers.insert(
+        "unknown".to_string(),
+        setup_indexer_with_blocks("http://w1:8000", &[&[1, 2, 3, 4]]),
+    );
+    policy.set_kv_event_monitor(Some(monitor));
+
+    let mut picks = [0usize; 2];
+    for i in 0..8u32 {
+        let novel = [100 + i, 200, 300, 400];
+        let idx = policy
+            .select_worker(
+                &workers,
+                &SelectWorkerInfo {
+                    tokens: Some(&novel),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        workers[idx].increment_load();
+        picks[idx] += 1;
+    }
+    assert_eq!(picks, [4, 4]);
+}
+
+#[test]
+fn hash_miss_burst_is_bounded_by_the_count_pressure_gate() {
+    let policy = CacheAwarePolicy::with_config(gate_at_mean(hash_config(&[4])));
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    TestFeed::attached_to(&policy).publish(&skewed_rate_loads(&workers));
+
+    let mut picks = [0usize; 2];
+    for i in 0..8u32 {
+        let head = [i, i, i, i, 9];
+        let idx = route_tokens(&policy, &workers, &head);
+        workers[idx].increment_load();
+        picks[idx] += 1;
+    }
+    assert_eq!(picks, [4, 4]);
+}
+
+/// Hash mode keys on token ids, so every HTTP-router request is a miss
+/// there; the same bound applies.
+#[test]
+fn hash_untokenized_burst_is_bounded_by_the_count_pressure_gate() {
+    let policy = CacheAwarePolicy::with_config(gate_at_mean(hash_config(&[4])));
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    TestFeed::attached_to(&policy).publish(&skewed_rate_loads(&workers));
+
+    let mut picks = [0usize; 2];
+    for i in 0..8 {
+        let text = format!("{i} novel prompt with nothing in common");
+        let idx = route_text(&policy, &workers, &text).unwrap();
+        workers[idx].increment_load();
+        picks[idx] += 1;
+    }
+    assert_eq!(picks, [4, 4]);
+}
+
+/// Two idle SGLang workers, one reporting the ~0.36 tok/s residual of
+/// its last one-token health generation, the other nothing. Scored
+/// against the residual, one dispatch read as ~2800 s of wait and the
+/// whole burst piled onto the other worker. An idle rank has no live
+/// rate, so both score at the default throughput and the misses
+/// water-fill without the gate's help.
+#[test]
+fn idle_rate_residual_does_not_herd_misses() {
+    let policy = CacheAwarePolicy::with_config(test_config());
+    let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
+    policy.init_workers(&workers);
+    let idle = |gen_throughput| WorkerLoadResponse {
+        loads: vec![SchedulerLoadSnapshot {
+            num_running_reqs: 0,
+            gen_throughput,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    TestFeed::attached_to(&policy).publish(&HashMap::from([
+        (workers[0].url().to_string(), idle(0.36)),
+        (workers[1].url().to_string(), idle(0.0)),
+    ]));
+
+    let mut picks = [0usize; 2];
+    for i in 0..8 {
+        let text = format!("{i} novel prompt with nothing in common");
+        let idx = route_text(&policy, &workers, &text).unwrap();
+        picks[idx] += 1;
+    }
+    assert_eq!(picks, [4, 4]);
+}
 
 fn hash_config(boundaries: &[usize]) -> CacheAwareConfig {
     CacheAwareConfig {

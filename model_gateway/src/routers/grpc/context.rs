@@ -936,13 +936,14 @@ pub(crate) struct ResponseState {
     /// Final processed response
     pub final_response: Option<FinalResponse>,
 
-    /// The engine's counters of a non-streamed chat or messages answer, as
-    /// the response stage recorded them for the settlement: the
-    /// client-facing usage drops the rendered prompt tokens the provider
-    /// does not bill and may carry the gateway parser's reasoning split
-    /// instead of the engine's count, and the Messages shape reports no
-    /// cache hits at all. `None` for the shapes whose response carries the
-    /// engine's counters unchanged (completion, generate, decisions).
+    /// The engine's counters of a non-streamed chat, messages or
+    /// transcription answer, as the response stage recorded them for the
+    /// settlement: the client-facing usage drops the rendered prompt tokens
+    /// the provider does not bill and may carry the gateway parser's
+    /// reasoning split instead of the engine's count, the Messages shape
+    /// reports no cache hits at all, and a transcript carries no usage.
+    /// `None` for the shapes whose response carries the engine's counters
+    /// unchanged (completion, generate, decisions, embeddings, classify).
     pub engine_counts: Option<TokenCounts>,
 
     /// Responses API iteration result (Harmony only, for tool loop orchestration)
