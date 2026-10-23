@@ -2720,10 +2720,10 @@ impl ChatTemplateState {
     /// `RendererCapabilities::raw_tool_call_arguments`. The API carries the
     /// arguments as a JSON string and the gateway parses them into the object
     /// the Transformers docs say a template reads; a template that writes
-    /// them by string concatenation (`'<sep>' + tool['function']['arguments']
-    /// + '<end>'`) cannot render that object, so the string must reach it as
+    /// them by string concatenation of `'<sep>'`, `tool['function']['arguments']`
+    /// and `'<end>'` cannot render that object, so the string must reach it as
     /// written. Resolved when the template is bound (see
-    /// [`Self::writes_tool_call_arguments_as_text`]).
+    /// `Self::writes_tool_call_arguments_as_text`).
     pub fn raw_tool_call_arguments(&self) -> bool {
         // In a named pair the `tool_use` template is the one with the
         // tool-call branch, and every request that renders a tool call goes

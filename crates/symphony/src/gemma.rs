@@ -37,8 +37,8 @@
 //! its colon is the cut call's: the key held for the value comes back with the end's reason,
 //! nothing is made up for the value that never came, and the object closes whole without the
 //! member; at the stream's end the key opens the member instead, nothing closes, and the call's
-//! bytes stay the call's ([`Assembler::finish`]). Nesting
-//! past the prefix parser's bound ([`DEEPEST`]) in what is written is reported from the bracket
+//! bytes stay the call's (`Assembler::finish`). Nesting
+//! past the prefix parser's bound (`DEEPEST`) in what is written is reported from the bracket
 //! that passes it, with the key held for it, so that the fragments stay a prefix that parser
 //! takes, as the JSON syntax keeps them, and the object closes whole without the member.
 //!
