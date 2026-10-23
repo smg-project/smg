@@ -5,9 +5,9 @@ import json
 import os
 import subprocess
 import sys
-from types import SimpleNamespace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
