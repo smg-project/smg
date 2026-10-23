@@ -243,9 +243,22 @@ The gateway drains in-flight requests for `router.shutdownGracePeriodSeconds` (d
 
 Readiness itself is a kubelet signal: with kube-state-metrics in the cluster, `kube_pod_status_ready` on the router pods complements `SmgGatewayDown`.
 
+#### Readiness Deadlines
+
+`/readiness` follows the engine, not the router process. A worker from `router.workerUrls` or `router.serviceDiscovery` is registered only once its engine reports healthy: the gateway polls it every `--worker-startup-check-interval` (30 s) for at most `--worker-startup-timeout-secs` (1800 s), and a worker whose engine is not healthy by then is not registered (a discovered worker is tried again on a later discovery pass, one named in `router.workerUrls` is not). The router therefore answers `/readiness` 503 for the whole of the engine's bring-up (weights, initialisation, warm-up: tens of minutes for a large checkpoint streamed from object storage, 37 minutes measured for a two-node tensor-parallel gang), while `/health` and `/liveness` answer 200 from the first second, and it becomes Ready within a poll of the engine.
+
+Every deadline on the router's readiness has to cover that bring-up:
+
+- The Deployment's `progressDeadlineSeconds`: the chart sets 1800, the gateway's start-up bound, instead of the Kubernetes default of 600. Kubernetes takes no action on it, but `kubectl rollout status`, Argo CD and Flux report the rollout as failed once it passes.
+- `helm install --wait` and `helm upgrade --wait` time out after 5 minutes by default: pass `--timeout` with the engine's budget (with `--atomic`, the upgrade would otherwise be rolled back, or the install removed, while the engine loads).
+- A serving controller that runs the router as a component of a model service, with an instance-ready or readiness deadline of its own: give the router component the engine component's budget. A controller whose router deadline was 30 minutes declared the router failed at the deadline, relocated it with an anti-affinity to its node that could not be scheduled, and left the service without an endpoint although the router became healthy seven minutes later; with the engine's four-hour budget on the router, the same service came up and served.
+- `--worker-startup-timeout-secs` itself (`router.extraArgs`) for an engine that needs more than 30 minutes, and the rollout deadline with it.
+
+The budget is not a startup probe on the router's `/readiness`: a startup probe that fails for its whole budget restarts the container, and the router process is not what is slow.
+
 #### Startup Probes
 
-Model loading takes 60-300 seconds. Workers have startup probes with generous defaults:
+Model loading takes from a minute to tens of minutes, depending on the checkpoint and where it is streamed from. Workers have startup probes with these defaults (`initialDelaySeconds` plus `failureThreshold` times `periodSeconds`: 360 s of budget):
 
 - HTTP mode: `httpGet /health` with `initialDelaySeconds: 60`, `failureThreshold: 30`
 - gRPC mode: `tcpSocket` probe (not all engines implement gRPC health checking yet)
@@ -259,6 +272,8 @@ workers:
       initialDelaySeconds: 180
       failureThreshold: 60
 ```
+
+Size the budget past the longest load you expect: a startup probe that fails for its whole budget restarts the worker, and the load starts over.
 
 ## Examples
 

@@ -16,6 +16,14 @@ spec:
   {{- if .Values.router.mesh.enabled }}
   serviceName: {{ include "smg.fullname" . }}-router-headless
   podManagementPolicy: Parallel
+  {{- else }}
+  {{- /* /readiness follows the engine: it answers 503 until a worker's engine
+       reports healthy, tens of minutes for a large checkpoint. The rollout's
+       progress deadline covers the gateway's own start-up bound
+       (--worker-startup-timeout-secs, 1800 s by default) instead of the
+       Kubernetes default of 600 s, so a router waiting for its engine is not
+       reported as a failed rollout (README, Readiness Deadlines). */}}
+  progressDeadlineSeconds: 1800
   {{- end }}
   selector:
     matchLabels:

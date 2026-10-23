@@ -197,7 +197,10 @@ router:
   #    router whose workers are registered at runtime through the admin API
   #    (no `workers`, `router.workerUrls` or `router.serviceDiscovery`
   #    configured) stays unready until the first one is: set `path: /health`
-  #    there, or register through a port-forward to the pod.
+  #    there, or register through a port-forward to the pod. A worker's engine
+  #    counts as healthy only once it reports so, which for a large checkpoint
+  #    is tens of minutes after its pod starts: every deadline on the router's
+  #    readiness has to cover that bring-up (README, Readiness Deadlines).
   readinessProbe:
     path: /readiness
     initialDelaySeconds: 5
