@@ -38,7 +38,7 @@ from smg_grpc_servicer.trace_context import trace_headers
 from smg_grpc_servicer.vllm import attach_vllm_logging, settle_logging
 from smg_grpc_servicer.vllm.admin import flush_cache, start_profile, stop_profile
 from smg_grpc_servicer.vllm.config_view import EngineConfigView, uses_mrope
-from smg_grpc_servicer.vllm.errors import grpc_code_for
+from smg_grpc_servicer.vllm.errors import GracefulHTTPError, VLLMClientError, grpc_code_for
 from smg_grpc_servicer.vllm.kv_events import (
     rank_sources_for,
     resolve_kv_events_config,
@@ -652,15 +652,21 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
                 logger.exception("Error in Generate for request %s", request_id)
             else:
                 logger.warning("Generate request %s rejected (%s): %s", request_id, code.name, e)
-            # A ValueError before the first output is generate()'s refusal of
+            # A refusal before the first output is generate()'s rejection of
             # the request's inputs (the prompt plus max_tokens over the model
-            # length, bad sampling params): add_request raises it before the
-            # engine core holds the request and generate() re-raises it with
-            # no abort, so no live id is left behind and the notice is still
-            # owed, as the Rust wire sends it when its generate call returns
-            # an error. Every other failure after the hand-over reaches here
-            # through the engine's own abort, which answers it.
-            refused = isinstance(e, ValueError) and not engine_started
+            # length, bad sampling params: a VLLMClientError, the ValueError
+            # of releases before 0.27) or of its admission (GracefulHTTPError):
+            # both are raised before the engine core holds the request and
+            # generate() re-raises them with no abort, so no live id is left
+            # behind and the notice is still owed, as the Rust wire sends it
+            # when its generate call returns an error. Every other failure
+            # after the hand-over reaches here through the engine's own abort,
+            # which answers it; an EngineGenerateError that wraps a ValueError
+            # could come from either side and stays without the notice.
+            refused = (
+                isinstance(e, (VLLMClientError, GracefulHTTPError, ValueError))
+                and not engine_started
+            )
             await self._notify_kv_transfer_rejected(
                 request_id, kv_transfer_params, handed_to_engine and not refused
             )

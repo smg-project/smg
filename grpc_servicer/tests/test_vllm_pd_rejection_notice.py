@@ -11,9 +11,10 @@ the pull is done the notice's own request is freed as it is admitted, so the
 connector's report of its empty pull names an id the scheduler no longer tracks.
 
 A refusal ``generate()`` raises before the engine core holds the request (vLLM's
-``add_request`` raises a ``ValueError`` for the request's inputs and ``generate()``
-re-raises it without an abort) leaves no live id behind and still gets the
-notice, as the Rust wire sends it when its generate call returns an error.
+``add_request`` raises a ``VLLMClientError`` for the request's inputs, a
+``ValueError`` before 0.27, and ``generate()`` re-raises it without an abort)
+leaves no live id behind and still gets the notice, as the Rust wire sends it
+when its generate call returns an error.
 """
 
 from __future__ import annotations
@@ -32,6 +33,11 @@ from smg_grpc_proto import vllm_engine_pb2  # noqa: E402
 from smg_grpc_proto.generated import common_pb2  # noqa: E402
 from smg_grpc_servicer.vllm.servicer import VllmEngineServicer  # noqa: E402
 from vllm.v1.engine.exceptions import EngineGenerateError  # noqa: E402
+
+try:
+    from vllm.exceptions import VLLMValidationError as RefusalError
+except ImportError:  # vLLM < 0.27 raises ValueError for request validation
+    RefusalError = ValueError
 
 DECODE_KV = json.dumps(
     {
@@ -158,10 +164,12 @@ async def test_a_caller_that_gives_up_before_the_engine_still_sends_the_notice(m
 async def test_a_request_the_engine_refuses_before_its_first_output_still_sends_the_notice(
     monkeypatch,
 ):
-    # vLLM's add_request raises the ValueError before the engine core holds
-    # the request and generate() re-raises it without an abort: no live id
-    # is left behind, so the notice is owed as for any pre-admission failure.
-    engine = _RefusingEngine(ValueError("prompt plus max_tokens over the model length"))
+    # vLLM's add_request raises the validation error (VLLMValidationError, a
+    # VLLMClientError; the ValueError of releases before 0.27) before the
+    # engine core holds the request and generate() re-raises it without an
+    # abort: no live id is left behind, so the notice is owed as for any
+    # pre-admission failure.
+    engine = _RefusingEngine(RefusalError("prompt plus max_tokens over the model length"))
     servicer = _servicer(monkeypatch, engine)
     context = await _drive_to_the_end(servicer, _decode_request())
     assert engine.entered.is_set()
