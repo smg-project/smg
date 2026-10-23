@@ -75,7 +75,9 @@ def interfaces():
     from vllm.transformers_utils.processor import get_video_processor_cls_name
 
     process = BaseRenderer.process_for_engine_async
-    require("skip_mm_cache" in inspect.signature(process).parameters, "renderer lacks skip_mm_cache")
+    require(
+        "skip_mm_cache" in inspect.signature(process).parameters, "renderer lacks skip_mm_cache"
+    )
     require(callable(get_video_processor_cls_name), "video processor interface unavailable")
     require(callable(MEDIA_CONNECTOR_REGISTRY.load), "media connector interface unavailable")
     # Exercise the actual vision-package import; model construction remains with the original fixture.
@@ -87,7 +89,9 @@ def interfaces():
         path = Path(spec.origin)
         raw = path.read_bytes()
         require(0 < len(raw) <= 8 * 1024 * 1024, "media source size")
-        records.append({"module": name, "path": str(path.resolve()), "bytes": len(raw), "sha256": sha(raw)})
+        records.append(
+            {"module": name, "path": str(path.resolve()), "bytes": len(raw), "sha256": sha(raw)}
+        )
     return {
         "renderer_signature": str(inspect.signature(process)),
         "connector_registry_type": type(MEDIA_CONNECTOR_REGISTRY).__name__,

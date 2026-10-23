@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -65,6 +66,23 @@ class Reports:
         )
 
 
+def record_backends(log_directory, output):
+    records = []
+    pattern = re.compile(r"Using (.+?) for MMEncoderAttention\.")
+    for path in sorted(log_directory.rglob("*")):
+        if not path.is_file():
+            continue
+        with path.open("rb") as stream:
+            raw = stream.read(16 * 1024 * 1024 + 1)
+        prefix = raw[: 16 * 1024 * 1024]
+        for line in prefix.decode(errors="replace").splitlines():
+            match = pattern.search(line)
+            if match:
+                records.append({"log": str(path), "backend": match[1], "line": line})
+    (output / "actual-vision-backend-log.json").write_text(json.dumps(records, indent=2) + "\n")
+    return records
+
+
 def main():
     require(os.environ["E2E_ENGINE"] == "vllm", "unexpected engine")
     require(os.environ["E2E_MM_PROCESSING"] == "worker", "wrong processing location")
@@ -80,13 +98,17 @@ def main():
             recipe["test_dir"],
             "--ignore=e2e_test/benchmarks",
             "--ignore=e2e_test/bindings_go",
-            "--reruns", "0",
-            "-s", "-vv",
+            "--reruns",
+            "0",
+            "-s",
+            "-vv",
             "--junitxml=" + str(junit),
         ],
         plugins=[reports],
     )
+    backend_records = record_backends(ROOT / "e2e-logs", output)
     reports.verify(recipe, junit)
+    require(backend_records, "actual ViT backend witness missing from worker logs")
     return int(result)
 
 
