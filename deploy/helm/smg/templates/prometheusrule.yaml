@@ -1,5 +1,6 @@
 {{- if .Values.prometheusRule.enabled }}
 {{- $a := .Values.prometheusRule.alerts }}
+{{- /* The matcher that selects this release's series: every expression carries it and keeps namespace and job through its aggregation, so several releases on one Prometheus alert apart and a firing alert names its gateway. */}}
 {{- $job := .Values.prometheusRule.jobSelector | default (printf "job=%q" (printf "%s-router" (include "smg.fullname" .))) }}
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
@@ -15,84 +16,84 @@ spec:
     - name: smg.router
       rules:
         - alert: SmgGatewayDown
-          expr: up{{ "{" }}{{ $job }}{{ "}" }} == 0
+          expr: up{ {{ $job }} } == 0 or absent(up{ {{ $job }} })
           for: {{ $a.scrapeMissingFor }}
           labels:
             severity: critical
           annotations:
-            summary: "A gateway stopped answering its metrics scrape"
-            description: "The scrape target {{ `{{ $labels.instance }}` }} has been down for {{ $a.scrapeMissingFor }}: the pod is gone, not ready, or its metrics port is unreachable."
+            summary: "A gateway stopped answering its metrics scrape, or has no scrape target"
+            description: "The scrape target {{ `{{ $labels.instance }}` }} has been down for {{ $a.scrapeMissingFor }}, or no target matches the release's job selector at all: the pod is gone, not ready, unreachable on its metrics port, or the selector names no Service."
         - alert: SmgNoHealthyWorker
-          expr: sum(max by (worker) (smg_worker_health)) == 0
+          expr: sum by (namespace, job) (max by (namespace, job, worker) (smg_worker_health{ {{ $job }} })) == 0
           for: {{ $a.noHealthyWorkerFor }}
           labels:
             severity: critical
           annotations:
             summary: "No healthy worker behind the gateway"
-            description: "Every registered worker has failed its health probes for {{ $a.noHealthyWorkerFor }}; requests are refused until one returns."
+            description: "Every worker registered with {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} has failed its health probes for {{ $a.noHealthyWorkerFor }}; requests are refused until one returns."
         - alert: SmgHighErrorRatio
           expr: |
-            sum(rate(smg_http_responses_total{status_code=~"5.."}[5m]))
-              / sum(rate(smg_http_responses_total[5m])) > {{ $a.errorRatio }}
+            sum by (namespace, job) (rate(smg_http_responses_total{ {{ $job }}, status_code=~"5.." }[5m]))
+              / sum by (namespace, job) (rate(smg_http_responses_total{ {{ $job }} }[5m])) > {{ $a.errorRatio }}
           for: {{ $a.errorRatioFor }}
           labels:
             severity: critical
           annotations:
             summary: "Too many responses are server errors"
-            description: "{{ `{{ $value | humanizePercentage }}` }} of responses were 5xx over the last 5 minutes (threshold {{ $a.errorRatio }})."
+            description: "{{ `{{ $value | humanizePercentage }}` }} of the responses of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} were 5xx over the last 5 minutes (threshold {{ $a.errorRatio }})."
         - alert: SmgTtftP99High
           expr: |
-            histogram_quantile(0.99, sum by (le) (rate(smg_router_ttft_seconds_bucket[5m]))) > {{ $a.ttftP99Seconds }}
+            histogram_quantile(0.99, sum by (le, namespace, job) (rate(smg_router_ttft_seconds_bucket{ {{ $job }} }[5m]))) > {{ $a.ttftP99Seconds }}
           for: {{ $a.ttftP99For }}
           labels:
             severity: critical
           annotations:
             summary: "Time to first token p99 is over the SLO"
-            description: "p99 TTFT is {{ `{{ $value | humanizeDuration }}` }} (threshold {{ $a.ttftP99Seconds }}s) for {{ $a.ttftP99For }}: queues are building in front of the engines."
+            description: "p99 TTFT of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} is {{ `{{ $value | humanizeDuration }}` }} (threshold {{ $a.ttftP99Seconds }}s) for {{ $a.ttftP99For }}: queues are building in front of the engines."
         - alert: SmgKvUsageNearCapacity
-          expr: max by (worker) (smg_engine_token_usage) > {{ $a.kvUsage }}
+          expr: max by (namespace, job, worker) (smg_engine_token_usage{ {{ $job }} }) > {{ $a.kvUsage }}
           for: {{ $a.kvUsageFor }}
           labels:
             severity: warning
           annotations:
             summary: "A worker's KV cache is nearly full"
-            description: "Worker {{ `{{ $labels.worker }}` }} reports {{ `{{ $value | humanizePercentage }}` }} KV token usage for {{ $a.kvUsageFor }}; the engine preempts and recomputes above this level."
+            description: "Worker {{ `{{ $labels.worker }}` }} of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} reports {{ `{{ $value | humanizePercentage }}` }} KV token usage for {{ $a.kvUsageFor }}; the engine preempts and recomputes above this level."
         - alert: SmgCircuitBreakerOpen
-          expr: max by (worker) (smg_worker_cb_state) == 1
+          expr: max by (namespace, job, worker) (smg_worker_cb_state{ {{ $job }} }) > 0
           for: {{ $a.circuitBreakerOpenFor }}
           labels:
             severity: warning
           annotations:
-            summary: "A worker's circuit breaker is open"
-            description: "Worker {{ `{{ $labels.worker }}` }} has been skipped by the router for {{ $a.circuitBreakerOpenFor }} after consecutive failures."
+            summary: "A worker's circuit breaker is open or half-open"
+            description: "The circuit breaker of worker {{ `{{ $labels.worker }}` }} of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} has been open or half-open for {{ $a.circuitBreakerOpenFor }}: the worker fails requests although it may still pass its health probes."
         - alert: SmgAdmissionRejections
-          expr: sum(rate(smg_admission_queue_rejected_total[5m])) > 0
+          expr: sum by (namespace, job) (rate(smg_admission_queue_rejected_total{ {{ $job }} }[5m])) > 0
           for: {{ $a.admissionRejectionsFor }}
           labels:
             severity: warning
           annotations:
             summary: "The gateway is rejecting requests at admission"
-            description: "{{ `{{ $value | humanize }}` }} requests per second have been rejected at the admission queue for {{ $a.admissionRejectionsFor }}: the concurrency limit is reached."
+            description: "{{ `{{ $value | humanize }}` }} requests per second have been rejected at the admission queue of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} for {{ $a.admissionRejectionsFor }}: the concurrency limit is reached."
         - alert: SmgEventLoopStalls
-          expr: sum(increase(smg_tokio_event_loop_stalls_total[10m])) > {{ $a.eventLoopStalls }}
+          expr: sum by (namespace, job) (increase(smg_tokio_event_loop_stalls_total{ {{ $job }} }[10m])) > {{ $a.eventLoopStalls }}
           labels:
             severity: warning
           annotations:
             summary: "The gateway's event loop is stalling"
-            description: "{{ `{{ $value | humanize }}` }} event-loop stalls in 10 minutes (threshold {{ $a.eventLoopStalls }}): a worker thread is blocked or the process is starved of CPU."
+            description: "{{ `{{ $value | humanize }}` }} event-loop stalls in 10 minutes on {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} (threshold {{ $a.eventLoopStalls }}): a worker thread is blocked or the process is starved of CPU."
         - alert: SmgDroppedLogLines
-          expr: sum by (sink) (delta(smg_log_dropped_lines[10m])) > 0
+          expr: sum by (namespace, job, sink) (delta(smg_log_dropped_lines{ {{ $job }} }[10m])) > 0
           labels:
             severity: warning
           annotations:
             summary: "Log lines are being dropped"
-            description: "The {{ `{{ $labels.sink }}` }} log sink dropped {{ `{{ $value | humanize }}` }} lines in 10 minutes; the sink cannot keep up with the log volume."
+            description: "The {{ `{{ $labels.sink }}` }} log sink of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} dropped {{ `{{ $value | humanize }}` }} lines in 10 minutes; the sink cannot keep up with the log volume."
         - alert: SmgKvEventDegradedRanks
-          expr: sum(smg_kv_event_degraded_ranks) > 0
+          expr: sum by (namespace, job) (smg_kv_event_degraded_ranks{ {{ $job }} }) > 0
           for: {{ $a.degradedRanksFor }}
           labels:
             severity: warning
           annotations:
             summary: "The KV event index is partial for a worker"
-            description: "{{ `{{ $value }}` }} engine ranks have a possibly stale KV index for {{ $a.degradedRanksFor }} (an unreplayed gap or a late relay snapshot); cache-aware routing under-predicts their cached prefixes until the next resync."
+            description: "{{ `{{ $value }}` }} engine ranks of {{ `{{ $labels.namespace }}` }}/{{ `{{ $labels.job }}` }} have a possibly stale KV index for {{ $a.degradedRanksFor }} (an unreplayed gap or a late relay snapshot); cache-aware routing under-predicts their cached prefixes until the next resync."
 {{- end }}

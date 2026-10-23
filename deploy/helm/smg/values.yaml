@@ -338,9 +338,12 @@ grafana:
 #   kvUsage 0.9 for 10m: above ninety percent of its KV cache an engine
 #     preempts and recomputes; sustained, the fleet is undersized.
 #   scrapeMissingFor 2m: a target down for two scrape intervals is a pod that
-#     is gone or not ready, not a missed scrape.
-#   circuitBreakerOpenFor 5m: a breaker that stays open outlives its own
-#     retry timeout: the worker is failing every probe.
+#     is gone or not ready, not a missed scrape; a target that left discovery
+#     (no up series at all) counts the same.
+#   circuitBreakerOpenFor 5m: the breaker reopens on each failed trial after
+#     its timeout, so a worker that fails requests while passing its health
+#     probes cycles open -> half-open -> open; five minutes in either state
+#     is that worker, not one failed call.
 #   admissionRejectionsFor 5m: rejections at the admission queue for five
 #     minutes are sustained overload, not a burst.
 #   eventLoopStalls 5 per 10m: a stall is a wake drift over 5 ms on the
@@ -353,9 +356,11 @@ prometheusRule:
   enabled: false
   # -- Labels the Prometheus Operator selects rules by (e.g. release: prometheus).
   labels: {}
-  # -- The label matcher of the router's scrape target in the `up` series,
-  #    e.g. job="smg-router". Empty: the Service name the ServiceMonitor
-  #    creates (<fullname>-router), which is the Operator's default job label.
+  # -- The label matcher that selects this release's series (every alert
+  #    carries it and keeps namespace and job through its aggregation, so
+  #    several releases on one Prometheus alert apart), e.g. job="smg-router".
+  #    Empty: the Service name the ServiceMonitor scrapes (<fullname>-router),
+  #    which is the Operator's default job label.
   jobSelector: ""
   alerts:
     errorRatio: 0.05

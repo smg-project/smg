@@ -37,7 +37,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (model, endpoint) (rate(smg_router_requests_total[5m]))",
+              "expr": "sum by (model, endpoint) (rate(smg_router_requests_total{job=~\"$job\"}[5m]))",
               "legendFormat": "{{ "{{" }}model{{ "}}" }} {{ "{{" }}endpoint{{ "}}" }}"
             }
           ],
@@ -60,7 +60,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (status_code) (rate(smg_http_responses_total[5m]))",
+              "expr": "sum by (status_code) (rate(smg_http_responses_total{job=~\"$job\"}[5m]))",
               "legendFormat": "{{ "{{" }}status_code{{ "}}" }}"
             }
           ],
@@ -83,7 +83,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum(rate(smg_http_responses_total{status_code=~\"5..\"}[5m])) / sum(rate(smg_http_responses_total[5m]))",
+              "expr": "sum(rate(smg_http_responses_total{job=~\"$job\", status_code=~\"5..\"}[5m])) / sum(rate(smg_http_responses_total{job=~\"$job\"}[5m]))",
               "legendFormat": "5xx"
             }
           ],
@@ -133,7 +133,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (error_code) (rate(smg_http_responses_total{error_code!=\"\"}[5m]))",
+              "expr": "sum by (error_code) (rate(smg_http_responses_total{job=~\"$job\", error_code!=\"\"}[5m]))",
               "legendFormat": "{{ "{{" }}error_code{{ "}}" }}"
             }
           ],
@@ -156,7 +156,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (error_type) (rate(smg_router_request_errors_total[5m]))",
+              "expr": "sum by (error_type) (rate(smg_router_request_errors_total{job=~\"$job\"}[5m]))",
               "legendFormat": "{{ "{{" }}error_type{{ "}}" }}"
             }
           ],
@@ -179,7 +179,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (token_type) (rate(smg_router_tokens_total[5m]))",
+              "expr": "sum by (token_type) (rate(smg_router_tokens_total{job=~\"$job\"}[5m]))",
               "legendFormat": "{{ "{{" }}token_type{{ "}}" }}"
             }
           ],
@@ -215,15 +215,15 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "histogram_quantile(0.5, sum by (le) (rate(smg_router_ttft_seconds_bucket[5m])))",
+              "expr": "histogram_quantile(0.5, sum by (le) (rate(smg_router_ttft_seconds_bucket{job=~\"$job\"}[5m])))",
               "legendFormat": "p50"
             },
             {
-              "expr": "histogram_quantile(0.95, sum by (le) (rate(smg_router_ttft_seconds_bucket[5m])))",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(smg_router_ttft_seconds_bucket{job=~\"$job\"}[5m])))",
               "legendFormat": "p95"
             },
             {
-              "expr": "histogram_quantile(0.99, sum by (le) (rate(smg_router_ttft_seconds_bucket[5m])))",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(smg_router_ttft_seconds_bucket{job=~\"$job\"}[5m])))",
               "legendFormat": "p99"
             }
           ],
@@ -246,7 +246,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "histogram_quantile(0.99, sum by (le, model) (rate(smg_router_ttft_seconds_bucket[5m])))",
+              "expr": "histogram_quantile(0.99, sum by (le, model) (rate(smg_router_ttft_seconds_bucket{job=~\"$job\"}[5m])))",
               "legendFormat": "{{ "{{" }}model{{ "}}" }}"
             }
           ],
@@ -269,15 +269,15 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "histogram_quantile(0.5, sum by (le) (rate(smg_router_tpot_seconds_bucket[5m])))",
+              "expr": "histogram_quantile(0.5, sum by (le) (rate(smg_router_tpot_seconds_bucket{job=~\"$job\"}[5m])))",
               "legendFormat": "p50"
             },
             {
-              "expr": "histogram_quantile(0.95, sum by (le) (rate(smg_router_tpot_seconds_bucket[5m])))",
+              "expr": "histogram_quantile(0.95, sum by (le) (rate(smg_router_tpot_seconds_bucket{job=~\"$job\"}[5m])))",
               "legendFormat": "p95"
             },
             {
-              "expr": "histogram_quantile(0.99, sum by (le) (rate(smg_router_tpot_seconds_bucket[5m])))",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(smg_router_tpot_seconds_bucket{job=~\"$job\"}[5m])))",
               "legendFormat": "p99"
             }
           ],
@@ -300,7 +300,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "histogram_quantile(0.99, sum by (le, model) (rate(smg_router_tpot_seconds_bucket[5m])))",
+              "expr": "histogram_quantile(0.99, sum by (le, model) (rate(smg_router_tpot_seconds_bucket{job=~\"$job\"}[5m])))",
               "legendFormat": "{{ "{{" }}model{{ "}}" }}"
             }
           ],
@@ -323,7 +323,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "histogram_quantile(0.99, sum by (le, endpoint) (rate(smg_router_request_duration_seconds_bucket[5m])))",
+              "expr": "histogram_quantile(0.99, sum by (le, endpoint) (rate(smg_router_request_duration_seconds_bucket{job=~\"$job\"}[5m])))",
               "legendFormat": "{{ "{{" }}endpoint{{ "}}" }}"
             }
           ],
@@ -346,7 +346,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "histogram_quantile(0.99, sum by (le, path) (rate(smg_http_request_duration_seconds_bucket[5m])))",
+              "expr": "histogram_quantile(0.99, sum by (le, path) (rate(smg_http_request_duration_seconds_bucket{job=~\"$job\"}[5m])))",
               "legendFormat": "{{ "{{" }}path{{ "}}" }}"
             }
           ],
@@ -381,11 +381,11 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum(smg_admission_inflight)",
+              "expr": "sum(smg_admission_inflight{job=~\"$job\"})",
               "legendFormat": "in flight"
             },
             {
-              "expr": "sum(smg_admission_queue_depth)",
+              "expr": "sum(smg_admission_queue_depth{job=~\"$job\"})",
               "legendFormat": "queued"
             }
           ],
@@ -408,7 +408,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum(rate(smg_admission_queue_rejected_total[5m]))",
+              "expr": "sum(rate(smg_admission_queue_rejected_total{job=~\"$job\"}[5m]))",
               "legendFormat": "rejected"
             }
           ],
@@ -431,7 +431,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "max by (worker) (smg_engine_running_requests)",
+              "expr": "max by (worker) (smg_engine_running_requests{job=~\"$job\"})",
               "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
             }
           ],
@@ -454,7 +454,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "max by (worker) (smg_engine_waiting_requests)",
+              "expr": "max by (worker) (smg_engine_waiting_requests{job=~\"$job\"})",
               "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
             }
           ],
@@ -477,7 +477,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "max by (worker) (smg_engine_token_usage)",
+              "expr": "max by (worker) (smg_engine_token_usage{job=~\"$job\"})",
               "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
             }
           ],
@@ -518,7 +518,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (le) (smg_http_inflight_request_age_count)",
+              "expr": "sum by (le) (smg_http_inflight_request_age_count{job=~\"$job\"})",
               "legendFormat": "<= {{ "{{" }}le{{ "}}" }} s"
             }
           ],
@@ -542,7 +542,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum(smg_http_connections_active)",
+              "expr": "sum(smg_http_connections_active{job=~\"$job\"})",
               "legendFormat": "connections"
             }
           ],
@@ -577,7 +577,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum(max by (worker) (smg_worker_health))",
+              "expr": "sum(max by (worker) (smg_worker_health{job=~\"$job\"}))",
               "legendFormat": "healthy"
             }
           ],
@@ -622,7 +622,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "max by (worker) (smg_worker_health)",
+              "expr": "max by (worker) (smg_worker_health{job=~\"$job\"})",
               "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
             }
           ],
@@ -646,7 +646,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "max by (worker) (smg_worker_cb_state)",
+              "expr": "max by (worker) (smg_worker_cb_state{job=~\"$job\"})",
               "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
             }
           ],
@@ -670,7 +670,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (result) (rate(smg_worker_health_checks_total[5m]))",
+              "expr": "sum by (result) (rate(smg_worker_health_checks_total{job=~\"$job\"}[5m]))",
               "legendFormat": "{{ "{{" }}result{{ "}}" }}"
             }
           ],
@@ -693,15 +693,15 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (stage) (rate(smg_worker_overload_shed_total[5m]))",
+              "expr": "sum by (stage) (rate(smg_worker_overload_shed_total{job=~\"$job\"}[5m]))",
               "legendFormat": "shed {{ "{{" }}stage{{ "}}" }}"
             },
             {
-              "expr": "sum by (stage) (rate(smg_worker_overload_fallback_total[5m]))",
+              "expr": "sum by (stage) (rate(smg_worker_overload_fallback_total{job=~\"$job\"}[5m]))",
               "legendFormat": "fallback {{ "{{" }}stage{{ "}}" }}"
             },
             {
-              "expr": "sum by (stage) (rate(smg_worker_liveness_fallback_total[5m]))",
+              "expr": "sum by (stage) (rate(smg_worker_liveness_fallback_total{job=~\"$job\"}[5m]))",
               "legendFormat": "liveness fallback {{ "{{" }}stage{{ "}}" }}"
             }
           ],
@@ -724,11 +724,11 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (endpoint) (rate(smg_worker_retries_total[5m]))",
+              "expr": "sum by (endpoint) (rate(smg_worker_retries_total{job=~\"$job\"}[5m]))",
               "legendFormat": "retry {{ "{{" }}endpoint{{ "}}" }}"
             },
             {
-              "expr": "sum by (endpoint) (rate(smg_worker_retries_exhausted_total[5m]))",
+              "expr": "sum by (endpoint) (rate(smg_worker_retries_exhausted_total{job=~\"$job\"}[5m]))",
               "legendFormat": "exhausted {{ "{{" }}endpoint{{ "}}" }}"
             }
           ],
@@ -763,7 +763,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "max by (worker) (smg_engine_cache_hit_rate)",
+              "expr": "max by (worker) (smg_engine_cache_hit_rate{job=~\"$job\"})",
               "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
             }
           ],
@@ -786,7 +786,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (branch) (rate(smg_cache_aware_policy_branch_total[5m]))",
+              "expr": "sum by (branch) (rate(smg_cache_aware_policy_branch_total{job=~\"$job\"}[5m]))",
               "legendFormat": "{{ "{{" }}branch{{ "}}" }}"
             }
           ],
@@ -809,11 +809,11 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "histogram_quantile(0.5, sum by (le) (rate(smg_cache_aware_match_ratio_bucket[5m])))",
+              "expr": "histogram_quantile(0.5, sum by (le) (rate(smg_cache_aware_match_ratio_bucket{job=~\"$job\"}[5m])))",
               "legendFormat": "p50"
             },
             {
-              "expr": "histogram_quantile(0.9, sum by (le) (rate(smg_cache_aware_match_ratio_bucket[5m])))",
+              "expr": "histogram_quantile(0.9, sum by (le) (rate(smg_cache_aware_match_ratio_bucket{job=~\"$job\"}[5m])))",
               "legendFormat": "p90"
             }
           ],
@@ -836,7 +836,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "histogram_quantile(0.99, sum by (le, worker) (rate(smg_kv_event_lag_seconds_bucket[5m])))",
+              "expr": "histogram_quantile(0.99, sum by (le, worker) (rate(smg_kv_event_lag_seconds_bucket{job=~\"$job\"}[5m])))",
               "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
             }
           ],
@@ -859,19 +859,19 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (outcome) (rate(smg_kv_event_gaps_total[5m]))",
+              "expr": "sum by (outcome) (rate(smg_kv_event_gaps_total{job=~\"$job\"}[5m]))",
               "legendFormat": "gap {{ "{{" }}outcome{{ "}}" }}"
             },
             {
-              "expr": "sum by (reason) (rate(smg_kv_event_resyncs_total[5m]))",
+              "expr": "sum by (reason) (rate(smg_kv_event_resyncs_total{job=~\"$job\"}[5m]))",
               "legendFormat": "resync {{ "{{" }}reason{{ "}}" }}"
             },
             {
-              "expr": "sum(rate(smg_kv_event_missed_batches_total[5m]))",
+              "expr": "sum(rate(smg_kv_event_missed_batches_total{job=~\"$job\"}[5m]))",
               "legendFormat": "missed batches"
             },
             {
-              "expr": "sum(rate(smg_kv_event_stream_errors_total[5m]))",
+              "expr": "sum(rate(smg_kv_event_stream_errors_total{job=~\"$job\"}[5m]))",
               "legendFormat": "stream errors"
             }
           ],
@@ -894,7 +894,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (worker) (smg_kv_event_degraded_ranks)",
+              "expr": "sum by (worker) (smg_kv_event_degraded_ranks{job=~\"$job\"})",
               "legendFormat": "{{ "{{" }}worker{{ "}}" }}"
             }
           ],
@@ -918,7 +918,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "max by (model) (smg_kv_index_entries)",
+              "expr": "max by (model) (smg_kv_index_entries{job=~\"$job\"})",
               "legendFormat": "{{ "{{" }}model{{ "}}" }}"
             }
           ],
@@ -953,7 +953,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (outcome) (rate(smg_symphony_outputs_total[5m]))",
+              "expr": "sum by (outcome) (rate(smg_symphony_outputs_total{job=~\"$job\"}[5m]))",
               "legendFormat": "{{ "{{" }}outcome{{ "}}" }}"
             }
           ],
@@ -977,7 +977,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (reason) (rate(smg_symphony_malformed_total[5m]))",
+              "expr": "sum by (reason) (rate(smg_symphony_malformed_total{job=~\"$job\"}[5m]))",
               "legendFormat": "{{ "{{" }}reason{{ "}}" }}"
             }
           ],
@@ -1000,15 +1000,15 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (reason) (rate(smg_symphony_fallback_total[5m]))",
+              "expr": "sum by (reason) (rate(smg_symphony_fallback_total{job=~\"$job\"}[5m]))",
               "legendFormat": "fallback {{ "{{" }}reason{{ "}}" }}"
             },
             {
-              "expr": "sum(rate(smg_symphony_refused_total[5m]))",
+              "expr": "sum(rate(smg_symphony_refused_total{job=~\"$job\"}[5m]))",
               "legendFormat": "refused"
             },
             {
-              "expr": "sum(rate(smg_symphony_calls_suppressed_total[5m]))",
+              "expr": "sum(rate(smg_symphony_calls_suppressed_total{job=~\"$job\"}[5m]))",
               "legendFormat": "calls suppressed"
             }
           ],
@@ -1043,7 +1043,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "max by (worker) (smg_tokio_worker_busy_ratio)",
+              "expr": "max by (worker) (smg_tokio_worker_busy_ratio{job=~\"$job\"})",
               "legendFormat": "worker {{ "{{" }}worker{{ "}}" }}"
             }
           ],
@@ -1067,11 +1067,11 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum(rate(smg_tokio_event_loop_stalls_total[5m]))",
+              "expr": "sum(rate(smg_tokio_event_loop_stalls_total{job=~\"$job\"}[5m]))",
               "legendFormat": "stalls/s"
             },
             {
-              "expr": "histogram_quantile(0.99, sum by (le) (rate(smg_tokio_event_loop_delay_seconds_bucket[5m])))",
+              "expr": "histogram_quantile(0.99, sum by (le) (rate(smg_tokio_event_loop_delay_seconds_bucket{job=~\"$job\"}[5m])))",
               "legendFormat": "delay p99 (s)"
             }
           ],
@@ -1094,7 +1094,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (sink) (smg_log_dropped_lines)",
+              "expr": "sum by (sink) (smg_log_dropped_lines{job=~\"$job\"})",
               "legendFormat": "{{ "{{" }}sink{{ "}}" }}"
             }
           ],
@@ -1118,11 +1118,11 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum(smg_allocator_resident_bytes)",
+              "expr": "sum(smg_allocator_resident_bytes{job=~\"$job\"})",
               "legendFormat": "resident"
             },
             {
-              "expr": "sum(smg_allocator_allocated_bytes)",
+              "expr": "sum(smg_allocator_allocated_bytes{job=~\"$job\"})",
               "legendFormat": "allocated"
             }
           ],
@@ -1145,11 +1145,11 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum(smg_tokio_alive_tasks)",
+              "expr": "sum(smg_tokio_alive_tasks{job=~\"$job\"})",
               "legendFormat": "alive tasks"
             },
             {
-              "expr": "sum(smg_tokio_global_queue_depth)",
+              "expr": "sum(smg_tokio_global_queue_depth{job=~\"$job\"})",
               "legendFormat": "global queue"
             }
           ],
@@ -1172,7 +1172,7 @@ data:
           "datasource": "Prometheus",
           "targets": [
             {
-              "expr": "sum by (layer, result) (rate(smg_tokenizer_cache_lookups_total[5m]))",
+              "expr": "sum by (layer, result) (rate(smg_tokenizer_cache_lookups_total{job=~\"$job\"}[5m]))",
               "legendFormat": "{{ "{{" }}layer{{ "}}" }} {{ "{{" }}result{{ "}}" }}"
             }
           ],
@@ -1197,7 +1197,29 @@ data:
         "inference"
       ],
       "templating": {
-        "list": []
+        "list": [
+          {
+            "name": "job",
+            "label": "job",
+            "type": "query",
+            "datasource": "Prometheus",
+            "query": "label_values(smg_http_requests_total, job)",
+            "definition": "label_values(smg_http_requests_total, job)",
+            "refresh": 2,
+            "includeAll": true,
+            "multi": true,
+            "sort": 1,
+            "current": {
+              "selected": true,
+              "text": [
+                "All"
+              ],
+              "value": [
+                "$__all"
+              ]
+            }
+          }
+        ]
       },
       "time": {
         "from": "now-1h",
