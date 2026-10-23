@@ -309,8 +309,7 @@ What the syntax says, and what the assembler does with it:
   that named no call (whole, its closing tag included); a call that started keeps the members it
   read. (A parameter tag written without its `<` and a call's arguments written as JSON and
   closed with a region of the model's own, both seen live, reached the client as content with
-  the format's tokens in it before.) The XML and Qwen-tagged assemblers still carry such bytes in
-  the `Malformed` event, which the adapters show.
+  the format's tokens in it before.)
 - **Every byte of the call lands in exactly one event**, with the Qwen assembler's accounting:
   the name's bytes in `ToolCallStart`, each tag's and value's bytes in the fragments they
   produce, the whitespace the template writes between tags as `Dropped { Wrapper }`, and what
@@ -427,10 +426,10 @@ What the syntax says, and what the assembler does with it:
   takes the whole slice.
 - **Every byte of the invoke lands in exactly one event**, with the tagged assemblers'
   accounting: the name's bytes in `ToolCallStart`, each tag's and value's bytes in the
-  fragments they produce, text where the syntax has tags as `Malformed` run by run, the
-  whitespace right after a tag the syntax read as `Dropped { Wrapper }` before the first run and
-  the whitespace between two runs, the model's, in the second run's event
-  (`event::release_between`).
+  fragments they produce, text where the syntax has tags refused run by run
+  (`Dropped { MalformedCall }` behind its `Malformed` event of no bytes), the whitespace right
+  after a tag the syntax read as `Dropped { Wrapper }` before the first run and the whitespace
+  between two runs, the model's, in the second run's refused bytes (`Assembler::refuse_between`).
 
 ## The value reader (`tagged::value`)
 
