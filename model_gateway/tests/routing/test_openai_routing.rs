@@ -11,7 +11,7 @@ use std::{
 use axum::{
     body::Body,
     extract::Request,
-    http::{Method, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::Response,
     routing::post,
     Json, Router,
@@ -32,7 +32,7 @@ use smg::{
         RouterFactory,
     },
     tenant::{RouteRequestMeta, TenantKey},
-    worker::{BasicWorkerBuilder, RuntimeType, Worker, WorkerType},
+    worker::{BasicWorkerBuilder, ModelCard, RuntimeType, Worker, WorkerType},
 };
 use smg_data_connector::{ResponseId, StoredResponse};
 use smg_external_router::{openai::OpenAIRouter, ExternalRouter};
@@ -948,6 +948,64 @@ async fn test_openai_router_circuit_breaker() {
     }
 }
 
+/// A caller's own key never refreshes the registry's model cards. The
+/// provider's catalogue is visible to the caller's key alone; a request for a
+/// model in it is refused, the provider's `/v1/models` sees the operator's
+/// configured key and no other, the worker's cards stay the operator's, and
+/// the next caller's request for the operator's model is served. Before, the
+/// first request was served after the worker's cards were replaced by the
+/// caller's catalogue, and the next caller got 404 for the operator's model.
+#[tokio::test]
+async fn a_callers_key_does_not_refresh_the_registrys_models() {
+    let mock_server = MockOpenAIServer::new_with_auth(Some("Bearer caller-key".to_string())).await;
+    let ctx = create_test_app_context().await;
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(mock_server.base_url())
+            .worker_type(WorkerType::Regular)
+            .runtime_type(RuntimeType::External)
+            .models(vec![ModelCard::new("gpt-4o-mini")])
+            .api_key("operator-key")
+            .health_config(openai_protocol::worker::HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build(),
+    );
+    ctx.worker_registry.register(Arc::clone(&worker));
+    let router = OpenAIRouter::new(&external_context(&ctx)).await.unwrap();
+    let tenant_meta = test_tenant_meta();
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "authorization",
+        HeaderValue::from_static("Bearer caller-key"),
+    );
+    let mut request = create_minimal_chat_request();
+    request.model = "gpt-4".to_string();
+    let refused = router
+        .route_chat(Some(&headers), &tenant_meta, request, "gpt-4")
+        .await;
+    assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        mock_server.models_requests(),
+        vec![Some("Bearer operator-key".to_string())],
+        "the refresh carries the configured key and never the caller's"
+    );
+    let ids: Vec<String> = worker.models().into_iter().map(|card| card.id).collect();
+    assert_eq!(
+        ids,
+        ["gpt-4o-mini"],
+        "the registry's cards are the operator's"
+    );
+
+    let mut request = create_minimal_chat_request();
+    request.model = "gpt-4o-mini".to_string();
+    let served = router
+        .route_chat(None, &tenant_meta, request, "gpt-4o-mini")
+        .await;
+    assert_eq!(served.status(), StatusCode::OK);
+}
+
 /// Test that /v1/models returns models from registered workers' ModelCards
 ///
 /// With the new worker-based design, models are returned from the WorkerRegistry
@@ -961,9 +1019,7 @@ async fn test_openai_router_models_from_registry() {
         BasicWorkerBuilder::new("http://localhost:8000")
             .worker_type(WorkerType::Regular)
             .runtime_type(RuntimeType::Sglang)
-            .models(vec![openai_protocol::model_card::ModelCard::new(
-                "gpt-3.5-turbo",
-            )])
+            .models(vec![ModelCard::new("gpt-3.5-turbo")])
             .health_config(openai_protocol::worker::HealthCheckConfig {
                 disable_health_check: true,
                 ..Default::default()

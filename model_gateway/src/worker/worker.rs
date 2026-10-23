@@ -725,6 +725,17 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     /// `until_ms` while it has anything in flight.
     fn note_diverted(&self, _until_ms: u64) {}
 
+    /// Claim the right to re-discover this worker's models now: `true` when
+    /// no refresh was claimed within the last `interval_ms` of the gateway
+    /// clock (`liveness::now_ms`), and the claim is recorded; `false` when
+    /// one was, so a run of misses asks the provider at most once per
+    /// interval and of concurrent misses one does (the others go on with the
+    /// cards as they stand; they do not wait for the winner's answer). A
+    /// worker that does not track it always grants the claim.
+    fn claim_models_refresh(&self, _interval_ms: u64) -> bool {
+        true
+    }
+
     /// A request of `tokens` prompt tokens was dispatched: work the engine
     /// still has to prefill before its first token (see
     /// [`Self::prefill_backlog`]). `timed` says the gateway will see that
@@ -2010,6 +2021,12 @@ impl Worker for BasicWorker {
 
     fn note_diverted(&self, until_ms: u64) {
         self.runtime.load().note_diverted(until_ms);
+    }
+
+    fn claim_models_refresh(&self, interval_ms: u64) -> bool {
+        self.runtime
+            .load()
+            .claim_models_refresh(super::liveness::now_ms(), interval_ms)
     }
 
     fn note_prefill_started(&self, tokens: u64, timed: bool) {
@@ -3553,6 +3570,45 @@ mod tests {
 
         // Not found
         assert!(metadata.find_model("unknown-model").is_none());
+    }
+
+    /// One refresh per interval per worker: the first claim wins, a claim
+    /// within the interval loses, the first claim after it wins again, and
+    /// the stamp moves only with a winning claim.
+    #[test]
+    fn a_models_refresh_is_claimed_at_most_once_per_interval() {
+        let runtime = WorkerRuntime::new("http://test:8080", WorkerStatus::Ready);
+        assert!(runtime.claim_models_refresh(1_000, 30_000), "never claimed");
+        assert!(!runtime.claim_models_refresh(1_001, 30_000), "just claimed");
+        assert!(
+            !runtime.claim_models_refresh(30_999, 30_000),
+            "still within"
+        );
+        assert!(
+            runtime.claim_models_refresh(31_000, 30_000),
+            "the interval passed"
+        );
+        assert!(
+            !runtime.claim_models_refresh(31_001, 30_000),
+            "claimed again"
+        );
+
+        // The clock's first millisecond is a claim too, not "never claimed".
+        let fresh = WorkerRuntime::new("http://test:8080", WorkerStatus::Ready);
+        assert!(fresh.claim_models_refresh(0, 30_000));
+        assert!(
+            !fresh.claim_models_refresh(0, 30_000),
+            "claimed at clock zero"
+        );
+        assert!(!fresh.claim_models_refresh(29_999, 30_000));
+        assert!(fresh.claim_models_refresh(30_001, 30_000));
+
+        let worker = BasicWorkerBuilder::new("http://test:8080").build();
+        assert!(worker.claim_models_refresh(30_000));
+        assert!(
+            !worker.claim_models_refresh(30_000),
+            "the worker's clock is the gateway's"
+        );
     }
 
     #[test]

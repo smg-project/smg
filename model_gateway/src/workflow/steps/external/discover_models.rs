@@ -186,7 +186,9 @@ fn infer_provider_from_id(id: &str) -> Option<ProviderType> {
 /// Resolve the API key to use for model discovery.
 ///
 /// Priority: per-provider env var > config.api_key > None (wildcard).
-fn resolve_discovery_api_key(
+/// Registration and the refresh on a miss (`routers::common::worker_selection`)
+/// resolve it the same way, so a worker is always discovered with one key.
+pub(crate) fn resolve_discovery_api_key(
     provider: Option<&ProviderType>,
     url: &str,
     config_api_key: Option<&str>,
@@ -208,8 +210,10 @@ fn resolve_discovery_api_key(
     None
 }
 
-/// Fetch models from /v1/models endpoint.
-async fn fetch_models(
+/// Fetch a provider's models from its `/v1/models` with `api_key`, grouped
+/// as registration keeps them. Registration runs it once; a serving
+/// request's miss runs it again with the same key.
+pub(crate) async fn fetch_models(
     url: &str,
     api_key: Option<&str>,
     provider: Option<&ProviderType>,
