@@ -183,8 +183,9 @@ impl Assembler {
 
     /// The block the model ended before `</function>`: after the last value the object is closed;
     /// the bytes of a value held for its close, a name or a tag cut short are refused
-    /// ([`refuse`](super::refuse)) and the object closes without the member never written; a streamed string a byte of whose
-    /// value went out is closed first ([`Self::close_open_string`]), since the model ended the
+    /// ([`refuse`](super::refuse)) and the object closes without the member never written; a
+    /// streamed string a byte of whose value went out is closed first
+    /// ([`Self::close_open_string`]), since the model ended the
     /// call and its bytes are the value whole, under one `Malformed { OpenAtTheMarker }` event of
     /// no bytes; a string no byte of the value followed is left open, since nothing is made up for
     /// a value the model never wrote: the fragments stand, and one `Malformed` event with what
@@ -248,8 +249,9 @@ impl Assembler {
     /// open string stays open, and a started call ends with the arguments it sent, which are no
     /// whole JSON since the object never closed; one `Malformed` event before its end says so,
     /// with the bytes of a value, a name or a tag cut short, or none ([`end_cut_call`]). A block
-    /// that never named a function has had its text refused as it came; what is left of it comes
-    /// back in the cut's `Malformed` word here, as the cut keeps what it found.
+    /// that never named a function has had its text refused as it came; what is left of it is
+    /// refused here as `UnterminatedRegion`, as the keyed assembler refuses what it held, so that
+    /// the reader's release of a refused output that made no call takes the whole slice.
     pub fn finish(mut self, out: &mut Events) {
         let held = self.held_tag();
         self.carried.push_str(&held);
@@ -258,9 +260,9 @@ impl Assembler {
         } else if matches!(self.stage, Stage::AfterCall) {
             // The block's calls ended at their own `</function>`: the whitespace after the last
             // is the template's, and a tag cut short is what the region never finished.
-            self.report_tag_cut(MalformedReason::UnterminatedRegion, out);
+            self.report_tag(MalformedReason::UnterminatedRegion, out);
         } else {
-            self.leftover_cut(MalformedReason::UnterminatedRegion, out);
+            self.leftover(MalformedReason::UnterminatedRegion, out);
         }
     }
 
@@ -376,20 +378,6 @@ impl Assembler {
         }
     }
 
-    /// The carried bytes as `Malformed` with their bytes, when there are any: the stream's cut,
-    /// where the word that counts the failure carries what the region never finished
-    /// ([`end_cut_call`]'s contract for a block with no call to end).
-    fn leftover_cut(&mut self, why: MalformedReason, out: &mut Events) {
-        let text = std::mem::take(&mut self.carried);
-        if !text.is_empty() {
-            out.push(Event::Malformed {
-                text: Text::uncounted(text),
-                why,
-            });
-            self.released = true;
-        }
-    }
-
     /// A tag that is refused, with the carried bytes: the whitespace before it is the template's
     /// and is dropped ([`Self::wrapper_before_tag`]), the tag's own bytes are refused; after text
     /// released since the last tag the syntax read, the whitespace is the model's and stays with
@@ -397,13 +385,6 @@ impl Assembler {
     fn report_tag(&mut self, why: MalformedReason, out: &mut Events) {
         self.wrapper_before_tag(out);
         self.leftover(why, out);
-    }
-
-    /// A tag the stream's cut left, with the carried bytes: the whitespace before it dropped as
-    /// the template's the same way, the tag's bytes in the `Malformed` event ([`Self::leftover_cut`]).
-    fn report_tag_cut(&mut self, why: MalformedReason, out: &mut Events) {
-        self.wrapper_before_tag(out);
-        self.leftover_cut(why, out);
     }
 
     /// Drops the whitespace carried before a tag as the template's wrapper, unless text was
@@ -978,7 +959,6 @@ mod tests {
         }
     }
 
-    /// No fragment is empty and no `Malformed` or `Dropped` text is empty.
     /// No fragment is empty and no `Malformed` or `Dropped` text is empty, but for the one event
     /// of no bytes that counts a refused run and stands right before its `Dropped {
     /// MalformedCall }`: any other empty report would claim a byte where none was.
@@ -1340,12 +1320,13 @@ mod tests {
         assert_eq!(bytes(&events), block);
         nothing_empty(&events);
         // The stream cut after the last call: the newline is the template's, a cut tag is what
-        // the region never finished.
+        // the region never finished, refused.
         let events = finished(&["<function=f>\n</function>\n<fun"]);
         assert_eq!(
             malformed(&events),
-            vec![("<fun".to_string(), MalformedReason::UnterminatedRegion)]
+            vec![(String::new(), MalformedReason::UnterminatedRegion)]
         );
+        assert_eq!(refused(&events), ["<fun"]);
         assert_eq!(dropped(&events), vec!["\n"]);
         // Whitespace alone after the last call is the template's at either ending, and nothing
         // after `</function>` adds nothing.
@@ -1411,10 +1392,9 @@ mod tests {
     }
 
     /// After text refused since the last call, the whitespace before a tag the ending cut short
-    /// is the model's and is not handed back: it leaves with the tag through either ending, refused
-    /// at the block's close and in the cut's word at the stream's end, as the engine ends a region
-    /// (`trailing_whitespace` first, then the ending). With no tag held, the whitespace before the
-    /// region's end is the template's and is handed back.
+    /// is the model's and is not handed back: it leaves with the tag, refused, through either
+    /// ending, as the engine ends a region (`trailing_whitespace` first, then the ending). With no
+    /// tag held, the whitespace before the region's end is the template's and is handed back.
     #[test]
     fn after_released_text_the_whitespace_before_a_cut_tag_stays_with_it_for_the_ending() {
         let declared = declared();
@@ -1432,20 +1412,15 @@ mod tests {
             assert_eq!(assembler.trailing_whitespace(), "");
             ending(assembler, &mut out);
             let events = out.drain();
-            let cut_word = why == MalformedReason::UnterminatedRegion;
             assert_eq!(
                 malformed(&events),
                 vec![
                     (String::new(), MalformedReason::TextBetweenCalls),
                     (String::new(), MalformedReason::TextBetweenCalls),
-                    (if cut_word { "\n<fun" } else { "" }.to_string(), why),
+                    (String::new(), why),
                 ]
             );
-            let mut expected = vec!["stray", " words"];
-            if !cut_word {
-                expected.push("\n<fun");
-            }
-            assert_eq!(refused(&events), expected);
+            assert_eq!(refused(&events), ["stray", " words", "\n<fun"]);
             assert_eq!(dropped(&events), vec!["\n"]);
             assert_eq!(ends(&events), 1);
         }
@@ -1899,20 +1874,21 @@ mod tests {
     }
 
     #[test]
-    fn a_block_without_a_function_tag_refuses_every_byte_and_the_cut_keeps_its_word() {
+    fn a_block_without_a_function_tag_refuses_every_byte_however_the_block_ends() {
         // A JSON object where tags were expected: its words are text between tags with the space
         // between them, refused, the newline before them the wrapper, and what is left at the end
-        // never closed, in the cut's word.
+        // never closed, refused as the region the cut never finished, so that a reader releasing
+        // a refused output that made no call takes the whole slice.
         let events = finished(&["\n{\"name\": \"f\"}\n"]);
         assert_eq!(
             malformed(&events),
             vec![
                 (String::new(), MalformedReason::TextBetweenTags),
                 (String::new(), MalformedReason::TextBetweenTags),
-                ("\n".to_string(), MalformedReason::UnterminatedRegion),
+                (String::new(), MalformedReason::UnterminatedRegion),
             ]
         );
-        assert_eq!(refused(&events), ["{\"name\":", " \"f\"}"]);
+        assert_eq!(refused(&events), ["{\"name\":", " \"f\"}", "\n"]);
         assert_eq!(dropped(&events), vec!["\n"]);
         assert_eq!(ends(&events), 0);
         assert_eq!(bytes(&events), "\n{\"name\": \"f\"}\n");
@@ -1920,12 +1896,10 @@ mod tests {
         let events = finished(&["\n<function=f"]);
         assert_eq!(
             malformed(&events),
-            vec![(
-                "\n<function=f".to_string(),
-                MalformedReason::UnterminatedRegion
-            )]
+            vec![(String::new(), MalformedReason::UnterminatedRegion)]
         );
-        assert_eq!(events.len(), 1);
+        assert_eq!(refused(&events), ["\n<function=f"]);
+        assert_eq!(events.len(), 2);
         let events = closed(&["\n<parameter=city>\nParis\n"]);
         assert_eq!(
             malformed(&events),

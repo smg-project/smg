@@ -153,10 +153,10 @@ and the value's text into the fragments they produce, the rest into the closing 
 between tags, a tag out of its place, a tag that cuts a name short and a name that is empty is
 refused (`tagged::refuse`): counted by a `Malformed` event of no bytes with the reason, the bytes
 dropped as a malformed call's (`Dropped { MalformedCall }`), never content, so the model's bytes are
-never read as something they are not, never shown as the answer, and never vanish into a source. Inside a value only `</parameter>` is a tag; `<function=`, `<parameter=`
-and `</function>` there are the value's text (the engine's parser ends a value at the next
-`<parameter=` or `</function>` as well, a tolerance to judge with adversarial fixtures rather than
-port).
+never read as something they are not, never shown as the answer, and never vanish into a source.
+Inside a value only `</parameter>` is a tag; `<function=`, `<parameter=` and `</function>` there
+are the value's text (the engine's parser ends a value at the next `<parameter=` or `</function>`
+as well, a tolerance to judge with adversarial fixtures rather than port).
 
 Two endings. `Assembler::close` is for a block the model ended before `</function>` (its own closing
 marker came, or the next call began): the call is over as far as the model is concerned, so after
@@ -198,8 +198,9 @@ JSON whatever stage the cut found, since the object closes only at the call's ow
 says so as the JSON assembler does: one `Malformed { UnterminatedRegion }` event of no bytes before
 `ToolCallEnd`. The fragments stand, since a fragment passed on cannot be taken back, and nothing is
 made up for a value the model never finished; the four assemblers of `tagged` share that end
-(`tagged::end_cut_call`), the keyed one refusing what it held and the Qwen and XML ones still
-reporting it.
+(`tagged::end_cut_call`), and what a block that named no call held is refused as
+`UnterminatedRegion` by every one of them, so that the reader's release of a refused output that
+made no call takes the whole slice.
 
 A third ending, the stream's stop. `Assembler::stop` is for the model's own end of output inside
 the block (`EngineFinish::Stop`; a cut for length, an abort or any other finish is `finish`): the
@@ -242,9 +243,8 @@ region, which the engines' own parsers read as the calls they are; so after `</f
 assembler stays in the block. Whitespace there is the template's and goes into the next event's
 source, the next `<function=` starts the next call at the next index with the id that index mints,
 and anything else is refused under `TextBetweenCalls`. A region that ends after its last call
-closed ends nothing: the whitespace after the call is dropped, and a tag the block's end cut short
-is refused; at the stream's cut it rides in the `UnterminatedRegion` word, as the cut keeps what it
-found.
+closed ends nothing: the whitespace after the call is dropped, and a tag the end cut short is
+refused, under `UnterminatedRegion` at the stream's cut.
 
 ## The keyed assembler (`tagged::keyed`)
 

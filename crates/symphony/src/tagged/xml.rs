@@ -217,8 +217,9 @@ impl Assembler {
     /// client. A streamed string's open fragment stays open; a call that started still ends, with
     /// no bytes of its own, as every assembler ends one, after the one `Malformed {
     /// UnterminatedRegion }` event that carries everything held and says that its arguments are
-    /// no whole value ([`end_cut_call`]); what a block that named no call held comes back as
-    /// `Malformed { UnterminatedRegion }` too.
+    /// no whole value ([`end_cut_call`]); what a block that named no call held is refused as
+    /// `UnterminatedRegion` too, as the keyed assembler refuses it, so that the reader's release
+    /// of a refused output that made no call takes the whole slice.
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
@@ -226,11 +227,8 @@ impl Assembler {
         self.hold_tag();
         if self.started() {
             end_cut_call(self.index, std::mem::take(&mut self.carried), "", out);
-        } else if !self.carried.is_empty() {
-            out.push(Event::Malformed {
-                text: Text::uncounted(std::mem::take(&mut self.carried)),
-                why: MalformedReason::UnterminatedRegion,
-            });
+        } else {
+            self.report(MalformedReason::UnterminatedRegion, out);
         }
     }
 
