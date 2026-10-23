@@ -22,7 +22,7 @@ def held_blocks(scheduler, request_id):
 
 def free_members(pool):
     limit = nonnegative_int(pool.num_gpu_blocks)
-    require(0 < limit <= 131072, "unknown or oversized pool")
+    require(0 < limit <= 131072 and len(pool.blocks) == limit, "unknown or oversized pool")
     queue = pool.free_block_queue
     previous = queue.fake_free_list_head
     current = previous.next_free_block
@@ -36,6 +36,15 @@ def free_members(pool):
             return members
         require(current is not None and id(current) not in members, "invalid or cyclic free queue")
         require(current.prev_free_block is previous, "inconsistent free queue links")
+        block_id = nonnegative_int(current.block_id)
+        require(
+            current.pool is pool
+            and block_id < limit
+            and pool.blocks[block_id] is current
+            and current.ref_cnt == 0
+            and current.is_null is False,
+            "free queue has foreign or occupied pages",
+        )
         members.add(id(current))
         previous, current = current, current.next_free_block
     raise ValueError("free queue exceeds pool bound")

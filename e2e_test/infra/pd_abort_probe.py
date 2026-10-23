@@ -4,6 +4,7 @@ import hashlib
 
 import httpx
 
+from .pd_local_kv_compat import enabled as local_kv_enabled
 from .pd_metrics import wait_for_generated_text
 from .pd_probe import observe_request
 from .pd_probe_contract import validate_prefix
@@ -104,5 +105,12 @@ def run_decode_abort(base_url, model, context, state, root, workers, identity):
         state["decode_abort"].update(
             validate_abort(files, workers, identity, expected_root, before, internal)
         )
+        if local_kv_enabled():
+            from .pd_local_kv_contract import validate_local_release
+
+            name, records, _ = decode_trace(files, workers, identity, expected_root)
+            state["local_kv"] = validate_local_release(
+                records, internal, before[name][1][-1]["seq"]
+            )
 
     observe_request(context["trace_dir"], workers, identity, state, root, validator=check)

@@ -7,6 +7,7 @@ is imported here; CPU contract stubs are not runtime engine evidence.
 import re
 from pathlib import Path
 
+from .pd_local_kv_compat import SOURCE_SHA256 as LOCAL_KV_SOURCES
 from .pd_scheduler_compat import SOURCE_SHA256
 
 
@@ -37,6 +38,10 @@ def validate_prefix(files, workers, identity, expected_root):
         ):
             raise ValueError("missing startup")
         startup = records[0]
+        local_sources = startup.get("source_contract", {}).get("local_kv_sources")
+        if local_sources is not None and local_sources != LOCAL_KV_SOURCES:
+            raise ValueError("unknown local KV source contract")
+        local_events = {"local_kv_return", "local_kv_unknown"} if local_sources else set()
         matching = [w for w in remaining if w.observer_instance == startup.get("worker_instance")]
         if len(matching) != 1:
             raise ValueError("unknown or duplicate worker instance")
@@ -82,6 +87,7 @@ def validate_prefix(files, workers, identity, expected_root):
                     "free_request_blocks_return",
                     "drain_deferred_return",
                 }
+                | local_events
             ):
                 raise ValueError("unknown trace identity/sequence")
         asynchronous = startup.get("async_scheduling")
