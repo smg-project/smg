@@ -28,13 +28,12 @@ spec:
        (initialDelaySeconds + failureThreshold x periodSeconds, the longest a
        load may take before the probe restarts the container) plus a 600 s
        margin for what runs on the rollout's clock before the probe's starts
-       (the node's provisioning, the image pull, the container start), never
-       below the Kubernetes default of 600 s: a worker sized for a long load is
-       not reported as a failed rollout while it loads (README, Startup
-       Probes). */}}
+       (the node's provisioning, the image pull, the container start): a worker
+       sized for a long load is not reported as a failed rollout while it loads
+       (README, Startup Probes). */}}
   {{- $probe := $worker.startupProbe | default (dict) }}
   {{- $budget := add ($probe.initialDelaySeconds | default 60) (mul ($probe.failureThreshold | default 30) ($probe.periodSeconds | default 10)) }}
-  progressDeadlineSeconds: {{ $worker.progressDeadlineSeconds | default (max 600 (add $budget 600)) }}
+  progressDeadlineSeconds: {{ $worker.progressDeadlineSeconds | default (add $budget 600) }}
   selector:
     matchLabels:
       {{- include "smg.selectorLabels" $ | nindent 6 }}
