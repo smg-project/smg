@@ -44,6 +44,7 @@ repos:
             src/tokenizer/chat_template\.rs|
             crates/multimodal/tests/fixtures/.*|
             crates/response_template/tests/fixtures/.*|
+            vendor_probe/baselines/.*|
             target/.*
           )$
 
