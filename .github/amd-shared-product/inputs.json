@@ -11,7 +11,7 @@
   "producer_branch": "ci/frozen-c9d-cpu-producer-20261023",
   "producer_policy": "frozen_c9d_dispatch_build_only_all_18_steps_success_v1",
   "target_product_commit": "ee1b8f0f83186a0e33d805b4b2551d17322a80fb",
-  "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat[1]/vllm/nvidia",
+  "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-4gpu-chat[1]/vllm/nvidia",
   "source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
     "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
@@ -94,17 +94,17 @@
   ],
   "budget": {
     "relay_hosted_cpu_minutes": 10,
-    "gpu_job_minutes": 60,
-    "pytest_minutes": 45,
+    "gpu_job_minutes": 30,
+    "pytest_minutes": 25,
     "cleanup_reserve_is_not_enforced_by_shared_workflow": true,
     "workflow_auto_retry": 0,
     "original_pytest_reruns": 2,
     "original_reruns_delay_seconds": 5
   },
   "contract": {
-    "selected": 227,
-    "models": 8,
-    "floor": 202,
+    "selected": 39,
+    "models": 2,
+    "floor": 32,
     "test_dirs": "e2e_test/chat_completions",
     "test_filter": "",
     "servicer_impl": "",
@@ -115,9 +115,16 @@
       "installed",
       "final"
     ],
-    "no_prior_GPU_acceptance_transferred": true
+    "no_prior_GPU_acceptance_transferred": true,
+    "gpu_tier": 4,
+    "tensor_parallel_size": 4,
+    "required_model_ids": [
+      "openai/gpt-oss-120b",
+      "meta-llama/Llama-4-Scout-17B-16E-Instruct"
+    ],
+    "original_skip_count": 4
   },
-  "diagnostic_difference": "caller container explicitly sets SPT_NOENV=1; current product shared workflow does not",
+  "diagnostic_difference": "caller sets SPT_NOENV=1 and runs full installed-engine servicer units (NV original four-GPU row leaves units off); shared workflow algorithms unchanged",
   "producer_binary_relabelled": false,
   "producer_artifact_pins_status": "EMPTY: no actual new successful dispatch producer or archives pinned",
   "explicit_product_dependency": {
@@ -127,7 +134,7 @@
     "parent_stack": "0707d631cb6827789619ab96999f868044dc06db",
     "visible_churn": 43
   },
-  "producer_snapshot_note": "Old normal c9d cancelled producer remains rejected; a new dispatch producer requires all18 steps and entire run success plus actual4archives/native audit",
+  "producer_snapshot_note": "Root reports CPU-only producer40038340532/head445bb37 admitted, but this preparation has no actual terminal producer or archive audit; all identity/artifact/native pins stay empty",
   "source_base": "c9d5431db92aa2d35521889f6297c4c6f7b05b4a",
   "producer_base_source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -145,5 +152,12 @@
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows": "7c956a4ee89bdf800d48c63815d10a4dd568d90e"
   },
-  "producer_source_map_note": "Expected 14 trees from reviewed diagnostic9841825, including its different workflow tree; actual admitted head/run unknown and must match exactly before relay"
+  "producer_source_map_note": "Expected 14 trees from reviewed diagnostic9841825, including its different workflow tree; actual admitted head/run unknown and must match exactly before relay",
+  "resource_precondition": {
+    "requested_runner_label": "8-gpu-mi300x",
+    "used_logical_devices": 4,
+    "ranks": 4,
+    "actual_four_VF_placement_or_availability_verified": false,
+    "physical_GPU_exclusivity_claimed": false
+  }
 }

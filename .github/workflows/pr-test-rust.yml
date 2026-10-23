@@ -1,11 +1,11 @@
-name: AMD shared product Python chat validation
+name: AMD shared product vLLM four-GPU chat validation
 on:
   workflow_dispatch:
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: amd-shared-product-python-chat
+  group: amd-shared-product-vllm-four-gpu-chat
   cancel-in-progress: false
 jobs:
   artifact-relay:
@@ -65,17 +65,17 @@ jobs:
           path: ${{ steps.relay.outputs.directory }}/evidence/
           if-no-files-found: ignore
           retention-days: 7
-  amd-product-python-chat:
+  amd-product-four-gpu-chat:
     needs: artifact-relay
     uses: ./.github/workflows/e2e-gpu-job.yml
     with:
       engine: vllm
-      gpu_tier: '1'
-      runner: 1-gpu-mi300x
-      timeout: 60
-      test_timeout: 45
+      gpu_tier: '4'
+      runner: 8-gpu-mi300x
+      timeout: 30
+      test_timeout: 25
       test_dirs: e2e_test/chat_completions
-      min_selected: 202
+      min_selected: 32
       servicer_unit_tests: true
       gpu_vendor: amd
       container_image: vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f
@@ -83,12 +83,12 @@ jobs:
     secrets: inherit
   finish:
     if: always()
-    needs: [artifact-relay, amd-product-python-chat]
+    needs: [artifact-relay, amd-product-four-gpu-chat]
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     steps:
       - name: Require the actual shared workflow to finish successfully
         env:
           RELAY: ${{ needs.artifact-relay.result }}
-          CHAT: ${{ needs.amd-product-python-chat.result }}
+          CHAT: ${{ needs.amd-product-four-gpu-chat.result }}
         run: test "$RELAY" = success && test "$CHAT" = success
