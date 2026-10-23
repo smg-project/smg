@@ -18,6 +18,7 @@ pub(crate) mod liveness;
 pub mod load;
 pub mod load_state;
 pub mod manager;
+pub mod metadata;
 pub mod metrics_aggregator;
 pub mod monitor;
 pub mod overload;
