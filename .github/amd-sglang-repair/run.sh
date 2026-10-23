@@ -22,6 +22,8 @@ python3 .github/amd-sglang-repair/tilelang_host_ir.py
 python3 .github/amd-sglang-repair/run_native.py
 python3 -m pytest -q grpc_servicer/tests -p no:cacheprovider -rs --junitxml=diagnostic-results/servicer-engine.xml
 python3 -m pip freeze > diagnostic-results/pip-freeze.txt
+timeout --signal=INT --kill-after=15s 585s env MAX_JOBS=8 CARGO_BUILD_JOBS=8 AITER_LOG_MORE=1 \
+    python3 .github/amd-sglang-repair/prewarm.py
 for suite in completions embeddings router; do
     python3 .github/amd-sglang-repair/run_tests.py "$suite"
 done
