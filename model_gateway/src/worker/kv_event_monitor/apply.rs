@@ -146,7 +146,11 @@ impl KvEventMonitor {
         indexer.apply_removed(worker_id, &seq_hashes, &mut worker_blocks.blocks);
     }
 
-    /// Drop every block of a worker from the indexer and forget its copies.
+    /// Drop every block of a worker from the indexer and forget its copies
+    /// and its block of record: a clear is the worker's new cache incarnation
+    /// (its publisher restarted or resynced), and a worker that comes back
+    /// with a narrower block than it stored before must index its stores as
+    /// they come, not count every one as a sub-block store.
     pub(super) fn apply_cleared(
         worker_id: u32,
         indexer: &KvIndex,
@@ -154,6 +158,7 @@ impl KvEventMonitor {
     ) {
         indexer.apply_cleared(worker_id, &mut worker_blocks.blocks);
         worker_blocks.copies.clear();
+        worker_blocks.block_of_record = 0;
     }
 }
 
@@ -1196,5 +1201,34 @@ mod tests {
         assert_eq!(wb.counters.sub_block_stores, 1);
         assert_eq!(wb.counters.sub_block_blocks, 1);
         assert_eq!(wb.counters.parentless_stores, 0);
+    }
+
+    /// A clear is the worker's new cache incarnation (its publisher restarted
+    /// or resynced): the block of record goes with the blocks, so a worker
+    /// that comes back with a narrower block indexes its stores as they come
+    /// instead of counting every one as a sub-block store.
+    #[test]
+    fn a_clear_resets_the_block_of_record() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let full: Vec<u32> = (10..42).collect();
+        KvEventMonitor::apply_stored(&stored_width(1, 32, &full, None), w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 1);
+        KvEventMonitor::apply_cleared(w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 0);
+        KvEventMonitor::apply_stored(
+            &stored_width(2, 4, &[1, 2, 3, 4], None),
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert_eq!(
+            indexer.current_size(),
+            1,
+            "the restarted worker's narrower block is indexed, not left out"
+        );
+        assert_eq!(wb.counters.sub_block_stores, 0);
+        assert_eq!(wb.counters.sub_block_blocks, 0);
     }
 }
