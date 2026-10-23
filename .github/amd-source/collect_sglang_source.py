@@ -24,13 +24,22 @@ PACKAGE_PATHS = {
         "srt/managers/io_struct.py",
     ),
     "smg_grpc_proto": (
+        "__init__.py",
         "sglang_encoder_pb2.py",
+        "generated/sglang_encoder_pb2.py",
         "sglang_encoder_pb2_grpc.py",
+        "generated/sglang_encoder_pb2_grpc.py",
         "sglang_scheduler_pb2.py",
+        "generated/sglang_scheduler_pb2.py",
     ),
 }
 SOURCE_PATHS = tuple(path for paths in PACKAGE_PATHS.values() for path in paths)
-OPTIONAL_PATHS = {"srt/disaggregation/encoder/__init__.py"}
+SDK_MODULES = ("sglang_encoder_pb2.py", "sglang_encoder_pb2_grpc.py", "sglang_scheduler_pb2.py")
+OPTIONAL_PATHS = {
+    "srt/disaggregation/encoder/__init__.py",
+    *SDK_MODULES,
+    *(f"generated/{name}" for name in SDK_MODULES),
+}
 
 
 def package_location(package="sglang"):
@@ -141,6 +150,13 @@ def collect(output, package="sglang", budget=None):
                 sha256=hashlib.sha256(data).hexdigest(),
             )
         record["files"].append(entry)
+    if package == "smg_grpc_proto":
+        copied = {entry["path"] for entry in record["files"] if entry["status"] == "copied"}
+        record["required_logical_modules"] = {
+            name: [path for path in (name, f"generated/{name}") if path in copied]
+            for name in SDK_MODULES
+        }
+        rejected = rejected or not all(record["required_logical_modules"].values())
     record["bytes_read"] = budget["bytes_read"] - initial_bytes
     record["shared_total_bytes_read"] = budget["bytes_read"]
     record["status"] = "rejected" if rejected else "recorded"

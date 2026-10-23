@@ -24,6 +24,11 @@ jobs:
     timeout-minutes: 3
     container:
       image: lmsysorg/sglang:v0.5.21-rocm10-mi30x@sha256:4420a7e492fce623285c635b9a6a7e09ccf77a3c812006494e4414655d46662d
+    env:
+      CUDA_VISIBLE_DEVICES: ""
+      ROCR_VISIBLE_DEVICES: ""
+      HIP_VISIBLE_DEVICES: ""
+      NVIDIA_VISIBLE_DEVICES: void
     steps:
       - uses: actions/checkout@v7
       - name: Require known runner and no GPU device exposure
@@ -34,6 +39,9 @@ jobs:
           esac
           test ! -e /dev/kfd
           test ! -e /dev/dri
+          for device in /dev/nvidia*; do
+            test ! -e "$device" || exit 1
+          done
       - name: Read bounded public package sources
         run: timeout --signal=INT --kill-after=5s 85s python3 .github/amd-source/collect_sglang_source.py --output engine-source-results
       - name: Upload source evidence
