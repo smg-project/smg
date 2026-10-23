@@ -184,8 +184,16 @@ jobs:
 
       # Engine-specific setup
       - name: Setup SGLang backend
-        if: inputs.engine == 'sglang'
+        if: inputs.engine == 'sglang' && inputs.gpu_vendor != 'amd'
         uses: ./.github/actions/setup-sglang
+
+      - name: Setup SGLang backend (in SGLang's ROCm image)
+        if: inputs.engine == 'sglang' && inputs.gpu_vendor == 'amd'
+        env:
+          SMG_SGLANG_ROCM_IMAGE: ${{ inputs.container_image }}
+        run: |
+          python3 scripts/ci_repair_sglang_rocm_native.py
+          bash scripts/ci_setup_sglang_rocm_image.sh
 
       - name: Setup vLLM backend
         if: inputs.engine == 'vllm' && inputs.gpu_vendor != 'amd'
