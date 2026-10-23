@@ -1,15 +1,15 @@
-name: AMD NIXL environment-backed close diagnostic
+name: AMD NIXL local KV lifecycle diagnostic
 on:
   workflow_dispatch:
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: amd-pd-nixl-env-close-e915
+  group: amd-pd-nixl-local-kv-e915
   cancel-in-progress: false
 jobs:
-  pd-nixl-env-close:
-    name: pd-nixl-env-close
+  pd-nixl-local-kv-close:
+    name: pd-nixl-local-kv-close
     runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_8 || '8-gpu-mi300x' }}
     timeout-minutes: 15
     container:
@@ -22,6 +22,7 @@ jobs:
       E2E_MIN_SELECTED: '1'
       E2E_VLLM_KV_BACKEND: nixl
       E2E_KV_BACKEND: nixl
+      SMG_PD_TRACE_LOCAL_KV: '1'
       E2E_LOG_DIR: e2e-logs
       PYTHONPATH: e2e_test
       PYTEST_ADDOPTS: ''
@@ -76,7 +77,7 @@ jobs:
         timeout-minutes: 2
         uses: actions/upload-artifact@v7
         with:
-          name: amd-pd-nixl-close-${{ github.run_id }}-${{ github.run_attempt }}
+          name: amd-pd-nixl-local-kv-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             diagnostic-results/
             e2e-logs/

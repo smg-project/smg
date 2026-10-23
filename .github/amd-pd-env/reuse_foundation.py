@@ -134,7 +134,7 @@ def consumer_budget():
     own = [
         j
         for j in consumer_jobs
-        if j["name"] == "pd-nixl-env-close"
+        if j["name"] == "pd-nixl-local-kv-close"
         and j["runner_name"] == os.environ["RUNNER_NAME"]
         and j["status"] == "in_progress"
         and j["head_sha"] == os.environ["GITHUB_SHA"]

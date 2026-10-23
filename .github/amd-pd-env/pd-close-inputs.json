@@ -15,7 +15,7 @@
     "crates": "d9f44a9aa4199dc40c7d76dd307fc57a521e563f",
     "model_gateway": "0e075a5556734438d2d5dc116c679133408b9ca5",
     "grpc_servicer": "8abb3d9a201fd9e955bddea291e1f724e8de6a08",
-    "e2e_test": "c4b9154acbadcb59b8c98081944f3c2e69b2f98d",
+    "e2e_test": "e0a9ffc8b6242d054b3d83071de09259bc3030bf",
     "scripts": "c0f693708bc1e440775822d630f8081df7f5f295",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/amd-qa": "118f63faa06ee099507e0a00dbe5717a439ce8b1"
@@ -100,9 +100,9 @@
     }
   ],
   "root_preflight_pending": [
-    "exact vLLM repair prerequisite success with actual native wheel/PNG/origins/units/3suites/pipchecks independently audited",
-    "real environment artifact identity/members/hashes/expiry bound",
-    "independent final packet review, current no-overlap and cumulative budget admission"
+    "Independent source/CPU review of this new local KV consumer",
+    "Additional allocator source hashes checked against actual fixed image before model startup",
+    "Root-only current identity, no-overlap, cumulative budget and ready-only admission"
   ],
   "runner_label_evidence": {
     "label": "8-gpu-mi300x",
@@ -356,7 +356,26 @@
     "served_name_original_product_commit": "2e7142f9b73b5e9983809aa76fb9797ac12aa1bf",
     "served_name_consumer_commit": "60d6dcf6632dc2126c615aeb42f3330a8406e165",
     "producer_e2e_tree": "ebb76667f5130610dee968dec4504a70c5d10cf0",
-    "consumer_e2e_tree": "c4b9154acbadcb59b8c98081944f3c2e69b2f98d",
-    "original_PD_probe_contract_unchanged": true
+    "consumer_e2e_tree": "e0a9ffc8b6242d054b3d83071de09259bc3030bf",
+    "original_PD_probe_contract_unchanged": true,
+    "local_kv_base": "a0cf3585725f3ef45fe7fa2dcb83cbcae2e4723d",
+    "original_decode_abort_assertions_unchanged": true,
+    "additional_local_reuse_gate": true
+  },
+  "local_kv_pilot": {
+    "opt_in": "SMG_PD_TRACE_LOCAL_KV=1",
+    "default_enabled": false,
+    "new_GPU_admitted": false,
+    "source_contract": "infra/pd_local_kv_compat.py",
+    "additional_allocator_files": 5,
+    "three_public_source_files_not_yet_captured_in_actual_image": true,
+    "criterion": "Same worker/scheduler/internal request, pool and block objects; native reference decrement and actual same-pool free-queue membership after a satisfied deferred fence, with at least one exclusive reusable page.",
+    "shared_or_prefix_cached_pages": "Shared reference release is distinct from reusable pages; prefix cache retention does not prevent native free-queue reuse.",
+    "other_request_reoccupation_or_ambiguous_observation": "unknown; no acceptance",
+    "transfer_ack": null,
+    "peer_memory_released": null,
+    "HBM_release_proven": false,
+    "observation": "partial",
+    "accepted": false
   }
 }

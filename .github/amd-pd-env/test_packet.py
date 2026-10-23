@@ -28,7 +28,7 @@ def job(monkeypatch, tmp_path):
     now = datetime.datetime.now(datetime.UTC)
     own = dict(
         id=19,
-        name="pd-nixl-env-close",
+        name="pd-nixl-local-kv-close",
         runner_name="offline-runner",
         status="in_progress",
         head_sha="a" * 40,
@@ -233,3 +233,45 @@ def test_budget_expiry_during_bootstrap_never_launches(job, tmp_path, monkeypatc
     with pytest.raises(ValueError, match="before execution"):
         budget_runner.main()
     assert (tmp_path / "diagnostic-results/job-budget.json").is_file()
+
+
+@pytest.mark.parametrize("fault", [None, "missing", "shared", "peer", "identity"])
+def test_local_kv_export_is_required_without_peer_claims(tmp_path, monkeypatch, fault):
+    monkeypatch.setenv("SMG_PD_TRACE_LOCAL_KV", "1")
+    monkeypatch.setattr(probe_evidence, "OUT", tmp_path)
+    (tmp_path / "pd-close.xml").write_text(
+        '<testsuite><testcase classname="router.test_pd_topologies.TestPDDecodeAbortProbe" '
+        'name="test_decode_client_close[pd_http]"/></testsuite>'
+    )
+    local = dict(
+        internal_request_id="cpu-request",
+        request_references_released=True,
+        exclusive_pages_reusable=[1],
+        observation="partial",
+        accepted=False,
+        transfer_ack=None,
+        peer_memory_released=None,
+    )
+    if fault == "missing":
+        local.pop("peer_memory_released")
+    elif fault == "shared":
+        local["exclusive_pages_reusable"] = []
+    elif fault == "peer":
+        local["transfer_ack"] = True
+    elif fault == "identity":
+        local["internal_request_id"] = "another-request"
+    export = dict(
+        accepted=False,
+        error=None,
+        backend="nixl",
+        local_kv=local,
+        decode_abort=dict(client_closed=True, internal_request_id="cpu-request"),
+    )
+    (tmp_path / "pd-close.log").write_text(
+        "SMG_PD_PROBE_BEGIN\n" + json.dumps(export) + "\nSMG_PD_PROBE_END\n"
+    )
+    if fault is None:
+        probe_evidence.results()
+    else:
+        with pytest.raises(ValueError, match="local reusable-page evidence"):
+            probe_evidence.results()

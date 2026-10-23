@@ -64,6 +64,8 @@ def preflight():
 
 
 def results():
+    from infra.pd_local_kv_compat import enabled as local_kv_enabled
+
     cases = list(ET.parse(OUT / "pd-close.xml").getroot().iter("testcase"))
     if len(cases) != 1 or not cases[0].get("classname", "").endswith(".TestPDDecodeAbortProbe"):
         raise ValueError("Exactly the existing single close probe must execute")
@@ -84,6 +86,22 @@ def results():
         or abort.get("client_closed") is not True
     ):
         raise ValueError("Probe did not complete its existing diagnostic contract")
+    if local_kv_enabled():
+        local = exported.get("local_kv", {})
+        if (
+            not isinstance(local.get("internal_request_id"), str)
+            or not local["internal_request_id"]
+            or local["internal_request_id"] != abort.get("internal_request_id")
+            or local.get("request_references_released") is not True
+            or not local.get("exclusive_pages_reusable")
+            or local.get("observation") != "partial"
+            or local.get("accepted") is not False
+            or "transfer_ack" not in local
+            or "peer_memory_released" not in local
+            or local.get("transfer_ack") is not None
+            or local.get("peer_memory_released") is not None
+        ):
+            raise ValueError("Missing local reusable-page evidence; peer release remains unknown")
     (OUT / "probe-export.json").write_text(json.dumps(exported, indent=2) + "\n")
 
 
