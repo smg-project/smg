@@ -1161,7 +1161,12 @@ impl ProtoGenerateRequest {
     /// the retained plan).
     pub fn set_request_id(&mut self, request_id: String) {
         match self {
-            Self::Sglang(req) => req.request_id = request_id,
+            Self::Sglang(req) => {
+                if let Some(handoff) = req.encode_handoff.as_mut() {
+                    handoff.request_id.clone_from(&request_id);
+                }
+                req.request_id = request_id;
+            }
             Self::Vllm(req) => req.request_id = request_id,
             Self::Trtllm(req) => req.request_id = request_id,
             Self::Mlx(req) => req.request_id = request_id,

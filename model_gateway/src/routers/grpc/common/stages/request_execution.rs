@@ -2999,6 +2999,96 @@ mod tests {
     }
 
     #[test]
+    fn epd_restamp_sglang_keeps_handoff_ids_and_clears_the_decode_copy() {
+        use crate::routers::grpc::{
+            common::stages::helpers::{restamp_plan_for_attempt, IdStamp},
+            context::AttemptStamp,
+        };
+
+        let worker = |url, role| -> Arc<dyn Worker> {
+            Arc::new(
+                BasicWorkerBuilder::new(url)
+                    .worker_type(role)
+                    .runtime_type(RuntimeType::Sglang)
+                    .connection_mode(ConnectionMode::Grpc)
+                    .build(),
+            )
+        };
+        let workers = WorkerSelection::Disaggregated {
+            encode_assignments: None,
+            prefill: worker("grpc://retry-prefill:30000", WorkerType::Prefill),
+            decode: worker("grpc://decode:30000", WorkerType::Decode),
+            runtime_type: RuntimeType::Sglang,
+        };
+        let urls = vec![
+            "grpc://encoder0:5001".to_string(),
+            "grpc://encoder1:5002".to_string(),
+            "grpc://encoder2:5003".to_string(),
+        ];
+        for id in [
+            IdStamp::Exact,
+            IdStamp::Suffixed { base: "rid".into() },
+            IdStamp::Minted {
+                prefix: "chatcmpl-",
+            },
+        ] {
+            let exact = matches!(id, IdStamp::Exact);
+            let mut request = ProtoGenerateRequest::Sglang(Box::new(sglang::GenerateRequest {
+                request_id: "first-attempt".into(),
+                ..Default::default()
+            }));
+            request
+                .set_encode_bootstrap_info(sglang::EncodeHandoff {
+                    request_id: request.request_id().to_string(),
+                    encoder_urls: urls.clone(),
+                    num_items_assigned: vec![1, 0, 2],
+                })
+                .unwrap();
+            let mut plan = ExecutionPlan::generate(ExecutionPlanKind::EncodePrefillDecode, request);
+            let stamp = AttemptStamp {
+                id,
+                sampling_mask: None,
+                sampling_baseline: None,
+                inject_pd_metadata: true,
+                tool_constraint: None,
+            };
+            for _ in 0..2 {
+                let previous = plan.clone();
+                restamp_plan_for_attempt(&mut plan, &stamp, &workers, &ToolParserFactory::new())
+                    .unwrap();
+                let ExecutionPlan::EncodePrefillDecode { request } = &plan else {
+                    panic!("expected an EPD plan");
+                };
+                assert_eq!(request.request_id() == previous.request_id(), exact);
+                let handoff = request.as_sglang().encode_handoff.as_ref().unwrap();
+                assert_eq!(handoff.request_id, request.request_id());
+                assert_eq!(handoff.encoder_urls, urls);
+                assert_eq!(handoff.num_items_assigned, [1, 0, 2]);
+                let (mut prefill, decode) = parallel_pd_requests(request.clone(), &workers);
+                assert_eq!(prefill.request_id(), decode.request_id());
+                assert_eq!(prefill.as_sglang().encode_handoff.as_ref(), Some(handoff));
+                assert!(decode.as_sglang().encode_handoff.is_none());
+                prefill.clear_encode_bootstrap_info();
+                assert!(prefill.as_sglang().encode_handoff.is_none());
+                assert!(request.as_sglang().encode_handoff.is_some());
+                let ExecutionPlan::EncodePrefillDecode { request } = previous else {
+                    panic!("expected the retained EPD plan");
+                };
+                assert_eq!(
+                    request
+                        .as_sglang()
+                        .encode_handoff
+                        .as_ref()
+                        .unwrap()
+                        .request_id,
+                    request.request_id(),
+                    "restamping cannot mutate another attempt's cloned request"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn tokenspeed_parallel_pd_forwards_selected_ranks_without_changing_the_room() {
         for (p_rank, p_size, d_rank, d_size) in [
             (Some(0), 1, Some(7), 16),
