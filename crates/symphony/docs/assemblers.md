@@ -199,8 +199,9 @@ says so as the JSON assembler does: one `Malformed { UnterminatedRegion }` event
 `ToolCallEnd`. The fragments stand, since a fragment passed on cannot be taken back, and nothing is
 made up for a value the model never finished; the four assemblers of `tagged` share that end
 (`tagged::end_cut_call`), and what a block that named no call held is refused as
-`UnterminatedRegion` by every one of them, so that the reader's release of a refused output that
-made no call takes the whole slice.
+`UnterminatedRegion` by the keyed, Qwen and XML ones, so that the reader's release of a refused
+output that made no call takes the whole slice; the attributed one takes the same shape on its own
+change.
 
 A third ending, the stream's stop. `Assembler::stop` is for the model's own end of output inside
 the block (`EngineFinish::Stop`; a cut for length, an abort or any other finish is `finish`): the
@@ -421,8 +422,9 @@ What the syntax says, and what the assembler does with it:
   cut: nothing is closed, and a call that started still ends, with no bytes of its own, as
   every assembler ends one, after the one `Malformed { UnterminatedRegion }` event that
   carries what was held, or no bytes, and says that its arguments are no whole value
-  (`tagged::end_cut_call`); what an invoke that named no call held comes back as
-  `Malformed { UnterminatedRegion }` too.
+  (`tagged::end_cut_call`); what an invoke that named no call held is refused as
+  `UnterminatedRegion` too, so that the reader's release of a refused output that made no call
+  takes the whole slice.
 - **Every byte of the invoke lands in exactly one event**, with the tagged assemblers'
   accounting: the name's bytes in `ToolCallStart`, each tag's and value's bytes in the
   fragments they produce, text where the syntax has tags as `Malformed` run by run, the
