@@ -330,6 +330,10 @@ async fn a_scheduler_that_falls_silent_after_hello_fails_the_link_at_the_bound()
         "{error}"
     );
     assert!(error.contains("without a sign of life"), "{error}");
+    assert!(
+        error.starts_with("TokenSpeed scheduler connection failed: "),
+        "{error}"
+    );
     assert!(!server.engine_ready());
     server.stop(Duration::from_secs(5)).unwrap();
 }

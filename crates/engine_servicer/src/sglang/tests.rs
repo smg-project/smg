@@ -1600,6 +1600,11 @@ async fn startup_timeout_keeps_the_server_up_and_reports_the_error() {
     config.servicer.engine_startup_timeout = Duration::from_millis(300);
     let server = SglangServicerServer::start(config).expect("servicer starts");
     wait_until(|| matches!(server.last_error(), Ok(Some(_)))).await;
+    let error = server.last_error().unwrap().unwrap();
+    assert!(
+        error.starts_with("SGLang scheduler connection failed: "),
+        "{error}"
+    );
     assert!(!server.engine_ready());
     assert!(server.running());
     let mut client = SglangSchedulerClient::connect(format!("http://{}", server.address()))

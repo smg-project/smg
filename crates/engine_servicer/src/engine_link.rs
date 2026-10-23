@@ -1,12 +1,18 @@
 //! The link to the engine: `None` while the ZMQ handshake runs, then the
 //! client or the reason it failed. Health is gated on it.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::{
+    sync::{Arc, Mutex, OnceLock},
+    time::Duration,
+};
 
-use engine_zmq_adapter::ZmqEngineClient;
-use engine_zmq_client::EngineLiveness;
+use engine_zmq_adapter::{connect_with_eos, EosTokenIds, Handshake, ZmqEngineClient};
+use engine_zmq_client::{EngineLiveness, StartupBudget};
 use llm_tokenizer::traits::Tokenizer;
-use tracing::warn;
+use openai_protocol::worker::RuntimeType;
+use tracing::{error, info, warn};
+
+use crate::{record_error, servicer_config::SilenceBounds, SharedError};
 
 /// A servicer's tokenizer, set once: by the lifecycle owner that already
 /// loaded it, else by [`load_tokenizer_once`]; `None` inside when there is
@@ -37,6 +43,106 @@ pub(crate) async fn load_tokenizer_once(slot: &TokenizerSlot, tokenizer_dir: Opt
         }
     };
     let _ = slot.set(tokenizer);
+}
+
+/// The words a wire's connect says of its peer: what sits at the other end
+/// of the link, as that engine's own documents name it (the connected log
+/// line and the failure message start with it), and the party the start-up
+/// bound waits on (what the failure text says it heard nothing from).
+pub(crate) struct PeerWords {
+    pub(crate) peer: &'static str,
+    pub(crate) party: &'static str,
+}
+
+/// The inputs of one connect, as the server's start hands them to the link.
+pub(crate) struct ConnectInputs {
+    pub(crate) ipc_base_url: String,
+    pub(crate) handshake_address: String,
+    pub(crate) engine_count: usize,
+    pub(crate) startup_timeout: Duration,
+    pub(crate) startup_ceiling: Option<Duration>,
+    pub(crate) silence: SilenceBounds,
+    pub(crate) last_error: SharedError,
+}
+
+/// Connect the engine behind `link`, in the background of a server that is
+/// already listening. Failures gate health and surface as the last error;
+/// nothing here retries, the lifecycle owner restarts the pair.
+///
+/// The handshake's silence bound (`startup_timeout`) counts from the latest
+/// sign of life: a handshake message, or the lifecycle owner's report that
+/// the engine process is alive (`link.liveness`); the ceiling bounds the
+/// whole start regardless. `configure` runs on the connected client first,
+/// with the wire's own setup (its structured-outputs support, the
+/// tokenizer's EOS, what it knows of the engine at start); then the engine's
+/// silence is bounded by `silence` (with the prefill allowance for the
+/// prompt it holds), applied before the first request reaches it, and the
+/// client is published.
+pub(crate) async fn connect_engine(
+    link: &EngineLink,
+    model_path: String,
+    eos_token_ids: &[u32],
+    runtime: RuntimeType,
+    words: PeerWords,
+    inputs: ConnectInputs,
+    configure: impl FnOnce(&ZmqEngineClient),
+) {
+    let ConnectInputs {
+        ipc_base_url,
+        handshake_address,
+        engine_count,
+        startup_timeout,
+        startup_ceiling,
+        silence,
+        last_error,
+    } = inputs;
+    // The engine stops at EOS itself; the ids only inform the adapter.
+    let eos = if eos_token_ids.is_empty() {
+        EosTokenIds::default()
+    } else {
+        EosTokenIds::from_ids(eos_token_ids)
+    };
+    match connect_with_eos(
+        &ipc_base_url,
+        model_path,
+        runtime,
+        Handshake::TcpOrIpc(&handshake_address),
+        engine_count,
+        eos,
+        StartupBudget {
+            silence: startup_timeout,
+            ceiling: startup_ceiling,
+            liveness: Some(link.liveness.clone()),
+        },
+    )
+    .await
+    {
+        Ok(client) => {
+            configure(&client);
+            silence.apply(&client);
+            info!(
+                handshake = %handshake_address,
+                engines = engine_count,
+                silence_window = ?silence.window,
+                prefill_tokens_per_sec = silence.prefill_tokens_per_sec,
+                "{} connected",
+                words.peer
+            );
+            let _ = link.client.set(client);
+        }
+        Err(connect_error) => {
+            let ceiling = startup_ceiling
+                .map_or_else(|| "none".to_string(), |ceiling| format!("{ceiling:?}"));
+            let message = format!(
+                "{} connection failed: {connect_error} (startup bounds: {startup_timeout:?} \
+                 without a sign of life from the {}, ceiling {ceiling})",
+                words.peer, words.party
+            );
+            error!(%message);
+            link.fail(message.clone());
+            record_error(&last_error, message);
+        }
+    }
 }
 
 /// The engine link: unset while the handshake runs, then the client or the

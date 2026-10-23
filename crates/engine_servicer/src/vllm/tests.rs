@@ -3518,6 +3518,10 @@ async fn an_engine_that_never_dials_in_fails_the_link_at_the_startup_bound() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert!(error.contains("timed out"), "{error}");
+    assert!(
+        error.starts_with("vLLM engine connection failed: "),
+        "{error}"
+    );
     assert!(!server.engine_ready());
     assert!(
         server.running(),
