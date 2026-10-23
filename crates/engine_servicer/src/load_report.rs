@@ -62,8 +62,8 @@ impl Aggregate {
     pub(crate) fn of(ranks: impl IntoIterator<Item = RankLoad>) -> Self {
         let (mut running, mut waiting, mut usage_sum, mut count) = (0_i32, 0_i32, 0.0_f64, 0_usize);
         for rank in ranks {
-            running += rank.running;
-            waiting += rank.waiting;
+            running = running.saturating_add(rank.running);
+            waiting = waiting.saturating_add(rank.waiting);
             usage_sum += rank.usage;
             count += 1;
         }
@@ -131,8 +131,8 @@ mod tests {
         assert_eq!(rank_ids(0).count(), 0);
     }
 
-    /// The aggregate sums the ranks and averages their usage; with no rank
-    /// every figure is zero.
+    /// The aggregate sums the ranks (saturating) and averages their usage;
+    /// with no rank every figure is zero.
     #[test]
     fn the_aggregate_sums_the_ranks_and_averages_their_usage() {
         let aggregate = Aggregate::of([
@@ -153,6 +153,22 @@ mod tests {
         );
         assert_eq!(aggregate.avg_usage, 0.375);
         let empty = Aggregate::of(std::iter::empty::<RankLoad>());
+        let saturated = Aggregate::of([
+            RankLoad {
+                running: i32::MAX,
+                waiting: i32::MAX,
+                usage: 0.0,
+            },
+            RankLoad {
+                running: 1,
+                waiting: 1,
+                usage: 0.0,
+            },
+        ]);
+        assert_eq!(
+            (saturated.running, saturated.waiting, saturated.total),
+            (i32::MAX, i32::MAX, i32::MAX)
+        );
         assert_eq!((empty.running, empty.waiting, empty.total), (0, 0, 0));
         assert_eq!(empty.avg_usage, 0.0);
     }
