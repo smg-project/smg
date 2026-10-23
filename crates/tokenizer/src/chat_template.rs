@@ -1529,15 +1529,16 @@ fn python_capitalize_filter(value: Value) -> String {
     }
 }
 
-/// Jinja2's `title` filter, `str(value).title()`: each word's first
-/// character upper-cased and the rest lower-cased, a word starting after
-/// whitespace or ASCII punctuation (minijinja's body on the Python `str`).
+/// Jinja2's `title` filter (not Python's `str.title()`): each word's first
+/// character upper-cased and the rest lower-cased, a word starting after a
+/// run of `-`, whitespace, `(`, `{`, `[` or `<` (Jinja2's
+/// `_word_beginning_split_re`, `([-\s({\[<]+)`), on the Python `str`.
 fn python_title_filter(value: Value) -> String {
     let text = python_str(&value);
     let mut out = String::with_capacity(text.len());
     let mut capitalize = true;
     for c in text.chars() {
-        if c.is_ascii_punctuation() || c.is_whitespace() {
+        if c.is_whitespace() || matches!(c, '-' | '(' | '{' | '[' | '<') {
             out.push(c);
             capitalize = true;
         } else if capitalize {
@@ -2835,6 +2836,7 @@ mod tests {
              {{ ['a', 'b'] | join(', ') }}|{{ 'Ab' | upper }}|{{ 7 | lower }}|\
              {{ 1.5 | replace('.', ',') }}|{{ 'x.y' | replace('.', '') }}|\
              {{ messages[0].content | capitalize }}|{{ messages[0].content | title }}|\
+             {{ \"get_weather don't\" | title }}|\
              {{ 'x.y.z' | replace('.', '-', 1) }}|{{ messages[0].content | join(', ', attribute='text') }}"
                 .to_string(),
         ))
@@ -2855,7 +2857,8 @@ mod tests {
              [{'TYPE': 'TEXT', 'TEXT': 'HI'}, {'TYPE': 'TEXT', 'TEXT': 'YO'}]|\
              {'type': 'text', 'text': 'hi'}|a, b|AB|7|1,5|xy|\
              [{'type': 'text', 'text': 'hi'}, {'type': 'text', 'text': 'yo'}]|\
-             [{'Type': 'Text', 'Text': 'Hi'}, {'Type': 'Text', 'Text': 'Yo'}]|x-y.z|Hi, Yo"
+             [{'type': 'text', 'text': 'hi'}, {'type': 'text', 'text': 'yo'}]|\
+             Get_weather Don't|x-y.z|Hi, Yo"
         );
     }
 
