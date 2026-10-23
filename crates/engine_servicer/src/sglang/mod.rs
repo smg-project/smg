@@ -264,41 +264,14 @@ impl SglangServicerServer {
             .max_encoding_message_size(usize::MAX),
         );
         let connect_state = Arc::clone(&state);
-        let silence = config.servicer.silence_bounds();
-        let ServicerConfig {
-            bind_address,
-            metrics_bind_address,
-            ipc_base_url,
-            handshake_address,
-            engine_count,
-            engine_startup_timeout,
-            engine_startup_ceiling,
-            ..
-        } = config.servicer;
         let server = servicer::Server::start(
             "smg-sglang-servicer",
-            &bind_address,
-            metrics_bind_address.as_deref(),
+            config.servicer,
             SERVICE_NAME,
+            "SGLang",
             &state,
             routes,
-            move |address, last_error| {
-                #[expect(
-                    clippy::disallowed_methods,
-                    reason = "engine connect is fire-and-forget; the runtime drop cancels it"
-                )]
-                let _connect = tokio::spawn(engine::connect_engine(
-                    connect_state,
-                    ipc_base_url,
-                    handshake_address,
-                    engine_count,
-                    engine_startup_timeout,
-                    engine_startup_ceiling,
-                    silence,
-                    last_error,
-                ));
-                info!(%address, "SGLang gRPC servicer listening");
-            },
+            move |inputs| engine::connect_engine(connect_state, inputs),
         )?;
         Ok(Self { server, state })
     }

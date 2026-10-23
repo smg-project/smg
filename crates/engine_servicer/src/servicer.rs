@@ -2,11 +2,13 @@
 //! handlers and the lifecycle owner read (the engine link, the admitted
 //! requests, the KV-event relay, the metrics, the serving switch) and the
 //! running server (the gRPC listener on its runtime thread, the `/metrics`
-//! listener beside it, the drain-and-stop path). A wire's module adds its
-//! model facts and its proto on top; the drain semantics, the listener budget
-//! and the stop path are written here once.
+//! listener beside it, the engine connect it launches once the listener is
+//! bound, the drain-and-stop path). A wire's module adds its model facts and
+//! its proto on top; the drain semantics, the connect's launch, the listener
+//! budget and the stop path are written here once.
 
 use std::{
+    future::Future,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -21,15 +23,15 @@ use tokio::net::TcpListener;
 use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
 use tonic::{service::Routes, transport, Status};
 use tonic_health::pb::health_server::HealthServer;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
-    engine_link::EngineLink,
+    engine_link::{ConnectInputs, EngineLink},
     health::HealthReporter,
     kv_events::{KvEventRelay, LoadFromState, RankLoads},
     metrics::{MetricsListener, ServicerMetrics, ServicerState, Snapshot},
     requests::RequestRegistry,
-    ServerThread, ServicerError, SharedError, Shutdown,
+    ServerThread, ServicerConfig, ServicerError, Shutdown,
 };
 
 /// A wire's state as the shared code sees it: where its shared half is.
@@ -261,34 +263,41 @@ pub(crate) struct Server {
 }
 
 impl Server {
-    /// Bind `bind_address` and serve `routes` (the wire's service) with the
-    /// health service beside it, on a dedicated runtime thread named
+    /// Bind `config.bind_address` and serve `routes` (the wire's service) with
+    /// the health service beside it, on a dedicated runtime thread named
     /// `thread_name`; returns once the listener is bound. The `/metrics`
-    /// listener binds first, when `metrics_bind_address` asks for one, so a
-    /// scrape during the engine's start answers; the KV-event relay reads its
-    /// load records off `state` and follows the publisher from the start.
-    /// `on_serve` runs on the server runtime once the listener is bound, with
-    /// the bound address as the engines log it (the listener's `local_addr`,
-    /// empty when the read fails) and the server's last-error slot: the
-    /// wire's engine connect, and whatever else lives as long as the runtime.
-    pub(crate) fn start<S, F>(
+    /// listener binds first, when `config.metrics_bind_address` asks for one,
+    /// so a scrape during the engine's start answers; the KV-event relay reads
+    /// its load records off `state` and follows the publisher from the start.
+    /// Once the listener is bound, `connect` gets the inputs of the engine
+    /// connect (the endpoints and the engine count off `config`, its two
+    /// start-up bounds, its silence bounds and the server's last-error slot)
+    /// and the future it returns runs on the server runtime, fire-and-forget:
+    /// the wire's engine connect, which gates health; dropping the runtime
+    /// with the server thread cancels it. The listening line names `engine`
+    /// with the bound address as the engines log it (the listener's
+    /// `local_addr`, empty when the read fails).
+    pub(crate) fn start<S, C, Fut>(
         thread_name: &str,
-        bind_address: &str,
-        metrics_bind_address: Option<&str>,
+        config: ServicerConfig,
         service_name: &str,
+        engine: &'static str,
         state: &Arc<S>,
         routes: Routes,
-        on_serve: F,
+        connect: C,
     ) -> Result<Self, ServicerError>
     where
         S: WireState + RankLoads,
-        F: FnOnce(String, SharedError) + Send + 'static,
+        C: FnOnce(ConnectInputs) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
     {
         let shared = state.shared();
         if let Some(relay) = &shared.kv_relay {
             relay.set_load_source(Arc::new(LoadFromState(Arc::downgrade(state))));
         }
-        let metrics_listener = metrics_bind_address
+        let metrics_listener = config
+            .metrics_bind_address
+            .as_deref()
             .map(|address| {
                 let probe = Arc::downgrade(state);
                 MetricsListener::start(
@@ -309,9 +318,19 @@ impl Server {
             Arc::new(move || health_state.shared().is_serving()),
         );
         let kv_relay = shared.kv_relay.clone();
+        let silence = config.silence_bounds();
+        let ServicerConfig {
+            bind_address,
+            ipc_base_url,
+            handshake_address,
+            engine_count,
+            engine_startup_timeout,
+            engine_startup_ceiling,
+            ..
+        } = config;
         let thread = ServerThread::start(
             thread_name,
-            bind_address,
+            &bind_address,
             move |listener: TcpListener, shutdown: Shutdown, last_error| async move {
                 // The KV-event relay follows the publisher from the start,
                 // before any gateway asks, so its history and live-block
@@ -326,7 +345,20 @@ impl Server {
                     .local_addr()
                     .map(|address| address.to_string())
                     .unwrap_or_default();
-                on_serve(address, last_error);
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "engine connect is fire-and-forget; the runtime drop cancels it"
+                )]
+                let _connect = tokio::spawn(connect(ConnectInputs {
+                    ipc_base_url,
+                    handshake_address,
+                    engine_count,
+                    startup_timeout: engine_startup_timeout,
+                    startup_ceiling: engine_startup_ceiling,
+                    silence,
+                    last_error,
+                }));
+                info!(%address, "{engine} gRPC servicer listening");
                 // Graceful first: stop accepting, let open streams finish. A
                 // connected client's idle keepalive connection would hold a
                 // purely graceful shutdown forever, so the drain grace bounds
@@ -417,8 +449,10 @@ impl Server {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
     use super::*;
-    use crate::metrics::Identity;
+    use crate::{metrics::Identity, record_error};
 
     fn shared() -> Shared {
         let metrics = ServicerMetrics::new(
@@ -494,5 +528,91 @@ mod tests {
         assert_eq!(status.message(), "engine connection failed: refused");
         assert_eq!(shared.health_message("healthy"), "Engine connection failed");
         assert_eq!(shared.snapshot().state, Some(ServicerState::EngineDown));
+    }
+
+    /// A wire of the shared state alone: no engine, no load figures.
+    struct TestState(Shared);
+
+    impl WireState for TestState {
+        fn shared(&self) -> &Shared {
+            &self.0
+        }
+    }
+
+    impl RankLoads for TestState {
+        fn rank_load(
+            &self,
+            _dp_rank: Option<i32>,
+        ) -> Option<smg_grpc_client::common_proto::EngineLoad> {
+            None
+        }
+
+        fn engine_link(&self) -> &EngineLink {
+            &self.0.engine
+        }
+    }
+
+    /// Once the listener is bound, the start hands the wire's connect the
+    /// inputs the configuration said and runs it on the server runtime; what
+    /// the connect records in its error slot is the server's last error.
+    #[test]
+    fn the_start_hands_the_connect_the_configurations_inputs_once_bound() {
+        let state = Arc::new(TestState(shared()));
+        let mut config =
+            ServicerConfig::new("127.0.0.1:0", "ipc:///tmp/engine", "tcp://127.0.0.1:1");
+        config.engine_count = 3;
+        config.engine_startup_timeout = Duration::from_secs(7);
+        config.engine_startup_ceiling = None;
+        config.engine_silence_timeout = Duration::from_secs(11);
+        config.engine_prefill_tokens_per_sec = 500;
+        let (seen_tx, seen_rx) = mpsc::channel();
+        let server = Server::start(
+            "smg-test-servicer",
+            config,
+            "test.Service",
+            "Test",
+            &state,
+            Routes::default(),
+            move |inputs| async move {
+                record_error(&inputs.last_error, "the test's connect failed".to_string());
+                let _ = seen_tx.send((
+                    inputs.ipc_base_url,
+                    inputs.handshake_address,
+                    inputs.engine_count,
+                    inputs.startup_timeout,
+                    inputs.startup_ceiling,
+                    inputs.silence.window,
+                    inputs.silence.prefill_tokens_per_sec,
+                    std::thread::current().name().map(str::to_string),
+                ));
+            },
+        )
+        .expect("the server starts");
+        let (ipc, handshake, engines, timeout, ceiling, window, rate, thread) = seen_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the connect ran");
+        assert_eq!(ipc, "ipc:///tmp/engine");
+        assert_eq!(handshake, "tcp://127.0.0.1:1");
+        assert_eq!(engines, 3);
+        assert_eq!(timeout, Duration::from_secs(7));
+        assert_eq!(ceiling, None);
+        assert_eq!(window, Duration::from_secs(11));
+        assert_eq!(rate, 500);
+        assert_eq!(
+            thread.as_deref(),
+            Some("smg-servicer-rt"),
+            "the server runtime"
+        );
+        assert!(server.running());
+        assert_eq!(
+            server
+                .last_error()
+                .expect("the slot is readable")
+                .as_deref(),
+            Some("the test's connect failed")
+        );
+        server
+            .stop(&state.0, Duration::from_secs(5))
+            .expect("the server stops");
     }
 }
