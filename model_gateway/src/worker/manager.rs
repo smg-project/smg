@@ -1858,6 +1858,30 @@ mod tests {
         )
     }
 
+    /// A probed worker promoted on `success_threshold` reads, probed every
+    /// `check_interval_secs`, with a one-second probe timeout.
+    fn probed_worker_with(
+        url: &str,
+        connection_mode: ConnectionMode,
+        success_threshold: u32,
+        check_interval_secs: u64,
+    ) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .worker_type(WorkerType::Regular)
+                .connection_mode(connection_mode)
+                .health_config(HealthCheckConfig {
+                    success_threshold,
+                    failure_threshold: 1,
+                    timeout_secs: 1,
+                    check_interval_secs,
+                    disable_health_check: false,
+                    drain_settle_secs: 0,
+                })
+                .build(),
+        )
+    }
+
     /// A worker whose health checks are off: its contacts are all the
     /// gateway will hear from it.
     fn unprobed_worker(url: &str) -> Arc<dyn Worker> {
@@ -2300,68 +2324,90 @@ mod tests {
         );
     }
 
+    /// Starts the manager over `registry` with an hour's default interval.
+    fn manager_over(registry: &Arc<WorkerRegistry>) -> WorkerManager {
+        WorkerManager::maybe_start(
+            registry.clone(),
+            WorkerManagerConfig {
+                default_check_interval_secs: 3600,
+                remove_unhealthy: UnhealthyRemovalScope::Disabled,
+            },
+            None,
+            true,
+            false,
+        )
+        .expect("health checks on: the manager runs")
+    }
+
+    /// Polls every 10 ms until `done` holds or `deadline` passes.
+    async fn wait_until(deadline: tokio::time::Instant, what: &str, done: impl Fn() -> bool) {
+        while !done() {
+            assert!(tokio::time::Instant::now() < deadline, "{what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// Through the running loop, against a `/health` that is held: the probe
     /// the contact brings forward reads the hold and the worker stays
-    /// demoted; once the health answers, the probe a contact brings forward
-    /// promotes it. The transport says the same thing both times.
+    /// demoted, and nothing probes it again without a signal (a failure
+    /// returns the schedule to the interval); once the health answers, the
+    /// scheduled probe promotes it. A second contact sends no signal: the
+    /// first cleared the unreachable veto that sends one.
     #[tokio::test]
     async fn a_demoted_worker_returns_on_the_health_read_its_contact_brings_forward() {
         let serving = Arc::new(AtomicBool::new(false));
         let hits = Arc::new(AtomicUsize::new(0));
         let url = start_health_stub(serving.clone(), hits.clone()).await;
         let registry = Arc::new(WorkerRegistry::new());
-        // An hour between probes: the probes this test sees are the ones the
-        // signals bring forward.
-        let worker = probed_worker(&url, ConnectionMode::Http);
+        // Two seconds between probes: the first probe this test sees is the
+        // one the signal brings forward, the second the scheduled one.
+        let worker = probed_worker_with(&url, ConnectionMode::Http, 1, 2);
         worker.set_status(WorkerStatus::NotReady);
         let revision = worker.revision();
         registry.register(worker.clone()).unwrap();
+        let mut manager = manager_over(&registry);
 
-        let mut manager = WorkerManager::maybe_start(
-            registry.clone(),
-            WorkerManagerConfig {
-                default_check_interval_secs: 3600,
-                remove_unhealthy: false,
-            },
-            None,
-            true,
-            false,
+        let contact = tokio::time::Instant::now();
+        registry
+            .connect_signal_sender()
+            .send(WorkerConnected {
+                url: url.clone(),
+                revision,
+            })
+            .unwrap();
+        wait_until(
+            contact + Duration::from_secs(5),
+            "the contact's probe did not read the health in time",
+            || hits.load(Ordering::SeqCst) > 0,
         )
-        .expect("health checks on: the manager runs");
-        let signal = || WorkerConnected {
-            url: url.clone(),
-            revision,
-        };
-
-        registry.connect_signal_sender().send(signal()).unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while hits.load(Ordering::SeqCst) == 0 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the contact's probe did not read the health in time"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
             worker.status(),
             WorkerStatus::NotReady,
             "a held health keeps the worker demoted whatever its transport says"
         );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a failed probe returns the schedule to the interval: no probe without a signal"
+        );
 
         serving.store(true, Ordering::SeqCst);
-        registry.connect_signal_sender().send(signal()).unwrap();
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while worker.status() != WorkerStatus::Ready {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the probe that read the health did not promote the worker in time"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        wait_until(
+            contact + Duration::from_secs(6),
+            "the scheduled probe did not promote the worker in time",
+            || worker.status() == WorkerStatus::Ready,
+        )
+        .await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "the hold and the scheduled pass, with no second signal"
+        );
         assert!(
-            hits.load(Ordering::SeqCst) >= 2,
-            "two probes: the hold and the pass"
+            tokio::time::Instant::now() >= contact + Duration::from_secs(2),
+            "the promoting probe was the scheduled one, an interval after the launch"
         );
 
         manager.shutdown().await;
