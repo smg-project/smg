@@ -1,0 +1,18 @@
+{
+  "realtime": {
+    "models": [
+      "Qwen/Qwen3-ASR-1.7B"
+    ],
+    "test_dir": "e2e_test/realtime/test_realtime_local.py",
+    "min_selected": 3,
+    "selected_count": 4,
+    "selection_metadata_sha256": "abacb1f69c3e52f688423d5d704a97fffd9705b5b42da95b0d2b062d7ee998d7",
+    "cases": [
+      "realtime/test_realtime_local.py::TestRealtimeLocalWebSocket::test_missing_auth_rejected",
+      "realtime/test_realtime_local.py::TestRealtimeLocalWebSocket::test_missing_model_rejected",
+      "realtime/test_realtime_local.py::TestRealtimeLocalWebSocket::test_session_created_on_connect",
+      "realtime/test_realtime_local.py::TestRealtimeLocalWebSocket::test_transcription_round_trip"
+    ],
+    "allowed_skips": {}
+  }
+}

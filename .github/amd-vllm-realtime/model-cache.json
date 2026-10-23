@@ -1,0 +1,61 @@
+{
+  "model_id": "Qwen/Qwen3-ASR-1.7B",
+  "revision": "7278e1e70fe206f11671096ffdd38061171dd6e5",
+  "config_sha256": "2e74a751548b8ad7d7526d29365ad8144c345d8b412b1152d25dc6698452712f",
+  "official_config_url": "https://huggingface.co/Qwen/Qwen3-ASR-1.7B/resolve/7278e1e70fe206f11671096ffdd38061171dd6e5/config.json",
+  "cache_observed_on_runner": false,
+  "runtime_files": [
+    {
+      "name": "chat_template.json",
+      "bytes": 1161,
+      "lfs_sha256": null
+    },
+    {
+      "name": "config.json",
+      "bytes": 6194,
+      "lfs_sha256": null
+    },
+    {
+      "name": "generation_config.json",
+      "bytes": 142,
+      "lfs_sha256": null
+    },
+    {
+      "name": "merges.txt",
+      "bytes": 1671853,
+      "lfs_sha256": null
+    },
+    {
+      "name": "model-00001-of-00002.safetensors",
+      "bytes": 4220320824,
+      "lfs_sha256": "a4cd1f1a04d90b757dc7f7dd26254e69a013b19e80efe590a83c6a3bde8608d6"
+    },
+    {
+      "name": "model-00002-of-00002.safetensors",
+      "bytes": 478200688,
+      "lfs_sha256": "6e0b9d9e09e2e0238e7ef3cc8a484ab387e91b90f1900bedf88bc92d7929ccfc"
+    },
+    {
+      "name": "model.safetensors.index.json",
+      "bytes": 64821,
+      "lfs_sha256": null
+    },
+    {
+      "name": "preprocessor_config.json",
+      "bytes": 330,
+      "lfs_sha256": null
+    },
+    {
+      "name": "tokenizer_config.json",
+      "bytes": 12487,
+      "lfs_sha256": null
+    },
+    {
+      "name": "vocab.json",
+      "bytes": 2776833,
+      "lfs_sha256": null
+    }
+  ],
+  "official_manifest_url": "https://huggingface.co/api/models/Qwen/Qwen3-ASR-1.7B/revision/7278e1e70fe206f11671096ffdd38061171dd6e5?blobs=true",
+  "runtime_file_bytes": 4703055333
+}
