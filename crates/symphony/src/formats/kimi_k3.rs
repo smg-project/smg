@@ -557,10 +557,19 @@ mod tests {
         ] {
             let events = run(PROMPT, &[output]);
             assert_eq!(bytes(&events), output, "{ending}");
+            // Refused whole: the bytes dropped as the model's failed call, never content, behind
+            // the counted event of no bytes.
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    Event::Malformed { text, .. } if !text.text.is_empty()
+                )),
+                "{ending}: {events:?}"
+            );
             assert!(
                 events.iter().any(|event| matches!(
                     event,
-                    Event::Malformed { text, .. } if text.text == ending
+                    Event::Dropped { text, why: DropReason::MalformedCall } if text.text.ends_with(ending)
                 )),
                 "{ending}: {events:?}"
             );
@@ -704,7 +713,14 @@ mod tests {
         assert!(
             stopped.iter().any(|event| matches!(
                 event,
-                Event::Malformed { text, why: MalformedReason::TagCutShort }
+                Event::Malformed { text, why: MalformedReason::TagCutShort } if text.text.is_empty()
+            )),
+            "the cut tag is counted: {stopped:?}"
+        );
+        assert!(
+            stopped.iter().any(|event| matches!(
+                event,
+                Event::Dropped { text, why: DropReason::MalformedCall }
                     if text.text == "<|open|>argument key=\"n\" type=\"number\"<|sep|>1.5"
             )),
             "the held number is reported: {stopped:?}"

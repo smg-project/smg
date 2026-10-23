@@ -394,7 +394,8 @@ impl Tally {
                     self.announced = true;
                 }
             }
-            // The bytes of a call block a syntax refused (the keyed one): they are the malformed
+            // The bytes of a call block a syntax refused (the keyed one, the attributed one inside
+            // an invoke): they are the malformed
             // run's, announced by the event of no bytes right before them, so the histogram and
             // the line still say how much of the answer was debris. At a cut call's end the bytes
             // held come before the event (`tagged::end_cut_call`): they count, and the run keeps

@@ -93,8 +93,10 @@ pub(crate) fn end_cut_call(index: u32, held: String, terminal: &str, out: &mut E
 /// format's own tokens, and what stands between them where the syntax has no place for text (a
 /// value whose key never opened, a name that is prose or Python, a tag written twice) is the
 /// model's failed call, which the families' own parsers drop whole; a client shown it saw the
-/// format's tags inside the answer. A call that started keeps the pairs it read. Nothing is
-/// pushed for no bytes; the engine renames `UnterminatedRegion` here as anywhere.
+/// format's tags inside the answer. For the attributed syntax inside an invoke the same (a word
+/// between tags, a tag out of its place or cut short, a tail the tag has no place for, an
+/// invoke that named no call). A call that started keeps the pairs it read. Nothing is pushed
+/// for no bytes; the engine renames `UnterminatedRegion` here as anywhere.
 pub(crate) fn refuse(text: String, why: MalformedReason, out: &mut Events) {
     if text.is_empty() {
         return;

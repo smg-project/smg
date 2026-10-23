@@ -281,11 +281,13 @@ What the syntax says, and what the assembler does with it:
   `ToolCallEnd`, as `tagged::end_cut_call` has it); a call that started keeps the pairs it read
   (`{}` when none), and a block that named no call has every byte refused, the marker that
   closed it included. The attributed assembler (`tagged::attributed`: DSML, XTML, `<parameter
-  name="…">`) refuses the same way what it meets inside an invoke where its syntax has tags: a
-  word between tags, a tag out of its place (a parameter tag written without its `<`, a call's
-  arguments written as JSON and closed with a region of the model's own, both seen live, reached
-  the client as content with the format's tokens in it before). The XML and Qwen-tagged
-  assemblers still carry such bytes in the `Malformed` event, which the adapters show.
+  name="…">`) refuses the same way everything inside an invoke its syntax cannot read: a word
+  between tags, a tag out of its place or cut short, a tail a tag has no place for, an invoke
+  that named no call (whole, its closing tag included); a call that started keeps the members it
+  read. (A parameter tag written without its `<` and a call's arguments written as JSON and
+  closed with a region of the model's own, both seen live, reached the client as content with
+  the format's tokens in it before.) The XML and Qwen-tagged assemblers still carry such bytes in
+  the `Malformed` event, which the adapters show.
 - **Every byte of the call lands in exactly one event**, with the Qwen assembler's accounting:
   the name's bytes in `ToolCallStart`, each tag's and value's bytes in the fragments they
   produce, the whitespace the template writes between tags as `Dropped { Wrapper }`, and what

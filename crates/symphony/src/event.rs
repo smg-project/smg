@@ -143,7 +143,8 @@ pub enum DropReason {
     /// Bytes of a call block the call syntax could not read as the call, for a syntax whose block
     /// is never prose (the keyed syntax: the block's markers and its four tags are the format's
     /// own tokens, and what stands between them where the syntax has no place for text is the
-    /// model's failed call). A `Malformed` event of no bytes with the reason stands right before
+    /// model's failed call; the attributed syntax inside an invoke, `tagged::attributed`, the
+    /// same). A `Malformed` event of no bytes with the reason stands right before
     /// them, or, for a call the end of the stream or a marker cut, right after them and before
     /// its `ToolCallEnd` (`tagged::end_cut_call`), so the failure is counted; the bytes
     /// themselves never reach a client as content.

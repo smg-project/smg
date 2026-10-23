@@ -487,10 +487,18 @@ mod tests {
         ] {
             let events = run("<think>\n\n</think>\n\n", &[output]);
             assert_eq!(bytes(&events), output, "{ending}");
+            // Refused whole: the counted event of no bytes, the bytes dropped, never content.
             assert!(
                 events.iter().any(|event| matches!(
                     event,
-                    Event::Malformed { text, .. } if text.text == ending
+                    Event::Dropped { text, why: DropReason::MalformedCall } if text.text.ends_with(ending)
+                )),
+                "{ending}: {events:?}"
+            );
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    Event::Malformed { text, .. } if !text.text.is_empty()
                 )),
                 "{ending}: {events:?}"
             );
@@ -571,18 +579,23 @@ mod tests {
         let events = run("<think>", &[output]);
         assert_eq!(bytes(&events), output);
         assert_eq!(arguments_of(&events, 0), r#"{"a": "1"}"#);
-        let malformed: Vec<&str> = events
+        // The tag with its tail is refused: its bytes dropped as the model's failed call, never
+        // content, behind the counted event of no bytes.
+        let refused: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(&*text.text),
+                Event::Dropped {
+                    text,
+                    why: DropReason::MalformedCall,
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect();
         assert!(
-            malformed
+            refused
                 .iter()
                 .any(|text| text.ends_with("<｜DSML｜ parameter name=\"x\" kind=\"y\">")),
-            "{malformed:?}"
+            "{refused:?}"
         );
     }
 
