@@ -35,12 +35,13 @@ def apply_encoder_handoff(request, tokenized, server_args, image_modality):
     for url in urls:
         parsed = urlsplit(url)
         if (
-            parsed.scheme != "grpc"
+            not url.startswith("grpc://")
+            or parsed.scheme != "grpc"
             or not parsed.hostname
             or not parsed.port
             or parsed.username is not None
             or parsed.password is not None
-            or parsed.path not in ("", "/")
+            or parsed.path != ""
             or parsed.query
             or parsed.fragment
             or any(c.isspace() for c in url)

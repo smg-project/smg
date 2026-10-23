@@ -87,6 +87,8 @@ def test_real_generate_submits_the_same_id_assignment_and_original_tokens(servic
         "sum",
         "duplicate",
         "url",
+        "url-trailing-slash",
+        "url-uppercase",
         "pixel",
         "video",
         "decode",
@@ -109,6 +111,10 @@ def test_invalid_handoff_aborts_before_scheduler_or_legacy_dispatch(service, cha
         value.encode_handoff.encoder_urls[1] = value.encode_handoff.encoder_urls[0]
     elif change == "url":
         value.encode_handoff.encoder_urls[0] = "http://encoder:5001"
+    elif change == "url-trailing-slash":
+        value.encode_handoff.encoder_urls[0] = "grpc://encoder:5001/"
+    elif change == "url-uppercase":
+        value.encode_handoff.encoder_urls[0] = "GRPC://encoder:5001"
     elif change == "pixel":
         value.mm_inputs.pixel_values.SetInParent()
     elif change == "video":
