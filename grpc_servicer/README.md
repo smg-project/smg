@@ -350,7 +350,11 @@ contract the Python servicer serves: text generation, PD disaggregation
 (`--kv-transfer-config`: connector params pass through both ways and
 `GetServerInfo` carries the pairing identity), Router-preprocessed media
 (inline and `/dev/shm` tensors), worker-side media processing (`media_refs`,
-below), `Embed`, `FlushCache`, `GetTokenizer` (which answers
+below), `Embed`, `FlushCache`, `StartProfile` and `StopProfile` (the engine's own
+torch profiler as its launch configured it, started and stopped on every rank;
+a start that sets per-request options is refused, since the engine takes its
+profiler's directory and options at launch; the same on the Python servicer),
+`GetTokenizer` (which answers
 FAILED_PRECONDITION when the launcher could not resolve a local tokenizer
 directory) and `SubscribeKvEvents` (vLLM's ZMQ publisher, which the servicer
 turns on by itself, on this path as on the Python one, when the launcher is

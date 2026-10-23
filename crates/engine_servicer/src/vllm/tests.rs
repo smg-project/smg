@@ -2288,6 +2288,88 @@ mod flush_cache {
         answered
     }
 
+    /// `StartProfile` is vLLM's `profile(True)` as a utility call on every rank and
+    /// `StopProfile` its `profile(False)`; the engine's answer is the Python servicer's
+    /// success response; an option the engine takes only at its launch is refused before
+    /// any call; the engine's own failure (a profiler it was launched without) is INTERNAL
+    /// with its words.
+    #[tokio::test]
+    async fn starts_and_stops_the_profiler_through_utility_calls() {
+        let mut h = harness(model_info(), None).await;
+        for (start, expected_args, op_name) in [
+            (true, vec![OpaqueValue::from(true)], "Start profiling"),
+            (false, vec![OpaqueValue::from(false)], "Stop profiling"),
+        ] {
+            let answer = async {
+                let call = recv_utility(&mut h.engine_in).await;
+                h.engine_out
+                    .send_utility_reply(0, call.call_id, Ok(OpaqueValue::Nil))
+                    .await
+                    .unwrap();
+                call
+            };
+            let (response, call) = if start {
+                let (response, call) = tokio::join!(
+                    h.client
+                        .start_profile(common::StartProfileRequest::default()),
+                    answer
+                );
+                (response, call)
+            } else {
+                let (response, call) =
+                    tokio::join!(h.client.stop_profile(common::StopProfileRequest {}), answer);
+                (response, call)
+            };
+            assert_eq!(call.method, "profile");
+            assert_eq!(call.args, expected_args);
+            assert_eq!(call.client_index, 0);
+            let response = response.expect(op_name).into_inner();
+            assert!(response.success, "{op_name}");
+            assert_eq!(response.message, format!("{op_name} succeeded"));
+        }
+        // Options the engine takes at its launch are refused before any call.
+        let status = h
+            .client
+            .start_profile(common::StartProfileRequest {
+                output_dir: Some("/traces".to_string()),
+                num_steps: Some(3),
+                ..Default::default()
+            })
+            .await
+            .expect_err("refused");
+        assert_eq!(status.code(), Code::InvalidArgument);
+        assert!(
+            status.message().contains("output_dir, num_steps"),
+            "{}",
+            status.message()
+        );
+        assert_engine_idle(&mut h.engine_in).await;
+        // The engine's own failure, in its words.
+        let (response, ()) = tokio::join!(
+            h.client
+                .start_profile(common::StartProfileRequest::default()),
+            async {
+                let call = recv_utility(&mut h.engine_in).await;
+                h.engine_out
+                    .send_utility_reply(
+                        0,
+                        call.call_id,
+                        Err("Profiler is not enabled.".to_string()),
+                    )
+                    .await
+                    .unwrap();
+            }
+        );
+        let status = response.expect_err("failed");
+        assert_eq!(status.code(), Code::Internal);
+        assert!(
+            status.message().contains("Profiler is not enabled"),
+            "{}",
+            status.message()
+        );
+        h.server.stop(Duration::from_secs(5)).expect("clean stop");
+    }
+
     /// The RPC is vLLM's `reset_prefix_cache(False, False)` as a utility call;
     /// `true` from the engine is the Python servicer's success response.
     #[tokio::test]

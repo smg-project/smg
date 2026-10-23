@@ -20,6 +20,12 @@ service VllmEngine {
   // Invalidate the local KV prefix cache without preempting requests.
   rpc FlushCache(smg.grpc.common.FlushCacheRequest) returns (smg.grpc.common.FlushCacheResponse);
 
+  // Start the engine's profiler (configured at its launch) on every rank
+  rpc StartProfile(smg.grpc.common.StartProfileRequest) returns (smg.grpc.common.ProfileResponse);
+
+  // Stop the profiler and export its traces
+  rpc StopProfile(smg.grpc.common.StopProfileRequest) returns (smg.grpc.common.ProfileResponse);
+
   // Abort a running request
   rpc Abort(AbortRequest) returns (AbortResponse);
 

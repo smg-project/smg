@@ -88,7 +88,7 @@ impl VllmEngineClient {
         Ok(())
     }
 
-    crate::impl_flush_cache!();
+    crate::impl_admin_ops!();
     crate::impl_get_tokenizer!();
     crate::impl_subscribe_kv_events!();
 

@@ -236,6 +236,20 @@ fn produce_after(tx: GenerateTx, delay: Duration) {
 
 #[tonic::async_trait]
 impl proto::vllm_engine_server::VllmEngine for Engine {
+    async fn start_profile(
+        &self,
+        _request: Request<smg_grpc_client::common_proto::StartProfileRequest>,
+    ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
+        Err(Status::unimplemented("unused in this test"))
+    }
+
+    async fn stop_profile(
+        &self,
+        _request: Request<smg_grpc_client::common_proto::StopProfileRequest>,
+    ) -> Result<Response<smg_grpc_client::common_proto::ProfileResponse>, Status> {
+        Err(Status::unimplemented("unused in this test"))
+    }
+
     type GenerateStream = ReceiverStream<Result<proto::GenerateResponse, Status>>;
 
     async fn generate(
