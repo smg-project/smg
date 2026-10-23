@@ -2351,8 +2351,7 @@ mod tests {
     /// the contact brings forward reads the hold and the worker stays
     /// demoted; the contact's probe re-arms the deadline an interval out: no
     /// further probe without a signal. Once the health answers, the scheduled
-    /// probe promotes it. A second contact sends no signal: the first cleared
-    /// the unreachable veto that sends one.
+    /// probe promotes it.
     #[tokio::test]
     async fn a_demoted_worker_stays_out_on_its_contacts_read_and_returns_on_the_scheduled_one() {
         let serving = Arc::new(AtomicBool::new(false));
