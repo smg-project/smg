@@ -5,7 +5,11 @@
 
 use std::borrow::Cow;
 
-use openai_protocol::chat::{ChatMessageDeltaRef, ChatStreamChoiceRef};
+use openai_protocol::{
+    chat::{ChatMessageDeltaRef, ChatStreamChoiceRef},
+    common::ChatLogProbsContent,
+};
+use symphony::Text;
 
 use super::*;
 
@@ -158,4 +162,137 @@ fn decimal_digits_are_the_number_s() {
         push_decimal(&mut buffer, value);
         assert_eq!(String::from_utf8_lossy(&buffer), value.to_string());
     }
+}
+
+/// The logprobs a chunk carries: a detailed entry for one token.
+fn logprobs() -> ChatLogProbs {
+    ChatLogProbs::Detailed {
+        content: Some(vec![ChatLogProbsContent {
+            token: "why".to_string(),
+            logprob: -0.25,
+            bytes: None,
+            top_logprobs: Vec::new(),
+        }]),
+        refusal: None,
+    }
+}
+
+/// The serializer's bytes for one text delta of choice `index`, with or
+/// without logprobs: what `push_chunk` wrote before the direct form existed.
+fn serialized_delta(
+    frame: &ChatChunkFrame,
+    index: u32,
+    field: TextDeltaField,
+    text: &str,
+    logprobs: Option<ChatLogProbs>,
+) -> Vec<u8> {
+    let (content, reasoning_content) = match field {
+        TextDeltaField::Content => (Some(Cow::Borrowed(text)), None),
+        TextDeltaField::Reasoning => (None, Some(Cow::Borrowed(text))),
+    };
+    let choice = ChatStreamChoiceRef {
+        index,
+        delta: ChatMessageDeltaRef {
+            role: None,
+            content,
+            tool_calls: None,
+            reasoning_content,
+        },
+        logprobs,
+        finish_reason: None,
+        matched_stop: None,
+    };
+    let mut buffer = BytesMut::new();
+    frame.write_chunk(&mut buffer, &choice, None, false);
+    buffer.to_vec()
+}
+
+/// With logprobs on, the first text delta of a step carries them (through the
+/// serializer), whichever kind it is, and the deltas after it, content and
+/// reasoning alike, are written in the direct form: byte for byte what the
+/// serializer wrote for every one of them.
+#[tokio::test]
+async fn push_events_puts_the_logprobs_on_the_first_text_delta_and_writes_the_serializer_s_bytes() {
+    let frame = frame();
+    let (tx, _rx) = sse_channel();
+    // `Events` merges consecutive text of one kind and drops empty text, so
+    // the kinds alternate here: three deltas, the first of them reasoning.
+    let mut events = Events::new();
+    events.push_content(Text::new("", 0));
+    events.push_reasoning(Text::new("why", 1));
+    events.push_content(Text::new("Hello \"there\"\n", 2));
+    events.push_reasoning(Text::new("", 0));
+    events.push_reasoning(Text::new("because", 1));
+    let mut buffer = BytesMut::new();
+    StreamingProcessor::push_events(
+        &tx,
+        &mut buffer,
+        &frame,
+        3,
+        &mut events,
+        Some(logprobs()),
+        None,
+        false,
+    )
+    .await
+    .expect("the events are written");
+
+    let mut expected = serialized_delta(
+        &frame,
+        3,
+        TextDeltaField::Reasoning,
+        "why",
+        Some(logprobs()),
+    );
+    expected.extend(serialized_delta(
+        &frame,
+        3,
+        TextDeltaField::Content,
+        "Hello \"there\"\n",
+        None,
+    ));
+    expected.extend(serialized_delta(
+        &frame,
+        3,
+        TextDeltaField::Reasoning,
+        "because",
+        None,
+    ));
+    assert_eq!(
+        String::from_utf8_lossy(&buffer),
+        String::from_utf8_lossy(&expected)
+    );
+    assert!(
+        String::from_utf8_lossy(&buffer)
+            .matches("\"logprobs\":{")
+            .count()
+            == 1,
+        "exactly the first text delta carries the logprobs"
+    );
+}
+
+/// Without logprobs every text delta takes the direct form, and the empty
+/// texts write nothing.
+#[tokio::test]
+async fn push_events_without_logprobs_writes_every_text_delta_in_the_direct_form() {
+    let frame = frame();
+    let (tx, _rx) = sse_channel();
+    let mut events = Events::new();
+    events.push_content(Text::new("a", 1));
+    events.push_content(Text::new("", 0));
+    events.push_reasoning(Text::new("b", 1));
+    let mut buffer = BytesMut::new();
+    StreamingProcessor::push_events(&tx, &mut buffer, &frame, 0, &mut events, None, None, true)
+        .await
+        .expect("the events are written");
+    let mut expected = written(&frame, 0, TextDeltaField::Content, "a", None, true);
+    expected.extend(written(
+        &frame,
+        0,
+        TextDeltaField::Reasoning,
+        "b",
+        None,
+        true,
+    ));
+    assert_eq!(buffer.to_vec(), expected);
 }
