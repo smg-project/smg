@@ -161,7 +161,7 @@
     ".github/amd-vllm-rust-servicer/",
     ".github/workflows/pr-test-rust.yml"
   ],
-  "consumer_setup_core_minutes": 27,
+  "consumer_setup_core_minutes": 55,
   "cleanup_reserved_minutes": 5,
   "target_product_commit": "66ea8bdb64422e8bc4821af122e484db261fcb29",
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat-rust-servicer[1]/vllm/nvidia",
