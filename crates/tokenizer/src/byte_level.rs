@@ -51,15 +51,44 @@ static CHAR_BYTES: LazyLock<[Option<u8>; ALPHABET_END]> = LazyLock::new(|| {
     table
 });
 
-/// What the table knows about an id.
+/// What the table knows about an id: whether it is in the vocabulary, which
+/// store holds its bytes, and whether `skip_special_tokens` strips it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     /// Not in the vocabulary.
     Absent,
-    /// A token kept in decoded text.
-    Ordinary,
-    /// A token `skip_special_tokens` strips.
-    Special,
+    /// A token kept in decoded text, whole: in the text store.
+    Text,
+    /// A token kept in decoded text, not whole on its own: in the byte store.
+    Bytes,
+    /// A token `skip_special_tokens` strips, in the text store.
+    SpecialText,
+    /// A token `skip_special_tokens` strips, in the byte store.
+    SpecialBytes,
+}
+
+impl Kind {
+    fn special(self) -> bool {
+        matches!(self, Self::SpecialText | Self::SpecialBytes)
+    }
+}
+
+/// The bytes of one token as the table holds them: text when the token is
+/// whole on its own (valid UTF-8 that does not end in the replacement
+/// character), bytes otherwise.
+#[derive(Clone, Copy)]
+enum Piece<'a> {
+    Text(&'a str),
+    Bytes(&'a [u8]),
+}
+
+impl Piece<'_> {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Piece::Text(text) => text.as_bytes(),
+            Piece::Bytes(bytes) => bytes,
+        }
+    }
 }
 
 /// Per-tokenizer table of the bytes each id decodes to.
@@ -67,54 +96,77 @@ enum Kind {
 /// Built once at load time: by [`ByteLevelTable::build`] for a `tokenizers`
 /// vocabulary whose decoder is exactly `ByteLevel`, through
 /// [`ByteLevelTableBuilder`] for a tiktoken vocabulary, whose ranks are byte
-/// strings already. About 9 bytes per id plus the token bytes themselves.
+/// strings already. The tokens that are whole on their own (valid UTF-8 not
+/// ending in U+FFFD: the common case, the step emits them as they are) live
+/// in a text store, so the decoder reads each as `&str` with no validation
+/// per token; the others live in a byte store. About 9 bytes per id plus the
+/// token bytes themselves.
 pub(crate) struct ByteLevelTable {
-    /// `offsets[id]..offsets[id + 1]` indexes `bytes` for token `id`.
-    offsets: Vec<usize>,
+    /// `spans[id]` indexes the store `kind[id]` names for token `id`.
+    spans: Vec<(u32, u32)>,
+    text: String,
     bytes: Vec<u8>,
     kind: Vec<Kind>,
 }
 
 /// Builds a [`ByteLevelTable`] one id at a time, from 0 up.
 pub(crate) struct ByteLevelTableBuilder {
-    offsets: Vec<usize>,
+    spans: Vec<(u32, u32)>,
+    text: String,
     bytes: Vec<u8>,
     kind: Vec<Kind>,
 }
 
 impl ByteLevelTableBuilder {
     pub(crate) fn with_capacity(ids: usize) -> Self {
-        let mut offsets = Vec::with_capacity(ids + 1);
-        offsets.push(0);
         Self {
-            offsets,
-            bytes: Vec::with_capacity(ids * 4),
+            spans: Vec::with_capacity(ids),
+            text: String::with_capacity(ids * 4),
+            bytes: Vec::new(),
             kind: Vec::with_capacity(ids),
         }
     }
 
     /// The next id decodes to `bytes`; `special` marks a token that
-    /// `skip_special_tokens` strips.
+    /// `skip_special_tokens` strips. A token that is whole on its own goes to
+    /// the text store, classified here once rather than on every step.
     pub(crate) fn push(&mut self, bytes: &[u8], special: bool) {
-        self.bytes.extend_from_slice(bytes);
-        self.offsets.push(self.bytes.len());
-        self.kind.push(if special {
-            Kind::Special
-        } else {
-            Kind::Ordinary
-        });
+        match std::str::from_utf8(bytes) {
+            Ok(text) if settled(text) => {
+                let start = self.text.len();
+                self.text.push_str(text);
+                self.spans.push((start as u32, self.text.len() as u32));
+                self.kind.push(if special {
+                    Kind::SpecialText
+                } else {
+                    Kind::Text
+                });
+            }
+            _ => {
+                let start = self.bytes.len();
+                self.bytes.extend_from_slice(bytes);
+                self.spans.push((start as u32, self.bytes.len() as u32));
+                self.kind.push(if special {
+                    Kind::SpecialBytes
+                } else {
+                    Kind::Bytes
+                });
+            }
+        }
     }
 
     /// The next id is not in the vocabulary.
     pub(crate) fn push_absent(&mut self) {
-        self.offsets.push(self.bytes.len());
+        self.spans.push((0, 0));
         self.kind.push(Kind::Absent);
     }
 
     pub(crate) fn finish(mut self) -> Arc<ByteLevelTable> {
+        self.text.shrink_to_fit();
         self.bytes.shrink_to_fit();
         Arc::new(ByteLevelTable {
-            offsets: self.offsets,
+            spans: self.spans,
+            text: self.text,
             bytes: self.bytes,
             kind: self.kind,
         })
@@ -152,9 +204,9 @@ impl ByteLevelTable {
     pub(crate) fn decode(&self, ids: &[TokenIdType], skip_special_tokens: bool) -> String {
         let mut bytes = Vec::with_capacity(ids.len().saturating_mul(4));
         for &id in ids {
-            if let Some((token_bytes, special)) = self.entry(id) {
+            if let Some((piece, special)) = self.entry(id) {
                 if !skip_special_tokens || !special {
-                    bytes.extend_from_slice(token_bytes);
+                    bytes.extend_from_slice(piece.as_bytes());
                 }
             }
         }
@@ -164,17 +216,21 @@ impl ByteLevelTable {
         }
     }
 
-    /// The bytes of `id` and whether it is special; `None` for an id the
-    /// vocabulary lacks.
+    /// The piece of `id` (text when the token is whole on its own, bytes
+    /// otherwise) and whether it is special; `None` for an id the vocabulary
+    /// lacks.
     #[inline]
-    fn entry(&self, id: TokenIdType) -> Option<(&[u8], bool)> {
+    fn entry(&self, id: TokenIdType) -> Option<(Piece<'_>, bool)> {
         let id = id as usize;
         let kind = *self.kind.get(id)?;
-        if kind == Kind::Absent {
-            return None;
-        }
-        let bytes = &self.bytes[self.offsets[id]..self.offsets[id + 1]];
-        Some((bytes, kind == Kind::Special))
+        let (start, end) = self.spans[id];
+        let (start, end) = (start as usize, end as usize);
+        let piece = match kind {
+            Kind::Absent => return None,
+            Kind::Text | Kind::SpecialText => Piece::Text(&self.text[start..end]),
+            Kind::Bytes | Kind::SpecialBytes => Piece::Bytes(&self.bytes[start..end]),
+        };
+        Some((piece, kind.special()))
     }
 }
 
@@ -266,7 +322,7 @@ impl ByteLevelIncremental {
     /// is skipped as special or is an id the vocabulary lacks and drops.
     fn piece(&mut self, token_id: TokenIdType) -> Result<Option<&str>> {
         self.fed += 1;
-        let Some((bytes, special)) = self.table.entry(token_id) else {
+        let Some((piece, special)) = self.table.entry(token_id) else {
             return match self.unknown {
                 UnknownId::Drop => Ok(None),
                 UnknownId::Reject => Err(anyhow!("unknown token id {token_id}")),
@@ -276,14 +332,13 @@ impl ByteLevelIncremental {
             return Ok(None);
         }
         if self.pending.is_empty() {
-            // The common case: a whole token of valid text, no copy.
-            if let Ok(text) = std::str::from_utf8(bytes) {
-                if settled(text) {
-                    return Ok(Some(text));
-                }
+            // The common case: a token whole on its own (the table knows it
+            // since load), borrowed as it is, no validation and no copy.
+            if let Piece::Text(text) = piece {
+                return Ok(Some(text));
             }
         }
-        self.pending.extend_from_slice(bytes);
+        self.pending.extend_from_slice(piece.as_bytes());
         self.text.clear();
         match String::from_utf8_lossy(&self.pending) {
             Cow::Borrowed(text) if settled(text) => self.text.push_str(text),
@@ -449,6 +504,38 @@ mod tests {
         assert_eq!(ours[&'A'], b'A');
         assert_eq!(ours[&'\u{100}'], 0);
         assert_eq!(ours[&'\u{120}'], b' ');
+    }
+
+    #[test]
+    fn whole_tokens_live_in_the_text_store_and_the_rest_in_the_byte_store() {
+        let tokenizer = byte_level_tokenizer();
+        let table = ByteLevelTable::build(&tokenizer).expect("byte-level table");
+        let id = |token: &str| tokenizer.token_to_id(token).expect(token);
+        let is_text = |token: &str| {
+            let (piece, _) = table.entry(id(token)).expect("in the vocabulary");
+            matches!(piece, Piece::Text(_))
+        };
+        // Valid UTF-8 that does not end in U+FFFD: whole on its own.
+        assert!(is_text("hello"));
+        assert!(is_text("Ġworld"));
+        assert!(is_text("Ã©"));
+        assert!(is_text("a"));
+        // A split character, a lead byte, a literal replacement character at
+        // the end: not whole, kept as bytes for the pending window.
+        assert!(!is_text("ðŁ"));
+        assert!(!is_text("Ġà"));
+        assert!(!is_text("ï¿½"));
+        // Every piece reads back the bytes the token stands for.
+        for token in ["hello", "Ã©", "ðŁ", "ï¿½"] {
+            let mut expected = Vec::new();
+            push_token_bytes(token, &mut expected);
+            let (piece, _) = table.entry(id(token)).expect("in the vocabulary");
+            assert_eq!(piece.as_bytes(), expected.as_slice(), "{token}");
+        }
+        // A whole token is the step's text as it is, with nothing pending.
+        let mut dec = ByteLevelIncremental::new(Arc::clone(&table), false, UnknownId::Drop);
+        assert_eq!(dec.step(id("hello")).unwrap(), "hello");
+        assert!(dec.pending().is_empty());
     }
 
     #[test]
