@@ -437,6 +437,10 @@ class Worker:
 
     def _build_cmd(self) -> list[str]:
         """Build engine-specific launch command using model specs."""
+        if self.worker_type == WorkerType.ENCODE and (
+            self.engine != "tokenspeed" or self.mode != ConnectionMode.GRPC
+        ):
+            raise ValueError("EPD encode workers currently require TokenSpeed over gRPC")
         spec = get_model_spec(self.model_id)
         model_path = spec["model"]
         tp_size = self.tp or spec.get("tp", 1)
