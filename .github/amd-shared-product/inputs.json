@@ -10,7 +10,7 @@
   "producer_sha": "c9d5431db92aa2d35521889f6297c4c6f7b05b4a",
   "producer_branch": "main",
   "producer_policy": "successful_build_job_with_consumer_revalidation",
-  "target_product_commit": "0707d631cb6827789619ab96999f868044dc06db",
+  "target_product_commit": "ee1b8f0f83186a0e33d805b4b2551d17322a80fb",
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat[1]/vllm/nvidia",
   "source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
@@ -23,7 +23,7 @@
     "crates": "ae100a0dd89846418c93c09861dd7f24b3222296",
     "model_gateway": "d1a181bfb1d16a661e16346d4eb8f257689701ce",
     "grpc_servicer": "a10bb7235d74ac91d8de4b3eafabd1ef7ed1344e",
-    "e2e_test": "0c1b778ffa433470e51be16334015adf82e01ba9",
+    "e2e_test": "35d5321770a24d3706a3c0730c465d3a0e11d437",
     "scripts": "2cd3cfb35b41a1b8cf38f82d76f71b9c89778f30",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows/e2e-gpu-job.yml": "26d9c12232fe4157cfed1dd2e5f0249acd550ff6",
@@ -119,5 +119,13 @@
   },
   "diagnostic_difference": "caller container explicitly sets SPT_NOENV=1; current product shared workflow does not",
   "producer_binary_relabelled": false,
-  "producer_artifact_pins_status": "EMPTY: actual c9d bytes/API metadata/native identity not yet audited"
+  "producer_artifact_pins_status": "EMPTY: actual c9d bytes/API metadata/native identity not yet audited",
+  "explicit_product_dependency": {
+    "PR": 4266,
+    "original_public_head": "3cef9af6a73610f501b920221c7232bf640219d0",
+    "current_leaf": "ee1b8f0f83186a0e33d805b4b2551d17322a80fb",
+    "parent_stack": "0707d631cb6827789619ab96999f868044dc06db",
+    "visible_churn": 43
+  },
+  "producer_snapshot_note": "root22:38: producer build cancelled with four unverified artifacts; current strict success policy rejects it; no pins or native hash are fabricated"
 }
