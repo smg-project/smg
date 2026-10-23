@@ -23,7 +23,7 @@ use super::{
 use crate::{
     error,
     header_utils::extract_auth_header,
-    metrics::{metrics_labels, Metrics},
+    metrics::{error_reason_for_refused_selection, metrics_labels, Metrics},
     upstream_body,
     worker::ExternalWorker,
 };
@@ -334,6 +334,7 @@ pub async fn handle_realtime_webrtc(
                 &parsed.model,
                 metrics_labels::ENDPOINT_REALTIME,
                 metrics_labels::ERROR_NO_WORKERS,
+                error_reason_for_refused_selection(response.status()),
             );
             return response;
         }
@@ -385,6 +386,7 @@ fn resolve_auth(
                     model,
                     metrics_labels::ENDPOINT_REALTIME,
                     metrics_labels::ERROR_VALIDATION,
+                    metrics_labels::REASON_INVALID_REQUEST,
                 );
                 Err((
                     StatusCode::BAD_REQUEST,
@@ -401,6 +403,7 @@ fn resolve_auth(
                 model,
                 metrics_labels::ENDPOINT_REALTIME,
                 metrics_labels::ERROR_VALIDATION,
+                metrics_labels::REASON_INVALID_REQUEST,
             );
             Err(StatusCode::UNAUTHORIZED.into_response())
         }

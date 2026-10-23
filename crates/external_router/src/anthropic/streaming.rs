@@ -24,7 +24,7 @@ use crate::{
     error as router_error,
     error::extract_error_code_from_response,
     mcp_utils::DEFAULT_MAX_ITERATIONS,
-    metrics::{metrics_labels, Metrics},
+    metrics::{error_reason_from_status, metrics_labels, Metrics},
     sse::SseEncoder,
 };
 
@@ -131,6 +131,7 @@ async fn build_streaming_error_response(
             model_id,
             "messages",
             "streaming_error",
+            error_reason_from_status(status),
         );
 
         let headers = response.headers().clone();

@@ -16,7 +16,7 @@ use tracing::{debug, error, info, warn};
 use super::utils::should_propagate_header;
 use crate::{
     error,
-    metrics::{bool_to_static_str, metrics_labels, Metrics},
+    metrics::{bool_to_static_str, error_reason_from_status, metrics_labels, Metrics},
     upstream_body::{read_response_body_limited, ReadBodyResult, MAX_ERROR_RESPONSE_SIZE},
     worker::ExternalWorker,
 };
@@ -140,6 +140,7 @@ pub(crate) async fn parse_response(
                 model_id,
                 "messages",
                 "parse_error",
+                metrics_labels::REASON_BAD_RESPONSE,
             );
             Err(error::bad_gateway(
                 "parse_error",
@@ -199,6 +200,7 @@ pub(crate) async fn handle_error_response(
         model_id,
         "messages",
         metrics_labels::ERROR_BACKEND,
+        error_reason_from_status(status),
     );
 
     (status, body).into_response()

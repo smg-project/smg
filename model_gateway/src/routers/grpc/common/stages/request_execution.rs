@@ -47,7 +47,7 @@ use crate::{
                 ProtoResponseVariant, ProtoStream,
             },
             utils::{
-                account_pd_side_failure,
+                account_pd_side_failure, mark_error_reason,
                 stream_failure::UpstreamClass,
                 tonic_ext::{TonicResultExt, TonicStatusExt},
             },
@@ -2603,11 +2603,10 @@ async fn sequential_prefill_side(
                 );
                 account_pd_side_failure(metrics_labels::WORKER_PREFILL, &e);
                 error!(function = "execute_sequential_pd", error = %e, "Prefill stream error");
-                return Err(PdSide::Prefill.answer(
-                    SidePhase::Stream,
-                    e.http_status(),
-                    e.message(),
-                ));
+                let mut response =
+                    PdSide::Prefill.answer(SidePhase::Stream, e.http_status(), e.message());
+                mark_error_reason(&mut response, e.error_reason());
+                return Err(response);
             }
         }
     }

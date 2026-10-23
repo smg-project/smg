@@ -238,6 +238,7 @@ fn a_decode_side_the_engine_fails_is_an_engine_error_of_the_decode_worker() {
                 r#"backend_type="pd""#,
                 r#"endpoint="chat""#,
                 r#"error_type="engine_error""#,
+                r#"reason="engine_error""#,
                 r#"model="failure-test""#,
             ],
         )

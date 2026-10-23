@@ -36,16 +36,13 @@ use super::{
     chat_utils::{send_error_sse_with_code, SseSender},
     metrics::error_type_from_status,
     pd_bootstrap::{account_pd_side_failure, dead_rendezvous_of, DeadRendezvous},
-    tonic_ext::{TonicStatusExt, CONSTRAINT_FAILED_CODE},
+    tonic_ext::{is_the_engines_own_report, TonicStatusExt, CONSTRAINT_FAILED_CODE},
 };
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     routers::{
         error::error_type_for_status,
-        grpc::{
-            context::{DispatchMetadata, WorkerSelection},
-            proto_wrapper::ENGINE_ERROR_MESSAGE,
-        },
+        grpc::context::{DispatchMetadata, WorkerSelection},
     },
     worker::{worker::WorkerTypeExt, ConnectionModeExt, Worker},
 };
@@ -84,6 +81,9 @@ pub(crate) struct UpstreamClass {
     pub(crate) http: StatusCode,
     /// The `error_type` label the status counts under.
     pub(crate) error_type: &'static str,
+    /// The `reason` label the status counts under: the cause behind the
+    /// class (see [`TonicStatusExt::error_reason`]).
+    pub(crate) reason: &'static str,
     /// What the worker's circuit breaker samples for the status; `None` for
     /// a failure that says nothing about the worker (the request's media).
     pub(crate) breaker_sample: Option<u16>,
@@ -116,6 +116,7 @@ impl UpstreamClass {
         Self {
             http,
             error_type,
+            reason: status.error_reason(),
             breaker_sample: status.breaker_status(),
         }
     }
@@ -194,14 +195,6 @@ impl UpstreamClass {
             error_type_for_status(self.http)
         }
     }
-}
-
-/// Whether `status` is the engine's own report that the request failed (its
-/// `Complete` had finish reason `error`; the ZMQ lane's adapters end their
-/// streams with the same words), as opposed to a failed call to the worker.
-/// The one status that carries no reason of the engine's.
-pub(super) fn is_the_engines_own_report(status: &tonic::Status) -> bool {
-    status.code() == tonic::Code::Internal && status.message() == ENGINE_ERROR_MESSAGE
 }
 
 /// Why a streaming response ended before its final chunk.
@@ -435,6 +428,7 @@ impl StreamSource {
                 grpc_code = ?status.code(),
                 http_status = class.http.as_u16(),
                 error_type = class.error_type,
+                reason = class.reason,
                 prefill = self.prefill.as_ref().map_or("none", |prefill| prefill.url()),
                 bootstrap_host = port.host.as_str(),
                 bootstrap_port = port.port,
@@ -452,6 +446,7 @@ impl StreamSource {
                 grpc_code = ?status.code(),
                 http_status = class.http.as_u16(),
                 error_type = class.error_type,
+                reason = class.reason,
                 "Stream ended by the engine before completion: {}",
                 status.message()
             ),
@@ -481,6 +476,7 @@ impl StreamSource {
             &self.model,
             self.endpoint,
             class.error_type,
+            class.reason,
         );
     }
 }
@@ -520,9 +516,12 @@ mod tests {
     use openai_protocol::worker::{HealthCheckConfig, WorkerType};
 
     use super::*;
-    use crate::worker::{
-        circuit_breaker::{CircuitBreakerConfig, CircuitState},
-        BasicWorkerBuilder, ConnectionMode,
+    use crate::{
+        routers::grpc::proto_wrapper::ENGINE_ERROR_MESSAGE,
+        worker::{
+            circuit_breaker::{CircuitBreakerConfig, CircuitState},
+            BasicWorkerBuilder, ConnectionMode,
+        },
     };
 
     fn dispatch() -> DispatchMetadata {
@@ -611,6 +610,18 @@ mod tests {
         .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
         assert!(line.ends_with(" 1"), "{line}");
         label(line, "error_type")
+    }
+
+    /// The `reason` of the one `smg_router_request_errors_total` sample of
+    /// the chat endpoint.
+    fn router_error_reason(rendered: &str) -> &str {
+        let line = sample(
+            rendered,
+            "smg_router_request_errors_total",
+            &["router_type=\"grpc\"", "endpoint=\"chat\""],
+        )
+        .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
+        label(line, "reason")
     }
 
     /// The value of the label `name` on a rendered sample line.
@@ -712,6 +723,7 @@ mod tests {
         let rendered = handle.render();
         assert_eq!(worker_error_type(&rendered), Some("backend_error"));
         assert_eq!(router_error_type(&rendered), "backend_error");
+        assert_eq!(router_error_reason(&rendered), "transport_disconnect");
     }
 
     /// A stream that ended with an HTTP/2 fault (the connection to the
@@ -730,6 +742,7 @@ mod tests {
             (class.http, class.error_type, class.breaker_sample),
             (StatusCode::BAD_GATEWAY, "backend_error", Some(502))
         );
+        assert_eq!(class.reason, "transport_disconnect");
         assert!(class.is_worker_failure());
         assert_eq!(class.client_type("stream_error"), "stream_error");
     }
@@ -759,6 +772,7 @@ mod tests {
         let rendered = handle.render();
         assert_eq!(worker_error_type(&rendered), None, "{rendered}");
         assert_eq!(router_error_type(&rendered), "validation_error");
+        assert_eq!(router_error_reason(&rendered), "media_fault");
     }
 
     #[test]
@@ -776,6 +790,7 @@ mod tests {
         let rendered = handle.render();
         assert_eq!(worker_error_type(&rendered), None, "{rendered}");
         assert_eq!(router_error_type(&rendered), "validation_error");
+        assert_eq!(router_error_reason(&rendered), "invalid_request");
     }
 
     #[test]
@@ -790,13 +805,20 @@ mod tests {
         let rendered = handle.render();
         assert_eq!(worker_error_type(&rendered), Some("timeout"));
         assert_eq!(router_error_type(&rendered), "timeout");
+        assert_eq!(router_error_reason(&rendered), "deadline");
     }
 
     #[test]
     fn an_unavailable_or_internal_status_after_the_first_chunk_is_a_backend_error() {
-        for status in [
-            tonic::Status::unavailable("connection reset"),
-            tonic::Status::internal("h2 protocol error: connection reset"),
+        for (status, reason) in [
+            (
+                tonic::Status::unavailable("connection reset"),
+                "engine_unavailable",
+            ),
+            (
+                tonic::Status::internal("h2 protocol error: connection reset"),
+                "engine_internal",
+            ),
         ] {
             assert_eq!(
                 StreamFailure::upstream(status.clone(), 7).error_type(),
@@ -806,7 +828,10 @@ mod tests {
             assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
             let rendered = handle.render();
             assert_eq!(worker_error_type(&rendered), Some("backend_error"));
+            // One class; the reason tells the worker's own UNAVAILABLE from
+            // its INTERNAL.
             assert_eq!(router_error_type(&rendered), "backend_error");
+            assert_eq!(router_error_reason(&rendered), reason);
         }
     }
 
@@ -824,6 +849,7 @@ mod tests {
         // The router counts the rate-limit error the client read, not an
         // internal error.
         assert_eq!(router_error_type(&rendered), "rate_limit_error");
+        assert_eq!(router_error_reason(&rendered), "overloaded");
     }
 
     #[test]

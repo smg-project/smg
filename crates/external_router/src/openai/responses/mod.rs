@@ -26,8 +26,9 @@ pub use streaming::handle_streaming_response;
 use crate::metrics::{metrics_labels, Metrics};
 
 /// Counts a router error of the Responses route: its fixed router, backend,
-/// connection and endpoint labels, the model, and the kind of error.
-fn record_error(model: &str, kind: &'static str) {
+/// connection and endpoint labels, the model, the kind of error and the
+/// reason behind it.
+fn record_error(model: &str, kind: &'static str, reason: &'static str) {
     Metrics::record_router_error(
         metrics_labels::ROUTER_OPENAI,
         metrics_labels::BACKEND_EXTERNAL,
@@ -35,5 +36,6 @@ fn record_error(model: &str, kind: &'static str) {
         model,
         metrics_labels::ENDPOINT_RESPONSES,
         kind,
+        reason,
     );
 }

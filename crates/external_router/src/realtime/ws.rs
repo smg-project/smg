@@ -16,7 +16,7 @@ use tracing::{debug, error};
 use super::{proxy, RealtimeLabels, RealtimeRegistry};
 use crate::{
     header_utils::extract_auth_header,
-    metrics::{metrics_labels, Metrics},
+    metrics::{error_reason_for_refused_selection, metrics_labels, Metrics},
     worker::ExternalWorker,
 };
 
@@ -48,6 +48,7 @@ pub async fn handle_realtime_ws(
                 &model,
                 metrics_labels::ENDPOINT_REALTIME,
                 metrics_labels::ERROR_NO_WORKERS,
+                error_reason_for_refused_selection(response.status()),
             );
             return response;
         }
@@ -69,6 +70,7 @@ pub async fn handle_realtime_ws(
                     &model,
                     metrics_labels::ENDPOINT_REALTIME,
                     metrics_labels::ERROR_VALIDATION,
+                    metrics_labels::REASON_INVALID_REQUEST,
                 );
                 return (
                     StatusCode::BAD_REQUEST,
@@ -85,6 +87,7 @@ pub async fn handle_realtime_ws(
                 &model,
                 metrics_labels::ENDPOINT_REALTIME,
                 metrics_labels::ERROR_VALIDATION,
+                metrics_labels::REASON_INVALID_REQUEST,
             );
             return StatusCode::UNAUTHORIZED.into_response();
         }
@@ -100,6 +103,7 @@ pub async fn handle_realtime_ws(
                 &model,
                 metrics_labels::ENDPOINT_REALTIME,
                 metrics_labels::ERROR_VALIDATION,
+                metrics_labels::REASON_INVALID_REQUEST,
             );
             return e.into_response();
         }

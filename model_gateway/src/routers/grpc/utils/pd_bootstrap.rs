@@ -13,7 +13,7 @@
 
 use std::{fmt, sync::Arc};
 
-use super::stream_failure::{is_the_engines_own_report, UpstreamClass};
+use super::{stream_failure::UpstreamClass, tonic_ext::is_the_engines_own_report};
 use crate::{
     observability::metrics::{metrics_labels, Metrics},
     worker::{

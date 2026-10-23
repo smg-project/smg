@@ -71,7 +71,7 @@ use super::{
     },
     spec::ResponseSpec,
     utils,
-    utils::error_type_for_response,
+    utils::{error_reason_for_response, error_type_for_response},
 };
 use crate::{
     config::types::RetryConfig,
@@ -863,8 +863,9 @@ impl RequestPipeline {
         );
     }
 
-    /// A refused request under this pipeline's labels, by its class: one of
-    /// the gateway's own refusals, or the response's status.
+    /// A refused request under this pipeline's labels, by its class (one of
+    /// the gateway's own refusals, or the response's status) and the cause
+    /// behind it (the worker's status, the refusal's code).
     pub(crate) fn record_error(
         &self,
         endpoint: Option<&'static str>,
@@ -879,6 +880,7 @@ impl RequestPipeline {
                 self.worker_registry.metric_model_label(model),
                 endpoint,
                 error_type_for_response(response),
+                error_reason_for_response(response),
             );
         }
     }
@@ -942,6 +944,7 @@ impl RequestPipeline {
             self.worker_registry.metric_model_label(model),
             endpoint,
             metrics_labels::ERROR_INTERNAL,
+            metrics_labels::REASON_INTERNAL,
         );
         error::internal_error("wrong_response_type", "Internal error: wrong response type")
     }
@@ -960,6 +963,7 @@ impl RequestPipeline {
             self.worker_registry.metric_model_label(model),
             endpoint,
             metrics_labels::ERROR_INTERNAL,
+            metrics_labels::REASON_INTERNAL,
         );
         error::internal_error("no_response_produced", "No response produced")
     }
@@ -4716,7 +4720,57 @@ mod request_release_tests {
             })
             .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
         assert!(line.contains("error_type=\"rate_limit_error\""), "{line}");
+        assert!(line.contains("reason=\"overloaded\""), "{line}");
         assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    /// Two dispatch failures of one class with different causes are two
+    /// series of the error family, one per `reason`, that sum to the count
+    /// the family had before the label existed; the gateway's own refusal
+    /// carries the reason its code names.
+    #[test]
+    fn a_router_error_carries_the_reason_behind_its_class() {
+        use crate::{observability::metrics::test_support::render_with_recorder, routers::error};
+
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_worker(&worker_registry, 1, WorkerType::Regular);
+        let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+        let failed =
+            |status: Status| status.to_http_error("start_generation_failed", "failed".to_string());
+        let rendered = render_with_recorder(|| {
+            for failure in [
+                failed(Status::unavailable("draining")),
+                failed(Status::cancelled("stream reset")),
+                failed(Status::cancelled("connection closed")),
+                error::service_unavailable(
+                    crate::routers::common::placement::NO_AVAILABLE_WORKERS_CODE,
+                    "every worker is down",
+                ),
+            ] {
+                pipeline.record_error(Some(metrics_labels::ENDPOINT_COMPLETIONS), MODEL, &failure);
+            }
+        });
+        let samples: Vec<&str> = rendered
+            .lines()
+            .filter(|line| {
+                line.starts_with("smg_router_request_errors_total{")
+                    && line.contains(&format!("model=\"{MODEL}\""))
+            })
+            .collect();
+        let value = |error_type: &str, reason: &str| -> u64 {
+            let line = samples
+                .iter()
+                .find(|line| {
+                    line.contains(&format!("error_type=\"{error_type}\""))
+                        && line.contains(&format!("reason=\"{reason}\""))
+                })
+                .unwrap_or_else(|| panic!("a {error_type}/{reason} series:\n{rendered}"));
+            line.rsplit(' ').next().unwrap().parse().unwrap()
+        };
+        assert_eq!(samples.len(), 3, "{rendered}");
+        assert_eq!(value("backend_error", "engine_unavailable"), 1);
+        assert_eq!(value("backend_error", "transport_disconnect"), 2);
+        assert_eq!(value("unavailable", "no_available_workers"), 1);
     }
 
     /// The same image to the same model served by a worker without a vision

@@ -3,17 +3,22 @@
 use axum::response::Response;
 use http::StatusCode;
 use llm_multimodal::MediaErrorCode;
+use smg_external_router::retry::REQUEST_TIMEOUT_CODE;
 
 use super::tonic_ext::CONSTRAINT_FAILED_CODE;
 use crate::{
-    observability::metrics::metrics_labels,
+    observability::metrics::{error_reason_from_status, metrics_labels},
+    rate_limit::RATE_LIMIT_ERROR_CODE,
     routers::{
         common::{
             overload::WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE,
-            placement::NO_AVAILABLE_WORKERS_CODE,
+            placement::{
+                MODEL_NOT_FOUND_CODE, NO_AVAILABLE_WORKERS_CODE, NO_MEDIA_REF_CAPABLE_WORKER_CODE,
+            },
         },
         error::extract_error_code_from_response,
         grpc::common::stages::SELECTION_QUEUE_TIMEOUT_ERROR_CODE,
+        PD_PREFILL_QUEUE_FULL,
     },
 };
 
@@ -98,6 +103,68 @@ pub(crate) fn error_type_for_response(response: &Response) -> &'static str {
         return metrics_labels::ERROR_VALIDATION;
     }
     error_type_from_status(response.status())
+}
+
+/// Response extension: the `reason` label of the router error this response
+/// ends a request with, decided where the cause was known (the worker's
+/// status, see `TonicStatusExt::error_reason`) and read where the error is
+/// counted (see [`error_reason_for_response`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ErrorReason(pub(crate) &'static str);
+
+/// Carry `reason` on `response` for the router that counts the error.
+pub(crate) fn mark_error_reason(response: &mut Response, reason: &'static str) {
+    response.extensions_mut().insert(ErrorReason(reason));
+}
+
+/// The `reason` label of a response the gateway answers: the cause behind
+/// [`error_type_for_response`]'s class, one of the `metrics_labels::REASON_*`
+/// values.
+///
+/// A response made of a worker's status carries the reason the status named
+/// ([`ErrorReason`], set by `TonicStatusExt::to_http_error`). Else the
+/// gateway's own code names the refusal: a pool with no available worker (the
+/// placement's verdict, the HTTP routers' and the prefill side's own words
+/// for it), the overload shed and the prefill admission queue, the selection
+/// queue's bound, a model nobody serves, the tenant limit, a constraint the
+/// engine could not continue under, a pool with no capable worker, an
+/// upstream call that timed out or could not connect, a worker's answer that
+/// could not be read. A response with no gateway code is a worker's answer
+/// relayed as it came, classed by its status; one with another gateway code
+/// is the gateway's own: its 4xx is the request's fault, its 504 a deadline
+/// (the silence verdicts), any other 5xx its own processing.
+pub(crate) fn error_reason_for_response(response: &Response) -> &'static str {
+    use metrics_labels::*;
+    if let Some(ErrorReason(reason)) = response.extensions().get::<ErrorReason>() {
+        return reason;
+    }
+    let status = response.status();
+    match extract_error_code_from_response(response) {
+        // routers/http/router.rs and pd_router.rs answer their empty pools
+        // under `no_workers` and `no_prefill_servers`.
+        NO_AVAILABLE_WORKERS_CODE | "no_workers" | "no_prefill_servers" => {
+            REASON_NO_AVAILABLE_WORKERS
+        }
+        WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE | PD_PREFILL_QUEUE_FULL => REASON_OVERLOAD_SHED,
+        SELECTION_QUEUE_TIMEOUT_ERROR_CODE => REASON_SELECTION_QUEUE_TIMEOUT,
+        MODEL_NOT_FOUND_CODE => REASON_MODEL_NOT_FOUND,
+        RATE_LIMIT_ERROR_CODE => REASON_RATE_LIMITED,
+        CONSTRAINT_FAILED_CODE => REASON_CONSTRAINT_FAILED,
+        // The disaggregated routers' pair verdict (`no_compatible_pd_pair`).
+        NO_MEDIA_REF_CAPABLE_WORKER_CODE | "no_compatible_pd_pair" => REASON_NO_CAPABLE_WORKER,
+        REQUEST_TIMEOUT_CODE => REASON_DEADLINE,
+        // The HTTP router's codes for a call that never reached the worker.
+        "call_upstream_connection_failed" => REASON_TRANSPORT_DISCONNECT,
+        // The decisions route's code for an answer it could not read.
+        "invalid_decisions_response" => REASON_BAD_RESPONSE,
+        "" => error_reason_from_status(status),
+        _ => match status.as_u16() {
+            408 | 504 => REASON_DEADLINE,
+            429 => REASON_OVERLOADED,
+            400..=499 => REASON_INVALID_REQUEST,
+            _ => REASON_INTERNAL,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +260,148 @@ mod tests {
         // A 502 of another making keeps the status's class.
         let other = error::bad_gateway("upstream_failed", "the worker's connection reset");
         assert_eq!(error_type_for_response(&other), "backend_error");
+    }
+
+    /// The reason behind a response's class: the status's own reason when
+    /// the response was made of a worker's status; else the gateway's code
+    /// (its refusals, the HTTP router's upstream-call codes, an answer it
+    /// could not read); else the status, read as a relayed worker's answer
+    /// when the response carries no gateway code and as the gateway's own
+    /// when it does.
+    #[test]
+    fn a_response_names_the_reason_behind_its_class() {
+        use metrics_labels::*;
+        use smg_grpc_client::constraint_failed_status;
+
+        use crate::routers::{
+            common::{overload, placement},
+            error,
+            grpc::utils::tonic_ext::TonicStatusExt,
+            prefill_queue_full,
+        };
+
+        // A worker's status, whatever code the answer is minted under.
+        let from_status = |status: tonic::Status| {
+            status.to_http_error("start_generation_failed", "failed".to_string())
+        };
+        for (response, reason) in [
+            (
+                from_status(tonic::Status::unavailable("draining")),
+                REASON_ENGINE_UNAVAILABLE,
+            ),
+            (
+                from_status(tonic::Status::internal("boom")),
+                REASON_ENGINE_INTERNAL,
+            ),
+            (
+                from_status(tonic::Status::cancelled("reset")),
+                REASON_TRANSPORT_DISCONNECT,
+            ),
+            (
+                from_status(tonic::Status::resource_exhausted("full")),
+                REASON_OVERLOADED,
+            ),
+            (
+                constraint_failed_status("the scheduler aborted the request: Aborted")
+                    .constraint_failure_response()
+                    .expect("answered"),
+                REASON_CONSTRAINT_FAILED,
+            ),
+        ] {
+            assert_eq!(
+                error_reason_for_response(&response),
+                reason,
+                "{}",
+                extract_error_code_from_response(&response)
+            );
+        }
+        // The gateway's own refusals, by their code.
+        for (response, reason) in [
+            (
+                placement::no_available_workers("every worker is down"),
+                REASON_NO_AVAILABLE_WORKERS,
+            ),
+            (
+                error::service_unavailable("no_workers", "No available workers"),
+                REASON_NO_AVAILABLE_WORKERS,
+            ),
+            (
+                error::service_unavailable("no_prefill_servers", "none"),
+                REASON_NO_AVAILABLE_WORKERS,
+            ),
+            (
+                overload::shed_pd_admission("decode-1", "m", 4, 5),
+                REASON_OVERLOAD_SHED,
+            ),
+            (prefill_queue_full(), REASON_OVERLOAD_SHED),
+            (
+                error::service_unavailable(SELECTION_QUEUE_TIMEOUT_ERROR_CODE, "waited too long"),
+                REASON_SELECTION_QUEUE_TIMEOUT,
+            ),
+            (error::model_not_found("m"), REASON_MODEL_NOT_FOUND),
+            (
+                crate::rate_limit::rejection_response(3),
+                REASON_RATE_LIMITED,
+            ),
+            (
+                placement::no_media_ref_capable_worker("no vision worker"),
+                REASON_NO_CAPABLE_WORKER,
+            ),
+            (
+                error::service_unavailable("no_compatible_pd_pair", "no pair"),
+                REASON_NO_CAPABLE_WORKER,
+            ),
+            (
+                smg_external_router::retry::request_timeout_response("upstream timed out"),
+                REASON_DEADLINE,
+            ),
+            (
+                error::internal_error("call_upstream_connection_failed", "refused"),
+                REASON_TRANSPORT_DISCONNECT,
+            ),
+            (
+                error::bad_gateway("invalid_decisions_response", "unreadable"),
+                REASON_BAD_RESPONSE,
+            ),
+            // The gateway's other codes: by the status's side of the fault.
+            (
+                error::bad_request("invalid_request", "bad"),
+                REASON_INVALID_REQUEST,
+            ),
+            (
+                error::create_error(StatusCode::GATEWAY_TIMEOUT, "decode_worker_silent", "quiet"),
+                REASON_DEADLINE,
+            ),
+            (
+                error::internal_error("no_response_produced", "none"),
+                REASON_INTERNAL,
+            ),
+            (
+                error::service_unavailable("tokenizer_not_ready", "loading"),
+                REASON_INTERNAL,
+            ),
+        ] {
+            assert_eq!(
+                error_reason_for_response(&response),
+                reason,
+                "{}",
+                extract_error_code_from_response(&response)
+            );
+        }
+        // A worker's answer relayed as it came carries no gateway code: the
+        // status is the worker's.
+        for (status, reason) in [
+            (StatusCode::INTERNAL_SERVER_ERROR, REASON_ENGINE_INTERNAL),
+            (StatusCode::BAD_GATEWAY, REASON_TRANSPORT_DISCONNECT),
+            (StatusCode::SERVICE_UNAVAILABLE, REASON_ENGINE_UNAVAILABLE),
+            (StatusCode::GATEWAY_TIMEOUT, REASON_DEADLINE),
+        ] {
+            let relayed = Response::builder()
+                .status(status)
+                .body(axum::body::Body::empty())
+                .expect("a response");
+            assert_eq!(error_reason_for_response(&relayed), reason, "{status}");
+        }
     }
 
     /// A refusal the gateway answers on its own counts as `unavailable`,

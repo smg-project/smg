@@ -19,8 +19,8 @@ use crate::{
                 ProtoStream,
             },
             utils::{
-                account_pd_side_failure, dead_rendezvous_of, stream_failure::UpstreamClass,
-                tonic_ext::TonicStatusExt, DeadRendezvous,
+                account_pd_side_failure, dead_rendezvous_of, mark_error_reason,
+                stream_failure::UpstreamClass, tonic_ext::TonicStatusExt, DeadRendezvous,
             },
         },
     },
@@ -224,7 +224,10 @@ fn stream_failed(
             ),
         ),
         (None, Some(side)) => {
-            side.answer(SidePhase::Stream, status.http_status(), status.message())
+            let mut response =
+                side.answer(SidePhase::Stream, status.http_status(), status.message());
+            mark_error_reason(&mut response, status.error_reason());
+            response
         }
         (None, None) => status.to_http_error(
             "worker_stream_failed",

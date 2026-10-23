@@ -6,7 +6,13 @@ use llm_multimodal::MediaErrorCode;
 use smg_grpc_client::{is_constraint_failure, is_transport_failure, WorkerMediaFault};
 use tonic::Code;
 
-use crate::routers::{common::retry::mark_non_retryable, error};
+use super::metrics::mark_error_reason;
+use crate::{
+    observability::metrics::metrics_labels,
+    routers::{
+        common::retry::mark_non_retryable, error, grpc::proto_wrapper::ENGINE_ERROR_MESSAGE,
+    },
+};
 
 /// The code the public API answers when the engine could not continue the
 /// request under the request's own constraint (see
@@ -32,8 +38,24 @@ pub(crate) trait TonicStatusExt {
     /// which tonic has no code for.
     fn http_status(&self) -> StatusCode;
 
-    /// Convert this gRPC error into an HTTP error response with the appropriate status code.
+    /// Convert this gRPC error into an HTTP error response with the appropriate
+    /// status code. The response carries the status's
+    /// [`error_reason`](TonicStatusExt::error_reason), so the router that
+    /// counts it reads the cause the status named (see
+    /// `error_reason_for_response`).
     fn to_http_error(&self, code: &str, msg: String) -> Response;
+
+    /// The `reason` label of a router error this status ends a request with:
+    /// the cause behind the class [`http_status`](TonicStatusExt::http_status)
+    /// maps it to, one of the `metrics_labels::REASON_*` values. The same
+    /// predicates, in the same order: a constraint the engine could not
+    /// continue under, a fault of the request's media, the worker's
+    /// connection failing under the call (an HTTP/2 or socket fault, or the
+    /// worker's side cancelling), then the code the worker answered: its
+    /// deadline, its capacity pushback, its unavailability, the request's
+    /// own fault, the engine's own report that the request failed, or a
+    /// failure inside the worker.
+    fn error_reason(&self) -> &'static str;
 
     /// The worker's report that the request's media failed, when the status
     /// carries one: the `smg-media-fault` trailer, or, from a worker that
@@ -127,7 +149,34 @@ impl TonicStatusExt for tonic::Status {
     }
 
     fn to_http_error(&self, code: &str, msg: String) -> Response {
-        error::create_error(self.http_status(), code, msg)
+        let mut response = error::create_error(self.http_status(), code, msg);
+        mark_error_reason(&mut response, self.error_reason());
+        response
+    }
+
+    fn error_reason(&self) -> &'static str {
+        use metrics_labels::*;
+        if is_constraint_failure(self) {
+            return REASON_CONSTRAINT_FAILED;
+        }
+        if self.media_fault().is_some() {
+            return REASON_MEDIA_FAULT;
+        }
+        if is_transport_failure(self) {
+            return REASON_TRANSPORT_DISCONNECT;
+        }
+        match self.code() {
+            Code::Cancelled => REASON_TRANSPORT_DISCONNECT,
+            Code::DeadlineExceeded => REASON_DEADLINE,
+            Code::ResourceExhausted => REASON_OVERLOADED,
+            Code::Unavailable => REASON_ENGINE_UNAVAILABLE,
+            Code::InvalidArgument | Code::FailedPrecondition | Code::OutOfRange => {
+                REASON_INVALID_REQUEST
+            }
+            Code::Internal if is_the_engines_own_report(self) => REASON_ENGINE_ERROR,
+            Code::Internal | Code::Unknown | Code::DataLoss => REASON_ENGINE_INTERNAL,
+            _ => REASON_OTHER,
+        }
     }
 
     fn media_fault(&self) -> Option<WorkerMediaFault> {
@@ -158,6 +207,14 @@ impl TonicStatusExt for tonic::Status {
         mark_non_retryable(&mut response);
         Some(response)
     }
+}
+
+/// Whether `status` is the engine's own report that the request failed (its
+/// `Complete` had finish reason `error`; the ZMQ lane's adapters end their
+/// streams with the same words), as opposed to a failed call to the worker.
+/// The one status that carries no reason of the engine's.
+pub(crate) fn is_the_engines_own_report(status: &tonic::Status) -> bool {
+    status.code() == Code::Internal && status.message() == ENGINE_ERROR_MESSAGE
 }
 
 /// Extension for `Result<T, tonic::Status>`: what the circuit breaker samples.
@@ -241,6 +298,106 @@ mod tests {
         let plain = tonic::Status::failed_precondition("the scheduler aborted the request");
         assert_eq!(plain.http_status(), StatusCode::BAD_REQUEST);
         assert!(plain.constraint_failure_response().is_none());
+    }
+
+    /// The reason a status names for the router error family, by the same
+    /// predicates that class it: the worker's connection failing under the
+    /// call (an HTTP/2 fault of any code, a socket fault, the worker's side
+    /// cancelling), its deadline, its capacity pushback, its unavailability,
+    /// the request's own fault, the engine's own report, a failure inside
+    /// the worker, a constraint, the request's media; a code outside them is
+    /// `other`.
+    #[test]
+    fn a_status_names_the_reason_behind_its_class() {
+        use metrics_labels::*;
+        use smg_grpc_client::{constraint_failed_status, h2::Reason};
+
+        for reason in [
+            Reason::ENHANCE_YOUR_CALM,
+            Reason::PROTOCOL_ERROR,
+            Reason::REFUSED_STREAM,
+            Reason::CANCEL,
+        ] {
+            let status =
+                tonic::Status::from_error(Box::new(smg_grpc_client::h2::Error::from(reason)));
+            assert_eq!(
+                status.error_reason(),
+                REASON_TRANSPORT_DISCONNECT,
+                "{reason:?}"
+            );
+        }
+        for (status, reason) in [
+            (
+                tonic::Status::cancelled("operation was canceled"),
+                REASON_TRANSPORT_DISCONNECT,
+            ),
+            (
+                tonic::Status::deadline_exceeded("too slow"),
+                REASON_DEADLINE,
+            ),
+            (
+                tonic::Status::resource_exhausted("kv cache full"),
+                REASON_OVERLOADED,
+            ),
+            (
+                tonic::Status::unavailable("draining"),
+                REASON_ENGINE_UNAVAILABLE,
+            ),
+            (
+                tonic::Status::invalid_argument("bad"),
+                REASON_INVALID_REQUEST,
+            ),
+            (
+                tonic::Status::failed_precondition("bad"),
+                REASON_INVALID_REQUEST,
+            ),
+            (tonic::Status::out_of_range("bad"), REASON_INVALID_REQUEST),
+            (
+                tonic::Status::internal(ENGINE_ERROR_MESSAGE),
+                REASON_ENGINE_ERROR,
+            ),
+            (
+                tonic::Status::internal("the servicer failed"),
+                REASON_ENGINE_INTERNAL,
+            ),
+            (tonic::Status::unknown("no idea"), REASON_ENGINE_INTERNAL),
+            (tonic::Status::data_loss("lost"), REASON_ENGINE_INTERNAL),
+            (
+                constraint_failed_status("the scheduler aborted the request: Aborted"),
+                REASON_CONSTRAINT_FAILED,
+            ),
+            (
+                tonic::Status::unavailable(
+                    "HTTP error while fetching media from https://example.invalid/a.png",
+                ),
+                REASON_MEDIA_FAULT,
+            ),
+            (tonic::Status::not_found("gone"), REASON_OTHER),
+            (tonic::Status::unimplemented("no"), REASON_OTHER),
+            (tonic::Status::permission_denied("no"), REASON_OTHER),
+        ] {
+            assert_eq!(status.error_reason(), reason, "{status:?}");
+        }
+    }
+
+    /// The HTTP answer made of a status carries the status's reason, so the
+    /// router that counts the answer (which sees no status) counts the cause
+    /// the status named.
+    #[test]
+    fn the_http_answer_of_a_status_carries_its_reason() {
+        use super::super::metrics::ErrorReason;
+
+        let response = tonic::Status::deadline_exceeded("too slow").to_http_error(
+            "start_generation_failed",
+            "Failed to start generation".to_string(),
+        );
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(
+            response.extensions().get::<ErrorReason>().map(|r| r.0),
+            Some(metrics_labels::REASON_DEADLINE)
+        );
+        let plain = error::internal_error("no_response_produced", "No response produced");
+        assert!(plain.extensions().get::<ErrorReason>().is_none());
     }
 
     #[test]

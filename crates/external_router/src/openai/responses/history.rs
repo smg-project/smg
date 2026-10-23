@@ -117,7 +117,11 @@ async fn visible_previous_chain(
             Ok(responses)
         }
         Ok(_) | Err(ResponseStorageError::ResponseNotFound(_)) => {
-            super::record_error(model, metrics_labels::ERROR_VALIDATION);
+            super::record_error(
+                model,
+                metrics_labels::ERROR_VALIDATION,
+                metrics_labels::REASON_INVALID_REQUEST,
+            );
             Err(error::bad_request(
                 "previous_response_not_found",
                 format!("Previous response with id '{prev_id_str}' not found."),
@@ -128,7 +132,11 @@ async fn visible_previous_chain(
                 "Failed to load previous response chain for {}: {}",
                 prev_id_str, e
             );
-            super::record_error(model, metrics_labels::ERROR_INTERNAL);
+            super::record_error(
+                model,
+                metrics_labels::ERROR_INTERNAL,
+                metrics_labels::REASON_INTERNAL,
+            );
             Err(error::storage_failure(
                 "load_previous_response_chain_failed",
                 format!("Failed to load previous response chain for {prev_id_str}"),
@@ -169,7 +177,11 @@ async fn check_conversation_visible(
     {
         Ok(Some(conversation)) if conversation.is_visible_to(tenant) => Ok(()),
         Ok(_) => {
-            super::record_error(model, metrics_labels::ERROR_VALIDATION);
+            super::record_error(
+                model,
+                metrics_labels::ERROR_VALIDATION,
+                metrics_labels::REASON_INVALID_REQUEST,
+            );
             Err(error::not_found(
                 "not_found",
                 format!("No conversation found with id '{}'", conv_id.0),
@@ -177,7 +189,11 @@ async fn check_conversation_visible(
         }
         Err(e) => {
             warn!("Failed to check conversation {}: {}", conv_id.0, e);
-            super::record_error(model, metrics_labels::ERROR_INTERNAL);
+            super::record_error(
+                model,
+                metrics_labels::ERROR_INTERNAL,
+                metrics_labels::REASON_INTERNAL,
+            );
             Err(error::storage_failure(
                 "check_conversation_failed",
                 format!("Failed to check conversation {}", conv_id.0),
@@ -212,7 +228,11 @@ async fn conversation_window_items(
         Ok(stored_items) => stored_items,
         Err(e) => {
             warn!("Failed to load conversation history: {}", e);
-            super::record_error(model, metrics_labels::ERROR_INTERNAL);
+            super::record_error(
+                model,
+                metrics_labels::ERROR_INTERNAL,
+                metrics_labels::REASON_INTERNAL,
+            );
             return Err(error::storage_failure(
                 "load_conversation_history_failed",
                 "Failed to load conversation history",

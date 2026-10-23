@@ -22,7 +22,7 @@ use serde_json::json;
 use tracing::warn;
 
 use crate::{
-    observability::metrics::{metrics_labels, Metrics},
+    observability::metrics::{error_reason_from_status, metrics_labels, Metrics},
     routers::grpc::utils::{
         error_type_from_status, route_to_endpoint,
         stream_failure::{MESSAGES_API_ERROR_TYPE, STREAM_ERROR_TYPE},
@@ -169,6 +169,7 @@ impl RelaySource {
     /// after a failed head is charged for that head and for the cut.
     pub(crate) fn account(&self, cut: &UpstreamCut, bytes_relayed: u64) {
         let error_type = error_type_from_status(cut.status);
+        let reason = error_reason_from_status(cut.status);
         warn!(
             worker = self.worker.url(),
             worker_type = self.worker_type,
@@ -176,6 +177,7 @@ impl RelaySource {
             bytes_relayed,
             http_status = cut.status.as_u16(),
             error_type,
+            reason,
             "Stream ended by the worker before completion: {}",
             cut.cause
         );
@@ -192,6 +194,7 @@ impl RelaySource {
             &self.model,
             route_to_endpoint(self.route),
             error_type,
+            reason,
         );
     }
 
@@ -350,6 +353,7 @@ mod tests {
                 "model=\"relay-test\"",
                 "endpoint=\"chat\"",
                 "error_type=\"backend_error\"",
+                "reason=\"transport_disconnect\"",
             ],
         )
         .unwrap_or_else(|| panic!("a router error is counted:\n{rendered}"));
@@ -374,7 +378,11 @@ mod tests {
             sample(
                 &rendered,
                 "smg_router_request_errors_total",
-                &["router_type=\"http\"", "error_type=\"timeout\""]
+                &[
+                    "router_type=\"http\"",
+                    "error_type=\"timeout\"",
+                    "reason=\"deadline\""
+                ]
             )
             .is_some(),
             "{rendered}"

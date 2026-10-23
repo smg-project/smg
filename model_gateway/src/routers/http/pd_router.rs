@@ -72,7 +72,10 @@ use crate::{
             trim_serialization_slack,
         },
         error,
-        grpc::utils::{error_type_for_response, error_type_from_status, route_to_endpoint},
+        grpc::utils::{
+            error_reason_for_response, error_type_for_response, error_type_from_status,
+            route_to_endpoint,
+        },
         http::router::send_with_stale_conn_retry,
         prefill_queue_full, prefill_queue_timeout, RouterTrait, PD_PREFILL_QUEUE_FULL,
         PD_PREFILL_QUEUE_TIMEOUT,
@@ -706,6 +709,7 @@ impl PDRouter {
                 model_label,
                 endpoint,
                 error_type_for_response(&response),
+                error_reason_for_response(&response),
             );
         }
 

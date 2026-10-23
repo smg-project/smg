@@ -15,8 +15,8 @@ use metrics_util::parse_quantiles;
 use once_cell::sync::Lazy;
 use smg_external_router::metrics::Metrics as RouterMetrics;
 pub use smg_external_router::metrics::{
-    bool_to_static_str, intern_model_label, intern_tool_label, metrics_labels, STREAMING_FALSE,
-    STREAMING_TRUE,
+    bool_to_static_str, error_reason_from_status, intern_model_label, intern_tool_label,
+    metrics_labels, STREAMING_FALSE, STREAMING_TRUE,
 };
 
 use super::worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder};
@@ -515,7 +515,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_router_request_errors_total",
-        "Router errors by router_type, backend_type, connection_mode, model, endpoint, error_type; model is the served model's id, unknown for a request that names no model, or other for a model the gateway does not serve"
+        "Router errors by router_type, backend_type, connection_mode, model, endpoint, error_type, reason; model is the served model's id, unknown for a request that names no model, or other for a model the gateway does not serve; reason is the cause behind the error_type as far as the router could tell it (deadline, transport_disconnect, engine_error, engine_internal, engine_unavailable, overloaded, rate_limited, overload_shed, selection_queue_timeout, no_available_workers, no_capable_worker, model_not_found, invalid_request, media_fault, constraint_failed, bad_response, internal, other)"
     );
     describe_counter!(
         "smg_router_upstream_responses_total",
@@ -1489,6 +1489,7 @@ impl Metrics {
         model_id: &str,
         endpoint: &'static str,
         error_type: &'static str,
+        reason: &'static str,
     ) {
         RouterMetrics::record_router_error(
             router_type,
@@ -1497,6 +1498,7 @@ impl Metrics {
             model_id,
             endpoint,
             error_type,
+            reason,
         );
     }
     pub fn record_worker_retry(worker_type: &'static str, endpoint: &'static str) {

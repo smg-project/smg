@@ -54,7 +54,7 @@ use crate::{
     middleware::{scheduler::PreemptionGuard, TenantRequestMeta},
     observability::{
         events::{self, Event},
-        metrics::{bool_to_static_str, metrics_labels, Metrics},
+        metrics::{bool_to_static_str, error_reason_from_status, metrics_labels, Metrics},
         otel_trace::inject_trace_context_http,
     },
     policies::{CacheNamespace, PolicyRegistry},
@@ -85,7 +85,10 @@ use crate::{
         error::{self, extract_error_code_from_response},
         external::GatewayWorker,
         gateway::Gateway,
-        grpc::utils::{error_type_for_response, error_type_from_status, route_to_endpoint},
+        grpc::utils::{
+            error_reason_for_response, error_type_for_response, error_type_from_status,
+            route_to_endpoint,
+        },
         http::{
             request_body::{
                 serialize_request_body, serialize_request_body_preserving_fields, RequestBodyError,
@@ -558,6 +561,7 @@ impl Router {
                 model,
                 endpoint,
                 error_type_for_response(&response),
+                error_reason_for_response(&response),
             );
         }
 
@@ -1555,6 +1559,7 @@ impl RouteOutcome<'_> {
                 &self.model_label,
                 self.endpoint,
                 error_type_for_response(response),
+                error_reason_for_response(response),
             );
         }
     }
@@ -1580,6 +1585,7 @@ impl RouteOutcome<'_> {
             &self.model_label,
             self.endpoint,
             error_type_from_status(err_status),
+            error_reason_for_response(err_resp),
         );
     }
 
@@ -1603,6 +1609,7 @@ impl RouteOutcome<'_> {
                 &self.model_label,
                 self.endpoint,
                 error_type_from_status(status),
+                error_reason_from_status(status),
             );
         }
     }
@@ -2041,6 +2048,7 @@ impl Router {
                 model_id,
                 endpoint,
                 error_type_from_status(status),
+                error_reason_from_status(status),
             );
         }
         Ok(response)
