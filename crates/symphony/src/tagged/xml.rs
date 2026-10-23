@@ -23,6 +23,7 @@
 
 use crate::{
     event::{runs, DropReason, Event, Events, MalformedReason, Text},
+    json::{PartialJson, PartialJsonError},
     tagged::{
         assembler::{push_escaped, push_quoted},
         end_cut_call,
@@ -30,6 +31,15 @@ use crate::{
     },
     Declared,
 };
+
+/// The nesting the arguments may reach, the arguments object counted: the prefix parser's bound
+/// ([`PartialJson::DEFAULT_MAX_DEPTH`]), which the JSON syntax's judge applies, so that the
+/// fragments of a call stay a prefix that parser takes, whichever syntax wrote them. An element
+/// becomes a container at its first child's tag; the tag that would make the element past the
+/// bound a container is refused with the rest of the call ([`Assembler::open_tag`]), and so is
+/// a leaf whose own JSON (a list or an object the text spells) would nest past it, or an empty
+/// element the tool declares a container at the bound ([`Assembler::close_element`]).
+const DEEPEST: usize = PartialJson::DEFAULT_MAX_DEPTH;
 
 /// The invoke's closing tag: the one terminal a started call's end carries. The next invoke's
 /// opening and the block's close end a call too, but they belong to the region, and the engine
@@ -65,6 +75,14 @@ pub struct Assembler {
     /// piece ([`Self::refuse_between`]); before any, the whitespace after a tag is the template's,
     /// dropped before a refusal or carried into the next event's source.
     released: bool,
+    /// Whether the arguments would have nested past [`DEEPEST`]: a tag that would have opened a
+    /// container past it ([`Self::open_tag`]), a leaf whose own JSON would nest past it, or an
+    /// empty element declared a container at the bound ([`Self::close_element`]). The arguments
+    /// are no longer read, every byte from the tag of the element that would cross the bound to
+    /// the call's end is held and refused at the end as invalid arguments (counted once, the
+    /// bytes dropped as a malformed call's), nothing of that element's member is written, and
+    /// the containers still open close whole at the end.
+    refused: bool,
     done: bool,
 }
 
@@ -135,6 +153,7 @@ impl Assembler {
             tag: None,
             after_separator: false,
             released: false,
+            refused: false,
             done: false,
         }
     }
@@ -173,7 +192,11 @@ impl Assembler {
     /// the string is closed first ([`Self::close_open_string`]), since the model ended the call
     /// and its bytes are the value whole, under one `Malformed { OpenAtTheMarker }` event of no
     /// bytes, and the containers above it close as after any leaf; an invoke whose name never
-    /// closed, or that had none, has its bytes refused.
+    /// closed, or that had none, has its bytes refused. After a tag or a value that would have
+    /// nested the arguments past [`DEEPEST`], the bytes held from the element that would cross
+    /// the bound are refused first ([`refuse`](super::refuse): one counted `Malformed {
+    /// InvalidArguments }` of no bytes, the bytes dropped as a malformed call's), and that
+    /// element's member is never written.
     pub fn close(mut self, terminal: &str, out: &mut Events) {
         if self.done {
             return;
@@ -185,6 +208,14 @@ impl Assembler {
             return;
         }
         self.close_open_string(MalformedReason::OpenAtTheMarker, out);
+        if self.refused {
+            self.value.clear();
+            super::refuse(
+                std::mem::take(&mut self.carried),
+                MalformedReason::InvalidArguments,
+                out,
+            );
+        }
         while let Some(element) = self.open.last() {
             match element.shape {
                 Shape::Object => {
@@ -285,6 +316,11 @@ impl Assembler {
 
     /// Reads as much of `text` as one step takes and returns the rest.
     fn take<'a>(&mut self, text: &'a str, declared: &Declared, out: &mut Events) -> &'a str {
+        if self.refused {
+            // Nesting past the bound: the rest of the call is held for the report at its end.
+            self.carried.push_str(text);
+            return "";
+        }
         match self.stage {
             Stage::Name => match text.find('"') {
                 Some(at) => {
@@ -419,7 +455,12 @@ impl Assembler {
     /// it makes that element a container or a leaf, by what the tool declares there, or, with no
     /// declaration, by whether the template's separator came before it (the template writes the
     /// separator before every tag it writes and never inside a value); then it opens an element
-    /// of its own.
+    /// of its own. An element that would become the container past [`DEEPEST`] (the arguments
+    /// object and the containers open above it counted) is refused instead, with every byte
+    /// from its own tag to the call's end ([`Self::close`]): the prefix parser would refuse the
+    /// nesting, so the fragments stop where they are still a prefix it takes, as the JSON syntax
+    /// stops at the bracket it cannot take; nothing of the element's member is written, so the
+    /// containers above it close whole at the end without it.
     fn open_tag(&mut self, key: &str, bytes: &str, declared: &Declared, out: &mut Events) {
         match self.open.last().map(|element| element.shape) {
             Some(Shape::Leaf(_)) => {
@@ -435,6 +476,12 @@ impl Assembler {
                 if leaf {
                     self.become_leaf(declared, out);
                     self.leaf_text(bytes, out);
+                    return;
+                }
+                if self.open.len() >= DEEPEST {
+                    self.carried.push_str(bytes);
+                    self.value.clear();
+                    self.refused = true;
                     return;
                 }
                 self.decide_container(key == ITEM, declared, out);
@@ -633,31 +680,24 @@ impl Assembler {
 
     /// The innermost element's closing tag: a streamed string gets its quote, a held leaf is
     /// written through [`json`], a container closes, an element with no child is empty by its
-    /// declared type.
+    /// declared type. A leaf whose own JSON would nest the arguments past [`DEEPEST`], and an
+    /// empty element declared a container at the bound, are refused instead, with every byte
+    /// from the element's own tag to the call's end ([`Self::close`]), as a tag that would nest
+    /// past the bound is ([`Self::open_tag`]): nothing of the member is written.
     fn close_element(&mut self, bytes: &str, declared: &Declared, out: &mut Events) {
         let Some(shape) = self.open.last().map(|element| element.shape) else {
             return;
         };
-        let fragment = match shape {
+        let written = match shape {
             Shape::Leaf(Leaf {
                 mode: Mode::Streaming,
                 ..
             }) => "\"".to_string(),
-            Shape::Leaf(Leaf { kind, .. }) => {
-                let written = json(&self.value, kind);
-                let mut fragment = self.prefix();
-                fragment.push_str(&written);
-                fragment
-            }
+            Shape::Leaf(Leaf { kind, .. }) => json(&self.value, kind),
             Shape::Object => "}".to_string(),
             Shape::List => "]".to_string(),
-            Shape::Open if !self.value.is_empty() => {
-                // Whitespace alone between the tags: a leaf after all.
-                let written = json(&self.value, self.kind_here(declared));
-                let mut fragment = self.prefix();
-                fragment.push_str(&written);
-                fragment
-            }
+            // Whitespace alone between the tags: a leaf after all.
+            Shape::Open if !self.value.is_empty() => json(&self.value, self.kind_here(declared)),
             Shape::Open => {
                 // The template writes `None` as an empty element only inside a list; a mapping
                 // skips a `None` member, so an empty element anywhere else is an empty string.
@@ -668,15 +708,32 @@ impl Assembler {
                         ..
                     })
                 );
-                let empty = match self.kind_here(declared) {
+                match self.kind_here(declared) {
                     Some(Kind::Array) => "[]",
                     Some(Kind::Object) => "{}",
                     Some(_) => "\"\"",
                     None if in_list => "null",
                     None => "\"\"",
-                };
+                }
+                .to_string()
+            }
+        };
+        let fragment = match shape {
+            Shape::Leaf(Leaf {
+                mode: Mode::Streaming,
+                ..
+            })
+            | Shape::Object
+            | Shape::List => written,
+            Shape::Leaf(_) | Shape::Open => {
+                if self.past_the_bound(&written) {
+                    self.carried.push_str(bytes);
+                    self.value.clear();
+                    self.refused = true;
+                    return;
+                }
                 let mut fragment = self.prefix();
-                fragment.push_str(empty);
+                fragment.push_str(&written);
                 fragment
             }
         };
@@ -686,6 +743,21 @@ impl Assembler {
         source.push_str(bytes);
         self.push_fragment(fragment, Text::uncounted(source), out);
         self.released = false;
+    }
+
+    /// Whether `written`, the value of the innermost element, would nest the arguments past
+    /// [`DEEPEST`]: the containers open above the element (the arguments object and the element
+    /// containers) leave it the rest, and only a list or an object the value spells can use it
+    /// up. The reading is the prefix parser's own, at the depth left, so the two agree exactly.
+    fn past_the_bound(&self, written: &str) -> bool {
+        if !written.starts_with(['[', '{']) {
+            return false;
+        }
+        let left = DEEPEST.saturating_sub(self.open.len());
+        matches!(
+            PartialJson::new(left, false).parse(written, false),
+            Err(PartialJsonError::TooDeep(_))
+        )
     }
 
     /// Refuses the carried bytes with `why`, whitespace included ([`refuse`](super::refuse)): the
