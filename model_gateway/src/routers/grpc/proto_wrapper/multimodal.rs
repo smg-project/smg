@@ -15,7 +15,7 @@ use smg_grpc_client::{
 use smg_mm_rdma::RdmaExporter;
 
 use super::{
-    log_mm_timing_enabled, mm_rdma_exporter, shm::write_tokenspeed_shm, VLLM_MROPE_GRID_KEYS,
+    VLLM_MROPE_GRID_KEYS, log_mm_timing_enabled, mm_rdma_exporter, shm::write_tokenspeed_shm,
 };
 
 /// How a streaming response's per-token payloads (token ids, sampled

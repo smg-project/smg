@@ -10,7 +10,7 @@ use smg_grpc_client::{
     trtllm_proto as trtllm, vllm_proto as vllm,
 };
 
-use super::{vllm_mm_hash_identity, vllm_mm_identity, EncodeBootstrapInfo, ProtoEmbedRequest};
+use super::{EncodeBootstrapInfo, ProtoEmbedRequest, vllm_mm_hash_identity, vllm_mm_identity};
 
 /// Unified ProtoRequest
 #[derive(Clone)]

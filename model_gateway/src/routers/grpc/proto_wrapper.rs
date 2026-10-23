@@ -29,7 +29,7 @@ use crate::{
         multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
         zmq_client::ZmqGenerateStream,
     },
-    worker::{liveness, Worker},
+    worker::{Worker, liveness},
 };
 
 mod embed;
@@ -55,7 +55,7 @@ pub use self::{
 };
 use self::{logprobs::convert_trtllm_output_logprobs, shm::vllm_mm_hash_identity};
 pub(crate) use self::{
-    multimodal::{stage_tokenspeed_tensor_rdma, EncodeBootstrapInfo, EncodeItemBootstrapInfo},
+    multimodal::{EncodeBootstrapInfo, EncodeItemBootstrapInfo, stage_tokenspeed_tensor_rdma},
     request::VLLM_MROPE_GRID_KEYS,
     shm::{
         cleanup_tokenspeed_items_encoder_shm, finish_tokenspeed_request, finish_vllm_request,
@@ -1202,8 +1202,8 @@ mod tracked_tests {
     use std::sync::Arc;
 
     use super::{
-        sglang, tokenspeed, vllm, DispatchBooking, FanoutStream, FirstItem, PrefillTicket,
-        ProtoGenerateResponse, ProtoStream,
+        DispatchBooking, FanoutStream, FirstItem, PrefillTicket, ProtoGenerateResponse,
+        ProtoStream, sglang, tokenspeed, vllm,
     };
     use crate::worker::{BasicWorkerBuilder, Worker};
 
@@ -2110,8 +2110,8 @@ mod fanout_tests {
     use std::{
         collections::VecDeque,
         sync::{
-            atomic::{AtomicBool, Ordering},
             Arc,
+            atomic::{AtomicBool, Ordering},
         },
     };
 
@@ -2377,13 +2377,17 @@ mod engine_error_tests {
 
     #[test]
     fn engine_error_is_true_only_for_complete_with_error_finish_reason() {
-        assert!(completes("error")
-            .iter()
-            .all(ProtoGenerateResponse::engine_error));
-        for reason in ["stop", "length", "abort", ""] {
-            assert!(!completes(reason)
+        assert!(
+            completes("error")
                 .iter()
-                .any(ProtoGenerateResponse::engine_error));
+                .all(ProtoGenerateResponse::engine_error)
+        );
+        for reason in ["stop", "length", "abort", ""] {
+            assert!(
+                !completes(reason)
+                    .iter()
+                    .any(ProtoGenerateResponse::engine_error)
+            );
         }
         let chunk = ProtoGenerateResponse::Vllm(Box::new(vllm::GenerateResponse {
             response: Some(vllm::generate_response::Response::Chunk(
@@ -2483,9 +2487,11 @@ mod tests {
             .unwrap();
         let rooms = tokenspeed.as_tokenspeed().encode_bootstrap_info.clone();
         assert_eq!(rooms.as_ref().unwrap().items[0].bootstrap_room, 17);
-        assert!(tokenspeed
-            .set_encode_bootstrap_info(sglang_encode_handoff())
-            .is_err());
+        assert!(
+            tokenspeed
+                .set_encode_bootstrap_info(sglang_encode_handoff())
+                .is_err()
+        );
         assert_eq!(tokenspeed.as_tokenspeed().encode_bootstrap_info, rooms);
         let mut sglang = ProtoGenerateRequest::Sglang(Box::default());
         assert!(sglang.set_encode_bootstrap_info(vec![item]).is_err());
@@ -2493,9 +2499,10 @@ mod tests {
         tokenspeed.clear_encode_bootstrap_info();
         assert!(tokenspeed.as_tokenspeed().encode_bootstrap_info.is_none());
         let mut vllm = ProtoGenerateRequest::Vllm(Box::default());
-        assert!(vllm
-            .set_encode_bootstrap_info(sglang_encode_handoff())
-            .is_err());
+        assert!(
+            vllm.set_encode_bootstrap_info(sglang_encode_handoff())
+                .is_err()
+        );
     }
 
     use smg_grpc_client::common_proto as common;
@@ -2851,9 +2858,11 @@ mod tests {
                 .chunk_semantics()
                 .is_delta()
         );
-        assert!(ProtoGenerateComplete::Vllm(Box::default())
-            .chunk_semantics()
-            .is_delta());
+        assert!(
+            ProtoGenerateComplete::Vllm(Box::default())
+                .chunk_semantics()
+                .is_delta()
+        );
 
         // Every other shape reports running totals.
         for chunk in [
