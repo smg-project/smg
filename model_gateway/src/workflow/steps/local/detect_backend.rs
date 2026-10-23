@@ -184,13 +184,50 @@ async fn try_sglang_server_info(
     Ok(())
 }
 
+/// Probe TokenSpeed's control server: `ts serve --control-port` answers
+/// `/get_server_info` with the engine's server args, tagged `tokenspeed_version`.
+/// The gateway `tokenspeed serve` embeds answers 501 there.
+async fn try_tokenspeed_server_info(
+    url: &str,
+    timeout_secs: u64,
+    client: &Client,
+    api_key: Option<&str>,
+) -> Result<(), String> {
+    let info_url = format!("{}/get_server_info", http_base_url(url));
+
+    let mut req = client
+        .get(&info_url)
+        .timeout(Duration::from_secs(timeout_secs));
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+
+    let response = req
+        .send()
+        .await
+        .map_err(|e| format!("Failed to reach {info_url}: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("/get_server_info returned {}", response.status()));
+    }
+    let info: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| format!("/get_server_info is not JSON: {e}"))?;
+    if info.get("tokenspeed_version").is_some() {
+        Ok(())
+    } else {
+        Err("/get_server_info carries no tokenspeed_version".to_string())
+    }
+}
+
 /// Detect HTTP backend runtime type.
 ///
 /// Strategy:
 /// 1. Primary: `GET /v1/models` → check `owned_by` field
 /// 2. Fallback: probe `/version` (vLLM) and `/server_info` (SGLang) in parallel
-/// 3. Last resort: a live OpenAI-compatible server matching no engine
-///    fingerprint is registered as `generic` rather than rejected
+/// 3. A live OpenAI-compatible server with an unknown `owned_by`: a
+///    `/get_server_info` tagged `tokenspeed_version` is TokenSpeed's control
+///    server; anything else is registered as `generic` rather than rejected
 async fn detect_http_backend(
     url: &str,
     timeout_secs: u64,
@@ -256,12 +293,20 @@ async fn detect_http_backend(
         // (issue #2085). Register it as a generic OpenAI-compatible backend
         // instead of rejecting a healthy worker.
         ModelsProbe::UnrecognizedOwnedBy(owned_by) => {
+            if try_tokenspeed_server_info(url, timeout_secs, client, api_key)
+                .await
+                .is_ok()
+            {
+                debug!("Detected HTTP backend via /get_server_info tokenspeed_version: tokenspeed");
+                return Ok("tokenspeed".to_string());
+            }
             warn!(
                 worker = %url,
                 owned_by = ?owned_by,
                 "Could not identify backend engine: /v1/models responded but its \
-                 owned_by is not a known engine, and neither /version (vllm) nor \
-                 /server_info (sglang) is exposed; registering as `generic` \
+                 owned_by is not a known engine, and neither /version (vllm), \
+                 /server_info (sglang) nor a tagged /get_server_info (tokenspeed) \
+                 is exposed; registering as `generic` \
                  OpenAI-compatible. Set runtime_type on the worker to override."
             );
             Ok("generic".to_string())
@@ -488,6 +533,49 @@ mod tests {
         server.abort();
 
         assert_eq!(runtime, "vllm");
+    }
+
+    fn self_hosted_with_server_info(server_info: serde_json::Value) -> Router {
+        models_route(json!({
+            "object": "list",
+            "data": [{"id": "m", "object": "model", "owned_by": "self_hosted"}]
+        }))
+        .route(
+            "/get_server_info",
+            get(move || {
+                let payload = server_info.clone();
+                async move { Json(payload) }
+            }),
+        )
+    }
+
+    #[tokio::test]
+    async fn http_detection_identifies_a_tokenspeed_control_server() {
+        // `ts serve --control-port` serves the engine's server args tagged with
+        // its version; the gateway `tokenspeed serve` embeds answers 501 there.
+        let (url, server) = serve_router(self_hosted_with_server_info(json!({
+            "tokenspeed_version": "0.1.1", "attn_tp_size": 1.0
+        })))
+        .await;
+
+        let runtime = detect_http_backend(&url, 5, &crate::http_client::client(), None)
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(runtime, "tokenspeed");
+    }
+
+    #[tokio::test]
+    async fn http_detection_keeps_untagged_server_info_generic() {
+        let (url, server) = serve_router(self_hosted_with_server_info(json!({"tp_size": 1}))).await;
+
+        let runtime = detect_http_backend(&url, 5, &crate::http_client::client(), None)
+            .await
+            .unwrap();
+        server.abort();
+
+        assert_eq!(runtime, "generic");
     }
 
     #[tokio::test]

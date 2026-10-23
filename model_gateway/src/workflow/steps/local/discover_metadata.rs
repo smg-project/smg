@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 use wfaas::{StepExecutor, StepResult, WorkflowContext, WorkflowError, WorkflowResult};
 
 use crate::{
-    routers::grpc::client::{flat_labels, GrpcClient},
+    routers::grpc::client::{flat_labels, GrpcClient, TOKENSPEED_GRPC_KEYS},
     worker::{
         sampling_defaults::SamplingDefaults, ConnectionMode, DEFAULT_SAMPLING_PARAMS_LABEL,
         UNKNOWN_MODEL_ID,
@@ -251,6 +251,9 @@ pub(crate) async fn discover_engine_labels(
         ConnectionMode::Http => {
             let labels = match runtime_type {
                 "vllm" => fetch_vllm_http_metadata_checked(client, url, api_key, strict).await?,
+                "tokenspeed" => {
+                    fetch_tokenspeed_http_metadata_checked(client, url, api_key, strict).await?
+                }
                 _ => fetch_sglang_http_metadata_checked(client, url, api_key, strict).await?,
             };
             Ok((labels, None))
@@ -307,8 +310,19 @@ async fn fetch_sglang_http_metadata_checked(
         Err(_) => {}
     }
 
-    // /v1/models gives us model identity and max_model_len when a compatible
-    // local frontend does not expose the SGLang-specific metadata endpoints.
+    add_models_identity(&mut labels, client, &base, api_key, strict).await?;
+    Ok(labels)
+}
+
+/// `/v1/models` fills model identity and `max_model_len` that the engine's own
+/// metadata endpoints left out.
+async fn add_models_identity(
+    labels: &mut HashMap<String, String>,
+    client: &Client,
+    base: &str,
+    api_key: Option<&str>,
+    strict: bool,
+) -> Result<(), String> {
     match http_get_json_classified::<ModelsResponse>(client, &format!("{base}/v1/models"), api_key)
         .await
     {
@@ -334,8 +348,87 @@ async fn fetch_sglang_http_metadata_checked(
         Err(MetadataError::Failed(e)) if strict => return Err(format!("/v1/models: {e}")),
         Err(_) => {}
     }
+    Ok(())
+}
 
+/// The tolerant read as a plain map, kept for the tests of the registration shape.
+#[cfg(test)]
+async fn fetch_tokenspeed_http_metadata(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+) -> HashMap<String, String> {
+    fetch_tokenspeed_http_metadata_checked(client, url, api_key, false)
+        .await
+        .unwrap_or_default()
+}
+
+/// TokenSpeed's control server (`ts serve --control-port`) answers
+/// `/get_server_info` with the engine's server args and RL advertisement: the
+/// facts the gRPC path reads from GetServerInfo, so take the same keys.
+/// `strict` as for SGLang.
+async fn fetch_tokenspeed_http_metadata_checked(
+    client: &Client,
+    url: &str,
+    api_key: Option<&str>,
+    strict: bool,
+) -> Result<HashMap<String, String>, String> {
+    let base = http_base_url(url);
+    let mut labels = HashMap::new();
+
+    match http_get_json_classified::<serde_json::Value>(
+        client,
+        &format!("{base}/get_server_info"),
+        api_key,
+    )
+    .await
+    {
+        Ok(serde_json::Value::Object(args)) => {
+            pick_json_fields(&mut labels, &args, TOKENSPEED_GRPC_KEYS);
+            if let Some(version) = args
+                .get("tokenspeed_version")
+                .and_then(serde_json::Value::as_str)
+                .filter(|v| !v.is_empty())
+            {
+                labels.insert("version".to_string(), version.to_string());
+            }
+        }
+        Ok(_) => {}
+        Err(MetadataError::Failed(e)) if strict => return Err(format!("get_server_info: {e}")),
+        Err(_) => {}
+    }
+    match get_json_with_fallback_classified::<ModelInfo>(client, &base, "model_info", api_key).await
+    {
+        Ok(info) => labels.extend(flat_labels(&info)),
+        Err(MetadataError::Failed(e)) if strict => return Err(format!("model_info: {e}")),
+        Err(_) => {}
+    }
+    add_models_identity(&mut labels, client, &base, api_key, strict).await?;
+    normalize_grpc_keys(&mut labels);
     Ok(labels)
+}
+
+/// The JSON twin of the gRPC path's `pick_prost_fields`: non-empty strings
+/// other than a stringified `"null"`, booleans, and non-zero numbers (whole
+/// ones written as integers).
+fn pick_json_fields(
+    labels: &mut HashMap<String, String>,
+    args: &serde_json::Map<String, serde_json::Value>,
+    keys: &[&str],
+) {
+    for key in keys {
+        let value = match args.get(*key) {
+            Some(serde_json::Value::String(s)) if !s.is_empty() && s != "null" => s.clone(),
+            Some(serde_json::Value::Bool(b)) => b.to_string(),
+            Some(serde_json::Value::Number(n)) => match n.as_f64() {
+                Some(f) if f != 0.0 && f.fract() == 0.0 => (f as i64).to_string(),
+                Some(f) if f != 0.0 => n.to_string(),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        labels.insert((*key).to_string(), value);
+    }
 }
 
 /// The tolerant read as a plain map, kept for the tests of the registration shape.
@@ -969,6 +1062,133 @@ mod tests {
 
         let labels = flat_labels(&info);
         assert!(!labels.contains_key("max_running_requests"));
+    }
+
+    #[tokio::test]
+    async fn tokenspeed_http_metadata_takes_the_engines_advertisement() {
+        use axum::{routing::get, Json, Router};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let router = Router::new()
+            .route(
+                "/get_server_info",
+                get(|| async {
+                    Json(json!({
+                        "tokenspeed_version": "0.1.1",
+                        "model": "/models/qwen",
+                        "attn_tp_size": 2.0,
+                        "pipeline_parallel_size": 1.0,
+                        "data_parallel_size": null,
+                        "kvstore_io_backend": "kernel",
+                        "disaggregation_mode": "null",
+                        "served_model_name": "null",
+                        "mapping": {"attn": {"tp_size": 2.0}},
+                        "rl.control_url": "http://0.0.0.0:48225",
+                        "rl.update_from": "disk,distributed,mooncake",
+                        "rl.pause_modes": "wait,abort,keep",
+                        "rl.abort": "true"
+                    }))
+                }),
+            )
+            .route(
+                "/get_model_info",
+                get(|| async {
+                    Json(json!({"model_path": "/models/qwen", "weight_version": "default"}))
+                }),
+            )
+            .route(
+                "/v1/models",
+                get(|| async {
+                    Json(json!({"object": "list", "data": [{
+                        "id": "qwen-served", "object": "model", "owned_by": "self_hosted",
+                        "root": "/models/qwen", "max_model_len": 4096
+                    }]}))
+                }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only mock TokenSpeed control server; handle is aborted at test end"
+        )]
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let labels = fetch_tokenspeed_http_metadata(
+            &crate::http_client::client(),
+            &format!("http://{addr}"),
+            None,
+        )
+        .await;
+        server.abort();
+
+        let get = |k: &str| labels.get(k).map(String::as_str);
+        assert_eq!(get("tp_size"), Some("2"));
+        assert_eq!(get("pp_size"), Some("1"));
+        assert_eq!(get("version"), Some("0.1.1"));
+        assert_eq!(get("rl.control_url"), Some("http://0.0.0.0:48225"));
+        assert_eq!(get("rl.update_from"), Some("disk,distributed,mooncake"));
+        assert_eq!(get("rl.pause_modes"), Some("wait,abort,keep"));
+        assert_eq!(get("rl.abort"), Some("true"));
+        assert_eq!(get("model_path"), Some("/models/qwen"));
+        assert_eq!(get("served_model_name"), Some("qwen-served"));
+        assert_eq!(get("max_model_len"), Some("4096"));
+        for absent in [
+            "attn_tp_size",
+            "mapping",
+            "kvstore_io_backend",
+            "dp_size",
+            "disaggregation_mode",
+        ] {
+            assert!(
+                !labels.contains_key(absent),
+                "{absent} should not be a label"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_strict_tokenspeed_read_fails_when_its_server_info_fails() {
+        // A label refresh must not take a failed read for an engine that
+        // reports less; registration keeps what the other endpoints gave.
+        use axum::{http::StatusCode, routing::get, Json, Router};
+        use serde_json::json;
+        use tokio::net::TcpListener;
+
+        let router = Router::new()
+            .route(
+                "/get_server_info",
+                get(|| async { StatusCode::INTERNAL_SERVER_ERROR }),
+            )
+            .route(
+                "/v1/models",
+                get(|| async { Json(json!({"object": "list", "data": [{"id": "qwen-served"}]})) }),
+            );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only mock TokenSpeed control server; handle is aborted at test end"
+        )]
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let client = crate::http_client::client();
+        let url = format!("http://{addr}");
+
+        let strict = fetch_tokenspeed_http_metadata_checked(&client, &url, None, true).await;
+        let tolerant = fetch_tokenspeed_http_metadata_checked(&client, &url, None, false).await;
+        server.abort();
+
+        let err = strict.expect_err("a failed get_server_info fails a strict read");
+        assert!(err.starts_with("get_server_info:"), "{err}");
+        let labels = tolerant.expect("registration tolerates it");
+        assert_eq!(
+            labels.get("served_model_name").map(String::as_str),
+            Some("qwen-served")
+        );
     }
 
     #[tokio::test]
