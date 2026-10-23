@@ -1,4 +1,4 @@
-"""Print the scheduler pin the installed TokenSpeed runtime nightly implies.
+"""Select the CI scheduler for the installed TokenSpeed runtime.
 
 Retain the lower-bound pin for older nightlies. The 20261023 runtime imports
 StorageConfig, which first appears in scheduler 0.1.42 although that runtime
