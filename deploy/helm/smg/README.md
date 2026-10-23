@@ -164,6 +164,21 @@ A changed credential rolls the router pods, as a changed store URL does: the pod
 
 The router's liveness probe is `httpGet /health`, which answers 200 while the process serves. Its readiness probe is `httpGet /readiness`, which answers 503 while the gateway has no healthy worker, while a tokenizer is not yet registered and while the gateway drains after SIGTERM, so the Service stops sending new connections to a pod that cannot take them (`router.livenessProbe.path` and `router.readinessProbe.path` override the routes).
 
+PD readiness defaults to one healthy prefill and one healthy decode worker. For some
+workloads, that remaining capacity is already insufficient: continued traffic can
+worsen SLA violations until the service fails. Use `router.extraArgs` to set
+`--prefill-min-ready-workers` and `--decode-min-ready-workers` to the minimum viable
+P/D capacity. Each role also supports `--<role>-expected-workers` with
+`--<role>-min-ready-percent` (1–100); the required count is the larger of the
+absolute minimum (default 1) and the percentage rounded up. For example,
+`--prefill-expected-workers 8 --prefill-min-ready-percent 75 --decode-min-ready-workers 2`
+requires 6P and 2D. The expected size stays fixed when workers disappear; setting
+it alone does not enable a percentage gate. These options apply to PD/EPD and are
+also available in the Python launcher. `/readiness` returns 503 below either
+threshold and includes per-role counts; the load balancer must honor readiness
+to stop new traffic. The thresholds do not enforce an exact P:D ratio or shed
+requests themselves.
+
 A router that gets its workers at runtime through the admin API (`POST /workers`) rather than from `workers`, `router.workerUrls` or `router.serviceDiscovery` has no healthy worker when it starts, so `/readiness` answers 503 until one is registered, the Service has no endpoint for the pod, and a registration sent through the Service cannot reach it (a rolling update's new pod then never becomes Ready). Such deployments set `router.readinessProbe.path: /health`, or register their workers through a port-forward to the pod.
 
 The gateway drains in-flight requests for `router.shutdownGracePeriodSeconds` (default 180, passed as `--shutdown-grace-period-secs`); the pod's `terminationGracePeriodSeconds` is that plus `router.terminationGraceMarginSeconds` (default 30), so the kubelet does not kill the drain at its default 30 s.

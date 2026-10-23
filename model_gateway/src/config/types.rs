@@ -101,6 +101,9 @@ pub struct RouterConfig {
     /// routes always remain available on the main `port` regardless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_port: Option<u16>,
+    /// Optional capacity thresholds for PD/EPD readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pd_readiness: Option<PdReadinessConfig>,
     /// Port of the admin listener. When set, the control-plane routes (the
     /// admin, worker-registry and RL routes) are served on it, with the probe
     /// routes, and the data listener answers 404 for them. `None` keeps the
@@ -600,6 +603,52 @@ pub struct RouterConfig {
     /// When set, wraps all storage backends with hook-based interceptors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_hook_wasm_path: Option<String>,
+}
+
+/// Capacity threshold for one PD role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReadinessRoleConfig {
+    /// Desired fleet size used as the stable percentage denominator. Has no
+    /// effect unless `min_healthy_percent` is also set.
+    pub expected_workers: Option<usize>,
+    /// Absolute safety floor, independent of the percentage threshold.
+    pub min_healthy_workers: usize,
+    /// Minimum healthy percentage of `expected_workers`.
+    pub min_healthy_percent: Option<u8>,
+}
+
+impl Default for ReadinessRoleConfig {
+    /// Preserve the one-healthy-worker requirement without a percentage gate.
+    fn default() -> Self {
+        Self {
+            expected_workers: None,
+            min_healthy_workers: 1,
+            min_healthy_percent: None,
+        }
+    }
+}
+
+impl ReadinessRoleConfig {
+    /// Effective number of healthy workers required for this role.
+    pub fn required_workers(self) -> usize {
+        let percentage_required =
+            self.expected_workers
+                .zip(self.min_healthy_percent)
+                .map_or(0, |(expected, percent)| {
+                    let percent = usize::from(percent);
+                    (expected / 100) * percent + ((expected % 100) * percent).div_ceil(100)
+                });
+        self.min_healthy_workers.max(percentage_required)
+    }
+}
+
+/// Independent readiness thresholds for the two PD pipeline roles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PdReadinessConfig {
+    pub prefill: ReadinessRoleConfig,
+    pub decode: ReadinessRoleConfig,
 }
 
 /// How a request's tenant is resolved on the serving path. The tenant scopes
@@ -1931,6 +1980,7 @@ impl Default for RouterConfig {
             pd_pairing_mode: PdPairingMode::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
+            pd_readiness: None,
             health_check_port: None,
             admin_port: None,
             admin_host: None,

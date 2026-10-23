@@ -345,6 +345,9 @@ class RouterArgs:
     control_plane_api_keys: list[tuple] = dataclasses.field(default_factory=list)
     control_plane_audit_enabled: bool = False
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
+    decode_expected_workers: int | None = None
+    decode_min_ready_percent: int | None = None
+    decode_min_ready_workers: int | None = None
     decode_policy: str | None = None  # Specific policy for decode nodes in PD mode
     decode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
     decode_urls: list[str] = dataclasses.field(default_factory=list)
@@ -522,7 +525,10 @@ class RouterArgs:
     postgres_op_timeout_secs: int = 5
     postgres_pool_max: int = 16
     power_of_two_load_metric: str = "expected_wait"
+    prefill_expected_workers: int | None = None
     prefill_max_inflight_requests_per_worker: int = -1
+    prefill_min_ready_percent: int | None = None
+    prefill_min_ready_workers: int | None = None
     prefill_policy: str | None = None  # Specific policy for prefill nodes in PD mode
     prefill_queue_size: int | None = None
     prefill_queue_timeout_secs: int | None = None
@@ -2349,6 +2355,46 @@ class RouterArgs:
         )
 
         # Health check configuration
+        health_group.add_argument(
+            f"--{prefix}decode-expected-workers",
+            type=int,
+            default=None,
+            help="Desired decode fleet size, used only as the fixed percentage denominator",
+        )
+        health_group.add_argument(
+            f"--{prefix}decode-min-ready-percent",
+            type=int,
+            choices=range(1, 101),
+            metavar="PERCENT",
+            default=None,
+            help="Minimum healthy percentage of expected decode workers (1-100)",
+        )
+        health_group.add_argument(
+            f"--{prefix}decode-min-ready-workers",
+            type=int,
+            default=None,
+            help="Minimum healthy decode workers required (default 1)",
+        )
+        health_group.add_argument(
+            f"--{prefix}prefill-expected-workers",
+            type=int,
+            default=None,
+            help="Desired prefill fleet size, used only as the fixed percentage denominator",
+        )
+        health_group.add_argument(
+            f"--{prefix}prefill-min-ready-percent",
+            type=int,
+            choices=range(1, 101),
+            metavar="PERCENT",
+            default=None,
+            help="Minimum healthy percentage of expected prefill workers (1-100)",
+        )
+        health_group.add_argument(
+            f"--{prefix}prefill-min-ready-workers",
+            type=int,
+            default=None,
+            help="Minimum healthy prefill workers required (default 1)",
+        )
         health_group.add_argument(
             f"--{prefix}health-failure-threshold",
             type=int,

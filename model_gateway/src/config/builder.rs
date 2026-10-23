@@ -7,8 +7,8 @@ use smg_mcp::McpConfig;
 use super::{
     AccessLogField, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
     DiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig,
-    MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PolicyConfig, PostgresConfig,
-    RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+    MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
+    PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
     TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
@@ -204,6 +204,12 @@ impl RouterConfigBuilder {
 
     pub fn health_check_port(mut self, health_check_port: Option<u16>) -> Self {
         self.config.health_check_port = health_check_port;
+        self
+    }
+
+    /// Set optional per-role capacity thresholds for PD/EPD readiness.
+    pub fn pd_readiness(mut self, pd_readiness: Option<PdReadinessConfig>) -> Self {
+        self.config.pd_readiness = pd_readiness;
         self
     }
 

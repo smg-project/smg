@@ -20,6 +20,38 @@ from smg.smg_rs import get_available_reasoning_parsers, get_available_tool_call_
 class TestRouterArgs:
     """Test RouterArgs dataclass and its methods."""
 
+    @pytest.mark.parametrize("role", ["prefill", "decode"])
+    def test_pd_readiness_capacity_flags(self, role):
+        """Both roles expose fixed-denominator percentage and absolute gates."""
+        args = parse_router_args(
+            [
+                "--pd-disaggregation",
+                f"--{role}-expected-workers",
+                "8",
+                f"--{role}-min-ready-workers",
+                "4",
+                f"--{role}-min-ready-percent",
+                "75",
+            ]
+        )
+        assert getattr(args, f"{role}_expected_workers") == 8
+        assert getattr(args, f"{role}_min_ready_workers") == 4
+        assert getattr(args, f"{role}_min_ready_percent") == 75
+
+    @pytest.mark.parametrize("role", ["prefill", "decode"])
+    @pytest.mark.parametrize("percent", ["0", "101"])
+    def test_pd_readiness_invalid_percentage(self, role, percent):
+        """Invalid percentages fail parsing rather than silently disabling readiness."""
+        with pytest.raises(SystemExit):
+            parse_router_args([f"--{role}-min-ready-percent", percent])
+
+    @pytest.mark.parametrize("role", ["prefill", "decode"])
+    def test_pd_readiness_reaches_native_validation(self, role):
+        """The Python wrapper forwards role gates to Rust before startup."""
+        args = RouterArgs(pd_disaggregation=True, **{f"{role}_min_ready_percent": 75})
+        with pytest.raises(ValueError, match="expected_workers"):
+            Router.from_args(args).start()
+
     def test_default_values(self):
         """Test that RouterArgs has correct default values."""
         args = RouterArgs()
