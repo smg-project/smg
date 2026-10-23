@@ -209,14 +209,16 @@ def test_an_http_worker_that_died_gets_the_same_report_at_once(tmp_path, monkeyp
 
 def test_an_http_worker_that_dies_during_the_wait_ends_it_within_seconds(tmp_path, monkeypatch):
     script = (
-        "import sys, time; time.sleep(1);"
+        "import sys, time; time.sleep(3);"
         " print('RuntimeError: the model path is unreadable'); sys.exit(2)"
     )
     worker = _spawned_worker(tmp_path, monkeypatch, script, ConnectionMode.HTTP, _refused_port())
     started = time.perf_counter()
     text = _death_text(worker, timeout=30)
     elapsed = time.perf_counter() - started
-    # The floor only shows the process was alive when the wait began; a busy
-    # runner may start the stub's sleep late, so it leaves room for that.
+    # The floor only shows the process was alive when the wait began. The stub
+    # sleeps three seconds so that a busy runner, which may start this wait
+    # late after the spawn, has two and a half seconds of room before the
+    # stub's own exit could end the wait under the floor.
     assert 0.5 <= elapsed < 10, elapsed
     assert '(exit status 2); the log says: "RuntimeError: the model path is unreadable"' in text
