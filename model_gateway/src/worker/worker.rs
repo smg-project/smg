@@ -2030,10 +2030,16 @@ impl Worker for BasicWorker {
         // after the timeout.
         let before = breaker.peek_state();
         breaker.record_outcome(success);
-        // A trip or a close moved the routing state; a record that left the
-        // breaker where it was publishes nothing, so the steady path takes
-        // no lock.
-        if breaker.peek_state() != before {
+        let after = breaker.peek_state();
+        // A trip or a close moved the routing state. A record that finds the
+        // breaker open publishes as well: its request was in flight across
+        // the trip, and a selection's read may have moved the breaker to
+        // half-open, and the series to available, between the peek and the
+        // record (open, half-open, open reads as no move); the publish
+        // returns early under the lock when the series already says
+        // circuit_open. A record that left a closed or half-open breaker
+        // where it was publishes nothing, so the steady path takes no lock.
+        if after != before || after == super::circuit_breaker::CircuitState::Open {
             self.publish_state();
         }
     }
@@ -3825,8 +3831,10 @@ mod tests {
 
     /// The facts are read in the routing decision's order: a worker that is
     /// not ready names its status before its open breaker, and the breaker
-    /// once the status is ready again. A registration publishes the current
-    /// pair whether or not it was the one published before.
+    /// once the status is ready again. A record that lands on an open
+    /// breaker past its timeout is ignored, and a record that finds the
+    /// breaker open publishes. A registration publishes the current pair
+    /// whether or not it was the one published before.
     #[test]
     fn the_first_excluding_fact_names_the_state_and_a_registration_republishes_it() {
         let recorder = PrometheusBuilder::new().build_recorder();
@@ -3877,6 +3885,18 @@ mod tests {
                 "the decision's read starts the trial"
             );
             assert_eq!(current_state(&handle.render()), "available/none");
+            // The round trip a late failure's compare cannot see: the
+            // decision's read moved the breaker to half-open and the series
+            // to available between the failure's peek of the breaker (open)
+            // and its record, which trips the breaker again. The breaker is
+            // open and the series says available; a record that finds the
+            // breaker open publishes, and the series says so again.
+            late.circuit_breaker.load().record_failure();
+            assert_eq!(late.circuit_breaker.load().peek_state(), CircuitState::Open);
+            assert_eq!(current_state(&handle.render()), "available/none");
+            late.record_circuit_breaker_outcome(false);
+            assert_eq!(late.circuit_breaker.load().peek_state(), CircuitState::Open);
+            assert_eq!(current_state(&handle.render()), "excluded/circuit_open");
 
             // The address's series were dropped (a removal) and the worker
             // registers again: the plain publish sees no move, the
