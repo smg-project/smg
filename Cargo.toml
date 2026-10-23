@@ -71,7 +71,7 @@ serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_with = { version = "3", features = ["macros"] }
 subtle = "2.6"
 thiserror = "2.0.18"
-tokio = { version = "1.52.3" }
+tokio = { version = "1.54.1" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
 uuid = { version = "1.23", features = ["v7", "serde"] }
