@@ -1698,7 +1698,10 @@ mod tests {
     /// since one would end the gateway reader's release of a refused output that made no call.
     #[test]
     fn an_invoke_the_cut_found_unnamed_is_refused_whole() {
-        for input in ["fo", "f<parameter name=\"s\">x\n"] {
+        for input in [
+            "fo", // codespell:ignore fo
+            "f<parameter name=\"s\">x\n",
+        ] {
             let events = run(&[input], true);
             assert_eq!(bytes(&events), input, "{input:?}");
             assert_eq!(shown(&events), "", "{input:?}: {events:?}");
