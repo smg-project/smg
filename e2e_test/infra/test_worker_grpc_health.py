@@ -168,8 +168,8 @@ def test_a_grpc_server_without_the_health_service_is_not_the_worker():
 
 @pytest.mark.parametrize("engine", sorted(ENGINES_WITHOUT_GRPC_HEALTH))
 def test_an_engine_without_the_health_service_passes_on_a_ready_channel(engine):
-    """The scripted mock worker and TRT-LLM serve their own proto's HealthCheck
-    and no grpc.health.v1; the harness keeps taking their ready channel."""
+    """TRT-LLM serves its own proto's HealthCheck and no grpc.health.v1; the
+    harness keeps taking its ready channel."""
     with grpc_listener(None) as port:
         assert _worker(port, engine=engine).grpc_serving() is True
 

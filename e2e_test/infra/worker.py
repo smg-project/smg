@@ -73,13 +73,13 @@ _ERROR_LEVEL_LINE = re.compile(r"\b(?:ERROR|CRITICAL|FATAL)\b|panicked at ")
 # ends with "run with NCCL_DEBUG=INFO for details") does not lower the line.
 _BELOW_ERROR_LEVEL_LINE = re.compile(r"\b(?:DEBUG|INFO|WARNING|WARN)\b")
 
-# The engines whose gRPC server carries no ``grpc.health.v1`` service: the
-# scripted mock worker, and TRT-LLM, whose upstream server registers its own
-# service and no standard health (each answers its own proto's HealthCheck,
-# the one the gateway probes). For these alone a ready channel that answers
-# UNIMPLEMENTED counts as the worker, until the harness asks their own
-# HealthCheck instead.
-ENGINES_WITHOUT_GRPC_HEALTH = frozenset({"mock", "trtllm"})
+# The engines whose gRPC server carries no ``grpc.health.v1`` service:
+# TRT-LLM, whose upstream server registers its own service and no standard
+# health (it answers its own proto's HealthCheck, the one the gateway
+# probes). For these alone a ready channel that answers UNIMPLEMENTED counts
+# as the worker, until the harness asks their own HealthCheck instead. The
+# scripted mock worker hosts the standard service like the engine servicers.
+ENGINES_WITHOUT_GRPC_HEALTH = frozenset({"trtllm"})
 
 
 def _excerpt(line: str) -> str:
@@ -1077,10 +1077,10 @@ class Worker:
         sit on the number until then: an HTTP/2 server's 404 reads as
         UNIMPLEMENTED through grpc, and the ready channel behind it is the
         stranger's, which the nightly PD sweep once certified as a decode
-        worker. Two engines' servers carry no such service, the scripted mock
-        worker and TRT-LLM (``ENGINES_WITHOUT_GRPC_HEALTH``; each answers its
-        own proto's HealthCheck, the one the gateway probes); for those alone
-        a ready channel that answers UNIMPLEMENTED counts.
+        worker. One engine's server carries no such service, TRT-LLM
+        (``ENGINES_WITHOUT_GRPC_HEALTH``; it answers its own proto's
+        HealthCheck, the one the gateway probes); for it alone a ready
+        channel that answers UNIMPLEMENTED counts.
         """
         try:
             import grpc
