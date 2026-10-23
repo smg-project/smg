@@ -47,7 +47,8 @@ def gateway_identity(gateway, expected):
         "harness requested parser differs",
     )
     fields = (root / "stat").read_text().rsplit(")", 1)[1].split()
-    require(int(fields[1]) == os.getpid(), "gateway is not a child of this pytest harness")
+    parent_pid = int(fields[1])
+    require(parent_pid == os.getpid(), "gateway is not a child of this pytest harness")
     start = fields[19]
     native = set()
     for line in (root / "maps").read_text().splitlines():
@@ -65,7 +66,7 @@ def gateway_identity(gateway, expected):
     require(digest == expected["sha256"], "loaded gateway native bytes differ from producer")
     return {
         "pid": pid,
-        "parent_pid": int(fields[1]),
+        "parent_pid": parent_pid,
         "start_ticks": start,
         "argv": argv,
         "launch_argv_intent": launch,
