@@ -152,7 +152,7 @@ class Collector:
 
 
 def guard_environment(environment):
-    require(environment.get("MAX_JOBS") == "8", "prewarm MAX_JOBS must be 8")
+    require(environment.get("MAX_JOBS") == "32", "prewarm MAX_JOBS must be 32")
     require(environment.get("CARGO_BUILD_JOBS") == "8", "prewarm Cargo jobs must be 8")
     require(environment.get("AITER_LOG_MORE") == "1", "compiler diagnostics must be enabled")
     for key in ["OMP_NUM_THREADS", "MKL_NUM_THREADS", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"]:

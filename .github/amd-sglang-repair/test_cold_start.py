@@ -22,7 +22,7 @@ SPEC.loader.exec_module(prewarm)
 
 def environment():
     return {
-        "MAX_JOBS": "8",
+        "MAX_JOBS": "32",
         "CARGO_BUILD_JOBS": "8",
         "AITER_LOG_MORE": "1",
         "OMP_NUM_THREADS": "1",
@@ -170,7 +170,8 @@ def test_exact_shell_tail_limits_prewarm_and_restores_original_suite_environment
         text=True,
     )
     calls = [json.loads(line) for line in run.stdout.splitlines()]
-    assert calls[0]["jobs"] == calls[0]["cargo"] == "8" and calls[0]["verbose"] == "1"
+    assert calls[0]["jobs"] == "32" and calls[0]["cargo"] == "8"
+    assert calls[0]["verbose"] == "1"
     assert run.returncode == (7 if fail_prewarm else 0)
     if fail_prewarm:
         assert len(calls) == 1
