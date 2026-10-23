@@ -616,6 +616,38 @@ def test_a_status_with_empty_details_is_worded_by_its_code():
     assert (flushed, refusal) == (False, "UNAVAILABLE") and "\n" not in refusal
 
 
+def test_a_multi_line_refusal_is_worded_on_one_line():
+    """Details with newlines (an engine's multi-line message forwarded by the
+    servicer), and an exception text with newlines, read as one line on the
+    end line; whitespace-only details fall through to the code's name."""
+
+    class _Status(Exception):
+        def __init__(self, text):
+            super().__init__(text)
+            self._text = text
+
+        def details(self):
+            return self._text
+
+        def code(self):
+            return SimpleNamespace(name="FAILED_PRECONDITION")
+
+        def __str__(self):
+            return "<_InactiveRpcError of RPC that terminated with:\n\tstatus = ...\n>"
+
+    assert (
+        warmup._refusal(_Status("engine busy:\n\tflush refused while 3 requests run\n"))
+        == "engine busy: flush refused while 3 requests run"
+    )
+    assert warmup._refusal(_Status(" \n\t ")) == "FAILED_PRECONDITION"
+    assert warmup._refusal(RuntimeError("line one\nline two")) == "line one line two"
+    wire = _Wire()
+    wire.flush_cache = lambda: (_ for _ in ()).throw(_Status("a\nb"))
+    report = run_warmup(plan_warmup(SMALL, "fast"), wire, budget_secs=30)
+    assert report.flush_refusal == "a b"
+    assert "\n" not in report.summary() and report.summary().endswith(": a b")
+
+
 def test_a_refused_flush_is_worded_by_the_status_details_not_its_repr():
     """A gRPC status' ``str`` runs over several lines (code, details, debug
     string); the end line carries its ``details()`` alone."""

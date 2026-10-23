@@ -629,20 +629,28 @@ class _Pass:
 def _refusal(error: BaseException) -> str:
     """The words of a refused flush, for the log and the end line: a gRPC
     status' details when the error carries them (a status' ``str`` runs over
-    several lines), else its code's name, else the error itself."""
+    several lines), else its code's name, else the error itself. Whatever the
+    source, the words are one line: runs of whitespace, newlines included,
+    read as one space (an engine's multi-line message would otherwise split
+    the end line)."""
     details = getattr(error, "details", None)
     if callable(details):
         with contextlib.suppress(Exception):
-            if text := details():
-                return str(text)
+            if text := _one_line(str(details() or "")):
+                return text
     # A status with empty details: its code's name keeps the reason to one
     # line (the status' ``str`` is the multi-line repr).
     code = getattr(error, "code", None)
     if callable(code):
         with contextlib.suppress(Exception):
             if (status := code()) is not None:
-                return str(getattr(status, "name", status))
-    return str(error) or type(error).__name__
+                return _one_line(str(getattr(status, "name", status)))
+    return _one_line(str(error)) or type(error).__name__
+
+
+def _one_line(text: str) -> str:
+    """``text`` with every run of whitespace, newlines included, as one space."""
+    return " ".join(text.split())
 
 
 def _flush(wire: WarmupWire, log: logging.Logger) -> tuple[bool, str | None]:
