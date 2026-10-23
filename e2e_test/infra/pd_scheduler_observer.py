@@ -1,7 +1,6 @@
 """Delegation hooks; CPU tests use contract stubs, not a running vLLM backend."""
 
-import os
-
+from .pd_local_kv_compat import enabled as local_kv_enabled
 from .pd_scheduler_trace import (
     SchedulerTrace,
     deferred_snapshot,
@@ -24,7 +23,7 @@ class SchedulerObserverMixin:
             self._smg_pd_trace.mark_unknown("setup", exc)
         self._smg_pd_scheduled = set()
         self._smg_local_kv = None
-        if os.environ.get("SMG_PD_TRACE_LOCAL_KV") == "1":
+        if local_kv_enabled():
             from .pd_local_kv_tracker import LocalKVTracker
 
             self._smg_local_kv = LocalKVTracker(self)

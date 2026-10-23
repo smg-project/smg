@@ -5,6 +5,8 @@ import sys
 from importlib.util import find_spec
 from pathlib import Path
 
+from . import pd_local_kv_compat as local_kv
+
 # Read from the installed, pinned ROCm image; version strings are insufficient.
 SOURCE_SHA256 = {
     "engine/arg_utils.py": "95be1adb96f55933f6a52260c8cb2181d04707401ca21d97c33108c5ab58f3ac",
@@ -21,9 +23,11 @@ SOURCE_SHA256 = {
 }
 
 
-def require_source_contract(root):
+def require_source_contract(root, expected_sources=None):
+    if expected_sources is None:
+        expected_sources = SOURCE_SHA256
     observed = {}
-    for relative, expected in SOURCE_SHA256.items():
+    for relative, expected in expected_sources.items():
         try:
             observed[relative] = hashlib.sha256((Path(root) / relative).read_bytes()).hexdigest()
         except OSError as exc:
@@ -39,12 +43,16 @@ def require_installed_contract():
     if len(locations) != 1:
         raise RuntimeError("unknown vLLM package location")
     root = Path(locations[0]).resolve()
-    return {"root": str(root), "sources": require_source_contract(root)}
+    contract = {"root": str(root), "sources": require_source_contract(root)}
+    if local_kv.enabled():
+        contract["local_kv_sources"] = require_source_contract(root, local_kv.SOURCE_SHA256)
+    return contract
 
 
 def require_loaded_contract(contract, scheduler, async_scheduler):
     root = Path(contract["root"])
-    for relative in SOURCE_SHA256:
+    sources = dict(SOURCE_SHA256, **contract.get("local_kv_sources", {}))
+    for relative in sources:
         name = "vllm." + relative[:-3].replace("/", ".")
         module = sys.modules.get(name)
         if module is None:
