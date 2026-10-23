@@ -6,9 +6,11 @@
 //! escapes the braces of a legend's `{{label}}` and names the uid through an
 //! `include`), parses it, and holds every `smg_*` family a panel queries
 //! against the families the workspace describes with `describe_counter!`,
-//! `describe_gauge!` and `describe_histogram!`, named by a literal or by a
-//! constant of the same file. A panel written against a name the code never
-//! had is empty on a real scrape, and nothing else notices.
+//! `describe_gauge!` and `describe_histogram!`, named by a literal, by a
+//! constant of the same file, or by a constant path into another file
+//! (`telemetry::OUTPUTS`) whose name has one value across the sources. A
+//! panel written against a name the code never had is empty on a real
+//! scrape, and nothing else notices.
 
 #![expect(clippy::expect_used, reason = "test failures should panic")]
 
@@ -116,7 +118,7 @@ struct Catalogue {
 impl Catalogue {
     fn from_sources() -> Self {
         let describe = Regex::new(
-            r#"describe_(counter|gauge|histogram)!\(\s*(?:"(smg_[a-z0-9_]+)"|([A-Z][A-Z0-9_]*))"#,
+            r#"describe_(counter|gauge|histogram)!\(\s*(?:"(smg_[a-z0-9_]+)"|(?:[a-z_][a-z0-9_]*::)*([A-Z][A-Z0-9_]*))"#,
         )
         .expect("valid regex");
         let constant = Regex::new(r#"const ([A-Z][A-Z0-9_]*): &str = "(smg_[a-z0-9_]+)""#)
@@ -125,17 +127,37 @@ impl Catalogue {
         for root in SOURCE_ROOTS {
             rust_files(&repo_root().join(root), &mut files);
         }
+        let texts: Vec<String> = files
+            .iter()
+            .map(|path| fs::read_to_string(path).expect("a source file reads"))
+            .collect();
+        // A constant named by path (`telemetry::OUTPUTS`) lives in another
+        // file: every source's constants by name, usable while the name has
+        // one value across the sources.
+        let mut everywhere: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+        for text in &texts {
+            for cap in constant.captures_iter(text) {
+                if let (Some(name), Some(value)) = (cap.get(1), cap.get(2)) {
+                    everywhere
+                        .entry(name.as_str())
+                        .or_default()
+                        .insert(value.as_str());
+                }
+            }
+        }
         let mut catalogue = Self::default();
-        for path in &files {
-            let text = fs::read_to_string(path).expect("a source file reads");
+        for text in &texts {
             let constants: HashMap<&str, &str> = constant
-                .captures_iter(&text)
+                .captures_iter(text)
                 .filter_map(|cap| Some((cap.get(1)?.as_str(), cap.get(2)?.as_str())))
                 .collect();
-            for cap in describe.captures_iter(&text) {
+            for cap in describe.captures_iter(text) {
                 let family = cap.get(2).map(|m| m.as_str()).or_else(|| {
-                    cap.get(3)
-                        .and_then(|name| constants.get(name.as_str()).copied())
+                    let name = cap.get(3)?.as_str();
+                    constants.get(name).copied().or_else(|| {
+                        let values = everywhere.get(name)?;
+                        (values.len() == 1).then(|| *values.iter().next().expect("one value"))
+                    })
                 });
                 let Some(family) = family else {
                     continue;
