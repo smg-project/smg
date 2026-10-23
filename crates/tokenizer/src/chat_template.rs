@@ -2327,8 +2327,52 @@ pub fn load_chat_template_from_file(template_path: &str) -> Result<Option<String
     // file is one escaped line renders as the engine renders it. An engine's
     // own HTTP server may load an operator-supplied file with a loader of its
     // own; this renderer follows transformers. The template engine drops
-    // exactly one trailing newline of the source, as Jinja2 does.
+    // exactly one trailing newline of the source, as Jinja2 does. A file
+    // written for a loader that unescaped the pair is logged once here,
+    // since nothing else at runtime would say why its prompts carry it.
+    if text_outside_tags_holds_backslash_n(&content) {
+        tracing::warn!(
+            path = %template_path,
+            "chat template text contains a literal backslash-n outside its tags; it is rendered as written, as transformers does"
+        );
+    }
     Ok(Some(content))
+}
+
+/// Whether the template's text outside its `{{ }}`, `{% %}` and `{# #}` tags
+/// holds a backslash followed by an `n`: the pair a loader that unescaped it
+/// (an engine's own `--chat-template` loader) turned into a newline and this
+/// loader renders as written. Inside a tag the template engine's own string
+/// escape makes the newline, as in Jinja2, so the pair there is not counted.
+fn text_outside_tags_holds_backslash_n(template: &str) -> bool {
+    let bytes = template.as_bytes();
+    let mut close: Option<&[u8]> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        match close {
+            Some(end) if rest.starts_with(end) => {
+                close = None;
+                i += end.len();
+            }
+            Some(_) => i += 1,
+            None if rest.starts_with(b"{{") => {
+                close = Some(b"}}");
+                i += 2;
+            }
+            None if rest.starts_with(b"{%") => {
+                close = Some(b"%}");
+                i += 2;
+            }
+            None if rest.starts_with(b"{#") => {
+                close = Some(b"#}");
+                i += 2;
+            }
+            None if rest.starts_with(b"\\n") => return true,
+            None => i += 1,
+        }
+    }
+    false
 }
 
 /// The chat templates a `tokenizer_config.json` `chat_template` value holds:
@@ -3155,6 +3199,23 @@ mod tests {
     /// that is one escaped line renders as that line); inside a Jinja string
     /// literal the template engine's own escape makes a newline of it, in
     /// both engines alike.
+    /// The load warning counts a backslash-n in the template's text, not one
+    /// inside a tag (a string literal the template engine's escape turns into a
+    /// newline), and a real newline is no such pair.
+    #[test]
+    fn a_backslash_n_counts_only_outside_the_template_s_tags() {
+        assert!(text_outside_tags_holds_backslash_n(
+            "<|im_start|>system<|im_end|>\\n{{ messages[0].content }}"
+        ));
+        assert!(text_outside_tags_holds_backslash_n(
+            "{%- for m in messages %}{{ m.content }}{%- endfor %}\\n"
+        ));
+        assert!(!text_outside_tags_holds_backslash_n(
+            "{{ '\\n' }}{% set nl = \"\\n\" %}{# a \\n in a note #}plain text"
+        ));
+        assert!(!text_outside_tags_holds_backslash_n("line one\nline two\n"));
+    }
+
     #[test]
     fn a_template_file_s_backslash_n_stays_the_two_characters_it_is() {
         let dir = tempfile::tempdir().unwrap();
