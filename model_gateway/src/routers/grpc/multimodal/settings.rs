@@ -842,37 +842,36 @@ mod tests {
         );
     }
 
-    /// Without the strict names in the reader, the other settings resolve
-    /// on their own: what the never-seeded path falls back to when the
-    /// placement or the TurboJPEG env is unreadable.
+    /// The real unseeded path defaults invalid policies without discarding valid
+    /// strict timeouts, decoder policies or the lenient settings.
     #[test]
     fn the_other_settings_survive_an_unreadable_placement_env() {
-        let full = env(&[
-            ("SMG_MM_PROCESSING", "routers"),
-            ("SMG_MM_TURBOJPEG", "mandatory"),
-            ("SMG_MM_PIXEL_CACHE_MB", "256"),
-            ("SMG_LOG_MM_TIMING", "1"),
-        ]);
-        let config = RouterConfig::default();
-        assert!(MultimodalSettings::resolve_with(&config, &full).is_err());
-        let rest = MultimodalSettings::resolve_with(&config, |name| {
-            if STRICT_ENV.contains(&name) {
-                Ok(None)
-            } else {
-                full(name)
-            }
-        })
-        .unwrap();
-        assert_eq!(
-            rest.processing,
-            Setting::from_default(MmProcessingMode::Auto)
-        );
-        assert_eq!(
-            rest.turbojpeg,
-            Setting::from_default(TurboJpegPolicy::Prefer)
-        );
-        assert_eq!(rest.pixel_cache_mb, from_env(256));
-        assert_eq!(rest.log_mm_timing, from_env(true));
+        for policy in ["mandatory", "require"] {
+            let full = env(&[
+                (ENV_PROCESSING, "routers"),
+                (ENV_TURBOJPEG, policy),
+                (ENV_FETCH_TIMEOUT_MS, "60000"),
+                (ENV_PIXEL_CACHE_MB, "256"),
+                (ENV_LOG_MM_TIMING, "1"),
+            ]);
+            assert!(MultimodalSettings::resolve_with(&RouterConfig::default(), &full).is_err());
+            let rest = resolve_unseeded_with(&full);
+            assert_eq!(
+                rest.processing,
+                Setting::from_default(MmProcessingMode::Auto)
+            );
+            assert_eq!(
+                rest.turbojpeg,
+                if policy == "require" {
+                    from_env(TurboJpegPolicy::Require)
+                } else {
+                    Setting::from_default(TurboJpegPolicy::Prefer)
+                }
+            );
+            assert_eq!(rest.fetch_timeout_ms, from_env(60000));
+            assert_eq!(rest.pixel_cache_mb, from_env(256));
+            assert_eq!(rest.log_mm_timing, from_env(true));
+        }
     }
 
     /// The numeric and boolean env knobs keep their lenient reading: an
