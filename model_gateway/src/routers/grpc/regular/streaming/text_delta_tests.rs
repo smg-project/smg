@@ -64,6 +64,7 @@ fn serialized(
     index: u32,
     field: TextDeltaField,
     text: &str,
+    logprobs: Option<ChatLogProbs>,
     usage: Option<&Usage>,
     emit_usage_null: bool,
 ) -> Vec<u8> {
@@ -79,7 +80,7 @@ fn serialized(
             tool_calls: None,
             reasoning_content,
         },
-        logprobs: None,
+        logprobs,
         finish_reason: None,
         matched_stop: None,
     };
@@ -110,7 +111,8 @@ fn text_delta_bytes_equal_the_serialized_choice() {
         for field in [TextDeltaField::Content, TextDeltaField::Reasoning] {
             for index in [0u32, 1, 7, 10, 4_294_967_295] {
                 for (usage, emit_usage_null) in usages {
-                    let expected = serialized(&frame, index, field, &text, usage, emit_usage_null);
+                    let expected =
+                        serialized(&frame, index, field, &text, None, usage, emit_usage_null);
                     let actual = written(&frame, index, field, &text, usage, emit_usage_null);
                     assert_eq!(
                         String::from_utf8_lossy(&actual),
@@ -135,6 +137,7 @@ fn a_text_delta_is_appended_after_what_the_buffer_holds() {
         2,
         TextDeltaField::Content,
         "x",
+        None,
         None,
         true,
     ));
@@ -177,36 +180,6 @@ fn logprobs() -> ChatLogProbs {
     }
 }
 
-/// The serializer's bytes for one text delta of choice `index`, with or
-/// without logprobs: what `push_chunk` wrote before the direct form existed.
-fn serialized_delta(
-    frame: &ChatChunkFrame,
-    index: u32,
-    field: TextDeltaField,
-    text: &str,
-    logprobs: Option<ChatLogProbs>,
-) -> Vec<u8> {
-    let (content, reasoning_content) = match field {
-        TextDeltaField::Content => (Some(Cow::Borrowed(text)), None),
-        TextDeltaField::Reasoning => (None, Some(Cow::Borrowed(text))),
-    };
-    let choice = ChatStreamChoiceRef {
-        index,
-        delta: ChatMessageDeltaRef {
-            role: None,
-            content,
-            tool_calls: None,
-            reasoning_content,
-        },
-        logprobs,
-        finish_reason: None,
-        matched_stop: None,
-    };
-    let mut buffer = BytesMut::new();
-    frame.write_chunk(&mut buffer, &choice, None, false);
-    buffer.to_vec()
-}
-
 /// With logprobs on, the first text delta of a step carries them (through the
 /// serializer), whichever kind it is, and the deltas after it, content and
 /// reasoning alike, are written in the direct form: byte for byte what the
@@ -215,10 +188,12 @@ fn serialized_delta(
 async fn push_events_puts_the_logprobs_on_the_first_text_delta_and_writes_the_serializer_s_bytes() {
     let frame = frame();
     let (tx, _rx) = sse_channel();
-    // `Events` merges consecutive text of one kind and drops empty text, so
-    // the kinds alternate here: three deltas, the first of them reasoning.
+    // `Events` merges consecutive text of one kind and drops text that is
+    // nothing (empty, no token), so the kinds alternate here and the first
+    // empty text counts a token: it reaches this function ahead of the first
+    // real delta, writes nothing, and leaves the logprobs to that delta.
     let mut events = Events::new();
-    events.push_content(Text::new("", 0));
+    events.push_content(Text::new("", 1));
     events.push_reasoning(Text::new("why", 1));
     events.push_content(Text::new("Hello \"there\"\n", 2));
     events.push_reasoning(Text::new("", 0));
@@ -237,26 +212,32 @@ async fn push_events_puts_the_logprobs_on_the_first_text_delta_and_writes_the_se
     .await
     .expect("the events are written");
 
-    let mut expected = serialized_delta(
+    let mut expected = serialized(
         &frame,
         3,
         TextDeltaField::Reasoning,
         "why",
         Some(logprobs()),
+        None,
+        false,
     );
-    expected.extend(serialized_delta(
+    expected.extend(serialized(
         &frame,
         3,
         TextDeltaField::Content,
         "Hello \"there\"\n",
         None,
+        None,
+        false,
     ));
-    expected.extend(serialized_delta(
+    expected.extend(serialized(
         &frame,
         3,
         TextDeltaField::Reasoning,
         "because",
         None,
+        None,
+        false,
     ));
     assert_eq!(
         String::from_utf8_lossy(&buffer),
@@ -271,28 +252,21 @@ async fn push_events_puts_the_logprobs_on_the_first_text_delta_and_writes_the_se
     );
 }
 
-/// Without logprobs every text delta takes the direct form, and the empty
-/// texts write nothing.
+/// Without logprobs every text delta takes the direct form; an empty text
+/// with a counted token (one `Events` keeps) reaches it and writes nothing.
 #[tokio::test]
 async fn push_events_without_logprobs_writes_every_text_delta_in_the_direct_form() {
     let frame = frame();
     let (tx, _rx) = sse_channel();
     let mut events = Events::new();
     events.push_content(Text::new("a", 1));
-    events.push_content(Text::new("", 0));
-    events.push_reasoning(Text::new("b", 1));
+    events.push_reasoning(Text::new("", 1));
+    events.push_content(Text::new("b", 1));
     let mut buffer = BytesMut::new();
     StreamingProcessor::push_events(&tx, &mut buffer, &frame, 0, &mut events, None, None, true)
         .await
         .expect("the events are written");
     let mut expected = written(&frame, 0, TextDeltaField::Content, "a", None, true);
-    expected.extend(written(
-        &frame,
-        0,
-        TextDeltaField::Reasoning,
-        "b",
-        None,
-        true,
-    ));
+    expected.extend(written(&frame, 0, TextDeltaField::Content, "b", None, true));
     assert_eq!(buffer.to_vec(), expected);
 }
