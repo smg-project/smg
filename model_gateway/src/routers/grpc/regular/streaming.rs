@@ -1305,6 +1305,12 @@ impl StreamingProcessor {
         emit_usage_null: bool,
     ) -> Result<(), ()> {
         frame.write_chunk(buffer, choice, usage, emit_usage_null);
+        Self::flush_full(tx, buffer).await
+    }
+
+    /// Hand the buffered chunks to the channel as one frame once they reach
+    /// [`CHUNK_FLUSH_BYTES`]; below that they wait for [`Self::flush_chunks`].
+    async fn flush_full(tx: &SseSender, buffer: &mut BytesMut) -> Result<(), ()> {
         if buffer.len() >= CHUNK_FLUSH_BYTES {
             tx.send(Ok(buffer.split().freeze())).await.map_err(|_| ())?;
         }
@@ -1332,6 +1338,26 @@ impl StreamingProcessor {
         emit_usage_null: bool,
     ) -> Result<(), String> {
         for event in events.consume() {
+            // The common delta: one text, no logprobs to carry. Its chunk is
+            // written without the serializer, the same bytes.
+            let text_delta = match &event {
+                Event::Content(text) | Event::Malformed { text, .. } if logprobs.is_none() => {
+                    Some((TextDeltaField::Content, text.text.as_ref()))
+                }
+                Event::Reasoning(text) if logprobs.is_none() => {
+                    Some((TextDeltaField::Reasoning, text.text.as_ref()))
+                }
+                _ => None,
+            };
+            if let Some((field, text)) = text_delta {
+                if !text.is_empty() {
+                    frame.write_text_delta(buffer, index, field, text, usage, emit_usage_null);
+                    Self::flush_full(tx, buffer)
+                        .await
+                        .map_err(|()| "Failed to send chunk".to_string())?;
+                }
+                continue;
+            }
             let Some(mut choice) = adapt::chat::into_delta_ref(index, event) else {
                 continue;
             };
@@ -4653,7 +4679,47 @@ impl ChatChunkFrame {
     ) {
         let start = buffer.len();
         buffer.extend_from_slice(&self.head);
-        let mut serialized = serde_json::to_writer((&mut *buffer).writer(), choice);
+        let serialized = serde_json::to_writer((&mut *buffer).writer(), choice);
+        Self::finish_chunk(buffer, start, serialized, usage, emit_usage_null);
+    }
+
+    /// Append `data: {...}\n\n` for the text delta `text` of the choice at
+    /// `index`: the bytes [`Self::write_chunk`] makes of a
+    /// [`ChatStreamChoiceRef`] whose delta carries the text under `field` and
+    /// nothing else, with no logprobs and no finish reason, written without
+    /// the serializer. The common delta of a stream is one string, and the
+    /// serializer's walk over the choice's fields was most of what a delta
+    /// cost to write; the bytes stay the same, as the parity test pins.
+    fn write_text_delta(
+        &self,
+        buffer: &mut BytesMut,
+        index: u32,
+        field: TextDeltaField,
+        text: &str,
+        usage: Option<&Usage>,
+        emit_usage_null: bool,
+    ) {
+        let start = buffer.len();
+        buffer.extend_from_slice(&self.head);
+        buffer.extend_from_slice(b"{\"index\":");
+        push_decimal(buffer, index);
+        buffer.extend_from_slice(field.opening());
+        push_json_string_contents(buffer, text);
+        buffer.extend_from_slice(b"\"},\"logprobs\":null,\"finish_reason\":null}");
+        Self::finish_chunk(buffer, start, Ok(()), usage, emit_usage_null);
+    }
+
+    /// Close the chunk whose head and choice are in `buffer` since `start`:
+    /// the choices' `]`, then `usage` or its `null` placeholder, `}` and the
+    /// event's blank line; a serialization error (none of the chunk's types
+    /// can raise one into memory) replaces the chunk with an error event.
+    fn finish_chunk(
+        buffer: &mut BytesMut,
+        start: usize,
+        mut serialized: serde_json::Result<()>,
+        usage: Option<&Usage>,
+        emit_usage_null: bool,
+    ) {
         if serialized.is_ok() {
             buffer.extend_from_slice(b"]");
             if let Some(usage) = usage {
@@ -4673,6 +4739,72 @@ impl ChatChunkFrame {
         }
         buffer.extend_from_slice(b"\n\n");
     }
+}
+
+/// The field a text delta of a chat chunk fills.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextDeltaField {
+    Content,
+    Reasoning,
+}
+
+impl TextDeltaField {
+    /// From the choice's `index` to the opening quote of the text.
+    fn opening(self) -> &'static [u8] {
+        match self {
+            Self::Content => b",\"delta\":{\"content\":\"",
+            Self::Reasoning => b",\"delta\":{\"reasoning_content\":\"",
+        }
+    }
+}
+
+/// Append the decimal digits of `value`.
+fn push_decimal(buffer: &mut BytesMut, mut value: u32) {
+    let mut digits = [0u8; 10];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    buffer.extend_from_slice(&digits[at..]);
+}
+
+/// Append the contents of the JSON string for `text`, without its quotes: the
+/// escapes the JSON serializer writes (`"` and `\` with a backslash, the C0
+/// controls as `\b` `\t` `\n` `\f` `\r` or `\u00xx`) and every other byte as
+/// it is, a run of them at a time.
+fn push_json_string_contents(buffer: &mut BytesMut, text: &str) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = text.as_bytes();
+    let mut plain_from = 0;
+    for (at, &byte) in bytes.iter().enumerate() {
+        let escape: &[u8] = match byte {
+            b'"' => b"\\\"",
+            b'\\' => b"\\\\",
+            0x08 => b"\\b",
+            b'\t' => b"\\t",
+            b'\n' => b"\\n",
+            0x0C => b"\\f",
+            b'\r' => b"\\r",
+            0x00..=0x1F => &[
+                b'\\',
+                b'u',
+                b'0',
+                b'0',
+                HEX[usize::from(byte >> 4)],
+                HEX[usize::from(byte & 0x0F)],
+            ],
+            _ => continue,
+        };
+        buffer.extend_from_slice(&bytes[plain_from..at]);
+        buffer.extend_from_slice(escape);
+        plain_from = at + 1;
+    }
+    buffer.extend_from_slice(&bytes[plain_from..]);
 }
 
 /// Serializing a string or an integer into memory cannot fail.
@@ -4846,6 +4978,8 @@ mod usage_chunk_tests;
 mod delta_slicing_tests;
 #[cfg(test)]
 mod sse_bytes_tests;
+#[cfg(test)]
+mod text_delta_tests;
 #[cfg(test)]
 mod usage_tests;
 
