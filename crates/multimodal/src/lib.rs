@@ -37,7 +37,10 @@ pub use registry::{
     EncoderInputFormat, MediaItemInfo, MediaPartOrder, ModelMetadata, ModelProcessorSpec,
     ModelRegistry, Tokenizer, DEEPSEEK_V41_IMAGE_PLACEHOLDER,
 };
-pub use tracker::{AsyncMultiModalTracker, TrackerOutput};
+pub use tracker::{
+    AsyncMultiModalTracker, FetchObserver, FetchOutcome, FetchReport, FetchSourceKind,
+    TrackerOutput,
+};
 pub use types::{
     AudioClip, AudioSource, EncoderFieldLayouts, FieldLayout, ImageDetail, ImageFrame, ImageSize,
     ImageSource, MediaContentPart, Modality, MultiModalData, MultiModalUUIDs, PlaceholderRange,

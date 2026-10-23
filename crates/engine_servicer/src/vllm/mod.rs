@@ -297,6 +297,7 @@ impl VllmServicerServer {
                 ranks: config.servicer.engine_count,
                 max_model_len: config.model.max_context_length,
                 matches_string_stops: true,
+                processes_media: true,
             },
             config.servicer.metrics_bind_address.is_some(),
         )?;

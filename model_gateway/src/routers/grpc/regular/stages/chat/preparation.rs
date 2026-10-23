@@ -113,6 +113,7 @@ pub(crate) async fn prepare_chat_like(
             &*tokenizer,
             "ChatPreparationStage::execute",
             || multimodal::media_plan_chat(&request.messages),
+            true,
         )
         .await?;
         let media_order = media.media_order;

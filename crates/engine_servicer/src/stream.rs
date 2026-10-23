@@ -202,6 +202,7 @@ mod tests {
             ranks: 1,
             max_model_len: 100,
             matches_string_stops: true,
+            processes_media: false,
         };
         ServicerMetrics::new(&identity, false)
             .expect("metrics without a listener")

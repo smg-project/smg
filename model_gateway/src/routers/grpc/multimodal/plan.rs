@@ -5,8 +5,8 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use llm_multimodal::{
-    registry::modality_limit_override, EncoderInputFormat, MediaContentPart, MediaPartOrder,
-    Modality, ModelMetadata,
+    registry::modality_limit_override, EncoderInputFormat, FetchSourceKind, MediaContentPart,
+    MediaPartOrder, Modality, ModelMetadata,
 };
 use llm_tokenizer::{traits::PromptEncoding, TokenizerTrait};
 use openai_protocol::worker::MmProcessingMode;
@@ -58,6 +58,32 @@ impl MediaPlan {
             plan.parts.push(part);
         }
         plan
+    }
+
+    /// The plan's items of `modality` per source (`url`, `data_url`,
+    /// `inline`): what the request carries, before any limit is applied.
+    pub(crate) fn source_counts(&self, modality: Modality) -> [(&'static str, usize); 3] {
+        let mut counts = [
+            (FetchSourceKind::Url.as_str(), 0),
+            (FetchSourceKind::DataUrl.as_str(), 0),
+            (FetchSourceKind::InlineBytes.as_str(), 0),
+        ];
+        for part in &self.parts {
+            let (of, source) = match part {
+                MediaContentPart::ImageUrl { url, .. } => (Modality::Image, url_source(url)),
+                MediaContentPart::ImageData { .. } => (Modality::Image, 2),
+                MediaContentPart::ImageEmbeds { .. } => (Modality::ImageEmbeds, 2),
+                MediaContentPart::AudioUrl { url, .. } => (Modality::Audio, url_source(url)),
+                MediaContentPart::AudioData { .. } => (Modality::Audio, 2),
+                MediaContentPart::VideoUrl { url, .. } => (Modality::Video, url_source(url)),
+                MediaContentPart::VideoData { .. } => (Modality::Video, 2),
+                MediaContentPart::Text { .. } => continue,
+            };
+            if of == modality {
+                counts[source].1 += 1;
+            }
+        }
+        counts
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -349,6 +375,13 @@ pub(crate) fn validate_rendered_media_anchors(
         );
     }
     Ok(())
+}
+
+/// The source index of a URL part in [`MediaPlan::source_counts`], read as
+/// the tracker reads the URL at the fetch: a `data:` URL is 1, any other URL
+/// 0.
+fn url_source(url: &str) -> usize {
+    usize::from(FetchSourceKind::of_url(url) == FetchSourceKind::DataUrl)
 }
 
 #[cfg(test)]

@@ -366,6 +366,27 @@ pub(crate) const WORKER_RETRY_BACKOFF_BUCKETS: &[f64] = &[
     0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
+/// Buckets of the media pipeline's times (seconds): a processing stage or
+/// one fetch runs from well under a millisecond (a token expansion, inline
+/// bytes) to seconds (a video decode, a slow host).
+pub(crate) const MM_SECONDS_BUCKETS: &[f64] = &[
+    0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0,
+];
+
+/// Buckets of the media items a request carries, per modality.
+pub(crate) const MM_MEDIA_PER_REQUEST_BUCKETS: &[f64] =
+    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 16.0, 32.0, 64.0];
+
+/// The `modality` label of a media series.
+fn mm_modality_label(modality: llm_multimodal::Modality) -> &'static str {
+    match modality {
+        llm_multimodal::Modality::Image => "image",
+        llm_multimodal::Modality::ImageEmbeds => "image_embeds",
+        llm_multimodal::Modality::Audio => "audio",
+        llm_multimodal::Modality::Video => "video",
+    }
+}
+
 /// Jemalloc's run-time options for a long-running gateway, for every final
 /// artifact (the `smg` executable, the Python extension, the Go FFI library)
 /// to export as
@@ -1071,6 +1092,29 @@ pub(crate) fn init_metrics() {
         "Bytes of preprocessed encoder inputs the pixel cache holds"
     );
     describe_gauge!("smg_mm_pixel_cache_entries", "Images the pixel cache holds");
+    // The media pipeline per request, from the clock reads and counts it
+    // already makes: its stages' time, the items a request carries and its
+    // fetches.
+    describe_histogram!(
+        "smg_mm_processing_seconds",
+        "Seconds a multimodal request spent in a processing stage (config_lookup, media_fetch_decode, preprocess, token_expand, total), by model"
+    );
+    describe_histogram!(
+        "smg_mm_media_per_request",
+        "Media items a generation request carried, by model and modality, counted before any refusal or limit (a refused request counts; a token count does not)"
+    );
+    describe_counter!(
+        "smg_mm_media_items_total",
+        "Media items generation requests carried, by model, modality and source (url, data_url, inline, read as the fetch reads them), counted before any refusal or limit"
+    );
+    describe_histogram!(
+        "smg_mm_media_fetch_seconds",
+        "Seconds one media fetch and decode took, by model, modality, source and outcome (ok, too_large, client_fault, host_fault)"
+    );
+    describe_counter!(
+        "smg_mm_media_fetch_bytes_total",
+        "Bytes the media fetches brought in, by model, modality and source"
+    );
     describe_counter!(
         "smg_responses_stream_failures_total",
         "Responses streams that ended with a response.failed terminal, by model and reason"
@@ -1298,6 +1342,11 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
     // The malformed bytes of an output run from a marker's worth to a whole
     // answer: their own buckets, or the recorder renders them as a summary.
     let malformed_bytes_matcher = Matcher::Full(String::from(symphony_telemetry::MALFORMED_BYTES));
+    // The media pipeline's histograms (seconds, and items per request): their
+    // own buckets, or the recorder renders them as summaries.
+    let mm_processing_matcher = Matcher::Full(String::from("smg_mm_processing_seconds"));
+    let mm_fetch_matcher = Matcher::Full(String::from("smg_mm_media_fetch_seconds"));
+    let mm_per_request_matcher = Matcher::Full(String::from("smg_mm_media_per_request"));
 
     HashMap::from([
         (duration_matcher, duration_bucket.clone()),
@@ -1318,6 +1367,12 @@ fn histogram_bucket_overrides(duration_buckets: Option<Vec<f64>>) -> HashMap<Mat
         (
             malformed_bytes_matcher,
             symphony_telemetry::MALFORMED_BYTES_BUCKETS.to_vec(),
+        ),
+        (mm_processing_matcher, MM_SECONDS_BUCKETS.to_vec()),
+        (mm_fetch_matcher, MM_SECONDS_BUCKETS.to_vec()),
+        (
+            mm_per_request_matcher,
+            MM_MEDIA_PER_REQUEST_BUCKETS.to_vec(),
         ),
     ])
 }
@@ -1762,6 +1817,75 @@ impl Metrics {
             "reason" => reason
         )
         .increment(1);
+    }
+
+    /// The interned label of `model_id`, for a handle that reports under it
+    /// (the media tracker's fetch observer).
+    pub fn interned_model_label(model_id: &str) -> Arc<str> {
+        intern_model_label(model_id)
+    }
+
+    /// One processing stage of a multimodal request: `seconds` spent in
+    /// `stage` (`config_lookup`, `media_fetch_decode`, `preprocess`,
+    /// `token_expand`, `total`), the clock reads the timing log makes.
+    pub fn record_mm_processing_stage(model_id: &str, stage: &'static str, seconds: f64) {
+        let model = intern_model_label(model_id);
+        histogram!("smg_mm_processing_seconds", "model" => model, "stage" => stage).record(seconds);
+    }
+
+    /// The media a request carries of `modality`, counted once per request
+    /// before its limits are checked: `count` items, `by_source` of them per
+    /// source (`url`, `data_url`, `inline`; a zero is skipped).
+    pub fn record_mm_request_media(
+        model_id: &str,
+        modality: llm_multimodal::Modality,
+        count: usize,
+        by_source: &[(&'static str, usize)],
+    ) {
+        let model = intern_model_label(model_id);
+        let modality = mm_modality_label(modality);
+        histogram!(
+            "smg_mm_media_per_request",
+            "model" => model.clone(),
+            "modality" => modality
+        )
+        .record(count as f64);
+        for (source, items) in by_source {
+            if *items > 0 {
+                counter!(
+                    "smg_mm_media_items_total",
+                    "model" => model.clone(),
+                    "modality" => modality,
+                    "source" => *source
+                )
+                .increment(*items as u64);
+            }
+        }
+    }
+
+    /// One media fetch, as the tracker reports it: its time by outcome, and
+    /// the bytes it brought in.
+    pub fn record_mm_fetch(model_id: &str, report: &llm_multimodal::FetchReport) {
+        let model = intern_model_label(model_id);
+        let modality = mm_modality_label(report.modality);
+        let source = report.source.as_str();
+        histogram!(
+            "smg_mm_media_fetch_seconds",
+            "model" => model.clone(),
+            "modality" => modality,
+            "source" => source,
+            "outcome" => report.outcome.as_str()
+        )
+        .record(report.duration.as_secs_f64());
+        if report.bytes > 0 {
+            counter!(
+                "smg_mm_media_fetch_bytes_total",
+                "model" => model,
+                "modality" => modality,
+                "source" => source
+            )
+            .increment(report.bytes as u64);
+        }
     }
 
     // ========================================================================

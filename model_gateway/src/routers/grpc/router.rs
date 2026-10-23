@@ -808,6 +808,7 @@ impl GrpcRouter {
                 message_utils::MessagesPrompt::from(&body),
                 &body.chat_tools(),
                 body.tool_choice.as_ref(),
+                false,
             )
             .await
         {
@@ -833,12 +834,16 @@ impl GrpcRouter {
     /// model with no tokenizer when the gateway does not load tokenizers
     /// itself is a gateway fault (500), as is a prompt that does not encode;
     /// a prompt that does not render is a 400.
+    /// `record_media` says whether the prompt's media counts in the
+    /// per-request media series: the `max_tokens: 0` answer is a Messages
+    /// request, a token count is not.
     async fn count_prompt_tokens(
         &self,
         model_id: &str,
         prompt: message_utils::MessagesPrompt<'_>,
         chat_tools: &[ChatTool],
         tool_choice: Option<&ToolChoice>,
+        record_media: bool,
     ) -> Result<u32, Response> {
         if !self.worker_registry.contains_model(model_id) {
             return Err(error::model_not_found(model_id));
@@ -860,11 +865,14 @@ impl GrpcRouter {
             tool_choice,
             tokenizer.renderer_capabilities(),
         );
+        // A token count is not a request the media series count; the
+        // `max_tokens: 0` answer is one, and the caller says which.
         let media = message_utils::resolve_messages_media(
             &self.shared_components,
             model_id,
             &*tokenizer,
             prompt.messages,
+            record_media,
         )
         .await?;
         message_utils::count_input_tokens(
@@ -917,6 +925,7 @@ impl GrpcRouter {
                 message_utils::MessagesPrompt::from(&*body),
                 &body.chat_tools(),
                 body.tool_choice.as_ref(),
+                true,
             )
             .await
         {

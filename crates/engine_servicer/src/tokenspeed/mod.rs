@@ -224,6 +224,9 @@ impl TokenSpeedServicerServer {
                 ranks: config.servicer.engine_count,
                 max_model_len: u32::try_from(config.model.max_context_length).unwrap_or(0),
                 matches_string_stops: true,
+                // Media reach this wire as the router's preprocessed tensors: the
+                // router-side families are their measurement.
+                processes_media: false,
             },
             config.servicer.metrics_bind_address.is_some(),
         )?;

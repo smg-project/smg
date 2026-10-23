@@ -249,6 +249,8 @@ impl SglangServicerServer {
                 max_model_len: u32::try_from(config.model.max_context_length).unwrap_or(0),
                 // The scheduler matches string stops itself.
                 matches_string_stops: false,
+                // No media reach this scheduler through the servicer yet.
+                processes_media: false,
             },
             config.servicer.metrics_bind_address.is_some(),
         )?;

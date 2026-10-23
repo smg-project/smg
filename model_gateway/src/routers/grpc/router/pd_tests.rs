@@ -1582,3 +1582,80 @@ async fn a_request_the_legacy_parsers_read_under_symphony_is_counted_once_throug
     assert!(lines[0].ends_with(" 2"), "{}", lines[0]);
     drop(guard);
 }
+
+/// The per-request media series count a `max_tokens: 0` request as the
+/// route counts it, as a Messages request; a count_tokens call of the same
+/// prompt is not a request and leaves the series as they were.
+#[test]
+fn max_tokens_zero_records_the_requests_media_and_count_tokens_does_not() {
+    fn items_total(body: &str) -> f64 {
+        body.lines()
+            .find(|line| {
+                line.starts_with("smg_mm_media_items_total")
+                    && line.contains("model=\"m\"")
+                    && line.contains("modality=\"image\"")
+                    && line.contains("source=\"data_url\"")
+            })
+            .and_then(|line| line.rsplit(' ').next()?.parse().ok())
+            .unwrap_or(0.0)
+    }
+
+    let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let messages = json!([{"role": "user", "content": [
+        {"type": "text", "text": "what is this?"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aGk="}}
+    ]}]);
+    ::metrics::with_local_recorder(&recorder, || {
+        runtime.block_on(async {
+            let ctx = grpc_ctx(regular_routing_mode()).await;
+            let tokenizer: Arc<dyn llm_tokenizer::traits::Tokenizer> = Arc::new(
+                llm_tokenizer::mock::MockTokenizer::new().with_deferred_chat_ids(vec![11, 12, 13]),
+            );
+            ctx.tokenizer_registry
+                .load("m", "m", "mock", || async move { Ok(tokenizer) })
+                .await
+                .expect("register the tokenizer");
+            let worker = BasicWorkerBuilder::new("grpc://worker:30000")
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Grpc)
+                .model(ModelCard::new("m"))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build();
+            ctx.worker_registry
+                .register(Arc::new(worker))
+                .expect("register worker");
+            let router = GrpcRouter::new(&ctx, Mode::Regular).expect("regular router");
+            let tenant_meta = TenantRequestMeta::new(TenantKey::new("test-tenant"));
+
+            let count: CountMessageTokensRequest =
+                serde_json::from_value(json!({"model": "m", "messages": messages.clone()}))
+                    .expect("count request");
+            let _ = router
+                .route_messages_count_tokens(None, &tenant_meta, count, "m")
+                .await;
+            assert_eq!(
+                items_total(&handle.render()),
+                0.0,
+                "a token count is not a request"
+            );
+
+            let body = json!({"model": "m", "max_tokens": 0, "messages": messages});
+            let _ = router
+                .route_messages(None, &tenant_meta, message_request(body), "m")
+                .await;
+            assert_eq!(
+                items_total(&handle.render()),
+                1.0,
+                "the max_tokens: 0 answer is a Messages request"
+            );
+        });
+    });
+}

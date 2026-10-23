@@ -465,6 +465,7 @@ mod tests {
                 ranks: 1,
                 max_model_len: 8,
                 matches_string_stops: false,
+                processes_media: false,
             },
             false,
         )

@@ -69,8 +69,129 @@ struct Hashed {
     slot: usize,
 }
 
+/// Where a fetched item's bytes come from, for a [`FetchReport`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchSourceKind {
+    /// A URL fetched over the network.
+    Url,
+    /// A `data:` URL carried in the request.
+    DataUrl,
+    /// Bytes carried in the request.
+    InlineBytes,
+    /// A file of the host.
+    File,
+}
+
+impl FetchSourceKind {
+    fn of(source: &FetchSource) -> Self {
+        match source {
+            FetchSource::Url(_) => Self::Url,
+            FetchSource::DataUrl(_) => Self::DataUrl,
+            FetchSource::InlineBytes(_) => Self::InlineBytes,
+            FetchSource::File(_) => Self::File,
+        }
+    }
+
+    /// The kind a URL part of a request is fetched as: a `data:` URL (the
+    /// tracker's rule: the scheme, however spelled) or a URL fetched over the
+    /// network.
+    #[must_use]
+    pub fn of_url(url: &str) -> Self {
+        if is_data_url(url, "data:") {
+            Self::DataUrl
+        } else {
+            Self::Url
+        }
+    }
+
+    /// The label value: `url`, `data_url`, `inline` or `file`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Url => "url",
+            Self::DataUrl => "data_url",
+            Self::InlineBytes => "inline",
+            Self::File => "file",
+        }
+    }
+}
+
+/// How a fetch ended, for a [`FetchReport`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FetchOutcome {
+    /// Fetched and decoded.
+    Ok,
+    /// The payload, or what it decodes to, is over a size limit.
+    TooLarge,
+    /// The caller's fault: a URL that cannot be fetched, bytes that do not
+    /// decode, a host the policy refuses.
+    ClientFault,
+    /// Not the caller's fault: a fetch that timed out, a host that failed,
+    /// a decoder this process lacks.
+    HostFault,
+}
+
+impl FetchOutcome {
+    fn of(result: &MultiModalResult<TrackedMedia>) -> Self {
+        match result {
+            Ok(_) => Self::Ok,
+            Err(MultiModalError::Media(error)) => {
+                if error.code() == crate::error::MediaErrorCode::TooLarge {
+                    Self::TooLarge
+                } else if error.fault() == crate::error::MediaFault::Client {
+                    Self::ClientFault
+                } else {
+                    Self::HostFault
+                }
+            }
+            Err(_) => Self::ClientFault,
+        }
+    }
+
+    /// The label value: `ok`, `too_large`, `client_fault` or `host_fault`.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::TooLarge => "too_large",
+            Self::ClientFault => "client_fault",
+            Self::HostFault => "host_fault",
+        }
+    }
+}
+
+/// One fetch, as the tracker reports it when the fetch ends: the modality,
+/// where the bytes came from, how it ended, how long the fetch and decode
+/// took, and the bytes it brought in (none when it failed). A part that
+/// repeats another part of the same request is not a fetch and is not
+/// reported.
+#[derive(Clone, Copy, Debug)]
+pub struct FetchReport {
+    pub modality: Modality,
+    pub source: FetchSourceKind,
+    pub outcome: FetchOutcome,
+    pub duration: std::time::Duration,
+    pub bytes: usize,
+}
+
+/// A fetch observer: called once per fetch as it ends, on the fetch's own
+/// task, with the label the tracker was given (a request's model, say).
+pub type FetchObserver = fn(label: &str, report: &FetchReport);
+
+/// The bytes a fetched item brought in.
+fn fetched_bytes(media: &TrackedMedia) -> usize {
+    match media {
+        TrackedMedia::Image(frame) => frame.raw_bytes.len(),
+        TrackedMedia::Video(clip) => clip.raw_bytes.len(),
+        TrackedMedia::Audio(clip) => clip.raw_bytes.len(),
+        TrackedMedia::Embeddings => 0,
+    }
+}
+
 pub struct AsyncMultiModalTracker {
     media_connector: Arc<MediaConnector>,
+    /// Where every fetch is reported, under the label, when set.
+    fetch_observer: Option<(Arc<str>, FetchObserver)>,
     pending: HashMap<Modality, Vec<Slot>>,
     uuids: MultiModalUUIDs,
     first_slot: HashMap<FetchKey, Bucket>,
@@ -88,6 +209,7 @@ impl AsyncMultiModalTracker {
     pub fn new(media_connector: Arc<MediaConnector>) -> Self {
         Self {
             media_connector,
+            fetch_observer: None,
             pending: HashMap::new(),
             uuids: HashMap::new(),
             first_slot: HashMap::new(),
@@ -101,6 +223,13 @@ impl AsyncMultiModalTracker {
     /// engine's own transparency rule); it becomes part of each frame's hash.
     pub fn with_image_transparency(mut self, policy: TransparencyPolicy) -> Self {
         self.image_transparency = policy;
+        self
+    }
+
+    /// Report every fetch to `observer` under `label` (see [`FetchReport`]).
+    #[must_use]
+    pub fn with_fetch_observer(mut self, label: Arc<str>, observer: FetchObserver) -> Self {
+        self.fetch_observer = Some((label, observer));
         self
     }
 
@@ -336,11 +465,34 @@ impl AsyncMultiModalTracker {
         let slot = match self.same_media_as(modality, settings, &source) {
             Some(first) => Slot::SameAs(first),
             None => {
+                let connector = Arc::clone(&self.media_connector);
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "spawn handle is stored in self.pending and awaited in finalize(); fire-and-forget is intentional for concurrent media fetching"
                 )]
-                let handle = tokio::spawn(fetch(Arc::clone(&self.media_connector), source));
+                let handle = match &self.fetch_observer {
+                    None => tokio::spawn(fetch(connector, source)),
+                    Some((label, observer)) => {
+                        let (label, observer) = (Arc::clone(label), *observer);
+                        let kind = FetchSourceKind::of(&source);
+                        let fetching = fetch(connector, source);
+                        tokio::spawn(async move {
+                            let started = std::time::Instant::now();
+                            let result = fetching.await;
+                            observer(
+                                &label,
+                                &FetchReport {
+                                    modality,
+                                    source: kind,
+                                    outcome: FetchOutcome::of(&result),
+                                    duration: started.elapsed(),
+                                    bytes: result.as_ref().map_or(0, fetched_bytes),
+                                },
+                            );
+                            result
+                        })
+                    }
+                };
                 Slot::Fetch(handle)
             }
         };
@@ -354,13 +506,18 @@ impl AsyncMultiModalTracker {
 // invalid data:// authorities retain URL parsing. Connector validation still
 // receives the original input unchanged.
 fn media_url_source(url: String, canonical_data_prefix: &str) -> MediaSource {
-    if url.starts_with(canonical_data_prefix) {
-        return MediaSource::DataUrl(url);
+    if is_data_url(&url, canonical_data_prefix) {
+        MediaSource::DataUrl(url)
+    } else {
+        MediaSource::Url(url)
     }
-    match url::Url::parse(&url) {
-        Ok(parsed) if parsed.scheme() == "data" => MediaSource::DataUrl(url),
-        _ => MediaSource::Url(url),
-    }
+}
+
+/// Whether `url` is a `data:` URL: the canonical prefix, or the scheme as the
+/// URL parser reads it (any spelling of its case).
+fn is_data_url(url: &str, canonical_data_prefix: &str) -> bool {
+    url.starts_with(canonical_data_prefix)
+        || url::Url::parse(url).is_ok_and(|parsed| parsed.scheme() == "data")
 }
 
 /// The fetch settings for one video: the request's `fps` when given (and
@@ -572,6 +729,71 @@ mod repeat_tests {
         )
         .expect("default connector");
         AsyncMultiModalTracker::new(Arc::new(connector))
+    }
+
+    /// The plan side classifies a URL part as the fetch will: the scheme as
+    /// the URL parser reads it, whatever its case, is a data URL.
+    #[test]
+    fn of_url_reads_the_scheme_as_the_fetch_does() {
+        assert_eq!(
+            FetchSourceKind::of_url("data:image/png;base64,AAAA"),
+            FetchSourceKind::DataUrl
+        );
+        assert_eq!(
+            FetchSourceKind::of_url("DATA:image/png;base64,AAAA"),
+            FetchSourceKind::DataUrl
+        );
+        assert_eq!(
+            FetchSourceKind::of_url("https://example.test/a.png"),
+            FetchSourceKind::Url
+        );
+        assert_eq!(FetchSourceKind::of_url("not a url"), FetchSourceKind::Url);
+    }
+
+    /// Every fetch is reported once, with its outcome and its bytes, under
+    /// the tracker's label; a part that repeats another is not a fetch.
+    #[tokio::test]
+    async fn the_fetch_observer_sees_each_fetch_once() {
+        static REPORTS: std::sync::Mutex<Vec<(String, FetchReport)>> =
+            std::sync::Mutex::new(Vec::new());
+        fn observe(label: &str, report: &FetchReport) {
+            REPORTS
+                .lock()
+                .expect("reports")
+                .push((label.to_string(), *report));
+        }
+        let mut tracker = tracker().with_fetch_observer(Arc::from("m"), observe);
+        tracker.push_part(image_part(None)).expect("a part");
+        tracker
+            .push_part(image_part(None))
+            .expect("the same part again: no fetch of its own");
+        tracker
+            .push_part(MediaContentPart::ImageUrl {
+                url: "data:image/png;base64,AAAA".to_string(),
+                detail: None,
+                uuid: None,
+                max_long_side_pixel: None,
+            })
+            .expect("a part whose bytes do not decode");
+        tracker
+            .finalize()
+            .await
+            .expect_err("the undecodable part fails the request");
+        let reports = REPORTS.lock().expect("reports").clone();
+        assert_eq!(reports.len(), 2, "{reports:?}");
+        assert!(reports.iter().all(|(label, _)| label == "m"));
+        let fetched = reports
+            .iter()
+            .find(|(_, report)| report.outcome == FetchOutcome::Ok)
+            .expect("the decoded fetch");
+        assert_eq!(fetched.1.modality, Modality::Image);
+        assert_eq!(fetched.1.source, FetchSourceKind::DataUrl);
+        assert!(fetched.1.bytes > 0, "{:?}", fetched.1);
+        let failed = reports
+            .iter()
+            .find(|(_, report)| report.outcome == FetchOutcome::ClientFault)
+            .expect("the failed fetch");
+        assert_eq!(failed.1.bytes, 0, "{:?}", failed.1);
     }
 
     fn image_part(max_long_side_pixel: Option<u32>) -> MediaContentPart {

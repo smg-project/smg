@@ -4179,10 +4179,20 @@ async fn the_configured_silence_bound_and_prefill_allowance_reach_the_engine_lin
 /// A bound servicer with its metrics listener on an ephemeral port, a
 /// handshaken mock engine and a gRPC client.
 async fn metrics_harness(model: VllmModelInfo, tokenizer: Option<Arc<dyn Tokenizer>>) -> Harness {
+    metrics_harness_with(model, tokenizer, None).await
+}
+
+/// [`metrics_harness`] with a worker-side media processor.
+async fn metrics_harness_with(
+    model: VllmModelInfo,
+    tokenizer: Option<Arc<dyn Tokenizer>>,
+    media_processor: Option<Arc<dyn MediaProcessor>>,
+) -> Harness {
     let dir = tempfile::tempdir().unwrap();
     let handshake = handshake_address(dir.path());
     let mut config = config(dir.path(), &handshake, model);
     config.servicer.metrics_bind_address = Some("127.0.0.1:0".to_string());
+    config.media_processor = media_processor;
     let server = match tokenizer {
         Some(tokenizer) => VllmServicerServer::start_with_tokenizer(config, tokenizer),
         None => VllmServicerServer::start(config),
@@ -4217,6 +4227,68 @@ fn scrape(server: &VllmServicerServer) -> String {
     let (status, body) = http_get(address, "/metrics");
     assert_eq!(status, 200);
     body
+}
+
+/// Worker-side media is measured at the gate: the references a request
+/// carries by modality (a refused request's too), the wait and the
+/// processing time, and the outcome.
+#[tokio::test]
+async fn media_processing_records_its_families() {
+    let processor = MockMediaProcessor::answering(Ok(processed_media()));
+    let mut h = metrics_harness_with(model_info(), None, Some(processor.clone())).await;
+    let mut request = generate_request("mm-m1", true, Vec::new());
+    request.input = Some(vllm::generate_request::Input::Tokenized(
+        vllm::TokenizedInput {
+            original_text: "describe".to_string(),
+            input_ids: vec![1, 2, 3],
+        },
+    ));
+    request.media_refs = Some(media_refs(&[
+        "https://example.com/x.png",
+        "https://example.com/y.png",
+    ]));
+    let _stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let _frames = h.engine_in.recv_frames().await.expect("add frames");
+    let mut audio = generate_request("mm-m2", false, Vec::new());
+    audio.media_refs = Some(vllm::MediaRefs {
+        items: vec![vllm::MediaRef {
+            modality: common::Modality::Audio as i32,
+            url: "https://example.com/x.wav".to_string(),
+        }],
+    });
+    let status = h.client.generate(audio).await.expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument, "{}", status.message());
+
+    let body = scrape(&h.server);
+    let items = "smg_servicer_media_items_per_request";
+    assert_eq!(
+        sample(&body, &format!("{items}_count"), "modality=\"image\""),
+        1.0
+    );
+    assert_eq!(
+        sample(&body, &format!("{items}_sum"), "modality=\"image\""),
+        2.0
+    );
+    assert_eq!(
+        sample(&body, &format!("{items}_count"), "modality=\"audio\""),
+        1.0
+    );
+    let stages = "smg_servicer_media_processing_seconds_count";
+    assert_eq!(sample(&body, stages, "stage=\"wait\""), 1.0);
+    assert_eq!(sample(&body, stages, "stage=\"process\""), 1.0);
+    let outcomes = "smg_servicer_media_requests_total";
+    assert_eq!(sample(&body, outcomes, "outcome=\"ok\""), 1.0);
+    assert_eq!(sample(&body, outcomes, "outcome=\"refused\""), 1.0);
+    assert!(
+        body.contains("# TYPE smg_servicer_media_processing_seconds histogram"),
+        "{body}"
+    );
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 
 /// The value of the sample of `name` whose labels contain `labels`.
@@ -4339,6 +4411,29 @@ smg_servicer_state{model="served",wire="vllm",state="warming_up"} 0
 smg_servicer_string_stops_total{model="served",wire="vllm",rank="0"} 0
 smg_servicer_time_to_first_token_seconds_count{model="served",wire="vllm",rank="0"} 5
 smg_servicer_time_to_first_token_seconds_sum{model="served",wire="vllm",rank="0"} <v>
+# HELP smg_servicer_media_items_per_request Media references a request carried, by modality, counted before they are checked (a refused request counts).
+# HELP smg_servicer_media_processing_seconds Seconds a request's worker-side media spent in a stage: waiting for a processing slot, or being processed.
+# HELP smg_servicer_media_requests_total Requests with worker-side media, by outcome: ok, refused before processing, or the processor's verdict (client, transient, invalid, unavailable, internal).
+# TYPE smg_servicer_media_items_per_request histogram
+# TYPE smg_servicer_media_processing_seconds histogram
+# TYPE smg_servicer_media_requests_total counter
+smg_servicer_media_items_per_request_count{model="served",wire="vllm",modality="audio"} 0
+smg_servicer_media_items_per_request_count{model="served",wire="vllm",modality="image"} 0
+smg_servicer_media_items_per_request_count{model="served",wire="vllm",modality="video"} 0
+smg_servicer_media_items_per_request_sum{model="served",wire="vllm",modality="audio"} 0
+smg_servicer_media_items_per_request_sum{model="served",wire="vllm",modality="image"} 0
+smg_servicer_media_items_per_request_sum{model="served",wire="vllm",modality="video"} 0
+smg_servicer_media_processing_seconds_count{model="served",wire="vllm",stage="process"} 0
+smg_servicer_media_processing_seconds_count{model="served",wire="vllm",stage="wait"} 0
+smg_servicer_media_processing_seconds_sum{model="served",wire="vllm",stage="process"} <v>
+smg_servicer_media_processing_seconds_sum{model="served",wire="vllm",stage="wait"} <v>
+smg_servicer_media_requests_total{model="served",wire="vllm",outcome="client"} 0
+smg_servicer_media_requests_total{model="served",wire="vllm",outcome="internal"} 0
+smg_servicer_media_requests_total{model="served",wire="vllm",outcome="invalid"} 0
+smg_servicer_media_requests_total{model="served",wire="vllm",outcome="ok"} 0
+smg_servicer_media_requests_total{model="served",wire="vllm",outcome="refused"} 0
+smg_servicer_media_requests_total{model="served",wire="vllm",outcome="transient"} 0
+smg_servicer_media_requests_total{model="served",wire="vllm",outcome="unavailable"} 0
 "#;
 
 /// One streamed request (three chunks, the engine's stop), one non-streamed

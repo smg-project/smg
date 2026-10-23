@@ -186,6 +186,7 @@ async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
                 MODEL,
                 tokenizer.as_ref(),
                 &request.messages,
+                false,
             )
             .await
             .unwrap();
@@ -279,4 +280,71 @@ async fn glm53_sglang_pd_builds_text_only_for_chat_and_messages() {
         }
         assert!(ctx.state.multimodal_inflight.is_none());
     }
+}
+
+/// A renderer that writes media as template text has no plan to build, and
+/// the request's media is recorded all the same: the per-request series
+/// count what a request carries.
+#[test]
+fn glm53_media_is_recorded_before_the_template_renders_it_as_text() {
+    fn sample(body: &str, name: &str, labels: &[&str]) -> Option<f64> {
+        body.lines()
+            .find(|line| line.starts_with(name) && labels.iter().all(|label| line.contains(label)))
+            .and_then(|line| line.rsplit(' ').next()?.parse().ok())
+    }
+
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    ::metrics::with_local_recorder(&recorder, || {
+        runtime.block_on(async {
+            let components = glm53_components(Arc::new(WorkerRegistry::new())).await;
+            let request: CreateMessageRequest = serde_json::from_value(serde_json::json!({
+                "model": MODEL, "max_tokens": 32, "messages": [{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "invalid"}},
+                    {"type": "text", "text": "after"}
+                ]}]
+            }))
+            .unwrap();
+            let tokenizer = components
+                .tokenizer_registry
+                .get_by_name(MODEL)
+                .unwrap()
+                .tokenizer;
+            let media = utils::message_utils::resolve_messages_media(
+                &components,
+                MODEL,
+                tokenizer.as_ref(),
+                &request.messages,
+                true,
+            )
+            .await
+            .unwrap();
+            assert!(media.media.is_none());
+            assert_eq!(media.media_order, llm_multimodal::MediaPartOrder::Authored);
+        });
+    });
+    let body = handle.render();
+    let model = format!("model=\"{MODEL}\"");
+    assert_eq!(
+        sample(
+            &body,
+            "smg_mm_media_per_request_count",
+            &[model.as_str(), "modality=\"image\""]
+        ),
+        Some(1.0),
+        "{body}"
+    );
+    assert_eq!(
+        sample(
+            &body,
+            "smg_mm_media_items_total",
+            &[model.as_str(), "modality=\"image\"", "source=\"data_url\""]
+        ),
+        Some(1.0),
+        "{body}"
+    );
 }

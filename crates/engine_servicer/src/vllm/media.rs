@@ -14,7 +14,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 pub use engine_zmq_adapter::ProcessedMedia as MediaFeatures;
@@ -25,6 +25,7 @@ use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
 use tonic::Status;
 
 use super::State;
+use crate::metrics::{MediaOutcome, MediaStage};
 
 /// A `Send` boxed future, the shape a processor's calls take.
 pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -210,6 +211,23 @@ pub(super) const PROCESSOR_OFF: &str =
                                         is off on this worker; check the router's --mm-processing \
                                         and this worker's mm_processor label";
 
+/// The outcome a processor's error counts under.
+fn outcome_of(error: &MediaError) -> MediaOutcome {
+    match error {
+        MediaError::Invalid(_) => MediaOutcome::Invalid,
+        MediaError::Unavailable(_) => MediaOutcome::Unavailable,
+        MediaError::Internal(_) => MediaOutcome::Internal,
+        MediaError::Media {
+            fault: WorkerMediaFault::Client,
+            ..
+        } => MediaOutcome::Client,
+        MediaError::Media {
+            fault: WorkerMediaFault::Transient,
+            ..
+        } => MediaOutcome::Transient,
+    }
+}
+
 /// The request's `media_refs` as processor items, checked as the Python
 /// servicer checks them (`parse_media_refs`): a fetchable modality and a
 /// non-empty reference each, at least one item; and, on this servicer, a
@@ -275,20 +293,37 @@ pub(super) async fn process_media_refs(
     let Some(refs) = req.media_refs.take().filter(|refs| !refs.items.is_empty()) else {
         return Ok(None);
     };
+    // What the request carries, by modality, counted before the references
+    // are checked: a refused request's references count too.
+    let metrics = &state.shared.metrics;
+    let (mut images, mut videos, mut audios) = (0, 0, 0);
+    for item in &refs.items {
+        match common::Modality::try_from(item.modality) {
+            Ok(common::Modality::Image) => images += 1,
+            Ok(common::Modality::Video) => videos += 1,
+            Ok(common::Modality::Audio) => audios += 1,
+            _ => {}
+        }
+    }
+    metrics.media_items(images, videos, audios);
+    let refused = |status: Status| {
+        metrics.media_outcome(MediaOutcome::Refused);
+        status
+    };
     let has_batches = req.mm_inputs.is_some() || !req.extra_mm_inputs.is_empty();
     let tokenized = match req.input.as_ref() {
         Some(vllm::generate_request::Input::Tokenized(tokenized)) if !has_batches => tokenized,
         _ => {
-            return Err(Status::invalid_argument(
+            return Err(refused(Status::invalid_argument(
                 "media_refs requires tokenized input and cannot be combined with preprocessed \
                  multimodal inputs",
-            ))
+            )))
         }
     };
     let Some(gate) = state.media.as_ref() else {
-        return Err(Status::invalid_argument(PROCESSOR_OFF));
+        return Err(refused(Status::invalid_argument(PROCESSOR_OFF)));
     };
-    let items = parse_media_refs(&refs, gate.processor.as_ref())?;
+    let items = parse_media_refs(&refs, gate.processor.as_ref()).map_err(refused)?;
     let request = MediaRequest {
         request_id: req.request_id.clone(),
         prompt_token_ids: tokenized.input_ids.clone(),
@@ -300,26 +335,45 @@ pub(super) async fn process_media_refs(
             .unwrap_or(0.0),
         want_identity: req.kv_transfer_params_json.is_some() || req.kv_transfer_params.is_some(),
     };
-    let permit = gate.acquire().await?;
+    let waited = Instant::now();
+    let permit = gate.acquire().await.map_err(refused)?;
+    metrics.media_stage(MediaStage::Wait, waited.elapsed());
     // The processor runs in its own task holding the slot: a caller that
     // gives up mid-fetch does not stop the work behind the bridge, so the
     // slot comes back when that work ends, not when the caller stops
     // waiting, and the cap bounds the work actually in flight.
     let processor = Arc::clone(&gate.processor);
+    // The stage's time and the request's outcome are recorded by the task
+    // itself, before it answers: a caller that gave up while the work ran
+    // still counts, or the histogram would miss exactly the slow runs.
+    let task_metrics = Arc::clone(metrics);
     let (tx, rx) = oneshot::channel();
     #[expect(
         clippy::disallowed_methods,
         reason = "the slot must outlive a caller that gives up; the task ends when the processor answers"
     )]
     tokio::spawn(async move {
+        let started = Instant::now();
         let outcome = processor.process(request).await;
+        let took = started.elapsed();
         drop(permit);
+        task_metrics.media_stage(MediaStage::Process, took);
+        task_metrics.media_outcome(match &outcome {
+            Ok(_) => MediaOutcome::Ok,
+            Err(error) => outcome_of(error),
+        });
         let _ = tx.send(outcome);
     });
     let processed = rx
         .await
-        .map_err(|_| Status::internal("media processing ended without a result"))?
-        .map_err(MediaError::into_status)?;
+        .map_err(|_| {
+            // The task ended without answering (it panicked or was cancelled
+            // before it recorded): a request that ended in processing,
+            // counted as one.
+            metrics.media_outcome(MediaOutcome::Internal);
+            Status::internal("media processing ended without a result")
+        })?
+        .map_err(|error| error.into_status())?;
     // The expanded prompt replaces the anchors the Router sent.
     if let Some(vllm::generate_request::Input::Tokenized(tokenized)) = req.input.as_mut() {
         tokenized.input_ids = processed.prompt_token_ids;

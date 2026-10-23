@@ -249,6 +249,17 @@ pub(crate) async fn process_multimodal_plan(
     // Step 4: Build lightweight intermediate (defers tensor serialization to assembly)
     let intermediate = intermediate_of(prepared_parts, expanded.bindings, spec)?;
 
+    // The stages' time as series, from the clock reads the timing log makes.
+    let total_ms = elapsed_ms(total_started);
+    for (stage, ms) in [
+        ("config_lookup", timings.config_lookup_ms),
+        ("media_fetch_decode", timings.media_fetch_decode_ms),
+        ("preprocess", timings.preprocess_ms),
+        ("token_expand", timings.token_expand_ms),
+        ("total", total_ms),
+    ] {
+        Metrics::record_mm_processing_stage(model_id, stage, ms / 1000.0);
+    }
     if log_timing {
         info!(
             modalities = ?present_modalities,
@@ -260,7 +271,7 @@ pub(crate) async fn process_multimodal_plan(
             config_lookup_ms = timings.config_lookup_ms,
             preprocess_ms = timings.preprocess_ms,
             token_expand_ms = timings.token_expand_ms,
-            total_ms = elapsed_ms(total_started),
+            total_ms,
             original_tokens,
             expanded_tokens,
             "smg_mm_timing process_multimodal_plan"
@@ -278,6 +289,10 @@ pub(crate) async fn process_multimodal_plan(
 async fn fetch_media(plan: MediaPlan, ctx: &PlanContext<'_>) -> Result<Fetched> {
     let video_config = ctx.model_config.video_preprocessor_config.as_ref();
     let mut tracker = AsyncMultiModalTracker::new(ctx.components.media_connector.clone())
+        .with_fetch_observer(
+            Metrics::interned_model_label(ctx.model_id),
+            Metrics::record_mm_fetch,
+        )
         .with_default_video_sample_fps(ctx.spec.default_video_sample_fps_with(video_config))
         .with_video_frame_sampling(
             ctx.spec

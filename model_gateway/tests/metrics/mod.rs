@@ -27,6 +27,7 @@ pub fn recorder() -> PrometheusHandle {
 mod engine_metrics_test;
 mod kv_event_lag_histogram_test;
 mod metrics_help_text_test;
+mod multimodal_series_test;
 mod pushed_loads_test;
 mod worker_request_counter_test;
 mod worker_retry_backoff_histogram_test;

@@ -101,6 +101,7 @@ impl MessagePreparationStage {
             model_id,
             &*tokenizer,
             &request.messages,
+            true,
         )
         .await?;
         let media_order = media.media_order;

@@ -88,6 +88,9 @@ pub(crate) const REQUEST_LATENCY_BUCKETS: &[f64] = &[
 ];
 /// Buckets of the `n` parameter.
 pub(crate) const PARAMS_N_BUCKETS: &[f64] = &[1.0, 2.0, 5.0, 10.0, 20.0];
+/// Buckets of the media references a request carries, per modality.
+pub(crate) const MEDIA_ITEMS_BUCKETS: &[f64] =
+    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 16.0, 32.0, 64.0];
 /// The token-count buckets' ceiling when the model's context length is not
 /// known.
 const DEFAULT_MAX_MODEL_LEN: u32 = 32_768;
@@ -266,6 +269,10 @@ pub(crate) struct Identity {
     /// TokenSpeed; SGLang's scheduler matches its own): the string-stop
     /// family is registered only then.
     pub(crate) matches_string_stops: bool,
+    /// Whether this servicer processes media itself (the worker-side media
+    /// path): the three media families are registered only then, so a wire
+    /// that measures no media exports no media series.
+    pub(crate) processes_media: bool,
 }
 
 /// The handles of one data-parallel rank.
@@ -316,6 +323,12 @@ struct Recorded {
     scrape_seconds: Gauge,
     scrapes_ok: Counter,
     scrapes_failed: Counter,
+    /// Worker-side media: the references per request by modality (image,
+    /// video, audio), the time per stage, the requests by outcome; `None` on
+    /// a wire that processes no media itself.
+    media_items: Option<[Histogram; MEDIA_MODALITIES.len()]>,
+    media_stages: Option<[Histogram; MediaStage::ALL.len()]>,
+    media_outcomes: Option<[Counter; MediaOutcome::ALL.len()]>,
 }
 
 /// Registers handles on this servicer's own recorder with its fixed labels.
@@ -420,7 +433,72 @@ pub(crate) mod names {
     pub(crate) const METRICS_DROPPED_TOTAL: &str = "smg_servicer_metrics_dropped_total";
     pub(crate) const METRICS_SCRAPE_SECONDS: &str = "smg_servicer_metrics_scrape_seconds";
     pub(crate) const METRICS_SCRAPES_TOTAL: &str = "smg_servicer_metrics_scrapes_total";
+    pub(crate) const MEDIA_ITEMS_PER_REQUEST: &str = "smg_servicer_media_items_per_request";
+    pub(crate) const MEDIA_PROCESSING_SECONDS: &str = "smg_servicer_media_processing_seconds";
+    pub(crate) const MEDIA_REQUESTS_TOTAL: &str = "smg_servicer_media_requests_total";
 }
+
+/// A media request's stage, for its time: the wait for a processing slot
+/// and the processing itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MediaStage {
+    Wait = 0,
+    Process = 1,
+}
+
+impl MediaStage {
+    const ALL: [Self; 2] = [Self::Wait, Self::Process];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Wait => "wait",
+            Self::Process => "process",
+        }
+    }
+}
+
+/// How a request's worker-side media processing ended: processed, refused
+/// before processing (references this worker does not take, a missing
+/// processor, no slot), or the processor's verdict (the caller's media, a
+/// transient failure, an invalid request, an unavailable or a failed
+/// processor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MediaOutcome {
+    Ok = 0,
+    Refused = 1,
+    Client = 2,
+    Transient = 3,
+    Invalid = 4,
+    Unavailable = 5,
+    Internal = 6,
+}
+
+impl MediaOutcome {
+    const ALL: [Self; 7] = [
+        Self::Ok,
+        Self::Refused,
+        Self::Client,
+        Self::Transient,
+        Self::Invalid,
+        Self::Unavailable,
+        Self::Internal,
+    ];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Refused => "refused",
+            Self::Client => "client",
+            Self::Transient => "transient",
+            Self::Invalid => "invalid",
+            Self::Unavailable => "unavailable",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+/// The media modalities a request's references are counted under.
+const MEDIA_MODALITIES: [&str; 3] = ["image", "video", "audio"];
 
 /// A servicer's metrics: the totals the request path adds to, and, with a
 /// listener, the recorder and the handles the scrape renders.
@@ -533,6 +611,46 @@ impl ServicerMetrics {
             cut: AtomicBool::new(false),
             errored: AtomicBool::new(false),
         })
+    }
+
+    /// The media references a request carried, per modality, counted before
+    /// they are checked (a refused request's included); a modality with none
+    /// is not an observation.
+    pub(crate) fn media_items(&self, image: usize, video: usize, audio: usize) {
+        let Some(handles) = self
+            .recorded
+            .as_ref()
+            .and_then(|recorded| recorded.media_items.as_ref())
+        else {
+            return;
+        };
+        for (handle, count) in handles.iter().zip([image, video, audio]) {
+            if count > 0 {
+                handle.record(count as f64);
+            }
+        }
+    }
+
+    /// A media request's time in `stage`.
+    pub(crate) fn media_stage(&self, stage: MediaStage, took: Duration) {
+        if let Some(handles) = self
+            .recorded
+            .as_ref()
+            .and_then(|recorded| recorded.media_stages.as_ref())
+        {
+            handles[stage as usize].record(took);
+        }
+    }
+
+    /// How a request's worker-side media processing ended.
+    pub(crate) fn media_outcome(&self, outcome: MediaOutcome) {
+        if let Some(handles) = self
+            .recorded
+            .as_ref()
+            .and_then(|recorded| recorded.media_outcomes.as_ref())
+        {
+            handles[outcome as usize].increment(1);
+        }
     }
 
     /// A request ended before its stream existed: the status `Generate`
@@ -661,7 +779,9 @@ impl Recorded {
             identity.max_model_len
         };
         let token_buckets = one_two_five_buckets(max_model_len);
-        let buckets: [(&str, &[f64]); 8] = [
+        let buckets: [(&str, &[f64]); 10] = [
+            (names::MEDIA_ITEMS_PER_REQUEST, MEDIA_ITEMS_BUCKETS),
+            (names::MEDIA_PROCESSING_SECONDS, TTFT_BUCKETS),
             (names::TIME_TO_FIRST_TOKEN_SECONDS, TTFT_BUCKETS),
             (names::E2E_REQUEST_LATENCY_SECONDS, REQUEST_LATENCY_BUCKETS),
             (
@@ -722,6 +842,22 @@ impl Recorded {
             scrape_seconds: registrar.gauge(names::METRICS_SCRAPE_SECONDS, &[]),
             scrapes_ok: registrar.counter(names::METRICS_SCRAPES_TOTAL, &[("code", "200")]),
             scrapes_failed: registrar.counter(names::METRICS_SCRAPES_TOTAL, &[("code", "500")]),
+            media_items: identity.processes_media.then(|| {
+                MEDIA_MODALITIES.map(|modality| {
+                    registrar.histogram(names::MEDIA_ITEMS_PER_REQUEST, &[("modality", modality)])
+                })
+            }),
+            media_stages: identity.processes_media.then(|| {
+                MediaStage::ALL.map(|stage| {
+                    registrar
+                        .histogram(names::MEDIA_PROCESSING_SECONDS, &[("stage", stage.label())])
+                })
+            }),
+            media_outcomes: identity.processes_media.then(|| {
+                MediaOutcome::ALL.map(|outcome| {
+                    registrar.counter(names::MEDIA_REQUESTS_TOTAL, &[("outcome", outcome.label())])
+                })
+            }),
             registrar,
         })
     }
@@ -838,6 +974,21 @@ fn describe(registrar: &Registrar) {
     registrar.describe_counter(
         names::METRICS_DROPPED_TOTAL,
         "Observations the pressure sampler dropped, by family.",
+    );
+    registrar.describe_histogram(
+        names::MEDIA_ITEMS_PER_REQUEST,
+        "Media references a request carried, by modality, counted before they are checked (a \
+         refused request counts).",
+    );
+    registrar.describe_histogram(
+        names::MEDIA_PROCESSING_SECONDS,
+        "Seconds a request's worker-side media spent in a stage: waiting for a processing slot, \
+         or being processed.",
+    );
+    registrar.describe_counter(
+        names::MEDIA_REQUESTS_TOTAL,
+        "Requests with worker-side media, by outcome: ok, refused before processing, or the \
+         processor's verdict (client, transient, invalid, unavailable, internal).",
     );
     registrar.describe_gauge(
         names::METRICS_SCRAPE_SECONDS,
@@ -1166,6 +1317,7 @@ mod tests {
             ranks,
             max_model_len: 100,
             matches_string_stops: true,
+            processes_media: true,
         }
     }
 
