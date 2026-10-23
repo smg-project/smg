@@ -810,6 +810,10 @@ pub(crate) fn init_metrics() {
         "smg_worker_stalled",
         "Liveness veto on a worker: 1 while routing skips it, by worker and reason"
     );
+    describe_gauge!(
+        "smg_worker_state",
+        "Routing state of a worker: 1 on the series of its current state and reason, 0 on a series it left; state is available or excluded, reason the first fact of the routing decision that excludes the worker (pending, not_ready, failed, draining: its status; overloaded: the load monitor's veto; unreachable, wedged: the liveness veto; circuit_open: its breaker) or none while it is available"
+    );
     describe_counter!(
         "smg_worker_stall_transitions_total",
         "Times the liveness veto was set on a worker, by worker and reason"
@@ -2448,6 +2452,23 @@ impl Metrics {
             "model" => intern_model_label(model_id)
         )
         .set(tokens as f64);
+    }
+
+    /// Set one `smg_worker_state` series of a worker: 1 on the state and
+    /// reason it is on, 0 on the pair it left.
+    pub fn set_worker_state(
+        worker_url: &str,
+        state: &'static str,
+        reason: &'static str,
+        current: bool,
+    ) {
+        gauge!(
+            "smg_worker_state",
+            "worker" => intern_string(worker_url),
+            "state" => state,
+            "reason" => reason
+        )
+        .set(if current { 1.0 } else { 0.0 });
     }
 
     /// Set worker health status

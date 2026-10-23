@@ -540,6 +540,18 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
         self.is_healthy() && !self.is_overloaded() && self.stall_reason().is_none()
     }
 
+    /// Publish the worker's routing state as the `smg_worker_state` series:
+    /// 1 on the state and reason the routing decision reads now, 0 on the
+    /// pair it left; nothing when the pair did not move. Called where a fact
+    /// of the decision moves (the status, the overload veto, the liveness
+    /// veto, the circuit breaker). A no-op for a worker without the series.
+    fn publish_state(&self) {}
+
+    /// [`Self::publish_state`] for an address whose series were dropped and
+    /// come back (a registration): the current pair is set whether or not it
+    /// was the one published before.
+    fn republish_state(&self) {}
+
     /// Whether the absolute overload guard currently vetoes this worker.
     ///
     /// Written only by the load monitor, once per ingested load report, and
@@ -1233,6 +1245,49 @@ pub trait RequestCompletionSink: Send + Sync + fmt::Debug {
     fn request_completed(&self, worker: &dyn Worker);
 }
 
+/// The `smg_worker_state` series, `(state, reason)`, in the order the routing
+/// decision reads the facts ([`Worker::is_available`]): the status first,
+/// then the overload veto, the liveness veto, the circuit breaker.
+const ROUTING_STATE_SERIES: [(&str, &str); 9] = [
+    ("available", "none"),
+    ("excluded", "pending"),
+    ("excluded", "not_ready"),
+    ("excluded", "failed"),
+    ("excluded", "draining"),
+    ("excluded", "overloaded"),
+    ("excluded", "unreachable"),
+    ("excluded", "wedged"),
+    ("excluded", "circuit_open"),
+];
+
+/// The published-state code of the `circuit_open` series (its index plus
+/// one): the one series a read of the breaker can end, when the breaker's
+/// timeout moves it from open to half-open.
+const CIRCUIT_OPEN_CODE: u8 = 9;
+
+/// The index in [`ROUTING_STATE_SERIES`] of a worker with these facts: the
+/// first that excludes it, else available.
+fn routing_state_series(
+    status: WorkerStatus,
+    overloaded: bool,
+    stall: Option<StallReason>,
+    circuit_open: bool,
+) -> usize {
+    match status {
+        WorkerStatus::Pending => 1,
+        WorkerStatus::NotReady => 2,
+        WorkerStatus::Failed => 3,
+        WorkerStatus::Draining => 4,
+        WorkerStatus::Ready if overloaded => 5,
+        WorkerStatus::Ready => match stall {
+            Some(StallReason::Unreachable) => 6,
+            Some(StallReason::Wedged) => 7,
+            None if circuit_open => 8,
+            None => 0,
+        },
+    }
+}
+
 /// Basic worker implementation
 pub struct BasicWorker {
     pub metadata: WorkerMetadata,
@@ -1404,6 +1459,44 @@ impl BasicWorker {
             .store(Some(Arc::new(handle.abort_handle())));
     }
 
+    /// Whether the breaker permits execution. A breaker that moves from open
+    /// to half-open on this read (its timeout) moves the worker's routing
+    /// state with it, and the breaker has no view of that state: the series
+    /// is published here, only when the one published was `circuit_open`.
+    fn breaker_allows(&self, rt: &WorkerRuntime) -> bool {
+        let allows = self.circuit_breaker.load().can_execute();
+        if allows && rt.published_state() == CIRCUIT_OPEN_CODE {
+            self.publish_state_under(rt);
+        }
+        allows
+    }
+
+    /// [`Worker::publish_state`] under the runtime guard the caller holds:
+    /// the pair the facts give now is set to 1 and the pair published before
+    /// it to 0, when they differ.
+    fn publish_state_under(&self, rt: &WorkerRuntime) {
+        let index = routing_state_series(
+            rt.status(),
+            rt.is_overloaded(),
+            rt.stall_reason(),
+            self.circuit_breaker.load().state() == super::circuit_breaker::CircuitState::Open,
+        );
+        let code = index as u8 + 1;
+        if rt.published_state() == code {
+            return;
+        }
+        let previous = rt.swap_published_state(code);
+        if previous == code {
+            return;
+        }
+        let (state, reason) = ROUTING_STATE_SERIES[index];
+        Metrics::set_worker_state(self.url(), state, reason, true);
+        if let Some(left) = (previous as usize).checked_sub(1) {
+            let (state, reason) = ROUTING_STATE_SERIES[left];
+            Metrics::set_worker_state(self.url(), state, reason, false);
+        }
+    }
+
     fn install_shared_state_from_basic(&self, other: &BasicWorker) {
         let shared_runtime = other.shared_runtime();
         shared_runtime.bump_revision();
@@ -1419,6 +1512,7 @@ impl BasicWorker {
             other_cb.publish_metrics();
             self.circuit_breaker.store(other_cb);
         }
+        self.publish_state();
 
         self.adopt_backend_client_from(other);
     }
@@ -1535,6 +1629,7 @@ impl Worker for BasicWorker {
     fn set_status(&self, status: WorkerStatus) {
         self.runtime.load().set_status(status);
         Metrics::set_worker_health(self.url(), status == WorkerStatus::Ready);
+        self.publish_state();
     }
 
     fn inherit_shared_state_from(&self, other: &dyn Worker) -> bool {
@@ -1682,7 +1777,7 @@ impl Worker for BasicWorker {
     }
 
     fn circuit_breaker_can_execute(&self) -> bool {
-        self.circuit_breaker.load().can_execute()
+        self.breaker_allows(&self.runtime.load())
     }
 
     fn is_overloaded(&self) -> bool {
@@ -1690,7 +1785,11 @@ impl Worker for BasicWorker {
     }
 
     fn set_overloaded(&self, overloaded: bool) -> bool {
-        self.runtime.load().set_overloaded(overloaded)
+        let changed = self.runtime.load().set_overloaded(overloaded);
+        if changed {
+            self.publish_state();
+        }
+        changed
     }
 
     fn stall_reason(&self) -> Option<StallReason> {
@@ -1698,7 +1797,11 @@ impl Worker for BasicWorker {
     }
 
     fn set_stall(&self, reason: Option<StallReason>) -> bool {
-        self.runtime.load().set_stall(reason)
+        let changed = self.runtime.load().set_stall(reason);
+        if changed {
+            self.publish_state();
+        }
+        changed
     }
 
     fn note_contact(&self) {
@@ -1868,7 +1971,7 @@ impl Worker for BasicWorker {
         rt.status() == WorkerStatus::Ready
             && !rt.is_overloaded()
             && rt.stall_reason().is_none()
-            && self.circuit_breaker.load().can_execute()
+            && self.breaker_allows(&rt)
     }
 
     fn is_healthy_and_eligible(&self) -> bool {
@@ -1897,7 +2000,7 @@ impl Worker for BasicWorker {
         let rt = self.runtime.load();
         RoutingState {
             healthy: rt.status() == WorkerStatus::Ready,
-            can_execute: self.circuit_breaker.load().can_execute(),
+            can_execute: self.breaker_allows(&rt),
             load: rt.load(),
             processed: rt.processed_requests(),
             overloaded: rt.is_overloaded(),
@@ -1907,6 +2010,17 @@ impl Worker for BasicWorker {
 
     fn record_circuit_breaker_outcome(&self, success: bool) {
         self.circuit_breaker.load().record_outcome(success);
+        self.publish_state();
+    }
+
+    fn publish_state(&self) {
+        self.publish_state_under(&self.runtime.load());
+    }
+
+    fn republish_state(&self) {
+        let rt = self.runtime.load();
+        rt.swap_published_state(0);
+        self.publish_state_under(&rt);
     }
 
     fn resilience(&self) -> &ResolvedResilience {
@@ -3579,6 +3693,142 @@ mod tests {
         // The count never goes negative.
         worker.note_output_ended();
         assert!(worker.output_silence().is_none());
+    }
+    /// The `smg_worker_state` samples of the test worker in a rendered
+    /// scrape: `(state, reason)` and the value.
+    fn state_series(rendered: &str) -> Vec<((String, String), f64)> {
+        rendered
+            .lines()
+            .filter_map(|line| {
+                let rest = line.strip_prefix("smg_worker_state{worker=\"http://worker:8000\",")?;
+                let (labels, value) = rest.split_once("} ")?;
+                let field = |name: &str| {
+                    let after = labels.split_once(&format!("{name}=\""))?.1;
+                    Some(after.split_once('"')?.0.to_owned())
+                };
+                Some(((field("state")?, field("reason")?), value.parse().ok()?))
+            })
+            .collect()
+    }
+
+    /// The one `smg_worker_state` series at 1, as `state/reason`; every
+    /// other series of the worker reads 0.
+    fn current_state(rendered: &str) -> String {
+        let series = state_series(rendered);
+        let mut on = series
+            .iter()
+            .filter(|(_, value)| *value == 1.0)
+            .map(|((state, reason), _)| format!("{state}/{reason}"));
+        let current = on.next().expect("one series at 1");
+        assert_eq!(on.next(), None, "two series at 1: {series:?}");
+        assert!(
+            series
+                .iter()
+                .all(|(_, value)| *value == 0.0 || *value == 1.0),
+            "{series:?}"
+        );
+        current
+    }
+
+    /// A worker's routing state is one series at 1 with the reason it is
+    /// out for, in the order the routing decision reads the facts, and the
+    /// series it leaves reads 0: the status, the overload veto, the liveness
+    /// veto, the breaker (a trip, and its timeout's move to half-open on the
+    /// next read of the breaker).
+    #[test]
+    fn a_workers_routing_state_is_one_series_with_the_reason_it_is_out_for() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let worker = BasicWorkerBuilder::new("http://worker:8000")
+                .health_config(no_health_check())
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    timeout_duration: Duration::from_millis(50),
+                    ..CircuitBreakerConfig::default()
+                })
+                .build();
+            assert!(
+                state_series(&handle.render()).is_empty(),
+                "nothing before the first publish"
+            );
+            worker.republish_state();
+            assert_eq!(current_state(&handle.render()), "available/none");
+
+            worker.set_status(WorkerStatus::NotReady);
+            assert_eq!(current_state(&handle.render()), "excluded/not_ready");
+            worker.set_status(WorkerStatus::Draining);
+            assert_eq!(current_state(&handle.render()), "excluded/draining");
+            worker.set_status(WorkerStatus::Ready);
+            assert_eq!(current_state(&handle.render()), "available/none");
+
+            assert!(worker.set_overloaded(true));
+            assert_eq!(current_state(&handle.render()), "excluded/overloaded");
+            assert!(!worker.set_overloaded(true), "no edge, no publish");
+            assert!(worker.set_overloaded(false));
+            assert_eq!(current_state(&handle.render()), "available/none");
+
+            assert!(worker.set_stall(Some(StallReason::Wedged)));
+            assert_eq!(current_state(&handle.render()), "excluded/wedged");
+            assert!(worker.set_stall(Some(StallReason::Unreachable)));
+            assert_eq!(current_state(&handle.render()), "excluded/unreachable");
+            assert!(worker.set_stall(None));
+            assert_eq!(current_state(&handle.render()), "available/none");
+
+            worker.record_circuit_breaker_outcome(false);
+            assert_eq!(worker.circuit_breaker_state(), CircuitState::Open);
+            assert_eq!(current_state(&handle.render()), "excluded/circuit_open");
+            // The breaker's timeout moves it to half-open on the next read,
+            // which is the routing decision's: the worker is on trial, and
+            // its series says so.
+            thread::sleep(Duration::from_millis(60));
+            assert!(worker.circuit_breaker_can_execute());
+            assert_eq!(worker.circuit_breaker_state(), CircuitState::HalfOpen);
+            assert_eq!(current_state(&handle.render()), "available/none");
+            worker.record_circuit_breaker_outcome(true);
+            assert_eq!(current_state(&handle.render()), "available/none");
+            // Every series the worker was on is still there, at 0.
+            assert_eq!(state_series(&handle.render()).len(), 7);
+        });
+    }
+
+    /// The facts are read in the routing decision's order: a worker that is
+    /// not ready names its status before its open breaker, and the breaker
+    /// once the status is ready again. A registration publishes the current
+    /// pair whether or not it was the one published before.
+    #[test]
+    fn the_first_excluding_fact_names_the_state_and_a_registration_republishes_it() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let worker = BasicWorkerBuilder::new("http://worker:8000")
+                .health_config(no_health_check())
+                .circuit_breaker_config(CircuitBreakerConfig {
+                    failure_threshold: 1,
+                    ..CircuitBreakerConfig::default()
+                })
+                .build();
+            worker.set_status(WorkerStatus::NotReady);
+            worker.record_circuit_breaker_outcome(false);
+            assert_eq!(current_state(&handle.render()), "excluded/not_ready");
+            worker.set_status(WorkerStatus::Ready);
+            assert_eq!(current_state(&handle.render()), "excluded/circuit_open");
+
+            // The address's series were dropped (a removal) and the worker
+            // registers again: the plain publish sees no move, the
+            // registration's publish sets the pair again.
+            let again = PrometheusBuilder::new().build_recorder();
+            let again_handle = again.handle();
+            metrics::with_local_recorder(&again, || {
+                worker.publish_state();
+                assert!(state_series(&again_handle.render()).is_empty());
+                worker.republish_state();
+                assert_eq!(
+                    current_state(&again_handle.render()),
+                    "excluded/circuit_open"
+                );
+            });
+        });
     }
 }
 

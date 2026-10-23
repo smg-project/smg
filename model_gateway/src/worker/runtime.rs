@@ -118,6 +118,11 @@ pub struct WorkerRuntime {
     overloaded: AtomicBool,
     /// Liveness veto, a [`StallReason`] as `u8` (0 = none).
     stall: AtomicU8,
+    /// The `smg_worker_state` series last published for the worker (the
+    /// series table's index plus one; 0 = none yet), so the series the
+    /// worker leaves is set to zero when the next is set to one. Shared
+    /// with a same-URL replacement like the facts the series summarises.
+    published_state: AtomicU8,
     /// Last successful contact and last token or completion, in
     /// [`super::liveness::now_ms`] milliseconds.
     last_contact_ms: AtomicU64,
@@ -499,6 +504,7 @@ impl WorkerRuntime {
             revision: AtomicU64::new(0),
             overloaded: AtomicBool::new(false),
             stall: AtomicU8::new(0),
+            published_state: AtomicU8::new(0),
             last_contact_ms: AtomicU64::new(super::liveness::now_ms()),
             last_token_ms: AtomicU64::new(super::liveness::now_ms()),
             last_waiting_reqs: AtomicI64::new(0),
@@ -578,6 +584,18 @@ impl WorkerRuntime {
     pub fn set_stall(&self, reason: Option<StallReason>) -> bool {
         let next = reason.map_or(0, |reason| reason as u8);
         self.stall.swap(next, Ordering::AcqRel) != next
+    }
+
+    /// The code of the `smg_worker_state` series published last (0 when
+    /// none was).
+    pub fn published_state(&self) -> u8 {
+        self.published_state.load(Ordering::Acquire)
+    }
+
+    /// Remember `code` as the published `smg_worker_state` series; the code
+    /// published before it comes back (0 when none was).
+    pub fn swap_published_state(&self, code: u8) -> u8 {
+        self.published_state.swap(code, Ordering::AcqRel)
     }
 
     pub fn note_contact(&self) {
