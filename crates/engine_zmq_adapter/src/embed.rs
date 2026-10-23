@@ -143,21 +143,17 @@ mod tests {
 
     use engine_zmq_client::{
         codec::{tensor::WireTensor, OpaqueValue},
-        mock_engine::{
-            connect_to_frontend, default_ready_response, EngineInbound, MockEngineInput,
-            MockEngineOutput,
-        },
+        mock_engine::{EngineInbound, MockEngineInput, MockEngineOutput},
         protocol::vllm::{
             output::{EngineCoreOutput, EngineCoreOutputs, RequestBatchOutputs},
             pooling::PoolingOutput,
         },
-        EngineId,
     };
     use openai_protocol::worker::RuntimeType;
     use tonic::Code;
 
     use super::*;
-    use crate::eos::EosTokenIds;
+    use crate::test_support::connected_pair_in;
 
     fn embed_request(id: &str, input_ids: Vec<u32>) -> vllm::EmbedRequest {
         vllm::EmbedRequest {
@@ -239,27 +235,8 @@ mod tests {
     async fn connected(
         dir: &std::path::Path,
     ) -> (ZmqEngineClient, MockEngineInput, MockEngineOutput) {
-        let ep = |name: &str| format!("ipc://{}", dir.join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Vllm,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let client = client.expect("adapter connect");
-        let (engine_in, engine_out) = engine.expect("mock engine").split();
+        let (client, engine) = connected_pair_in(dir, RuntimeType::Vllm).await;
+        let (engine_in, engine_out) = engine.split();
         (client, engine_in, engine_out)
     }
 

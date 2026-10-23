@@ -345,6 +345,9 @@ class RouterArgs:
     control_plane_api_keys: list[tuple] = dataclasses.field(default_factory=list)
     control_plane_audit_enabled: bool = False
     cors_allowed_origins: list[str] = dataclasses.field(default_factory=list)
+    decode_expected_workers: int | None = None
+    decode_min_ready_percent: int | None = None
+    decode_min_ready_workers: int | None = None
     decode_policy: str | None = None  # Specific policy for decode nodes in PD mode
     decode_selector: dict[str, str] = dataclasses.field(default_factory=dict)
     decode_urls: list[str] = dataclasses.field(default_factory=list)
@@ -471,6 +474,8 @@ class RouterArgs:
     # media itself (every redirect hop included); None allows any host the
     # address policy passes
     mm_allowed_media_domains: list[str] | None = None
+    # Image/audio download budget in milliseconds; None uses SMG_MM_FETCH_TIMEOUT_MS, then 10000
+    mm_fetch_timeout_ms: int | None = None
     # Per-request image-count limit replacing model spec limits; None keeps spec limits
     mm_per_request_image_limit: int | None = None
     # Pixel cache budget (MiB) for router-side preprocessed media; None falls
@@ -485,6 +490,8 @@ class RouterArgs:
     # loaded: prefer (the pure-Rust fallback decoder, behind one warning) |
     # require (start-up fails); None falls back to SMG_MM_TURBOJPEG, then prefer
     mm_turbojpeg: str | None = None
+    # Video download budget in milliseconds; None uses SMG_MM_VIDEO_FETCH_TIMEOUT_MS, then 30000
+    mm_video_fetch_timeout_ms: int | None = None
     model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
     model_id_from: str | None = None
     model_path: str | None = None
@@ -522,7 +529,10 @@ class RouterArgs:
     postgres_op_timeout_secs: int = 5
     postgres_pool_max: int = 16
     power_of_two_load_metric: str = "expected_wait"
+    prefill_expected_workers: int | None = None
     prefill_max_inflight_requests_per_worker: int = -1
+    prefill_min_ready_percent: int | None = None
+    prefill_min_ready_workers: int | None = None
     prefill_policy: str | None = None  # Specific policy for prefill nodes in PD mode
     prefill_queue_size: int | None = None
     prefill_queue_timeout_secs: int | None = None
@@ -560,9 +570,9 @@ class RouterArgs:
     redis_pool_max: int = 16
     redis_retention_days: int = 30
     redis_url: str | None = None
-    # None = follow service_discovery: recovery works by removal + discovery
-    # re-registration, so it defaults on exactly when discovery can complete
-    # the loop (resolved by the Rust core).
+    # None = follow discovery: with a provider, remove only the workers it
+    # discovered, which it re-registers; True removes any failed local worker,
+    # False none (resolved by the Rust core).
     remove_unhealthy_workers: bool | None = None
     request_id_headers: list[str] | None = None
     # Request timeout in seconds
@@ -972,7 +982,8 @@ class RouterArgs:
             default=RouterArgs.least_load_default_throughput,
             help=(
                 "Input throughput (tokens/s) for least_load prefill workers; fallback"
-                " output throughput for other workers when no live rate is reported."
+                " output throughput for other workers when no candidate reports a live"
+                " rate."
                 " Shared across roles; separate prefill/decode values require"
                 " constructing RouterConfig programmatically in Rust."
             ),
@@ -1728,6 +1739,24 @@ class RouterArgs:
             ),
         )
         parser.add_argument(
+            f"--{prefix}mm-fetch-timeout-ms",
+            type=_positive_int,
+            default=RouterArgs.mm_fetch_timeout_ms,
+            help=(
+                "Image/audio download timeout in milliseconds; positive. "
+                "Falls back to SMG_MM_FETCH_TIMEOUT_MS, then 10000."
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-video-fetch-timeout-ms",
+            type=_positive_int,
+            default=RouterArgs.mm_video_fetch_timeout_ms,
+            help=(
+                "Video download timeout in milliseconds; positive. "
+                "Falls back to SMG_MM_VIDEO_FETCH_TIMEOUT_MS, then 30000."
+            ),
+        )
+        parser.add_argument(
             f"--{prefix}mm-turbojpeg",
             type=str.lower,
             choices=["prefer", "require"],
@@ -2350,6 +2379,46 @@ class RouterArgs:
 
         # Health check configuration
         health_group.add_argument(
+            f"--{prefix}decode-expected-workers",
+            type=_positive_int,
+            default=None,
+            help="Desired decode fleet size, used only as the fixed percentage denominator",
+        )
+        health_group.add_argument(
+            f"--{prefix}decode-min-ready-percent",
+            type=int,
+            choices=range(1, 101),
+            metavar="PERCENT",
+            default=None,
+            help="Minimum healthy percentage of expected decode workers (1-100)",
+        )
+        health_group.add_argument(
+            f"--{prefix}decode-min-ready-workers",
+            type=_positive_int,
+            default=None,
+            help="Minimum healthy decode workers required (default 1)",
+        )
+        health_group.add_argument(
+            f"--{prefix}prefill-expected-workers",
+            type=_positive_int,
+            default=None,
+            help="Desired prefill fleet size, used only as the fixed percentage denominator",
+        )
+        health_group.add_argument(
+            f"--{prefix}prefill-min-ready-percent",
+            type=int,
+            choices=range(1, 101),
+            metavar="PERCENT",
+            default=None,
+            help="Minimum healthy percentage of expected prefill workers (1-100)",
+        )
+        health_group.add_argument(
+            f"--{prefix}prefill-min-ready-workers",
+            type=_positive_int,
+            default=None,
+            help="Minimum healthy prefill workers required (default 1)",
+        )
+        health_group.add_argument(
             f"--{prefix}health-failure-threshold",
             type=int,
             default=RouterArgs.health_failure_threshold,
@@ -2402,10 +2471,12 @@ class RouterArgs:
             help=(
                 "Let workers recover after prolonged failure: unhealthy workers"
                 " are removed so service discovery re-registers and re-probes"
-                " them once their engine returns. Defaults to the"
-                " service-discovery setting (recovery-by-removal needs"
-                " discovery to re-add the worker); use the --no- form to keep"
-                " it off under discovery"
+                " them once their engine returns. Unset, it follows discovery:"
+                " with a discovery provider it removes only the workers that"
+                " provider discovered, while static and API-added workers,"
+                " which nothing would re-add, recover in place. Pass it to"
+                " remove every failed local worker, or the --no- form to"
+                " remove none"
             ),
         )
         health_group.add_argument(

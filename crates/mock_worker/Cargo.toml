@@ -36,6 +36,7 @@ engine-zmq-client = { workspace = true, features = ["mock-engine"] }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic.workspace = true
+tonic-health.workspace = true
 prost-types.workspace = true
 axum.workspace = true
 serde_json.workspace = true

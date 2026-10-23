@@ -107,7 +107,7 @@ pub struct EngineCoreOutput {
 /// vLLM's `RequestSpecDecodeMetrics` (a dataclass, so a msgpack map): the
 /// histogram of accepted draft tokens per verify step and the drafted total.
 /// Informational, so the wire decodes it leniently (see
-/// [`WireEngineCoreOutput`]): the per-step detail is optional, and a shape
+/// `WireEngineCoreOutput`): the per-step detail is optional, and a shape
 /// this struct does not know drops the metrics rather than the batch.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]

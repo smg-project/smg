@@ -20,6 +20,9 @@
 //!   guard, shared by the HTTP and gRPC selection paths
 //! - [`pd_admission`] — the disaggregated dispatch's admission gate: never
 //!   post more bootstrap rooms to a pair than its decode engine can admit
+//! - `pd_failure` — the one vocabulary a prefill or decode side's failure is
+//!   named by (the side, the phase, the failure's own status), the HTTP and
+//!   gRPC prefill-decode paths' answers built from it
 //! - `placement` — policy-driven worker placement over the routing
 //!   pools (single worker and prefill/decode pairs), the one sequence the
 //!   HTTP and gRPC families used to each carry a copy of
@@ -48,6 +51,7 @@ pub(crate) mod kv_transfer;
 pub use smg_external_router::{mcp_utils, openai_bridge};
 pub mod overload;
 pub mod pd_admission;
+pub(crate) mod pd_failure;
 pub use smg_external_router::persistence_utils;
 pub(crate) mod placement;
 pub use smg_external_router::realtime;

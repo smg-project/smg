@@ -270,17 +270,14 @@ pub fn discover_chat_template_in_dir(dir: &Path) -> Option<String> {
 }
 
 /// Whether `tokenizer_config.json` in `dir` carries a `chat_template` the
-/// loaders read: a string. A named-template list (the form some checkpoints
-/// ship) is not read by them, so it must not stand in the way of the file
-/// fallbacks.
+/// loaders read: a string, or a list of named templates (see
+/// `ConfigChatTemplates`). The file fallbacks serve a config without one.
 fn config_has_chat_template(dir: &Path) -> bool {
     std::fs::read_to_string(dir.join("tokenizer_config.json"))
         .ok()
         .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
         .is_some_and(|config| {
-            config
-                .get("chat_template")
-                .is_some_and(serde_json::Value::is_string)
+            crate::chat_template::ConfigChatTemplates::read(config.get("chat_template")).is_some()
         })
 }
 
@@ -806,16 +803,13 @@ mod tests {
             path.join("chat_template.json").to_str()
         );
 
-        // A named-template list in the config is not a template the loaders
-        // read, so the legacy file still serves such a checkpoint.
+        // A named-template list in the config is the tokenizer's own template
+        // too (default / tool_use), so the legacy file does not replace it.
         std::fs::write(
             path.join("tokenizer_config.json"),
             r#"{"chat_template": [{"name": "default", "template": "a"}, {"name": "tool_use", "template": "b"}]}"#,
         )
         .unwrap();
-        assert_eq!(
-            discover(path).as_deref(),
-            path.join("chat_template.json").to_str()
-        );
+        assert_eq!(discover(path), None);
     }
 }

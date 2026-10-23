@@ -143,7 +143,8 @@ pub enum DropReason {
     /// Bytes of a call block the call syntax could not read as the call, for a syntax whose block
     /// is never prose (the keyed syntax: the block's markers and its four tags are the format's
     /// own tokens, and what stands between them where the syntax has no place for text is the
-    /// model's failed call). A `Malformed` event of no bytes with the reason stands right before
+    /// model's failed call; the attributed syntax inside an invoke, `tagged::attributed`, the
+    /// same). A `Malformed` event of no bytes with the reason stands right before
     /// them, or, for a call the end of the stream or a marker cut, right after them and before
     /// its `ToolCallEnd` (`tagged::end_cut_call`), so the failure is counted; the bytes
     /// themselves never reach a client as content.
@@ -262,6 +263,13 @@ malformed_reasons! {
     /// stop closed is counted under every table; the call itself only where the table has no
     /// stop row, since there the template writes the closing marker the model skipped.
     OpenAtTheStop => "a call, or a string value in it, left open at the stream's stop",
+    /// A string value the model left open at the call's closing marker (the value's closing tag
+    /// never came, the call's close did), closed there by a syntax that writes the arguments' JSON
+    /// for values the model wrote as text between tags: the string gets its closing quote, and
+    /// the object closes as at any marker, so that a call delivered under `tool_calls` reads as
+    /// JSON. The marker is the model's own end of the call, so the value's bytes are complete, as
+    /// at the stop. The event carries no bytes and stands before the closing quote.
+    OpenAtTheMarker => "a string value left open at the call's closing marker",
 }
 
 impl std::fmt::Display for MalformedReason {

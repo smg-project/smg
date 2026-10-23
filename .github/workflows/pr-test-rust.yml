@@ -263,7 +263,7 @@ jobs:
           pytest -q grpc_servicer/tests -rs
 
       - name: Run CI tooling unit tests
-        run: pytest -q scripts/tests/test_ci_node_health.py scripts/tests/test_ci_prepared_backend_env.py scripts/tests/test_ci_tokenspeed_scheduler_pin.py scripts/tests/test_ci_gpu_runner_image.py scripts/tests/test_bench_gate.py scripts/tests/test_ci_reap_job_processes.py scripts/tests/test_check_release_versions.py scripts/tests/test_ci_rust_tests.py scripts/tests/test_ci_apt_update.py
+        run: pytest -q scripts/tests/test_ci_node_health.py scripts/tests/test_ci_prepared_backend_env.py scripts/tests/test_ci_tokenspeed_scheduler_pin.py scripts/tests/test_ci_tokenspeed_image_tag.py scripts/tests/test_ci_gpu_runner_image.py scripts/tests/test_bench_gate.py scripts/tests/test_ci_reap_job_processes.py scripts/tests/test_check_release_versions.py scripts/tests/test_ci_rust_tests.py scripts/tests/test_ci_apt_update.py
 
       # CPU-only unit tests for the e2e harness itself (connection-mode parsing,
       # ZMQ/EPD command builders, ZMQ-lane collection filter). --noconftest keeps
@@ -523,7 +523,7 @@ jobs:
   # dependency objects on every cold run, which rust-cache restores anyway,
   # and a local sccache disk cache never outlives a hosted runner. The
   # gateway binary's own AArch64 check
-  # (model_gateway/tests/allocator_artifact_test.rs: jemalloc's 64 KiB page
+  # (model_gateway/tests/startup/allocator_artifact_test.rs: jemalloc's 64 KiB page
   # setting) is not run here: it builds the smg binary, which the hosted
   # runner cannot afford on every pull request; it stays with the nightly
   # image.
@@ -672,7 +672,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # Resolve today's published nightly carrier to an immutable digest.
+      # Resolve the pinned nightly's carrier to an immutable digest.
       # A missing image falls back to installing nightly wheels on the runner.
       # Resolution must stay tolerant so detect-changes can gate other lanes.
       - name: Resolve TokenSpeed CI image
@@ -732,8 +732,10 @@ jobs:
               - 'scripts/ci_install_sglang.sh'
               - 'scripts/ci_install_vllm.sh'
               - 'scripts/ci_install_tokenspeed.sh'
+              - 'scripts/ci_tokenspeed_scheduler_pin.py'
               - 'scripts/ci_install_flashinfer.py'
               - '.github/versions/tokenspeed.ref'
+              - '.github/versions/tokenspeed-nightly.txt'
               - 'scripts/ci_install_e2e_deps.sh'
               - 'scripts/ci_killall_sglang.sh'
               - 'scripts/ci_build_wheel.sh'
@@ -766,10 +768,12 @@ jobs:
               - 'scripts/ci_install_trtllm.sh'
               - 'scripts/ci_apt_mirror.sh'
               - 'scripts/ci_install_tokenspeed.sh'
+              - 'scripts/ci_tokenspeed_scheduler_pin.py'
               - 'scripts/ci_install_flashinfer.py'
               - 'scripts/ci_tokenspeed_image_tag.sh'
               - 'scripts/ci_fetch_tokenspeed_prebuilt.sh'
               - '.github/versions/tokenspeed.ref'
+              - '.github/versions/tokenspeed-nightly.txt'
             agentic:
               - 'crates/mcp/**'
               - 'crates/data_connector/**'
@@ -1071,8 +1075,16 @@ jobs:
       engine: vllm
       gpu_tier: "1"
       runner: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
-      timeout: 50
-      test_timeout: 30
+      # Measured on the AMD runner: the suite's eight vLLM workers took 18:52
+      # to come up and the step 21:58 end to end before the servicers'
+      # planned warm-up; with it (the default level, up to 300 s per worker)
+      # the seven workers before gpt-oss-20b took 20:08 to come up, and
+      # gpt-oss-20b's own start (engine 2:36 + warm-up ~2:45) ran into the
+      # 30-minute step cap. The slowest composition seen (the earlier run's
+      # engine starts + the later run's warm-ups) projects to ~34 minutes;
+      # 45 keeps the ~30 % headroom the CUDA vLLM row keeps over its 24.
+      timeout: 60
+      test_timeout: 45
       test_dirs: e2e_test/chat_completions
       min_selected: 202 # the vLLM row's floor: both rows select the same cases
       servicer_unit_tests: true

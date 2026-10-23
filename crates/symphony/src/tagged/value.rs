@@ -16,6 +16,8 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::Value;
 
+use crate::tagged::assembler::push_escaped;
+
 /// The texts that mean null for a nullable string: JSON's word and the `None` a template writes
 /// for a null argument.
 pub(crate) const NULL_WORDS: [&str; 2] = ["null", "None"];
@@ -673,6 +675,52 @@ fn reads_back_as_an_argument(text: &str) -> bool {
 /// `text` as a JSON string.
 fn string(text: &str) -> String {
     Value::String(text.to_string()).to_string()
+}
+
+/// The JSON a value's text the end of the stream cut stands for, as far as it is known: the text
+/// as written when it is a strict prefix of a JSON value (a number's digits, the start of a
+/// literal word, an object or a list the model was writing), the JSON of a Python literal the cut
+/// found complete (`True` as `true`, `['a', 'b']` as `["a", "b"]`), which is what the close
+/// makes of it ([`inferred`]), and otherwise the opening of a JSON string holding it, the close's
+/// reading of text that is neither. Either way the result is a strict prefix of a JSON value, so
+/// that a client that reads the arguments as they arrive is never handed bytes no JSON value
+/// begins with, and a cut that lands after a whole literal agrees with the close on its type.
+pub(crate) fn cut(text: &str) -> String {
+    if json_prefix(text) {
+        return text.to_owned();
+    }
+    if let Some(json) = cut_literal(text) {
+        return json;
+    }
+    let mut json = String::with_capacity(text.len() + 1);
+    json.push('"');
+    push_escaped(&mut json, text);
+    json
+}
+
+/// The JSON of a Python literal the cut found complete, [`cut`]'s middle branch (`True` as
+/// `true`, `['a', 'b']` as `["a", "b"]`), when that JSON reads back as an argument; `None` for
+/// any other text.
+fn cut_literal(text: &str) -> Option<String> {
+    python_literal(text.trim()).filter(|json| reads_back_as_an_argument(json))
+}
+
+/// Whether [`cut`] writes `text` as the opening of a JSON string rather than as written or as a
+/// literal's JSON: the text is no strict prefix of a JSON value and no complete Python literal
+/// ([`cut_literal`]), the two tests [`cut`] itself makes, so the two cannot drift. Bytes held
+/// behind such a text (a start of a tag the cut left short) belong in that string, as they would
+/// in a streamed one.
+pub(crate) fn cut_opens_a_string(text: &str) -> bool {
+    !json_prefix(text) && cut_literal(text).is_none()
+}
+
+/// Whether `text` is a strict prefix of a JSON value: one `serde_json` reads whole, or one it
+/// stops reading only because the text ended.
+pub(crate) fn json_prefix(text: &str) -> bool {
+    match serde_json::from_str::<Value>(text) {
+        Ok(_) => true,
+        Err(error) => error.is_eof(),
+    }
 }
 
 #[cfg(test)]

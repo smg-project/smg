@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use openai_protocol::common::Usage;
+use openai_protocol::{common::Usage, generate::GenerateResponse};
 
 use crate::{
     rate_limit::UsageSettlement,
@@ -54,6 +54,37 @@ impl TokenCounts {
             reasoning: responses.iter().map(|r| r.reasoning_tokens()).sum(),
             spec_accepted: responses.iter().map(|r| r.spec_accepted_tokens()).sum(),
             spec_drafted: responses.iter().map(|r| r.spec_draft_tokens()).sum(),
+        }
+    }
+
+    /// The counters of the generate answers of one request, one per choice,
+    /// as [`Self::of`] takes them from the frames: the shared prompt's count
+    /// and cache hit once, the greatest any choice reports (the choice that
+    /// prefilled the shared prefix may report fewer hits than its siblings),
+    /// the choices' own completion and reasoning counts summed. A generate
+    /// answer carries no speculative counts.
+    pub(crate) fn of_generated(responses: &[GenerateResponse]) -> Self {
+        Self {
+            prompt: responses
+                .iter()
+                .map(|r| r.meta_info.prompt_tokens)
+                .max()
+                .unwrap_or(0),
+            completion: responses
+                .iter()
+                .map(|r| r.meta_info.completion_tokens)
+                .sum(),
+            cached: responses
+                .iter()
+                .map(|r| r.meta_info.cached_tokens)
+                .max()
+                .unwrap_or(0),
+            reasoning: responses
+                .iter()
+                .map(|r| r.meta_info.reasoning_tokens.unwrap_or(0))
+                .sum(),
+            spec_accepted: 0,
+            spec_drafted: 0,
         }
     }
 

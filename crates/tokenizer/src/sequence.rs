@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::traits::{IncrementalDecoder, TokenIdType, Tokenizer as TokenizerTrait};
+use crate::traits::{DecodeStep, IncrementalDecoder, TokenIdType, Tokenizer as TokenizerTrait};
 
 /// Maintains state for an ongoing sequence of tokens and their decoded text.
 ///
@@ -190,6 +190,40 @@ impl Sequence {
             self.total_tokens += 1;
             return Ok(text);
         }
+        Ok(self.step_generic(token_id)?.into_text())
+    }
+
+    /// [`append_token`](Self::append_token), with the newly decoded text
+    /// appended to `out`; says whether there was any. A stream that collects
+    /// its text in one buffer takes each token's text without a string per
+    /// token.
+    #[inline]
+    pub fn append_token_into(&mut self, token_id: TokenIdType, out: &mut String) -> Result<bool> {
+        if let Some(decoder) = self.incremental.as_mut() {
+            let appended = decoder.step_into(token_id, out)?;
+            self.total_tokens += 1;
+            return Ok(appended);
+        }
+        Ok(match self.step_generic(token_id)?.text {
+            // The generic step's text is a string of its own: an `out` with no
+            // allocation yet takes it as it is rather than a copy of it; a
+            // cleared buffer kept for reuse (a stream's delta, the jail) keeps
+            // its capacity and is appended to.
+            Some(text) if !text.is_empty() => {
+                if out.capacity() == 0 {
+                    *out = text;
+                } else {
+                    out.push_str(&text);
+                }
+                true
+            }
+            _ => false,
+        })
+    }
+
+    /// One token through the generic algorithm (`Decoder::decode_step`), with
+    /// the sequence's counters kept.
+    fn step_generic(&mut self, token_id: TokenIdType) -> Result<DecodeStep> {
         let step = self.tokenizer.decode_step_reporting(
             token_id,
             &mut self.token_ids,
@@ -202,7 +236,7 @@ impl Sequence {
         if step.prefix_mismatch {
             self.prefix_mismatches += 1;
         }
-        Ok(step.into_text())
+        Ok(step)
     }
 
     /// Finish incremental decoding without inventing an extra token.
@@ -296,6 +330,25 @@ mod tests {
         let text2 = seq.append_token(2).unwrap();
         // The incremental text should be " world" (with the space that the mock tokenizer adds)
         assert_eq!(text2, " world");
+    }
+
+    #[test]
+    fn append_token_into_takes_the_text_only_into_a_buffer_with_no_allocation() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let mut seq = Sequence::new(tokenizer);
+
+        // A fresh string has nothing to keep: the step's text is taken as it is.
+        let mut fresh = String::new();
+        assert!(seq.append_token_into(1, &mut fresh).unwrap());
+        assert_eq!(fresh, "Hello");
+
+        // A cleared buffer kept for reuse keeps its capacity across the
+        // tick's first token.
+        let mut reused = String::with_capacity(256);
+        reused.clear();
+        assert!(seq.append_token_into(2, &mut reused).unwrap());
+        assert_eq!(reused, " world");
+        assert!(reused.capacity() >= 256);
     }
 
     #[test]

@@ -62,9 +62,11 @@ which defines them on a gRPC launcher's parser that lacks them: `vllm serve
 --grpc` and the stock `python -m vllm.entrypoints.grpc_server` (there the
 values also reach a servicer built without the namespace, through the
 environment). A flag left out falls back to the matching `SMG_VLLM_MM_*`
-variable, which logs a deprecation line on a launcher that has the flag; a
-launcher without the flags (no plugins loaded, a servicer built on its own)
-takes the variable as its documented setting and logs nothing. The startup
+variable. Legacy variables log a deprecation line on a launcher that has the
+flag; the TurboJPEG policy and download timeout variables remain supported
+fallbacks and never log a deprecation warning. A launcher without the flags
+(no plugins loaded, a servicer built on its own) takes the variable as its
+documented setting and logs nothing. The startup
 line `VllmEngineServicer initialized (mm_processor=inprocess, source=flag)` and
 the `mm_processor_source` label name where the value came from.
 
@@ -115,6 +117,25 @@ owner, which the router relays as a 400 `start_generation_failed`. With the
 defaults a 50 MB item clears the router and stops at the worker's 32 MiB, so
 that flag is the one to raise; the router's `--max-payload-size` (default
 512 MiB) must also hold the whole request body.
+
+Media URL download budgets can be set with `--mm-fetch-timeout-ms` (images
+and audio, default **10000**) and `--mm-video-fetch-timeout-ms` (video,
+default **30000**). Both take positive integer milliseconds and cover the
+fetch from connection through the last byte, not decoding or inference.
+Set them on the process that downloads the media:
+
+- **Router preprocessing** (shared by vLLM, SGLang and TokenSpeed): the Rust
+  and Python router CLIs accept both flags, with environment fallbacks
+  `SMG_MM_FETCH_TIMEOUT_MS` and `SMG_MM_VIDEO_FETCH_TIMEOUT_MS`.
+- **vLLM Rust worker**, `--servicer-impl rust --mm-processor smg`: the same
+  flags use `SMG_VLLM_MM_FETCH_TIMEOUT_MS` and
+  `SMG_VLLM_MM_VIDEO_FETCH_TIMEOUT_MS` as environment fallbacks.
+
+An explicit flag takes precedence over its environment variable. Unset
+values retain the defaults above. These settings do not change downloads
+performed by vLLM's own `inprocess` or `redis` processors; configure those
+through the engine's media loader settings. SGLang and TokenSpeed currently
+use the Router's media pipeline, so set the budgets on the Router for them.
 
 On the router side, `--mm-processing` selects `auto` (default: forward when
 every registered worker of the model advertises `mm_processor` and the model's
@@ -380,27 +401,44 @@ engine's own settings bound the hold, and they work only together:
 - `UCX_CUDA_IPC_CACHE=n` in the engine's environment: a mapping ends with its
   transfer instead of staying cached.
 - `kv_connector_extra_config.engine_ttl` (seconds) in `--kv-transfer-config`:
-  how long a peer may stay idle before the connector forgets it (an hour by
-  the connector's default). Forgetting the peer releases its transfer state,
-  the transfers that were in flight when it died included; with the cache
-  off their mappings go with them, with the cache on the mappings outlive the
-  peer either way.
+  a peer idle longer than this is dropped the next time the connector runs
+  its sweep, which it does when it handshakes a new peer and when it sends a
+  heartbeat; an hour by the connector's default. A restarted leg counts as a
+  new peer only for the peers that do not hold its memory: the leg whose
+  memory a peer still holds fails its startup memory check before it
+  handshakes anyone, so its own restart cannot run the sweep that would
+  release it. The heartbeat goes out on a known peer's requests as well, at
+  most once per sixth of the connector's lease (five seconds at its default)
+  while any request is waiting for its KV, so a busy decode runs the sweep
+  every few seconds; the peer a request reads from is stamped active before
+  the sweep, so a pair's own traffic never drops the pair. A single pair
+  whose prefill died sends no heartbeat either; its
+  decode lets go of the dead leg's memory only when another peer turns up or
+  a live peer's requests run the sweep. Dropping the peer releases its
+  transfer state, the transfers that were in flight when it died included;
+  with the cache off their mappings go with them, with the cache on the
+  mappings outlive the peer either way.
 
 Neither is free, which is why the servicer does not set them for you. With
 the cache off, every request's transfer opens and closes each of the peer's
 allocations it touches (about one per layer, the way the engine allocates its
-KV cache): a first-token cost worth measuring on a latency-sensitive same-host
-pair. With a short TTL, a healthy pair that was idle longer than the TTL pays
-a full handshake on its next request (the peer's metadata plus a descriptor
-list over every one of its KV blocks: seconds on a large cache), and with P
-prefill legs a decode leg sees each one P times less often than it sees
-requests. Legs on different hosts are not affected: over TCP or RDMA nothing
-of the peer's memory is imported, and a restart passes the memory check at
-once. The repository's end-to-end harness runs its NIXL pairs with the cache
-off and a TTL of 3 s because it restarts legs on purpose; a production pair
-on one host wants a TTL of a few minutes, long enough that no busy pair idles
-through it, short enough that a crashed leg restarts within the pod's own
-back-off instead of an hour.
+KV cache). Measured on one host, two tensor-parallel-2 legs over CUDA IPC,
+prompts of about 5100 tokens, 40 sequential requests per arm: the first token
+came 2 % later at the median (885 to 903 ms) and 5 % later at the 90th
+percentile (900 to 943 ms), with one three-second outlier in forty, in the
+cache-off arm. A short TTL costs a quiet pair nothing by itself, since the
+sweep runs only when a new peer turns up or a heartbeat goes out on a
+request; when either happens, a healthy pair that had been idle longer than
+the TTL (other than the pair whose own request ran the sweep) is dropped
+with the dead ones and runs its handshake again on its next request (the
+peer's metadata plus a descriptor list over every one of its KV blocks:
+seconds on a large cache). Legs on different hosts are not
+affected: over TCP or RDMA nothing of the peer's memory is imported, and a
+restart passes the memory check at once. The repository's end-to-end harness
+runs its NIXL pairs with the cache off and a TTL of 3 s because it restarts
+legs on purpose; a production pair on one host wants a TTL of a few minutes,
+longer than any gap a busy pair leaves, shorter than the restart back-off a
+crashed leg would otherwise sit through.
 
 ##### Planned warm-up before SERVING (`SMG_VLLM_SERVICER_WARMUP`)
 
@@ -416,23 +454,34 @@ warm-up over the engine before they report SERVING: a decode staircase (as
 many concurrent requests as the running window holds, each asking for one more
 token than the last, so every running-batch size runs once), a prefill ladder
 (one request per 128-token length class up to `--max-num-batched-tokens`, the
-graph-capture sizes, lengths one above the tuners' bucket grid), and a second
-pass over the bucket grid whose timings show what the first pass paid. Every
+graph-capture sizes, lengths one above the tuners' bucket grid), a second
+pass over the bucket grid whose timings show what the first pass paid, and,
+where the engine's module asks for it (TokenSpeed, below), every remaining
+prompt length up to the step, last, in an order whose every prefix is a
+uniform spread of the range, so a budget cut leaves an even coverage. Every
 request carries its own token ids, so prefix caching never hides a prefill,
 and the engine's prefix cache is flushed at the end. One INFO line per shape
-with its time; readiness (the gRPC health service, so the startup and
+with its time (a chunk remainder's at DEBUG, with an INFO progress line every
+500 remainders and one at their end); readiness (the gRPC health service, so the startup and
 readiness probes) stays NOT_SERVING until the pass ran, and flips SERVING
 whatever the pass returned (a failed request is a logged line, never a worker
 kept out of rotation). `SMG_VLLM_SERVICER_WARMUP` = `full` (the default:
 every 128-token class; about a minute on a 16k step), `fast` (the tuners'
 bucket grid only: seconds), `off`, a budget in seconds (`120`) or
-`<level>:<seconds>` (`fast:30`); the budget (default 300 s) bounds the pass:
+`<level>:<seconds>` (`fast:30`); the budget (default 300 s; 900 s for
+TokenSpeed, whose plan holds the chunk remainders, below) bounds the pass:
 it ends between shapes, the remaining ones named in the log, and each
 request's timeout is clamped to what is left of it (one second at least), so
 a shape that hangs cannot hold readiness past the budget. On the Rust path the
 pass runs over the servicer's own gRPC port between the engine's handshake and
-SERVING; the Python servicer runs it over its in-process engine with its
-health service holding NOT_SERVING meanwhile. Under data parallelism every
+SERVING, once the KV-event relay's subscription has reached the engine's
+publisher (the warm-up's batches are the engine's first, and a subscription
+that landed after them would leave the relay's history starting late for the
+engine's life; the relay dials the publisher every second from the servicer's
+start, so the subscription is normally in place before the handshake, and the
+wait is bounded at 30 s with a logged fall-through); the Python servicer runs
+it over its in-process engine with its health service holding NOT_SERVING
+meanwhile. Under data parallelism every
 rank is a scheduler of its own: the plan runs the staircase once per rank and
 every prefill shape on every rank at once, each request pinned to its rank
 (`data_parallel_rank`), so the log's step count is per rank.
@@ -772,10 +821,26 @@ free port), `SMG_TOKENSPEED_SERVICER_DRAIN_SECS` (default 5),
 `SMG_TOKENSPEED_SERVICER_WARMUP` (the planned warm-up before SERVING, as for
 vLLM above: `full` by default, `fast`, `off`, a budget in seconds or
 `<level>:<seconds>`; planned from `--max-num-seqs` and the chunk size or
-`--max-prefill-tokens`; the Python servicer runs the same plan over its own
-port after its first warm-up request, and both skip it on a disaggregation
-role; under attention data parallelism the servicer routes a request by load,
-not by rank, so each prefill shape warms one rank and the log says so),
+`--max-prefill-tokens`; at the `full` level this engine's plan also visits
+every prompt length up to the chunk size the class ladder leaves out, last,
+in an order whose every prefix is a uniform spread (`fast` plans the classes
+alone and leaves the hazard below open, which the start log says): a chunked prefill's last chunk is any count
+below the chunk size, a prefill chunk reaches two cuBLAS GEMMs here (the
+compressor's fp32 router projection above 32 tokens, the grouped output
+projection's batched GEMM) whose kernels the library picks per token count
+and loads on first use, and such a first use during serving, with the
+overlapped previous chunk's TP collective in flight, has deadlocked the
+forward; at a 4,096-token chunk that is 4,042 one-token requests after the
+ladder's 54, about 0.17 s each on a four-GPU node (692 s measured for the
+whole pass, inside this engine's 900 s default budget; with no chunk size set
+the engine's default step of 8,192 tokens gives about 8,140 remainders, about
+1,380 s, which the budget cuts about halfway, evenly: set a chunk size or a
+larger budget to cover every count); the Python servicer runs the same plan
+over its own port after its first warm-up request, and both skip it on a
+disaggregation role; under attention data parallelism the servicer routes a
+request by load, not by rank, so each prefill shape, the chunk remainders
+included, warms one rank and the log says so: there the remainder hazard
+stays open on the ranks a count did not reach until the wire can pin a rank),
 `SMG_TOKENSPEED_SERVICER_STARTUP_TIMEOUT_SECS` (default 1800) and
 `SMG_TOKENSPEED_SERVICER_STARTUP_CEILING_SECS` (default 14400; the two startup
 bounds as for vLLM above: the launcher reports the scheduler process alive each
@@ -939,7 +1004,11 @@ port ranges if multiple DP ranks publish events. The Rust servicer's relay
 uses the same replay endpoint (the vLLM, SGLang and TokenSpeed launchers all
 pass `replay_endpoint` from the engine's kv-events config) for gaps in flight
 and for the batches published before its subscription joined the publisher;
-without one those are counted as lost or unknown, never silently skipped.
+without one those are counted as lost or unknown, never silently skipped. The
+relay dials the publisher every second from the servicer's start, so its
+subscription lands within a second of the engine binding the socket, and the
+launcher starts its planned warm-up only after that, so the warm-up's batches
+(the engine's first) are the first the relay's history records.
 
 Without replay, or when history is expired, empty, malformed, or unavailable
 (timeout: five seconds), the bridge reports `OUT_OF_RANGE` before streaming or

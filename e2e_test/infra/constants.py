@@ -455,7 +455,19 @@ BRAVE_MCP_URL = f"http://{host_port(BRAVE_MCP_HOST, BRAVE_MCP_PORT)}/mcp"
 MOCK_MCP_HOST = DEFAULT_HOST
 
 # Timeouts (seconds)
-DEFAULT_STARTUP_TIMEOUT = 300
+# A worker's start-up wait covers two phases before its health reads SERVING:
+# the engine's own start (model load, graph capture, its kernel warm-ups) and
+# the servicer's planned warm-up (smg_grpc_servicer.warmup), which holds the
+# health until it ran and is bounded by its own budget, 300 s unless
+# SMG_<ENGINE>_SERVICER_WARMUP says otherwise. The default bound is the sum, so
+# a model whose engine start alone fit the old 300 s is not failed by the
+# warm-up that now follows it (a 20B MoE on a slower accelerator took 2:36 of
+# engine start and 2:45 of warm-up). A model's spec raises it further, and
+# replaces it: such a spec is sized the same way, its engine's start plus the
+# budget (``model_specs``, pinned by a test).
+ENGINE_START_SECS = 300
+SERVICER_WARMUP_BUDGET_SECS = 300  # smg_grpc_servicer.warmup.DEFAULT_BUDGET_SECS, pinned by a test
+DEFAULT_STARTUP_TIMEOUT = ENGINE_START_SECS + SERVICER_WARMUP_BUDGET_SECS
 DEFAULT_ROUTER_TIMEOUT = 60
 HEALTH_CHECK_INTERVAL = 2  # Check every 2s (was 5s)
 

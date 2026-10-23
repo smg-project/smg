@@ -46,7 +46,9 @@ pub use huggingface::HuggingFaceTokenizer;
 pub use mock::MockTokenizer;
 pub use registry::{LoadError, LoadOutcome, TokenizerRegistry};
 pub use sequence::Sequence;
-pub use stop::{SequenceDecoderOutput, StopSequenceConfig, StopSequenceDecoder};
+pub use stop::{
+    SequenceDecoderOutput, SequenceDecoderStep, StopSequenceConfig, StopSequenceDecoder,
+};
 pub use stream::DecodeStream;
 pub use tiktoken::{TiktokenModel, TiktokenTokenizer};
 pub use traits::{
@@ -75,7 +77,7 @@ impl Tokenizer {
         )?))
     }
 
-    /// Create a tokenizer from an Arc<dyn Tokenizer>
+    /// Create a tokenizer from an `Arc<dyn Tokenizer>`
     pub fn from_arc(tokenizer: Arc<dyn traits::Tokenizer>) -> Self {
         Tokenizer(tokenizer)
     }

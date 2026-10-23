@@ -53,6 +53,15 @@
 //!   `none`. The response's `x-smg-parser` header says `legacy` for the same request; the
 //!   counter says how often, and why, across a deployment.
 //!
+//! And, after an output was read, what the response could not carry:
+//!
+//! - `refused`: a whole Messages response whose `tool_use` block cannot carry the arguments the
+//!   model wrote (JSON no `input` value holds): the request answers with an error, the output
+//!   keeps whatever count the read gave it (`clean`; `unknown_tool` or `malformed` when an
+//!   undeclared call or a malformed run came beside the refused call), and the refusal is counted
+//!   once by its reason under the table ([`record_refused`]): this series is the fold's, a subset
+//!   of no outcome, so a sum over the outcomes still reads the table's reading.
+//!
 //! Cost: a clean output records one counter increment through a key built once per table (the
 //! `metrics` macros build a key, with a `Vec` of labels, on every call), no allocation. A
 //! malformed one adds a histogram observation, the per-reason counters, and, when the table's
@@ -64,7 +73,8 @@
 //! access to it; the undeclared name on the `unknown_tool` line is the one exception, an
 //! identifier where a declared name was expected. Suppressed calls are counted and write no line.
 //! A request the legacy parsers read under Symphony records one counter increment, through a key
-//! built once per reason and table, and nothing where a table reads.
+//! built once per reason and table, and nothing where a table reads. A refused message records
+//! one, through the table's key built once.
 
 use std::{
     sync::{
@@ -94,6 +104,10 @@ pub(crate) const CALLS_SUPPRESSED: &str = "smg_symphony_calls_suppressed_total";
 /// Requests Symphony was configured for that the legacy parsers read, by `reason` and `table`
 /// ([`record_fallback`]).
 pub(crate) const FALLBACK: &str = "smg_symphony_fallback_total";
+/// Whole Messages responses refused after the output was read (counted under its own outcome),
+/// by `table` and `reason` ([`record_refused`]): `tool_use_input`, a `tool_use` block that cannot
+/// carry the arguments the model wrote.
+pub(crate) const REFUSED: &str = "smg_symphony_refused_total";
 /// The buckets of [`MALFORMED_BYTES`]: a marker's worth to a whole answer.
 pub(crate) const MALFORMED_BYTES_BUCKETS: [f64; 9] = [
     1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0,
@@ -111,7 +125,7 @@ const NO_TABLE: &str = "none";
 /// (`MalformedReason`, in its order, each under the crate's own spelling of it), so a dashboard
 /// tells a stray tag from a call written in the wrong syntax without the sampled line, and
 /// `other` for a reason this build does not know (the crate's enum is non-exhaustive).
-const REASONS: [&str; 30] = [
+const REASONS: [&str; 31] = [
     "unterminated_region",
     "invalid_arguments",
     "unknown_tool",
@@ -141,6 +155,7 @@ const REASONS: [&str; 30] = [
     "no_forced_function",
     "marker_out_of_place",
     "open_at_the_stop",
+    "open_at_the_marker",
     "other",
 ];
 /// The place of `other` in [`REASONS`]: a reason the match below does not know.
@@ -156,6 +171,8 @@ const FALLBACK_REASONS: [&str; 5] = [
     "passthrough",
     "forced_call_without_tag",
 ];
+/// The `reason` label of [`REFUSED`]: the one refusal the Messages fold names.
+const REFUSED_TOOL_USE_INPUT: &str = "tool_use_input";
 const CLEAN: usize = 0;
 const MALFORMED_OUTCOME: usize = 1;
 const FAILED: usize = 2;
@@ -214,6 +231,7 @@ fn reason_index(why: MalformedReason) -> usize {
         MalformedReason::NoForcedFunction => 26,
         MalformedReason::MarkerOutOfPlace => 27,
         MalformedReason::OpenAtTheStop => 28,
+        MalformedReason::OpenAtTheMarker => 29,
         _ => OTHER_REASON,
     }
 }
@@ -376,7 +394,8 @@ impl Tally {
                     self.announced = true;
                 }
             }
-            // The bytes of a call block a syntax refused (the keyed one): they are the malformed
+            // The bytes of a call block a syntax refused (the keyed one, the attributed one inside
+            // an invoke): they are the malformed
             // run's, announced by the event of no bytes right before them, so the histogram and
             // the line still say how much of the answer was debris. At a cut call's end the bytes
             // held come before the event (`tagged::end_cut_call`): they count, and the run keeps
@@ -628,9 +647,18 @@ impl Tally {
     }
 }
 
-/// Records an output the table refused (`ParseError`): the request fails with it.
+/// Records an output the reader could not read whole, which the request fails with: the table
+/// refused it (`ParseError`), or the decoder refused a token or the text it held (the reader's
+/// `failed`).
 pub(crate) fn record_failed(table: &'static str) {
     increment(&series(table).outputs[FAILED], 1);
+}
+
+/// Records a whole Messages response refused after its output was read under `table`: its
+/// `tool_use` block cannot carry the arguments the model wrote. The output's own count stands,
+/// whatever outcome the read gave it; this one is the fold's, by its reason.
+pub(crate) fn record_refused(table: &'static str) {
+    increment(&series(table).refused, 1);
 }
 
 /// Records a request Symphony was configured for that the legacy parsers read, for `why`: under
@@ -668,6 +696,8 @@ struct Series {
     /// [`FALLBACK`] by reason, in the order of [`FALLBACK_REASONS`]: the series of the table
     /// that had no tag for a forced call, or of `none`, under which the other reasons count.
     fallback: [Key; 5],
+    /// [`REFUSED`] under its one reason.
+    refused: Key,
     /// The bucket of the lines on malformed outputs.
     sampler: Sampler,
     /// The bucket of the lines on empty outputs: their own, so a steady flow of empty outputs (a
@@ -697,6 +727,7 @@ impl Series {
             malformed_bytes: key(MALFORMED_BYTES, &[]),
             calls_suppressed: key(CALLS_SUPPRESSED, &[]),
             fallback: FALLBACK_REASONS.map(|reason| key(FALLBACK, &[("reason", reason)])),
+            refused: key(REFUSED, &[("reason", REFUSED_TOOL_USE_INPUT)]),
             sampler: Sampler::new(),
             empty_lines: Sampler::new(),
             unknown_tool_lines: Sampler::new(),
@@ -1325,6 +1356,19 @@ mod tests {
         let line = line_with(&scrape, OUTPUTS, &["table=\"qwen3\"", "outcome=\"failed\""])
             .expect("the outputs counter");
         assert!(line.ends_with(" 1"), "{line}");
+    }
+
+    #[test]
+    fn a_refused_message_is_counted_by_its_reason_and_not_as_an_output() {
+        let scrape = rendered(|| record_refused("qwen3"));
+        let line = line_with(
+            &scrape,
+            REFUSED,
+            &["table=\"qwen3\"", "reason=\"tool_use_input\""],
+        )
+        .expect("the refused counter");
+        assert!(line.ends_with(" 1"), "{line}");
+        assert!(!scrape.contains(OUTPUTS), "{scrape}");
     }
 
     #[tracing_test::traced_test]

@@ -26,7 +26,11 @@ Two modes:
 **gRPC** (TokenSpeed scheduler — the gateway tokenizes, the worker speaks token
 ids): `HealthCheck`, `GetModelInfo`, `GetServerInfo`, `Generate` (streamed
 chunks + complete), `GetLoads`, `Abort`, and (realistic mode only)
-`SubscribeKvEvents`; other admin RPCs return `unimplemented`.
+`SubscribeKvEvents`; other admin RPCs return `unimplemented`. Beside the
+scheduler service the server hosts the standard `grpc.health.v1` service
+(`Check`, `Watch`): the empty name and the scheduler service are SERVING
+exactly when `HealthCheck` answers healthy (`POST /admin/serving/{port}` flips
+both), any other name is unknown.
 
 **ZMQ** (`--zmq-handshake <ipc://…> --zmq-count N [--zmq-start-index I]`):
 mock vLLM `EngineCore` ranks on the `engine-zmq-client` wire. Unlike the HTTP

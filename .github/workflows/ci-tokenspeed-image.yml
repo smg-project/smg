@@ -1,7 +1,8 @@
 name: CI TokenSpeed Image
 
-# Publishes a runner-matched carrier tagged by the TokenSpeed nightly date.
-# Jobs still upgrade nightly wheels and validate their FlashInfer artifacts.
+# Publishes a runner-matched carrier tagged by the pinned TokenSpeed nightly's
+# date. Jobs install that pin (a no-op on the carrier) and validate their
+# FlashInfer artifacts.
 
 on:
   schedule:
@@ -10,10 +11,12 @@ on:
     branches: [main]
     paths:
       - '.github/versions/tokenspeed.ref'
+      - '.github/versions/tokenspeed-nightly.txt'
       - 'docker/ci-tokenspeed.Dockerfile'
       - 'scripts/ci_apt_mirror.sh'
       - 'scripts/ci_ensure_python_headers.sh'
       - 'scripts/ci_install_tokenspeed.sh'
+      - 'scripts/ci_tokenspeed_scheduler_pin.py'
       - 'scripts/ci_install_flashinfer.py'
       - 'scripts/ci_retry.sh'
       - 'scripts/ci_setup_python_venv.sh'
@@ -75,7 +78,10 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Rebuild on tooling changes even when today's nightly already exists.
+      # A push to `main` that touches a listed path rebuilds the pinned tag in
+      # place (`no-cache`), so the carrier behind the pin moves with the tooling;
+      # a rebuild only when the tag is missing or forced (or an input-hash tag)
+      # is owed, with the carrier's unbounded dependencies pinned.
       - name: Check for existing image
         id: exists
         env:

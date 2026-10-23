@@ -23,6 +23,11 @@ own scheduler, and routes a request that names a ``data_parallel_rank`` to
 that rank (the Rust server over its wire, the in-process engine client by the
 same argument): the plan carries the rank count and pins every request, so
 every rank runs every shape, and the log's count is per rank.
+
+The plan keeps to the length classes (:attr:`WarmupInputs.every_prefill_length`
+stays off): the first use of a prefill length between two classes has only
+cost this engine a kernel search, never a hang, and at its default step of
+16,384 tokens a pass over every length would take an hour.
 """
 
 from __future__ import annotations
@@ -117,7 +122,12 @@ class GrpcWire:
         from smg_grpc_proto.generated import common_pb2
 
         response = self._stub.FlushCache(common_pb2.FlushCacheRequest(), timeout=60)
-        return bool(getattr(response, "success", True))
+        success = bool(getattr(response, "success", True))
+        if not success and (message := str(getattr(response, "message", "") or "")):
+            # The servicer answered the refusal with its reason: raised, the
+            # warm-up's end line carries the words as it does for a raised status.
+            raise RuntimeError(message)
+        return success
 
     def close(self) -> None:
         if self._owns_channel:

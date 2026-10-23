@@ -737,7 +737,11 @@ struct Admitted {
 /// A rank that shows only sliding-window groups (a window-only model) would
 /// otherwise give the gateway nothing: its window stores are forwarded with
 /// their group identity, the hashes aligned to the tail of the tokens, and
-/// counted ([`Counts::window_only_stores`]).
+/// counted ([`Counts::window_only_stores`]). The groups are learned for the
+/// rank's life: an `AllBlocksCleared` empties the block records, not them,
+/// so the stores that share a batch with the clear (an engine that resets
+/// its prefix cache and stores the next prompt in one step) are judged
+/// like every other step's.
 #[derive(Default)]
 pub struct Normalizer {
     ranks: HashMap<i32, RankState>,
@@ -928,7 +932,18 @@ impl Normalizer {
                 if is_residency_agent(ownership.as_deref()) {
                     return Err(self.drop(DropReason::UnsupportedOwnership, event_id));
                 }
-                self.ranks.remove(&rank);
+                // The cache is empty: the block records go, and the hashes
+                // forwarded while the rank was window-only with them. The
+                // groups stay: they describe the model, not the cache, and
+                // the stores that share this batch with the clear (an engine
+                // resets its prefix cache and stores the next prompt in one
+                // step) are judged under them, so the window groups' copies
+                // of the prompt are dropped as on every other step instead
+                // of forwarded as window-only ahead of the main group's.
+                if let Some(state) = self.ranks.get_mut(&rank) {
+                    state.tiers.clear();
+                    state.window_forwarded.clear();
+                }
                 self.counts.forwarded_cleared += 1;
                 kv_cache_event::Data::Cleared(common::KvCacheCleared { ownership })
             }
@@ -1632,6 +1647,120 @@ mod tests {
         assert_eq!(
             stored(&batches[0].events[1]).kv_cache_spec_kind.as_deref(),
             Some("mla_attention")
+        );
+    }
+
+    /// An engine that resets its prefix cache and stores the next prompt in
+    /// one step publishes the clear and the stores in one batch, the window
+    /// groups' stores ahead of the main group's. The clear empties the block
+    /// records but not the groups, so the window stores are dropped as on
+    /// every other step and the main group's store is forwarded whole; the
+    /// records cleared, the prompt's blocks are new, not duplicates.
+    #[test]
+    fn a_clear_in_the_batch_keeps_the_learned_groups() {
+        let window = |hashes: &[i64], tokens: &[u32]| {
+            let event = with(store(hashes, None, tokens), "group_idx", json!(1));
+            let event = with(event, "kv_cache_spec_kind", json!("sliding_window"));
+            with(event, "kv_cache_spec_sliding_window", json!(8))
+        };
+        let prompt: Vec<u32> = (1..=12).collect();
+        let (batches, normalizer) = normalize_all(vec![
+            // The groups are learned on the first step.
+            one(vec![
+                window(&[1], &[1, 2, 3, 4]),
+                store(&[1], None, &[1, 2, 3, 4]),
+            ]),
+            // The reset and the next prompt in one step: the window group
+            // names the prompt's last two blocks, the main group all three.
+            one(vec![
+                json!({"type": "AllBlocksCleared"}),
+                window(&[2, 3], &prompt),
+                store(&[1, 2, 3], None, &prompt),
+            ]),
+            // The step after is judged the same way.
+            one(vec![
+                window(&[4], &[13, 14, 15, 16]),
+                store(&[4], Some(3), &[13, 14, 15, 16]),
+            ]),
+        ]);
+        assert_eq!(batches[0].events.len(), 1);
+        assert_eq!(batches[1].events.len(), 2, "{:?}", batches[1].events);
+        assert!(matches!(
+            batches[1].events[0].data,
+            Some(kv_cache_event::Data::Cleared(_))
+        ));
+        let prompt_store = stored(&batches[1].events[1]);
+        assert_eq!(
+            prompt_store
+                .blocks
+                .iter()
+                .map(|block| block.block_hash)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(prompt_store.group_idx, Some(0));
+        assert_eq!(batches[2].events.len(), 1);
+        let counts = normalizer.counts();
+        assert_eq!(counts.dropped(DropReason::NonMainAttentionGroup), 3);
+        assert_eq!(counts.window_only_stores, 0);
+        assert_eq!(counts.forwarded_stored, 3);
+        assert_eq!(
+            counts.duplicate_stores, 0,
+            "block 1 was stored again after the clear: a new block, not a resend"
+        );
+    }
+
+    /// The relay's record of the reset step, as a snapshot hands it to a
+    /// subscriber that joins afterwards: the whole prompt as one run under
+    /// the main group, nothing under the window group. (Recorded under the
+    /// window group, the blocks the window named would be left out of the
+    /// main group's run and skipped by the gateway as non-main: a fresh
+    /// subscriber would score the prompt's first blocks only.)
+    #[test]
+    fn a_snapshot_after_a_reset_step_holds_the_prompt_under_the_main_group() {
+        use crate::kv_state::{LiveState, SnapshotChunks};
+
+        let window = |hashes: &[i64], tokens: &[u32]| {
+            let event = with(store(hashes, None, tokens), "group_idx", json!(1));
+            let event = with(event, "kv_cache_spec_kind", json!("sliding_window"));
+            with(event, "kv_cache_spec_sliding_window", json!(8))
+        };
+        let prompt: Vec<u32> = (1..=24).collect();
+        let (batches, _) = normalize_all(vec![
+            one(vec![
+                window(&[9], &[1, 2, 3, 4]),
+                store(&[9], None, &[1, 2, 3, 4]),
+            ]),
+            one(vec![
+                json!({"type": "AllBlocksCleared"}),
+                window(&[5, 6], &prompt),
+                store(&[1, 2, 3, 4, 5, 6], None, &prompt),
+            ]),
+        ]);
+        let mut state = LiveState::new();
+        for batch in &batches {
+            state.apply(batch);
+        }
+        let chunks: Vec<common::KvEventBatch> =
+            SnapshotChunks::at(state.snapshot(), 1, 2.0, 0).collect();
+        assert_eq!(chunks.len(), 1);
+        let chunk = &chunks[0];
+        assert_eq!(chunk.snapshot.as_ref().map(|marker| marker.blocks), Some(6));
+        assert!(matches!(
+            chunk.events[0].data,
+            Some(kv_cache_event::Data::Cleared(_))
+        ));
+        assert_eq!(chunk.events.len(), 2, "{:?}", chunk.events);
+        let run = stored(&chunk.events[1]);
+        assert_eq!(run.parent_block_hash, None);
+        assert_eq!(run.group_idx, Some(0));
+        assert_eq!(run.kv_cache_spec_kind.as_deref(), Some("full_attention"));
+        assert_eq!(
+            run.blocks
+                .iter()
+                .map(|block| block.block_hash)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5, 6]
         );
     }
 

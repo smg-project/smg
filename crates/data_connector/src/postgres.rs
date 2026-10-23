@@ -870,7 +870,7 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             params.push(val);
         }
 
-        let sql = insert_sql(&table, &col_names);
+        let sql = insert_if_absent_sql(&table, &col_names);
 
         let client = self
             .store
@@ -878,9 +878,22 @@ impl ConversationItemStorage for PostgresConversationItemStorage {
             .get()
             .await
             .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
-        execute_cached(&client, &sql, &params)
+        let inserted = execute_cached(&client, &sql, &params)
             .await
             .map_err(ConversationItemStorageError::from_pg)?;
+        drop(client);
+        if inserted == 0 {
+            // The row under the id stands: the item is the stored one (the
+            // contract of [`ConversationItemStorage::create_item`]). No row
+            // under it means another unique constraint of the table refused
+            // the insert.
+            return self.get_item(&id).await?.ok_or_else(|| {
+                ConversationItemStorageError::StorageError(format!(
+                    "item {} was not stored: the insert was refused by a unique constraint other than the id's",
+                    id.0
+                ))
+            });
+        }
         Ok(ConversationItem {
             id,
             response_id,
@@ -1558,6 +1571,15 @@ fn insert_sql(table: &str, col_names: &[&str]) -> String {
         col_names.join(", "),
         param_placeholders(col_names.len())
     )
+}
+
+/// `INSERT ... ON CONFLICT DO NOTHING`: the row is inserted, or left as it
+/// is when a unique constraint already holds one (the id's primary key on the
+/// table the store creates). No conflict target, so the statement needs no
+/// index: a configured table that pre-exists without the key inserts as
+/// before. The caller reads the affected count: 0 means a row stands.
+fn insert_if_absent_sql(table: &str, col_names: &[&str]) -> String {
+    format!("{} ON CONFLICT DO NOTHING", insert_sql(table, col_names))
 }
 
 /// The conversation-item link table, qualified, with its conversation and
@@ -2359,6 +2381,15 @@ mod tests {
         assert_eq!(
             update_if_open_sql("r", &["response_key", "input"], None),
             "UPDATE r SET response_key = $1, input = $2 WHERE response_key = $1"
+        );
+    }
+
+    #[test]
+    fn insert_if_absent_sql_leaves_a_stored_row_as_it_is() {
+        assert_eq!(
+            insert_if_absent_sql("conversation_items", &["id", "item_type", "content"]),
+            "INSERT INTO conversation_items (id, item_type, content) VALUES ($1, $2, $3) \
+             ON CONFLICT DO NOTHING"
         );
     }
 

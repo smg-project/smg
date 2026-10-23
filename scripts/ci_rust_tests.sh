@@ -68,7 +68,8 @@ shard_row() {
 # The packages a shard tests (static: no cargo needed).
 packages_of() {
     case "$1" in
-        gateway-unit|gateway-[0-9]*) echo smg ;;
+        gateway-unit) echo smg smg-test-harness ;;
+        gateway-[0-9]*) echo smg ;;
         bindings)   echo smg-python smg-golang ;;
         tokenizer)  echo llm-tokenizer ;;
         multimodal) echo llm-multimodal ;;
@@ -143,7 +144,12 @@ commands_of() {
     local shard=$1
     case "$shard" in
         gateway-unit)
-            echo "-p smg --lib --bins"
+            # The lib's unit tests and the smg binary's. The alias binary amg is the same
+            # source (its manifest entry says test = false); an explicit --bins would build
+            # and run its harness anyway, so the binary is named.
+            # One invocation for both packages: on its own, the harness's `-p` would unify the gateway
+            # down to the harness's feature set and build the gateway lib a second time.
+            echo "-p smg -p smg-test-harness --lib --bin smg"
             echo "-p smg --doc" ;;
         gateway-[0-9]*)
             local index=${shard#gateway-} selectors
@@ -164,7 +170,7 @@ commands_of() {
         agentic)
             echo "-p data-connector -p smg-mcp -p smg-wasm -p wfaas --features smg-wasm/storage-hooks"
             # Opt-in (#[ignore]) cases against the database the workflow creates for the job.
-            echo "-p data-connector --test postgres_integration :: --ignored --test-threads=1" ;;
+            echo "-p data-connector --test postgres_integration --test conformance :: --ignored --test-threads=1" ;;
         protocols)
             echo "-p openai-protocol -p smg-external-router -p smg-auth -p smg-rl -p smg-client -p openapi-gen --features openai-protocol/axum,smg-external-router/openai,smg-external-router/anthropic,smg-external-router/gemini" ;;
         engine)
