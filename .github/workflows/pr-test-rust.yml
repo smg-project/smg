@@ -987,6 +987,7 @@ jobs:
               ("scripts/ci_agentic_svc_deps.sh",                 "agentic vendor"),
               ("scripts/oracle_flyway/**",                       "agentic vendor"),
               ("scripts/ci_cargo_audit.sh",                      NONE),
+              ("scripts/ci_rust_tests.sh",                       NONE),
               ("scripts/ci_gpu_runner_image.py",                 NONE),
               ("scripts/ci_node_health.py",                      NONE),
               ("scripts/ci_prune_tokenspeed_images.sh",          NONE),
@@ -1039,6 +1040,7 @@ jobs:
               # request), the workers, the configuration, the registration workflow,
               # the server and the entry points every lane
               ("model_gateway/tests/**",                         NONE),
+              ("model_gateway/test_harness/**",                  NONE),
               ("model_gateway/benches/**",                       NONE),
               ("model_gateway/src/endpoints/responses/**",       "agentic vendor"),
               ("model_gateway/src/endpoints/conversations/**",   "agentic vendor"),
