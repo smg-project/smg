@@ -38,6 +38,7 @@ jobs:
       PYTHONPATH: e2e_test
       SHOW_WORKER_LOGS: '0'
       SHOW_ROUTER_LOGS: '1'
+      SPT_NOENV: '1'
       E2E_LOG_DIR: e2e-logs
       PYTEST_ADDOPTS: ''
       PIP_RETRIES: '0'

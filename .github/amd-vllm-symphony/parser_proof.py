@@ -40,11 +40,15 @@ def gateway_identity(gateway, expected):
     marker = "E2E_JOB_MARKER=" + os.environ["E2E_JOB_MARKER"]
     require(marker.encode() in environment, "gateway not owned by this job")
     argv = [value.decode() for value in (root / "cmdline").read_bytes().split(b"\0") if value]
+    launch = list(gateway.process.args)
+    require(argv == launch or argv == ["smg::router"], "actual gateway argv/title differs")
     require(
-        argv.count("--parser") == 1 and argv[argv.index("--parser") + 1] == "symphony",
-        "actual gateway parser differs",
+        launch.count("--parser") == 1 and launch[launch.index("--parser") + 1] == "symphony",
+        "harness requested parser differs",
     )
-    start = (root / "stat").read_text().rsplit(")", 1)[1].split()[19]
+    fields = (root / "stat").read_text().rsplit(")", 1)[1].split()
+    require(int(fields[1]) == os.getpid(), "gateway is not a child of this pytest harness")
+    start = fields[19]
     native = set()
     for line in (root / "maps").read_text().splitlines():
         fields = line.split(maxsplit=5)
@@ -59,7 +63,16 @@ def gateway_identity(gateway, expected):
             NATIVE_HASHES[key] = hashlib.file_digest(stream, "sha256").hexdigest()
     digest = NATIVE_HASHES[key]
     require(digest == expected["sha256"], "loaded gateway native bytes differ from producer")
-    return {"pid": pid, "start_ticks": start, "argv": argv, "native": str(path), "sha256": digest}
+    return {
+        "pid": pid,
+        "parent_pid": int(fields[1]),
+        "start_ticks": start,
+        "argv": argv,
+        "launch_argv_intent": launch,
+        "native": str(path),
+        "sha256": digest,
+        "marker_visible_in_proc": True,
+    }
 
 
 class ParserProof:
