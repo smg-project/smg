@@ -2,8 +2,8 @@
 //! segments a request's tensors ride in (write, reserve, name, probe and
 //! sweep), the handles collected from a request so the segments are unlinked
 //! once the engine has read them, and the request-finish paths that do the
-//! unlinking. Moved out of `proto_wrapper.rs` as is; the timing wrapper the
-//! payload builder reads stays beside it in the parent.
+//! unlinking. Moved out of `proto_wrapper.rs` as is; the timing wrapper and
+//! the payload builder that reads it live in the multimodal module.
 
 use std::{
     collections::HashMap,
