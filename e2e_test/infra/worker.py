@@ -160,6 +160,10 @@ class Worker:
     # The launcher's process group, from its spawn to the end of ``stop``: what
     # is reaped and waited for when the launcher itself is already gone.
     _pgid: int | None = field(default=None, repr=False)
+    # Set by ``stop``, cleared by ``start``: the teardown (the reaping, the log
+    # handle, the ports) runs once per start, and once for a worker that never
+    # started; a second ``stop`` finds nothing to do.
+    _torn_down: bool = field(default=False, repr=False)
     _moriio_ports: list[int] = field(default_factory=list, repr=False)
 
     @property
@@ -205,6 +209,8 @@ class Worker:
             wait_ready: If True, block until the worker passes health checks.
                 If False, spawn the process and return immediately.
         """
+        # Every start arms its teardown, before anything is built or spawned for it.
+        self._torn_down = False
         cmd = self._build_cmd()
         env = self._build_env()
 
@@ -279,7 +285,8 @@ class Worker:
         )
 
     def stop(self) -> None:
-        """Terminate the worker and reap everything it started.
+        """Terminate the worker and reap everything it started, then release
+        what the harness holds for it: the log handle and the reserved ports.
 
         Also the teardown after the launcher exited on its own (its engine
         died under it, or :meth:`kill_engine` took the engine away): the
@@ -287,32 +294,44 @@ class Worker:
         their device contexts, and a replacement started on the same GPUs
         inside that window fails its startup memory check against the old
         allocation. So the group and the memory are waited for whether the
-        launcher is alive or gone, once per start.
+        launcher is alive or gone, once per start. A worker that never
+        spawned (its launch failed before the spawn) has nothing to wait for;
+        its log handle and its ports are released all the same, so a restart
+        opens one log file and the port pool keeps its size. A second call
+        finds nothing to do.
         """
-        if self.process is None or (self._pgid is None and self.process.poll() is not None):
-            return  # never started, or torn down already
+        if self._torn_down:
+            return
+        self._torn_down = True
+        if self.process is not None and (self._pgid is not None or self.process.poll() is None):
+            self._reap(self.process)
+        self._close_log_file()
+        self._release_ports()
 
-        pid = self.process.pid
+    def _reap(self, process: subprocess.Popen) -> None:
+        """Signal the launcher's group while it is alive, then wait for the
+        group to empty and for the GPU memory to come back (see :meth:`stop`)."""
+        pid = process.pid
         # Workers run in their own session, so the launcher and every engine
         # process share one group, led by the launcher.
         pgid = self._pgid if self._pgid is not None else pid
         self._pgid = None
 
-        if self.process.poll() is None:
+        if process.poll() is None:
             logger.info("Stopping worker %s (PID %d)", self.model_id, pid)
             try:
                 os.killpg(pgid, signal.SIGTERM)
             except (ProcessLookupError, OSError):
-                self.process.terminate()
+                process.terminate()
             try:
-                self.process.wait(timeout=10)
+                process.wait(timeout=10)
             except subprocess.TimeoutExpired:
                 try:
                     os.killpg(pgid, signal.SIGKILL)
                 except (ProcessLookupError, OSError):
-                    self.process.kill()
+                    process.kill()
                 try:
-                    self.process.wait(timeout=5)
+                    process.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     logger.error("Worker PID %d did not die after SIGKILL", pid)
         else:
@@ -320,7 +339,7 @@ class Worker:
                 "Worker %s (PID %d) had exited with %s; reaping what it left behind",
                 self.model_id,
                 pid,
-                self.process.returncode,
+                process.returncode,
             )
 
         # ``process.wait`` only reaps the launcher. The engine's children
@@ -352,7 +371,7 @@ class Worker:
                     gpu_compute_apps(sorted(held)),
                 )
 
-        # Clean up log file
+    def _close_log_file(self) -> None:
         if self._log_file is not None:
             try:
                 self._log_file.close()
@@ -360,7 +379,7 @@ class Worker:
                 pass
             self._log_file = None
 
-        # Release reserved ports
+    def _release_ports(self) -> None:
         from .process_utils import release_port
 
         release_port(self.port)
