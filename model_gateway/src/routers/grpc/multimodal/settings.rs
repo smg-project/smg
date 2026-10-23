@@ -65,12 +65,14 @@ const ENV_ONE_PASS_WIRE: &str = "SMG_MM_ONE_PASS_WIRE";
 /// pipeline on a launcher that does not carry the setting); not a legacy
 /// name either.
 const ENV_TURBOJPEG: &str = "SMG_MM_TURBOJPEG";
+const ENV_FETCH_TIMEOUT_MS: &str = "SMG_MM_FETCH_TIMEOUT_MS";
+const ENV_VIDEO_FETCH_TIMEOUT_MS: &str = "SMG_MM_VIDEO_FETCH_TIMEOUT_MS";
 /// The env settings an unreadable value of which stops start-up ([`strict`]).
 const STRICT_ENV: [&str; 4] = [
     ENV_PROCESSING,
     ENV_TURBOJPEG,
-    "SMG_MM_FETCH_TIMEOUT_MS",
-    "SMG_MM_VIDEO_FETCH_TIMEOUT_MS",
+    ENV_FETCH_TIMEOUT_MS,
+    ENV_VIDEO_FETCH_TIMEOUT_MS,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,8 +129,12 @@ impl Default for MultimodalSettings {
             allow_private_media_hosts: Setting::from_default(false),
             one_pass_wire: Setting::from_default(true),
             turbojpeg: Setting::from_default(TurboJpegPolicy::Prefer),
-            video_fetch_timeout_ms: Setting::from_default(30_000),
-            fetch_timeout_ms: Setting::from_default(10_000),
+            video_fetch_timeout_ms: Setting::from_default(
+                llm_multimodal::media::DEFAULT_VIDEO_FETCH_TIMEOUT.as_millis() as u64,
+            ),
+            fetch_timeout_ms: Setting::from_default(
+                llm_multimodal::media::DEFAULT_FETCH_TIMEOUT.as_millis() as u64,
+            ),
         }
     }
 }
@@ -146,8 +152,8 @@ impl MultimodalSettings {
     /// Every setting is flag > env > default through [`resolve`]; the env
     /// switches share one spelling ([`switch`]; the one that is on by
     /// default reads the off spellings too, [`two_way_switch`]); an
-    /// unreadable `SMG_MM_PROCESSING` or `SMG_MM_TURBOJPEG` stops startup
-    /// ([`strict`]).
+    /// unreadable processing mode, TurboJPEG policy or download budget stops
+    /// startup ([`strict`]).
     /// The reader answers `None` for a variable that is unset and an error
     /// for one it refuses to read, which stops startup the same way.
     pub(crate) fn resolve_with(
@@ -254,14 +260,16 @@ impl MultimodalSettings {
             ),
             fetch_timeout_ms: timeout_setting(
                 config.mm_fetch_timeout_ms,
-                env_nonempty("SMG_MM_FETCH_TIMEOUT_MS")?,
-                "SMG_MM_FETCH_TIMEOUT_MS",
+                "mm_fetch_timeout_ms",
+                env_nonempty(ENV_FETCH_TIMEOUT_MS)?,
+                ENV_FETCH_TIMEOUT_MS,
                 defaults.fetch_timeout_ms,
             )?,
             video_fetch_timeout_ms: timeout_setting(
                 config.mm_video_fetch_timeout_ms,
-                env_nonempty("SMG_MM_VIDEO_FETCH_TIMEOUT_MS")?,
-                "SMG_MM_VIDEO_FETCH_TIMEOUT_MS",
+                "mm_video_fetch_timeout_ms",
+                env_nonempty(ENV_VIDEO_FETCH_TIMEOUT_MS)?,
+                ENV_VIDEO_FETCH_TIMEOUT_MS,
                 defaults.video_fetch_timeout_ms,
             )?,
             // Not a legacy name either (a worker's pipeline without the flag
@@ -282,11 +290,17 @@ impl MultimodalSettings {
 /// Resolve a positive millisecond budget without deprecating its env spelling.
 fn timeout_setting(
     flag: Option<u64>,
+    config_name: &str,
     env: Option<String>,
     name: &str,
     default: Setting<u64>,
 ) -> Result<Setting<u64>> {
     let setting = strict(flag, env, name, None, default)?;
+    let name = if setting.source == SettingSource::Flag {
+        config_name
+    } else {
+        name
+    };
     anyhow::ensure!(setting.value > 0, "{name} must be positive");
     Ok(setting)
 }
@@ -483,8 +497,8 @@ pub(crate) fn init_mm_settings(settings: MultimodalSettings) {
 
 /// The process-wide settings. Never seeded (tests, embedded use): resolved
 /// lazily from env and the built-in defaults, and an unreadable
-/// `SMG_MM_PROCESSING` or `SMG_MM_TURBOJPEG` falls back to its default while
-/// the other settings keep their env values.
+/// setting in [`STRICT_ENV`] falls back to its default while the other
+/// settings keep their env values.
 pub(crate) fn mm_settings() -> &'static MultimodalSettings {
     SETTINGS.get_or_init(|| {
         let config = RouterConfig::default();
@@ -549,14 +563,27 @@ mod tests {
         assert_eq!(resolved.video_fetch_timeout_ms.value, 2);
         for name in ["SMG_MM_FETCH_TIMEOUT_MS", "SMG_MM_VIDEO_FETCH_TIMEOUT_MS"] {
             for raw in ["0", "-1", "bad", "1.5"] {
-                assert!(MultimodalSettings::resolve_with(&config, env(&[(name, raw)])).is_err());
+                let error =
+                    MultimodalSettings::resolve_with(&config, env(&[(name, raw)])).unwrap_err();
+                assert!(error.to_string().contains(name), "{error}");
             }
         }
         let zero = RouterConfig {
             mm_fetch_timeout_ms: Some(0),
             ..config
         };
-        assert!(MultimodalSettings::resolve_with(&zero, no_env).is_err());
+        let error = MultimodalSettings::resolve_with(&zero, no_env).unwrap_err();
+        assert_eq!(error.to_string(), "mm_fetch_timeout_ms must be positive");
+        let zero = RouterConfig {
+            mm_fetch_timeout_ms: None,
+            mm_video_fetch_timeout_ms: Some(0),
+            ..zero
+        };
+        let error = MultimodalSettings::resolve_with(&zero, no_env).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "mm_video_fetch_timeout_ms must be positive"
+        );
     }
 
     fn no_env(name: &str) -> Result<Option<String>> {

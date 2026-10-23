@@ -62,9 +62,11 @@ which defines them on a gRPC launcher's parser that lacks them: `vllm serve
 --grpc` and the stock `python -m vllm.entrypoints.grpc_server` (there the
 values also reach a servicer built without the namespace, through the
 environment). A flag left out falls back to the matching `SMG_VLLM_MM_*`
-variable, which logs a deprecation line on a launcher that has the flag; a
-launcher without the flags (no plugins loaded, a servicer built on its own)
-takes the variable as its documented setting and logs nothing. The startup
+variable. Legacy variables log a deprecation line on a launcher that has the
+flag; the TurboJPEG policy and download timeout variables remain supported
+fallbacks and never log a deprecation warning. A launcher without the flags
+(no plugins loaded, a servicer built on its own) takes the variable as its
+documented setting and logs nothing. The startup
 line `VllmEngineServicer initialized (mm_processor=inprocess, source=flag)` and
 the `mm_processor_source` label name where the value came from.
 
