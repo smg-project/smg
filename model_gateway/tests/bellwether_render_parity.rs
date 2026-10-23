@@ -197,16 +197,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          the model, until the recorder pins the day",
     ),
     (
-        "cosmos3-edge-policy-droid/render/*",
-        "the template writes a newline before the first turn, which the gateway's render \
-         drops: every case of the model",
-    ),
-    (
-        "cosmos3-edge/render/*",
-        "the template writes a newline before the first turn, which the gateway's render \
-         drops: every case of the model",
-    ),
-    (
         "deepseek-v3.1/render/bfcl-*",
         "the checkpoint's template never reads the request's tools and the reference is \
          its own render; the gateway writes the family's tools block into the system prompt \
