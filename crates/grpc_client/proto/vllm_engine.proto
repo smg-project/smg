@@ -177,8 +177,8 @@ message MultimodalInputs {
 }
 
 // One media item the worker fetches and processes itself. `url` is forwarded
-// verbatim from the API request: http(s)://, data:<mime>;base64,..., or
-// file://. The worker's MediaConnector applies --allowed-media-domains /
+// verbatim from the API request: `http(s)://`, `data:<mime>;base64,...`, or
+// `file://`. The worker's MediaConnector applies --allowed-media-domains /
 // --allowed-local-media-path / VLLM_*_FETCH_TIMEOUT.
 message MediaRef {
   smg.grpc.common.Modality modality = 1;  // IMAGE | VIDEO
