@@ -29,6 +29,7 @@ pub mod resilience;
 pub mod runtime;
 pub mod sampling_defaults;
 pub mod service;
+pub mod stream;
 // FIXME: worker.rs is a 1800-line monolith containing the Worker trait,
 // BasicWorker impl, HealthChecker, WorkerType, ConnectionMode, and more.
 // Break it apart into focused modules (e.g. health_checker.rs, types.rs).
@@ -73,9 +74,10 @@ pub use registry::{WorkerOrigin, WorkerRegistry};
 pub use resilience::{resolve_resilience, ResolvedResilience, DEFAULT_RETRYABLE_STATUS_CODES};
 pub use sampling_defaults::DEFAULT_SAMPLING_PARAMS_LABEL;
 pub use service::WorkerService;
+pub use stream::GuardedStream;
 pub(crate) use worker::ConnectionModeExt;
 pub use worker::{
-    BasicWorker, ConnectionMode, GuardedStream, RequestCompletionSink, RuntimeType, Worker,
-    WorkerLoadGuard, WorkerType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR,
-    MORIIO_MODE_LABEL, NIXL_CONNECTOR,
+    BasicWorker, ConnectionMode, RequestCompletionSink, RuntimeType, Worker, WorkerLoadGuard,
+    WorkerType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR, MORIIO_MODE_LABEL,
+    NIXL_CONNECTOR,
 };
