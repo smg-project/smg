@@ -199,9 +199,8 @@ says so as the JSON assembler does: one `Malformed { UnterminatedRegion }` event
 `ToolCallEnd`. The fragments stand, since a fragment passed on cannot be taken back, and nothing is
 made up for a value the model never finished; the four assemblers of `tagged` share that end
 (`tagged::end_cut_call`), and what a block that named no call held is refused as
-`UnterminatedRegion` by the keyed, Qwen and XML ones, so that the reader's release of a refused
-output that made no call takes the whole slice; the attributed one takes the same shape on its own
-change.
+`UnterminatedRegion` by every one of them, so that the reader's release of a refused output that
+made no call takes the whole slice.
 
 A third ending, the stream's stop. `Assembler::stop` is for the model's own end of output inside
 the block (`EngineFinish::Stop`; a cut for length, an abort or any other finish is `finish`): the
