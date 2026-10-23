@@ -1,10 +1,12 @@
 //! `GET /v1/models` and `GET /v1/models/{id}`: the gateway's model inventory.
 //!
-//! Self-hosted models are read from the worker registry. A caller presenting
-//! its own provider credential (bring your own key) is answered from the
-//! external upstreams instead, but never when that credential is one of the
-//! gateway's own keys: a tenant-scoped key must not be forwarded to a third
-//! party as if it were the caller's.
+//! Self-hosted models are read from the worker registry; every alias of a
+//! self-hosted model is listed as an entry of its own (the same model under
+//! the alias name), so every name a client may send is one it can discover.
+//! A caller presenting its own provider credential (bring your own key) is
+//! answered from the external upstreams instead, but never when that
+//! credential is one of the gateway's own keys: a tenant-scoped key must not
+//! be forwarded to a third party as if it were the caller's.
 //!
 //! The list and the single model come in the shape of the API family the
 //! caller speaks: a request carrying the `anthropic-version` header gets the
@@ -207,6 +209,30 @@ fn self_hosted_cards(registry: &WorkerRegistry) -> Vec<ModelCard> {
         .collect()
 }
 
+/// The self-hosted inventory as the list presents it: every card, then one
+/// entry per alias (the same card under the alias name), so every name a
+/// client may send is one it can discover. A model's own id is never
+/// re-listed as another card's alias; the shapes list a name once.
+fn listed_cards(registry: &WorkerRegistry) -> Vec<ModelCard> {
+    let mut cards = self_hosted_cards(registry);
+    let ids: HashSet<&str> = cards.iter().map(|card| card.id.as_str()).collect();
+    let aliased: Vec<ModelCard> = cards
+        .iter()
+        .flat_map(|card| {
+            card.aliases
+                .iter()
+                .filter(|alias| !ids.contains(alias.as_str()))
+                .map(|alias| ModelCard {
+                    id: alias.clone(),
+                    aliases: Vec::new(),
+                    ..card.clone()
+                })
+        })
+        .collect();
+    cards.extend(aliased);
+    cards
+}
+
 /// The self-hosted inventory as a list in the caller's shape, or the 503 of
 /// an empty one in the caller's error envelope.
 async fn registry_models_response(
@@ -214,7 +240,7 @@ async fn registry_models_response(
     shape: ModelShape,
     request_id: String,
 ) -> Response {
-    let cards = self_hosted_cards(registry);
+    let cards = listed_cards(registry);
     if cards.is_empty() {
         shape.no_models(request_id).await
     } else {
@@ -602,6 +628,81 @@ mod tests {
         assert_eq!(body["request_id"], "req_models_1", "{body}");
         assert!(body["error"].get("code").is_none(), "{body}");
         assert!(body["error"].get("param").is_none(), "{body}");
+    }
+
+    /// Every alias of a self-hosted model is listed as an entry of its own,
+    /// after the models' own ids, with its model's `owned_by`, `created` and
+    /// display name, in either shape of the list: a name a client may send
+    /// is a name it can discover. A model without aliases lists as before.
+    #[tokio::test]
+    async fn every_alias_is_listed_as_an_entry_of_its_own() {
+        let mut aliased = ModelCard::new("m1");
+        aliased.display_name = Some("Model One".to_owned());
+        aliased.aliases = vec!["alias-1a".to_owned(), "alias-1b".to_owned()];
+        let registry = registry_with(vec![aliased, ModelCard::new("m2")]);
+
+        let openai =
+            json_body(registry_models_response(&registry, ModelShape::OpenAi, rid()).await).await;
+        assert_eq!(
+            listed_ids(&openai),
+            ["m1", "m2", "alias-1a", "alias-1b"],
+            "{openai}"
+        );
+        assert_eq!(
+            openai["data"][2],
+            serde_json::json!({
+                "id": "alias-1a",
+                "object": "model",
+                "created": 0,
+                "owned_by": "self_hosted"
+            }),
+            "{openai}"
+        );
+
+        let anthropic =
+            json_body(registry_models_response(&registry, ModelShape::Anthropic, rid()).await)
+                .await;
+        assert_eq!(
+            listed_ids(&anthropic),
+            ["m1", "m2", "alias-1a", "alias-1b"],
+            "{anthropic}"
+        );
+        assert_eq!(anthropic["data"][1]["display_name"], "m2", "{anthropic}");
+        assert_eq!(
+            anthropic["data"][3]["display_name"], "Model One",
+            "{anthropic}"
+        );
+        assert_eq!(anthropic["first_id"], "m1", "{anthropic}");
+        assert_eq!(anthropic["last_id"], "alias-1b", "{anthropic}");
+    }
+
+    /// A name is listed once: a model's own id is never re-listed as another
+    /// card's alias, and an alias two cards declare makes one entry.
+    #[tokio::test]
+    async fn a_name_is_listed_once_and_a_models_own_id_wins() {
+        let mut first = ModelCard::new("org/first");
+        first.aliases = vec!["org/second".to_owned(), "shared".to_owned()];
+        let mut third = ModelCard::new("org/third");
+        third.aliases = vec!["shared".to_owned()];
+        let registry = registry_with(vec![first, ModelCard::new("org/second"), third]);
+
+        let body =
+            json_body(registry_models_response(&registry, ModelShape::OpenAi, rid()).await).await;
+        assert_eq!(
+            listed_ids(&body),
+            ["org/first", "org/second", "org/third", "shared"],
+            "{body}"
+        );
+    }
+
+    /// The ids of a list body, in order.
+    fn listed_ids(body: &Value) -> Vec<&str> {
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect()
     }
 
     /// A canonical id that is also another card's alias names its own card:
