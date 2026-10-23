@@ -104,7 +104,7 @@ const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 /// rebuilds the pipeline, and the loader follows the class (see
 /// `huggingface::HuggingFaceTokenizer::llama_class_pipeline`). The tokenizer
 /// crate's fixture harness lists the same sets under the same reason.
-const LEGACY_FILE_PIPELINE: &str = "the render ids of this Llama-class checkpoint were recorded from its raw tokenizer.json read by `tokenizers` (the file's legacy pipeline, the ids transformers 4.x gave by taking the file as is: a word marker after every special token); transformers 5.17.0, the version the engines run, rebuilds the class's pipeline (no normalizer, a Metaspace pre-tokenizer with the prepend scheme `first`) and the loader matches it since smg-project/smg#4248, so the reference has one id more than the engine after each `</s>` while the text is equal; every render case of the model, until the sets are re-recorded with the class (smg-project/bellwether#210), when this entry heals and the run asks for its removal";
+const LEGACY_FILE_PIPELINE: &str = "the render ids of this Llama-class checkpoint were recorded from its raw tokenizer.json read by `tokenizers` (the file's legacy pipeline, the ids transformers 4.x gave by taking the file as is: a word marker after every special token, a marker token missed after a newline or a letter); transformers 5.17.0, the version the engines run, rebuilds the class's pipeline (no normalizer, a Metaspace pre-tokenizer) and the loader matches it since smg-project/smg#4248, so the reference's ids differ from the engine's at the special tokens and the markers while the text is equal; every render case of the model, until the sets are re-recorded with the class (smg-project/bellwether#210), when this entry heals and the run asks for its removal";
 
 /// Cases known to differ from the reference, each with the reason and where
 /// it is tracked: a fixture id, `<slug>/render/<name>`, or a prefix ending in
@@ -112,7 +112,8 @@ const LEGACY_FILE_PIPELINE: &str = "the render ids of this Llama-class checkpoin
 /// (`<slug>/render/*` for a model's whole render side,
 /// `<slug>/render/bfcl-multi-turn-*` for a family of its sets). A prefix is
 /// for a cause that covers a model or a set wholesale and is held to the rule
-/// an id is: the run fails when no loaded case under it differs any more, and
+/// an id is: the run fails when no loaded case under it differs any more (a
+/// case under it listed by its own id is that entry's, not the prefix's), and
 /// when no loaded case is under it at all.
 const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     (
@@ -1700,22 +1701,24 @@ impl Report {
             .is_some_and(|id| id.starts_with(prefix))
     }
 
-    /// Whether a differing case's id begins with `prefix`.
-    fn differs_under(&self, prefix: &str) -> bool {
-        self.differences
-            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
-            .next()
-            .is_some_and(|(id, _)| id.starts_with(prefix))
-    }
-
     /// The entries of `known` whose compared cases all match the reference
-    /// now.
+    /// now. A case listed by its own id is not counted under a prefix: that
+    /// entry names its cause and is held to the rule itself, so the prefix
+    /// heals once every other case under it matches, instead of outliving
+    /// its cause for as long as the by-id sibling differs.
     fn healed<'k>(&self, known: &BTreeMap<&'k str, &'k str>) -> Vec<&'k str> {
         known
             .keys()
             .copied()
             .filter(|entry| match prefix_of(entry) {
-                Some(prefix) => self.seen_under(prefix) && !self.differs_under(prefix),
+                Some(prefix) => {
+                    self.seen_under(prefix)
+                        && !self
+                            .differences
+                            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+                            .take_while(|(id, _)| id.starts_with(prefix))
+                            .any(|(id, _)| !known.contains_key(id.as_str()))
+                }
                 None => self.seen.contains(*entry) && !self.differences.contains_key(*entry),
             })
             .collect()
@@ -2841,6 +2844,59 @@ fn a_prefix_entry_covers_the_cases_under_it_and_must_cover_one() {
                 && failure.contains("m/render/gsm8k-*")
                 && !failure.contains("bfcl")
         }),
+        "{failures:#?}"
+    );
+}
+
+#[test]
+fn a_prefix_entry_heals_when_only_cases_listed_by_their_own_id_still_differ() {
+    let model = "org/m";
+    let root = tree(&[
+        ("m/manifest.toml", &manifest(model)),
+        ("m/sets.toml", &sets_toml(&[("render/common", 3)])),
+        (
+            "m/render/common.jsonl",
+            &(differing_line("m/render/common-0", model)
+                + &render_line("m/render/common-1", model)
+                + &differing_line("m/render/common-2", model)),
+        ),
+    ])
+    .unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let listed = BTreeMap::from([
+        ("m/render/*", "recorded with another pipeline"),
+        ("m/render/common-0", "the template drops the role"),
+    ]);
+    let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    assert_eq!(report.differences.len(), 2, "{:#?}", report.differences);
+    // common-2 differs under the prefix without an entry of its own: the
+    // prefix is live, and nothing fails the run.
+    assert_eq!(
+        report.failures(root.path(), &listed, &BTreeMap::new()),
+        Vec::<String>::new()
+    );
+    // Once common-2 matches, the by-id entry alone keeps a difference under
+    // the prefix, and that one is the entry's own: the prefix has healed and
+    // must go, while the by-id entry stays.
+    let root = tree(&[
+        ("m/manifest.toml", &manifest(model)),
+        ("m/sets.toml", &sets_toml(&[("render/common", 3)])),
+        (
+            "m/render/common.jsonl",
+            &(differing_line("m/render/common-0", model)
+                + &render_line("m/render/common-1", model)
+                + &render_line("m/render/common-2", model)),
+        ),
+    ])
+    .unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    assert_eq!(report.differences.len(), 1, "{:#?}", report.differences);
+    let failures = report.failures(root.path(), &listed, &BTreeMap::new());
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0].contains("matching the reference now")
+            && failures[0].ends_with("remove: m/render/*"),
         "{failures:#?}"
     );
 }
