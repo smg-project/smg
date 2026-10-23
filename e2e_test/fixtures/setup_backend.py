@@ -23,6 +23,7 @@ import os
 import time
 
 import anthropic
+import httpx
 import openai
 import pytest
 from infra import (
@@ -44,7 +45,7 @@ from infra import (
 )
 from infra.constants import vllm_kv_backend
 from infra.model_specs import get_model_spec
-from infra.process_utils import wait_for_workers_ready
+from infra.process_utils import ProcessExitedError
 from infra.worker import stop_workers
 from infra.worker_pool import get_pool
 
@@ -786,8 +787,27 @@ def _register_sglang_epd_encoders(gateway, workers, model_id, model_path, timeou
                 or any(arg.startswith("--model-path=") for arg in cmd)
             ):
                 raise ValueError("SG encoder command must use the configured EPD model path")
+    deadline = time.perf_counter() + timeout
+    expected_urls = {worker.base_url for worker in workers}
+    reason = "registration not checked"
+
+    def remaining():
+        seconds = deadline - time.perf_counter()
+        if seconds <= 0:
+            raise TimeoutError(
+                f"SG EPD expected healthy URLs {sorted(expected_urls)} not ready: {reason}"
+            )
+        return seconds
+
+    def check_processes():
+        if gateway.process is not None and gateway.process.poll() is not None:
+            raise ProcessExitedError(f"Gateway exited with code {gateway.process.returncode}")
+        for worker in workers:
+            worker.raise_if_exited()
+
     for worker in workers:
         if worker.worker_type == WorkerType.ENCODE:
+            check_processes()
             ok, detail = gateway.add_worker(
                 worker.base_url,
                 worker_type="encode",
@@ -798,18 +818,34 @@ def _register_sglang_epd_encoders(gateway, workers, model_id, model_path, timeou
                     "runtime_type": "sglang",
                     "models": [{"id": model_path}],
                 },
-                ready_timeout=timeout,
+                wait_ready=False,
+                timeout=min(10.0, remaining()),
             )
             if not ok:
                 raise RuntimeError(f"Registering SG encoder {worker.base_url} failed: {detail}")
-    wait_for_workers_ready(
-        gateway.base_url,
-        len(workers),
-        timeout=timeout,
-        process=gateway.process,
-        expected_urls=[worker.base_url for worker in workers],
-        workers=workers,
-    )
+    while True:
+        check_processes()
+        try:
+            listed = gateway.list_workers(timeout=min(5.0, remaining()), strict=True)
+            missing = expected_urls - {w.url for w in listed if w.status == "healthy"}
+            reason = f"missing or unhealthy: {sorted(missing)}"
+            if not missing:
+                resp = httpx.get(f"{gateway.base_url}/readiness", timeout=min(5.0, remaining()))
+                data = resp.json()
+                reason = f"readiness: {data.get('reason') or data.get('status')}"
+                healthy = data.get("healthy_workers", 0)
+                if (
+                    resp.status_code == 200
+                    and data.get("status") == "ready"
+                    and isinstance(healthy, int)
+                    and healthy >= len(workers)
+                ):
+                    check_processes()
+                    remaining()
+                    return
+        except (httpx.RequestError, ValueError) as exc:
+            reason = str(exc)
+        time.sleep(min(0.1, remaining()))
 
 
 def _setup_epd(
