@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -65,12 +66,14 @@ def test_no_lower_bound_means_no_pin(mod, requirements):
 
 
 def test_main_prints_the_pin(mod, monkeypatch, capsys):
+    monkeypatch.setattr(mod.metadata, "version", lambda _: "0.1.1.post20261009")
     monkeypatch.setattr(mod.metadata, "requires", lambda name: NIGHTLY)
     assert mod.main() == 0
     assert capsys.readouterr().out == "tokenspeed-scheduler==0.1.26\n"
 
 
 def test_main_prints_nothing_without_a_bound(mod, monkeypatch, capsys):
+    monkeypatch.setattr(mod.metadata, "version", lambda _: "0.1.1.post20261009")
     monkeypatch.setattr(mod.metadata, "requires", lambda name: ["tokenspeed-scheduler"])
     assert mod.main() == 0
     out, err = capsys.readouterr()
@@ -85,3 +88,36 @@ def test_main_fails_without_the_runtime(mod, monkeypatch, capsys):
     monkeypatch.setattr(mod.metadata, "requires", missing)
     assert mod.main() == 1
     assert capsys.readouterr().out == ""
+
+
+def test_storage_nightly_uses_known_pair_without_changing_old_nightlies(mod):
+    requirements = ["tokenspeed-scheduler>=0.1.41"]
+    assert mod.scheduler_pin(requirements, "0.1.1.post20261023") == "tokenspeed-scheduler==0.1.42"
+    assert mod.scheduler_pin(requirements, "0.1.1.post20261021") == "tokenspeed-scheduler==0.1.41"
+    assert mod.scheduler_pin(requirements, "0.1.1.post20261024") == "tokenspeed-scheduler==0.1.41"
+
+
+def test_known_pair_cannot_override_declared_constraints(mod):
+    assert mod.scheduler_pin(["tokenspeed-scheduler==0.1.41"], "0.1.1.post20261023") == (
+        "tokenspeed-scheduler==0.1.41"
+    )
+    with pytest.raises(ValueError, match="conflicts"):
+        mod.scheduler_pin(["tokenspeed-scheduler>=0.1.41,<0.1.42"], "0.1.1.post20261023")
+
+
+@pytest.mark.parametrize("version,storage", [("0.1.41", True), ("0.1.42", False)])
+def test_storage_nightly_rejects_wrong_version_or_missing_native_symbol(
+    mod, monkeypatch, version, storage
+):
+    monkeypatch.setattr(mod.metadata, "version", lambda _: version)
+    module = SimpleNamespace(Scheduler=object(), StorageConfig=object() if storage else None)
+    monkeypatch.setattr(mod.importlib, "import_module", lambda _: module)
+    with pytest.raises((RuntimeError, ImportError)):
+        mod.check_scheduler("0.1.1.post20261023")
+
+
+def test_old_nightly_checks_its_scheduler_without_requiring_storage(mod, monkeypatch):
+    monkeypatch.setattr(
+        mod.importlib, "import_module", lambda _: SimpleNamespace(Scheduler=object())
+    )
+    mod.check_scheduler("0.1.1.post20261009")
