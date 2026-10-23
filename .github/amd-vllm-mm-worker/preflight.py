@@ -46,6 +46,7 @@ def check_cache(expected, cache, resolved):
     require(config.resolve().is_relative_to(cache), "model config escapes cache")
     require(sha(config.read_bytes()) == expected["config_sha256"], "Qwen config hash changed")
     index = snapshot / "model.safetensors.index.json"
+    require(index.resolve().is_relative_to(cache), "model index escapes cache")
     names = set(json.loads(index.read_text())["weight_map"].values())
     require(names == set(expected["weight_files"]), "Qwen shard index changed")
     shards = []
