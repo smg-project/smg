@@ -98,8 +98,8 @@ pub(crate) const PROFILE: RendererProfile = RendererProfile {
     // `<｜Assistant｜><think>` ends the prompt when thinking is on.
     think_in_prefill: true,
     // The shim honours the engine's `enable_thinking` alias, renders a
-    // trailing assistant message itself when `add_generation_prompt` is
-    // false, and parses tool-call `arguments` strings with the reference's
+    // trailing assistant message itself when `continue_final_message` asks,
+    // and parses tool-call `arguments` strings with the reference's
     // tolerance.
     capabilities: RendererCapabilities {
         enable_thinking_alias: true,

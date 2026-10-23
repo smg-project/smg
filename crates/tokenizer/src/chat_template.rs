@@ -858,6 +858,17 @@ pub struct ChatTemplateParams<'a> {
     pub continue_final_message: bool,
 }
 
+impl ChatTemplateParams<'_> {
+    /// Whether a render under these parameters carries the generation header
+    /// unless it continues the final message: the one `add_generation_prompt`
+    /// asks for, or the one a continuation the renderer cannot honour falls
+    /// back to, with the message's text after it. A render that continued
+    /// the message carries none (`ChatTemplateOutput::generation_prompt`).
+    pub fn generation_prompt_unless_continued(&self) -> bool {
+        self.add_generation_prompt || self.continue_final_message
+    }
+}
+
 /// The initial size of a `tojson` output buffer: room for a function schema
 /// of the usual size without a reallocation.
 const TOJSON_BUFFER_BYTES: usize = 1024;

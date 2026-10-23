@@ -113,6 +113,15 @@ pub struct ChatTemplateOutput {
     /// the generation prompt instead: the completion then starts wherever
     /// that prompt leaves it, inside a reasoning block it opens for one.
     pub continued_final_message: bool,
+    /// The prompt is rendered for generation, as `add_generation_prompt: true`
+    /// renders it: the renderer's generation header follows the last turn
+    /// where its reference writes one. False when the request asked for no
+    /// header and the renderer honoured it, and when the final message was
+    /// continued instead. A renderer with an encoder of its own writes the
+    /// header whatever the request asked, as the engines' own encoders do,
+    /// and reports true; the reasoning decisions read this rather than the
+    /// request, since nothing opens a reasoning block without the header.
+    pub generation_prompt: bool,
 }
 
 /// Core encoding trait - separate from decoding for modularity
@@ -320,8 +329,10 @@ pub trait Tokenizer: Encoder + Decoder {
     /// prefill to the flat rendering and reports [`PromptEncoding::FromText`];
     /// renderers whose ids are not a function of the text override it and
     /// hand back a deferred encode instead. The default reports a requested
-    /// `continue_final_message` as honored; renderers that can fall back
-    /// from it override this to report what they did.
+    /// `continue_final_message` as honored, and the generation header as
+    /// `add_generation_prompt` asked for it; renderers that can fall back
+    /// from a continuation, or write the header whatever was asked, override
+    /// this to report what they did.
     fn apply_chat_template_with_encoding(
         &self,
         messages: &[serde_json::Value],
@@ -329,6 +340,7 @@ pub trait Tokenizer: Encoder + Decoder {
         assistant_prefix: Option<&str>,
     ) -> Result<ChatTemplateOutput> {
         let continued_final_message = params.continue_final_message;
+        let generation_prompt_unless_continued = params.generation_prompt_unless_continued();
         let mut text = self.apply_chat_template(messages, params)?;
         if let Some(prefix) = assistant_prefix {
             text.push_str(prefix);
@@ -338,6 +350,7 @@ pub trait Tokenizer: Encoder + Decoder {
             encoding: PromptEncoding::FromText,
             unbilled_prompt_tokens: 0,
             continued_final_message,
+            generation_prompt: generation_prompt_unless_continued && !continued_final_message,
         })
     }
 

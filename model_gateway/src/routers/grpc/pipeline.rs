@@ -5412,6 +5412,7 @@ mod rate_limit_reserve_tests {
                 text: String::new(),
                 unbilled_prompt_tokens: 0,
                 continued_final_message: false,
+                generation_prompt: true,
             },
             chat_request: Arc::new(chat_request),
             format: TranscriptionResponseFormat::Json,

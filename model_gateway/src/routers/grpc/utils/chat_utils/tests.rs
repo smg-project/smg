@@ -1414,6 +1414,7 @@ fn add_generation_prompt_false_renders_the_conversation_without_a_header() {
 
 /// Through a Jinja template: without the header the prompt ends at the last
 /// turn's end marker; with it (the field absent) the assistant header follows.
+/// The rendered prompt reports which, for the reasoning decisions.
 #[test]
 fn jinja_template_renders_no_header_when_add_generation_prompt_is_false() {
     let mut tokenizer =
@@ -1436,13 +1437,58 @@ fn jinja_template_renders_no_header_when_add_generation_prompt_is_false() {
         )
         .unwrap()
         .0
-        .text
     };
-    assert_eq!(render(json!(false)), "<|turn|>user<|body|>Hello.<|end|>");
+    let closed = render(json!(false));
+    assert_eq!(closed.text, "<|turn|>user<|body|>Hello.<|end|>");
+    assert!(!closed.generation_prompt);
+    let open = render(Value::Null);
     assert_eq!(
-        render(Value::Null),
+        open.text,
         "<|turn|>user<|body|>Hello.<|end|><|turn|>assistant"
     );
+    assert!(open.generation_prompt);
+}
+
+/// The rendered prompt reports whether it carries the generation header, as
+/// the reasoning decisions read it: the header the request asked for, none
+/// under `add_generation_prompt: false`, none for a natively continued
+/// message, and the emulation's header (the message's text after it)
+/// otherwise.
+#[test]
+fn the_rendered_prompt_reports_its_generation_header() {
+    let processed = |capabilities: RendererCapabilities, body: Value| -> ProcessedMessages {
+        let tokenizer = llm_tokenizer::MockTokenizer::new()
+            .with_renderer_capabilities(capabilities)
+            .with_json_chat_template();
+        let request: ChatCompletionRequest = serde_json::from_value(body).unwrap();
+        process_chat_messages_with_placeholders(
+            &request,
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap()
+        .0
+    };
+    let hello = json!({"model": "m", "messages": [{"role": "user", "content": "Hello"}]});
+    assert!(processed(Default::default(), hello.clone()).generation_prompt);
+    let mut closed = hello;
+    closed["add_generation_prompt"] = json!(false);
+    assert!(!processed(Default::default(), closed).generation_prompt);
+    let pair = json!({
+        "model": "m",
+        "continue_final_message": true,
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Sure"}
+        ]
+    });
+    let native = processed(NATIVE_CONTINUATION, pair.clone());
+    assert!(native.continued_final_message);
+    assert!(!native.generation_prompt);
+    let emulated = processed(Default::default(), pair);
+    assert!(!emulated.continued_final_message);
+    assert!(emulated.generation_prompt);
 }
 
 /// A text-rendered prompt reaches the tokenizer with each rendered marker

@@ -901,6 +901,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
                         text: String::new(),
                         unbilled_prompt_tokens: 0,
                         continued_final_message: false,
+                        generation_prompt: false,
                     },
                     PromptEncoding::FromText,
                 ));
@@ -931,6 +932,7 @@ pub(crate) fn process_chat_messages_with_placeholders(
             text,
             unbilled_prompt_tokens: rendered.unbilled_prompt_tokens,
             continued_final_message: rendered.continued_final_message,
+            generation_prompt: rendered.generation_prompt,
         },
         rendered.encoding,
     ))
