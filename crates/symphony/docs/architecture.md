@@ -162,9 +162,9 @@ Three tiers, two of them at run time:
   references get wrong. Each run counts them on its diagnostic line.
 
 The adapters show malformed text as content and drop nothing, so a client never loses the bytes a
-parser hands back with the event; the keyed syntax, whose block is never prose, and the attributed
-syntax inside an invoke hand them back as `Dropped { MalformedCall }` behind an event of no bytes
-instead, so that the failure is counted and the format's own tags never reach the answer
+parser hands back with the event; the keyed, attributed, Qwen-tagged and XML assemblers hand them
+back as `Dropped { MalformedCall }` behind an event of no bytes instead, so that the failure is
+counted and the format's own tags never reach the answer
 (`docs/assemblers.md`). The reason is for the
 operator. The set is closed and `Copy` so that a reader can count malformed
 regions by table and reason as a bounded label, log a sample with the table, the reason and the
