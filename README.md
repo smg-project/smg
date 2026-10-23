@@ -34,7 +34,7 @@ Engine-agnostic, high-performance model-routing gateway for large-scale LLM depl
 | **🔌 One API, Any Backend**     | Route to self-hosted engines over HTTP or gRPC, or to OpenAI, Anthropic, Gemini, and xAI — plus any OpenAI-compatible endpoint — through a single unified gateway. |
 | **⚡ Built for Speed**           | Native Rust with streaming gRPC pipelines, cached tokenization with zero-copy cache hits, prefill/decode disaggregation (including a separate encode stage for vision), and DP-aware routing for data-parallel engines. |
 | **🔒 Enterprise Control**       | Priority admission scheduling with preemption and per-tenant controls, API-key auth with OIDC on the control plane, WebAssembly plugins for custom logic, and chat history that never leaves your infrastructure. |
-| **📊 Full Observability**       | 90+ Prometheus metrics, OpenTelemetry tracing with W3C trace context propagated into the engines over both HTTP and gRPC, and structured JSON logs with request correlation. |
+| **📊 Full Observability**       | 200+ Prometheus metric families ([catalog](docs/observability/metrics-catalog.md), [labels](docs/observability/metric-labels.md), [probes and knobs](docs/observability/probes-and-knobs.md)), OpenTelemetry tracing with W3C trace context propagated into the engines over both HTTP and gRPC, and structured JSON logs with request correlation. |
 
 **API Coverage:** OpenAI Chat Completions, Completions, Embeddings, Rerank, and Classify; Responses and Conversations APIs for agents; Anthropic Messages; Gemini Interactions; Realtime over WebSocket and WebRTC; audio transcription; tokenize/detokenize; and MCP tool execution with approval policies in the Responses and Messages APIs.
 

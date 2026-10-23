@@ -748,7 +748,7 @@ pub(crate) fn init_metrics() {
     );
     describe_gauge!(
         "smg_kv_event_degraded_ranks",
-        "KV event ranks whose index may be stale after an unreplayed gap, by worker"
+        "KV event ranks whose index may be stale, by worker: a gap the publisher could not replay, or a relay snapshot that started late (the engine's blocks from before the relay's record are unknown until they leave the engine); cleared by the next resync"
     );
     describe_gauge!(
         "smg_log_dropped_lines",
