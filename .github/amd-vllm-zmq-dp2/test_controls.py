@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+from types import SimpleNamespace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -74,6 +75,13 @@ def test_current_original_worker_builds_two_local_ranks_on_two_devices(monkeypat
     monkeypatch.setenv("E2E_ZMQ_ENGINE_COUNT", "2")
     monkeypatch.setenv("E2E_GPU_OFFSET", "0")
     monkeypatch.setenv("ROUTER_LOCAL_MODEL_PATH", "")
+
+    # Only launch entrypoints need the unbuilt native module; this control never invokes them.
+    def no_launch(*_args, **_kwargs):
+        pytest.fail("unexpected native router launch")
+
+    monkeypatch.setitem(sys.modules, "smg.launch_router", SimpleNamespace(launch_router=no_launch))
+    monkeypatch.setitem(sys.modules, "smg.router_args", SimpleNamespace(RouterArgs=object))
     from infra import ConnectionMode
     from infra import worker as source
 
