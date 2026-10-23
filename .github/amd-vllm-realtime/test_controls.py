@@ -216,3 +216,32 @@ def test_one(realtime_gateway):
     observer.verify()
     assert calls[0][1]["extra_engine_args"] == ["--revision", observer.manifest["revision"]]
     assert infra.start_workers is start
+
+
+def test_actual_http_builder_and_revision_resolution(monkeypatch):
+    monkeypatch.syspath_prepend(str(HERE.resolve().parents[1] / "e2e_test"))
+    monkeypatch.setenv("ROUTER_LOCAL_MODEL_PATH", "")
+    from infra import ConnectionMode, Worker
+
+    manifest = json.loads((HERE / "model-cache.json").read_text())
+    worker = Worker(
+        manifest["model_id"],
+        "vllm",
+        34567,
+        [0],
+        mode=ConnectionMode.HTTP,
+        extra_engine_args=["--revision", manifest["revision"]],
+    )
+    argv = worker._build_cmd()
+    proof.http_arguments(argv, manifest)
+    bad = list(argv)
+    bad[bad.index("--model") + 1] = "/unverified/model/alias"
+    with pytest.raises(ValueError, match="alias"):
+        proof.http_arguments(bad, manifest)
+    bad = list(argv)
+    bad[bad.index("--revision") + 1] = "main"
+    with pytest.raises(ValueError, match="revision"):
+        proof.http_arguments(bad, manifest)
+    preflight.revision_source("get_model_path(self.model, self.revision)")
+    with pytest.raises(ValueError, match="ignores pinned"):
+        preflight.revision_source("get_model_path(self.model, 'main')")

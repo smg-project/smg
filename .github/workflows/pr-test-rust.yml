@@ -38,7 +38,7 @@ jobs:
       HF_HOME: /models
       HF_HUB_OFFLINE: '1'
       TRANSFORMERS_OFFLINE: '1'
-      ROUTER_LOCAL_MODEL_PATH: /models
+      ROUTER_LOCAL_MODEL_PATH: ''
       PYTHONPATH: e2e_test
       SHOW_WORKER_LOGS: '0'
       SHOW_ROUTER_LOGS: '1'

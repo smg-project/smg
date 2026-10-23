@@ -80,17 +80,22 @@ def gateway_identity(gateway, native):
     return {**value, "native": str(path), "native_sha256": NATIVE_HASHES[key]}
 
 
+def http_arguments(argv, manifest):
+    require(argument(argv, "--model") == manifest["model_id"], "unpinned model alias")
+    require(argument(argv, "-m") == "vllm.entrypoints.openai.api_server", "not HTTP API server")
+    require(argument(argv, "--revision") == manifest["revision"], "ASR revision not pinned")
+    require(argument(argv, "--served-model-name") == manifest["model_id"], "served model changed")
+    require("Qwen3ASRRealtimeGeneration" in argument(argv, "--hf-overrides"), "wrong architecture")
+    require(argument(argv, "--mm-encoder-attn-backend") == "TORCH_SDPA", "encoder backend changed")
+    require("--enforce-eager" in argv, "original eager mode missing")
+
+
 def worker_identity(worker, manifest):
     require(worker.engine == "vllm" and worker.mode.value == "http", "not local vLLM HTTP")
     require(worker.model_id == manifest["model_id"], "ASR model changed")
     value = process_identity(worker.process)
     argv = value["argv"]
-    require(argument(argv, "-m") == "vllm.entrypoints.openai.api_server", "not HTTP API server")
-    require(argument(argv, "--revision") == manifest["revision"], "ASR revision not pinned")
-    require(argument(argv, "--served-model-name") == worker.model_id, "served model changed")
-    require("Qwen3ASRRealtimeGeneration" in argument(argv, "--hf-overrides"), "wrong architecture")
-    require(argument(argv, "--mm-encoder-attn-backend") == "TORCH_SDPA", "encoder backend changed")
-    require("--enforce-eager" in argv, "original eager mode missing")
+    http_arguments(argv, manifest)
     models = local_json(worker.base_url, "/v1/models")
     require(worker.model_id in {m["id"] for m in models["data"]}, "worker not serving original ID")
     return {
