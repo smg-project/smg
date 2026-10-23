@@ -961,7 +961,7 @@ pub(crate) fn init_metrics() {
     );
     describe_gauge!(
         "smg_kv_block_size_tokens",
-        "Tokens per KV block of a model as the gateway knows it: seeded from a worker's registration, replaced by the size of the first block its KV event stream stores"
+        "Tokens per KV block of a model as the gateway knows it: seeded from a worker's registration, replaced by the size of the first block its KV event stream stores, 0 once the model's last subscription ended and no size is known"
     );
     describe_gauge!(
         "smg_engine_pd_kv_transfer_latency_ms",
@@ -2440,7 +2440,8 @@ impl Metrics {
 
     /// The tokens per KV block of `model_id` as the gateway knows it now
     /// (`smg_kv_block_size_tokens`): seeded at a worker's registration,
-    /// replaced by the first block its event stream stores.
+    /// replaced by the first block its event stream stores, 0 when the
+    /// model's last subscription ended and no size is known.
     pub fn set_kv_block_size(model_id: &str, tokens: usize) {
         gauge!(
             "smg_kv_block_size_tokens",

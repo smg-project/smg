@@ -191,6 +191,9 @@ impl KvEventMonitor {
     fn publish_dropped_index(model_id: &str) {
         Metrics::set_kv_index_size(model_id, 0, 0);
         Metrics::set_kv_index_chain_stats(model_id, &kv_index::ChainIndexStats::default());
+        // The size went with the model's last subscription: 0, a size no
+        // block has, says none is known.
+        Metrics::set_kv_block_size(model_id, 0);
     }
 
     /// Start the periodic index-shape publication. The task shares only the
@@ -275,9 +278,11 @@ impl KvEventMonitor {
                     .or_insert(KvBlockSize {
                         tokens: bs,
                         from_events: false,
-                    })
-                    .tokens;
-                Metrics::set_kv_block_size(&model_id, known);
+                    });
+                // Under the entry's lock, as the learn site writes it, so a
+                // size a stream learns meanwhile is not overwritten on the
+                // gauge by the seed.
+                Metrics::set_kv_block_size(&model_id, known.tokens);
             } else {
                 warn!(worker_url = %url, "Worker reports kv_block_size=0, ignoring");
             }

@@ -224,7 +224,8 @@ fn record_engine_load_sets_the_kv_capacity_when_the_engine_reports_it() {
     assert_metric(&rendered, "smg_engine_token_usage", &CORE_LABELS, "0.5");
 }
 
-/// A model's block size is one gauge, set from what the gateway knows.
+/// A model's block size is one gauge, set from what the gateway knows, and
+/// 0 once it knows none.
 #[test]
 fn the_kv_block_size_of_a_model_is_a_gauge() {
     let rendered = render_with_recorder(|| {
@@ -237,6 +238,11 @@ fn the_kv_block_size_of_a_model_is_a_gauge() {
         &["model=\"m\""],
         "64",
     );
+    let rendered = render_with_recorder(|| {
+        Metrics::set_kv_block_size("m", 64);
+        Metrics::set_kv_block_size("m", 0);
+    });
+    assert_metric(&rendered, "smg_kv_block_size_tokens", &["model=\"m\""], "0");
 }
 
 #[test]
