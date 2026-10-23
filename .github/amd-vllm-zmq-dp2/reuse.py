@@ -188,7 +188,7 @@ def main():
     inputs = json.loads(INPUTS.read_text())
     require(
         inputs.get("ready") is True and inputs.get("run_budget_admitted") is True,
-        "Realtime diagnostic source and budget not admitted",
+        "DP2 diagnostic source and budget not admitted",
     )
     budget = load_budget()
     require(
