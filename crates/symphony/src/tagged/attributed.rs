@@ -1705,6 +1705,7 @@ mod tests {
             assert_eq!(accounted, input.len(), "{input:?}: {events:?}");
         }
     }
+
     #[test]
     fn a_nullable_string_is_null_or_the_string() {
         let as_null = run(&["f\">\n<parameter name=\"ns\">null</parameter>\n"], false);

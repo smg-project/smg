@@ -571,6 +571,7 @@ async fn a_block_the_token_limit_cut_before_a_call_was_named_is_released_whole_a
         "{choice:?}"
     );
 }
+
 #[tokio::test]
 async fn a_refused_block_released_as_the_answer_keeps_its_tokens_logprobs() {
     // The whole answer after the thought is a call written as Python inside the call tag: the
