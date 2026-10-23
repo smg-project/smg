@@ -1,20 +1,28 @@
-//! A gRPC worker's engine dies and comes back on the same address. The
-//! gateway's health probes see it return within their interval, and the
-//! worker has to be routable again right then, not when the circuit breaker
-//! that opened during the outage times out on its own (60 s by default).
+//! A gRPC worker's engine dies on its address. Comes back: the gateway's
+//! health probes see it return within their interval, and the worker has to
+//! be routable again right then, not when the circuit breaker that opened
+//! during the outage times out on its own (60 s by default). Dies under a
+//! request's retries, with its address resetting every connection: each
+//! attempt is lost to the socket under the call, and the client is answered
+//! as for every other way the worker's transport fails, on the last attempt
+//! as on the ones before it.
 
 use std::{
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
+use axum::{body::to_bytes, response::Response};
 use openai_protocol::{
     completion::CompletionRequest,
     model_card::ModelCard,
     worker::{HealthCheckConfig, WorkerStatus},
 };
 use smg::{
-    config::{RouterConfig, RoutingMode},
+    config::{RetryConfig, RouterConfig, RoutingMode},
     middleware::TenantRequestMeta,
     routers::{RouterFactory, RouterTrait},
     tenant::TenantKey,
@@ -24,7 +32,12 @@ use smg::{
         BasicWorkerBuilder, ConnectionMode, RuntimeType, Worker, WorkerType,
     },
 };
-use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::oneshot,
+    task::JoinHandle,
+};
 
 use crate::common;
 
@@ -145,34 +158,45 @@ fn completion_request() -> CompletionRequest {
     .expect("completion request")
 }
 
-async fn request_status(router: &dyn RouterTrait) -> u16 {
+async fn request(router: &dyn RouterTrait) -> Response {
     let tenant = TenantRequestMeta::new(TenantKey::new("restart-test-tenant"));
     router
         .route_completion(None, &tenant, completion_request(), MODEL)
         .await
-        .status()
-        .as_u16()
+}
+
+async fn request_status(router: &dyn RouterTrait) -> u16 {
+    request(router).await.status().as_u16()
 }
 
 /// A gRPC regular router over one worker on `port`, with the health probes
 /// running: one failed probe demotes the worker, one passing probe promotes
-/// it, and its circuit breaker opens on the first failed request.
+/// it. Its circuit breaker opens after `breaker_failures` failed requests;
+/// `retries` is the retry policy, none for a router that answers the first
+/// attempt.
 #[expect(
     clippy::expect_used,
     reason = "test helper: a router that does not build fails the fixture"
 )]
-async fn build_router(port: u16) -> (Box<dyn RouterTrait>, Arc<dyn Worker>, WorkerManager) {
-    let mut config = RouterConfig::builder()
+async fn build_router(
+    port: u16,
+    breaker_failures: u32,
+    retries: Option<RetryConfig>,
+) -> (Box<dyn RouterTrait>, Arc<dyn Worker>, WorkerManager) {
+    let builder = RouterConfig::builder()
         .mode(RoutingMode::Regular {
             worker_urls: vec![],
         })
         .grpc_connection()
         .random_policy()
-        .disable_retries()
         .host("127.0.0.1")
         .port(0)
-        .max_payload_size(1024 * 1024)
-        .build_unchecked();
+        .max_payload_size(1024 * 1024);
+    let builder = match retries {
+        Some(retries) => builder.retry_config(retries),
+        None => builder.disable_retries(),
+    };
+    let mut config = builder.build_unchecked();
     config.health_check.disable_health_check = false;
 
     let app_context = common::create_test_context_with_mock_tokenizer(config, MODEL).await;
@@ -192,7 +216,7 @@ async fn build_router(port: u16) -> (Box<dyn RouterTrait>, Arc<dyn Worker>, Work
                 drain_settle_secs: 0,
             })
             .circuit_breaker_config(CircuitBreakerConfig {
-                failure_threshold: 1,
+                failure_threshold: breaker_failures,
                 success_threshold: 1,
                 timeout_duration: BREAKER_TIMEOUT,
                 window_duration: BREAKER_TIMEOUT,
@@ -225,7 +249,7 @@ async fn build_router(port: u16) -> (Box<dyn RouterTrait>, Arc<dyn Worker>, Work
 async fn a_restarted_worker_is_routable_when_its_probes_pass_again() {
     let port = free_port().await;
     let engine = MockEngine::start(port).await;
-    let (router, worker, mut manager) = build_router(port).await;
+    let (router, worker, mut manager) = build_router(port, 1, None).await;
 
     // Pending until the first probe passes; then it serves.
     wait_until("the worker's first promotion", RECOVERY_BOUND, || {
@@ -282,4 +306,150 @@ async fn a_restarted_worker_is_routable_when_its_probes_pass_again() {
 
     engine.kill().await;
     manager.shutdown().await;
+}
+
+/// A peer on the engine's address that takes every call as far as the
+/// socket goes, then resets the connection: it answers the connection
+/// preface with its own (an empty SETTINGS frame), reads the request up to
+/// the frame that ends the stream and closes under a zero linger (RST). What
+/// an engine process dying under a request looks like to the gateway's
+/// channel: the call is answered by the layers below gRPC alone.
+struct ResettingPeer {
+    served: JoinHandle<()>,
+    connections: Arc<AtomicUsize>,
+}
+
+impl ResettingPeer {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test helper: the peer's accept loop is aborted by the test before it returns"
+    )]
+    async fn start(port: u16) -> Self {
+        let listener = bind(port).await;
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&connections);
+        let served = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                counted.fetch_add(1, Ordering::SeqCst);
+                if stream
+                    .write_all(&[0, 0, 0, 0x4, 0, 0, 0, 0, 0])
+                    .await
+                    .is_err()
+                {
+                    continue;
+                }
+                read_the_request(&mut stream).await;
+                let _ = stream.set_zero_linger();
+                drop(stream);
+            }
+        });
+        Self {
+            served,
+            connections,
+        }
+    }
+
+    /// How many connections the peer took so far.
+    fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+
+    fn stop(self) {
+        self.served.abort();
+    }
+}
+
+/// Read `stream` until the client's request is in or the client is gone:
+/// the 24-byte connection preface, then frames of a 9-byte header (a 24-bit
+/// length, the type, the flags, the stream id) up to a complete HEADERS or
+/// DATA frame that ends the stream.
+async fn read_the_request(stream: &mut TcpStream) {
+    const PREFACE: usize = 24;
+    const DATA: u8 = 0x0;
+    const HEADERS: u8 = 0x1;
+    const END_STREAM: u8 = 0x1;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return,
+            Ok(read) => bytes.extend_from_slice(&chunk[..read]),
+        }
+        let mut at = PREFACE;
+        while bytes.len() >= at + 9 {
+            let length = usize::from(bytes[at]) << 16
+                | usize::from(bytes[at + 1]) << 8
+                | usize::from(bytes[at + 2]);
+            let (kind, flags) = (bytes[at + 3], bytes[at + 4]);
+            if bytes.len() < at + 9 + length {
+                break;
+            }
+            if matches!(kind, DATA | HEADERS) && flags & END_STREAM != 0 {
+                return;
+            }
+            at += 9 + length;
+        }
+    }
+}
+
+/// The engine dies under a request's retries and its address resets every
+/// connection once the request is in: each attempt is lost to the socket
+/// under the call, which tonic reports with no gRPC code of its own
+/// (`Unknown`, the words "transport error"). The client is answered as for
+/// the other ways the worker's transport fails under a call (a cancelled
+/// call, an HTTP/2 fault): a 502 on the last attempt as on the ones before
+/// it, never a 500 that reads as the worker's own answer for the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transport_reset_on_the_last_attempt_is_answered_like_the_attempts_before_it() {
+    const ATTEMPTS: u32 = 3;
+    let port = free_port().await;
+    let engine = MockEngine::start(port).await;
+    // The breaker outlasts the attempts: every one of them reaches the worker.
+    let (router, worker, mut manager) = build_router(
+        port,
+        ATTEMPTS + 1,
+        Some(RetryConfig {
+            max_retries: ATTEMPTS,
+            initial_backoff_ms: 10,
+            max_backoff_ms: 20,
+            backoff_multiplier: 1.0,
+            jitter_factor: 0.0,
+        }),
+    )
+    .await;
+    wait_until("the worker's first promotion", RECOVERY_BOUND, || {
+        worker.status() == WorkerStatus::Ready
+    })
+    .await;
+    assert_eq!(request_status(router.as_ref()).await, 200);
+    // No probe runs from here on: the worker stays routable, and the
+    // request's own attempts alone meet the reset.
+    manager.shutdown().await;
+
+    engine.kill().await;
+    let peer = ResettingPeer::start(port).await;
+    let response = request(router.as_ref()).await;
+    let status = response.status().as_u16();
+    let body = to_bytes(response.into_body(), 64 * 1024)
+        .await
+        .expect("the error body");
+    let body = String::from_utf8_lossy(&body);
+    let connections = peer.connections();
+    peer.stop();
+
+    assert!(
+        body.contains("transport error"),
+        "the attempts were lost to the socket under the call: {status} {body}"
+    );
+    assert_eq!(
+        connections, ATTEMPTS as usize,
+        "one connection per attempt, each reset: {status} {body}"
+    );
+    assert_eq!(status, 502, "{body}");
+    assert_eq!(
+        worker.circuit_breaker_state(),
+        CircuitState::Closed,
+        "{ATTEMPTS} transport failures under a threshold of {}",
+        ATTEMPTS + 1
+    );
 }

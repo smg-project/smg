@@ -7916,6 +7916,7 @@ version = "1.15.0"
 dependencies = [
  "futures",
  "h2",
+ "hyper",
  "hyper-util",
  "openai-protocol",
  "prost",

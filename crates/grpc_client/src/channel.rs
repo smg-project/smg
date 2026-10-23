@@ -133,6 +133,16 @@ fn configured_endpoint(
 /// status's source chain can. A status the worker answered with (its
 /// trailers) carries no such source.
 ///
+/// The socket under the call failing (the peer reset the connection, or
+/// closed it with the call in flight) is the same connection going away,
+/// seen below the framing: h2 reports it as an I/O failure, hyper unwraps
+/// that into an I/O error of its own, with the `io::Error` behind it and no
+/// `h2::Error` left in the chain, and tonic, which has no code for it,
+/// answers `Unknown` with the words "transport error". That `hyper::Error`
+/// over an `io::Error` is the second shape read here. A dial that fails is
+/// tonic's own `UNAVAILABLE`, with an `io::Error` under its connect error
+/// and no `hyper::Error`: not a failure under a call.
+///
 /// The gateway's liveness asks a different question of the ends of its
 /// polls and streams, whether the peer is reachable for work, and answers
 /// it from the code alone (`worker::liveness::is_connection_code` in the
@@ -141,6 +151,13 @@ pub fn is_transport_failure(status: &tonic::Status) -> bool {
     let mut source = std::error::Error::source(status);
     while let Some(error) = source {
         if error.is::<h2::Error>() {
+            return true;
+        }
+        if error.is::<hyper::Error>()
+            && error
+                .source()
+                .is_some_and(|cause| cause.is::<std::io::Error>())
+        {
             return true;
         }
         source = error.source();
@@ -190,14 +207,18 @@ mod tests {
     };
 
     use hyper_util::rt::TokioIo;
-    use tokio::io::DuplexStream;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt, DuplexStream},
+        net::{TcpListener, TcpStream},
+    };
     use tonic::{codegen::http::Uri, transport::Endpoint};
     use tower::Service;
 
     use super::{
-        configured_endpoint, is_transport_failure, normalize_grpc_endpoint,
+        configured_endpoint, is_transport_failure, normalize_grpc_endpoint, testing,
         DEFAULT_CONNECT_TIMEOUT, STREAM_WINDOW,
     };
+    use crate::{tokenspeed_proto, TokenSpeedSchedulerClient};
 
     #[derive(Clone, Copy)]
     struct PendingConnector;
@@ -348,7 +369,7 @@ mod tests {
     {
         use tokio::io::AsyncReadExt as _;
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
@@ -562,9 +583,152 @@ mod tests {
             "busy"
         )));
         assert!(!is_transport_failure(&tonic::Status::internal("boom")));
+        // An I/O error with no HTTP layer's account over it is not one either.
         let other = tonic::Status::from_error(Box::new(io::Error::other("not http/2")));
         assert_eq!(other.code(), tonic::Code::Unknown);
         assert!(!is_transport_failure(&other));
+    }
+
+    /// How a loopback peer ends the socket once the request has reached it.
+    #[derive(Clone, Copy, Debug)]
+    enum SocketEnd {
+        /// A close under a zero linger: a reset (RST) rather than FIN.
+        Reset,
+        /// A plain close with the call in flight: FIN.
+        Close,
+    }
+
+    /// Read `stream` until the client's request is in: the 24-byte
+    /// connection preface, then frames of a 9-byte header (a 24-bit length,
+    /// the type, the flags, the stream id) up to a complete HEADERS or DATA
+    /// frame that ends the stream. Nothing of the request is left unread, so
+    /// a plain close afterwards is a FIN, not the reset the kernel sends for
+    /// a close over unread data.
+    async fn read_the_request(stream: &mut TcpStream) {
+        const PREFACE: usize = 24;
+        const DATA: u8 = 0x0;
+        const HEADERS: u8 = 0x1;
+        const END_STREAM: u8 = 0x1;
+        let mut bytes = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).await.expect("read the client");
+            assert!(read > 0, "the client closed first");
+            bytes.extend_from_slice(&chunk[..read]);
+            let mut at = PREFACE;
+            while bytes.len() >= at + 9 {
+                let length = usize::from(bytes[at]) << 16
+                    | usize::from(bytes[at + 1]) << 8
+                    | usize::from(bytes[at + 2]);
+                let (kind, flags) = (bytes[at + 3], bytes[at + 4]);
+                if bytes.len() < at + 9 + length {
+                    break;
+                }
+                if matches!(kind, DATA | HEADERS) && flags & END_STREAM != 0 {
+                    return;
+                }
+                at += 9 + length;
+            }
+        }
+    }
+
+    /// A loopback peer that takes a call as far as the socket goes: it
+    /// answers the connection preface with its own (an empty SETTINGS
+    /// frame, so the client's request goes out at once), reads the request
+    /// and ends the socket, on every connection. The call is answered by
+    /// the layers below gRPC alone.
+    async fn a_peer_that_ends_the_socket(end: SocketEnd) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a loopback port of the system's choice");
+        let url = format!(
+            "http://{}",
+            listener.local_addr().expect("the bound address")
+        );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test-only peer; it ends with the test's runtime"
+        )]
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                stream
+                    .write_all(&[0, 0, 0, 0x4, 0, 0, 0, 0, 0])
+                    .await
+                    .expect("the server preface");
+                read_the_request(&mut stream).await;
+                if let SocketEnd::Reset = end {
+                    stream.set_zero_linger().expect("a zero linger");
+                }
+                drop(stream);
+            }
+        });
+        url
+    }
+
+    /// The `io::Error` in `status`'s source chain, by kind.
+    fn io_error_kind_in(status: &tonic::Status) -> Option<io::ErrorKind> {
+        let mut source = std::error::Error::source(status);
+        while let Some(error) = source {
+            if let Some(io) = error.downcast_ref::<io::Error>() {
+                return Some(io.kind());
+            }
+            source = error.source();
+        }
+        None
+    }
+
+    /// The socket under a call failing (the peer reset the connection, or
+    /// closed it with the call in flight) reaches tonic as hyper's I/O
+    /// error, not as an `h2::Error`, and tonic has no code for it: `Unknown`
+    /// with the words "transport error". Which `io::Error` sits behind it
+    /// is the lower layers' choice (h2 closes the streams of a connection
+    /// whose socket ended with a broken pipe of its own, a read or a write
+    /// that failed carries the OS error); it is the worker's connection
+    /// going away under the call all the same: a transport failure, either
+    /// way the socket ends. A dial the peer refuses is tonic's own
+    /// `UNAVAILABLE`, with an `io::Error` under its connect error and no
+    /// HTTP layer's account over it: not a failure under a call.
+    #[tokio::test]
+    async fn a_status_made_of_the_socket_failing_under_the_call_is_a_transport_failure() {
+        for end in [SocketEnd::Reset, SocketEnd::Close] {
+            let url = a_peer_that_ends_the_socket(end).await;
+            let client = TokenSpeedSchedulerClient::connect(&url)
+                .await
+                .expect("the peer accepts the dial");
+            let status = tokio::time::timeout(Duration::from_secs(10), client.health_check())
+                .await
+                .expect("the call ends with the socket")
+                .expect_err("the peer answers no call");
+            assert_eq!(status.code(), tonic::Code::Unknown, "{end:?}: {status:?}");
+            assert_eq!(status.message(), "transport error", "{end:?}: {status:?}");
+            assert!(
+                matches!(
+                    io_error_kind_in(&status),
+                    Some(io::ErrorKind::ConnectionReset | io::ErrorKind::BrokenPipe)
+                ),
+                "{end:?}: {status:?}"
+            );
+            assert!(is_transport_failure(&status), "{end:?}: {status:?}");
+        }
+
+        let refused = testing::refused_endpoint();
+        let channel = configured_endpoint(&refused.url, DEFAULT_CONNECT_TIMEOUT)
+            .expect("endpoint")
+            .connect_lazy();
+        let mut client =
+            tokenspeed_proto::token_speed_scheduler_client::TokenSpeedSchedulerClient::new(channel);
+        let status = client
+            .health_check(tonic::Request::new(tokenspeed_proto::HealthCheckRequest {}))
+            .await
+            .expect_err("nothing listens");
+        assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
+        assert_eq!(
+            io_error_kind_in(&status),
+            Some(io::ErrorKind::ConnectionRefused),
+            "{status:?}"
+        );
+        assert!(!is_transport_failure(&status), "{status:?}");
     }
 
     // --- late frames on forgotten streams ------------------------------------
