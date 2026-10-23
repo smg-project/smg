@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import dataclasses
 import logging
 import random
@@ -478,6 +479,9 @@ class WarmupReport:
     budget_hit: bool = False
     stopped: str | None = None
     flushed: bool | None = None
+    #: Why the flush was refused, when the wire raised: the servicer's own
+    #: words (a status' details), for the end line.
+    flush_refusal: str | None = None
 
     @property
     def covered(self) -> int:
@@ -504,6 +508,8 @@ class WarmupReport:
             text += f"; stopped: {self.stopped}"
         if self.flushed is False:
             text += "; the engine's cache was not flushed (the warm-up's blocks stay cached)"
+            if self.flush_refusal:
+                text += f": {self.flush_refusal}"
         return text
 
 
@@ -606,9 +612,10 @@ class _Pass:
             " (every count up to the step used once)" if done == self._remainders else "",
         )
 
-    def finish(self, flushed: bool | None) -> WarmupReport:
+    def finish(self, flushed: bool | None, flush_refusal: str | None = None) -> WarmupReport:
         self.report.secs = time.monotonic() - self._started
         self.report.flushed = flushed
+        self.report.flush_refusal = flush_refusal
         # The remainders the budget or a stop cut short: their last partial
         # batch reported once, as the periodic line would have.
         done = self._remainders_done
@@ -618,13 +625,27 @@ class _Pass:
         return self.report
 
 
-def _flush(wire: WarmupWire, log: logging.Logger) -> bool:
-    """The engine's cache flushed, best effort; the outcome is logged, never raised."""
+def _refusal(error: BaseException) -> str:
+    """The words of a refused flush, for the log and the end line: a gRPC
+    status' details when the error carries them (a status' ``str`` runs over
+    several lines), else the error itself."""
+    details = getattr(error, "details", None)
+    if callable(details):
+        with contextlib.suppress(Exception):
+            if text := details():
+                return str(text)
+    return str(error) or type(error).__name__
+
+
+def _flush(wire: WarmupWire, log: logging.Logger) -> tuple[bool, str | None]:
+    """The engine's cache flushed, best effort; the outcome is logged, never
+    raised. Returns whether it was, and the refusal's words when it was not."""
     try:
-        return bool(wire.flush_cache())
+        return bool(wire.flush_cache()), None
     except Exception as error:  # noqa: BLE001 -- the flush is a courtesy to the next requests
-        log.info("The warm-up's cache flush was not accepted: %s", error)
-        return False
+        refusal = _refusal(error)
+        log.info("The warm-up's cache flush was not accepted: %s", refusal)
+        return False, refusal
 
 
 def run_warmup(
@@ -665,7 +686,7 @@ def run_warmup(
                     if error is not None:
                         errors.append(error)
         run.record(step, time.monotonic() - started, errors)
-    return run.finish(_flush(wire, log) if run.report.results else None)
+    return run.finish(*(_flush(wire, log) if run.report.results else (None, None)))
 
 
 async def run_warmup_async(
@@ -688,14 +709,14 @@ async def run_warmup_async(
         )
         errors = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
         run.record(step, time.monotonic() - started, errors)
-    flushed = None
+    flushed = refusal = None
     if run.report.results:
         try:
             flushed = bool(await wire.flush_cache())
         except Exception as error:  # noqa: BLE001 -- the flush is a courtesy to the next requests
-            log.info("The warm-up's cache flush was not accepted: %s", error)
-            flushed = False
-    return run.finish(flushed)
+            flushed, refusal = False, _refusal(error)
+            log.info("The warm-up's cache flush was not accepted: %s", refusal)
+    return run.finish(flushed, refusal)
 
 
 def plan_for(
