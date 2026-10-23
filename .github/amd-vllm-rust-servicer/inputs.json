@@ -163,7 +163,7 @@
   ],
   "consumer_setup_core_minutes": 55,
   "cleanup_reserved_minutes": 5,
-  "target_product_commit": "66ea8bdb64422e8bc4821af122e484db261fcb29",
+  "target_product_commit": "bfa321a3b4d57b1ca89d4f540adec8d6c1a49ac1",
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat-rust-servicer[1]/vllm/nvidia",
   "compiled_producer_exclusion": "crates/grpc_client/python contains only build-time Python gencode packaging; current proto/src/build.rs and all Rust crates bind exactly to producer. Python packages are freshly installed and full installed engine suite plus 14 exact cases must pass.",
   "artifact_audit_sha256": "0cbeae5eb885567da4c45b46a875b6f161aaf5074d62451001ceac23d12b6449",
