@@ -23,6 +23,16 @@ _HTTP_TO_GRPC_CODE = {
 }
 
 
+class ForeignKvHandoff(ValueError):
+    """A request's KV-transfer params name another request: the pairing
+    connector's ``remote_request_id`` (the prefill side's id, which the router
+    gives both sides of one request) is not the request's own id. Refused
+    before anything acts on the params (``FAILED_PRECONDITION``), the
+    rejection notice included, so no request consumes, or releases, the blocks
+    a prefill pinned for a different one. A ``ValueError``, so a reader of the
+    caller's errors still sees it as one."""
+
+
 def grpc_code_for_http_status(status: object) -> grpc.StatusCode:
     """The gRPC code for an engine's HTTP status (an ``HTTPStatus``, an int or
     a numeric string); ``INTERNAL`` for any status not in the table, 500

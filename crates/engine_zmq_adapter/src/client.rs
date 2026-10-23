@@ -48,8 +48,9 @@ use crate::{
     },
     vllm::{
         fan_out_requests, has_media, kv_transfer_params, now_secs, ranked_candidate_count,
-        refuse_greedy_choices, translate_media, translate_request_with_media,
-        translated_from_processed, ProcessedMedia, TranslatedMedia, VllmGenerateStream,
+        refuse_foreign_kv_handoff, refuse_greedy_choices, translate_media,
+        translate_request_with_media, translated_from_processed, ProcessedMedia, TranslatedMedia,
+        VllmGenerateStream,
     },
 };
 
@@ -626,6 +627,9 @@ impl ZmqEngineClient {
             .first()
             .map(|e| (e.ready_response.max_model_len, e.ready_response.dtype))
             .ok_or_else(|| tonic::Status::unavailable("no connected ZMQ engine"))?;
+        // A handoff that names another request is refused before anything
+        // acts on it (see `refuse_foreign_kv_handoff`).
+        refuse_foreign_kv_handoff(&req).map_err(tonic::Status::failed_precondition)?;
         // Media is translated once for all choices (an SHM payload is read,
         // and unlinked, a single time) and off the runtime: `/dev/shm` reads
         // and the dtype casts of multi-megabyte tensors would otherwise hold a

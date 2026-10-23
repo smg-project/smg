@@ -908,6 +908,43 @@ async fn a_duplicate_decode_side_sends_no_rejection_notice() {
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["pd3".to_string()]);
 }
 
+/// A decode side whose handoff names another request is refused before the
+/// engine sees anything of it, the rejection notice included: a notice under
+/// those params would release the blocks the prefill side pinned for that
+/// other request. A handoff that names this request is taken as before.
+#[tokio::test]
+async fn a_decode_side_whose_handoff_names_another_request_is_refused_without_a_notice() {
+    let mut h = harness(model_info(), None).await;
+    let mut request = generate_request("pd4", true, Vec::new());
+    request.kv_transfer_params_json = Some(
+        r#"{"do_remote_prefill":true,"remote_request_id":"pd9","remote_block_ids":[1]}"#
+            .to_string(),
+    );
+    let status = h.client.generate(request).await.expect_err("refused");
+    assert_eq!(status.code(), Code::FailedPrecondition);
+    assert!(
+        status.message().contains("\"pd9\"") && status.message().contains("\"pd4\""),
+        "{}",
+        status.message()
+    );
+    assert_engine_idle(&mut h.engine_in).await;
+    let mut request = generate_request("pd4", true, Vec::new());
+    request.kv_transfer_params_json = Some(
+        r#"{"do_remote_prefill":true,"remote_request_id":"pd4","remote_block_ids":[1]}"#
+            .to_string(),
+    );
+    let stream = h
+        .client
+        .generate(request)
+        .await
+        .expect("generate")
+        .into_inner();
+    let engine_request = recv_add(&mut h.engine_in).await;
+    assert_eq!(engine_request.request_id, "pd4");
+    drop(stream);
+    assert_eq!(recv_abort(&mut h.engine_in).await, vec!["pd4".to_string()]);
+}
+
 /// Router-preprocessed media serves every choice of an `n > 1` request: the
 /// `/dev/shm` payload is read (and unlinked) once, and each engine request
 /// carries the per-item features.

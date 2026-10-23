@@ -543,6 +543,63 @@ fn vllm_forwards_prompt_logprobs() {
     );
 }
 
+/// A handoff that names another request is refused; one that names this
+/// request, names none, or names it with an empty string or a value that is no
+/// id passes, as do params of another shape (a legacy pair, a store's handoff),
+/// malformed params (the caller's own check refuses them), no params at all,
+/// and any handoff on a request that carries no id of its own.
+#[test]
+fn a_kv_handoff_that_names_another_request_is_refused() {
+    let mut req = tokenized_req(vllm::SamplingParams::default());
+    req.request_id = "req-1".to_string();
+    assert_eq!(refuse_foreign_kv_handoff(&req), Ok(()));
+    for (params, foreign) in [
+        (
+            r#"{"do_remote_prefill":true,"remote_request_id":"req-1","remote_block_ids":[3]}"#,
+            false,
+        ),
+        (
+            r#"{"do_remote_prefill":true,"remote_request_id":"req-2","remote_block_ids":[3]}"#,
+            true,
+        ),
+        (
+            r#"{"do_remote_prefill":true,"remote_block_ids":[3]}"#,
+            false,
+        ),
+        (
+            r#"{"do_remote_prefill":true,"remote_request_id":""}"#,
+            false,
+        ),
+        (r#"{"do_remote_prefill":true,"remote_request_id":7}"#, false),
+        (
+            r#"{"transfer_id":"xfer-1","remote_host":"10.0.0.1","remote_port":5600}"#,
+            false,
+        ),
+        ("[1]", false),
+    ] {
+        req.kv_transfer_params_json = Some(params.to_string());
+        let verdict = refuse_foreign_kv_handoff(&req);
+        assert_eq!(verdict.is_err(), foreign, "{params}: {verdict:?}");
+        if let Err(why) = verdict {
+            assert!(
+                why.contains("\"req-2\"") && why.contains("\"req-1\""),
+                "{why}"
+            );
+        }
+    }
+    req.kv_transfer_params_json = None;
+    req.kv_transfer_params = Some(vllm::KvTransferParams {
+        remote_host: "10.0.0.1".to_string(),
+        remote_port: 5600,
+    });
+    assert_eq!(refuse_foreign_kv_handoff(&req), Ok(()));
+    req.request_id = String::new();
+    req.kv_transfer_params = None;
+    req.kv_transfer_params_json =
+        Some(r#"{"do_remote_prefill":true,"remote_request_id":"req-2"}"#.to_string());
+    assert_eq!(refuse_foreign_kv_handoff(&req), Ok(()));
+}
+
 #[test]
 fn kv_transfer_params_prefer_json_then_the_legacy_pair() {
     let mut req = tokenized_req(vllm::SamplingParams::default());

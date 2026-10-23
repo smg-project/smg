@@ -759,6 +759,36 @@ pub(crate) fn kv_transfer_params(
     Ok(None)
 }
 
+/// The guard a request's KV handoff passes before anything acts on it: a
+/// handoff that names another request (`remote_request_id`, the prefill side's
+/// id under the pairing connector, which the router gives both sides of one
+/// request) is refused, so no request consumes, or releases, the blocks a
+/// prefill pinned for a different one. Params that name no request (the
+/// legacy host/port pair, a store's handoff, a connector with a vocabulary of
+/// its own) pass, as do params the caller's own check refuses as malformed
+/// and a request that carries no id of its own (nothing to compare against;
+/// the id is required elsewhere); the engine's connector judges the rest.
+pub fn refuse_foreign_kv_handoff(req: &vllm::GenerateRequest) -> Result<(), String> {
+    let Some(params) = kv_transfer_params(req).ok().flatten() else {
+        return Ok(());
+    };
+    match params
+        .get("remote_request_id")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(named)
+            if !named.is_empty() && !req.request_id.is_empty() && named != req.request_id =>
+        {
+            Err(format!(
+                "kv_transfer_params name another request: remote_request_id {named:?} is not this \
+                 request's id {:?}",
+                req.request_id
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn translate_sampling(
     sp: vllm::SamplingParams,
     default_max_tokens: u32,

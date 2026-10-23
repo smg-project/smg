@@ -5,6 +5,7 @@ import logging
 
 from smg_grpc_proto import vllm_engine_pb2
 
+from smg_grpc_servicer.engine_status import ForeignKvHandoff
 from smg_grpc_servicer.vllm.config_view import EngineConfigView
 
 logger = logging.getLogger(__name__)
@@ -124,6 +125,8 @@ def params_from_request(
 
     Raises:
         ValueError: If the JSON field is malformed or the legacy field is invalid.
+        ForeignKvHandoff: If the params name another request (``remote_request_id``
+            is a non-empty string other than the request's own, non-empty id).
     """
     if request.HasField("kv_transfer_params_json"):
         try:
@@ -132,6 +135,12 @@ def params_from_request(
             raise ValueError(f"Invalid kv_transfer_params_json: {e}") from e
         if not isinstance(params, dict):
             raise ValueError("kv_transfer_params_json must be a JSON object")
+        named = params.get("remote_request_id")
+        if isinstance(named, str) and named and request.request_id and named != request.request_id:
+            raise ForeignKvHandoff(
+                f"kv_transfer_params name another request: remote_request_id {named!r} is not "
+                f"this request's id {request.request_id!r}"
+            )
         return params
     if request.HasField("kv_transfer_params"):
         remote_host = request.kv_transfer_params.remote_host

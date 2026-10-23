@@ -13,8 +13,8 @@ use std::{
 };
 
 use engine_zmq_adapter::{
-    fold_tokenizer_eos_backstop, kv_transfer_rejection_params, stops::take_vllm_string_stops,
-    VllmGenerateStream, ZmqEngineClient,
+    fold_tokenizer_eos_backstop, kv_transfer_rejection_params, refuse_foreign_kv_handoff,
+    stops::take_vllm_string_stops, VllmGenerateStream, ZmqEngineClient,
 };
 use futures::{stream::SelectAll, Stream};
 use llm_tokenizer::stop::StopSequenceDecoder;
@@ -45,6 +45,10 @@ pub(super) async fn generate(
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
     }
+    // A PD decode side whose handoff names another request is refused before
+    // the rejection notice is armed (`submit`): a notice under those params
+    // would release the blocks a prefill pinned for that other request.
+    refuse_foreign_kv_handoff(&req).map_err(Status::failed_precondition)?;
     submit(state, client, req, trace_headers, arrival).await
 }
 

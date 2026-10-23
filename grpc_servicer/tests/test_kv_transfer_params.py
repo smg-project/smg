@@ -316,6 +316,34 @@ class TestParamsFromRequest:
         with pytest.raises(ValueError, match="must be a JSON object"):
             kv_transfer.params_from_request(request)
 
+    def test_a_handoff_that_names_another_request_is_refused(self):
+        request = vllm_engine_pb2.GenerateRequest(
+            request_id="req-2", kv_transfer_params_json=json.dumps(NIXL_HANDOFF)
+        )
+        with pytest.raises(kv_transfer.ForeignKvHandoff, match="'req-1'.*'req-2'"):
+            kv_transfer.params_from_request(request)
+
+    @pytest.mark.parametrize(
+        "params",
+        [
+            NIXL_HANDOFF,
+            {"do_remote_prefill": True, "remote_block_ids": [1]},
+            {"do_remote_prefill": True, "remote_request_id": ""},
+            {"do_remote_prefill": True, "remote_request_id": 7},
+            {"transfer_id": "xfer-1", "remote_host": "10.0.0.1", "remote_port": 5600},
+        ],
+        ids=["this request", "no id", "empty id", "no string", "another connector"],
+    )
+    def test_a_handoff_that_names_this_request_or_none_passes(self, params):
+        request = vllm_engine_pb2.GenerateRequest(
+            request_id="req-1", kv_transfer_params_json=json.dumps(params)
+        )
+        assert kv_transfer.params_from_request(request) == params
+
+    def test_a_request_without_an_id_of_its_own_is_not_compared(self):
+        request = vllm_engine_pb2.GenerateRequest(kv_transfer_params_json=json.dumps(NIXL_HANDOFF))
+        assert kv_transfer.params_from_request(request) == NIXL_HANDOFF
+
     def test_typed_fallback_builds_mooncake_dict(self):
         request = vllm_engine_pb2.GenerateRequest(
             kv_transfer_params=vllm_engine_pb2.KvTransferParams(

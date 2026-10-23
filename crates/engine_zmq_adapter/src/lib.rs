@@ -54,4 +54,7 @@ pub use structured_outputs::{
     StructuredOutputsBackendConfig, StructuredOutputsSupport,
 };
 pub use tokenspeed::{to_tokenspeed_response, GridTensors, TokenSpeedGenerateStream};
-pub use vllm::{structured_outputs_backend_from_config, ProcessedMedia, VllmGenerateStream};
+pub use vllm::{
+    refuse_foreign_kv_handoff, structured_outputs_backend_from_config, ProcessedMedia,
+    VllmGenerateStream,
+};

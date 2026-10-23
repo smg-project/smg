@@ -6,7 +6,7 @@ import grpc
 from vllm.exceptions import VLLMNotFoundError
 from vllm.v1.engine.exceptions import EngineGenerateError
 
-from smg_grpc_servicer.engine_status import grpc_code_for_http_status
+from smg_grpc_servicer.engine_status import ForeignKvHandoff, grpc_code_for_http_status
 
 try:
     from vllm.exceptions import VLLMClientError
@@ -25,6 +25,8 @@ def grpc_code_for(exc: BaseException) -> grpc.StatusCode:
     """gRPC code for an engine failure: client-caused errors are INVALID_ARGUMENT."""
     if isinstance(exc, EngineGenerateError) and exc.__cause__ is not None:
         exc = exc.__cause__
+    if isinstance(exc, ForeignKvHandoff):
+        return grpc.StatusCode.FAILED_PRECONDITION
     if isinstance(exc, GracefulHTTPError):
         return grpc_code_for_http_status(exc.http_status)
     if isinstance(exc, VLLMNotFoundError):

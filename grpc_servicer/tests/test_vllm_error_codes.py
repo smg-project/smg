@@ -110,6 +110,14 @@ def test_an_oversized_media_result_is_the_callers_error(split_hierarchy):
     assert errors.grpc_code_for(too_large) is grpc.StatusCode.INVALID_ARGUMENT
 
 
+def test_a_foreign_kv_handoff_is_a_failed_precondition(split_hierarchy):
+    from smg_grpc_servicer.engine_status import ForeignKvHandoff
+
+    errors, _ = split_hierarchy
+    refused = ForeignKvHandoff("kv_transfer_params name another request")
+    assert errors.grpc_code_for(refused) is grpc.StatusCode.FAILED_PRECONDITION
+
+
 def test_not_found_maps_to_not_found(split_hierarchy):
     errors, classes = split_hierarchy
     assert errors.grpc_code_for(classes["VLLMNotFoundError"]("lora")) is grpc.StatusCode.NOT_FOUND
