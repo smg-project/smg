@@ -122,7 +122,12 @@ class GrpcWire:
         from smg_grpc_proto.generated import common_pb2
 
         response = self._stub.FlushCache(common_pb2.FlushCacheRequest(), timeout=60)
-        return bool(getattr(response, "success", True))
+        success = bool(getattr(response, "success", True))
+        if not success and (message := str(getattr(response, "message", "") or "")):
+            # The servicer answered the refusal with its reason: raised, the
+            # warm-up's end line carries the words as it does for a raised status.
+            raise RuntimeError(message)
+        return success
 
     def close(self) -> None:
         if self._owns_channel:

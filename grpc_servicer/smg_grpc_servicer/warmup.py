@@ -479,8 +479,9 @@ class WarmupReport:
     budget_hit: bool = False
     stopped: str | None = None
     flushed: bool | None = None
-    #: Why the flush was refused, when the wire raised: the servicer's own
-    #: words (a status' details), for the end line.
+    #: Why the flush was refused, when the wire raised or the servicer
+    #: answered the refusal with a message: the servicer's own words (a
+    #: status' details, else its code), for the end line.
     flush_refusal: str | None = None
 
     @property
@@ -628,12 +629,19 @@ class _Pass:
 def _refusal(error: BaseException) -> str:
     """The words of a refused flush, for the log and the end line: a gRPC
     status' details when the error carries them (a status' ``str`` runs over
-    several lines), else the error itself."""
+    several lines), else its code's name, else the error itself."""
     details = getattr(error, "details", None)
     if callable(details):
         with contextlib.suppress(Exception):
             if text := details():
                 return str(text)
+    # A status with empty details: its code's name keeps the reason to one
+    # line (the status' ``str`` is the multi-line repr).
+    code = getattr(error, "code", None)
+    if callable(code):
+        with contextlib.suppress(Exception):
+            if (status := code()) is not None:
+                return str(getattr(status, "name", status))
     return str(error) or type(error).__name__
 
 
