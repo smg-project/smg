@@ -5,13 +5,16 @@ probe the watch relies on."""
 from __future__ import annotations
 
 import ast
+import dataclasses
 from pathlib import Path
 
 import pytest
+from infra import ConnectionMode
 from infra import worker as worker_module
 from infra.servicer_warmup import (
     LEVEL_FAST,
     LEVEL_FULL,
+    SERVICER_LOG_ENGINE_ARGS,
     SERVICER_WARMUP_ENV,
     WarmupEnd,
     WarmupStart,
@@ -36,6 +39,62 @@ END_LINE = (
     "215 of 215 steps covered in 25.7 s (0 failed requests)\n"
 )
 
+# The same two lines as the other engines' processes write them, with the lines
+# around them: the engine's root logger format under the Python servicer, and
+# the Rust servicer's own (coloured) lines between them under the Rust one.
+SGLANG_PYTHON_LOG = (
+    "[2026-10-23 10:09:39] Servicer implementation: python (source=default)\n"
+    "[2026-10-23 10:10:19] Planned warm-up starts (level full: 175 steps (1 decode staircase, "
+    "152 prefill shapes, 22 measured again), 1136255 prompt tokens and 8558 output tokens over "
+    "a window of 0 and a step of 16384; budget 300 s; window and step from the server arguments "
+    "(the engine's default step when unset)): readiness is held until it ran\n"
+    "[2026-10-23 10:10:20] Warm-up step 1/175 decode batch 128 down to 1 (128 requests): 718 ms\n"
+    "[2026-10-23 10:10:33] Warm-up step 175/175 prefill 16384 tokens again: 200 ms\n"
+    "[2026-10-23 10:10:33] Planned warm-up over: 175 of 175 steps covered in 14.6 s "
+    "(0 failed requests)\n"
+    "[2026-10-23 10:10:33] The server is fired up and ready to roll!\n"
+)
+SGLANG_RUST_LOG = (
+    "[2026-10-23 10:10:48] Servicer implementation: rust (source=env)\n"
+    "[2026-10-23 10:10:48] Rust SGLang servicer listening on 127.0.0.1:41455 (scheduler handshake "
+    "tcp://127.0.0.1:42879, 1 DP rank(s))\n"
+    "\x1b[2m2026-10-23T10:11:26.307699Z\x1b[0m \x1b[32m INFO\x1b[0m "
+    "\x1b[2mengine_servicer::sglang::engine\x1b[0m\x1b[2m:\x1b[0m SGLang scheduler connected "
+    "\x1b[3mhandshake\x1b[0m\x1b[2m=\x1b[0mtcp://127.0.0.1:42879 \x1b[3mengines\x1b[0m\x1b[2m=\x1b[0m1\n"
+    "[2026-10-23 10:11:26] Planned warm-up starts (level full: 175 steps (1 decode staircase, "
+    "152 prefill shapes, 22 measured again), 1136255 prompt tokens and 8558 output tokens over "
+    "a window of 0 and a step of 16384; budget 300 s; window and step from the server arguments "
+    "(the engine's default step when unset)): readiness is held until it ran\n"
+    "[2026-10-23 10:11:27] Warm-up step 1/175 decode batch 128 down to 1 (128 requests): 811 ms\n"
+    "[2026-10-23 10:11:41] Planned warm-up over: 175 of 175 steps covered in 14.8 s "
+    "(0 failed requests)\n"
+)
+TOKENSPEED_PYTHON_LOG = (
+    "2026-10-23 10:54:53,259 [smg_grpc_servicer.tokenspeed] INFO Servicer implementation: "
+    "python (source=default)\n"
+    "[2026-10-23 10:58:52] Planned warm-up starts (level full: 109 steps (1 decode staircase, "
+    "87 prefill shapes, 21 measured again), 321406 prompt tokens and 13148 output tokens over "
+    "a window of 160 and a step of 8192; budget 300 s; window and step from the server "
+    "arguments (the engine's default step when unset)): readiness is held until it ran\n"
+    "[2026-10-23 10:58:53] Warm-up step 1/109 decode batch 160 down to 1 (160 requests): 916 ms\n"
+    "[2026-10-23 10:58:57] Planned warm-up over: 109 of 109 steps covered in 5.6 s "
+    "(0 failed requests)\n"
+    "[2026-10-23 10:58:57] TokenSpeed gRPC server is ready to serve\n"
+)
+TOKENSPEED_RUST_LOG = (
+    "2026-10-23 10:59:15,053 [smg_grpc_servicer.rust_lifecycle] INFO Rust TokenSpeed servicer "
+    "listening on 127.0.0.1:38167 (scheduler handshake tcp://127.0.0.1:52719, 1 DP rank(s))\n"
+    "\x1b[2m2026-10-23T11:00:18.672282Z\x1b[0m \x1b[32m INFO\x1b[0m "
+    "\x1b[2mengine_servicer::tokenspeed::engine\x1b[0m\x1b[2m:\x1b[0m TokenSpeed scheduler "
+    "connected \x1b[3mhandshake\x1b[0m\x1b[2m=\x1b[0mtcp://127.0.0.1:52719\n"
+    "[2026-10-23 11:00:19] Planned warm-up starts (level full: 109 steps (1 decode staircase, "
+    "87 prefill shapes, 21 measured again), 321406 prompt tokens and 13148 output tokens over "
+    "a window of 160 and a step of 8192; budget 300 s; window and step from the server "
+    "arguments (the engine's default step when unset)): readiness is held until it ran\n"
+    "[2026-10-23 11:00:25] Planned warm-up over: 109 of 109 steps covered in 6.3 s "
+    "(0 failed requests); the engine's cache was not flushed (the warm-up's blocks stay cached)\n"
+)
+
 
 # ---------------------------------------------------------------------------
 # The lines
@@ -45,6 +104,23 @@ END_LINE = (
 def test_the_start_line_gives_the_level_the_step_count_and_the_budget():
     assert warmup_start("engine lines\n" + START_LINE) == WarmupStart(LEVEL_FULL, 215, 300.0)
     assert warmup_start("nothing yet") is None
+
+
+@pytest.mark.parametrize(
+    ("log", "steps", "secs"),
+    [
+        pytest.param(SGLANG_PYTHON_LOG, 175, 14.6, id="sglang-python-servicer"),
+        pytest.param(SGLANG_RUST_LOG, 175, 14.8, id="sglang-rust-servicer-coloured-lines-between"),
+        pytest.param(TOKENSPEED_PYTHON_LOG, 109, 5.6, id="tokenspeed-python-servicer"),
+        pytest.param(TOKENSPEED_RUST_LOG, 109, 6.3, id="tokenspeed-rust-servicer-unflushed-end"),
+    ],
+)
+def test_the_lines_are_read_in_the_other_engines_log_formats(log, steps, secs):
+    assert warmup_start(log) == WarmupStart(LEVEL_FULL, steps, 300.0)
+    end = warmup_end(log)
+    assert end == WarmupEnd(steps, steps, secs, 0, budget_hit=False, stopped=False)
+    assert end.complete
+    assert warmup_skipped(log) is None
 
 
 def test_a_fast_start_line_with_a_set_budget_and_data_parallel_ranks_parses_too():
@@ -265,6 +341,41 @@ def test_a_workers_own_knob_wins_over_the_jobs_level(monkeypatch):
         extra_env={"SMG_VLLM_SERVICER_WARMUP": LEVEL_FULL},
     )._build_env()
     assert own["SMG_VLLM_SERVICER_WARMUP"] == LEVEL_FULL
+
+
+# ---------------------------------------------------------------------------
+# The engine's log level
+# ---------------------------------------------------------------------------
+
+# The case's model: any worker of the suite's smallest model, as the case starts it.
+CASE_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
+
+
+def _log_level_flag(cmd: list[str]) -> str | None:
+    """The engine's ``--log-level`` as its parser keeps it: the last one given."""
+    level = None
+    for flag, value in zip(cmd, cmd[1:]):
+        if flag == "--log-level":
+            level = value
+    return level
+
+
+@pytest.mark.parametrize("engine", sorted(SERVICER_WARMUP_ENV))
+def test_the_followed_workers_engine_logs_at_the_level_the_pass_lines_carry(engine):
+    """The legs' workers run the engines that take a ``--log-level`` at
+    ``warning``, where the servicer's INFO lines are not written; the worker a
+    case follows carries the table's arguments and runs at ``info``. An engine
+    the harness leaves at its own default has nothing to add."""
+    as_the_legs = Worker(
+        model_id=CASE_MODEL, engine=engine, port=50111, gpu_ids=[0], mode=ConnectionMode.GRPC
+    )
+    followed = dataclasses.replace(as_the_legs, extra_engine_args=SERVICER_LOG_ENGINE_ARGS[engine])
+    legs_level = _log_level_flag(as_the_legs._build_cmd())
+    if legs_level is None:
+        assert SERVICER_LOG_ENGINE_ARGS[engine] == []
+    else:
+        assert legs_level == "warning"
+        assert _log_level_flag(followed._build_cmd()) == "info"
 
 
 # ---------------------------------------------------------------------------

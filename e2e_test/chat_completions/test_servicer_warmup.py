@@ -31,7 +31,12 @@ from infra import (
 )
 from infra.constants import ENV_SHOW_WORKER_LOGS
 from infra.model_specs import get_model_spec
-from infra.servicer_warmup import LEVEL_FULL, SERVICER_WARMUP_ENV, watch_warmup
+from infra.servicer_warmup import (
+    LEVEL_FULL,
+    SERVICER_LOG_ENGINE_ARGS,
+    SERVICER_WARMUP_ENV,
+    watch_warmup,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,17 +65,22 @@ class TestFullWarmupBeforeServing:
             pool.cleanup()
 
         # The engine's own start is bounded as any worker's start is; the pass
-        # then gets its own budget on top, read off the worker's log.
+        # then gets its own budget on top, read off the worker's log, which
+        # the engine must write at the level the servicer's lines carry.
         spec = get_model_spec(MODEL)
         engine_start_secs = effective_startup_timeout(
             spec.get("startup_timeout", DEFAULT_STARTUP_TIMEOUT)
         )
+        # The engine writes its log at the level the servicer's lines carry
+        # (the table's args), so the pass's lines can be read off the worker's log.
+        extra_engine_args = list(SERVICER_LOG_ENGINE_ARGS[engine])
         # TokenSpeed's full plan runs the chunk remainders, one-token requests
         # at every prefill length up to the chunk size, last and under the same
         # budget; the harness pins no chunk size, so the engine's own step
         # (8,192, or its prefill budget) would hand thousands of them to the
         # 900 s budget. Pinned, the count is known and a normal run ends complete.
-        extra_engine_args = ["--chunked-prefill-size", "2048"] if engine == "tokenspeed" else None
+        if engine == "tokenspeed":
+            extra_engine_args += ["--chunked-prefill-size", "2048"]
         worker = start_workers(
             MODEL,
             engine,

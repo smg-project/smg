@@ -29,6 +29,20 @@ SERVICER_WARMUP_ENV = {
 LEVEL_FAST = "fast"
 LEVEL_FULL = "full"
 
+#: The engine arguments the worker a case follows needs so the servicer's lines
+#: reach its log. The harness starts the SGLang and TokenSpeed engines at their
+#: ``warning`` level (``worker.py``), and both engines apply that level to the
+#: process's root logger: every INFO line of the servicer package, the pass's
+#: two lines among them, goes unwritten, under the Python and the Rust servicer
+#: alike. The followed worker runs its engine at ``info`` instead (the last
+#: ``--log-level`` on the command line wins). vLLM's servicer logs through
+#: vLLM's own logger, which the harness leaves at its default, INFO.
+SERVICER_LOG_ENGINE_ARGS = {
+    "vllm": [],
+    "sglang": ["--log-level", "info"],
+    "tokenspeed": ["--log-level", "info"],
+}
+
 # "Planned warm-up starts (level full: 215 steps (1 decode staircase, 192 prefill
 # shapes, 22 measured again), 1152519 prompt tokens and 526038 output tokens over
 # a window of 1024 and a step of 16384; budget 300 s; <source>): readiness is held
