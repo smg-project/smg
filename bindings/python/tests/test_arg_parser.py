@@ -1622,6 +1622,18 @@ class TestParseRouterArgs:
             "worker",
         ]
         assert parse_router_args([]).access_log_fields == []
+        args = [
+            "--access-log-fields",
+            "model,input_tokens,output_tokens,cached_tokens,finish_reason,ttft_us",
+        ]
+        assert parse_router_args(args).access_log_fields == [
+            "model",
+            "input_tokens",
+            "output_tokens",
+            "cached_tokens",
+            "finish_reason",
+            "ttft_us",
+        ]
         for unknown in (["peer"], ["client_addr,peer"]):
             with pytest.raises(SystemExit):
                 parse_router_args(["--access-log-fields", *unknown])

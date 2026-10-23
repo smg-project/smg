@@ -50,7 +50,7 @@ use super::{
 use crate::{
     app_context::AppContext,
     config::types::RetryConfig,
-    middleware::TenantRequestMeta,
+    middleware::{AccessLogRecord, TenantRequestMeta},
     observability::metrics::metrics_labels,
     routers::{error, grpc::regular::symphony::template::Templates, RouterTrait},
     worker::{RoutingPool, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
@@ -621,7 +621,11 @@ impl GrpcRouter {
         }
         debug!(response_id = %id, harmony = is_harmony, "Background response queued");
 
-        let tenant_meta = tenant_meta.clone();
+        let mut tenant_meta = tenant_meta.clone();
+        // The run outlives the response: the access-log record stays behind
+        // with the request (its handle would hold the request span open for
+        // the run, whose facts have no line to land on).
+        tenant_meta.remove_extension::<AccessLogRecord>();
         let headers = headers.cloned();
         let model_id = model_id.to_string();
         if request.stream.unwrap_or(false) {

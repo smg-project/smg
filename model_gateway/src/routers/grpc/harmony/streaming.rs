@@ -29,6 +29,7 @@ use super::{
     HarmonyParserAdapter,
 };
 use crate::{
+    middleware::GenerationFacts,
     observability::metrics::{metrics_labels, LocalStopAbort, Metrics, StreamingMetricsParams},
     rate_limit::SharedReservationHandle,
     routers::{
@@ -1069,6 +1070,9 @@ struct ChatDecode {
     spec_accepted: HashMap<u32, u32>,
     spec_drafted: HashMap<u32, u32>,
     parsed_reasoning_tokens: u32,
+    /// The finish reason the first choice's final chunk reported, kept for the access-log
+    /// record alone (only while the dispatch carries its handle).
+    first_finish_reason: Option<String>,
     // Indices that received a *decode* `Complete` -- unlike `prompt_tokens` (which may already
     // be populated from the prefill phase before the loop even starts, in PD mode), this is
     // only ever set from this stream's own Complete messages, so it can't be fooled by prefill
@@ -1104,6 +1108,7 @@ impl ChatDecode {
             spec_accepted: HashMap::new(),
             spec_drafted: HashMap::new(),
             parsed_reasoning_tokens: 0,
+            first_finish_reason: None,
             decode_completed_indices: HashSet::new(),
             tailed: HashSet::new(),
             engine_outlived: false,
@@ -1286,6 +1291,7 @@ impl ChatDecode {
         // A router-side stop fired: emit the final chunk now and swallow the rest of this
         // index's stream (the request is aborted once every choice has closed).
         if let Some(stop) = stop_matched {
+            self.note_finish(index, dispatch, "stop");
             HarmonyStreamingProcessor::emit_final_chunk(
                 index,
                 "stop",
@@ -1390,6 +1396,7 @@ impl ChatDecode {
             // The choice's only engine output is its Complete (a completion with no tokens: a
             // finish that carries none comes without a Chunk, so no parser was made for it); it
             // ends with its finish chunk as a choice with output does.
+            self.note_finish(index, dispatch, complete.finish_reason());
             HarmonyStreamingProcessor::emit_final_chunk(
                 index,
                 complete.finish_reason(),
@@ -1436,6 +1443,7 @@ impl ChatDecode {
             .await?;
         }
 
+        self.note_finish(index, dispatch, &final_output.finish_reason);
         HarmonyStreamingProcessor::emit_final_chunk(
             index,
             &final_output.finish_reason,
@@ -1447,6 +1455,20 @@ impl ChatDecode {
         )
         .await?;
         Ok(())
+    }
+
+    /// The finish reason choice 0 is sent, kept for the access-log record: every path that
+    /// closes the choice (its parsed finish, a Complete without output, a router-side stop)
+    /// passes here.
+    fn note_finish(
+        &mut self,
+        index: u32,
+        dispatch: &context::DispatchMetadata,
+        finish_reason: &str,
+    ) {
+        if index == 0 && dispatch.access_log.is_some() {
+            self.first_finish_reason = Some(finish_reason.to_owned());
+        }
     }
 
     /// The stream has ended: the counters once, for the usage chunk, the settlement and the
@@ -1506,18 +1528,29 @@ impl ChatDecode {
         }
 
         // Record streaming metrics
+        let ttft = self
+            .first_token_time
+            .map(|t| t.duration_since(self.start_time));
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: metrics_labels::BACKEND_HARMONY,
             model_id: &original_request.model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
-            ttft: self
-                .first_token_time
-                .map(|t| t.duration_since(self.start_time)),
+            ttft,
             generation_duration: self.start_time.elapsed(),
             input_tokens: Some(counts.prompt as u64),
             output_tokens: counts.completion as u64,
         });
+        if let Some(record) = dispatch.access_log.as_ref() {
+            record.generation(&GenerationFacts {
+                model: &dispatch.model,
+                input_tokens: counts.prompt,
+                output_tokens: counts.completion,
+                cached_tokens: counts.cached,
+                finish_reason: self.first_finish_reason.as_deref(),
+                first_token: self.first_token_time,
+            });
+        }
 
         Ok(())
     }

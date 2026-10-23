@@ -255,6 +255,12 @@ _ACCESS_LOG_FIELD_NAMES = (
     "request_bytes",
     "response_bytes",
     "worker",
+    "model",
+    "input_tokens",
+    "output_tokens",
+    "cached_tokens",
+    "finish_reason",
+    "ttft_us",
 )
 
 
@@ -1831,8 +1837,10 @@ class RouterArgs:
             help=(
                 "Optional fields of the access-log record, each written once it is listed,"
                 " space- or comma-separated (e.g. client_addr worker response_bytes, or"
-                " client_addr,worker as the Rust CLI takes it). Without this flag the record"
-                " keeps the fields it has always had."
+                " client_addr,worker as the Rust CLI takes it); model, input_tokens,"
+                " output_tokens, cached_tokens, finish_reason and ttft_us are the generation"
+                " facts the pipeline knows when the response ends. Without this flag the"
+                " record keeps the fields it has always had."
             ),
         )
 

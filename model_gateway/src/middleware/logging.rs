@@ -105,24 +105,148 @@ impl AccessLogFields {
         self.0 & Self::bit(field) != 0
     }
 
+    /// Whether a field only an inner layer learns is selected: the tenant
+    /// and the key the serving path resolves, and the generation facts the
+    /// pipeline knows when the response ends. The record handle rides the
+    /// request only then.
+    #[must_use]
+    pub fn carries_inner(self) -> bool {
+        INNER_FIELDS.iter().any(|field| self.contains(*field))
+    }
+
+    /// Whether a generation field is selected: the record then rides the
+    /// route meta into the pipeline, which records the facts where the
+    /// response ends, and a streamed body's end gets the line that carries
+    /// them (`finished streaming the response`).
+    #[must_use]
+    pub fn carries_generation(self) -> bool {
+        GENERATION_FIELDS.iter().any(|field| self.contains(*field))
+    }
+
     fn bit(field: AccessLogField) -> u16 {
         1 << (field as u16)
     }
+}
+
+/// The fields only an inner layer learns (see
+/// [`AccessLogFields::carries_inner`]).
+const INNER_FIELDS: [AccessLogField; 8] = [
+    AccessLogField::Tenant,
+    AccessLogField::KeyId,
+    AccessLogField::Model,
+    AccessLogField::InputTokens,
+    AccessLogField::OutputTokens,
+    AccessLogField::CachedTokens,
+    AccessLogField::FinishReason,
+    AccessLogField::Ttft,
+];
+
+/// The generation fields (see [`AccessLogFields::carries_generation`]).
+const GENERATION_FIELDS: [AccessLogField; 6] = [
+    AccessLogField::Model,
+    AccessLogField::InputTokens,
+    AccessLogField::OutputTokens,
+    AccessLogField::CachedTokens,
+    AccessLogField::FinishReason,
+    AccessLogField::Ttft,
+];
+
+/// What the pipeline knows about a generation when its response ends, for
+/// the record's generation fields: the engine's counters as the usage
+/// settlement takes them, the finish reason the response reported for its
+/// first choice, and when a streamed response's first token went out.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GenerationFacts<'a> {
+    /// The model the response reports.
+    pub model: &'a str,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cached_tokens: u32,
+    pub finish_reason: Option<&'a str>,
+    /// When the first output token went out, on a streamed response:
+    /// `ttft_us` is its distance from the request's arrival, where `latency`
+    /// starts. None for a buffered answer, which has no first token of its
+    /// own.
+    pub first_token: Option<Instant>,
 }
 
 /// The access-log record of one request, handed down the request's
 /// extensions while a field only an inner layer learns is selected: the
 /// serving path authenticates the caller's key and resolves its tenant in
 /// route layers, after the request's first line, and those layers record
-/// what they learn here. Absent while neither field is selected, so a
-/// resolving layer pays one extension lookup and nothing else.
+/// what they learn here; the route meta carries it on into the pipeline,
+/// which records the generation's facts where the response ends. Absent
+/// while no such field is selected, so a resolving layer pays one extension
+/// lookup and nothing else, and the pipeline pays nothing.
 #[derive(Clone, Debug)]
 pub struct AccessLogRecord {
     span: Span,
     fields: AccessLogFields,
+    /// When the request arrived: where `latency` and `ttft_us` start.
+    started: Instant,
 }
 
 impl AccessLogRecord {
+    /// A record over `span` carrying `fields` for a request that arrived at
+    /// `started` (the layer builds the one that rides a request).
+    #[must_use]
+    pub fn new(span: Span, fields: AccessLogFields, started: Instant) -> Self {
+        Self {
+            span,
+            fields,
+            started,
+        }
+    }
+
+    /// When the request arrived: where `latency` and `ttft_us` start.
+    #[must_use]
+    pub fn started(&self) -> Instant {
+        self.started
+    }
+
+    /// Whether a generation field is selected (the route meta carries the
+    /// handle on into the pipeline only then).
+    #[must_use]
+    pub fn carries_generation(&self) -> bool {
+        self.fields.carries_generation()
+    }
+
+    /// The generation's facts, each written when its field is selected:
+    /// once per request, by the pipeline, where the response ends. A
+    /// buffered answer's are written before its finish line and are on it;
+    /// a streamed response's are known at its last frame, after the finish
+    /// line went out with the head, and are on the stream's end line
+    /// (`finished streaming the response`), which a selected generation
+    /// field earns the stream.
+    pub fn generation(&self, facts: &GenerationFacts<'_>) {
+        if self.fields.contains(AccessLogField::Model) {
+            self.span.record("model", facts.model);
+        }
+        if self.fields.contains(AccessLogField::InputTokens) {
+            self.span
+                .record("input_tokens", u64::from(facts.input_tokens));
+        }
+        if self.fields.contains(AccessLogField::OutputTokens) {
+            self.span
+                .record("output_tokens", u64::from(facts.output_tokens));
+        }
+        if self.fields.contains(AccessLogField::CachedTokens) {
+            self.span
+                .record("cached_tokens", u64::from(facts.cached_tokens));
+        }
+        if self.fields.contains(AccessLogField::FinishReason) {
+            if let Some(reason) = facts.finish_reason {
+                self.span.record("finish_reason", reason);
+            }
+        }
+        if self.fields.contains(AccessLogField::Ttft) {
+            if let Some(first_token) = facts.first_token {
+                let ttft = first_token.saturating_duration_since(self.started);
+                self.span.record("ttft_us", ttft.as_micros() as u64);
+            }
+        }
+    }
+
     /// The caller's tenant, as the serving path keyed it.
     pub fn tenant(&self, tenant: &str) {
         if self.fields.contains(AccessLogField::Tenant) {
@@ -333,6 +457,12 @@ impl<B> MakeSpan<B> for RequestSpan {
             response_bytes = Empty,
             response_bytes_sent = Empty,
             worker = Empty,
+            model = Empty,
+            input_tokens = Empty,
+            output_tokens = Empty,
+            cached_tokens = Empty,
+            finish_reason = Empty,
+            ttft_us = Empty,
             module = "smg"
         );
 
@@ -553,11 +683,10 @@ where
             record_request_fields(&span, &request, fields);
             RequestLogger.on_request(&request, &span);
             let mut request = request;
-            if fields.contains(AccessLogField::Tenant) || fields.contains(AccessLogField::KeyId) {
-                request.extensions_mut().insert(AccessLogRecord {
-                    span: span.clone(),
-                    fields,
-                });
+            if fields.carries_inner() {
+                request
+                    .extensions_mut()
+                    .insert(AccessLogRecord::new(span.clone(), fields, start));
             }
             let mut request_bytes = None;
             if fields.contains(AccessLogField::RequestBytes) {
@@ -596,9 +725,11 @@ where
             ResponseLogger.on_response(&response, start.elapsed(), &span);
             close_log.head_sent();
             let count_bytes = fields.contains(AccessLogField::ResponseBytes);
-            // A body without a declared length is a stream: its bytes are
-            // known at its end, which then gets a line of its own.
-            let end_line = count_bytes && progress.declared().is_none();
+            // A body without a declared length is a stream: its bytes, and
+            // the generation facts the pipeline records at its last frame,
+            // are known at its end, which then gets a line of its own.
+            let end_line =
+                (count_bytes || fields.carries_generation()) && progress.declared().is_none();
             // The span stays open until the body ends: handed to the edge's one
             // body wrapper with the close line it owes and the bytes it counts,
             // which the wrapper reports at the body's end, failure or drop.
@@ -717,18 +848,21 @@ pub(crate) struct SpanDuty {
     /// Whether the record carries the response body's bytes.
     count_bytes: bool,
     /// Whether the body's end gets a line of its own (a streamed body, whose
-    /// bytes are known only then); cleared once the line is written.
+    /// bytes and generation facts are known only then); cleared once the
+    /// line is written.
     end_line: bool,
 }
 
 impl SpanDuty {
     /// The body ended (its last frame, or the declared length out) with
     /// `bytes_sent` bytes out: a streamed body's end gets its line, with the
-    /// bytes, when the record carries them.
+    /// bytes and the generation facts the record carries.
     pub(crate) fn ended(&mut self, bytes_sent: u64) {
         self.close_log.done();
         if std::mem::replace(&mut self.end_line, false) {
-            self.span.record("response_bytes", bytes_sent);
+            if self.count_bytes {
+                self.span.record("response_bytes", bytes_sent);
+            }
             let _enter = self.span.enter();
             info!(
                 target: "smg::response",
@@ -1294,6 +1428,7 @@ mod field_tests {
     const PEER: &str = "198.51.100.7:51514";
     const FORWARDED: &str = "203.0.113.9, 198.51.100.2";
     const AGENT: &str = "test-client/1.0";
+    const MODEL: &str = "test-model";
     const FRAME: &[u8] = b"data: x\n\n";
 
     /// The lines a subscriber wrote.
@@ -1371,9 +1506,66 @@ mod field_tests {
         Router::new()
             .route(
                 "/v1/chat/completions",
-                post(|body: Bytes| async move {
+                post(|request: Request<Body>| async move {
+                    // The pipeline's part: the generation's facts through
+                    // the handle, when the record carries them.
+                    let record = request.extensions().get::<AccessLogRecord>().cloned();
+                    let body = request
+                        .into_body()
+                        .collect()
+                        .await
+                        .expect("body")
+                        .to_bytes();
                     assert_eq!(body.len(), PAYLOAD.len());
+                    if let Some(record) = record {
+                        record.generation(&GenerationFacts {
+                            model: MODEL,
+                            input_tokens: 12,
+                            output_tokens: 7,
+                            cached_tokens: 4,
+                            finish_reason: Some("stop"),
+                            first_token: Some(record.started() + Duration::from_micros(1500)),
+                        });
+                    }
                     routed((StatusCode::OK, REPLY).into_response())
+                }),
+            )
+            .route(
+                "/v1/stream/generation",
+                post(|request: Request<Body>| async move {
+                    // The pipeline's part on a stream: the facts through the
+                    // handle at the stream's end, from inside the body.
+                    let record = request.extensions().get::<AccessLogRecord>().cloned();
+                    let _ = request.into_body().collect().await.expect("body");
+                    let frames =
+                        futures::stream::unfold((0u8, record), |(sent, record)| async move {
+                            if sent < 3 {
+                                return Some((
+                                    Ok::<_, Infallible>(Bytes::from_static(FRAME)),
+                                    (sent + 1, record),
+                                ));
+                            }
+                            if let Some(record) = record.as_ref() {
+                                record.generation(&GenerationFacts {
+                                    model: MODEL,
+                                    input_tokens: 12,
+                                    output_tokens: 7,
+                                    cached_tokens: 4,
+                                    finish_reason: Some("stop"),
+                                    first_token: Some(
+                                        record.started() + Duration::from_micros(1500),
+                                    ),
+                                });
+                            }
+                            None
+                        });
+                    routed(
+                        (
+                            [(header::CONTENT_TYPE, "text/event-stream")],
+                            Body::from_stream(frames),
+                        )
+                            .into_response(),
+                    )
                 }),
             )
             .route(
@@ -1533,6 +1725,12 @@ mod field_tests {
         assert_eq!(span["request_bytes"], PAYLOAD.len());
         assert_eq!(span["response_bytes"], REPLY.len());
         assert_eq!(span["worker"], WORKER);
+        assert_eq!(span["model"], MODEL);
+        assert_eq!(span["input_tokens"], 12);
+        assert_eq!(span["output_tokens"], 7);
+        assert_eq!(span["cached_tokens"], 4);
+        assert_eq!(span["finish_reason"], "stop");
+        assert_eq!(span["ttft_us"], 1500);
         let mut expected: Vec<&str> = DEFAULT_FINISH_KEYS.to_vec();
         expected.extend(AccessLogField::ALL.iter().map(|field| field.as_str()));
         expected.sort_unstable();
@@ -1587,6 +1785,70 @@ mod field_tests {
                 assert_eq!(span["response_bytes"], 3 * FRAME.len());
                 assert_eq!(span["worker"], WORKER);
                 assert_eq!(span["status_code"], 200);
+            }
+        }
+    }
+
+    /// A streamed response's generation facts are known at its end, after
+    /// the finish line went out with the head: they land on the end line,
+    /// which a selected generation field earns the stream on its own, bytes
+    /// selected or not; the finish line carries none of them.
+    #[tokio::test]
+    async fn a_streamed_response_gets_its_generation_facts_on_the_end_line() {
+        let generation = AccessLogFields::from_fields(&GENERATION_FIELDS);
+        let bytes_only = AccessLogFields::from_fields(&[AccessLogField::ResponseBytes]);
+        for (fields, expected_lines) in [
+            (generation, 3),
+            (AccessLogFields::all(), 3),
+            (bytes_only, 3),
+            (AccessLogFields::NONE, 2),
+        ] {
+            let capture = Capture::default();
+            let _guard = tracing::subscriber::set_default(json_subscriber(&capture));
+            let response = app(fields, None)
+                .oneshot(request("/v1/stream/generation"))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes();
+            assert_eq!(body.len(), 3 * FRAME.len());
+
+            let lines = access_lines(&capture);
+            assert_eq!(lines.len(), expected_lines, "{fields:?}: {lines:?}");
+            let (message, span) = &lines[1];
+            assert_eq!(message, "finished processing request");
+            for field in GENERATION_FIELDS {
+                assert!(
+                    !span.contains_key(field.as_str()),
+                    "{fields:?}: a stream's {field:?} is not known at its head: {span:?}"
+                );
+            }
+            if expected_lines == 3 {
+                let (message, span) = &lines[2];
+                assert_eq!(message, "finished streaming the response");
+                if fields.contains(AccessLogField::Model) {
+                    assert_eq!(span["model"], MODEL, "{fields:?}");
+                    assert_eq!(span["input_tokens"], 12, "{fields:?}");
+                    assert_eq!(span["output_tokens"], 7, "{fields:?}");
+                    assert_eq!(span["cached_tokens"], 4, "{fields:?}");
+                    assert_eq!(span["finish_reason"], "stop", "{fields:?}");
+                    assert_eq!(span["ttft_us"], 1500, "{fields:?}");
+                } else {
+                    assert!(!span.contains_key("model"), "{fields:?}: {span:?}");
+                }
+                if fields.contains(AccessLogField::ResponseBytes) {
+                    assert_eq!(span["response_bytes"], 3 * FRAME.len(), "{fields:?}");
+                } else {
+                    assert!(
+                        !span.contains_key("response_bytes"),
+                        "{fields:?}: the bytes are not selected: {span:?}"
+                    );
+                }
             }
         }
     }
@@ -1797,6 +2059,12 @@ mod field_tests {
                 format!("request_bytes={}", PAYLOAD.len()),
                 format!("response_bytes={}", REPLY.len()),
                 format!("worker=\"{WORKER}\""),
+                format!("model=\"{MODEL}\""),
+                "input_tokens=12".to_owned(),
+                "output_tokens=7".to_owned(),
+                "cached_tokens=4".to_owned(),
+                "finish_reason=\"stop\"".to_owned(),
+                "ttft_us=1500".to_owned(),
             ] {
                 assert_eq!(
                     finish.contains(&needle),
@@ -1821,6 +2089,11 @@ mod field_tests {
                 true,
             ),
             (AccessLogFields::from_fields(&[AccessLogField::KeyId]), true),
+            (
+                AccessLogFields::from_fields(&[AccessLogField::InputTokens]),
+                true,
+            ),
+            (AccessLogFields::from_fields(&[AccessLogField::Ttft]), true),
         ] {
             let app = Router::new()
                 .route(

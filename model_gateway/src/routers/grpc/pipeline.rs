@@ -25,8 +25,8 @@ use openai_protocol::{
     completion::CompletionRequest,
     decisions::{DecisionUsage, DecisionsRequest},
     embedding::EmbeddingRequest,
-    generate::{GenerateRequest, GenerateResponse},
-    messages::CreateMessageRequest,
+    generate::{GenerateFinishReason, GenerateRequest, GenerateResponse},
+    messages::{CreateMessageRequest, StopReason},
 };
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_external_router::header_utils::insert_routed_worker_id;
@@ -75,7 +75,7 @@ use super::{
 };
 use crate::{
     config::types::RetryConfig,
-    middleware::{ReportedRefusal, TenantRequestMeta},
+    middleware::{GenerationFacts, ReportedRefusal, TenantRequestMeta},
     observability::{
         cache_trace,
         metrics::{bool_to_static_str, metrics_labels, Metrics},
@@ -599,6 +599,7 @@ impl RequestPipeline {
             &attempt_plan,
             &dctx.dispatch_model,
             dctx.workers.as_ref(),
+            dctx.access_log.clone(),
         ));
 
         execute_plan(dctx, attempt_plan, last_attempt).await?;
@@ -685,6 +686,11 @@ impl RequestPipeline {
                     return Err(response);
                 }
             };
+            if metrics_endpoint.is_none() {
+                // A run the Responses API drives inside a request of its own:
+                // the request's record is the outer request's, written once.
+                dctx.access_log = None;
+            }
             Metrics::record_request_buffers_released_early(plan.wire_len());
 
             let max_attempts = retry_config.map_or(1, |config| config.max_retries.max(1));
@@ -717,7 +723,10 @@ impl RequestPipeline {
                         }
                         return Ok(RunOutcome::Early(Self::routed_response(&dctx, response)));
                     }
-                    Ok(None) => return Ok(RunOutcome::Final(dctx, attempt_start)),
+                    Ok(None) => {
+                        Self::record_buffered_generation(&dctx);
+                        return Ok(RunOutcome::Final(dctx, attempt_start));
+                    }
                     Err(response) => response,
                 };
 
@@ -820,6 +829,92 @@ impl RequestPipeline {
             .iter()
             .map(|pool| placement::candidates(&self.worker_registry, model_id, *pool, Some(wire)))
             .collect()
+    }
+
+    /// The access-log record's generation fields of a buffered answer,
+    /// written once, here, where every endpoint's answer passes with its
+    /// counters: the engine's counters the response stage recorded (chat,
+    /// messages, transcription) or the usage the answer carries (completion,
+    /// generate, decisions), and the finish reason the answer reports for
+    /// its first choice. An answer with no generation (embeddings,
+    /// classification) and a run without the handle record nothing.
+    fn record_buffered_generation(ctx: &DispatchContext) {
+        let Some(record) = ctx.access_log.as_ref() else {
+            return;
+        };
+        let Some(answer) = ctx.response.final_response.as_ref() else {
+            return;
+        };
+        let engine_counts = ctx.response.engine_counts;
+        let counts_of = |usage: Option<&Usage>| {
+            usage.map(|usage| TokenCounts {
+                prompt: usage.prompt_tokens,
+                completion: usage.completion_tokens,
+                cached: usage
+                    .prompt_tokens_details
+                    .as_ref()
+                    .map_or(0, |details| details.cached_tokens),
+                ..TokenCounts::default()
+            })
+        };
+        let (counts, finish_reason): (Option<TokenCounts>, Option<&str>) = match answer {
+            FinalResponse::Chat(response) => (
+                engine_counts.or_else(|| counts_of(response.usage.as_ref())),
+                response
+                    .choices
+                    .first()
+                    .and_then(|choice| choice.finish_reason.as_deref()),
+            ),
+            FinalResponse::Completion(response) => (
+                counts_of(response.usage.as_ref()),
+                response
+                    .choices
+                    .first()
+                    .and_then(|choice| choice.finish_reason.as_deref()),
+            ),
+            FinalResponse::Generate(responses) => (
+                Some(TokenCounts::of_generated(responses)),
+                responses
+                    .first()
+                    .map(|response| match &response.meta_info.finish_reason {
+                        GenerateFinishReason::Length { .. } => "length",
+                        GenerateFinishReason::Stop { .. } => "stop",
+                        GenerateFinishReason::Other(value) => value
+                            .get("type")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("other"),
+                    }),
+            ),
+            FinalResponse::Decisions(response) => {
+                let count = |tokens: u64| u32::try_from(tokens).unwrap_or(u32::MAX);
+                (
+                    Some(TokenCounts {
+                        prompt: count(response.usage.input_tokens),
+                        completion: count(response.usage.output_tokens),
+                        cached: count(response.usage.input_tokens_details.cached_tokens),
+                        ..TokenCounts::default()
+                    }),
+                    None,
+                )
+            }
+            FinalResponse::Messages(message) => (
+                engine_counts,
+                message.stop_reason.as_ref().map(StopReason::as_str),
+            ),
+            FinalResponse::Transcription { .. } => (engine_counts, None),
+            FinalResponse::Embedding(_) | FinalResponse::Classify(_) => return,
+        };
+        let Some(counts) = counts else {
+            return;
+        };
+        record.generation(&GenerationFacts {
+            model: &ctx.dispatch_model,
+            input_tokens: counts.prompt,
+            output_tokens: counts.completion,
+            cached_tokens: counts.cached,
+            finish_reason,
+            first_token: None,
+        });
     }
 
     /// Attribute a response to the worker from the successful dispatch attempt.
@@ -3132,6 +3227,86 @@ mod request_release_tests {
         axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("drain SSE body")
+    }
+
+    /// The access-log record's generation fields are written by the
+    /// pipeline where the response ends: at a streamed completion's last
+    /// frame and before a buffered answer's finish line, with the engine's
+    /// counts, the first choice's finish reason and, streamed, the time to
+    /// the first token. A choice the gateway's own stop closes (here a
+    /// stop token id, matched in the engine's chunk before its Complete)
+    /// records the "stop" the client was sent. The request span is the one
+    /// the logging layer makes, so the fields land on the record's own
+    /// lines.
+    #[tokio::test]
+    async fn the_access_log_record_carries_the_generation_facts() {
+        use crate::observability::logging::test_support::RequestSpanProbe;
+
+        for (stream, local_stop) in [(true, false), (false, false), (true, true)] {
+            // The request span as the logging layer makes it, with the
+            // record's fields declared, and the handle the layer hands down.
+            let probe = RequestSpanProbe::new("POST", "/v1/completions");
+            let meta = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"))
+                .with_extension(probe.record());
+
+            let port = spawn_stub(GatedScheduler::default()).await;
+            let worker_registry = Arc::new(WorkerRegistry::new());
+            register_worker(&worker_registry, port, WorkerType::Regular);
+            let pipeline = completion_pipeline(&worker_registry, Mode::Regular);
+            let components = components(worker_registry).await;
+            let mut request = serde_json::json!({
+                "model": MODEL,
+                "prompt": "Hello world",
+                "stream": stream,
+            });
+            if local_stop {
+                // The stub's one output token, as a stop the gateway matches
+                // itself: the choice closes in the chunk, its Complete is
+                // the tail.
+                request["stop_token_ids"] = serde_json::json!([100]);
+            }
+            let request: Arc<CompletionRequest> =
+                Arc::new(serde_json::from_value(request).expect("completion request"));
+            let response = pipeline
+                .execute_completion(
+                    request,
+                    None,
+                    MODEL.to_string(),
+                    components,
+                    Some(meta),
+                    None,
+                    None,
+                )
+                .await;
+            assert_eq!(
+                response.status(),
+                http::StatusCode::OK,
+                "stream={stream} local_stop={local_stop}"
+            );
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("drain the body");
+
+            // The fields, as a line written under the span carries them.
+            let fields = probe.fields();
+            let case = format!("stream={stream} local_stop={local_stop}: {fields}");
+            assert_eq!(fields["model"], MODEL, "{case}");
+            assert_eq!(fields["input_tokens"], 2, "{case}");
+            assert_eq!(fields["output_tokens"], 1, "{case}");
+            assert_eq!(fields["cached_tokens"], 0, "{case}");
+            assert_eq!(fields["finish_reason"], "stop", "{case}");
+            if stream {
+                assert!(
+                    fields["ttft_us"].as_u64().is_some(),
+                    "a streamed response has its first token: {fields}"
+                );
+            } else {
+                assert!(
+                    fields.get("ttft_us").is_none(),
+                    "a buffered answer has no first token of its own: {fields}"
+                );
+            }
+        }
     }
 
     /// The spans the OpenTelemetry layer exported, as a trace backend sees

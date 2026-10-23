@@ -1111,8 +1111,12 @@ struct ServingArgs {
 
     /// Optional fields of the access-log record, comma-separated:
     /// client_addr, forwarded_for, user_agent, tenant, key_id,
-    /// request_bytes, response_bytes, worker (default: none, the record
-    /// keeps the fields it has always had)
+    /// request_bytes, response_bytes, worker, model, input_tokens,
+    /// output_tokens, cached_tokens, finish_reason, ttft_us (default: none,
+    /// the record keeps the fields it has always had). The generation
+    /// fields are what the pipeline knows when the response ends: the
+    /// engine's token counts, the first choice's finish reason, the time
+    /// to the first token of a streamed response in microseconds.
     #[arg(long, value_delimiter = ',', value_parser = parse_access_log_field, help_heading = "Logging")]
     access_log_fields: Vec<AccessLogField>,
 

@@ -379,6 +379,11 @@ pub(crate) struct DispatchContext {
     pub streaming: bool,
     pub headers: Option<HeaderMap>,
     pub rate_limit_cell: Option<Arc<RateLimitCell>>,
+    /// The access-log record's handle, when the record carries a generation
+    /// field (see `AccessLogFields::carries_inner`): the pipeline writes the
+    /// generation's facts through it where the response ends. None otherwise,
+    /// and for a run the Responses API drives inside a request of its own.
+    pub access_log: Option<crate::middleware::AccessLogRecord>,
     pub routing: RoutingSnapshot,
     pub wire: WireConstraint,
     /// The selected worker's constrained decoding, when its policy chose the
@@ -820,6 +825,10 @@ pub(crate) struct DispatchMetadata {
     pub model: String,
     pub created: u64,
     pub weight_version: Option<String>,
+    /// The access-log record's handle (see `DispatchContext::access_log`),
+    /// riding into the response stream's task, which records the
+    /// generation's facts at the stream's end.
+    pub access_log: Option<crate::middleware::AccessLogRecord>,
 }
 
 /// Load guards for worker load tracking
@@ -1081,6 +1090,10 @@ impl RequestContext {
             streaming,
             headers,
             rate_limit_cell,
+            access_log: tenant_request_meta
+                .as_ref()
+                .and_then(|meta| meta.extension::<crate::middleware::AccessLogRecord>())
+                .cloned(),
             routing,
             wire,
             constraint_decided_on: state.constraint_decided_on,

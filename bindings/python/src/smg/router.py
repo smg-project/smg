@@ -365,8 +365,11 @@ class Router:
         log_level: Logging level. Options: 'debug', 'info', 'warn', 'error'.
         access_log_fields: Optional fields of the access-log record, each written
             once listed: 'client_addr', 'forwarded_for', 'user_agent', 'tenant',
-            'key_id', 'request_bytes', 'response_bytes', 'worker'. An empty list
-            keeps the record's fields as they have always been. Default: []
+            'key_id', 'request_bytes', 'response_bytes', 'worker', and the
+            generation facts the pipeline knows when the response ends:
+            'model', 'input_tokens', 'output_tokens', 'cached_tokens',
+            'finish_reason', 'ttft_us'. An empty list keeps the record's fields
+            as they have always been. Default: []
         service_discovery: Enable Kubernetes service discovery. When enabled, the
             router will automatically discover worker pods based on the selector.
             Default: False

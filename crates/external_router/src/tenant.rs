@@ -101,6 +101,15 @@ impl RouteRequestMeta {
     {
         self.extensions.get::<T>()
     }
+
+    /// Take an extension off the meta: for a clone that must not carry it on
+    /// (a run that outlives the request drops its request-scoped handles).
+    pub fn remove_extension<T>(&mut self) -> Option<T>
+    where
+        T: Send + Sync + 'static,
+    {
+        self.extensions.remove::<T>()
+    }
 }
 
 impl PartialEq for RouteRequestMeta {

@@ -15,7 +15,8 @@ use smg_grpc_client::vllm_engine::{proto, proto::generate_response::Response as 
 
 use super::{usage_tests::harmony_tokens, HarmonyStreamingProcessor};
 use crate::{
-    observability::metrics::metrics_labels,
+    middleware::AccessLogRecord,
+    observability::{logging::test_support::RequestSpanProbe, metrics::metrics_labels},
     routers::grpc::{
         context, harmony::try_harmony_encoding, regular::streaming::eof_tests::scripted_stream,
         utils,
@@ -59,12 +60,22 @@ fn answering_choice(index: u32) -> Vec<proto::GenerateResponse> {
 /// The `data:` events of the streamed chat completion for `frames`, `[DONE]`
 /// left out.
 async fn streamed_events(frames: Vec<proto::GenerateResponse>, choices: u32) -> Vec<Value> {
+    streamed_events_recorded(frames, choices, None).await
+}
+
+/// [`streamed_events`] for a request that carries `access_log`.
+async fn streamed_events_recorded(
+    frames: Vec<proto::GenerateResponse>,
+    choices: u32,
+    access_log: Option<AccessLogRecord>,
+) -> Vec<Value> {
     let (stream, server) = scripted_stream(frames, "0").await;
     let dispatch = context::DispatchMetadata {
         request_id: "harmony-lone-complete".to_string(),
         model: "harmony-test".to_string(),
         created: 1,
         weight_version: None,
+        access_log,
     };
     let request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "harmony-test", "messages": [], "n": choices, "stream": true,
@@ -125,6 +136,25 @@ async fn harmony_lone_complete_opens_the_choice_before_its_finish() {
         vec![(Some("assistant"), None), (None, Some("stop"))],
         "{events:?}"
     );
+}
+
+/// The lone Complete's finish reason reaches the access-log record, as a
+/// choice with content's does: it is the only finish the client sees.
+#[tokio::test]
+async fn harmony_lone_complete_records_its_finish_reason() {
+    let probe = RequestSpanProbe::new("POST", "/v1/chat/completions");
+    let events = streamed_events_recorded(
+        vec![complete_with(0, Vec::new(), "length")],
+        1,
+        Some(probe.record()),
+    )
+    .await;
+    assert_eq!(
+        choice_trail(&events, 0),
+        vec![(Some("assistant"), None), (None, Some("length"))],
+        "{events:?}"
+    );
+    assert_eq!(probe.fields()["finish_reason"], "length", "{events:?}");
 }
 
 #[tokio::test]

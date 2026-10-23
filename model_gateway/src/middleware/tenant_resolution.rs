@@ -194,10 +194,16 @@ fn attach_route_request_meta(
     state: &TenantResolutionState,
     request: &mut Request<Body>,
 ) -> Result<(), Response> {
-    let request_meta = resolve_route_request_meta(state, request)?;
-    // The access log, when it carries the tenant.
+    let mut request_meta = resolve_route_request_meta(state, request)?;
+    // The access log, when it carries the tenant; its handle rides the meta
+    // on into the router only for the generation facts the pipeline records
+    // where the response ends: the meta can outlive the response (a
+    // background Responses run keeps it), and the handle's span with it.
     if let Some(record) = request.extensions().get::<AccessLogRecord>() {
         record.tenant(request_meta.tenant_key().as_str());
+        if record.carries_generation() {
+            request_meta.insert_extension(record.clone());
+        }
     }
     request.extensions_mut().insert(request_meta);
     Ok(())

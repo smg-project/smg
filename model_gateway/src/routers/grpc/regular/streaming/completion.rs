@@ -56,6 +56,10 @@ pub(super) struct CompletionStreamOutcome {
     pub(super) spec_draft_tokens: u32,
     pub(super) completion_tokens: u32,
     pub(super) first_token_time: Option<Instant>,
+    /// The finish reason the unit's first choice (index 0) reported, kept
+    /// for the access-log record alone (only while the dispatch carries its
+    /// handle).
+    pub(super) finish_reason: Option<String>,
     /// Whether *every* expected `n>1` choice in this unit received a
     /// `Complete` message (the only source of authoritative usage) -- a
     /// clean EOF partway through leaves this `false` even if some choices
@@ -124,6 +128,9 @@ pub(super) struct CompletionStream<'a> {
     spec_accepted: HashMap<u32, u32>,
     spec_drafted: HashMap<u32, u32>,
     total_completion: CompletionTokenTracker,
+    /// The finish reason the unit's first choice (index 0) reported (see
+    /// `CompletionStreamOutcome::finish_reason`).
+    first_finish_reason: Option<String>,
 }
 
 /// A completion chunk's choice: `text` at `index`, with its finish reason.
@@ -178,6 +185,7 @@ impl<'a> CompletionStream<'a> {
             sse_buffer: BytesMut::with_capacity(4096),
             total_prompt: 0,
             total_cached: 0,
+            first_finish_reason: None,
             reasoning_tokens: HashMap::new(),
             spec_accepted: HashMap::new(),
             spec_drafted: HashMap::new(),
@@ -299,6 +307,7 @@ impl<'a> CompletionStream<'a> {
                 .await?;
             }
 
+            self.note_finish(index, "stop");
             StreamingProcessor::send_completion_chunk(
                 self.tx,
                 &mut self.sse_buffer,
@@ -393,6 +402,7 @@ impl<'a> CompletionStream<'a> {
             complete.finish_reason(),
         )
         .to_string();
+        self.note_finish(index, &finish_reason);
 
         StreamingProcessor::send_completion_chunk(
             self.tx,
@@ -404,10 +414,20 @@ impl<'a> CompletionStream<'a> {
         Ok(())
     }
 
+    /// The finish reason choice 0 is sent, kept for the access-log record: every path that
+    /// closes the choice (its Complete, a local stop in a chunk, a local stop at the
+    /// engine's end) passes here.
+    fn note_finish(&mut self, index: u32, finish_reason: &str) {
+        if index == 0 && self.dispatch.access_log.is_some() {
+            self.first_finish_reason = Some(finish_reason.to_owned());
+        }
+    }
+
     /// After the engine's end: pending text and locally matched stops of
     /// the choices no `Complete` closed go out, without inventing engine
     /// usage. A local stop still honors the requested suffix.
     pub(super) async fn finish_open_choices(&mut self) -> Result<(), utils::StreamFailure> {
+        let mut first_stopped = false;
         for (index, decoder) in &mut self.stop_decoders {
             if self.completed_indices.contains(index) || self.stopped_indices.contains(index) {
                 continue;
@@ -415,6 +435,7 @@ impl<'a> CompletionStream<'a> {
             let tail = decoder.finish().map_err(|e| e.to_string())?;
             utils::warn_detokenize_recoveries(&self.dispatch.request_id, *index, decoder);
             let stopped = decoder.is_stopped();
+            first_stopped |= stopped && *index == 0;
             let mut text = match tail {
                 SequenceDecoderOutput::Text(text)
                 | SequenceDecoderOutput::StoppedWithText(text) => text,
@@ -435,6 +456,9 @@ impl<'a> CompletionStream<'a> {
                 &completion_choice(*index, text, stopped.then(|| "stop".to_string())),
             )
             .await?;
+        }
+        if first_stopped {
+            self.note_finish(0, "stop");
         }
         Ok(())
     }
@@ -504,6 +528,7 @@ impl<'a> CompletionStream<'a> {
             spec_draft_tokens: self.spec_drafted.values().sum(),
             completion_tokens: self.total_completion.total(),
             first_token_time: self.first_token_time,
+            finish_reason: self.first_finish_reason,
             saw_complete,
         }
     }

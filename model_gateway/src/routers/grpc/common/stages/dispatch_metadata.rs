@@ -12,6 +12,7 @@ pub(crate) fn prepare_dispatch_metadata(
     plan: &ExecutionPlan,
     dispatch_model: &str,
     workers: Option<&WorkerSelection>,
+    access_log: Option<crate::middleware::AccessLogRecord>,
 ) -> DispatchMetadata {
     let weight_version = workers
         .map(|w| match w {
@@ -31,5 +32,6 @@ pub(crate) fn prepare_dispatch_metadata(
         model: dispatch_model.to_string(),
         created,
         weight_version: Some(weight_version),
+        access_log,
     }
 }

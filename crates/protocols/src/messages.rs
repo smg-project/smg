@@ -1319,6 +1319,22 @@ pub enum StopReason {
     Refusal,
 }
 
+impl StopReason {
+    /// The reason's wire spelling (its `snake_case` serialization), without
+    /// serializing it.
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::EndTurn => "end_turn",
+            Self::MaxTokens => "max_tokens",
+            Self::StopSequence => "stop_sequence",
+            Self::ToolUse => "tool_use",
+            Self::PauseTurn => "pause_turn",
+            Self::Refusal => "refusal",
+        }
+    }
+}
+
 /// Billing and rate-limit usage.
 ///
 /// The public API writes the cache counters, the cache-creation breakdown,

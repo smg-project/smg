@@ -171,6 +171,7 @@ fn dispatch() -> context::DispatchMetadata {
         model: "eof-test".to_string(),
         created: 1,
         weight_version: None,
+        access_log: None,
     }
 }
 
@@ -324,6 +325,7 @@ async fn streamed_generate(
         backend_type: "test",
         model: "eof-test".to_string(),
         expected_choices: choices,
+        access_log: None,
     };
     let (tx, rx) = sse_channel();
     let result = if with_input_logprobs {

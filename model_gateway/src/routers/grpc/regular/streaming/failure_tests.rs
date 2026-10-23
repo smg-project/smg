@@ -46,6 +46,7 @@ fn dispatch() -> context::DispatchMetadata {
         model: "failure-test".to_string(),
         created: 1,
         weight_version: None,
+        access_log: None,
     }
 }
 

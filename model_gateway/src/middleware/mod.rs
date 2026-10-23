@@ -26,7 +26,7 @@ pub use body_timeout::{RequestBodyTimeoutLayer, RequestBodyTimeouts};
 pub use concurrency::{AdmissionQueue, ConcurrencyLimitLayer};
 pub use logging::{
     create_logging_layer, trace_context_on_response, AccessLogFields, AccessLogRecord,
-    ProbeResponse, ReportedRefusal, RequestLogger, RequestSpan, ResponseLogger,
+    GenerationFacts, ProbeResponse, ReportedRefusal, RequestLogger, RequestSpan, ResponseLogger,
     StreamFailureLogger,
 };
 pub use messages_errors::{

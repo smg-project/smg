@@ -282,6 +282,7 @@ pub(super) fn dispatch() -> context::DispatchMetadata {
         model: "eof-test".to_string(),
         created: 1,
         weight_version: None,
+        access_log: None,
     }
 }
 
@@ -388,6 +389,60 @@ async fn byte_fallback_completion_sse_keeps_tail_and_exact_usage() {
         assert_eq!(usages[0]["usage"]["completion_tokens"], ids.len());
         assert_eq!(usages[0]["usage"]["prompt_tokens"], 1);
     }
+}
+
+/// A stop the gateway matches in the text its decoder releases at the
+/// engine's end (no Complete came) closes the choice with "stop", and the
+/// access-log record reads that reason.
+#[tokio::test]
+async fn completion_stop_at_the_engine_end_records_its_finish_reason() {
+    use crate::observability::logging::test_support::RequestSpanProbe;
+
+    let tokenizer = byte_fallback_tokenizer();
+    // `t`, then <0xF2>: the dangling byte is held until the end, where it
+    // decodes to the replacement character the stop names.
+    let frames: Vec<_> = [1, 2]
+        .iter()
+        .map(|id| proto::GenerateResponse {
+            response: Some(GenerationEvent::Chunk(proto::GenerateStreamChunk {
+                token_ids: vec![*id],
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                ..Default::default()
+            })),
+        })
+        .collect();
+    let (stream, server) = scripted_stream(frames, "0").await;
+    let request: openai_protocol::completion::CompletionRequest = serde_json::from_value(
+        serde_json::json!({"model":"eof-test", "prompt":"test", "stream":true,
+            "ignore_eos":true, "max_tokens":2, "stop":"\u{FFFD}"}),
+    )
+    .unwrap();
+    let probe = RequestSpanProbe::new("POST", "/v1/completions");
+    let mut metadata = dispatch();
+    metadata.access_log = Some(probe.record());
+    let response = Arc::new(processor(false))
+        .process_completion_streaming_response(
+            context::ExecutionResult::Single { stream },
+            CompletionResponseSpec::from(&request),
+            metadata,
+            tokenizer,
+            None,
+            None,
+            utils::StreamSource::new(None, &dispatch(), metrics_labels::ENDPOINT_COMPLETIONS),
+        )
+        .await;
+    let body = timeout(
+        Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 65536),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    server.abort();
+    let wire = String::from_utf8(body.to_vec()).unwrap();
+    assert!(wire.contains("\"finish_reason\":\"stop\""), "{wire}");
+    assert_eq!(probe.fields()["finish_reason"], "stop", "{wire}");
 }
 
 #[tokio::test]

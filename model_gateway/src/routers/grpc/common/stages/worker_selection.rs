@@ -3052,6 +3052,7 @@ mod tests {
             streaming: false,
             headers: None,
             rate_limit_cell: None,
+            access_log: None,
             routing: RoutingSnapshot {
                 context_requirements: ContextRequirements::default(),
                 routing_text: None,

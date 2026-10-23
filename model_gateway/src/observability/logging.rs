@@ -727,8 +727,20 @@ pub fn init_logging(config: LoggingConfig, otel_layer_config: Option<TraceConfig
 /// Logging helpers for tests elsewhere in the crate.
 #[cfg(test)]
 pub(crate) mod test_support {
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+        time::Instant,
+    };
+
+    use tower_http::trace::MakeSpan as _;
     use tracing::{subscriber::DefaultGuard, Dispatch};
-    use tracing_subscriber::{layer::SubscriberExt, Layer, Registry};
+    use tracing_subscriber::{fmt::MakeWriter, layer::SubscriberExt, Layer, Registry};
+
+    use crate::{
+        middleware::{AccessLogFields, AccessLogRecord, RequestSpan},
+        observability::log_format::{JsonLine, SpanFields},
+    };
 
     /// A test's subscriber: this thread's default until the value drops,
     /// seeing every line the thread writes meanwhile.
@@ -759,6 +771,82 @@ pub(crate) mod test_support {
         TestSubscriber {
             _guard: guard,
             _second: second,
+        }
+    }
+
+    /// A request span as the logging layer makes it (its fields declared),
+    /// under a JSON subscriber of this thread: what a record writes on the
+    /// span is read back from a probe line written inside it.
+    pub(crate) struct RequestSpanProbe {
+        lines: Arc<Mutex<Vec<u8>>>,
+        pub(crate) span: tracing::Span,
+        _subscriber: TestSubscriber,
+    }
+
+    impl RequestSpanProbe {
+        pub(crate) fn new(method: &str, uri: &str) -> Self {
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = test_subscriber(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(Lines(Arc::clone(&lines)))
+                    .fmt_fields(SpanFields)
+                    .event_format(JsonLine::new()),
+            );
+            let span = RequestSpan.make_span(
+                &http::Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .body(())
+                    .expect("request"),
+            );
+            Self {
+                lines,
+                span,
+                _subscriber: subscriber,
+            }
+        }
+
+        /// The access-log record over the span, every field selected.
+        pub(crate) fn record(&self) -> AccessLogRecord {
+            AccessLogRecord::new(self.span.clone(), AccessLogFields::all(), Instant::now())
+        }
+
+        /// The span's fields, as a line written under it carries them.
+        pub(crate) fn fields(&self) -> serde_json::Value {
+            {
+                let _entered = self.span.enter();
+                tracing::info!(target: "smg::response", "probe");
+            }
+            let text = String::from_utf8(self.lines.lock().expect("lines").clone()).expect("utf-8");
+            text.lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a JSON line"))
+                .find(|line| line["message"] == "probe")
+                .map(|line| line["span"].clone())
+                .expect("the probe line")
+        }
+    }
+
+    /// The probe's lines, as the subscriber's writer.
+    #[derive(Clone)]
+    struct Lines(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Lines {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lines").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for Lines {
+        type Writer = Lines;
+
+        fn make_writer(&'a self) -> Lines {
+            self.clone()
         }
     }
 }

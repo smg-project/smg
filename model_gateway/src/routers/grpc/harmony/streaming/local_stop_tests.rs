@@ -15,7 +15,7 @@ use tokio::{sync::oneshot, time::timeout};
 
 use super::{usage_tests::harmony_tokens, HarmonyStreamingProcessor};
 use crate::{
-    observability::metrics::metrics_labels,
+    observability::{logging::test_support::RequestSpanProbe, metrics::metrics_labels},
     routers::grpc::{context, regular::streaming::eof_tests::gated_stream, utils},
 };
 
@@ -50,11 +50,15 @@ async fn a_router_stop_ends_the_read_and_the_engine_request() {
     let chunks: Vec<_> = tokens.chunks(3).map(|ids| chunk(ids.to_vec())).collect();
     let (gate_tx, gate) = oneshot::channel::<()>();
     let (stream, server) = gated_stream(chunks, gate, vec![complete(tokens.clone())], "0").await;
+    // The request carries the access-log record: the stop's "stop" is the
+    // finish reason it reads.
+    let probe = RequestSpanProbe::new("POST", "/v1/chat/completions");
     let dispatch = context::DispatchMetadata {
         request_id: "harmony-local-stop".to_string(),
         model: "harmony-test".to_string(),
         created: 1,
         weight_version: None,
+        access_log: Some(probe.record()),
     };
     let request: ChatCompletionRequest = serde_json::from_value(json!({
         "model": "harmony-test", "messages": [], "stream": true,
@@ -118,4 +122,5 @@ async fn a_router_stop_ends_the_read_and_the_engine_request() {
         "{completion} of {} tokens",
         tokens.len()
     );
+    assert_eq!(probe.fields()["finish_reason"], "stop", "{events:?}");
 }

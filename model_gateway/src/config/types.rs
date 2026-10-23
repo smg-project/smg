@@ -702,7 +702,9 @@ impl Default for TenantResolutionConfig {
 /// An optional field of the access-log record (`access_log_fields`). The
 /// record always carries the request's method, path, version, request id,
 /// status and latency; each field here is written once it is selected, under
-/// the name the variant spells in `snake_case`.
+/// the name [`Self::as_str`] spells: the variant in `snake_case`, with its
+/// unit where it has one (`ttft_us`), on the command line, in the config
+/// file and in the record alike.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AccessLogField {
@@ -734,11 +736,29 @@ pub enum AccessLogField {
     ResponseBytes,
     /// The worker the request was routed to.
     Worker,
+    /// The model the response reports (the canonical id an alias resolved
+    /// to), as the pipeline knew it when the response ended.
+    Model,
+    /// The prompt tokens the engine counted for the request.
+    InputTokens,
+    /// The tokens the engine generated for the request, every choice summed.
+    OutputTokens,
+    /// The prompt tokens the engine served from its cache.
+    CachedTokens,
+    /// The finish reason the response reported for its first choice (`stop`,
+    /// `length`, `tool_calls`, ...; a Messages answer's `end_turn`,
+    /// `max_tokens`, ...).
+    FinishReason,
+    /// The time from the request's arrival (where `latency` starts) to its
+    /// first output token, in microseconds (as `latency` is), on a streamed
+    /// response; a buffered answer has none.
+    #[serde(rename = "ttft_us")]
+    Ttft,
 }
 
 impl AccessLogField {
     /// Every field, in the order the configuration documents them.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 14] = [
         Self::ClientAddr,
         Self::ForwardedFor,
         Self::UserAgent,
@@ -747,6 +767,12 @@ impl AccessLogField {
         Self::RequestBytes,
         Self::ResponseBytes,
         Self::Worker,
+        Self::Model,
+        Self::InputTokens,
+        Self::OutputTokens,
+        Self::CachedTokens,
+        Self::FinishReason,
+        Self::Ttft,
     ];
 
     /// The field's name: its key in the record and its spelling in the
@@ -762,6 +788,12 @@ impl AccessLogField {
             Self::RequestBytes => "request_bytes",
             Self::ResponseBytes => "response_bytes",
             Self::Worker => "worker",
+            Self::Model => "model",
+            Self::InputTokens => "input_tokens",
+            Self::OutputTokens => "output_tokens",
+            Self::CachedTokens => "cached_tokens",
+            Self::FinishReason => "finish_reason",
+            Self::Ttft => "ttft_us",
         }
     }
 

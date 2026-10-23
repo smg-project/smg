@@ -40,6 +40,7 @@ use super::symphony::{
     engine_finish, finished, reasoning_text_tokens, telemetry::Who, Delta, Reader,
 };
 use crate::{
+    middleware::{AccessLogRecord, GenerationFacts},
     observability::metrics::{metrics_labels, LocalStopAbort, Metrics, StreamingMetricsParams},
     rate_limit::{SharedReservationHandle, UsageSettlement},
     routers::{
@@ -171,6 +172,8 @@ struct GenerateStreamContext {
     /// complete -- a clean EOF with fewer `Complete` messages than this has
     /// only partial usage, not authoritative usage for the whole request.
     expected_choices: u32,
+    /// The access-log record's handle (see `DispatchMetadata::access_log`).
+    access_log: Option<AccessLogRecord>,
 }
 
 impl StreamingProcessor {
@@ -480,6 +483,7 @@ impl StreamingProcessor {
             backend_type: self.backend_type,
             model: dispatch.model.clone(),
             expected_choices: generate_request.expected_choices,
+            access_log: dispatch.access_log.clone(),
         };
 
         // Spawn background task based on execution mode
@@ -586,6 +590,9 @@ impl StreamingProcessor {
         // authoritative usage. Chunks alone (tracked in `completion_tokens_map`)
         // don't count: an index can start generating and never finish.
         let mut completed_indices: HashSet<u32> = HashSet::new();
+        // The first closed choice's finish reason, for the access-log
+        // record alone.
+        let mut first_finish_reason: Option<String> = None;
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut sse_encoder = SseEncoder::new();
 
@@ -654,6 +661,9 @@ impl StreamingProcessor {
                     cached_tokens = cached_tokens.max(complete.cached_tokens());
                     reasoning_tokens_map.insert(index, complete.reasoning_tokens());
                     completed_indices.insert(index);
+                    if index == 0 && ctx.access_log.is_some() {
+                        first_finish_reason = Some(complete.finish_reason().to_owned());
+                    }
 
                     // Send final chunk with finish_reason
                     let finish_response = serde_json::json!({
@@ -704,7 +714,14 @@ impl StreamingProcessor {
                 handle.close_reserved_only().await;
             }
         }
-        Self::record_generate_metrics(start_time, first_token_time, total_completion, None, &ctx);
+        Self::record_generate_metrics(
+            start_time,
+            first_token_time,
+            total_completion,
+            None,
+            &ctx,
+            (prompt_tokens, cached_tokens, first_finish_reason.as_deref()),
+        );
 
         Ok(())
     }
@@ -800,6 +817,9 @@ impl StreamingProcessor {
         // authoritative usage. Chunks alone (tracked in `completion_tokens_map`)
         // don't count: an index can start generating and never finish.
         let mut completed_indices: HashSet<u32> = HashSet::new();
+        // The first closed choice's finish reason, for the access-log
+        // record alone.
+        let mut first_finish_reason: Option<String> = None;
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut sse_encoder = SseEncoder::new();
 
@@ -902,6 +922,9 @@ impl StreamingProcessor {
                     cached_tokens = cached_tokens.max(complete.cached_tokens());
                     reasoning_tokens_map.insert(index, complete.reasoning_tokens());
                     completed_indices.insert(index);
+                    if index == 0 && ctx.access_log.is_some() {
+                        first_finish_reason = Some(complete.finish_reason().to_owned());
+                    }
 
                     // Parse finish_reason
                     let finish_reason = utils::parse_finish_reason(
@@ -966,6 +989,7 @@ impl StreamingProcessor {
             total_completion,
             pd_timing.as_ref(),
             &ctx,
+            (prompt_tokens, cached_tokens, first_finish_reason.as_deref()),
         );
 
         Ok(())
@@ -975,13 +999,17 @@ impl StreamingProcessor {
     // Helper Methods
     // ========================================================================
 
-    /// Record streaming metrics for generate endpoint
+    /// Record streaming metrics for generate endpoint, and the access-log
+    /// record's generation fields when the request carries them
+    /// (`generation` = the prompt and cached token counts and the first
+    /// choice's finish reason).
     fn record_generate_metrics(
         start_time: Instant,
         first_token_time: Option<Instant>,
         total_completion: u32,
         pd_timing: Option<&context::PdTiming>,
         ctx: &GenerateStreamContext,
+        generation: (u32, u32, Option<&str>),
     ) {
         // PD mode: the stream task starts after the prefill side was dispatched
         // (sequential PD: after it completes, with the first decode chunk
@@ -990,16 +1018,28 @@ impl StreamingProcessor {
         let stream_base = pd_timing
             .map(|timing| timing.prefill_start)
             .unwrap_or(start_time);
+        let ttft = first_token_time.map(|t| t.duration_since(stream_base));
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: ctx.backend_type,
             model_id: &ctx.model,
             endpoint: metrics_labels::ENDPOINT_GENERATE,
-            ttft: first_token_time.map(|t| t.duration_since(stream_base)),
+            ttft,
             generation_duration: stream_base.elapsed(),
             input_tokens: None, // generate endpoint doesn't expose prompt tokens in streaming
             output_tokens: total_completion as u64,
         });
+        if let Some(record) = ctx.access_log.as_ref() {
+            let (input_tokens, cached_tokens, finish_reason) = generation;
+            record.generation(&GenerationFacts {
+                model: &ctx.model,
+                input_tokens,
+                output_tokens: total_completion,
+                cached_tokens,
+                finish_reason,
+                first_token: first_token_time,
+            });
+        }
     }
 
     /// Process a chunk of tokens through the stop decoder
@@ -1929,6 +1969,7 @@ impl StreamingProcessor {
                     let mut total_completion = 0u32;
                     let mut first_token_time: Option<Instant> = None;
                     let mut all_saw_complete = true;
+                    let mut first_finish_reason: Option<String> = None;
                     for outcome in outcomes {
                         total_prompt += outcome.prompt_tokens;
                         total_cached += outcome.cached_tokens;
@@ -1937,6 +1978,7 @@ impl StreamingProcessor {
                         total_spec_drafted += outcome.spec_draft_tokens;
                         total_completion += outcome.completion_tokens;
                         all_saw_complete &= outcome.saw_complete;
+                        first_finish_reason = first_finish_reason.or(outcome.finish_reason);
                         first_token_time = match (first_token_time, outcome.first_token_time) {
                             (Some(current), Some(candidate)) => Some(current.min(candidate)),
                             (current, candidate) => current.or(candidate),
@@ -1989,16 +2031,27 @@ impl StreamingProcessor {
                         Self::format_completion_sse_into(&mut sse_buffer, &usage_chunk);
                         let _ = tx.send(Ok(Bytes::from(sse_buffer))).await;
                     }
+                    let ttft = first_token_time.map(|t| t.duration_since(start_time));
                     Metrics::record_streaming_metrics(StreamingMetricsParams {
                         router_type: metrics_labels::ROUTER_GRPC,
                         backend_type: processor.backend_type,
                         model_id: &dispatch.model,
                         endpoint: metrics_labels::ENDPOINT_COMPLETIONS,
-                        ttft: first_token_time.map(|t| t.duration_since(start_time)),
+                        ttft,
                         generation_duration: start_time.elapsed(),
                         input_tokens: Some(total_prompt as u64),
                         output_tokens: total_completion as u64,
                     });
+                    if let Some(record) = dispatch.access_log.as_ref() {
+                        record.generation(&GenerationFacts {
+                            model: &dispatch.model,
+                            input_tokens: total_prompt,
+                            output_tokens: total_completion,
+                            cached_tokens: total_cached,
+                            finish_reason: first_finish_reason.as_deref(),
+                            first_token: first_token_time,
+                        });
+                    }
                 }
             }
 
@@ -3400,13 +3453,10 @@ impl<'a> ChatStream<'a> {
 
         let complete_usage = self.prompt_tokens.len() as u32 >= self.spec.expected_choices;
         for (position, (index, finish_reason)) in self.finish_reasons.iter().enumerate() {
-            let final_finish_reason = if self.has_tool_calls.get(index).copied().unwrap_or(false)
-                && finish_reason == "stop"
-            {
-                "tool_calls".to_string()
-            } else {
-                finish_reason.clone()
-            };
+            let final_finish_reason = self
+                .reported_finish_reason(*index)
+                .unwrap_or(finish_reason)
+                .to_string();
 
             let matched_stop_value = self.matched_stops.get(index).and_then(|v| v.clone());
 
@@ -3468,9 +3518,25 @@ impl<'a> ChatStream<'a> {
         Ok(())
     }
 
+    /// The finish reason the stream reports for choice `index`: the
+    /// engine's, except that a choice which carried tool calls and stopped
+    /// on its own ends with `tool_calls`, as the API spells it.
+    fn reported_finish_reason(&self, index: u32) -> Option<&str> {
+        let finish_reason = self.finish_reasons.get(&index)?;
+        Some(
+            if self.has_tool_calls.get(&index).copied().unwrap_or(false) && finish_reason == "stop"
+            {
+                "tool_calls"
+            } else {
+                finish_reason.as_str()
+            },
+        )
+    }
+
     /// The end: the reservation settled with what the stream used
-    /// ([`Self::counts`], the engine's counts as they are), and the
-    /// streaming metrics recorded.
+    /// ([`Self::counts`], the engine's counts as they are), the streaming
+    /// metrics recorded, and the access-log record's generation fields
+    /// written when the request carries them.
     async fn settle_and_record(self, reservation: Option<Arc<SharedReservationHandle>>) {
         let model = &self.dispatch.model;
         let counts = self.counts();
@@ -3498,16 +3564,27 @@ impl<'a> ChatStream<'a> {
             .as_ref()
             .map(|timing| timing.prefill_start)
             .unwrap_or(self.start_time);
+        let ttft = self.first_token_time.map(|t| t.duration_since(stream_base));
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.processor.backend_type,
             model_id: model,
             endpoint: metrics_labels::ENDPOINT_CHAT,
-            ttft: self.first_token_time.map(|t| t.duration_since(stream_base)),
+            ttft,
             generation_duration: stream_base.elapsed(),
             input_tokens: Some(total_prompt as u64),
             output_tokens: total_completion as u64,
         });
+        if let Some(record) = self.dispatch.access_log.as_ref() {
+            record.generation(&GenerationFacts {
+                model,
+                input_tokens: counts.prompt,
+                output_tokens: counts.completion,
+                cached_tokens: counts.cached,
+                finish_reason: self.reported_finish_reason(0),
+                first_token: self.first_token_time,
+            });
+        }
     }
 }
 
@@ -3703,6 +3780,9 @@ struct MessagesStream<'a> {
     /// separately so settle can tell "no usage" from "zero tokens".
     saw_complete: bool,
     finish_reason_str: String,
+    /// The stop reason the `message_delta` reported, kept for the access-log
+    /// record alone.
+    stop_reason_sent: Option<messages::StopReason>,
     matched_stop: Option<Value>,
     /// Set once the local stop decoder fires: pins "stop" and ignores later
     /// engine output (the backend has no stop-string detection over ZMQ).
@@ -3881,6 +3961,7 @@ impl<'a> MessagesStream<'a> {
             prompt_tokens: 0,
             saw_complete: false,
             finish_reason_str: String::new(),
+            stop_reason_sent: None,
             matched_stop: None,
             stopped: false,
             closed_by_stop: false,
@@ -4526,6 +4607,9 @@ impl<'a> MessagesStream<'a> {
         } else {
             None
         };
+        if self.dispatch.access_log.is_some() {
+            self.stop_reason_sent = stop_reason.clone();
+        }
 
         StreamingProcessor::send_messages_event(
             self.tx,
@@ -4584,18 +4668,32 @@ impl<'a> MessagesStream<'a> {
         }
 
         // Record metrics
+        let ttft = self
+            .first_token_time
+            .map(|t| t.duration_since(self.start_time));
         Metrics::record_streaming_metrics(StreamingMetricsParams {
             router_type: metrics_labels::ROUTER_GRPC,
             backend_type: self.processor.backend_type,
             model_id: &self.dispatch.model,
             endpoint: metrics_labels::ENDPOINT_MESSAGES,
-            ttft: self
-                .first_token_time
-                .map(|t| t.duration_since(self.start_time)),
+            ttft,
             generation_duration: self.start_time.elapsed(),
             input_tokens: Some(u64::from(self.prompt_tokens)),
             output_tokens: u64::from(self.completion_tokens.total()),
         });
+        if let Some(record) = self.dispatch.access_log.as_ref() {
+            record.generation(&GenerationFacts {
+                model: &self.dispatch.model,
+                input_tokens: self.prompt_tokens,
+                output_tokens: self.completion_tokens.total(),
+                cached_tokens: self.cached_tokens,
+                finish_reason: self
+                    .stop_reason_sent
+                    .as_ref()
+                    .map(messages::StopReason::as_str),
+                first_token: self.first_token_time,
+            });
+        }
     }
 }
 
