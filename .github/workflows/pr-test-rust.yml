@@ -42,7 +42,7 @@ jobs:
       SPT_NOENV: '1'
       ROCR_VISIBLE_DEVICES: '0,1'
       HIP_VISIBLE_DEVICES: '0,1'
-      RUST_LOG: warn,engine_zmq_adapter::client=info,engine_zmq_client::transport=info
+      RUST_LOG: warn,engine_zmq_adapter::client=info,engine_zmq_client::transport=debug
       E2E_LOG_DIR: e2e-logs
       PYTEST_ADDOPTS: ''
       PIP_RETRIES: '0'
