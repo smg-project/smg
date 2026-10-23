@@ -249,10 +249,10 @@ Readiness itself is a kubelet signal: with kube-state-metrics in the cluster, `k
 
 Every deadline on the router's readiness has to cover that bring-up:
 
-- The Deployment's `progressDeadlineSeconds`: the chart sets 1800, the gateway's start-up bound, instead of the Kubernetes default of 600. Kubernetes takes no action on it, but `kubectl rollout status`, Argo CD and Flux report the rollout as failed once it passes.
+- The router Deployment's `progressDeadlineSeconds` (`router.progressDeadlineSeconds`, 1920 by default): the gateway's start-up bound, 1800 s, plus the chart's tail after it (one start-up poll, the readiness probe's period, the registration) and a margin for the image pull and container start, which run on the rollout's clock before the gateway's; the Kubernetes default is 600. Kubernetes takes no action on it, but `kubectl rollout status`, Argo CD and Flux report the rollout as failed once it passes.
 - `helm install --wait` and `helm upgrade --wait` time out after 5 minutes by default: pass `--timeout` with the engine's budget (with `--atomic`, the upgrade would otherwise be rolled back, or the install removed, while the engine loads).
 - A serving controller that runs the router as a component of a model service, with an instance-ready or readiness deadline of its own: give the router component the engine component's budget. A controller whose router deadline was 30 minutes declared the router failed at the deadline, relocated it with an anti-affinity to its node that could not be scheduled, and left the service without an endpoint although the router became healthy seven minutes later; with the engine's four-hour budget on the router, the same service came up and served.
-- `--worker-startup-timeout-secs` itself (`router.extraArgs`) for an engine that needs more than 30 minutes, and the rollout deadline with it.
+- `--worker-startup-timeout-secs` itself (`router.extraArgs`) for an engine that needs more than 30 minutes, and `router.progressDeadlineSeconds` with it.
 
 The budget is not a startup probe on the router's `/readiness`: a startup probe that fails for its whole budget restarts the container, and the router process is not what is slow.
 
@@ -273,7 +273,7 @@ workers:
       failureThreshold: 60
 ```
 
-Size the budget past the longest load you expect: a startup probe that fails for its whole budget restarts the worker, and the load starts over.
+Size the budget past the longest load you expect: a startup probe that fails for its whole budget restarts the worker, and the load starts over. The worker Deployment's rollout deadline follows the budget (`initialDelaySeconds + failureThreshold * periodSeconds`, plus 120 s for the image pull and container start, never below the Kubernetes default of 600 s), so `kubectl rollout status`, Argo CD, Flux and `helm --wait` do not report a worker still loading within its budget as a failed rollout; `progressDeadlineSeconds` on the worker entry overrides it.
 
 ## Examples
 
