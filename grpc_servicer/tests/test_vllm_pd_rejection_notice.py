@@ -15,12 +15,18 @@ A refusal ``generate()`` raises before the engine core holds the request (vLLM's
 ``ValueError`` before 0.27, and ``generate()`` re-raises it without an abort)
 leaves no live id behind and still gets the notice, as the Rust wire sends it
 when its generate call returns an error.
+
+Where a Mooncake connector runs, alone or as any child of a wrapper, the notice
+is withheld altogether, a legitimate pre-admission one included (that connector
+reports the notice's empty pull as a finished transfer and the decode engine
+dies on it); NIXL keeps it.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -50,17 +56,29 @@ DECODE_KV = json.dumps(
 )
 
 
+def _kv_transfer_config(connector: str, **extra):
+    """A decode side's ``KVTransferConfig`` as the servicer reads it."""
+    return SimpleNamespace(
+        kv_connector=connector,
+        kv_role="kv_consumer",
+        engine_id="decode-engine",
+        kv_connector_extra_config=extra or None,
+    )
+
+
 class _Engine:
     """An engine whose generate() admits the request and then produces nothing."""
 
-    def __init__(self):
+    def __init__(self, kv_transfer_config=None):
         self.entered = asyncio.Event()
         self.notify_kv_transfer_request_rejected = AsyncMock()
         self.renderer = SimpleNamespace(process_for_engine=lambda prompt, **kwargs: prompt)
         self.model_config = SimpleNamespace(
             is_multimodal_model=False, dtype=torch.float32, uses_mrope=False
         )
-        self.vllm_config = SimpleNamespace(kv_events_config=None)
+        self.vllm_config = SimpleNamespace(
+            kv_events_config=None, kv_transfer_config=kv_transfer_config
+        )
 
     async def generate(self, *, prompt, sampling_params, request_id, **kwargs):
         self.entered.set()
@@ -193,3 +211,87 @@ async def test_an_engine_failure_after_admission_sends_no_notice(monkeypatch):
     engine.notify_kv_transfer_request_rejected.assert_not_awaited()
     context.abort.assert_awaited_once()
     assert context.abort.await_args.args[0] is grpc.StatusCode.INTERNAL
+
+
+@pytest.mark.asyncio
+async def test_a_nixl_decode_side_still_sends_the_pre_admission_notice(monkeypatch):
+    engine = _Engine(_kv_transfer_config("NixlConnector"))
+    processor = _HangingProcessor()
+    servicer = _servicer(monkeypatch, engine, processor)
+    await _cancel_after(servicer, _decode_request(refs=True), processor.entered)
+    engine.notify_kv_transfer_request_rejected.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_mooncake_decode_side_withholds_the_pre_admission_notice(monkeypatch, caplog):
+    engine = _Engine(_kv_transfer_config("MooncakeConnector"))
+    processor = _HangingProcessor()
+    servicer = _servicer(monkeypatch, engine, processor)
+    with caplog.at_level(logging.WARNING):
+        await _cancel_after(servicer, _decode_request(refs=True), processor.entered)
+    assert not engine.entered.is_set()
+    engine.notify_kv_transfer_request_rejected.assert_not_awaited()
+    withheld = [r for r in caplog.records if "withheld on the Mooncake connector" in r.getMessage()]
+    assert len(withheld) == 1, caplog.text
+    assert "req-decode" in withheld[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_a_mooncake_decode_side_withholds_the_notice_for_a_refused_request(monkeypatch):
+    # The refusal generate() raises before holding the request keeps the
+    # notice on every other connector; on Mooncake that notice is fatal too.
+    engine = _RefusingEngine(RefusalError("prompt plus max_tokens over the model length"))
+    engine.vllm_config.kv_transfer_config = _kv_transfer_config("MooncakeConnector")
+    servicer = _servicer(monkeypatch, engine)
+    context = await _drive_to_the_end(servicer, _decode_request())
+    assert engine.entered.is_set()
+    engine.notify_kv_transfer_request_rejected.assert_not_awaited()
+    context.abort.assert_awaited_once()
+    assert context.abort.await_args.args[0] is grpc.StatusCode.INVALID_ARGUMENT
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "connectors",
+    [
+        # the projection's mover
+        [
+            {"kv_connector": "MooncakeConnector", "engine_id": "decode-engine"},
+            {"kv_connector": "SharedStorageConnector"},
+        ],
+        # a second P2P child beside it: the projection stays at the wrapper
+        [
+            {"kv_connector": "NixlConnector", "engine_id": "decode-engine"},
+            {"kv_connector": "MooncakeConnector", "engine_id": "decode-engine"},
+        ],
+        # an empty child engine id: the projection stays at the wrapper
+        [{"kv_connector": "MooncakeConnector", "engine_id": ""}],
+        # a malformed sibling: the projection stays at the wrapper
+        [{"kv_connector": "MooncakeConnector", "engine_id": "decode-engine"}, "not a child"],
+    ],
+    ids=["mover", "second-p2p-child", "empty-engine-id", "malformed-sibling"],
+)
+async def test_a_wrapper_with_a_mooncake_child_withholds_the_notice_under_any_projection(
+    monkeypatch, connectors
+):
+    engine = _Engine(_kv_transfer_config("MultiConnector", connectors=connectors))
+    processor = _HangingProcessor()
+    servicer = _servicer(monkeypatch, engine, processor)
+    await _cancel_after(servicer, _decode_request(refs=True), processor.entered)
+    engine.notify_kv_transfer_request_rejected.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_wrapper_without_a_mooncake_child_still_sends_the_notice(monkeypatch):
+    wrapper = _kv_transfer_config(
+        "MultiConnector",
+        connectors=[
+            {"kv_connector": "NixlConnector", "engine_id": "decode-engine"},
+            {"kv_connector": "SharedStorageConnector"},
+        ],
+    )
+    engine = _Engine(wrapper)
+    processor = _HangingProcessor()
+    servicer = _servicer(monkeypatch, engine, processor)
+    await _cancel_after(servicer, _decode_request(refs=True), processor.entered)
+    engine.notify_kv_transfer_request_rejected.assert_awaited_once()
