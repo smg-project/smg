@@ -146,8 +146,22 @@ jobs:
           enable-cache: true
           cache-dependency-glob: .bellwether/uv.lock
 
+      # Not the whole tree: at this pin that is 864 GB of compressed sets in
+      # Git LFS over 1,470 models. `--plain` writes the hand-written sets alone
+      # (common, turns, render common: a few MB, nothing fetched), and
+      # `--sample-sets N` every Nth compressed set of the tree besides, whole,
+      # the same sets on every run of the same pin, so the benchmark-scale
+      # sets keep a rotating foothold in the job. At N=5000 that is about 40
+      # sets and 5 GB of plain lines; the sampled run of 2026-10-22 at N=1000
+      # (195 sets, 25 GB) took the render-parity harness 4.3 min and the
+      # tokenizer harness 8.5 min on 8 threads, so the knob is the runner's
+      # disk, not the step's time. Each model's sets.toml in the tree lists
+      # the sets written and no other.
       - name: Unpack the fixtures
-        run: uv run --locked --project .bellwether bellwether unpack --fixtures .bellwether/fixtures --out .bellwether/fixtures-plain
+        run: >-
+          uv run --locked --project .bellwether bellwether unpack
+          --fixtures .bellwether/fixtures --out .bellwether/fixtures-plain
+          --plain --sample-sets 5000
 
       # This job builds the bellwether_* test targets and the response-template
       # crate's two, and nothing else, so it keeps its own cache entry instead
@@ -184,9 +198,11 @@ jobs:
       # own, all at once: each
       # is one thread comparing its sets, the runner has 8 CPUs, so the step
       # takes as long as the longest target, not their sum. The pinned commit
-      # records 78 models: the tokenizer harness takes about an hour on the
-      # CPU runner and the gateway's render parity about as long, so the step
-      # has twice the time of the longest and the build; Symphony's replay
+      # records 1,470 models, 814 with sets; the tree the job unpacks holds
+      # their hand-written sets whole and every 5,000th benchmark set (the
+      # unpack step above), on which the render-parity and the tokenizer
+      # harnesses take minutes, so the step has far more than the longest
+      # needs and the build; Symphony's replay
       # runs on 1 case in 200 of each benchmark set (its SYMPHONY_SAMPLE_EVERY
       # switch, the hand-written sets whole), as the whole replay of every
       # recorded model takes hours. Each target's output is its own group in
@@ -203,17 +219,19 @@ jobs:
           BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures-plain
           BELLWETHER_REPORT_DIR: ${{ runner.temp }}/bellwether-reports
           SYMPHONY_SAMPLE_EVERY: "200"
-          # Two of the recorded templates (Apertus, Muse Glimmer) write the day
-          # of the render into the prompt with strftime_now, so their references
-          # carry the day they were recorded: 2026-10-07, in every case of both.
-          # The gateway's strftime_now takes its instant from SOURCE_DATE_EPOCH
-          # when it is set, so the harness renders that day too; noon UTC of it,
-          # so the day is the same in whichever zone the runner formats it. The
-          # value belongs with the pin: when .github/versions/bellwether.ref
-          # moves to a commit that re-recorded those sets, set it to the day
-          # their references carry (neither the pin's commit date nor the sets'
-          # commit date is that day).
-          SOURCE_DATE_EPOCH: "1791374400"
+          # Some twenty of the recorded templates (Apertus, Arcee Blitz, the
+          # Granite 3 and 4 line, the LFM2.5 bases and VL variants, Mistral
+          # Small 24B 2501, Muse Glimmer, SmolLM3, a Llama 3.2 variant) write
+          # the day of the render into the prompt with strftime_now, so their
+          # references carry the day they were recorded. The gateway's
+          # strftime_now takes its instant from SOURCE_DATE_EPOCH when it is
+          # set, so the harness renders that day too; noon UTC of it, so the
+          # day is the same in whichever zone the runner formats it. The value
+          # belongs with the pin: 2026-10-14, the day most of them were
+          # recorded at this pin; the seven recorded on the two days before
+          # are listed by prefix in the render harness's KNOWN_DIFFERENCES
+          # until the recorder pins the day itself.
+          SOURCE_DATE_EPOCH: "1791979200"
         run: |
           source "$HOME/.cargo/env"
           # Gateway forwards the feature to llm-tokenizer. Supported models

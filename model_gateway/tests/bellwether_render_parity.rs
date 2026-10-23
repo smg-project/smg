@@ -97,6 +97,11 @@ const SHOWN: usize = 20;
 /// The fixture kinds this test reads, each a directory of sets beside a
 /// model's manifest.
 const KINDS: [&str; 1] = ["render"];
+/// The set bellwether records by hand for every model, whose cases carry
+/// names of their own (`no-generation-prompt`) where a benchmark set's are
+/// numbered (`gsm8k-17`): the tree holds it for every model, so a case name's
+/// entry is stale when it is not among the cases.
+const HAND_WRITTEN_SET: &str = "common";
 /// How a file Git LFS has not fetched begins: the pointer stands where the
 /// content would be.
 const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
@@ -110,283 +115,132 @@ const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 const LEGACY_FILE_PIPELINE: &str = "the render ids of this Llama-class checkpoint were recorded from its raw tokenizer.json read by `tokenizers` (the file's legacy pipeline, the ids transformers 4.x gave by taking the file as is: a word marker after every special token, a marker token missed after a newline or a letter); transformers 5.17.0, the version the engines run, rebuilds the class's pipeline (no normalizer, a Metaspace pre-tokenizer) and the loader matches it since smg-project/smg#4248, so the reference's ids differ from the engine's at the special tokens and the markers while the text is equal; every render case of the model, until the sets are re-recorded with the class (smg-project/bellwether#210), when this entry heals and the run asks for its removal";
 
 /// Cases known to differ from the reference, each with the reason and where
-/// it is tracked: a fixture id, `<slug>/render/<name>`, or a prefix ending in
+/// it is tracked: a fixture id, `<slug>/render/<name>`; a prefix ending in
 /// `*`, which stands for every case whose id begins with what is before it
 /// (`<slug>/render/*` for a model's whole render side,
-/// `<slug>/render/bfcl-multi-turn-*` for a family of its sets). A prefix is
-/// for a cause that covers a model or a set wholesale and is held to the rule
-/// an id is: the run fails when no loaded case under it differs any more (a
-/// case under it listed by its own id is that entry's, not the prefix's), and
-/// when no loaded case is under it at all.
+/// `<slug>/render/bfcl-multi-turn-*` for a family of its sets); or a suffix
+/// beginning with `*`, which stands for the case of that name of every model
+/// (`*/render/no-generation-prompt`); or a set by its file,
+/// `<slug>/render/<set>.jsonl`, for a benchmark set whole (its case ids need
+/// not begin with its name). A prefix
+/// is for a cause that covers a model or a family of sets wholesale, a suffix
+/// for one that covers a hand-written case across the models, and each is held
+/// to the rule an id is: the run fails
+/// when no loaded case under it differs any more (a differing case counts for
+/// the one entry that lists it, its own id else the first that covers it, so
+/// an entry does not outlive its cause while a case another entry names
+/// still differs under it), and when the tree holds its
+/// set and no loaded case is under it; the entries of a benchmark set the
+/// tree omits (`bellwether unpack --sample-sets` writes every Nth) are left
+/// alone, an id of one of its cases among them.
 const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     (
-        "apertus-8b-instruct-2509/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
+        "*/render/no-generation-prompt",
+        "add_generation_prompt is not a field of SMG's chat request; the header is \
+         always appended (smg-project/smg#2780): one case of every model",
     ),
     (
-        "hunyuan-a13b-instruct/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
+        "*/render/text-developer-role",
+        "the gateway renders a developer message as a system message when the template \
+         has no developer branch, as the engine's renderer does (smg-project/smg#3022); \
+         the recorded template run keeps or drops the role: one case of every such model",
     ),
     (
-        "iquest-q1/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "iquest-q1/render/tools-call-arguments-object",
+        "*/render/tools-call-arguments-object",
         "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
+         engines do; the template accepts an object (smg-project/bellwether#12): one \
+         case of every model",
     ),
     (
-        "k2-horizon-36b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
+        "*/render/tools-history-content-and-call",
+        "the gateway parses a history call's arguments into an object before rendering, \
+         which the templates that write the string as recorded render otherwise: one \
+         case of every such model",
     ),
     (
-        "k2-horizon-36b/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
+        "*/render/tools-history-parallel-calls",
+        "the gateway parses a history call's arguments into an object before rendering, \
+         which the templates that write the string as recorded render otherwise: one \
+         case of every such model",
     ),
     (
-        "laguna-xs.2/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
+        "*/render/tools-history-results-reordered",
+        "the gateway parses a history call's arguments into an object before rendering, \
+         which the templates that write the string as recorded render otherwise: one \
+         case of every such model",
     ),
     (
-        "laguna-xs.2/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
+        "*/render/tools-history-single-call",
+        "the gateway parses a history call's arguments into an object before rendering, \
+         which the templates that write the string as recorded render otherwise: one \
+         case of every such model",
     ),
     (
-        "laguna-xs.2/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
+        "apertus-70b-instruct-2509/render/*",
+        "the template writes the day of the render into the prompt with strftime_now and \
+         the group was recorded on 2026-10-13, where the job renders SOURCE_DATE_EPOCH's \
+         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
+         the model, until the recorder pins the day",
     ),
     (
-        "lfm2.5-1.2b-instruct/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
+        "apertus-8b-instruct-2509/render/*",
+        "the template writes the day of the render into the prompt with strftime_now and \
+         the group was recorded on 2026-10-12, where the job renders SOURCE_DATE_EPOCH's \
+         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
+         the model, until the recorder pins the day",
     ),
     (
-        "lfm2.5-1.2b-instruct/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
+        "arcee-blitz-caller-beta/render/*",
+        "the checkpoint's chat_template is a list of named templates (default, \
+         tool_use), which the gateway's loader does not read: no case of the model \
+         renders",
     ),
     (
-        "lfm2.5-1.2b-instruct/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
+        "arcee-blitz/render/*",
+        "the template writes the day of the render into the prompt with strftime_now and \
+         the group was recorded on 2026-10-13, where the job renders SOURCE_DATE_EPOCH's \
+         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
+         the model, until the recorder pins the day",
     ),
     (
-        "llava-1.5-7b-hf/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
+        "autoglm-phone-9b-multilingual/render/*",
+        "the gateway hands this template the text of an assistant or system turn as a \
+         parts list, which the template prints as JSON where the reference run had the \
+         string",
     ),
     (
-        "llava-1.5-7b-hf/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
+        "autoglm-phone-9b/render/*",
+        "the gateway hands this template the text of an assistant or system turn as a \
+         parts list, which the template prints as JSON where the reference run had the \
+         string",
     ),
     (
-        "llava-1.5-7b-hf/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
+        "caller/render/*",
+        "the checkpoint's chat_template is a list of named templates (default, \
+         tool_use), which the gateway's loader does not read: no case of the model \
+         renders",
     ),
     (
-        "muse-glimmer-30b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
+        "cosmos3-edge-policy-droid/render/*",
+        "the template writes a newline before the first turn, which the gateway's render \
+         drops: every case of the model",
     ),
     (
-        "muse-glimmer-30b/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
+        "cosmos3-edge/render/*",
+        "the template writes a newline before the first turn, which the gateway's render \
+         drops: every case of the model",
     ),
     (
-        "muse-glimmer-30b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
+        "deephermes-3-llama-3-8b-preview/render/*",
+        "the checkpoint's chat_template is a list of named templates (default, \
+         tool_use), which the gateway's loader does not read: no case of the model \
+         renders",
     ),
     (
-        "olmo-3-7b-instruct/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "olmo-3-7b-instruct/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "olmo-3-7b-instruct/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "phi-4-multimodal-instruct/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "phi-4-multimodal-instruct/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen-agentworld-35b-a3b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen-agentworld-35b-a3b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen-drive-1.0-4b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen-drive-1.0-4b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3-8b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always appended \
-         (smg-project/smg#2780)",
-    ),
-    (
-        "deepseek-r1/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always appended \
-         (smg-project/smg#2780)",
-    ),
-    (
-        "deepseek-r1/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3-8b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the engines do; \
-         the Qwen3 template accepts an object (smg-project/bellwether#12, needs:simo)",
-    ),
-    (
-        "qwen3-omni-30b-a3b-instruct/render/continue-final-message",
-        "the reference was recorded with string content, while the gateway hands this template \
-         text parts, as the engine does (smg-project/bellwether#105 recorded the Thinking \
-         variant that way, not this one); the template finds the last user query only in \
-         string content, so only the reference opens an empty thought block in the continued \
-         turn",
-    ),
-    (
-        "qwen3-omni-30b-a3b-instruct/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3-omni-30b-a3b-instruct/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3-omni-30b-a3b-thinking/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3-omni-30b-a3b-thinking/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "glm-5.3-flash/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "glm-5.3-flash/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "glm-5.3-flash/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "hy4-preview/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "hy4-preview/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "hy4-preview/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "minimax-m2.7/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "minimax-m2.7/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "minimax-m2.7/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "minimax-m3/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "minimax-m3/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "ai21-jamba2-3b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "ai21-jamba2-3b/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "deepseek-v3-0324/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
+        "deephermes-financial-fundamentals-prediction-specialist-atropos/render/*",
+        "the checkpoint's chat_template is a list of named templates (default, \
+         tool_use), which the gateway's loader does not read: no case of the model \
+         renders",
     ),
     (
         "deepseek-v3.1/render/bfcl-*",
@@ -407,21 +261,10 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
-        "deepseek-v3.1/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
         "deepseek-v3.1/render/swebench-*",
         "the checkpoint's template never reads the request's tools and the reference is \
          its own render; the gateway writes the family's tools block into the system prompt \
          as the engines' tool chat templates do (smg-project/smg#3946)",
-    ),
-    (
-        "deepseek-v3.1/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
     ),
     (
         "deepseek-v3.1/render/tools-declared-user-asks",
@@ -460,6 +303,27 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          as the engines' tool chat templates do (smg-project/smg#3946)",
     ),
     (
+        "deepseek-v3.2-exp/render/text-system-after-user",
+        "the gateway renders this checkpoint through its port of the checkpoint's own \
+         encoder, as the engines do, where the reference is the run of the Jinja \
+         template the checkpoint ships, which renders no tools block and places a system \
+         message after a user turn otherwise",
+    ),
+    (
+        "deepseek-v3.2-exp/render/tools-declared-user-asks",
+        "the gateway renders this checkpoint through its port of the checkpoint's own \
+         encoder, as the engines do, where the reference is the run of the Jinja \
+         template the checkpoint ships, which renders no tools block and places a system \
+         message after a user turn otherwise",
+    ),
+    (
+        "deepseek-v3.2-exp/render/tools-schema-with-defs",
+        "the gateway renders this checkpoint through its port of the checkpoint's own \
+         encoder, as the engines do, where the reference is the run of the Jinja \
+         template the checkpoint ships, which renders no tools block and places a system \
+         message after a user turn otherwise",
+    ),
+    (
         "deepseek-v4.1-flash/render/hermes-func-calling-*",
         "the checkpoint's own encoder, which this renderer follows and the engines port, \
          parses a history call's `arguments` string into one DSML parameter per key; the \
@@ -474,16 +338,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          checkpoint's Jinja template cannot read JSON text and writes the string whole as a \
          single `arguments` parameter, so the reference is the template's own rendering of \
          a call history, not the encoder's (the cases without a call history match)",
-    ),
-    (
-        "deepseek-v4.1-flash/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "deepseek-v4.1-flash/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
         "deepseek-v4.1-flash/render/tools-history-content-and-call",
@@ -514,89 +368,42 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          parameter",
     ),
     (
-        "dots3-note-prev/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
+        "falcon-e-3b-base-prequantized/render/*",
+        "the gateway hands this template the text of an assistant or system turn as a \
+         parts list, which the template prints as JSON where the reference run had the \
+         string",
     ),
     (
-        "dots3-note-prev/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
+        "falcon3-10b-base-1.58bit-prequantized/render/*",
+        "the gateway hands this template the text of an assistant or system turn as a \
+         parts list, which the template prints as JSON where the reference run had the \
+         string",
     ),
     (
-        "dots3-note-prev/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
+        "glm-4.1v-9b-base/render/*",
+        "the gateway hands this template the text of an assistant or system turn as a \
+         parts list, which the template prints as JSON where the reference run had the \
+         string",
     ),
     (
-        "ernie-4.5-21b-a3b-thinking/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
+        "granite-3.2-8b-instruct-preview/render/*",
+        "the template writes the day of the render into the prompt with strftime_now and \
+         the group was recorded on 2026-10-13, where the job renders SOURCE_DATE_EPOCH's \
+         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
+         the model, until the recorder pins the day",
     ),
     (
-        "ernie-4.5-21b-a3b-thinking/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
+        "granite-3.3-8b-math-prm-v2/render/*",
+        "the template writes the day of the render into the prompt with strftime_now and \
+         the group was recorded on 2026-10-13, where the job renders SOURCE_DATE_EPOCH's \
+         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
+         the model, until the recorder pins the day",
     ),
     (
-        "gemma-4-e4b-it/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "gemma-4-e4b-it/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "glm-4.6/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "glm-4.6/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "glm-4.6/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "glm-4.7-flash/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "glm-4.7-flash/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "glm-4.7-flash/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "granite-4.1-3b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "granite-4.1-3b/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "granite-4.1-3b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
+        "hermes-3-llama-3.1-8b/render/*",
+        "the checkpoint's chat_template is a list of named templates (default, \
+         tool_use), which the gateway's loader does not read: no case of the model \
+         renders",
     ),
     (
         "hermes-4-14b/render/hermes-func-calling-*",
@@ -609,22 +416,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
          differently (smg-project/smg#2783)",
-    ),
-    (
-        "hermes-4-14b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "hermes-4-14b/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "hermes-4-14b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
         "hermes-4-14b/render/tools-history-content-and-call",
@@ -647,40 +438,34 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template does not render as the reference does (smg-project/smg#2783)",
     ),
     (
-        "inkling/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
+        "hunyuanocr/render/*",
+        "the gateway hands this template the text of an assistant or system turn as a \
+         parts list, which the template prints as JSON where the reference run had the \
+         string",
     ),
     (
-        "inkling/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
+        "hyperclovax-seed-omni-8b/render/*",
+        "the gateway hands this template the text of an assistant or system turn as a \
+         parts list, which the template prints as JSON where the reference run had the \
+         string",
     ),
     (
-        "k-exaone-236b-a23b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
+        "lightonocr-0.9b-16k-1025/render/*",
+        "the template's text has a backslash and an n where a newline would be \
+         (`system<|im_end|>\\n`), which the reference run keeps as the two characters \
+         and the gateway's render turns into the newline: every case of the model",
     ),
     (
-        "k-exaone-236b-a23b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
+        "lightonocr-0.9b-32k-1025/render/*",
+        "the template's text has a backslash and an n where a newline would be \
+         (`system<|im_end|>\\n`), which the reference run keeps as the two characters \
+         and the gateway's render turns into the newline: every case of the model",
     ),
     (
-        "ling-3.0-flash/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "ling-3.0-flash/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "ling-3.0-flash/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
+        "llama-3.1-nemotron-nano-8b-v1/render/glaive-v2-32.jsonl",
+        "the gateway parses a history call's arguments into an object before rendering, \
+         which the template, writing the string as recorded, renders otherwise: a \
+         benchmark set in the tree's sample, every case with a call in its history",
     ),
     (
         "llama-xlam-2-8b-fc-r/render/hermes-func-calling-*",
@@ -693,22 +478,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
          differently (smg-project/smg#2783)",
-    ),
-    (
-        "llama-xlam-2-8b-fc-r/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "llama-xlam-2-8b-fc-r/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "llama-xlam-2-8b-fc-r/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
         "llama-xlam-2-8b-fc-r/render/tools-history-content-and-call",
@@ -731,90 +500,52 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template does not render as the reference does (smg-project/smg#2783)",
     ),
     (
-        "mimo-v2.5/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
+        "llava-critic-r1-7b-llama32v/render/*",
+        "the gateway hands this template the text of an assistant or system turn as a \
+         parts list, which the template prints as JSON where the reference run had the \
+         string",
     ),
     (
-        "mimo-v2.5/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
+        "mimo-vl-7b-rl-2508/render/glaive-v2-61.jsonl",
+        "the gateway parses a history call's arguments into an object before rendering, \
+         which the template, writing the string as recorded, renders otherwise: a \
+         benchmark set in the tree's sample, every case with a call in its history",
     ),
     (
-        "minicpm5-2b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
+        "mistral-small-24b-instruct-2501/render/*",
+        "the template writes the day of the render into the prompt with strftime_now and \
+         the group was recorded on 2026-10-12, where the job renders SOURCE_DATE_EPOCH's \
+         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
+         the model, until the recorder pins the day",
     ),
     (
-        "minicpm5-2b/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
+        "muse-glimmer-30b/render/*",
+        "the template writes the day of the render into the prompt with strftime_now and \
+         the group was recorded on 2026-10-12, where the job renders SOURCE_DATE_EPOCH's \
+         day, 2026-10-14, the day most of the dated groups were recorded; every case of \
+         the model, until the recorder pins the day",
+    ),
+    ("nanbeige4-3b-thinking-2510/render/*", LEGACY_FILE_PIPELINE),
+    ("nanbeige4-3b-thinking-2511/render/*", LEGACY_FILE_PIPELINE),
+    ("nanbeige4.1-3b/render/*", LEGACY_FILE_PIPELINE),
+    ("nanollama/render/*", LEGACY_FILE_PIPELINE),
+    (
+        "nanowhale-100m-base/render/*",
+        "the gateway's renderer detection picks the DeepSeek encoder port from the \
+         checkpoint's architecture, where the checkpoint ships a chat template of its \
+         own, which the reference ran: every case of the model",
     ),
     (
-        "minicpm5-2b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
+        "nft-7b/render/swehero-5.jsonl",
+        "the gateway parses a history call's arguments into an object before rendering, \
+         which the template, writing the string as recorded, renders otherwise: a \
+         benchmark set in the tree's sample, every case with a call in its history",
     ),
     (
-        "minimax-m2/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "minimax-m2/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "minimax-m2/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "nanbeige4.2-3b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "nanbeige4.2-3b/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "nanbeige4.2-3b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "nvidia-nemotron-3-nano-30b-a3b-bf16/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "nvidia-nemotron-3-nano-30b-a3b-bf16/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "nvidia-nemotron-3-nano-30b-a3b-bf16/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "phi-4-mini-instruct/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "phi-4-mini-instruct/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
+        "nvidia-nemotronlabs-ai-for-media-sports-tennis/render/*",
+        "the gateway hands this template the text of an assistant or system turn as a \
+         parts list, which the template prints as JSON where the reference run had the \
+         string",
     ),
     (
         "qwen2.5-7b-instruct-1m/render/hermes-func-calling-*",
@@ -827,22 +558,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "the gateway parses tool-call arguments into objects before rendering and this \
          template writes them as the API's string, so a call in the history renders \
          differently (smg-project/smg#2783)",
-    ),
-    (
-        "qwen2.5-7b-instruct-1m/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen2.5-7b-instruct-1m/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen2.5-7b-instruct-1m/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
     (
         "qwen2.5-7b-instruct-1m/render/tools-history-content-and-call",
@@ -865,358 +580,12 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template does not render as the reference does (smg-project/smg#2783)",
     ),
     (
-        "qwen2.5-omni-7b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen2.5-omni-7b/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen2.5-vl-32b-instruct/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen2.5-vl-32b-instruct/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen2.5-vl-7b-instruct/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen2.5-vl-7b-instruct/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3-30b-a3b-instruct-2507/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3-30b-a3b-instruct-2507/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3-30b-a3b-instruct-2507/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3-30b-a3b-thinking-2507/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3-30b-a3b-thinking-2507/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3-30b-a3b-thinking-2507/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3-30b-a3b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3-30b-a3b/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3-30b-a3b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3-4b-instruct-2507/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3-4b-instruct-2507/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3-4b-instruct-2507/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3-4b-saferl/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3-4b-saferl/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3-4b-saferl/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3-4b-thinking-2507/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3-4b-thinking-2507/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3-4b-thinking-2507/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3-8b/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3-coder-30b-a3b-instruct/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3-coder-30b-a3b-instruct/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3-coder-30b-a3b-instruct/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3-coder-next/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3-coder-next/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3-coder-next/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3-next-80b-a3b-instruct/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3-next-80b-a3b-instruct/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3-next-80b-a3b-instruct/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3-next-80b-a3b-thinking/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3-next-80b-a3b-thinking/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3-next-80b-a3b-thinking/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3-omni-30b-a3b-thinking/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the engines \
-         do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3-vl-235b-a22b-thinking/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3-vl-235b-a22b-thinking/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3-vl-30b-a3b-instruct/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3-vl-30b-a3b-instruct/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3-vl-30b-a3b-instruct/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the engines \
-         do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3-vl-8b-instruct/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3-vl-8b-instruct/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3-vl-8b-instruct/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the engines \
-         do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3-vl-8b-thinking/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3-vl-8b-thinking/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "qwen3.5-27b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3.5-27b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3.5-2b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3.5-2b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3.5-35b-a3b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3.5-35b-a3b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3.5-9b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3.5-9b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3.6-27b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3.6-27b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3.6-35b-a3b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3.6-35b-a3b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3.8-2.4t-a95b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3.8-2.4t-a95b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3.8-27b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3.8-27b/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3.8-flash-next/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwen3.8-flash-next/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "qwen3guard-gen-0.6b/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
+        "qwen3-omni-30b-a3b-instruct/render/continue-final-message",
+        "the reference was recorded with string content, while the gateway hands this template \
+         text parts, as the engine does (smg-project/bellwether#105 recorded the Thinking \
+         variant that way, not this one); the template finds the last user query only in \
+         string content, so only the reference opens an empty thought block in the continued \
+         turn",
     ),
     (
         "qwq-32b/render/hermes-func-calling-*",
@@ -1231,135 +600,227 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          differently (smg-project/smg#2783)",
     ),
     (
-        "qwq-32b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "qwq-32b/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
         "qwq-32b/render/tools-history-content-and-call",
         "the gateway parses tool-call arguments into objects before rendering, which this \
          template does not render as the reference does (smg-project/smg#2783)",
     ),
     (
-        "seed-oss-36b-instruct/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
+        "shieldvlm-7b-qwen/render/glaive-v2-12.jsonl",
+        "the gateway parses a history call's arguments into an object before rendering, \
+         which the template, writing the string as recorded, renders otherwise: a \
+         benchmark set in the tree's sample, every case with a call in its history",
     ),
     (
-        "seed-oss-36b-instruct/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "seed-oss-36b-instruct/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "step-3.5-flash/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "step-3.5-flash/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "step-3.5-flash/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "step3/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "step3/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "step3/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
+        "spec-decoding-subfolder-fixture/render/*",
+        LEGACY_FILE_PIPELINE,
     ),
     ("tinyllama-1.1b-chat-v1.0/render/*", LEGACY_FILE_PIPELINE),
-    (
-        "tinyllama-1.1b-chat-v1.0/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "tinyllama-1.1b-chat-v1.0/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "trinity-mini/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
-    (
-        "trinity-mini/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "trinity-mini/render/tools-call-arguments-object",
-        "SMG's request schema types tool-call arguments as a string, as the API and the \
-         engines do; the template accepts an object (smg-project/bellwether#12)",
-    ),
-    (
-        "webworld-32b/render/text-developer-role",
-        "the gateway renders a developer message as a system message when the template has no \
-         developer branch, as the engine's renderer does (smg-project/smg#3022); the recorded \
-         template run keeps or drops the role",
-    ),
-    (
-        "webworld-32b/render/no-generation-prompt",
-        "add_generation_prompt is not a field of SMG's chat request; the header is always \
-         appended (smg-project/smg#2780)",
-    ),
+    ("toolmind-web-3b/render/*", LEGACY_FILE_PIPELINE),
 ];
 /// Models whose tokenizer is known not to load, with the reason and where it
 /// is tracked, so the run compares the others: an unlisted model that does
 /// not load fails the run, and so does a listed one whose tokenizer loads
 /// now, so the list cannot rot.
-const KNOWN_UNLOADED: &[(&str, &str)] = &[(
-    "kimi-k3",
-    "the checkpoint ships tiktoken.model and no tokenizer.json; this harness fetches \
+const KNOWN_UNLOADED: &[(&str, &str)] = &[
+    (
+        "c4ai-command-a-03-2025",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "c4ai-command-r-v01",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "command-a-reasoning-08-2025",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "functiongemma-270m-it",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "gemma-1.1-2b-it",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "gemma-2-2b-it",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "gemma-3-12b-it-qat-q4-0-unquantized",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "gemma-3-1b-it",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "gemma-3-1b-it-qat-q4-0-unquantized",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "gemma-3-270m-it",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "gemma-3-4b-it",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "gemma-3n-e2b-it",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "kimi-k3",
+        "the checkpoint ships tiktoken.model and no tokenizer.json; this harness fetches \
          tokenizer.json only (the tokenizer harness reads the tiktoken file since \
          smg-project/smg#2923)",
-)];
+    ),
+    (
+        "llama-3.2-11b-vision-instruct",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "llama-3.2-1b-instruct",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "llama-4-maverick-17b-128e-instruct",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "llama-4-scout-17b-16e",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "llama-4-scout-17b-16e-instruct",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "llama-guard-3-1b",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "llama-guard-4-12b",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "medgemma-27b-it",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+    (
+        "skywork-or1-32b-preview",
+        "a gated repository: the job runs without a Hugging Face token, so the tokenizer \
+         files behind the gate are not fetched (bellwether recorded the group with its \
+         own secret)",
+    ),
+];
 
-/// The reason `known` lists for `id`: the entry that is the id itself, else
-/// the first prefix entry the id begins with; none when the id is not listed.
-fn known_reason<'a>(known: &BTreeMap<&'a str, &'a str>, id: &str) -> Option<&'a str> {
-    known.get(id).copied().or_else(|| {
-        known
-            .iter()
-            .find(|(entry, _)| prefix_of(entry).is_some_and(|prefix| id.starts_with(prefix)))
-            .map(|(_, reason)| *reason)
-    })
+/// The reason `known` lists for the case `id` of the set `set`: the entry
+/// that is the id itself, else the first entry that covers it; none when the
+/// case is not listed.
+fn known_reason<'a>(known: &BTreeMap<&'a str, &'a str>, id: &str, set: &str) -> Option<&'a str> {
+    known_entry(known, id, set).map(|(_, reason)| reason)
 }
 
-/// What a prefix entry stands for: the part before its trailing `*`; none for
-/// an entry that is one fixture id.
-fn prefix_of(entry: &str) -> Option<&str> {
-    entry.strip_suffix('*')
+/// The entry of `known` that lists the case `id` of the set `set`, and its
+/// reason: the entry that is the id itself, else the first that covers it;
+/// none when the case is not listed. A differing case counts for this entry
+/// alone when the list is held to its rule, so that an entry heals once every
+/// case it is the entry of matches, whatever its other entries still cover.
+fn known_entry<'a>(
+    known: &BTreeMap<&'a str, &'a str>,
+    id: &str,
+    set: &str,
+) -> Option<(&'a str, &'a str)> {
+    known
+        .get_key_value(id)
+        .map(|(entry, reason)| (*entry, *reason))
+        .or_else(|| {
+            known
+                .iter()
+                .find(|(entry, _)| Listed::of(entry).covers(id, set))
+                .map(|(entry, reason)| (*entry, *reason))
+        })
+}
+
+/// What an entry of the list stands for: one fixture id; a prefix, the part
+/// before its trailing `*`, for a cause that covers a model or a family of
+/// sets wholesale; a set, named by its file `<slug>/<kind>/<set>.jsonl`, for a
+/// cause that covers a benchmark set, whose case ids need not begin with its
+/// name; or a suffix, the part after its leading `*`, for a cause that covers
+/// one case of every model (`*/render/no-generation-prompt`).
+#[derive(Clone, Copy)]
+enum Listed<'e> {
+    Id(&'e str),
+    Prefix(&'e str),
+    Set(&'e str),
+    Suffix(&'e str),
+}
+
+impl<'e> Listed<'e> {
+    fn of(entry: &'e str) -> Self {
+        if let Some(set) = entry.strip_suffix(".jsonl") {
+            Self::Set(set)
+        } else if let Some(prefix) = entry.strip_suffix('*') {
+            Self::Prefix(prefix)
+        } else if let Some(suffix) = entry.strip_prefix('*') {
+            Self::Suffix(suffix)
+        } else {
+            Self::Id(entry)
+        }
+    }
+
+    /// Whether the entry lists the case `id` of the set `set`
+    /// (`<slug>/<kind>/<set>`).
+    fn covers(self, id: &str, set: &str) -> bool {
+        match self {
+            Self::Id(entry) => id == entry,
+            Self::Prefix(prefix) => id.starts_with(prefix),
+            Self::Set(entry) => set == entry,
+            Self::Suffix(suffix) => id.ends_with(suffix),
+        }
+    }
 }
 
 /// `fixtures/<slug>/manifest.toml`: the model and the revision its fixtures
@@ -1538,6 +999,10 @@ impl Output<'_> {
 struct Report {
     /// Each model whose render sets were read.
     loaded_slugs: BTreeSet<String>,
+    /// `<slug>/render/<set>` of each set read.
+    sets_read: BTreeSet<String>,
+    /// The set of each case that differs, by id.
+    set_of_difference: BTreeMap<String, String>,
     /// The id of every case compared.
     seen: BTreeSet<String>,
     /// Why each case that differs from the reference differs, by id.
@@ -1563,6 +1028,7 @@ impl Report {
     fn record(
         &mut self,
         fixture: &Fixture,
+        set: &str,
         outcome: Result<(), String>,
         tally: &mut Tally,
         known: &BTreeMap<&str, &str>,
@@ -1581,20 +1047,29 @@ impl Report {
                 fixture.id, fixture.reference.source
             );
             lines.push_str(&line);
-            match known_reason(known, &fixture.id) {
+            match known_reason(known, &fixture.id, set) {
                 Some(reason) => {
                     tally.listed += 1;
                     lines.push_str(&format!("          known: {reason}\n"));
                 }
                 None => self.shown.unlisted(&line),
             }
+            self.set_of_difference
+                .insert(fixture.id.clone(), set.to_string());
             self.differences.insert(fixture.id.clone(), why);
         }
+    }
+
+    /// The set of a differing case, `<slug>/<kind>/<set>`.
+    fn set_of(&self, id: &str) -> &str {
+        self.set_of_difference.get(id).map_or("", String::as_str)
     }
 
     /// Take in what one model's comparison reported.
     fn merge(&mut self, other: Report) {
         self.loaded_slugs.extend(other.loaded_slugs);
+        self.sets_read.extend(other.sets_read);
+        self.set_of_difference.extend(other.set_of_difference);
         self.seen.extend(other.seen);
         self.differences.extend(other.differences);
         self.witnessed += other.witnessed;
@@ -1653,7 +1128,7 @@ impl Report {
         let unexpected: Vec<(&str, &str)> = self
             .differences
             .iter()
-            .filter(|(id, _)| known_reason(known, id).is_none())
+            .filter(|(id, _)| known_reason(known, id, self.set_of(id)).is_none())
             .map(|(id, why)| (id.as_str(), why.as_str()))
             .collect();
         if !unexpected.is_empty() {
@@ -1696,53 +1171,97 @@ impl Report {
         failures
     }
 
-    /// Whether a compared case's id begins with `prefix`.
-    fn seen_under(&self, prefix: &str) -> bool {
-        self.seen
-            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
-            .next()
-            .is_some_and(|id| id.starts_with(prefix))
+    /// Whether a compared case is one `listed` covers: the id itself, one
+    /// under its prefix, one of its set, or one that ends with its suffix.
+    fn seen_listed(&self, listed: Listed<'_>) -> bool {
+        match listed {
+            Listed::Id(id) => self.seen.contains(id),
+            Listed::Set(set) => self.sets_read.contains(set),
+            Listed::Prefix(prefix) => self
+                .seen
+                .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+                .next()
+                .is_some_and(|id| id.starts_with(prefix)),
+            Listed::Suffix(suffix) => self.seen.iter().any(|id| id.ends_with(suffix)),
+        }
     }
 
     /// The entries of `known` whose compared cases all match the reference
-    /// now. A case listed by its own id is not counted under a prefix: that
-    /// entry names its cause and is held to the rule itself, so the prefix
-    /// heals once every other case under it matches, instead of outliving
-    /// its cause for as long as the by-id sibling differs.
+    /// now: the entries no differing case counts for, where a case counts for
+    /// the one entry that lists it ([`known_entry`]), so that a prefix, a set
+    /// or a suffix heals once every case under it that no entry of its own
+    /// names matches, instead of outliving its cause for as long as a case
+    /// another entry lists still differs under it.
     fn healed<'k>(&self, known: &BTreeMap<&'k str, &'k str>) -> Vec<&'k str> {
+        let live: BTreeSet<&str> = self
+            .differences
+            .keys()
+            .filter_map(|id| known_entry(known, id, self.set_of(id)).map(|(entry, _)| entry))
+            .collect();
         known
             .keys()
             .copied()
-            .filter(|entry| match prefix_of(entry) {
-                Some(prefix) => {
-                    self.seen_under(prefix)
-                        && !self
-                            .differences
-                            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
-                            .take_while(|(id, _)| id.starts_with(prefix))
-                            .any(|(id, _)| !known.contains_key(id.as_str()))
-                }
-                None => self.seen.contains(*entry) && !self.differences.contains_key(*entry),
-            })
+            .filter(|entry| self.seen_listed(Listed::of(entry)) && !live.contains(entry))
             .collect()
     }
 
-    /// The entries of `known` for a model whose render sets were read that
-    /// are no longer among its cases.
+    /// The entries of `known` whose set the tree holds that are no longer
+    /// among its cases.
     fn gone<'k>(&self, known: &BTreeMap<&'k str, &'k str>) -> Vec<&'k str> {
         known
             .keys()
             .copied()
             .filter(|entry| {
-                let slug = entry.split('/').next().unwrap_or_default();
-                self.loaded_slugs.contains(slug)
-                    && match prefix_of(entry) {
-                        Some(prefix) => !self.seen_under(prefix),
-                        None => !self.seen.contains(*entry),
-                    }
+                let listed = Listed::of(entry);
+                self.holds(listed) && !self.seen_listed(listed)
             })
             .collect()
     }
+
+    /// Whether the tree read holds what `listed` stands for, so that an entry
+    /// with no case under it is stale: for a case name, any loaded model; for
+    /// a set, the set read; for an id or a prefix, its model loaded and its
+    /// set read: the set whose name the id or the prefix begins with, any set
+    /// under a prefix of set names, and the hand-written set for an id of a
+    /// hand-written case's shape. A benchmark case is `<set>-<n>` and a
+    /// hand-written case a name, so an id that no read set prefixes is a
+    /// hand-written case unless it ends in `-<n>`: a benchmark set the tree
+    /// omits, the unpack's sample being every Nth, leaves its entries alone,
+    /// an id of one of its cases among them, while an id of a hand-written
+    /// case the tree no longer has (renamed, dropped, or a typo in the entry)
+    /// is held to the hand-written set and read as gone.
+    fn holds(&self, listed: Listed<'_>) -> bool {
+        let entry = match listed {
+            Listed::Suffix(_) => return !self.loaded_slugs.is_empty(),
+            Listed::Set(set) => return self.sets_read.contains(set),
+            Listed::Id(entry) | Listed::Prefix(entry) => entry,
+        };
+        // `<slug>/<kind>/` and what follows it.
+        let (dir, rest) = entry
+            .match_indices('/')
+            .nth(1)
+            .map_or((entry, ""), |(at, _)| entry.split_at(at + 1));
+        let mut sets = self
+            .sets_read
+            .range::<str, _>((Bound::Included(dir), Bound::Unbounded))
+            .map_while(|set| set.strip_prefix(dir));
+        match listed {
+            Listed::Prefix(_) => sets.any(|set| set.starts_with(rest) || rest.starts_with(set)),
+            _ => {
+                sets.any(|set| rest.starts_with(set))
+                    || (!is_benchmark_case(rest)
+                        && self.sets_read.contains(&format!("{dir}{HAND_WRITTEN_SET}")))
+            }
+        }
+    }
+}
+
+/// Whether `name`, the part of a case id after `<slug>/<kind>/`, is of a
+/// benchmark case's shape, `<set>-<n>`; a hand-written case's name does not
+/// end in a number.
+fn is_benchmark_case(name: &str) -> bool {
+    name.rsplit_once('-')
+        .is_some_and(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 #[test]
@@ -1962,6 +1481,8 @@ where
     let mut tally = Tally::default();
     let mut read = BTreeMap::new();
     for (_, set, path) in &sets {
+        let set_path = format!("{slug}/{set}");
+        report.sets_read.insert(set_path.clone());
         let mut transformers = None;
         let cases = for_each_case(path, |fixture: Fixture| {
             assert_eq!(fixture.kind, "render", "{}: not a render case", fixture.id);
@@ -1981,7 +1502,7 @@ where
                 }
                 Ok(got) => Err(describe(&got, &fixture.reference)),
             };
-            report.record(&fixture, outcome, &mut tally, known, &mut lines);
+            report.record(&fixture, &set_path, outcome, &mut tally, known, &mut lines);
         })?;
         let transformers = transformers.map_or(String::new(), |version| {
             format!("; recorded with transformers {version}")
@@ -1993,7 +1514,15 @@ where
     report
         .mismatches
         .extend(set_mismatches(slug, &read, &listed));
-    tally.stale = report.healed(known).len() + report.gone(known).len();
+    // The entries scoped to this model; the ones that span models (`*/...`)
+    // are judged once, on the merged report.
+    let own_prefix = format!("{slug}/");
+    let own: BTreeMap<&str, &str> = known
+        .iter()
+        .filter(|(entry, _)| entry.starts_with(&own_prefix))
+        .map(|(entry, reason)| (*entry, *reason))
+        .collect();
+    tally.stale = report.healed(&own).len() + report.gone(&own).len();
     Ok(Compared {
         lines,
         summary: format!("{slug}: {tally}"),
@@ -2559,6 +2088,109 @@ fn compare_quietly(
 }
 
 #[test]
+fn a_prefix_entry_heals_when_only_cases_listed_by_their_own_id_still_differ() {
+    let model = "org/m";
+    let listed = BTreeMap::from([
+        ("m/render/*", "recorded with another pipeline"),
+        ("m/render/common-0", "the template drops the role"),
+    ]);
+    // common-2 differs under the prefix with no entry of its own: the prefix
+    // is live, and nothing fails the run.
+    let root = tree(&[
+        ("m/manifest.toml", &manifest(model)),
+        ("m/sets.toml", &sets_toml(&[("render/common", 3)])),
+        (
+            "m/render/common.jsonl",
+            &(differing_line("m/render/common-0", model)
+                + &render_line("m/render/common-1", model)
+                + &differing_line("m/render/common-2", model)),
+        ),
+    ])
+    .unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    assert_eq!(report.differences.len(), 2, "{:#?}", report.differences);
+    assert_eq!(
+        report.failures(root.path(), &listed, &BTreeMap::new()),
+        Vec::<String>::new()
+    );
+    // Once common-2 matches, the one difference left under the prefix is the
+    // by-id entry's own: the prefix has healed and must go, the by-id entry
+    // stays.
+    let root = tree(&[
+        ("m/manifest.toml", &manifest(model)),
+        ("m/sets.toml", &sets_toml(&[("render/common", 3)])),
+        (
+            "m/render/common.jsonl",
+            &(differing_line("m/render/common-0", model)
+                + &render_line("m/render/common-1", model)
+                + &render_line("m/render/common-2", model)),
+        ),
+    ])
+    .unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    assert_eq!(report.differences.len(), 1, "{:#?}", report.differences);
+    let failures = report.failures(root.path(), &listed, &BTreeMap::new());
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0].contains("matching the reference now")
+            && failures[0].ends_with("remove: m/render/*"),
+        "{failures:#?}"
+    );
+}
+
+#[test]
+fn a_prefix_entry_heals_when_only_the_case_a_suffix_entry_names_still_differs() {
+    let model = "org/m";
+    // The suffix entry names common-0 of every model, the prefix the model's
+    // whole render side; with common-2 differing too, the prefix is live.
+    let listed = BTreeMap::from([
+        ("*/render/common-0", "the header the gateway always appends"),
+        ("m/render/*", "recorded with another pipeline"),
+    ]);
+    let root = tree(&[
+        ("m/manifest.toml", &manifest(model)),
+        ("m/sets.toml", &sets_toml(&[("render/common", 3)])),
+        (
+            "m/render/common.jsonl",
+            &(differing_line("m/render/common-0", model)
+                + &render_line("m/render/common-1", model)
+                + &differing_line("m/render/common-2", model)),
+        ),
+    ])
+    .unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    assert_eq!(
+        report.failures(root.path(), &listed, &BTreeMap::new()),
+        Vec::<String>::new()
+    );
+    // With common-0 the only difference left, it counts for the suffix entry
+    // that names it: the prefix has healed and must go, the suffix stays.
+    let root = tree(&[
+        ("m/manifest.toml", &manifest(model)),
+        ("m/sets.toml", &sets_toml(&[("render/common", 3)])),
+        (
+            "m/render/common.jsonl",
+            &(differing_line("m/render/common-0", model)
+                + &render_line("m/render/common-1", model)
+                + &render_line("m/render/common-2", model)),
+        ),
+    ])
+    .unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    let failures = report.failures(root.path(), &listed, &BTreeMap::new());
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0].contains("matching the reference now")
+            && failures[0].ends_with("remove: m/render/*"),
+        "{failures:#?}"
+    );
+}
+
+#[test]
 fn compressed_sets_and_lfs_pointers_are_found_under_the_root() {
     let pointer = "version https://git-lfs.github.com/spec/v1\n\
                    oid sha256:4d7a214614ab2935c943f9e0ff69d22eadbb8f32b1258daaa5e2ca24d17e2393\n\
@@ -2768,14 +2400,17 @@ fn a_prefix_entry_covers_the_cases_under_it_and_must_cover_one() {
         "{failures:#?}"
     );
     // A prefix under which every loaded case matches must go, and so must one
-    // that no loaded case begins with.
+    // under a set the tree holds that no loaded case begins with; one under a
+    // set the tree omits is left alone, since the tree holds every Nth
+    // benchmark set.
     let stale = BTreeMap::from([
         (
             "m/render/bfcl-multi-turn-*",
             "the template writes a field the typed tools drop",
         ),
+        ("m/render/bfcl-multi-turn-base-9*", "no such case"),
         ("m/render/common-*", "matches now"),
-        ("m/render/gsm8k-*", "no such set"),
+        ("m/render/gsm8k-*", "a set the tree omits"),
     ]);
     let failures = report.failures(root.path(), &stale, &BTreeMap::new());
     assert_eq!(failures.len(), 2, "{failures:#?}");
@@ -2790,62 +2425,203 @@ fn a_prefix_entry_covers_the_cases_under_it_and_must_cover_one() {
     assert!(
         failures.iter().any(|failure| {
             failure.contains("no longer among the loaded fixtures")
-                && failure.contains("m/render/gsm8k-*")
-                && !failure.contains("bfcl")
+                && failure.contains("m/render/bfcl-multi-turn-base-9*")
+                && !failure.contains("gsm8k")
+                && !failure.contains("bfcl-multi-turn-*")
         }),
         "{failures:#?}"
     );
 }
 
 #[test]
-fn a_prefix_entry_heals_when_only_cases_listed_by_their_own_id_still_differ() {
+fn an_id_entry_of_an_omitted_benchmark_case_is_left_alone_and_of_a_lost_hand_written_one_is_not() {
     let model = "org/m";
     let root = tree(&[
         ("m/manifest.toml", &manifest(model)),
-        ("m/sets.toml", &sets_toml(&[("render/common", 3)])),
+        (
+            "m/sets.toml",
+            &sets_toml(&[("render/bfcl-multi-turn-base", 1), ("render/common", 1)]),
+        ),
+        (
+            "m/render/bfcl-multi-turn-base.jsonl",
+            &render_line("m/render/bfcl-multi-turn-base-0", model),
+        ),
         (
             "m/render/common.jsonl",
-            &(differing_line("m/render/common-0", model)
-                + &render_line("m/render/common-1", model)
-                + &differing_line("m/render/common-2", model)),
+            &render_line("m/render/text-developer-role", model),
         ),
     ])
     .unwrap();
     let manifests = read_manifests(root.path()).unwrap();
-    let listed = BTreeMap::from([
-        ("m/render/*", "recorded with another pipeline"),
-        ("m/render/common-0", "the template drops the role"),
+    let report =
+        compare_quietly(root.path(), &manifests, &BTreeMap::new(), |_, _| Ok(mock())).unwrap();
+    // A hand-written case that matches now, a case of a set the tree holds
+    // that is not among its cases, and a hand-written name the tree's set
+    // lacks (renamed, dropped, or a typo) are stale; a case of a set the tree
+    // omits is left alone, since the tree holds every Nth benchmark set.
+    let stale = BTreeMap::from([
+        ("m/render/bfcl-multi-turn-base-9", "no such case"),
+        ("m/render/text-developer-role", "matches now"),
+        ("m/render/text-develoepr-role", "a typo"),
+        ("m/render/continue-final-message", "no such case"),
+        ("m/render/gsm8k-17", "a case of a set the tree omits"),
     ]);
+    // One line names the healed entry, one the gone entries.
+    let failures = report.failures(root.path(), &stale, &BTreeMap::new());
+    assert_eq!(failures.len(), 2, "{failures:#?}");
+    assert!(
+        failures.iter().all(|failure| !failure.contains("gsm8k")),
+        "{failures:#?}"
+    );
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contains("matching the reference now")
+                && failure.contains("m/render/text-developer-role")
+        }),
+        "{failures:#?}"
+    );
+    for gone in [
+        "m/render/bfcl-multi-turn-base-9",
+        "m/render/text-develoepr-role",
+        "m/render/continue-final-message",
+    ] {
+        assert!(
+            failures.iter().any(|failure| {
+                failure.contains("no longer among the loaded fixtures") && failure.contains(gone)
+            }),
+            "{gone}: {failures:#?}"
+        );
+    }
+}
+
+#[test]
+fn a_set_entry_covers_the_set_whole_and_must_cover_a_difference() {
+    let model = "org/m";
+    let root = tree(&[
+        ("m/manifest.toml", &manifest(model)),
+        (
+            "m/sets.toml",
+            &sets_toml(&[("render/common", 1), ("render/glaive-v2-05", 2)]),
+        ),
+        (
+            "m/render/common.jsonl",
+            &render_line("m/render/common-1", model),
+        ),
+        // The set's ids carry the sample's numbers, not the set's name.
+        (
+            "m/render/glaive-v2-05.jsonl",
+            &(differing_line("m/render/glaive-v2-8174-3", model)
+                + &differing_line("m/render/glaive-v2-8194-1", model)),
+        ),
+    ])
+    .unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let listed = BTreeMap::from([(
+        "m/render/glaive-v2-05.jsonl",
+        "the template writes a history call's arguments as recorded",
+    )]);
     let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
     assert_eq!(report.differences.len(), 2, "{:#?}", report.differences);
-    // common-2 differs under the prefix without an entry of its own: the
-    // prefix is live, and nothing fails the run.
+    // The set entry covers both differing cases, so nothing fails the run.
     assert_eq!(
         report.failures(root.path(), &listed, &BTreeMap::new()),
         Vec::<String>::new()
     );
-    // Once common-2 matches, the by-id entry alone keeps a difference under
-    // the prefix, and that one is the entry's own: the prefix has healed and
-    // must go, while the by-id entry stays.
+    // Without it the two are unlisted.
+    let failures = report.failures(root.path(), &BTreeMap::new(), &BTreeMap::new());
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0].contains("m/render/glaive-v2-8174-3")
+            && failures[0].contains("m/render/glaive-v2-8194-1"),
+        "{failures:#?}"
+    );
+    // A set entry whose every case matches must go; one for a set the tree
+    // omits is left alone.
+    let stale = BTreeMap::from([
+        ("m/render/common.jsonl", "matches now"),
+        (
+            "m/render/glaive-v2-05.jsonl",
+            "the template writes a history call's arguments as recorded",
+        ),
+        ("m/render/gsm8k.jsonl", "a set the tree omits"),
+    ]);
+    let failures = report.failures(root.path(), &stale, &BTreeMap::new());
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0].contains("matching the reference now")
+            && failures[0].contains("m/render/common.jsonl")
+            && !failures[0].contains("glaive")
+            && !failures[0].contains("gsm8k"),
+        "{failures:#?}"
+    );
+}
+
+#[test]
+fn a_suffix_entry_covers_the_case_of_every_model_and_must_cover_one() {
+    let (m, n) = ("org/m", "org/n");
     let root = tree(&[
-        ("m/manifest.toml", &manifest(model)),
-        ("m/sets.toml", &sets_toml(&[("render/common", 3)])),
+        ("m/manifest.toml", &manifest(m)),
+        ("m/sets.toml", &sets_toml(&[("render/common", 2)])),
         (
             "m/render/common.jsonl",
-            &(differing_line("m/render/common-0", model)
-                + &render_line("m/render/common-1", model)
-                + &render_line("m/render/common-2", model)),
+            &(render_line("m/render/common-1", m)
+                + &differing_line("m/render/no-generation-prompt", m)),
+        ),
+        ("n/manifest.toml", &manifest(n)),
+        ("n/sets.toml", &sets_toml(&[("render/common", 2)])),
+        (
+            "n/render/common.jsonl",
+            &(render_line("n/render/common-1", n)
+                + &differing_line("n/render/no-generation-prompt", n)),
         ),
     ])
     .unwrap();
     let manifests = read_manifests(root.path()).unwrap();
+    let listed = BTreeMap::from([(
+        "*/render/no-generation-prompt",
+        "the header is always appended",
+    )]);
     let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
-    assert_eq!(report.differences.len(), 1, "{:#?}", report.differences);
-    let failures = report.failures(root.path(), &listed, &BTreeMap::new());
+    assert_eq!(report.differences.len(), 2, "{:#?}", report.differences);
+    // The suffix covers the case of both models, so nothing fails the run.
+    assert_eq!(
+        report.failures(root.path(), &listed, &BTreeMap::new()),
+        Vec::<String>::new()
+    );
+    // Without it the two are unlisted.
+    let failures = report.failures(root.path(), &BTreeMap::new(), &BTreeMap::new());
     assert_eq!(failures.len(), 1, "{failures:#?}");
     assert!(
-        failures[0].contains("matching the reference now")
-            && failures[0].ends_with("remove: m/render/*"),
+        failures[0].contains("m/render/no-generation-prompt")
+            && failures[0].contains("n/render/no-generation-prompt"),
+        "{failures:#?}"
+    );
+    // A suffix whose every loaded case matches must go, and so must one that
+    // no loaded case ends with.
+    let stale = BTreeMap::from([
+        (
+            "*/render/no-generation-prompt",
+            "the header is always appended",
+        ),
+        ("*/render/common-1", "matches now"),
+        ("*/render/text-developer-role", "no such case"),
+    ]);
+    let failures = report.failures(root.path(), &stale, &BTreeMap::new());
+    assert_eq!(failures.len(), 2, "{failures:#?}");
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contains("matching the reference now")
+                && failure.contains("*/render/common-1")
+                && !failure.contains("no-generation-prompt")
+        }),
+        "{failures:#?}"
+    );
+    assert!(
+        failures.iter().any(|failure| {
+            failure.contains("no longer among the loaded fixtures")
+                && failure.contains("*/render/text-developer-role")
+                && !failure.contains("no-generation-prompt")
+        }),
         "{failures:#?}"
     );
 }
