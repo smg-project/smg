@@ -103,6 +103,18 @@ impl Shared {
         }
     }
 
+    /// Whether the KV-event relay's subscriptions have reached the engine's
+    /// publishers, or there is none to wait for (events off, a relay told to
+    /// start lazily, one that gave up). The lifecycle owner holds its planned
+    /// warm-up until then, so the warm-up's batches start the relay's
+    /// history and a gateway that subscribes later gets the engine's whole
+    /// life.
+    pub(crate) fn kv_relay_subscribed(&self) -> bool {
+        self.kv_relay
+            .as_ref()
+            .is_none_or(|relay| relay.subscribed())
+    }
+
     /// SERVING only once the engine link is up and alive and the lifecycle
     /// owner has not started draining.
     pub(crate) fn is_serving(&self) -> bool {

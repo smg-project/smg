@@ -342,11 +342,7 @@ impl TokenSpeedServicerServer {
     /// history and a gateway that subscribes later gets the scheduler's whole
     /// life.
     pub fn kv_relay_subscribed(&self) -> bool {
-        self.state
-            .shared
-            .kv_relay
-            .as_ref()
-            .is_none_or(|relay| relay.subscribed())
+        self.state.shared.kv_relay_subscribed()
     }
 
     /// Admitted requests still preprocessing, streaming, or unwinding an abort.
