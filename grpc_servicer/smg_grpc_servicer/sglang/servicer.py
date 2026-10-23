@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 from collections.abc import AsyncIterator
 from contextlib import aclosing
@@ -49,6 +50,7 @@ from smg_grpc_proto.generated import common_pb2
 from smg_grpc_servicer.engine_status import abort_for_constraint_failure
 from smg_grpc_servicer.health_probe import await_probe
 from smg_grpc_servicer.sglang.config_view import EngineConfigView
+from smg_grpc_servicer.sglang.encoder_handoff import apply_encoder_handoff
 from smg_grpc_servicer.sglang.health_servicer import SGLangHealthServicer
 from smg_grpc_servicer.sglang.kv_events import subscribe_kv_events
 from smg_grpc_servicer.sglang.loads import (
@@ -183,13 +185,7 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
                 tokenizer_backend=server_args.tokenizer_backend,
             )
         self.mm_receiver = None
-        if (
-            self.server_args.language_only
-            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
-        ):
-            from sglang.srt.disaggregation import encode_receiver as mm_receiver
-
-            self.mm_receiver = mm_receiver.create_mm_receiver(self.server_args)
+        self._mm_receiver_lock = threading.Lock()
 
         # Parse KV events config for SubscribeKvEvents support
         self._kv_events_config: KVEventsConfig | None = None
@@ -916,12 +912,26 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
         grpc_req: sglang_scheduler_pb2.GenerateRequest,
         tokenized_req: TokenizedGenerateReqInput,
     ) -> None:
-        if not self.mm_receiver:
+        if grpc_req.HasField("encode_handoff"):
+            apply_encoder_handoff(grpc_req, tokenized_req, self.server_args, Modality.IMAGE)
+            return
+
+        if not (
+            self.server_args.language_only
+            and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
+        ):
             return
 
         image_urls = list(grpc_req.mm_inputs.image_urls)
         if not image_urls:
             return
+
+        # The legacy auto-dispatch receiver is unnecessary for router-dispatched EPD.
+        with self._mm_receiver_lock:
+            if self.mm_receiver is None:
+                from sglang.srt.disaggregation import encode_receiver as mm_receiver
+
+                self.mm_receiver = mm_receiver.create_mm_receiver(self.server_args)
 
         encode_req = self.mm_receiver.build_and_send_encode_request(
             image_urls=image_urls,
@@ -970,7 +980,11 @@ class SGLangSchedulerServicer(sglang_scheduler_pb2_grpc.SglangSchedulerServicer)
 
         # Parse multimodal inputs if present
         mm_inputs = None
-        if grpc_req.HasField("mm_inputs") and grpc_req.mm_inputs.HasField("pixel_values"):
+        if (
+            not grpc_req.HasField("encode_handoff")
+            and grpc_req.HasField("mm_inputs")
+            and grpc_req.mm_inputs.HasField("pixel_values")
+        ):
             mm_inputs = self._parse_mm_inputs(grpc_req.mm_inputs)
 
         # Create request

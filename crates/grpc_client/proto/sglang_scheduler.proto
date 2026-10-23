@@ -165,6 +165,16 @@ message GenerateRequest {
   // Ask SGLang scheduler to count reasoning tokens.
   // Keep false unless the request explicitly enables reasoning/thinking.
   bool require_reasoning = 18;
+
+  // Router-dispatched image embeddings; consumed only by a language-only prefill.
+  EncodeHandoff encode_handoff = 19;
+}
+
+message EncodeHandoff {
+  string request_id = 1;
+  // Keep this snapshot in the same order as num_items_assigned.
+  repeated string encoder_urls = 2;
+  repeated uint32 num_items_assigned = 3;
 }
 
 message TokenizedInput {
