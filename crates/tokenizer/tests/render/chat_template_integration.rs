@@ -400,9 +400,25 @@ fn test_tojson_invalid_kwargs_rejected() {
         "unexpected separators error: {err}"
     );
 
-    let err = render_invalid_template(r"{{ data|tojson(indent=-1) }}");
+    // A negative indent renders as Python's `json.dumps` does: newlines only,
+    // as `indent=0`; a float indent is refused, as Python refuses it.
+    let rendered = ChatTemplateProcessor::new(r"{{ data|tojson(indent=-1) }}".to_string())
+        .unwrap()
+        .apply_chat_template(
+            &[],
+            ChatTemplateParams {
+                template_kwargs: Some(&std::collections::HashMap::from([(
+                    "data".to_string(),
+                    serde_json::json!({"k": 1}),
+                )])),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(rendered, "{\n\"k\": 1\n}");
+    let err = render_invalid_template(r"{{ data|tojson(indent=2.0) }}");
     assert!(
-        err.contains("indent cannot be negative"),
+        err.contains("indent must be an integer or a string"),
         "unexpected indent error: {err}"
     );
 
