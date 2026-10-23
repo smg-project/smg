@@ -368,18 +368,6 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
          template does not render as the reference does (smg-project/smg#2783)",
     ),
     (
-        "lightonocr-0.9b-16k-1025/render/*",
-        "the template's text has a backslash and an n where a newline would be \
-         (`system<|im_end|>\\n`), which the reference run keeps as the two characters \
-         and the gateway's render turns into the newline: every case of the model",
-    ),
-    (
-        "lightonocr-0.9b-32k-1025/render/*",
-        "the template's text has a backslash and an n where a newline would be \
-         (`system<|im_end|>\\n`), which the reference run keeps as the two characters \
-         and the gateway's render turns into the newline: every case of the model",
-    ),
-    (
         "llama-3.1-nemotron-nano-8b-v1/render/glaive-v2-32.jsonl",
         "the gateway parses a history call's arguments into an object before rendering, \
          which the template, writing the string as recorded, renders otherwise: a \
