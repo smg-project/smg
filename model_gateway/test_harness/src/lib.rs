@@ -3,6 +3,7 @@
 
 pub mod grpc_harness;
 pub mod held_worker;
+pub mod hub_fetch;
 pub mod mock_mcp_server;
 #[cfg(feature = "provider-openai")]
 pub mod mock_openai_server;
@@ -19,11 +20,10 @@ pub mod tls_mock_worker;
 // Re-export commonly used test builders
 use std::{
     collections::HashMap,
-    fs,
     future::Future,
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{Arc, OnceLock},
 };
 
 use llm_tokenizer::{mock::MockTokenizer, registry::TokenizerRegistry, traits::Tokenizer};
@@ -740,71 +740,22 @@ pub fn create_test_context_with_mcp_config(
 // Tokenizer download configuration
 const TINYLLAMA_TOKENIZER_URL: &str =
     "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json";
+/// Names another source of the TinyLlama tokenizer file: a mirror, or a stub
+/// standing in for the hub.
+const TINYLLAMA_TOKENIZER_URL_ENV: &str = "TINYLLAMA_TOKENIZER_URL";
 const CACHE_DIR: &str = ".tokenizer_cache";
 const TINYLLAMA_TOKENIZER_FILENAME: &str = "tinyllama_tokenizer.json";
 
-// Global mutex to prevent concurrent downloads
-static DOWNLOAD_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-
-/// Downloads the TinyLlama tokenizer from HuggingFace if not already cached.
-/// Returns the path to the cached tokenizer file.
-///
-/// This function is thread-safe and will only download the tokenizer once
-/// even if called from multiple threads concurrently.
-#[expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::print_stdout,
-    reason = "test helper - panicking on failure is intentional"
-)]
+/// The TinyLlama tokenizer file, downloaded into the cache once per process
+/// unless it is there already ([`hub_fetch::cached_download`]: one download
+/// at a time, a rate-limited hub waited out, a lock a failed download left
+/// poisoned taken back). Returns the path to the cached tokenizer file.
 pub fn ensure_tokenizer_cached() -> PathBuf {
-    // Get or initialize the mutex
-    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
-
-    // Lock to ensure only one thread downloads at a time
-    let _guard = mutex.lock().unwrap();
-
-    let cache_dir = PathBuf::from(CACHE_DIR);
-    let tokenizer_path = cache_dir.join(TINYLLAMA_TOKENIZER_FILENAME);
-
-    // Create cache directory if it doesn't exist
-    if !cache_dir.exists() {
-        fs::create_dir_all(&cache_dir).expect("Failed to create cache directory");
-    }
-
-    // Download tokenizer if not already cached
-    if !tokenizer_path.exists() {
-        println!("Downloading TinyLlama tokenizer from HuggingFace...");
-
-        // Use blocking reqwest client since we're in tests/benchmarks
-        let client = smg::clients::blocking_http_client();
-        let response = client
-            .get(TINYLLAMA_TOKENIZER_URL)
-            .send()
-            .expect("Failed to download tokenizer");
-
-        assert!(
-            response.status().is_success(),
-            "Failed to download tokenizer: HTTP {}",
-            response.status()
-        );
-
-        let content = response.bytes().expect("Failed to read tokenizer content");
-
-        assert!(
-            content.len() >= 100,
-            "Downloaded content too small: {} bytes",
-            content.len()
-        );
-
-        fs::write(&tokenizer_path, content).expect("Failed to write tokenizer to cache");
-        println!(
-            "Tokenizer downloaded and cached successfully ({} bytes)",
-            tokenizer_path.metadata().unwrap().len()
-        );
-    }
-
-    tokenizer_path
+    let url = std::env::var(TINYLLAMA_TOKENIZER_URL_ENV)
+        .unwrap_or_else(|_| TINYLLAMA_TOKENIZER_URL.to_string());
+    let path = PathBuf::from(CACHE_DIR).join(TINYLLAMA_TOKENIZER_FILENAME);
+    hub_fetch::cached_download(&smg::clients::blocking_http_client(), &url, &path, 100);
+    path
 }
 
 /// Common test prompts for consistency across tests

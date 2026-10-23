@@ -83,6 +83,10 @@ use llm_tokenizer::{create_tokenizer, traits::Tokenizer, MockTokenizer, Sequence
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 
+use crate::common::hub_fetch::{
+    cached_download, fetch, rate_limit_wait, RATE_LIMITED_TRIES, RATE_LIMIT_WINDOW,
+};
+
 mod common;
 
 const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
@@ -1296,60 +1300,6 @@ fn download(
     Ok(Some(path))
 }
 
-/// How many times a GET the hub rate-limits (HTTP 429) is sent, waiting between
-/// tries what the answer says ([`rate_limit_wait`]): a run on a cold cache fetches
-/// a few files of several hundred models without a token, more than the hub
-/// serves one address in one window.
-const RATE_LIMITED_TRIES: u32 = 6;
-/// The hub's rate-limit window (`ratelimit-policy: "fixed window";...;w=300`):
-/// the longest wait between two tries.
-const RATE_LIMIT_WINDOW: Duration = Duration::from_secs(300);
-
-/// GET `url`, waiting out the hub's rate limit; the response, whatever its
-/// status, after the last try.
-fn fetch(
-    client: &reqwest::blocking::Client,
-    url: &str,
-) -> Result<reqwest::blocking::Response, String> {
-    let mut tries = 0;
-    loop {
-        let response = client
-            .get(url)
-            .send()
-            .map_err(|e| format!("GET {url}: {e}"))?;
-        tries += 1;
-        if response.status() != reqwest::StatusCode::TOO_MANY_REQUESTS
-            || tries == RATE_LIMITED_TRIES
-        {
-            return Ok(response);
-        }
-        std::thread::sleep(rate_limit_wait(response.headers()));
-    }
-}
-
-/// The wait a rate-limited answer asks for: `Retry-After` in seconds, else the
-/// seconds left in the hub's window (`ratelimit: "resolvers";r=0;t=240`) and one
-/// more, since `t=` is whole seconds and a try at the boundary is limited again
-/// with `t=0`; else ten seconds; a whole window at most.
-fn rate_limit_wait(headers: &reqwest::header::HeaderMap) -> Duration {
-    let seconds = |value: &reqwest::header::HeaderValue| -> Option<u64> {
-        value.to_str().ok()?.trim().parse().ok()
-    };
-    let retry_after = headers.get(reqwest::header::RETRY_AFTER).and_then(seconds);
-    let window_left = headers
-        .get("ratelimit")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| {
-            value
-                .split(';')
-                .map(str::trim)
-                .find_map(|part| part.strip_prefix("t="))
-                .and_then(|left| left.parse::<u64>().ok())
-                .map(|left| left + 1)
-        });
-    Duration::from_secs(retry_after.or(window_left).unwrap_or(10)).min(RATE_LIMIT_WINDOW)
-}
-
 /// `<hub cache>/models--<org>--<name>/snapshots/<revision>`, the layout
 /// `huggingface_hub` keeps, under `HF_HUB_CACHE`, `HF_HOME/hub` or the default
 /// `~/.cache/huggingface/hub`.
@@ -2005,6 +1955,40 @@ fn the_wait_after_a_rate_limit_is_what_the_answer_says_and_a_window_at_most() {
     assert_eq!(
         rate_limit_wait(&headers(&[("ratelimit", "\"resolvers\";r=0;t=1000")])),
         RATE_LIMIT_WINDOW
+    );
+}
+
+/// A cached download the hub rate-limits once lands on the second try, and a call after it
+/// reads the cache; a download that failed under the download lock (limited at every try)
+/// leaves no file and no poisoned lock behind, so the test after it downloads instead of
+/// failing on the poison.
+#[test]
+fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
+    const LIMITED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0";
+    const LIMITED_EVERY_TIME: &[&str] = &[LIMITED; RATE_LIMITED_TRIES as usize];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tokenizer.json");
+    let (url, served) = loopback(LIMITED_EVERY_TIME).unwrap();
+    let failed = std::thread::spawn({
+        let path = path.clone();
+        move || cached_download(&common::http_client(), &url, &path, 2)
+    })
+    .join();
+    assert!(
+        failed.is_err(),
+        "limited at every try, the download must fail"
+    );
+    assert_eq!(served.load(Ordering::SeqCst), RATE_LIMITED_TRIES as usize);
+    assert!(!path.exists(), "a failed download leaves no file");
+    let (url, served) = loopback(&[LIMITED, "HTTP/1.1 200 OK"]).unwrap();
+    cached_download(&common::http_client(), &url, &path, 2);
+    assert_eq!(fs::read(&path).unwrap(), b"ok");
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+    cached_download(&common::http_client(), &url, &path, 2);
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        2,
+        "a cached file is not fetched again"
     );
 }
 
