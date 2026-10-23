@@ -936,7 +936,7 @@ mod tests {
     use std::{collections::VecDeque, sync::Mutex};
 
     use super::*;
-    use crate::service_discovery::testing::create_test_app_context;
+    use crate::service_discovery::testing::{create_test_app_context, live_app_context};
 
     const PASSING_2_0_4: &str = include_str!("testdata/consul/health-passing-2.0.4.json");
     const PASSING_1_22_7: &str = include_str!("testdata/consul/health-passing-1.22.7.json");
@@ -1959,64 +1959,6 @@ mod tests {
         )]
         let handle = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (port, handle)
-    }
-
-    /// A gateway that runs the jobs the reconciler submits: a live job queue
-    /// and workflow engines, a startup window the slow engine fits in, and
-    /// no drain wait on removal.
-    fn live_app_context() -> Arc<AppContext> {
-        use std::sync::OnceLock;
-
-        use llm_tokenizer::registry::TokenizerRegistry;
-        use smg_data_connector::{
-            MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
-        };
-
-        use crate::{
-            config::{HealthCheckConfig, PolicyConfig, RouterConfig},
-            policies::PolicyRegistry,
-            worker::WorkerRegistry,
-            workflow::{JobQueue, JobQueueConfig, WorkflowEngines},
-        };
-
-        let config = RouterConfig::builder()
-            .mode(regular())
-            .policy(PolicyConfig::RoundRobin)
-            .worker_startup_timeout_secs(5)
-            .worker_startup_check_interval_secs(1)
-            .health_check_config(HealthCheckConfig {
-                drain_settle_secs: 0,
-                ..HealthCheckConfig::default()
-            })
-            .build_unchecked();
-        let context = Arc::new(
-            AppContext::builder()
-                .router_config(config.clone())
-                .client(crate::clients::http_client())
-                .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
-                .worker_registry(Arc::new(WorkerRegistry::new()))
-                .policy_registry(Arc::new(PolicyRegistry::new(config.policy.clone())))
-                .response_storage(Arc::new(MemoryResponseStorage::new()))
-                .conversation_storage(Arc::new(MemoryConversationStorage::new()))
-                .conversation_item_storage(Arc::new(MemoryConversationItemStorage::new()))
-                .worker_job_queue(Arc::new(OnceLock::new()))
-                .workflow_engines(Arc::new(OnceLock::new()))
-                .mcp_orchestrator(Arc::new(OnceLock::new()))
-                .build()
-                .unwrap(),
-        );
-        context
-            .worker_job_queue
-            .set(JobQueue::new(
-                JobQueueConfig::default(),
-                Arc::downgrade(&context),
-            ))
-            .ok();
-        context
-            .workflow_engines
-            .set(WorkflowEngines::new(&context.router_config))
-            .ok();
-        context
     }
 
     /// An instance Consul drops while the gateway is still registering it is
