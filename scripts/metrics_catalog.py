@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import difflib
-import os
 import re
 import sys
 from collections import defaultdict
@@ -53,12 +52,32 @@ COMMAND = "python3 -I scripts/metrics_catalog.py"
 # deployment has the group at all (the shape that creates the series).
 GROUPS: list[tuple[str, str, str]] = [
     ("smg_http_", "HTTP front", "every gateway"),
-    ("smg_router_", "Router request path", "every gateway; `token_type`-labelled series on gRPC backends only"),
-    ("smg_admission_", "Admission", "every gateway (`--max-concurrent-requests` sets the token count)"),
+    (
+        "smg_router_",
+        "Router request path",
+        "every gateway; `token_type`-labelled series on gRPC backends only",
+    ),
+    (
+        "smg_admission_",
+        "Admission",
+        "every gateway (`--max-concurrent-requests` sets the token count)",
+    ),
     ("smg_scheduler_", "Priority scheduler", "gateways with the priority scheduler on"),
-    ("smg_worker_", "Workers, health and circuit breaker", "every gateway with at least one worker"),
-    ("smg_workers_", "Workers, health and circuit breaker", "every gateway with at least one worker"),
-    ("smg_engine_", "Engine load reports", "workers that report load (gRPC `GetLoads` polls or pushed load records; `--engine-metrics` forces the polls)"),
+    (
+        "smg_worker_",
+        "Workers, health and circuit breaker",
+        "every gateway with at least one worker",
+    ),
+    (
+        "smg_workers_",
+        "Workers, health and circuit breaker",
+        "every gateway with at least one worker",
+    ),
+    (
+        "smg_engine_",
+        "Engine load reports",
+        "workers that report load (gRPC `GetLoads` polls or pushed load records; `--engine-metrics` forces the polls)",
+    ),
     ("smg_kv_event_", "KV events", "gRPC workers whose engine publishes KV cache events"),
     ("smg_kv_events_", "KV events", "gRPC workers whose engine publishes KV cache events"),
     ("smg_kv_index_", "KV index", "cache-aware routing on a KV-event fleet"),
@@ -70,7 +89,11 @@ GROUPS: list[tuple[str, str, str]] = [
     ("smg_policy_", "Other policies", "every gateway"),
     ("smg_routing_key_", "Other policies", "every gateway"),
     ("smg_pd_", "Prefill/decode", "prefill/decode (PD, EPD) deployments"),
-    ("smg_symphony_", "Symphony tables", "gRPC backends reading tool calls and reasoning through a Symphony table"),
+    (
+        "smg_symphony_",
+        "Symphony tables",
+        "gRPC backends reading tool calls and reasoning through a Symphony table",
+    ),
     ("smg_tokenizer_", "Tokenizer", "gRPC backends (the gateway tokenizes)"),
     ("smg_detokenize_", "Tokenizer", "gRPC backends (the gateway detokenizes)"),
     ("smg_mm_", "Multimodal", "gateways that process media (images, video, audio)"),
@@ -80,37 +103,69 @@ GROUPS: list[tuple[str, str, str]] = [
     ("smg_discovery_", "Service discovery", "`--service-discovery` providers"),
     ("smg_rl_", "RL control plane", "the RL control-plane routes"),
     ("smg_tokio_", "Runtime", "every gateway"),
-    ("smg_allocator_", "Runtime", "builds with the jemalloc statistics feature (the release binaries)"),
+    (
+        "smg_allocator_",
+        "Runtime",
+        "builds with the jemalloc statistics feature (the release binaries)",
+    ),
     ("smg_log_", "Runtime", "every gateway"),
-    ("smg_servicer_", "Engine servicer", "the Rust servicer with `--metrics-port` (its own `/metrics`, not the gateway's)"),
+    (
+        "smg_servicer_",
+        "Engine servicer",
+        "the Rust servicer with `--metrics-port` (its own `/metrics`, not the gateway's)",
+    ),
     ("router_mesh_", "Mesh", "`--mesh-*` high-availability peers"),
     ("router_rl_", "Mesh", "`--mesh-*` high-availability peers"),
     ("router_lb_", "Mesh", "`--mesh-*` high-availability peers"),
 ]
 GROUP_ORDER = [
-    "HTTP front", "Router request path", "Admission", "Priority scheduler",
-    "Workers, health and circuit breaker", "Engine load reports", "KV events", "KV index",
-    "Cache-aware policy", "Other policies", "Prefill/decode", "Symphony tables", "Tokenizer",
-    "Multimodal", "MCP tools", "Response storage", "Service discovery", "RL control plane",
-    "Runtime", "Engine servicer", "Mesh", "Other",
+    "HTTP front",
+    "Router request path",
+    "Admission",
+    "Priority scheduler",
+    "Workers, health and circuit breaker",
+    "Engine load reports",
+    "KV events",
+    "KV index",
+    "Cache-aware policy",
+    "Other policies",
+    "Prefill/decode",
+    "Symphony tables",
+    "Tokenizer",
+    "Multimodal",
+    "MCP tools",
+    "Response storage",
+    "Service discovery",
+    "RL control plane",
+    "Runtime",
+    "Engine servicer",
+    "Mesh",
+    "Other",
 ]
 
 # What a label key means. Keys the code uses and this table does not know
 # are rendered with an empty meaning, which the label page makes visible.
 LABEL_MEANING: dict[str, str] = {
-    "model": "the served model id as the gateway knows it; `other` once the bounded set of client-supplied names is full, `unknown` when the request named none",
+    "model": "the served model id as the gateway knows it; `other` once the bounded set of "
+    "client-supplied names is full, `unknown` when the request named none",
     "worker": "the worker's URL (the registration address); series labelled this way leave `/metrics` with the worker",
-    "worker_type": "`regular`, `prefill`, `decode`, `encode` (role), or `http`/`grpc` where the family counts by connection",
-    "endpoint": "the API family of the request (`chat`, `completions`, `generate`, `responses`, `messages`, `embeddings`, `rerank`, `classify`, `realtime*`, `audio_transcriptions`, `decisions`, `systemone`, or `other`)",
-    "router_type": "which router served the request: `http` (proxying), `grpc` (the tokenizing pipeline) or `openai` (external providers)",
+    "worker_type": "`regular`, `prefill`, `decode`, `encode` (role), or `http`/`grpc` where the family "
+    "counts by connection",
+    "endpoint": "the API family of the request (`chat`, `completions`, `generate`, `responses`, "
+    "`messages`, `embeddings`, `rerank`, `classify`, `realtime*`, `audio_transcriptions`, `decisions`, "
+    "`systemone`, or `other`)",
+    "router_type": "which router served the request: `http` (proxying), `grpc` (the tokenizing pipeline) "
+    "or `openai` (external providers)",
     "backend_type": "`regular`, `pd` (prefill/decode), `external` or `harmony`",
     "connection_mode": "how the gateway reaches the worker: `http`, `grpc`, `zmq`, `websocket`, `webrtc`",
     "streaming": "`true`/`false`: the request asked for a stream",
     "token_type": "`input`/`output` (prompt vs generated tokens)",
     "error_type": "the router's failure class for the request",
-    "error_code": "the API error code of the response body (`model_not_found`, `worker_overload_protection_shed`, ...), empty on success",
+    "error_code": "the API error code of the response body (`model_not_found`, "
+    "`worker_overload_protection_shed`, ...), empty on success",
     "status_code": "the HTTP status of the response",
-    "path": "the matched route template (not the raw URI), or the body path (`streamed`/`buffered`) on the body-path family",
+    "path": "the matched route template (not the raw URI), or the body path (`streamed`/`buffered`) on "
+    "the body-path family",
     "method": "the HTTP method",
     "dp_rank": "the engine's data-parallel rank the report came from",
     "policy": "the routing policy that picked the worker",
@@ -123,7 +178,8 @@ LABEL_MEANING: dict[str, str] = {
     "stage": "the pipeline stage at which the event happened (`selection`, `dispatch`, ...)",
     "outcome": "how the operation ended (the family's HELP names the values)",
     "reason": "why it happened (the family's HELP names the values)",
-    "result": "`success`, `error`, `timeout`, `not_found`, or `allowed`/`rejected` on the rate limiter, `hit`/`miss` on caches",
+    "result": "`success`, `error`, `timeout`, `not_found`, or `allowed`/`rejected` on the rate limiter, "
+    "`hit`/`miss` on caches",
     "kind": "the sub-kind the family counts (the HELP names the values)",
     "table": "the Symphony table that read the output (a table name, `response_template`, `other`, or `none`)",
     "disposition": "what the gateway did with a KV event batch (`applied`, `stale`, `snapshot`, `load_only`)",
@@ -167,7 +223,8 @@ LABEL_MEANING: dict[str, str] = {
     "error": "the gRPC status code the stream failed with (`out_of_range`, `unavailable`, `data_loss`, ...)",
     "leg": "the side of a prefill/decode pair whose rendezvous failed (the worker type of that side)",
     "runtime": "the engine runtime of the worker the request went to, as the worker registered it",
-    "step": "which step of a store did not complete (`record`: nothing stored; `linking`: the record stored, its conversation link not)",
+    "step": "which step of a store did not complete (`record`: nothing stored; `linking`: the record "
+    "stored, its conversation link not)",
     "store": "the mesh replication store (one per replicated table)",
     "timeout": "the timeout that closed the connection (`header_read`, `idle`)",
     "tool_name": "the MCP tool invoked (bounded; `other` past the cap)",
@@ -193,11 +250,50 @@ VALUE_SETS: dict[str, str] = {
 
 # Recorder names too generic to attribute callers to by name alone.
 GENERIC_FN = {
-    "new", "default", "drop", "set", "get", "record", "observe", "render", "call", "from",
-    "into", "update", "run", "start", "stop", "clear", "tick", "poll", "apply", "build",
-    "with", "inner", "handle", "init", "install", "reset", "sample", "flush", "retire",
-    "register", "remove", "insert", "len", "name", "labels", "key", "counter", "gauge",
-    "histogram", "rank", "describe", "describe_counter", "describe_gauge", "describe_histogram",
+    "new",
+    "default",
+    "drop",
+    "set",
+    "get",
+    "record",
+    "observe",
+    "render",
+    "call",
+    "from",
+    "into",
+    "update",
+    "run",
+    "start",
+    "stop",
+    "clear",
+    "tick",
+    "poll",
+    "apply",
+    "build",
+    "with",
+    "inner",
+    "handle",
+    "init",
+    "install",
+    "reset",
+    "sample",
+    "flush",
+    "retire",
+    "register",
+    "remove",
+    "insert",
+    "len",
+    "name",
+    "labels",
+    "key",
+    "counter",
+    "gauge",
+    "histogram",
+    "rank",
+    "describe",
+    "describe_counter",
+    "describe_gauge",
+    "describe_histogram",
 }
 
 # Zero-series registrations: a family emitted only here is published at start
@@ -241,7 +337,9 @@ def is_test_file(path: Path) -> bool:
     )
 
 
-TEST_MOD_RE = re.compile(r"(?m)^[ \t]*#\[cfg\(test\)\]\s*\n[ \t]*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*(\{|;)")
+TEST_MOD_RE = re.compile(
+    r"(?m)^[ \t]*#\[cfg\(test\)\]\s*\n[ \t]*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*(\{|;)"
+)
 
 
 def strip_tests_and_comments(text: str) -> str:
@@ -255,9 +353,9 @@ def strip_tests_and_comments(text: str) -> str:
         if not m:
             break
         if m.group(1) == ";":
-            text = text[: m.start()] + text[m.end():]
+            text = text[: m.start()] + text[m.end() :]
         else:
-            text = text[: m.start()] + text[balanced(text, m.end() - 1):]
+            text = text[: m.start()] + text[balanced(text, m.end() - 1) :]
     return "\n".join("" if re.match(r"\s*//", line) else line for line in text.split("\n"))
 
 
@@ -364,20 +462,21 @@ def literal(arg: str) -> str | None:
     return re.sub(r"\s+", " ", body).strip()
 
 
-def resolve_name(expr: str, source: Source, all_consts: dict[str, list[tuple[str, str]]]) -> str | None:
+def resolve_name(
+    expr: str, source: Source, all_consts: dict[str, list[tuple[str, str]]]
+) -> str | None:
     """A family name from a literal or a constant path."""
     expr = expr.strip()
     lit = literal(expr)
     if lit is not None:
         return lit
-    m = re.fullmatch(r"(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Z][A-Z0-9_]*)(?:\.into\(\))?", expr)
-    if not m:
-        m = re.fullmatch(r"String::from\(((?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Z][A-Z0-9_]*)\)", expr)
-        if not m:
-            return None
-        expr = m.group(1)
-        m = re.fullmatch(r"(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Z][A-Z0-9_]*)", expr)
-    ident = m.group(1)
+    wrapped = re.fullmatch(r"String::from\(((?:[A-Za-z_][A-Za-z0-9_]*::)*[A-Z][A-Z0-9_]*)\)", expr)
+    if wrapped:
+        expr = wrapped.group(1)
+    path = re.fullmatch(r"(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Z][A-Z0-9_]*)(?:\.into\(\))?", expr)
+    if not path:
+        return None
+    ident = path.group(1)
     if ident in source.consts:
         return source.consts[ident]
     candidates = all_consts.get(ident, [])
@@ -390,7 +489,9 @@ def resolve_name(expr: str, source: Source, all_consts: dict[str, list[tuple[str
     return candidates[0][1] if candidates else None
 
 
-FN_RE = re.compile(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:const\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)")
+FN_RE = re.compile(
+    r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:const\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)"
+)
 
 
 def enclosing_fn(text: str, at: int) -> str:
@@ -443,12 +544,19 @@ def collect(sources: list[Source]) -> tuple[dict[str, Family], list[str]]:
         text = s.text
         for m in DESCRIBE_RE.finditer(text):
             end = balanced(text, m.end() - 1)
-            args = split_args(text[m.end(): end - 1])
-            if not args or args[0].startswith("&self") or "KeyName::" in args[0] or args[0] in ("key", "name"):
+            args = split_args(text[m.end() : end - 1])
+            if (
+                not args
+                or args[0].startswith("&self")
+                or "KeyName::" in args[0]
+                or args[0] in ("key", "name")
+            ):
                 continue  # the definition or the inner call of a describe method, not a site
             name = resolve_name(args[0], s, all_consts)
             if name is None:
-                warnings.append(f"{s.rel}:{line_of(text, m.start())}: describe with an unresolved name {args[0]!r}")
+                warnings.append(
+                    f"{s.rel}:{line_of(text, m.start())}: describe with an unresolved name {args[0]!r}"
+                )
                 continue
             help_text = None
             for arg in reversed(args):
@@ -461,16 +569,18 @@ def collect(sources: list[Source]) -> tuple[dict[str, Family], list[str]]:
             f.described_at.append(f"{s.rel}:{line_of(text, m.start())}")
 
         for m in EMIT_MACRO_RE.finditer(text):
-            if text[max(0, m.start() - 9): m.start()].endswith("describe_"):
+            if text[max(0, m.start() - 9) : m.start()].endswith("describe_"):
                 continue
             end = balanced(text, m.end() - 1)
-            inner = text[m.end(): end - 1]
+            inner = text[m.end() : end - 1]
             args = split_args(inner)
             if not args:
                 continue
             name = resolve_name(args[0], s, all_consts)
             if name is None:
-                warnings.append(f"{s.rel}:{line_of(text, m.start())}: {m.group(1)}! with a dynamic name {args[0][:40]!r}")
+                warnings.append(
+                    f"{s.rel}:{line_of(text, m.start())}: {m.group(1)}! with a dynamic name {args[0][:40]!r}"
+                )
                 continue
             f = fam(name)
             keys = set(LABEL_PAIR_RE.findall(inner))
@@ -497,13 +607,15 @@ def collect(sources: list[Source]) -> tuple[dict[str, Family], list[str]]:
                 if name is None:
                     continue
                 end = balanced(text, text.rfind("(", 0, m.end()))
-                rest = text[m.end(): end - 1]
+                rest = text[m.end() : end - 1]
                 keys = set(TUPLE_KEY_RE.findall(rest))
                 ident = re.fullmatch(r"\s*([a-z_]+)\s*", rest)
                 if not keys and ident:
                     # `labels` bound in the enclosing function: its own tuples only
                     a, b = enclosing_fn_span(text, m.start())
-                    binding = re.search(r"let\s+" + ident.group(1) + r"\b[^=]*=\s*&\[(.*?)\];", text[a:b], re.S)
+                    binding = re.search(
+                        r"let\s+" + ident.group(1) + r"\b[^=]*=\s*&\[(.*?)\];", text[a:b], re.S
+                    )
                     if binding:
                         keys = set(TUPLE_KEY_RE.findall(binding.group(1)))
                 f = fam(name)
@@ -547,7 +659,7 @@ def collect(sources: list[Source]) -> tuple[dict[str, Family], list[str]]:
 
 def short(rel: str) -> str:
     if rel.startswith("model_gateway/src/"):
-        return rel[len("model_gateway/src/"):]
+        return rel[len("model_gateway/src/") :]
     m = re.match(r"crates/([^/]+)/src/(.*)", rel)
     if m:
         return f"{m.group(1)}:{m.group(2)}"
@@ -559,7 +671,9 @@ def is_metrics_module(rel: str) -> bool:
 
 
 def find_callers(families: dict[str, Family], sources: list[Source]) -> dict[str, list[str]]:
-    names = sorted({fn for f in families.values() for fn, _ in f.recorders if fn and fn not in GENERIC_FN})
+    names = sorted(
+        {fn for f in families.values() for fn, _ in f.recorders if fn and fn not in GENERIC_FN}
+    )
     callers: dict[str, set[str]] = defaultdict(set)
     if not names:
         return {}
@@ -611,15 +725,23 @@ def edges_summary(edges: list[float]) -> str:
     return f"{fmt_num(edges[0])}, {fmt_num(edges[1])} … {fmt_num(edges[-2])}, {fmt_num(edges[-1])} ({len(edges)} edges)"
 
 
-def bucket_sets(sources: list[Source]) -> tuple[dict[str, list[float]], dict[str, str], dict[str, str]]:
+def bucket_sets(
+    sources: list[Source],
+) -> tuple[dict[str, list[float]], dict[str, str], dict[str, str]]:
     """Named edge sets, exact-name assignments and suffix assignments."""
     sets: dict[str, list[float]] = {}
-    const_re = re.compile(r"const\s+([A-Z][A-Z0-9_]*BUCKETS)\s*:\s*&\[f64\]\s*=\s*&\[(.*?)\];", re.S)
+    const_re = re.compile(
+        r"const\s+([A-Z][A-Z0-9_]*BUCKETS)\s*:\s*&\[f64\]\s*=\s*&\[(.*?)\];", re.S
+    )
     for s in sources:
         for m in const_re.finditer(s.text):
             sets[m.group(1)] = numbers(m.group(2))
     full: dict[str, str] = {}
     suffix: dict[str, str] = {}
+    const_index: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    for s in sources:
+        for k, v in s.consts.items():
+            const_index[k].append((s.rel, v))
     for s in sources:
         text = s.text
         # The gateway's override table.
@@ -629,7 +751,9 @@ def bucket_sets(sources: list[Source]) -> tuple[dict[str, list[float]], dict[str
             body = text[a:b]
             default = re.search(r"unwrap_or_else\(\|\|\s*\{\s*vec!\[(.*?)\]", body, re.S)
             if default:
-                sets["REQUEST_DURATION_BUCKETS (default of --prometheus-duration-buckets)"] = numbers(default.group(1))
+                sets["REQUEST_DURATION_BUCKETS (default of --prometheus-duration-buckets)"] = (
+                    numbers(default.group(1))
+                )
             matchers: dict[str, tuple[str, str]] = {}
             for m in re.finditer(r"let\s+(\w+)\s*=\s*Matcher::(Full|Suffix)\((.*?)\);", body, re.S):
                 arg = m.group(3).strip()
@@ -637,11 +761,13 @@ def bucket_sets(sources: list[Source]) -> tuple[dict[str, list[float]], dict[str
                 if lit:
                     matchers[m.group(1)] = (m.group(2), lit.group(1))
                 else:
-                    consts = {k: v for src in sources for k, v in src.consts.items()}
-                    name = resolve_name(arg, s, {k: [("", v)] for k, v in consts.items()})
+                    name = resolve_name(arg, s, const_index)
                     if name:
                         matchers[m.group(1)] = (m.group(2), name)
-            for m in re.finditer(r"\(\s*(\w+)\s*,\s*([A-Za-z_:\.\(\)]+?)(?:\.to_vec\(\))?(?:\.clone\(\))?\s*,?\s*\)", body):
+            for m in re.finditer(
+                r"\(\s*(\w+)\s*,\s*([A-Za-z_:\.\(\)]+?)(?:\.to_vec\(\))?(?:\.clone\(\))?\s*,?\s*\)",
+                body,
+            ):
                 var, expr = m.group(1), m.group(2)
                 if var not in matchers:
                     continue
@@ -652,14 +778,18 @@ def bucket_sets(sources: list[Source]) -> tuple[dict[str, list[float]], dict[str
                 (full if mode == "Full" else suffix)[target] = set_name
         # The servicer's per-family table.
         for m in re.finditer(r"\(\s*(names::[A-Z][A-Z0-9_]*)\s*,\s*(&?[A-Za-z_]+)\s*,?\s*\)", text):
-            consts = {k: [("", v)] for src in sources for k, v in src.consts.items()}
-            name = resolve_name(m.group(1), s, consts)
+            name = resolve_name(m.group(1), s, const_index)
             if name and name.startswith("smg_servicer_"):
                 full[name] = m.group(2).lstrip("&")
     return sets, full, suffix
 
 
-def assign_buckets(families: dict[str, Family], sets: dict[str, list[float]], full: dict[str, str], suffix: dict[str, str]) -> None:
+def assign_buckets(
+    families: dict[str, Family],
+    sets: dict[str, list[float]],
+    full: dict[str, str],
+    suffix: dict[str, str],
+) -> None:
     for f in families.values():
         if f.kind != "histogram":
             continue
@@ -691,7 +821,7 @@ def value_sets(sources: list[Source]) -> dict[str, list[str]]:
         m = re.search(r"pub mod metrics_labels\s*\{", s.text)
         if not m:
             continue
-        body = s.text[m.start(): balanced(s.text, s.text.find("{", m.start()))]
+        body = s.text[m.start() : balanced(s.text, s.text.find("{", m.start()))]
         for c in CONST_RE.finditer(body):
             for prefix, key in VALUE_SETS.items():
                 if c.group(1).startswith(prefix):
@@ -704,34 +834,48 @@ def value_sets(sources: list[Source]) -> dict[str, list[str]]:
 # ----------------------------------------------------------------------------
 # The gateway's flags (clap) for the probes/knobs page
 
-FLAG_HEADINGS = {"Logging", "Prometheus Metrics", "Tracing (OpenTelemetry)", "Health Checks", "Profiling"}
-FLAG_FIELDS = {"health_check_port", "admin_port", "admin_host", "engine_metrics", "log_mm_timing", "shutdown_grace_period_secs"}
+FLAG_HEADINGS = {
+    "Logging",
+    "Prometheus Metrics",
+    "Tracing (OpenTelemetry)",
+    "Health Checks",
+    "Profiling",
+}
+FLAG_FIELDS = {
+    "health_check_port",
+    "admin_port",
+    "admin_host",
+    "engine_metrics",
+    "log_mm_timing",
+    "shutdown_grace_period_secs",
+}
 
 
 def flags_table() -> str:
     text = MAIN_RS.read_text(encoding="utf-8")
     rows = []
     pattern = re.compile(
-        r"((?:[ \t]*///[^\n]*\n)+)[ \t]*#\[arg\((.*?)\)\]\s*\n(?:[ \t]*#\[arg\((.*?)\)\]\s*\n)?[ \t]*(?:pub(?:\([^)]*\))?\s+)?([a-z_][a-z0-9_]*)\s*:",
+        r"((?:[ \t]*///[^\n]*\n)+)[ \t]*#\[arg\((.*?)\)\]\s*\n"
+        r"(?:[ \t]*#\[arg\((.*?)\)\]\s*\n)?[ \t]*(?:pub(?:\([^)]*\))?\s+)?([a-z_][a-z0-9_]*)\s*:",
         re.S,
     )
     for m in pattern.finditer(text):
         doc, attrs, attrs2, fieldname = m.groups()
         attrs = attrs + ("," + attrs2 if attrs2 else "")
-        heading = re.search(r"help_heading\s*=\s*\"([^\"]+)\"", attrs)
-        heading = heading.group(1) if heading else ""
+        heading_match = re.search(r"help_heading\s*=\s*\"([^\"]+)\"", attrs)
+        heading = heading_match.group(1) if heading_match else ""
         if heading not in FLAG_HEADINGS and fieldname not in FLAG_FIELDS:
             continue
         long = re.search(r"long\s*=\s*\"([^\"]+)\"", attrs)
         flag = "--" + (long.group(1) if long else fieldname.replace("_", "-"))
-        default = re.search(r"default_value(?:_t)?\s*=\s*([^,)]+)", attrs)
-        default_text = default.group(1).strip().strip('"') if default else ""
+        default_match = re.search(r"default_value(?:_t)?\s*=\s*([^,)]+)", attrs)
+        default_text = default_match.group(1).strip().strip('"') if default_match else ""
         if "SetTrue" in attrs and not default_text:
             default_text = "false"
         docs = " ".join(line.strip()[3:].strip() for line in doc.strip().split("\n"))
         docs = docs.replace("|", "\\|")
         rows.append((heading or "Worker Configuration", flag, default_text or "unset", docs))
-    rows.sort(key=lambda r: (list(FLAG_HEADINGS | {"Worker Configuration"}).index(r[0]) if False else r[0], r[1]))
+    rows.sort(key=lambda r: (r[0], r[1]))
     out = ["| Flag | Default | Help heading | What it does |", "|---|---|---|---|"]
     for heading, flag, default, docs in rows:
         out.append(f"| `{flag}` | `{default}` | {heading} | {docs} |")
@@ -753,7 +897,9 @@ def md_cell(text: str) -> str:
     return text.replace("|", "\\|").replace("\n", " ")
 
 
-def render_catalog(families: dict[str, Family], callers: dict[str, list[str]], sets: dict[str, list[float]]) -> str:
+def render_catalog(
+    families: dict[str, Family], callers: dict[str, list[str]], sets: dict[str, list[float]]
+) -> str:
     by_group: dict[str, list[Family]] = defaultdict(list)
     for f in families.values():
         by_group[group_of(f.name)[0]].append(f)
@@ -766,16 +912,22 @@ def render_catalog(families: dict[str, Family], callers: dict[str, list[str]], s
     lines = [
         "# Metrics catalog",
         "",
-        f"Generated by `{COMMAND}` from the registration and recording sites in the sources; do not edit by hand (`--check` holds this page to the code).",
+        f"Generated by `{COMMAND}` from the registration and recording sites in the sources; "
+        "do not edit by hand (`--check` holds this page to the code).",
         "",
         f"{len(described)} families: {counters} counters, {gauges} gauges, {histograms} histograms. "
-        "A family is on `/metrics` once something recorded it, except the pre-registered ones (marked *zero at start*), which are published at process start so dashboards and alerts find the series before the first event.",
+        "A family is on `/metrics` once something recorded it, except the pre-registered ones "
+        "(marked *zero at start*), which are published at process start so dashboards and alerts "
+        "find the series before the first event.",
         "",
         "How to read a row:",
         "",
-        "- **Labels**: the label keys the recorder sets; the [label reference](metric-labels.md) says what each key means and which values are fixed.",
-        "- **Buckets** (histograms): the edge set the exporter uses; a family without one renders as a summary (quantile lines). The sets are listed at the end.",
-        "- **Recorded by**: the recorder function and the modules that call it (the request point); `gateway` paths are under `model_gateway/src/`, `crate:path` under `crates/<crate>/src/`.",
+        "- **Labels**: the label keys the recorder sets; the [label reference](metric-labels.md) says "
+        "what each key means and which values are fixed.",
+        "- **Buckets** (histograms): the edge set the exporter uses; a family without one renders as a "
+        "summary (quantile lines). The sets are listed at the end.",
+        "- **Recorded by**: the recorder function and the modules that call it (the request point); "
+        "`gateway` paths are under `model_gateway/src/`, `crate:path` under `crates/<crate>/src/`.",
         "- **Help**: the `# HELP` text of the scrape.",
         "",
         "Groups and when a deployment has them:",
@@ -783,7 +935,7 @@ def render_catalog(families: dict[str, Family], callers: dict[str, list[str]], s
         "| Group | Families | Present when |",
         "|---|---|---|",
     ]
-    seen_when = {}
+    seen_when: dict[str, str] = {}
     for prefix, group, when in GROUPS:
         seen_when.setdefault(group, when)
     for group in GROUP_ORDER:
@@ -798,7 +950,11 @@ def render_catalog(families: dict[str, Family], callers: dict[str, list[str]], s
             continue
         lines += [f"## {group}", ""]
         has_hist = any(f.kind == "histogram" for f in fams)
-        header = "| Family | Type | Labels |" + (" Buckets |" if has_hist else "") + " Recorded by | Help |"
+        header = (
+            "| Family | Type | Labels |"
+            + (" Buckets |" if has_hist else "")
+            + " Recorded by | Help |"
+        )
         sep = "|---|---|---|" + ("---|" if has_hist else "") + "---|---|"
         lines += [header, sep]
         for f in sorted(fams, key=lambda x: x.name):
@@ -816,12 +972,29 @@ def render_catalog(families: dict[str, Family], callers: dict[str, list[str]], s
             lines.append(row)
         lines.append("")
     if undescribed:
-        lines += ["## Families recorded without a description", "", "These names are recorded but no `describe_*` site gives them a HELP text; the scrape shows them without one.", ""]
+        lines += [
+            "## Families recorded without a description",
+            "",
+            "These names are recorded but no `describe_*` site gives them a HELP text; the scrape "
+            "shows them without one.",
+            "",
+        ]
         lines += [f"- `{n}`" for n in undescribed] + [""]
     if unrecorded:
-        lines += ["## Families described but never recorded", "", "Described names with no recording site this script can see (a dynamic name, or a description that outlived its recorder).", ""]
+        lines += [
+            "## Families described but never recorded",
+            "",
+            "Described names with no recording site this script can see (a dynamic name, or a "
+            "description that outlived its recorder).",
+            "",
+        ]
         lines += [f"- `{n}`" for n in unrecorded] + [""]
-    lines += ["## Bucket edge sets", "", "| Set | Edges (seconds unless the family says otherwise) |", "|---|---|"]
+    lines += [
+        "## Bucket edge sets",
+        "",
+        "| Set | Edges (seconds unless the family says otherwise) |",
+        "|---|---|",
+    ]
     for name in sorted(sets):
         lines.append(f"| `{name.split(' ')[0]}` | {', '.join(fmt_num(e) for e in sets[name])} |")
     lines.append("")
@@ -866,7 +1039,8 @@ def render_labels(families: dict[str, Family], values: dict[str, list[str]]) -> 
         f"Generated by `{COMMAND}`; do not edit by hand.",
         "",
         "Every label key a family carries, what it means, and the families that carry it. "
-        "Label values that identify a worker are its registration URL, so per-worker series come and go with the fleet (the gateway retires a worker's series when the worker is removed). "
+        "Label values that identify a worker are its registration URL, so per-worker series come and "
+        "go with the fleet (the gateway retires a worker's series when the worker is removed). "
         "Client-controlled values (`model`, MCP `tool`) are bounded: past the cap they collapse to `other`.",
         "",
         "| Key | Meaning | Families |",
@@ -878,7 +1052,16 @@ def render_labels(families: dict[str, Family], values: dict[str, list[str]]) -> 
         if len(fams) > 6:
             shown += f" and {len(fams) - 6} more"
         lines.append(f"| `{key}` | {md_cell(LABEL_MEANING.get(key, ''))} | {len(fams)}: {shown} |")
-    lines += ["", "## Fixed value sets", "", "Values the code fixes as constants (the shared label module of the router crate); a value outside the set is a bug, not a new category.", "", "| Key | Values |", "|---|---|"]
+    lines += [
+        "",
+        "## Fixed value sets",
+        "",
+        "Values the code fixes as constants (the shared label module of the router crate); a value "
+        "outside the set is a bug, not a new category.",
+        "",
+        "| Key | Values |",
+        "|---|---|",
+    ]
     for key in sorted(values):
         lines.append(f"| `{key}` | {', '.join(f'`{v}`' for v in values[key])} |")
     lines.append("")
@@ -909,8 +1092,12 @@ def splice_flags(page: str, table: str) -> str:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--check", action="store_true", help="exit 1 when a page differs from a fresh render")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--check", action="store_true", help="exit 1 when a page differs from a fresh render"
+    )
     parser.add_argument("--print", action="store_true", help="print the catalog instead of writing")
     parser.add_argument("--quiet", action="store_true", help="no warnings on stderr")
     args = parser.parse_args()
@@ -930,7 +1117,11 @@ def main() -> int:
     if not args.quiet:
         for w in warnings:
             print(f"note: {w}", file=sys.stderr)
-        print(f"{sum(1 for f in families.values() if f.kind)} described families, {len(families)} named, from {len(sources)} sources", file=sys.stderr)
+        print(
+            f"{sum(1 for f in families.values() if f.kind)} described families, {len(families)} named, "
+            f"from {len(sources)} sources",
+            file=sys.stderr,
+        )
 
     if args.print:
         sys.stdout.write(catalog)
@@ -946,7 +1137,14 @@ def main() -> int:
             if current != text:
                 stale += 1
                 print(f"stale: {path.relative_to(REPO)} (run `{COMMAND}`)", file=sys.stderr)
-                diff = difflib.unified_diff(current.splitlines(), text.splitlines(), "checked in", "fresh render", lineterm="", n=1)
+                diff = difflib.unified_diff(
+                    current.splitlines(),
+                    text.splitlines(),
+                    "checked in",
+                    "fresh render",
+                    lineterm="",
+                    n=1,
+                )
                 for i, line in enumerate(diff):
                     if i >= 40:
                         print("  …", file=sys.stderr)
