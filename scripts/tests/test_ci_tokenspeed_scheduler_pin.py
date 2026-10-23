@@ -105,15 +105,31 @@ def test_known_pair_cannot_override_declared_constraints(mod):
         mod.scheduler_pin(["tokenspeed-scheduler>=0.1.41,<0.1.42"], "0.1.1.post20261023")
 
 
-@pytest.mark.parametrize("version,storage", [("0.1.41", True), ("0.1.42", False)])
-def test_storage_nightly_rejects_wrong_version_or_missing_native_symbol(
-    mod, monkeypatch, version, storage
-):
-    monkeypatch.setattr(mod.metadata, "version", lambda _: version)
-    module = SimpleNamespace(Scheduler=object(), StorageConfig=object() if storage else None)
+def test_storage_nightly_rejects_wrong_version_with_all_symbols_present(mod, monkeypatch):
+    monkeypatch.setattr(mod.metadata, "version", lambda _: "0.1.41")
+    module = SimpleNamespace(
+        Scheduler=object(), StorageConfig=object(), StoragePressure=object(), StorageKind=object()
+    )
     monkeypatch.setattr(mod.importlib, "import_module", lambda _: module)
-    with pytest.raises((RuntimeError, ImportError)):
+    with pytest.raises(RuntimeError, match="requires the CI scheduler pair 0.1.42"):
         mod.check_scheduler("0.1.1.post20261023")
+
+
+def test_storage_nightly_rejects_missing_storage_config_at_correct_version(mod, monkeypatch):
+    monkeypatch.setattr(mod.metadata, "version", lambda _: "0.1.42")
+    module = SimpleNamespace(Scheduler=object(), StoragePressure=object(), StorageKind=object())
+    monkeypatch.setattr(mod.importlib, "import_module", lambda _: module)
+    with pytest.raises(ImportError, match="lacks StorageConfig"):
+        mod.check_scheduler("0.1.1.post20261023")
+
+
+def test_storage_nightly_accepts_correct_version_with_all_symbols_present(mod, monkeypatch):
+    monkeypatch.setattr(mod.metadata, "version", lambda _: "0.1.42")
+    module = SimpleNamespace(
+        Scheduler=object(), StorageConfig=object(), StoragePressure=object(), StorageKind=object()
+    )
+    monkeypatch.setattr(mod.importlib, "import_module", lambda _: module)
+    assert mod.check_scheduler("0.1.1.post20261023") is None
 
 
 def test_old_nightly_checks_its_scheduler_without_requiring_storage(mod, monkeypatch):
