@@ -187,6 +187,58 @@ fn record_engine_load_sets_core_gauges_per_dp_rank() {
     );
 }
 
+/// The capacity behind the usage ratio is a series of its own when the
+/// engine reports it, and absent when the record carries the ratio alone.
+#[test]
+fn record_engine_load_sets_the_kv_capacity_when_the_engine_reports_it() {
+    let mut response = WorkerLoadResponse {
+        timestamp: "t".to_string(),
+        dp_rank_count: 1,
+        loads: vec![SchedulerLoadSnapshot {
+            dp_rank: 2,
+            token_usage: 0.5,
+            max_total_num_tokens: 262_144,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let rendered = render_with_recorder(|| {
+        Metrics::record_engine_load("http://w:1", "m", &response);
+    });
+    assert_metric(
+        &rendered,
+        "smg_engine_kv_capacity_tokens",
+        &CORE_LABELS,
+        "262144",
+    );
+    assert_metric(&rendered, "smg_engine_token_usage", &CORE_LABELS, "0.5");
+
+    response.loads[0].max_total_num_tokens = 0;
+    let rendered = render_with_recorder(|| {
+        Metrics::record_engine_load("http://w:1", "m", &response);
+    });
+    assert!(
+        !rendered.contains("smg_engine_kv_capacity_tokens"),
+        "a record without the capacity sets no series; rendered:\n{rendered}"
+    );
+    assert_metric(&rendered, "smg_engine_token_usage", &CORE_LABELS, "0.5");
+}
+
+/// A model's block size is one gauge, set from what the gateway knows.
+#[test]
+fn the_kv_block_size_of_a_model_is_a_gauge() {
+    let rendered = render_with_recorder(|| {
+        Metrics::set_kv_block_size("m", 16);
+        Metrics::set_kv_block_size("m", 64);
+    });
+    assert_metric(
+        &rendered,
+        "smg_kv_block_size_tokens",
+        &["model=\"m\""],
+        "64",
+    );
+}
+
 #[test]
 fn record_engine_load_sets_pd_gauges_when_disagg_present() {
     let response = WorkerLoadResponse {

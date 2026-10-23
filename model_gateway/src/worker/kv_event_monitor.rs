@@ -269,12 +269,15 @@ impl KvEventMonitor {
         // overwrite this with the backend's actual page size once received.
         if let Some(bs) = worker.metadata().spec.kv_block_size {
             if bs > 0 {
-                self.block_sizes
+                let known = self
+                    .block_sizes
                     .entry(model_id.clone())
                     .or_insert(KvBlockSize {
                         tokens: bs,
                         from_events: false,
-                    });
+                    })
+                    .tokens;
+                Metrics::set_kv_block_size(&model_id, known);
             } else {
                 warn!(worker_url = %url, "Worker reports kv_block_size=0, ignoring");
             }

@@ -956,6 +956,14 @@ pub(crate) fn init_metrics() {
         "Engine-reported prefix cache hit rate (0.0-1.0) by worker, model, dp_rank"
     );
     describe_gauge!(
+        "smg_engine_kv_capacity_tokens",
+        "Engine-reported KV cache capacity in tokens by worker, model, dp_rank: the denominator of smg_engine_token_usage; absent while the engine has not reported it (a record that carries only the core figures keeps the last reported value); divided by smg_kv_block_size_tokens it is the engine's total KV blocks"
+    );
+    describe_gauge!(
+        "smg_kv_block_size_tokens",
+        "Tokens per KV block of a model as the gateway knows it: seeded from a worker's registration, replaced by the size of the first block its KV event stream stores"
+    );
+    describe_gauge!(
         "smg_engine_pd_kv_transfer_latency_ms",
         "Engine-reported PD KV transfer latency (ms) by worker, role, dp_rank"
     );
@@ -2430,6 +2438,17 @@ impl Metrics {
         }
     }
 
+    /// The tokens per KV block of `model_id` as the gateway knows it now
+    /// (`smg_kv_block_size_tokens`): seeded at a worker's registration,
+    /// replaced by the first block its event stream stores.
+    pub fn set_kv_block_size(model_id: &str, tokens: usize) {
+        gauge!(
+            "smg_kv_block_size_tokens",
+            "model" => intern_model_label(model_id)
+        )
+        .set(tokens as f64);
+    }
+
     /// Set worker health status
     pub fn set_worker_health(worker_url: &str, healthy: bool) {
         let worker_interned = intern_string(worker_url);
@@ -2919,6 +2938,18 @@ impl Metrics {
                 "dp_rank" => Arc::clone(&dp_rank),
             )
             .set(load.cache_hit_rate);
+            // The capacity behind the usage ratio, when the engine reports
+            // it (a snapshot read off an HTTP metrics page carries the
+            // ratio alone and leaves it 0).
+            if load.max_total_num_tokens > 0 {
+                gauge!(
+                    "smg_engine_kv_capacity_tokens",
+                    "worker" => Arc::clone(&worker),
+                    "model" => Arc::clone(&model),
+                    "dp_rank" => Arc::clone(&dp_rank),
+                )
+                .set(f64::from(load.max_total_num_tokens));
+            }
 
             // PD gauges only when the engine reported a disagg section. Labeled
             // by dp_rank too, so DP ranks sharing a role don't overwrite.
@@ -3012,6 +3043,7 @@ impl Metrics {
                 "smg_engine_token_usage",
                 "smg_engine_gen_throughput",
                 "smg_engine_cache_hit_rate",
+                "smg_engine_kv_capacity_tokens",
             ] {
                 gauge!(
                     name,
