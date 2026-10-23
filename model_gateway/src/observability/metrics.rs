@@ -55,7 +55,7 @@ pub(crate) fn interner_size() -> usize {
 
 /// Per-worker caches of the handles the gateway's per-request records go
 /// through: the HTTP layer's, the stream-timing set's and the per-worker
-/// request counter's. The helpers, the installed flag and the router's
+/// request counters' and gauges'. The helpers, the installed flag and the router's
 /// request and duration caches are the external router crate's
 /// (`smg_external_router::metrics::handles`), so every router records the
 /// same way.
@@ -109,14 +109,14 @@ mod handles {
     }
 
     /// Every registration or removal of a worker moves this on, and a
-    /// thread whose kept worker counters are from an earlier state drops
+    /// thread whose kept per-worker handles are from an earlier state drops
     /// them at its next record: a removal drops the address's series from
     /// the per-worker store, so a handle kept from before feeds nothing,
     /// and a handle built while the address was retired is a no-op one,
     /// which a re-registration would otherwise leave in place.
     static WORKER_SET_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-    /// A worker registered or was removed: the kept worker counters are
+    /// A worker registered or was removed: the kept per-worker handles are
     /// stale.
     pub(super) fn worker_set_changed() {
         WORKER_SET_GENERATION.fetch_add(1, Ordering::AcqRel);
