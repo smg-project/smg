@@ -16,6 +16,8 @@
 //! same engine, so `\p{L}` or `\s` cannot mean one thing here and another
 //! there.
 
+use std::{collections::HashMap, sync::Arc};
+
 use super::unicode;
 
 /// A set of characters: Unicode categories, code point ranges, negation.
@@ -26,6 +28,98 @@ struct Class {
     ranges: Vec<(u32, u32)>,
     /// Membership of U+0000..=U+007F, resolved once.
     ascii: AsciiSet,
+    /// Whether any member lies beyond ASCII (a negated class, a category, a
+    /// range that reaches U+0080): a class without one answers `false` there
+    /// at once.
+    beyond_ascii: bool,
+    /// The class's bit in the pattern's shared [`BlockTable`], when the
+    /// pattern built one.
+    table: Option<(u8, Arc<BlockTable>)>,
+}
+
+/// The membership of a pattern's classes for the code points of the Basic
+/// Multilingual Plane beyond ASCII, by block of 256: `rows[index[block]]
+/// [low]` holds one bit per class that has a slot. Blocks with the same row
+/// share it (most blocks are all letters, or nothing, to every class), so a
+/// pattern's table is a few dozen rows. It is built once at parse from the
+/// classes' own ranges and category tables, so a test here and a range
+/// search agree by construction; a code point beyond the plane, or a class
+/// of a pattern with more classes than the mask has bits, takes the search.
+#[derive(Clone)]
+struct BlockTable {
+    index: Box<[u16; 256]>,
+    rows: Vec<[u32; 256]>,
+}
+
+impl std::fmt::Debug for BlockTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BlockTable")
+            .field("rows", &self.rows.len())
+            .finish()
+    }
+}
+
+/// The most classes a [`BlockTable`] tells apart: the bits of a row's entry.
+const MAX_SLOTS: usize = 32;
+
+impl BlockTable {
+    /// Gives a slot to every class with members beyond ASCII and builds the
+    /// table; `None` (and no slots) when there is no such class or more than
+    /// the mask holds.
+    fn build(classes: &[Class]) -> Option<Self> {
+        let candidates = classes.iter().filter(|class| class.beyond_ascii).count();
+        if candidates == 0 || candidates > MAX_SLOTS {
+            return None;
+        }
+        let mut flat = vec![0u32; 0x1_0000];
+        for (slot, class) in classes
+            .iter()
+            .filter(|class| class.beyond_ascii)
+            .enumerate()
+        {
+            let bit = 1u32 << slot;
+            if class.negated {
+                for entry in &mut flat[0x80..] {
+                    *entry |= bit;
+                }
+            }
+            class.for_each_listed_range(|start, end| {
+                let (start, end) = (start.max(0x80), end.min(0xFFFF));
+                for entry in flat.iter_mut().take(end as usize + 1).skip(start as usize) {
+                    if class.negated {
+                        *entry &= !bit;
+                    } else {
+                        *entry |= bit;
+                    }
+                }
+            });
+        }
+        let mut index = Box::new([0u16; 256]);
+        let mut rows: Vec<[u32; 256]> = Vec::new();
+        let mut seen: HashMap<[u32; 256], u16> = HashMap::new();
+        for (block, entry) in index.iter_mut().enumerate() {
+            let mut row = [0u32; 256];
+            row.copy_from_slice(&flat[block * 256..(block + 1) * 256]);
+            *entry = match seen.get(&row) {
+                Some(&id) => id,
+                None => {
+                    rows.push(row);
+                    let id = u16::try_from(rows.len() - 1).ok()?;
+                    seen.insert(row, id);
+                    id
+                }
+            };
+        }
+        Some(Self { index, rows })
+    }
+
+    /// Membership of `code` (U+0080..=U+FFFF) in the class with `slot`.
+    #[inline]
+    fn contains(&self, slot: u8, code: u32) -> bool {
+        debug_assert!((0x80..0x1_0000).contains(&code));
+        let row = &self.rows[usize::from(self.index[((code >> 8) & 0xff) as usize])];
+        row[(code & 0xff) as usize] & (1u32 << slot) != 0
+    }
 }
 
 /// A set of ASCII characters as a membership table, one entry per code
@@ -118,7 +212,50 @@ impl Class {
             }
         }
         self.ascii = ascii;
+        self.beyond_ascii =
+            self.negated || self.categories != 0 || self.ranges.iter().any(|&(_, end)| end >= 0x80);
         self
+    }
+
+    /// Calls `f` with every range the class lists, its own and its
+    /// categories' (the members before negation).
+    fn for_each_listed_range(&self, mut f: impl FnMut(u32, u32)) {
+        for &(start, end) in &self.ranges {
+            f(start, end);
+        }
+        for &(bit, table) in &CATEGORY_TABLES {
+            if self.categories & bit != 0 {
+                for &(start, end) in table {
+                    f(start, end);
+                }
+            }
+        }
+    }
+
+    /// Whether `c` is in the class: the ASCII table below U+0080, the
+    /// pattern's block table in the rest of the Basic Multilingual Plane, the
+    /// range search beyond it (and for a class without a table).
+    #[inline]
+    fn contains(&self, c: char) -> bool {
+        let code = u32::from(c);
+        if code < 0x80 {
+            self.ascii.contains(code)
+        } else {
+            self.contains_beyond_ascii(code)
+        }
+    }
+
+    /// Membership beyond ASCII, out of line as the range search was: the
+    /// table test is two loads and a mask, the search runs for the rest.
+    #[inline(never)]
+    fn contains_beyond_ascii(&self, code: u32) -> bool {
+        if !self.beyond_ascii {
+            return false;
+        }
+        match &self.table {
+            Some((slot, table)) if code < 0x1_0000 => table.contains(*slot, code),
+            _ => self.contains_slow(code),
+        }
     }
 
     fn contains_slow(&self, code: u32) -> bool {
@@ -131,24 +268,12 @@ impl Class {
         hit != self.negated
     }
 
-    #[inline]
-    fn contains(&self, c: char) -> bool {
-        let code = u32::from(c);
-        if code < 128 {
-            self.ascii.contains(code)
-        } else {
-            self.contains_slow(code)
-        }
-    }
-
     /// The characters the class may hold, exact below U+0080 and one bit for
     /// the rest, set unless every member of the class is ASCII.
     fn first(&self) -> First {
         First {
             ascii: self.ascii,
-            non_ascii: self.negated
-                || self.categories != 0
-                || self.ranges.iter().any(|&(_, end)| end >= 128),
+            non_ascii: self.beyond_ascii,
             nullable: false,
         }
     }
@@ -313,8 +438,18 @@ impl Pattern {
         let mut firsts = Vec::new();
         compile(&root, &mut program, &mut firsts);
         program.push(Op::Match);
+        let mut classes = parser.classes;
+        if let Some(table) = BlockTable::build(&classes).map(Arc::new) {
+            for (slot, class) in classes
+                .iter_mut()
+                .filter(|class| class.beyond_ascii)
+                .enumerate()
+            {
+                class.table = Some((u8::try_from(slot).ok()?, Arc::clone(&table)));
+            }
+        }
         Some(Self {
-            classes: parser.classes,
+            classes,
             program,
             firsts,
         })
@@ -1155,6 +1290,61 @@ mod tests {
         (0..len)
             .map(|_| POOL[(pseudo_random(state) % POOL.len() as u64) as usize])
             .collect()
+    }
+
+    #[test]
+    fn the_block_table_agrees_with_the_range_search_for_every_class() {
+        // Every code point of the first blocks (Latin, Greek, Cyrillic, the
+        // marks, the CJK punctuation), a stride over the rest of the plane,
+        // and the edges: the ASCII border, the block borders, the plane's end
+        // and a few astral code points, which take the range search.
+        let mut probes: Vec<u32> = (0x80..0x3000).collect();
+        probes.extend((0x3000..0x1_0000).step_by(13));
+        probes.extend([
+            0x7f, 0x80, 0xff, 0x100, 0x1ff, 0x200, 0xfffd, 0xffff, 0x1_0000, 0x1_f600, 0x2_0000,
+            0x10_ffff,
+        ]);
+        for pattern in PATTERNS {
+            let parsed = Pattern::parse(pattern).expect("parses");
+            assert!(
+                parsed.classes.iter().any(|class| class.table.is_some()),
+                "{pattern}: a table"
+            );
+            for (index, class) in parsed.classes.iter().enumerate() {
+                assert_eq!(
+                    class.table.is_some(),
+                    class.beyond_ascii,
+                    "{pattern} class {index}"
+                );
+                for &code in &probes {
+                    let Some(c) = char::from_u32(code) else {
+                        continue;
+                    };
+                    assert_eq!(
+                        class.contains(c),
+                        class.contains_slow(code),
+                        "{pattern} class {index} U+{code:04X}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_pattern_with_more_unicode_classes_than_the_table_holds_takes_the_search() {
+        // 33 negated classes: every one has members beyond ASCII, one more
+        // than the mask has bits, so the pattern runs on the range search.
+        let pattern: String = (0..33u8)
+            .map(|i| format!("[^{}\r\n]", char::from(b'a' + i % 26)))
+            .collect::<Vec<_>>()
+            .join("|");
+        let parsed = Pattern::parse(&pattern).expect("parses");
+        assert!(parsed.classes.iter().all(|class| class.table.is_none()));
+        let text = "ab\u{e9}\u{4e2d}\u{1f600} c\nd";
+        assert_eq!(
+            parsed.find_iter(text).collect::<Vec<_>>(),
+            oracle_matches(&pattern, text)
+        );
     }
 
     #[test]
