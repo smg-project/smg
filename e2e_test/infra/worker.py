@@ -238,7 +238,8 @@ class Worker:
         if self.mode == ConnectionMode.ZMQ:
             # SMG (the router) binds the ZMQ sockets and this engine dials in;
             # there is no worker port to probe. The gateway's readiness gate
-            # (wait_for_workers_ready) covers the engine, so just proceed.
+            # (wait_for_workers_ready, started with this worker) covers the
+            # engine's load and its exit, so just proceed.
             logger.info(
                 "Worker %s spawned at %s (PID %d) — ZMQ readiness gated by the gateway",
                 self.model_id,
@@ -405,6 +406,13 @@ class Worker:
     def is_alive(self) -> bool:
         """Check if the worker process is still running."""
         return self.process is not None and self.process.poll() is None
+
+    def raise_if_exited(self) -> None:
+        """End a start-up wait on this worker's exit: the death report (the
+        exit status, what the log says, the log's path), raised at once
+        instead of the wait running to its bound."""
+        if not self.is_alive():
+            raise RuntimeError(self._death_report())
 
     def effective_kv_backend(self) -> str:
         """This worker's KV transfer backend: its own override, else the lane's."""
@@ -1087,8 +1095,7 @@ class Worker:
         """Wait for a gRPC worker to become healthy."""
         start = time.perf_counter()
         while time.perf_counter() - start < timeout:
-            if not self.is_alive():
-                raise RuntimeError(self._death_report())
+            self.raise_if_exited()
             if self.grpc_serving():
                 return
             time.sleep(HEALTH_CHECK_INTERVAL)

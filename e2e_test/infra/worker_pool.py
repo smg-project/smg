@@ -252,6 +252,7 @@ class WorkerPool:
                 )
                 gateway.start(
                     worker_urls=[w.base_url for w in workers],
+                    workers=workers,
                     model_path=model_path,
                     backend=engine,
                     policy=gateway_config["policy"],
