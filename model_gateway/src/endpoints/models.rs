@@ -211,17 +211,20 @@ fn self_hosted_cards(registry: &WorkerRegistry) -> Vec<ModelCard> {
 
 /// The self-hosted inventory as the list presents it: every card, then one
 /// entry per alias (the same card under the alias name), so every name a
-/// client may send is one it can discover. A model's own id is never
-/// re-listed as another card's alias; the shapes list a name once.
+/// client may send is one it can discover. An alias is listed under the
+/// model the registry resolves it to, and nowhere else: a name that is a
+/// registered model's id, a contested alias's losing declaration or the
+/// reserved wildcard name is never shown as an alias routing does not honour.
 fn listed_cards(registry: &WorkerRegistry) -> Vec<ModelCard> {
     let mut cards = self_hosted_cards(registry);
-    let ids: HashSet<&str> = cards.iter().map(|card| card.id.as_str()).collect();
     let aliased: Vec<ModelCard> = cards
         .iter()
         .flat_map(|card| {
             card.aliases
                 .iter()
-                .filter(|alias| !ids.contains(alias.as_str()))
+                .filter(|alias| {
+                    registry.resolve_model_alias(alias).as_deref() == Some(card.id.as_str())
+                })
                 .map(|alias| ModelCard {
                     id: alias.clone(),
                     aliases: Vec::new(),
@@ -485,8 +488,14 @@ mod tests {
 
     fn registry_with(cards: Vec<ModelCard>) -> WorkerRegistry {
         let registry = WorkerRegistry::new();
+        register_worker(&registry, "http://internal.invalid:8000", cards);
+        registry
+    }
+
+    /// Register a self-hosted worker at `url` serving `cards`.
+    fn register_worker(registry: &WorkerRegistry, url: &str, cards: Vec<ModelCard>) {
         let worker: Arc<dyn Worker> = Arc::new(
-            BasicWorkerBuilder::new("http://internal.invalid:8000")
+            BasicWorkerBuilder::new(url)
                 .worker_type(WorkerType::Regular)
                 .models(cards)
                 .health_config(HealthCheckConfig {
@@ -496,7 +505,6 @@ mod tests {
                 .build(),
         );
         registry.register(worker);
-        registry
     }
 
     /// A request id for the tests that do not read it back.
@@ -674,6 +682,39 @@ mod tests {
         );
         assert_eq!(anthropic["first_id"], "m1", "{anthropic}");
         assert_eq!(anthropic["last_id"], "alias-1b", "{anthropic}");
+    }
+
+    /// An alias two workers' cards declare is listed once, under the card
+    /// the registry resolves it to (the first registered keeps it), whatever
+    /// order the workers come back in: the entry describes the model routing
+    /// sends the name to.
+    #[tokio::test]
+    async fn a_contested_alias_is_listed_under_the_card_the_registry_resolves_it_to() {
+        let registry = WorkerRegistry::new();
+        let mut first = ModelCard::new("org/first");
+        first.display_name = Some("First".to_owned());
+        first.aliases = vec!["shared".to_owned()];
+        register_worker(&registry, "http://first.invalid:8000", vec![first]);
+        let mut second = ModelCard::new("org/second");
+        second.display_name = Some("Second".to_owned());
+        second.aliases = vec!["shared".to_owned()];
+        register_worker(&registry, "http://second.invalid:8000", vec![second]);
+        assert_eq!(
+            registry.resolve_model_alias("shared").as_deref(),
+            Some("org/first")
+        );
+
+        let body =
+            json_body(registry_models_response(&registry, ModelShape::Anthropic, rid()).await)
+                .await;
+        let shared: Vec<&Value> = body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["id"] == "shared")
+            .collect();
+        assert_eq!(shared.len(), 1, "{body}");
+        assert_eq!(shared[0]["display_name"], "First", "{body}");
     }
 
     /// A name is listed once: a model's own id is never re-listed as another
