@@ -50,7 +50,9 @@ use zip::{CompressionMethod, ZipArchive};
 use super::*;
 use crate::{
     kv_events,
-    testing::{assert_bucket_edges, assert_golden, http_get, servicer_config, Bounded},
+    testing::{
+        assert_bucket_edges, assert_golden, captured_logs, http_get, servicer_config, Bounded,
+    },
     tokenizer_bundle, ServicerError,
 };
 
@@ -3895,6 +3897,110 @@ async fn drain_refuses_new_decode_requests_but_keeps_the_rejection_notice() {
     assert_eq!(notice.request_id, "draining");
     assert!(notice.abort_immediately);
     assert_eq!(h.server.active_requests(), 0);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A PD decode side on `connector`, with the request the adapter refuses
+/// after admission closed and before the engine got it (a negative
+/// temperature fails its own check of the sampling params): the refusal
+/// path of the notice.
+fn decode_side_on(connector: &str) -> VllmModelInfo {
+    let mut model = model_info();
+    model.kv_connector = connector.to_string();
+    model.kv_role = "kv_consumer".to_string();
+    model.kv_engine_id = "decode-engine".to_string();
+    model
+}
+
+fn refused_decode_request(id: &str) -> vllm::GenerateRequest {
+    let mut request = generate_request(id, true, Vec::new());
+    request.sampling_params.as_mut().unwrap().temperature = Some(-1.0);
+    request.kv_transfer_params_json =
+        Some(r#"{"do_remote_prefill":true,"remote_block_ids":[3]}"#.to_string());
+    request
+}
+
+/// On the NIXL connector a decode side refused before the engine got it
+/// still sends the rejection notice.
+#[tokio::test]
+async fn a_nixl_decode_side_refused_before_the_engine_still_sends_the_notice() {
+    let mut h = harness(decode_side_on("NixlConnector"), None).await;
+    let status = h
+        .client
+        .generate(refused_decode_request("pd-nixl"))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    let notice = recv_add(&mut h.engine_in).await;
+    assert_eq!(notice.request_id, "pd-nixl");
+    assert!(notice.abort_immediately);
+    assert_eq!(notice.prompt_token_ids.as_deref(), Some(&[0][..]));
+    // The notice's own stream is dropped once the add is out.
+    assert_eq!(
+        recv_abort(&mut h.engine_in).await,
+        vec!["pd-nixl".to_string()]
+    );
+    assert_engine_idle(&mut h.engine_in).await;
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// On the Mooncake connector the same refusal sends no notice (the decode
+/// engine would die on it) and logs one warning line that names the request
+/// and the reason; the refused id is free again.
+#[tokio::test]
+async fn a_mooncake_decode_side_withholds_the_notice_with_one_warning_line() {
+    let logs = captured_logs();
+    let mut h = harness(decode_side_on("MooncakeConnector"), None).await;
+    let status = h
+        .client
+        .generate(refused_decode_request("pd-mooncake"))
+        .await
+        .expect_err("refused");
+    assert_eq!(status.code(), Code::InvalidArgument);
+    assert_engine_idle(&mut h.engine_in).await;
+    let lines = logs.lines_containing("pd-mooncake");
+    assert_eq!(lines.len(), 1, "one warning line: {lines:?}");
+    assert!(lines[0].contains("WARN"), "{}", lines[0]);
+    assert!(
+        lines[0].contains("KV-transfer rejection notice withheld on the Mooncake connector"),
+        "{}",
+        lines[0]
+    );
+    let _stream = h
+        .client
+        .generate(generate_request("pd-mooncake", true, Vec::new()))
+        .await
+        .expect("the refused id is free again")
+        .into_inner();
+    let accepted = recv_add(&mut h.engine_in).await;
+    assert_eq!(accepted.request_id, "pd-mooncake");
+    assert!(!accepted.abort_immediately);
+    assert_eq!(logs.lines_containing("pd-mooncake").len(), 1);
+    h.server.stop(Duration::from_secs(5)).expect("clean stop");
+}
+
+/// A Mooncake decode side abandoned while its media is still being fetched
+/// (the notice the drop guard sends on every other connector) withholds it
+/// too.
+#[tokio::test]
+async fn a_cancelled_mooncake_decode_side_withholds_the_notice() {
+    let logs = captured_logs();
+    let processor = MockMediaProcessor::slow(Ok(processed_media()), Duration::from_millis(1500), 4);
+    let mut h = harness_with(decode_side_on("MooncakeConnector"), None, Some(processor)).await;
+    let mut request = media_request("mr-mooncake");
+    request.kv_transfer_params_json =
+        Some(r#"{"do_remote_prefill":true,"remote_block_ids":[3]}"#.to_string());
+    let _ = tokio::time::timeout(Duration::from_millis(200), h.client.generate(request)).await;
+    // The guard fires when the abandoned request's future is dropped.
+    wait_until(|| !logs.lines_containing("mr-mooncake").is_empty()).await;
+    assert_engine_idle(&mut h.engine_in).await;
+    let lines = logs.lines_containing("mr-mooncake");
+    assert_eq!(lines.len(), 1, "one warning line: {lines:?}");
+    assert!(
+        lines[0].contains("withheld on the Mooncake connector"),
+        "{}",
+        lines[0]
+    );
     h.server.stop(Duration::from_secs(5)).expect("clean stop");
 }
 

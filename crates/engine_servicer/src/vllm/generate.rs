@@ -48,6 +48,12 @@ pub(super) async fn generate(
     submit(state, client, req, trace_headers, arrival).await
 }
 
+/// The connector on which the notice is withheld (see
+/// [`RejectionNotice::send`]), by the name the launcher resolves off the
+/// engine's `kv_transfer_config` (a wrapper's mover) and `GetServerInfo`
+/// reports.
+const MOONCAKE_CONNECTOR: &str = "MooncakeConnector";
+
 /// The rejection notice a refused PD decode side owes its prefill side, so the
 /// connector releases the blocks that side pinned: what vLLM's own frontend
 /// sends, an immediately aborted one-token request under the refused id.
@@ -56,10 +62,19 @@ struct RejectionNotice {
     request_id: String,
     params: serde_json::Value,
     rank: Option<u32>,
+    /// Whether the engine moves its KV with the Mooncake connector, which
+    /// gets no notice (see `send`).
+    withheld: bool,
 }
 
 impl RejectionNotice {
-    fn owed_by(client: &ZmqEngineClient, req: &vllm::GenerateRequest) -> Option<Self> {
+    /// The notice `req` owes when it is a PD decode side, `kv_connector`
+    /// being the engine's connector as the launcher resolved it.
+    fn owed_by(
+        client: &ZmqEngineClient,
+        kv_connector: &str,
+        req: &vllm::GenerateRequest,
+    ) -> Option<Self> {
         kv_transfer_rejection_params(req).map(|params| Self {
             client: client.clone(),
             request_id: req.request_id.clone(),
@@ -67,18 +82,48 @@ impl RejectionNotice {
             rank: req
                 .data_parallel_rank
                 .and_then(|rank| u32::try_from(rank).ok()),
+            withheld: kv_connector == MOONCAKE_CONNECTOR,
         })
     }
 
     /// Send the notice, detached: the refusal does not wait on the engine,
     /// and a caller that already gave up has no future left to carry it.
+    ///
+    /// On the Mooncake connector the notice is withheld, a legitimate
+    /// pre-admission one included, with one warning line: that connector
+    /// reports the notice's empty pull as a finished transfer and the decode
+    /// engine dies on it; the prefill side's blocks are released by the
+    /// connector's own abort timeout instead.
     fn send(self) {
         let Self {
             client,
             request_id,
             params,
             rank,
+            withheld,
         } = self;
+        if withheld {
+            // Remove once upstream fixes the connector: in vLLM 0.31's
+            // MooncakeConnector the notice's request is admitted and freed in
+            // one scheduler step, its empty pull (the prefill-block release)
+            // completes afterwards, and `process_pulling_result` reports it
+            // as `finished_recving` like a pull that carried KV; the
+            // scheduler's `_update_from_kv_xfer_finished` then asserts that
+            // the freed id is still tracked and the EngineCore exits. The
+            // connector's failure path (`_handle_failed_recv`) guards exactly
+            // this case and names this hook; the success path does not. NIXL
+            // releases with a notification and no pull, so it keeps the
+            // notice.
+            tracing::warn!(
+                request_id,
+                "KV-transfer rejection notice withheld on the Mooncake connector: vLLM 0.31's \
+                 MooncakeConnector.process_pulling_result reports the notice's empty pull as \
+                 finished_recving for an id Scheduler._update_from_kv_xfer_finished no longer \
+                 tracks, which kills the decode engine; the prefill side releases the blocks \
+                 at the connector's own abort timeout instead"
+            );
+            return;
+        }
         #[expect(
             clippy::disallowed_methods,
             reason = "the notice outlives the refused request's future; it ends once the add is out"
@@ -122,7 +167,11 @@ async fn submit(
     // A PD decode side refused before admission still owes its prefill side
     // the notice: armed from the first refusal below until the engine can
     // hold the request.
-    let mut notice = ArmedNotice(RejectionNotice::owed_by(client, &req));
+    let mut notice = ArmedNotice(RejectionNotice::owed_by(
+        client,
+        &state.model.kv_connector,
+        &req,
+    ));
     // A pooling runner serves no generation task; vLLM's frontend refuses
     // this before the engine sees it, in these words.
     if !state.model.is_generation {
