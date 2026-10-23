@@ -505,11 +505,13 @@ impl Assembler {
 
     /// The value the end of the stream cut ([`Self::finish`]), written as far as the model wrote
     /// it. The bytes the value held (the start of a CDATA closer, the opener's first bytes while
-    /// the section was undecided) are its text; the start of a tag the scanner held is a tag the
-    /// end cut short, never the value's text, whatever the family builds its tags of (a cut
-    /// inside a string value's closing tag used to deliver the tag's bytes as the value's,
+    /// the section was undecided) are its text; the start of the closing tag the scanner held is
+    /// a tag the end cut short, never the value's text, whatever the family builds its tags of (a
+    /// cut inside a string value's closing tag used to deliver the tag's bytes as the value's,
     /// `"KRW</｜DSML｜ parameter`; the value is `"KRW`), returned to be dropped after the call's
-    /// end so that every byte keeps its place; a newline held as the template's framing before a
+    /// end so that every byte keeps its place, as is a held tail that begins with a structural
+    /// token or follows a closed section; a held start of the opening tag is the value's text,
+    /// as the whole tag is inside a value; a newline held as the template's framing before a
     /// closing tag that never came stays the template's. Then by the value's mode: a streamed
     /// string's fragments stand; a string whose key came and no byte opens, `{"key": "`; a value
     /// held for its close is written as one fragment, its key and its bytes as the JSON they
@@ -535,12 +537,26 @@ impl Assembler {
             return None;
         };
         let section_closed = value.cdata == Cdata::Done;
-        let text = self.take_held();
-        // The start of a tag the scanner holds is a tag the end cut short, never the value's
-        // text, whatever the family builds its tags of: the limit fell while the model was
-        // writing, and the start of the closing tag at the end of its output is that tag (`KRW`
-        // and then `</`, up to the tag's last byte). It leaves after the call's end.
-        let cut_tag = Some(self.scanner.set_aside()).filter(|tail| !tail.is_empty());
+        let mut text = self.take_held();
+        // The start of the closing tag the scanner holds is a tag the end cut short, never the
+        // value's text, whatever the family builds its tags of: the limit fell while the model
+        // was writing, and the start of the closing tag at the end of its output is that tag
+        // (`KRW` and then `</`, up to the tag's last byte). It leaves after the call's end, as
+        // does a tail that begins with a structural token or follows a closed section. A held
+        // start of the opening tag (`see <p`) is the value's text, as the whole tag is inside a
+        // value: the cut is judged as the whole tag would be.
+        let tail = self.scanner.set_aside();
+        let mut cut_tag = None;
+        if !tail.is_empty() {
+            if section_closed
+                || self.tags.is_cut_tag(&tail)
+                || self.tags.parameter_close.starts_with(tail.as_str())
+            {
+                cut_tag = Some(tail);
+            } else {
+                text.push_str(&tail);
+            }
+        }
         if self.tags.value_on_its_own_line && text == "\n" {
             if let Stage::Value(value) = &mut self.stage {
                 if matches!(value.mode, Mode::Whole | Mode::Undecided) && value.end.is_none() {
@@ -2146,7 +2162,7 @@ mod tests {
     /// arguments are no whole value before the call's end; whole and one character at a time.
     #[test]
     fn a_value_the_end_cut_leaves_as_the_calls_own_bytes_and_nothing_as_content() {
-        let cases: [(Tags, &str, &str, &[&str]); 28] = [
+        let cases: [(Tags, &str, &str, &[&str]); 29] = [
             // Typed by the tools: an object cut inside a nested string.
             (
                 Tags::MINIMAX_M2,
@@ -2284,6 +2300,14 @@ mod tests {
                 &["</parameter"],
             ),
             (Tags::MINIMAX_M2, "f\">\n<parameter name=\"n\">12<", r#"{"n": 12"#, &["<"]),
+            // A held start of the OPENING tag is the value's text, as the whole tag is inside a
+            // value: the cut is judged as the whole tag would be.
+            (
+                Tags::MINIMAX_M2,
+                "f\">\n<parameter name=\"s\">see <p",
+                r#"{"s": "see <p"#,
+                &[],
+            ),
             (
                 Tags::MINICPM5,
                 "f\"><param name=\"s\">x</par",

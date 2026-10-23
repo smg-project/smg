@@ -184,9 +184,10 @@ as `Malformed` text, the parameter tag included, and a chat client read
 `<parameter name="prefs">{"size": "large", "temp` as content next to a call whose arguments stopped
 at the member before. A string whose key came and no byte of it opens, `{"key": "`; a parameter tag
 the cut found open and the template's whitespace between tags leave as wrapping (`Dropped`), as the
-stop drops a tag the end cut short; the start of a tag held behind a value is a tag the end cut
-short too, whatever the family builds its tags of, dropped after the call's end so every byte keeps
-its place, and never the value's text: the limit fell while the model was writing, and the start of
+stop drops a tag the end cut short; the start of the closing tag held behind a value is a tag the
+end cut short too, whatever the family builds its tags of, dropped after the call's end so every
+byte keeps its place, and never the value's text (a held start of the opening tag is the value's
+text, as the whole tag is inside a value): the limit fell while the model was writing, and the start of
 the closing tag at the end of its output is that tag (a cut inside a string value's closing tag
 used to deliver the tag's bytes as the value's, `"from_currency": "KRW</｜DSML｜ parameter`; the
 value is `"KRW`). At `finish` a started call's arguments are no whole
