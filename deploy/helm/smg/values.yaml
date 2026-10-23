@@ -17,6 +17,16 @@ global:
 router:
   replicas: 1
 
+  # -- Rollout progress deadline of the router Deployment, in seconds.
+  #    /readiness follows the engine, so the deadline covers the gateway's own
+  #    worker start-up bound (--worker-startup-timeout-secs, 1800 s by default)
+  #    plus the chart's tail after it (one start-up poll of 30 s, the readiness
+  #    probe's period, the registration) and a margin for the image pull and
+  #    container start, which run on the rollout's clock before the gateway's.
+  #    Raise it with --worker-startup-timeout-secs (README, Readiness
+  #    Deadlines). The mesh StatefulSet has no such field.
+  progressDeadlineSeconds: 1920
+
   # -- Routing policy: cache_aware, round_robin, power_of_two, manual, random, prefix_hash
   policy: cache_aware
 
@@ -197,7 +207,10 @@ router:
   #    router whose workers are registered at runtime through the admin API
   #    (no `workers`, `router.workerUrls` or `router.serviceDiscovery`
   #    configured) stays unready until the first one is: set `path: /health`
-  #    there, or register through a port-forward to the pod.
+  #    there, or register through a port-forward to the pod. A worker's engine
+  #    counts as healthy only once it reports so, which for a large checkpoint
+  #    is tens of minutes after its pod starts: every deadline on the router's
+  #    readiness has to cover that bring-up (README, Readiness Deadlines).
   readinessProbe:
     path: /readiness
     initialDelaySeconds: 5
@@ -414,6 +427,7 @@ workers: []
 #       initialDelaySeconds: 60
 #       periodSeconds: 10
 #       failureThreshold: 30
+#     progressDeadlineSeconds: 600      # rollout deadline; default: the startup probe's budget + 120 s, at least 600
 
 # Engine default ports (used when worker.port is not set)
 engineDefaults:

@@ -6,12 +6,12 @@ requires-python = ">=3.12"
 
 dependencies = [
   "anthropic",
+  "fastmcp-slim[server]>=3.3,<5",
   "grpcio",
   "grpcio-health-checking",
   "httpx",
   "jinja2",
-  # infra.mock_mcp_server needs mcp.server.fastmcp: added in 1.2, removed in 2.0
-  "mcp>=1.2,<2",
+  "mcp>=1.24,<3",
   "numpy",
   "openai",
   "pandas",

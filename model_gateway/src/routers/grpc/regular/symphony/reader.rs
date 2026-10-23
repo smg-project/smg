@@ -956,6 +956,58 @@ mod tests {
         );
     }
 
+    /// A call whose elements nest past the bound the JSON reader applies to every syntax
+    /// (`PartialJson::DEFAULT_MAX_DEPTH` containers, the arguments object counted) still reaches
+    /// the client as a call: its arguments close whole without the member that crossed the
+    /// bound, so a strict reader takes them, and the output counts as malformed under
+    /// `invalid_arguments`, once.
+    #[test]
+    fn a_call_nested_past_the_bound_reaches_the_client_whole_and_counts_as_malformed() {
+        use symphony::{adapt::chat::message, formats::minimax_m3, json::PartialJson};
+        let levels = PartialJson::DEFAULT_MAX_DEPTH + 1;
+        let body = format!("{}1{}", "<d>".repeat(levels), "</d>".repeat(levels))
+            .replace('<', "]<]minimax[>[<");
+        let output = format!(
+            "</mm:think>]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name=\"lookup\">{body}\
+             ]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>"
+        );
+        let scrape = rendered(|| {
+            let events = read_pieces(minimax_m3(), "]~b]ai\n", &[&output], EngineFinish::Stop);
+            let choice = message(0, &events);
+            let calls = choice.message.tool_calls.expect("the call");
+            assert_eq!(calls.len(), 1, "{events:?}");
+            assert_eq!(calls[0].function.name, "lookup");
+            let arguments: Value =
+                serde_json::from_str(calls[0].function.arguments.as_deref().expect("arguments"))
+                    .expect("arguments a strict reader takes");
+            // The arguments object and the containers below it, as many as the reader takes:
+            // the deepest closes empty, the member that would have crossed the bound unwritten.
+            let mut depth = 0;
+            let mut value = &arguments;
+            while let Some(inner) = value.get("d") {
+                depth += 1;
+                value = inner;
+            }
+            assert_eq!(depth, PartialJson::DEFAULT_MAX_DEPTH - 1, "{arguments}");
+            assert_eq!(value, &serde_json::json!({}), "{arguments}");
+            assert_eq!(choice.finish_reason.as_deref(), Some("tool_calls"));
+        });
+        let outputs = line_with(
+            &scrape,
+            "smg_symphony_outputs_total",
+            &["table=\"minimax_m3\"", "outcome=\"malformed\""],
+        )
+        .expect("the outputs counter");
+        assert!(outputs.ends_with(" 1"), "{outputs}");
+        let reason = line_with(
+            &scrape,
+            "smg_symphony_malformed_total",
+            &["table=\"minimax_m3\"", "reason=\"invalid_arguments\""],
+        )
+        .expect("the reason counter");
+        assert!(reason.ends_with(" 1"), "{reason}");
+    }
+
     /// The released bytes have their places in the output, not the event's: the content spans
     /// a logprobs filter reads are the released slice's range, from the block's opener, and the
     /// released event past the output's end is left out; an output that answered in text before

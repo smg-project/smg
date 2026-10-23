@@ -380,9 +380,17 @@ What the syntax says, and what the assembler does with it:
   declaration a tag opens a child only after the template's separator, since the template
   writes the separator before every tag it writes and never inside a value. A list's items
   and an object's members are elements in turn, so the tree nests as deep as the arguments
-  do. Whitespace right after an opening tag is held until the element's next byte says what
-  it is: a leaf's text when text or the closing tag follows (a value that is one space is one
-  space), the template's when a child tag follows.
+  do, up to the nesting the JSON reader allows every syntax (`PartialJson::DEFAULT_MAX_DEPTH`
+  containers, the arguments object counted): the tag that would make an element the container
+  past that bound is refused with every byte from the element's own tag to the call's end, as
+  one `Malformed { InvalidArguments }`, nothing of that member is written, and the containers
+  open close whole at the end, so the arguments stay a value a strict reader takes and the
+  element stack never grows past the bound; a leaf whose own JSON (a list or an object its
+  text spells) would nest past the bound, and an empty element the tool declares a container
+  at the bound, are refused the same way, so the bound holds for the value the client reads,
+  not only for the tags. Whitespace right after an opening tag is held
+  until the element's next byte says what it is: a leaf's text when text or the closing tag
+  follows (a value that is one space is one space), the template's when a child tag follows.
 - **A value's type comes from the request's tools at every depth** (`Declared::kind_at`:
   below an object a key selects a property, below an array any element selects its items). A
   declared string is its text, streamed as it arrives; every other leaf is written whole at
