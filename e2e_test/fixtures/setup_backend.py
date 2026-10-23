@@ -509,6 +509,7 @@ def _setup_local(
             gateway,
             gateway_config,
             worker_urls=[w.base_url for w in workers],
+            workers=workers,
             model_path=model_path,
             backend=engine if is_zmq else None,
         )
@@ -929,6 +930,7 @@ def backend_router(request: pytest.FixtureRequest):
     try:
         gateway.start(
             worker_urls=[w.base_url for w in workers],
+            workers=workers,
             model_path=model_path,
             backend=engine if is_zmq else None,
             # ZMQ loads the model inside the gateway's readiness gate; cover it.

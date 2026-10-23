@@ -26,7 +26,19 @@ flips, so the first-time costs are paid while nothing is routed here:
 - **odd variants**: lengths off the compilers' alignment (one above a
   bucket), which specialise separately;
 - a **second pass** over the bucket grid, whose timings show what the first
-  pass paid.
+  pass paid;
+- the **chunk remainders**, when the engine module asks for them
+  (:attr:`WarmupInputs.every_prefill_length`) and the level is ``full``:
+  every prompt length up to the step the ladder left out, last, in an order
+  whose every prefix is a uniform spread of the range (:func:`spread_order`),
+  so a budget cut leaves an even coverage rather than a missing tail. A
+  chunked prefill's last chunk is any count below the step, and an engine
+  whose kernel choice at a prefill length comes from a library it reaches
+  lazily loads a never-used kernel on that count's first use; during serving,
+  with a collective of the overlapped previous chunk still in flight, that
+  load has deadlocked the forward. The ``fast`` level plans none of them and
+  leaves that hazard open (the start log says so): it is for a test leg or a
+  quick restart, and the shipped default is ``full``.
 
 Every request carries its own token ids (no two requests share a prefix
 block), so prefix caching never turns a planned prefill into a hit, and the
@@ -44,6 +56,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import dataclasses
 import logging
 import random
@@ -57,8 +70,16 @@ LEVEL_FAST = "fast"
 LEVEL_FULL = "full"
 LEVELS = (LEVEL_FAST, LEVEL_FULL)
 DEFAULT_LEVEL = LEVEL_FULL
-#: The whole pass is bounded by this many seconds unless the knob says otherwise.
+#: The whole pass is bounded by this many seconds unless the knob says
+#: otherwise. An engine module whose plan is longer (the chunk remainders)
+#: states a default of its own through :func:`parse_setting`'s
+#: ``default_budget_secs``; the engines that plan the length classes alone
+#: keep this one.
 DEFAULT_BUDGET_SECS = 300.0
+#: How many chunk remainders go by between the INFO lines that report their
+#: progress (each remainder's own line is DEBUG: thousands of one-token
+#: requests at a fraction of a second each say little one by one).
+REMAINDER_PROGRESS_EVERY = 500
 #: The values of the knob that run no warm-up.
 OFF_VALUES = ("off", "0", "false", "no", "none")
 #: The width of a prefill length class the ``full`` level covers one by one:
@@ -108,21 +129,24 @@ class WarmupSetting:
         return f"{self.level}:{self.budget_secs:g}"
 
 
-def parse_setting(text: str | None, *, name: str) -> WarmupSetting:
+def parse_setting(
+    text: str | None, *, name: str, default_budget_secs: float = DEFAULT_BUDGET_SECS
+) -> WarmupSetting:
     """The setting a value of the knob ``name`` stands for: unset or empty is
-    the default (``full``, :data:`DEFAULT_BUDGET_SECS`); one of
-    :data:`OFF_VALUES` runs none; ``fast`` or ``full`` picks the level under
-    the default budget; a number of seconds is the budget at the default
-    level; ``<level>:<seconds>`` sets both. Anything else is a ``ValueError``
-    naming the variable and the value."""
+    the default (``full``, ``default_budget_secs``: :data:`DEFAULT_BUDGET_SECS`
+    unless the engine module states its own); one of :data:`OFF_VALUES` runs
+    none; ``fast`` or ``full`` picks the level under the default budget; a
+    number of seconds is the budget at the default level;
+    ``<level>:<seconds>`` sets both. Anything else is a ``ValueError`` naming
+    the variable and the value."""
     raw = (text or "").strip().lower()
     if not raw:
-        return WarmupSetting(True)
+        return WarmupSetting(True, DEFAULT_LEVEL, default_budget_secs)
     if raw in OFF_VALUES:
         return WarmupSetting(False)
     level, separator, budget = raw.partition(":")
     if level in LEVELS and not separator:
-        return WarmupSetting(True, level)
+        return WarmupSetting(True, level, default_budget_secs)
     if not separator and level not in LEVELS:
         level, budget = DEFAULT_LEVEL, level
     if level in LEVELS:
@@ -134,7 +158,7 @@ def parse_setting(text: str | None, *, name: str) -> WarmupSetting:
             return WarmupSetting(True, level, secs)
     raise ValueError(
         f"{name}={text!r}: expected one of {', '.join(OFF_VALUES[:1] + LEVELS)}, a budget in "
-        f"seconds, or <level>:<seconds> (the default is {DEFAULT_LEVEL}:{DEFAULT_BUDGET_SECS:g})"
+        f"seconds, or <level>:<seconds> (the default is {DEFAULT_LEVEL}:{default_budget_secs:g})"
     )
 
 
@@ -167,16 +191,38 @@ class WarmupInputs:
     #: every shape on every rank, each request pinned to its rank; an engine
     #: module states more than one only where its wire can pin a rank.
     data_parallel_size: int = 1
+    #: Whether the plan visits every prompt length up to the step, not only
+    #: the length classes and the grid: an engine module sets it when the
+    #: engine's kernel choice at a prefill length comes from a library the
+    #: servicer cannot bucket and a first use during serving is a hazard, so
+    #: every length is used once here, before anything is routed (a chunked
+    #: prefill's last chunk is any count below the step). Honoured at the
+    #: ``full`` level alone: a ``fast`` start plans the classes and leaves the
+    #: hazard open, and :func:`plan_for` warns so.
+    every_prefill_length: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
 class WarmupRequest:
     request_id: str
-    token_ids: tuple[int, ...]
+    #: How many prompt tokens the request carries. The ids themselves are
+    #: drawn when a wire reads :attr:`token_ids`: a plan over every count of
+    #: a step holds thousands of requests and millions of tokens, and keeps
+    #: counts, not tokens.
+    prompt_tokens: int
     max_tokens: int
+    #: The ordinal that seeds the request's own token ids, and the vocabulary
+    #: they are drawn below (:func:`token_ids`).
+    seed: int
+    vocab_size: int
     #: The data-parallel rank the request is pinned to; ``None`` leaves the
     #: servicer's own routing to pick the engine (one rank, or no pinning).
     data_parallel_rank: int | None = None
+
+    @property
+    def token_ids(self) -> tuple[int, ...]:
+        """The request's own token ids, drawn afresh on each read."""
+        return token_ids(self.prompt_tokens, self.seed, self.vocab_size)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -184,12 +230,14 @@ class WarmupStep:
     """One scheduler shape: the requests sent together to reach it."""
 
     name: str
-    kind: str  # "decode", "prefill" or "again" (the measuring second pass)
+    # "decode", "prefill", "again" (the measuring second pass) or "remainder"
+    # (a prompt length the ladder left out, for an engine that asks for all)
+    kind: str
     requests: tuple[WarmupRequest, ...]
 
     @property
     def prompt_tokens(self) -> int:
-        return sum(len(request.token_ids) for request in self.requests)
+        return sum(request.prompt_tokens for request in self.requests)
 
     @property
     def output_tokens(self) -> int:
@@ -213,15 +261,17 @@ class WarmupPlan:
     def describe(self) -> str:
         kinds = {
             kind: sum(1 for step in self.steps if step.kind == kind)
-            for kind in ("decode", "prefill", "again")
+            for kind in ("decode", "prefill", "again", "remainder")
         }
         ranks = self.inputs.data_parallel_size
         return (
             f"level {self.level}: {len(self.steps)} steps ({kinds['decode']} decode "
             f"staircase{'s' if kinds['decode'] != 1 else ''}, "
-            f"{kinds['prefill']} prefill shapes, {kinds['again']} measured again), "
-            f"{self.prompt_tokens} prompt tokens and {self.output_tokens} output tokens over a "
-            f"window of {self.inputs.max_num_seqs} and a step of {self.inputs.max_num_batched_tokens}"
+            f"{kinds['prefill']} prefill shapes, {kinds['again']} measured again"
+            + (f", {kinds['remainder']} chunk remainders" if kinds["remainder"] else "")
+            + f"), {self.prompt_tokens} prompt tokens and {self.output_tokens} output tokens over "
+            f"a window of {self.inputs.max_num_seqs} and a step of "
+            f"{self.inputs.max_num_batched_tokens}"
             + (f" on each of {ranks} data-parallel ranks" if ranks > 1 else "")
         )
 
@@ -266,6 +316,23 @@ def odd_variants(counts: Iterable[int], limit: int) -> list[int]:
     return [count + 1 for count in counts if count >= 16 and count + 1 <= limit]
 
 
+def spread_order(count: int) -> list[int]:
+    """``1..count`` in the order of the bit-reversed integers (the van der
+    Corput order): the power of two at the top of the range first, then the
+    halves, the quarters, and so on, so every prefix of the order is a
+    near-uniform spread of the range and a pass that stops partway leaves an
+    even coverage rather than a missing tail."""
+    if count < 1:
+        return []
+    bits = count.bit_length()
+    order: list[int] = []
+    for index in range(1 << bits):
+        value = int(f"{index:0{bits}b}"[::-1], 2)
+        if 1 <= value <= count:
+            order.append(value)
+    return order
+
+
 def token_ids(count: int, seed: int, vocab_size: int) -> tuple[int, ...]:
     """``count`` token ids for the request with ordinal ``seed``: drawn from
     the vocabulary's ordinary region, a different sequence per seed, so no two
@@ -288,8 +355,10 @@ class _Requests:
         self._next += 1
         return WarmupRequest(
             request_id=f"smg-warmup-{ordinal}",
-            token_ids=token_ids(prompt_tokens, ordinal, self._vocab_size),
+            prompt_tokens=prompt_tokens,
             max_tokens=max_tokens,
+            seed=ordinal,
+            vocab_size=self._vocab_size,
             data_parallel_rank=rank,
         )
 
@@ -297,11 +366,14 @@ class _Requests:
 def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
     """The steps for ``inputs`` at ``level``, in the order they run: the
     decode staircase first (cheap, and every ramp's first shapes), then the
-    prefill shapes by length, the odd variants, the second pass. A prompt
-    never exceeds the admission step nor the context less its output. Under
-    data parallelism (``inputs.data_parallel_size`` above one) the staircase
-    runs once per rank and every prefill shape goes to every rank at once,
-    each request pinned to its rank."""
+    prefill shapes by length, the odd variants, the second pass, and, when
+    the inputs ask for every prefill length, the chunk remainders in
+    :func:`spread_order` at the ``full`` level (the ``fast`` level keeps the
+    merged ladder: a test leg or a quick start takes the classes alone, and
+    the shipped default is ``full``). A prompt never exceeds the admission
+    step nor the context less its output. Under data parallelism (``inputs.data_parallel_size`` above
+    one) the staircase runs once per rank and every prefill shape goes to
+    every rank at once, each request pinned to its rank."""
     if level not in LEVELS:
         raise ValueError(f"unknown warm-up level {level!r}; expected one of {LEVELS}")
     steps: list[WarmupStep] = []
@@ -361,6 +433,17 @@ def plan_warmup(inputs: WarmupInputs, level: str = DEFAULT_LEVEL) -> WarmupPlan:
                 requests=tuple(requests.one(length, 1, rank) for rank in ranks),
             )
         )
+    if inputs.every_prefill_length and level == LEVEL_FULL:
+        for length in spread_order(limit):
+            if length in lengths:
+                continue
+            steps.append(
+                WarmupStep(
+                    name=f"prefill {length} tokens (chunk remainder)",
+                    kind="remainder",
+                    requests=tuple(requests.one(length, 1, rank) for rank in ranks),
+                )
+            )
     return WarmupPlan(level, inputs, tuple(steps))
 
 
@@ -396,6 +479,10 @@ class WarmupReport:
     budget_hit: bool = False
     stopped: str | None = None
     flushed: bool | None = None
+    #: Why the flush was refused, when the wire raised or the servicer
+    #: answered the refusal with a message: the servicer's own words (a
+    #: status' details, else its code), for the end line.
+    flush_refusal: str | None = None
 
     @property
     def covered(self) -> int:
@@ -422,6 +509,8 @@ class WarmupReport:
             text += f"; stopped: {self.stopped}"
         if self.flushed is False:
             text += "; the engine's cache was not flushed (the warm-up's blocks stay cached)"
+            if self.flush_refusal:
+                text += f": {self.flush_refusal}"
         return text
 
 
@@ -437,6 +526,10 @@ class _Pass:
         self.report = WarmupReport(plan)
         self._started = time.monotonic()
         self._failed_in_a_row = 0
+        self._remainders = sum(1 for step in plan.steps if step.kind == "remainder")
+        self._remainders_done = 0
+        self._remainder_secs = 0.0
+        self._remainder_failures = 0
         log.info(
             "Planned warm-up starts (%s; budget %.0f s%s): readiness is held until it ran",
             plan.describe(),
@@ -471,6 +564,7 @@ class _Pass:
     def record(self, step: WarmupStep, secs: float, errors: list[BaseException]) -> None:
         self.report.results.append(StepResult(step, secs, len(errors)))
         index = len(self.report.results)
+        remainder = step.kind == "remainder"
         if errors:
             self._failed_in_a_row += 1 if len(errors) == len(step.requests) else 0
             self.log.warning(
@@ -483,26 +577,91 @@ class _Pass:
                 secs * 1000,
                 errors[0],
             )
-            return
-        self._failed_in_a_row = 0
+        else:
+            self._failed_in_a_row = 0
+            # A chunk remainder is one of thousands of one-token requests: its
+            # own line is DEBUG, and the remainders' progress is one INFO line
+            # every so many (:data:`REMAINDER_PROGRESS_EVERY`) and at their end.
+            self.log.log(
+                logging.DEBUG if remainder else logging.INFO,
+                "Warm-up step %d/%d %s: %.0f ms",
+                index,
+                len(self.plan.steps),
+                step.name,
+                secs * 1000,
+            )
+        if remainder:
+            self._remainder_done(secs, bool(errors))
+
+    def _remainder_done(self, secs: float, failed: bool) -> None:
+        self._remainders_done += 1
+        self._remainder_secs += secs
+        self._remainder_failures += 1 if failed else 0
+        done = self._remainders_done
+        if done % REMAINDER_PROGRESS_EVERY == 0 or done == self._remainders:
+            self._remainder_progress()
+
+    def _remainder_progress(self) -> None:
+        done = self._remainders_done
         self.log.info(
-            "Warm-up step %d/%d %s: %.0f ms", index, len(self.plan.steps), step.name, secs * 1000
+            "Warm-up chunk remainders: %d of %d done in %.0f s (%.0f ms each, %d failed)%s",
+            done,
+            self._remainders,
+            self._remainder_secs,
+            self._remainder_secs * 1000 / done,
+            self._remainder_failures,
+            " (every count up to the step used once)" if done == self._remainders else "",
         )
 
-    def finish(self, flushed: bool | None) -> WarmupReport:
+    def finish(self, flushed: bool | None, flush_refusal: str | None = None) -> WarmupReport:
         self.report.secs = time.monotonic() - self._started
         self.report.flushed = flushed
+        self.report.flush_refusal = flush_refusal
+        # The remainders the budget or a stop cut short: their last partial
+        # batch reported once, as the periodic line would have.
+        done = self._remainders_done
+        if done and done != self._remainders and done % REMAINDER_PROGRESS_EVERY:
+            self._remainder_progress()
         self.log.info("Planned warm-up over: %s", self.report.summary())
         return self.report
 
 
-def _flush(wire: WarmupWire, log: logging.Logger) -> bool:
-    """The engine's cache flushed, best effort; the outcome is logged, never raised."""
+def _refusal(error: BaseException) -> str:
+    """The words of a refused flush, for the log and the end line: a gRPC
+    status' details when the error carries them (a status' ``str`` runs over
+    several lines), else its code's name, else the error itself. Whatever the
+    source, the words are one line: runs of whitespace, newlines included,
+    read as one space (an engine's multi-line message would otherwise split
+    the end line)."""
+    details = getattr(error, "details", None)
+    if callable(details):
+        with contextlib.suppress(Exception):
+            if text := _one_line(str(details() or "")):
+                return text
+    # A status with empty details: its code's name keeps the reason to one
+    # line (the status' ``str`` is the multi-line repr).
+    code = getattr(error, "code", None)
+    if callable(code):
+        with contextlib.suppress(Exception):
+            if (status := code()) is not None:
+                return _one_line(str(getattr(status, "name", status)))
+    return _one_line(str(error)) or type(error).__name__
+
+
+def _one_line(text: str) -> str:
+    """``text`` with every run of whitespace, newlines included, as one space."""
+    return " ".join(text.split())
+
+
+def _flush(wire: WarmupWire, log: logging.Logger) -> tuple[bool, str | None]:
+    """The engine's cache flushed, best effort; the outcome is logged, never
+    raised. Returns whether it was, and the refusal's words when it was not."""
     try:
-        return bool(wire.flush_cache())
+        return bool(wire.flush_cache()), None
     except Exception as error:  # noqa: BLE001 -- the flush is a courtesy to the next requests
-        log.info("The warm-up's cache flush was not accepted: %s", error)
-        return False
+        refusal = _refusal(error)
+        log.info("The warm-up's cache flush was not accepted: %s", refusal)
+        return False, refusal
 
 
 def run_warmup(
@@ -543,7 +702,7 @@ def run_warmup(
                     if error is not None:
                         errors.append(error)
         run.record(step, time.monotonic() - started, errors)
-    return run.finish(_flush(wire, log) if run.report.results else None)
+    return run.finish(*(_flush(wire, log) if run.report.results else (None, None)))
 
 
 async def run_warmup_async(
@@ -566,14 +725,14 @@ async def run_warmup_async(
         )
         errors = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
         run.record(step, time.monotonic() - started, errors)
-    flushed = None
+    flushed = refusal = None
     if run.report.results:
         try:
             flushed = bool(await wire.flush_cache())
         except Exception as error:  # noqa: BLE001 -- the flush is a courtesy to the next requests
-            log.info("The warm-up's cache flush was not accepted: %s", error)
-            flushed = False
-    return run.finish(flushed)
+            flushed, refusal = False, _refusal(error)
+            log.info("The warm-up's cache flush was not accepted: %s", refusal)
+    return run.finish(flushed, refusal)
 
 
 def plan_for(
@@ -593,6 +752,13 @@ def plan_for(
         log.info("Planned warm-up: none for this engine or model")
         return None
     plan = plan_warmup(inputs, setting.level)
+    if inputs.every_prefill_length and setting.level != LEVEL_FULL:
+        log.warning(
+            "Planned warm-up at the %s level plans the length classes alone and leaves out the "
+            "chunk remainders this engine asks for: a prompt length's first use during serving "
+            "stays a hazard until a start at the full level",
+            setting.level,
+        )
     if not plan.steps:
         log.info(
             "Planned warm-up: nothing to plan (window %d, step %d, context %d, vocabulary %d)",

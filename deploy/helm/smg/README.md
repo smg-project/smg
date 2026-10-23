@@ -98,6 +98,45 @@ Workers are automatically wired to the router via `--worker-urls`. The URL schem
 
 SGLang uses `sglang.launch_server` for both modes (adds `--grpc-mode` for gRPC).
 
+#### Worker Metrics (gRPC mode)
+
+A gRPC worker can serve Prometheus metrics from the engine pod itself:
+
+```yaml
+workers:
+  - name: llama-8b
+    engine: vllm
+    connectionMode: grpc
+    metrics:
+      enabled: true
+      port: 29100                       # default; must differ from the serving port
+```
+
+The chart then runs the engine behind the Rust servicer and gives its
+metrics listener a port (the pod gets `SMG_<ENGINE>_SERVICER_IMPL=rust` and
+`SMG_<ENGINE>_SERVICER_METRICS_PORT=<port>`, the variables the launcher reads
+when the flags are absent), names the port `metrics` on the container and
+the worker Service, and, when `router.metrics.serviceMonitor.enabled` is on,
+adds one `<release>-worker` ServiceMonitor over the worker Services with the
+router's interval and labels. The endpoint answers `GET /metrics` with the
+`smg_servicer_*` families (requests by finish reason, refusals, errors,
+in-flight requests, prompt / cached / generated tokens, the time-to-first-token,
+inter-token and end-to-end latency histograms, the servicer's lifecycle state),
+labelled `model`, `rank` and `wire`; it binds beside the gRPC listener before
+the engine connects, so a scrape during start-up answers
+`smg_servicer_state{state="starting"} 1`.
+
+Off (the default), nothing changes: the launcher's own servicer choice stands
+and the pod exposes no metrics port. The Python servicer has no endpoint, so
+`extraArgs: ["--servicer-impl", "python"]` together with `metrics.enabled`
+is refused by the launcher before the engine starts. The SGLang Rust servicer
+serves neither PD/EPD disaggregation nor image and video input yet (it
+advertises no vision support, so the gateway refuses media for that worker at
+its gate), so a disaggregated or multimodal SGLang worker keeps `metrics` off.
+A `metrics.port` equal to the serving port is refused when the chart renders.
+An HTTP worker runs the engine's own server, which has its own `/metrics`; the
+setting is ignored there.
+
 #### HuggingFace Token
 
 Gated models (e.g., Llama) require a HuggingFace token:
@@ -164,9 +203,45 @@ A changed credential rolls the router pods, as a changed store URL does: the pod
 
 The router's liveness probe is `httpGet /health`, which answers 200 while the process serves. Its readiness probe is `httpGet /readiness`, which answers 503 while the gateway has no healthy worker, while a tokenizer is not yet registered and while the gateway drains after SIGTERM, so the Service stops sending new connections to a pod that cannot take them (`router.livenessProbe.path` and `router.readinessProbe.path` override the routes).
 
+PD readiness defaults to one healthy prefill and one healthy decode worker. For some
+workloads, that remaining capacity is already insufficient: continued traffic can
+worsen SLA violations until the service fails. Use `router.extraArgs` to set
+`--prefill-min-ready-workers` and `--decode-min-ready-workers` to the minimum viable
+P/D capacity. Each role also supports `--<role>-expected-workers` with
+`--<role>-min-ready-percent` (1–100); the required count is the larger of the
+absolute minimum (default 1) and the percentage rounded up. For example,
+`--prefill-expected-workers 8 --prefill-min-ready-percent 75 --decode-min-ready-workers 2`
+requires 6P and 2D. The expected size stays fixed when workers disappear; setting
+it alone does not enable a percentage gate. These options apply to PD/EPD and are
+also available in the Python launcher. `/readiness` returns 503 below either
+threshold and includes per-role counts; the load balancer must honor readiness
+to stop new traffic. The thresholds do not enforce an exact P:D ratio or shed
+requests themselves.
+
 A router that gets its workers at runtime through the admin API (`POST /workers`) rather than from `workers`, `router.workerUrls` or `router.serviceDiscovery` has no healthy worker when it starts, so `/readiness` answers 503 until one is registered, the Service has no endpoint for the pod, and a registration sent through the Service cannot reach it (a rolling update's new pod then never becomes Ready). Such deployments set `router.readinessProbe.path: /health`, or register their workers through a port-forward to the pod.
 
 The gateway drains in-flight requests for `router.shutdownGracePeriodSeconds` (default 180, passed as `--shutdown-grace-period-secs`); the pod's `terminationGracePeriodSeconds` is that plus `router.terminationGraceMarginSeconds` (default 30), so the kubelet does not kill the drain at its default 30 s.
+
+#### Dashboard and Alerts
+
+`grafana.dashboard.enabled` ships a Grafana dashboard as a ConfigMap (label `grafana_dashboard: "1"` for the sidecar loader) with `namespace` and `job` variables that pick the release (every query is scoped to both) and 41 panels in seven rows: traffic (request rate, responses by status, 5xx ratio, errors by API code and router error type, token throughput), latency (TTFT and time per output token p50/p95/p99 and per model, request and HTTP duration p99), capacity and queues (admission in-flight and queued, rejections, engine running and waiting requests, KV cache usage and in-flight request age per worker, connections), workers (healthy count, health and circuit-breaker state per worker, health checks, overload shed and fallback, retries), cache and KV events (engine prefix cache hit rate, cache-aware decisions and match ratio, KV event lag, integrity counters, degraded ranks, index size), Symphony (outputs by outcome, malformed outputs by reason, fallbacks and refusals) and runtime (tokio busy ratio, event-loop stalls and delay, dropped log lines, memory, tasks, tokenizer cache). Every panel queries a family the gateway describes; the gateway's test suite holds the dashboard to the catalog.
+
+`prometheusRule.enabled` adds a `PrometheusRule` with ten alerts, thresholds under `prometheusRule.alerts` (the defaults and their rationale are in `values.yaml`). Every expression selects this release's series through `prometheusRule.jobSelector` (empty = this release's namespace and the Service the ServiceMonitor scrapes, the Operator's default `namespace` and `job` labels, so a same-named release in another namespace stays out) and keeps `namespace` and `job` through its aggregation, so several releases on one Prometheus alert apart and a firing alert names its gateway:
+
+| Alert | Severity | Fires when |
+|---|---|---|
+| `SmgGatewayDown` | critical | the router's scrape target is down, or no target matches the selector, for `scrapeMissingFor` |
+| `SmgNoHealthyWorker` | critical | no registered worker is healthy for `noHealthyWorkerFor` |
+| `SmgHighErrorRatio` | critical | the 5xx share of responses exceeds `errorRatio` for `errorRatioFor` |
+| `SmgTtftP99High` | critical | p99 time to first token exceeds `ttftP99Seconds` for `ttftP99For` |
+| `SmgKvUsageNearCapacity` | warning | a worker's KV token usage exceeds `kvUsage` for `kvUsageFor` |
+| `SmgCircuitBreakerOpen` | warning | a worker's circuit breaker is open or half-open for `circuitBreakerOpenFor` (a worker failing requests while passing its probes cycles between the two) |
+| `SmgAdmissionRejections` | warning | the admission queue rejects requests for `admissionRejectionsFor` |
+| `SmgEventLoopStalls` | warning | more than `eventLoopStalls` event-loop stalls in ten minutes |
+| `SmgDroppedLogLines` | warning | a log sink dropped lines in the last ten minutes |
+| `SmgKvEventDegradedRanks` | warning | an engine rank's KV index stays degraded for `degradedRanksFor` |
+
+Readiness itself is a kubelet signal: with kube-state-metrics in the cluster, `kube_pod_status_ready` on the router pods complements `SmgGatewayDown`.
 
 #### Startup Probes
 
@@ -197,7 +272,7 @@ workers:
 | [`with-postgres.yaml`](examples/with-postgres.yaml) | PostgreSQL history backend, its URL in a Secret |
 | [`with-service-discovery.yaml`](examples/with-service-discovery.yaml) | K8s auto-discovery |
 | [`with-ingress.yaml`](examples/with-ingress.yaml) | Ingress with TLS |
-| [`with-monitoring.yaml`](examples/with-monitoring.yaml) | ServiceMonitor + Grafana dashboard |
+| [`with-monitoring.yaml`](examples/with-monitoring.yaml) | ServiceMonitor + Grafana dashboard + PrometheusRule |
 
 ## Testing
 

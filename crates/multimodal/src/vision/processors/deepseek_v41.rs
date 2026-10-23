@@ -16,14 +16,14 @@
 //! and no token is reserved.
 
 use image::{DynamicImage, Rgb, RgbImage};
-use ndarray::{Array2, Array4};
+use ndarray::Array4;
 
 use crate::{
     encoder_inputs::{ModelSpecificValue, PreprocessedEncoderInputs},
     vision::{
         preprocessor_config::PreProcessorConfig,
         processor::VisionPreProcessor,
-        transforms::{pad_to_size_pil, resize_bicubic_pil_rgb, TransformError},
+        transforms::{pad_to_size_pil_rgb, resize_bicubic_pil_rgb, rgb_bytes, TransformError},
     },
 };
 
@@ -235,64 +235,66 @@ impl DeepseekV41Processor {
         }
     }
 
-    /// Transform one decoded image into normalized ViT patches.
-    ///
-    /// Same math as the reference `load_image`, except the image is already
-    /// decoded (the gateway supplies images instead of a record dict).
-    fn load_image(&self, image: &DynamicImage) -> Result<(Array2<f32>, GridPlan), TransformError> {
-        let rgb = image.to_rgb8();
-        let (width, height) = rgb.dimensions();
-        let plan = self.plan_image_grid(width, height);
+    /// The pixel size and layout of one decoded image: the reference
+    /// `load_image`'s resize or pad to the plan's size, over the image's own
+    /// RGB bytes (borrowed when it is already RGB8).
+    fn transform(&self, image: &DynamicImage, plan: &GridPlan) -> Result<RgbImage, TransformError> {
+        let (width, height, rgb) = rgb_bytes(image);
+        let (width, height) = (width as u32, height as u32);
         let (out_w, out_h) = (plan.best_width as u32, plan.best_height as u32);
-        let transformed = match self.max_wh_ratio {
+        match self.max_wh_ratio {
             // The reference stretches with `>=` here while `plan_image_grid`
             // clamps the width with `>`, so at exactly
             // `width == max_wh_ratio * height` the width is kept and the
             // image is stretched rather than padded. Pillow's `Image.resize`
             // defaults to BICUBIC.
             Some(max_wh_ratio) if f64::from(width) >= max_wh_ratio * f64::from(height) => {
-                resize_bicubic_pil_rgb(rgb.as_raw(), width, height, out_w, out_h)?
+                resize_bicubic_pil_rgb(&rgb, width, height, out_w, out_h)
             }
-            _ => pad_to_size_pil(&DynamicImage::ImageRgb8(rgb), out_w, out_h, PAD_COLOR)?.to_rgb8(),
-        };
-        Ok((self.patchify(&transformed, &plan), plan))
+            _ => pad_to_size_pil_rgb(&rgb, width, height, out_w, out_h, PAD_COLOR),
+        }
     }
 
-    /// Normalize (`/ 255`, then `(x - 0.5) / 0.5`) fused with patchification:
-    /// patch `(i, j)` in row-major order holds `[c, dy, dx]` elements, matching
-    /// the reference `reshape(3, n_vit_h, p, n_vit_w, p).permute(1, 3, 0, 2, 4)`.
-    #[expect(
-        clippy::expect_used,
-        reason = "the patch buffer is sized from the plan it is reshaped by"
-    )]
-    fn patchify(&self, image: &RgbImage, plan: &GridPlan) -> Array2<f32> {
+    /// Normalize (`/ 255`, then `(x - 0.5) / 0.5`) fused with patchification,
+    /// appended to `out`: patch `(i, j)` in row-major order holds `[c, dy, dx]`
+    /// elements, matching the reference
+    /// `reshape(3, n_vit_h, p, n_vit_w, p).permute(1, 3, 0, 2, 4)`. `table`
+    /// is [`value_table`]: the normalized value of every byte, so the pass is
+    /// a lookup per element, written once in patch order.
+    fn patchify_into(
+        &self,
+        image: &RgbImage,
+        plan: &GridPlan,
+        table: &[f32; 256],
+        out: &mut Vec<f32>,
+    ) {
         let p = self.patch_size;
-        let n_patches = plan.n_vit_h * plan.n_vit_w;
-        let patch_len = 3 * p * p;
-        let mut out = vec![0.0f32; n_patches * patch_len];
         let raw = image.as_raw();
         let row_stride = plan.best_width * 3;
         for i in 0..plan.n_vit_h {
             for j in 0..plan.n_vit_w {
-                let patch = &mut out[(i * plan.n_vit_w + j) * patch_len..][..patch_len];
                 for c in 0..3 {
                     for dy in 0..p {
-                        for dx in 0..p {
-                            // f32 op order matches the reference: v/255, then
-                            // (x - 0.5) / 0.5.
-                            patch[c * p * p + dy * p + dx] =
-                                (raw[(i * p + dy) * row_stride + (j * p + dx) * 3 + c] as f32
-                                    / 255.0
-                                    - 0.5)
-                                    / 0.5;
-                        }
+                        let row = &raw[(i * p + dy) * row_stride + j * p * 3..][..p * 3];
+                        out.extend(
+                            row.as_chunks::<3>()
+                                .0
+                                .iter()
+                                .map(|pixel| table[usize::from(pixel[c])]),
+                        );
                     }
                 }
             }
         }
-        Array2::from_shape_vec((n_patches, patch_len), out)
-            .expect("patch buffer matches its shape by construction")
     }
+}
+
+/// The `f32` every pixel byte normalizes to, in the reference's own `f32`
+/// operation order: `v / 255`, then `(x - 0.5) / 0.5`. The table replaces
+/// two divisions per element with a lookup and keeps every bit, since each
+/// entry is that computation.
+fn value_table() -> [f32; 256] {
+    std::array::from_fn(|value| (value as f32 / 255.0 - 0.5) / 0.5)
 }
 
 impl VisionPreProcessor for DeepseekV41Processor {
@@ -306,7 +308,7 @@ impl VisionPreProcessor for DeepseekV41Processor {
 
     #[expect(
         clippy::expect_used,
-        reason = "per-image patch arrays are standard-layout and the concatenation is sized by construction"
+        reason = "the patch buffer is written in patch order and sized by the plans it is reshaped by"
     )]
     fn preprocess(
         &self,
@@ -316,7 +318,18 @@ impl VisionPreProcessor for DeepseekV41Processor {
             return Err(TransformError::EmptyBatch);
         }
 
-        let mut patches = Vec::new();
+        let plans: Vec<GridPlan> = images
+            .iter()
+            .map(|image| self.plan_image_grid(image.width(), image.height()))
+            .collect();
+        let total_patches: usize = plans.iter().map(|plan| plan.n_vit_h * plan.n_vit_w).sum();
+        let p = self.patch_size;
+        let patch_len = 3 * p * p;
+        // Every image's patches land in the one buffer the engine reads, in
+        // order; no per-image copy.
+        let mut encoder_input = Vec::with_capacity(total_patches * patch_len);
+        let table = value_table();
+
         let mut feature_token_counts = Vec::with_capacity(images.len());
         let mut item_sizes = Vec::with_capacity(images.len());
         let mut vit_grid = Vec::with_capacity(images.len() * 2);
@@ -325,11 +338,9 @@ impl VisionPreProcessor for DeepseekV41Processor {
         let mut patches_per_image = Vec::with_capacity(images.len());
         let mut types_per_image = Vec::with_capacity(images.len());
 
-        let mut total_patches = 0usize;
-        for image in images {
-            let (image_patches, plan) = self.load_image(image)?;
-            total_patches += plan.n_vit_h * plan.n_vit_w;
-            patches.push(image_patches);
+        for (image, plan) in images.iter().zip(&plans) {
+            let transformed = self.transform(image, plan)?;
+            self.patchify_into(&transformed, plan, &table, &mut encoder_input);
             feature_token_counts.push(plan.num_image_tokens());
             item_sizes.push((image.width(), image.height()));
             vit_grid.extend([plan.n_vit_h as i64, plan.n_vit_w as i64]);
@@ -339,20 +350,10 @@ impl VisionPreProcessor for DeepseekV41Processor {
             types_per_image.push(plan.num_image_tokens() as i64);
         }
 
-        let patch_len = 3 * self.patch_size * self.patch_size;
-        let mut encoder_input = Vec::with_capacity(total_patches * patch_len);
-        for image_patches in &patches {
-            encoder_input.extend_from_slice(
-                image_patches
-                    .as_slice()
-                    .expect("patch array is standard-layout by construction"),
-            );
-        }
         // The engine consumes patches as `(np, 3, p, p)` (see its
         // `DeepseekV4VLImagePixelInputs`).
-        let p = self.patch_size;
         let encoder_input = Array4::from_shape_vec((total_patches, 3, p, p), encoder_input)
-            .expect("concatenated patch buffer matches its shape by construction");
+            .expect("the patch buffer matches its shape by construction");
 
         let n_images = images.len();
         Ok(

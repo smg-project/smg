@@ -8,6 +8,10 @@
 {{- $gpuType = $worker.gpu.type | default "nvidia.com/gpu" }}
 {{- end }}
 {{- $mode := $worker.connectionMode | default "http" }}
+{{- $metricsPort := include "smg.workerMetricsPort" (dict "worker" $worker) }}
+{{- if and $metricsPort (eq (int $metricsPort) (int $port)) }}
+{{- fail (printf "worker %s: metrics.port %v is the serving port; the metrics listener needs a port of its own" $worker.name $port) }}
+{{- end }}
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -51,6 +55,11 @@ spec:
             - name: serve
               containerPort: {{ $port }}
               protocol: TCP
+            {{- if $metricsPort }}
+            - name: metrics
+              containerPort: {{ $metricsPort }}
+              protocol: TCP
+            {{- end }}
           {{- if $worker.resources }}
           resources:
             {{- $res := deepCopy $worker.resources }}
@@ -65,7 +74,7 @@ spec:
             limits:
               {{ $gpuType }}: {{ $gpuCount }}
           {{- end }}
-          {{- if or $.Values.huggingface.token $worker.extraEnv }}
+          {{- if or $.Values.huggingface.token $worker.extraEnv $metricsPort }}
           env:
             {{- if $.Values.huggingface.token }}
             - name: HF_TOKEN
@@ -73,6 +82,15 @@ spec:
                 secretKeyRef:
                   name: {{ include "smg.fullname" $ }}-hf-token
                   key: token
+            {{- end }}
+            {{- if $metricsPort }}
+            {{- /* The engine's launcher reads the servicer implementation and
+                   the metrics listener's port from these variables (its
+                   --servicer-impl / --metrics-port flags override them). */}}
+            - name: SMG_{{ upper $worker.engine }}_SERVICER_IMPL
+              value: "rust"
+            - name: SMG_{{ upper $worker.engine }}_SERVICER_METRICS_PORT
+              value: {{ $metricsPort | quote }}
             {{- end }}
             {{- with $worker.extraEnv }}
             {{- toYaml . | nindent 12 }}

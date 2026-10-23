@@ -215,7 +215,7 @@ impl ProviderProfile {
     /// The record also keeps which names carry a model's contract (the
     /// vendor-named aliases of a served model whose own name selects none),
     /// so a profile that reads a version from the model name reads an
-    /// opaque name as the vendor names behind it ([`served_under`]); an
+    /// opaque name as the vendor names behind it (`served_under`); an
     /// alias named for the vendor it resolves to is read as its own name,
     /// as it always was, and one vendor's name for another vendor's model
     /// as that model.

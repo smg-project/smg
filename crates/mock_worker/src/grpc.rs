@@ -1,5 +1,7 @@
 //! Mock gRPC worker implementing the TokenSpeed scheduler service. The gateway
 //! tokenizes and sends token ids; this service streams back canned token ids.
+//! Beside it the server hosts the standard `grpc.health.v1` service, which
+//! answers as the scheduler's own `HealthCheck` does.
 
 use std::{
     future::{pending, Future},
@@ -20,7 +22,12 @@ use tokio::{
     sync::{mpsc, watch},
 };
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::{transport::Server, Request, Response, Status};
+use tonic::{server::NamedService, transport::Server, Request, Response, Status};
+use tonic_health::pb::{
+    health_check_response::ServingStatus,
+    health_server::{Health, HealthServer},
+    HealthCheckRequest, HealthCheckResponse,
+};
 use ts::{
     generate_response::Response as GenResp,
     token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer},
@@ -112,6 +119,11 @@ pub async fn serve_with_listener_until(
         shutdown.await;
         let _ = stop.send(true);
     };
+    let overrides = crate::overrides::for_port(addr.map(|a| a.port()).unwrap_or(0));
+    let health = MockHealth {
+        overrides: Arc::clone(&overrides),
+        stopped: stopped.clone(),
+    };
     let service = MockScheduler {
         cfg,
         name,
@@ -119,7 +131,7 @@ pub async fn serve_with_listener_until(
         capture,
         stopped,
         prefill_pending: Arc::new(AtomicU64::new(0)),
-        overrides: crate::overrides::for_port(addr.map(|a| a.port()).unwrap_or(0)),
+        overrides,
     };
     let server = async {
         // tonic drains on incoming EOF when graceful shutdown is enabled,
@@ -144,6 +156,7 @@ pub async fn serve_with_listener_until(
                     .max_decoding_message_size(max_message_bytes)
                     .max_encoding_message_size(max_message_bytes),
             )
+            .add_service(HealthServer::new(health))
             .serve_with_incoming_shutdown(incoming, pending())
             .await
         {
@@ -536,6 +549,109 @@ impl TokenSpeedScheduler for MockScheduler {
         // The mock has no tokenizer artifacts to serve; the gateway's
         // remote-tokenizer fallback treats Unimplemented as "not supported".
         Err(Status::unimplemented("mock-worker"))
+    }
+}
+
+/// `Health.Watch` poll interval: the override is read, not signalled.
+const HEALTH_WATCH_INTERVAL: Duration = Duration::from_millis(250);
+
+type HealthWatchStream = Pin<Box<dyn Stream<Item = Result<HealthCheckResponse, Status>> + Send>>;
+
+/// The standard `grpc.health.v1` service of a gRPC worker: the whole server
+/// (the empty name) and the scheduler service are SERVING exactly when the
+/// scheduler's own `HealthCheck` answers healthy, i.e. unless the admin API
+/// set the worker not serving (`/admin/serving/{port}`); any other name is
+/// unknown. It is the service a harness or a probe asks before it asks the
+/// engine's own protocol, as every engine servicer hosts it.
+#[derive(Clone)]
+struct MockHealth {
+    overrides: Arc<crate::overrides::WorkerOverrides>,
+    /// Flips when the worker stops: ends the watch streams, which have no
+    /// end of their own, so the server's drain can finish.
+    stopped: watch::Receiver<bool>,
+}
+
+impl MockHealth {
+    /// The serving status of `service`, read from the override per probe.
+    fn status(&self, service: &str) -> ServingStatus {
+        if !service.is_empty()
+            && service != <TokenSpeedSchedulerServer<MockScheduler> as NamedService>::NAME
+        {
+            ServingStatus::ServiceUnknown
+        } else if self.overrides.serving() {
+            ServingStatus::Serving
+        } else {
+            ServingStatus::NotServing
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl Health for MockHealth {
+    type WatchStream = HealthWatchStream;
+
+    /// An unknown service is NOT_FOUND, as the health protocol specifies.
+    async fn check(
+        &self,
+        request: Request<HealthCheckRequest>,
+    ) -> Result<Response<HealthCheckResponse>, Status> {
+        let service = request.into_inner().service;
+        match self.status(&service) {
+            ServingStatus::ServiceUnknown => {
+                Err(Status::not_found(format!("unknown service {service:?}")))
+            }
+            status => Ok(Response::new(HealthCheckResponse {
+                status: status as i32,
+            })),
+        }
+    }
+
+    /// The current status first, then every change; an unknown service is
+    /// SERVICE_UNKNOWN on the stream rather than an error, as the health
+    /// protocol specifies. The stream ends when the worker stops (a known
+    /// name reads NOT_SERVING once more first): the server's drain waits for
+    /// every open stream, and a client keeps a watch open for as long as it
+    /// lives.
+    async fn watch(
+        &self,
+        request: Request<HealthCheckRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        let service = request.into_inner().service;
+        let known = self.status(&service) != ServingStatus::ServiceUnknown;
+        let stream = stream::unfold(
+            (self.clone(), service, None, self.stopped.clone(), false),
+            move |(health, service, last, mut stopped, ended)| async move {
+                if ended {
+                    return None;
+                }
+                loop {
+                    let status = health.status(&service) as i32;
+                    if last != Some(status) {
+                        return Some((
+                            Ok(HealthCheckResponse { status }),
+                            (health, service, Some(status), stopped, false),
+                        ));
+                    }
+                    let stopping = tokio::select! {
+                        _ = tokio::time::sleep(HEALTH_WATCH_INTERVAL) => false,
+                        _ = stopped.wait_for(|stop| *stop) => true,
+                    };
+                    if stopping {
+                        let not_serving = ServingStatus::NotServing as i32;
+                        if known && last != Some(not_serving) {
+                            return Some((
+                                Ok(HealthCheckResponse {
+                                    status: not_serving,
+                                }),
+                                (health, service, Some(not_serving), stopped, true),
+                            ));
+                        }
+                        return None;
+                    }
+                }
+            },
+        );
+        Ok(Response::new(Box::pin(stream)))
     }
 }
 
@@ -1082,7 +1198,158 @@ fn snapshot_to_scheduler_load(s: &engine::LoadSnapshot) -> ts::SchedulerLoad {
 
 #[cfg(test)]
 mod tests {
+    use tonic::{transport::Channel, Code};
+    use tonic_health::pb::health_client::HealthClient;
+    use ts::token_speed_scheduler_client::TokenSpeedSchedulerClient;
+
     use super::*;
+
+    /// The next item of a health watch, within the test's patience.
+    async fn next(watch: &mut tonic::Streaming<HealthCheckResponse>) -> ServingStatus {
+        tokio::time::timeout(Duration::from_secs(5), watch.message())
+            .await
+            .expect("a watch item in time")
+            .expect("watch item")
+            .expect("a stream item")
+            .status()
+    }
+
+    /// A watch has no end of its own, so the worker's stop ends it: the
+    /// server's drain finishes with a watch open, and the watcher reads
+    /// NOT_SERVING once more, then the stream's end.
+    #[tokio::test]
+    async fn an_open_watch_ends_when_the_worker_stops() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the test joins the server's task: its drain is what it checks"
+        )]
+        let server = tokio::spawn(serve_with_listener_until(
+            Arc::new(Config::default()),
+            listener,
+            async move {
+                let _ = stopped.await;
+            },
+        ));
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect");
+        let mut health = HealthClient::new(channel);
+        let mut watch = health
+            .watch(HealthCheckRequest {
+                service: String::new(),
+            })
+            .await
+            .expect("watch")
+            .into_inner();
+        assert_eq!(next(&mut watch).await, ServingStatus::Serving);
+
+        stop.send(()).expect("the server waits for the stop");
+        tokio::time::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("the drain finishes with a watch open")
+            .expect("the server task");
+        assert_eq!(next(&mut watch).await, ServingStatus::NotServing);
+        let end = tokio::time::timeout(Duration::from_secs(5), watch.message())
+            .await
+            .expect("the watch ends in time")
+            .expect("a clean end of the stream");
+        assert!(end.is_none(), "the watch did not end: {end:?}");
+    }
+
+    /// The standard health service answers as the scheduler's own
+    /// `HealthCheck`: SERVING for the whole server and for the scheduler
+    /// service, NOT_FOUND for another name, NOT_SERVING on both once the admin
+    /// override flips, and `Watch` reports the flip.
+    #[tokio::test]
+    async fn the_standard_health_service_follows_the_serving_override() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the server serves until the test process exits"
+        )]
+        let _server = tokio::spawn(serve_with_listener(Arc::new(Config::default()), listener));
+        let channel = Channel::from_shared(format!("http://{addr}"))
+            .expect("endpoint")
+            .connect()
+            .await
+            .expect("connect");
+        let mut health = HealthClient::new(channel.clone());
+        let mut scheduler = TokenSpeedSchedulerClient::new(channel);
+        let scheduler_service = <TokenSpeedSchedulerServer<MockScheduler> as NamedService>::NAME;
+
+        // One `Check` on a clone of the client, so `health` stays free to watch.
+        let probe = health.clone();
+        let check = |service: &str| {
+            let request = HealthCheckRequest {
+                service: service.to_string(),
+            };
+            let mut probe = probe.clone();
+            async move {
+                probe
+                    .check(request)
+                    .await
+                    .map(|response| response.into_inner().status())
+            }
+        };
+        assert_eq!(check("").await.expect("check"), ServingStatus::Serving);
+        assert_eq!(
+            check(scheduler_service).await.expect("check"),
+            ServingStatus::Serving
+        );
+        assert_eq!(
+            check("not.a.Service").await.expect_err("unknown").code(),
+            Code::NotFound
+        );
+
+        let mut watch = health
+            .watch(HealthCheckRequest {
+                service: String::new(),
+            })
+            .await
+            .expect("watch")
+            .into_inner();
+        assert_eq!(next(&mut watch).await, ServingStatus::Serving);
+
+        // The override map is process-wide and keyed by port: put the entry
+        // back on the way out (a failed assertion included), or a later test
+        // that draws the same ephemeral port would start out not serving.
+        struct Restore(Arc<crate::overrides::WorkerOverrides>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                self.0.set_serving(true);
+            }
+        }
+        let overrides = crate::overrides::for_port(addr.port());
+        let _restore = Restore(Arc::clone(&overrides));
+        overrides.set_serving(false);
+        assert_eq!(check("").await.expect("check"), ServingStatus::NotServing);
+        assert_eq!(
+            check(scheduler_service).await.expect("check"),
+            ServingStatus::NotServing
+        );
+        assert_eq!(next(&mut watch).await, ServingStatus::NotServing);
+        let own = scheduler
+            .health_check(ts::HealthCheckRequest::default())
+            .await
+            .expect("the scheduler's own health check")
+            .into_inner();
+        assert!(!own.healthy, "the two health answers disagree: {own:?}");
+
+        let mut unknown = health
+            .watch(HealthCheckRequest {
+                service: "not.a.Service".to_string(),
+            })
+            .await
+            .expect("watch")
+            .into_inner();
+        assert_eq!(next(&mut unknown).await, ServingStatus::ServiceUnknown);
+    }
 
     /// The sockets the gRPC worker serves carry `TCP_NODELAY`, so a token
     /// frame is never held back for the acknowledgement of the frame before.

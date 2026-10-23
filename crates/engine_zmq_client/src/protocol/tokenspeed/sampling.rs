@@ -35,7 +35,7 @@ pub struct SamplingParams {
     /// Token IDs that stop generation (a Python set; encoded as an array).
     /// The normalized form uses `None` rather than an empty collection.
     pub stop_token_ids: Option<Vec<u32>>,
-    /// Controls randomness. Below [`SAMPLING_EPS`] normalizes to greedy.
+    /// Controls randomness. Below `SAMPLING_EPS` normalizes to greedy.
     pub temperature: f64,
     /// Cumulative probability threshold for nucleus sampling.
     pub top_p: f64,

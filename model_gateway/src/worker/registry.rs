@@ -1257,7 +1257,9 @@ impl WorkerRegistry {
     //   (WorkerManager)            Pending/NotReady -> Failed       (decided under the lock)
     //                              Ready -> NotReady
     //   connect signal             any -> Ready                     `transition_status_if_revision`
-    //   (WorkerManager)
+    //   (WorkerManager)            (a ZMQ handshake, or a worker
+    //                              without health checks; a probed
+    //                              worker's signal moves its probe)
     //   mesh health hint           Pending/NotReady -> Ready        `transition_under_lock`
     //   (`on_remote_worker_state`) Ready -> NotReady                (decided under the lock)
     //   drain step                 Ready -> Draining                `apply_if_revision`

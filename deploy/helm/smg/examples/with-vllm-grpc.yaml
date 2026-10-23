@@ -31,6 +31,8 @@ workers:
     model: meta-llama/Llama-3.1-8B-Instruct
     replicas: 1
     connectionMode: grpc
+    metrics:
+      enabled: true  # the engine pod serves smg_servicer_* on :29100 (the Rust servicer)
     gpu:
       count: 1
     image:

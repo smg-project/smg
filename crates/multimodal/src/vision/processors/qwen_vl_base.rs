@@ -522,7 +522,7 @@ impl QwenVLProcessorBase {
             num_patches,
             output_values,
             tokens: self.calculate_tokens_from_grid(grid_t, grid_h, grid_w),
-            second_per_grid: temporal_patch_size as f32 / sample_fps,
+            second_per_grid: (temporal_patch_size as f64 / sample_fps) as f32,
             filter: self.transforms.filter,
             do_resize: self.transforms.do_resize,
             norm: self.transforms.norm,

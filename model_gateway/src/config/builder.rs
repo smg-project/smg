@@ -7,8 +7,8 @@ use smg_mcp::McpConfig;
 use super::{
     AccessLogField, CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult,
     DiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig, MemoryConfig,
-    MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PolicyConfig, PostgresConfig,
-    RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
+    MetricsConfig, OracleConfig, ParserChoice, PdPairingMode, PdReadinessConfig, PolicyConfig,
+    PostgresConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
     TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
 };
 use crate::worker::{ConnectionMode, RuntimeType};
@@ -204,6 +204,12 @@ impl RouterConfigBuilder {
 
     pub fn health_check_port(mut self, health_check_port: Option<u16>) -> Self {
         self.config.health_check_port = health_check_port;
+        self
+    }
+
+    /// Set optional per-role capacity thresholds for PD/EPD readiness.
+    pub fn pd_readiness(mut self, pd_readiness: Option<PdReadinessConfig>) -> Self {
+        self.config.pd_readiness = pd_readiness;
         self
     }
 
@@ -425,6 +431,18 @@ impl RouterConfigBuilder {
     /// Host-DRAM budget (MiB) for router-side preprocessed media.
     pub fn mm_pixel_cache_mb(mut self, mb: Option<usize>) -> Self {
         self.config.mm_pixel_cache_mb = mb;
+        self
+    }
+
+    /// Image/audio download timeout in milliseconds; unset uses env/default.
+    pub fn mm_fetch_timeout_ms(mut self, timeout: Option<u64>) -> Self {
+        self.config.mm_fetch_timeout_ms = timeout;
+        self
+    }
+
+    /// Video download timeout in milliseconds; unset uses env/default.
+    pub fn mm_video_fetch_timeout_ms(mut self, timeout: Option<u64>) -> Self {
+        self.config.mm_video_fetch_timeout_ms = timeout;
         self
     }
 

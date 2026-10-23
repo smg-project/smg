@@ -213,6 +213,9 @@ pub(crate) enum UnknownId {
 pub(crate) struct ByteLevelIncremental {
     table: Arc<ByteLevelTable>,
     pending: Vec<u8>,
+    /// The text a run of pending bytes decoded to once it settled, kept so
+    /// the next run's text needs no allocation.
+    text: String,
     skip_special_tokens: bool,
     unknown: UnknownId,
     /// Tokens fed so far, to place the once-per-stream report.
@@ -230,6 +233,7 @@ impl ByteLevelIncremental {
         Self {
             table,
             pending: Vec::new(),
+            text: String::new(),
             skip_special_tokens,
             unknown,
             fed: 0,
@@ -255,29 +259,34 @@ fn settled(text: &str) -> bool {
     !text.is_empty() && !text.ends_with(char::REPLACEMENT_CHARACTER)
 }
 
-impl IncrementalDecoder for ByteLevelIncremental {
-    fn step(&mut self, token_id: TokenIdType) -> Result<String> {
+impl ByteLevelIncremental {
+    /// The text `token_id` makes final: a whole token of valid text borrowed
+    /// from the table (the common case), or a pending run's decode in the
+    /// decoder's own buffer; `None` while the token completes no character,
+    /// is skipped as special or is an id the vocabulary lacks and drops.
+    fn piece(&mut self, token_id: TokenIdType) -> Result<Option<&str>> {
         self.fed += 1;
         let Some((bytes, special)) = self.table.entry(token_id) else {
             return match self.unknown {
-                UnknownId::Drop => Ok(String::new()),
+                UnknownId::Drop => Ok(None),
                 UnknownId::Reject => Err(anyhow!("unknown token id {token_id}")),
             };
         };
         if self.skip_special_tokens && special {
-            return Ok(String::new());
+            return Ok(None);
         }
         if self.pending.is_empty() {
             // The common case: a whole token of valid text, no copy.
             if let Ok(text) = std::str::from_utf8(bytes) {
                 if settled(text) {
-                    return Ok(text.to_owned());
+                    return Ok(Some(text));
                 }
             }
         }
         self.pending.extend_from_slice(bytes);
-        let text = match String::from_utf8_lossy(&self.pending) {
-            Cow::Borrowed(text) if settled(text) => text.to_owned(),
+        self.text.clear();
+        match String::from_utf8_lossy(&self.pending) {
+            Cow::Borrowed(text) if settled(text) => self.text.push_str(text),
             // A replacement inside settled text stands for bytes no later
             // token can complete: say so once per stream, not once per token.
             Cow::Owned(text) if settled(&text) => {
@@ -288,16 +297,33 @@ impl IncrementalDecoder for ByteLevelIncremental {
                         "invalid UTF-8 bytes in the token stream decoded to U+FFFD"
                     );
                 }
-                text
+                self.text = text;
             }
-            _ => return Ok(String::new()),
-        };
+            _ => return Ok(None),
+        }
         self.pending.clear();
-        Ok(text)
+        Ok(Some(&self.text))
+    }
+}
+
+impl IncrementalDecoder for ByteLevelIncremental {
+    fn step(&mut self, token_id: TokenIdType) -> Result<String> {
+        Ok(self.piece(token_id)?.map(str::to_owned).unwrap_or_default())
+    }
+
+    fn step_into(&mut self, token_id: TokenIdType, out: &mut String) -> Result<bool> {
+        Ok(match self.piece(token_id)? {
+            Some(text) => {
+                out.push_str(text);
+                true
+            }
+            None => false,
+        })
     }
 
     fn reset(&mut self) {
         self.pending.clear();
+        self.text.clear();
         self.fed = 0;
         self.reported = false;
     }
@@ -666,5 +692,44 @@ mod tests {
         let mut skip = ByteLevelIncremental::new(table, true, UnknownId::Drop);
         assert_eq!(skip.step(special).expect("step"), "");
         assert_eq!(skip.step(added).expect("step"), ADDED);
+    }
+
+    /// `step_into` appends what `step` returns, token for token, across the
+    /// characters the fixtures split over tokens, and leaves the same pending bytes.
+    #[test]
+    fn step_into_appends_the_steps_text() {
+        let tokenizer = byte_level_tokenizer();
+        let table = ByteLevelTable::build(&tokenizer).expect("table");
+        let texts = [
+            "hello world",
+            "café naïve",
+            "日本語のテキストと한국어",
+            "emoji 😀👍🏽",
+            &format!("hello{SPECIAL} world {ADDED} done{SPECIAL}"),
+        ];
+        for text in texts {
+            let ids = tokenizer
+                .encode(text, false)
+                .expect("encode")
+                .get_ids()
+                .to_vec();
+            for skip in [false, true] {
+                let (steps, pending) = stream(&table, &ids, skip);
+                let mut into = ByteLevelIncremental::new(Arc::clone(&table), skip, UnknownId::Drop);
+                let mut out = String::new();
+                for (&id, step) in ids.iter().zip(&steps) {
+                    let before = out.len();
+                    let appended = into.step_into(id, &mut out).expect("step_into");
+                    assert_eq!(&out[before..], step, "{text:?} skip={skip} token {id}");
+                    assert_eq!(
+                        appended,
+                        !step.is_empty(),
+                        "{text:?} skip={skip} token {id}"
+                    );
+                }
+                assert_eq!(out, steps.concat(), "{text:?} skip={skip}");
+                assert_eq!(into.pending(), pending.as_slice(), "{text:?} skip={skip}");
+            }
+        }
     }
 }
