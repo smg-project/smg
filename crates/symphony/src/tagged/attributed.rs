@@ -467,7 +467,9 @@ impl Assembler {
     /// ([`Self::cut_value`]). A call that started still ends, with no bytes of its own, as every
     /// assembler ends one, after the one `Malformed { UnterminatedRegion }` event of no bytes
     /// that says that its arguments are no whole value ([`end_cut_call`]); what a block that
-    /// named no call held comes back as `Malformed { UnterminatedRegion }`.
+    /// named no call held is refused as `UnterminatedRegion`, as the keyed assembler refuses it,
+    /// so that the reader's release of a refused output that made no call takes the whole slice
+    /// (a `Malformed` event with bytes would end that release).
     pub fn finish(mut self, out: &mut Events) {
         if self.done {
             return;
@@ -477,12 +479,7 @@ impl Assembler {
             self.object.carried.push_str(&held);
             let held = self.scanner.held().to_string();
             self.object.carried.push_str(&held);
-            if !self.object.carried.is_empty() {
-                out.push(Event::Malformed {
-                    text: Text::uncounted(std::mem::take(&mut self.object.carried)),
-                    why: MalformedReason::UnterminatedRegion,
-                });
-            }
+            self.object.refuse(MalformedReason::UnterminatedRegion, out);
             return;
         }
         let cut_tag = if matches!(self.stage, Stage::Value(_)) {
