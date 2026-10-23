@@ -41,12 +41,13 @@ impl Drop for Dropped {
 #[tokio::test]
 async fn epd_sglang_real_encode_rpc_and_original_pd_response() {
     let peer = Peer::new().await;
+    let peer_ref = &peer;
     for id in ["attempt-1", "attempt-2"] {
         let req = request(&peer, id);
-        dispatch(req, Duration::from_secs(2), |prefill| async {
+        dispatch(req, Duration::from_secs(2), |prefill| async move {
             assert_eq!(prefill.request_id, id);
             assert_eq!(prefill.encode_handoff.as_ref().unwrap().request_id, id);
-            register(&peer, id).await.unwrap();
+            register(peer_ref, id).await.unwrap();
             Ok::<_, Response>(())
         })
         .await

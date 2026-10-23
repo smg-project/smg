@@ -4,4 +4,5 @@ use super::*;
 mod encoder_peer;
 
 mod media;
+mod stage;
 mod transport;
