@@ -1374,6 +1374,77 @@ fn native_continuation_keeps_the_trailing_assistant_message_instead_of_prefixing
     assert_eq!(native["assistant_prefix"], json!(""));
 }
 
+/// `add_generation_prompt: false` renders the conversation without a
+/// generation header; absent, the header is rendered as before. A continued
+/// final message keeps its own rule: no header natively, the emulation's
+/// header and prefix otherwise, whatever the field says.
+#[test]
+fn add_generation_prompt_false_renders_the_conversation_without_a_header() {
+    let request = |fields: Value| -> ChatCompletionRequest {
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "Hello"}]});
+        body.as_object_mut()
+            .unwrap()
+            .extend(fields.as_object().unwrap().clone());
+        serde_json::from_value(body).unwrap()
+    };
+    let closed = render_with(
+        Default::default(),
+        &request(json!({"add_generation_prompt": false})),
+    );
+    assert_eq!(closed["add_generation_prompt"], json!(false));
+    assert_eq!(closed["messages"].as_array().unwrap().len(), 1);
+    let open = render_with(Default::default(), &request(json!({})));
+    assert_eq!(open["add_generation_prompt"], json!(true));
+
+    let pair = request(json!({
+        "continue_final_message": true,
+        "add_generation_prompt": false,
+        "messages": [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "Sure"}
+        ]
+    }));
+    let emulated = render_with(Default::default(), &pair);
+    assert_eq!(emulated["add_generation_prompt"], json!(true));
+    assert_eq!(emulated["assistant_prefix"], json!("Sure"));
+    let native = render_with(NATIVE_CONTINUATION, &pair);
+    assert_eq!(native["add_generation_prompt"], json!(false));
+    assert_eq!(native["messages"].as_array().unwrap().len(), 2);
+}
+
+/// Through a Jinja template: without the header the prompt ends at the last
+/// turn's end marker; with it (the field absent) the assistant header follows.
+#[test]
+fn jinja_template_renders_no_header_when_add_generation_prompt_is_false() {
+    let mut tokenizer =
+        llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase).unwrap();
+    tokenizer
+        .set_chat_template(HEADER_TEMPLATE.to_string())
+        .unwrap();
+    let render = |add_generation_prompt: Value| {
+        let request: ChatCompletionRequest = serde_json::from_value(json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "Hello."}],
+            "add_generation_prompt": add_generation_prompt
+        }))
+        .unwrap();
+        process_chat_messages_with_placeholders(
+            &request,
+            &tokenizer,
+            None,
+            MediaPartOrder::MediaFirst,
+        )
+        .unwrap()
+        .0
+        .text
+    };
+    assert_eq!(render(json!(false)), "<|turn|>user<|body|>Hello.<|end|>");
+    assert_eq!(
+        render(Value::Null),
+        "<|turn|>user<|body|>Hello.<|end|><|turn|>assistant"
+    );
+}
+
 /// A text-rendered prompt reaches the tokenizer with each rendered marker
 /// already rewritten to its anchor; without placeholders it is left alone.
 /// The mock's JSON template writes no marker, so the one here is typed.

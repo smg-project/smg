@@ -467,6 +467,12 @@ pub fn chat_reasoning_starts_in_rendered_prefill(
     continued_final_message: bool,
     tokenizer: &dyn Tokenizer,
 ) -> bool {
+    // Without a generation header (`add_generation_prompt: false` and no
+    // continued message) nothing opens a `<think>`: the prompt ends after
+    // the closed last message and the completion starts in content mode.
+    if !request.adds_generation_prompt() && !request.continues_final_assistant() {
+        return false;
+    }
     reasoning_starts_in_prefill(
         request.chat_template_kwargs.as_ref(),
         request.effective_reasoning_effort(),
@@ -1336,6 +1342,26 @@ mod tests {
         ));
         assert!(chat_reasoning_starts_in_prefill(
             &request(true, "user"),
+            &tok
+        ));
+        // Without a generation header nothing opens a `<think>`: a request
+        // with `add_generation_prompt: false` and no continued message is not
+        // armed; a continued message keeps the rule above.
+        let closed = |continue_final: bool, last_role: &str| -> ChatCompletionRequest {
+            let mut body = serde_json::to_value(request(continue_final, last_role)).expect("value");
+            body["add_generation_prompt"] = Value::Bool(false);
+            serde_json::from_value(body).expect("chat request")
+        };
+        assert!(!chat_reasoning_starts_in_prefill(
+            &closed(false, "user"),
+            &tok
+        ));
+        assert!(!chat_reasoning_starts_in_prefill(
+            &closed(false, "assistant"),
+            &tok
+        ));
+        assert!(!chat_reasoning_starts_in_prefill(
+            &closed(true, "assistant"),
             &tok
         ));
         // The request-level `high` is written over the kwargs `none`.

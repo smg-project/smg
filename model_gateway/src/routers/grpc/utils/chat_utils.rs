@@ -874,7 +874,14 @@ pub(crate) fn process_chat_messages_with_placeholders(
                 .native_assistant_continuation;
 
         let params = ChatTemplateParams {
-            add_generation_prompt: !native_continuation,
+            // A continued final message decides its header by the renderer
+            // (none natively, the emulation's otherwise); any other request's
+            // header is its own `add_generation_prompt`, `true` when absent.
+            add_generation_prompt: if continues_final_assistant {
+                !native_continuation
+            } else {
+                request.adds_generation_prompt()
+            },
             continue_final_message: native_continuation,
             tools: tools_json.as_deref(),
             template_kwargs: final_template_kwargs,
