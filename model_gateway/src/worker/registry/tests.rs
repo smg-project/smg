@@ -1188,7 +1188,7 @@ fn routing_pool_alias_reuses_canonical_snapshot() {
     assert!(Arc::ptr_eq(&canonical, &alias));
 }
 
-// Health-checker integration tests moved to worker/manager.rs along with
+// Health-checker integration tests moved to worker/manager/tests.rs along with
 // the loop itself. The registry is now a pure collection — see
 // `worker::manager::WorkerManager` tests.
 
