@@ -3782,6 +3782,7 @@ mod segment_tests {
             }
             let params = ChatTemplateParams {
                 add_generation_prompt: !case.continue_final_message,
+                continue_final_message: case.continue_final_message,
                 tools: case.tools.as_deref(),
                 template_kwargs: Some(&kwargs),
                 ..Default::default()
