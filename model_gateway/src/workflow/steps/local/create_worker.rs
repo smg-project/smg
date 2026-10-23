@@ -150,16 +150,6 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         ) {
             warn!(model = %model_card.id, worker = %config.url, "{message}");
         }
-        // Under Symphony the failure classes of the table that reads the model
-        // exist at zero from the model's first worker, so a dashboard finds
-        // `failed` and `malformed` before the first such output.
-        publish_symphony_series(
-            &model_card,
-            app_context.router_config.parser,
-            &flags,
-            &app_context.worker_registry,
-        );
-
         let runtime_type = match context.data.detected_runtime_type.as_deref() {
             Some(s) => s.parse::<RuntimeType>().unwrap_or(config.runtime_type),
             None => config.runtime_type,
@@ -266,6 +256,18 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         } else {
             vec![None] // single worker, no DP
         };
+
+        // Under Symphony the failure classes of the table that reads the model
+        // exist at zero from the registration of a worker the pipeline reads
+        // with, so a dashboard finds `failed` and `malformed` before the first
+        // such output; after every check above, so a refused registration
+        // leaves no series behind.
+        publish_symphony_series(
+            &model_card,
+            app_context.router_config.parser,
+            *connection_mode,
+            &flags,
+        );
 
         // The worker keeps the spec it was registered with, so every field
         // the API accepted rides along: provider, kv_block_size, the
@@ -555,19 +557,20 @@ pub(super) fn validate_parser_overrides(
 }
 
 /// Under `--parser symphony`, publish at zero the Symphony series of the table that reads `card`'s
-/// model when the model's first worker registers (`registry` has none of its workers yet), so
-/// `failed`, `malformed` and the rest exist before the first such output
-/// (`regular::symphony::telemetry::init_table_series`). A later worker of the model, the legacy
-/// parser choice and a model the legacy parsers read publish nothing (the fallback series of such
-/// a model, under `none`, exist from start-up). Workers of one model registering at the same
-/// moment may each publish, which sets nothing twice.
+/// model as this worker's labels and the gateway's flags select it, so `failed`, `malformed` and
+/// the rest exist before the first such output (`regular::symphony::telemetry::init_table_series`).
+/// Every worker of a model publishes (a later worker whose labels select another table brings
+/// that table's series; publishing a table again sets nothing). An HTTP worker publishes nothing:
+/// only the gRPC and ZMQ pipeline reads with Symphony. The legacy parser choice and a model the
+/// legacy parsers read publish nothing either (the fallback series of such a model, under `none`,
+/// exist from start-up).
 pub(super) fn publish_symphony_series(
     card: &ModelCard,
     parser: ParserChoice,
+    connection_mode: ConnectionMode,
     flags: &Names,
-    registry: &WorkerRegistry,
 ) {
-    if parser != ParserChoice::Symphony || !registry.get_by_model(&card.id).is_empty() {
+    if parser != ParserChoice::Symphony || connection_mode == ConnectionMode::Http {
         return;
     }
     let labels = Names {
@@ -1136,27 +1139,33 @@ fn validate_zmq_dp(
 mod tests {
     use super::*;
 
-    /// Under `--parser symphony`, the registration of a model's first worker publishes the
-    /// failure classes of the table that reads the model at zero; the model's next worker and the
-    /// legacy parser choice publish nothing.
+    /// Under `--parser symphony`, the registration of a gRPC worker publishes the failure classes
+    /// of the table its names select for the model at zero: the registry's table for an unlabeled
+    /// worker of a model it knows, and another table for a worker whose labels name one. The
+    /// legacy parser choice and an HTTP worker (the pipeline that reads with Symphony never
+    /// serves it) publish nothing.
     #[test]
-    fn a_models_first_registration_publishes_its_tables_failure_classes_at_zero() {
+    fn a_workers_registration_publishes_its_tables_failure_classes_at_zero() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         let known = ModelCard::new("Qwen/Qwen3-8B");
-        let registry = WorkerRegistry::new();
-        let publish = |parser, registry: &WorkerRegistry| {
+        let publish = |card: &ModelCard, parser, connection_mode| {
             metrics::with_local_recorder(&recorder, || {
-                publish_symphony_series(&known, parser, &Names::default(), registry);
+                publish_symphony_series(card, parser, connection_mode, &Names::default());
             });
             handle.render()
         };
         assert!(
-            !publish(ParserChoice::Legacy, &registry).contains("smg_symphony_"),
+            !publish(&known, ParserChoice::Legacy, ConnectionMode::Grpc).contains("smg_symphony_"),
             "the legacy parsers publish no table"
         );
-        let scrape = publish(ParserChoice::Symphony, &registry);
-        let zero = |name: &str, labels: [&str; 2]| {
+        assert!(
+            !publish(&known, ParserChoice::Symphony, ConnectionMode::Http)
+                .contains("smg_symphony_"),
+            "an HTTP worker publishes no table"
+        );
+        let scrape = publish(&known, ParserChoice::Symphony, ConnectionMode::Grpc);
+        let zero = |scrape: &str, name: &str, labels: [&str; 2]| {
             scrape
                 .lines()
                 .find(|line| {
@@ -1166,6 +1175,7 @@ mod tests {
         };
         assert!(
             zero(
+                &scrape,
                 "smg_symphony_outputs_total",
                 ["table=\"qwen3\"", "outcome=\"failed\""]
             ),
@@ -1173,29 +1183,25 @@ mod tests {
         );
         assert!(
             zero(
+                &scrape,
                 "smg_symphony_malformed_total",
                 ["table=\"qwen3\"", "reason=\"unterminated_region\""]
             ),
             "{scrape}"
         );
-        registry
-            .register(Arc::new(
-                BasicWorkerBuilder::new("grpc://a:1")
-                    .model(known.clone())
-                    .build(),
-            ))
-            .expect("register");
-        // The model's next worker finds the series published and sets nothing
-        // (the exporter orders families as it pleases: compare the lines).
-        let lines = |scrape: &str| {
-            scrape
-                .lines()
-                .map(str::to_owned)
-                .collect::<std::collections::BTreeSet<_>>()
-        };
-        assert_eq!(
-            lines(&publish(ParserChoice::Symphony, &registry)),
-            lines(&scrape)
+        assert!(!scrape.contains("table=\"kimi_k2\""), "{scrape}");
+        // A later worker of the model whose labels name another table brings
+        // that table's series: requests count under it from then on.
+        let mut labeled = known.clone();
+        labeled.tool_parser = Some("kimi_k2".to_string());
+        let scrape = publish(&labeled, ParserChoice::Symphony, ConnectionMode::Zmq);
+        assert!(
+            zero(
+                &scrape,
+                "smg_symphony_outputs_total",
+                ["table=\"kimi_k2\"", "outcome=\"failed\""]
+            ),
+            "{scrape}"
         );
     }
 
