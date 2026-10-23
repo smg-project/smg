@@ -1,7 +1,4 @@
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-};
+use std::{collections::HashMap, path::PathBuf};
 
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 
@@ -30,111 +27,42 @@ use openai_protocol::worker::{MmProcessingMode, TransportMode};
 use rand::{distr::Alphanumeric, RngExt};
 use smg::{
     config::{
-        bind_socket_addr, resolve_worker_auto_recovery, validate_mesh_server_name, AccessLogField,
-        CacheIndexKind, CircuitBreakerConfig, ConfigError, ConfigResult, ConsulDiscoveryConfig,
-        DiscoveryConfig, FileDiscoveryConfig, HealthCheckConfig, HistoryBackend,
-        KubernetesDiscoveryConfig, ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig,
-        ParserChoice, PdPairingMode, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric,
-        RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig, RoutingMode,
-        SchemaConfig, SlurmDiscoveryConfig, TenantApiKeyEntry, TokenizerCacheConfig, TraceConfig,
+        bind_socket_addr, validate_mesh_server_name, AccessLogField, CacheIndexKind,
+        CircuitBreakerConfig, ConfigError, ConfigResult, ConsulDiscoveryConfig, DiscoveryConfig,
+        FileDiscoveryConfig, HealthCheckConfig, HistoryBackend, KubernetesDiscoveryConfig,
+        ManualAssignmentMode, MemoryConfig, MetricsConfig, OracleConfig, ParserChoice,
+        PdPairingMode, PdReadinessConfig, PolicyConfig, PostgresConfig, PowerOfTwoLoadMetric,
+        ReadinessRoleConfig, RedisConfig, RetryConfig, RouterConfig, RoutingKeyOverrideConfig,
+        RoutingMode, SchemaConfig, SlurmDiscoveryConfig, TokenizerCacheConfig, TraceConfig,
         TurboJpegPolicy, DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS, DEFAULT_ZMQ_STARTUP_TIMEOUT_SECS,
     },
     mesh_discovery::MeshDiscoveryConfig,
     observability::metrics::{register_jemalloc_as_global_allocator, PrometheusConfig},
     policies::cost::DEFAULT_POLICY as DEFAULT_SELECTION_POLICY,
-    server::{
-        self,
-        posture::{SecretSource, SecretSources},
-        ServerConfig,
-    },
-    service_discovery::{ModelIdSource, RuntimeDiscoveryConfig},
+    server::{self, posture::SecretSources, ServerConfig},
+    service_discovery::RuntimeDiscoveryConfig,
     version,
     worker::{ConnectionMode, RuntimeType},
 };
 use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, JwtConfig, Role};
 use smg_mesh::{MTLSConfig, MeshServerConfig};
 
-/// The command line as the gateway reads it, before clap sees it: the
-/// `--prefill <url> [bootstrap_port|none]` and `--encode <url>
-/// [bootstrap_port|none]` occurrences are hand-parsed (clap cannot express
-/// the optional trailing port) and stripped from the arguments clap parses.
-struct CommandLine {
-    /// argv without the `--prefill` / `--encode` occurrences and their values.
-    clap_args: Vec<String>,
-    prefill_urls: Vec<(String, Option<u16>)>,
-    encode_urls: Vec<(String, Option<u16>)>,
-}
+mod cli;
 
-impl CommandLine {
-    /// Split `args` (argv, the program name first). Each url list is what
-    /// [`parse_url_port_args`] reads for its flag over the whole of `args`,
-    /// independently of the other flag; `clap_args` is `args` with every
-    /// `<flag> <url> [port|none]` run removed by the same token rule, so a
-    /// flag given without a url (last on the line) reaches clap, which
-    /// refuses it as unexpected.
-    fn split(args: &[String]) -> Self {
-        Self {
-            clap_args: strip_url_port_args(args),
-            prefill_urls: parse_url_port_args(args, "--prefill"),
-            encode_urls: parse_url_port_args(args, "--encode"),
-        }
-    }
-}
-
-/// Whether the token after a `--prefill` / `--encode` url is its optional
-/// bootstrap port: a port number or `none` (any case). Another flag, or a
-/// url, is not consumed.
-fn is_bootstrap_port_token(token: &str) -> bool {
-    !token.starts_with("--") && (token.parse::<u16>().is_ok() || token.to_lowercase() == "none")
-}
-
-/// Parse the repeated `<flag> <url> [bootstrap_port|none]` occurrences of
-/// `args` into (url, optional bootstrap port) pairs; `none` and an absent
-/// port both read as `None`.
-fn parse_url_port_args(args: &[String], flag: &str) -> Vec<(String, Option<u16>)> {
-    let mut entries = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == flag && i + 1 < args.len() {
-            let url = args[i + 1].clone();
-            let mut bootstrap_port = None;
-            if args
-                .get(i + 2)
-                .is_some_and(|token| is_bootstrap_port_token(token))
-            {
-                bootstrap_port = args[i + 2].parse::<u16>().ok();
-                i += 1;
-            }
-            entries.push((url, bootstrap_port));
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    entries
-}
-
-/// `args` without the `--prefill` / `--encode` occurrences and their url and
-/// optional port, by the token rule of [`parse_url_port_args`].
-fn strip_url_port_args(args: &[String]) -> Vec<String> {
-    let mut kept = Vec::new();
-    let mut i = 0;
-    while i < args.len() {
-        if (args[i] == "--prefill" || args[i] == "--encode") && i + 1 < args.len() {
-            i += 2;
-            if args
-                .get(i)
-                .is_some_and(|token| is_bootstrap_port_token(token))
-            {
-                i += 1;
-            }
-        } else {
-            kept.push(args[i].clone());
-            i += 1;
-        }
-    }
-    kept
-}
+use cli::{
+    secrets::{
+        process_env, EnvLookup, API_KEY_SETTING, POSTGRES_DB_URL_SETTING, REDIS_URL_SETTING,
+        TENANT_API_KEYS_SETTING,
+    },
+    url_port::CommandLine,
+    value::{
+        parse_access_log_field, parse_control_plane_api_key, parse_job_queue_capacity,
+        parse_job_queue_concurrency, parse_kv_index, parse_mm_processing, parse_mm_turbojpeg,
+        parse_model_alias, parse_model_id_from, parse_positive_usize,
+        parse_power_of_two_load_metric, parse_role_mapping, parse_routing_key_header,
+        parse_tenant_api_key, parse_transport_mode, parse_unit_fraction,
+    },
+};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
 pub enum Backend {
@@ -245,90 +173,6 @@ enum Commands {
     },
 }
 
-/// Parse the `--multimodal-tensor-transport` value into a `TransportMode`.
-fn parse_transport_mode(value: &str) -> Result<TransportMode, String> {
-    TransportMode::parse(value)
-        .ok_or_else(|| format!("invalid value '{value}'; expected inline, shm, auto, or rdma"))
-}
-
-/// Parse the deprecated `--kv-index` value. The chain index is the only KV
-/// index, so `chain` is the one value accepted; `positional` names the index
-/// that went with kv-index 2.0.0 and is refused with the reason.
-fn parse_kv_index(value: &str) -> Result<String, String> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "chain" => Ok("chain".to_string()),
-        "positional" => Err(
-            "the positional KV index was removed (kv-index 2.0.0): the chain index is the \
-             only KV index, drop --kv-index"
-                .to_string(),
-        ),
-        _ => Err(format!(
-            "invalid value '{value}'; the chain index is the only KV index, so --kv-index \
-             takes chain only (and is deprecated)"
-        )),
-    }
-}
-
-/// Parse the `--power-of-two-load-metric` value into a `PowerOfTwoLoadMetric`.
-fn parse_power_of_two_load_metric(value: &str) -> Result<PowerOfTwoLoadMetric, String> {
-    PowerOfTwoLoadMetric::parse(value).ok_or_else(|| {
-        format!("invalid value '{value}'; expected expected_wait, requests, or least_requests")
-    })
-}
-
-/// Parse one `--access-log-fields` name into an `AccessLogField`.
-fn parse_access_log_field(value: &str) -> Result<AccessLogField, String> {
-    value.parse()
-}
-
-/// Parse the `--mm-processing` value into an `MmProcessingMode`.
-fn parse_mm_processing(value: &str) -> Result<MmProcessingMode, String> {
-    MmProcessingMode::parse(value)
-        .ok_or_else(|| format!("invalid value '{value}'; expected auto, router, or worker"))
-}
-
-/// Parse the `--mm-turbojpeg` value into a `TurboJpegPolicy`.
-fn parse_mm_turbojpeg(value: &str) -> Result<TurboJpegPolicy, String> {
-    TurboJpegPolicy::parse(value)
-        .ok_or_else(|| format!("invalid value '{value}'; expected prefer or require"))
-}
-
-fn parse_positive_usize(value: &str) -> Result<usize, String> {
-    match value.parse::<usize>() {
-        Ok(n) if n >= 1 => Ok(n),
-        Ok(_) => Err(format!("invalid value '{value}'; expected a count >= 1")),
-        Err(err) => Err(format!("invalid value '{value}': {err}")),
-    }
-}
-
-fn parse_usize_in_range(value: &str, max: usize) -> Result<usize, String> {
-    match value.parse::<usize>() {
-        Ok(n) if (1..=max).contains(&n) => Ok(n),
-        Ok(n) => Err(format!("invalid value '{n}'; expected 1..={max}")),
-        Err(err) => Err(format!("invalid value '{value}': {err}")),
-    }
-}
-
-/// Parse a ratio in `(0.0, 1.0]`. Zero is excluded because a `>=` threshold of
-/// 0.0 would mark every worker overloaded unconditionally.
-fn parse_unit_fraction(value: &str) -> Result<f64, String> {
-    match value.parse::<f64>() {
-        Ok(v) if v > 0.0 && v <= 1.0 => Ok(v),
-        Ok(_) => Err(format!(
-            "invalid value '{value}'; expected a fraction in (0.0, 1.0]"
-        )),
-        Err(err) => Err(format!("invalid value '{value}': {err}")),
-    }
-}
-
-fn parse_job_queue_capacity(value: &str) -> Result<usize, String> {
-    parse_usize_in_range(value, 1_000_000)
-}
-
-fn parse_job_queue_concurrency(value: &str) -> Result<usize, String> {
-    parse_usize_in_range(value, 100_000)
-}
-
 // clap renders `--help` by `help_heading`: the headings in first-use order,
 // the fields of a heading in declaration order. The sections below follow
 // that grouping, one header per heading, so a field is added under its
@@ -388,6 +232,39 @@ struct RoutingArgs {
     /// Unset = dedicated probe listener off.
     #[arg(long, help_heading = "Worker Configuration")]
     health_check_port: Option<u16>,
+
+    /// Desired number of prefill workers used as the stable readiness
+    /// percentage denominator. This does not enable a percentage gate by
+    /// itself; set `--prefill-min-ready-percent` to do that.
+    #[arg(long = "prefill-expected-workers", help_heading = "Health Checks")]
+    readiness_prefill_expected_workers: Option<usize>,
+
+    /// Absolute minimum number of healthy prefill workers required.
+    #[arg(long = "prefill-min-ready-workers", help_heading = "Health Checks")]
+    readiness_prefill_min_healthy_workers: Option<usize>,
+
+    /// Minimum healthy percentage of the expected prefill workers (1-100).
+    #[arg(
+        long = "prefill-min-ready-percent",
+        value_parser = clap::value_parser!(u8).range(1..=100),
+        help_heading = "Health Checks"
+    )]
+    readiness_prefill_min_healthy_percent: Option<u8>,
+
+    /// Absolute minimum number of healthy decode workers required (default 1).
+    #[arg(long = "decode-min-ready-workers", help_heading = "Health Checks")]
+    readiness_decode_min_healthy_workers: Option<usize>,
+    /// Desired decode fleet size used as the fixed readiness percentage denominator.
+    #[arg(long = "decode-expected-workers", help_heading = "Health Checks")]
+    readiness_decode_expected_workers: Option<usize>,
+
+    /// Minimum healthy percentage of expected decode workers (1-100).
+    #[arg(
+        long = "decode-min-ready-percent",
+        value_parser = clap::value_parser!(u8).range(1..=100),
+        help_heading = "Health Checks"
+    )]
+    readiness_decode_min_healthy_percent: Option<u8>,
 
     /// Port of the admin listener. When set, the control-plane routes (the
     /// admin routes /flush_cache, /start_profile, /stop_profile,
@@ -682,7 +559,7 @@ struct RoutingArgs {
     least_load_kv_pressure_weight: f64,
 
     /// Input throughput (tokens/s) for least_load prefill workers; fallback
-    /// output throughput for other workers when no live rate is reported.
+    /// output throughput for other workers when no candidate reports a live rate.
     /// Shared across roles; separate prefill/decode values require constructing
     /// RouterConfig programmatically in Rust.
     #[arg(long, default_value_t = 2000.0, help_heading = "Routing Policy")]
@@ -1019,6 +896,16 @@ struct WorkerArgs {
     /// match the engine's. Falls back to `SMG_MM_TURBOJPEG`.
     #[arg(long, value_parser = parse_mm_turbojpeg, help_heading = "Multimodal")]
     mm_turbojpeg: Option<TurboJpegPolicy>,
+
+    /// Video download timeout in milliseconds; positive.
+    /// Falls back to `SMG_MM_VIDEO_FETCH_TIMEOUT_MS`, then 30000.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Multimodal")]
+    mm_video_fetch_timeout_ms: Option<u64>,
+
+    /// Image/audio download timeout in milliseconds; positive.
+    /// Falls back to `SMG_MM_FETCH_TIMEOUT_MS`, then 10000.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Multimodal")]
+    mm_fetch_timeout_ms: Option<u64>,
 
     /// Listener IP for the RDMA pixel lane's metadata exchange, a plain IPv4
     /// or IPv6 address (no hostname, port or brackets: the workers connect to
@@ -1516,11 +1403,11 @@ struct ServingArgs {
     /// removed from the registry so service discovery re-registers and
     /// re-probes it once its engine returns. Without this a Failed worker
     /// stays registered, out of rotation, and keeps being probed, so it
-    /// rejoins in place as soon as it answers again. Defaults to the
-    /// --service-discovery setting: discovery-managed fleets recover by
-    /// removal plus re-registration, while a static fleet has nothing to
-    /// re-add a removed worker and recovers in place instead. Pass =false
-    /// to keep it off under discovery.
+    /// rejoins in place as soon as it answers again. Unset, it follows
+    /// discovery: with a discovery provider it removes only the workers that
+    /// provider discovered, which it re-registers, while static and
+    /// API-added workers, which nothing would re-add, recover in place. Pass
+    /// it to remove every failed local worker, or =false to remove none.
     #[arg(
         long,
         visible_alias = "worker-auto-recovery",
@@ -1969,343 +1856,6 @@ enum OracleConnectSource {
     Wallet { path: String, alias: String },
 }
 
-/// Validate `--model-id-from` value at CLI parse time.
-fn parse_model_id_from(s: &str) -> Result<String, String> {
-    ModelIdSource::parse(s)?;
-    Ok(s.to_string())
-}
-
-/// Validate `--routing-key-headers` values at CLI parse time; names are
-/// normalized to lowercase.
-fn parse_routing_key_header(s: &str) -> Result<String, String> {
-    http::header::HeaderName::try_from(s)
-        .map(|name| name.as_str().to_string())
-        .map_err(|e| format!("Invalid header name '{s}': {e}"))
-}
-
-/// Validate `--model-alias` value at CLI parse time (format: alias=canonical).
-fn parse_model_alias(s: &str) -> Result<String, String> {
-    let Some((alias, canonical)) = s.split_once('=') else {
-        return Err(format!(
-            "Invalid model-alias value '{s}'. Expected: <alias>=<canonical>"
-        ));
-    };
-    if alias.is_empty() || canonical.is_empty() {
-        return Err(format!(
-            "Invalid model-alias value '{s}'. Alias and canonical model ID must be non-empty"
-        ));
-    }
-    if alias == canonical {
-        return Err(format!(
-            "Invalid model-alias value '{s}'. Alias must differ from the canonical model ID"
-        ));
-    }
-    Ok(s.to_string())
-}
-
-/// Parse a JWT role mapping from CLI format "idp_role=gateway_role". A
-/// malformed entry is a configuration error, never a dropped mapping: with
-/// the mapping dropped the map can end up empty, and an empty map grants the
-/// gateway's admin role to any token whose roles claim says `admin`.
-fn parse_role_mapping(mapping: &str) -> ConfigResult<(String, Role)> {
-    let parts: Vec<&str> = mapping.splitn(2, '=').collect();
-    if parts.len() != 2 {
-        return Err(ConfigError::InvalidValue {
-            field: "jwt-role-mapping".to_string(),
-            value: mapping.to_string(),
-            reason: "expected 'idp_role=gateway_role'".to_string(),
-        });
-    }
-    let idp_role = parts[0].to_string();
-    let gateway_role = match parts[1].to_lowercase().as_str() {
-        "admin" => Role::Admin,
-        "user" => Role::User,
-        _ => {
-            return Err(ConfigError::InvalidValue {
-                field: "jwt-role-mapping".to_string(),
-                value: mapping.to_string(),
-                reason: "the gateway role must be 'admin' or 'user'".to_string(),
-            });
-        }
-    };
-    Ok((idp_role, gateway_role))
-}
-
-/// Parse a control-plane API key from CLI format "id:name:role:key". A
-/// malformed entry is a configuration error, never a dropped key: a dropped
-/// key would leave the control plane open (or lock an operator out) with
-/// nothing but a stderr line to show for it. The entry is not echoed, since
-/// it carries the credential.
-fn parse_control_plane_api_key(key_str: &str) -> ConfigResult<ApiKeyEntry> {
-    let parts: Vec<&str> = key_str.splitn(4, ':').collect();
-    if parts.len() != 4 {
-        return Err(ConfigError::InvalidValue {
-            field: "control-plane-api-keys".to_string(),
-            value: "<redacted>".to_string(),
-            reason: "expected 'id:name:role:key'".to_string(),
-        });
-    }
-    let id = parts[0];
-    let name = parts[1];
-    let role_str = parts[2];
-    let key = parts[3];
-
-    let role = match role_str.to_lowercase().as_str() {
-        "admin" => Role::Admin,
-        "user" => Role::User,
-        // The field is not named either: with the fields out of order it is the credential.
-        _ => {
-            return Err(ConfigError::InvalidValue {
-                field: "control-plane-api-keys".to_string(),
-                value: "<redacted>".to_string(),
-                reason: "the role must be 'admin' or 'user'".to_string(),
-            });
-        }
-    };
-
-    Ok(ApiKeyEntry::new(id, name, key, role))
-}
-
-/// Parse a tenant-scoped data-plane API key from CLI format "tenant_id:key".
-/// Only checks for the ':' separator; non-empty/duplicate checks live in
-/// `ConfigValidator::validate_tenant_api_keys` so they also cover
-/// `TenantApiKeyEntry` values from a config file or language binding. Fails
-/// hard (an empty `AuthConfig` disables auth entirely, not just narrows it)
-/// and never echoes `key_str`, which may be the plaintext credential.
-fn parse_tenant_api_key(key_str: &str) -> ConfigResult<TenantApiKeyEntry> {
-    let Some((tenant_id, key)) = key_str.split_once(':') else {
-        return Err(ConfigError::InvalidValue {
-            field: "tenant-api-key".to_string(),
-            value: "<redacted>".to_string(),
-            reason: "expected 'tenant_id:key' (missing ':' separator)".to_string(),
-        });
-    };
-
-    Ok(TenantApiKeyEntry {
-        tenant_id: tenant_id.trim().to_string(),
-        key: key.trim().to_string(),
-    })
-}
-
-// ==================== Secret sources ====================
-
-/// A secret the command line, the environment or a file can give: the
-/// names of its sources, for the resolution and for the refusals. A
-/// refusal names sources and paths; none carries a value.
-struct SecretSetting {
-    /// What the secret is, for the refusals.
-    what: &'static str,
-    /// The `ConfigError` field a bad file is reported under.
-    file_field: &'static str,
-    /// The flag taking the value.
-    flag: &'static str,
-    /// The environment variable taking the value.
-    env: &'static str,
-    /// The flag naming a file that holds the value.
-    file_flag: &'static str,
-    /// The environment variable naming that file.
-    file_env: &'static str,
-}
-
-const API_KEY_SETTING: SecretSetting = SecretSetting {
-    what: "the shared API key",
-    file_field: "api-key-file",
-    flag: "--api-key",
-    env: "SMG_API_KEY",
-    file_flag: "--api-key-file",
-    file_env: "SMG_API_KEY_FILE",
-};
-
-const TENANT_API_KEYS_SETTING: SecretSetting = SecretSetting {
-    what: "the tenant API keys",
-    file_field: "tenant-api-keys-file",
-    flag: "--tenant-api-key",
-    env: "SMG_TENANT_API_KEYS",
-    file_flag: "--tenant-api-keys-file",
-    file_env: "SMG_TENANT_API_KEYS_FILE",
-};
-
-const POSTGRES_DB_URL_SETTING: SecretSetting = SecretSetting {
-    what: "the PostgreSQL connection URL",
-    file_field: "postgres-db-url-file",
-    flag: "--postgres-db-url",
-    env: "SMG_POSTGRES_DB_URL",
-    file_flag: "--postgres-db-url-file",
-    file_env: "SMG_POSTGRES_DB_URL_FILE",
-};
-
-const REDIS_URL_SETTING: SecretSetting = SecretSetting {
-    what: "the Redis connection URL",
-    file_field: "redis-url-file",
-    flag: "--redis-url",
-    env: "SMG_REDIS_URL",
-    file_flag: "--redis-url-file",
-    file_env: "SMG_REDIS_URL_FILE",
-};
-
-/// An environment lookup: the value of a variable, `None` when it is not
-/// set, and a refusal when it is set to bytes that are not UTF-8 (a source
-/// that is set but unusable is refused, not passed over as unset). A
-/// parameter rather than `std::env::var` so a test need not touch the
-/// process environment.
-type EnvLookup<'a> = &'a dyn Fn(&str) -> ConfigResult<Option<String>>;
-
-/// The process environment as an [`EnvLookup`].
-fn process_env(name: &str) -> ConfigResult<Option<String>> {
-    env_value(name, std::env::var_os(name))
-}
-
-/// A variable's raw value as a string: `None` when the variable is unset,
-/// a refusal naming the variable when its bytes are not UTF-8.
-fn env_value(name: &str, raw: Option<std::ffi::OsString>) -> ConfigResult<Option<String>> {
-    raw.map(|value| {
-        value.into_string().map_err(|_| ConfigError::InvalidValue {
-            field: name.to_string(),
-            value: "<not UTF-8>".to_string(),
-            reason: "set, but its value is not UTF-8".to_string(),
-        })
-    })
-    .transpose()
-}
-
-impl SecretSetting {
-    /// The file the flag or, failing that, the environment names.
-    fn file(&self, flag_value: Option<&Path>, env: EnvLookup<'_>) -> ConfigResult<Option<PathBuf>> {
-        Ok(match flag_value {
-            Some(path) => Some(path.to_path_buf()),
-            None => env(self.file_env)?.map(PathBuf::from),
-        })
-    }
-
-    /// The refusal for a value and a file given together: ranking them
-    /// would honour a stale secret in silence.
-    fn given_twice(&self) -> ConfigError {
-        ConfigError::IncompatibleConfig {
-            reason: format!(
-                "{} is given twice, by {} (or {}) and by {} (or {}); give one source",
-                self.what, self.flag, self.env, self.file_flag, self.file_env
-            ),
-        }
-    }
-
-    /// The refusal for a file that cannot be used, naming the path, never
-    /// the content.
-    fn bad_file(&self, path: &Path, reason: &str) -> ConfigError {
-        ConfigError::InvalidValue {
-            field: self.file_field.to_string(),
-            value: path.display().to_string(),
-            reason: reason.to_string(),
-        }
-    }
-
-    fn read_file(&self, path: &Path) -> ConfigResult<String> {
-        std::fs::read_to_string(path)
-            .map_err(|e| self.bad_file(path, &format!("the file cannot be read: {e}")))
-    }
-
-    /// The value of a single-valued secret and its source: the flag's,
-    /// else the environment's, else the content of the file the flag or the
-    /// environment names; the environment's value and the file's content
-    /// have their surrounding whitespace (a trailing newline) dropped, since
-    /// a Secret made from a file usually carries the editor's newline into
-    /// both. A value and a file together are refused, as is a file that is
-    /// empty or holds more than one line (a tenant key file or a
-    /// concatenated pair in the place of one value is a mistake, not a
-    /// value). An empty value from the flag or the environment passes here
-    /// and is refused where the value is validated.
-    fn resolve_value(
-        &self,
-        flag_value: Option<&str>,
-        file_flag_value: Option<&Path>,
-        env: EnvLookup<'_>,
-    ) -> ConfigResult<Option<(String, SecretSource)>> {
-        let value = match flag_value {
-            Some(value) => Some((value.to_string(), SecretSource::Flag)),
-            None => {
-                env(self.env)?.map(|value| (value.trim().to_string(), SecretSource::Environment))
-            }
-        };
-        match (value, self.file(file_flag_value, env)?) {
-            (Some(_), Some(_)) => Err(self.given_twice()),
-            (Some(value), None) => Ok(Some(value)),
-            (None, None) => Ok(None),
-            (None, Some(path)) => {
-                let content = self.read_file(&path)?;
-                let value = content.trim();
-                if value.is_empty() {
-                    return Err(self.bad_file(&path, "the file is empty"));
-                }
-                if value.lines().count() > 1 {
-                    return Err(self.bad_file(
-                        &path,
-                        "the file holds more than one line; it must hold the value alone",
-                    ));
-                }
-                Ok(Some((value.to_string(), SecretSource::File)))
-            }
-        }
-    }
-
-    /// The entries of a list-valued secret and their source: the flag's
-    /// occurrences, else the environment's value split at ',' and at line
-    /// ends, else the lines of the file the flag or the environment names,
-    /// blank lines and `#` comment lines skipped; the whitespace around an
-    /// entry is dropped. Entries and a file together are refused, and so is
-    /// a source that is set but holds no entry: the source was meant to
-    /// close the serving routes, and an empty one would leave them open.
-    fn resolve_entries(
-        &self,
-        flag_values: &[String],
-        file_flag_value: Option<&Path>,
-        env: EnvLookup<'_>,
-    ) -> ConfigResult<Option<(Vec<String>, SecretSource)>> {
-        let entries_of = |text: &str, separators: &[char]| -> Vec<String> {
-            text.split(separators)
-                .map(str::trim)
-                .filter(|entry| !entry.is_empty() && !entry.starts_with('#'))
-                .map(str::to_string)
-                .collect()
-        };
-        let value = if flag_values.is_empty() {
-            match env(self.env)? {
-                Some(text) => {
-                    let entries = entries_of(&text, &[',', '\n']);
-                    if entries.is_empty() {
-                        return Err(ConfigError::InvalidValue {
-                            field: self.env.to_string(),
-                            value: "<empty>".to_string(),
-                            reason: format!(
-                                "set but holds no entry; {} are tenant_id:key entries separated by ',' or a newline",
-                                self.what
-                            ),
-                        });
-                    }
-                    Some((entries, SecretSource::Environment))
-                }
-                None => None,
-            }
-        } else {
-            Some((flag_values.to_vec(), SecretSource::Flag))
-        };
-        match (value, self.file(file_flag_value, env)?) {
-            (Some(_), Some(_)) => Err(self.given_twice()),
-            (Some(value), None) => Ok(Some(value)),
-            (None, None) => Ok(None),
-            (None, Some(path)) => {
-                let content = self.read_file(&path)?;
-                let entries = entries_of(&content, &['\n']);
-                if entries.is_empty() {
-                    return Err(self.bad_file(
-                        &path,
-                        "the file holds no entry; one tenant_id:key per line, blank and # lines skipped",
-                    ));
-                }
-                Ok(Some((entries, SecretSource::File)))
-            }
-        }
-    }
-}
-
 impl CliArgs {
     /// Phase 1b, resolve: the secrets the environment or a file may give in
     /// the command line's place, read into the flag fields so the phases
@@ -2359,6 +1909,34 @@ impl CliArgs {
 }
 
 impl CliArgs {
+    /// Preserve legacy readiness unless a role threshold was explicitly configured.
+    fn pd_readiness_config(&self) -> Option<PdReadinessConfig> {
+        let configured = self.routing.readiness_prefill_expected_workers.is_some()
+            || self.routing.readiness_prefill_min_healthy_workers.is_some()
+            || self.routing.readiness_prefill_min_healthy_percent.is_some()
+            || self.routing.readiness_decode_min_healthy_workers.is_some()
+            || self.routing.readiness_decode_expected_workers.is_some()
+            || self.routing.readiness_decode_min_healthy_percent.is_some();
+        configured.then(|| PdReadinessConfig {
+            prefill: ReadinessRoleConfig {
+                expected_workers: self.routing.readiness_prefill_expected_workers,
+                min_healthy_workers: self
+                    .routing
+                    .readiness_prefill_min_healthy_workers
+                    .unwrap_or(1),
+                min_healthy_percent: self.routing.readiness_prefill_min_healthy_percent,
+            },
+            decode: ReadinessRoleConfig {
+                expected_workers: self.routing.readiness_decode_expected_workers,
+                min_healthy_workers: self
+                    .routing
+                    .readiness_decode_min_healthy_workers
+                    .unwrap_or(1),
+                min_healthy_percent: self.routing.readiness_decode_min_healthy_percent,
+            },
+        })
+    }
+
     /// Build control plane authentication configuration from CLI args. A
     /// configuration that asks for authentication but cannot be honoured
     /// (a malformed key entry, an issuer without an audience or the reverse)
@@ -3316,6 +2894,7 @@ impl CliArgs {
             .zmq_startup_timeout_secs(self.routing.zmq_startup_timeout_secs)
             .host(&self.routing.host)
             .port(self.routing.port)
+            .pd_readiness(self.pd_readiness_config())
             .health_check_port(self.routing.health_check_port)
             .admin_port(self.routing.admin_port)
             .admin_host(self.routing.admin_host.clone())
@@ -3368,6 +2947,8 @@ impl CliArgs {
             .mm_allowed_media_domains(self.workers.mm_allowed_media_domains.clone())
             .mm_allow_private_media_hosts(self.workers.mm_allow_private_media_hosts)
             .mm_turbojpeg(self.workers.mm_turbojpeg)
+            .mm_video_fetch_timeout_ms(self.workers.mm_video_fetch_timeout_ms)
+            .mm_fetch_timeout_ms(self.workers.mm_fetch_timeout_ms)
             .rdma_listen_ip(self.workers.rdma_listen_ip.clone())
             .rdma_slot_ttl_s(self.workers.rdma_slot_ttl_s)
             .log_mm_timing(self.workers.log_mm_timing)
@@ -3410,10 +2991,9 @@ impl CliArgs {
                 check_interval_secs: self.serving.health_check_interval_secs,
                 endpoint: self.serving.health_check_endpoint.clone(),
                 disable_health_check: self.serving.disable_health_check,
-                remove_unhealthy_workers: resolve_worker_auto_recovery(
-                    self.serving.remove_unhealthy_workers,
-                    self.selected_discovery_provider().is_some(),
-                ),
+                // Kept unresolved: the server resolves it against the
+                // discovery the configuration selects.
+                remove_unhealthy_workers: self.serving.remove_unhealthy_workers,
                 drain_settle_secs: self.serving.drain_settle_secs,
             })
             .tokenizer_cache(TokenizerCacheConfig {
@@ -3703,6 +3283,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    use smg::{config::UnhealthyRemovalScope, server::posture::SecretSource};
+
     use super::*;
 
     /// Exercise both generated builders and startup parsing on Rust's default
@@ -3763,6 +3347,88 @@ mod tests {
             .chain(args.iter().map(|s| (*s).to_string()))
             .collect();
         Cli::parse_from(argv).router_args
+    }
+
+    /// The CLI preserves independent role thresholds and rounds percentages up.
+    #[test]
+    fn pd_readiness_cli_flags_flow_into_router_config() {
+        let config = cli_args_from(&[
+            "--pd-disaggregation",
+            "--prefill-expected-workers",
+            "8",
+            "--prefill-min-ready-workers",
+            "4",
+            "--prefill-min-ready-percent",
+            "80",
+            "--decode-min-ready-workers",
+            "2",
+            "--decode-expected-workers",
+            "4",
+            "--decode-min-ready-percent",
+            "75",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+
+        let readiness = config.pd_readiness.unwrap();
+        assert_eq!(readiness.prefill.expected_workers, Some(8));
+        assert_eq!(readiness.prefill.min_healthy_workers, 4);
+        assert_eq!(readiness.prefill.min_healthy_percent, Some(80));
+        assert_eq!(readiness.prefill.required_workers(), 7);
+        assert_eq!(readiness.decode.expected_workers, Some(4));
+        assert_eq!(readiness.decode.min_healthy_percent, Some(75));
+        assert_eq!(readiness.decode.required_workers(), 3);
+    }
+
+    /// An expected size alone preserves the legacy one-worker minimum.
+    #[test]
+    fn pd_readiness_expected_count_does_not_enable_a_percentage_gate() {
+        let config = cli_args_from(&["--pd-disaggregation", "--prefill-expected-workers", "8"])
+            .to_router_config(vec![], vec![])
+            .unwrap();
+
+        let readiness = config.pd_readiness.unwrap();
+        assert_eq!(readiness.prefill.min_healthy_percent, None);
+        assert_eq!(readiness.prefill.required_workers(), 1);
+        assert_eq!(readiness.decode.required_workers(), 1);
+    }
+
+    /// An absolute floor remains effective when the percentage asks for fewer workers.
+    #[test]
+    fn pd_readiness_uses_the_larger_absolute_and_percentage_gate() {
+        let config = cli_args_from(&[
+            "--pd-disaggregation",
+            "--prefill-expected-workers",
+            "4",
+            "--prefill-min-ready-workers",
+            "3",
+            "--prefill-min-ready-percent",
+            "50",
+        ])
+        .to_router_config(vec![], vec![])
+        .unwrap();
+
+        let readiness = config.pd_readiness.unwrap();
+        assert_eq!(readiness.prefill.required_workers(), 3);
+    }
+
+    /// A percentage without a stable denominator is rejected at startup.
+    #[test]
+    fn pd_readiness_percentage_requires_expected_count() {
+        let result = cli_args_from(&["--pd-disaggregation", "--prefill-min-ready-percent", "80"])
+            .to_router_config(vec![], vec![]);
+        assert!(matches!(result, Err(ConfigError::MissingRequired { .. })));
+    }
+
+    /// Role thresholds cannot silently do nothing in regular routing mode.
+    #[test]
+    fn pd_readiness_flags_are_rejected_outside_disaggregated_mode() {
+        let result =
+            cli_args_from(&["--prefill-min-ready-workers", "2"]).to_router_config(vec![], vec![]);
+        assert!(matches!(
+            result,
+            Err(ConfigError::IncompatibleConfig { .. })
+        ));
     }
 
     /// `--prefill` / `--encode` take an optional trailing bootstrap port (a
@@ -4996,7 +4662,10 @@ mod tests {
             }))
         );
         // Recovery by removal works here too: the next reread re-adds the worker.
-        assert!(router.health_check.remove_unhealthy_workers);
+        assert_eq!(
+            router.unhealthy_removal_scope(),
+            UnhealthyRemovalScope::DiscoveryOwned
+        );
 
         let server = cli.to_server_config(router).unwrap();
         assert!(matches!(
@@ -5126,7 +4795,10 @@ mod tests {
                 check_interval_secs: 10,
             }))
         );
-        assert!(router.health_check.remove_unhealthy_workers);
+        assert_eq!(
+            router.unhealthy_removal_scope(),
+            UnhealthyRemovalScope::DiscoveryOwned
+        );
 
         let server = cli.to_server_config(router).unwrap();
         assert!(matches!(
@@ -5183,7 +4855,10 @@ mod tests {
                 check_interval_secs: 10,
             }))
         );
-        assert!(router.health_check.remove_unhealthy_workers);
+        assert_eq!(
+            router.unhealthy_removal_scope(),
+            UnhealthyRemovalScope::DiscoveryOwned
+        );
 
         let server = cli.to_server_config(router).unwrap();
         assert!(matches!(
@@ -5325,41 +5000,56 @@ mod tests {
         assert!(!no_discovery.routing.enable_igw);
     }
 
-    /// `--worker-auto-recovery` defaults to the `--service-discovery`
-    /// setting: recovery works by removal plus discovery re-registration, so
-    /// it is on exactly when discovery can complete that loop, and off when
-    /// removal would permanently shrink a static fleet. Explicit values win
-    /// in both directions.
+    /// `--worker-auto-recovery` follows discovery when it is not given:
+    /// recovery works by removal plus re-registration, so by default it
+    /// covers exactly the workers a provider discovered, which the provider
+    /// registers again, and none without discovery, where removal would
+    /// shrink a static fleet for good. An explicit value wins in both
+    /// directions, `true` taking every local worker. The CLI keeps the
+    /// setting as given; `unhealthy_removal_scope` resolves it.
     #[test]
     fn worker_auto_recovery_follows_service_discovery_by_default() {
-        let derived_on = cli_args_from(&["--service-discovery", "--selector", "app=w"])
-            .to_router_config(vec![], vec![])
-            .unwrap();
-        assert!(derived_on.health_check.remove_unhealthy_workers);
-
-        let derived_on_tagged =
-            cli_args_from(&["--discovery-provider", "kubernetes", "--selector", "app=w"])
+        let scope = |args: &[&str]| {
+            let router = cli_args_from(args)
                 .to_router_config(vec![], vec![])
                 .unwrap();
-        assert!(derived_on_tagged.health_check.remove_unhealthy_workers);
-
-        let derived_off = cli_args_from(&[]).to_router_config(vec![], vec![]).unwrap();
-        assert!(!derived_off.health_check.remove_unhealthy_workers);
-
-        let forced_off = cli_args_from(&[
-            "--service-discovery",
-            "--selector",
-            "app=w",
-            "--remove-unhealthy-workers=false",
-        ])
-        .to_router_config(vec![], vec![])
-        .unwrap();
-        assert!(!forced_off.health_check.remove_unhealthy_workers);
-
-        let forced_on = cli_args_from(&["--remove-unhealthy-workers"])
-            .to_router_config(vec![], vec![])
-            .unwrap();
-        assert!(forced_on.health_check.remove_unhealthy_workers);
+            (
+                router.health_check.remove_unhealthy_workers,
+                router.unhealthy_removal_scope(),
+            )
+        };
+        use UnhealthyRemovalScope::{AllLocal, Disabled, DiscoveryOwned};
+        assert_eq!(
+            scope(&["--service-discovery", "--selector", "app=w"]),
+            (None, DiscoveryOwned)
+        );
+        assert_eq!(
+            scope(&["--discovery-provider", "kubernetes", "--selector", "app=w"]),
+            (None, DiscoveryOwned)
+        );
+        assert_eq!(scope(&[]), (None, Disabled));
+        assert_eq!(
+            scope(&[
+                "--service-discovery",
+                "--selector",
+                "app=w",
+                "--remove-unhealthy-workers=false",
+            ]),
+            (Some(false), Disabled)
+        );
+        assert_eq!(
+            scope(&["--remove-unhealthy-workers"]),
+            (Some(true), AllLocal)
+        );
+        assert_eq!(
+            scope(&[
+                "--service-discovery",
+                "--selector",
+                "app=w",
+                "--worker-auto-recovery",
+            ]),
+            (Some(true), AllLocal)
+        );
     }
 
     /// `--health-check-port` must flow into BOTH conversion paths
@@ -5691,6 +5381,16 @@ mod tests {
         assert!(Cli::try_parse_from(["smg", "--cache-ttl-secs", "0"]).is_err());
     }
 
+    /// Millisecond fetch budgets accept only positive integers at the CLI boundary.
+    #[test]
+    fn mm_fetch_timeout_flags_reject_invalid_values() {
+        for flag in ["--mm-fetch-timeout-ms", "--mm-video-fetch-timeout-ms"] {
+            for value in ["0", "-1", "invalid", "1.5"] {
+                assert!(Cli::try_parse_from(["smg", flag, value]).is_err());
+            }
+        }
+    }
+
     /// The media placement and engine-side media flags must reach both
     /// `RouterConfig` and the wrapped `ServerConfig.router_config`.
     #[test]
@@ -5698,6 +5398,10 @@ mod tests {
         let cli = cli_args_from(&[
             "--mm-processing",
             "worker",
+            "--mm-fetch-timeout-ms",
+            "60000",
+            "--mm-video-fetch-timeout-ms",
+            "120000",
             "--mm-pixel-cache-mb",
             "256",
             "--mm-pixel-rdma",
@@ -5717,6 +5421,8 @@ mod tests {
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.mm_processing, Some(MmProcessingMode::Worker));
         assert_eq!(router_config.mm_pixel_cache_mb, Some(256));
+        assert_eq!(router_config.mm_fetch_timeout_ms, Some(60000));
+        assert_eq!(router_config.mm_video_fetch_timeout_ms, Some(120000));
         assert!(router_config.mm_pixel_rdma);
         assert_eq!(router_config.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(router_config.rdma_slot_ttl_s, Some(600));
@@ -5729,6 +5435,8 @@ mod tests {
         let nested = &server_config.router_config;
         assert_eq!(nested.mm_processing, Some(MmProcessingMode::Worker));
         assert_eq!(nested.mm_pixel_cache_mb, Some(256));
+        assert_eq!(nested.mm_fetch_timeout_ms, Some(60000));
+        assert_eq!(nested.mm_video_fetch_timeout_ms, Some(120000));
         assert!(nested.mm_pixel_rdma);
         assert_eq!(nested.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(nested.rdma_slot_ttl_s, Some(600));
@@ -5751,6 +5459,8 @@ mod tests {
         assert_eq!(router_config.mm_allowed_media_domains, None);
         assert!(!router_config.mm_allow_private_media_hosts);
         assert_eq!(router_config.mm_turbojpeg, None);
+        assert_eq!(router_config.mm_fetch_timeout_ms, None);
+        assert_eq!(router_config.mm_video_fetch_timeout_ms, None);
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(server_config.router_config.mm_processing, None);
@@ -6226,16 +5936,19 @@ mod tests {
     /// where the operator set one.
     #[test]
     fn a_variable_that_is_not_utf8_is_refused_not_passed_over() {
-        assert_eq!(env_value("SMG_API_KEY", None).expect("unset"), None);
         assert_eq!(
-            env_value("SMG_API_KEY", Some("k".into())).expect("set"),
+            cli::secrets::env_value("SMG_API_KEY", None).expect("unset"),
+            None
+        );
+        assert_eq!(
+            cli::secrets::env_value("SMG_API_KEY", Some("k".into())).expect("set"),
             Some("k".to_string())
         );
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
             let raw = std::ffi::OsString::from_vec(vec![b'k', 0xff, b'y']);
-            let err = env_value("SMG_API_KEY", Some(raw)).expect_err("not UTF-8");
+            let err = cli::secrets::env_value("SMG_API_KEY", Some(raw)).expect_err("not UTF-8");
             assert!(
                 matches!(&err, ConfigError::InvalidValue { field, value, .. }
                     if field == "SMG_API_KEY" && value == "<not UTF-8>"),

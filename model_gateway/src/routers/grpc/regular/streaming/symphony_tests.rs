@@ -15,7 +15,7 @@ use openai_protocol::{
 use serde_json::{json, Value};
 use smg_grpc_client::{tokenspeed_proto::GenerateComplete, vllm_engine::proto};
 use symphony::{
-    formats::{deepseek_v4, glm, plain, qwen3},
+    formats::{deepseek_v4, deepseek_v4_1, gemma4, glm, glm4, llama4, plain, qwen3},
     CallSyntax, Format,
 };
 
@@ -32,7 +32,7 @@ use crate::{
         proto_wrapper::ProtoGenerateComplete,
         regular::{
             processor::ResponseProcessor,
-            symphony::{assign, template::Templates, Asks, Assignment},
+            symphony::{assign, template::Templates, testing::Refusing, Asks, Assignment},
         },
         utils::ModelNames,
     },
@@ -56,13 +56,29 @@ async fn stream_events(
     with_tools: bool,
     spec: ChatResponseSpec,
 ) -> (Result<(), utils::StreamFailure>, Vec<Value>) {
+    stream_events_through(
+        Arc::new(CharacterTokenizer::default()),
+        responses,
+        with_tools,
+        spec,
+    )
+    .await
+}
+
+/// [`stream_events`] decoding through `tokenizer`.
+async fn stream_events_through(
+    tokenizer: Arc<dyn Tokenizer>,
+    responses: Vec<proto::GenerateResponse>,
+    with_tools: bool,
+    spec: ChatResponseSpec,
+) -> (Result<(), utils::StreamFailure>, Vec<Value>) {
     let (stream, server) = scripted_stream(responses, "0").await;
     let (tx, rx) = sse_channel();
     let result = processor(with_tools)
         .process_streaming_chunks(
             stream,
             dispatch(),
-            Arc::new(CharacterTokenizer::default()),
+            tokenizer,
             (None, None, false, false, false),
             spec,
             &tx,
@@ -348,11 +364,39 @@ async fn fold(output: &str) -> (ChatChoice, u32) {
 
 /// [`fold`] over `format` after `prompt`.
 async fn fold_with(output: &str, format: Format, prompt: &str) -> (ChatChoice, u32) {
-    let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
+    fold_finished(output, format, prompt, "stop").await
+}
+
+/// [`fold_with`] with the engine's finish reason chosen.
+async fn fold_finished(
+    output: &str,
+    format: Format,
+    prompt: &str,
+    finish_reason: &str,
+) -> (ChatChoice, u32) {
+    fold_through(
+        Arc::new(CharacterTokenizer::default()),
+        output,
+        format,
+        prompt,
+        finish_reason,
+    )
+    .await
+    .expect("a choice")
+}
+
+/// [`fold_finished`] decoding through `tokenizer`, with the unary path's own verdict.
+async fn fold_through(
+    tokenizer: Arc<dyn Tokenizer>,
+    output: &str,
+    format: Format,
+    prompt: &str,
+    finish_reason: &str,
+) -> Result<(ChatChoice, u32), String> {
     let output_ids: Vec<u32> = output.chars().map(u32::from).collect();
     let complete = ProtoGenerateComplete::TokenSpeed(GenerateComplete {
         output_ids: output_ids.clone(),
-        finish_reason: "stop".to_string(),
+        finish_reason: finish_reason.to_string(),
         output_logprobs: Some(smg_grpc_client::tokenspeed_proto::OutputLogProbs {
             token_logprobs: vec![-0.5; output_ids.len()],
             token_ids: output_ids,
@@ -384,7 +428,6 @@ async fn fold_with(output: &str, format: Format, prompt: &str) -> (ChatChoice, u
             None,
         )
         .await
-        .expect("a choice")
 }
 
 /// The tokens whose logprobs the choice kept, joined.
@@ -422,6 +465,110 @@ async fn symphony_folds_a_whole_output_into_the_message() {
         kept_logprob_tokens(&choice),
         "Hello ",
         "the content's tokens alone keep their logprobs"
+    );
+}
+
+/// A DSML call the token limit cut, the shape of a tool request whose `max_tokens` is below the
+/// call's length: the declared `lookup` tool, its first parameter whole, its second cut inside a
+/// `string="true"` value or inside a `string="false"` object.
+const CUT_CALL_PREFIX: &str = concat!(
+    "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n",
+    "<｜DSML｜ parameter name=\"q\" string=\"true\">rain</｜DSML｜ parameter>\n"
+);
+
+/// The two cut tails and the arguments a client reads for each: the prefix as the model wrote it.
+const CUT_CALL_TAILS: [(&str, &str); 2] = [
+    (
+        "<｜DSML｜ parameter name=\"city\" string=\"true\">Par",
+        r#"{"q": "rain", "city": "Par"#,
+    ),
+    (
+        "<｜DSML｜ parameter name=\"options\" string=\"false\">{\"days\": 3, \"uni",
+        r#"{"q": "rain", "options": {"days": 3, "uni"#,
+    ),
+];
+
+#[tokio::test]
+async fn a_streamed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
+    for (tail, arguments) in CUT_CALL_TAILS {
+        let output = format!("{CUT_CALL_PREFIX}{tail}");
+        // Chunked at the cut member's tag and inside its value, then the engine's `length`.
+        let at = output.find(tail).expect("the tail");
+        let inside = at + tail.len() - 2;
+        let spec = assigned(chat_spec(true), deepseek_v4_1(), "<think>");
+        let responses = vec![
+            chunk(0, &output[..at]),
+            chunk(0, &output[at..inside]),
+            chunk(0, &output[inside..]),
+            complete(0, "length"),
+        ];
+        let (result, events) = stream_events(responses, true, spec).await;
+        assert!(result.is_ok(), "{tail:?}: {result:?}");
+        let calls = tool_call_deltas(&events);
+        assert_eq!(
+            calls[0]["function"]["name"], "lookup",
+            "{tail:?}: {events:#?}"
+        );
+        let streamed: String = calls
+            .iter()
+            .filter_map(|call| call["function"]["arguments"].as_str())
+            .collect();
+        assert_eq!(streamed, arguments, "{tail:?}: {events:#?}");
+        assert_eq!(
+            chat_text(&events, 0, "content"),
+            "",
+            "nothing of the call is content: {tail:?}: {events:#?}"
+        );
+        let finish = events
+            .iter()
+            .find_map(|event| event["choices"][0]["finish_reason"].as_str())
+            .expect("a finish chunk");
+        assert_eq!(finish, "length", "{tail:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_whole_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
+    for (tail, arguments) in CUT_CALL_TAILS {
+        let output = format!("{CUT_CALL_PREFIX}{tail}");
+        let (choice, _) = fold_finished(&output, deepseek_v4_1(), "<think>", "length").await;
+        let calls = choice.message.tool_calls.as_ref().expect("the call");
+        assert_eq!(calls.len(), 1, "{tail:?}");
+        assert_eq!(calls[0].function.name, "lookup");
+        assert_eq!(
+            calls[0].function.arguments.as_deref(),
+            Some(arguments),
+            "{tail:?}: {choice:?}"
+        );
+        assert_eq!(
+            choice.message.content, None,
+            "nothing of the call is content: {tail:?}: {choice:?}"
+        );
+        assert_eq!(choice.finish_reason.as_deref(), Some("length"), "{tail:?}");
+    }
+}
+
+/// A DSML block the token limit cut before its invoke named a call, after a refusal inside it (a
+/// parameter tag where the name's quote should have come, and the text after it): no call, so the
+/// reader releases the output's own slice from the invoke's opener as the content at the end, the
+/// held newline the cut found included, where a `Malformed` event with bytes at the cut ended that
+/// release and left the client the newline alone. The `calls` marker before it is the table's
+/// framing, dropped as always.
+#[tokio::test]
+async fn a_block_the_token_limit_cut_before_a_call_was_named_is_released_whole_as_content() {
+    let invoke = "<｜DSML｜ invoke name=\"f<｜DSML｜ parameter name=\"s\" string=\"true\">x\n";
+    let output = format!("</think>\n\n<｜DSML｜ calls>\n{invoke}");
+    let (choice, _) = fold_finished(&output, deepseek_v4_1(), "<think>", "length").await;
+    assert!(choice.message.tool_calls.is_none(), "{choice:?}");
+    assert_eq!(
+        choice.message.content.as_deref(),
+        Some(invoke),
+        "the slice from the invoke's opener, whole: {choice:?}"
+    );
+    assert_eq!(
+        choice.finish_reason.as_deref(),
+        Some("length"),
+        "{choice:?}"
     );
 }
 
@@ -516,6 +663,22 @@ pub(super) async fn message_events(
     spec: MessagesResponseSpec,
     stop: Option<&str>,
 ) -> (Result<(), utils::StreamFailure>, Vec<Value>) {
+    message_events_through(
+        Arc::new(CharacterTokenizer::default()),
+        responses,
+        spec,
+        stop,
+    )
+    .await
+}
+
+/// [`message_events`] decoding through `tokenizer`.
+async fn message_events_through(
+    tokenizer: Arc<dyn Tokenizer>,
+    responses: Vec<proto::GenerateResponse>,
+    spec: MessagesResponseSpec,
+    stop: Option<&str>,
+) -> (Result<(), utils::StreamFailure>, Vec<Value>) {
     let (stream, server) = scripted_stream(responses, "0").await;
     let (tx, rx) = sse_channel();
     let stop = stop.map(|stop| StringOrArray::String(stop.to_string()));
@@ -523,7 +686,7 @@ pub(super) async fn message_events(
         .process_messages_streaming_chunks(
             stream,
             dispatch(),
-            Arc::new(CharacterTokenizer::default()),
+            tokenizer,
             (stop, None, false, false, false),
             spec,
             &tx,
@@ -793,7 +956,8 @@ async fn a_conversation_that_ends_with_a_system_turn_keeps_the_thought_out_of_th
 
 /// A `tool_use` block never carries `{}` for arguments the model wrote as JSON that no input
 /// value holds: the message is refused with the call named, where the stream carries the text as
-/// written for the client's own reader.
+/// written for the client's own reader. The refusal is counted once under the table by its
+/// reason; the output's own count stays the read's verdict, clean.
 #[tokio::test]
 async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() {
     let output = "<tool_call>\n{\"name\": \"lookup\", \"arguments\": {\"days\": 9.99e999999}}\n\
@@ -808,17 +972,19 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
     let (stream, server) = scripted_stream(vec![frame], "0").await;
     let tokenizer: Arc<dyn Tokenizer> = Arc::new(CharacterTokenizer::default());
     let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
-    let result = ResponseProcessor::new(
-        ToolParserFactory::new(),
-        ReasoningParserFactory::new(),
-        utils::ParserResolver::disabled(),
-    )
-    .process_non_streaming_messages_response(
-        context::ExecutionResult::Single { stream },
-        spec(),
-        dispatch(),
-        tokenizer,
-        &mut decoder,
+    let (result, scrape) = scraped(
+        ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        )
+        .process_non_streaming_messages_response(
+            context::ExecutionResult::Single { stream },
+            spec(),
+            dispatch(),
+            tokenizer,
+            &mut decoder,
+        ),
     )
     .await;
     server.abort();
@@ -841,9 +1007,34 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
             && body.contains("number out of range"),
         "{body}"
     );
-    // The stream: the fragments as the model wrote them, and the stop reason the calls give.
-    let (result, events) =
-        message_events(vec![chunk(0, output), complete(0, "stop")], spec(), None).await;
+    // Counted once under the table by its reason; the output's own count is the read's: clean.
+    let refused = series_line(
+        &scrape,
+        "smg_symphony_refused_total",
+        &["table=\"qwen3\"", "reason=\"tool_use_input\""],
+    )
+    .expect("the refused count");
+    assert!(refused.ends_with(" 1"), "{refused}");
+    let outputs = series_line(
+        &scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"clean\""],
+    )
+    .expect("the clean count");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert_eq!(
+        scrape.matches("smg_symphony_outputs_total{").count(),
+        1,
+        "{scrape}"
+    );
+    // The stream: the fragments as the model wrote them, and the stop reason the calls give;
+    // nothing refused, nothing counted as refused.
+    let ((result, events), scrape) = scraped(message_events(
+        vec![chunk(0, output), complete(0, "stop")],
+        spec(),
+        None,
+    ))
+    .await;
     assert!(result.is_ok(), "{result:?}");
     let partial: String = events
         .iter()
@@ -851,6 +1042,7 @@ async fn a_message_whose_tool_use_input_cannot_carry_the_arguments_is_refused() 
         .collect();
     assert_eq!(partial, "{\"days\": 9.99e999999}");
     assert_eq!(message_stop_reason(&events), "tool_use");
+    assert!(!scrape.contains("smg_symphony_refused_total"), "{scrape}");
 }
 
 /// The scrape of a recorder of this test's own after `read` ran on this thread (the test
@@ -1554,4 +1746,368 @@ async fn a_stream_whose_text_ends_in_a_python_call_in_the_tag_carries_the_block_
     .expect("the reason counter");
     assert!(reason.ends_with(" 1"), "{reason}");
     assert!(logs_contain(&format!("released_bytes={}", released.len())));
+}
+
+/// The scrape of an output whose decoder failed: counted `failed` for the table, once, and under
+/// no other outcome.
+fn counted_failed_once(scrape: &str) {
+    let outputs = series_line(
+        scrape,
+        "smg_symphony_outputs_total",
+        &["table=\"qwen3\"", "outcome=\"failed\""],
+    )
+    .expect("the failed count");
+    assert!(outputs.ends_with(" 1"), "{outputs}");
+    assert_eq!(
+        scrape.matches("smg_symphony_outputs_total{").count(),
+        1,
+        "{scrape}"
+    );
+}
+
+/// The frames of an output whose decoder's end comes at the engine's `Complete`, and of one
+/// whose end comes with the transport's, without a `Complete`.
+fn ends_of(output: &str) -> [Vec<proto::GenerateResponse>; 2] {
+    [
+        vec![chunk(0, output), complete(0, "stop")],
+        vec![chunk(0, output)],
+    ]
+}
+
+#[tokio::test]
+async fn a_decoders_end_that_fails_counts_the_output_as_failed_on_the_chat_paths() {
+    let format = || qwen3(CallSyntax::Json);
+    let prompt = "<|im_start|>assistant\n";
+    // The whole response: the request's error names the decoder's end.
+    let (result, scrape) = scraped(fold_through(
+        Arc::new(Refusing::the_end()),
+        "Hello",
+        format(),
+        prompt,
+        "stop",
+    ))
+    .await;
+    let error = result.expect_err("the decoder's end");
+    assert!(
+        error.contains("Failed to finish token decoding") && error.contains("refused"),
+        "{error}"
+    );
+    counted_failed_once(&scrape);
+    // The stream: the decoder's end at the engine's Complete, and at the transport's end.
+    for frames in ends_of("Hello") {
+        let ((result, _), scrape) = scraped(stream_events_through(
+            Arc::new(Refusing::the_end()),
+            frames,
+            true,
+            assigned(chat_spec(true), format(), prompt),
+        ))
+        .await;
+        let error = result.expect_err("the decoder's end");
+        assert!(format!("{error:?}").contains("refused"), "{error:?}");
+        counted_failed_once(&scrape);
+    }
+}
+
+#[tokio::test]
+async fn a_decoders_end_that_fails_counts_the_output_as_failed_on_the_messages_paths() {
+    let spec = || assigned_message(qwen3(CallSyntax::Json), "<|im_start|>assistant\n", false);
+    // The whole message: a 500 under the read failure's code.
+    let mut frame = complete(0, "stop");
+    if let Some(proto::generate_response::Response::Complete(complete)) = &mut frame.response {
+        complete.output_ids = "Hello".chars().map(u32::from).collect();
+        complete.completion_tokens = complete.output_ids.len() as u32;
+    }
+    let (stream, server) = scripted_stream(vec![frame], "0").await;
+    let tokenizer: Arc<dyn Tokenizer> = Arc::new(Refusing::the_end());
+    let mut decoder = utils::create_stop_decoder(&tokenizer, None, None, false, false, true);
+    let (result, scrape) = scraped(
+        ResponseProcessor::new(
+            ToolParserFactory::new(),
+            ReasoningParserFactory::new(),
+            utils::ParserResolver::disabled(),
+        )
+        .process_non_streaming_messages_response(
+            context::ExecutionResult::Single { stream },
+            spec(),
+            dispatch(),
+            tokenizer,
+            &mut decoder,
+        ),
+    )
+    .await;
+    server.abort();
+    let response = match result {
+        Ok((message, _)) => panic!("a message with {:?}", message.content),
+        Err(response) => response,
+    };
+    assert_eq!(response.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    let body = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        axum::body::to_bytes(response.into_body(), 65536),
+    )
+    .await
+    .expect("the body in time")
+    .expect("the body");
+    let body = String::from_utf8(body.to_vec()).expect("text");
+    assert!(
+        body.contains("symphony_read_failed") && body.contains("Failed to finish token decoding"),
+        "{body}"
+    );
+    counted_failed_once(&scrape);
+    // The stream: the decoder's end at the engine's Complete, and at the transport's end.
+    for frames in ends_of("Hello") {
+        let ((result, _), scrape) = scraped(message_events_through(
+            Arc::new(Refusing::the_end()),
+            frames,
+            spec(),
+            None,
+        ))
+        .await;
+        let error = result.expect_err("the decoder's end");
+        assert!(format!("{error:?}").contains("refused"), "{error:?}");
+        counted_failed_once(&scrape);
+    }
+}
+
+/// The generation prompt's tail of a table whose calls are a bare Python list.
+const PYTHONIC_PROMPT: &str = "<|header_start|>assistant<|header_end|>\n\n";
+
+/// A pythonic call the token limit cut, the shape of a tool request whose `max_tokens` is below
+/// the call's length: the declared `lookup` tool, cut inside its first quoted value and inside a
+/// second one; the arguments a client reads for each are the prefix as the model wrote it, the
+/// cut member's key and its open string included.
+const PYTHONIC_CUT_CALLS: [(&str, &str); 2] = [
+    ("[lookup(city=\"Par", r#"{"city": "Par"#),
+    (
+        "[lookup(city=\"Paris\", days=\"3",
+        r#"{"city": "Paris", "days": "3"#,
+    ),
+];
+
+#[tokio::test]
+async fn a_streamed_pythonic_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length(
+) {
+    for (output, arguments) in PYTHONIC_CUT_CALLS {
+        // Chunked before the cut member's key and inside its value, then the engine's `length`.
+        let at = output.rfind(", ").map_or(8, |at| at + 2);
+        let spec = assigned(chat_spec(true), llama4(), PYTHONIC_PROMPT);
+        let responses = vec![
+            chunk(0, &output[..at]),
+            chunk(0, &output[at..output.len() - 2]),
+            chunk(0, &output[output.len() - 2..]),
+            complete(0, "length"),
+        ];
+        let (result, events) = stream_events(responses, true, spec).await;
+        assert!(result.is_ok(), "{output:?}: {result:?}");
+        let calls = tool_call_deltas(&events);
+        assert_eq!(
+            calls[0]["function"]["name"], "lookup",
+            "{output:?}: {events:#?}"
+        );
+        let streamed: String = calls
+            .iter()
+            .filter_map(|call| call["function"]["arguments"].as_str())
+            .collect();
+        assert_eq!(streamed, arguments, "{output:?}: {events:#?}");
+        assert_eq!(
+            chat_text(&events, 0, "content"),
+            "",
+            "nothing of the call is content: {output:?}: {events:#?}"
+        );
+        let finish = events
+            .iter()
+            .find_map(|event| event["choices"][0]["finish_reason"].as_str())
+            .expect("a finish chunk");
+        assert_eq!(finish, "length", "{output:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_whole_pythonic_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length()
+{
+    for (output, arguments) in PYTHONIC_CUT_CALLS {
+        let (choice, _) = fold_finished(output, llama4(), PYTHONIC_PROMPT, "length").await;
+        let calls = choice.message.tool_calls.as_ref().expect("the call");
+        assert_eq!(calls.len(), 1, "{output:?}");
+        assert_eq!(calls[0].function.name, "lookup");
+        assert_eq!(
+            calls[0].function.arguments.as_deref(),
+            Some(arguments),
+            "{output:?}: {choice:?}"
+        );
+        assert_eq!(
+            choice.message.content, None,
+            "nothing of the call is content: {output:?}: {choice:?}"
+        );
+        assert_eq!(
+            choice.finish_reason.as_deref(),
+            Some("length"),
+            "{output:?}"
+        );
+    }
+}
+
+/// The generation prompt's tail of the Gemma 4 table: the model's turn opened.
+const GEMMA_PROMPT: &str = "<|turn>model\n";
+
+/// A Gemma 4 call the token limit cut, the shape of a tool request whose `max_tokens` is below
+/// the call's length: the declared `lookup` tool, cut inside a bare member after a string member
+/// and cut inside its first string; the arguments a client reads for each are the prefix as the
+/// model wrote it, the cut member's key and bytes included and no closing brace.
+const GEMMA_CUT_CALLS: [(&str, &str); 2] = [
+    (
+        "<|tool_call>call:lookup{artist:<|\"|>Taylor<|\"|>,n:1",
+        r#"{"artist": "Taylor", "n": 1"#,
+    ),
+    (
+        "<|tool_call>call:lookup{artist:<|\"|>Tay",
+        r#"{"artist": "Tay"#,
+    ),
+];
+
+#[tokio::test]
+async fn a_streamed_gemma_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length()
+{
+    for (output, arguments) in GEMMA_CUT_CALLS {
+        // Chunked before the cut member and inside it, then the engine's `length`.
+        let spec = assigned(chat_spec(true), gemma4(), GEMMA_PROMPT);
+        let responses = vec![
+            chunk(0, &output[..output.len() - 4]),
+            chunk(0, &output[output.len() - 4..output.len() - 1]),
+            chunk(0, &output[output.len() - 1..]),
+            complete(0, "length"),
+        ];
+        let (result, events) = stream_events(responses, true, spec).await;
+        assert!(result.is_ok(), "{output:?}: {result:?}");
+        let calls = tool_call_deltas(&events);
+        assert_eq!(
+            calls[0]["function"]["name"], "lookup",
+            "{output:?}: {events:#?}"
+        );
+        let streamed: String = calls
+            .iter()
+            .filter_map(|call| call["function"]["arguments"].as_str())
+            .collect();
+        assert_eq!(streamed, arguments, "{output:?}: {events:#?}");
+        assert!(
+            serde_json::from_str::<Value>(&streamed).is_err(),
+            "the arguments stay cut: {streamed:?}"
+        );
+        assert_eq!(
+            chat_text(&events, 0, "content"),
+            "",
+            "nothing of the call is content: {output:?}: {events:#?}"
+        );
+        let finish = events
+            .iter()
+            .find_map(|event| event["choices"][0]["finish_reason"].as_str())
+            .expect("a finish chunk");
+        assert_eq!(finish, "length", "{output:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_whole_gemma_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
+    for (output, arguments) in GEMMA_CUT_CALLS {
+        let (choice, _) = fold_finished(output, gemma4(), GEMMA_PROMPT, "length").await;
+        let calls = choice.message.tool_calls.as_ref().expect("the call");
+        assert_eq!(calls.len(), 1, "{output:?}");
+        assert_eq!(calls[0].function.name, "lookup");
+        assert_eq!(
+            calls[0].function.arguments.as_deref(),
+            Some(arguments),
+            "{output:?}: {choice:?}"
+        );
+        assert_eq!(
+            choice.message.content, None,
+            "nothing of the call is content: {output:?}: {choice:?}"
+        );
+        assert_eq!(
+            choice.finish_reason.as_deref(),
+            Some("length"),
+            "{output:?}"
+        );
+    }
+}
+
+/// The generation prompt's tail of the GLM 4.5 and 4.6 table: the turn opened.
+const KEYED_PROMPT: &str = "<|assistant|>";
+
+/// A keyed call the token limit cut, the shape of a tool request whose `max_tokens` is below the
+/// call's length: the declared `lookup` tool, its first value whole, then cut inside an object
+/// value and inside an integer, both held for their close; the arguments a client reads for each
+/// are the prefix as the model wrote it, the cut member's key and bytes included.
+const KEYED_CUT_CALLS: [(&str, &str); 2] = [
+    (
+        "\n<think></think>\n<tool_call>lookup\n<arg_key>q</arg_key>\n<arg_value>rain</arg_value>\n\
+         <arg_key>options</arg_key>\n<arg_value>{\"days\": 3, \"uni",
+        r#"{"q": "rain", "options": {"days": 3, "uni"#,
+    ),
+    (
+        "\n<think></think>\n<tool_call>lookup\n<arg_key>q</arg_key>\n<arg_value>rain</arg_value>\n\
+         <arg_key>n</arg_key>\n<arg_value>12",
+        r#"{"q": "rain", "n": 12"#,
+    ),
+];
+
+#[tokio::test]
+async fn a_streamed_keyed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length()
+{
+    for (output, arguments) in KEYED_CUT_CALLS {
+        // Chunked before the cut member's key tag and inside its value, then the engine's `length`.
+        let at = output.rfind("<arg_key>").expect("the cut member's tag");
+        let spec = assigned(chat_spec(true), glm4(), KEYED_PROMPT);
+        let responses = vec![
+            chunk(0, &output[..at]),
+            chunk(0, &output[at..output.len() - 2]),
+            chunk(0, &output[output.len() - 2..]),
+            complete(0, "length"),
+        ];
+        let (result, events) = stream_events(responses, true, spec).await;
+        assert!(result.is_ok(), "{output:?}: {result:?}");
+        let calls = tool_call_deltas(&events);
+        assert_eq!(
+            calls[0]["function"]["name"], "lookup",
+            "{output:?}: {events:#?}"
+        );
+        let streamed: String = calls
+            .iter()
+            .filter_map(|call| call["function"]["arguments"].as_str())
+            .collect();
+        assert_eq!(streamed, arguments, "{output:?}: {events:#?}");
+        assert_eq!(
+            chat_text(&events, 0, "content"),
+            "",
+            "nothing of the call is content: {output:?}: {events:#?}"
+        );
+        let finish = events
+            .iter()
+            .find_map(|event| event["choices"][0]["finish_reason"].as_str())
+            .expect("a finish chunk");
+        assert_eq!(finish, "length", "{output:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_whole_keyed_call_the_token_limit_cut_keeps_its_bytes_in_the_call_and_finishes_length() {
+    for (output, arguments) in KEYED_CUT_CALLS {
+        let (choice, _) = fold_finished(output, glm4(), KEYED_PROMPT, "length").await;
+        let calls = choice.message.tool_calls.as_ref().expect("the call");
+        assert_eq!(calls.len(), 1, "{output:?}");
+        assert_eq!(calls[0].function.name, "lookup");
+        assert_eq!(
+            calls[0].function.arguments.as_deref(),
+            Some(arguments),
+            "{output:?}: {choice:?}"
+        );
+        assert_eq!(
+            choice.message.content, None,
+            "nothing of the call is content: {output:?}: {choice:?}"
+        );
+        assert_eq!(
+            choice.finish_reason.as_deref(),
+            Some("length"),
+            "{output:?}"
+        );
+    }
 }

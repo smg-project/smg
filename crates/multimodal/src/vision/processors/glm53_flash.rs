@@ -492,7 +492,7 @@ fn preprocess_video_frames<F: RgbSource>(
     .with_extra(
         "video_second_per_grid",
         ModelSpecificValue::Tensor {
-            data: vec![params.temporal as f32 / fps],
+            data: vec![(params.temporal as f64 / fps) as f32],
             shape: vec![1],
         },
     ))

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 from infra.streams import (
     StreamedToolCall,
     collect_streamed_chat,
     collect_streamed_response,
+    read_sse_chat,
 )
 from openai.types.chat import ChatCompletionChunk
 from openai.types.responses import (
@@ -181,3 +184,73 @@ def test_a_response_stream_that_never_completed_has_no_final_response():
     assert streamed.completed_events == []
     with pytest.raises(AssertionError, match="no response.completed event"):
         streamed.final_response
+
+
+def _data(frame: dict | str) -> str:
+    return "data: " + (frame if isinstance(frame, str) else json.dumps(frame))
+
+
+def _sse_chunk(delta: dict, finish_reason: str | None = None) -> str:
+    return _data(
+        {
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+        }
+    )
+
+
+def test_a_completed_sse_stream_reads_its_finish_reason_and_done():
+    first = []
+    end = read_sse_chat(
+        [
+            ": keep-alive",
+            "event: message",
+            _sse_chunk({"role": "assistant", "content": ""}),
+            "",
+            _sse_chunk({"content": "Once"}),
+            _sse_chunk({"content": " upon"}, finish_reason="length"),
+            # A usage-only chunk has no choices and counts for nothing.
+            _data({"id": "chatcmpl-1", "choices": [], "usage": {"total_tokens": 3}}),
+            _data("[DONE]"),
+            _sse_chunk({"content": "never read"}),
+        ],
+        on_first_chunk=lambda: first.append(True),
+    )
+
+    assert (end.chunks, end.finish_reason, end.error, end.done) == (3, "length", None, True)
+    assert first == [True]
+
+
+def test_a_failed_sse_stream_reads_the_error_frame_and_done():
+    # What the gateway sends when the worker's stream fails after the headers.
+    end = read_sse_chat(
+        [
+            _sse_chunk({"role": "assistant", "content": "Once"}),
+            _data(
+                {
+                    "error": {
+                        "message": "decode stream failed: connection closed",
+                        "type": "stream_error",
+                        "code": "worker_stream_failed",
+                    }
+                }
+            ),
+            _data("[DONE]"),
+        ]
+    )
+
+    assert end.chunks == 1
+    assert end.finish_reason is None
+    assert end.error == {
+        "message": "decode stream failed: connection closed",
+        "type": "stream_error",
+        "code": "worker_stream_failed",
+    }
+    assert end.done
+
+
+def test_a_cut_sse_stream_is_neither_finished_nor_done():
+    end = read_sse_chat([_sse_chunk({"content": "Once"}), "data: {not json", "data: 42"])
+
+    assert (end.chunks, end.finish_reason, end.error, end.done) == (1, None, None, False)

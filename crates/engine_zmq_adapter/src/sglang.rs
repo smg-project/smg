@@ -763,21 +763,18 @@ pub(crate) fn normalize_finish_reason(reason: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use engine_zmq_client::{
         codec::{decode_msgpack, encode_msgpack},
-        mock_engine::{connect_to_frontend, default_ready_response},
+        mock_engine::default_ready_response,
         protocol::sglang::{
             output::BatchTokenIDSlimOutput,
             request::{SglangRequestType, TokenizedGenerateReqInput as WireRequest},
         },
-        EngineId,
     };
     use openai_protocol::worker::RuntimeType;
 
     use super::*;
-    use crate::{client::ZmqEngineClient, eos::EosTokenIds};
+    use crate::test_support::connected_pair;
 
     /// The translation under the mock scheduler's context window.
     fn translate(req: sglang_proto::GenerateRequest) -> Result<WireRequest, String> {
@@ -1027,29 +1024,7 @@ mod tests {
     /// back to vLLM-proto responses, matched stop included.
     #[tokio::test]
     async fn generate_e2e_translates_and_streams_sglang() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Sglang,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let client = client.expect("adapter connect");
-        let engine = engine.expect("mock engine");
+        let (client, engine, _dir) = connected_pair(RuntimeType::Sglang).await;
 
         let unsupported = client
             .generate_sglang(sglang_proto::GenerateRequest {
@@ -1193,27 +1168,7 @@ mod tests {
     /// indexed `Complete`s that each report the shared prompt in full.
     #[tokio::test]
     async fn generate_e2e_fans_out_n2_sglang() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Sglang,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let (client, engine) = (client.unwrap(), engine.unwrap());
+        let (client, engine, _dir) = connected_pair(RuntimeType::Sglang).await;
         #[expect(
             clippy::disallowed_methods,
             reason = "engine task ends after responding"
@@ -1289,27 +1244,7 @@ mod tests {
     /// scheduler's 400 as the caller's fault.
     #[tokio::test]
     async fn sglang_abort_finish_is_an_error_with_the_scheduler_status() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Sglang,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let (client, engine) = (client.unwrap(), engine.unwrap());
+        let (client, engine, _dir) = connected_pair(RuntimeType::Sglang).await;
         #[expect(
             clippy::disallowed_methods,
             reason = "engine task ends after responding"
@@ -1378,27 +1313,7 @@ mod tests {
     async fn only_the_abort_the_scheduler_attributes_to_the_grammar_is_the_constraint_failing() {
         use smg_grpc_client::is_constraint_failure;
 
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::Sglang,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let (client, engine) = (client.unwrap(), engine.unwrap());
+        let (client, engine, _dir) = connected_pair(RuntimeType::Sglang).await;
         // (rid, the plugin's err_type column, the status, the message, the code)
         let cases = [
             (

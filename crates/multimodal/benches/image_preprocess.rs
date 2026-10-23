@@ -20,7 +20,9 @@ use llm_multimodal::{
     encoder_inputs::EncoderDtype,
     vision::{
         preprocessor_config::PreProcessorConfig,
-        processors::{Llama4VisionProcessor, Qwen2VLProcessor, Qwen3VLProcessor},
+        processors::{
+            DeepseekV41Processor, Llama4VisionProcessor, Qwen2VLProcessor, Qwen3VLProcessor,
+        },
         transforms, VisionPreProcessor,
     },
     Modality,
@@ -295,7 +297,7 @@ criterion_group!(
 criterion_group!(
     name = wire_benches;
     config = Criterion::default().with_measurement(CpuTime);
-    targets = bench_wire_write
+    targets = bench_wire_write, bench_deepseek_v41
 );
 criterion_main!(benches, wire_benches);
 
@@ -551,6 +553,50 @@ fn wire_class(w: u32, h: u32, target: (usize, usize)) -> String {
     } else {
         format!("{w}x{h}-to-{tw}x{th}")
     }
+}
+
+// ── DeepSeek V4.1: one image per size class ──────────────────────
+
+/// The per-image cost of the patch processor (the contain fit or stretch to
+/// the planned grid, then the normalised patches) on one image of each size
+/// class, in CPU time: what an image pays before its request can leave.
+fn bench_deepseek_v41(c: &mut Criterion<CpuTime>) {
+    let config = PreProcessorConfig::from_json(
+        r#"{"patch_size": 14, "min_pixels": 295936, "downsample_ratio": 3, "max_image_tokens": 1024}"#,
+    )
+    .unwrap();
+    let processor = DeepseekV41Processor::from_preprocessor_config(&config);
+    // (class, width, height): the medians of the size classes an image
+    // corpus falls into, from a small diagram to a 4k-side scan.
+    let classes: &[(&str, u32, u32)] = &[
+        ("small", 300, 232),
+        ("medium", 640, 480),
+        ("large", 1024, 768),
+        ("document", 1240, 1754),
+        ("scan", 2048, 1536),
+        ("huge", 4096, 3072),
+    ];
+    let mut group = c.benchmark_group("deepseek_v41");
+    group
+        .sample_size(20)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(2));
+    for &(class, w, h) in classes {
+        let plan = processor.plan_image_grid(w, h);
+        let images = [make_test_image(w, h)];
+        group.bench_with_input(
+            BenchmarkId::new(
+                "single",
+                format!(
+                    "{class}-{w}x{h}-to-{}x{}",
+                    plan.best_width, plan.best_height
+                ),
+            ),
+            &images,
+            |b, imgs| b.iter(|| processor.preprocess(imgs).unwrap()),
+        );
+    }
+    group.finish();
 }
 
 /// The processors that emit pixel bytes write the wire in two passes or in

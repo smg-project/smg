@@ -8,13 +8,13 @@
 //! ```
 //!
 //! The table has one state, an arguments state the output starts in, and the pythonic assembler
-//! reads the turn bare ([`pythonic::Assembler::bare`](crate::pythonic::Assembler::bare)): the list
+//! reads the turn bare (`pythonic::Assembler::bare`): the list
 //! as it arrives where the turn starts with one; content otherwise, and a list after the content
 //! once it is whole, well formed and made of calls to the request's tools, since code holds
 //! `[name(` of its own; the template's wrapping after the list. The
 //! template writes every value as `"%s"` of it, so the quotes carry no type and a quoted value
 //! reads by the type the request's tool declares for the parameter
-//! ([`Dialect::LLAMA4`](crate::pythonic::Dialect::LLAMA4)). The model's `<|python_start|>` and
+//! (`Dialect::LLAMA4`). The model's `<|python_start|>` and
 //! `<|python_end|>`, which it may write around its text or the list, are dropped wherever they
 //! stand. A turn opens with `<|header_start|>assistant<|header_end|>`, so the prompt's replay
 //! starts there. Recorded as `llama-4-scout-17b-16e-instruct` and
@@ -460,19 +460,76 @@ mod tests {
         assert_eq!(dropped(&events), ["[", "]", "\n\n"]);
         let events = run_until(PROMPT, &["[get_weather(city=\"Par"], EngineFinish::Length);
         assert_eq!(content(&events), "");
-        // A value is held until its extent is known, so a cut one comes back as the unterminated
-        // region's text and the call ends with nothing of its own.
-        assert_eq!(calls(&events), [("get_weather".to_string(), String::new())]);
+        // A value is held until its extent is known; cut by the token limit it is the call's own
+        // fragment, the open string as written, and the one word of no bytes before the call's
+        // end says that the arguments are no whole value.
+        assert_eq!(
+            calls(&events),
+            [("get_weather".to_string(), r#"{"city": "Par"#.to_string())]
+        );
+        assert_eq!(malformed(&events), "");
         assert!(events.iter().any(|event| matches!(
             event,
             Event::Malformed { text, why: MalformedReason::UnterminatedRegion }
-                if text.text == "city=\"Par"
+                if text.text.is_empty()
         )));
         assert_eq!(finish(&events), (FinishReason::Length, 1));
         // A bracket the end cut before any call is content, as it would have been.
         let events = run_until(PROMPT, &["[get_wea"], EngineFinish::Length);
         assert_eq!(content(&events), "[get_wea");
         assert!(calls(&events).is_empty());
+    }
+
+    /// A call the token limit cut, the shape of a tool request whose `max_tokens` is below the
+    /// call's length: inside the first value's quotes, inside a second quoted value, after a
+    /// key's `=` and inside a key. The call's arguments are the prefix as the model wrote it,
+    /// the cut member's key and its open string included; nothing of the call reaches a chat
+    /// client as content; the one word before the call's end says that the arguments are no
+    /// whole value; and the finish is the engine's `length`, whole, a character at a time and
+    /// at every two-way cut.
+    #[test]
+    fn a_call_the_token_limit_cut_keeps_its_bytes_as_its_arguments_and_nothing_as_content() {
+        use crate::testing::the_same_at_every_cut;
+        for (output, arguments) in [
+            ("[get_weather(city=\"Par", r#"{"city": "Par"#),
+            (
+                "[get_weather(city=\"Paris\", days=\"3",
+                r#"{"city": "Paris", "days": "3"#,
+            ),
+            (
+                "[get_weather(city=\"Paris\", days=",
+                r#"{"city": "Paris", "days": "#,
+            ),
+            ("[get_weather(city=\"Paris\", da", r#"{"city": "Paris""#),
+        ] {
+            let read = |pieces: &[&str]| run_until(PROMPT, pieces, EngineFinish::Length);
+            let said = the_same_at_every_cut(read, output);
+            assert_eq!(
+                said.calls,
+                vec![("get_weather".to_string(), arguments.to_string())],
+                "{output:?}"
+            );
+            assert_eq!(said.finish, Some((FinishReason::Length, 1)), "{output:?}");
+            assert_eq!(said.content, "", "{output:?}");
+            let events = read(&[output]);
+            assert_eq!(bytes(&events), output, "{output:?}");
+            assert_eq!(
+                malformed(&events),
+                "",
+                "nothing of the call is content: {events:?}"
+            );
+            assert!(
+                matches!(
+                    &events[events.len() - 3..],
+                    [
+                        Event::Malformed { text, why: MalformedReason::UnterminatedRegion },
+                        Event::ToolCallEnd { source, .. },
+                        Event::Finish { .. },
+                    ] if text.text.is_empty() && source.text.is_empty()
+                ),
+                "{output:?}: {events:?}"
+            );
+        }
     }
 
     /// The model explains which call it would make, the list inside the sentence: the chat

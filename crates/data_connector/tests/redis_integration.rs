@@ -28,13 +28,18 @@ fn test_redis_url() -> Option<String> {
     std::env::var("DATA_CONNECTOR_TEST_REDIS_URL").ok()
 }
 
+/// The retention the bundles below are built with: one day, in the days the
+/// configuration takes and in the milliseconds `PTTL` answers.
+const RETENTION_DAYS: u64 = 1;
+const RETENTION_MS: i64 = 86_400_000;
+
 async fn redis_bundle(url: &str) -> Result<StorageBundle, String> {
     let redis_cfg = RedisConfig {
         url: url.to_string(),
         pool_max: 4,
         op_timeout_secs: RedisConfig::default_op_timeout_secs(),
         schema: None,
-        retention_days: Some(1),
+        retention_days: Some(RETENTION_DAYS),
     };
     create_storage(StorageFactoryConfig {
         backend: &HistoryBackend::Redis,
@@ -965,4 +970,290 @@ async fn a_conditional_object_update_whose_answer_is_lost_has_written_its_output
         .await
         .expect("delete response");
     assert!(record.found_by(&record.msg_id).await.is_none());
+}
+
+/// The milliseconds left on `key` (`-1`: no expiry, `-2`: no such key),
+/// read through the test's own connection.
+#[expect(
+    clippy::expect_used,
+    reason = "a helper of the tests below: a failure in one fails the test"
+)]
+async fn pttl(server: &mut MultiplexedConnection, key: &str) -> i64 {
+    redis::cmd("PTTL")
+        .arg(key)
+        .query_async(server)
+        .await
+        .expect("PTTL")
+}
+
+/// The milliseconds left on `record` and on `index`, read in one round trip
+/// so the two are compared at one instant.
+#[expect(
+    clippy::expect_used,
+    reason = "a helper of the tests below: a failure in one fails the test"
+)]
+async fn pttl_pair(server: &mut MultiplexedConnection, record: &str, index: &str) -> (i64, i64) {
+    redis::pipe()
+        .cmd("PTTL")
+        .arg(record)
+        .cmd("PTTL")
+        .arg(index)
+        .query_async(server)
+        .await
+        .expect("PTTL")
+}
+
+/// With a retention every conversation hash and item hash expires, and the
+/// sorted set listing a conversation's items did not: it stayed, one member
+/// per item ever linked, after everything it pointed at was gone, so a
+/// conversation never deleted left its index behind for good. The index
+/// carries the retention from its newest link (the one write of the link
+/// and its expiry), so it goes by itself and no earlier than the newest
+/// item it lists; a listing skips the entry of an item the retention took,
+/// as the memory store lists only the items it holds.
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn the_item_index_of_a_conversation_expires_with_its_items() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let bundle = redis_bundle(&url)
+        .await
+        .expect("failed to initialize Redis storage");
+    let mut server = redis::Client::open(url.as_str())
+        .expect("a client for the test's own commands")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect");
+    let conversations = bundle.conversation_storage;
+    let conversation = conversations
+        .create_conversation(NewConversation::default())
+        .await
+        .expect("create conversation");
+    let items = bundle.conversation_item_storage;
+
+    // Four items, their ids unique to this run (the server keeps the keys of
+    // earlier runs): three linked as a batch, the fourth on its own later.
+    let nonce = &conversation.id.0;
+    let ids: Vec<ConversationItemId> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|s| ConversationItemId::from(format!("msg_{s}_{nonce}").as_str()))
+        .collect();
+    for id in &ids {
+        items
+            .create_item(NewConversationItem {
+                id: Some(id.clone()),
+                response_id: None,
+                item_type: "message".to_string(),
+                role: Some("user".to_string()),
+                content: json!([]),
+                status: Some("completed".to_string()),
+                tenant: None,
+            })
+            .await
+            .expect("create item");
+    }
+    let mut stamps = AddedAtSequence::new();
+    let batch: Vec<_> = ids[..3]
+        .iter()
+        .map(|id| (id.clone(), stamps.next_added_at()))
+        .collect();
+    items
+        .link_items(&conversation.id, &batch)
+        .await
+        .expect("link items");
+
+    // The index expires as the newest item it lists does: its expiry was
+    // written after the item's with the same retention, so it goes no earlier
+    // (the two reads are one round trip, a millisecond apart at most).
+    let index_key = format!("conversation:{}:items", conversation.id.0);
+    let (item_left, index_left) =
+        pttl_pair(&mut server, &format!("item:{}", ids[2].0), &index_key).await;
+    assert!(
+        item_left > 0 && item_left <= RETENTION_MS,
+        "the item hash carries the retention ({item_left} ms left)"
+    );
+    assert!(
+        index_left > 0,
+        "the item index carries the retention too; with none ({index_left}) it outlives every item it lists"
+    );
+    assert!(
+        index_left <= RETENTION_MS && index_left + 50 >= item_left,
+        "the index ({index_left} ms left) goes with its newest item ({item_left} ms left), not before"
+    );
+
+    // A later link refreshes it: the index lives as long as its newest link.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    items
+        .link_item(&conversation.id, &ids[3], stamps.next_added_at())
+        .await
+        .expect("link item");
+    let refreshed = pttl(&mut server, &index_key).await;
+    assert!(
+        refreshed > RETENTION_MS - 1_000,
+        "a link refreshes the index's retention ({refreshed} ms left of {RETENTION_MS})"
+    );
+
+    // The retention takes the first item (brought forward here through the
+    // test's own connection): the listing skips its entry, as the memory
+    // store lists only the items it holds, and the item is gone.
+    let _: () = redis::cmd("PEXPIRE")
+        .arg(format!("item:{}", ids[0].0))
+        .arg(1)
+        .query_async(&mut server)
+        .await
+        .expect("bring the first item's retention forward");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let listed: Vec<ConversationItemId> = items
+        .list_items(
+            &conversation.id,
+            ListParams {
+                limit: 10,
+                order: SortOrder::Asc,
+                after: None,
+            },
+        )
+        .await
+        .expect("list items")
+        .into_iter()
+        .map(|item| item.id)
+        .collect();
+    assert_eq!(listed, ids[1..].to_vec(), "the items the retention left");
+    assert!(items.get_item(&ids[0]).await.expect("get item").is_none());
+
+    conversations
+        .delete_conversation(&conversation.id)
+        .await
+        .expect("delete conversation");
+}
+
+/// The sorted set listing a safety identifier's responses had no expiry
+/// either: an identifier never listed again kept one member per response it
+/// ever made, after the records themselves were gone. The index carries the
+/// retention from its newest entry, written with the record's own writes and
+/// refreshed by the conditional writes that refresh the record's (a status
+/// transition's object update, the store of the result); the listing still
+/// drops the entry of a record the retention took, as the memory store lists
+/// only the records it holds.
+#[tokio::test]
+#[ignore = "requires a live Redis server; set DATA_CONNECTOR_TEST_REDIS_URL and run with -- --ignored"]
+async fn the_identifier_index_expires_with_the_responses_it_indexes() {
+    let Some(url) = test_redis_url() else {
+        return;
+    };
+    let resp = redis_bundle(&url)
+        .await
+        .expect("failed to initialize Redis storage")
+        .response_storage;
+    let mut server = redis::Client::open(url.as_str())
+        .expect("a client for the test's own commands")
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connect");
+
+    // Two responses under one safety identifier (unique to this run): the
+    // first stored whole, the second queued and then stored through the
+    // conditional write, a background response's way.
+    let mut first = StoredResponse::new(None);
+    let identifier = format!("sid_{}", first.id.0);
+    first.safety_identifier = Some(identifier.clone());
+    first.raw_response = json!({"id": first.id.0, "status": "completed", "output": []});
+    let first_id = resp.store_response(first).await.expect("store the first");
+    let mut second = StoredResponse::new(None);
+    second.safety_identifier = Some(identifier.clone());
+    second.raw_response = json!({"id": second.id.0, "status": "queued", "output": []});
+    let second_id = resp
+        .store_response(second.clone())
+        .await
+        .expect("store the second, queued");
+
+    let index_key = format!("safety:{identifier}:responses");
+    let (record_left, index_left) = pttl_pair(
+        &mut server,
+        &format!("response:{}", second_id.0),
+        &index_key,
+    )
+    .await;
+    assert!(
+        record_left > 0 && record_left <= RETENTION_MS,
+        "the record carries the retention ({record_left} ms left)"
+    );
+    assert!(
+        index_left > 0,
+        "the identifier index carries the retention too; with none ({index_left}) it outlives every response it lists"
+    );
+    assert!(
+        index_left <= RETENTION_MS && index_left + 50 >= record_left,
+        "the index ({index_left} ms left) goes with its newest record ({record_left} ms left), not before"
+    );
+
+    // A status transition's object update refreshes the index's expiry as
+    // its script refreshes the record's, so a record that ends in a failure
+    // or a cancel is listed under its identifier for as long as it exists.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert!(matches!(
+        resp.update_response_object_if_open(
+            &second_id,
+            json!({"id": second.id.0, "status": "in_progress", "output": []})
+        )
+        .await
+        .expect("conditional update"),
+        ConditionalStore::Stored
+    ));
+    let refreshed = pttl(&mut server, &index_key).await;
+    assert!(
+        refreshed > RETENTION_MS - 1_000,
+        "a status transition refreshes the index's retention ({refreshed} ms left of {RETENTION_MS})"
+    );
+
+    // So does the conditional store of the result.
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    second.raw_response = json!({"id": second.id.0, "status": "completed", "output": []});
+    assert!(matches!(
+        resp.store_response_if_open(second)
+            .await
+            .expect("conditional store"),
+        ConditionalStore::Stored
+    ));
+    let refreshed = pttl(&mut server, &index_key).await;
+    assert!(
+        refreshed > RETENTION_MS - 1_000,
+        "a conditional store refreshes the index's retention ({refreshed} ms left of {RETENTION_MS})"
+    );
+
+    // The retention takes the first record (brought forward through the
+    // test's own connection): the listing answers the second alone and drops
+    // the first's entry from the index.
+    let _: () = redis::cmd("PEXPIRE")
+        .arg(format!("response:{}", first_id.0))
+        .arg(1)
+        .query_async(&mut server)
+        .await
+        .expect("bring the first record's retention forward");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let listed: Vec<ResponseId> = resp
+        .list_identifier_responses(&identifier, None, None)
+        .await
+        .expect("list the identifier's responses")
+        .into_iter()
+        .map(|response| response.id)
+        .collect();
+    assert_eq!(
+        listed,
+        vec![second_id.clone()],
+        "the record the retention left"
+    );
+    let members: i64 = redis::cmd("ZCARD")
+        .arg(&index_key)
+        .query_async(&mut server)
+        .await
+        .expect("ZCARD");
+    assert_eq!(
+        members, 1,
+        "the listing dropped the entry of the record that is gone"
+    );
+
+    resp.delete_response(&second_id)
+        .await
+        .expect("delete response");
 }

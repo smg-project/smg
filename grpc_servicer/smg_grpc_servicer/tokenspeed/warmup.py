@@ -6,6 +6,29 @@ TokenSpeed captures its decode graphs at start and tunes its attention and
 MoE kernels per shape as the shapes arrive; the first request at a token count
 pays the selection. The plan visits the counts before the health flips, under
 ``SMG_TOKENSPEED_SERVICER_WARMUP``.
+
+The plan here also visits every prompt length up to the chunk size, not only
+the length classes (:attr:`WarmupInputs.every_prefill_length`). A prefill
+chunk reaches two cuBLAS GEMMs in this engine (the compressor's fp32 router
+projection falls back to cuBLAS above 32 tokens; the grouped output
+projection is a batched GEMM), whose kernels the library picks per token
+count and loads on first use. A chunked prefill's last chunk is any count
+below the chunk size, so a long turn's second chunk is a count the engine has
+not seen; under the overlap schedule its forward is launched while the first
+chunk's TP collective is still in flight, and the lazy kernel load inside
+that forward has deadlocked every rank (the forward threads inside the
+driver's module load, the collective waiting for them). Every count used
+once before SERVING, with nothing else in flight, leaves no first use to
+serving. The remainders run last, in an order whose every prefix is a
+uniform spread of the range, so the budget cuts evenly if it cuts at all.
+They run at the ``full`` level alone (the shipped default): a start at
+``fast`` takes the length classes and leaves the hazard open, which the
+start log says.
+
+Under attention data parallelism the servicer routes by load and the wire
+pins no rank, so a remainder, like every prefill shape, reaches one rank: the
+hazard stays open on the other ranks there until the wire can pin a rank (the
+warning at planning says so).
 """
 
 from __future__ import annotations
@@ -23,6 +46,15 @@ WARMUP_ENV = "SMG_TOKENSPEED_SERVICER_WARMUP"
 #: The engine's own prefill budget when the arguments carry neither a chunk
 #: size nor a prefill budget as a count.
 DEFAULT_STEP_TOKENS = 8192
+#: This engine's default budget for the pass, in place of the shared
+#: :data:`smg_grpc_servicer.warmup.DEFAULT_BUDGET_SECS` (300 s, which the
+#: other engines keep): room for the chunk remainders at a 4,096-token chunk,
+#: 4,042 one-token requests at about 0.17 s each on a four-GPU node (692 s
+#: measured for the whole pass). At the engine's default step of 8,192
+#: tokens (no chunk size set) the remainders are about 8,140, about 1,380 s,
+#: and the budget cuts the pass about halfway, evenly (the spread order): a
+#: chunk size, or a larger budget on the knob, covers every count.
+DEFAULT_BUDGET_SECS = 900.0
 _MAX_MESSAGE_BYTES = 1024 * 1024 * 256
 
 
@@ -44,7 +76,10 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
         logger.warning(
             "The engine runs %d scheduler ranks and the servicer routes a warm-up request to the "
             "least-loaded one: each prefill shape of the planned warm-up reaches one rank; the "
-            "other ranks pay its first-time cost at their first request of that shape",
+            "other ranks pay its first-time cost at their first request of that shape, and the "
+            "chunk remainders, when the plan runs them (the full level), reach one rank each "
+            "too, so the hazard they answer (a count's first use during serving) stays open on "
+            "the other ranks until the wire can pin a rank",
             ranks,
         )
     step = args.chunked_prefill_size or args.max_prefill_tokens or DEFAULT_STEP_TOKENS
@@ -54,6 +89,8 @@ def warmup_inputs(server_args: Any, facts: Mapping[str, Any]) -> WarmupInputs | 
         max_model_len=args.max_model_len or int(facts.get("max_context_length") or 0),
         vocab_size=int(facts.get("vocab_size") or 0),
         source="window and step from the server arguments (the engine's default step when unset)",
+        # Every count a chunk can hold, once, before serving (the module's doc).
+        every_prefill_length=True,
     )
 
 
@@ -101,7 +138,12 @@ class GrpcWire:
         from smg_grpc_proto.generated import common_pb2
 
         response = self._stub.FlushCache(common_pb2.FlushCacheRequest(), timeout=60)
-        return bool(getattr(response, "success", True))
+        success = bool(getattr(response, "success", True))
+        if not success and (message := str(getattr(response, "message", "") or "")):
+            # The servicer answered the refusal with its reason: raised, the
+            # warm-up's end line carries the words as it does for a raised status.
+            raise RuntimeError(message)
+        return success
 
     def close(self) -> None:
         if self._owns_channel:

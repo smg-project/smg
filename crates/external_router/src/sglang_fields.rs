@@ -61,7 +61,7 @@ pub fn strip_sglang_fields(payload: &mut Value) {
 }
 
 /// Drop every [`SGLANG_FIELDS`] entry that is `null` or a boolean equal to
-/// the engine default for it ([`sglang_default`]). Everything else goes out
+/// the engine default for it (`sglang_default`). Everything else goes out
 /// as the client sent it.
 pub fn strip_default_sglang_fields(payload: &mut Value) {
     if let Some(obj) = payload.as_object_mut() {

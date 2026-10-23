@@ -56,7 +56,7 @@ pub struct TokenSpeedEncoderClient {
 }
 
 impl TokenSpeedEncoderClient {
-    /// Connect reusing a cached `Channel` for `endpoint` (see [`channel_cache`]).
+    /// Connect reusing a cached `Channel` for `endpoint` (see `channel_cache`).
     /// The lock is never held across the connect `await`, so a
     /// rare concurrent first-connect may build two channels for the same endpoint
     /// — harmless: the first cached wins and the extra is dropped.

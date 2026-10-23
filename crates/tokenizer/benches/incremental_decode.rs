@@ -114,6 +114,19 @@ fn bench_decode(c: &mut Criterion) {
         );
     });
 
+    group.bench_function("sequence_append_token_into", |b| {
+        b.iter_batched(
+            || (Sequence::new(dyn_tokenizer.clone()), String::new()),
+            |(mut seq, mut text)| {
+                for &id in &ids {
+                    seq.append_token_into(id, &mut text).expect("step");
+                }
+                text.len()
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
     group.bench_function("generic_decode_step", |b| {
         b.iter_batched(
             || (Vec::new(), String::new(), 0usize),
@@ -149,6 +162,27 @@ fn bench_decode(c: &mut Criterion) {
                     };
                 }
                 total
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("stop_decoder_process_token_into", |b| {
+        let config = StopSequenceConfig::default()
+            .with_stop_sequence("<|im_end|>")
+            .with_stop_sequence("\n\nHuman:");
+        b.iter_batched(
+            || {
+                (
+                    StopSequenceDecoder::new(dyn_tokenizer.clone(), config.clone(), false),
+                    String::new(),
+                )
+            },
+            |(mut decoder, mut text)| {
+                for &id in &ids {
+                    decoder.process_token_into(id, &mut text).expect("token");
+                }
+                text.len()
             },
             BatchSize::SmallInput,
         );

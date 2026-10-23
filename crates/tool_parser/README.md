@@ -153,7 +153,7 @@ pub struct StreamingParseResult {
    registry.map_model("my-model-*", "myparser");
    ```
 4. Add to `src/lib.rs` public exports
-5. Create `tests/tool_parser_<model>.rs` with test cases
+5. Create `tests/models/tool_parser_<model>.rs` with test cases and declare it in `tests/models/mod.rs`
 
 ## License
 

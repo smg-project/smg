@@ -40,6 +40,7 @@ from tokenspeed.runtime.multimodal.inputs import (
 from tokenspeed.runtime.multimodal.shm_transport import ShmTensorHandle
 
 from smg_grpc_servicer import mm_shm
+from smg_grpc_servicer.engine_status import grpc_code_for_http_status
 from smg_grpc_servicer.health_probe import await_probe
 from smg_grpc_servicer.mm_rdma import RdmaPixelPuller
 from smg_grpc_servicer.tokenizer_bundle import tokenizer_bundle, tokenizer_chunks
@@ -1827,14 +1828,13 @@ class TokenSpeedSchedulerServicer(tokenspeed_scheduler_pb2_grpc.TokenSpeedSchedu
 
 
 def _abort_status_code(reason: dict) -> grpc.StatusCode:
-    status_code = reason.get("status_code")
-    if status_code == 400:
-        return grpc.StatusCode.INVALID_ARGUMENT
-    if status_code in (408, 504):
-        return grpc.StatusCode.DEADLINE_EXCEEDED
-    if status_code == 429:
-        return grpc.StatusCode.RESOURCE_EXHAUSTED
-    return grpc.StatusCode.INTERNAL
+    """The gRPC code for an abort the engine reports with an HTTP-style
+    ``status_code`` (400 for the caller's input, 429 for a full queue, 408 or
+    504 for a timeout, ...): the table every engine servicer shares, so the
+    same engine condition is the same status behind every engine. An abort
+    without a status (a pause, a shutdown, a capacity abort) is ``INTERNAL``,
+    as it was."""
+    return grpc_code_for_http_status(reason.get("status_code"))
 
 
 def _version_str(version: Any) -> str | None:

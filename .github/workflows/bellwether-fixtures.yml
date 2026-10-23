@@ -239,10 +239,22 @@ jobs:
           pid[response_template_layout]=$!
           targets+=(response_template_lib response_template_layout)
           failed=()
+          # The tokenizer library behind the opt-in pipeline prints the whole vocabulary on
+          # stdout, megabytes per line, when a vocabulary spells the same bytes twice (literally
+          # and in the byte-level alphabet); a few models put gigabytes of it into this log. Each
+          # target's log is printed without those lines, with a count of them; the wait has read
+          # the exit status already, so the verdict is the same, and `|| true` keeps grep's
+          # "nothing left" status from ending the step. `-a` reads a log that holds a NUL byte
+          # line by line too, where grep would print "binary file matches" in place of the log.
+          dump='hash collision in vocab; rebuild with u128 keys'
           for target in "${targets[@]}"; do
             wait "${pid[$target]}" || failed+=("$target")
             echo "::group::$target"
-            cat "$RUNNER_TEMP/$target.log"
+            dumps=$(grep -a -c -e "$dump" "$RUNNER_TEMP/$target.log" || true)
+            grep -a -v -e "$dump" "$RUNNER_TEMP/$target.log" || true
+            if (( dumps > 0 )); then
+              echo "::notice::$target: $dumps vocabulary dump lines left out of the log"
+            fi
             echo "::endgroup::"
           done
           if (( ${#failed[@]} > 0 )); then

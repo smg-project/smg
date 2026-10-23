@@ -1,0 +1,46 @@
+[package]
+name = "smg-test-harness"
+version = "0.1.0"
+edition = "2021"
+rust-version.workspace = true
+publish = false
+description = "The gateway's test harness: the mock workers, app builders and launch helpers its integration tests share. A workspace member for tests only."
+
+[features]
+# The mock OpenAI-compatible server, used by the gateway's provider tests; the gateway's `provider-openai` feature turns it on.
+provider-openai = []
+
+[dependencies]
+smg = { path = "..", default-features = false, features = ["test-util"] }
+mock-worker = { path = "../../crates/mock_worker" }
+smg-grpc-client.workspace = true
+smg-data-connector.workspace = true
+smg-mcp.workspace = true
+smg-auth.workspace = true
+openai-protocol = { workspace = true, features = ["axum"] }
+llm-tokenizer.workspace = true
+tool-parser.workspace = true
+reasoning-parser.workspace = true
+anyhow.workspace = true
+axum = { workspace = true, features = ["macros", "multipart", "ws", "tracing"] }
+axum-server = { version = "0.8.0", default-features = false, features = ["tls-rustls-no-provider"] }
+futures.workspace = true
+futures-util = "0.3"
+http.workspace = true
+http-body-util = "0.1"
+openssl = "0.10.81"
+rand.workspace = true
+reqwest = { workspace = true, features = ["stream", "blocking", "json", "rustls-no-provider", "multipart", "http2"] }
+rmcp = { version = "1.7", features = ["client"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-pemfile = "2.2"
+serde_json = { version = "1.0", default-features = false, features = ["std", "preserve_order", "raw_value"] }
+tempfile = "3.27"
+tokio = { workspace = true, features = ["full", "test-util"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tonic.workspace = true
+tower = { version = "0.5", features = ["util"] }
+uuid = { workspace = true, features = ["serde", "fast-rng"] }
+
+[lints]
+workspace = true

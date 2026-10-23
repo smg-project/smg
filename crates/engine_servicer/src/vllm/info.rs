@@ -4,12 +4,12 @@
 
 use std::{sync::Arc, time::Duration};
 
-use engine_zmq_adapter::ZmqEngineClient;
 use smg_grpc_client::vllm_proto as vllm;
 use tonic::Status;
 use tracing::info;
 
-use super::{State, SERVER_TYPE};
+use super::{State, HEALTHY, SERVER_TYPE};
+use crate::load_report::{rank_ids, RankFigures};
 
 /// How often the engine stats line is logged (vLLM's `VLLM_LOG_STATS_INTERVAL`
 /// default).
@@ -26,11 +26,11 @@ pub(super) async fn log_engine_stats(state: Arc<State>) {
     let mut idle_logged = false;
     loop {
         ticker.tick().await;
-        let Some(client) = state.engine.client.get() else {
+        let Some(client) = state.shared.engine.client.get() else {
             continue;
         };
-        let prompt = state.metrics.prompt_tokens_total();
-        let generation = state.metrics.generation_tokens_total();
+        let prompt = state.shared.metrics.prompt_tokens_total();
+        let generation = state.shared.metrics.generation_tokens_total();
         let prompt_delta = prompt.saturating_sub(last_prompt);
         let generation_delta = generation.saturating_sub(last_generation);
         (last_prompt, last_generation) = (prompt, generation);
@@ -69,8 +69,8 @@ pub(super) async fn log_engine_stats(state: Arc<State>) {
 /// `HealthCheck`: SERVING only with the engine link up and no drain announced.
 pub(super) fn health_check(state: &State) -> vllm::HealthCheckResponse {
     vllm::HealthCheckResponse {
-        healthy: state.is_serving(),
-        message: state.health_message().to_string(),
+        healthy: state.shared.is_serving(),
+        message: state.shared.health_message(HEALTHY).to_string(),
     }
 }
 
@@ -82,12 +82,7 @@ pub(super) fn model_info(state: &State) -> vllm::GetModelInfoResponse {
     // for a launcher that reported none.
     let mut max_context_length = model.max_context_length;
     if max_context_length == 0 {
-        if let Some(ready) = state
-            .engine
-            .client
-            .get()
-            .and_then(ZmqEngineClient::ready_response)
-        {
+        if let Some(ready) = state.shared.ready() {
             max_context_length = u32::try_from(ready.max_model_len).unwrap_or(u32::MAX);
         }
     }
@@ -131,11 +126,7 @@ pub(super) async fn server_info(state: &State) -> vllm::GetServerInfoResponse {
 }
 
 fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
-    let ready = state
-        .engine
-        .client
-        .get()
-        .and_then(ZmqEngineClient::ready_response);
+    let ready = state.shared.ready();
     let data_parallel_size = ready
         .map(|ready| i32::try_from(ready.data_parallel_size).unwrap_or(i32::MAX))
         .filter(|&size| size > 0)
@@ -155,7 +146,7 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
         .unwrap_or_default();
     vllm::GetServerInfoResponse {
         active_requests: state.active_requests(),
-        uptime_seconds: state.started.elapsed().as_secs_f64(),
+        uptime_seconds: state.shared.started.elapsed().as_secs_f64(),
         server_type: SERVER_TYPE.to_string(),
         data_parallel_size,
         kv_connector: model.kv_connector.clone(),
@@ -174,26 +165,11 @@ fn server_facts(state: &State) -> vllm::GetServerInfoResponse {
         mm_device_do_normalize: model.mm_device_do_normalize,
         mm_item_limits: model.mm_item_limits.clone(),
         mm_encoder_budget: model.mm_encoder_budget,
-        max_num_seqs: max_num_seqs(state),
+        max_num_seqs: state.shared.running_window(model.max_num_seqs),
         engine_reasoning_parser: model.engine_reasoning_parser.clone(),
         constrained_decoding_start: model.constrained_decoding_start.clone(),
         ..Default::default()
     }
-}
-
-/// The scheduler's running window: the launcher's `--max-num-seqs`, else the
-/// handshake's; 0 before the engine is up on a launcher that reported none.
-fn max_num_seqs(state: &State) -> i32 {
-    if state.model.max_num_seqs > 0 {
-        return state.model.max_num_seqs;
-    }
-    state
-        .engine
-        .client
-        .get()
-        .and_then(ZmqEngineClient::ready_response)
-        .map(|ready| i32::try_from(ready.max_num_seqs).unwrap_or(i32::MAX))
-        .unwrap_or_default()
 }
 
 /// `GetLoads`: the per-rank load piggybacked on engine output, in the gRPC
@@ -203,29 +179,26 @@ fn max_num_seqs(state: &State) -> i32 {
 /// carry, each rank's own: the servicer picks the rank a request goes to
 /// and sees what that rank cached and streamed for it.
 pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
-    let client = state.engine()?;
+    let client = state.shared.engine()?;
     let ready = client.ready_response();
-    let max_running_requests = max_num_seqs(state);
-    let max_total_num_tokens = ready
-        .and_then(|ready| ready.kv_cache_size_tokens)
-        .map(|tokens| i32::try_from(tokens).unwrap_or(i32::MAX))
-        .unwrap_or_default();
+    let max_running_requests = state.shared.running_window(state.model.max_num_seqs);
+    let max_total_num_tokens = state.shared.kv_capacity_tokens();
     let snapshot = client.get_loads();
     let mut dp_rank_count = snapshot.dp_rank_count;
     let mut loads: Vec<vllm::SchedulerLoad> = snapshot
         .loads
         .into_iter()
         .map(|load| {
-            let num_used_tokens = (load.token_usage * f64::from(max_total_num_tokens)).round();
+            let figures = RankFigures::of(&load, max_total_num_tokens);
             let estimate = state.loads.estimate(load.dp_rank, load.num_waiting_reqs);
             vllm::SchedulerLoad {
-                dp_rank: load.dp_rank,
-                num_running_reqs: load.num_running_reqs,
-                num_waiting_reqs: load.num_waiting_reqs,
-                num_total_reqs: load.num_running_reqs.saturating_add(load.num_waiting_reqs),
-                num_used_tokens: num_used_tokens.clamp(0.0, f64::from(i32::MAX)) as i32,
-                token_usage: load.token_usage,
-                utilization: load.token_usage,
+                dp_rank: figures.dp_rank,
+                num_running_reqs: figures.running,
+                num_waiting_reqs: figures.waiting,
+                num_total_reqs: figures.total,
+                num_used_tokens: figures.used_tokens,
+                token_usage: figures.usage,
+                utilization: figures.usage,
                 max_running_requests,
                 max_total_num_tokens,
                 num_waiting_uncached_tokens: estimate.queued_token_work,
@@ -238,15 +211,9 @@ pub(super) fn loads(state: &State) -> Result<vllm::GetLoadsResponse, Status> {
         // No output batch has carried a snapshot yet. The Python servicer
         // reports a zero-filled entry per rank, and the Router reads an
         // empty list as no report at all.
-        let ranks = ready
-            .and_then(|ready| usize::try_from(ready.data_parallel_size).ok())
-            .filter(|&ranks| ranks > 0)
-            .or_else(|| usize::try_from(state.model.data_parallel_size).ok())
-            .unwrap_or(1)
-            .max(1);
-        loads = (0..ranks)
-            .map(|rank| {
-                let dp_rank = i32::try_from(rank).unwrap_or(i32::MAX);
+        let ranks = state.shared.rank_count(state.model.data_parallel_size);
+        loads = rank_ids(ranks)
+            .map(|dp_rank| {
                 // The servicer's own figures do not wait for the engine's
                 // first snapshot: what this rank cached and streamed so far,
                 // and the token-work queued to it. The engine has not said
