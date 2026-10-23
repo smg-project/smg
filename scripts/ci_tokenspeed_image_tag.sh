@@ -1,18 +1,21 @@
 #!/bin/bash
-# Resolve the newest published nightly; derive the carrier tag from its date.
+# Print the carrier tag of the pinned TokenSpeed nightly, or the version itself
+# with --version. The pin is .github/versions/tokenspeed-nightly.txt: the
+# carrier is built from it, the e2e lanes resolve its tag and install it, and a
+# bump is a pull request gated by its own TokenSpeed lanes, so a nightly that
+# does not import never reaches the lanes of every other pull request.
 set -euo pipefail
-python3 - "$@" <<'PYTHON'
-import re
-import sys
-import subprocess
 
-index = subprocess.check_output(
-    ["curl", "-fsSL", "--retry", "3", "--max-time", "30",
-     "https://lightseek.org/whl/nightly/tokenspeed/"], text=True
-)
-versions = re.findall(r"tokenspeed-(\d+\.\d+\.\d+\.post\d{8})-py3-none-any\.whl", index)
-if not versions:
-    raise RuntimeError("No dated TokenSpeed nightly wheels published")
-version = max(versions, key=lambda value: tuple(map(int, re.findall(r"\d+", value))))
-print(version if "--version" in sys.argv else f"ci-tokenspeed-{version.rsplit('post', 1)[1]}")
-PYTHON
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PIN="${TOKENSPEED_NIGHTLY_PIN:-${SCRIPT_DIR}/../.github/versions/tokenspeed-nightly.txt}"
+
+version="$(tr -d '[:space:]' < "$PIN")"
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.post[0-9]{8}$ ]]; then
+    echo "ERROR: ${PIN} must hold one dated TokenSpeed nightly version (x.y.z.postYYYYMMDD), got '${version}'" >&2
+    exit 1
+fi
+if [ "${1:-}" = "--version" ]; then
+    printf '%s\n' "$version"
+else
+    printf 'ci-tokenspeed-%s\n' "${version##*post}"
+fi
