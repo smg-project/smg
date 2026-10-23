@@ -15,6 +15,7 @@ pub mod selector;
 pub mod state;
 #[cfg(test)]
 pub(crate) mod testing;
+mod versions;
 pub mod view;
 
 use std::sync::Arc;

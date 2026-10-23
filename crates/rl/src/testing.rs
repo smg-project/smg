@@ -49,6 +49,8 @@ pub fn worker(id: &str, url: &str, runtime: RuntimeType) -> RlWorkerInfo {
         worker_type: WorkerType::Regular,
         connection_mode: ConnectionMode::Http,
         status: WorkerStatus::Ready,
+        downs: 0,
+        revision: 0,
         is_dp_aware: url.contains('@'),
         dp_size: None,
         labels,

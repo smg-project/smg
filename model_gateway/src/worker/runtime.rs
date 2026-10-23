@@ -91,6 +91,7 @@ impl RoutingState {
 pub struct WorkerRuntime {
     status: AtomicU8,
     cache_trace_epochs_valid: AtomicBool,
+    downs: AtomicU64,
     consecutive_failures: AtomicUsize,
     consecutive_successes: AtomicUsize,
     total_pending_probes: AtomicUsize,
@@ -488,6 +489,7 @@ impl WorkerRuntime {
                 initial_status,
                 WorkerStatus::NotReady | WorkerStatus::Failed
             )),
+            downs: AtomicU64::new(0),
             consecutive_failures: AtomicUsize::new(0),
             consecutive_successes: AtomicUsize::new(0),
             total_pending_probes: AtomicUsize::new(0),
@@ -756,12 +758,17 @@ impl WorkerRuntime {
         if matches!(status, WorkerStatus::NotReady | WorkerStatus::Failed) {
             self.cache_trace_epochs_valid
                 .store(false, Ordering::Release);
+            self.downs.fetch_add(1, Ordering::AcqRel);
         }
         self.status.store(status as u8, Ordering::Release);
     }
 
     pub fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
+    }
+
+    pub fn downs(&self) -> u64 {
+        self.downs.load(Ordering::Acquire)
     }
 
     pub fn bump_revision(&self) -> u64 {
