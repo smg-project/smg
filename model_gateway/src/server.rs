@@ -1556,8 +1556,12 @@ async fn start_observability(
     config: &ServerConfig,
     app_context: &Arc<AppContext>,
     metrics_handle: Option<PrometheusHandle>,
+    partition_detector: Option<Arc<smg_mesh::PartitionDetector>>,
 ) -> Result<Arc<crate::health::ProbeState>, Box<dyn std::error::Error>> {
-    let probe_state = crate::health::ProbeState::new(app_context.inflight_tracker.clone());
+    let probe_state = crate::health::ProbeState::new_with_partition_detector(
+        app_context.inflight_tracker.clone(),
+        partition_detector,
+    );
     let _readiness_maintainer = crate::health::spawn_readiness_maintainer(
         probe_state.clone(),
         app_context.worker_registry.clone(),
@@ -2138,7 +2142,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     // among them bind now, before the admin and HTTP listeners; the mesh TLS
     // material, the apps and the listener addresses can still fail the start
     // after this point, with these two bound.
-    let probe_state = start_observability(&config, &app_context, metrics_handle).await?;
+    let partition_detector = mesh_handler
+        .as_ref()
+        .and_then(|handler| handler.partition_detector())
+        .cloned();
+    let probe_state =
+        start_observability(&config, &app_context, metrics_handle, partition_detector).await?;
 
     let app_state = Arc::new(AppState {
         router,

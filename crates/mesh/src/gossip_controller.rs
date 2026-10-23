@@ -50,8 +50,8 @@ use super::{
     service::{
         broadcast_node_states,
         gossip::{
-            gossip_client::GossipClient, gossip_message, NodeState, NodeStatus, Ping, PingReq,
-            StateSync, StreamMessage,
+            gossip_client::GossipClient, gossip_message, NodeState, NodeStatus, NodeUpdate, Ping,
+            PingReq, StateSync, StreamMessage,
         },
         try_ping, ClusterState,
     },
@@ -59,6 +59,7 @@ use super::{
 use crate::{
     crdt_kv::CrdtWatermark,
     metrics,
+    partition::PartitionDetector,
     transport::{
         limits::MAX_MESSAGE_SIZE,
         peer_stream::{handle_frame, next_frame, send_round, Frame, RoundOutcome, SenderState},
@@ -92,6 +93,7 @@ pub struct GossipController {
     /// registry, and chunk assembler shared with the server-side
     /// SyncStream handlers.
     mesh_kv: Option<Arc<crate::kv::MeshKV>>,
+    partition_detector: Option<Arc<PartitionDetector>>,
 }
 
 impl GossipController {
@@ -111,6 +113,7 @@ impl GossipController {
             sync_connections: Arc::new(Mutex::new(HashMap::new())),
             current_stream_batch: Arc::new(RwLock::new(Arc::new(crate::kv::RoundBatch::default()))),
             mesh_kv: None,
+            partition_detector: None,
         }
     }
 
@@ -120,6 +123,11 @@ impl GossipController {
     /// (inbound) SyncStream handlers.
     pub fn with_mesh_kv(mut self, mesh_kv: Arc<crate::kv::MeshKV>) -> Self {
         self.mesh_kv = Some(mesh_kv);
+        self
+    }
+
+    pub fn with_partition_detector(mut self, partition_detector: Arc<PartitionDetector>) -> Self {
+        self.partition_detector = Some(partition_detector);
         self
     }
 
@@ -138,8 +146,15 @@ impl GossipController {
         loop {
             log::info!("Round {} Status:{:?}", round, self.state.read());
             self.reap_finished_streams().await;
+
+            if let Some(partition_detector) = &self.partition_detector {
+                partition_detector.update_last_seen(&self.self_name);
+                let cluster_state = self.state.read().clone();
+                partition_detector.detect_partition(&cluster_state);
+            }
+
             let targets = self.probe_targets();
-            let peer = self.peer_to_dial(&targets);
+            let peer = self.select_peer(&targets, round);
             round += 1;
             self.periodic_gc(round, &targets, &mut retry_managers);
             self.collect_stream_batch();
@@ -218,31 +233,12 @@ impl GossipController {
         });
     }
 
-    /// The members this round may dial: the table without this node and
-    /// without the members marked Down or Leaving (see `is_probe_target`).
+    /// The members this round may dial: the table without this node or
+    /// members marked Leaving. Down members remain probeable for recovery.
     fn probe_targets(&self) -> BTreeMap<String, NodeState> {
         let mut targets = self.state.read().clone();
         targets.retain(|name, node| self.is_probe_target(name, node));
         targets
-    }
-
-    /// The peer this round dials: a random probe target, or, while the table
-    /// holds nobody else, the configured join peer as a Suspected placeholder
-    /// named `init_peer`: at the start, and again should every other member
-    /// be gone, under its backoff like any peer. Members a service discovery
-    /// wrote into the table take precedence.
-    fn peer_to_dial(&self, targets: &BTreeMap<String, NodeState>) -> Option<NodeState> {
-        if targets.is_empty() {
-            return self.init_peer.map(|init_peer| NodeState {
-                name: INIT_PEER_NAME.to_string(),
-                address: init_peer.to_string(),
-                status: NodeStatus::Suspected as i32,
-                version: 1,
-                metadata: HashMap::new(),
-            });
-        }
-        let random_nodes = get_random_values_refs(targets, 1);
-        random_nodes.first().map(|&node| node.clone())
     }
 
     /// The round's housekeeping. Every fifth round (~5 s) the chunk
@@ -353,27 +349,7 @@ impl GossipController {
             Ok(node_update) => {
                 log::info!("Received NodeUpdate from peer: {:?}", node_update);
                 // Update state for Alive or Leaving status
-                if node_update.status == NodeStatus::Alive as i32
-                    || node_update.status == NodeStatus::Leaving as i32
-                {
-                    let updated_peer = {
-                        let mut s = read_state.write();
-                        let entry = s
-                            .entry(node_update.name.clone())
-                            .and_modify(|e| {
-                                e.status = node_update.status;
-                                e.address.clone_from(&node_update.address);
-                            })
-                            .or_insert_with(|| NodeState {
-                                name: node_update.name.clone(),
-                                address: node_update.address.clone(),
-                                status: node_update.status,
-                                version: 1,
-                                metadata: HashMap::new(),
-                            });
-                        entry.clone()
-                    }; // Lock is released here
-
+                if let Some(updated_peer) = self.update_membership(&node_update) {
                     // If node is Alive, establish sync_stream connection with freshest address.
                     if node_update.status == NodeStatus::Alive as i32 {
                         if let Err(e) = self
@@ -406,7 +382,7 @@ impl GossipController {
                         node.address,
                         peer_addr
                     );
-                    if try_ping(
+                    if let Ok(node_update) = try_ping(
                         node,
                         Some(gossip_message::Payload::PingReq(PingReq {
                             node: Some(peer.clone()),
@@ -414,10 +390,14 @@ impl GossipController {
                         self.mtls_manager.clone(),
                     )
                     .await
-                    .is_ok()
                     {
-                        reachable = true;
-                        break;
+                        if node_update.status == NodeStatus::Alive as i32
+                            && node_update.name == peer_name
+                        {
+                            self.update_membership(&node_update);
+                            reachable = true;
+                            break;
+                        }
                     }
                 }
                 if !reachable {
@@ -425,11 +405,14 @@ impl GossipController {
 
                     // Broadcast only the unreachable node's status is enough.
                     if let Some(mut unreachable_node) = target.remove(&peer_name) {
-                        if unreachable_node.status == NodeStatus::Suspected as i32 {
-                            unreachable_node.status = NodeStatus::Down as i32;
+                        unreachable_node.status = if unreachable_node.status
+                            == NodeStatus::Suspected as i32
+                            || unreachable_node.status == NodeStatus::Down as i32
+                        {
+                            NodeStatus::Down as i32
                         } else {
-                            unreachable_node.status = NodeStatus::Suspected as i32;
-                        }
+                            NodeStatus::Suspected as i32
+                        };
                         unreachable_node.version += 1;
 
                         // Broadcast target nodes should include self.
@@ -475,20 +458,81 @@ impl GossipController {
         Ok(())
     }
 
-    /// Whether `node` is one to probe: another node, neither `Down` nor
-    /// `Leaving`.
+    fn update_membership(&self, node_update: &NodeUpdate) -> Option<NodeState> {
+        if node_update.status != NodeStatus::Alive as i32
+            && node_update.status != NodeStatus::Leaving as i32
+        {
+            return None;
+        }
+
+        let updated_peer = {
+            let mut state = self.state.write();
+            let entry = state
+                .entry(node_update.name.clone())
+                .and_modify(|node| {
+                    if node_update.status == NodeStatus::Alive as i32
+                        && node.status != NodeStatus::Alive as i32
+                    {
+                        node.version = node.version.saturating_add(1);
+                    }
+                    node.status = node_update.status;
+                    node.address.clone_from(&node_update.address);
+                })
+                .or_insert_with(|| NodeState {
+                    name: node_update.name.clone(),
+                    address: node_update.address.clone(),
+                    status: node_update.status,
+                    version: 1,
+                    metadata: HashMap::new(),
+                });
+            entry.clone()
+        };
+
+        if node_update.status == NodeStatus::Alive as i32 {
+            if let Some(partition_detector) = &self.partition_detector {
+                partition_detector.update_last_seen(&node_update.name);
+            }
+        }
+
+        Some(updated_peer)
+    }
+
+    /// Whether `node` is one to probe: another node that is not leaving.
+    /// Down members stay probeable so a recovered peer can rejoin.
     fn is_probe_target(&self, name: &str, node: &NodeState) -> bool {
-        name != self.self_name
-            && node.status != NodeStatus::Down as i32
-            && node.status != NodeStatus::Leaving as i32
+        name != self.self_name && node.status != NodeStatus::Leaving as i32
     }
 
     /// Whether the membership table holds a node to probe.
     fn has_another_member(&self) -> bool {
-        self.state
-            .read()
-            .iter()
-            .any(|(name, node)| self.is_probe_target(name, node))
+        self.state.read().iter().any(|(name, node)| {
+            self.is_probe_target(name, node) && node.status != NodeStatus::Down as i32
+        })
+    }
+
+    fn select_peer(
+        &self,
+        candidates: &BTreeMap<String, NodeState>,
+        round: u64,
+    ) -> Option<NodeState> {
+        let has_non_down_member = candidates
+            .values()
+            .any(|node| node.status != NodeStatus::Down as i32);
+        let dial_init_peer = candidates.is_empty()
+            || (self.init_peer.is_some() && !has_non_down_member && round.is_multiple_of(2));
+
+        if dial_init_peer {
+            self.init_peer.map(|init_peer| NodeState {
+                name: INIT_PEER_NAME.to_string(),
+                address: init_peer.to_string(),
+                status: NodeStatus::Suspected as i32,
+                version: 1,
+                metadata: HashMap::new(),
+            })
+        } else {
+            let random_nodes = get_random_values_refs(candidates, 1);
+            random_nodes.first().map(|&node| node.clone())
+        }
     }
 
     /// Determine if this node should initiate sync_stream connection
@@ -860,6 +904,142 @@ impl RetryManager {
 #[cfg(test)]
 mod retry_manager_tests {
     use super::*;
+
+    fn controller_with_members(
+        members: BTreeMap<String, NodeState>,
+        init_peer: Option<SocketAddr>,
+    ) -> GossipController {
+        GossipController::new(
+            Arc::new(RwLock::new(members)),
+            "127.0.0.1:8000".parse().unwrap(),
+            "node-a",
+            init_peer,
+            None,
+        )
+    }
+
+    fn controller() -> GossipController {
+        controller_with_members(BTreeMap::new(), None)
+    }
+
+    fn node(name: &str, status: NodeStatus) -> NodeState {
+        NodeState {
+            name: name.to_string(),
+            address: "127.0.0.1:8001".to_string(),
+            status: status as i32,
+            version: 1,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn down_members_remain_probeable_for_recovery() {
+        let controller = controller();
+        assert!(controller.is_probe_target("node-b", &node("node-b", NodeStatus::Down)));
+        assert!(!controller.is_probe_target("node-b", &node("node-b", NodeStatus::Leaving)));
+        assert!(!controller.is_probe_target("node-a", &node("node-a", NodeStatus::Alive)));
+    }
+
+    #[test]
+    fn down_members_do_not_block_join_peer_redial_or_their_own_probes() {
+        let members = BTreeMap::from([("node-b".to_string(), node("node-b", NodeStatus::Down))]);
+        let candidates = members.clone();
+        let init_peer = "127.0.0.1:8002".parse().unwrap();
+        let controller = controller_with_members(members, Some(init_peer));
+
+        assert!(!controller.has_another_member());
+
+        let join_peer = controller.select_peer(&candidates, 0).unwrap();
+        assert_eq!(join_peer.name, INIT_PEER_NAME);
+        assert_eq!(join_peer.address, init_peer.to_string());
+
+        let down_member = controller.select_peer(&candidates, 1).unwrap();
+        assert_eq!(down_member.name, "node-b");
+        assert_eq!(down_member.status, NodeStatus::Down as i32);
+    }
+
+    #[test]
+    fn successful_indirect_probe_restores_quorum_membership() {
+        let state = Arc::new(RwLock::new(BTreeMap::from([
+            ("node-a".to_string(), node("node-a", NodeStatus::Alive)),
+            ("node-b".to_string(), node("node-b", NodeStatus::Down)),
+            ("node-c".to_string(), node("node-c", NodeStatus::Alive)),
+        ])));
+        let detector = Arc::new(PartitionDetector::new(crate::partition::PartitionConfig {
+            unreachable_timeout: Duration::from_secs(30),
+            min_cluster_size: 3,
+            quorum_threshold: 3,
+        }));
+        detector.update_last_seen("node-a");
+        detector.update_last_seen("node-c");
+        let controller = GossipController::new(
+            state.clone(),
+            "127.0.0.1:8000".parse().unwrap(),
+            "node-a",
+            None,
+            None,
+        )
+        .with_partition_detector(detector.clone());
+
+        assert_eq!(
+            detector.detect_partition(&state.read()),
+            crate::partition::PartitionState::PartitionedWithoutQuorum
+        );
+        assert!(controller
+            .update_membership(&NodeUpdate {
+                name: "node-b".to_string(),
+                address: "127.0.0.1:8002".to_string(),
+                status: NodeStatus::Alive as i32,
+            })
+            .is_some());
+        assert_eq!(
+            state.read().get("node-b").unwrap().status,
+            NodeStatus::Alive as i32
+        );
+        assert_eq!(state.read().get("node-b").unwrap().version, 2);
+        controller.update_membership(&NodeUpdate {
+            name: "node-b".to_string(),
+            address: "127.0.0.1:8002".to_string(),
+            status: NodeStatus::Alive as i32,
+        });
+        assert_eq!(state.read().get("node-b").unwrap().version, 2);
+        assert_eq!(
+            detector.detect_partition(&state.read()),
+            crate::partition::PartitionState::Normal
+        );
+    }
+
+    #[test]
+    fn alive_recovery_at_max_version_does_not_overflow() {
+        let members = BTreeMap::from([(
+            "node-b".to_string(),
+            NodeState {
+                name: "node-b".to_string(),
+                address: "127.0.0.1:8002".to_string(),
+                status: NodeStatus::Down as i32,
+                version: u64::MAX,
+                metadata: HashMap::new(),
+            },
+        )]);
+        let state = Arc::new(RwLock::new(members));
+        let controller = GossipController::new(
+            state.clone(),
+            "127.0.0.1:8000".parse().unwrap(),
+            "node-a",
+            None,
+            None,
+        );
+
+        controller.update_membership(&NodeUpdate {
+            name: "node-b".to_string(),
+            address: "127.0.0.1:8002".to_string(),
+            status: NodeStatus::Alive as i32,
+        });
+
+        let recovered = state.read().get("node-b").unwrap().clone();
+        assert_eq!(recovered.status, NodeStatus::Alive as i32);
+        assert_eq!(recovered.version, u64::MAX);
+    }
 
     #[test]
     fn first_retry_uses_initial_delay() {

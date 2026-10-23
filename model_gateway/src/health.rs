@@ -55,6 +55,7 @@ use axum::{
 use llm_tokenizer::TokenizerRegistry;
 use openai_protocol::worker::MmProcessingMode;
 use serde_json::json;
+use smg_mesh::PartitionDetector;
 use tokio::{
     sync::broadcast::{
         error::{RecvError, TryRecvError},
@@ -115,13 +116,22 @@ pub struct ReadinessSnapshot {
 pub struct ProbeState {
     readiness: ArcSwap<ReadinessSnapshot>,
     inflight_tracker: Arc<InFlightRequestTracker>,
+    partition_detector: Option<Arc<PartitionDetector>>,
 }
 
 impl std::fmt::Debug for ProbeState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let readiness = self.readiness.load();
         f.debug_struct("ProbeState")
-            .field("readiness", &self.readiness.load())
+            .field("readiness", &readiness)
             .field("draining", &self.inflight_tracker.is_draining())
+            .field(
+                "quorum_ready",
+                &self
+                    .partition_detector
+                    .as_ref()
+                    .is_none_or(|detector| detector.should_serve()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -131,9 +141,18 @@ impl ProbeState {
     /// previous behaviour for an empty registry). The first recompute by
     /// the maintainer replaces it.
     pub fn new(inflight_tracker: Arc<InFlightRequestTracker>) -> Arc<Self> {
+        Self::new_with_partition_detector(inflight_tracker, None)
+    }
+
+    /// Create probe state that also gates readiness on the mesh quorum.
+    pub fn new_with_partition_detector(
+        inflight_tracker: Arc<InFlightRequestTracker>,
+        partition_detector: Option<Arc<PartitionDetector>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             readiness: ArcSwap::from_pointee(ReadinessSnapshot::default()),
             inflight_tracker,
+            partition_detector,
         })
     }
 
@@ -227,7 +246,6 @@ impl ProbeState {
                 .iter()
                 .filter(|w| w.connection_mode().uses_grpc_pipeline())
                 .all(|w| tokenizer_registered(w.model_id()));
-
         // Under worker-side media placement, a model whose workers report a
         // vision encoder and none of which processes media references refuses
         // every request that forwards media references
@@ -278,7 +296,8 @@ impl ProbeState {
     /// and while worker-side media placement has a model no worker processes
     /// media for, the ready body names it under
     /// `models_without_media_processing` (the status stays ready: the pod
-    /// serves everything else).
+    /// serves everything else). The mesh detector check is constant-time and
+    /// does not scan membership.
     pub fn readiness_response(&self) -> Response {
         if self.inflight_tracker.is_draining() {
             return mark_probe(
@@ -294,7 +313,11 @@ impl ProbeState {
         }
 
         let snapshot = self.readiness.load();
-        if snapshot.workers_ready && snapshot.tokenizers_ready {
+        let quorum_ready = self
+            .partition_detector
+            .as_ref()
+            .is_none_or(|detector| detector.should_serve());
+        if snapshot.workers_ready && snapshot.tokenizers_ready && quorum_ready {
             let mut body = json!({
                 "status": "ready",
                 "healthy_workers": snapshot.healthy_workers,
@@ -306,7 +329,9 @@ impl ProbeState {
             }
             mark_probe((StatusCode::OK, Json(body)).into_response())
         } else {
-            let reason = if snapshot.workers_ready {
+            let reason = if !quorum_ready {
+                "mesh quorum unavailable"
+            } else if snapshot.workers_ready {
                 "tokenizer not yet registered"
             } else {
                 "insufficient healthy workers"
@@ -534,9 +559,10 @@ pub fn start_probe_listener(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{collections::BTreeMap, sync::Arc};
 
     use openai_protocol::worker::{HealthCheckConfig, WorkerStatus};
+    use smg_mesh::gossip::{NodeState, NodeStatus};
     use tower::ServiceExt;
 
     use super::*;
@@ -638,6 +664,58 @@ mod tests {
         assert!(!snapshot.workers_ready);
         assert_eq!(snapshot.total_workers, 0);
         assert_eq!(snapshot.healthy_workers, 0);
+    }
+
+    #[tokio::test]
+    async fn mesh_quorum_gates_readiness_and_recovers() {
+        let detector = Arc::new(PartitionDetector::default());
+        let state = ProbeState::new_with_partition_detector(
+            InFlightRequestTracker::new(),
+            Some(detector.clone()),
+        );
+        let registry = WorkerRegistry::new();
+        let router_config = regular_config();
+        registry
+            .register(http_worker("http://w1:8080", WorkerStatus::Ready))
+            .unwrap();
+
+        let mut cluster_state = BTreeMap::from([
+            ("node1".to_string(), mesh_node("node1", NodeStatus::Alive)),
+            ("node2".to_string(), mesh_node("node2", NodeStatus::Down)),
+            ("node3".to_string(), mesh_node("node3", NodeStatus::Down)),
+        ]);
+        detector.detect_partition(&cluster_state);
+        assert!(!detector.should_serve());
+        recompute(&state, &registry, &router_config);
+        assert_eq!(
+            state.readiness_response().status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let body = axum::body::to_bytes(state.readiness_response().into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(std::str::from_utf8(&body)
+            .unwrap()
+            .contains("mesh quorum unavailable"));
+
+        cluster_state.get_mut("node2").unwrap().status = NodeStatus::Alive as i32;
+        cluster_state.get_mut("node3").unwrap().status = NodeStatus::Alive as i32;
+        detector.update_last_seen("node2");
+        detector.update_last_seen("node3");
+        detector.detect_partition(&cluster_state);
+        assert!(detector.should_serve());
+        recompute(&state, &registry, &router_config);
+        assert_eq!(state.readiness_response().status(), StatusCode::OK);
+    }
+
+    fn mesh_node(name: &str, status: NodeStatus) -> NodeState {
+        NodeState {
+            name: name.to_string(),
+            address: "127.0.0.1:8080".to_string(),
+            status: status as i32,
+            version: 1,
+            metadata: std::collections::HashMap::new(),
+        }
     }
 
     #[test]
