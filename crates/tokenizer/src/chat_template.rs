@@ -1515,39 +1515,51 @@ fn python_lower_filter(value: Value) -> String {
 }
 
 /// Jinja2's `capitalize` filter, `str(value).capitalize()`: the first
-/// character upper-cased, the rest lower-cased (minijinja's body on the
-/// Python `str`).
+/// character upper-cased, the rest lower-cased in the whole string's context,
+/// so a sigma right after the first character takes the final form Python
+/// gives it (`'ΑΣ'` is `Ας` here and `Ασ` under `title`, which slices the
+/// word first). Python 3.8+ title-cases the first character: the same as
+/// upper-casing it but for `ß`, the digraphs, the ligatures, Georgian and
+/// the Greek letters with an iota subscript.
 fn python_capitalize_filter(value: Value) -> String {
     let text = python_str(&value);
-    let mut chars = text.chars();
-    match chars.next() {
-        Some(first) => first
-            .to_uppercase()
-            .chain(chars.flat_map(char::to_lowercase))
-            .collect(),
-        None => String::new(),
-    }
+    let Some(first) = text.chars().next() else {
+        return String::new();
+    };
+    // The whole string lower-cased keeps the first character in the sigma
+    // rule's context, as CPython's `capitalize` reads it; the first
+    // character's own lower-case form is then swapped for the upper-case one.
+    let lowered = text.to_lowercase();
+    let first_lowered = first.to_lowercase().map(char::len_utf8).sum::<usize>();
+    let mut out = String::with_capacity(lowered.len());
+    out.extend(first.to_uppercase());
+    out.push_str(&lowered[first_lowered..]);
+    out
 }
 
 /// Jinja2's `title` filter (not Python's `str.title()`): each word's first
-/// character upper-cased and the rest lower-cased, a word starting after a
-/// run of `-`, whitespace, `(`, `{`, `[` or `<` (Jinja2's
-/// `_word_beginning_split_re`, `([-\s({\[<]+)`), on the Python `str`.
+/// character upper-cased and the rest lower-cased as one string (a word-final
+/// sigma takes the final form Python's `lower()` gives it), a word starting
+/// after a run of `-`, `(`, `{`, `[`, `<` or Python's `\s` (Jinja2's
+/// `_word_beginning_split_re`, `([-\s({\[<]+)`; see `python_isspace`), on
+/// the Python `str`.
 fn python_title_filter(value: Value) -> String {
+    let is_separator = |c: char| python_isspace(c) || matches!(c, '-' | '(' | '{' | '[' | '<');
     let text = python_str(&value);
     let mut out = String::with_capacity(text.len());
-    let mut capitalize = true;
-    for c in text.chars() {
-        if c.is_whitespace() || matches!(c, '-' | '(' | '{' | '[' | '<') {
-            out.push(c);
-            capitalize = true;
-        } else if capitalize {
-            out.extend(c.to_uppercase());
-            capitalize = false;
-        } else {
-            out.extend(c.to_lowercase());
+    let mut rest: &str = &text;
+    while let Some(start) = rest.find(|c: char| !is_separator(c)) {
+        let (separators, word) = rest.split_at(start);
+        out.push_str(separators);
+        let end = word.find(is_separator).unwrap_or(word.len());
+        let mut chars = word[..end].chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(&chars.as_str().to_lowercase());
         }
+        rest = &word[end..];
     }
+    out.push_str(rest);
     out
 }
 
@@ -1947,9 +1959,10 @@ fn consolidate_system_messages(messages: Vec<serde_json::Value>) -> Vec<serde_js
 /// the prompt is cut where it lands.
 const CONTINUE_FINAL_MESSAGE_TAG: &str = "CONTINUE_FINAL_MESSAGE_TAG ";
 
-/// Python's `str.isspace`, which transformers' `strip`/`rstrip` and the
-/// checkpoints' whitespace runs go by: Unicode white space plus the
-/// separators U+001C..=U+001F.
+/// Python's `str.isspace` (and `re`'s `\s` on a `str` pattern), which
+/// transformers' `strip`/`rstrip`, the checkpoints' whitespace runs and
+/// Jinja2's `title` go by: Unicode white space plus the separators
+/// U+001C..=U+001F.
 pub(crate) fn python_isspace(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
@@ -2826,7 +2839,8 @@ mod tests {
     /// The string filters Jinja2 starts with `str(value)` write a list or a
     /// dict as Python does, like `string` and `trim`: `join` of every item
     /// (or of an attribute of each), `replace` (with a count), `upper`,
-    /// `lower`, `capitalize`, `title`; a string and an integer are untouched.
+    /// `lower`, `capitalize`, `title` (a word-final sigma and a `\x1c`
+    /// separator as Python has them); a string and an integer are untouched.
     #[test]
     fn the_string_filters_start_with_python_s_str() {
         let state = ChatTemplateState::new(Some(
@@ -2837,16 +2851,21 @@ mod tests {
              {{ 1.5 | replace('.', ',') }}|{{ 'x.y' | replace('.', '') }}|\
              {{ messages[0].content | capitalize }}|{{ messages[0].content | title }}|\
              {{ \"get_weather don't\" | title }}|\
+             {{ messages[1].content | title }}|{{ messages[1].content | capitalize }}|\
+             {{ 'ΑΣ' | title }}{{ 'ΑΣ' | capitalize }}|\
              {{ 'x.y.z' | replace('.', '-', 1) }}|{{ messages[0].content | join(', ', attribute='text') }}"
                 .to_string(),
         ))
         .unwrap();
         let rendered = state
             .apply(
-                &[serde_json::json!({"role": "user", "content": [
-                    {"type": "text", "text": "Hi"},
-                    {"type": "text", "text": "Yo"}
-                ]})],
+                &[
+                    serde_json::json!({"role": "user", "content": [
+                        {"type": "text", "text": "Hi"},
+                        {"type": "text", "text": "Yo"}
+                    ]}),
+                    serde_json::json!({"role": "user", "content": "a\u{1c}b ΟΔΟΣ ΚΑΙ"}),
+                ],
                 ChatTemplateParams::default(),
             )
             .unwrap();
@@ -2858,7 +2877,7 @@ mod tests {
              {'type': 'text', 'text': 'hi'}|a, b|AB|7|1,5|xy|\
              [{'type': 'text', 'text': 'hi'}, {'type': 'text', 'text': 'yo'}]|\
              [{'type': 'text', 'text': 'hi'}, {'type': 'text', 'text': 'yo'}]|\
-             Get_weather Don't|x-y.z|Hi, Yo"
+             Get_weather Don't|A\u{1c}B Οδος Και|A\u{1c}b οδος και|ΑσΑς|x-y.z|Hi, Yo"
         );
     }
 
