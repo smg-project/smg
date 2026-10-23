@@ -1,7 +1,10 @@
 """Actual Python caller/API; the HTTP registry and engine processes are stand-ins."""
 
 import json
+import subprocess
+import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import import_module
 from types import SimpleNamespace
@@ -16,12 +19,21 @@ from infra.worker import Worker
 
 setup = import_module("fixtures.setup_backend")
 MODEL = "Qwen/Qwen3.5-9B"
+worker_raise_if_exited = Worker.raise_if_exited
 
 
 @pytest.fixture
 def registry(monkeypatch):
     state = SimpleNamespace(
-        workers=[], posts=[], launches=[], shutdowns=[], stopped=[], reject=False, ready=True
+        workers=[],
+        posts=[],
+        launches=[],
+        shutdowns=[],
+        stopped=[],
+        reject=False,
+        ready=True,
+        visible=None,
+        delay=0.0,
     )
 
     class Handler(BaseHTTPRequestHandler):
@@ -30,28 +42,33 @@ def registry(monkeypatch):
             self.send_response(status)
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             state.posts.append(body)
             if state.reject:
                 return self.answer(422, {"error": "registration rejected"})
-            state.workers.append({**body, "id": "encoder", "healthy": True})
+            state.workers.append({**body, "id": "encoder", "is_healthy": True})
             return self.answer(202, {"worker_id": "encoder"})
 
         def do_GET(self):
+            time.sleep(state.delay)
+            visible = state.workers if state.visible is None else state.visible
             url = urlsplit(self.path)
             if url.path == "/readiness":
                 return self.answer(
                     200 if state.ready else 503,
                     {
                         "status": "ready" if state.ready else "not_ready",
-                        "healthy_workers": len(state.workers),
+                        "healthy_workers": sum(w.get("is_healthy", False) for w in visible),
                     },
                 )
             model = parse_qs(url.query).get("model", [None])[0]
-            workers = [w for w in state.workers if model is None or w["models"][0]["id"] == model]
+            workers = [w for w in visible if model is None or w["models"][0]["id"] == model]
             return self.answer(200, {"total": len(workers), "workers": workers})
 
         def log_message(self, *args):
@@ -97,7 +114,7 @@ def test_real_fixture_registers_native_encoder_explicitly(registry, monkeypatch)
                 "id": worker.worker_type.value,
                 "url": worker.base_url,
                 "models": [{"id": MODEL}],
-                "healthy": True,
+                "is_healthy": True,
             }
         )
     monkeypatch.setattr(
@@ -178,7 +195,7 @@ def test_registration_waits_for_fleet_readiness_after_accepted_api(registry):
     state.ready = False
     fleet = workers()
     state.workers = [
-        {"id": str(i), "url": w.base_url, "models": [{"id": MODEL}]}
+        {"id": str(i), "url": w.base_url, "models": [{"id": MODEL}], "is_healthy": True}
         for i, w in enumerate(fleet[1:])
     ]
     with pytest.raises(TimeoutError, match="readiness: not_ready"):
@@ -192,8 +209,12 @@ def test_configured_model_key_may_map_to_a_distinct_snapshot_path(registry, monk
     monkeypatch.setitem(
         model_specs.MODEL_SPECS, MODEL, {**model_specs.MODEL_SPECS[MODEL], "model": snapshot}
     )
-    monkeypatch.setattr(setup, "wait_for_workers_ready", lambda *a, **kw: None)
-    setup._register_sglang_epd_encoders(gateway, workers(), MODEL, snapshot, 1)
+    fleet = workers()
+    state.workers = [
+        {"id": str(i), "url": w.base_url, "models": [{"id": snapshot}], "is_healthy": True}
+        for i, w in enumerate(fleet[1:])
+    ]
+    setup._register_sglang_epd_encoders(gateway, fleet, MODEL, snapshot, 1)
     assert state.posts[0]["models"] == [{"id": snapshot}]
     assert state.posts[0]["labels"] == {"model_path": snapshot}
 
@@ -205,3 +226,114 @@ def test_duplicate_encoder_model_path_override_is_rejected(registry):
     with pytest.raises(ValueError, match="encoder command"):
         setup._register_sglang_epd_encoders(gateway, fleet, MODEL, MODEL, 1)
     assert state.posts == []
+
+
+@pytest.mark.parametrize("missing", ["all", "encode", "prefill", "decode", "unhealthy"])
+def test_expected_fleet_is_required_and_failure_cleans_up(registry, monkeypatch, missing):
+    state, gateway = registry
+    fleet = workers()
+    state.visible = [
+        {"id": str(i), "url": w.base_url, "models": [{"id": MODEL}], "is_healthy": True}
+        for i, w in enumerate(fleet)
+    ]
+    state.visible[0]["id"] = "encoder"
+    for i, worker in enumerate(fleet):
+        if missing == "all" or missing == worker.worker_type.value:
+            state.visible[i]["url"] = f"grpc://other-{i}:6000"
+    if missing == "unhealthy":
+        state.visible[0]["is_healthy"] = False
+        state.visible.append({"id": "extra", "url": "grpc://other:6000", "is_healthy": True})
+    monkeypatch.setattr(
+        setup,
+        "_start_workers_tracked",
+        lambda **kw: [w for w in fleet if w.worker_type == kw["worker_type"]],
+    )
+    backend = setup._setup_epd(
+        MODEL,
+        MODEL,
+        "sglang",
+        ConnectionMode.GRPC,
+        (1, 1, 1),
+        {**setup._GW_DEFAULTS, "timeout": 0.3},
+        gateway,
+        None,
+    )
+    with pytest.raises(TimeoutError, match="expected healthy URLs"):
+        next(backend)
+    assert len(state.posts) == 1  # HTTP 202 alone is insufficient.
+    assert state.shutdowns and state.stopped == fleet
+
+
+def test_expected_fleet_allows_extra_healthy_workers(registry):
+    state, gateway = registry
+    fleet = workers()
+    state.workers = [
+        {"id": str(i), "url": w.base_url, "models": [{"id": MODEL}], "is_healthy": True}
+        for i, w in enumerate(fleet[1:])
+    ] + [{"id": "extra", "url": "grpc://other:6000", "is_healthy": True}]
+    setup._register_sglang_epd_encoders(gateway, fleet, MODEL, MODEL, 1)
+    assert len(state.posts) == 1
+
+
+def test_expected_fleet_http_timeout_is_bounded_and_cleans_up(registry, monkeypatch):
+    state, gateway = registry
+    fleet = workers()
+    state.delay = 1.0
+    monkeypatch.setattr(
+        setup,
+        "_start_workers_tracked",
+        lambda **kw: [w for w in fleet if w.worker_type == kw["worker_type"]],
+    )
+    backend = setup._setup_epd(
+        MODEL,
+        MODEL,
+        "sglang",
+        ConnectionMode.GRPC,
+        (1, 1, 1),
+        {**setup._GW_DEFAULTS, "timeout": 0.15},
+        gateway,
+        None,
+    )
+    started = time.perf_counter()
+    with pytest.raises(TimeoutError, match="expected healthy URLs"):
+        next(backend)
+    assert time.perf_counter() - started < 0.8
+    assert state.shutdowns and state.stopped == fleet
+
+
+@pytest.mark.parametrize("role", ["gateway", "worker"])
+def test_expected_fleet_rejects_exited_process_with_live_registry(registry, monkeypatch, role):
+    state, gateway = registry
+    fleet = workers()
+    state.workers = [
+        {"id": str(i), "url": w.base_url, "models": [{"id": MODEL}], "is_healthy": True}
+        for i, w in enumerate(fleet[1:])
+    ]
+    process = subprocess.Popen([sys.executable, "-c", "raise SystemExit(17)"])
+    assert process.wait(timeout=5) == 17
+    if role == "gateway":
+        gateway.process = process
+        message = "Gateway exited with code 17"
+    else:
+        fleet[0].process = process
+        monkeypatch.setattr(fleet[0], "raise_if_exited", lambda: worker_raise_if_exited(fleet[0]))
+        message = "died during startup.*exit status 17"
+    monkeypatch.setattr(
+        setup,
+        "_start_workers_tracked",
+        lambda **kw: [w for w in fleet if w.worker_type == kw["worker_type"]],
+    )
+    backend = setup._setup_epd(
+        MODEL,
+        MODEL,
+        "sglang",
+        ConnectionMode.GRPC,
+        (1, 1, 1),
+        {**setup._GW_DEFAULTS, "timeout": 1},
+        gateway,
+        None,
+    )
+    with pytest.raises(RuntimeError, match=message):
+        next(backend)
+    assert state.posts == []
+    assert state.shutdowns and state.stopped == fleet
