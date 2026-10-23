@@ -31,7 +31,7 @@ use openai_protocol::{
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use smg_external_router::header_utils::insert_routed_worker_id;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::{debug, error};
+use tracing::{debug, error, Instrument};
 
 use super::{
     common::{
@@ -79,6 +79,7 @@ use crate::{
     observability::{
         cache_trace,
         metrics::{bool_to_static_str, metrics_labels, Metrics},
+        otel_trace::stage_span,
     },
     policies::PolicyRegistry,
     rate_limit::{RateLimitManager, UsageSettlement},
@@ -497,18 +498,33 @@ impl RequestPipeline {
             };
         }
 
+        // Each stage runs under a child span of the request span while
+        // tracing exports spans (`stage_span`: none otherwise), so a trace
+        // says which stage of a slow request was slow.
         let stages = &self.stages;
         step!(
             stages.preparation.name(),
-            stages.preparation.execute(ctx).await
+            stages
+                .preparation
+                .execute(ctx)
+                .instrument(stage_span("preparation"))
+                .await
         )?;
         step!(
             stages.rate_limit.name(),
-            stages.rate_limit.execute(ctx).await
+            stages
+                .rate_limit
+                .execute(ctx)
+                .instrument(stage_span("rate_limit"))
+                .await
         )?;
         step!(
             stages.worker_selection.name(),
-            stages.worker_selection.execute(ctx).await
+            stages
+                .worker_selection
+                .execute(ctx)
+                .instrument(stage_span("worker_selection"))
+                .await
         )?;
         let workers = stage_output(ctx.state.workers.as_ref(), "run_ingress")?;
         // Keep the post-selection guard for paths without pre-filtering
@@ -530,14 +546,22 @@ impl RequestPipeline {
                 &ctx.input.model_id,
                 self.worker_registry.overload_shed_enabled(),
             )
+            .instrument(stage_span("client_acquisition"))
             .await
         )?);
         if let Some(encode) = &stages.encode {
-            step!(encode.name(), encode.execute(ctx).await)?;
+            step!(
+                encode.name(),
+                encode.execute(ctx).instrument(stage_span("encode")).await
+            )?;
         }
         step!(
             stages.request_building.name(),
-            stages.request_building.build(ctx).await
+            stages
+                .request_building
+                .build(ctx)
+                .instrument(stage_span("request_building"))
+                .await
         )
     }
 
@@ -562,7 +586,11 @@ impl RequestPipeline {
             // re-stamped (engine ids, sampling defaults, the forced tool
             // call's shape, PD rooms) for the new workers. Buffered decode
             // state from the failed attempt is reset.
-            self.stages.worker_selection.reselect(dctx).await?;
+            self.stages
+                .worker_selection
+                .reselect(dctx)
+                .instrument(stage_span("worker_selection"))
+                .await?;
             let workers = stage_output(dctx.workers.as_ref(), "run_attempt")?;
             dctx.clients = Some(
                 acquire_clients(
@@ -570,6 +598,7 @@ impl RequestPipeline {
                     &dctx.model_id,
                     self.worker_registry.overload_shed_enabled(),
                 )
+                .instrument(stage_span("client_acquisition"))
                 .await?,
             );
             let retained = plan.as_mut().ok_or_else(consumed)?;
@@ -605,6 +634,7 @@ impl RequestPipeline {
         self.stages
             .response_processing
             .process(dctx, attempt_spec)
+            .instrument(stage_span("response_processing"))
             .await
             .inspect_err(|response| {
                 error!(

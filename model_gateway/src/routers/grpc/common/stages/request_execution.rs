@@ -20,6 +20,7 @@ use crate::{
     observability::{
         cache_trace,
         metrics::{metrics_labels, Metrics},
+        otel_trace::stage_span,
     },
     routers::{
         common::{
@@ -42,9 +43,9 @@ use crate::{
             },
             multimodal::worker_language_model_only,
             proto_wrapper::{
-                DispatchBooking, FanoutStream, FirstItem, PrefillCachedTokens, PrefillTicket,
-                ProtoEmbedRequest, ProtoGenerateRequest, ProtoInputLogProbs, ProtoRequest,
-                ProtoResponseVariant, ProtoStream,
+                DispatchBooking, DispatchTrace, FanoutStream, FirstItem, PrefillCachedTokens,
+                PrefillTicket, ProtoEmbedRequest, ProtoGenerateRequest, ProtoInputLogProbs,
+                ProtoRequest, ProtoResponseVariant, ProtoStream,
             },
             utils::{
                 account_pd_side_failure,
@@ -339,7 +340,14 @@ pub(crate) async fn execute_plan(
     // The upstream span: the dispatch, then the response stream (it closes
     // with the load guards, which the response body holds to its last frame;
     // see `LoadGuards::traced`). A failed dispatch sets its status to ERROR;
-    // success is left unset, as the RPC conventions have it.
+    // success is left unset, as the RPC conventions have it. The engine's
+    // first output stamps `first_output_us`, its distance from the dispatch
+    // (see `proto_wrapper::DispatchTrace`); a disaggregated dispatch's two
+    // calls are its child spans (`prefill_call`, `decode_call`), each from
+    // the side's dispatch to its first message, which is when a servicer
+    // answers the call: the prefill call is the prefill, the decode call the
+    // handoff and the first decoded token; the rest of the decode stream
+    // runs under this span, which closes with the stream.
     let span = info_span!(
         target: "smg::otel-trace",
         "grpc_execute",
@@ -348,19 +356,27 @@ pub(crate) async fn execute_plan(
         model = %model,
         mode = %mode,
         otel.status_code = tracing::field::Empty,
+        first_output_us = tracing::field::Empty,
     );
 
     let result = async {
+        // One first-output clock per dispatch span, before anything is
+        // dispatched; every stream of the dispatch shares it and the first
+        // output among them stamps the span (see `DispatchTrace`).
+        let trace = DispatchTrace::now();
         match execution_plan {
             ExecutionPlan::Single(request) => match request {
-                ProtoRequest::Generate(req) => execute_single(req, clients, workers, ledger).await,
+                ProtoRequest::Generate(req) => {
+                    execute_single(req, clients, workers, ledger, trace).await
+                }
                 ProtoRequest::Embed(req) => {
                     execute_single_embed(req, clients, workers, ledger).await
                 }
             },
             ExecutionPlan::PrefillDecode(req) => {
                 let prefill_guard = require_prefill_guard(prefill_guard)?;
-                execute_pd_dispatch(req, clients, workers, model, prefill_guard, ledger).await
+                execute_pd_dispatch(req, clients, workers, model, prefill_guard, ledger, trace)
+                    .await
             }
             ExecutionPlan::EncodePrefillDecode { request } => {
                 // Bootstrap info was injected into the prefill request during
@@ -375,6 +391,7 @@ pub(crate) async fn execute_plan(
                     encode_dispatch,
                     prefill_guard,
                     ledger,
+                    trace,
                 )
                 .await
             }
@@ -387,6 +404,7 @@ pub(crate) async fn execute_plan(
                     model,
                     prefill_guard,
                     ledger,
+                    trace,
                 )
                 .await
             }
@@ -438,6 +456,7 @@ async fn execute_pd_dispatch(
     model: &str,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    trace: Option<DispatchTrace>,
 ) -> Result<ExecutionResult, Response> {
     let Some(runtime_type) = workers.disaggregated_runtime_type() else {
         error!(
@@ -473,6 +492,7 @@ async fn execute_pd_dispatch(
                 model,
                 prefill_guard,
                 ledger,
+                trace.clone(),
             )
             .await
         }
@@ -485,7 +505,7 @@ async fn execute_pd_dispatch(
             }
         },
     }?;
-    Ok(attribute_pd_sides(result, workers))
+    Ok(attribute_pd_sides(result, workers, trace))
 }
 
 /// Pair each side's stream of a disaggregated dispatch with the worker it was
@@ -500,7 +520,11 @@ async fn execute_pd_dispatch(
 /// side's first response (see [`ProtoStream::tracked_decode_side`]). The
 /// sequential dispatch's prefill stream is drained already; the wrapper is a
 /// no-op on it.
-fn attribute_pd_sides(result: ExecutionResult, workers: &WorkerSelection) -> ExecutionResult {
+fn attribute_pd_sides(
+    result: ExecutionResult,
+    workers: &WorkerSelection,
+    trace: Option<DispatchTrace>,
+) -> ExecutionResult {
     let ExecutionResult::PrefillDecode {
         prefill,
         decode,
@@ -519,9 +543,12 @@ fn attribute_pd_sides(result: ExecutionResult, workers: &WorkerSelection) -> Exe
     // so it can wait for the side's first token under the side's bound: a side
     // already on a worker is left as it is (a second layer would sample its
     // success twice).
+    // The decode side's first output is the request's first token: its
+    // layer holds the dispatch span's first-output clock; the prefill side's
+    // layer, and the attribution layer over it, stamp nothing.
     let decode = match workers.decode_worker() {
         Some(worker) if decode.worker().is_none() => {
-            (*decode).tracked_decode_side(Arc::clone(worker))
+            (*decode).tracked_decode_side(Arc::clone(worker), trace)
         }
         _ => *decode,
     };
@@ -612,6 +639,10 @@ async fn execute_fanout_pd(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the dispatch's inputs, each independent: the request, its clients and workers, the model, the encode jobs, the admission slot, the attempt's ledger and the span's clock"
+)]
 async fn execute_epd_dispatch(
     mut proto_request: ProtoGenerateRequest,
     clients: &mut ClientSelection,
@@ -620,6 +651,7 @@ async fn execute_epd_dispatch(
     encode_dispatch: Option<EncodeDispatchPlan>,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    trace: Option<DispatchTrace>,
 ) -> Result<ExecutionResult, Response> {
     if let Some(encode_dispatch) = encode_dispatch {
         spawn_encode_dispatch(encode_dispatch);
@@ -632,6 +664,7 @@ async fn execute_epd_dispatch(
         model,
         prefill_guard,
         ledger,
+        trace,
     )
     .await
 }
@@ -683,6 +716,10 @@ fn spawn_encode_dispatch(encode_dispatch: EncodeDispatchPlan) {
 /// Dispatch one backend request per batched prompt concurrently, preserving
 /// prompt order. Fail-fast: the first failed dispatch fails the batch and
 /// drops the remaining streams (abort-on-drop reclaims them backend-side).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the dispatch's inputs, each independent: the plan's kind and requests, their clients and workers, the model, the admission slot, the attempt's ledger and the span's clock"
+)]
 async fn execute_batch_dispatch(
     kind: ExecutionPlanKind,
     requests: Vec<ProtoGenerateRequest>,
@@ -691,6 +728,7 @@ async fn execute_batch_dispatch(
     model: &str,
     prefill_guard: Option<PrefillLoadGuard>,
     ledger: &AttemptLedger,
+    trace: Option<DispatchTrace>,
 ) -> Result<ExecutionResult, Response> {
     // One Prefill handle per PD sub-request, all on the one admission slot.
     let prefill_guards: Vec<Option<PrefillLoadGuard>> = match kind {
@@ -708,10 +746,13 @@ async fn execute_batch_dispatch(
         .zip(prefill_guards)
         .map(|(request, prefill_guard)| {
             let mut clients = clients.clone();
+            // The batch's sub-requests share the dispatch span's clock: the
+            // first output among them is the batch's.
+            let trace = trace.clone();
             async move {
                 match kind {
                     ExecutionPlanKind::Single => {
-                        execute_single(request, &mut clients, workers, ledger).await
+                        execute_single(request, &mut clients, workers, ledger, trace).await
                     }
                     // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
                     ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
@@ -723,6 +764,7 @@ async fn execute_batch_dispatch(
                             model,
                             prefill_guard,
                             ledger,
+                            trace,
                         )
                         .await
                     }
@@ -739,6 +781,7 @@ async fn execute_single(
     clients: &mut ClientSelection,
     workers: &WorkerSelection,
     ledger: &AttemptLedger,
+    trace: Option<DispatchTrace>,
 ) -> Result<ExecutionResult, Response> {
     let client = clients.single_or_mismatch("execute_single")?;
 
@@ -760,6 +803,7 @@ async fn execute_single(
         worker,
         prompt_tokens,
         streaming,
+        trace,
     )
     .await;
     if let Some(status) = result.breaker_status() {
@@ -803,13 +847,14 @@ async fn dispatch_single_booked(
     worker: Option<&Arc<dyn Worker>>,
     prompt_tokens: u64,
     streaming: bool,
+    trace: Option<DispatchTrace>,
 ) -> StreamResult {
     let Some(worker) = worker else {
         return call.await;
     };
     let booking = DispatchBooking::book(worker, prompt_tokens, streaming);
     let stream = call.await?;
-    Ok(stream.tracked_booked(Arc::clone(worker), booking))
+    Ok(stream.tracked_booked(Arc::clone(worker), booking, trace))
 }
 
 /// Client answer for a request the worker did not start; an engine rejection (4xx) is not a fault.
@@ -982,15 +1027,20 @@ async fn execute_parallel_pd(
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
     let prefill_dispatch: SideDispatch = Box::pin(dispatch_prefill_within(
         bound.clone(),
-        Box::pin(async move { prefill_client.generate(prefill_request).await }),
+        Box::pin(
+            async move { prefill_client.generate(prefill_request).await }
+                .instrument(stage_span("prefill_call")),
+        ),
         prefill_worker.cloned(),
         workers.decode_worker().cloned(),
         sides.prefill_label,
         sides.request_id.clone(),
         sides.prompt_tokens,
     ));
-    let decode_dispatch: SideDispatch =
-        Box::pin(async move { decode_client.generate(decode_request).await });
+    let decode_dispatch: SideDispatch = Box::pin(
+        async move { decode_client.generate(decode_request).await }
+            .instrument(stage_span("decode_call")),
+    );
 
     // The prefill worker's handoffs are watched for only where its side has a bound.
     let handoff_to = bound.as_ref().and(prefill_worker);
@@ -2405,6 +2455,7 @@ async fn execute_sequential_pd(
     model: &str,
     prefill_guard: PrefillLoadGuard,
     ledger: &AttemptLedger,
+    trace: Option<DispatchTrace>,
 ) -> Result<ExecutionResult, Response> {
     let runtime = workers
         .disaggregated_runtime_type()
@@ -2451,6 +2502,7 @@ async fn execute_sequential_pd(
         decode_request,
         decode_client.clone(),
         handed_off,
+        trace,
     )
     .await?;
     // Decode established: record the success-only PD metrics here.
@@ -2530,7 +2582,10 @@ async fn sequential_prefill_side(
         prefill_worker.and_then(|worker| PrefillTicket::book(worker, sides.prompt_tokens));
     let prefill_stream = dispatch_prefill_within(
         bound.clone(),
-        Box::pin(async move { prefill_client.generate(prefill_request).await }),
+        Box::pin(
+            async move { prefill_client.generate(prefill_request).await }
+                .instrument(stage_span("prefill_call")),
+        ),
         prefill_worker.cloned(),
         None,
         sides.prefill_label,
@@ -2746,6 +2801,7 @@ async fn sequential_decode_side(
     decode_request: ProtoGenerateRequest,
     mut decode_client: BackendClient,
     handed_off: bool,
+    trace: Option<DispatchTrace>,
 ) -> Result<(ProtoStream, Instant), Response> {
     let workers = sides.workers;
     // Send request to decode
@@ -2779,7 +2835,10 @@ async fn sequential_decode_side(
     let decode_worker = workers.decode_worker().cloned();
     let decode_stream = dispatch_decode_within(
         decode_bound,
-        Box::pin(async move { decode_client.generate(decode_request).await }),
+        Box::pin(
+            async move { decode_client.generate(decode_request).await }
+                .instrument(stage_span("decode_call")),
+        ),
         decode_worker.clone(),
         sides.decode_label,
         sides.request_id.clone(),
@@ -2798,10 +2857,13 @@ async fn sequential_decode_side(
     // the worker's breaker success is sampled at the side's first response
     // (`ProtoStream::tracked_decode_side`), never at the dispatch; the
     // attribution stage leaves a side tracked here as it is.
+    // This side's first output is the request's first token: its layer holds
+    // the dispatch span's first-output clock (see `attribute_pd_sides`, which
+    // leaves a side already on a worker alone).
     let mut decode_stream = match &decode_worker {
         Some(worker) => decode_stream
             .defer_abort_until_first_item()
-            .tracked_decode_side(Arc::clone(worker)),
+            .tracked_decode_side(Arc::clone(worker), trace),
         None => decode_stream.defer_abort_until_first_item(),
     };
     // Without a bound nothing is pulled ahead and the side counts as answered,
@@ -4174,7 +4236,7 @@ mod tests {
         let workers = tokenspeed_pair();
         let decode = Arc::clone(workers.decode_worker().expect("a pair"));
         let mut stream = ProtoStream::Fanout(FanoutStream::new(Vec::new()))
-            .tracked_decode_side(Arc::clone(&decode));
+            .tracked_decode_side(Arc::clone(&decode), None);
         let first = first_decode_response_within(
             &mut stream,
             Some(three_second_decode_bound()),
@@ -5046,7 +5108,7 @@ mod tests {
                     )))
                 }
             };
-            let stream = dispatch_single_booked(call, Some(&worker), 4_096, streaming)
+            let stream = dispatch_single_booked(call, Some(&worker), 4_096, streaming, None)
                 .await
                 .expect("the call answered");
             assert_eq!(
@@ -5067,6 +5129,7 @@ mod tests {
             Some(&worker),
             4_096,
             true,
+            None,
         )
         .await;
         assert!(failed.is_err(), "the call's failure is the dispatch's");

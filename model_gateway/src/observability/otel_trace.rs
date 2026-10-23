@@ -188,6 +188,19 @@ pub fn is_otel_enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
 }
 
+/// A child span of the current span for one stage of a request's pipeline,
+/// named `stage`, while tracing exports spans; [`tracing::Span::none`]
+/// otherwise, so a stage costs a request nothing beyond the flag's read.
+/// The span is the tracer's own (the `smg::otel-trace` target), under the
+/// request span or the dispatch span it is created in.
+#[must_use]
+pub fn stage_span(stage: &'static str) -> tracing::Span {
+    if !is_otel_enabled() {
+        return tracing::Span::none();
+    }
+    tracing::info_span!(target: "smg::otel-trace", "pipeline_stage", otel.name = stage, stage)
+}
+
 pub async fn flush_spans_async() -> Result<()> {
     if !is_otel_enabled() {
         return Ok(());

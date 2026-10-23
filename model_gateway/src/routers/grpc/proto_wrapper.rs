@@ -4,7 +4,16 @@
 //! supported backend, allowing the router to work with any backend
 //! transparently.
 
-use std::{collections::HashMap, future::Future, pin::Pin, sync::Arc, time::Instant};
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Instant,
+};
 
 use futures::future::select_all;
 use futures_util::StreamExt;
@@ -25,6 +34,7 @@ use smg_grpc_client::{
 use tokio::time::error::Elapsed;
 
 use crate::{
+    observability::otel_trace::is_otel_enabled,
     routers::grpc::{
         multimodal::{log_mm_timing_enabled, mm_rdma_exporter},
         zmq_client::ZmqGenerateStream,
@@ -1974,6 +1984,63 @@ pub struct TrackedStream {
     /// by [`ProtoStream::first_response_within`], handed to the next `next`
     /// as it was: its bookkeeping ran when it was pulled.
     replay: Option<Option<Result<ProtoGenerateResponse, tonic::Status>>>,
+    /// The dispatch span to stamp with the stream's first output, while
+    /// tracing exports spans; taken at the first output.
+    trace: Option<DispatchTrace>,
+}
+
+/// The dispatch span and the instant of the dispatch, kept only while
+/// tracing exports spans: the first output of the dispatch's streams stamps
+/// the span's `first_output_us`, the engine's time to its first output as
+/// the gateway saw it, so a trace of a slow request says whether the engine
+/// or the stream after it was slow. One per dispatch span, made with the
+/// span before anything is dispatched and shared by every layer whose first
+/// output may be the request's first token (a single dispatch's stream, a
+/// disaggregated request's decode side, each sub-request of a batch); the
+/// first of them to see output stamps, the others find the stamp made. The
+/// layers over a side's stream that has answered already hold none.
+#[derive(Clone)]
+pub(crate) struct DispatchTrace(Arc<DispatchClock>);
+
+struct DispatchClock {
+    span: tracing::Span,
+    dispatched: Instant,
+    stamped: AtomicBool,
+}
+
+impl DispatchTrace {
+    /// The current span with `dispatched` as the dispatch instant, while
+    /// tracing exports spans; `None` otherwise, so an untraced request pays
+    /// the flag's read and nothing else. Taken before the dispatch's call
+    /// is polled: a servicer answers the call together with its first
+    /// message, so an instant taken at the call's return would be the first
+    /// output's own and the stamp about zero.
+    pub(crate) fn at(dispatched: Instant) -> Option<Self> {
+        is_otel_enabled().then(|| {
+            Self(Arc::new(DispatchClock {
+                span: tracing::Span::current(),
+                dispatched,
+                stamped: AtomicBool::new(false),
+            }))
+        })
+    }
+
+    /// [`Self::at`] this instant.
+    pub(crate) fn now() -> Option<Self> {
+        Self::at(Instant::now())
+    }
+
+    /// A stream's first output: the span is stamped once, by the first
+    /// holder to get here, with the microseconds since the dispatch, as a
+    /// signed integer (the tracer exports an `i64` field as an integer
+    /// attribute and a `u64` one as its text).
+    fn first_output(self) {
+        if self.0.stamped.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let micros = i64::try_from(self.0.dispatched.elapsed().as_micros()).unwrap_or(i64::MAX);
+        self.0.span.record("first_output_us", micros);
+    }
 }
 
 /// What [`ProtoStream::first_response_within`] found as the stream's first
@@ -2253,7 +2320,7 @@ mod tracked_tests {
         );
         worker.record_outcome(504);
         let mut stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
-            .tracked_decode_side(Arc::clone(&worker));
+            .tracked_decode_side(Arc::clone(&worker), None);
         match &stream {
             ProtoStream::Tracked(tracked) => {
                 assert!(tracked.samples_success, "the success waits for a response");
@@ -2426,7 +2493,7 @@ mod tracked_tests {
                 .build(),
         );
         worker.record_outcome(504);
-        let mut stream = stream.tracked_decode_side(Arc::clone(&worker));
+        let mut stream = stream.tracked_decode_side(Arc::clone(&worker), None);
         assert!(worker.output_silence().is_none(), "nothing booked unread");
         assert_eq!(which(stream.next().await.as_ref()), Some(1), "replayed");
         assert!(worker.output_silence().is_some(), "booked at the replay");
@@ -2500,7 +2567,7 @@ mod tracked_tests {
         );
         assert!(booking.prefill.as_ref().is_some_and(|ticket| ticket.timed));
         let stream = ProtoStream::Fanout(FanoutStream::<ProtoStream>::new(Vec::new()))
-            .tracked_booked(Arc::clone(&worker), booking);
+            .tracked_booked(Arc::clone(&worker), booking, None);
         assert_eq!(
             books(&worker),
             (pending, 1),
@@ -2555,15 +2622,25 @@ impl ProtoStream {
     #[must_use]
     pub fn tracked(self, worker: Arc<dyn Worker>, prompt_tokens: u64, streaming: bool) -> Self {
         let booking = DispatchBooking::book(&worker, prompt_tokens, streaming);
-        self.tracked_booked(worker, booking)
+        self.tracked_booked(worker, booking, None)
     }
 
     /// [`Self::tracked`] for a request booked at its dispatch (see
     /// [`DispatchBooking::book`]): the stream takes the booking over, so the
     /// prompt's span runs from before the call was polled to the first
     /// response, and the request has been in the pile since the dispatch.
+    /// `trace` is the dispatch span's first-output clock, taken with the
+    /// span before anything is dispatched and shared by every layer whose
+    /// first output may be the request's first token; the first to see
+    /// output stamps the span (see [`DispatchTrace`]). A layer added over a
+    /// stream that has answered already passes `None`.
     #[must_use]
-    pub(crate) fn tracked_booked(self, worker: Arc<dyn Worker>, booking: DispatchBooking) -> Self {
+    pub(crate) fn tracked_booked(
+        self,
+        worker: Arc<dyn Worker>,
+        booking: DispatchBooking,
+        trace: Option<DispatchTrace>,
+    ) -> Self {
         let DispatchBooking { prefill, progress } = booking;
         Self::Tracked(Box::new(TrackedStream {
             inner: self,
@@ -2573,6 +2650,7 @@ impl ProtoStream {
             output: None,
             samples_success: false,
             replay: None,
+            trace,
         }))
     }
 
@@ -2607,6 +2685,9 @@ impl ProtoStream {
             output: None,
             samples_success: false,
             replay: None,
+            // The request's first token is the decode side's: the prefill
+            // side stamps nothing on the dispatch span.
+            trace: None,
         }))
     }
 
@@ -2622,8 +2703,13 @@ impl ProtoStream {
     /// request; a stream that ends with nothing on it earns no success
     /// either, as a prefill side's does not.
     #[must_use]
-    pub(crate) fn tracked_decode_side(self, worker: Arc<dyn Worker>) -> Self {
-        let mut stream = self.tracked(worker, 0, false);
+    pub(crate) fn tracked_decode_side(
+        self,
+        worker: Arc<dyn Worker>,
+        trace: Option<DispatchTrace>,
+    ) -> Self {
+        let booking = DispatchBooking::book(&worker, 0, false);
+        let mut stream = self.tracked_booked(worker, booking, trace);
         if let Self::Tracked(tracked) = &mut stream {
             tracked.samples_success = true;
         }
@@ -2747,6 +2833,9 @@ impl ProtoStream {
                 if tracked.output.is_none() {
                     tracked.output = Some(OutputTicket::open(&tracked.worker));
                 }
+                if let Some(trace) = tracked.trace.take() {
+                    trace.first_output();
+                }
                 if let Some(ticket) = tracked.prefill.as_mut() {
                     ticket.first_response(u64::from(response.cached_tokens()));
                 }
@@ -2854,6 +2943,7 @@ impl ProtoStream {
                     output,
                     samples_success,
                     replay,
+                    trace,
                 } = *stream;
                 Self::Tracked(Box::new(TrackedStream {
                     inner: inner.defer_abort_until_first_item(),
@@ -2863,6 +2953,7 @@ impl ProtoStream {
                     output,
                     samples_success,
                     replay,
+                    trace,
                 }))
             }
             Self::DecodeSide(side) => {
