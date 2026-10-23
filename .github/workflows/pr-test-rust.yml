@@ -992,7 +992,7 @@ jobs:
               ("scripts/ci_node_health.py",                      NONE),
               ("scripts/ci_prune_tokenspeed_images.sh",          NONE),
               ("scripts/ci_setup_sglang_rocm_image.sh",          NONE),
-              ("scripts/ci_setup_vllm_rocm_image.sh",            NONE),
+              ("scripts/ci_setup_vllm_rocm_image.sh", "chat-completions"),
               ("scripts/ci_*",                                   FULL),
               ("scripts/**",                                     NONE),
               # the servicers: an engine's package its rows; the MLX servicer has its own
