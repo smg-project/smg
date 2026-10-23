@@ -150,17 +150,18 @@ named by the request rather than framed.
 Every byte of the call lands in exactly one event. Whitespace between tags is the template's and
 goes into the source of the next event: the function tag's into `ToolCallStart`, a parameter tag's
 and the value's text into the fragments they produce, the rest into the closing `}`. Anything else
-between tags, a tag out of its place, a tag that cuts a name short and a name that is empty come
-back as `Malformed` with a reason, so the model's bytes are never read as something they are not and
-never vanish into a source. Inside a value only `</parameter>` is a tag; `<function=`, `<parameter=`
+between tags, a tag out of its place, a tag that cuts a name short and a name that is empty is
+refused (`tagged::refuse`): counted by a `Malformed` event of no bytes with the reason, the bytes
+dropped as a malformed call's (`Dropped { MalformedCall }`), never content, so the model's bytes are
+never read as something they are not, never shown as the answer, and never vanish into a source. Inside a value only `</parameter>` is a tag; `<function=`, `<parameter=`
 and `</function>` there are the value's text (the engine's parser ends a value at the next
 `<parameter=` or `</function>` as well, a tolerance to judge with adversarial fixtures rather than
 port).
 
 Two endings. `Assembler::close` is for a block the model ended before `</function>` (its own closing
 marker came, or the next call began): the call is over as far as the model is concerned, so after
-the last value the object is closed, and a value held for its close comes back as `Malformed`, its
-member never written. A streamed string the close finds open, a byte of whose value went out, is
+the last value the object is closed, and a value held for its close is refused, its member never
+written. A streamed string the close finds open, a byte of whose value went out, is
 closed first, as the stop closes one (the third ending, below): the model ended the call, so the
 value's bytes are the value whole, the start of a tag held is its text since no tag followed, the
 newline held as the template's framing is the closing quote's source, and one `Malformed {
@@ -215,13 +216,13 @@ string the stop closed under any table, and for the call itself where the table 
 since there the template writes the closing marker the model skipped (under the row the stop
 stands for that marker, and a call open at it is the expected shape; `docs/engine.md`). A value
 held for its close (a number, an object, a string that may still be null) and a string the model
-opened without writing a byte of it keep the marker's path: reported or refused, the member never
+opened without writing a byte of it keep the marker's path: refused, the member never
 written, or, where its opening fragment went out with the parameter tag (the Qwen assembler), left
 open and said as the block's end leaves it; nothing made up. The two differ by what the client has
 seen: a streamed string's fragments already reached it, so closing the string adds the quote alone,
 while a held value's bytes reached nobody and its close is a tag the model never wrote, so the stop
 writes no member of it; a held scalar that reads whole as its declared kind (`1.5` under `number`)
-is reported and dropped the same way today. A cut keeps `finish`'s, the prefix as
+is refused the same way today. A cut keeps `finish`'s, the prefix as
 written under `length`, the held value in the call. The four
 assemblers of `tagged` share this ending (`tagged::open_at_the_stop`); the JSON, pythonic and Gemma
 assemblers, whose quotes and braces are the model's own, end a call the stop found open as a cut
@@ -240,9 +241,10 @@ region, and a model answering with several calls at once writes them one after a
 region, which the engines' own parsers read as the calls they are; so after `</function>` the
 assembler stays in the block. Whitespace there is the template's and goes into the next event's
 source, the next `<function=` starts the next call at the next index with the id that index mints,
-and anything else is `Malformed { TextBetweenCalls }`. A region that ends after its last call
-closed ends nothing: the whitespace after the call is dropped, and a tag the end cut short is
-reported.
+and anything else is refused under `TextBetweenCalls`. A region that ends after its last call
+closed ends nothing: the whitespace after the call is dropped, and a tag the block's end cut short
+is refused; at the stream's cut it rides in the `UnterminatedRegion` word, as the cut keeps what it
+found.
 
 ## The keyed assembler (`tagged::keyed`)
 
@@ -397,22 +399,25 @@ What the syntax says, and what the assembler does with it:
   brackets, with a leading `/` for a closing tag. A `<` followed by anything else is
   text, so a comparison in a value stays text; a `<` that does spell a tag is one, inside a
   value too, as every marker parser reads it. Inside a leaf, a tag other than the leaf's own
-  closing tag is the leaf's text; a closing tag that matches nothing open is reported.
-- **The name ends at its quote**, and the invoke tag at `>`; text between the two is reported,
-  as for DSML. An invoke with no name starts no call, and everything in it is reported.
+  closing tag is the leaf's text; a closing tag that matches nothing open is refused, as is text
+  where the syntax has tags (`tagged::refuse`: a `Malformed` event of no bytes counts it, the bytes
+  leave as `Dropped { MalformedCall }`, never content).
+- **The name ends at its quote**, and the invoke tag at `>`; text between the two is refused,
+  as for DSML. An invoke with no name starts no call, and it is refused whole, the terminal that
+  ended it included.
 - **The separator keeps its place.** When nothing is held before it, it is `Dropped { Wrapper }`
   at once; when a value's text or an opening tag is held, its bytes go into the next
   fragment's source, so every event's bytes stay in the output's order.
 - **Two endings.** `Assembler::close` is the invoke's closing tag (`INVOKE_CLOSE`, the one
   terminal a started call's end carries), or the next invoke's opening or the block's close,
   which end the call with no bytes of their own: every open container is closed, a tag the
-  end cut short is reported, a leaf never written and an element without a child come back as
-  `Malformed`, and the arguments object is closed; a streamed string innermost is closed first,
+  end cut short, a leaf never written and an element without a child are refused, and the
+  arguments object is closed; a streamed string innermost is closed first,
   the start of a tag held as its text, under one `Malformed { OpenAtTheMarker }` event of no
   bytes before its quote (`tagged::left_open`), since the model ended the call and the
   value's bytes are complete, then the containers above it. An invoke that
   named no call takes whichever terminal ended it, so that it is
-  reported the same way however it ended. `Assembler::finish` is a stream that was
+  refused the same way however it ended. `Assembler::finish` is a stream that was
   cut: nothing is closed, and a call that started still ends, with no bytes of its own, as
   every assembler ends one, after the one `Malformed { UnterminatedRegion }` event that
   carries what was held, or no bytes, and says that its arguments are no whole value

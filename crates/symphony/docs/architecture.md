@@ -87,7 +87,8 @@ reasons.
 **The assemblers.** Each turns one call syntax into call events with the same accounting: every
 byte of the call in exactly one event (the name's in the start, each tag's and value's in the
 fragment it produces, the template's whitespace between tags in the next event's source, anything
-else between tags as `Malformed` run by run so that where the chunks were cut changes nothing).
+else between tags refused run by run, a `Malformed` event of no bytes and the bytes as `Dropped {
+MalformedCall }`, so that where the chunks were cut changes nothing and no slip reads as the answer).
 Two endings: `close` for a call the model ended (its closing marker, the next call's opener or the
 block's close), which closes the object for the client; `finish` for a stream that was cut, which
 closes nothing. A value's type comes from the request's tools (`Declared`) where the syntax writes
