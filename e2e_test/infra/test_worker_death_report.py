@@ -99,6 +99,41 @@ def test_the_text_names_the_first_and_last_error_of_the_log_and_its_path(tmp_pat
     assert str(tmp_path) not in text
 
 
+# A TP worker whose NCCL init failed: the root cause names a level word inside its
+# message (torch's "run with NCCL_DEBUG=INFO for details"), at error level.
+NCCL_SHAPE = r"""
+import sys
+core = "(EngineCore pid=2) ERROR 10-22 11:03:45 [core.py:1433] "
+main = "(MainProcess pid=1) ERROR 10-22 11:03:45 [server.py:204] "
+nccl = (
+    "torch.distributed.DistBackendError: NCCL error in: NCCLUtils.hpp:268, unhandled cuda error"
+    " (run with NCCL_DEBUG=INFO for details), NCCL version 2.21.5"
+)
+lines = [
+    "(MainProcess pid=1) INFO 10-22 11:03:41 [server.py:72] transfer backend is available",
+    core + "EngineCore failed to start.",
+    core + nccl,
+    nccl,
+    main + "RuntimeError: Engine core initialization failed. See root cause above.",
+]
+print("\n".join(lines))
+sys.exit(1)
+"""
+
+
+def test_a_level_word_inside_an_error_level_exception_message_does_not_hide_it(
+    tmp_path, monkeypatch
+):
+    worker = _dead_worker(tmp_path, monkeypatch, NCCL_SHAPE)
+    text = _death_text(worker)
+    # The NCCL line is the root cause: quoted first, the wrapper last.
+    assert text.index("DistBackendError: NCCL error in") < text.index(
+        "RuntimeError: Engine core initialization failed"
+    )
+    assert text.count("DistBackendError") == 1
+    assert "run with NCCL_DEBUG=INFO for details" in text
+
+
 def test_an_empty_log_leaves_the_exit_status_alone(tmp_path, monkeypatch):
     worker = _dead_worker(tmp_path, monkeypatch, "import sys; sys.exit(3)")
     assert _death_text(worker) == (

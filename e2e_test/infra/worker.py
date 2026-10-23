@@ -66,7 +66,9 @@ _EXCEPTION_LINE = re.compile(r"(?:Error|Exception): ")
 # A log line at error level, or a Rust panic, when nothing printed an exception.
 _ERROR_LEVEL_LINE = re.compile(r"\b(?:ERROR|CRITICAL|FATAL)\b|panicked at ")
 # A line logged below error level: a warning that names an exception (a missing
-# optional import, say) is not the cause of the death.
+# optional import, say) is not the cause of the death. The level is read before
+# the exception marker only: a level word inside the message (torch's NCCL error
+# ends with "run with NCCL_DEBUG=INFO for details") does not lower the line.
 _BELOW_ERROR_LEVEL_LINE = re.compile(r"\b(?:DEBUG|INFO|WARNING|WARN)\b")
 
 
@@ -985,7 +987,8 @@ class Worker:
         exceptions = [
             line
             for line in lines
-            if _EXCEPTION_LINE.search(line) and not _BELOW_ERROR_LEVEL_LINE.search(line)
+            if (match := _EXCEPTION_LINE.search(line))
+            and not _BELOW_ERROR_LEVEL_LINE.search(line, 0, match.start())
         ]
         errors = [line for line in lines if _ERROR_LEVEL_LINE.search(line)]
         if exceptions:
