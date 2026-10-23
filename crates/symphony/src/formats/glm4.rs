@@ -52,7 +52,7 @@ mod tests {
         event::{DropReason, Event, FinishReason, MalformedReason, Text},
         testing::{
             a_forced_tag_begins_with_the_templates_text, arguments_of, bytes, content, drive,
-            drive_to, reasoning, the_same_at_every_cut, Said,
+            drive_to, reasoning, said, the_same_at_every_cut, Said,
         },
         Declared, EngineFinish,
     };
@@ -306,6 +306,91 @@ mod tests {
         assert_eq!(bytes(&events), OPEN_AT_THE_STOP);
     }
 
+    /// The same shape as the live stream carries it: the model ends the value with its end-of-box
+    /// marker and a newline, skips `</arg_value>` alone, writes `</tool_call>`, and then its
+    /// turn's stop token, which the engine hides and reports as a stop. The closing marker, not
+    /// the stop, ends the call with the string open.
+    const OPEN_AT_THE_MARKER: &str = concat!(
+        "\n<think></think>\n<tool_call>answer_string\n<arg_key>answer</arg_key>\n",
+        "<arg_value>Logistic regression is a statistical method for a binary outcome.",
+        "<|end_of_box|>\n</tool_call>"
+    );
+
+    #[test]
+    fn a_string_value_the_model_leaves_open_at_the_calls_closing_marker_is_closed_there_and_said() {
+        // Whole, one character at a time, at every two-way cut, and one piece per token at the
+        // end as the stream carries it (the text, the box marker, the newline, the marker): the
+        // call carries the value with every byte of the model's text, its arguments one JSON
+        // object under `stop` with one call, which a client reading `tool_calls` parses; the one
+        // `Malformed` event of no bytes says the marker closed the string, right before the
+        // closing quote; the marker's bytes are the call's end.
+        let run = |pieces: &[&str]| {
+            drive(
+                &mut Engine::new(glm4(), Declared::of(&answer_tool())),
+                PROMPT,
+                pieces,
+            )
+        };
+        let arguments = format!(
+            "{{\"answer\": {}}}",
+            serde_json::to_string(ANSWER).expect("json")
+        );
+        let expected = Said {
+            calls: vec![("answer_string".to_string(), arguments.clone())],
+            finish: Some((FinishReason::Stop, 1)),
+            content: String::new(),
+            reasoning: String::new(),
+        };
+        assert_eq!(the_same_at_every_cut(run, OPEN_AT_THE_MARKER), expected);
+        let as_streamed = [
+            "\n<think></think>\n<tool_call>answer_string\n<arg_key>answer</arg_key>\n<arg_value>",
+            "Logistic regression is a statistical method for a binary outcome",
+            ".",
+            "<|end_of_box|>",
+            "\n",
+            "</tool_call>",
+        ];
+        let events = run(&as_streamed);
+        assert_eq!(said(&events), expected);
+        let read: serde_json::Value =
+            serde_json::from_str(&arguments_of(&events, 0)).expect("whole JSON");
+        assert_eq!(read["answer"], ANSWER);
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::OpenAtTheMarker)]
+        );
+        let at = events
+            .iter()
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the one word");
+        assert!(
+            matches!(&events[at + 1], Event::ToolCallArguments { json, .. } if json == "\""),
+            "{events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::ToolCallEnd { source, .. } if source.text == "</tool_call>"
+            )),
+            "{events:?}"
+        );
+        assert_eq!(bytes(&events), as_streamed.concat());
+        // Cut by the token limit after the marker: the marker closed the call before the cut, so
+        // the arguments are the same whole object, and the engine's finish is kept.
+        let cut = drive_to(
+            &mut Engine::new(glm4(), Declared::of(&answer_tool())),
+            PROMPT,
+            &[OPEN_AT_THE_MARKER],
+            EngineFinish::Length,
+        );
+        assert_eq!(arguments_of(&cut, 0), arguments);
+        assert_eq!(
+            malformed(&cut),
+            [(String::new(), MalformedReason::OpenAtTheMarker)]
+        );
+        assert_eq!(said(&cut).finish, Some((FinishReason::Length, 1)));
+    }
+
     #[test]
     fn the_same_value_cut_by_the_token_limit_stays_open_and_says_so() {
         // The twin under `length`: the prefix as written, no closing quote and no brace, the
@@ -331,6 +416,56 @@ mod tests {
         assert_eq!(
             malformed(&run(&[OPEN_AT_THE_STOP])),
             [(String::new(), MalformedReason::UnterminatedRegion)]
+        );
+    }
+
+    #[test]
+    fn a_call_the_token_limit_cut_inside_an_object_keeps_it_in_its_arguments() {
+        // The report's shape under `length`: the string whole, the object cut inside a nested
+        // string. The arguments are the prefix as written, the cut member's key and bytes
+        // included (before this the member left the call as a failed call's bytes and the
+        // arguments stopped at the string), no closing quote and no brace, the one `Malformed {
+        // UnterminatedRegion }` event of no bytes, nothing dropped as a failed call; whole, one
+        // character at a time and at every two-way cut.
+        let output = concat!(
+            "\n<think></think>\n<tool_call>ChaDri_change_drink\n",
+            "<arg_key>drink_id</arg_key>\n<arg_value>latte</arg_value>\n",
+            "<arg_key>new_preferences</arg_key>\n<arg_value>{\"size\": \"large\", \"temp"
+        );
+        let run = |pieces: &[&str]| {
+            drive_to(
+                &mut Engine::new(glm4(), declared()),
+                PROMPT,
+                pieces,
+                EngineFinish::Length,
+            )
+        };
+        let said = the_same_at_every_cut(run, output);
+        assert_eq!(
+            said.calls,
+            vec![(
+                "ChaDri_change_drink".to_string(),
+                r#"{"drink_id": "latte", "new_preferences": {"size": "large", "temp"#.to_string()
+            )]
+        );
+        assert_eq!(said.finish, Some((FinishReason::Length, 1)));
+        assert_eq!(said.content, "");
+        assert!(serde_json::from_str::<serde_json::Value>(&said.calls[0].1).is_err());
+        let events = run(&[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(
+            malformed(&events),
+            [(String::new(), MalformedReason::UnterminatedRegion)]
+        );
+        assert!(
+            !events.iter().any(|event| matches!(
+                event,
+                Event::Dropped {
+                    why: DropReason::MalformedCall,
+                    ..
+                }
+            )),
+            "nothing of the call is a failed call's bytes: {events:?}"
         );
     }
 

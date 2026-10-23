@@ -251,16 +251,20 @@ mod tests {
         assert_eq!(starts, [(0, "f"), (1, "g"), (2, "h")]);
         assert_eq!(arguments_of(&events, 0), r#"{"a": true}"#);
         assert_eq!(arguments_of(&events, 1), "{}");
-        // The block's close cut `h` inside a string: nothing is closed for a value the model
-        // never closed, and the one word of no bytes before the end says so.
-        assert_eq!(arguments_of(&events, 2), r#"{"b": "x"#);
-        let ended = events
+        // The block's close ended `h` inside a string: the model ended the call, so the string
+        // is closed with the value's bytes whole, and the one word of no bytes before the
+        // closing quote says the marker closed it.
+        assert_eq!(arguments_of(&events, 2), r#"{"b": "x"}"#);
+        let at = events
             .iter()
-            .position(|event| matches!(event, Event::ToolCallEnd { index: 2, .. }))
-            .expect("the third call ends");
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the one word");
         assert!(matches!(
-            &events[ended - 1],
-            Event::Malformed { text, .. } if text.text.is_empty()
+            &events[at..at + 2],
+            [
+                Event::Malformed { text, why: MalformedReason::OpenAtTheMarker },
+                Event::ToolCallArguments { index: 2, json, .. }
+            ] if text.text.is_empty() && json == "\""
         ));
         assert_eq!(ends(&events), [Tags::XTML.invoke_close, "", ""]);
         assert!(matches!(
@@ -439,7 +443,7 @@ mod tests {
             "<|open|>argument key=\"x\" type=\"number\"<|sep|>1"
         );
         // The model's own end of output there ends the call as its closing tag would: the value
-        // held for its close is reported, the object closes without it, and one word says the
+        // held for its close is refused, the object closes without it, and one word says the
         // stop closed the call.
         let stopped = run(PROMPT, &[output]);
         assert_eq!(arguments_of(&stopped, 0), "{}");
@@ -529,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn a_call_that_named_nothing_is_reported_however_it_ended() {
+    fn a_call_that_named_nothing_is_refused_whole_however_it_ended() {
         for (output, ending) in [
             (
                 concat!(
@@ -553,10 +557,19 @@ mod tests {
         ] {
             let events = run(PROMPT, &[output]);
             assert_eq!(bytes(&events), output, "{ending}");
+            // Refused whole: the bytes dropped as the model's failed call, never content, behind
+            // the counted event of no bytes.
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    Event::Malformed { text, .. } if !text.text.is_empty()
+                )),
+                "{ending}: {events:?}"
+            );
             assert!(
                 events.iter().any(|event| matches!(
                     event,
-                    Event::Malformed { text, .. } if text.text == ending
+                    Event::Dropped { text, why: DropReason::MalformedCall } if text.text.ends_with(ending)
                 )),
                 "{ending}: {events:?}"
             );
@@ -640,7 +653,7 @@ mod tests {
         // assembler still holds the argument's bytes, which came before the cut tag, so the call
         // ends first (its bytes, malformed, and its end) and the cut tag is dropped after them;
         // every byte in exactly one event, in the output's order, and none of it content. Cut
-        // by the token limit the argument is the call's unfinished bytes; at the model's own
+        // by the token limit the argument is the call's own fragment, as written; at the model's own
         // stop the call ends as its closing tag would end it, the held number reported, the
         // object closed without it, and the one word says the stop closed the call.
         let tokens = [
@@ -672,13 +685,27 @@ mod tests {
             EngineFinish::Length,
         );
         in_order(&events);
+        assert_eq!(
+            arguments_of(&events, 0),
+            r#"{"n": 1.5"#,
+            "the unfinished argument is the call's own bytes, as written: {events:?}"
+        );
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::ToolCallArguments { json, source, .. }
+                    if json == r#"{"n": 1.5"#
+                        && source.text == "<|open|>argument key=\"n\" type=\"number\"<|sep|>1.5"
+            )),
+            "{events:?}"
+        );
         assert!(
             events.iter().any(|event| matches!(
                 event,
                 Event::Malformed { text, why: MalformedReason::UnterminatedRegion }
-                    if text.text == "<|open|>argument key=\"n\" type=\"number\"<|sep|>1.5"
+                    if text.text.is_empty()
             )),
-            "the unfinished argument is the call's malformed bytes: {events:?}"
+            "the one word says the arguments are no whole value: {events:?}"
         );
         let stopped = run(PROMPT_THINKING_OFF, &tokens);
         in_order(&stopped);
@@ -686,10 +713,17 @@ mod tests {
         assert!(
             stopped.iter().any(|event| matches!(
                 event,
-                Event::Malformed { text, why: MalformedReason::TagCutShort }
+                Event::Malformed { text, why: MalformedReason::TagCutShort } if text.text.is_empty()
+            )),
+            "the cut tag is counted: {stopped:?}"
+        );
+        assert!(
+            stopped.iter().any(|event| matches!(
+                event,
+                Event::Dropped { text, why: DropReason::MalformedCall }
                     if text.text == "<|open|>argument key=\"n\" type=\"number\"<|sep|>1.5"
             )),
-            "the held number is reported: {stopped:?}"
+            "the held number is refused, never content: {stopped:?}"
         );
         assert!(stopped.iter().any(|event| matches!(
             event,
@@ -711,5 +745,55 @@ mod tests {
         let cut = run(PROMPT_THINKING_OFF, &["Pong.", "<|close|>", "think"]);
         assert_eq!(content(&cut), "Pong.<|close|>think", "{cut:?}");
         assert_eq!(bytes(&cut), "Pong.<|close|>think");
+    }
+
+    /// A call whose arguments the model wrote as JSON and closed with a `json` region of its own
+    /// (seen live): the call is read with no arguments, and the JSON with the region's tags is
+    /// refused as the model's failed call, counted and never content, where `{…}<|close|>json
+    /// <|sep|>` reached the client as content before.
+    #[test]
+    fn arguments_written_as_json_in_a_region_of_the_models_own_are_refused_never_content() {
+        const OUTPUT: &str = concat!(
+            "Noise.<|close|>think<|sep|><|open|>tools<|sep|>",
+            "<|open|>call tool=\"get_law_categories\" index=\"0\"<|sep|>",
+            "{\"country\":\"United States\",\"law_type\":\"noise\"}<|close|>json<|sep|>",
+            "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+        );
+        const SLIP: &str =
+            "{\"country\":\"United States\",\"law_type\":\"noise\"}<|close|>json<|sep|>";
+        for pieces in [vec![OUTPUT], OUTPUT.split_inclusive(',').collect()] {
+            let events = run(PROMPT, &pieces);
+            assert_eq!(bytes(&events), OUTPUT, "{pieces:?}");
+            assert_eq!(arguments_of(&events, 0), "{}", "{pieces:?}");
+            let shown: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Content(text) | Event::Malformed { text, .. } => Some(&*text.text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(shown, "", "{pieces:?}: {events:?}");
+            let refused: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Dropped {
+                        text,
+                        why: DropReason::MalformedCall,
+                    } => Some(&*text.text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(refused, SLIP, "{pieces:?}");
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    Event::Malformed {
+                        why: MalformedReason::TagOutOfPlace,
+                        ..
+                    }
+                )),
+                "{pieces:?}"
+            );
+        }
     }
 }

@@ -63,7 +63,7 @@ struct Golden {
 
 #[derive(Deserialize)]
 struct Sampling {
-    fps: f32,
+    fps: f64,
     min_frames: usize,
     max_frames: usize,
     temporal_patch_size: usize,

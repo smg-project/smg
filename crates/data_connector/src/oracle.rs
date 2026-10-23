@@ -707,7 +707,8 @@ impl ConversationItemStorage for OracleConversationItemStorage {
         let schema = self.store.schema.clone();
         let hook_extra = current_extra_columns().unwrap_or_default();
 
-        self.store
+        let inserted = self
+            .store
             .execute(move |conn| {
                 let si = &schema.conversation_items;
                 let table = si.qualified_table(schema.owner.as_deref());
@@ -751,18 +752,33 @@ impl ConversationItemStorage for OracleConversationItemStorage {
                     params.push(val);
                 }
 
-                let placeholders: Vec<String> =
-                    (1..=params.len()).map(|i| format!(":{i}")).collect();
-                let sql = format!(
-                    "INSERT INTO {table} ({}) VALUES ({})",
-                    columns.join(", "),
-                    placeholders.join(", ")
-                );
-                conn.execute(&sql, &params[..]).map_err(map_oracle_error)?;
-                Ok(())
+                let (sql, binds) = create_item_sql(&table, &columns);
+                let named: Vec<(&str, &dyn ToSql)> = binds
+                    .iter()
+                    .map(String::as_str)
+                    .zip(params.iter().copied())
+                    .collect();
+                match conn.execute_named(&sql, &named) {
+                    Ok(stmt) => stmt.row_count().map_err(map_oracle_error),
+                    // ORA-00001: a concurrent create of the same id won the
+                    // insert between this MERGE's probe and its own insert;
+                    // the row under the id stands, as when the probe finds it.
+                    Err(err) if err.db_error().is_some_and(|db_err| db_err.code() == 1) => Ok(0),
+                    Err(err) => Err(map_oracle_error(err)),
+                }
             })
             .await
             .map_err(ConversationItemStorageError::from_failure)?;
+        if inserted == 0 {
+            // The row under the id stands: the item is the stored one (the
+            // contract of [`ConversationItemStorage::create_item`]).
+            return self.get_item(&id).await?.ok_or_else(|| {
+                ConversationItemStorageError::StorageError(format!(
+                    "item {} was not stored and is not found under its id",
+                    id.0
+                ))
+            });
+        }
 
         Ok(ConversationItem {
             id,
@@ -1490,15 +1506,38 @@ impl ResponseRow {
 /// matches), so a configured table that pre-exists without the primary key
 /// the store would create works too.
 fn store_response_sql(table: &str, columns: &[&str]) -> (String, Vec<String>) {
+    merge_on_id_sql(table, columns, true)
+}
+
+/// The statement of [`ConversationItemStorage::create_item`], with the names
+/// of its binds in the columns' order: the merge of [`store_response_sql`]
+/// without its WHEN MATCHED clause, so the row is inserted when none is
+/// stored under the id and a stored one is left as it is (the caller reads
+/// the row count: 0 means a row stands). The values are bound in INSERT
+/// VALUES, outside the source, as there (the content may be a CLOB), and the
+/// merge needs no index on the id.
+fn create_item_sql(table: &str, columns: &[&str]) -> (String, Vec<String>) {
+    merge_on_id_sql(table, columns, false)
+}
+
+/// A MERGE on the first of `columns` (the id) with one named bind per column
+/// (`v1..vn`; the id's is the one-row source): a row under the id takes the
+/// other columns' values when `update_matched` and is left as it is
+/// otherwise; no row inserts one.
+fn merge_on_id_sql(table: &str, columns: &[&str], update_matched: bool) -> (String, Vec<String>) {
     let binds: Vec<String> = (1..=columns.len()).map(|i| format!("v{i}")).collect();
     let id_col = columns.first().copied().unwrap_or("id");
     let id_bind = binds.first().cloned().unwrap_or_else(|| "v1".to_string());
-    let updates: Vec<String> = columns
-        .iter()
-        .zip(&binds)
-        .skip(1)
-        .map(|(col, bind)| format!("t.{col} = :{bind}"))
-        .collect();
+    let updates: Vec<String> = if update_matched {
+        columns
+            .iter()
+            .zip(&binds)
+            .skip(1)
+            .map(|(col, bind)| format!("t.{col} = :{bind}"))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let values: Vec<String> = binds.iter().map(|bind| format!(":{bind}")).collect();
     let matched = if updates.is_empty() {
         String::new()
@@ -2233,6 +2272,21 @@ mod tests {
         );
         let (plain, _) = update_if_open_sql("r", &["response_key", "input"], None);
         assert_eq!(plain, "UPDATE r SET input = :v2 WHERE response_key = :v1");
+    }
+
+    #[test]
+    fn create_item_sql_inserts_under_a_free_id_and_leaves_a_stored_row_as_it_is() {
+        let (sql, binds) = create_item_sql("conversation_items", &["id", "item_type", "content"]);
+        assert_eq!(
+            sql,
+            "MERGE INTO conversation_items t USING (SELECT :v1 AS id FROM dual) s ON (t.id = s.id) \
+             WHEN NOT MATCHED THEN INSERT (id, item_type, content) VALUES (:v1, :v2, :v3)"
+        );
+        assert_eq!(binds, ["v1", "v2", "v3"]);
+        // The content may be a CLOB: bound in INSERT VALUES, never inside the
+        // source (ORA-01461 above 4,000 bytes there), as `store_response_sql` binds.
+        let source = &sql[sql.find("USING (").unwrap()..sql.find(") s ON").unwrap()];
+        assert!(!source.contains(":v3"), "{source}");
     }
 
     #[test]

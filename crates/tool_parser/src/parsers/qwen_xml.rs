@@ -24,7 +24,7 @@ use crate::{
 /// - String-typed parameter values stream as they are generated; other types
 ///   arrive whole once their value is complete (coercion needs all of it)
 ///
-/// Reference: https://huggingface.co/Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8?chat_template=default
+/// Reference: <https://huggingface.co/Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8?chat_template=default>
 pub struct QwenXmlParser {
     /// Regex for extracting tool calls in parse_complete
     extractor: Regex,

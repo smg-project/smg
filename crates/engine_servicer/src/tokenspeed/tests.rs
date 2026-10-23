@@ -494,6 +494,7 @@ async fn health_gates_on_the_engine_link_and_the_drain_flag() {
     assert_eq!(held.message, "Warming up");
     let (admitted, _cancel) = server
         .state
+        .shared
         .registry
         .register("held-probe")
         .expect("admission stays open while readiness is held");
@@ -517,7 +518,7 @@ async fn health_gates_on_the_engine_link_and_the_drain_flag() {
     assert!(!draining.healthy);
     assert_eq!(draining.message, "Draining");
     assert!(
-        server.state.registry.register("late").is_err(),
+        server.state.shared.registry.register("late").is_err(),
         "the drain closes admission"
     );
     server.stop(Duration::from_secs(5)).expect("clean stop");
@@ -990,6 +991,7 @@ async fn info_rpcs_report_the_launcher_facts_and_the_handshake() {
     wait_until(|| {
         h.server
             .state
+            .shared
             .engine
             .client
             .get()
@@ -1097,6 +1099,7 @@ async fn the_relay_subscribes_to_the_publisher_at_boot_before_any_gateway() {
     let relay = h
         .server
         .state
+        .shared
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
@@ -1184,6 +1187,7 @@ async fn a_publisher_already_counting_when_the_servicer_starts_is_replayed_from_
     let relay = h
         .server
         .state
+        .shared
         .kv_relay
         .clone()
         .expect("a relay for the publisher");
@@ -1391,7 +1395,12 @@ async fn a_shutdown_after_the_engines_completion_ends_the_stream_cleanly() {
     assert_eq!(done.output_ids, vec![10]);
     // The shutdown lands between the completion and the poll that ends the
     // stream: `cancel_all` is what `stop()` fires first.
-    h.server.state.registry.cancel_all().expect("cancel_all");
+    h.server
+        .state
+        .shared
+        .registry
+        .cancel_all()
+        .expect("cancel_all");
     assert!(
         stream.next().bounded().await.is_none(),
         "a clean end after the completion, not a status"
@@ -1420,6 +1429,7 @@ async fn every_rank_of_a_data_parallel_publisher_reaches_the_gateway() {
     let relay = h
         .server
         .state
+        .shared
         .kv_relay
         .clone()
         .expect("a relay for the publishers");
@@ -2013,7 +2023,7 @@ async fn the_scrape_pins_the_families_after_a_scripted_sequence() {
     send(&mut h.engine_out, &batch("c1", vec![50], 1, None, None)).await;
     chunk_tokens(c1.message().bounded().await.unwrap().unwrap());
     h.server.set_serving(false);
-    h.server.state.registry.cancel_all().unwrap();
+    h.server.state.shared.registry.cancel_all().unwrap();
     let cut = c1.message().bounded().await.expect_err("a cut is a status");
     assert_eq!(cut.code(), Code::Unavailable);
     assert_eq!(recv_abort(&mut h.engine_in).await, vec!["c1".to_string()]);

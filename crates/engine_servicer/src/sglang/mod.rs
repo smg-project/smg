@@ -14,39 +14,31 @@ mod service;
 #[cfg(test)]
 mod tests;
 
-use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::{Duration, Instant, SystemTime},
-};
+use std::{sync::Arc, time::Duration};
 
 use engine_zmq_adapter::{
     ConstraintKinds, StructuredOutputBackend, StructuredOutputsBackendConfig,
-    StructuredOutputsSupport, ZmqEngineClient,
+    StructuredOutputsSupport,
 };
-use futures::FutureExt;
 use smg_grpc_client::sglang_proto::sglang_scheduler_server::SglangSchedulerServer;
-use tokio::net::TcpListener;
-use tokio_stream::{wrappers::TcpListenerStream, StreamExt};
-use tonic::{transport::Server, Status};
-use tonic_health::pb::health_server::HealthServer;
-use tracing::{info, warn};
+use tonic::service::Routes;
+use tracing::info;
 
 use crate::{
     engine_link::EngineLink,
-    health::HealthReporter,
-    metrics::{Identity, MetricsListener, ServicerMetrics, ServicerState, Snapshot},
+    kv_events::KvEventRelay,
+    metrics::{Identity, ServicerMetrics},
     proto_json,
-    requests::RequestRegistry,
-    ServerThread, ServicerConfig, ServicerError, Shutdown,
+    servicer::{self, Shared, WireState},
+    ServicerConfig, ServicerError,
 };
 
 /// The gRPC service name, as the health service reports it.
 pub const SERVICE_NAME: &str = "sglang.grpc.scheduler.SglangScheduler";
 /// The `wire` label of this servicer's metrics.
 const WIRE: &str = "sglang";
+/// What `HealthCheck`'s message says of a serving engine on this wire.
+const HEALTHY: &str = "healthy";
 
 /// What `GetModelInfo` and `GetServerInfo` report: the facts the Python
 /// servicer reads off SGLang's `ModelConfig` and `ServerArgs`, which the
@@ -180,119 +172,39 @@ pub struct SglangServicerConfig {
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
 /// attaches to every batch it streams.
-struct LoadFromState(std::sync::Weak<State>);
-
-impl crate::kv_events::LoadSource for LoadFromState {
-    fn load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
-        let state = self.0.upgrade()?;
-        let response = info::loads(&state, dp_rank).ok()?;
-        let load = response.loads.first()?;
+impl crate::kv_events::RankLoads for State {
+    fn rank_load(&self, dp_rank: Option<i32>) -> Option<smg_grpc_client::common_proto::EngineLoad> {
+        let response = info::loads(self, dp_rank).ok()?;
         // The engine reports no queued token-work on this wire yet: the
         // record's `waiting_uncached_tokens` stays unset.
-        let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
-        record.engine_silence_ms = state.engine.output_silence_ms();
-        record.engine_reports_steps = state.engine.reports_steps();
-        record.prefill_pending_tokens = state.engine.prefill_pending_tokens();
-        Some(record)
+        Some(smg_grpc_client::common_proto::EngineLoad::from(
+            response.loads.first()?,
+        ))
+    }
+
+    fn engine_link(&self) -> &EngineLink {
+        &self.shared.engine
     }
 }
 
 pub(super) struct State {
     pub(super) model: SglangModelInfo,
-    /// The KV-event relay for the engine's ZMQ publisher; `None` when events
-    /// are off (`SubscribeKvEvents` is then UNIMPLEMENTED).
-    pub(super) kv_relay: Option<Arc<crate::kv_events::KvEventRelay>>,
-    /// The local tokenizer directory `GetTokenizer` bundles; `None` when none
-    /// resolved.
-    pub(super) tokenizer_dir: Option<String>,
-    pub(super) engine: EngineLink,
-    /// The request, token and latency metrics.
-    pub(super) metrics: Arc<ServicerMetrics>,
-    pub(super) registry: Arc<RequestRegistry>,
-    /// Cleared by the lifecycle owner to drain (`set_serving`, admission
-    /// closed with it) or to hold readiness alone (`set_ready`, admission
-    /// open): health answers NOT_SERVING either way.
-    pub(super) serving: AtomicBool,
-    pub(super) started: Instant,
-    pub(super) started_at: SystemTime,
+    /// What every servicer's state shares: the engine link, the admitted
+    /// requests, the KV-event relay, the metrics and the serving switch.
+    pub(super) shared: Shared,
 }
 
-impl State {
-    /// The lifecycle state a scrape reports: the drain is read off the
-    /// registry (admission closed); a cleared serving flag with admission
-    /// open is readiness held back, not a drain.
-    fn lifecycle_state(&self) -> ServicerState {
-        if !self.registry.is_accepting() {
-            return ServicerState::Draining;
-        }
-        match (self.engine.client.get(), self.engine.error()) {
-            (Some(client), _) if client.is_alive() => {
-                if self.serving.load(Ordering::Acquire) {
-                    ServicerState::Serving
-                } else {
-                    ServicerState::WarmingUp
-                }
-            }
-            (Some(_), _) | (None, Some(_)) => ServicerState::EngineDown,
-            (None, None) => ServicerState::Starting,
-        }
-    }
-
-    /// What a metrics scrape reads off the servicer at that moment.
-    pub(super) fn snapshot(&self) -> Snapshot {
-        Snapshot {
-            active: self.registry.active(),
-            state: Some(self.lifecycle_state()),
-        }
-    }
-
-    pub(super) fn engine(&self) -> Result<&ZmqEngineClient, Status> {
-        if let Some(client) = self.engine.client.get() {
-            return Ok(client);
-        }
-        Err(match self.engine.error() {
-            Some(error) => Status::unavailable(format!("engine connection failed: {error}")),
-            None => Status::unavailable("engine is still connecting"),
-        })
-    }
-
-    /// SERVING only once the engine link is up and alive and the lifecycle
-    /// owner has not started draining.
-    pub(super) fn is_serving(&self) -> bool {
-        self.serving.load(Ordering::Acquire)
-            && self
-                .engine
-                .client
-                .get()
-                .is_some_and(ZmqEngineClient::is_alive)
-    }
-
-    pub(super) fn health_message(&self) -> &'static str {
-        if !self.serving.load(Ordering::Acquire) {
-            // Admission still open: the lifecycle owner holds readiness for
-            // its own requests (the planned warm-up); closed: it drains.
-            return if self.registry.is_accepting() {
-                "Warming up"
-            } else {
-                "Draining"
-            };
-        }
-        match (self.engine.client.get(), self.engine.error()) {
-            (Some(client), _) if client.is_alive() => "healthy",
-            (Some(_), _) => "Engine is not alive",
-            (None, Some(_)) => "Engine connection failed",
-            (None, None) => "Engine is starting",
-        }
+impl WireState for State {
+    fn shared(&self) -> &Shared {
+        &self.shared
     }
 }
 
 /// A running Rust SGLang servicer. `start` returns once the gRPC listener is
 /// bound; the engines connect in the background and gate health.
 pub struct SglangServicerServer {
-    thread: ServerThread,
+    server: servicer::Server,
     state: Arc<State>,
-    /// The `/metrics` listener, when the configuration asked for one.
-    metrics_listener: Option<MetricsListener>,
 }
 
 impl SglangServicerServer {
@@ -323,7 +235,7 @@ impl SglangServicerServer {
         }
         // One publisher per data-parallel rank: the launcher's width (the
         // handshake's figure, which may differ, is not known yet).
-        let kv_relay = crate::kv_events::KvEventRelay::for_publisher(
+        let kv_relay = KvEventRelay::for_publisher(
             &config.model.kv_events_endpoint,
             Some(&config.model.kv_events_replay_endpoint),
             &config.model.kv_events_topic,
@@ -341,52 +253,21 @@ impl SglangServicerServer {
             config.servicer.metrics_bind_address.is_some(),
         )?;
         let state = Arc::new(State {
-            tokenizer_dir: config.servicer.tokenizer_dir.clone(),
             model: config.model,
-            kv_relay,
-            engine: EngineLink::default(),
-            metrics,
-            registry: Arc::new(RequestRegistry::default()),
-            serving: AtomicBool::new(true),
-            started: Instant::now(),
-            started_at: SystemTime::now(),
+            shared: Shared::new(kv_relay, metrics, config.servicer.tokenizer_dir.clone()),
         });
-        if let Some(relay) = &state.kv_relay {
-            relay.set_load_source(Arc::new(LoadFromState(Arc::downgrade(&state))));
-        }
-        // The metrics listener binds beside the gRPC listener, before the
-        // scheduler connects: a scrape during its start answers.
-        let metrics_listener = config
-            .servicer
-            .metrics_bind_address
-            .as_deref()
-            .map(|address| {
-                let probe = Arc::downgrade(&state);
-                MetricsListener::start(
-                    address,
-                    Arc::clone(&state.metrics),
-                    Arc::new(move || {
-                        probe
-                            .upgrade()
-                            .map(|state| state.snapshot())
-                            .unwrap_or_default()
-                    }),
-                )
+        let routes = Routes::new(
+            SglangSchedulerServer::new(service::SglangService {
+                state: Arc::clone(&state),
             })
-            .transpose()?;
-        let service = service::SglangService {
-            state: Arc::clone(&state),
-        };
-        let health_state = Arc::clone(&state);
-        let health = HealthReporter::new(
-            &["", SERVICE_NAME],
-            Arc::new(move || health_state.is_serving()),
+            .max_decoding_message_size(usize::MAX)
+            .max_encoding_message_size(usize::MAX),
         );
         let connect_state = Arc::clone(&state);
-        let kv_relay = state.kv_relay.clone();
         let silence = config.servicer.silence_bounds();
         let ServicerConfig {
             bind_address,
+            metrics_bind_address,
             ipc_base_url,
             handshake_address,
             engine_count,
@@ -394,16 +275,14 @@ impl SglangServicerServer {
             engine_startup_ceiling,
             ..
         } = config.servicer;
-        let thread = ServerThread::start(
+        let server = servicer::Server::start(
             "smg-sglang-servicer",
             &bind_address,
-            move |listener: TcpListener, shutdown: Shutdown, last_error| async move {
-                // The KV-event relay follows the publisher from the start,
-                // before any gateway asks, so its history and live-block
-                // record cover the engine's whole life.
-                if let Some(relay) = &kv_relay {
-                    relay.start_at_boot();
-                }
+            metrics_bind_address.as_deref(),
+            SERVICE_NAME,
+            &state,
+            routes,
+            move |address, last_error| {
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "engine connect is fire-and-forget; the runtime drop cancels it"
@@ -418,71 +297,29 @@ impl SglangServicerServer {
                     silence,
                     last_error,
                 ));
-                info!(address = %listener.local_addr().map(|a| a.to_string()).unwrap_or_default(), "SGLang gRPC servicer listening");
-                // Graceful first: stop accepting, let open streams finish;
-                // the drain grace bounds a client holding an idle connection.
-                let graceful = Server::builder()
-                    // Router-preprocessed media arrives as multi-megabyte
-                    // inline tensors; size the HTTP/2 windows for them.
-                    .initial_stream_window_size(Some(16 * 1024 * 1024))
-                    .initial_connection_window_size(Some(64 * 1024 * 1024))
-                    .max_frame_size(Some(1024 * 1024))
-                    .add_service(
-                        SglangSchedulerServer::new(service)
-                            .max_decoding_message_size(usize::MAX)
-                            .max_encoding_message_size(usize::MAX),
-                    )
-                    .add_service(HealthServer::new(health))
-                    .serve_with_incoming_shutdown(
-                        TcpListenerStream::new(listener).map(|conn| {
-                            if let Ok(stream) = &conn {
-                                if let Err(error) = stream.set_nodelay(true) {
-                                    warn!(%error, "could not set TCP_NODELAY on an accepted connection");
-                                }
-                            }
-                            conn
-                        }),
-                        shutdown.clone().map(|_| ()),
-                    );
-                let forced = async move {
-                    let grace = shutdown.await;
-                    tokio::time::sleep(grace).await;
-                };
-                tokio::select! {
-                    result = graceful => result.map_err(|error| error.to_string()),
-                    () = forced => {
-                        warn!("gRPC servicer closed its remaining connections after the drain grace");
-                        Ok(())
-                    }
-                }
+                info!(%address, "SGLang gRPC servicer listening");
             },
         )?;
-        Ok(Self {
-            thread,
-            state,
-            metrics_listener,
-        })
+        Ok(Self { server, state })
     }
 
     /// The bound `ip:port`.
     pub fn address(&self) -> String {
-        self.thread.address().to_string()
+        self.server.address()
     }
 
     /// The metrics listener's bound `ip:port`; `None` when none was asked for.
     pub fn metrics_address(&self) -> Option<String> {
-        self.metrics_listener
-            .as_ref()
-            .map(|listener| listener.address().to_string())
+        self.server.metrics_address()
     }
 
     pub fn running(&self) -> bool {
-        self.thread.running()
+        self.server.running()
     }
 
     /// Whether the engine handshake completed.
     pub fn engine_ready(&self) -> bool {
-        self.state.engine.client.get().is_some()
+        self.state.shared.engine_ready()
     }
 
     /// Report a sign of life from the scheduler process while the handshake
@@ -492,20 +329,17 @@ impl SglangServicerServer {
     /// (`engine_startup_ceiling`) still holds. A no-op once the scheduler is
     /// connected.
     pub fn note_engine_alive(&self) {
-        if !self.engine_ready() {
-            self.state.engine.liveness.touch();
-        }
+        self.state.shared.note_engine_alive();
     }
 
     pub fn last_error(&self) -> Result<Option<String>, ServicerError> {
-        self.thread.last_error()
+        self.server.last_error()
     }
 
     /// Announce SERVING (`true`) or drain (`false`): health flips at once,
     /// new admission closes while in-flight streams keep running until `stop`.
     pub fn set_serving(&self, serving: bool) {
-        self.state.registry.set_accepting(serving);
-        self.state.serving.store(serving, Ordering::Release);
+        self.state.shared.set_serving(serving);
     }
 
     /// Hold (`false`) or release (`true`) readiness alone: health flips as
@@ -513,27 +347,28 @@ impl SglangServicerServer {
     /// requests (its planned warm-up before SERVING) still reach the engine.
     /// `set_serving(false)` is the drain switch and closes admission as well.
     pub fn set_ready(&self, ready: bool) {
-        self.state.serving.store(ready, Ordering::Release);
+        self.state.shared.set_ready(ready);
+    }
+
+    /// Whether the KV-event relay's subscriptions have reached the scheduler's
+    /// publishers, or there is none to wait for (events off, a relay told to
+    /// start lazily, one that gave up). The lifecycle owner holds its planned
+    /// warm-up until then, so the warm-up's batches start the relay's
+    /// history and a gateway that subscribes later gets the scheduler's whole
+    /// life.
+    pub fn kv_relay_subscribed(&self) -> bool {
+        self.state.shared.kv_relay_subscribed()
     }
 
     /// Admitted requests still preprocessing, streaming, or unwinding an abort.
     pub fn active_requests(&self) -> usize {
-        self.state.registry.active()
+        self.state.shared.registry.active()
     }
 
     /// Signal shutdown and wait up to `timeout` for the server thread;
     /// in-flight streams are cancelled with it (which aborts their engine
     /// requests).
     pub fn stop(&self, timeout: Duration) -> Result<(), ServicerError> {
-        self.set_serving(false);
-        self.state.registry.cancel_all()?;
-        let started = Instant::now();
-        let stopped = self.thread.stop(timeout);
-        // The metrics listener goes last, inside what is left of the budget,
-        // so a scrape during the drain still reads the servicer draining.
-        if let Some(listener) = &self.metrics_listener {
-            listener.stop(timeout.saturating_sub(started.elapsed()))?;
-        }
-        stopped
+        self.server.stop(&self.state.shared, timeout)
     }
 }

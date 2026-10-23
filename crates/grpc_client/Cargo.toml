@@ -36,6 +36,10 @@ futures.workspace = true
 # `tonic::Status` made of one carries in its source chain
 # (`channel::is_transport_failure`); also the raw peer of the channel tests.
 h2 = "0.4.19"
+# The HTTP layer under tonic's channel: the type of the I/O failure under a
+# call (the socket reset or closed) a `tonic::Status` carries in its source
+# chain, without an `h2::Error` (`channel::is_transport_failure`).
+hyper = { version = "1", default-features = false }
 
 # Archive validation
 sha2 = "0.11"

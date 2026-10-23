@@ -1,7 +1,7 @@
 //! Hy4: reasoning between `<think:opensource>` and `</think:opensource>`, the turn's calls between
 //! `<tool_calls:opensource>` and `</tool_calls:opensource>`, each call between
 //! `<tool_call:opensource>` and `</tool_call:opensource>` as its name and keyed arguments in Hy4's
-//! spelling of the tags ([`keyed::Tags::HY4`]), typed by the request's tools. Everything else is
+//! spelling of the tags (`keyed::Tags::HY4`), typed by the request's tools. Everything else is
 //! content. The prompt opens the thought, and an empty thought writes `</think:opensource>` at
 //! once. A turn opens with `<｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜>`, so the
 //! prompt's replay starts there. Recorded as `hy4-preview` (tencent/Hy4-preview).

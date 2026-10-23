@@ -136,7 +136,7 @@ fn regex_rows_match_the_regex_module() {
 /// The `regex` module drops an empty group, also with `?`, before it merges
 /// alternatives of one character, so each of these matches as `[^ab]`: it
 /// finds nothing in "a" or "b", where Python's `re` finds both (`regex`
-/// 2026.9.10, transformers 5.18.0). The port refuses them or matches alike.
+/// 2026.9.29, transformers 5.18.0). The port refuses them or matches alike.
 #[test]
 fn empty_groups_do_not_hide_merged_negated_classes() {
     for source in [
@@ -171,7 +171,7 @@ fn empty_groups_do_not_hide_merged_negated_classes() {
 }
 
 /// `\w` and `\s` in a class, with what the `regex` module returns (`regex`
-/// 2026.9.10, `regex.compile(pattern, regex.DOTALL)`; spans in characters).
+/// 2026.9.29, `regex.compile(pattern, regex.DOTALL)`; spans in characters).
 /// Its `\s` is Unicode White_Space: U+001C, which Python's `re` counts as
 /// whitespace, is not one. Alternatives with such a negated class are not
 /// merged the way `[^a]|[^b]` is. A class with a class escape and its
@@ -256,7 +256,7 @@ fn class_escapes_match_the_regex_module() {
 
 /// Lookahead in a pattern used only with `finditer`, such as a tag pattern
 /// whose closing tag may be left out, with what the `regex`
-/// module returns (`regex` 2026.9.10, spans in characters). Lookahead in an
+/// module returns (`regex` 2026.9.29, spans in characters). Lookahead in an
 /// open or close pattern, and a group, backreference or repeat in or of one,
 /// stay refused.
 #[test]
@@ -335,7 +335,7 @@ fn lookahead_in_finditer_patterns() {
 }
 
 /// Class escapes in classes, with what the `regex` module returns (`regex`
-/// 2026.9.10, `regex.compile(pattern, regex.DOTALL)`; spans in characters).
+/// 2026.9.29, `regex.compile(pattern, regex.DOTALL)`; spans in characters).
 /// The module reads a `-` next to a class escape as a member (`[\s-a]` is
 /// `\s`, `-` and `a`), where Python's `re` rejects the range, and `\b` in a
 /// class as a backspace. Two negated classes of one character stay refused
@@ -438,7 +438,7 @@ fn parse_errors_do_not_quote_the_output() {
 /// Characters the `regex` module reads as literals where they start nothing
 /// else (`{`, `}`, `]`, and `|` or `^` inside a class), counted repeats, and
 /// escapes of control characters and code points, with what it returns
-/// (`regex` 2026.9.10, spans in characters). A quantifier with nothing to
+/// (`regex` 2026.9.29, spans in characters). A quantifier with nothing to
 /// repeat is rejected as the module rejects it.
 #[test]
 fn braces_brackets_and_escapes() {

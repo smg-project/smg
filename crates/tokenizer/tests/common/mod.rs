@@ -1,10 +1,11 @@
 //! Common test utilities for tokenizer tests
 #![allow(dead_code)] // each integration test binary uses a subset of these helpers
 
+pub mod hub_fetch;
+
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
 };
 
 use rustls::crypto::ring;
@@ -12,11 +13,11 @@ use rustls::crypto::ring;
 // Tokenizer download configuration
 const TINYLLAMA_TOKENIZER_URL: &str =
     "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json";
+/// Names another source of the TinyLlama tokenizer file: a mirror, or a stub
+/// standing in for the hub.
+const TINYLLAMA_TOKENIZER_URL_ENV: &str = "TINYLLAMA_TOKENIZER_URL";
 const CACHE_DIR: &str = ".tokenizer_cache";
 const TINYLLAMA_TOKENIZER_FILENAME: &str = "tinyllama_tokenizer.json";
-
-// Global mutex to prevent concurrent downloads
-static DOWNLOAD_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// The blocking HTTP client of the download helpers. The client takes the
 /// process-level TLS crypto provider (reqwest's `rustls-no-provider`
@@ -42,62 +43,16 @@ pub fn http_client_builder() -> reqwest::blocking::ClientBuilder {
     reqwest::blocking::Client::builder()
 }
 
-/// Downloads the TinyLlama tokenizer from HuggingFace if not already cached.
-/// Returns the path to the cached tokenizer file.
-///
-/// This function is thread-safe and will only download the tokenizer once
-/// even if called from multiple threads concurrently.
-#[expect(clippy::unwrap_used, reason = "test helper — panics are intentional")]
-#[expect(clippy::expect_used, reason = "test helper — panics are intentional")]
-#[expect(clippy::print_stdout, reason = "test diagnostic output")]
+/// The TinyLlama tokenizer file, downloaded into the cache once per process
+/// unless it is there already ([`hub_fetch::cached_download`]: one download
+/// at a time, a rate-limited hub waited out, a lock a failed download left
+/// poisoned taken back). Returns the path to the cached tokenizer file.
 pub fn ensure_tokenizer_cached() -> PathBuf {
-    // Get or initialize the mutex
-    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
-
-    // Lock to ensure only one thread downloads at a time
-    let _guard = mutex.lock().unwrap();
-
-    let cache_dir = PathBuf::from(CACHE_DIR);
-    let tokenizer_path = cache_dir.join(TINYLLAMA_TOKENIZER_FILENAME);
-
-    // Create cache directory if it doesn't exist
-    if !cache_dir.exists() {
-        fs::create_dir_all(&cache_dir).expect("Failed to create cache directory");
-    }
-
-    // Download tokenizer if not already cached
-    if !tokenizer_path.exists() {
-        println!("Downloading TinyLlama tokenizer from HuggingFace...");
-
-        // Use blocking reqwest client since we're in tests/benchmarks
-        let client = http_client();
-        let response = client
-            .get(TINYLLAMA_TOKENIZER_URL)
-            .send()
-            .expect("Failed to download tokenizer");
-
-        assert!(
-            response.status().is_success(),
-            "Failed to download tokenizer: HTTP {}",
-            response.status()
-        );
-
-        let content = response.bytes().expect("Failed to read tokenizer content");
-
-        assert!(
-            content.len() >= 100,
-            "Downloaded content too small: {} bytes",
-            content.len()
-        );
-
-        fs::write(&tokenizer_path, content).expect("Failed to write tokenizer to cache");
-        println!(
-            "Tokenizer downloaded and cached successfully ({} bytes)",
-            tokenizer_path.metadata().unwrap().len()
-        );
-    }
-
-    tokenizer_path
+    let url = std::env::var(TINYLLAMA_TOKENIZER_URL_ENV)
+        .unwrap_or_else(|_| TINYLLAMA_TOKENIZER_URL.to_string());
+    let path = PathBuf::from(CACHE_DIR).join(TINYLLAMA_TOKENIZER_FILENAME);
+    hub_fetch::cached_download(&http_client(), &url, &path, 100);
+    path
 }
 
 /// Common test prompts for consistency across tests
@@ -126,7 +81,6 @@ const KIMI_K3_CACHE_DIR: &str = ".tokenizer_cache/kimi_k3";
 /// `KIMI_K3_MODEL_DIR` points at a full checkpoint directory and skips the
 /// download; otherwise the two tokenizer files are fetched once from the
 /// public repository into `.tokenizer_cache/kimi_k3/`.
-#[expect(clippy::unwrap_used, reason = "test helper — panics are intentional")]
 #[expect(clippy::expect_used, reason = "test helper — panics are intentional")]
 #[expect(clippy::print_stdout, reason = "test diagnostic output")]
 #[expect(clippy::panic, reason = "test helper — panics are intentional")]
@@ -135,8 +89,7 @@ pub fn ensure_kimi_k3_cached() -> PathBuf {
         return PathBuf::from(dir);
     }
 
-    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
-    let _guard = mutex.lock().unwrap();
+    let _guard = hub_fetch::download_lock();
 
     let cache_dir = PathBuf::from(KIMI_K3_CACHE_DIR);
     if !cache_dir.exists() {
@@ -153,9 +106,7 @@ pub fn ensure_kimi_k3_cached() -> PathBuf {
         }
         println!("Downloading Kimi-K3 {file} from HuggingFace...");
         let client = http_client();
-        let response = client
-            .get(format!("{KIMI_K3_REPO}/{file}"))
-            .send()
+        let response = hub_fetch::fetch(&client, &format!("{KIMI_K3_REPO}/{file}"))
             .unwrap_or_else(|e| panic!("Failed to download {file}: {e}"));
         assert!(
             response.status().is_success(),
@@ -216,7 +167,7 @@ fn download_tokenizer_file(
     println!("Downloading {label} {file} from HuggingFace...");
     let client = http_client();
     let url = format!("{base}/{file}");
-    let response = match client.get(&url).send() {
+    let response = match hub_fetch::fetch(&client, &url) {
         Ok(response) => response,
         Err(error) => {
             println!("{label} download skipped (transport error): {error}");
@@ -256,18 +207,13 @@ fn download_tokenizer_file(
 /// only when offline (the repository is unreachable) and no override is set;
 /// a local failure (unwritable cache directory or file) panics so the parity
 /// gate cannot be skipped silently.
-#[expect(
-    clippy::unwrap_used,
-    clippy::panic,
-    reason = "test helper — panics are intentional"
-)]
+#[expect(clippy::panic, reason = "test helper — panics are intentional")]
 pub fn ensure_deepseek_v41_cached() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("DEEPSEEK_V41_MODEL_DIR") {
         return Some(PathBuf::from(dir));
     }
 
-    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
-    let _guard = mutex.lock().unwrap();
+    let _guard = hub_fetch::download_lock();
 
     let cache_dir = PathBuf::from(DEEPSEEK_V41_CACHE_DIR);
     if !cache_dir.exists() {
@@ -325,18 +271,13 @@ const DEEPSEEK_V4_CACHE_DIR: &str = ".tokenizer_cache/deepseek_v4";
 /// only when offline (the repository is unreachable) and no override is set;
 /// a local failure (unwritable cache directory or file) panics so the parity
 /// gate cannot be skipped silently.
-#[expect(
-    clippy::unwrap_used,
-    clippy::panic,
-    reason = "test helper — panics are intentional"
-)]
+#[expect(clippy::panic, reason = "test helper — panics are intentional")]
 pub fn ensure_deepseek_v4_cached() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("DEEPSEEK_V4_MODEL_DIR") {
         return Some(PathBuf::from(dir));
     }
 
-    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
-    let _guard = mutex.lock().unwrap();
+    let _guard = hub_fetch::download_lock();
 
     let cache_dir = PathBuf::from(DEEPSEEK_V4_CACHE_DIR);
     if !cache_dir.exists() {
@@ -383,18 +324,13 @@ const MINIMAX_M3_CACHE_DIR: &str = ".tokenizer_cache/minimax_m3";
 /// offline (the repository is unreachable) and no override is set; a local
 /// failure (unwritable cache directory or file) panics so the parity gate
 /// cannot be skipped silently.
-#[expect(
-    clippy::unwrap_used,
-    clippy::panic,
-    reason = "test helper — panics are intentional"
-)]
+#[expect(clippy::panic, reason = "test helper — panics are intentional")]
 pub fn ensure_minimax_m3_cached() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("MINIMAX_M3_MODEL_DIR") {
         return Some(PathBuf::from(dir));
     }
 
-    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
-    let _guard = mutex.lock().unwrap();
+    let _guard = hub_fetch::download_lock();
 
     let cache_dir = PathBuf::from(MINIMAX_M3_CACHE_DIR);
     if !cache_dir.exists() {

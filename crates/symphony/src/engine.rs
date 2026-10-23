@@ -1844,11 +1844,10 @@ mod tests {
             );
             assert_eq!(bytes(&stopped), output);
         }
-        // Inside a string the stop closes the string too, which the marker does not: the model
-        // wrote nothing after the value's bytes, so they are the value whole, and the one word
-        // of no bytes before the closing quote says the stop closed it, under the row as
-        // without it; the marker leaves the string open and says the arguments are no whole
-        // value, as before.
+        // Inside a string the stop closes the string too: the model wrote nothing after the
+        // value's bytes, so they are the value whole, and the one word of no bytes before the
+        // closing quote says the stop closed it, under the row as without it; the marker closes
+        // it the same way, under its own word.
         let output = "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par";
         for format in [glm().closes_at_stop("call"), glm()] {
             let events = run(format, output, EngineFinish::Stop);
@@ -1866,13 +1865,13 @@ mod tests {
         assert_eq!(
             calls(&marked),
             [(
-                r#"{"city": "Par"#.to_string(),
+                r#"{"city": "Par"}"#.to_string(),
                 Some("</tool_call>".to_string())
             )]
         );
         assert_eq!(
             malformed(&marked),
-            [(String::new(), MalformedReason::BlockWithoutACompleteCall)]
+            [(String::new(), MalformedReason::OpenAtTheMarker)]
         );
     }
 

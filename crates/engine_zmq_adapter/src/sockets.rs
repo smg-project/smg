@@ -175,7 +175,8 @@ pub(crate) async fn ensure_ipc_socket_dir(base_url: &str) -> Result<(), String> 
 
 /// Remove a stale ipc socket file left by a previous gateway process, if any.
 /// Only ever unlinks sockets (never a regular file at the path), inside the
-/// owner-verified socket dir.
+/// owner-verified socket dir. A socket that disappears between the stat and
+/// the unlink counts as removed: the step's job is a free path, and it is.
 #[cfg(unix)]
 pub(crate) async fn unlink_stale_socket(address: &str) -> Result<(), String> {
     let Some(path) = address.strip_prefix("ipc://") else {
@@ -192,9 +193,14 @@ pub(crate) async fn unlink_stale_socket(address: &str) -> Result<(), String> {
                 ));
             }
             tracing::info!("Removing stale ipc socket {path} from a previous gateway run");
-            tokio::fs::remove_file(path)
-                .await
-                .map_err(|e| format!("failed to remove stale ipc socket {path}: {e}"))
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => Ok(()),
+                // Gone between the stat and the unlink (a previous bind's
+                // teardown task, or a sweep beside this one, took it): the
+                // path is free, which is all the bind needs.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(format!("failed to remove stale ipc socket {path}: {e}")),
+            }
         }
     }
 }
@@ -227,6 +233,56 @@ mod tests {
         let err = unlink_stale_socket(&addr).await.unwrap_err();
         assert!(err.contains("not a socket"), "{err}");
         assert!(sock_path.exists(), "regular file must survive");
+    }
+
+    /// The step's job is a free path, so a socket that vanishes between the
+    /// stat and the unlink counts as removed. A previous bind's teardown
+    /// unlinks its socket files on their own tasks, and a connect retry sweeps
+    /// the same paths while those tasks may still be running: the sweep used
+    /// to fail the whole connect with NotFound although the path was free.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unlink_stale_socket_counts_a_socket_that_vanishes_under_it_as_removed() {
+        use std::{
+            os::unix::net::UnixListener,
+            sync::{
+                atomic::{AtomicBool, Ordering},
+                Arc,
+            },
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let sock_path = dir.path().join("vanishing.sock");
+        let addr = format!("ipc://{}", sock_path.display());
+        // A thread creates and unlinks the socket as fast as it can, so the
+        // helper's stat keeps finding a socket that its unlink then misses.
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = std::thread::spawn({
+            let (path, stop) = (sock_path.clone(), Arc::clone(&stop));
+            move || {
+                let mut cycles = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    // Only this thread creates the file, and it is unlinked
+                    // (here or by the helper) before the next bind, so the
+                    // bind never finds the path taken.
+                    drop(UnixListener::bind(&path).expect("bind the churned socket"));
+                    let _ = std::fs::remove_file(&path);
+                    cycles += 1;
+                }
+                cycles
+            }
+        });
+        let mut verdict = Ok(());
+        for round in 0..1_000 {
+            if let Err(e) = unlink_stale_socket(&addr).await {
+                verdict = Err(format!("round {round}: {e}"));
+                break;
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let cycles = churn.join().expect("the churn thread");
+        assert!(cycles > 0, "the churn thread never cycled the socket");
+        verdict.expect("a socket that vanishes between the stat and the unlink counts as removed");
     }
 
     #[test]

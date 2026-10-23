@@ -18,7 +18,9 @@ What a user of PD mode hits, in the order they hit it:
   engine slots on both pools instead of generating to its limit
 - failure: a pool loses one worker and traffic keeps flowing; a pool loses its
   only worker and the client gets a prompt error instead of a hang; the
-  worker comes back and rejoins rotation
+  worker comes back and rejoins rotation; a decode engine dies under live
+  streams and each stream ends with an error frame, never silently, while
+  its peers keep serving and its restart on the same GPU rejoins
 - operations: a PD fleet assembled at runtime through the worker API in IGW
   mode routes through prefill and decode
 
@@ -46,6 +48,7 @@ import threading
 import time
 from collections import Counter
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from urllib.parse import urlparse
@@ -67,6 +70,7 @@ from infra.pd_logs import (
     read_logs,
     worker_log_dir,
 )
+from infra.streams import SseChatEnd, read_sse_chat
 
 logger = logging.getLogger(__name__)
 
@@ -238,8 +242,9 @@ def _logs_since(log_dir: Path, sizes: dict[Path, int]) -> str:
         if not path.is_file():
             continue
         with path.open("rb") as fh:
-            # A restart truncates the log (mode "w"): a stale offset past EOF
-            # would silently read nothing, so fall back to the whole file.
+            # A restart moves the previous log aside and reopens the path at
+            # 0 bytes: a stale offset past EOF would silently read nothing, so
+            # fall back to the whole file.
             start = sizes.get(path, 0)
             fh.seek(start if start <= path.stat().st_size else 0)
             parts.append(fh.read().decode("utf-8", errors="replace"))
@@ -487,6 +492,45 @@ def _run_all(fns: list[Callable[[], None]], timeout: float) -> list[BaseExceptio
         if t.is_alive():
             errors.append(TimeoutError(f"a request was still running {timeout:.0f}s in"))
     return errors
+
+
+@dataclass
+class _StreamOutcome:
+    """How one streamed chat completion ended: the response status, the SSE
+    stream's end (see :class:`SseChatEnd`), or the exception that cut it."""
+
+    status: int | None = None
+    end: SseChatEnd = field(default_factory=SseChatEnd)
+    exception: str | None = None
+
+
+def _stream_chat(
+    gateway: Gateway, model: str, *, max_tokens: int, first_token: threading.Event
+) -> _StreamOutcome:
+    """Stream one chat completion to its end, ``first_token`` set at its first
+    chunk. A response that is not a stream (a status other than 200) is kept
+    as an error with its body."""
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": "Write a very long story about the sea."}],
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "stream": True,
+        "ignore_eos": True,
+    }
+    outcome = _StreamOutcome()
+    try:
+        with httpx.stream(
+            "POST", f"{gateway.base_url}/v1/chat/completions", json=body, timeout=120.0
+        ) as resp:
+            outcome.status = resp.status_code
+            if resp.status_code != 200:
+                outcome.end.error = {"http_status": resp.status_code, "body": resp.read()[:300]}
+                return outcome
+            outcome.end = read_sse_chat(resp.iter_lines(), on_first_chunk=first_token.set)
+    except Exception as exc:  # reported in the outcome, judged by the test
+        outcome.exception = repr(exc)
+    return outcome
 
 
 def _long_prompt(secret: str) -> str:
@@ -840,6 +884,120 @@ class TestPDTopology:
     @pytest.mark.flaky(reruns=0)  # a restart per attempt; a real failure must surface once
     def test_prefill_pool_survives_losing_one_worker(self, setup_backend):
         self._pool_survives_losing_one(setup_backend, "prefill")
+
+    @pytest.mark.flaky(reruns=0)  # a restart per attempt; a real failure must surface once
+    def test_decode_engine_death_under_streaming_traffic(self, setup_backend):
+        """A decode engine dies under live streams.
+
+        Each stream ends complete or with the gateway's error frame and
+        ``[DONE]``, never silently and never as a completion the engine
+        aborted; the gateway stops routing to the worker and its peers answer
+        new requests; the worker's restart on the same GPU rejoins rotation.
+
+        The fault is the engine's own processes dying under their launcher,
+        what a device fault or the kernel's out-of-memory killer does, not an
+        orderly stop: the launcher reports the death and exits, and the
+        harness restarts the worker once its ranks have released the device
+        memory. Over a KV transport whose peers keep a dead engine's memory
+        mapped, the restart fails its startup memory check here: that is
+        this row's finding about the transport, not a reason to skip.
+        """
+        mode, model, client, gateway = setup_backend
+        if mode != "pd_grpc":
+            # The MoRI-IO lanes run on the HTTP PD router and skip here too.
+            pytest.skip(
+                "the stream-failure contract asserted here is the gRPC pipeline's; "
+                "the HTTP PD router relays the engine's own frames"
+            )
+        decodes = gateway.decode_workers
+        if len(decodes) < 2:
+            pytest.skip("topology has a single decode worker")
+        victim = decodes[-1]
+        if is_sglang() and victim.effective_kv_backend() == "nixl":
+            # The nightly SGLang-over-NIXL row keeps the other peer restarts
+            # out by name for the same reason.
+            pytest.skip(
+                "the SGLang prefill segfaults when its decode comes back on the same "
+                "address (#2503), and this row restarts the decode on its old port"
+            )
+        peers = {w.base_url for w in decodes[:-1]}
+
+        streams = 4 * len(decodes)
+        before = len(_pairs_logged())
+        outcomes: list[_StreamOutcome] = []
+        first_tokens = [threading.Event() for _ in range(streams)]
+
+        def _run(event: threading.Event) -> None:
+            outcomes.append(_stream_chat(gateway, model, max_tokens=600, first_token=event))
+
+        threads = [threading.Thread(target=_run, args=(e,), daemon=True) for e in first_tokens]
+        for t in threads:
+            t.start()
+        # Every stream is past its first token before the kill, so the engine
+        # dies under live decode, on the victim and on its peers alike.
+        deadline = time.monotonic() + 60.0
+        for event in first_tokens:
+            assert event.wait(max(0.0, deadline - time.monotonic())), (
+                "a stream had no first token within 60s"
+            )
+        pairs = _wait_for_pairs(before + streams)[before:]
+        decodes_used = {d for _, d in pairs}
+        assert victim.base_url in decodes_used, f"no stream landed on {victim.base_url}: {pairs}"
+
+        killed = victim.kill_engine()
+        assert killed, f"{victim.base_url}: the launcher had no engine process to kill"
+        logger.info(
+            "%s: engine processes %s killed under %d streams", victim.base_url, killed, streams
+        )
+
+        for t in threads:
+            t.join(timeout=120.0)
+        try:
+            assert len(outcomes) == streams, (
+                f"{streams - len(outcomes)} streams still running 120s after the kill"
+            )
+            logger.info("stream outcomes after the kill: %s", outcomes)
+            exceptions = [o for o in outcomes if o.exception is not None]
+            assert not exceptions, f"streams failed below the SSE layer: {exceptions}"
+            ends = [o.end for o in outcomes]
+            aborted = [e for e in ends if e.finish_reason == "abort"]
+            assert not aborted, f"streams ended as completions the engine aborted: {aborted}"
+            silent = [
+                e for e in ends if e.error is None and e.finish_reason not in ("stop", "length")
+            ]
+            assert not silent, (
+                f"streams ended with neither a completion nor an error frame: {silent}"
+            )
+            failed = [e for e in ends if e.error is not None]
+            assert failed, "no stream reported the engine's death"
+            undone = [e for e in failed if not e.done]
+            assert not undone, f"failed streams not closed with [DONE]: {undone}"
+
+            # The gateway takes the worker out of rotation on its own and the
+            # peers answer: no client reads an error for a worker that is gone.
+            _wait_for_status(gateway, victim.base_url, "unhealthy", timeout=30.0)
+            before = len(_pairs_logged())
+            for i in range(6):
+                _ask(client, model, f"Reply with the number {i}.", max_tokens=8)
+            pairs = _wait_for_pairs(before + 6)[before:]
+            used = {d for _, d in pairs}
+            assert victim.base_url not in used, "gateway kept routing to the dead decode worker"
+            assert used <= peers, f"unknown decode workers in placement: {used - peers}"
+        finally:
+            # Whatever the verdict, the class's later tests need the pool back.
+            # stop() reaps the engine's processes and waits for the device
+            # memory before the same GPU is loaded again.
+            victim.stop()
+            victim.start(timeout=_RESTART_TIMEOUT)
+            _wait_for_status(gateway, victim.base_url, "healthy", timeout=60.0)
+        before = len(_pairs_logged())
+        count = 4 * len(decodes)
+        for i in range(count):
+            _ask(client, model, f"Reply with the number {i}.", max_tokens=8)
+        pairs = _wait_for_pairs(before + count)[before:]
+        assert victim.base_url in {d for _, d in pairs}, (
+            "restarted decode worker never rejoined rotation"
+        )
 
     # The name keeps "leg": two workflows select this test by `not sole_leg_outage`
     # (the nightly PD sweep and the PR e2e matrix); a rename moves those filters with it.

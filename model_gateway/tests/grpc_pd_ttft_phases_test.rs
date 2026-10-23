@@ -11,9 +11,6 @@
 //! Each case runs on a current-thread runtime under a thread-local Prometheus
 //! recorder, so the request path's emissions land in the rendered text.
 
-#[path = "common/mod.rs"]
-mod common;
-
 use std::{future::Future, time::Duration};
 
 use common::grpc_harness::{
@@ -28,6 +25,7 @@ use smg::{
     worker::{RuntimeType, WorkerType},
 };
 use smg_grpc_client::vllm_proto as proto;
+use smg_test_harness as common;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};

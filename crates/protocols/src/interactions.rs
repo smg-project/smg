@@ -214,7 +214,7 @@ impl Interaction {
 // ============================================================================
 
 /// Server-Sent Event for Interactions API streaming
-/// See: https://ai.google.dev/api/interactions-api#streaming
+/// See: <https://ai.google.dev/api/interactions-api#streaming>
 #[skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "event_type")]
@@ -290,7 +290,7 @@ pub enum InteractionStreamEvent {
 }
 
 /// Delta content for streaming updates
-/// See: https://ai.google.dev/api/interactions-api#ContentDelta
+/// See: <https://ai.google.dev/api/interactions-api#ContentDelta>
 #[skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -450,7 +450,7 @@ pub struct InteractionsCancelParams {
 // ============================================================================
 
 /// Interaction tool types
-/// See: https://ai.google.dev/api/interactions-api#Resource:Tool
+/// See: <https://ai.google.dev/api/interactions-api#Resource:Tool>
 #[skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -612,7 +612,7 @@ pub enum ImageSize {
 }
 
 /// Agent configuration
-/// See: https://ai.google.dev/api/interactions-api#CreateInteraction-deep_research
+/// See: <https://ai.google.dev/api/interactions-api#CreateInteraction-deep_research>
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentConfig {
@@ -632,7 +632,7 @@ pub enum AgentConfig {
 // ============================================================================
 
 /// Input can be Content, array of Content, array of Turn, or string
-/// See: https://ai.google.dev/api/interactions-api#request-body
+/// See: <https://ai.google.dev/api/interactions-api#request-body>
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum InteractionsInput {
@@ -647,7 +647,7 @@ pub enum InteractionsInput {
 }
 
 /// A turn in a conversation with role and content
-/// See: https://ai.google.dev/api/interactions-api#Resource:Turn
+/// See: <https://ai.google.dev/api/interactions-api#Resource:Turn>
 #[skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Turn {
@@ -666,7 +666,7 @@ pub enum TurnContent {
 }
 
 /// Content is a polymorphic type representing different content types
-/// See: https://ai.google.dev/api/interactions-api#Resource:Content
+/// See: <https://ai.google.dev/api/interactions-api#Resource:Content>
 #[skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]

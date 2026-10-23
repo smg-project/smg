@@ -9,7 +9,9 @@ the headless engine, construct the server, poll ``engine_ready`` /
 The count includes aborted requests until their response streams are released.
 ``set_ready(False)`` holds the health answer alone, admission open, for the
 launcher's own requests before SERVING (its planned warm-up); ``set_ready(True)``
-releases it.
+releases it. ``kv_relay_subscribed`` says whether the KV-event relay's
+subscription reached the engine's publisher (or there is none to wait for),
+which the launcher reads before it starts the warm-up.
 Worker-side media processing is the one request-time crossing, when the
 Python processors are chosen: a ``media_processor`` object
 (``smg_grpc_servicer.vllm.rust_media``) runs them for a request's

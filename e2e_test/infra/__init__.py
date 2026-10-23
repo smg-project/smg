@@ -80,7 +80,7 @@ from .process_utils import (
     wait_for_workers_ready,
 )
 from .run_eval import run_eval
-from .worker import Worker, start_workers, stop_workers
+from .worker import Worker, start_workers, stop_workers, worker_startup_timeout
 from .worker_pool import WorkerPool, cleanup_pool, get_pool
 
 __all__ = [
@@ -155,6 +155,7 @@ __all__ = [
     "Worker",
     "start_workers",
     "stop_workers",
+    "worker_startup_timeout",
     # Session-scoped worker cache
     "WorkerPool",
     "get_pool",

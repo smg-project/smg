@@ -73,7 +73,12 @@ from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 from smg_grpc_servicer.tokenspeed.kv_events import resolve_kv_events_config
 from smg_grpc_servicer.tokenspeed.loads import running_window
 from smg_grpc_servicer.tokenspeed.redact import redact_secrets
-from smg_grpc_servicer.tokenspeed.warmup import WARMUP_ENV, warmup_inputs, warmup_wire
+from smg_grpc_servicer.tokenspeed.warmup import (
+    DEFAULT_BUDGET_SECS,
+    WARMUP_ENV,
+    warmup_inputs,
+    warmup_wire,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -548,6 +553,7 @@ class TokenSpeedLauncher(RustLauncher):
     metrics_host_env = METRICS_HOST_ENV
     without_tokenizer = "string stops will be refused"
     warmup_env = WARMUP_ENV
+    warmup_default_budget_secs = DEFAULT_BUDGET_SECS
     # TokenSpeed's ``ModelConfig`` for the served model, built on first use
     # and kept for the hooks after it: the KV-events default reads the cache's
     # layer labels off it, the facts the rest.

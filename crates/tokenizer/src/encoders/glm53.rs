@@ -7,7 +7,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    fmt::{self, Write as _},
+    fmt::Write as _,
 };
 
 use anyhow::{bail, Result};
@@ -61,41 +61,10 @@ fn text(value: &Value) -> String {
         Value::Bool(true) => "True".into(),
         Value::Bool(false) => "False".into(),
         Value::String(value) => value.clone(),
-        Value::Number(value) if value.is_f64() => {
-            let mut number = value.as_f64().unwrap_or_default().to_string();
-            if !number.contains('.') {
-                number.push_str(".0");
-            }
-            number
-        }
-        Value::Number(value) => value.to_string(),
-        _ => format!("{:?}", TextValue(value)),
-    }
-}
-
-/// MiniJinja displays containers using Rust's debug formatting with Python
-/// boolean/null words. Nested floats use debug spelling, unlike scalar text.
-struct TextValue<'a>(&'a Value);
-
-impl fmt::Debug for TextValue<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            Value::Null => formatter.write_str("None"),
-            Value::Bool(value) => formatter.write_str(if *value { "True" } else { "False" }),
-            Value::Number(value) if value.is_f64() => {
-                fmt::Debug::fmt(&value.as_f64().unwrap_or_default(), formatter)
-            }
-            Value::Number(value) => fmt::Display::fmt(value, formatter),
-            Value::String(value) => fmt::Debug::fmt(value, formatter),
-            Value::Array(values) => formatter
-                .debug_list()
-                .entries(values.iter().map(TextValue))
-                .finish(),
-            Value::Object(values) => formatter
-                .debug_map()
-                .entries(values.iter().map(|(key, value)| (key, TextValue(value))))
-                .finish(),
-        }
+        Value::Number(value) if !value.is_f64() => value.to_string(),
+        // A float spells as Python's `str`, a list or a map as Python's repr,
+        // as the template writes them.
+        _ => chat_template::python_repr(value),
     }
 }
 

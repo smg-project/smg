@@ -4,8 +4,8 @@
 //! `Abort` RPC can end.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
-    future::Future,
+    collections::BTreeMap,
+    ops::ControlFlow,
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
@@ -19,14 +19,14 @@ use engine_zmq_adapter::{
 use futures::{stream::SelectAll, Stream};
 use llm_tokenizer::stop::StopSequenceDecoder;
 use smg_grpc_client::vllm_proto as vllm;
-use tokio::sync::oneshot;
 use tonic::Status;
 
 use super::{media::process_media_refs, State};
 use crate::{
-    metrics::{complete_finish_reason, ChoiceMetrics, RequestMetrics},
-    requests::{settle_shutdown, CancelReason, HeldTerminal, Registration},
+    metrics::{complete_finish_reason, ChoiceMetrics},
+    requests::HeldTerminal,
     stop_match::{stop_decoder, StopMatcher},
+    stream::{poll_engine_item, Choice, RequestStream},
     BoxStream,
 };
 
@@ -41,12 +41,18 @@ pub(super) async fn generate(
 ) -> Result<BoxStream<vllm::GenerateResponse>, Status> {
     // The request's arrival, the instant its latencies are measured from.
     let arrival = Instant::now();
-    let client = state.engine()?;
+    let client = state.shared.engine()?;
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
     }
     submit(state, client, req, trace_headers, arrival).await
 }
+
+/// The connector on which the notice is withheld (see
+/// [`RejectionNotice::send`]), by the name the launcher resolves off the
+/// engine's `kv_transfer_config` (a wrapper's mover) and `GetServerInfo`
+/// reports.
+const MOONCAKE_CONNECTOR: &str = "MooncakeConnector";
 
 /// The rejection notice a refused PD decode side owes its prefill side, so the
 /// connector releases the blocks that side pinned: what vLLM's own frontend
@@ -56,10 +62,19 @@ struct RejectionNotice {
     request_id: String,
     params: serde_json::Value,
     rank: Option<u32>,
+    /// Whether the engine moves its KV with the Mooncake connector, which
+    /// gets no notice (see `send`).
+    withheld: bool,
 }
 
 impl RejectionNotice {
-    fn owed_by(client: &ZmqEngineClient, req: &vllm::GenerateRequest) -> Option<Self> {
+    /// The notice `req` owes when it is a PD decode side, `kv_connector`
+    /// being the engine's connector as the launcher resolved it.
+    fn owed_by(
+        client: &ZmqEngineClient,
+        kv_connector: &str,
+        req: &vllm::GenerateRequest,
+    ) -> Option<Self> {
         kv_transfer_rejection_params(req).map(|params| Self {
             client: client.clone(),
             request_id: req.request_id.clone(),
@@ -67,18 +82,48 @@ impl RejectionNotice {
             rank: req
                 .data_parallel_rank
                 .and_then(|rank| u32::try_from(rank).ok()),
+            withheld: kv_connector == MOONCAKE_CONNECTOR,
         })
     }
 
     /// Send the notice, detached: the refusal does not wait on the engine,
     /// and a caller that already gave up has no future left to carry it.
+    ///
+    /// On the Mooncake connector the notice is withheld, a legitimate
+    /// pre-admission one included, with one warning line: that connector
+    /// reports the notice's empty pull as a finished transfer and the decode
+    /// engine dies on it; the prefill side's blocks are released by the
+    /// connector's own abort timeout instead.
     fn send(self) {
         let Self {
             client,
             request_id,
             params,
             rank,
+            withheld,
         } = self;
+        if withheld {
+            // Remove once upstream fixes the connector: in vLLM 0.31's
+            // MooncakeConnector the notice's request is admitted and freed in
+            // one scheduler step, its empty pull (the prefill-block release)
+            // completes afterwards, and `process_pulling_result` reports it
+            // as `finished_recving` like a pull that carried KV; the
+            // scheduler's `_update_from_kv_xfer_finished` then asserts that
+            // the freed id is still tracked and the EngineCore exits. The
+            // connector's failure path (`_handle_failed_recv`) guards exactly
+            // this case and names this hook; the success path does not. NIXL
+            // releases with a notification and no pull, so it keeps the
+            // notice.
+            tracing::warn!(
+                request_id,
+                "KV-transfer rejection notice withheld on the Mooncake connector: vLLM 0.31's \
+                 MooncakeConnector.process_pulling_result reports the notice's empty pull as \
+                 finished_recving for an id Scheduler._update_from_kv_xfer_finished no longer \
+                 tracks, which kills the decode engine; the prefill side releases the blocks \
+                 at the connector's own abort timeout instead"
+            );
+            return;
+        }
         #[expect(
             clippy::disallowed_methods,
             reason = "the notice outlives the refused request's future; it ends once the add is out"
@@ -122,7 +167,11 @@ async fn submit(
     // A PD decode side refused before admission still owes its prefill side
     // the notice: armed from the first refusal below until the engine can
     // hold the request.
-    let mut notice = ArmedNotice(RejectionNotice::owed_by(client, &req));
+    let mut notice = ArmedNotice(RejectionNotice::owed_by(
+        client,
+        &state.model.kv_connector,
+        &req,
+    ));
     // A pooling runner serves no generation task; vLLM's frontend refuses
     // this before the engine sees it, in these words.
     if !state.model.is_generation {
@@ -133,15 +182,20 @@ async fn submit(
     let request_id = req.request_id.clone();
     // Register before anything slow: an `Abort` landing while the media is
     // processed must find the entry, and a duplicate id is refused up front.
-    let (registration, cancel) = state.registry.register(&request_id).inspect_err(|error| {
-        // The id names a request that is still live; a notice under it would
-        // reuse it (and, past an `n > 1` fan-out, get in and free the live
-        // side's blocks). Only a drain refusal proves admission is closed;
-        // a poisoned registry cannot establish whether the id is live.
-        if error.code() != tonic::Code::Unavailable {
-            notice.disarm();
-        }
-    })?;
+    let (registration, cancel) =
+        state
+            .shared
+            .registry
+            .register(&request_id)
+            .inspect_err(|error| {
+                // The id names a request that is still live; a notice under it would
+                // reuse it (and, past an `n > 1` fan-out, get in and free the live
+                // side's blocks). Only a drain refusal proves admission is closed;
+                // a poisoned registry cannot establish whether the id is live.
+                if error.code() != tonic::Code::Unavailable {
+                    notice.disarm();
+                }
+            })?;
     // Worker-side media: the request's references become engine features
     // and its prompt the expanded one, before the frontend duties below.
     let (processed_media, media_identity) = match process_media_refs(state, &mut req).await? {
@@ -210,7 +264,7 @@ async fn submit(
         state: Arc::clone(state),
         request_id: request_id.clone(),
     };
-    let metrics = state.metrics.request(
+    let metrics = state.shared.metrics.request(
         arrival,
         u32::try_from(rank).ok(),
         prompt_tokens,
@@ -235,15 +289,9 @@ async fn submit(
             metrics.choice(),
         ));
     }
-    Ok(Box::pin(GenerateStream {
-        choices,
-        cancel,
-        aborted: None,
-        cut: None,
-        metrics,
-        _registration: registration,
-        _loads: loads,
-    }))
+    Ok(Box::pin(
+        RequestStream::new(choices, cancel, registration, metrics).holding(loads),
+    ))
 }
 
 /// The data-parallel rank a choice's engine request went to, as the load
@@ -343,6 +391,19 @@ impl ChoiceStream {
         self.prompt_counted = true;
     }
 
+    /// A terminal response with the request's media identity on it, when
+    /// there is one; anything else passes through.
+    fn stamped(&self, mut response: vllm::GenerateResponse) -> vllm::GenerateResponse {
+        if let (Some(identity), Some(vllm::generate_response::Response::Complete(complete))) =
+            (self.media_identity.as_deref(), response.response.as_mut())
+        {
+            complete.media_identity = Some(identity.clone());
+        }
+        response
+    }
+}
+
+impl Choice for ChoiceStream {
     /// End this choice on an abort: the `Complete` it was about to yield, the
     /// engine's parked one, or a synthesized `abort` one; `None` once it has
     /// already ended. Dropping the engine stream aborts the engine side.
@@ -357,17 +418,6 @@ impl ChoiceStream {
             self.metrics.ended(reason);
         }
         Some(self.stamped(complete))
-    }
-
-    /// A terminal response with the request's media identity on it, when
-    /// there is one; anything else passes through.
-    fn stamped(&self, mut response: vllm::GenerateResponse) -> vllm::GenerateResponse {
-        if let (Some(identity), Some(vllm::generate_response::Response::Complete(complete))) =
-            (self.media_identity.as_deref(), response.response.as_mut())
-        {
-            complete.media_identity = Some(identity.clone());
-        }
-        response
     }
 }
 
@@ -417,21 +467,9 @@ impl Stream for ChoiceStream {
                 this.inner = None;
                 return Poll::Ready(Some(Ok(this.stamped(complete))));
             }
-            let Some(inner) = this.inner.as_mut() else {
-                return Poll::Ready(None);
-            };
-            let item = match Pin::new(inner).poll_next(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(None) => {
-                    this.inner = None;
-                    return Poll::Ready(None);
-                }
-                Poll::Ready(Some(Err(status))) => {
-                    this.inner = None;
-                    this.metrics.failed(status.code());
-                    return Poll::Ready(Some(Err(status)));
-                }
-                Poll::Ready(Some(Ok(item))) => item,
+            let item = match poll_engine_item(&mut this.inner, &mut this.metrics, cx) {
+                ControlFlow::Continue(item) => item,
+                ControlFlow::Break(poll) => return poll,
             };
             let Some(vllm::generate_response::Response::Chunk(chunk)) = item.response.as_ref()
             else {
@@ -500,82 +538,6 @@ impl Stream for ChoiceStream {
                 continue;
             }
             return Poll::Ready(Some(Ok(item)));
-        }
-    }
-}
-
-/// The merged response stream of one generate request: its choices polled
-/// together (interleaved, each tagged with its `index`), ended early by the
-/// `Abort` RPC.
-struct GenerateStream {
-    choices: SelectAll<ChoiceStream>,
-    cancel: oneshot::Receiver<CancelReason>,
-    /// Set once aborted: the terminal `Complete` of every choice still open
-    /// at that point, yielded before the stream ends.
-    aborted: Option<VecDeque<vllm::GenerateResponse>>,
-    /// The status a shutdown ends the stream with once `aborted` is drained,
-    /// when it cut a choice still open; `None` ends it plainly.
-    cut: Option<Status>,
-    /// The request's observation, recorded when the stream and its choices
-    /// are gone.
-    metrics: Arc<RequestMetrics>,
-    _registration: Registration,
-    _loads: LoadsGuard,
-}
-
-impl Stream for GenerateStream {
-    type Item = ChoiceItem;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        loop {
-            if let Some(aborted) = this.aborted.as_mut() {
-                if let Some(response) = aborted.pop_front() {
-                    return Poll::Ready(Some(Ok(response)));
-                }
-                // The completions the choices already held went out; a
-                // shutdown that cut a choice still open ends the stream with
-                // its status, a plain abort just ends it.
-                return Poll::Ready(this.cut.take().map(|status| {
-                    this.metrics.failed(status.code());
-                    Err(status)
-                }));
-            }
-            // The cancellation names its cause. An `Abort` RPC is the caller's
-            // own abort: the request ends as the Python servicer ends it, with
-            // each open choice's `Complete(finish_reason = "abort")`. A
-            // shutdown with the request still open is its engine side going
-            // away under it (the lifecycle owner stopping the pair after the
-            // engine exited, a drain whose grace ran out): no completion the
-            // caller could read as a short answer, so the stream ends with
-            // UNAVAILABLE, which the Router classes as the worker's failure.
-            // Either way dropping the choices aborts the engine side.
-            if let Poll::Ready(reason) = Pin::new(&mut this.cancel).poll(cx) {
-                if reason == Ok(CancelReason::Shutdown) {
-                    // A choice the engine (or a stop string) finished before
-                    // this poll keeps its completion; only a choice still
-                    // open is cut, and only then does the stream end with the
-                    // status (see `settle_shutdown`).
-                    let (finished, cut) = settle_shutdown(&mut this.choices);
-                    this.aborted = Some(finished);
-                    if cut {
-                        this.metrics.cut();
-                    }
-                    this.cut = cut.then(|| Status::unavailable(crate::requests::SHUTDOWN_MESSAGE));
-                    continue;
-                }
-                // The abort, or a sender dropped without a word (the registry
-                // entry went away): the completion it always was.
-                let aborted = this
-                    .choices
-                    .iter_mut()
-                    .filter_map(ChoiceStream::abort)
-                    .collect();
-                this.choices.clear();
-                this.aborted = Some(aborted);
-                continue;
-            }
-            return Pin::new(&mut this.choices).poll_next(cx);
         }
     }
 }

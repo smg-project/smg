@@ -510,14 +510,14 @@ pub trait ModelProcessorSpec: Send + Sync {
     /// Frame rate to sample a video at when the request names no `fps`: the
     /// model's reference processor default, so token counts match it. `None`
     /// keeps the media connector's default.
-    fn default_video_sample_fps(&self) -> Option<f32> {
+    fn default_video_sample_fps(&self) -> Option<f64> {
         None
     }
 
     /// [`Self::default_video_sample_fps`] given the video preprocessor config
     /// the checkpoint ships, for a family whose reference reads the rate from
     /// it; the default ignores the config.
-    fn default_video_sample_fps_with(&self, _config: Option<&PreProcessorConfig>) -> Option<f32> {
+    fn default_video_sample_fps_with(&self, _config: Option<&PreProcessorConfig>) -> Option<f64> {
         self.default_video_sample_fps()
     }
 

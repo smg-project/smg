@@ -142,7 +142,12 @@ pub fn split_stored_message_content(raw: Value) -> (Value, Option<MessagePhase>)
 // ============================================================================
 
 /// Create a conversation item and optionally link it to a conversation.
-/// Sets default "completed" status if not provided.
+/// Sets default "completed" status if not provided. An item the store
+/// already holds under the id (a turn whose input echoes an item of an
+/// earlier response, with the id it came with) is the stored item, linked at
+/// its new place; every backend answers it so. The stored item is linked
+/// only when the caller's tenant may read it: an id held by another tenant
+/// is refused before the link, as an item referenced by id is.
 /// `added_at` stamps the link; a caller linking several items takes the stamps from one
 /// [`AddedAtSequence`], so the conversation lists them in the order they were linked.
 pub async fn create_and_link_item(
@@ -154,6 +159,7 @@ pub async fn create_and_link_item(
     if new_item.status.is_none() {
         new_item.status = Some("completed".to_string());
     }
+    let tenant = new_item.tenant.clone();
 
     let created = item_storage
         .create_item(new_item)
@@ -161,6 +167,15 @@ pub async fn create_and_link_item(
         .map_err(|e| format!("Failed to create item: {e}"))?;
 
     if let Some(conv_id) = conv_id_opt {
+        // The item under an echoed id may be another tenant's: linked here, it
+        // would be read through this conversation. The one rule of tenant scope
+        // decides before the link, as it does for an item referenced by id.
+        if !created.is_visible_to(tenant.as_deref()) {
+            return Err(format!(
+                "Failed to link item {}: the item under this id is held by another tenant",
+                created.id.0
+            ));
+        }
         item_storage
             .link_item(conv_id, &created.id, added_at)
             .await
@@ -849,6 +864,49 @@ mod tests {
             new_item.content,
             json!([{"type": "input_text", "text": "hi"}])
         );
+    }
+
+    /// A turn that echoes an item id held by another tenant links nothing: the
+    /// item under the id is that tenant's, and the link would read it through
+    /// this conversation. The item's own tenant links it, as the contract says.
+    #[tokio::test]
+    async fn an_echoed_id_held_by_another_tenant_is_refused_before_the_link() {
+        use smg_data_connector::{ListParams, MemoryConversationItemStorage, SortOrder};
+
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let echoed = |tenant: &str| NewConversationItem {
+            id: Some(ConversationItemId::from("msg_theirs")),
+            response_id: None,
+            item_type: "message".to_string(),
+            role: Some("user".to_string()),
+            content: json!([{"type": "input_text", "text": tenant}]),
+            status: None,
+            tenant: Some(tenant.to_string()),
+        };
+        items.create_item(echoed("tenant-a")).await.unwrap();
+        let conversation = ConversationId::from("conv_b");
+
+        let err = create_and_link_item(&items, Some(&conversation), echoed("tenant-b"), Utc::now())
+            .await
+            .unwrap_err();
+        assert!(err.contains("held by another tenant"), "{err}");
+        let linked = items
+            .list_items(
+                &conversation,
+                ListParams {
+                    limit: 20,
+                    order: SortOrder::Asc,
+                    after: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(linked.is_empty(), "nothing is linked: {linked:?}");
+
+        create_and_link_item(&items, Some(&conversation), echoed("tenant-a"), Utc::now())
+            .await
+            .unwrap();
     }
 
     /// A background record closed with the object this persist writes (the

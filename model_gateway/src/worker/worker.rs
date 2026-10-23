@@ -565,7 +565,7 @@ pub trait Worker: Send + Sync + fmt::Debug + 'static {
     }
 
     /// Set or clear the liveness veto, returning `true` when it changed.
-    /// Route writes through [`super::liveness`], which logs and counts the
+    /// Route writes through the `liveness` module, which logs and counts the
     /// transition.
     fn set_stall(&self, _reason: Option<StallReason>) -> bool {
         false

@@ -519,7 +519,7 @@ pub(crate) fn process_message_content_format(
                     )?;
                 }
                 messages::Role::Assistant => {
-                    result.push(convert_assistant_message(&message.content));
+                    result.push(convert_assistant_message(&message.content, content_format));
                 }
                 // A `system`-role message in `messages[]` (e.g. from Claude Code) is
                 // forwarded in place, preserving its position in the conversation so
@@ -740,7 +740,10 @@ fn extract_tool_result_text(tool_result: &messages::ToolResultBlock) -> String {
 ///
 /// Extracts text content, tool calls, and reasoning/thinking into the
 /// appropriate JSON fields that the chat template expects.
-fn convert_assistant_message(content: &InputContent) -> Value {
+fn convert_assistant_message(
+    content: &InputContent,
+    content_format: ChatTemplateContentFormat,
+) -> Value {
     match content {
         InputContent::String(text) => json!({"role": "assistant", "content": text}),
         InputContent::Blocks(blocks) => {
@@ -772,11 +775,12 @@ fn convert_assistant_message(content: &InputContent) -> Value {
             let mut obj = serde_json::Map::new();
             obj.insert("role".into(), Value::String("assistant".into()));
 
-            // With no text blocks (e.g. tool-calls-only), render content as
-            // `null` — the OpenAI-faithful representation the chat template
-            // expects — rather than an empty text frame.
+            // With no text blocks (a tool-use-only turn) the content is the
+            // empty content the engine's chat utils hand a template in its
+            // format (`""` or `[]`), never null, which a template that tests
+            // or concatenates every assistant message's content cannot take.
             let content = if text_parts.is_empty() {
-                Value::Null
+                chat_utils::empty_content(content_format)
             } else {
                 Value::String(text_parts.join(""))
             };
@@ -1027,8 +1031,13 @@ mod tests {
         assert_eq!(tool_calls[0]["function"]["name"], "calculator");
     }
 
+    /// An assistant turn without a text block (a tool-use-only turn) is
+    /// handed to the template as the empty content the engine's chat utils
+    /// hand it: `""` under the string format, `[]` under the OpenAI format,
+    /// never null, which a template that tests or concatenates the content
+    /// cannot take.
     #[test]
-    fn test_absent_assistant_content_renders_null() {
+    fn an_assistant_turn_without_text_is_the_engines_empty_content_in_the_templates_format() {
         let messages = vec![InputMessage {
             role: Role::Assistant,
             content: InputContent::Blocks(vec![InputContentBlock::ToolUse(
@@ -1041,14 +1050,72 @@ mod tests {
             )]),
         }];
 
-        let result = process_message_content_format(
-            &messages,
-            ChatTemplateContentFormat::String,
-            None,
-            MediaPartOrder::MediaFirst,
-        )
+        for (format, empty) in [
+            (ChatTemplateContentFormat::String, json!("")),
+            (ChatTemplateContentFormat::OpenAI, json!([])),
+        ] {
+            let result =
+                process_message_content_format(&messages, format, None, MediaPartOrder::MediaFirst)
+                    .unwrap();
+            assert_eq!(result[0]["content"], empty, "{format:?}");
+            assert_eq!(
+                result[0]["tool_calls"][0]["function"]["name"],
+                json!("calc")
+            );
+        }
+    }
+
+    /// A tool-use-only assistant turn in the history renders through a
+    /// template that tests, splits and prints every assistant message's
+    /// content (a reasoning model's template strips the thought this way):
+    /// the check is false on the empty content and nothing is printed for
+    /// the turn, as the engine's own server renders it.
+    #[test]
+    fn a_tool_use_only_assistant_turn_renders_through_a_content_testing_template() {
+        let mut tokenizer =
+            llm_tokenizer::TiktokenTokenizer::new(llm_tokenizer::TiktokenModel::Cl100kBase)
+                .unwrap();
+        tokenizer
+            .set_chat_template(
+                "{%- for message in messages -%}\
+                 {%- if message.role == 'assistant' and '</think>' in message.content -%}\
+                 {%- set content = message.content.split('</think>')[-1].lstrip() -%}\
+                 {%- else -%}{%- set content = message.content -%}{%- endif -%}\
+                 <|{{ message.role }}|>{{ content }}\
+                 {%- if message.tool_calls -%}{%- for call in message.tool_calls -%}\
+                 <call:{{ call.function.name }}>{%- endfor -%}{%- endif -%}\
+                 <|end|>{%- endfor -%}\
+                 {%- if add_generation_prompt -%}<|assistant|>{%- endif -%}"
+                    .to_string(),
+            )
+            .unwrap();
+        assert_eq!(
+            tokenizer.chat_template_content_format(),
+            ChatTemplateContentFormat::String
+        );
+        let request: CreateMessageRequest = serde_json::from_value(json!({
+            "model": "m", "max_tokens": 8,
+            "messages": [
+                {"role": "user", "content": "What is the weather in Paris?"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "tu_1", "name": "get_weather", "input": {"city": "Paris"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_1", "content": "18 celsius"}
+                ]}
+            ]
+        }))
         .unwrap();
-        assert!(result[0]["content"].is_null());
+        let rendered =
+            process_messages(&request, &tokenizer, None, None, MediaPartOrder::MediaFirst)
+                .unwrap()
+                .0
+                .text;
+        assert_eq!(
+            rendered,
+            "<|user|>What is the weather in Paris?<|end|><|assistant|><call:get_weather><|end|>\
+             <|tool|>18 celsius<|end|><|assistant|>"
+        );
     }
 
     #[test]
@@ -1674,7 +1741,7 @@ mod tests {
         );
     }
 
-    /// The K3 stand-in vocabulary of the kit test (`tests/kimi_k3_tool_choice_none.rs`):
+    /// The K3 stand-in vocabulary of the kit test (`tests/grpc/kimi_k3_tool_choice_none.rs`):
     /// byte-level ranks plus the K3 control tokens, under the config that
     /// selects the renderer, so the rendering reads back as text.
     fn k3_stand_in_dir() -> tempfile::TempDir {

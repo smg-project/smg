@@ -362,3 +362,95 @@ pub(super) fn whole(extra: Value, continued: Option<&str>) -> Value {
 pub(super) fn after_thought(format: &Value) -> &Value {
     &format["elements"][1]
 }
+
+/// A character tokenizer (a token is a character's code point) whose decoder refuses where a
+/// test says: the step that decodes the id no character carries ([`Self::REFUSED`]) fails, and
+/// under [`Self::the_end`] the decoder's end fails, where the text it held would go out.
+#[derive(Default)]
+pub(crate) struct Refusing {
+    at_the_end: bool,
+    special_tokens: llm_tokenizer::traits::SpecialTokens,
+}
+
+impl Refusing {
+    /// An id no character carries (a surrogate): the step that decodes it fails.
+    pub(crate) const REFUSED: u32 = 0xD800;
+
+    /// A tokenizer whose decoder's end fails.
+    pub(crate) fn the_end() -> Self {
+        Self {
+            at_the_end: true,
+            ..Self::default()
+        }
+    }
+}
+
+impl llm_tokenizer::traits::Encoder for Refusing {
+    fn encode(
+        &self,
+        input: &str,
+        _add_special_tokens: bool,
+    ) -> anyhow::Result<llm_tokenizer::traits::Encoding> {
+        Ok(llm_tokenizer::traits::Encoding::Plain(
+            input.chars().map(u32::from).collect(),
+        ))
+    }
+
+    fn encode_batch(
+        &self,
+        inputs: &[&str],
+        add_special_tokens: bool,
+    ) -> anyhow::Result<Vec<llm_tokenizer::traits::Encoding>> {
+        inputs
+            .iter()
+            .map(|input| self.encode(input, add_special_tokens))
+            .collect()
+    }
+}
+
+impl llm_tokenizer::traits::Decoder for Refusing {
+    fn decode(&self, token_ids: &[u32], _skip_special_tokens: bool) -> anyhow::Result<String> {
+        token_ids
+            .iter()
+            .map(|id| {
+                char::from_u32(*id)
+                    .ok_or_else(|| anyhow::anyhow!("no character carries token {id}"))
+            })
+            .collect()
+    }
+
+    fn finish_decode(
+        &self,
+        _ids: &mut Vec<u32>,
+        _prefix: &mut String,
+        _prefix_index: &mut usize,
+        _skip_special_tokens: bool,
+    ) -> anyhow::Result<llm_tokenizer::traits::DecodeStep> {
+        if self.at_the_end {
+            anyhow::bail!("the decoder's end refused the text it held");
+        }
+        Ok(llm_tokenizer::traits::DecodeStep::default())
+    }
+}
+
+impl Tokenizer for Refusing {
+    fn vocab_size(&self) -> usize {
+        128
+    }
+
+    fn get_special_tokens(&self) -> &llm_tokenizer::traits::SpecialTokens {
+        &self.special_tokens
+    }
+
+    fn token_to_id(&self, token: &str) -> Option<u32> {
+        token.chars().next().map(u32::from)
+    }
+
+    fn id_to_token(&self, id: u32) -> Option<String> {
+        char::from_u32(id).map(|character| character.to_string())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+}

@@ -677,9 +677,10 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
     let mut reasoning_open = false;
     let mut finished = false;
     // Whether the last event was the word of a call, or a string in it, that the stream's stop
-    // closed (`Malformed { OpenAtTheStop }`, of no bytes): the fragment right after it may close
-    // the string with no byte of the output behind it, since the model's own end of output is
-    // what closed it.
+    // closed (`Malformed { OpenAtTheStop }`, of no bytes), or of a string the call's closing
+    // marker closed (`Malformed { OpenAtTheMarker }`): the fragment right after it may close the
+    // string with no byte of the output behind it, since the model's own end of output, or of
+    // the call, is what closed it.
     let mut after_the_stops_word = false;
     for (at, event) in replayed.events.iter().enumerate() {
         let place = || format!("{} ({which}), event {at}: {event:?}", describe(case));
@@ -840,11 +841,14 @@ fn check_well_formed(case: &Case, which: &str, replayed: &Replayed) {
                 }
             }
             Event::Malformed { text, why } => {
-                // The word of a call, or a string in it, that the stream's stop closed: the
-                // fragment right after it may close the string with no bytes behind it, and the
-                // call's arguments at its end are whole JSON, which the end checks as for a call
-                // no word was said about.
-                let stops_word = *why == MalformedReason::OpenAtTheStop && text.text.is_empty();
+                // The word of a call, or a string in it, that the stream's stop closed, or of a
+                // string the call's closing marker closed: the fragment right after it may close
+                // the string with no bytes behind it, and the call's arguments at its end are
+                // whole JSON, which the end checks as for a call no word was said about.
+                let stops_word = matches!(
+                    why,
+                    MalformedReason::OpenAtTheStop | MalformedReason::OpenAtTheMarker
+                ) && text.text.is_empty();
                 after_the_stops_word = stops_word;
                 for index in &started {
                     if !ended.contains(index) && !malformed_inside.contains(index) && !stops_word {

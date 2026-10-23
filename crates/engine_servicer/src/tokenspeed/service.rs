@@ -35,7 +35,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
     ) -> Result<Response<Self::GenerateStream>, Status> {
         generate::generate(&self.state, request.into_inner())
             .await
-            .inspect_err(|status| self.state.metrics.request_not_started(status))
+            .inspect_err(|status| self.state.shared.metrics.request_not_started(status))
             .map(Response::new)
     }
 
@@ -54,6 +54,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
         // The choices of an `n > 1` request live under the one registration,
         // so aborting the parent id ends every choice.
         self.state
+            .shared
             .registry
             .abort(std::slice::from_ref(&request.request_id))?;
         Ok(Response::new(ts::AbortResponse {
@@ -114,7 +115,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
         &self,
         _request: Request<common::GetTokenizerRequest>,
     ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        tokenizer_bundle::get_tokenizer(self.state.tokenizer_dir.clone())
+        tokenizer_bundle::get_tokenizer(self.state.shared.tokenizer_dir.clone())
             .await
             .map(Response::new)
     }
@@ -123,7 +124,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
         &self,
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        let Some(relay) = &self.state.kv_relay else {
+        let Some(relay) = &self.state.shared.kv_relay else {
             return Err(Status::unimplemented(
                 kv_events::TOKENSPEED_DISABLED_MESSAGE,
             ));

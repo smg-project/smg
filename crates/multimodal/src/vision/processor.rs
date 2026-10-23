@@ -30,8 +30,8 @@ fn dim_for_ndim(
 impl PreprocessedEncoderInputs {
     /// Get the number of channels.
     ///
-    /// For 4D tensors [B, C, H, W], returns shape[1].
-    /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[2].
+    /// For 4D tensors `[B, C, H, W]`, returns `shape[1]`.
+    /// For 5D tensors `[B, N, C, H, W]` (Phi3-Vision), returns `shape[2]`.
     ///
     /// # Errors
     /// Returns `TransformError::InvalidShape` if encoder_input is not 4D or 5D.
@@ -41,8 +41,8 @@ impl PreprocessedEncoderInputs {
 
     /// Get the height of processed images.
     ///
-    /// For 4D tensors [B, C, H, W], returns shape[2].
-    /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[3].
+    /// For 4D tensors `[B, C, H, W]`, returns `shape[2]`.
+    /// For 5D tensors `[B, N, C, H, W]` (Phi3-Vision), returns `shape[3]`.
     ///
     /// # Errors
     /// Returns `TransformError::InvalidShape` if encoder_input is not 4D or 5D.
@@ -52,8 +52,8 @@ impl PreprocessedEncoderInputs {
 
     /// Get the width of processed images.
     ///
-    /// For 4D tensors [B, C, H, W], returns shape[3].
-    /// For 5D tensors [B, N, C, H, W] (Phi3-Vision), returns shape[4].
+    /// For 4D tensors `[B, C, H, W]`, returns `shape[3]`.
+    /// For 5D tensors `[B, N, C, H, W]` (Phi3-Vision), returns `shape[4]`.
     ///
     /// # Errors
     /// Returns `TransformError::InvalidShape` if encoder_input is not 4D or 5D.
@@ -82,8 +82,9 @@ pub struct VisionPreprocessingContext {
 /// resolves at construction.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VideoClipOptions {
-    /// The rate the clip's frames were sampled at, in frames per second.
-    pub sample_fps: f32,
+    /// The rate the clip's frames were sampled at, in frames per second, as
+    /// the double the request or the checkpoint named it.
+    pub sample_fps: f64,
     /// The long-side cap the caller asked for, when it named one; the frames
     /// were already scaled to it.
     pub max_long_side_pixel: Option<u32>,
@@ -91,7 +92,7 @@ pub struct VideoClipOptions {
 
 impl VideoClipOptions {
     /// A clip sampled at `sample_fps` with no long-side cap.
-    pub fn sampled_at(sample_fps: f32) -> Self {
+    pub fn sampled_at(sample_fps: f64) -> Self {
         Self {
             sample_fps,
             max_long_side_pixel: None,

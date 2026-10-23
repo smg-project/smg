@@ -3,15 +3,17 @@
 
 use std::{
     future::Future,
-    io::{Read, Write},
+    io::{self, Read, Write},
     net::{SocketAddr, TcpStream},
     panic::Location,
     path::Path,
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Duration,
 };
 
 use engine_zmq_client::mock_engine::MOCK_DEADLINE;
 use tokio::time::timeout;
+use tracing_subscriber::EnvFilter;
 
 use crate::ServicerConfig;
 
@@ -197,5 +199,54 @@ pub(crate) fn assert_bucket_edges(body: &str, max_model_len: u32) {
         seen.retain(|le| le.is_finite());
         seen.sort_by(f64::total_cmp);
         assert_eq!(seen, edges, "the bucket edges of {name}");
+    }
+}
+
+/// The warnings and errors this test process logs, for the tests that assert
+/// a log line. The process-wide subscriber is installed on the first call (a
+/// global subscriber is set once per process; the servicers install none of
+/// their own, that is the launcher's `init_tracing`), every event from then
+/// on lands in one buffer, and a test reads the lines that name its request.
+pub(crate) fn captured_logs() -> CapturedLogs {
+    static LOGS: OnceLock<CapturedLogs> = OnceLock::new();
+    LOGS.get_or_init(|| {
+        let logs = CapturedLogs(Arc::new(Mutex::new(Vec::new())));
+        let writer = logs.clone();
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new("warn"))
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .try_init();
+        logs
+    })
+    .clone()
+}
+
+#[derive(Clone)]
+pub(crate) struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+impl CapturedLogs {
+    /// The captured lines that contain `needle`, oldest first.
+    pub(crate) fn lines_containing(&self, needle: &str) -> Vec<String> {
+        let bytes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        String::from_utf8_lossy(&bytes)
+            .lines()
+            .filter(|line| line.contains(needle))
+            .map(str::to_string)
+            .collect()
+    }
+}
+
+impl Write for CapturedLogs {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }

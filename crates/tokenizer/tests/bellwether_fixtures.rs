@@ -83,6 +83,10 @@ use llm_tokenizer::{create_tokenizer, traits::Tokenizer, MockTokenizer, Sequence
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 
+use crate::common::hub_fetch::{
+    cached_download, fetch, rate_limit_wait, RATE_LIMITED_TRIES, RATE_LIMIT_WINDOW,
+};
+
 mod common;
 
 const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
@@ -105,6 +109,11 @@ const KINDS: [&str; 2] = ["render", "parse"];
 /// content would be.
 const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 
+/// The reason of the render sets recorded from a Llama-class checkpoint's
+/// `tokenizer.json` read as a file, where the loader now runs the reference
+/// class's pipeline (see `huggingface::HuggingFaceTokenizer::llama_class_pipeline`).
+const LEGACY_FILE_PIPELINE: &str = "render ids recorded with the checkpoint's legacy file pipeline (a word marker after every special token, a normalized marker matched only behind a space, which it takes); the loader encodes such a checkpoint as its reference class does since the Llama-class pipeline change; to be re-recorded with the class backend";
+
 /// Cases known to differ from the reference, each with the reason and where
 /// it is tracked: a fixture id, `<slug>/render/<name>` or `<slug>/parse/<name>`,
 /// or a prefix ending in `*`, which stands for every case whose id begins
@@ -114,7 +123,18 @@ const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 /// pre-tokenizer for instance, and is held to the rule an id is: the run
 /// fails when no loaded case under it differs any more, and when no loaded
 /// case is under it at all.
-const KNOWN_DIFFERENCES: &[(&str, &str)] = &[];
+const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
+    ("nanbeige4-3b-thinking-2510/render/*", LEGACY_FILE_PIPELINE),
+    ("nanbeige4-3b-thinking-2511/render/*", LEGACY_FILE_PIPELINE),
+    ("nanbeige4.1-3b/render/*", LEGACY_FILE_PIPELINE),
+    ("nanollama/render/*", LEGACY_FILE_PIPELINE),
+    (
+        "spec-decoding-subfolder-fixture/render/*",
+        LEGACY_FILE_PIPELINE,
+    ),
+    ("tinyllama-1.1b-chat-v1.0/render/*", LEGACY_FILE_PIPELINE),
+    ("toolmind-web-3b/render/*", LEGACY_FILE_PIPELINE),
+];
 
 /// Models whose tokenizer is known not to load, with the reason and where it
 /// is tracked, so the run compares the others: an unlisted model that does
@@ -1198,14 +1218,22 @@ fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, Str
     let dir = PathBuf::from(CACHE_DIR).join(slug).join(revision);
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let client = common::http_client();
-    download(&client, model, revision, &dir, "tokenizer_config.json", 100)?
-        .ok_or_else(|| format!("{model} at {revision} serves no tokenizer_config.json"))?;
-    download(&client, model, revision, &dir, "config.json", 2)?;
+    download(
+        &client,
+        HUB,
+        model,
+        revision,
+        &dir,
+        "tokenizer_config.json",
+        100,
+    )?
+    .ok_or_else(|| format!("{model} at {revision} serves no tokenizer_config.json"))?;
+    download(&client, HUB, model, revision, &dir, "config.json", 2)?;
     let mut vocabulary = None;
     for files in VOCABULARIES {
         let mut whole = true;
         for file in files {
-            whole &= download(&client, model, revision, &dir, file, 100_000)?.is_some();
+            whole &= download(&client, HUB, model, revision, &dir, file, 100_000)?.is_some();
         }
         if whole {
             vocabulary = Some(files);
@@ -1225,11 +1253,16 @@ fn vocabularies() -> String {
         .join(", ")
 }
 
-/// Fetches `file` into `dir` unless it is there already; `Ok(None)` when the
-/// checkpoint does not serve it (HTTP 404), an error for any other failure
-/// or a file shorter than `min_bytes`.
+/// The hub the checkpoints' files are fetched from, at the manifest's revision.
+const HUB: &str = "https://huggingface.co";
+
+/// Fetches `file` from `hub` into `dir` unless it is there already; `Ok(None)` when the
+/// checkpoint does not serve it (HTTP 404, remembered beside the name as
+/// `<file>.absent`, since the revision is a commit and the answer final), an
+/// error for any other failure or a file shorter than `min_bytes`.
 fn download(
     client: &reqwest::blocking::Client,
+    hub: &str,
     model: &str,
     revision: &str,
     dir: &Path,
@@ -1240,12 +1273,14 @@ fn download(
     if path.is_file() {
         return Ok(Some(path));
     }
-    let url = format!("https://huggingface.co/{model}/resolve/{revision}/{file}");
-    let response = client
-        .get(&url)
-        .send()
-        .map_err(|e| format!("GET {url}: {e}"))?;
+    let absent = dir.join(format!("{file}.absent"));
+    if absent.is_file() {
+        return Ok(None);
+    }
+    let url = format!("{hub}/{model}/resolve/{revision}/{file}");
+    let response = fetch(client, &url)?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
+        fs::write(&absent, b"").map_err(|e| format!("cannot write {}: {e}", absent.display()))?;
         return Ok(None);
     }
     if !response.status().is_success() {
@@ -1824,4 +1859,150 @@ fn an_error_in_the_fan_out_leaves_the_other_threads_their_item_in_flight_and_no_
         started <= 1,
         "{started} items started beside the one that failed; the other thread had one in flight"
     );
+}
+
+/// A loopback server for the loaders' tests: it answers its connections with `heads` in order
+/// (each a response head whole; the body is `ok`), then stops, so a request past the last answer
+/// is refused; the count is the requests read, bumped before the answer goes out. A failure on
+/// the server's side ends it, and the test reads it in the count or in a refused connection.
+fn loopback(heads: &'static [&'static str]) -> io::Result<(String, Arc<AtomicUsize>)> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let served = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&served);
+    std::thread::spawn(move || {
+        for head in heads {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") && matches!(stream.read(&mut byte), Ok(1)) {
+                request.push(byte[0]);
+            }
+            count.fetch_add(1, Ordering::SeqCst);
+            let answer = format!("{head}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            if stream.write_all(answer.as_bytes()).is_err() {
+                return;
+            }
+        }
+    });
+    Ok((url, served))
+}
+
+/// A GET the hub rate-limits is sent again after the wait the answer asks for, and the answer
+/// past the limit is the one returned; after the last try, the limit itself is.
+#[test]
+fn a_rate_limited_get_is_sent_again_after_the_retry_after_wait() {
+    const LIMITED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0";
+    const LIMITED_EVERY_TIME: &[&str] = &[LIMITED; RATE_LIMITED_TRIES as usize];
+    let client = common::http_client();
+    let (url, served) = loopback(&[LIMITED, "HTTP/1.1 200 OK"]).unwrap();
+    let response = fetch(
+        &client,
+        &format!("{url}/org/m/resolve/r/tokenizer_config.json"),
+    )
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().unwrap(), "ok");
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+    let (url, served) = loopback(LIMITED_EVERY_TIME).unwrap();
+    let response = fetch(
+        &client,
+        &format!("{url}/org/m/resolve/r/tokenizer_config.json"),
+    )
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(served.load(Ordering::SeqCst), RATE_LIMITED_TRIES as usize);
+}
+
+/// The wait between two tries: `Retry-After` in seconds first, else the seconds left in the
+/// hub's window from the `ratelimit` header plus one (whole seconds: a try at the boundary is
+/// limited again), else ten seconds; never more than one window (an HTTP-date `Retry-After` is
+/// not a number and falls through).
+#[test]
+fn the_wait_after_a_rate_limit_is_what_the_answer_says_and_a_window_at_most() {
+    let headers = |pairs: &[(&'static str, &str)]| {
+        let mut map = reqwest::header::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, value.parse().unwrap());
+        }
+        map
+    };
+    assert_eq!(rate_limit_wait(&headers(&[])), Duration::from_secs(10));
+    assert_eq!(
+        rate_limit_wait(&headers(&[("retry-after", "7")])),
+        Duration::from_secs(7)
+    );
+    assert_eq!(
+        rate_limit_wait(&headers(&[("ratelimit", "\"resolvers\";r=0;t=240")])),
+        Duration::from_secs(241)
+    );
+    assert_eq!(
+        rate_limit_wait(&headers(&[
+            ("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT"),
+            ("ratelimit", "\"resolvers\";r=0;t=30"),
+        ])),
+        Duration::from_secs(31)
+    );
+    assert_eq!(
+        rate_limit_wait(&headers(&[
+            ("retry-after", "7"),
+            ("ratelimit", "\"resolvers\";r=0;t=240")
+        ])),
+        Duration::from_secs(7)
+    );
+    assert_eq!(
+        rate_limit_wait(&headers(&[("ratelimit", "\"resolvers\";r=0;t=1000")])),
+        RATE_LIMIT_WINDOW
+    );
+}
+
+/// A cached download the hub rate-limits once lands on the second try, and a call after it
+/// reads the cache; a download that failed under the download lock (limited at every try)
+/// leaves no file and no poisoned lock behind, so the test after it downloads instead of
+/// failing on the poison.
+#[test]
+fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
+    const LIMITED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0";
+    const LIMITED_EVERY_TIME: &[&str] = &[LIMITED; RATE_LIMITED_TRIES as usize];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tokenizer.json");
+    let (url, served) = loopback(LIMITED_EVERY_TIME).unwrap();
+    let failed = std::thread::spawn({
+        let path = path.clone();
+        move || cached_download(&common::http_client(), &url, &path, 2)
+    })
+    .join();
+    assert!(
+        failed.is_err(),
+        "limited at every try, the download must fail"
+    );
+    assert_eq!(served.load(Ordering::SeqCst), RATE_LIMITED_TRIES as usize);
+    assert!(!path.exists(), "a failed download leaves no file");
+    let (url, served) = loopback(&[LIMITED, "HTTP/1.1 200 OK"]).unwrap();
+    cached_download(&common::http_client(), &url, &path, 2);
+    assert_eq!(fs::read(&path).unwrap(), b"ok");
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+    cached_download(&common::http_client(), &url, &path, 2);
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        2,
+        "a cached file is not fetched again"
+    );
+}
+
+/// A file the checkpoint does not serve is asked for once: the answer is remembered beside its
+/// name, and the next run reads it without a request.
+#[test]
+fn a_file_the_checkpoint_does_not_serve_is_asked_for_once() {
+    let client = common::http_client();
+    let (url, served) = loopback(&["HTTP/1.1 404 Not Found"]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    for _ in 0..2 {
+        let got = download(&client, &url, "org/m", "r", dir.path(), "config.json", 2).unwrap();
+        assert!(got.is_none());
+    }
+    assert!(dir.path().join("config.json.absent").is_file());
+    assert_eq!(served.load(Ordering::SeqCst), 1);
 }

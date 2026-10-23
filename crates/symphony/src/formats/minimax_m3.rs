@@ -638,35 +638,42 @@ mod tests {
     }
 
     /// The invoke's close inside a streamed string, by its own closing tag, the block's close or
-    /// the next invoke: nothing is closed for a value the model never closed; the fragments
-    /// stand, and the one `Malformed` event before the end carries the start of a tag held there
-    /// or no bytes and says that the arguments are no whole value, under the engine's name for a
-    /// region a marker closed.
+    /// the next invoke: the model ended the call, so the value's bytes are the value whole. The
+    /// string is closed, the start of a tag held there its text since no tag followed, under one
+    /// `Malformed { OpenAtTheMarker }` event of no bytes right before the closing quote; the
+    /// containers above it and the object close, and the arguments read as JSON.
     #[test]
-    fn the_invokes_close_inside_a_string_leaves_it_open_and_reports_what_was_held() {
-        for (output, held) in [
+    fn the_invokes_close_inside_a_string_closes_it_there_and_says_so() {
+        for (output, value) in [
             (
                 "</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par</na</invoke>\n</tool_call>",
-                "</na",
+                "Par</na",
             ),
-            ("</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par</tool_call>", ""),
+            ("</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par</tool_call>", "Par"),
             (
                 "</mm:think><tool_call>\n<invoke name=\"alert\"><name>Par<invoke name=\"alert\">\
                  </invoke>\n</tool_call>",
-                "",
+                "Par",
             ),
         ] {
             let events = run_with(tools(), "", &[output]);
             assert_eq!(bytes(&events), output, "{output:?}");
-            assert_eq!(arguments_of(&events, 0), r#"{"name": "Par"#, "{output:?}");
-            let ended = events
+            assert_eq!(
+                arguments_of(&events, 0),
+                format!("{{\"name\": \"{value}\"}}"),
+                "{output:?}"
+            );
+            let at = events
                 .iter()
-                .position(|event| matches!(event, Event::ToolCallEnd { index: 0, .. }))
-                .expect("the call ends");
+                .position(|event| matches!(event, Event::Malformed { .. }))
+                .expect("the one word");
             assert!(
                 matches!(
-                    &events[ended - 1],
-                    Event::Malformed { text, why: MalformedReason::BlockWithoutACompleteCall } if text.text == held
+                    &events[at..at + 2],
+                    [
+                        Event::Malformed { text, why: MalformedReason::OpenAtTheMarker },
+                        Event::ToolCallArguments { index: 0, json, .. }
+                    ] if text.text.is_empty() && json == "\""
                 ),
                 "{output:?}: {events:#?}"
             );

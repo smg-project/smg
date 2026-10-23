@@ -17,7 +17,8 @@ use crate::{
     byte_level::{ByteLevelIncremental, ByteLevelTable, ByteLevelTableBuilder, UnknownId},
     chat_template::{
         load_chat_template_from_file, python_isspace, ChatTemplateContentFormat,
-        ChatTemplateParams, ChatTemplateState, ThinkingKeyName, ThinkingToggle,
+        ChatTemplateParams, ChatTemplateState, ConfigChatTemplates, ThinkingKeyName,
+        ThinkingToggle,
     },
     encoders::{
         join_segments,
@@ -76,7 +77,8 @@ struct TiktokenConfig {
     added_tokens: HashMap<String, TokenIdType>,
     /// Ids `skip_special_tokens` removes from decoded text.
     skip_token_ids: HashSet<TokenIdType>,
-    chat_template: Option<String>,
+    /// The config's chat template(s), named ones included.
+    chat_template: ConfigChatTemplates,
 }
 
 /// Parse an already-loaded `tokenizer_config.json` value into a `TiktokenConfig`.
@@ -85,10 +87,7 @@ fn parse_tiktoken_config(value: &serde_json::Value) -> TiktokenConfig {
         special_tokens: parse_special_tokens(value),
         added_tokens: parse_added_tokens_decoder(value),
         skip_token_ids: parse_skip_token_ids(value),
-        chat_template: value
-            .get("chat_template")
-            .and_then(|v| v.as_str())
-            .map(String::from),
+        chat_template: ConfigChatTemplates::read(value.get("chat_template")),
     }
 }
 
@@ -363,13 +362,20 @@ impl TiktokenTokenizer {
 
         // 5. Load chat template — propagate errors for explicit paths,
         //    silently fall back for auto-discovery
+        //    A template file stands alone (no `tool_use` beside it).
         let chat_template = if let Some(p) = chat_template_path {
-            load_chat_template_from_file(p)?
+            ConfigChatTemplates {
+                default: load_chat_template_from_file(p)?,
+                tool_use: None,
+            }
+        } else if config.chat_template.is_some() {
+            config.chat_template
         } else {
-            config.chat_template.or_else(|| {
-                discover_chat_template_in_dir(dir)
-                    .and_then(|p| load_chat_template_from_file(&p).ok().flatten())
-            })
+            ConfigChatTemplates {
+                default: discover_chat_template_in_dir(dir)
+                    .and_then(|p| load_chat_template_from_file(&p).ok().flatten()),
+                tool_use: None,
+            }
         };
 
         // Load merged EOS token IDs from config.json + generation_config.json,
@@ -393,7 +399,7 @@ impl TiktokenTokenizer {
             vocab,
             reverse_vocab,
             vocab_size,
-            chat_template: ChatTemplateState::new(chat_template)?,
+            chat_template: ChatTemplateState::from_config(chat_template)?,
             eos_token_ids,
             skip_token_ids: config.skip_token_ids,
             profile: renderer.profile(),
@@ -778,7 +784,7 @@ impl Decoder for TiktokenTokenizer {
     /// pending-bytes buffer: no window re-decoded per token, and a character
     /// that merely spans tokens is held back, not a decode failure. An id the
     /// vocabulary lacks fails the stream, as `decode` fails on it. A
-    /// vocabulary without the table (see [`MAX_BYTE_LEVEL_TABLE_IDS`]) streams
+    /// vocabulary without the table (see `MAX_BYTE_LEVEL_TABLE_IDS`) streams
     /// through the generic decoder.
     fn incremental_decoder(
         &self,
@@ -1075,6 +1081,54 @@ mod tests {
             std::fs::write(dir.path().join("config.json"), model_config).unwrap();
         }
         dir
+    }
+
+    /// The tiktoken loader reads a configuration's named templates the same
+    /// way: `default` for a plain request, `tool_use` for one that declares
+    /// tools; a template file stands alone for both.
+    #[test]
+    fn the_loader_reads_a_named_template_list_and_a_template_file_stands_alone() {
+        let dir = write_minimal_tiktoken_dir(
+            r#"{"chat_template": [{"name": "default", "template": "d"}, {"name": "tool_use", "template": "t"}]}"#,
+            None,
+        );
+        let messages = [serde_json::json!({"role": "user", "content": "Hi"})];
+        let tools: [serde_json::Value; 0] = [];
+        let with_tools = || ChatTemplateParams {
+            tools: Some(&tools),
+            ..Default::default()
+        };
+
+        let tokenizer = TiktokenTokenizer::from_dir(dir.path()).unwrap();
+        assert_eq!(
+            tokenizer
+                .apply_chat_template(&messages, ChatTemplateParams::default())
+                .unwrap(),
+            "d"
+        );
+        assert_eq!(
+            tokenizer
+                .apply_chat_template(&messages, with_tools())
+                .unwrap(),
+            "t"
+        );
+
+        let file = dir.path().join("own.jinja");
+        std::fs::write(&file, "f").unwrap();
+        let tokenizer =
+            TiktokenTokenizer::from_dir_with_chat_template(dir.path(), file.to_str()).unwrap();
+        assert_eq!(
+            tokenizer
+                .apply_chat_template(&messages, ChatTemplateParams::default())
+                .unwrap(),
+            "f"
+        );
+        assert_eq!(
+            tokenizer
+                .apply_chat_template(&messages, with_tools())
+                .unwrap(),
+            "f"
+        );
     }
 
     #[test]

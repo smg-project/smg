@@ -654,16 +654,11 @@ pub(crate) fn normalize_finish_reason(reason: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use engine_zmq_client::{
-        mock_engine::{connect_to_frontend, default_ready_response},
-        EngineId,
-    };
+    use engine_zmq_client::mock_engine::default_ready_response;
     use openai_protocol::worker::RuntimeType;
 
     use super::*;
-    use crate::{client::ZmqEngineClient, eos::EosTokenIds};
+    use crate::test_support::connected_pair;
 
     /// The translation under the mock scheduler's context window.
     fn translate_for(
@@ -688,29 +683,7 @@ mod tests {
             },
         };
 
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::TokenSpeed,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let client = client.expect("adapter connect");
-        let engine = engine.expect("mock engine");
+        let (client, engine, _dir) = connected_pair(RuntimeType::TokenSpeed).await;
 
         #[expect(
             clippy::disallowed_methods,
@@ -1311,29 +1284,7 @@ mod tests {
             },
         };
 
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::TokenSpeed,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let client = client.expect("adapter connect");
-        let engine = engine.expect("mock engine");
+        let (client, engine, _dir) = connected_pair(RuntimeType::TokenSpeed).await;
 
         #[expect(
             clippy::disallowed_methods,
@@ -1436,28 +1387,7 @@ mod tests {
         };
         use smg_grpc_client::is_constraint_failure;
 
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::TokenSpeed,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let client = client.expect("adapter connect");
-        let engine = engine.expect("mock engine");
+        let (client, engine, _dir) = connected_pair(RuntimeType::TokenSpeed).await;
         let cases = [
             ("r1", "abort", true),
             ("r2", "error", true),

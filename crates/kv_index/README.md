@@ -217,6 +217,8 @@ Servicers: `SMG_KV_EVENT_HISTORY_BATCHES` (10,000), `SMG_KV_EVENT_HISTORY_BYTES`
 
 Metrics added: `smg_kv_index_lookup_seconds{index}`, `smg_kv_event_apply_seconds{worker}`,
 `smg_kv_event_blocks_total{worker,op}`, `smg_kv_event_parentless_stores_total{worker}`,
+`smg_kv_event_sub_block_stores_total{worker}` (stores narrower than the worker's block of record,
+a hybrid engine's prefix entries at its hash granularity, left out of the index),
 `smg_kv_index_blocks{worker}`, `smg_kv_index_memberships` and `smg_kv_index_entries` per model,
 `smg_kv_index_runs_live`, `smg_kv_index_blocks_live`, `smg_kv_index_arena_bytes`,
 `smg_kv_index_arena_free_bytes`, `smg_kv_index_slab_bytes`, `smg_kv_index_moved_hashes`, `smg_kv_index_engine_conflicts`;

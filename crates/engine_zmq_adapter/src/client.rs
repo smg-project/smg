@@ -1269,12 +1269,22 @@ impl ZmqEngineClient {
 }
 
 pub(crate) fn zmq_status(error: engine_zmq_client::Error) -> tonic::Status {
+    zmq_status_of(&error)
+}
+
+/// The status of a connector error, by reference: the connector fans the
+/// failure of its engine out to every request in flight as the one error
+/// shared (`Error::Shared`), and a shared error answers as the bare one.
+fn zmq_status_of(error: &engine_zmq_client::Error) -> tonic::Status {
     match error {
-        // The engine is gone, or is not taking input right now: either way
-        // this request is better served elsewhere.
+        engine_zmq_client::Error::Shared(inner) => zmq_status_of(inner),
+        // The engine is gone, is not taking input right now, or the
+        // connector to it is shutting down (its engine died, or the servicer
+        // drains): either way this request is better served elsewhere.
         engine_zmq_client::Error::EngineCoreDead
         | engine_zmq_client::Error::EngineInputBlocked { .. }
-        | engine_zmq_client::Error::EngineInputFull { .. } => {
+        | engine_zmq_client::Error::EngineInputFull { .. }
+        | engine_zmq_client::Error::ClientClosed { .. } => {
             tonic::Status::unavailable(error.to_string())
         }
         other => tonic::Status::internal(other.to_string()),
@@ -1311,7 +1321,63 @@ mod tests {
     use tonic::Code;
 
     use super::*;
-    use crate::eos::EosTokenIds;
+    use crate::{eos::EosTokenIds, test_support::connected_pair};
+
+    /// A request that reaches the connector once it is shutting down (its
+    /// engine died and the servicer is on its way out) is answered the way a
+    /// dead engine core answers it, UNAVAILABLE, so the gateway retries it on
+    /// another worker instead of returning the engine's INTERNAL to the
+    /// client; the engine's own failures keep their INTERNAL.
+    #[test]
+    fn a_closing_connector_answers_unavailable_like_a_dead_engine_core() {
+        let closed = zmq_status(engine_zmq_client::Error::ClientClosed {
+            message: "client is shutting down".to_string(),
+        });
+        assert_eq!(closed.code(), Code::Unavailable, "{closed:?}");
+        assert!(
+            closed.message().contains("client is shutting down"),
+            "{closed:?}"
+        );
+        assert_eq!(
+            zmq_status(engine_zmq_client::Error::EngineCoreDead).code(),
+            Code::Unavailable
+        );
+        let engine_failure = zmq_status(engine_zmq_client::Error::RequestStreamClosed {
+            request_id: "req-1".to_string(),
+        });
+        assert_eq!(engine_failure.code(), Code::Internal, "{engine_failure:?}");
+    }
+
+    /// The failure the connector fans out to the requests in flight when its
+    /// engine dies (`RequestRegistry::fail_all`) reaches them shared; a
+    /// request that had streamed nothing is as well served elsewhere as one
+    /// that arrived after the close.
+    #[test]
+    fn a_fanned_out_failure_answers_as_the_bare_one_does() {
+        let shared = |error: engine_zmq_client::Error| {
+            zmq_status(engine_zmq_client::Error::Shared(Arc::new(error)))
+        };
+        assert_eq!(
+            shared(engine_zmq_client::Error::EngineCoreDead).code(),
+            Code::Unavailable
+        );
+        let ended = shared(engine_zmq_client::Error::ClientClosed {
+            message: "engine output stream ended".to_string(),
+        });
+        assert_eq!(ended.code(), Code::Unavailable, "{ended:?}");
+        assert!(
+            ended.message().contains("engine output stream ended"),
+            "{ended:?}"
+        );
+        let nested = zmq_status(engine_zmq_client::Error::Shared(Arc::new(
+            engine_zmq_client::Error::Shared(Arc::new(
+                engine_zmq_client::Error::RequestStreamClosed {
+                    request_id: "req-2".to_string(),
+                },
+            )),
+        )));
+        assert_eq!(nested.code(), Code::Internal, "{nested:?}");
+    }
 
     /// A connected client over a throwaway ipc endpoint. The mock engine is
     /// dropped on return: these tests only inspect request-side EOS state.
@@ -1867,29 +1933,8 @@ mod tests {
     /// TokenSpeed has no prefix-cache reset on the ZMQ wire.
     #[tokio::test]
     async fn reset_prefix_cache_is_unimplemented_for_tokenspeed() {
-        let dir = tempfile::tempdir().unwrap();
-        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
-        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
-        let (client, engine) = tokio::join!(
-            ZmqEngineClient::connect(
-                &handshake,
-                &input,
-                &output,
-                1,
-                "m".to_string(),
-                EosTokenIds::default(),
-                RuntimeType::TokenSpeed,
-                Duration::from_secs(10)
-            ),
-            connect_to_frontend(
-                &handshake,
-                EngineId::from_engine_index(0),
-                default_ready_response()
-            ),
-        );
-        let _engine = engine.expect("mock engine");
+        let (client, _engine, _dir) = connected_pair(RuntimeType::TokenSpeed).await;
         let status = client
-            .expect("adapter connect")
             .reset_prefix_cache(Duration::from_secs(1))
             .await
             .expect_err("tokenspeed");

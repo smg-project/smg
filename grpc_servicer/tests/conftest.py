@@ -85,6 +85,7 @@ def nothing_of_the_launchers_in_the_environment():
 
 
 _TOKENSPEED_SERVICER = _GRPC_SERVICER_ROOT / "smg_grpc_servicer" / "tokenspeed" / "servicer.py"
+_VLLM_ERRORS = _GRPC_SERVICER_ROOT / "smg_grpc_servicer" / "vllm" / "errors.py"
 
 
 @pytest.fixture
@@ -116,6 +117,48 @@ def tokenspeed_servicer_mod(monkeypatch):
         monkeypatch.setitem(sys.modules, name, module)
     name = "smg_grpc_servicer.tokenspeed.servicer"
     spec = importlib.util.spec_from_file_location(name, _TOKENSPEED_SERVICER)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.fixture
+def vllm_errors_mod(monkeypatch):
+    """The vLLM servicer's error module, loaded with the engine's exception
+    hierarchy stubbed (the current one: the client/server split and the
+    admission-control ``GracefulHTTPError`` that carries an HTTP status).
+    """
+
+    class VLLMError(Exception):
+        pass
+
+    class VLLMClientError(VLLMError):
+        pass
+
+    class VLLMNotFoundError(VLLMClientError):
+        pass
+
+    class GracefulHTTPError(VLLMError):
+        def __init__(self, message, http_status):
+            super().__init__(message)
+            self.http_status = http_status
+
+    class EngineGenerateError(VLLMError):
+        pass
+
+    for name in ("vllm", "vllm.v1", "vllm.v1.engine"):
+        monkeypatch.setitem(sys.modules, name, ModuleType(name))
+    exceptions = ModuleType("vllm.exceptions")
+    exceptions.VLLMClientError = VLLMClientError
+    exceptions.VLLMNotFoundError = VLLMNotFoundError
+    exceptions.GracefulHTTPError = GracefulHTTPError
+    monkeypatch.setitem(sys.modules, "vllm.exceptions", exceptions)
+    engine_exceptions = ModuleType("vllm.v1.engine.exceptions")
+    engine_exceptions.EngineGenerateError = EngineGenerateError
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine.exceptions", engine_exceptions)
+    name = "smg_grpc_servicer.vllm.errors"
+    spec = importlib.util.spec_from_file_location(name, _VLLM_ERRORS)
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, name, module)
     spec.loader.exec_module(module)

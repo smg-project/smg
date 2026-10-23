@@ -210,6 +210,9 @@ mod tests {
                 ..
             }
         )));
+        // The held value is the call's own, as written; nothing of it is content.
+        assert_eq!(testing::arguments_of(&events, 0), r#"{"days": 1"#);
+        assert_eq!(content(&events), "");
         assert!(matches!(
             events.last(),
             Some(Event::Finish {

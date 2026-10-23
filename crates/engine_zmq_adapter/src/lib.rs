@@ -31,6 +31,8 @@ mod sockets;
 pub mod stops;
 mod stream;
 mod structured_outputs;
+#[cfg(test)]
+mod test_support;
 mod tokenspeed;
 mod vllm;
 

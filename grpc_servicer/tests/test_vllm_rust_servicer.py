@@ -780,6 +780,31 @@ def test_model_info_carries_the_pooler_config():
     assert info["pooler_use_activation"] is None and info["pooler_dimensions"] is None
 
 
+def test_model_info_names_the_mooncake_mover_the_rust_servicer_withholds_the_notice_on():
+    """The Rust servicer withholds a PD decode side's rejection notice on the
+    Mooncake connector by the name the launcher hands it, so a wrapper whose
+    mover is Mooncake is handed ``MooncakeConnector`` too (the mover's engine
+    id with it), as ``GetServerInfo`` reports the pair."""
+    config = _config()
+    config.kv_transfer_config = SimpleNamespace(
+        kv_connector="MultiConnector",
+        kv_role="kv_consumer",
+        engine_id="eng-d",
+        kv_connector_extra_config={
+            "connectors": [
+                {"kv_connector": "MooncakeConnector", "engine_id": "decode-engine"},
+                {"kv_connector": "SharedStorageConnector"},
+            ]
+        },
+    )
+    info = rust.model_info_from_config(config)
+    assert (info["kv_connector"], info["kv_role"], info["kv_engine_id"]) == (
+        "MooncakeConnector",
+        "kv_consumer",
+        "decode-engine",
+    )
+
+
 def test_model_info_projects_a_multi_connector_onto_the_child_that_moves_the_kv():
     """The Rust servicer reports the connector the launcher hands it, so the
     launcher hands it the wrapper's mover: the one P2P child whatever rides

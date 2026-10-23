@@ -39,9 +39,21 @@ use crate::event::{DropReason, Event, Events, MalformedReason, Text};
 /// four assemblers of this module push it from their `stop`; a call cut by the token limit, an
 /// abort or any finish but `Stop` never comes here ([`end_cut_call`]).
 pub(crate) fn open_at_the_stop(out: &mut Events) {
+    left_open(MalformedReason::OpenAtTheStop, out);
+}
+
+/// The one event of a string value that one of a call's two own ends closed: the stream's stop
+/// (`why` = [`MalformedReason::OpenAtTheStop`], [`open_at_the_stop`]) or the call's closing
+/// marker (`why` = [`MalformedReason::OpenAtTheMarker`]: the model ended the call, its own
+/// closing marker, the next call's opener or the block's close came, with the string's closing
+/// tag never written). Either way the model wrote nothing more of the value, so the assembler
+/// closes the string; the event carries no bytes and stands before the closing quote. The four
+/// assemblers of this module push it from their `close_open_string`; a value held whole for its
+/// close keeps the ending's own path, reported or refused, nothing made up for it.
+pub(crate) fn left_open(why: MalformedReason, out: &mut Events) {
     out.push(Event::Malformed {
         text: Text::uncounted(String::new()),
-        why: MalformedReason::OpenAtTheStop,
+        why,
     });
 }
 
@@ -56,11 +68,13 @@ pub(crate) fn open_at_the_stop(out: &mut Events) {
 /// (no closing quote, no closing brace), and one `Malformed` event before the call's end says that
 /// the arguments are no whole value, as the JSON assembler says it: it carries the bytes still held
 /// (the start of a tag, a value's text, the template's newline; a pythonic key or separator cut
-/// short), or none when the cut fell between events or the syntax refused what it held first (the
-/// keyed one, [`refuse`]), so that a client that reads the arguments as JSON is told rather than
-/// left to find out. The reason is `UnterminatedRegion`, which the engine keeps for a region the
-/// end of the stream cut and renames for one a marker closed; `terminal` is the marker's bytes when
-/// they are the call's own end, and nothing when they are the region's or the stream ended.
+/// short), or none when the cut fell between events, the syntax refused what it held first (the
+/// keyed one, [`refuse`]) or wrote it as the call's own fragment, dropping the wrapping before the
+/// end and a cut tag after it (the attributed one at the end of the stream), so that a client that
+/// reads the arguments as JSON is told rather than left to find out. The reason is
+/// `UnterminatedRegion`, which the engine keeps for a region the end of the stream cut and renames
+/// for one a marker closed; `terminal` is the marker's bytes when they are the call's own end, and
+/// nothing when they are the region's or the stream ended.
 pub(crate) fn end_cut_call(index: u32, held: String, terminal: &str, out: &mut Events) {
     out.push(Event::Malformed {
         text: Text::uncounted(held),
@@ -79,8 +93,10 @@ pub(crate) fn end_cut_call(index: u32, held: String, terminal: &str, out: &mut E
 /// format's own tokens, and what stands between them where the syntax has no place for text (a
 /// value whose key never opened, a name that is prose or Python, a tag written twice) is the
 /// model's failed call, which the families' own parsers drop whole; a client shown it saw the
-/// format's tags inside the answer. A call that started keeps the pairs it read. Nothing is
-/// pushed for no bytes; the engine renames `UnterminatedRegion` here as anywhere.
+/// format's tags inside the answer. For the attributed syntax inside an invoke the same (a word
+/// between tags, a tag out of its place or cut short, a tail the tag has no place for, an
+/// invoke that named no call). A call that started keeps the pairs it read. Nothing is pushed
+/// for no bytes; the engine renames `UnterminatedRegion` here as anywhere.
 pub(crate) fn refuse(text: String, why: MalformedReason, out: &mut Events) {
     if text.is_empty() {
         return;

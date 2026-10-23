@@ -21,7 +21,7 @@ use crate::{
 /// - Function name directly after `<｜tool▁call▁begin｜>`
 /// - Raw JSON arguments directly after `<｜tool▁sep｜>`
 ///
-/// Reference: https://huggingface.co/deepseek-ai/DeepSeek-V3.1
+/// Reference: <https://huggingface.co/deepseek-ai/DeepSeek-V3.1>
 pub struct DeepSeek31Parser {
     /// Regex for extracting complete tool call blocks
     tool_call_extractor: Regex,

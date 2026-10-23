@@ -268,40 +268,63 @@ impl Encoder for CachedTokenizer {
                     Encoding::Plain(tokens)
                 };
                 match l1.lookup_with_seeds(input, &self.special_tokens, add_special_tokens) {
-                    PrefixLookup::Hit(prefix_tokens, hit, Some(deepest)) => {
-                        // Also cache this input's deepest boundary: a later input that extends
-                        // it (the next turn of the same conversation) then matches there, not at
-                        // the shorter prefix this one shares with other conversations.
-                        let mut tokens = buffer(&prefix_tokens, hit.end);
-                        let spliced = self
-                            .special_tokens
-                            .encode_segment_into(&hit, input, deepest.end, inner, &mut tokens)
-                            .and_then(|()| {
-                                l1.insert_prefix(deepest.digest, deepest.end, &tokens[head..]);
-                                self.special_tokens.encode_segment_into(
-                                    &deepest,
-                                    input,
-                                    input.len(),
-                                    inner,
-                                    &mut tokens,
-                                )
-                            });
-                        match spliced {
-                            Ok(()) => finish(tokens),
-                            Err(_) => fallback()?,
-                        }
-                    }
-                    PrefixLookup::Hit(prefix_tokens, hit, None) if hit.end < input.len() => {
+                    PrefixLookup::Hit(prefix_tokens, hit, deeper) if hit.end < input.len() => {
                         // The suffix is encoded after the boundary's token (never as segment 0)
                         // straight into the result: one allocation, one copy of the prefix.
+                        // Two boundaries deeper than the match are cached on the way, as the
+                        // cumulative prefixes they end: the one right after the match, so a
+                        // prefix many inputs share behind a shallow match (a system turn with
+                        // its tool schemas behind the template's leading token, which every
+                        // prompt matches once a single request has seeded it) is learned one
+                        // boundary per request and serves the next request there; and the
+                        // input's deepest one, so its next turn matches there. Caching the
+                        // deepest alone left a shared prefix behind a shallow match unlearned
+                        // (every request matched the leading token and re-encoded the rest);
+                        // caching every boundary of every input copied a dozen prefixes per
+                        // request into entries nothing else matches. Once the shared prefix
+                        // is learned to its end, the next boundary is the request's own: it
+                        // enters as a speculation the sampler evicts ahead of the matched
+                        // entries it sees, so speculations take up little of the budget and
+                        // the deepest entries a next turn waits for live the longer for it.
                         let mut tokens = buffer(&prefix_tokens, hit.end);
-                        match self.special_tokens.encode_segment_into(
-                            &hit,
-                            input,
-                            input.len(),
-                            inner,
-                            &mut tokens,
-                        ) {
+                        let mut from = hit;
+                        let mut spliced = Ok(());
+                        let learn = [(deeper.next, true), (deeper.deepest, false)];
+                        for (seed, speculative) in learn
+                            .into_iter()
+                            .filter_map(|(seed, speculative)| seed.map(|seed| (seed, speculative)))
+                        {
+                            spliced = self.special_tokens.encode_segment_into(
+                                &from,
+                                input,
+                                seed.end,
+                                inner,
+                                &mut tokens,
+                            );
+                            if spliced.is_err() {
+                                break;
+                            }
+                            if speculative {
+                                l1.insert_prefix_speculative(
+                                    seed.digest,
+                                    seed.end,
+                                    &tokens[head..],
+                                );
+                            } else {
+                                l1.insert_prefix(seed.digest, seed.end, &tokens[head..]);
+                            }
+                            from = seed;
+                        }
+                        let spliced = spliced.and_then(|()| {
+                            self.special_tokens.encode_segment_into(
+                                &from,
+                                input,
+                                input.len(),
+                                inner,
+                                &mut tokens,
+                            )
+                        });
+                        match spliced {
                             Ok(()) => finish(tokens),
                             Err(_) => fallback()?,
                         }
@@ -777,15 +800,80 @@ mod tests {
         );
         counting.reset();
         let encoded = cached.encode(&turn_two, true).unwrap();
-        // The text past the previous turn's deepest boundary, encoded in two
-        // parts (up to this turn's deepest boundary, then its tail), each after
-        // the `<|im_start|>` that ends its boundary.
+        // The text past the previous turn's deepest boundary, encoded in three
+        // segments (to the boundary right after the match, to this turn's deepest
+        // boundary, then its tail), each behind the special token that ends its
+        // boundary: `<|im_start|>` at the match, `<|im_end|>` after the answer,
+        // `<|im_start|>` at the deepest.
         assert_eq!(
             counting.bytes_encoded(),
-            turn_two.len() - deepest + 2 * "<|im_start|>".len(),
+            turn_two.len() - deepest + 2 * "<|im_start|>".len() + "<|im_end|>".len(),
             "the next turn must match its own previous turn, not the shared prefix"
         );
         let fresh = BosTokenizer::new().encode(&turn_two, true).unwrap();
+        assert_eq!(encoded.token_ids(), fresh.token_ids());
+    }
+
+    #[test]
+    fn test_l1_shallow_hit_caches_the_boundaries_on_the_way_to_the_deepest() {
+        // The first request of all is a bare user turn (a readiness probe): it seeds
+        // the template's leading token as a cached boundary. Conversations that
+        // share a system prompt follow. The first of them matches only that leading
+        // token; it must cache the boundary right after it, the end of the shared
+        // system prompt, so the next conversation matches there and the one after
+        // that one boundary deeper. (Caching the deepest boundary alone never
+        // learned a shared prefix behind a shallow match: every later request
+        // matched the leading token and re-encoded the rest.)
+        let counting = Arc::new(CountingTokenizer::new());
+        let cached = CachedTokenizer::new(counting.clone(), l1_only_config());
+        cached
+            .encode(
+                "<|im_start|>user\nprobe<|im_end|><|im_start|>assistant\n",
+                true,
+            )
+            .unwrap();
+        let system = "<|im_start|>system\nYou are helpful.<|im_end|>";
+        let first = format!(
+            "{system}<|im_start|>user\nfirst conversation<|im_end|><|im_start|>assistant\n"
+        );
+        cached.encode(&first, true).unwrap();
+
+        // The first conversation matched the leading token and cached the boundary
+        // right after it, the end of the system prompt: the second conversation
+        // matches there and encodes the rest in three segments (to the boundary
+        // after the match, the `<|im_start|>` of its user turn; to its deepest
+        // boundary; the tail), each behind the token that ends its boundary:
+        // `<|im_end|>`, `<|im_start|>`, `<|im_start|>`.
+        let second = format!(
+            "{system}<|im_start|>user\nsecond conversation<|im_end|><|im_start|>assistant\n"
+        );
+        counting.reset();
+        let encoded = cached.encode(&second, true).unwrap();
+        assert_eq!(
+            counting.bytes_encoded(),
+            second.len() - system.len() + "<|im_end|>".len() + 2 * "<|im_start|>".len(),
+            "the second conversation must match at the shared system prompt, not at the leading token"
+        );
+        let fresh = BosTokenizer::new().encode(&second, true).unwrap();
+        assert_eq!(encoded.token_ids(), fresh.token_ids());
+
+        // The second conversation cached the boundary after its match in turn: a
+        // third one matches one boundary deeper, at the `<|im_start|>` of the user
+        // turn, and encodes its own turn (to the boundary after the match, then to
+        // its deepest one) and its tail: three segments, behind `<|im_start|>`,
+        // `<|im_end|>` and `<|im_start|>`.
+        let third = format!(
+            "{system}<|im_start|>user\nthird conversation<|im_end|><|im_start|>assistant\n"
+        );
+        let deeper = system.len() + "<|im_start|>".len();
+        counting.reset();
+        let encoded = cached.encode(&third, true).unwrap();
+        assert_eq!(
+            counting.bytes_encoded(),
+            third.len() - deeper + 2 * "<|im_start|>".len() + "<|im_end|>".len(),
+            "the third conversation must match one boundary deeper than the second"
+        );
+        let fresh = BosTokenizer::new().encode(&third, true).unwrap();
         assert_eq!(encoded.token_ids(), fresh.token_ids());
     }
 

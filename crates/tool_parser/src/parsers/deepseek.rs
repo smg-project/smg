@@ -20,7 +20,7 @@ use crate::{
 /// - JSON arguments in code blocks
 /// - Support for multiple sequential tool calls
 ///
-/// Reference: https://huggingface.co/deepseek-ai/DeepSeek-V3-0324?chat_template=default
+/// Reference: <https://huggingface.co/deepseek-ai/DeepSeek-V3-0324?chat_template=default>
 pub struct DeepSeekParser {
     /// Regex for extracting complete tool calls
     tool_call_extractor: Regex,

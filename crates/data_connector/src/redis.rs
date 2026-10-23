@@ -92,6 +92,17 @@ impl RedisStore {
     fn retention_seconds(&self) -> Option<u64> {
         self.retention_days.map(|days| days * 24 * 60 * 60)
     }
+
+    /// Appends to `pipe` the expiry of an index key that lists records (a
+    /// conversation's items, a safety identifier's responses): the
+    /// retention, counted from this write, as the records' own. The index
+    /// lives as long as the newest record it lists could and then goes by
+    /// itself. Nothing when records are kept for good.
+    fn expire_index(&self, pipe: &mut redis::Pipeline, key: &str) {
+        if let Some(seconds) = self.retention_seconds() {
+            pipe.expire(key, seconds as i64).ignore();
+        }
+    }
 }
 
 impl Clone for RedisStore {
@@ -470,6 +481,19 @@ fn link_score(added_at: DateTime<Utc>) -> f64 {
     added_at.timestamp_micros() as f64 / 1000.0
 }
 
+/// The write of [`ConversationItemStorage::create_item`], one run on the
+/// server: the hash under `KEYS[1]` is written (its fields `ARGV[2..]`, in
+/// pairs; its expiry `ARGV[1]`, in seconds, when not empty) only when no key
+/// exists under the id, and an empty table is answered then; an existing
+/// hash is answered as it is (`HGETALL`) and left untouched, so a second
+/// create under an id is the stored item on this backend as on the others.
+const CREATE_ITEM_SCRIPT: &str = "
+if redis.call('EXISTS', KEYS[1]) == 1 then return redis.call('HGETALL', KEYS[1]) end
+for i = 2, #ARGV - 1, 2 do redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1]) end
+if ARGV[1] ~= '' then redis.call('EXPIRE', KEYS[1], ARGV[1]) end
+return {}
+";
+
 #[async_trait]
 impl ConversationItemStorage for RedisConversationItemStorage {
     async fn create_item(
@@ -511,36 +535,34 @@ impl ConversationItemStorage for RedisConversationItemStorage {
             .await
             .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
 
-        let mut pipe = redis::pipe();
-
-        pipe.hset(&key, si.col("id"), id_str);
+        let mut fields: Vec<(&str, String)> = vec![(si.col("id"), id_str.to_string())];
         if !si.is_skipped("response_id") {
             if let Some(rid) = &conversation_item.response_id {
-                pipe.hset(&key, si.col("response_id"), rid);
+                fields.push((si.col("response_id"), rid.clone()));
             }
         }
         if !si.is_skipped("item_type") {
-            pipe.hset(&key, si.col("item_type"), &conversation_item.item_type);
+            fields.push((si.col("item_type"), conversation_item.item_type.clone()));
         }
         if !si.is_skipped("role") {
             if let Some(r) = &conversation_item.role {
-                pipe.hset(&key, si.col("role"), r);
+                fields.push((si.col("role"), r.clone()));
             }
         }
         if !si.is_skipped("content") {
-            pipe.hset(&key, si.col("content"), &content_json);
+            fields.push((si.col("content"), content_json));
         }
         if !si.is_skipped("status") {
             if let Some(s) = &conversation_item.status {
-                pipe.hset(&key, si.col("status"), s);
+                fields.push((si.col("status"), s.clone()));
             }
         }
         if !si.is_skipped("created_at") {
-            pipe.hset(&key, si.col("created_at"), created_at.to_rfc3339());
+            fields.push((si.col("created_at"), created_at.to_rfc3339()));
         }
         if !si.is_skipped("tenant") {
             if let Some(tenant) = &conversation_item.tenant {
-                pipe.hset(&key, si.col("tenant"), tenant);
+                fields.push((si.col("tenant"), tenant.clone()));
             }
         }
 
@@ -548,19 +570,33 @@ impl ConversationItemStorage for RedisConversationItemStorage {
         let hook_extra = current_extra_columns().unwrap_or_default();
         for (name, val) in resolve_extra_column_values(si, &hook_extra) {
             if let Some(v) = val {
-                pipe.hset(&key, name, v);
+                fields.push((name, v));
             }
         }
 
-        if let Some(days) = self.store.retention_days {
-            pipe.expire(&key, (days * 24 * 60 * 60) as i64);
+        // One run on the server: the hash is written only when nothing is
+        // stored under the id, and an existing hash is answered as it is, so
+        // a second create under an id is the stored item here as on every
+        // backend (a plain HSET merged the new fields into the old hash).
+        let retention = self
+            .store
+            .retention_seconds()
+            .map(|seconds| seconds.to_string())
+            .unwrap_or_default();
+        let script = redis::Script::new(CREATE_ITEM_SCRIPT);
+        let mut invocation = script.key(&key);
+        invocation.arg(retention);
+        for (field, value) in &fields {
+            invocation.arg(*field).arg(value);
         }
-
-        pipe.query_async::<()>(&mut conn)
+        let stored: HashMap<String, String> = invocation
+            .invoke_async(&mut conn)
             .await
             .map_err(ConversationItemStorageError::from_redis)?;
-
-        Ok(conversation_item)
+        if stored.is_empty() {
+            return Ok(conversation_item);
+        }
+        self.build_item_from_map(&stored, id_str)
     }
 
     async fn link_item(
@@ -581,7 +617,11 @@ impl ConversationItemStorage for RedisConversationItemStorage {
             .get()
             .await
             .map_err(|e| ConversationItemStorageError::pool_unavailable(&e))?;
-        conn.zadd::<_, _, _, ()>(&key, iid, score)
+        // The link and the index's expiry in the one round trip.
+        let mut pipe = redis::pipe();
+        pipe.zadd(&key, iid, score).ignore();
+        self.store.expire_index(&mut pipe, &key);
+        pipe.query_async::<()>(&mut *conn)
             .await
             .map_err(ConversationItemStorageError::from_redis)?;
 
@@ -612,6 +652,7 @@ impl ConversationItemStorage for RedisConversationItemStorage {
             let score = link_score(*added_at);
             pipe.zadd(&key, item_id.0.as_str(), score).ignore();
         }
+        self.store.expire_index(&mut pipe, &key);
         pipe.query_async::<()>(&mut *conn)
             .await
             .map_err(ConversationItemStorageError::from_redis)?;
@@ -974,20 +1015,48 @@ impl RedisResponseStorage {
             .map_err(ResponseStorageError::from_redis)
     }
 
-    /// Index the response by its safety identifier, if it has one.
-    async fn index_by_identifier(
-        &self,
-        conn: &mut Connection,
-        response: &StoredResponse,
-    ) -> ResponseResult<()> {
+    /// Appends to `pipe` the response's entry in the index of its safety
+    /// identifier, if it has one, and the index's expiry (the retention, as
+    /// the record's). Nothing when the schema skips the identifier.
+    fn index_by_identifier(&self, pipe: &mut redis::Pipeline, response: &StoredResponse) {
         let sr = &self.store.schema.responses;
         if sr.is_skipped("safety_identifier") {
-            return Ok(());
+            return;
         }
         if let Some(safety) = &response.safety_identifier {
             let safety_key = self.safety_key(safety);
             let score = response.created_at.timestamp_millis() as f64;
-            conn.zadd::<_, _, _, ()>(safety_key, response.id.0.as_str(), score)
+            pipe.zadd(&safety_key, response.id.0.as_str(), score)
+                .ignore();
+            self.store.expire_index(pipe, &safety_key);
+        }
+    }
+
+    /// Pushes the expiry of the identifier index forward with the record's,
+    /// after a write that moved the record's expiry without re-indexing it (a
+    /// status transition's object update): the identifier is read from the
+    /// hash, since the index key depends on it and cannot be declared to the
+    /// write's script up front. Nothing without a retention, under a schema
+    /// that skips the identifier, or for a record without one. The callers
+    /// treat an error as bookkeeping left undone, not as a failed write.
+    async fn refresh_identifier_index(
+        &self,
+        conn: &mut Connection,
+        key: &str,
+    ) -> ResponseResult<()> {
+        let sr = &self.store.schema.responses;
+        let Some(seconds) = self.store.retention_seconds() else {
+            return Ok(());
+        };
+        if sr.is_skipped("safety_identifier") {
+            return Ok(());
+        }
+        let safety: Option<String> = conn
+            .hget(key, sr.col("safety_identifier"))
+            .await
+            .map_err(ResponseStorageError::from_redis)?;
+        if let Some(safety) = safety {
+            conn.expire::<_, ()>(self.safety_key(&safety), seconds as i64)
                 .await
                 .map_err(ResponseStorageError::from_redis)?;
         }
@@ -1136,15 +1205,17 @@ impl ResponseStorage for RedisResponseStorage {
             .await
             .map_err(|e| ResponseStorageError::pool_unavailable(&e))?;
 
+        // The hash, the keys that go with it and the identifier's index
+        // entry in the one round trip.
         let mut pipe = redis::pipe();
         for (field, value) in &fields {
             pipe.hset(&key, *field, value);
         }
         self.index_writes(&mut pipe, &key, &response);
+        self.index_by_identifier(&mut pipe, &response);
         pipe.query_async::<()>(&mut conn)
             .await
             .map_err(ResponseStorageError::from_redis)?;
-        self.index_by_identifier(&mut conn, &response).await?;
 
         Ok(response_id)
     }
@@ -1180,8 +1251,23 @@ impl ResponseStorage for RedisResponseStorage {
             "stored" => {
                 // A repeat of the entry the record's first store made (the
                 // identifier does not change between the writes of one
-                // response), so a failure here loses nothing.
-                self.index_by_identifier(&mut conn, &response).await?;
+                // response) with the index's expiry afresh, as the script
+                // refreshed the record's. The script has committed the write
+                // by now: a failure here is bookkeeping, logged, and leaves
+                // the index with its earlier expiry, which the next write
+                // under the identifier moves on; the caller is told what was
+                // written.
+                let mut pipe = redis::pipe();
+                self.index_by_identifier(&mut pipe, &response);
+                if !pipe.is_empty() {
+                    if let Err(e) = pipe.query_async::<()>(&mut conn).await {
+                        tracing::warn!(
+                            response_id = %response.id.0,
+                            error = %e,
+                            "the record was stored; its identifier index keeps its earlier expiry"
+                        );
+                    }
+                }
                 Ok(ConditionalStore::Stored)
             }
             "closed" => {
@@ -1226,7 +1312,22 @@ impl ResponseStorage for RedisResponseStorage {
             )
             .await?;
         match outcome.as_str() {
-            "stored" => Ok(ConditionalStore::Stored),
+            "stored" => {
+                // The script moved the record's expiry; the identifier's
+                // index follows, so the record is listed under it for as long
+                // as it exists. The write is committed by now: a failure of
+                // the refresh is logged and the caller is told what was
+                // written (the index keeps its earlier expiry, which the next
+                // write under the identifier moves on).
+                if let Err(e) = self.refresh_identifier_index(&mut conn, &key).await {
+                    tracing::warn!(
+                        response_id = %id.0,
+                        error = %e,
+                        "the record moved; its identifier index keeps its earlier expiry"
+                    );
+                }
+                Ok(ConditionalStore::Stored)
+            }
             "closed" => {
                 drop(conn);
                 Ok(match self.get_response(id).await? {
@@ -1569,6 +1670,27 @@ mod tests {
             link_score(whole).to_bits(),
             1_700_000_000_123.0_f64.to_bits()
         );
+    }
+
+    #[test]
+    fn create_item_script_answers_an_existing_hash_and_writes_only_a_missing_one() {
+        let script = CREATE_ITEM_SCRIPT;
+        let answered = script
+            .find("if redis.call('EXISTS', KEYS[1]) == 1 then return redis.call('HGETALL', KEYS[1]) end")
+            .expect("an existing hash is answered as it is");
+        for write in [
+            "for i = 2, #ARGV - 1, 2 do redis.call('HSET', KEYS[1], ARGV[i], ARGV[i + 1]) end",
+            "if ARGV[1] ~= '' then redis.call('EXPIRE', KEYS[1], ARGV[1]) end",
+        ] {
+            let at = script
+                .find(write)
+                .unwrap_or_else(|| panic!("the script writes: {write}"));
+            assert!(
+                at > answered,
+                "written only past the existence check: {write}"
+            );
+        }
+        assert!(script.trim_end().ends_with("return {}"));
     }
 
     #[test]

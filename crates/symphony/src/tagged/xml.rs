@@ -170,10 +170,10 @@ impl Assembler {
     /// The call's end: `terminal` is the closing marker the engine read (its bytes go into
     /// `ToolCallEnd`), or nothing when the block ended another way. Every open container is
     /// closed, a leaf never written is reported, the object is closed; inside a streamed string
-    /// nothing is closed, since nothing is made up for a value the model never finished: the
-    /// fragments stand, and one `Malformed` event with what was held, or no bytes, says that the
-    /// arguments are no whole value before the call's end ([`end_cut_call`]); an invoke whose
-    /// name never closed, or that had none, has its bytes reported.
+    /// the string is closed first ([`Self::close_open_string`]), since the model ended the call
+    /// and its bytes are the value whole, under one `Malformed { OpenAtTheMarker }` event of no
+    /// bytes, and the containers above it close as after any leaf; an invoke whose name never
+    /// closed, or that had none, has its bytes reported.
     pub fn close(mut self, terminal: &str, out: &mut Events) {
         if self.done {
             return;
@@ -184,21 +184,7 @@ impl Assembler {
             self.report(MalformedReason::CallWithoutName, out);
             return;
         }
-        if let Some(Element {
-            shape:
-                Shape::Leaf(Leaf {
-                    mode: Mode::Streaming,
-                    ..
-                }),
-            ..
-        }) = self.open.last()
-        {
-            // Inside a streamed string nothing is closed, neither the string nor the containers
-            // above it; the one word before the end carries the start of a tag held, or no bytes.
-            end_cut_call(self.index, std::mem::take(&mut self.carried), terminal, out);
-            self.done = true;
-            return;
-        }
+        self.close_open_string(MalformedReason::OpenAtTheMarker, out);
         while let Some(element) = self.open.last() {
             match element.shape {
                 Shape::Object => {
@@ -252,9 +238,8 @@ impl Assembler {
     /// ends as its closing tag would end it, with no bytes for the end ([`Self::close`]): every
     /// open container is closed, a leaf never written and an element without a child are
     /// reported, the object is closed, an invoke whose name never closed has its bytes reported.
-    /// A streamed string still open is closed first: the model wrote nothing after its bytes, so
-    /// they are the value whole, and the start of a tag held is its text too, since no tag
-    /// followed. One `Malformed { OpenAtTheStop }` event of no bytes stands before the fragment
+    /// A streamed string still open is closed first ([`Self::close_open_string`]), under the
+    /// stop's word. One `Malformed { OpenAtTheStop }` event of no bytes stands before the fragment
     /// that closes what was open ([`open_at_the_stop`](super::open_at_the_stop)): for a string
     /// the stop closed under any table, and for the call itself where the table has no stop row
     /// (`as_marker`), since there the template writes the marker the model skipped.
@@ -263,7 +248,21 @@ impl Assembler {
             return;
         }
         self.hold_tag();
-        let string_open = matches!(
+        let string_closed = self.close_open_string(MalformedReason::OpenAtTheStop, out);
+        if !string_closed && self.started() && !as_marker {
+            super::open_at_the_stop(out);
+        }
+        self.close("", out);
+    }
+
+    /// A streamed string still open when the call ends, at its closing marker or at the stream's
+    /// stop: the model wrote nothing more of the value after the call's end, so its bytes are the
+    /// value whole, and the start of a tag held is its text too, since no tag followed. The string
+    /// is closed: the one word of no bytes (`why`: the end that closed it,
+    /// [`left_open`](super::left_open)), then the closing quote; the containers above it are the
+    /// ending's to close. Says whether a string was open; nothing happens otherwise.
+    fn close_open_string(&mut self, why: MalformedReason, out: &mut Events) -> bool {
+        if !matches!(
             self.open.last(),
             Some(Element {
                 shape: Shape::Leaf(Leaf {
@@ -272,20 +271,18 @@ impl Assembler {
                 }),
                 ..
             })
-        );
-        if string_open {
-            let held = std::mem::take(&mut self.carried);
-            if !held.is_empty() {
-                self.leaf_text(&held, out);
-            }
-            super::open_at_the_stop(out);
-            self.open.pop();
-            self.value.clear();
-            self.push_fragment("\"".to_string(), Text::default(), out);
-        } else if self.started() && !as_marker {
-            super::open_at_the_stop(out);
+        ) {
+            return false;
         }
-        self.close("", out);
+        let held = std::mem::take(&mut self.carried);
+        if !held.is_empty() {
+            self.leaf_text(&held, out);
+        }
+        super::left_open(why, out);
+        self.open.pop();
+        self.value.clear();
+        self.push_fragment("\"".to_string(), Text::default(), out);
+        true
     }
 
     /// Reads as much of `text` as one step takes and returns the rest.

@@ -91,7 +91,7 @@ pub struct CrdtChange {
 /// namespace's operations; the log itself carries no merge-strategy knowledge.
 /// Engines drive merge (op-id collision policy) and compaction (per-key fold
 /// rule) themselves via [`Self::operations`], [`Self::append`], and
-/// [`Self::compact_by_key`].
+/// `Self::compact_by_key`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperationLog {
     operations: Vec<Operation>,

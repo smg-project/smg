@@ -776,14 +776,14 @@ impl Format {
     /// after the thought reads as before, from wherever a start row, an anchor or the prompt's
     /// replay puts the turn. A call's markers are the terminals on the rows into or out of an
     /// arguments state or a calls wrapper, and the message frame's are the terminals with a row
-    /// into or out of the frame ([`Self::message_framing`]): a table whose thought is framed by
+    /// into or out of the frame (`Self::message_framing`): a table whose thought is framed by
     /// them alone (Inkling's, whose kind markers also move between the bodies) shows none, and
     /// neither does the variant [`Self::without_calls`] made of it. A state's own text rows
     /// stay with it: a trimmed stay is still trimmed, a framing state's text still dropped; and a
     /// tag the end cut short is still dropped, as the legacy parsers drop it on both their paths.
     /// A table without a thought changes only in what it shows; the thought-first mark and the
     /// layout, which serve the tags alone, go. A marker with no row out of the thought's state is
-    /// its text and counts no malformed run, as in the table ([`Self::is_remade`]), so an output
+    /// its text and counts no malformed run, as in the table (`Self::is_remade`), so an output
     /// counts the same whether the request separates reasoning or not.
     #[must_use]
     pub fn without_reasoning(mut self) -> Self {
@@ -815,7 +815,7 @@ impl Format {
     /// text where they move the engine, so a call's bytes stay in the content as the model wrote
     /// them. The markers that frame the thought and the answer are not shown: a marker that also
     /// opens the thought, and, where the turn starts in a message header
-    /// ([`Self::message_framing`]: Inkling's arguments state, which the message opener returns
+    /// (`Self::message_framing`: Inkling's arguments state, which the message opener returns
     /// to and the thought and the answer open from), every marker of the message frame, which
     /// stays dropped in a variant made of this one too; so the thought and the answer read as
     /// before, their markers dropped, and a call the model writes anyway is content between
@@ -827,7 +827,7 @@ impl Format {
     /// its first byte. A state's own text rows stay with it, as in [`Self::without_reasoning`].
     /// A stop that closed a call closes nothing; the layout goes. A marker with no row out of a
     /// state made content here is its text and adds no malformed run of its own
-    /// ([`Self::is_remade`]): in the table the call's syntax reads it and says what it is.
+    /// (`Self::is_remade`): in the table the call's syntax reads it and says what it is.
     #[must_use]
     pub fn without_calls(mut self) -> Self {
         let frame = self.message_frame();
