@@ -1,4 +1,4 @@
-"""Run the complete original Rust-servicer chat row with strict terminal accounting."""
+"""Run the complete original Python-servicer chat row with strict terminal accounting."""
 
 import json
 import os
@@ -6,6 +6,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
+from python_proof import PythonProof
 from reuse import require
 from selection import capture
 
@@ -71,28 +72,10 @@ class Reports:
         )
 
 
-def record_rust_workers(log_directory, output, models):
-    records = []
-    for model in models:
-        for path in sorted(
-            log_directory.glob("worker-" + model.replace("/", "__") + "_vllm_grpc_*.log")
-        ):
-            with path.open("rb") as stream:
-                raw = stream.read(16 * 1024 * 1024 + 1)
-            for line in raw[: 16 * 1024 * 1024].decode(errors="replace").splitlines():
-                if "Rust vLLM servicer listening on " in line:
-                    records.append({"model": model, "log": str(path), "line": line})
-    (output / "actual-rust-worker-log.json").write_text(json.dumps(records, indent=2) + "\n")
-    return records
-
-
-def require_rust_workers(records, models):
-    require({r["model"] for r in records} == set(models), "actual Rust worker witness missing")
-
-
 def main():
     require(os.environ["E2E_ENGINE"] == "vllm", "unexpected engine")
-    require(os.environ["E2E_VLLM_SERVICER_IMPL"] == "rust", "wrong servicer lane")
+    require(not os.environ.get("E2E_VLLM_SERVICER_IMPL"), "wrong servicer lane")
+    require(os.environ.get("SPT_NOENV") == "1", "process marker preservation missing")
     require(not os.environ.get("E2E_MM_PROCESSING"), "original processing lane changed")
     require(not os.environ.get("E2E_CONNECTION_MODE"), "original connection lane changed")
     recipe = json.loads(CASES.read_text())["chat"]
@@ -101,6 +84,7 @@ def main():
     output.mkdir()
     reports = Reports(output / "case-reports.jsonl", recipe)
     junit = output / "result.xml"
+    proof = PythonProof(output, recipe)
     result = pytest.main(
         [
             recipe["test_dir"],
@@ -112,11 +96,10 @@ def main():
             "-vv",
             "--junitxml=" + str(junit),
         ],
-        plugins=[reports],
+        plugins=[reports, proof],
     )
-    workers = record_rust_workers(ROOT / "e2e-logs", output, recipe["models"])
     reports.verify(recipe, junit)
-    require_rust_workers(workers, recipe["models"])
+    proof.verify()
     return int(result)
 
 

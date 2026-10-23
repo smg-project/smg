@@ -14,7 +14,8 @@ COMMAND = ["bash", ".github/amd-vllm-python/run.sh"]
 def main():
     budget = reuse.consumer_budget()
     path = (
-        Path(os.environ["RUNNER_TEMP"]) / f"vllm-python-servicer-budget-{budget['consumer_job']}.json"
+        Path(os.environ["RUNNER_TEMP"])
+        / f"vllm-python-servicer-budget-{budget['consumer_job']}.json"
     )
     path.write_text(json.dumps(budget, indent=2) + "\n")
     env = dict(os.environ, SMG_VLLM_PYTHON_BUDGET_FILE=str(path))
