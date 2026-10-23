@@ -3021,7 +3021,7 @@ mod tests {
     }
 
     #[test]
-    fn encode_handoff_sglang_is_prefill_only_on_actual_parallel_pd_split() {
+    fn epd_sglang_handoff_and_media_are_prefill_only_on_actual_parallel_pd_split() {
         let worker = |url, role| -> Arc<dyn Worker> {
             Arc::new(
                 BasicWorkerBuilder::new(url)
@@ -3039,6 +3039,10 @@ mod tests {
         };
         let mut request = ProtoGenerateRequest::Sglang(Box::new(sglang::GenerateRequest {
             request_id: "original-rid".to_string(),
+            mm_inputs: Some(sglang::MultimodalInputs {
+                image_urls: vec!["data:image/png;base64,original-inline-bytes".to_string()],
+                ..Default::default()
+            }),
             disaggregated_params: Some(sglang::DisaggregatedParams {
                 bootstrap_host: "prefill".to_string(),
                 bootstrap_port: 8998,
@@ -3057,6 +3061,14 @@ mod tests {
         assert_eq!(decode.request_id(), "original-rid");
         assert_eq!(prefill.as_sglang().encode_handoff, Some(handoff));
         assert!(decode.as_sglang().encode_handoff.is_none());
+        assert_eq!(
+            prefill.as_sglang().mm_inputs.as_ref().unwrap().image_urls,
+            ["data:image/png;base64,original-inline-bytes"]
+        );
+        assert!(
+            decode.as_sglang().mm_inputs.is_none(),
+            "decode cannot trigger legacy auto-encoding"
+        );
         assert_eq!(
             prefill.as_sglang().disaggregated_params,
             decode.as_sglang().disaggregated_params

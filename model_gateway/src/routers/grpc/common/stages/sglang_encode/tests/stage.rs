@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use axum::http::StatusCode;
 use llm_multimodal::{
     EncoderFieldLayouts, FieldLayout, ImageFrame, ImageSource, PlaceholderRange,
     PreprocessedEncoderInputs,
@@ -23,7 +24,6 @@ use crate::{
         },
         context::{
             ClientSelection, EncodeOutputs, PreparationOutput, RequestContext, SharedComponents,
-            WorkerSelection,
         },
         multimodal::{MediaBatch, PrecomputedMultimodalIntermediate, PromptBinding},
         proto_wrapper::{MultimodalData, ProtoGenerateRequest},
@@ -241,7 +241,7 @@ async fn epd_sglang_actual_stage_and_build_keep_inline_media_and_final_id() {
     replacement.set_status(openai_protocol::worker::WorkerStatus::NotReady);
     assert_eq!(
         selection.reselect(&mut retry).await.unwrap_err().status(),
-        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        StatusCode::SERVICE_UNAVAILABLE,
         "no silent PD fallback without encoder"
     );
     server.abort();
