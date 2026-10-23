@@ -4,6 +4,8 @@ import subprocess
 
 from artifact_io import ROOT, git_output, require
 
+WORKFLOW = ".github/workflows/pr-test-rust.yml"
+
 
 def check_map(read_oid, revision, expected):
     for path, oid in expected.items():

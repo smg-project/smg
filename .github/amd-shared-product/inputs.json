@@ -4,12 +4,12 @@
   "artifacts_pinned": false,
   "artifacts": [],
   "gateway_native": null,
-  "run_id": 40031104366,
-  "run_attempt": 1,
-  "build_job_id": 120679491331,
-  "producer_sha": "c9d5431db92aa2d35521889f6297c4c6f7b05b4a",
-  "producer_branch": "main",
-  "producer_policy": "successful_build_job_with_consumer_revalidation",
+  "run_id": null,
+  "run_attempt": null,
+  "build_job_id": null,
+  "producer_sha": null,
+  "producer_branch": "ci/frozen-c9d-cpu-producer-20261023",
+  "producer_policy": "frozen_c9d_dispatch_build_only_all_18_steps_success_v1",
   "target_product_commit": "ee1b8f0f83186a0e33d805b4b2551d17322a80fb",
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat[1]/vllm/nvidia",
   "source_trees": {
@@ -86,7 +86,7 @@
     "e2e_test": "ac24cbe1b88c3219bbe07b76dc4dd8370bf2ff1b",
     "scripts": "a5f12792df38a4cb1f82ef724f8234360fddf99a",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
-    ".github/workflows": "7c956a4ee89bdf800d48c63815d10a4dd568d90e"
+    ".github/workflows": "01f44d96ef6820514539989da56df9c60c184790"
   },
   "explicit_consumer_only_paths": [
     ".github/amd-shared-product/",
@@ -119,7 +119,7 @@
   },
   "diagnostic_difference": "caller container explicitly sets SPT_NOENV=1; current product shared workflow does not",
   "producer_binary_relabelled": false,
-  "producer_artifact_pins_status": "EMPTY: actual c9d bytes/API metadata/native identity not yet audited",
+  "producer_artifact_pins_status": "EMPTY: no actual new successful dispatch producer or archives pinned",
   "explicit_product_dependency": {
     "PR": 4266,
     "original_public_head": "3cef9af6a73610f501b920221c7232bf640219d0",
@@ -127,5 +127,23 @@
     "parent_stack": "0707d631cb6827789619ab96999f868044dc06db",
     "visible_churn": 43
   },
-  "producer_snapshot_note": "root22:38: producer build cancelled with four unverified artifacts; current strict success policy rejects it; no pins or native hash are fabricated"
+  "producer_snapshot_note": "Old normal c9d cancelled producer remains rejected; a new dispatch producer requires all18 steps and entire run success plus actual4archives/native audit",
+  "source_base": "c9d5431db92aa2d35521889f6297c4c6f7b05b4a",
+  "producer_base_source_trees": {
+    ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
+    "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
+    "Cargo.lock": "658f9376c020bef5e29a3e5728b4931cee891427",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
+    "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
+    "crates": "aa609afdadbb89b16d28d8763ec0d8a47672433a",
+    "model_gateway": "d1a181bfb1d16a661e16346d4eb8f257689701ce",
+    "grpc_servicer": "2cbef8f1440732b8034bfded7a9eba7e8e8d23ca",
+    "e2e_test": "ac24cbe1b88c3219bbe07b76dc4dd8370bf2ff1b",
+    "scripts": "a5f12792df38a4cb1f82ef724f8234360fddf99a",
+    ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+    ".github/workflows": "7c956a4ee89bdf800d48c63815d10a4dd568d90e"
+  },
+  "producer_source_map_note": "Expected 14 trees from reviewed diagnostic9841825, including its different workflow tree; actual admitted head/run unknown and must match exactly before relay"
 }

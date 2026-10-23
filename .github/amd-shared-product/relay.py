@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 import artifact_io as io
-import producer
+import frozen_producer
 import source
 import wheel_record
 
@@ -49,13 +49,16 @@ def main(inputs, output):
     output.mkdir(parents=True, exist_ok=False)
     evidence = output / "evidence"
     evidence.mkdir()
-    run, job = (
-        get(f"actions/runs/{inputs['run_id']}"),
-        get(f"actions/jobs/{inputs['build_job_id']}"),
+    run = get(f"actions/runs/{inputs['run_id']}")
+    attempt_jobs = get(
+        f"actions/runs/{inputs['run_id']}/attempts/{inputs['run_attempt']}/jobs?per_page=100"
     )
+    jobs = attempt_jobs["jobs"]
+    io.require(attempt_jobs["total_count"] == len(jobs) == 1, "single build-only attempt")
+    job = jobs[0]
+    (evidence / "producer-attempt-jobs.json").write_text(json.dumps(attempt_jobs, indent=2) + "\n")
     for name, value in (("producer-run", run), ("producer-build-job", job)):
         (evidence / f"{name}.json").write_text(json.dumps(value, indent=2) + "\n")
-    producer.verify(run, job, inputs)
     records = []
     for page in range(1, 11):
         batch = get(f"actions/runs/{inputs['run_id']}/artifacts?per_page=100&page={page}")[
@@ -66,7 +69,10 @@ def main(inputs, output):
             break
     else:
         raise ValueError("artifact pagination cap")
-    producer.unique_artifacts(records, inputs)
+    context = frozen_producer.verify_completed(
+        run, jobs, inputs, records, datetime.datetime.now(datetime.UTC)
+    )
+    (evidence / "frozen-producer-context.json").write_text(json.dumps(context, indent=2) + "\n")
     (evidence / "producer-artifacts.json").write_text(json.dumps(records, indent=2) + "\n")
     verified = []
     for artifact in inputs["artifacts"]:
@@ -102,6 +108,9 @@ def main(inputs, output):
                     "build_job": job["id"],
                     "run_status": run["status"],
                     "run_conclusion": run["conclusion"],
+                    "policy": inputs["producer_policy"],
+                    "source_base": inputs["source_base"],
+                    "source_maps_verified": True,
                 },
                 "relay_consumer": {
                     "run": os.environ["GITHUB_RUN_ID"],
