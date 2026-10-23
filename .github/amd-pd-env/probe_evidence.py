@@ -13,8 +13,13 @@ OUT = Path("diagnostic-results")
 
 def preflight():
     from infra.model_specs import get_model_spec
+    from infra.pd_local_kv_compat import enabled as local_kv_enabled
     from infra.pd_scheduler_compat import require_installed_contract
 
+    if local_kv_enabled():
+        from capture_sources import capture
+
+        capture(OUT)
     contract = require_installed_contract()
     model_id = "meta-llama/Llama-3.1-8B-Instruct"
     requested = get_model_spec(model_id)["model"]
