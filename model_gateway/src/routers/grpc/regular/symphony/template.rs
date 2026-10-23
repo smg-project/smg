@@ -177,7 +177,8 @@ fn compile(model: &str, tokenizer: &dyn Tokenizer) -> Result<Format, String> {
 /// writes the same one in every rendering.
 fn render(tokenizer: &dyn Tokenizer, case: Case) -> Option<String> {
     let mut messages = case.messages();
-    if tokenizer.chat_template_content_format() == ChatTemplateContentFormat::OpenAI {
+    if tokenizer.chat_template_content_format_for_request(true) == ChatTemplateContentFormat::OpenAI
+    {
         for message in messages.as_array_mut()? {
             if let Some(text) = message.get("content").and_then(Value::as_str) {
                 let part = json!([{"type": "text", "text": text}]);

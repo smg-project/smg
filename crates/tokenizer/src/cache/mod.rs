@@ -511,6 +511,14 @@ impl Tokenizer for CachedTokenizer {
         self.inner.chat_template_content_format()
     }
 
+    fn chat_template_content_format_for_request(
+        &self,
+        has_tools: bool,
+    ) -> ChatTemplateContentFormat {
+        self.inner
+            .chat_template_content_format_for_request(has_tools)
+    }
+
     fn thinking_toggle(&self) -> ThinkingToggle {
         self.inner.thinking_toggle()
     }

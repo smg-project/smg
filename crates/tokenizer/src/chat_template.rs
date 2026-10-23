@@ -2496,6 +2496,15 @@ pub struct ChatTemplateState {
     /// when the request declares tools, as the engine's chat utils render.
     /// The accessors answer for the default template.
     tool_use: Option<Box<ChatTemplateState>>,
+    /// The processor's template of a checkpoint that ships one beside the
+    /// tokenizer's and differs from it (see [`Self::from_checkpoint`]),
+    /// rendered in place of the default one when the request declares no
+    /// tools, as the engine's server resolves a request's template: the
+    /// request's own first, the processor's second unless tools are
+    /// declared, the tokenizer's third. The accessors answer for the default
+    /// template, which the processor's agrees with on the thinking answers;
+    /// [`Self::content_format_for_tools`] answers for the one selected.
+    processor: Option<Box<ChatTemplateState>>,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -2506,6 +2515,7 @@ impl std::fmt::Debug for ChatTemplateState {
             .field("thinking_toggle", &self.thinking_toggle)
             .field("think_in_prefill", &self.think_in_prefill)
             .field("has_tool_use", &self.tool_use.is_some())
+            .field("has_processor", &self.processor.is_some())
             .finish()
     }
 }
@@ -2535,6 +2545,7 @@ impl ChatTemplateState {
             root_role_supported,
             raw_tool_call_arguments: false,
             tool_use: None,
+            processor: None,
         };
         state.raw_tool_call_arguments = state.writes_tool_call_arguments_as_text();
         Ok(state)
@@ -2577,6 +2588,81 @@ impl ChatTemplateState {
         Ok(state)
     }
 
+    /// The templates of a checkpoint: the configuration's (see
+    /// [`Self::from_config`]) and the processor's, the legacy
+    /// `chat_template.json` a multimodal checkpoint may ship beside the
+    /// tokenizer's template. The engine's server renders a request that
+    /// declares no tools through the processor's template when the checkpoint
+    /// has one, and one that declares tools through the tokenizer's, so the
+    /// processor's is kept for the tool-less requests where it differs from
+    /// the default template; one equal to it, or one without a default
+    /// template to differ from (the loaders take the legacy file as the one
+    /// template of such a configuration), changes nothing.
+    ///
+    /// The processor's template is kept only when it agrees with the default
+    /// one on how a request's thinking is prepared and its answer read (the
+    /// toggle and its key, the prefill's think block) and on how a history
+    /// tool call's arguments are written: those answers are read from the
+    /// default template before the request's template is chosen, so a
+    /// processor template that disagrees would render a prompt the parser is
+    /// not set up for. Such a template, like one that does not compile, is
+    /// not used, every request renders through the tokenizer's templates as
+    /// before, and the load says why. The content format may differ: it
+    /// follows the selected template ([`Self::content_format_for_tools`]).
+    pub fn from_checkpoint(
+        templates: ConfigChatTemplates,
+        processor: Option<String>,
+    ) -> Result<Self> {
+        let processor = processor.filter(|template| {
+            templates
+                .default
+                .as_deref()
+                .is_some_and(|default| default != template)
+        });
+        let mut state = Self::from_config(templates)?;
+        if let Some(template) = processor {
+            match Self::new(Some(template)) {
+                Ok(processor) if state.prepares_thinking_as(&processor) => {
+                    state.processor = Some(Box::new(processor));
+                }
+                Ok(processor) => tracing::warn!(
+                    default_thinking_toggle = ?state.thinking_toggle,
+                    processor_thinking_toggle = ?processor.thinking_toggle,
+                    default_thinking_key_name = ?state.thinking_key_name,
+                    processor_thinking_key_name = ?processor.thinking_key_name,
+                    default_think_in_prefill = state.think_in_prefill,
+                    processor_think_in_prefill = processor.think_in_prefill,
+                    default_prefill_opens_think_block = state.prefill_opens_think_block,
+                    processor_prefill_opens_think_block = processor.prefill_opens_think_block,
+                    default_raw_tool_call_arguments = state.raw_tool_call_arguments(),
+                    processor_raw_tool_call_arguments = processor.raw_tool_call_arguments(),
+                    "the checkpoint's processor chat template disagrees with the tokenizer's on \
+                     how a request's thinking is prepared and read or on how a history tool \
+                     call's arguments are written, and is not used; requests render through the \
+                     tokenizer's template"
+                ),
+                Err(e) => tracing::warn!(
+                    "the checkpoint's processor chat template does not compile and is not used; \
+                     requests render through the tokenizer's template: {e}"
+                ),
+            }
+        }
+        Ok(state)
+    }
+
+    /// Whether `other` prepares a request's thinking, reads its answer and
+    /// writes a history tool call's arguments as this template does (see
+    /// [`Self::from_checkpoint`]).
+    fn prepares_thinking_as(&self, other: &Self) -> bool {
+        other.thinking_toggle == self.thinking_toggle
+            && other.thinking_key_name == self.thinking_key_name
+            && other.think_in_prefill == self.think_in_prefill
+            && other.prefill_opens_think_block == self.prefill_opens_think_block
+            // The answer the gateway reads: a named pair's comes from its
+            // `tool_use` template (see [`Self::raw_tool_call_arguments`]).
+            && other.raw_tool_call_arguments == self.raw_tool_call_arguments()
+    }
+
     /// Create a `ChatTemplateState` with no template set.
     ///
     /// Unlike `new(None)`, this is infallible since there is no template to
@@ -2593,6 +2679,7 @@ impl ChatTemplateState {
             root_role_supported: true,
             raw_tool_call_arguments: false,
             tool_use: None,
+            processor: None,
         }
     }
 
@@ -2619,14 +2706,31 @@ impl ChatTemplateState {
             .render_with_continuation(messages, params)
     }
 
-    /// The template a request renders through: the `tool_use` one of a
-    /// configuration that names it when the request declares tools, else
-    /// this one.
+    /// The template a request renders through (see
+    /// [`Self::template_for_tools`]).
     fn template_for(&self, params: &ChatTemplateParams) -> &Self {
-        match &self.tool_use {
-            Some(tool_use) if params.tools.is_some() => tool_use,
-            _ => self,
-        }
+        self.template_for_tools(params.tools.is_some())
+    }
+
+    /// The template a request renders through: the `tool_use` one of a
+    /// configuration that names it when the request declares tools, the
+    /// processor's one of a checkpoint that ships it when the request
+    /// declares none, else this one.
+    fn template_for_tools(&self, has_tools: bool) -> &Self {
+        let selected = if has_tools {
+            &self.tool_use
+        } else {
+            &self.processor
+        };
+        selected.as_deref().unwrap_or(self)
+    }
+
+    /// The content format of the template a request renders through
+    /// ([`Self::template_for_tools`]): what the request's message content is
+    /// shaped into before the render, as the engine's server detects it on
+    /// the template it resolved for the request.
+    pub fn content_format_for_tools(&self, has_tools: bool) -> ChatTemplateContentFormat {
+        self.template_for_tools(has_tools).content_format
     }
 
     fn render_with_continuation(
@@ -2755,6 +2859,7 @@ impl ChatTemplateState {
         self.env = Some(env);
         // A replacement template stands alone, as a template file does.
         self.tool_use = None;
+        self.processor = None;
         self.raw_tool_call_arguments = self.writes_tool_call_arguments_as_text();
         Ok(())
     }
@@ -3166,6 +3271,150 @@ mod tests {
             !ConfigChatTemplates::read(Some(&serde_json::json!({"name": "default"}))).is_some()
         );
         assert!(!ConfigChatTemplates::read(None).is_some());
+    }
+
+    /// A checkpoint's processor template renders the requests that declare no
+    /// tools and the configuration's templates the ones that do, as the
+    /// engine's server resolves them; the content format answers for the
+    /// template selected. One equal to the default template, or one without
+    /// a default template to differ from, is not kept; a replacement template
+    /// drops it.
+    #[test]
+    fn a_checkpoint_s_processor_template_renders_a_request_without_tools() {
+        let default = "default:{{ messages[0]['content'] }}";
+        let processor = "processor:{% for message in messages %}\
+             {% for part in message['content'] %}{{ part['text'] }}{% endfor %}{% endfor %}";
+        let messages = [serde_json::json!({"role": "user", "content": "Hi"})];
+        let tools = [serde_json::json!({"type": "function", "function": {"name": "f"}})];
+        let with_tools = || ChatTemplateParams {
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        let templates = || ConfigChatTemplates {
+            default: Some(default.to_string()),
+            tool_use: Some("tool_use:{{ tools | length }}".to_string()),
+        };
+
+        let mut state =
+            ChatTemplateState::from_checkpoint(templates(), Some(processor.to_string())).unwrap();
+        assert!(format!("{state:?}").contains("has_processor: true"));
+        assert_eq!(
+            state
+                .apply(&messages, ChatTemplateParams::default())
+                .unwrap(),
+            "processor:Hi"
+        );
+        assert_eq!(state.apply(&messages, with_tools()).unwrap(), "tool_use:1");
+        assert_eq!(
+            state.content_format_for_tools(false),
+            ChatTemplateContentFormat::OpenAI
+        );
+        assert_eq!(
+            state.content_format_for_tools(true),
+            ChatTemplateContentFormat::String
+        );
+        assert_eq!(state.content_format(), ChatTemplateContentFormat::String);
+        state.set("alone:{{ tools is none }}".to_string()).unwrap();
+        assert!(format!("{state:?}").contains("has_processor: false"));
+        assert_eq!(
+            state
+                .apply(&messages, ChatTemplateParams::default())
+                .unwrap(),
+            "alone:True"
+        );
+
+        let equal =
+            ChatTemplateState::from_checkpoint(templates(), Some(default.to_string())).unwrap();
+        assert!(format!("{equal:?}").contains("has_processor: false"));
+        assert_eq!(
+            equal
+                .apply(&messages, ChatTemplateParams::default())
+                .unwrap(),
+            "default:Hi"
+        );
+
+        let without_default = ChatTemplateState::from_checkpoint(
+            ConfigChatTemplates::default(),
+            Some(processor.to_string()),
+        )
+        .unwrap();
+        assert!(format!("{without_default:?}").contains("has_processor: false"));
+        assert!(without_default
+            .apply(&messages, ChatTemplateParams::default())
+            .is_err());
+
+        // A processor template that disagrees with the default one on how a
+        // request's thinking is prepared (here: a toggle the default has
+        // none of) is not used: the render would not match the parse.
+        let thinking = "{% if enable_thinking %}<think>{% endif %}{{ messages[0]['content'] }}";
+        let disagreeing =
+            ChatTemplateState::from_checkpoint(templates(), Some(thinking.to_string())).unwrap();
+        assert!(format!("{disagreeing:?}").contains("has_processor: false"));
+        assert_eq!(
+            disagreeing
+                .apply(&messages, ChatTemplateParams::default())
+                .unwrap(),
+            "default:Hi"
+        );
+        let agreeing = ChatTemplateState::from_checkpoint(
+            ConfigChatTemplates {
+                default: Some(thinking.to_string()),
+                tool_use: None,
+            },
+            Some(
+                "processor:{{ messages[0]['content'] }}{% if enable_thinking %}<think>{% endif %}"
+                    .to_string(),
+            ),
+        )
+        .unwrap();
+        assert!(format!("{agreeing:?}").contains("has_processor: true"));
+
+        // The raw-arguments answer compared is the one the gateway reads: in
+        // a named pair the `tool_use` template's, not the default's.
+        let concatenating = "{% for m in messages %}{% for c in m.tool_calls or [] %}\
+                             {{ 'args=' + c.function.arguments }}{% endfor %}{% endfor %}";
+        let named_pair = || ConfigChatTemplates {
+            default: Some("{{ messages | length }}".to_string()),
+            tool_use: Some(concatenating.to_string()),
+        };
+        let kept = ChatTemplateState::from_checkpoint(
+            named_pair(),
+            Some(format!("processor:{concatenating}")),
+        )
+        .unwrap();
+        assert!(kept.raw_tool_call_arguments());
+        assert!(format!("{kept:?}").contains("has_processor: true"));
+        let dropped = ChatTemplateState::from_checkpoint(
+            named_pair(),
+            Some(
+                "{% for m in messages %}{% for c in m.tool_calls or [] %}\
+                 {{ c.function.arguments | tojson }}{% endfor %}{% endfor %}"
+                    .to_string(),
+            ),
+        )
+        .unwrap();
+        assert!(format!("{dropped:?}").contains("has_processor: false"));
+
+        // A processor template that does not compile leaves the tokenizer's
+        // templates serving every request; the configuration's own still
+        // fails the load, as before.
+        let broken =
+            ChatTemplateState::from_checkpoint(templates(), Some("{{".to_string())).unwrap();
+        assert!(format!("{broken:?}").contains("has_processor: false"));
+        assert_eq!(
+            broken
+                .apply(&messages, ChatTemplateParams::default())
+                .unwrap(),
+            "default:Hi"
+        );
+        assert!(ChatTemplateState::from_checkpoint(
+            ConfigChatTemplates {
+                default: Some("{{".to_string()),
+                tool_use: None,
+            },
+            None,
+        )
+        .is_err());
     }
 
     /// The answer to how a history tool call's arguments are written comes

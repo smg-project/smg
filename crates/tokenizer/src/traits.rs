@@ -346,6 +346,20 @@ pub trait Tokenizer: Encoder + Decoder {
         ChatTemplateContentFormat::default()
     }
 
+    /// The content format of the template a request renders through, by
+    /// whether the request declares tools: a checkpoint can ship one template
+    /// for requests with tools and another for those without (see
+    /// `ChatTemplateState::content_format_for_tools`), and the request's
+    /// message content takes the shape of the one that renders it. The
+    /// default template's format for a tokenizer with one template.
+    fn chat_template_content_format_for_request(
+        &self,
+        has_tools: bool,
+    ) -> ChatTemplateContentFormat {
+        let _ = has_tools;
+        self.chat_template_content_format()
+    }
+
     /// Get the thinking toggle support for this template.
     fn thinking_toggle(&self) -> ThinkingToggle {
         ThinkingToggle::None

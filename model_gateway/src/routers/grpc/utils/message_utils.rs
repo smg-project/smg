@@ -127,7 +127,7 @@ pub(crate) fn process_messages_prompt(
     placeholder_tokens: Option<&PlaceholderTokens>,
     media_order: MediaPartOrder,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
-    let content_format = tokenizer.chat_template_content_format();
+    let content_format = tokenizer.chat_template_content_format_for_request(chat_tools.is_some());
 
     // Step 1: Convert InputMessages to chat template JSON values
     let mut transformed_messages = process_message_content_format(

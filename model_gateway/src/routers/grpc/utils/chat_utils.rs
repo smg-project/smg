@@ -819,8 +819,11 @@ pub(crate) fn process_chat_messages_with_placeholders(
     media_order: MediaPartOrder,
 ) -> Result<(ProcessedMessages, PromptEncoding), String> {
     let rendered = {
-        // Get content format and transform messages accordingly
-        let content_format = tokenizer.chat_template_content_format();
+        // Get content format and transform messages accordingly: the format
+        // of the template this request renders through, which a checkpoint
+        // may pick by whether the request declares tools.
+        let content_format =
+            tokenizer.chat_template_content_format_for_request(request.tools.is_some());
         let mut transformed_messages = process_content_format_with_order(
             &request.messages,
             content_format,

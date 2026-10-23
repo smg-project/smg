@@ -663,6 +663,31 @@ impl HuggingFaceTokenizer {
             tool_use_template = None;
         }
 
+        // The processor's legacy template file beside the tokenizer, for the
+        // requests without tools the engine's server renders through it (see
+        // `ChatTemplateState::from_checkpoint`): read when the template in
+        // use is the checkpoint's own (the configuration's, or the sibling
+        // `chat_template.jinja` the discovery prefers); a template file given
+        // from elsewhere is the operator's and stands alone, as the request's
+        // own template outranks the processor's in the engine's server. A
+        // file that does not parse is no processor template: the engine's
+        // processor does not load then, and its server falls back to the
+        // tokenizer's template.
+        let tokenizer_dir = tokenizer_path.parent();
+        let checkpoints_own_template = chat_template_path.is_none_or(|path| {
+            tokenizer_dir.is_some_and(|dir| Path::new(path) == dir.join("chat_template.jinja"))
+        });
+        let processor_template = tokenizer_dir
+            .filter(|_| checkpoints_own_template)
+            .and_then(crate::factory::discover_processor_chat_template_in_dir)
+            .and_then(|path| match load_chat_template_from_file(&path) {
+                Ok(template) => template,
+                Err(e) => {
+                    debug!("the processor's chat template at {path} does not load: {e}");
+                    None
+                }
+            });
+
         // The configuration's special tokens on request (the rule is on
         // `from_file`): an explicit `add_bos_token` / `add_eos_token` of
         // true replaces the file's post-processor with the template the
@@ -717,10 +742,13 @@ impl HuggingFaceTokenizer {
             .and_then(|checkpoint| checkpoint.renderer(chat_template_str.as_deref()))
             .map(Renderer::Glm53)
             .unwrap_or(renderer);
-        let chat_template = ChatTemplateState::from_config(ConfigChatTemplates {
-            default: chat_template_str,
-            tool_use: tool_use_template,
-        })?;
+        let chat_template = ChatTemplateState::from_checkpoint(
+            ConfigChatTemplates {
+                default: chat_template_str,
+                tool_use: tool_use_template,
+            },
+            processor_template,
+        )?;
         let media_handling = glm.as_ref().map_or_else(Default::default, |checkpoint| {
             checkpoint.media_handling(&chat_template)
         });
@@ -1921,6 +1949,15 @@ impl TokenizerTrait for HuggingFaceTokenizer {
             .unwrap_or_else(|| self.chat_template.content_format())
     }
 
+    fn chat_template_content_format_for_request(
+        &self,
+        has_tools: bool,
+    ) -> ChatTemplateContentFormat {
+        self.profile
+            .and_then(|profile| profile.content_format)
+            .unwrap_or_else(|| self.chat_template.content_format_for_tools(has_tools))
+    }
+
     fn thinking_toggle(&self) -> ThinkingToggle {
         self.profile.map_or_else(
             || self.chat_template.thinking_toggle(),
@@ -3069,6 +3106,159 @@ mod tests {
                 .unwrap(),
             "f"
         );
+    }
+
+    /// A multimodal checkpoint may ship the processor's legacy
+    /// `chat_template.json` beside the tokenizer's template, and the two can
+    /// differ: the engine's server renders a request without tools through
+    /// the processor's template and one with tools through the tokenizer's,
+    /// and so does the loader, the content shape following the template
+    /// selected. The checkpoint's own `chat_template.jinja` is the
+    /// tokenizer's template and keeps the processor's for the tool-less
+    /// requests; equal templates, a processor file beside a configuration
+    /// without a template, an operator's template file and a replacement
+    /// template change nothing.
+    #[test]
+    fn the_processor_s_template_renders_a_request_without_tools() {
+        use crate::chat_template::ChatTemplateContentFormat;
+
+        let temp = TempDir::new().unwrap();
+        let tokenizer_path = temp.path().join("tokenizer.json");
+        fs::write(&tokenizer_path, MIN_TOKENIZER_JSON).unwrap();
+        let config_path = temp.path().join("tokenizer_config.json");
+        let processor_path = temp.path().join("chat_template.json");
+        let jinja_path = temp.path().join("chat_template.jinja");
+        let write = |path: &std::path::Path, template: &str| {
+            fs::write(path, json!({"chat_template": template}).to_string()).unwrap();
+        };
+        let string_template =
+            "tokenizer:{% for message in messages %}{{ message['content'] }}{% endfor %}";
+        let parts_template = "processor:{% for message in messages %}\
+             {% for part in message['content'] %}{{ part['text'] }}{% endfor %}{% endfor %}";
+        let messages = [json!({"role": "user", "content": "Hi"})];
+        let tools: [serde_json::Value; 0] = [];
+        let with_tools = || ChatTemplateParams {
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        let load = || HuggingFaceTokenizer::from_file(tokenizer_path.to_str().unwrap()).unwrap();
+        let render = |tokenizer: &HuggingFaceTokenizer, params: ChatTemplateParams| {
+            tokenizer.apply_chat_template(&messages, params).unwrap()
+        };
+
+        // Both, differing: the processor's for a request without tools, with
+        // the content shape of that template; the tokenizer's with tools.
+        write(&config_path, string_template);
+        write(&processor_path, parts_template);
+        let tokenizer = load();
+        assert_eq!(
+            render(&tokenizer, ChatTemplateParams::default()),
+            "processor:Hi"
+        );
+        assert_eq!(render(&tokenizer, with_tools()), "tokenizer:Hi");
+        assert_eq!(
+            tokenizer.chat_template_content_format_for_request(false),
+            ChatTemplateContentFormat::OpenAI
+        );
+        assert_eq!(
+            tokenizer.chat_template_content_format_for_request(true),
+            ChatTemplateContentFormat::String
+        );
+        assert_eq!(
+            tokenizer.chat_template_content_format(),
+            ChatTemplateContentFormat::String
+        );
+
+        // The checkpoint's own `chat_template.jinja` is the tokenizer's
+        // template (the discovery prefers it): the processor's still renders
+        // the tool-less requests.
+        fs::write(&jinja_path, "jinja:{{ messages[0]['content'] }}").unwrap();
+        let tokenizer = load();
+        assert_eq!(
+            render(&tokenizer, ChatTemplateParams::default()),
+            "processor:Hi"
+        );
+        assert_eq!(render(&tokenizer, with_tools()), "jinja:Hi");
+        fs::remove_file(&jinja_path).unwrap();
+
+        // Equal templates: one template, whatever the request declares.
+        write(&processor_path, string_template);
+        let tokenizer = load();
+        assert_eq!(
+            render(&tokenizer, ChatTemplateParams::default()),
+            "tokenizer:Hi"
+        );
+        assert_eq!(render(&tokenizer, with_tools()), "tokenizer:Hi");
+        assert_eq!(
+            tokenizer.chat_template_content_format_for_request(false),
+            tokenizer.chat_template_content_format()
+        );
+
+        // The processor's file beside a configuration without a template is
+        // the one template of the checkpoint, as before.
+        write(&processor_path, parts_template);
+        fs::write(
+            &config_path,
+            json!({"tokenizer_class": "PreTrainedTokenizerFast"}).to_string(),
+        )
+        .unwrap();
+        let tokenizer = load();
+        assert_eq!(
+            render(&tokenizer, ChatTemplateParams::default()),
+            "processor:Hi"
+        );
+        assert_eq!(render(&tokenizer, with_tools()), "processor:Hi");
+
+        // An operator's template file stands alone, as the request's own
+        // template outranks the processor's in the engine's server; so does
+        // a replacement template.
+        write(&config_path, string_template);
+        let own = temp.path().join("own.jinja");
+        fs::write(&own, "own:{{ messages[0]['content'] }}").unwrap();
+        let mut tokenizer = HuggingFaceTokenizer::from_file_with_chat_template(
+            tokenizer_path.to_str().unwrap(),
+            own.to_str(),
+        )
+        .unwrap();
+        assert_eq!(render(&tokenizer, ChatTemplateParams::default()), "own:Hi");
+        assert_eq!(render(&tokenizer, with_tools()), "own:Hi");
+        let mut tokenizer_with_both = load();
+        assert_eq!(
+            render(&tokenizer_with_both, ChatTemplateParams::default()),
+            "processor:Hi"
+        );
+        tokenizer_with_both
+            .set_chat_template("alone:{{ messages[0]['content'] }}".to_string())
+            .unwrap();
+        assert_eq!(
+            render(&tokenizer_with_both, ChatTemplateParams::default()),
+            "alone:Hi"
+        );
+        assert_eq!(render(&tokenizer_with_both, with_tools()), "alone:Hi");
+        tokenizer
+            .set_chat_template("alone:{{ messages[0]['content'] }}".to_string())
+            .unwrap();
+        assert_eq!(
+            render(&tokenizer, ChatTemplateParams::default()),
+            "alone:Hi"
+        );
+
+        // A processor file that does not parse, or a processor template that
+        // does not compile, is no processor template: the tokenizer loads and
+        // its own template serves every request.
+        fs::write(&processor_path, "{not json").unwrap();
+        let tokenizer = load();
+        assert_eq!(
+            render(&tokenizer, ChatTemplateParams::default()),
+            "tokenizer:Hi"
+        );
+        write(&processor_path, "{{ messages[0]['content'] ");
+        let tokenizer = load();
+        assert_eq!(
+            render(&tokenizer, ChatTemplateParams::default()),
+            "tokenizer:Hi"
+        );
+        assert_eq!(render(&tokenizer, with_tools()), "tokenizer:Hi");
     }
 
     // Regression: DeepSeek V3.2/V4 bypass ChatTemplateState::apply, so the
