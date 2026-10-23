@@ -1342,7 +1342,8 @@ impl StreamingProcessor {
     /// not repeat it, as the older path's do not (and are built without it, one
     /// allocation per delta saved). The step's events are consumed
     /// out of the buffer, which keeps its room for the next step: what an event
-    /// owns moves into its chunk, a borrowed text is copied into it once.
+    /// owns moves into its chunk, and a text the event borrows from the delta
+    /// is written from there, with no copy of its own.
     #[expect(clippy::too_many_arguments)]
     async fn push_events(
         tx: &SseSender,
@@ -1355,7 +1356,7 @@ impl StreamingProcessor {
         emit_usage_null: bool,
     ) -> Result<(), String> {
         for event in events.consume() {
-            let Some(mut choice) = adapt::chat::into_delta_without_role(index, event) else {
+            let Some(mut choice) = adapt::chat::into_delta_ref(index, event) else {
                 continue;
             };
             if choice.finish_reason.is_some() {
