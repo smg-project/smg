@@ -65,8 +65,15 @@ const ENV_ONE_PASS_WIRE: &str = "SMG_MM_ONE_PASS_WIRE";
 /// pipeline on a launcher that does not carry the setting); not a legacy
 /// name either.
 const ENV_TURBOJPEG: &str = "SMG_MM_TURBOJPEG";
+const ENV_FETCH_TIMEOUT_MS: &str = "SMG_MM_FETCH_TIMEOUT_MS";
+const ENV_VIDEO_FETCH_TIMEOUT_MS: &str = "SMG_MM_VIDEO_FETCH_TIMEOUT_MS";
 /// The env settings an unreadable value of which stops start-up ([`strict`]).
-const STRICT_ENV: [&str; 2] = [ENV_PROCESSING, ENV_TURBOJPEG];
+const STRICT_ENV: [&str; 4] = [
+    ENV_PROCESSING,
+    ENV_TURBOJPEG,
+    ENV_FETCH_TIMEOUT_MS,
+    ENV_VIDEO_FETCH_TIMEOUT_MS,
+];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MultimodalSettings {
@@ -103,6 +110,10 @@ pub(crate) struct MultimodalSettings {
     /// be loaded: `Prefer` serves with the pure-Rust decoder behind one
     /// warning, `Require` stops start-up.
     pub turbojpeg: Setting<TurboJpegPolicy>,
+    /// Video URL fetch budget in milliseconds.
+    pub video_fetch_timeout_ms: Setting<u64>,
+    /// Image/audio URL fetch budget in milliseconds.
+    pub fetch_timeout_ms: Setting<u64>,
 }
 
 impl Default for MultimodalSettings {
@@ -118,6 +129,12 @@ impl Default for MultimodalSettings {
             allow_private_media_hosts: Setting::from_default(false),
             one_pass_wire: Setting::from_default(true),
             turbojpeg: Setting::from_default(TurboJpegPolicy::Prefer),
+            video_fetch_timeout_ms: Setting::from_default(
+                llm_multimodal::media::DEFAULT_VIDEO_FETCH_TIMEOUT.as_millis() as u64,
+            ),
+            fetch_timeout_ms: Setting::from_default(
+                llm_multimodal::media::DEFAULT_FETCH_TIMEOUT.as_millis() as u64,
+            ),
         }
     }
 }
@@ -135,8 +152,8 @@ impl MultimodalSettings {
     /// Every setting is flag > env > default through [`resolve`]; the env
     /// switches share one spelling ([`switch`]; the one that is on by
     /// default reads the off spellings too, [`two_way_switch`]); an
-    /// unreadable `SMG_MM_PROCESSING` or `SMG_MM_TURBOJPEG` stops startup
-    /// ([`strict`]).
+    /// unreadable processing mode, TurboJPEG policy or download budget stops
+    /// startup ([`strict`]).
     /// The reader answers `None` for a variable that is unset and an error
     /// for one it refuses to read, which stops startup the same way.
     pub(crate) fn resolve_with(
@@ -241,6 +258,20 @@ impl MultimodalSettings {
                     )
                 },
             ),
+            fetch_timeout_ms: timeout_setting(
+                config.mm_fetch_timeout_ms,
+                "mm_fetch_timeout_ms",
+                env_nonempty(ENV_FETCH_TIMEOUT_MS)?,
+                ENV_FETCH_TIMEOUT_MS,
+                defaults.fetch_timeout_ms,
+            )?,
+            video_fetch_timeout_ms: timeout_setting(
+                config.mm_video_fetch_timeout_ms,
+                "mm_video_fetch_timeout_ms",
+                env_nonempty(ENV_VIDEO_FETCH_TIMEOUT_MS)?,
+                ENV_VIDEO_FETCH_TIMEOUT_MS,
+                defaults.video_fetch_timeout_ms,
+            )?,
             // Not a legacy name either (a worker's pipeline without the flag
             // reads it), so no deprecation line; unreadable, it stops
             // start-up: `require` misread as the default would serve the
@@ -254,6 +285,24 @@ impl MultimodalSettings {
             )?,
         })
     }
+}
+
+/// Resolve a positive millisecond budget without deprecating its env spelling.
+fn timeout_setting(
+    flag: Option<u64>,
+    config_name: &str,
+    env: Option<String>,
+    name: &str,
+    default: Setting<u64>,
+) -> Result<Setting<u64>> {
+    let setting = strict(flag, env, name, None, default)?;
+    let name = if setting.source == SettingSource::Flag {
+        config_name
+    } else {
+        name
+    };
+    anyhow::ensure!(setting.value > 0, "{name} must be positive");
+    Ok(setting)
 }
 
 /// The TurboJPEG policy for a process that was given no setting of its own
@@ -448,20 +497,40 @@ pub(crate) fn init_mm_settings(settings: MultimodalSettings) {
 
 /// The process-wide settings. Never seeded (tests, embedded use): resolved
 /// lazily from env and the built-in defaults, and an unreadable
-/// `SMG_MM_PROCESSING` or `SMG_MM_TURBOJPEG` falls back to its default while
-/// the other settings keep their env values.
+/// setting in [`STRICT_ENV`] falls back to its default while the other
+/// settings keep their env values.
 pub(crate) fn mm_settings() -> &'static MultimodalSettings {
-    SETTINGS.get_or_init(|| {
-        let config = RouterConfig::default();
-        MultimodalSettings::resolve(&config).unwrap_or_else(|error| {
-            warn!(error = %error, "unreadable multimodal env setting; using its default");
-            MultimodalSettings::resolve_with(&config, |name| {
-                Ok((!STRICT_ENV.contains(&name))
-                    .then(|| std::env::var(name).ok())
-                    .flatten())
+    SETTINGS.get_or_init(|| resolve_unseeded_with(process_env))
+}
+
+/// Embedded use has no startup error boundary: default only the invalid strict
+/// settings, retaining valid policies and budgets. The normal startup resolver
+/// remains strict. An explicit env reader keeps tests away from global state.
+fn resolve_unseeded_with(env: impl Fn(&str) -> Result<Option<String>>) -> MultimodalSettings {
+    let config = RouterConfig::default();
+    MultimodalSettings::resolve_with(&config, &env).unwrap_or_else(|error| {
+        warn!(error = %error, "unreadable multimodal env setting; using its default");
+        let invalid: Vec<_> = STRICT_ENV
+            .into_iter()
+            .filter(|key| {
+                MultimodalSettings::resolve_with(&config, |name| {
+                    if name == *key {
+                        env(name)
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .is_err()
             })
-            .unwrap_or_default()
+            .collect();
+        MultimodalSettings::resolve_with(&config, |name| {
+            if invalid.contains(&name) {
+                Ok(None)
+            } else {
+                env(name)
+            }
         })
+        .unwrap_or_default()
     })
 }
 
@@ -477,6 +546,111 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |name| Ok(map.get(name).cloned())
+    }
+
+    /// Both budgets resolve independently and reject malformed/nonpositive input.
+    #[test]
+    fn media_fetch_timeout_precedence_and_validation() {
+        let config = RouterConfig::default();
+        let defaults = MultimodalSettings::resolve_with(&config, no_env).unwrap();
+        assert_eq!(defaults.fetch_timeout_ms.value, 10_000);
+        assert_eq!(defaults.video_fetch_timeout_ms.value, 30_000);
+        let resolved = MultimodalSettings::resolve_with(
+            &config,
+            env(&[
+                ("SMG_MM_FETCH_TIMEOUT_MS", "60000"),
+                ("SMG_MM_VIDEO_FETCH_TIMEOUT_MS", "120000"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(resolved.fetch_timeout_ms.value, 60_000);
+        assert_eq!(resolved.video_fetch_timeout_ms.value, 120_000);
+        assert_eq!(resolved.fetch_timeout_ms.source, SettingSource::Env);
+        let explicit = RouterConfig {
+            mm_fetch_timeout_ms: Some(1),
+            mm_video_fetch_timeout_ms: Some(2),
+            ..config.clone()
+        };
+        let resolved = MultimodalSettings::resolve_with(
+            &explicit,
+            env(&[
+                ("SMG_MM_FETCH_TIMEOUT_MS", "bad"),
+                ("SMG_MM_VIDEO_FETCH_TIMEOUT_MS", "bad"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(resolved.fetch_timeout_ms.value, 1);
+        assert_eq!(resolved.video_fetch_timeout_ms.value, 2);
+        for name in ["SMG_MM_FETCH_TIMEOUT_MS", "SMG_MM_VIDEO_FETCH_TIMEOUT_MS"] {
+            for raw in ["0", "-1", "bad", "1.5"] {
+                let error =
+                    MultimodalSettings::resolve_with(&config, env(&[(name, raw)])).unwrap_err();
+                assert!(error.to_string().contains(name), "{error}");
+            }
+        }
+        let zero = RouterConfig {
+            mm_fetch_timeout_ms: Some(0),
+            ..config
+        };
+        let error = MultimodalSettings::resolve_with(&zero, no_env).unwrap_err();
+        assert_eq!(error.to_string(), "mm_fetch_timeout_ms must be positive");
+        let zero = RouterConfig {
+            mm_fetch_timeout_ms: None,
+            mm_video_fetch_timeout_ms: Some(0),
+            ..zero
+        };
+        let error = MultimodalSettings::resolve_with(&zero, no_env).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "mm_video_fetch_timeout_ms must be positive"
+        );
+    }
+
+    /// A bad timeout in embedded use must not relax other valid strict settings.
+    #[test]
+    fn unseeded_media_fetch_timeout_preserves_valid_settings() {
+        for bad in [ENV_FETCH_TIMEOUT_MS, ENV_VIDEO_FETCH_TIMEOUT_MS] {
+            for invalid in [Some("bad"), Some("0"), Some("-1"), None] {
+                let valid = env(&[
+                    (ENV_PROCESSING, "worker"),
+                    (ENV_TURBOJPEG, "require"),
+                    (ENV_FETCH_TIMEOUT_MS, "60000"),
+                    (ENV_VIDEO_FETCH_TIMEOUT_MS, "120000"),
+                    (ENV_PIXEL_CACHE_MB, "32"),
+                ]);
+                let resolved = resolve_unseeded_with(|name| {
+                    if name == bad {
+                        match invalid {
+                            Some(value) => Ok(Some(value.to_string())),
+                            None => anyhow::bail!("not Unicode"),
+                        }
+                    } else {
+                        valid(name)
+                    }
+                });
+                assert_eq!(resolved.processing.value, MmProcessingMode::Worker);
+                assert_eq!(resolved.processing.source, SettingSource::Env);
+                assert_eq!(resolved.turbojpeg.value, TurboJpegPolicy::Require);
+                assert_eq!(resolved.turbojpeg.source, SettingSource::Env);
+                assert_eq!(resolved.pixel_cache_mb.value, 32);
+                assert_eq!(
+                    resolved.fetch_timeout_ms.value,
+                    if bad == ENV_FETCH_TIMEOUT_MS {
+                        10000
+                    } else {
+                        60000
+                    }
+                );
+                assert_eq!(
+                    resolved.video_fetch_timeout_ms.value,
+                    if bad == ENV_VIDEO_FETCH_TIMEOUT_MS {
+                        30000
+                    } else {
+                        120000
+                    }
+                );
+            }
+        }
     }
 
     fn no_env(name: &str) -> Result<Option<String>> {
@@ -668,37 +842,36 @@ mod tests {
         );
     }
 
-    /// Without the strict names in the reader, the other settings resolve
-    /// on their own: what the never-seeded path falls back to when the
-    /// placement or the TurboJPEG env is unreadable.
+    /// The real unseeded path defaults invalid policies without discarding valid
+    /// strict timeouts, decoder policies or the lenient settings.
     #[test]
     fn the_other_settings_survive_an_unreadable_placement_env() {
-        let full = env(&[
-            ("SMG_MM_PROCESSING", "routers"),
-            ("SMG_MM_TURBOJPEG", "mandatory"),
-            ("SMG_MM_PIXEL_CACHE_MB", "256"),
-            ("SMG_LOG_MM_TIMING", "1"),
-        ]);
-        let config = RouterConfig::default();
-        assert!(MultimodalSettings::resolve_with(&config, &full).is_err());
-        let rest = MultimodalSettings::resolve_with(&config, |name| {
-            if STRICT_ENV.contains(&name) {
-                Ok(None)
-            } else {
-                full(name)
-            }
-        })
-        .unwrap();
-        assert_eq!(
-            rest.processing,
-            Setting::from_default(MmProcessingMode::Auto)
-        );
-        assert_eq!(
-            rest.turbojpeg,
-            Setting::from_default(TurboJpegPolicy::Prefer)
-        );
-        assert_eq!(rest.pixel_cache_mb, from_env(256));
-        assert_eq!(rest.log_mm_timing, from_env(true));
+        for policy in ["mandatory", "require"] {
+            let full = env(&[
+                (ENV_PROCESSING, "routers"),
+                (ENV_TURBOJPEG, policy),
+                (ENV_FETCH_TIMEOUT_MS, "60000"),
+                (ENV_PIXEL_CACHE_MB, "256"),
+                (ENV_LOG_MM_TIMING, "1"),
+            ]);
+            assert!(MultimodalSettings::resolve_with(&RouterConfig::default(), &full).is_err());
+            let rest = resolve_unseeded_with(&full);
+            assert_eq!(
+                rest.processing,
+                Setting::from_default(MmProcessingMode::Auto)
+            );
+            assert_eq!(
+                rest.turbojpeg,
+                if policy == "require" {
+                    from_env(TurboJpegPolicy::Require)
+                } else {
+                    Setting::from_default(TurboJpegPolicy::Prefer)
+                }
+            );
+            assert_eq!(rest.fetch_timeout_ms, from_env(60000));
+            assert_eq!(rest.pixel_cache_mb, from_env(256));
+            assert_eq!(rest.log_mm_timing, from_env(true));
+        }
     }
 
     /// The numeric and boolean env knobs keep their lenient reading: an

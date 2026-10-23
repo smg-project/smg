@@ -7,7 +7,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    fmt::{self, Write as _},
+    fmt::Write as _,
 };
 
 use anyhow::{bail, Result};
@@ -28,9 +28,16 @@ pub(crate) enum Template {
 
 impl Template {
     pub(crate) fn detect(source: &str) -> Option<Self> {
-        // The shared .jinja loader trims the file and expands literal \n.
-        // tokenizer_config.json and set_chat_template retain the original.
-        let matches = |known: &str| source == known || source == known.trim().replace("\\n", "\n");
+        // The shared .jinja loader reads the file as written but expands
+        // literal \n; tokenizer_config.json and set_chat_template retain the
+        // original. One trailing newline of a source never reaches the prompt
+        // (minijinja drops it, as Jinja2 does), so a copy with or without it
+        // renders alike and takes the native path alike.
+        let body = |text: &str| text.strip_suffix('\n').unwrap_or(text).to_owned();
+        let matches = |known: &str| {
+            let source = body(source);
+            source == body(known) || source == body(&known.replace("\\n", "\n"))
+        };
         if matches(TEXT_TEMPLATE) {
             Some(Self::Text)
         } else if matches(FLASH_TEMPLATE) {
@@ -61,41 +68,10 @@ fn text(value: &Value) -> String {
         Value::Bool(true) => "True".into(),
         Value::Bool(false) => "False".into(),
         Value::String(value) => value.clone(),
-        Value::Number(value) if value.is_f64() => {
-            let mut number = value.as_f64().unwrap_or_default().to_string();
-            if !number.contains('.') {
-                number.push_str(".0");
-            }
-            number
-        }
-        Value::Number(value) => value.to_string(),
-        _ => format!("{:?}", TextValue(value)),
-    }
-}
-
-/// MiniJinja displays containers using Rust's debug formatting with Python
-/// boolean/null words. Nested floats use debug spelling, unlike scalar text.
-struct TextValue<'a>(&'a Value);
-
-impl fmt::Debug for TextValue<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.0 {
-            Value::Null => formatter.write_str("None"),
-            Value::Bool(value) => formatter.write_str(if *value { "True" } else { "False" }),
-            Value::Number(value) if value.is_f64() => {
-                fmt::Debug::fmt(&value.as_f64().unwrap_or_default(), formatter)
-            }
-            Value::Number(value) => fmt::Display::fmt(value, formatter),
-            Value::String(value) => fmt::Debug::fmt(value, formatter),
-            Value::Array(values) => formatter
-                .debug_list()
-                .entries(values.iter().map(TextValue))
-                .finish(),
-            Value::Object(values) => formatter
-                .debug_map()
-                .entries(values.iter().map(|(key, value)| (key, TextValue(value))))
-                .finish(),
-        }
+        Value::Number(value) if !value.is_f64() => value.to_string(),
+        // A float spells as Python's `str`, a list or a map as Python's repr,
+        // as the template writes them.
+        _ => chat_template::python_repr(value),
     }
 }
 
@@ -479,13 +455,15 @@ mod tests {
             "../../tests/fixtures/glm53/render_fixtures.json"
         ))
         .unwrap();
-        let loaded_text = TEXT_TEMPLATE.trim().replace("\\n", "\n");
-        let loaded_flash = FLASH_TEMPLATE.trim().replace("\\n", "\n");
+        let loaded_text = TEXT_TEMPLATE.replace("\\n", "\n");
+        let loaded_flash = FLASH_TEMPLATE.replace("\\n", "\n");
+        let stripped_text = TEXT_TEMPLATE.strip_suffix('\n').unwrap();
         for (source, template) in [
             (TEXT_TEMPLATE, Template::Text),
             (FLASH_TEMPLATE, Template::Flash),
             (loaded_text.as_str(), Template::Text),
             (loaded_flash.as_str(), Template::Flash),
+            (stripped_text, Template::Text),
         ] {
             assert_eq!(Template::detect(source), Some(template));
             let jinja = ChatTemplateState::new(Some(source.into())).unwrap();

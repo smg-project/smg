@@ -27,7 +27,7 @@ on:
       - model_gateway/src/workflow/**
       - crates/protocols/src/worker.rs
       - crates/mock_worker/**
-      - model_gateway/tests/k8s_discovery_test.rs
+      - model_gateway/tests/discovery/k8s_discovery_test.rs
       - e2e_test/discovery/**
       - .github/workflows/e2e-discovery.yml
   schedule:

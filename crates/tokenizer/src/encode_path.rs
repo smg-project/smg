@@ -4,9 +4,9 @@
 //! `tokenizers` v1 pipeline (feature `tokenizers-v1`), the crate's direct
 //! byte-level encoder (`native`), and `tokenizers` 0.23 itself. Each of the
 //! first two takes the tokenizers whose configuration it reproduces and
-//! declines the rest with a reason ([`Declined`]); the load logs the path it
+//! declines the rest with a reason (`Declined`); the load logs the path it
 //! ended on and those reasons, once. After the choice an input can still
-//! leave the direct encoder for `tokenizers` ([`Fallback`]), which costs the
+//! leave the direct encoder for `tokenizers` (`Fallback`), which costs the
 //! work done up to that point.
 //!
 //! The process-lifetime totals here have the shape of `cache::activity`:
@@ -138,7 +138,7 @@ pub struct EncodePathLoads {
 /// tokenizer instances.
 #[derive(Debug, Clone, Copy)]
 pub struct EncodeFallbacks {
-    /// `not_nfc` or `piece_declined`, see [`Fallback`].
+    /// `not_nfc` or `piece_declined`, see `Fallback`.
     pub reason: &'static str,
     /// Inputs encoded by `tokenizers` after the direct encoder gave them
     /// up; one per input, a batch counting each of its inputs.

@@ -32,7 +32,7 @@ mm-rdma = ["smg-mm-rdma/nixl"]
 # it serves; IGW mode registers every router compiled in, and a worker that
 # targets a provider is admitted only when its router is present. Leave them
 # all out for a self-hosted-only build.
-provider-openai = ["smg-external-router/openai"]
+provider-openai = ["smg-external-router/openai", "smg-test-harness/provider-openai"]
 provider-anthropic = ["smg-external-router/anthropic"]
 provider-gemini = ["smg-external-router/gemini"]
 providers = ["provider-openai", "provider-anthropic", "provider-gemini"]
@@ -53,6 +53,8 @@ path = "src/main.rs"
 [[bin]]
 name = "amg"
 path = "src/main.rs"
+# The same source as `smg`: its unit tests run in the `smg` binary's test harness, so this one builds none.
+test = false
 
 [dependencies]
 # Workspace dependencies (simple)
@@ -170,6 +172,9 @@ toml = "1.1"
 # the provider routers) would leak into every test target whatever features the
 # build selected, so a `--no-default-features` test run would not be one.
 smg = { path = ".", default-features = false, features = ["test-util"] }
+# The gateway's test harness (the mock workers, app builders and launch helpers the
+# integration tests share): a workspace member for tests only, compiled once.
+smg-test-harness = { path = "test_harness" }
 smg-external-router = { workspace = true, default-features = false }
 # Enable the mock engine for the ZMQ client's loopback tests.
 engine-zmq-client = { workspace = true, features = ["mock-engine"] }

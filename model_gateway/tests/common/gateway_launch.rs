@@ -1,8 +1,11 @@
 //! The launcher the gateway's start-up tests share: the built binary on
 //! fresh loopback ports, run until it exits, a watched port is bound or its
 //! health route answers, within a deadline; what became of it is read from
-//! [`Launch`]. Included by path from the start-up tests, which need nothing
-//! else of this directory, and as `common::gateway_launch` elsewhere.
+//! [`Launch`]. Declared by path at the root of the start-up binary
+//! (`startup_tests.rs`) and reached as `crate::gateway_launch` by its tests;
+//! `runtime_worker_threads_startup_test.rs` includes it by path too. It stays
+//! out of `smg-test-harness` because `CARGO_BIN_EXE_smg` is defined only for
+//! the gateway's own test targets.
 #![allow(
     dead_code,
     clippy::unwrap_used,

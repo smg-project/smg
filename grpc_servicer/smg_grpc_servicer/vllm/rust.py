@@ -264,6 +264,8 @@ def smg_media_options(
         )
         or None,
         "max_item_bytes": settings.max_item_bytes,
+        "fetch_timeout_ms": settings.fetch_timeout_ms,
+        "video_fetch_timeout_ms": settings.video_fetch_timeout_ms,
         "video_frame_budget": video_frame_budget(model_config),
         "video_loader_rule": video_loader_rule(model_config),
         # A launcher that was not given the policy sends none, so the pipeline

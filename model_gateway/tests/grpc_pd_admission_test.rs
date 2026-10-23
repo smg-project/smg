@@ -9,9 +9,6 @@
 //! while another still holds the room is shed with the overload 503, where
 //! the same pair without the label admits both.
 
-#[path = "common/mod.rs"]
-mod common;
-
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use common::grpc_harness::{
@@ -24,6 +21,7 @@ use smg::{
     tenant::TenantKey,
     worker::{RuntimeType, WorkerType},
 };
+use smg_test_harness as common;
 
 const MODEL: &str = "pd-admission-test-model";
 /// How long the canned mock holds each request before answering, so that a

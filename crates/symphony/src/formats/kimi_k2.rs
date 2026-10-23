@@ -39,7 +39,7 @@
 //! written, the marker included (the templates always write the opener; the tests pin it).
 //!
 //! The structural tag of a forced or required call is written from the table's layout
-//! ([`layout`], [`Format::grammar_for`]), which spells a call as the templates render one: the
+//! (`layout`, [`Format::grammar_for`]), which spells a call as the templates render one: the
 //! block's opener, `<|tool_call_begin|>functions.NAME:`, the call's number as a run of digits
 //! (the model counts its calls; no request knows the count ahead), `<|tool_call_argument_begin|>`,
 //! the tool's schema as the one JSON value, `<|tool_call_end|>`, and the block's close; from the

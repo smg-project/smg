@@ -17,3 +17,32 @@ spec:
     - port: metrics
       interval: {{ .Values.router.metrics.serviceMonitor.interval }}
 {{- end }}
+{{- /* The workers' ServiceMonitor: one object over every worker Service, under
+the same settings; a worker Service without a `metrics` port yields no
+target, so only the workers with `metrics.enabled` are scraped. */ -}}
+{{- $scraped := false }}
+{{- range .Values.workers }}
+{{- if include "smg.workerMetricsPort" (dict "worker" .) }}
+{{- $scraped = true }}
+{{- end }}
+{{- end }}
+{{- if and .Values.router.metrics.serviceMonitor.enabled $scraped }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "smg.fullname" . }}-worker
+  labels:
+    {{- include "smg.labels" . | nindent 4 }}
+    {{- range $key, $value := .Values.router.metrics.serviceMonitor.labels }}
+    {{ $key }}: {{ $value | quote }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "smg.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: worker
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.router.metrics.serviceMonitor.interval }}
+{{- end }}

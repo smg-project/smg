@@ -46,6 +46,9 @@ pub(crate) struct StopMatcher {
     decoder: Option<StopSequenceDecoder>,
     min_tokens: u32,
     generated: u32,
+    /// Where the decoder puts the text it releases; the matcher only wants
+    /// the match, so the buffer is cleared before every token.
+    text: String,
 }
 
 impl StopMatcher {
@@ -54,6 +57,7 @@ impl StopMatcher {
             decoder,
             min_tokens,
             generated: 0,
+            text: String::new(),
         }
     }
 
@@ -67,9 +71,12 @@ impl StopMatcher {
         };
         for &token in token_ids {
             self.generated = self.generated.saturating_add(1);
-            decoder.process_token(token).map_err(|error| {
-                Status::internal(format!("incremental detokenization failed: {error}"))
-            })?;
+            self.text.clear();
+            decoder
+                .process_token_into(token, &mut self.text)
+                .map_err(|error| {
+                    Status::internal(format!("incremental detokenization failed: {error}"))
+                })?;
             if !decoder.is_stopped() {
                 continue;
             }

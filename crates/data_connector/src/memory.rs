@@ -511,9 +511,13 @@ impl ConversationItemStorage for MemoryConversationItemStorage {
             tenant: new_item.tenant,
         };
         let mut store = self.inner.write();
-        if store.items.insert(id.clone(), item.clone()).is_none() {
-            store.order.push(created_at, id);
+        // An id already stored answers its item, untouched (the contract of
+        // [`ConversationItemStorage::create_item`]); a replace rewrote it.
+        if let Some(stored) = store.items.get(&id) {
+            return Ok(stored.clone());
         }
+        store.items.insert(id.clone(), item.clone());
+        store.order.push(created_at, id);
         store.evict(&self.bounds, created_at);
         Ok(item)
     }

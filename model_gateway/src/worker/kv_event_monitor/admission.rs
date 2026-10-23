@@ -182,7 +182,7 @@ impl KvEventMonitor {
             Self::apply_event(event, worker_id, indexer, &mut state.index);
         }
         Metrics::record_kv_event_apply(worker_url, started.elapsed().as_secs_f64());
-        Self::record_parentless(worker_url, &state.index.counters, &counters_before);
+        Self::record_not_indexed(worker_url, &state.index.counters, &counters_before);
         if stored_blocks > 0 {
             Metrics::record_kv_event_blocks(worker_url, "stored", stored_blocks);
         }
@@ -269,7 +269,7 @@ impl KvEventMonitor {
             }
             Self::apply_event(event, worker_id, indexer, &mut state.index);
         }
-        Self::record_parentless(worker_url, &state.index.counters, &counters_before);
+        Self::record_not_indexed(worker_url, &state.index.counters, &counters_before);
         if snapshot_blocks > 0 {
             Metrics::record_kv_event_blocks(worker_url, "snapshot", snapshot_blocks);
         }
@@ -306,8 +306,9 @@ impl KvEventMonitor {
         }
     }
 
-    /// Publish the parent-less stores a batch produced, if any.
-    fn record_parentless(
+    /// Publish the stores a batch placed without their parent and the
+    /// sub-block stores it left out of the index, if any.
+    fn record_not_indexed(
         worker_url: &str,
         after: &WorkerIndexCounters,
         before: &WorkerIndexCounters,
@@ -315,6 +316,10 @@ impl KvEventMonitor {
         let (stores, blocks) = after.parentless_since(before);
         if stores > 0 {
             Metrics::record_kv_event_parentless(worker_url, stores, blocks);
+        }
+        let (stores, blocks) = after.sub_block_since(before);
+        if stores > 0 {
+            Metrics::record_kv_event_sub_block(worker_url, stores, blocks);
         }
     }
 
@@ -407,6 +412,23 @@ mod tests {
         KvCacheEvent {
             event_id: 0,
             data: Some(kv_cache_event::Data::Cleared(KvCacheCleared::default())),
+        }
+    }
+
+    /// One stored block of `width` tokens under `parent`, its tokens unique to `id`.
+    fn stored_width(parent: Option<i64>, id: i64, width: i32) -> KvCacheEvent {
+        KvCacheEvent {
+            event_id: 0,
+            data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                blocks: vec![KvBlock {
+                    block_hash: id,
+                    token_ids: (0..width as u32).map(|i| (id as u32) * 64 + i).collect(),
+                    block_size: width,
+                    ..Default::default()
+                }],
+                parent_block_hash: parent,
+                ..Default::default()
+            })),
         }
     }
 
@@ -558,6 +580,8 @@ mod tests {
         worker: u32,
         state: WorkerStreamState,
         reference: ReferenceIndexer,
+        /// The reference's block of record: the widest block stored so far.
+        block_of_record: i32,
     }
 
     impl Sim {
@@ -569,6 +593,7 @@ mod tests {
                 worker,
                 state: WorkerStreamState::default(),
                 reference: ReferenceIndexer::new(),
+                block_of_record: 0,
             }
         }
 
@@ -585,12 +610,19 @@ mod tests {
         }
 
         /// Apply a batch to the reference with the subscriber's semantics
-        /// (a store whose parent is unknown starts a new chain).
+        /// (a store whose parent is unknown starts a new chain; a store
+        /// narrower than the block of record is left out).
         fn reference_apply(&mut self, b: &KvEventBatch) {
             let seed = namespace_seed(None, None);
             for event in &b.events {
                 match event.data.as_ref().unwrap() {
                     kv_cache_event::Data::Stored(st) => {
+                        let width = st.blocks.first().map_or(0, |block| block.block_size);
+                        if width > self.block_of_record {
+                            self.block_of_record = width;
+                        } else if width > 0 && width < self.block_of_record {
+                            continue;
+                        }
                         let blocks: Vec<StoredBlock> = st
                             .blocks
                             .iter()
@@ -615,7 +647,7 @@ mod tests {
                             .collect();
                         self.reference.apply_removed(self.worker, &hashes);
                     }
-                    kv_cache_event::Data::Cleared(_) => self.reference.apply_cleared(self.worker),
+                    kv_cache_event::Data::Cleared(_) => self.reference_clear(),
                 }
             }
         }
@@ -624,6 +656,13 @@ mod tests {
         fn deliver(&mut self, b: &KvEventBatch) -> BatchOutcome {
             self.reference_apply(b);
             self.feed(b)
+        }
+
+        /// A clear of the reference: its index and its block of record go
+        /// together, as production's do on a clear.
+        fn reference_clear(&mut self) {
+            self.reference.apply_cleared(self.worker);
+            self.block_of_record = 0;
         }
 
         fn assert_matches_reference(&self) {
@@ -802,13 +841,49 @@ mod tests {
         }
         // The engine restarts: its cache is empty and it counts from 0 again.
         let fresh = batch(0, None, vec![stored(None, &[21, 22])]);
-        sim.reference.apply_cleared(sim.worker);
+        sim.reference_clear();
         sim.reference_apply(&fresh);
         assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
         assert_eq!(
             sim.deliver(&batch(1, None, vec![stored(Some(22), &[23])])),
             BatchOutcome::Applied
         );
+        assert!(!sim.state.ranks[&0].is_degraded());
+        sim.assert_matches_reference();
+    }
+
+    /// The engine restarts with a narrower block than it stored before: the
+    /// clear takes the block of record with the blocks, so the fresh stores
+    /// are indexed as they come (none counted as a sub-block store) and
+    /// production matches the reference, whose record resets the same way.
+    #[test]
+    fn recovery_publisher_restart_with_a_narrower_block_matches_reference() {
+        let mut sim = Sim::new();
+        sim.deliver(&batch(
+            1,
+            None,
+            vec![stored_width(None, 1, 32), stored_width(Some(1), 2, 32)],
+        ));
+        for seq in 2..=(RESTART_WINDOW + 5) {
+            sim.deliver(&batch(seq, None, vec![]));
+        }
+        assert_eq!(sim.state.index.counters.sub_block_stores, 0);
+        // The engine restarts at a 4-token block: its cache is empty and it
+        // counts from 0 again.
+        let fresh = batch(
+            0,
+            None,
+            vec![stored_width(None, 11, 4), stored_width(Some(11), 12, 4)],
+        );
+        sim.reference_clear();
+        sim.reference_apply(&fresh);
+        assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
+        assert_eq!(
+            sim.indexer.worker_block_count(sim.worker),
+            2,
+            "the narrower blocks are indexed"
+        );
+        assert_eq!(sim.state.index.counters.sub_block_stores, 0);
         assert!(!sim.state.ranks[&0].is_degraded());
         sim.assert_matches_reference();
     }
@@ -823,7 +898,7 @@ mod tests {
         // engine stream live; neither can replay).
         sim.state.ranks.get_mut(&0).unwrap().reconnected();
         let fresh = batch(1, None, vec![stored(None, &[7])]);
-        sim.reference.apply_cleared(sim.worker);
+        sim.reference_clear();
         sim.reference_apply(&fresh);
         assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
         sim.assert_matches_reference();
@@ -838,7 +913,7 @@ mod tests {
         // SGLang's first batch after a restart carries AllBlocksCleared and
         // its counter starts over, with the servicer's stream still up.
         let first = batch(0, None, vec![cleared(), stored(None, &[9])]);
-        sim.reference.apply_cleared(sim.worker);
+        sim.reference_clear();
         sim.reference_apply(&first);
         assert_eq!(sim.feed(&first), BatchOutcome::Applied);
         sim.assert_matches_reference();
@@ -896,7 +971,7 @@ mod tests {
         // as a first one rather than clearing the index again.
         sim.state.reconnected();
         let fresh = batch(1, Some(1), vec![stored(None, &[111])]);
-        sim.reference.apply_cleared(sim.worker);
+        sim.reference_clear();
         sim.reference_apply(&fresh);
         assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
         assert_eq!(
@@ -921,7 +996,7 @@ mod tests {
         sim.deliver(&batch(2, None, vec![on_host]));
         sim.state.reconnected();
         let fresh = batch(1, None, vec![stored(None, &[1, 2])]);
-        sim.reference.apply_cleared(sim.worker);
+        sim.reference_clear();
         sim.reference_apply(&fresh);
         assert_eq!(sim.feed(&fresh), BatchOutcome::Applied);
         assert_eq!(
@@ -1214,5 +1289,140 @@ mod tests {
             );
             sim.assert_matches_reference();
         });
+    }
+
+    /// A store narrower than the block of record (a hybrid engine's prefix
+    /// entry at its hash granularity, under a parent it never publishes) is
+    /// counted under its own metric and never as parent-less, and the index
+    /// holds what the full blocks made it.
+    #[test]
+    fn sub_block_stores_are_counted_and_not_indexed() {
+        use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+        fn counter(handle: &PrometheusHandle, name: &str) -> Option<f64> {
+            handle
+                .render()
+                .lines()
+                .find(|line| line.starts_with(&format!("{name}{{worker=\"grpc://w1:9000\"}}")))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+        }
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let mut sim = Sim::new();
+            // Two full blocks, then the tail entry under a parent never
+            // published, in the one batch the engine sends them in.
+            sim.deliver(&batch(
+                1,
+                None,
+                vec![
+                    stored_width(None, 1, 32),
+                    stored_width(Some(1), 2, 32),
+                    stored_width(Some(999), 3, 4),
+                ],
+            ));
+            assert_eq!(sim.indexer.worker_block_count(sim.worker), 2);
+            assert_eq!(
+                counter(&handle, "smg_kv_event_sub_block_stores_total"),
+                Some(1.0)
+            );
+            assert_eq!(
+                counter(&handle, "smg_kv_event_sub_block_blocks_total"),
+                Some(1.0)
+            );
+            assert_eq!(
+                counter(&handle, "smg_kv_event_parentless_stores_total"),
+                None
+            );
+            assert_eq!(sim.state.index.counters.sub_block_stores, 1);
+            assert_eq!(sim.state.index.counters.parentless_stores, 0);
+            // The chain continues from the full block.
+            sim.deliver(&batch(2, None, vec![stored_width(Some(2), 4, 32)]));
+            assert_eq!(sim.indexer.worker_block_count(sim.worker), 3);
+            assert_eq!(
+                counter(&handle, "smg_kv_event_parentless_stores_total"),
+                None
+            );
+            sim.assert_matches_reference();
+        });
+    }
+
+    /// A hybrid engine whose hash granularity is narrower than its block
+    /// registers a prompt's tail entry at that granularity once the request's
+    /// computed tokens reach the next block boundary: in the step that stores
+    /// the full block, a one-hash store of a fraction of the block under an
+    /// intermediate hash the engine never publishes. Its eviction later lists
+    /// the entry beside the full hash. The index keeps the full blocks only:
+    /// no parent-less store, no root chain of one entry.
+    #[test]
+    fn a_tail_entry_beside_a_full_block_under_a_wider_record_is_not_parent_less() {
+        fn run(parent: Option<i64>, ids: &[i64], width: u32) -> KvCacheEvent {
+            KvCacheEvent {
+                event_id: 0,
+                data: Some(kv_cache_event::Data::Stored(KvBlocksStored {
+                    blocks: ids
+                        .iter()
+                        .map(|&id| KvBlock {
+                            block_hash: id,
+                            token_ids: (0..width).map(|i| (id as u32) * 1000 + i).collect(),
+                            block_size: width as i32,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    parent_block_hash: parent,
+                    ..Default::default()
+                })),
+            }
+        }
+        let mut sim = Sim::new();
+        // The prefix: thirteen full blocks in one store.
+        let prefix: Vec<i64> = (1..=13).collect();
+        sim.deliver(&batch(1, None, vec![run(None, &prefix, 256)]));
+        assert_eq!(sim.indexer.worker_block_count(sim.worker), 13);
+        // A turn's decode crosses the next block boundary: the full block,
+        // then the prompt's eight-token tail entry under the intermediate
+        // hash one hash-block before it.
+        sim.deliver(&batch(
+            2,
+            None,
+            vec![run(Some(13), &[14], 256), run(Some(9001), &[901], 8)],
+        ));
+        // The next turn: the same full block again (a second copy) and its
+        // own tail entry.
+        sim.deliver(&batch(
+            3,
+            None,
+            vec![run(Some(13), &[14], 256), run(Some(9002), &[902], 8)],
+        ));
+        assert_eq!(
+            sim.state.index.counters.parentless_stores, 0,
+            "a tail entry is not a parent-less store"
+        );
+        assert_eq!(sim.state.index.counters.parentless_blocks, 0);
+        assert_eq!(
+            (
+                sim.state.index.counters.sub_block_stores,
+                sim.state.index.counters.sub_block_blocks
+            ),
+            (2, 2),
+            "the two entries are counted as sub-block stores"
+        );
+        assert_eq!(
+            sim.indexer.worker_block_count(sim.worker),
+            14,
+            "the full blocks only"
+        );
+        // The eviction of each block lists the entry beside the full hash.
+        sim.deliver(&batch(4, None, vec![removed(&[14, 901])]));
+        assert_eq!(
+            sim.indexer.worker_block_count(sim.worker),
+            14,
+            "the second copy of the full block stands"
+        );
+        sim.deliver(&batch(5, None, vec![removed(&[14, 902])]));
+        assert_eq!(sim.indexer.worker_block_count(sim.worker), 13);
+        sim.assert_matches_reference();
     }
 }

@@ -10,6 +10,7 @@ use tracing::error as trace_error;
 use crate::{
     observability::metrics::metrics_labels,
     routers::{
+        common::pd_failure::{PdSide, SidePhase},
         error,
         grpc::{
             context::ExecutionResult,
@@ -153,7 +154,7 @@ async fn collect_prefill_decode(
             }
             UpstreamClass::account_collected_failure(worker.as_ref(), &status);
         }
-        stream_failed("Prefill", &status, None)
+        stream_failed(Some(PdSide::Prefill), "Prefill", &status, None)
     })?;
 
     // The client's prompt-side usage is the prefill side's.
@@ -161,7 +162,7 @@ async fn collect_prefill_decode(
     let mut decode_responses = collect_stream_responses(
         &mut decode_stream,
         "Decode",
-        Some(metrics_labels::WORKER_DECODE),
+        Some(PdSide::Decode),
         prefill_worker.as_ref(),
     )
     .await?;
@@ -194,14 +195,17 @@ fn merge_prefill_logprobs(
     }
 }
 
-/// The client's answer when `side`'s stream ended with `status` before its
-/// `Complete`: the status's own HTTP class with the wording clients know,
-/// under the code and with the words that name the dead rendezvous port when
-/// the gateway found one behind the failure; a worker's report that the
-/// engine could not continue the request under its constraint is answered
-/// for the constraint.
+/// The client's answer when `worker_name`'s stream ended with `status`
+/// before its `Complete`: the status's own HTTP class, under the code and
+/// with the words that name the dead rendezvous port when the gateway found
+/// one behind the failure; else, for a disaggregated `side`, the side's
+/// stream-phase code of the shared vocabulary (`pd_failure`), the one the
+/// HTTP prefill-decode router answers for the same failure; for a single
+/// worker the code clients know. A worker's report that the engine could not
+/// continue the request under its constraint is answered for the constraint.
 fn stream_failed(
-    side: &str,
+    side: Option<PdSide>,
+    worker_name: &str,
     status: &tonic::Status,
     rendezvous: Option<&DeadRendezvous>,
 ) -> Response {
@@ -211,14 +215,20 @@ fn stream_failed(
     if let Some(response) = status.constraint_failure_response() {
         return response;
     }
-    match rendezvous {
-        Some(rendezvous) => status.to_http_error(
+    match (rendezvous, side) {
+        (Some(rendezvous), _) => status.to_http_error(
             "pd_rendezvous_failed",
-            format!("{side} stream failed: {}; {rendezvous}", status.message()),
+            format!(
+                "{worker_name} stream failed: {}; {rendezvous}",
+                status.message()
+            ),
         ),
-        None => status.to_http_error(
+        (None, Some(side)) => {
+            side.answer(SidePhase::Stream, status.http_status(), status.message())
+        }
+        (None, None) => status.to_http_error(
             "worker_stream_failed",
-            format!("{side} stream failed: {}", status.message()),
+            format!("{worker_name} stream failed: {}", status.message()),
         ),
     }
 }
@@ -234,7 +244,7 @@ fn stream_failed(
 async fn collect_stream_responses<S: FanoutChild>(
     stream: &mut S,
     worker_name: &str,
-    side: Option<&'static str>,
+    side: Option<PdSide>,
     prefill: Option<&Arc<dyn Worker>>,
 ) -> Result<Vec<ProtoGenerateComplete>, Response> {
     let mut all_responses = Vec::new();
@@ -251,11 +261,11 @@ async fn collect_stream_responses<S: FanoutChild>(
             Err(status) => {
                 let rendezvous = match side {
                     Some(side) => {
-                        account_pd_side_failure(side, &status);
+                        account_pd_side_failure(side.name(), &status);
                         // Before anything was read from the decode stream, as the
                         // streamed path reads it before its first token: once a
                         // response came, a chunk included, the sides met.
-                        if side == metrics_labels::WORKER_DECODE && !read_any {
+                        if side == PdSide::Decode && !read_any {
                             dead_rendezvous_of(prefill, &status).await
                         } else {
                             None
@@ -291,7 +301,12 @@ async fn collect_stream_responses<S: FanoutChild>(
                 if let Some(worker) = stream.worker() {
                     UpstreamClass::account_collected_failure(worker.as_ref(), &status);
                 }
-                return Err(stream_failed(worker_name, &status, rendezvous.as_ref()));
+                return Err(stream_failed(
+                    side,
+                    worker_name,
+                    &status,
+                    rendezvous.as_ref(),
+                ));
             }
         };
         if let ProtoResponseVariant::Complete(complete) = gen_response.into_response() {
@@ -457,7 +472,7 @@ mod tests {
                 collect_stream_responses(
                     &mut FailingStream(Some(status.clone())),
                     "Decode",
-                    Some(metrics_labels::WORKER_DECODE),
+                    Some(PdSide::Decode),
                     None,
                 )
                 .await,
@@ -510,7 +525,7 @@ mod tests {
                     false,
                 ),
                 "Decode",
-                Some(metrics_labels::WORKER_DECODE),
+                Some(PdSide::Decode),
                 Some(&prefill),
             )
             .await
@@ -522,7 +537,7 @@ mod tests {
                 .headers()
                 .get("X-SMG-Error-Code")
                 .and_then(|code| code.to_str().ok()),
-            Some("worker_stream_failed")
+            Some("decode_stream_error")
         );
         let rendered = handle.render();
         assert!(
@@ -558,7 +573,7 @@ mod tests {
             collect_stream_responses(
                 &mut ChunkThenFailing(Some(tonic::Status::internal(ENGINE_ERROR_MESSAGE)), false),
                 "Decode",
-                Some(metrics_labels::WORKER_DECODE),
+                Some(PdSide::Decode),
                 Some(&prefill),
             )
             .await
@@ -570,7 +585,7 @@ mod tests {
                 .headers()
                 .get("X-SMG-Error-Code")
                 .and_then(|code| code.to_str().ok()),
-            Some("worker_stream_failed")
+            Some("decode_stream_error")
         );
         let rendered = handle.render();
         assert!(
@@ -586,7 +601,7 @@ mod tests {
     /// names the rendezvous in its code and its message (the status's own
     /// HTTP class kept), and the rendezvous family counts it under the
     /// request phase on the prefill side. Behind a port that accepts, the
-    /// answer is the one clients know.
+    /// answer is the decode side's stream failure, as on the HTTP router.
     #[tokio::test]
     async fn a_decode_leg_the_engine_failed_without_a_reason_names_the_dead_rendezvous_port() {
         let prefill_on = |port: u16| -> Arc<dyn Worker> {
@@ -616,7 +631,7 @@ mod tests {
                 collect_stream_responses(
                     &mut FailingStream(Some(report())),
                     "Decode",
-                    Some(metrics_labels::WORKER_DECODE),
+                    Some(PdSide::Decode),
                     Some(&prefill_on(live)),
                 )
                 .await
@@ -625,7 +640,7 @@ mod tests {
                 collect_stream_responses(
                     &mut FailingStream(Some(report())),
                     "Decode",
-                    Some(metrics_labels::WORKER_DECODE),
+                    Some(PdSide::Decode),
                     Some(&prefill_on(dead)),
                 )
                 .await
@@ -638,8 +653,8 @@ mod tests {
                 .headers()
                 .get("X-SMG-Error-Code")
                 .and_then(|code| code.to_str().ok()),
-            Some("worker_stream_failed"),
-            "behind a port that accepts, the answer clients know"
+            Some("decode_stream_error"),
+            "behind a port that accepts, the side's own stream failure"
         );
         assert_eq!(answer.status(), StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(

@@ -18,7 +18,7 @@ use crate::{
 /// V3.2 and V4 share one grammar and differ only in the outer block name.
 /// V4.1 puts a leading space inside every tag (`<｜DSML｜ calls>`,
 /// `<｜DSML｜ invoke ...>`, `<｜DSML｜ parameter ...>`) and follows the
-/// reference parser's rules rather than V4's (see [`DsmlDialect::is_v41`]).
+/// reference parser's rules rather than V4's (see `DsmlDialect::is_v41`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DsmlDialect {
     V32,

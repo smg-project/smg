@@ -3,8 +3,6 @@
 //! Its own test binary: the logging subscriber is installed once per process,
 //! and this test needs it writing JSON lines to a directory it can read back.
 
-mod common;
-
 use std::{
     fs,
     path::Path,
@@ -21,6 +19,7 @@ use smg::{
     routers::RouterFactory,
     workflow::Job,
 };
+use smg_test_harness as common;
 use tower::ServiceExt;
 
 /// The trace id the caller chose; the gateway must log and echo this one.

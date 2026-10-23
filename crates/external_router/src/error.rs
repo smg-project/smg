@@ -150,7 +150,7 @@ pub fn model_not_found(model: &str) -> Response {
 
 /// Error-code metric label for a response.
 ///
-/// Reads only the [`GatewayErrorCode`] extension set by [`create_error`],
+/// Reads only the `GatewayErrorCode` extension set by [`create_error`],
 /// never the client-visible `X-SMG-Error-Code` header.
 pub fn extract_error_code_from_response<B>(response: &Response<B>) -> &str {
     response

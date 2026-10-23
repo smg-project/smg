@@ -18,7 +18,7 @@ use minijinja::{
     },
     syntax::SyntaxConfig,
     value::{Kwargs, ValueKind},
-    Environment, Error as MinijinjaError, ErrorKind, Value,
+    Environment, Error as MinijinjaError, ErrorKind, Output, State, Value,
 };
 use serde::Serialize;
 use serde_json::{self, ser::Formatter, Value as JsonValue};
@@ -846,7 +846,7 @@ pub struct ChatTemplateParams<'a> {
     pub thinking: Option<bool>,
     /// The instant the template's `strftime_now` writes, for a render that
     /// must come out the same each time; `None` is the clock (see
-    /// [`render_instant`]).
+    /// `render_instant`).
     pub now: Option<DateTime<FixedOffset>>,
     /// Leave the final message open for the model to continue, as
     /// transformers' `continue_final_message` does: the conversation is
@@ -1364,6 +1364,11 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
     env.set_trim_blocks(true);
     env.set_lstrip_blocks(true);
 
+    // Jinja2 writes `{{ x }}` as Python's `str(x)`, so a list or a dict comes
+    // out as its repr; minijinja would write it in Rust's debug form (see
+    // `python_formatter`).
+    env.set_formatter(python_formatter);
+
     // Register the template with owned storage (no lifetime dependency on caller)
     env.add_template_owned("chat".to_owned(), template)
         .map_err(|e| anyhow!("Failed to add template: {e}"))?;
@@ -1375,12 +1380,397 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
     // This overrides minijinja's built-in tojson to support additional kwargs
     // like ensure_ascii, separators, and sort_keys that HuggingFace templates use
     env.add_filter("tojson", tojson_filter);
+    // Jinja2's `string` and `trim` filters start with `str(value)` too: a
+    // value `spelled_by_python` (a sequence, a map, a float) is written as
+    // Python spells it.
+    env.add_filter("string", python_string_filter);
+    env.add_filter("trim", python_trim_filter);
+    // So do `join` (of every item), `replace`, `upper`, `lower`,
+    // `capitalize` and `title`. Two remain with the engine: the `~` operator
+    // concatenates inside it (minijinja's own spelling of a list or a dict)
+    // and cannot be hooked from here; `format` reads its format string, a
+    // string in any template that uses it, and writes its arguments inside
+    // the engine too.
+    env.add_filter("join", python_join_filter);
+    env.add_filter("replace", python_replace_filter);
+    env.add_filter("upper", python_upper_filter);
+    env.add_filter("lower", python_lower_filter);
+    env.add_filter("capitalize", python_capitalize_filter);
+    env.add_filter("title", python_title_filter);
     env.add_function("raise_exception", raise_exception);
     // Jinja2's dict() also builds a map from key/value pairs; minijinja's takes a mapping only
     env.add_function("dict", dict_function);
     env.add_test("iterable", is_iterable);
 
     Ok(env)
+}
+
+/// `str(value)` as Jinja2's string filters apply it: a string is itself, a
+/// value `spelled_by_python` (a sequence, a map, a float) is written as
+/// Python spells it (see `python_formatter`), anything else keeps
+/// minijinja's spelling.
+fn python_str(value: &Value) -> Cow<'_, str> {
+    match value.kind() {
+        ValueKind::String => Cow::Borrowed(value.as_str().unwrap_or_default()),
+        _ if spelled_by_python(value) => {
+            let mut text = String::new();
+            // Writing into a String cannot fail.
+            let _ = write_python_repr(&mut text, value);
+            Cow::Owned(text)
+        }
+        _ => Cow::Owned(value.to_string()),
+    }
+}
+
+/// Whether `str(value)` differs from the template engine's own spelling: a
+/// sequence or a map (Python's repr of it) and a float (`1e-05`, `1e+16`,
+/// `nan`, where the engine writes `0.00001`, `10000000000000000.0`, `NaN`).
+/// An integer, a string, `True` / `False` / `None` spell alike.
+fn spelled_by_python(value: &Value) -> bool {
+    match value.kind() {
+        ValueKind::Seq | ValueKind::Map => true,
+        ValueKind::Number => !value.is_integer(),
+        _ => false,
+    }
+}
+
+/// Jinja2's `string` filter, `str(value)`: a value `spelled_by_python` comes
+/// out as Python spells it, as it does from `{{ x }}`.
+fn python_string_filter(value: Value) -> Value {
+    match value.kind() {
+        ValueKind::String => value,
+        _ => Value::from(python_str(&value).into_owned()),
+    }
+}
+
+/// Jinja2's `trim` filter, `str(value).strip(chars)`: the same `str` as the
+/// `string` filter, then minijinja's trim.
+fn python_trim_filter(value: Value, chars: Option<Cow<'_, str>>) -> String {
+    let text = python_str(&value);
+    match chars {
+        Some(chars) => {
+            let chars: Vec<char> = chars.chars().collect();
+            text.trim_matches(&chars[..]).to_string()
+        }
+        None => text.trim().to_string(),
+    }
+}
+
+/// Jinja2's `join` filter, `joiner.join(str(item) for item in value)`: an
+/// item that is not a string goes through the same `str`; with
+/// `attribute=`, each item's attribute (a dotted path) is joined instead.
+fn python_join_filter(
+    value: Value,
+    joiner: Option<Cow<'_, str>>,
+    kwargs: Kwargs,
+) -> std::result::Result<String, MinijinjaError> {
+    let attribute: Option<Cow<'_, str>> = kwargs.get("attribute")?;
+    kwargs.assert_all_used()?;
+    let joiner = joiner.as_deref().unwrap_or_default();
+    let mut text = String::new();
+    for (index, item) in value.try_iter()?.enumerate() {
+        if index > 0 {
+            text.push_str(joiner);
+        }
+        let item =
+            match &attribute {
+                // Jinja2's attribute getter: a dotted path, each segment an index
+                // when it is a number and an attribute otherwise.
+                Some(attribute) => attribute.split('.').try_fold(item, |value, segment| {
+                    match segment.parse::<usize>() {
+                        Ok(index) => value.get_item(&Value::from(index)),
+                        Err(_) => value.get_attr(segment),
+                    }
+                })?,
+                None => item,
+            };
+        text.push_str(&python_str(&item));
+    }
+    Ok(text)
+}
+
+/// Jinja2's `replace` filter, `str(value).replace(old, new, count)`: a
+/// non-negative `count` bounds the replacements, as Python's does.
+fn python_replace_filter(
+    value: Value,
+    old: Cow<'_, str>,
+    new: Cow<'_, str>,
+    count: Option<i64>,
+) -> String {
+    let text = python_str(&value);
+    match count.and_then(|count| usize::try_from(count).ok()) {
+        Some(count) => text.replacen(&*old, &new, count),
+        None => text.replace(&*old, &new),
+    }
+}
+
+/// Jinja2's `upper` filter, `str(value).upper()`.
+fn python_upper_filter(value: Value) -> String {
+    python_str(&value).to_uppercase()
+}
+
+/// Jinja2's `lower` filter, `str(value).lower()`.
+fn python_lower_filter(value: Value) -> String {
+    python_str(&value).to_lowercase()
+}
+
+/// Jinja2's `capitalize` filter, `str(value).capitalize()`: the first
+/// character upper-cased, the rest lower-cased in the whole string's context,
+/// so a sigma right after the first character takes the final form Python
+/// gives it (`'ΑΣ'` is `Ας` here and `Ασ` under `title`, which slices the
+/// word first). Python 3.8+ title-cases the first character: the same as
+/// upper-casing it but for `ß`, the digraphs, the ligatures, Georgian and
+/// the Greek letters with an iota subscript.
+fn python_capitalize_filter(value: Value) -> String {
+    let text = python_str(&value);
+    let Some(first) = text.chars().next() else {
+        return String::new();
+    };
+    // The whole string lower-cased keeps the first character in the sigma
+    // rule's context, as CPython's `capitalize` reads it; the first
+    // character's own lower-case form is then swapped for the upper-case one.
+    let lowered = text.to_lowercase();
+    let first_lowered = first.to_lowercase().map(char::len_utf8).sum::<usize>();
+    let mut out = String::with_capacity(lowered.len());
+    out.extend(first.to_uppercase());
+    out.push_str(&lowered[first_lowered..]);
+    out
+}
+
+/// Jinja2's `title` filter (not Python's `str.title()`): each word's first
+/// character upper-cased and the rest lower-cased as one string (a word-final
+/// sigma takes the final form Python's `lower()` gives it), a word starting
+/// after a run of `-`, `(`, `{`, `[`, `<` or Python's `\s` (Jinja2's
+/// `_word_beginning_split_re`, `([-\s({\[<]+)`; see `python_isspace`), on
+/// the Python `str`.
+fn python_title_filter(value: Value) -> String {
+    let is_separator = |c: char| python_isspace(c) || matches!(c, '-' | '(' | '{' | '[' | '<');
+    let text = python_str(&value);
+    let mut out = String::with_capacity(text.len());
+    let mut rest: &str = &text;
+    while let Some(start) = rest.find(|c: char| !is_separator(c)) {
+        let (separators, word) = rest.split_at(start);
+        out.push_str(separators);
+        let end = word.find(is_separator).unwrap_or(word.len());
+        let mut chars = word[..end].chars();
+        if let Some(first) = chars.next() {
+            out.extend(first.to_uppercase());
+            out.push_str(&chars.as_str().to_lowercase());
+        }
+        rest = &word[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The output formatter of `{{ }}`: a sequence, a map or a float is written
+/// as Python's `str` spells it (see `spelled_by_python`), everything else as
+/// minijinja's default formatter writes it (a string as it is, integers,
+/// `True` / `False` / `None` already spell as `str` does). The `~` operator
+/// and the string filters not re-registered in `build_environment` go
+/// through the engine's own `Display`, which this renderer cannot hook.
+/// A template that prints a message's content where the engine's chat utils
+/// handed it a list of parts writes `[{'type': 'text', 'text': 'Hi'}]` into
+/// the prompt, and so must this renderer; minijinja's debug form
+/// (`[{"type": "text", "text": "Hi"}]`) is different bytes.
+fn python_formatter(
+    out: &mut Output,
+    state: &State,
+    value: &Value,
+) -> std::result::Result<(), MinijinjaError> {
+    if spelled_by_python(value) {
+        write_python_repr(out, value).map_err(Into::into)
+    } else {
+        minijinja::escape_formatter(out, state, value)
+    }
+}
+
+/// `repr(value)` of a JSON value, as the template renderer writes a value
+/// `spelled_by_python` it prints (a sequence, a map, a float; see
+/// `write_python_repr`): for a native encoder that must write the bytes the
+/// checkpoint's template would.
+pub(crate) fn python_repr(value: &JsonValue) -> String {
+    let mut text = String::new();
+    // Writing into a String cannot fail.
+    let _ = write_python_repr(&mut text, &Value::from_serialize(value));
+    text
+}
+
+/// `repr(value)` as Python writes it: strings quoted with Python's quote
+/// choice and escapes, `True` / `False` / `None`, Python's float spelling,
+/// `[a, b]` for a sequence and `{k: v}` for a map in insertion order. A value
+/// of another kind (bytes, an iterator, a plain object) keeps minijinja's
+/// spelling.
+fn write_python_repr(out: &mut dyn std::fmt::Write, value: &Value) -> std::fmt::Result {
+    match value.kind() {
+        ValueKind::None => out.write_str("None"),
+        ValueKind::Bool => out.write_str(if value.is_true() { "True" } else { "False" }),
+        ValueKind::Number if value.is_integer() => write!(out, "{value}"),
+        ValueKind::Number => match f64::try_from(value.clone()) {
+            Ok(number) => write_python_float(out, number),
+            Err(_) => write!(out, "{value}"),
+        },
+        ValueKind::String => write_python_str(out, value.as_str().unwrap_or_default()),
+        ValueKind::Seq => match value.try_iter() {
+            Ok(items) => {
+                out.write_str("[")?;
+                for (index, item) in items.enumerate() {
+                    if index > 0 {
+                        out.write_str(", ")?;
+                    }
+                    write_python_repr(out, &item)?;
+                }
+                out.write_str("]")
+            }
+            Err(_) => write!(out, "{value}"),
+        },
+        ValueKind::Map => match value.as_object().and_then(|map| map.try_iter_pairs()) {
+            Some(pairs) => {
+                out.write_str("{")?;
+                for (index, (key, item)) in pairs.enumerate() {
+                    if index > 0 {
+                        out.write_str(", ")?;
+                    }
+                    write_python_repr(out, &key)?;
+                    out.write_str(": ")?;
+                    write_python_repr(out, &item)?;
+                }
+                out.write_str("}")
+            }
+            None => write!(out, "{value}"),
+        },
+        _ => write!(out, "{value}"),
+    }
+}
+
+/// `repr(float)`: the shortest digits that read back to the number, written
+/// positionally when the decimal point falls within 1e-4 .. 1e16 and in
+/// exponent form with a sign and at least two exponent digits beyond
+/// (`1e+16`, `1e-05`), `.0` on a whole number, `nan`, `inf` and `-inf`.
+fn write_python_float(out: &mut dyn std::fmt::Write, number: f64) -> std::fmt::Result {
+    if number.is_nan() {
+        return out.write_str("nan");
+    }
+    if number.is_infinite() {
+        return out.write_str(if number < 0.0 { "-inf" } else { "inf" });
+    }
+    if number.is_sign_negative() {
+        out.write_str("-")?;
+    }
+    // Rust's `{:e}` is the shortest round-trip form: `d.ddde[-]x`.
+    let scientific = format!("{:e}", number.abs());
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+    // The digits before the decimal point (Python's `decpt`).
+    let point = exponent + 1;
+    if !(-3..=16).contains(&point) {
+        out.write_str(&digits[..1])?;
+        if digits.len() > 1 {
+            write!(out, ".{}", &digits[1..])?;
+        }
+        let sign = if exponent < 0 { '-' } else { '+' };
+        return write!(out, "e{sign}{:02}", exponent.abs());
+    }
+    if point <= 0 {
+        write!(
+            out,
+            "0.{}{digits}",
+            "0".repeat(point.unsigned_abs() as usize)
+        )
+    } else if point as usize >= digits.len() {
+        write!(
+            out,
+            "{digits}{}.0",
+            "0".repeat(point as usize - digits.len())
+        )
+    } else {
+        let (whole, fraction) = digits.split_at(point as usize);
+        write!(out, "{whole}.{fraction}")
+    }
+}
+
+/// `repr(str)`: single quotes, or double quotes when the text holds a single
+/// quote and no double quote; `\\`, the quote, `\t`, `\n`, `\r` escaped, and
+/// every other character `str.isprintable` rejects as `\xNN`, `\uNNNN` or
+/// `\UNNNNNNNN`.
+fn write_python_str(out: &mut dyn std::fmt::Write, text: &str) -> std::fmt::Result {
+    let quote = if text.contains('\'') && !text.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
+    out.write_char(quote)?;
+    // The text is written in runs between the characters that need an
+    // escape; printable ASCII, the common case, is one run.
+    let mut plain = 0;
+    for (at, c) in text.char_indices() {
+        let code = c as u32;
+        if (0x20..0x7f).contains(&code) && c != '\\' && c != quote {
+            continue;
+        }
+        if code >= 0x80 && python_printable(c) {
+            continue;
+        }
+        out.write_str(&text[plain..at])?;
+        match c {
+            '\\' => out.write_str("\\\\")?,
+            '\t' => out.write_str("\\t")?,
+            '\n' => out.write_str("\\n")?,
+            '\r' => out.write_str("\\r")?,
+            c if c == quote => {
+                out.write_char('\\')?;
+                out.write_char(c)?;
+            }
+            _ if code < 0x100 => write!(out, "\\x{code:02x}")?,
+            _ if code < 0x10000 => write!(out, "\\u{code:04x}")?,
+            _ => write!(out, "\\U{code:08x}")?,
+        }
+        plain = at + c.len_utf8();
+    }
+    out.write_str(&text[plain..])?;
+    out.write_char(quote)
+}
+
+/// `str.isprintable` for one character, which decides what `repr` escapes:
+/// everything but the control (Cc), format (Cf), private-use (Co), separator
+/// (Zs other than the space, Zl, Zp) characters and the noncharacters. An
+/// unassigned code point (Cn), which Python also escapes, is written as it is.
+fn python_printable(c: char) -> bool {
+    let code = c as u32;
+    !(c.is_control()
+        || matches!(
+            code,
+            0xa0 | 0x1680 | 0x2000..=0x200a | 0x202f | 0x205f | 0x3000
+        )
+        || matches!(code, 0x2028 | 0x2029)
+        || matches!(
+            code,
+            0xad | 0x600..=0x605
+                | 0x61c
+                | 0x6dd
+                | 0x70f
+                | 0x890
+                | 0x891
+                | 0x8e2
+                | 0x180e
+                | 0x200b..=0x200f
+                | 0x202a..=0x202e
+                | 0x2060..=0x2064
+                | 0x2066..=0x206f
+                | 0xfeff
+                | 0xfff9..=0xfffb
+                | 0x110bd
+                | 0x110cd
+                | 0x13430..=0x1343f
+                | 0x1bca0..=0x1bca3
+                | 0x1d173..=0x1d17a
+                | 0xe0001
+                | 0xe0020..=0xe007f
+        )
+        || matches!(code, 0xe000..=0xf8ff | 0xf0000..=0xffffd | 0x100000..=0x10fffd)
+        || matches!(code, 0xfdd0..=0xfdef)
+        || (code & 0xfffe) == 0xfffe)
 }
 
 /// Jinja2's `iterable` test: `iter(value)` succeeds. minijinja iterates
@@ -1569,9 +1959,10 @@ fn consolidate_system_messages(messages: Vec<serde_json::Value>) -> Vec<serde_js
 /// the prompt is cut where it lands.
 const CONTINUE_FINAL_MESSAGE_TAG: &str = "CONTINUE_FINAL_MESSAGE_TAG ";
 
-/// Python's `str.isspace`, which transformers' `strip`/`rstrip` and the
-/// checkpoints' whitespace runs go by: Unicode white space plus the
-/// separators U+001C..=U+001F.
+/// Python's `str.isspace` (and `re`'s `\s` on a `str` pattern), which
+/// transformers' `strip`/`rstrip`, the checkpoints' whitespace runs and
+/// Jinja2's `title` go by: Unicode white space plus the separators
+/// U+001C..=U+001F.
 pub(crate) fn python_isspace(c: char) -> bool {
     c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
 }
@@ -1925,9 +2316,67 @@ pub fn load_chat_template_from_file(template_path: &str) -> Result<Option<String
         ));
     }
 
-    // Plain .jinja file
-    let template = content.trim().replace("\\n", "\n");
-    Ok(Some(template))
+    // A plain .jinja file is the template as written: transformers' tokenizer
+    // reads a checkpoint's `chat_template.jinja` whole, and so does the
+    // `--chat-template` loader of the engine the render fixtures are recorded
+    // against, so a newline the template opens with reaches the prompt
+    // (`\n<|im_start|>system`). An engine's own HTTP server may load an
+    // operator-supplied file with a loader of its own; this renderer follows
+    // transformers. The template engine drops exactly one trailing newline of
+    // the source, as Jinja2 does.
+    Ok(Some(content.replace("\\n", "\n")))
+}
+
+/// The chat templates a `tokenizer_config.json` `chat_template` value holds:
+/// a string is the one template; a list of named templates (`[{"name":
+/// "default", "template": ...}, {"name": "tool_use", "template": ...}]`) is
+/// read as transformers reads it into a dict, and the engine's chat utils
+/// take `tool_use` when the request declares tools and `default` otherwise
+/// (`get_chat_template`). A later entry of a name replaces an earlier one;
+/// any other value is no template.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ConfigChatTemplates {
+    pub default: Option<String>,
+    pub tool_use: Option<String>,
+}
+
+impl ConfigChatTemplates {
+    pub fn read(value: Option<&serde_json::Value>) -> Self {
+        match value {
+            Some(serde_json::Value::String(template)) => Self {
+                default: Some(template.clone()),
+                tool_use: None,
+            },
+            Some(serde_json::Value::Array(entries)) => {
+                let mut templates = Self::default();
+                for entry in entries {
+                    let name = entry.get("name").and_then(serde_json::Value::as_str);
+                    let template = entry.get("template").and_then(serde_json::Value::as_str);
+                    match (name, template) {
+                        (Some("default"), Some(template)) => {
+                            templates.default = Some(template.to_string());
+                        }
+                        (Some("tool_use"), Some(template)) => {
+                            templates.tool_use = Some(template.to_string());
+                        }
+                        _ => {}
+                    }
+                }
+                templates
+            }
+            _ => Self::default(),
+        }
+    }
+
+    /// Whether the value names a template at all.
+    pub fn is_some(&self) -> bool {
+        self.default.is_some() || self.tool_use.is_some()
+    }
+
+    /// Whether the value names no template.
+    pub fn is_none(&self) -> bool {
+        !self.is_some()
+    }
 }
 
 /// Chat template state that can be embedded in any tokenizer struct.
@@ -1966,6 +2415,11 @@ pub struct ChatTemplateState {
     /// Whether the template writes a history tool call's `arguments` as the
     /// text the request sent (see [`Self::raw_tool_call_arguments`]).
     raw_tool_call_arguments: bool,
+    /// The `tool_use` template of a configuration that names its templates
+    /// (see [`ConfigChatTemplates`]), rendered in place of the default one
+    /// when the request declares tools, as the engine's chat utils render.
+    /// The accessors answer for the default template.
+    tool_use: Option<Box<ChatTemplateState>>,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -1975,6 +2429,7 @@ impl std::fmt::Debug for ChatTemplateState {
             .field("content_format", &self.content_format)
             .field("thinking_toggle", &self.thinking_toggle)
             .field("think_in_prefill", &self.think_in_prefill)
+            .field("has_tool_use", &self.tool_use.is_some())
             .finish()
     }
 }
@@ -2003,8 +2458,46 @@ impl ChatTemplateState {
             developer_role_supported,
             root_role_supported,
             raw_tool_call_arguments: false,
+            tool_use: None,
         };
         state.raw_tool_call_arguments = state.writes_tool_call_arguments_as_text();
+        Ok(state)
+    }
+
+    /// The templates of a configuration (see [`ConfigChatTemplates`]): the
+    /// default one, and the `tool_use` one for requests that declare tools.
+    pub fn from_config(templates: ConfigChatTemplates) -> Result<Self> {
+        let mut state = Self::new(templates.default)?;
+        if let Some(template) = templates.tool_use {
+            let tool_use = Self::new(Some(template))?;
+            // A request is prepared (its content shape, its thinking switch)
+            // and its answer read (the prefill's think block) by the default
+            // template's answers before the template is chosen; a pair that
+            // disagrees on them is prepared for the wrong one when tools are
+            // declared, so say so once at load, naming every answer tested.
+            if tool_use.content_format != state.content_format
+                || tool_use.thinking_toggle != state.thinking_toggle
+                || tool_use.thinking_key_name != state.thinking_key_name
+                || tool_use.think_in_prefill != state.think_in_prefill
+                || tool_use.prefill_opens_think_block != state.prefill_opens_think_block
+            {
+                tracing::warn!(
+                    default_content_format = ?state.content_format,
+                    tool_use_content_format = ?tool_use.content_format,
+                    default_thinking_toggle = ?state.thinking_toggle,
+                    tool_use_thinking_toggle = ?tool_use.thinking_toggle,
+                    default_thinking_key_name = ?state.thinking_key_name,
+                    tool_use_thinking_key_name = ?tool_use.thinking_key_name,
+                    default_think_in_prefill = state.think_in_prefill,
+                    tool_use_think_in_prefill = tool_use.think_in_prefill,
+                    default_prefill_opens_think_block = state.prefill_opens_think_block,
+                    tool_use_prefill_opens_think_block = tool_use.prefill_opens_think_block,
+                    "the named chat templates disagree on how a request is prepared; \
+                     requests are prepared by the default template's answers"
+                );
+            }
+            state.tool_use = Some(Box::new(tool_use));
+        }
         Ok(state)
     }
 
@@ -2023,6 +2516,7 @@ impl ChatTemplateState {
             developer_role_supported: true,
             root_role_supported: true,
             raw_tool_call_arguments: false,
+            tool_use: None,
         }
     }
 
@@ -2041,6 +2535,25 @@ impl ChatTemplateState {
     /// after the generation prompt (see
     /// [`ChatTemplateParams::continue_final_message`]).
     pub fn apply_with_continuation(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+    ) -> Result<(String, bool)> {
+        self.template_for(&params)
+            .render_with_continuation(messages, params)
+    }
+
+    /// The template a request renders through: the `tool_use` one of a
+    /// configuration that names it when the request declares tools, else
+    /// this one.
+    fn template_for(&self, params: &ChatTemplateParams) -> &Self {
+        match &self.tool_use {
+            Some(tool_use) if params.tools.is_some() => tool_use,
+            _ => self,
+        }
+    }
+
+    fn render_with_continuation(
         &self,
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
@@ -2164,6 +2677,8 @@ impl ChatTemplateState {
         self.think_in_prefill = think_in_prefill;
         self.prefill_opens_think_block = prefill_opens_think_block;
         self.env = Some(env);
+        // A replacement template stands alone, as a template file does.
+        self.tool_use = None;
         self.raw_tool_call_arguments = self.writes_tool_call_arguments_as_text();
         Ok(())
     }
@@ -2211,12 +2726,20 @@ impl ChatTemplateState {
     /// `RendererCapabilities::raw_tool_call_arguments`. The API carries the
     /// arguments as a JSON string and the gateway parses them into the object
     /// the Transformers docs say a template reads; a template that writes
-    /// them by string concatenation (`'<sep>' + tool['function']['arguments']
-    /// + '<end>'`) cannot render that object, so the string must reach it as
+    /// them by string concatenation of `'<sep>'`, `tool['function']['arguments']`
+    /// and `'<end>'` cannot render that object, so the string must reach it as
     /// written. Resolved when the template is bound (see
-    /// [`Self::writes_tool_call_arguments_as_text`]).
+    /// `Self::writes_tool_call_arguments_as_text`).
     pub fn raw_tool_call_arguments(&self) -> bool {
-        self.raw_tool_call_arguments
+        // In a named pair the `tool_use` template is the one with the
+        // tool-call branch, and every request that renders a tool call goes
+        // through it; the default template (plain chat, as a rule) has no
+        // answer of its own.
+        self.tool_use
+            .as_ref()
+            .map_or(self.raw_tool_call_arguments, |tool_use| {
+                tool_use.raw_tool_call_arguments
+            })
     }
 
     /// Decide [`Self::raw_tool_call_arguments`] by the template's behaviour,
@@ -2374,6 +2897,253 @@ mod tests {
             detect_chat_template_content_format(plain),
             ChatTemplateContentFormat::String
         );
+    }
+
+    /// `{{ x }}` of a list or a dict is Python's repr, the bytes the engine's
+    /// prompt holds when a template prints a content value its chat utils
+    /// handed over as parts; a float alone spells as Python's `str` does; a
+    /// string, an integer and a flag are written as before.
+    #[test]
+    fn a_sequence_or_a_map_is_written_as_python_s_repr() {
+        let state = ChatTemplateState::new(Some("{{ messages[0].content }}".to_string())).unwrap();
+        let render = |content: serde_json::Value| {
+            state
+                .apply(
+                    &[serde_json::json!({"role": "user", "content": content})],
+                    ChatTemplateParams::default(),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            render(serde_json::json!([{"type": "text", "text": "Welcome! How can I help?"}])),
+            "[{'type': 'text', 'text': 'Welcome! How can I help?'}]"
+        );
+        // Python's quote choice and escapes (`python3 -c 'print(repr(...))'`).
+        assert_eq!(
+            render(serde_json::json!([
+                {"type": "text", "text": "it's"},
+                {"type": "text", "text": "say \"hi\""},
+                {"t": "both ' and \""}
+            ])),
+            r#"[{'type': 'text', 'text': "it's"}, {'type': 'text', 'text': 'say "hi"'}, {'t': 'both \' and "'}]"#
+        );
+        assert_eq!(
+            render(serde_json::json!({
+                "a": null, "b": true, "c": 1.0, "d": 1e16, "e": 0.0001, "f": 1e-5,
+                "g": "tab\tnl\nbs\\ nbsp\u{a0} zw\u{200b} eé 😀", "h": [1, 2.5, -3, 100.0, 0.001]
+            })),
+            "{'a': None, 'b': True, 'c': 1.0, 'd': 1e+16, 'e': 0.0001, 'f': 1e-05, \
+             'g': 'tab\\tnl\\nbs\\\\ nbsp\\xa0 zw\\u200b eé 😀', 'h': [1, 2.5, -3, 100.0, 0.001]}"
+        );
+        assert_eq!(render(serde_json::json!([])), "[]");
+        assert_eq!(render(serde_json::json!({})), "{}");
+        assert_eq!(render(serde_json::json!("plain")), "plain");
+        assert_eq!(render(serde_json::json!(2.0)), "2.0");
+        // A float printed alone spells as Python's `str` does, like one in a
+        // list; an integer as before.
+        assert_eq!(render(serde_json::json!(1e-5)), "1e-05");
+        assert_eq!(render(serde_json::json!(1e16)), "1e+16");
+        assert_eq!(render(serde_json::json!(100.0)), "100.0");
+        assert_eq!(render(serde_json::json!(-0.001)), "-0.001");
+        assert_eq!(render(serde_json::json!(12)), "12");
+        assert_eq!(render(serde_json::json!(false)), "False");
+        assert_eq!(render(serde_json::json!(null)), "None");
+
+        // The `string` and `trim` filters start with the same `str`.
+        let filtered = ChatTemplateState::new(Some(
+            "{{ messages[0].content | string }}|{{ messages[0].content | trim }}|\
+             {{ ' x ' | trim }}|{{ 'ab' | trim('a') }}|{{ 7 | string }}|{{ 0.00001 | string }}"
+                .to_string(),
+        ))
+        .unwrap();
+        let rendered = filtered
+            .apply(
+                &[serde_json::json!({"role": "user", "content": [{"type": "text", "text": "Hi"}]})],
+                ChatTemplateParams::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "[{'type': 'text', 'text': 'Hi'}]|[{'type': 'text', 'text': 'Hi'}]|x|b|7|1e-05"
+        );
+    }
+
+    /// The string filters Jinja2 starts with `str(value)` write a list or a
+    /// dict as Python does, like `string` and `trim`: `join` of every item
+    /// (or of an attribute of each), `replace` (with a count), `upper`,
+    /// `lower`, `capitalize`, `title` (a word-final sigma and a `\x1c`
+    /// separator as Python has them); a string and an integer are untouched.
+    #[test]
+    fn the_string_filters_start_with_python_s_str() {
+        let state = ChatTemplateState::new(Some(
+            "{{ messages[0].content | join(' + ') }}|\
+             {{ messages[0].content | replace('text', 'T') }}|\
+             {{ messages[0].content | upper }}|{{ messages[0].content[0] | lower }}|\
+             {{ ['a', 'b'] | join(', ') }}|{{ 'Ab' | upper }}|{{ 7 | lower }}|\
+             {{ 1.5 | replace('.', ',') }}|{{ 'x.y' | replace('.', '') }}|\
+             {{ messages[0].content | capitalize }}|{{ messages[0].content | title }}|\
+             {{ \"get_weather don't\" | title }}|\
+             {{ messages[1].content | title }}|{{ messages[1].content | capitalize }}|\
+             {{ 'ΑΣ' | title }}{{ 'ΑΣ' | capitalize }}|\
+             {{ 'x.y.z' | replace('.', '-', 1) }}|{{ messages[0].content | join(', ', attribute='text') }}"
+                .to_string(),
+        ))
+        .unwrap();
+        let rendered = state
+            .apply(
+                &[
+                    serde_json::json!({"role": "user", "content": [
+                        {"type": "text", "text": "Hi"},
+                        {"type": "text", "text": "Yo"}
+                    ]}),
+                    serde_json::json!({"role": "user", "content": "a\u{1c}b ΟΔΟΣ ΚΑΙ"}),
+                ],
+                ChatTemplateParams::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "{'type': 'text', 'text': 'Hi'} + {'type': 'text', 'text': 'Yo'}|\
+             [{'type': 'T', 'T': 'Hi'}, {'type': 'T', 'T': 'Yo'}]|\
+             [{'TYPE': 'TEXT', 'TEXT': 'HI'}, {'TYPE': 'TEXT', 'TEXT': 'YO'}]|\
+             {'type': 'text', 'text': 'hi'}|a, b|AB|7|1,5|xy|\
+             [{'type': 'text', 'text': 'hi'}, {'type': 'text', 'text': 'yo'}]|\
+             [{'type': 'text', 'text': 'hi'}, {'type': 'text', 'text': 'yo'}]|\
+             Get_weather Don't|A\u{1c}B Οδος Και|A\u{1c}b οδος και|ΑσΑς|x-y.z|Hi, Yo"
+        );
+    }
+
+    /// The case of the record: a template that loops over content somewhere
+    /// (the openai content format) and prints `message.content` elsewhere
+    /// gets a string content as a one-item part list, and prints it the way
+    /// the engine's prompt holds it.
+    #[test]
+    fn a_parts_list_a_template_prints_comes_out_as_the_engine_writes_it() {
+        let template = "{%- for m in messages %}\n{%- if m.role == 'system' %}<|system|>\n{{ m.content }}\
+                        {%- else %}<|{{ m.role }}|>\n{%- for part in m.content %}{{ part.text }}{%- endfor %}\
+                        {%- endif %}{%- endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(state.content_format(), ChatTemplateContentFormat::OpenAI);
+        let rendered = state
+            .apply(
+                &[
+                    serde_json::json!({"role": "system", "content": "You are a terse assistant."}),
+                    serde_json::json!({"role": "user", "content": "Hello."}),
+                ],
+                ChatTemplateParams::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|system|>\n[{'type': 'text', 'text': 'You are a terse assistant.'}]<|user|>Hello."
+        );
+    }
+
+    /// A configuration that ships its templates as a named list is read as
+    /// transformers reads it: `default` renders a plain request, `tool_use`
+    /// one that declares tools; a string stays the one template; a replacement
+    /// template drops the pair.
+    #[test]
+    fn a_named_template_list_renders_tool_use_for_a_request_with_tools() {
+        let config = serde_json::json!([
+            {"name": "default", "template": "default:{{ messages | length }}"},
+            {"name": "tool_use", "template": "tool_use:{{ tools | length }}"}
+        ]);
+        let templates = ConfigChatTemplates::read(Some(&config));
+        assert_eq!(
+            templates,
+            ConfigChatTemplates {
+                default: Some("default:{{ messages | length }}".to_string()),
+                tool_use: Some("tool_use:{{ tools | length }}".to_string()),
+            }
+        );
+        let mut state = ChatTemplateState::from_config(templates).unwrap();
+        let messages = [serde_json::json!({"role": "user", "content": "Hi"})];
+        let tools = [serde_json::json!({"type": "function", "function": {"name": "f"}})];
+        let with_tools = ChatTemplateParams {
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        assert_eq!(
+            state
+                .apply(&messages, ChatTemplateParams::default())
+                .unwrap(),
+            "default:1"
+        );
+        assert_eq!(state.apply(&messages, with_tools).unwrap(), "tool_use:1");
+
+        state.set("alone:{{ tools is none }}".to_string()).unwrap();
+        let with_tools = ChatTemplateParams {
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        assert_eq!(state.apply(&messages, with_tools).unwrap(), "alone:False");
+
+        assert_eq!(
+            ConfigChatTemplates::read(Some(&serde_json::json!("one"))),
+            ConfigChatTemplates {
+                default: Some("one".to_string()),
+                tool_use: None,
+            }
+        );
+        assert!(
+            !ConfigChatTemplates::read(Some(&serde_json::json!({"name": "default"}))).is_some()
+        );
+        assert!(!ConfigChatTemplates::read(None).is_some());
+    }
+
+    /// The answer to how a history tool call's arguments are written comes
+    /// from the `tool_use` template of a named pair: the default one has no
+    /// tool-call branch to ask.
+    #[test]
+    fn a_named_pair_answers_tool_call_arguments_from_the_tool_use_template() {
+        let concatenating = "{% for m in messages %}{% for c in m.tool_calls or [] %}\
+                             {{ 'args=' + c.function.arguments }}{% endfor %}{% endfor %}";
+        let alone = ChatTemplateState::new(Some(concatenating.to_string())).unwrap();
+        assert!(alone.raw_tool_call_arguments());
+        let pair = ChatTemplateState::from_config(ConfigChatTemplates {
+            default: Some("{{ messages | length }}".to_string()),
+            tool_use: Some(concatenating.to_string()),
+        })
+        .unwrap();
+        assert!(pair.raw_tool_call_arguments());
+        let plain = ChatTemplateState::from_config(ConfigChatTemplates {
+            default: Some("{{ messages | length }}".to_string()),
+            tool_use: Some("{{ tools | tojson }}".to_string()),
+        })
+        .unwrap();
+        assert!(!plain.raw_tool_call_arguments());
+    }
+
+    /// A template file is read as written: a newline before its first block
+    /// is the template's and reaches the prompt, as it does through the
+    /// engine's chat utils, which read the file whole; exactly one trailing
+    /// newline of the source is dropped, as Jinja2 drops it.
+    #[test]
+    fn a_template_file_keeps_the_newline_it_opens_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let render = |source: &str| {
+            let path = dir.path().join("chat_template.jinja");
+            fs::write(&path, source).unwrap();
+            let template = load_chat_template_from_file(path.to_str().unwrap())
+                .unwrap()
+                .unwrap();
+            let state = ChatTemplateState::new(Some(template)).unwrap();
+            state
+                .apply(
+                    &[serde_json::json!({"role": "user", "content": "Hi"})],
+                    ChatTemplateParams::default(),
+                )
+                .unwrap()
+        };
+        // Text around the blocks, as the templates of the record open (a `{%-`
+        // tag strips the whitespace before it, and `trim_blocks` the newline
+        // after a tag, in both engines alike).
+        let body = "<s>{% for m in messages %}<|{{ m.role }}|>{{ m.content }}{% endfor %}</s>";
+        assert_eq!(render(&format!("\n{body}")), "\n<s><|user|>Hi</s>");
+        assert_eq!(render(&format!("\n{body}\n")), "\n<s><|user|>Hi</s>");
+        assert_eq!(render(&format!("\n{body}\n\n")), "\n<s><|user|>Hi</s>\n");
+        assert_eq!(render(&format!("  {body}  ")), "  <s><|user|>Hi</s>  ");
     }
 
     /// The rewrite keeps each tag's whitespace modifiers and leaves a template
