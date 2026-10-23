@@ -98,6 +98,45 @@ Workers are automatically wired to the router via `--worker-urls`. The URL schem
 
 SGLang uses `sglang.launch_server` for both modes (adds `--grpc-mode` for gRPC).
 
+#### Worker Metrics (gRPC mode)
+
+A gRPC worker can serve Prometheus metrics from the engine pod itself:
+
+```yaml
+workers:
+  - name: llama-8b
+    engine: vllm
+    connectionMode: grpc
+    metrics:
+      enabled: true
+      port: 29100                       # default; must differ from the serving port
+```
+
+The chart then runs the engine behind the Rust servicer and gives its
+metrics listener a port (the pod gets `SMG_<ENGINE>_SERVICER_IMPL=rust` and
+`SMG_<ENGINE>_SERVICER_METRICS_PORT=<port>`, the variables the launcher reads
+when the flags are absent), names the port `metrics` on the container and
+the worker Service, and, when `router.metrics.serviceMonitor.enabled` is on,
+adds one `<release>-worker` ServiceMonitor over the worker Services with the
+router's interval and labels. The endpoint answers `GET /metrics` with the
+`smg_servicer_*` families (requests by finish reason, refusals, errors,
+in-flight requests, prompt / cached / generated tokens, the time-to-first-token,
+inter-token and end-to-end latency histograms, the servicer's lifecycle state),
+labelled `model`, `rank` and `wire`; it binds beside the gRPC listener before
+the engine connects, so a scrape during start-up answers
+`smg_servicer_state{state="starting"} 1`.
+
+Off (the default), nothing changes: the launcher's own servicer choice stands
+and the pod exposes no metrics port. The Python servicer has no endpoint, so
+`extraArgs: ["--servicer-impl", "python"]` together with `metrics.enabled`
+is refused by the launcher before the engine starts. The SGLang Rust servicer
+serves neither PD/EPD disaggregation nor image and video input yet (it
+advertises no vision support, so the gateway refuses media for that worker at
+its gate), so a disaggregated or multimodal SGLang worker keeps `metrics` off.
+A `metrics.port` equal to the serving port is refused when the chart renders.
+An HTTP worker runs the engine's own server, which has its own `/metrics`; the
+setting is ignored there.
+
 #### HuggingFace Token
 
 Gated models (e.g., Llama) require a HuggingFace token:
