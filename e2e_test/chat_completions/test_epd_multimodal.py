@@ -14,12 +14,16 @@ is a thinking model, so the answer may arrive in ``reasoning_content`` rather th
 
 Usage:
     pytest e2e_test/chat_completions/test_epd_multimodal.py -v
+
+AMD SGLang functional-equivalence opt-in (Python gRPC servicer):
+    E2E_AMD_SGLANG_EPD_EQUIVALENT=1 E2E_ENGINE=sglang pytest <same module>
 """
 
 from __future__ import annotations
 
 import base64
 import logging
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -52,6 +56,10 @@ _LOG_DIR = Path(tempfile.mkdtemp(prefix="smg-e2e-epd-"))
 # log_level=debug (below).
 EPD_DISPATCH_MARKER = "EPD encode dispatch issued"
 
+_EPD_ENGINES = ("tokenspeed",)
+if os.environ.get("E2E_AMD_SGLANG_EPD_EQUIVALENT") == "1":
+    _EPD_ENGINES += ("sglang",)
+
 # (encode, prefill, decode) worker counts. Every worker is tp=1, so 1e1p1d uses
 # 3 GPUs and the rest use 4 — all fit the 4-GPU runner. Counts ride in the param
 # because setup_backend is class-scoped and can't read per-param marks.
@@ -77,7 +85,7 @@ def _epd_dispatch_count() -> int:
     return read_logs(_LOG_DIR, "smg*").count(EPD_DISPATCH_MARKER)
 
 
-@pytest.mark.engine("tokenspeed")
+@pytest.mark.engine(*_EPD_ENGINES)
 @pytest.mark.gpu(4)
 @pytest.mark.e2e
 @pytest.mark.model("Qwen/Qwen3.5-9B")
