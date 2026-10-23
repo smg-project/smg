@@ -248,6 +248,22 @@ impl StopSequenceDecoder {
     /// its own. [`process_token_into`](Self::process_token_into) appends it
     /// to a buffer of the caller's instead.
     pub fn process_token(&mut self, token_id: TokenIdType) -> Result<SequenceDecoderOutput> {
+        if !self.stopped
+            && self.token_only
+            && !self.config.stop_tokens.contains(&token_id)
+            && !self.config.visible_stop_tokens.contains(&token_id)
+        {
+            // The common path of the appending form, in its owned shape: the
+            // decoder's own string for the token (one exact allocation, as
+            // before the appending form existed) rather than an empty string
+            // grown by appending into it.
+            let text = self.sequence.append_token(token_id)?;
+            return Ok(if text.is_empty() {
+                SequenceDecoderOutput::Held
+            } else {
+                SequenceDecoderOutput::Text(text)
+            });
+        }
         let mut text = String::new();
         Ok(self
             .process_token_into(token_id, &mut text)?

@@ -205,8 +205,15 @@ impl Sequence {
             return Ok(appended);
         }
         Ok(match self.step_generic(token_id)?.text {
+            // The generic step's text is a string of its own: an empty `out`
+            // takes it as it is, so the owned forms above this one (an empty
+            // string handed in, the text handed back) pay no copy for it.
             Some(text) if !text.is_empty() => {
-                out.push_str(&text);
+                if out.is_empty() {
+                    *out = text;
+                } else {
+                    out.push_str(&text);
+                }
                 true
             }
             _ => false,
