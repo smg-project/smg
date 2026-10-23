@@ -254,6 +254,17 @@
       "chat_completions/test_openai_server.py::TestChatCompletionGptOss::test_response_prefill[smg-grpc]": "gpt-oss Harmony pipeline doesn't implement continue_final_message",
       "chat_completions/test_servicer_warmup.py::TestFullWarmupBeforeServing::test_the_full_pass_ends_inside_its_budget_before_the_servicer_serves": "a ZMQ engine has no health service of its own: the gateway gates it"
     },
-    "metadata_binding": "Actual current 3f6 pytest ZMQ collection, AMD and NVIDIA independently identical; no fixtures or network"
+    "metadata_binding": "Actual current 3f6 pytest ZMQ collection, AMD and NVIDIA independently identical; no fixtures or network",
+    "allowed_skip_phases": {
+      "chat_completions/test_function_calling.py::TestOpenAIServerFunctionCalling::test_function_call_strict[openai-grpc]": "setup",
+      "chat_completions/test_function_calling.py::TestOpenAIServerFunctionCalling::test_function_call_strict[smg-grpc]": "setup",
+      "chat_completions/test_function_calling.py::TestToolChoiceMistral::test_conflicting_defs_required_tool_choice[openai-grpc]": "setup",
+      "chat_completions/test_function_calling.py::TestToolChoiceMistral::test_conflicting_defs_required_tool_choice[smg-grpc]": "setup",
+      "chat_completions/test_openai_server.py::TestChatCompletionGptOss::test_regex[openai-grpc]": "setup",
+      "chat_completions/test_openai_server.py::TestChatCompletionGptOss::test_regex[smg-grpc]": "setup",
+      "chat_completions/test_openai_server.py::TestChatCompletionGptOss::test_response_prefill[openai-grpc]": "setup",
+      "chat_completions/test_openai_server.py::TestChatCompletionGptOss::test_response_prefill[smg-grpc]": "setup",
+      "chat_completions/test_servicer_warmup.py::TestFullWarmupBeforeServing::test_the_full_pass_ends_inside_its_budget_before_the_servicer_serves": "call"
+    }
   }
 }

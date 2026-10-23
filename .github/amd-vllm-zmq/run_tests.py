@@ -50,7 +50,7 @@ class Reports:
                     "unexpected skip",
                 )
                 phase = skipped[0]["phase"]
-                require(phase in {"setup", "call"}, "skip in wrong phase")
+                require(phase == recipe["allowed_skip_phases"].get(nodeid), "skip in wrong phase")
                 expected = (
                     {"setup", "teardown"} if phase == "setup" else {"setup", "call", "teardown"}
                 )
