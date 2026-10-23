@@ -516,6 +516,7 @@ class Worker:
                 "--encoder-transfer-backend",
                 "--grpc-mode",
                 "--language-only",
+                "--language-model-only",
                 "--disaggregation-mode",
             }
             extras = [*spec.get("sglang_args", []), *(self.extra_engine_args or [])]

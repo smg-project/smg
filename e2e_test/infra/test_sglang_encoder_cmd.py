@@ -59,6 +59,7 @@ def test_text_only_encoder_rejected_before_environment_or_spawn(monkeypatch):
         ["--encoder-transfer-backend=zmq_to_tokenizer"],
         ["--disaggregation-mode", "prefill"],
         ["--language-only"],
+        ["--language-model-only"],
         ["--grpc-mode"],
     ],
 )
