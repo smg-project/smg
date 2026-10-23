@@ -500,17 +500,37 @@ pub(crate) fn init_mm_settings(settings: MultimodalSettings) {
 /// setting in [`STRICT_ENV`] falls back to its default while the other
 /// settings keep their env values.
 pub(crate) fn mm_settings() -> &'static MultimodalSettings {
-    SETTINGS.get_or_init(|| {
-        let config = RouterConfig::default();
-        MultimodalSettings::resolve(&config).unwrap_or_else(|error| {
-            warn!(error = %error, "unreadable multimodal env setting; using its default");
-            MultimodalSettings::resolve_with(&config, |name| {
-                Ok((!STRICT_ENV.contains(&name))
-                    .then(|| std::env::var(name).ok())
-                    .flatten())
+    SETTINGS.get_or_init(|| resolve_unseeded_with(process_env))
+}
+
+/// Embedded use has no startup error boundary: default only the invalid strict
+/// settings, retaining valid policies and budgets. The normal startup resolver
+/// remains strict. An explicit env reader keeps tests away from global state.
+fn resolve_unseeded_with(env: impl Fn(&str) -> Result<Option<String>>) -> MultimodalSettings {
+    let config = RouterConfig::default();
+    MultimodalSettings::resolve_with(&config, &env).unwrap_or_else(|error| {
+        warn!(error = %error, "unreadable multimodal env setting; using its default");
+        let invalid: Vec<_> = STRICT_ENV
+            .into_iter()
+            .filter(|key| {
+                MultimodalSettings::resolve_with(&config, |name| {
+                    if name == *key {
+                        env(name)
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .is_err()
             })
-            .unwrap_or_default()
+            .collect();
+        MultimodalSettings::resolve_with(&config, |name| {
+            if invalid.contains(&name) {
+                Ok(None)
+            } else {
+                env(name)
+            }
         })
+        .unwrap_or_default()
     })
 }
 
@@ -584,6 +604,53 @@ mod tests {
             error.to_string(),
             "mm_video_fetch_timeout_ms must be positive"
         );
+    }
+
+    /// A bad timeout in embedded use must not relax other valid strict settings.
+    #[test]
+    fn unseeded_media_fetch_timeout_preserves_valid_settings() {
+        for bad in [ENV_FETCH_TIMEOUT_MS, ENV_VIDEO_FETCH_TIMEOUT_MS] {
+            for invalid in [Some("bad"), Some("0"), Some("-1"), None] {
+                let valid = env(&[
+                    (ENV_PROCESSING, "worker"),
+                    (ENV_TURBOJPEG, "require"),
+                    (ENV_FETCH_TIMEOUT_MS, "60000"),
+                    (ENV_VIDEO_FETCH_TIMEOUT_MS, "120000"),
+                    (ENV_PIXEL_CACHE_MB, "32"),
+                ]);
+                let resolved = resolve_unseeded_with(|name| {
+                    if name == bad {
+                        match invalid {
+                            Some(value) => Ok(Some(value.to_string())),
+                            None => anyhow::bail!("not Unicode"),
+                        }
+                    } else {
+                        valid(name)
+                    }
+                });
+                assert_eq!(resolved.processing.value, MmProcessingMode::Worker);
+                assert_eq!(resolved.processing.source, SettingSource::Env);
+                assert_eq!(resolved.turbojpeg.value, TurboJpegPolicy::Require);
+                assert_eq!(resolved.turbojpeg.source, SettingSource::Env);
+                assert_eq!(resolved.pixel_cache_mb.value, 32);
+                assert_eq!(
+                    resolved.fetch_timeout_ms.value,
+                    if bad == ENV_FETCH_TIMEOUT_MS {
+                        10000
+                    } else {
+                        60000
+                    }
+                );
+                assert_eq!(
+                    resolved.video_fetch_timeout_ms.value,
+                    if bad == ENV_VIDEO_FETCH_TIMEOUT_MS {
+                        30000
+                    } else {
+                        120000
+                    }
+                );
+            }
+        }
     }
 
     fn no_env(name: &str) -> Result<Option<String>> {
