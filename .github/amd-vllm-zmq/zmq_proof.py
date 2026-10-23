@@ -12,17 +12,27 @@ from reuse import require
 NATIVE_HASHES = {}
 
 
-def process_identity(process):
+def process_identity(process, title=None):
     require(process is not None and process.poll() is None, "owned process not alive")
     root = Path("/proc") / str(process.pid)
+    fields = (root / "stat").read_text().rsplit(")", 1)[1].split()
+    require(int(fields[1]) == os.getpid(), "process is not a child of this pytest harness")
+    argv = [x.decode() for x in (root / "cmdline").read_bytes().split(b"\0") if x]
+    launch = list(process.args)
+    overwritten = title is not None and argv == [title]
+    require(overwritten or argv == launch, "actual process argv differs from harness launch")
     marker = ("E2E_JOB_MARKER=" + os.environ["E2E_JOB_MARKER"]).encode()
-    require(
-        marker in (root / "environ").read_bytes().split(b"\0"), "process belongs to another job"
-    )
+    visible = marker in (root / "environ").read_bytes().split(b"\0")
+    require(visible or overwritten, "process belongs to another job")
     return {
         "pid": process.pid,
-        "start_ticks": (root / "stat").read_text().rsplit(")", 1)[1].split()[19],
-        "argv": [x.decode() for x in (root / "cmdline").read_bytes().split(b"\0") if x],
+        "parent_pid": int(fields[1]),
+        "start_ticks": fields[19],
+        "argv": argv,
+        "launch_argv": launch,
+        "marker_visible_in_proc": visible,
+        "ownership": "live fixture Popen child + kernel PPid + start ticks",
+        "title_overwrote_initial_argv_and_environment": overwritten,
     }
 
 
@@ -34,8 +44,9 @@ def argument(argv, name):
 def witness(gateway, workers, model, native):
     from smg.serve import _zmq_handshake_port
 
-    result = process_identity(gateway.process)
-    argv = result["argv"]
+    result = process_identity(gateway.process, "smg::router")
+    argv = result["launch_argv"]
+    require(argument(argv, "-m") == "smg.launch_router", "wrong original gateway launcher")
     require(argument(argv, "--backend") == "vllm", "actual gateway backend differs")
     i = argv.index("--worker-urls") + 1 if argv.count("--worker-urls") == 1 else 0
     require(i > 0, "missing/duplicate worker URLs")
@@ -156,6 +167,8 @@ class ZmqProof:
                         record["before"][key] == record["after"][key]
                         for key in (
                             "pid",
+                            "parent_pid",
+                            "launch_argv",
                             "start_ticks",
                             "argv",
                             "engines",
