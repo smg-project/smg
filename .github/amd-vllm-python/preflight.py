@@ -1,12 +1,10 @@
-"""Require all original cached models and the real installed Rust launcher binding."""
+"""Require original cached models and the real installed Python servicer binding."""
 
 import hashlib
 import importlib
-import importlib.machinery
 import inspect
 import json
 import os
-import sys
 from pathlib import Path
 
 from cached_models import cached_model
@@ -20,56 +18,54 @@ def sha(raw):
     return hashlib.sha256(raw).hexdigest()
 
 
-def rust_binding():
-    from smg import servicer, smg_rs
-    from smg_grpc_servicer.vllm import launcher_switch, rust
+def python_binding():
+    from smg_grpc_servicer.vllm import launcher_switch, rust, servicer
 
-    rust.require_upstream_hook()
-    hook = launcher_switch.require_launcher_hook()
-    require(hook.state == launcher_switch.BOUND, "actual Rust launcher is not bound")
-    require(hook.module in launcher_switch.LAUNCHER_MODULES, "unknown launcher module")
-    require(servicer.VllmGrpcServer is smg_rs.VllmGrpcServer, "Rust native server identity differs")
-    native = Path(smg_rs.__file__).resolve()
+    require(rust.resolve_servicer_impl() == "python", "Python implementation not selected")
+    cls = servicer.VllmEngineServicer
+    expected = Path("grpc_servicer/smg_grpc_servicer/vllm/servicer.py").resolve()
     require(
-        any(str(native).endswith(s) for s in importlib.machinery.EXTENSION_SUFFIXES), "not native"
+        Path(inspect.getfile(cls)).resolve() == expected, "installed Python class source differs"
     )
-    digest = hashlib.sha256()
-    with native.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    function = getattr(sys.modules[hook.module], launcher_switch.HOOK_ATTRIBUTE)
-    original = inspect.unwrap(function)
-    modules = [
-        hook.module,
-        "smg.servicer",
-        "smg_grpc_servicer.vllm.rust",
-        "smg_grpc_servicer.vllm.launcher_switch",
-        "smg_grpc_servicer.vllm.plugin",
-    ]
-    directory = OUT / "rust-launcher-sources"
+    require(
+        inspect.isasyncgenfunction(cls.Generate)
+        and Path(cls.Generate.__code__.co_filename).resolve() == expected,
+        "Generate is not the installed Python async generator",
+    )
+    launcher = importlib.import_module(launcher_switch.LAUNCHER_MODULES[0])
+    require(launcher.VllmEngineServicer is cls, "launcher uses another servicer class")
+    original = inspect.unwrap(launcher.serve_grpc)
+    require(
+        Path(original.__code__.co_filename).resolve() == Path(launcher.__file__).resolve(),
+        "Python launcher original coroutine source differs",
+    )
+    modules = [servicer, launcher, launcher_switch, rust]
+    directory = OUT / "python-servicer-sources"
     directory.mkdir()
     records, total = [], 0
-    for index, name in enumerate(modules):
-        module = importlib.import_module(name)
+    for index, module in enumerate(modules):
         path = Path(module.__file__).resolve()
         with path.open("rb") as stream:
             raw = stream.read(2 * 1024 * 1024 + 1)
         total += len(raw)
-        require(0 < len(raw) <= 2 * 1024 * 1024 and total <= 4 * 1024 * 1024, "launcher source cap")
+        require(0 < len(raw) <= 2 * 1024 * 1024 and total <= 4 * 1024 * 1024, "source cap")
         target = f"{index:02d}-{path.name}"
         (directory / target).write_bytes(raw)
-        records.append({"module": name, "path": str(path), "file": target, "sha256": sha(raw)})
+        records.append(
+            {"module": module.__name__, "path": str(path), "file": target, "sha256": sha(raw)}
+        )
     require(
-        Path(original.__code__.co_filename).resolve() == Path(records[0]["path"]),
-        "bound launcher original code path differs",
+        b"VllmEngineServicer initialized (mm_processor=" in expected.read_bytes(),
+        "Python constructor log boundary changed",
+    )
+    require(
+        b"vLLM gRPC server started on " in Path(launcher.__file__).read_bytes(),
+        "Python server listener log boundary changed",
     )
     return {
-        "hook_state": hook.state,
-        "hook_module": hook.module,
-        "original_coroutine": original.__qualname__,
-        "native_extension": str(native),
-        "native_extension_sha256": digest.hexdigest(),
-        "native_server_symbol_identity": True,
+        "class": cls.__module__ + "." + cls.__qualname__,
+        "Generate_code_path": str(expected),
+        "launcher_class_identity": True,
         "sources": records,
         "model_or_server_started_by_preflight": False,
     }
@@ -80,7 +76,8 @@ def main():
         os.environ.get("HF_HUB_OFFLINE") == os.environ.get("TRANSFORMERS_OFFLINE") == "1",
         "offline guards missing",
     )
-    require(os.environ.get("E2E_VLLM_SERVICER_IMPL") == "rust", "wrong servicer lane")
+    require(not os.environ.get("E2E_VLLM_SERVICER_IMPL"), "wrong servicer lane")
+    require(os.environ.get("SPT_NOENV") == "1", "process marker preservation missing")
     require(not os.environ.get("E2E_CONNECTION_MODE"), "wrong connection mode")
     from infra.model_specs import get_model_spec
 
@@ -108,13 +105,13 @@ def main():
                     "Qwen original shards changed",
                 )
             result["models"].append(cache)
-        result["rust_binding"] = rust_binding()
+        result["python_binding"] = python_binding()
         result["preflight"] = "passed"
     except BaseException as error:
         result["failure"] = {"type": type(error).__name__, "detail": str(error)}
         raise
     finally:
-        (OUT / "rust-servicer-preflight.json").write_text(json.dumps(result, indent=2) + "\n")
+        (OUT / "python-servicer-preflight.json").write_text(json.dumps(result, indent=2) + "\n")
 
 
 if __name__ == "__main__":

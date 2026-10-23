@@ -100,7 +100,7 @@ def api_get(path):
         headers={
             "Authorization": "Bearer " + os.environ["GITHUB_TOKEN"],
             "Accept": "application/vnd.github+json",
-            "User-Agent": "smg-vllm-rust-servicer",
+            "User-Agent": "smg-vllm-python-servicer",
         },
     )
     return urllib.request.build_opener(NoRedirect()).open(request, timeout=30)
@@ -134,7 +134,7 @@ def consumer_budget():
     own = [
         j
         for j in consumer_jobs
-        if j["name"] == "vllm-rust-servicer"
+        if j["name"] == "vllm-python-servicer"
         and j["runner_name"] == os.environ["RUNNER_NAME"]
         and j["status"] == "in_progress"
         and j["head_sha"] == os.environ["GITHUB_SHA"]
@@ -158,7 +158,7 @@ def consumer_budget():
 
 
 def load_budget():
-    budget = json.loads(Path(os.environ["SMG_VLLM_RUST_BUDGET_FILE"]).read_text())
+    budget = json.loads(Path(os.environ["SMG_VLLM_PYTHON_BUDGET_FILE"]).read_text())
     require(
         all(
             budget[key] == os.environ[env]
@@ -188,7 +188,7 @@ def main():
     inputs = json.loads(INPUTS.read_text())
     require(
         inputs.get("ready") is True and inputs.get("run_budget_admitted") is True,
-        "Rust diagnostic source and budget not admitted",
+        "Python diagnostic source and budget not admitted",
     )
     budget = load_budget()
     require(

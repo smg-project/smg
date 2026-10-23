@@ -1,15 +1,15 @@
-name: AMD vLLM Rust servicer full chat verification
+name: AMD vLLM Python servicer full chat verification
 on:
   workflow_dispatch:
 permissions:
   contents: read
   actions: read
 concurrency:
-  group: amd-vllm-rust-servicer-current-20261023
+  group: amd-vllm-python-current-20261023
   cancel-in-progress: false
 jobs:
-  vllm-rust-servicer:
-    name: vllm-rust-servicer
+  vllm-python-servicer:
+    name: vllm-python-servicer
     if: vars.SMG_RUN_AMD_LEGS == 'true'
     runs-on: ${{ vars.SMG_RUNNER_AMD_GPU_1 || '1-gpu-mi300x' }}
     timeout-minutes: 60
@@ -28,7 +28,8 @@ jobs:
       E2E_CONNECTION_MODE: ''
       E2E_PARSER: ''
       E2E_SGLANG_SERVICER_IMPL: ''
-      E2E_VLLM_SERVICER_IMPL: rust
+      E2E_VLLM_SERVICER_IMPL: ''
+      SPT_NOENV: '1'
       SMG_VLLM_SERVICER_WARMUP: fast
       BRAVE_MCP_HOST: ''
       HF_HOME: /models
@@ -48,12 +49,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Mark only this job's processes
-        run: echo "E2E_JOB_MARKER=vllm-rust-servicer-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
+        run: echo "E2E_JOB_MARKER=vllm-python-servicer-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${RUNNER_NAME}" >> "$GITHUB_ENV"
       - name: Reuse, install and test within one absolute job budget
         timeout-minutes: 55
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: python3 .github/amd-vllm-rust-servicer/budget.py
+        run: python3 .github/amd-vllm-python/budget.py
       - name: Clean owned processes and record final dependency state
         shell: bash
         if: always() && env.E2E_JOB_MARKER != ''
@@ -70,7 +71,7 @@ jobs:
             fi
             python3 -m pip check > diagnostic-results/pipcheck-after.txt 2>&1 || status=1
             python3 .github/amd-qa/closure_audit.py snapshot diagnostic-results/final.json || status=1
-            python3 .github/amd-vllm-rust-servicer/environment.py final || status=1
+            python3 .github/amd-vllm-python/environment.py final || status=1
           fi
           exit "$status"
       - name: Preserve evidence even on failure
@@ -78,7 +79,7 @@ jobs:
         timeout-minutes: 2
         uses: actions/upload-artifact@v7
         with:
-          name: amd-vllm-rust-servicer-${{ github.run_id }}
+          name: amd-vllm-python-${{ github.run_id }}
           path: |
             diagnostic-results/
             e2e-logs/

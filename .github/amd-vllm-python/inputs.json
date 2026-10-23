@@ -156,16 +156,21 @@
   "producer_source_relabelled": false,
   "consumer_reference_sha": "3f6f0f2b360264e81891140b1d189dc1b4d30133",
   "historical_reference_sha": "e9157e32ef87c74f38c7d0f165b4a35fffd4eb57",
-  "old_prepared_source": "84354e8526a17739ec27c39f29ccedb58fd0b6b5",
   "explicit_consumer_only_paths": [
-    ".github/amd-vllm-rust-servicer/",
+    ".github/amd-vllm-python/",
     ".github/workflows/pr-test-rust.yml"
   ],
   "consumer_setup_core_minutes": 55,
   "cleanup_reserved_minutes": 5,
-  "target_product_commit": "bfa321a3b4d57b1ca89d4f540adec8d6c1a49ac1",
-  "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat-rust-servicer[1]/vllm/nvidia",
+  "target_product_commit": "3f6f0f2b360264e81891140b1d189dc1b4d30133",
+  "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-1gpu-chat[1]/vllm/nvidia",
   "compiled_producer_exclusion": "crates/grpc_client/python contains only build-time Python gencode packaging; current proto/src/build.rs and all Rust crates bind exactly to producer. Python packages are freshly installed and full installed engine suite plus 14 exact cases must pass.",
   "artifact_audit_sha256": "0cbeae5eb885567da4c45b46a875b6f161aaf5074d62451001ceac23d12b6449",
-  "source_audit_sha256": "abf033aa059e7ffd9400f4ba5d07093446976f28cff1efbc6439978401a8caf9"
+  "source_audit_sha256": "abf033aa059e7ffd9400f4ba5d07093446976f28cff1efbc6439978401a8caf9",
+  "generic_source_base": "be2f75eda0e4c0381602c6e208d8758425cec3e3",
+  "gateway_native": {
+    "name": "smg/smg_rs.abi3.so",
+    "bytes": 142586672,
+    "sha256": "24d966051cbb23b9bfb7b3c010437085689c90a01ebfb8f78bcd97429be1bd91"
+  }
 }
