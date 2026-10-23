@@ -1,11 +1,12 @@
 """Unit tests for the harness's address handling: the ``E2E_HOST`` switch, the
-bracket-aware ``host_port`` join and the family-aware port reservation."""
+bracket-aware ``host_port`` join, the family-aware port reservation and the
+range the engines' late-bound ports come from."""
 
 import socket
 
 import pytest
-from infra.constants import ENV_HOST, default_host, host_port
-from infra.process_utils import get_open_port, release_port
+from infra.constants import DEFAULT_HOST, ENV_HOST, default_host, host_port
+from infra.process_utils import get_engine_port, get_open_port, release_port
 
 
 def test_default_host_is_the_ipv4_loopback_unless_e2e_host_says_otherwise(monkeypatch):
@@ -65,6 +66,33 @@ def test_reserved_ports_are_not_handed_out_twice():
     ports = [get_open_port(host="127.0.0.1") for _ in range(5)]
     try:
         assert len(set(ports)) == len(ports)
+    finally:
+        for port in ports:
+            release_port(port)
+
+
+def _ephemeral_range() -> tuple[int, int]:
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            low, high = f.read().split()
+    except (OSError, ValueError):
+        pytest.skip("no readable ip_local_port_range on this host")
+    return int(low), int(high)
+
+
+def test_an_engines_port_lies_below_the_kernels_ephemeral_range():
+    """An engine binds its port after its model load, so the number must be
+    one no other process's ``bind(0)`` can be handed meanwhile: below the
+    range the kernel allots those from. The number is free and distinct."""
+    low, _ = _ephemeral_range()
+    if low <= 20001:
+        pytest.skip(f"no room below the ephemeral range (floor {low}) on this host")
+    ports = [get_engine_port() for _ in range(5)]
+    try:
+        assert len(set(ports)) == len(ports)
+        for port in ports:
+            assert 1024 <= port < low, (port, low)
+            assert _binds(DEFAULT_HOST, port)
     finally:
         for port in ports:
             release_port(port)

@@ -110,6 +110,20 @@ def get_open_port_block(count: int, max_attempts: int = 50) -> int:
     )
 
 
+def get_engine_port() -> int:
+    """Reserve a port an engine binds long after the harness chose it.
+
+    An engine listens last: it loads its model first, so its ports sit chosen
+    and unbound for a minute or more. A number from :func:`get_open_port` is
+    one the kernel's ephemeral range gave out, and every ``bind(0)`` and
+    outgoing connection on the host draws from that range: a stranger's HTTP
+    server sat on a decode worker's port by the time the engine bound it.
+    The engines' ports come from below that range instead, as the MoRI-IO
+    ports do. Release with :func:`release_port`.
+    """
+    return get_open_port_block(1)
+
+
 def port_is_free(port: int, host: str = DEFAULT_HOST) -> bool:
     """Whether ``port`` can still be bound on ``host``.
 

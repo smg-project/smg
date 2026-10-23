@@ -47,6 +47,7 @@ from .process_utils import (
     ProcessExitedError,
     detect_ib_device,
     detect_rdma_fabric_devices,
+    get_engine_port,
     get_open_port,
     get_open_port_block,
     gpu_compute_apps,
@@ -777,7 +778,7 @@ class Worker:
         # advertised at all. ``ts serve`` always enables the control app, so
         # every lane runs the engine as deployed.
         if self.rl_control_port is None:
-            self.rl_control_port = get_open_port()
+            self.rl_control_port = get_engine_port()
         cmd.extend(["--rl-control-port", str(self.rl_control_port)])
         if self.worker_type in (WorkerType.ENCODE, WorkerType.PREFILL, WorkerType.DECODE):
             cmd.extend(["--disaggregation-mode", self.worker_type.value])
@@ -928,7 +929,7 @@ class Worker:
                 # the peer through the worker's moriio_host label.
                 env["VLLM_HOST_IP"] = moriio_host()
             else:
-                self.nixl_port = get_open_port()
+                self.nixl_port = get_engine_port()
                 env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(self.nixl_port)
                 # Single-host NIXL moves KV over CUDA IPC, and UCX caches the
                 # imported handles on the reader. A decode worker then keeps a
@@ -1050,9 +1051,20 @@ class Worker:
             raise
 
     def grpc_serving(self, timeout: float = 5.0) -> bool:
-        """One health answer of a gRPC worker: ``True`` on SERVING (or, from a
-        server without the health service, on a ready channel), ``False`` on
-        anything else, a refused connection and a NOT_SERVING included."""
+        """One health answer of a gRPC worker: ``True`` on SERVING from its
+        ``grpc.health.v1`` service, ``False`` on anything else: a NOT_SERVING,
+        a refused connection, and an answer without the health service.
+
+        Every engine servicer hosts the health service, so UNIMPLEMENTED is
+        not this worker speaking. An engine binds its port only once it has
+        loaded its model, and another process's listener can sit on the
+        number until then: an HTTP/2 server's 404 reads as UNIMPLEMENTED
+        through grpc, and the ready channel behind it is the stranger's, which
+        the nightly PD sweep once certified as a decode worker. The scripted
+        mock worker is the one engine without the service (it answers the
+        engine proto's own HealthCheck, the one the gateway probes); for it
+        alone a ready channel that answers UNIMPLEMENTED counts.
+        """
         try:
             import grpc
             from grpc_health.v1 import health_pb2, health_pb2_grpc
@@ -1069,9 +1081,11 @@ class Worker:
                 response = stub.Check(request, timeout=timeout)
                 return response.status == health_pb2.HealthCheckResponse.SERVING
             except grpc.RpcError as e:
-                # UNIMPLEMENTED means server is up but doesn't have health service;
-                # fall back to channel connectivity check
-                if hasattr(e, "code") and e.code() == grpc.StatusCode.UNIMPLEMENTED:
+                if (
+                    self.engine == "mock"
+                    and hasattr(e, "code")
+                    and e.code() == grpc.StatusCode.UNIMPLEMENTED
+                ):
                     try:
                         grpc.channel_ready_future(channel).result(timeout=timeout)
                         return True
@@ -1195,16 +1209,20 @@ def start_workers(
         for i in range(count):
             gpu_ids = list(range(gpu_offset, gpu_offset + gpus_per_worker))
             gpu_offset += gpus_per_worker
-            port = get_open_port()
+            # The engine binds these once it has loaded its model: numbers the
+            # kernel never hands to another process's bind(0) meanwhile.
+            port = get_engine_port()
             bootstrap_port = (
-                get_open_port() if worker_type in (WorkerType.PREFILL, WorkerType.ENCODE) else None
+                get_engine_port()
+                if worker_type in (WorkerType.PREFILL, WorkerType.ENCODE)
+                else None
             )
             is_ts_disagg = engine == "tokenspeed" and worker_type in (
                 WorkerType.ENCODE,
                 WorkerType.PREFILL,
                 WorkerType.DECODE,
             )
-            dist_init_port = get_open_port() if is_ts_disagg else None
+            dist_init_port = get_engine_port() if is_ts_disagg else None
             dist_init_addr = host_port(DEFAULT_HOST, dist_init_port) if dist_init_port else None
 
             worker = Worker(
