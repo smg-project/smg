@@ -1175,19 +1175,35 @@ pub struct ChatStreamChoiceRef<'a> {
 }
 
 impl<'a> From<ChatStreamChoice> for ChatStreamChoiceRef<'a> {
-    /// The owned choice's text as its own (an owned [`Cow`] each).
+    /// The owned choice's text as its own (an owned [`Cow`] each). The owned
+    /// types are taken apart field by field with no rest pattern, so a field
+    /// added to either of them is a compile error here until the borrowed
+    /// type carries it too.
     fn from(choice: ChatStreamChoice) -> Self {
+        let ChatStreamChoice {
+            index,
+            delta,
+            logprobs,
+            finish_reason,
+            matched_stop,
+        } = choice;
+        let ChatMessageDelta {
+            role,
+            content,
+            tool_calls,
+            reasoning_content,
+        } = delta;
         ChatStreamChoiceRef {
-            index: choice.index,
+            index,
             delta: ChatMessageDeltaRef {
-                role: choice.delta.role.map(Cow::Owned),
-                content: choice.delta.content.map(Cow::Owned),
-                tool_calls: choice.delta.tool_calls,
-                reasoning_content: choice.delta.reasoning_content.map(Cow::Owned),
+                role: role.map(Cow::Owned),
+                content: content.map(Cow::Owned),
+                tool_calls,
+                reasoning_content: reasoning_content.map(Cow::Owned),
             },
-            logprobs: choice.logprobs,
-            finish_reason: choice.finish_reason.map(Cow::Owned),
-            matched_stop: choice.matched_stop,
+            logprobs,
+            finish_reason: finish_reason.map(Cow::Owned),
+            matched_stop,
         }
     }
 }
