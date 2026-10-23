@@ -98,6 +98,14 @@ const KINDS: [&str; 1] = ["render"];
 /// content would be.
 const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 
+/// The reason of the render sets of a Llama-class checkpoint whose
+/// `tokenizer.json` keeps the legacy pipeline: the reference's ids were
+/// recorded from that file read as it is, the engines' tokenizer class
+/// rebuilds the pipeline, and the loader follows the class (see
+/// `huggingface::HuggingFaceTokenizer::llama_class_pipeline`). The tokenizer
+/// crate's fixture harness lists the same sets under the same reason.
+const LEGACY_FILE_PIPELINE: &str = "the render ids of this Llama-class checkpoint were recorded from its raw tokenizer.json read by `tokenizers` (the file's legacy pipeline, the ids transformers 4.x gave by taking the file as is: a word marker after every special token); transformers 5.17.0, the version the engines run, rebuilds the class's pipeline (no normalizer, a Metaspace pre-tokenizer with the prepend scheme `first`) and the loader matches it since smg-project/smg#4248, so the reference has one id more than the engine after each `</s>` while the text is equal; every render case of the model, until the sets are re-recorded with the class (smg-project/bellwether#210), when this entry heals and the run asks for its removal";
+
 /// Cases known to differ from the reference, each with the reason and where
 /// it is tracked: a fixture id, `<slug>/render/<name>`, or a prefix ending in
 /// `*`, which stands for every case whose id begins with what is before it
@@ -1282,6 +1290,7 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
+    ("tinyllama-1.1b-chat-v1.0/render/*", LEGACY_FILE_PIPELINE),
     (
         "tinyllama-1.1b-chat-v1.0/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
