@@ -220,6 +220,12 @@ where
             )
         })?
         .map_err(|e| error::service_unavailable("sglang_encode_connect_failed", e.to_string()))?;
+    tracing::debug!(
+        request_id = %request.request_id,
+        num_encode_items = handoff.num_items_assigned.iter().copied().map(u64::from).sum::<u64>(),
+        encoder_urls = ?handoff.encoder_urls,
+        "EPD encode dispatch issued with prefill/decode"
+    );
     let mut pd_error = None;
     let pd_error_slot = &mut pd_error;
     let result = encode_with_prefill(

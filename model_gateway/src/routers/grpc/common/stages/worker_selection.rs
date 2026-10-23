@@ -2102,10 +2102,8 @@ fn shared_epd_runtime(
         .iter()
         .map(|w| w.metadata().spec.runtime_type)
         .find(|runtime| {
-            // The current EPD multimodal encoder adapter is TokenSpeed-
-            // specific. Do not select a shared SGLang/vLLM runtime only to
-            // reject it later during request building.
-            (!needs_encode || *runtime == RuntimeType::TokenSpeed)
+            // Only runtimes with an encoder adapter may take IMAGE EPD.
+            (!needs_encode || matches!(runtime, RuntimeType::TokenSpeed | RuntimeType::Sglang))
                 && all_decode
                     .iter()
                     .any(|w| w.metadata().spec.runtime_type == *runtime)
@@ -3080,6 +3078,37 @@ mod tests {
                 .is_some_and(|reason| reason.contains("No decode worker")),
             "the refusal names the missing role"
         );
+    }
+
+    #[test]
+    fn epd_sglang_runtime_gate_keeps_tokenspeed_and_rejects_vllm() {
+        for (runtime, expected) in [
+            (RuntimeType::Sglang, Some(RuntimeType::Sglang)),
+            (RuntimeType::TokenSpeed, Some(RuntimeType::TokenSpeed)),
+            (RuntimeType::Vllm, None),
+        ] {
+            let workers = |role| {
+                vec![Arc::new(
+                    BasicWorkerBuilder::new("grpc://localhost:5001")
+                        .runtime_type(runtime)
+                        .worker_type(role)
+                        .connection_mode(ConnectionMode::Grpc)
+                        .health_config(no_health_check())
+                        .build(),
+                ) as Arc<dyn Worker>]
+            };
+            let encode = workers(WorkerType::Encode);
+            let prefill = workers(WorkerType::Prefill);
+            let decode = workers(WorkerType::Decode);
+            assert_eq!(
+                shared_epd_runtime(&encode, &prefill, &decode, true),
+                expected
+            );
+            assert_eq!(
+                shared_epd_runtime(&[], &prefill, &decode, false),
+                Some(runtime)
+            );
+        }
     }
 
     /// A retry context with a retained wire and no extra request constraints.

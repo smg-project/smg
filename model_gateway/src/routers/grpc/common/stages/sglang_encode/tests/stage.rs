@@ -10,23 +10,31 @@ use smg_grpc_client::SglangSchedulerClient;
 
 use super::*;
 use crate::{
+    config::types::PolicyConfig,
+    policies::PolicyRegistry,
     routers::grpc::{
         backend_client::BackendClient,
         client::GrpcClient,
-        common::stages::{encode::EncodeStage, helpers, PipelineStage},
+        common::stages::{
+            encode::EncodeStage,
+            helpers,
+            worker_selection::{WorkerSelectionMode, WorkerSelectionStage},
+            PipelineStage,
+        },
         context::{
-            ClientSelection, EncodeOutputs, RequestContext, SharedComponents, WorkerSelection,
+            ClientSelection, EncodeOutputs, PreparationOutput, RequestContext, SharedComponents,
+            WorkerSelection,
         },
         multimodal::{MediaBatch, PrecomputedMultimodalIntermediate, PromptBinding},
         proto_wrapper::{MultimodalData, ProtoGenerateRequest},
         regular::symphony::template::Templates,
         utils::ParserResolver,
     },
-    worker::{BasicWorkerBuilder, Worker, WorkerRegistry},
+    worker::{BasicWorkerBuilder, ModelCard, Worker, WorkerRegistry},
 };
 
 fn intermediate() -> MultimodalIntermediate {
-    let images = super::media::originals();
+    let images = media::originals();
     let frames = images
         .iter()
         .enumerate()
@@ -75,9 +83,8 @@ fn intermediate() -> MultimodalIntermediate {
             encoder_input_key: None,
         }])
         .unwrap();
-    intermediate.sglang_encoder_media = Some(MediaPlan::new(
-        images.into_iter().map(super::media::image_uri),
-    ));
+    intermediate.sglang_encoder_media =
+        Some(MediaPlan::new(images.into_iter().map(media::image_uri)));
     intermediate
 }
 
@@ -88,10 +95,11 @@ async fn epd_sglang_actual_stage_and_build_keep_inline_media_and_final_id() {
         SglangSchedulerClient::connect(&url).await.unwrap(),
     ));
     let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+    let registry = Arc::new(WorkerRegistry::new());
     let components = Arc::new(SharedComponents {
         templates: Arc::new(Templates::new(tokenizer_registry.clone())),
         tokenizer_registry,
-        worker_registry: Arc::new(WorkerRegistry::new()),
+        worker_registry: registry.clone(),
         tool_parser_factory: Default::default(),
         reasoning_parser_factory: Default::default(),
         parser_resolver: ParserResolver::disabled(),
@@ -103,29 +111,55 @@ async fn epd_sglang_actual_stage_and_build_keep_inline_media_and_final_id() {
     let input = serde_json::from_value(serde_json::json!({"text": "image prompt"})).unwrap();
     let mut ctx =
         RequestContext::for_generate(Arc::new(input), None, "stage-model".into(), components);
-    let role_worker = |role| {
+    let role_worker = |url: &str, role| {
         Arc::new(
-            BasicWorkerBuilder::new(&url)
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new("stage-model"))
                 .worker_type(role)
                 .runtime_type(RuntimeType::Sglang)
                 .connection_mode(ConnectionMode::Grpc)
+                .health_config(openai_protocol::worker::HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
                 .build(),
         ) as Arc<dyn Worker>
     };
-    let a = super::media::encoder("grpc://encoder-a:5001");
-    let b = super::media::encoder("grpc://encoder-b:5002");
-    ctx.state.workers = Some(WorkerSelection::Disaggregated {
-        encode_assignments: Some(
-            [a.clone(), b.clone(), a, b]
-                .into_iter()
-                .enumerate()
-                .map(|(item_index, worker)| EncodeWorkerAssignment { item_index, worker })
-                .collect(),
-        ),
-        prefill: role_worker(WorkerType::Prefill),
-        decode: role_worker(WorkerType::Decode),
-        runtime_type: RuntimeType::Sglang,
+    let first_encoder = role_worker("grpc://encoder-a:5001", WorkerType::Encode);
+    for worker in [
+        first_encoder.clone(),
+        role_worker(&url, WorkerType::Prefill),
+        role_worker("grpc://decode:5002", WorkerType::Decode),
+    ] {
+        registry.register(worker).unwrap();
+    }
+    let selection = WorkerSelectionStage::new(
+        registry.clone(),
+        Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
+        WorkerSelectionMode::EncodePrefillDecode,
+        None,
+    );
+    ctx.state.preparation = Some(PreparationOutput::Generate {
+        original_text: Some("image prompt".into()),
+        token_ids: vec![1, 2, 3, 4],
     });
+    ctx.state.multimodal_intermediate = Some(intermediate());
+    selection.execute(&mut ctx).await.unwrap();
+    let assignments = ctx
+        .state
+        .workers
+        .as_ref()
+        .unwrap()
+        .encode_assignments()
+        .unwrap();
+    assert_eq!(
+        assignments.len(),
+        4,
+        "initial selection read real nonempty media hashes"
+    );
+    assert!(assignments
+        .iter()
+        .all(|a| a.worker.url() == first_encoder.url()));
     ctx.state.clients = Some(ClientSelection::Disaggregated {
         prefill: client.clone(),
         decode: client,
@@ -140,8 +174,11 @@ async fn epd_sglang_actual_stage_and_build_keep_inline_media_and_final_id() {
         .await
         .unwrap()
         .unwrap();
-    let expected = super::media::originals();
-    assert_eq!(data.inline_bytes(), expected.iter().map(String::len).sum());
+    let expected = media::originals();
+    assert_eq!(
+        data.inline_bytes(),
+        expected.iter().map(String::len).sum::<usize>()
+    );
     let MultimodalData::Sglang(data) = data else {
         panic!("wrong backend")
     };
@@ -168,10 +205,44 @@ async fn epd_sglang_actual_stage_and_build_keep_inline_media_and_final_id() {
         .is_none());
     let handoff = request.as_sglang().encode_handoff.as_ref().unwrap();
     assert_eq!(handoff.request_id, "built-final-id");
-    assert_eq!(handoff.num_items_assigned, [2, 2]);
+    assert_eq!(handoff.num_items_assigned, [4]);
     assert!(
         matches!(&ctx.state.encode_outputs, Some(EncodeOutputs::Sglang(_))),
         "retry owns the immutable plan"
+    );
+    // A retry reselects all three SG pools, including a replacement encoder.
+    let mut retry = ctx.into_dispatch().unwrap();
+    first_encoder.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+    let replacement = role_worker("grpc://encoder-b:5001", WorkerType::Encode);
+    registry.register(replacement.clone()).unwrap();
+    selection.reselect(&mut retry).await.unwrap();
+    let assignments = retry
+        .workers
+        .as_ref()
+        .unwrap()
+        .encode_assignments()
+        .unwrap();
+    assert_eq!(assignments.len(), 4);
+    assert!(assignments
+        .iter()
+        .all(|a| a.worker.url() == replacement.url()));
+    assert_eq!(
+        retry
+            .workers
+            .as_ref()
+            .unwrap()
+            .prefill_worker()
+            .unwrap()
+            .metadata()
+            .spec
+            .runtime_type,
+        RuntimeType::Sglang
+    );
+    replacement.set_status(openai_protocol::worker::WorkerStatus::NotReady);
+    assert_eq!(
+        selection.reselect(&mut retry).await.unwrap_err().status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "no silent PD fallback without encoder"
     );
     server.abort();
 }

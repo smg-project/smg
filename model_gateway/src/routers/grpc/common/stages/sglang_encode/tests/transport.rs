@@ -14,8 +14,25 @@ use super::{
     *,
 };
 
+struct DispatchMarkers(Arc<AtomicUsize>);
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for DispatchMarkers {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Message<'a>(&'a AtomicUsize);
+        impl tracing::field::Visit for Message<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message"
+                    && format!("{value:?}").contains("EPD encode dispatch issued")
+                {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                }
+            }
+        }
+        event.record(&mut Message(&self.0));
+    }
+}
+
 fn request(peer: &Peer, id: &str) -> sglang_proto::GenerateRequest {
-    let images = super::media::originals();
+    let images = media::originals();
     sglang_proto::GenerateRequest {
         request_id: id.into(),
         mm_inputs: Some(sglang_proto::MultimodalInputs {
@@ -40,6 +57,10 @@ impl Drop for Dropped {
 
 #[tokio::test]
 async fn epd_sglang_real_encode_rpc_and_original_pd_response() {
+    let markers = Arc::new(AtomicUsize::new(0));
+    let _subscriber = crate::observability::logging::test_support::test_subscriber(
+        DispatchMarkers(markers.clone()),
+    );
     let peer = Peer::new().await;
     let peer_ref = &peer;
     for id in ["attempt-1", "attempt-2"] {
@@ -53,9 +74,14 @@ async fn epd_sglang_real_encode_rpc_and_original_pd_response() {
         .await
         .unwrap();
     }
+    assert_eq!(
+        markers.load(Ordering::SeqCst),
+        2,
+        "fresh dispatch marker per real attempt"
+    );
     let requests = peer.state.requests.lock().unwrap().clone();
     assert_eq!(requests.len(), 2);
-    assert_eq!(requests[0].mm_items, super::media::originals());
+    assert_eq!(requests[0].mm_items, media::originals());
     assert_eq!(requests[1].req_id, "attempt-2");
     assert_eq!((requests[0].num_parts, requests[0].part_idx), (1, 0));
     let error = dispatch(
