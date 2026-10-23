@@ -18,7 +18,7 @@ use crate::{
         },
         error::extract_error_code_from_response,
         grpc::common::stages::SELECTION_QUEUE_TIMEOUT_ERROR_CODE,
-        PD_PREFILL_QUEUE_FULL,
+        PD_PREFILL_QUEUE_FULL, PD_PREFILL_QUEUE_TIMEOUT,
     },
 };
 
@@ -125,14 +125,17 @@ pub(crate) fn mark_error_reason(response: &mut Response, reason: &'static str) {
 /// ([`ErrorReason`], set by `TonicStatusExt::to_http_error`). Else the
 /// gateway's own code names the refusal: a pool with no available worker (the
 /// placement's verdict, the HTTP routers' and the prefill side's own words
-/// for it), the overload shed and the prefill admission queue, the selection
-/// queue's bound, a model nobody serves, the tenant limit, a constraint the
-/// engine could not continue under, a pool with no capable worker, an
-/// upstream call that timed out or could not connect, a worker's answer that
-/// could not be read. A response with no gateway code is a worker's answer
-/// relayed as it came, classed by its status; one with another gateway code
-/// is the gateway's own: its 4xx is the request's fault, its 504 a deadline
-/// (the silence verdicts), any other 5xx its own processing.
+/// for it), the overload shed and a prefill admission queue that is full,
+/// the bound of the selection queue or of the prefill admission queue, a
+/// model nobody serves, the tenant limit, a constraint the engine could not
+/// continue under, a pool with no capable worker, an upstream call that
+/// timed out or whose connection failed before or under the call, a worker's
+/// answer that could not be read or decoded. A response with no gateway code
+/// is a worker's answer relayed as it came, classed by its status; one with
+/// another gateway code is the gateway's own: its 429 is a shed of its own
+/// (a budget or a cap the gateway holds), its other 4xx the request's fault,
+/// its 504 a deadline (the silence verdicts), any other 5xx its own
+/// processing.
 pub(crate) fn error_reason_for_response(response: &Response) -> &'static str {
     use metrics_labels::*;
     if let Some(ErrorReason(reason)) = response.extensions().get::<ErrorReason>() {
@@ -146,21 +149,32 @@ pub(crate) fn error_reason_for_response(response: &Response) -> &'static str {
             REASON_NO_AVAILABLE_WORKERS
         }
         WORKER_OVERLOAD_PROTECTION_SHED_ERROR_CODE | PD_PREFILL_QUEUE_FULL => REASON_OVERLOAD_SHED,
-        SELECTION_QUEUE_TIMEOUT_ERROR_CODE => REASON_SELECTION_QUEUE_TIMEOUT,
+        // A wait past an admission bound inside the gateway: the selection
+        // queue's or the prefill admission queue's.
+        SELECTION_QUEUE_TIMEOUT_ERROR_CODE | PD_PREFILL_QUEUE_TIMEOUT => {
+            REASON_SELECTION_QUEUE_TIMEOUT
+        }
         MODEL_NOT_FOUND_CODE => REASON_MODEL_NOT_FOUND,
         RATE_LIMIT_ERROR_CODE => REASON_RATE_LIMITED,
         CONSTRAINT_FAILED_CODE => REASON_CONSTRAINT_FAILED,
         // The disaggregated routers' pair verdict (`no_compatible_pd_pair`).
         NO_MEDIA_REF_CAPABLE_WORKER_CODE | "no_compatible_pd_pair" => REASON_NO_CAPABLE_WORKER,
         REQUEST_TIMEOUT_CODE => REASON_DEADLINE,
-        // The HTTP router's codes for a call that never reached the worker.
-        "call_upstream_connection_failed" => REASON_TRANSPORT_DISCONNECT,
-        // The decisions route's code for an answer it could not read.
-        "invalid_decisions_response" => REASON_BAD_RESPONSE,
+        // The HTTP router's codes for a worker connection that failed before
+        // the call (a connect fault), under it (a reset or a close before the
+        // head, filed by the client as a request fault) or under the body.
+        "call_upstream_connection_failed"
+        | "call_upstream_request_error"
+        | "call_upstream_body_error" => REASON_TRANSPORT_DISCONNECT,
+        // The decisions route's code for an answer it could not read, the
+        // HTTP router's for one it could not decode.
+        "invalid_decisions_response" | "call_upstream_decode_error" => REASON_BAD_RESPONSE,
         "" => error_reason_from_status(status),
+        // Another code of the gateway's own: a 429 under it is a shed of the
+        // gateway's (a budget or a cap it holds), never a worker's pushback.
         _ => match status.as_u16() {
             408 | 504 => REASON_DEADLINE,
-            429 => REASON_OVERLOADED,
+            429 => REASON_OVERLOAD_SHED,
             400..=499 => REASON_INVALID_REQUEST,
             _ => REASON_INTERNAL,
         },
@@ -277,7 +291,7 @@ mod tests {
             common::{overload, placement},
             error,
             grpc::utils::tonic_ext::TonicStatusExt,
-            prefill_queue_full,
+            prefill_queue_full, prefill_queue_timeout,
         };
 
         // A worker's status, whatever code the answer is minted under.
@@ -338,6 +352,18 @@ mod tests {
                 error::service_unavailable(SELECTION_QUEUE_TIMEOUT_ERROR_CODE, "waited too long"),
                 REASON_SELECTION_QUEUE_TIMEOUT,
             ),
+            // The prefill admission queue's own bound is a wait of the
+            // gateway's, not a worker's pushback (its 429 alone would say so).
+            (prefill_queue_timeout(), REASON_SELECTION_QUEUE_TIMEOUT),
+            // The gateway's other 429s are sheds of its own budgets and caps.
+            (
+                error::too_many_requests("multimodal_inflight_budget", "busy"),
+                REASON_OVERLOAD_SHED,
+            ),
+            (
+                crate::routers::grpc::common::responses::background::limit_reached(4),
+                REASON_OVERLOAD_SHED,
+            ),
             (error::model_not_found("m"), REASON_MODEL_NOT_FOUND),
             (
                 crate::rate_limit::rejection_response(3),
@@ -359,9 +385,29 @@ mod tests {
                 error::internal_error("call_upstream_connection_failed", "refused"),
                 REASON_TRANSPORT_DISCONNECT,
             ),
+            // The client files a reset or a close before the head as a
+            // request fault, and a body cut short as a body fault: both are
+            // the worker's connection failing under the call.
+            (
+                error::internal_error("call_upstream_request_error", "reset"),
+                REASON_TRANSPORT_DISCONNECT,
+            ),
+            (
+                error::internal_error("call_upstream_body_error", "cut"),
+                REASON_TRANSPORT_DISCONNECT,
+            ),
             (
                 error::bad_gateway("invalid_decisions_response", "unreadable"),
                 REASON_BAD_RESPONSE,
+            ),
+            (
+                error::internal_error("call_upstream_decode_error", "garbled"),
+                REASON_BAD_RESPONSE,
+            ),
+            // The client's own fault building the request stays the gateway's.
+            (
+                error::internal_error("call_upstream_builder_error", "bad url"),
+                REASON_INTERNAL,
             ),
             // The gateway's other codes: by the status's side of the fault.
             (
