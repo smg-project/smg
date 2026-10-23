@@ -42,7 +42,12 @@ def prepare(manifest, root, downloader):
     require(result["config_sha256"] == manifest["config_sha256"], "pinned ASR config differs")
     expected = {f["name"] for f in files if f["name"].endswith(".safetensors")}
     require({f["filename"] for f in result["weight_files"]} == expected, "incomplete ASR shards")
-    return {**result, "prepared_missing_files": [f["name"] for f in missing]}
+    return {
+        **result,
+        "prepared_missing_files": [f["name"] for f in missing],
+        "snapshot_download_invoked": bool(missing),
+        "no_model_download": not bool(missing),
+    }
 
 
 def revision_source(raw):

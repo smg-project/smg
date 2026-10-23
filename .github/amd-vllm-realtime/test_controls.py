@@ -142,7 +142,11 @@ def test_complete_pinned_snapshot_and_missing_shard(tmp_path):
 
     result = preflight.prepare(manifest, tmp_path, download)
     assert result["snapshot"] == revision and len(calls) == 1
-    preflight.prepare(manifest, tmp_path, lambda **_: pytest.fail("complete cache downloaded"))
+    assert result["snapshot_download_invoked"] and not result["no_model_download"]
+    cached = preflight.prepare(
+        manifest, tmp_path, lambda **_: pytest.fail("complete cache downloaded")
+    )
+    assert cached["no_model_download"] and not cached["snapshot_download_invoked"]
     (snapshot / "model.safetensors").unlink()
     with pytest.raises(ValueError, match="runtime file size"):
         preflight.prepare(manifest, tmp_path, lambda **_: str(snapshot))
