@@ -27,7 +27,7 @@
 //! defers the subscription to the first `SubscribeKvEvents` for a
 //! memory-constrained host). The servicer starts minutes before the engine
 //! binds its publisher, so the relay knocks on the endpoint's port every
-//! second ([`DIAL_INTERVAL`], a plain connect) until it is bound, then joins
+//! second (`DIAL_INTERVAL`, a plain connect) until it is bound, then joins
 //! over ZMQ, and the subscription lands within a second of the bind, before
 //! the engine's handshake; the lifecycle owner
 //! reads [`KvEventRelay::subscribed`] and holds its planned warm-up until
@@ -804,7 +804,7 @@ impl KvEventRelay {
     }
 
     /// Whether every rank's subscription has reached its publisher, or there
-    /// is nothing to wait for: a relay not started ([`RELAY_START_ENV`] is
+    /// is nothing to wait for: a relay not started (`RELAY_START_ENV` is
     /// `lazy`) or one that gave up. The lifecycle owner holds its planned
     /// warm-up until this says so, so the warm-up's batches start the
     /// history instead of being published to nobody.
@@ -823,7 +823,7 @@ impl KvEventRelay {
     }
 
     /// Subscribe to every rank's publisher if not yet subscribed. Called at
-    /// the servicer's start ([`Self::start_at_boot`]) and by
+    /// the servicer's start (`Self::start_at_boot`) and by
     /// [`Self::subscribe`]; needs a Tokio runtime.
     pub fn start(&self) {
         let mut tasks = self.tasks.lock().unwrap_or_else(PoisonError::into_inner);

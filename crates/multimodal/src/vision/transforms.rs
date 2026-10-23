@@ -1030,9 +1030,9 @@ fn resize_pil_bytes(
 /// back to bytes) with one difference from Pillow's own current code: the
 /// normalized kernel is quantized to 16-bit taps at the finest scale that
 /// keeps the largest weight below 2^15, not at a fixed 22 bits
-/// ([`KernelQuantization::TorchUint8`]). The two differ by up to two levels on
+/// (`KernelQuantization::TorchUint8`). The two differ by up to two levels on
 /// a fraction of the pixels, which an engine fed by such a processor sees.
-/// The passes run in [`super::torch_resample`]: 16-bit taps, 32-bit sums, on
+/// The passes run in `super::torch_resample`: 16-bit taps, 32-bit sums, on
 /// the vector unit where there is one.
 pub fn resize_bicubic_torch_aa_rgb(
     data: &[u8],
