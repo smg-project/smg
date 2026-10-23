@@ -2715,6 +2715,10 @@ impl CacheAwarePolicy {
             "event_spill"
         };
         Metrics::record_worker_cache_aware_policy_branch(branch);
+        // The predicted overlap of every event-driven decision, so the
+        // histogram reads the production ratio and not the tree path's
+        // alone (`request_blocks` is at least one).
+        Metrics::record_cache_aware_match_ratio(overlap_blocks as f64 / request_blocks);
         debug!(
             worker = workers[idx].url(),
             branch,

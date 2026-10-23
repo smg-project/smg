@@ -106,6 +106,8 @@ mod handles {
         pub(super) input_tokens: OnceCell<Counter>,
         /// `smg_router_tokens_total{token_type="output"}`.
         pub(super) output_tokens: OnceCell<Counter>,
+        /// `smg_router_tokens_total{token_type="cached"}`.
+        pub(super) cached_tokens: OnceCell<Counter>,
     }
 
     /// Every registration or removal of a worker moves this on, and a
@@ -545,7 +547,7 @@ pub(crate) fn init_metrics() {
     );
     describe_counter!(
         "smg_router_tokens_total",
-        "Total tokens processed by router_type, backend_type, model, endpoint, token_type (gRPC only)"
+        "Total tokens processed by router_type, backend_type, model, endpoint, token_type (gRPC only); token_type is input, output, or cached (the prompt tokens the engine reports it served from its cache, a share of input counted again, so cached / input is the cache hit share the router's overlap prediction is judged by)"
     );
     describe_histogram!(
         "smg_router_generation_duration_seconds",
@@ -1435,6 +1437,9 @@ pub struct StreamingMetricsParams<'a> {
     pub generation_duration: Duration,
     /// Input token count (None for endpoints that don't track this)
     pub input_tokens: Option<u64>,
+    /// Prompt tokens the engine reported it served from its cache (None for
+    /// endpoints that don't track this)
+    pub cached_tokens: Option<u64>,
     /// Output token count
     pub output_tokens: u64,
 }
@@ -1842,6 +1847,7 @@ impl Metrics {
             ttft,
             generation_duration,
             input_tokens,
+            cached_tokens,
             output_tokens,
         } = params;
 
@@ -1901,6 +1907,16 @@ impl Metrics {
                 "token_type" => metrics_labels::TOKEN_OUTPUT
             )
         };
+        let cached_counter = || {
+            counter!(
+                "smg_router_tokens_total",
+                "router_type" => router_type,
+                "backend_type" => backend_type,
+                "model" => model(),
+                "endpoint" => endpoint,
+                "token_type" => metrics_labels::TOKEN_CACHED
+            )
+        };
 
         if !handles::keep_handles() {
             if let Some(ttft) = ttft {
@@ -1912,6 +1928,9 @@ impl Metrics {
             generation_histogram().record(generation_duration.as_secs_f64());
             if let Some(input) = input_tokens {
                 input_counter().increment(input);
+            }
+            if let Some(cached) = cached_tokens {
+                cached_counter().increment(cached);
             }
             output_counter().increment(output_tokens);
             return;
@@ -1945,6 +1964,11 @@ impl Metrics {
                         kept.input_tokens
                             .get_or_init(input_counter)
                             .increment(input);
+                    }
+                    if let Some(cached) = cached_tokens {
+                        kept.cached_tokens
+                            .get_or_init(cached_counter)
+                            .increment(cached);
                     }
                     kept.output_tokens
                         .get_or_init(output_counter)

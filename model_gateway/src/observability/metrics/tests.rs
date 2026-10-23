@@ -925,6 +925,7 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
                 ttft,
                 generation_duration: Duration::from_millis(50),
                 input_tokens,
+                cached_tokens: input_tokens.map(|input| input / 10),
                 output_tokens,
             });
         }
@@ -936,6 +937,7 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
             ttft: None,
             generation_duration: Duration::from_millis(20),
             input_tokens: None,
+            cached_tokens: None,
             output_tokens: 1,
         });
     };
@@ -953,6 +955,7 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
     for expected in [
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\",token_type=\"output\"} 7",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\",token_type=\"input\"} 107",
+        "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\",token_type=\"cached\"} 10",
         "smg_router_tokens_total{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\",endpoint=\"generate\",token_type=\"output\"} 1",
         "smg_router_ttft_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 2",
         "smg_router_tpot_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m1\",endpoint=\"chat\"} 1",
@@ -968,6 +971,7 @@ fn the_stream_timing_set_renders_the_same_through_kept_handles() {
         "smg_router_ttft_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
         "smg_router_tpot_seconds_count{router_type=\"grpc\",backend_type=\"regular\",model=\"m2\"",
         "model=\"m2\",endpoint=\"generate\",token_type=\"input\"",
+        "model=\"m2\",endpoint=\"generate\",token_type=\"cached\"",
     ] {
         assert!(!kept.contains(absent), "unexpected {absent} in:\n{kept}");
     }
@@ -1166,6 +1170,7 @@ fn time_per_router_record() {
             ttft: Some(Duration::from_millis(50)),
             generation_duration: Duration::from_secs(1),
             input_tokens: Some(128),
+            cached_tokens: Some(64),
             output_tokens: 128,
         });
         duration();
