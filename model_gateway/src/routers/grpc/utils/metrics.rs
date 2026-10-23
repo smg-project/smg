@@ -290,7 +290,7 @@ mod tests {
         use crate::routers::{
             common::{overload, placement},
             error,
-            grpc::utils::tonic_ext::TonicStatusExt,
+            grpc::{common::responses::background, utils::tonic_ext::TonicStatusExt},
             prefill_queue_full, prefill_queue_timeout,
         };
 
@@ -360,10 +360,7 @@ mod tests {
                 error::too_many_requests("multimodal_inflight_budget", "busy"),
                 REASON_OVERLOAD_SHED,
             ),
-            (
-                crate::routers::grpc::common::responses::background::limit_reached(4),
-                REASON_OVERLOAD_SHED,
-            ),
+            (background::limit_reached(4), REASON_OVERLOAD_SHED),
             (error::model_not_found("m"), REASON_MODEL_NOT_FOUND),
             (
                 crate::rate_limit::rejection_response(3),

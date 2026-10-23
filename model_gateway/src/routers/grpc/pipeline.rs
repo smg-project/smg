@@ -4743,7 +4743,7 @@ mod request_release_tests {
                 failed(Status::cancelled("stream reset")),
                 failed(Status::cancelled("connection closed")),
                 error::service_unavailable(
-                    crate::routers::common::placement::NO_AVAILABLE_WORKERS_CODE,
+                    placement::NO_AVAILABLE_WORKERS_CODE,
                     "every worker is down",
                 ),
             ] {
