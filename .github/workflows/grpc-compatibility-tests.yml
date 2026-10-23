@@ -5,9 +5,7 @@ on:
     paths:
       - crates/grpc_client/proto/**
       - crates/grpc_client/python/**
-      - grpc_servicer/pyproject.toml
-      - grpc_servicer/scripts/gen_proto_stubs.py
-      - grpc_servicer/smg_grpc_servicer/health_frame.py
+      - grpc_servicer/**
       - scripts/check_grpc_compatibility.py
       - scripts/ci_install_e2e_deps.sh
       - scripts/ci_setup_vllm_rocm_image.sh
