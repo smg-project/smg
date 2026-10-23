@@ -1264,6 +1264,12 @@ const ROUTING_STATE_SERIES: [(&str, &str); 9] = [
 /// one): the one series a read of the breaker can end, when the breaker's
 /// timeout moves it from open to half-open.
 const CIRCUIT_OPEN_CODE: u8 = 9;
+const _: () = assert!(matches!(
+    ROUTING_STATE_SERIES[CIRCUIT_OPEN_CODE as usize - 1]
+        .1
+        .as_bytes(),
+    b"circuit_open"
+));
 
 /// The index in [`ROUTING_STATE_SERIES`] of a worker with these facts: the
 /// first that excludes it, else available.
@@ -1473,8 +1479,12 @@ impl BasicWorker {
 
     /// [`Worker::publish_state`] under the runtime guard the caller holds:
     /// the pair the facts give now is set to 1 and the pair published before
-    /// it to 0, when they differ.
+    /// it to 0, when they differ. One publish at a time, from the facts to
+    /// the last write: every fact is stored before its publish is called, so
+    /// the last publish in lock order reads every fact that moved, and the
+    /// series end on the pair the facts give.
     fn publish_state_under(&self, rt: &WorkerRuntime) {
+        let _publish = rt.publish_lock();
         let index = routing_state_series(
             rt.status(),
             rt.is_overloaded(),
@@ -1482,9 +1492,6 @@ impl BasicWorker {
             self.circuit_breaker.load().state() == super::circuit_breaker::CircuitState::Open,
         );
         let code = index as u8 + 1;
-        if rt.published_state() == code {
-            return;
-        }
         let previous = rt.swap_published_state(code);
         if previous == code {
             return;
@@ -2009,8 +2016,15 @@ impl Worker for BasicWorker {
     }
 
     fn record_circuit_breaker_outcome(&self, success: bool) {
-        self.circuit_breaker.load().record_outcome(success);
-        self.publish_state();
+        let breaker = self.circuit_breaker.load();
+        let before = breaker.state();
+        breaker.record_outcome(success);
+        // A trip or a close moved the routing state; a record that left the
+        // breaker where it was publishes nothing, so the steady path takes
+        // no lock.
+        if breaker.state() != before {
+            self.publish_state();
+        }
     }
 
     fn publish_state(&self) {
@@ -3759,6 +3773,10 @@ mod tests {
             assert_eq!(current_state(&handle.render()), "excluded/not_ready");
             worker.set_status(WorkerStatus::Draining);
             assert_eq!(current_state(&handle.render()), "excluded/draining");
+            worker.set_status(WorkerStatus::Pending);
+            assert_eq!(current_state(&handle.render()), "excluded/pending");
+            worker.set_status(WorkerStatus::Failed);
+            assert_eq!(current_state(&handle.render()), "excluded/failed");
             worker.set_status(WorkerStatus::Ready);
             assert_eq!(current_state(&handle.render()), "available/none");
 
@@ -3787,8 +3805,12 @@ mod tests {
             assert_eq!(current_state(&handle.render()), "available/none");
             worker.record_circuit_breaker_outcome(true);
             assert_eq!(current_state(&handle.render()), "available/none");
-            // Every series the worker was on is still there, at 0.
-            assert_eq!(state_series(&handle.render()).len(), 7);
+            // Every series the worker was on is still there, at 0: one per
+            // reason of the table.
+            assert_eq!(
+                state_series(&handle.render()).len(),
+                ROUTING_STATE_SERIES.len()
+            );
         });
     }
 
