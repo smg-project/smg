@@ -83,7 +83,9 @@ def transition(record, released):
         if previous["ref_count"] == previous["held_references"]:
             exclusive.append(previous["block_id"])
     require(
-        bool(exclusive) and record["exclusive_pages_reusable"] == exclusive,
+        bool(exclusive)
+        and all(type(block_id) is int for block_id in record["exclusive_pages_reusable"])
+        and record["exclusive_pages_reusable"] == exclusive,
         "no strictly reusable exclusive page",
     )
 

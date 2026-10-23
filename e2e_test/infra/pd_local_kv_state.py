@@ -41,7 +41,7 @@ def free_members(pool):
             current.pool is pool
             and block_id < limit
             and pool.blocks[block_id] is current
-            and current.ref_cnt == 0
+            and nonnegative_int(current.ref_cnt) == 0
             and current.is_null is False,
             "free queue has foreign or occupied pages",
         )
