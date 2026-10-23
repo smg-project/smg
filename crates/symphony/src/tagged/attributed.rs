@@ -397,13 +397,14 @@ impl Assembler {
 
     /// The invoke's end: `terminal` is the closing tag the engine read (its bytes go into
     /// `ToolCallEnd`), or nothing when the block ended another way. After the last parameter the
-    /// object is closed and the call ends; inside a value held for its close what was held comes
-    /// back as `Malformed` and the object closes without that member; inside a value whose member
-    /// was already written at its section's close nothing is reported, and the object closes after
-    /// that member with the whitespace carried since the section as the close's source; inside a
-    /// streamed string the string is closed first ([`Self::close_open_string`]), since the model
-    /// ended the call and its bytes are the value whole, under one `Malformed { OpenAtTheMarker }`
-    /// event of no bytes; an invoke that never named a function has its bytes reported.
+    /// object is closed and the call ends; inside a value held for its close what was held is
+    /// refused (the counted event of no bytes, the bytes as `Dropped { MalformedCall }`) and the
+    /// object closes without that member; inside a value whose member was already written at its
+    /// section's close nothing is reported, and the object closes after that member with the
+    /// whitespace carried since the section as the close's source; inside a streamed string the
+    /// string is closed first ([`Self::close_open_string`]), since the model ended the call and
+    /// its bytes are the value whole, under one `Malformed { OpenAtTheMarker }` event of no bytes;
+    /// an invoke that never named a function is refused whole, the terminal included.
     pub fn close(mut self, terminal: &str, out: &mut Events) {
         if self.done {
             return;
@@ -589,8 +590,8 @@ impl Assembler {
     /// The stream's stop inside the invoke: the model's own end of output, not a cut. The call
     /// ends as its closing tag would end it, with no bytes for the end ([`Self::close`]): after
     /// the last parameter the object is closed, a name, a tag or a value held for its close that
-    /// the stop found open is reported and the object closes without that member, an invoke that
-    /// never named a function has its bytes reported. A streamed string still open is closed
+    /// the stop found open is refused and the object closes without that member, an invoke that
+    /// never named a function is refused whole. A streamed string still open is closed
     /// first ([`Self::close_open_string`]), under the stop's word. One `Malformed { OpenAtTheStop }`
     /// event of no bytes stands before the fragment that closes what was open
     /// ([`open_at_the_stop`](super::open_at_the_stop)): for a string the stop closed under any
@@ -894,8 +895,8 @@ impl Assembler {
 
     /// The parameter tag is whole: the value begins, typed by what the tool declares for the key,
     /// or by the tag's `string` attribute. A tag with any other tail after the name's quote
-    /// (`<parameter name="x" type="int">`) is not one the syntax has: the whole tag comes back as
-    /// `Malformed`, and no parameter opens.
+    /// (`<parameter name="x" type="int">`) is not one the syntax has: the whole tag is refused,
+    /// and no parameter opens.
     fn open_value(&mut self, key: String, tail: &str, declared: &Declared, out: &mut Events) {
         let (kind, mode) = match (self.tags.typing, tail) {
             (Typing::Declared, "") => {

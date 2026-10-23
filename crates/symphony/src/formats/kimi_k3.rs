@@ -443,7 +443,7 @@ mod tests {
             "<|open|>argument key=\"x\" type=\"number\"<|sep|>1"
         );
         // The model's own end of output there ends the call as its closing tag would: the value
-        // held for its close is reported, the object closes without it, and one word says the
+        // held for its close is refused, the object closes without it, and one word says the
         // stop closed the call.
         let stopped = run(PROMPT, &[output]);
         assert_eq!(arguments_of(&stopped, 0), "{}");
@@ -533,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn a_call_that_named_nothing_is_reported_however_it_ended() {
+    fn a_call_that_named_nothing_is_refused_whole_however_it_ended() {
         for (output, ending) in [
             (
                 concat!(
@@ -723,7 +723,7 @@ mod tests {
                 Event::Dropped { text, why: DropReason::MalformedCall }
                     if text.text == "<|open|>argument key=\"n\" type=\"number\"<|sep|>1.5"
             )),
-            "the held number is reported: {stopped:?}"
+            "the held number is refused, never content: {stopped:?}"
         );
         assert!(stopped.iter().any(|event| matches!(
             event,

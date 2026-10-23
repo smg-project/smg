@@ -466,10 +466,11 @@ mod tests {
     }
 
     #[test]
-    fn an_invoke_that_named_nothing_is_reported_however_it_ended() {
+    fn an_invoke_that_named_nothing_is_refused_whole_however_it_ended() {
         // The invoke tag cut short before its name, ended by the block's close, by the next
-        // invoke's opening, or by its own closing tag: each ending's bytes come back as
-        // `Malformed`, and no call is counted for it.
+        // invoke's opening, or by its own closing tag: each ending's bytes are refused (counted
+        // by an event of no bytes, dropped as the model's failed call, never content), and no
+        // call is counted for it.
         for (output, ending) in [
             (
                 "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"</｜DSML｜ calls>",

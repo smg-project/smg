@@ -302,7 +302,8 @@ What the syntax says, and what the assembler does with it:
   written whole at `</parameter>` through `json`, which reads the JSON the template writes
   for a number, a boolean, a list, an object or null (`tojson`), and infers the rest. A
   parameter tag with anything between the name's closing quote and `>` is no parameter tag the
-  syntax has: the whole tag comes back as `Malformed`, and no parameter opens.
+  syntax has: the whole tag is refused (a `Malformed` event of no bytes, the bytes as `Dropped {
+  MalformedCall }`), and no parameter opens.
 - **Or the tag's `string` attribute types the value** (`Typing::StringAttribute`, DSML):
   `string="true"` is the text, streamed like a declared string; `string="false"` is JSON the
   model wrote, written whole at the close through `json`'s inference. The request's tools are
@@ -332,7 +333,7 @@ What the syntax says, and what the assembler does with it:
   value is dropped when it is a newline, and a trailing newline is held until the closing tag
   says it was the framing, or more text says it was the value's.
 - **The newlines between the tags are the template's** and go into the next event's source;
-  text where the syntax has tags is reported.
+  text where the syntax has tags is refused (counted, never content).
 - **Two endings**, as DSML's: `Assembler::close` is the invoke's closing tag, or the block's
   end before it, and inside a streamed string closes the string first, as the keyed assembler's
   does (`tagged::left_open`), except that a held tail beginning with one of the family's
