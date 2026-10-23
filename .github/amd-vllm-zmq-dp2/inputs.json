@@ -1,17 +1,82 @@
 {
   "ready": false,
   "run_budget_admitted": false,
-  "run_id": null,
-  "run_attempt": null,
-  "producer_sha": null,
-  "build_job_id": null,
+  "run_id": 40023385348,
+  "run_attempt": 1,
+  "producer_sha": "0474fbdeb4274d57be30351a718934e073f9bc46",
+  "build_job_id": 120653452303,
   "producer_branch": "main",
   "producer_policy": "successful_build_job_with_consumer_revalidation",
   "producer_run_conclusion_snapshot": null,
-  "producer_job_conclusion_snapshot": null,
+  "producer_job_conclusion_snapshot": "success",
   "separate_producer_CPU_or_provenance_archive": false,
-  "artifacts_pinned": false,
-  "artifacts": [],
+  "artifacts_pinned": true,
+  "artifacts": [
+    {
+      "id": 12533155532,
+      "name": "python-client-types",
+      "bytes": 34373,
+      "sha256": "fbf8c1b4fc65359b56da038c766278bcc6eb09d0c7494da542b8dda1252094ea",
+      "expires_at": "2026-10-24T21:19:21Z",
+      "files": {
+        "_generated.py": {
+          "bytes": 187180,
+          "sha256": "923116b9c80eba45c8f8d11393f404aa71b9928981665e1697d7f4989330837d"
+        }
+      },
+      "destination": "clients/python/smg_client/types"
+    },
+    {
+      "id": 12532577062,
+      "name": "wasm-test-fixtures",
+      "bytes": 56596,
+      "sha256": "1fdc4ab1ac8f43afeede3ea54c8a098f24924b25ee35285b6d1bae6b72062b8b",
+      "expires_at": "2026-10-24T21:19:24Z",
+      "files": {
+        "storage_hook_guest.wasm": {
+          "bytes": 80680,
+          "sha256": "7e3a093e09bfe30244d128c1aaaf8558a1b13c05558cc81cff04021947445e11"
+        },
+        "storage_hook_passthrough.wasm": {
+          "bytes": 79153,
+          "sha256": "3a10ce115ea179026a00f3e85ce6b6a388bcc1f274bc7abfc074be876d7c3e55"
+        }
+      },
+      "destination": "crates/wasm/tests/fixtures"
+    },
+    {
+      "id": 12532242848,
+      "name": "go-ffi-library",
+      "bytes": 13837530,
+      "sha256": "22428ab0b1c471fa0918617cd08502bf36b8c05db8a0840c16a86d4125cbe685",
+      "expires_at": "2026-10-24T21:19:06Z",
+      "files": {
+        "libsmg_go.d": {
+          "bytes": 65384,
+          "sha256": "9b067061ff5329fb88215636725e2a76dd11c1582c084cceb73d653556dd5eab"
+        },
+        "libsmg_go.so": {
+          "bytes": 35009288,
+          "sha256": "1767f7f81d4669713af552f1c1119a49ecbdd7e3a707d10d26de750d50f79fc9"
+        }
+      },
+      "destination": "bindings/golang/target/release"
+    },
+    {
+      "id": 12531524418,
+      "name": "smg-wheel",
+      "bytes": 52413226,
+      "sha256": "4655010577f1f403e8dc7f50f43dbfc34b1722c28626fa17031a7ae953162486",
+      "expires_at": "2026-10-24T21:18:52Z",
+      "files": {
+        "smg-1.13.0-cp38-abi3-manylinux_2_28_x86_64.whl": {
+          "bytes": 52554652,
+          "sha256": "48acb2baec6d141945f8ff31fdf819d47b865b4ee4ab06a3d97f49c8e6af8b77"
+        }
+      },
+      "destination": "wheel"
+    }
+  ],
   "source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
     "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
@@ -20,8 +85,8 @@
     "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
     "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
     "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
-    "crates": "80cb40912a137aebd936511c2b6a2f0949485294",
-    "model_gateway": "7f33a6a15d4fc3e4b143cc512aac4bc581ca400b",
+    "crates": "3aa660c2404fc11f58a096bc731eca87394afc82",
+    "model_gateway": "6594f94a79af95d308b8513cd13a076ed1f6ecc8",
     "grpc_servicer": "a10bb7235d74ac91d8de4b3eafabd1ef7ed1344e",
     "e2e_test": "0c1b778ffa433470e51be16334015adf82e01ba9",
     "scripts": "d2332134f3fe28c3cbb0069838cb6e2a52c0b250",
@@ -41,11 +106,11 @@
     "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
     "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
     "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
-    "model_gateway": "7f33a6a15d4fc3e4b143cc512aac4bc581ca400b",
+    "model_gateway": "6594f94a79af95d308b8513cd13a076ed1f6ecc8",
     "examples/wasm": "fc10fea21779371f9de247209af2028cf8173236",
     "crates/auth": "642cfcb069e7a56f0637909b6bf67365f4c48d07",
     "crates/data_connector": "0f2944404b40f9dc1abf7b681179db30ba01ccab",
-    "crates/engine_servicer": "5d44c40622ac5c8d9306b2cafab0fb183d9ec1c9",
+    "crates/engine_servicer": "68628b86d024d0d197ebea9f9b2d20739955d4ca",
     "crates/engine_zmq_adapter": "8ab4e37c36d2a6b9317ecb745afe46970eb0020e",
     "crates/engine_zmq_client": "17704bdc0b1ae560d05c8957adc84fe31fbf5592",
     "crates/external_router": "6db695a38d5adc95f0a29133adc9c65e1d0244ae",
@@ -72,12 +137,27 @@
     "crates/grpc_client/src": "0068eacf800c1ca3dc8fd23d9658c0d4866ca266",
     "crates/grpc_client/tests": "1bfcdb65a82db071422c03fc4f70b19d143dde5c"
   },
-  "producer_source_trees": {},
+  "producer_source_trees": {
+    ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
+    "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
+    "Cargo.lock": "658f9376c020bef5e29a3e5728b4931cee891427",
+    "rust-toolchain.toml": "1b3e16ebff6f9fe991fc29854025255c597f785d",
+    "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
+    "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
+    "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
+    "crates": "02595fccfc56ff2b8acec36f99b4a5e7f5048de0",
+    "model_gateway": "6594f94a79af95d308b8513cd13a076ed1f6ecc8",
+    "grpc_servicer": "2cbef8f1440732b8034bfded7a9eba7e8e8d23ca",
+    "e2e_test": "ac24cbe1b88c3219bbe07b76dc4dd8370bf2ff1b",
+    "scripts": "a5f12792df38a4cb1f82ef724f8234360fddf99a",
+    ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
+    ".github/workflows": "d3540fdc5527e394a7f4e4540a1158c53d782996"
+  },
   "producer_source_relabelled": false,
-  "consumer_reference_sha": "859f27e11ee55635435fef9703d0e039935c5009",
+  "consumer_reference_sha": "0474fbdeb4274d57be30351a718934e073f9bc46",
   "historical_reference_sha": "e9157e32ef87c74f38c7d0f165b4a35fffd4eb57",
   "explicit_consumer_only_paths": [
-    ".github/amd-vllm-realtime/",
+    ".github/amd-vllm-zmq-dp2/",
     ".github/workflows/pr-test-rust.yml"
   ],
   "consumer_setup_core_minutes": 55,
@@ -86,10 +166,14 @@
   "reference_target_id": ".github/workflows/pr-test-rust.yml#e2e-2gpu-chat-zmq-dp[0]/vllm/nvidia",
   "compiled_producer_exclusion": "crates/grpc_client/python contains only build-time Python gencode packaging; current proto/src/build.rs and all Rust crates bind exactly to producer. Python packages are freshly installed and full installed engine suite plus 14 exact cases must pass.",
   "generic_source_base": "e4e2b1060c5c199ec1ce5dc18295f9f9d1a85e83",
-  "zmq_native": null,
-  "producer_bound": false,
-  "expected_producer_reference_sha": "859f27e11ee55635435fef9703d0e039935c5009",
-  "producer_binding_requirement": "A future successful build for exact859 with4 actual ZIP/payload/native hashes; no361 artifact transfer.",
+  "zmq_native": {
+    "name": "smg/smg_rs.abi3.so",
+    "bytes": 142530352,
+    "sha256": "6b243963422cf2cc0874b178e8df2c1815b2c8d798819610129a53bd293b1974"
+  },
+  "producer_bound": true,
+  "expected_producer_reference_sha": "0474fbdeb4274d57be30351a718934e073f9bc46",
+  "producer_binding_requirement": "Successful exact0474 build with four actual archive/member hashes; compiled paths match Git0474. Consumer revalidates installed engine CPU/14 controls/two wholepip and full DP2 contract. No859 or361 binary relabelling.",
   "expected_producer_source_trees": {
     ".cargo": "cce22c920ba185c83e70a3b87560ea52d345a666",
     "Cargo.toml": "1524dd4960a96dd3ae5069917324836dee979150",
@@ -98,15 +182,17 @@
     "Makefile": "0ae752629aa26b1b28cf23a0ad49fca5d4461845",
     "bindings": "e97f000df477e928953b6bcb5a7927adf5ff88c1",
     "clients": "03b0cbb722670d98b37b726af18c1796beef82d5",
-    "crates": "9c1af43eaf86f17b4598ae82e99869ace128f87a",
-    "model_gateway": "7f33a6a15d4fc3e4b143cc512aac4bc581ca400b",
+    "crates": "02595fccfc56ff2b8acec36f99b4a5e7f5048de0",
+    "model_gateway": "6594f94a79af95d308b8513cd13a076ed1f6ecc8",
     "grpc_servicer": "2cbef8f1440732b8034bfded7a9eba7e8e8d23ca",
     "e2e_test": "ac24cbe1b88c3219bbe07b76dc4dd8370bf2ff1b",
     "scripts": "a5f12792df38a4cb1f82ef724f8234360fddf99a",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
     ".github/workflows": "d3540fdc5527e394a7f4e4540a1158c53d782996"
   },
-  "compiled_inputs_verified_against_actual_artifact": false,
+  "compiled_inputs_verified_against_actual_artifact": true,
   "dependency_junction": "864549b8e08d8f79b434fc7ae721270759bc8d7d",
-  "dependency_scope": "Existing small public dependency PRs merged normally with859. ZMQ headless command bypasses the HTTP/gRPC served-name helper; alias4266 is not silently assumed as a dependency."
+  "dependency_scope": "Existing small public dependency PRs merged normally with859. ZMQ headless command bypasses the HTTP/gRPC served-name helper; alias4266 is not silently assumed as a dependency.",
+  "producer_run_status_snapshot": "queued",
+  "previous_consumer_reference_sha": "859f27e11ee55635435fef9703d0e039935c5009"
 }
