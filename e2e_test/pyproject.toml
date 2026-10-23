@@ -6,12 +6,12 @@ requires-python = ">=3.12"
 
 dependencies = [
   "anthropic",
-  "fastmcp-slim[server]>=4.1.3,<5",
+  "fastmcp-slim[server]>=3.3,<5",
   "grpcio",
   "grpcio-health-checking",
   "httpx",
   "jinja2",
-  "mcp>=2.2,<3",
+  "mcp>=1.24,<3",
   "numpy",
   "openai",
   "pandas",
