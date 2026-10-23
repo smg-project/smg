@@ -139,7 +139,10 @@ def test_03_tilelang_gfx942_elementwise():
     gfx942(torch)
     assert importlib.metadata.version("tilelang") == "0.1.7.post3+cuda.gita55a8230"
     official = whole_vendor("elementwise_add")
-    kernel = official.elementwise_add(32, 32, 32, 32, "float32", "float32", 128)
+    from host_ir_trace import observe
+
+    with observe(Path("diagnostic-results/native/host-ir")):
+        kernel = official.elementwise_add(32, 32, 32, 32, "float32", "float32", 128)
     left = torch.arange(1024, device="cuda", dtype=torch.float32).reshape(32, 32)
     right = torch.full_like(left, 3)
     left_before, right_before = left.clone(), right.clone()

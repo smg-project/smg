@@ -7,6 +7,7 @@ import os
 import sys
 from pathlib import Path
 
+from tilelang_host_ir import verify_loaded as verify_tilelang_wrapper
 from tvm_slots import verify_loaded as verify_tvm_support
 
 ENV = (
@@ -33,6 +34,7 @@ MODULES = (
     "tvm",
     "tvm._ffi.base",
     "tvm.runtime.support",
+    "tilelang.jit.adapter.wrapper",
     "tilelang",
     "xgrammar",
 )
@@ -167,3 +169,4 @@ class RuntimeIdentity:
                 raise RuntimeError("actual imported registry differs from installed candidate")
 
             verify_tvm_support(value["loaded_modules"].get("tvm.runtime.support", {}))
+            verify_tilelang_wrapper(value["loaded_modules"].get("tilelang.jit.adapter.wrapper", {}))
