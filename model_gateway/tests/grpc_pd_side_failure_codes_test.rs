@@ -17,9 +17,6 @@
 //! shape's prefill speaks the TokenSpeed proto and fails its stream after a
 //! chunk, for the collected answer that drains it.
 
-#[path = "common/mod.rs"]
-mod common;
-
 use std::time::Duration;
 
 use common::grpc_harness::{
@@ -35,6 +32,7 @@ use smg::{
 use smg_grpc_client::{
     common_proto as grpc_common, tokenspeed_scheduler::tokenspeed_proto as ts, vllm_proto as proto,
 };
+use smg_test_harness as common;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Code, Request, Response, Status};
