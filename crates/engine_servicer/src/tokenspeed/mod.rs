@@ -343,6 +343,7 @@ impl TokenSpeedServicerServer {
     /// life.
     pub fn kv_relay_subscribed(&self) -> bool {
         self.state
+            .shared
             .kv_relay
             .as_ref()
             .is_none_or(|relay| relay.subscribed())
