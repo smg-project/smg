@@ -30,9 +30,9 @@ use crate::{
         error,
         grpc::{
             context::{
-                stage_output, DispatchContext, EncodeWorkerAssignment, PreparationOutput,
-                RequestContext, RequestInput, RequestType, RoutingSnapshot, WireConstraint,
-                WorkerSelection,
+                stage_output, DispatchContext, EncodeOutputs, EncodeWorkerAssignment,
+                PreparationOutput, RequestContext, RequestInput, RequestType, RoutingSnapshot,
+                WireConstraint, WorkerSelection,
             },
             multimodal,
         },
@@ -623,6 +623,7 @@ impl WorkerSelectionStage {
                             placement,
                             sticky_key,
                             &encode_item_hashes,
+                            None,
                         ),
                     )
                     .await?;
@@ -702,6 +703,41 @@ impl WorkerSelectionStage {
             ledger.admits(worker)
                 && decided_on.is_none_or(|decoding| decoding.decides_alike(worker))
         };
+
+        if let Some(EncodeOutputs::Sglang(plan)) = ctx.encode_outputs.as_ref() {
+            let pinned = |worker: &dyn Worker| {
+                admits(worker) && context_requirements.admits(worker, model_id)
+            };
+            let inputs = PlacementInputs {
+                text,
+                tokens,
+                headers,
+                rid_key,
+                cache_namespace,
+                candidate_filter: Some(&pinned),
+                tried: &[],
+            };
+            let ((assignments, prefill, decode, runtime_type), guard) = self
+                .admit_encode_prefill_decode_workers(
+                    model_id,
+                    inputs,
+                    ctx.sticky_key.as_deref(),
+                    &plan.hashes,
+                    Some(RuntimeType::Sglang),
+                )
+                .await?;
+            let assignments = super::sglang_encode::contiguous(&assignments).map_err(|e| {
+                error::bad_request("sglang_encode_assignment_invalid", e.to_string())
+            })?;
+            ctx.workers = Some(WorkerSelection::Disaggregated {
+                encode_assignments: Some(assignments),
+                prefill,
+                decode,
+                runtime_type,
+            });
+            ctx.pd_prefill_guard = Some(guard);
+            return Ok(());
+        }
 
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
@@ -827,6 +863,7 @@ impl WorkerSelectionStage {
         inputs: PlacementInputs<'_>,
         sticky_key: Option<&str>,
         encode_item_hashes: &[Vec<u8>],
+        runtime_pin: Option<RuntimeType>,
     ) -> Result<(EncodePrefillDecodeWorkerSelection, PrefillLoadGuard), Response> {
         acquire_prefill(
             self.prefill_admission.as_deref(),
@@ -838,6 +875,7 @@ impl WorkerSelectionStage {
                     inputs,
                     encode_item_hashes,
                     capacity,
+                    runtime_pin,
                 )
             },
         )
@@ -1884,6 +1922,7 @@ impl WorkerSelectionStage {
         inputs: PlacementInputs<'_>,
         encode_item_hashes: &[Vec<u8>],
         prefill_capacity: Option<&PrefillSelectionContext<'_>>,
+        runtime_pin: Option<RuntimeType>,
     ) -> Result<EncodePrefillDecodeWorkerSelection, EpdSelectionFailure> {
         let PlacementInputs {
             text,
@@ -1905,8 +1944,8 @@ impl WorkerSelectionStage {
         let all_prefill = epd_role_candidates(&snapshot, WorkerType::Prefill, true)?;
         let all_decode = epd_role_candidates(&snapshot, WorkerType::Decode, true)?;
 
-        let Some(target_runtime) =
-            shared_epd_runtime(&all_encode, &all_prefill, &all_decode, needs_encode)
+        let Some(target_runtime) = runtime_pin
+            .or_else(|| shared_epd_runtime(&all_encode, &all_prefill, &all_decode, needs_encode))
         else {
             warn!("No available encode/prefill/decode worker set with a shared runtime");
             return Err(EpdSelectionFailure::Unavailable);
@@ -1930,7 +1969,13 @@ impl WorkerSelectionStage {
         // Filter all three pools to the target runtime
         let available_encode = on_runtime(all_encode, target_runtime);
         let mut available_prefill = on_runtime(all_prefill, target_runtime);
-        let available_decode = on_runtime(all_decode, target_runtime);
+        let mut available_decode = on_runtime(all_decode, target_runtime);
+        if runtime_pin.is_some() {
+            available_prefill
+                .retain(|w| inputs.candidate_filter.is_none_or(|accepts| accepts(&**w)));
+            available_decode
+                .retain(|w| inputs.candidate_filter.is_none_or(|accepts| accepts(&**w)));
+        }
 
         if (needs_encode && available_encode.is_empty())
             || available_prefill.is_empty()
