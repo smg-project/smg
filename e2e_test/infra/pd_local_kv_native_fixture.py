@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Original vLLM 0.31 source selections; see native-fixture-provenance.json in delivery.
+# Source: vllm-project/vllm db9527a46873454610df6dbedf79a36d6bf1a7f6 (v0.31.0).
+# v1/core/{kv_cache_utils,block_pool,kv_cache_manager,kv_cache_coordinator,
+# single_type_kv_cache_manager}.py and v1/core/sched/scheduler.py.
+# Original selected bodies; imports and annotation spelling adapted for CPU.
 
 from __future__ import annotations
 

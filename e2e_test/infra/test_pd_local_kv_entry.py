@@ -20,8 +20,10 @@ def test_existing_abort_entry_waits_for_post_fence_reusable_page(monkeypatch, pe
     before = pending.write()
     scheduler, req, raw = observed(deferred=True)
     held = scheduler.owners.pop(req.request_id)
+    scheduler.requests.pop(req.request_id)
     req.request_id = pending.internal
     scheduler.owners[req.request_id] = held
+    scheduler.requests[req.request_id] = req
     scheduler._free_blocks(req)
     scheduler.processed_step_seq = 4
     scheduler._drain_deferred_frees()
