@@ -128,7 +128,8 @@ mod tests {
         }
     }
 
-    /// One DP rank with the given queued tokens, KV utilization, and throughput.
+    /// One DP rank with the given queued tokens, KV utilization, and live
+    /// throughput (a request is running, so the rate gauge counts).
     fn make_load(
         num_waiting_uncached_tokens: i32,
         token_usage: f64,
@@ -139,6 +140,7 @@ mod tests {
             dp_rank_count: 1,
             loads: vec![SchedulerLoadSnapshot {
                 dp_rank: 0,
+                num_running_reqs: 1,
                 num_waiting_uncached_tokens,
                 token_usage,
                 gen_throughput,

@@ -83,13 +83,13 @@ impl BoundedLabels {
     }
 }
 
-/// Intern a client-supplied model label, bounded by [`MAX_MODEL_LABELS`].
+/// Intern a client-supplied model label, bounded by `MAX_MODEL_LABELS`.
 pub fn intern_model_label(model_id: &str) -> Arc<str> {
     MODEL_LABELS.intern(model_id)
 }
 
 /// Intern a client/model-controlled MCP tool-name label, bounded by
-/// [`MAX_TOOL_LABELS`].
+/// `MAX_TOOL_LABELS`.
 pub fn intern_tool_label(tool_name: &str) -> Arc<str> {
     TOOL_LABELS.intern(tool_name)
 }

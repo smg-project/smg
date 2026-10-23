@@ -225,7 +225,7 @@ pub struct VideoClip {
     pub frames: Vec<DynamicImage>,
     pub rgb_video: Option<DecodedRgbVideo>,
     /// Effective frame rate after connector-side sampling and frame-count clamps.
-    pub sample_fps: f32,
+    pub sample_fps: f64,
     /// Source fps and sampled frame indices; `None` when the decoder could not recover them.
     pub sampling: Option<VideoSamplingInfo>,
     pub raw_bytes: bytes::Bytes,
@@ -326,7 +326,7 @@ impl VideoClip {
         raw_bytes: bytes::Bytes,
         source: VideoSource,
         hash: String,
-        sample_fps: f32,
+        sample_fps: f64,
     ) -> Self {
         Self {
             frames,
@@ -354,7 +354,7 @@ impl VideoClip {
         raw_bytes: bytes::Bytes,
         source: VideoSource,
         hash: String,
-        sample_fps: f32,
+        sample_fps: f64,
     ) -> Self {
         Self {
             frames: Vec::new(),
@@ -391,7 +391,7 @@ impl VideoClip {
         self.rgb_video.as_ref()
     }
 
-    pub fn sample_fps(&self) -> f32 {
+    pub fn sample_fps(&self) -> f64 {
         self.sample_fps
     }
 

@@ -251,7 +251,8 @@ mod tests {
             }
         )));
         // The call ends, with no bytes of its own, as every assembler ends a started call at the
-        // end of the stream; its arguments stay cut, `{` without its `}`.
+        // end of the stream; its arguments stay cut, the value as written, `{` without its `}`.
+        assert_eq!(arguments_of(&events, 0), r#"{"x": 1"#);
         assert!(events.iter().any(|event| matches!(
             event,
             Event::ToolCallEnd { index: 0, source } if source.text.is_empty()
@@ -260,6 +261,212 @@ mod tests {
             events.last(),
             Some(Event::Finish { tool_calls: 1, .. })
         ));
+    }
+
+    /// A call the token limit cut, the shape of a tool request whose `max_tokens` is below the
+    /// call's length: inside a `string="true"` value and inside a `string="false"` object. The
+    /// call's arguments are the prefix as the model wrote it, the cut member's key and bytes
+    /// included; nothing of the call reaches a chat client as content (no `Malformed` text, the
+    /// tag the cut member came in is the fragment's source); the one word before the call's end
+    /// says the arguments are no whole value; and the finish is the engine's `length`, whole, a
+    /// character at a time and at every two-way cut.
+    #[test]
+    fn a_call_the_token_limit_cut_keeps_its_bytes_as_its_arguments_and_nothing_as_content() {
+        use crate::{
+            event::{FinishReason, MalformedReason},
+            testing::{drive_to, the_same_at_every_cut},
+        };
+        let invoke = concat!(
+            "</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"ChaDri_change_drink\">\n",
+            "<｜DSML｜ parameter name=\"drink_id\" string=\"true\">latte</｜DSML｜ parameter>\n"
+        );
+        for (tail, arguments) in [
+            (
+                "<｜DSML｜ parameter name=\"size\" string=\"true\">lar",
+                r#"{"drink_id": "latte", "size": "lar"#,
+            ),
+            (
+                "<｜DSML｜ parameter name=\"new_preferences\" string=\"false\">{\"size\": \"large\", \"temp",
+                r#"{"drink_id": "latte", "new_preferences": {"size": "large", "temp"#,
+            ),
+        ] {
+            let output = format!("{invoke}{tail}");
+            let read = |pieces: &[&str]| {
+                drive_to(
+                    &mut Engine::with_call_ids(
+                        Arc::new(deepseek_v4_1()),
+                        Declared::default(),
+                        ids(),
+                    ),
+                    "<think>",
+                    pieces,
+                    EngineFinish::Length,
+                )
+            };
+            let said = the_same_at_every_cut(read, &output);
+            assert_eq!(
+                said.calls,
+                vec![("ChaDri_change_drink".to_string(), arguments.to_string())],
+                "{tail:?}"
+            );
+            assert_eq!(said.finish, Some((FinishReason::Length, 1)), "{tail:?}");
+            let events = read(&[&output]);
+            assert_eq!(bytes(&events), output, "{tail:?}");
+            let shown: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Content(text) | Event::Malformed { text, .. } => Some(&*text.text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(shown, "", "nothing of the call is content: {events:?}");
+            assert!(
+                matches!(
+                    &events[events.len() - 3..],
+                    [
+                        Event::Malformed { text, why: MalformedReason::UnterminatedRegion },
+                        Event::ToolCallEnd { source, .. },
+                        Event::Finish { .. },
+                    ] if text.text.is_empty() && source.text.is_empty()
+                ),
+                "{tail:?}: {events:?}"
+            );
+        }
+    }
+
+    /// A call the token limit cut inside a string value's closing tag, the shapes one tool
+    /// request recorded with `max_tokens` below the call's length as the cut walked through the
+    /// tag: the arguments are the prefix as the model wrote it, up to the value's last byte and
+    /// nothing of the tag (`"KRW`, `"JFK`; the tag's start leaves as wrapping after the call's
+    /// end), the preamble is the content and nothing of the call is, the finish is the engine's
+    /// `length`, and the shapes recorded around it (a cut inside the value, after a complete
+    /// member inside the next parameter's tag) read as before; whole, a character at a time and
+    /// at every two-way cut. Before this the tag's bytes rode inside the value,
+    /// `"from_currency": "KRW</｜DSML｜ parameter`.
+    #[test]
+    fn a_call_the_token_limit_cut_inside_a_string_values_closing_tag_keeps_the_value_not_the_tag() {
+        use crate::{
+            event::{DropReason, FinishReason, MalformedReason},
+            testing::{drive_to, the_same_at_every_cut},
+        };
+        let currency = (
+            "I'll convert 2,500 South Korean Won to Vietnamese Dong for you.",
+            concat!(
+                "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"convert_currency\">\n",
+                "<｜DSML｜ parameter name=\"amount\" string=\"false\">2500</｜DSML｜ parameter>\n",
+                "<｜DSML｜ parameter name=\"from_currency\" string=\"true\">KRW"
+            ),
+            "convert_currency",
+        );
+        let flights = (
+            "I'll search for flights from CDG to JFK on that date for 3 passengers.",
+            concat!(
+                "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"search_flights\">\n",
+                "<｜DSML｜ parameter name=\"origin\" string=\"true\">CDG</｜DSML｜ parameter>\n",
+                "<｜DSML｜ parameter name=\"destination\" string=\"true\">JFK"
+            ),
+            "search_flights",
+        );
+        // A recorded request's preamble and call up to the value, its function's name; the tail
+        // after the value; the arguments; the wrapping dropped after the call started.
+        type Case<'a> = (
+            &'a (&'a str, &'a str, &'a str),
+            &'a str,
+            &'a str,
+            &'a [&'a str],
+        );
+        let cases: [Case; 5] = [
+            // Inside the closing tag: after its word, and right after its sentinel.
+            (
+                &currency,
+                "</｜DSML｜ parameter",
+                r#"{"amount": 2500, "from_currency": "KRW"#,
+                &["</｜DSML｜ parameter"],
+            ),
+            (
+                &flights,
+                "</｜DSML｜",
+                r#"{"origin": "CDG", "destination": "JFK"#,
+                &["</｜DSML｜"],
+            ),
+            // Inside the value.
+            (
+                &flights,
+                "",
+                r#"{"origin": "CDG", "destination": "JFK"#,
+                &[],
+            ),
+            // After the closing tag, inside the next parameter's tag: the member whole, the tag
+            // the end cut short and the newline before it as wrapping, before the call's end.
+            (
+                &currency,
+                "</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"to_",
+                r#"{"amount": 2500, "from_currency": "KRW""#,
+                &["\n<｜DSML｜ parameter name=\"to_"],
+            ),
+            (
+                &flights,
+                "</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"stops\" string=\"false\"",
+                r#"{"origin": "CDG", "destination": "JFK""#,
+                &["\n<｜DSML｜ parameter name=\"stops\" string=\"false\""],
+            ),
+        ];
+        for ((preamble, call, name), tail, arguments, wrapping) in cases {
+            let output = format!("</think>{preamble}\n\n{call}{tail}");
+            let read = |pieces: &[&str]| {
+                drive_to(
+                    &mut Engine::with_call_ids(
+                        Arc::new(deepseek_v4_1()),
+                        Declared::default(),
+                        ids(),
+                    ),
+                    "<think>",
+                    pieces,
+                    EngineFinish::Length,
+                )
+            };
+            let said = the_same_at_every_cut(read, &output);
+            assert_eq!(
+                said.calls,
+                vec![(name.to_string(), arguments.to_string())],
+                "{tail:?}"
+            );
+            assert_eq!(said.finish, Some((FinishReason::Length, 1)), "{tail:?}");
+            assert_eq!(said.content, *preamble, "{tail:?}");
+            let events = read(&[&output]);
+            assert_eq!(bytes(&events), output, "{tail:?}");
+            let shown: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Content(text) | Event::Malformed { text, .. } => Some(&*text.text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                shown, *preamble,
+                "nothing of the call is content: {events:?}"
+            );
+            let wrapping_after_the_start: Vec<&str> = events
+                .iter()
+                .skip_while(|event| !matches!(event, Event::ToolCallStart { .. }))
+                .filter_map(|event| match event {
+                    Event::Dropped {
+                        text,
+                        why: DropReason::Wrapper,
+                    } => Some(&*text.text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(wrapping_after_the_start, wrapping, "{tail:?}: {events:?}");
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    Event::Malformed { text, why: MalformedReason::UnterminatedRegion }
+                        if text.text.is_empty()
+                )),
+                "{tail:?}: {events:?}"
+            );
+        }
     }
 
     #[test]
@@ -394,10 +601,11 @@ mod tests {
     }
 
     #[test]
-    fn an_invoke_that_named_nothing_is_reported_however_it_ended() {
+    fn an_invoke_that_named_nothing_is_refused_whole_however_it_ended() {
         // The invoke tag cut short before its name, ended by the block's close, by the next
-        // invoke's opening, or by its own closing tag: each ending's bytes come back as
-        // `Malformed`, and no call is counted for it.
+        // invoke's opening, or by its own closing tag: each ending's bytes are refused (counted
+        // by an event of no bytes, dropped as the model's failed call, never content), and no
+        // call is counted for it.
         for (output, ending) in [
             (
                 "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"</｜DSML｜ calls>",
@@ -415,10 +623,18 @@ mod tests {
         ] {
             let events = run("<think>\n\n</think>\n\n", &[output]);
             assert_eq!(bytes(&events), output, "{ending}");
+            // Refused whole: the counted event of no bytes, the bytes dropped, never content.
             assert!(
                 events.iter().any(|event| matches!(
                     event,
-                    Event::Malformed { text, .. } if text.text == ending
+                    Event::Dropped { text, why: DropReason::MalformedCall } if text.text.ends_with(ending)
+                )),
+                "{ending}: {events:?}"
+            );
+            assert!(
+                !events.iter().any(|event| matches!(
+                    event,
+                    Event::Malformed { text, .. } if !text.text.is_empty()
                 )),
                 "{ending}: {events:?}"
             );
@@ -434,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tag_the_invokes_close_cut_short_inside_a_string_is_reported() {
+    fn a_tag_the_invokes_close_cut_short_inside_a_string_is_the_values_text() {
         let output = concat!(
             "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"f\">\n",
             "<｜DSML｜ parameter name=\"a\" string=\"true\">x</｜DSML｜ par</｜DSML｜ invoke>\n",
@@ -442,16 +658,21 @@ mod tests {
         );
         let events = run("<think>\n\n</think>\n\n", &[output]);
         assert_eq!(bytes(&events), output);
-        // The string the invoke's close cut stays open: nothing is made up for it, and the one
-        // word before the end carries the tag's bytes.
-        assert_eq!(arguments_of(&events, 0), r#"{"a": "x"#);
-        let ended = events
+        // The invoke's close inside the string ends the call: the string is closed with every
+        // byte the model wrote between the tag and the close, the start of a tag held there
+        // included, since no tag followed, and the one word of no bytes before the closing quote
+        // says the marker closed it.
+        assert_eq!(arguments_of(&events, 0), r#"{"a": "x</｜DSML｜ par"}"#);
+        let at = events
             .iter()
-            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
-            .expect("the call ends");
+            .position(|event| matches!(event, Event::Malformed { .. }))
+            .expect("the one word");
         assert!(matches!(
-            &events[ended - 1],
-            Event::Malformed { text, .. } if text.text == "</｜DSML｜ par"
+            &events[at..at + 2],
+            [
+                Event::Malformed { text, why: crate::event::MalformedReason::OpenAtTheMarker },
+                Event::ToolCallArguments { json, .. }
+            ] if text.text.is_empty() && json == "\""
         ));
     }
 
@@ -494,18 +715,23 @@ mod tests {
         let events = run("<think>", &[output]);
         assert_eq!(bytes(&events), output);
         assert_eq!(arguments_of(&events, 0), r#"{"a": "1"}"#);
-        let malformed: Vec<&str> = events
+        // The tag with its tail is refused: its bytes dropped as the model's failed call, never
+        // content, behind the counted event of no bytes.
+        let refused: Vec<&str> = events
             .iter()
             .filter_map(|event| match event {
-                Event::Malformed { text, .. } => Some(&*text.text),
+                Event::Dropped {
+                    text,
+                    why: DropReason::MalformedCall,
+                } => Some(&*text.text),
                 _ => None,
             })
             .collect();
         assert!(
-            malformed
+            refused
                 .iter()
                 .any(|text| text.ends_with("<｜DSML｜ parameter name=\"x\" kind=\"y\">")),
-            "{malformed:?}"
+            "{refused:?}"
         );
     }
 

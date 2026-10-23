@@ -76,6 +76,9 @@ use openai_protocol::{chat::ChatCompletionRequest, validated::Normalizable};
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 use smg::routers::grpc::utils::{process_chat_messages, request_as_rendered};
+use smg_test_harness::hub_fetch::{
+    cached_download, fetch, rate_limit_wait, RATE_LIMITED_TRIES, RATE_LIMIT_WINDOW,
+};
 use validator::Validate;
 
 const FIXTURES_ENV: &str = "BELLWETHER_FIXTURES";
@@ -98,13 +101,22 @@ const KINDS: [&str; 1] = ["render"];
 /// content would be.
 const LFS_POINTER: &[u8] = b"version https://git-lfs.github.com/spec/v1";
 
+/// The reason of the render sets of a Llama-class checkpoint whose
+/// `tokenizer.json` keeps the legacy pipeline: the reference's ids were
+/// recorded from that file read as it is, the engines' tokenizer class
+/// rebuilds the pipeline, and the loader follows the class (see
+/// `huggingface::HuggingFaceTokenizer::llama_class_pipeline`). The tokenizer
+/// crate's fixture harness lists the same sets under the same reason.
+const LEGACY_FILE_PIPELINE: &str = "the render ids of this Llama-class checkpoint were recorded from its raw tokenizer.json read by `tokenizers` (the file's legacy pipeline, the ids transformers 4.x gave by taking the file as is: a word marker after every special token, a marker token missed after a newline or a letter); transformers 5.17.0, the version the engines run, rebuilds the class's pipeline (no normalizer, a Metaspace pre-tokenizer) and the loader matches it since smg-project/smg#4248, so the reference's ids differ from the engine's at the special tokens and the markers while the text is equal; every render case of the model, until the sets are re-recorded with the class (smg-project/bellwether#210), when this entry heals and the run asks for its removal";
+
 /// Cases known to differ from the reference, each with the reason and where
 /// it is tracked: a fixture id, `<slug>/render/<name>`, or a prefix ending in
 /// `*`, which stands for every case whose id begins with what is before it
 /// (`<slug>/render/*` for a model's whole render side,
 /// `<slug>/render/bfcl-multi-turn-*` for a family of its sets). A prefix is
 /// for a cause that covers a model or a set wholesale and is held to the rule
-/// an id is: the run fails when no loaded case under it differs any more, and
+/// an id is: the run fails when no loaded case under it differs any more (a
+/// case under it listed by its own id is that entry's, not the prefix's), and
 /// when no loaded case is under it at all.
 const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
     (
@@ -1282,6 +1294,7 @@ const KNOWN_DIFFERENCES: &[(&str, &str)] = &[
         "SMG's request schema types tool-call arguments as a string, as the API and the \
          engines do; the template accepts an object (smg-project/bellwether#12)",
     ),
+    ("tinyllama-1.1b-chat-v1.0/render/*", LEGACY_FILE_PIPELINE),
     (
         "tinyllama-1.1b-chat-v1.0/render/no-generation-prompt",
         "add_generation_prompt is not a field of SMG's chat request; the header is always \
@@ -1691,22 +1704,24 @@ impl Report {
             .is_some_and(|id| id.starts_with(prefix))
     }
 
-    /// Whether a differing case's id begins with `prefix`.
-    fn differs_under(&self, prefix: &str) -> bool {
-        self.differences
-            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
-            .next()
-            .is_some_and(|(id, _)| id.starts_with(prefix))
-    }
-
     /// The entries of `known` whose compared cases all match the reference
-    /// now.
+    /// now. A case listed by its own id is not counted under a prefix: that
+    /// entry names its cause and is held to the rule itself, so the prefix
+    /// heals once every other case under it matches, instead of outliving
+    /// its cause for as long as the by-id sibling differs.
     fn healed<'k>(&self, known: &BTreeMap<&'k str, &'k str>) -> Vec<&'k str> {
         known
             .keys()
             .copied()
             .filter(|entry| match prefix_of(entry) {
-                Some(prefix) => self.seen_under(prefix) && !self.differs_under(prefix),
+                Some(prefix) => {
+                    self.seen_under(prefix)
+                        && !self
+                            .differences
+                            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+                            .take_while(|(id, _)| id.starts_with(prefix))
+                            .any(|(id, _)| !known.contains_key(id.as_str()))
+                }
                 None => self.seen.contains(*entry) && !self.differences.contains_key(*entry),
             })
             .collect()
@@ -2344,20 +2359,28 @@ fn tokenizer_dir(model: &str, revision: &str, slug: &str) -> Result<PathBuf, Str
     let dir = PathBuf::from(CACHE_DIR).join(slug).join(revision);
     fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
     let client = smg::clients::blocking_http_client();
-    download(&client, model, revision, &dir, "tokenizer_config.json", 100)?
-        .ok_or_else(|| format!("{model} at {revision} serves no tokenizer_config.json"))?;
+    download(
+        &client,
+        HUB,
+        model,
+        revision,
+        &dir,
+        "tokenizer_config.json",
+        100,
+    )?
+    .ok_or_else(|| format!("{model} at {revision} serves no tokenizer_config.json"))?;
     for (file, min_bytes) in [
         ("chat_template.jinja", 1),
         ("chat_template.json", 1),
         ("config.json", 50),
     ] {
-        download(&client, model, revision, &dir, file, min_bytes)?;
+        download(&client, HUB, model, revision, &dir, file, min_bytes)?;
     }
     let mut vocabulary = None;
     for files in VOCABULARIES {
         let mut whole = true;
         for file in files {
-            whole &= download(&client, model, revision, &dir, file, 100_000)?.is_some();
+            whole &= download(&client, HUB, model, revision, &dir, file, 100_000)?.is_some();
         }
         if whole {
             vocabulary = Some(files);
@@ -2377,11 +2400,16 @@ fn vocabularies() -> String {
         .join(", ")
 }
 
-/// Fetches `file` into `dir` unless it is there already; `Ok(None)` when the
-/// checkpoint does not serve it (HTTP 404), an error for any other failure
-/// or a file shorter than `min_bytes`.
+/// The hub the checkpoints' files are fetched from, at the manifest's revision.
+const HUB: &str = "https://huggingface.co";
+
+/// Fetches `file` from `hub` into `dir` unless it is there already; `Ok(None)` when the
+/// checkpoint does not serve it (HTTP 404, remembered beside the name as
+/// `<file>.absent`, since the revision is a commit and the answer final), an
+/// error for any other failure or a file shorter than `min_bytes`.
 fn download(
     client: &reqwest::blocking::Client,
+    hub: &str,
     model: &str,
     revision: &str,
     dir: &Path,
@@ -2392,12 +2420,14 @@ fn download(
     if path.is_file() {
         return Ok(Some(path));
     }
-    let url = format!("https://huggingface.co/{model}/resolve/{revision}/{file}");
-    let response = client
-        .get(&url)
-        .send()
-        .map_err(|e| format!("GET {url}: {e}"))?;
+    let absent = dir.join(format!("{file}.absent"));
+    if absent.is_file() {
+        return Ok(None);
+    }
+    let url = format!("{hub}/{model}/resolve/{revision}/{file}");
+    let response = fetch(client, &url)?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
+        fs::write(&absent, b"").map_err(|e| format!("cannot write {}: {e}", absent.display()))?;
         return Ok(None);
     }
     if !response.status().is_success() {
@@ -2768,6 +2798,59 @@ fn a_prefix_entry_covers_the_cases_under_it_and_must_cover_one() {
 }
 
 #[test]
+fn a_prefix_entry_heals_when_only_cases_listed_by_their_own_id_still_differ() {
+    let model = "org/m";
+    let root = tree(&[
+        ("m/manifest.toml", &manifest(model)),
+        ("m/sets.toml", &sets_toml(&[("render/common", 3)])),
+        (
+            "m/render/common.jsonl",
+            &(differing_line("m/render/common-0", model)
+                + &render_line("m/render/common-1", model)
+                + &differing_line("m/render/common-2", model)),
+        ),
+    ])
+    .unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let listed = BTreeMap::from([
+        ("m/render/*", "recorded with another pipeline"),
+        ("m/render/common-0", "the template drops the role"),
+    ]);
+    let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    assert_eq!(report.differences.len(), 2, "{:#?}", report.differences);
+    // common-2 differs under the prefix without an entry of its own: the
+    // prefix is live, and nothing fails the run.
+    assert_eq!(
+        report.failures(root.path(), &listed, &BTreeMap::new()),
+        Vec::<String>::new()
+    );
+    // Once common-2 matches, the by-id entry alone keeps a difference under
+    // the prefix, and that one is the entry's own: the prefix has healed and
+    // must go, while the by-id entry stays.
+    let root = tree(&[
+        ("m/manifest.toml", &manifest(model)),
+        ("m/sets.toml", &sets_toml(&[("render/common", 3)])),
+        (
+            "m/render/common.jsonl",
+            &(differing_line("m/render/common-0", model)
+                + &render_line("m/render/common-1", model)
+                + &render_line("m/render/common-2", model)),
+        ),
+    ])
+    .unwrap();
+    let manifests = read_manifests(root.path()).unwrap();
+    let report = compare_quietly(root.path(), &manifests, &listed, |_, _| Ok(mock())).unwrap();
+    assert_eq!(report.differences.len(), 1, "{:#?}", report.differences);
+    let failures = report.failures(root.path(), &listed, &BTreeMap::new());
+    assert_eq!(failures.len(), 1, "{failures:#?}");
+    assert!(
+        failures[0].contains("matching the reference now")
+            && failures[0].ends_with("remove: m/render/*"),
+        "{failures:#?}"
+    );
+}
+
+#[test]
 fn stdout_has_one_line_per_model_and_the_report_every_case() {
     // "m" has one listed difference and SHOWN + 1 unlisted ones, "n" no render
     // sets, "o" one matching case that the list says differs.
@@ -2969,4 +3052,162 @@ fn an_error_in_the_fan_out_leaves_the_other_threads_their_item_in_flight_and_no_
         started <= 1,
         "{started} items started beside the one that failed; the other thread had one in flight"
     );
+}
+
+/// A loopback server for the loaders' tests: it answers its connections with `heads` in order
+/// (each a response head whole; the body is `ok`), then stops, so a request past the last answer
+/// is refused; the count is the requests read, bumped before the answer goes out. A failure on
+/// the server's side ends it, and the test reads it in the count or in a refused connection.
+fn loopback(heads: &'static [&'static str]) -> io::Result<(String, Arc<AtomicUsize>)> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let served = Arc::new(AtomicUsize::new(0));
+    let count = Arc::clone(&served);
+    std::thread::spawn(move || {
+        for head in heads {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") && matches!(stream.read(&mut byte), Ok(1)) {
+                request.push(byte[0]);
+            }
+            count.fetch_add(1, Ordering::SeqCst);
+            let answer = format!("{head}\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+            if stream.write_all(answer.as_bytes()).is_err() {
+                return;
+            }
+        }
+    });
+    Ok((url, served))
+}
+
+/// A GET the hub rate-limits is sent again after the wait the answer asks for, and the answer
+/// past the limit is the one returned; after the last try, the limit itself is.
+#[test]
+fn a_rate_limited_get_is_sent_again_after_the_retry_after_wait() {
+    const LIMITED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0";
+    const LIMITED_EVERY_TIME: &[&str] = &[LIMITED; RATE_LIMITED_TRIES as usize];
+    let client = smg::clients::blocking_http_client();
+    let (url, served) = loopback(&[LIMITED, "HTTP/1.1 200 OK"]).unwrap();
+    let response = fetch(
+        &client,
+        &format!("{url}/org/m/resolve/r/tokenizer_config.json"),
+    )
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(response.text().unwrap(), "ok");
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+    let (url, served) = loopback(LIMITED_EVERY_TIME).unwrap();
+    let response = fetch(
+        &client,
+        &format!("{url}/org/m/resolve/r/tokenizer_config.json"),
+    )
+    .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(served.load(Ordering::SeqCst), RATE_LIMITED_TRIES as usize);
+}
+
+/// The wait between two tries: `Retry-After` in seconds first, else the seconds left in the
+/// hub's window from the `ratelimit` header plus one (whole seconds: a try at the boundary is
+/// limited again), else ten seconds; never more than one window (an HTTP-date `Retry-After` is
+/// not a number and falls through).
+#[test]
+fn the_wait_after_a_rate_limit_is_what_the_answer_says_and_a_window_at_most() {
+    let headers = |pairs: &[(&'static str, &str)]| {
+        let mut map = reqwest::header::HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(*name, value.parse().unwrap());
+        }
+        map
+    };
+    assert_eq!(rate_limit_wait(&headers(&[])), Duration::from_secs(10));
+    assert_eq!(
+        rate_limit_wait(&headers(&[("retry-after", "7")])),
+        Duration::from_secs(7)
+    );
+    assert_eq!(
+        rate_limit_wait(&headers(&[("ratelimit", "\"resolvers\";r=0;t=240")])),
+        Duration::from_secs(241)
+    );
+    assert_eq!(
+        rate_limit_wait(&headers(&[
+            ("retry-after", "Wed, 21 Oct 2026 07:28:00 GMT"),
+            ("ratelimit", "\"resolvers\";r=0;t=30"),
+        ])),
+        Duration::from_secs(31)
+    );
+    assert_eq!(
+        rate_limit_wait(&headers(&[
+            ("retry-after", "7"),
+            ("ratelimit", "\"resolvers\";r=0;t=240")
+        ])),
+        Duration::from_secs(7)
+    );
+    assert_eq!(
+        rate_limit_wait(&headers(&[("ratelimit", "\"resolvers\";r=0;t=1000")])),
+        RATE_LIMIT_WINDOW
+    );
+}
+
+/// A cached download the hub rate-limits once lands on the second try, and a call after it
+/// reads the cache; a download that failed under the download lock (limited at every try)
+/// leaves no file and no poisoned lock behind, so the test after it downloads instead of
+/// failing on the poison.
+#[test]
+fn a_cached_download_outlives_a_rate_limit_and_a_failed_download_before_it() {
+    const LIMITED: &str = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 0";
+    const LIMITED_EVERY_TIME: &[&str] = &[LIMITED; RATE_LIMITED_TRIES as usize];
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tokenizer.json");
+    let (url, served) = loopback(LIMITED_EVERY_TIME).unwrap();
+    let failed = std::thread::spawn({
+        let path = path.clone();
+        move || cached_download(&smg::clients::blocking_http_client(), &url, &path, 2)
+    })
+    .join();
+    assert!(
+        failed.is_err(),
+        "limited at every try, the download must fail"
+    );
+    assert_eq!(served.load(Ordering::SeqCst), RATE_LIMITED_TRIES as usize);
+    assert!(!path.exists(), "a failed download leaves no file");
+    let (url, served) = loopback(&[LIMITED, "HTTP/1.1 200 OK"]).unwrap();
+    cached_download(&smg::clients::blocking_http_client(), &url, &path, 2);
+    assert_eq!(fs::read(&path).unwrap(), b"ok");
+    assert_eq!(served.load(Ordering::SeqCst), 2);
+    cached_download(&smg::clients::blocking_http_client(), &url, &path, 2);
+    assert_eq!(
+        served.load(Ordering::SeqCst),
+        2,
+        "a cached file is not fetched again"
+    );
+}
+
+/// The gateway's test harness and the tokenizer crate's tests carry the same
+/// `hub_fetch.rs`, so a fix to the retry or the download lock in one reaches
+/// the other: the two files are checked byte for byte.
+#[test]
+fn the_hub_fetch_module_is_the_tokenizer_crate_s_copy() {
+    assert_eq!(
+        include_str!("../test_harness/src/hub_fetch.rs"),
+        include_str!("../../crates/tokenizer/tests/common/hub_fetch.rs"),
+        "the two hub_fetch.rs copies have drifted"
+    );
+}
+
+/// A file the checkpoint does not serve is asked for once: the answer is remembered beside its
+/// name, and the next run reads it without a request.
+#[test]
+fn a_file_the_checkpoint_does_not_serve_is_asked_for_once() {
+    let client = smg::clients::blocking_http_client();
+    let (url, served) = loopback(&["HTTP/1.1 404 Not Found"]).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    for _ in 0..2 {
+        let got = download(&client, &url, "org/m", "r", dir.path(), "config.json", 2).unwrap();
+        assert!(got.is_none());
+    }
+    assert!(dir.path().join("config.json.absent").is_file());
+    assert_eq!(served.load(Ordering::SeqCst), 1);
 }

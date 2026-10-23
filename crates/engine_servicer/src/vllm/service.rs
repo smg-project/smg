@@ -32,7 +32,7 @@ impl VllmEngine for VllmEngineService {
         let trace_headers = crate::trace_context::trace_headers(request.metadata());
         generate::generate(&self.state, request.into_inner(), trace_headers)
             .await
-            .inspect_err(|status| self.state.metrics.request_not_started(status))
+            .inspect_err(|status| self.state.shared.metrics.request_not_started(status))
             .map(Response::new)
     }
 
@@ -66,6 +66,7 @@ impl VllmEngine for VllmEngineService {
         request: Request<vllm::AbortRequest>,
     ) -> Result<Response<vllm::AbortResponse>, Status> {
         self.state
+            .shared
             .registry
             .abort(&request.into_inner().request_ids)?;
         Ok(Response::new(vllm::AbortResponse::default()))
@@ -96,7 +97,7 @@ impl VllmEngine for VllmEngineService {
         &self,
         _request: Request<common::GetTokenizerRequest>,
     ) -> Result<Response<Self::GetTokenizerStream>, Status> {
-        tokenizer_bundle::get_tokenizer(self.state.tokenizer_dir.clone())
+        tokenizer_bundle::get_tokenizer(self.state.shared.tokenizer_dir.clone())
             .await
             .map(Response::new)
     }
@@ -105,7 +106,7 @@ impl VllmEngine for VllmEngineService {
         &self,
         request: Request<common::SubscribeKvEventsRequest>,
     ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
-        let Some(relay) = &self.state.kv_relay else {
+        let Some(relay) = &self.state.shared.kv_relay else {
             return Err(Status::unimplemented(kv_events::VLLM_DISABLED_MESSAGE));
         };
         relay.subscribe(request.into_inner()).map(Response::new)

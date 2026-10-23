@@ -7,6 +7,7 @@ last worker, so the three findings a readiness wait must report can be staged.
 
 from __future__ import annotations
 
+import os
 import socket
 import stat
 import subprocess
@@ -17,9 +18,10 @@ import time
 from pathlib import Path
 
 import pytest
-from infra.constants import ENV_SHOW_ROUTER_LOGS
+from infra.constants import ENV_SHOW_ROUTER_LOGS, ENV_SHOW_WORKER_LOGS, ConnectionMode
 from infra.gateway import Gateway
 from infra.process_utils import ProcessExitedError, wait_for_health, wait_for_workers_ready
+from infra.worker import Worker
 
 FAKE_ROUTER = textwrap.dedent(
     '''
@@ -264,4 +266,81 @@ def test_readiness_waits_stop_when_the_process_exits():
         wait_for_health("http://127.0.0.1:9", timeout=30, process=exited())
     with pytest.raises(ProcessExitedError, match="exited with code 3"):
         wait_for_workers_ready("http://127.0.0.1:9", 1, timeout=30, process=exited())
+    assert time.perf_counter() - started < 10
+
+
+# A worker that dials the router in: the router binds the wire, so the worker
+# has no port of its own to probe and loads its model inside the gateway's
+# readiness wait. The launcher here dies before any ready line, as an engine
+# whose install does not match its servicer's does.
+DIALING_WORKER = "ipc:///tmp/smg-zmq/engine-31002"
+DYING_LAUNCHER = (
+    "import sys; print('INFO loading the engine', flush=True);"
+    " raise ImportError(\"cannot import name 'serve' from 'engine'\")"
+)
+
+
+def _dialing_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, script: str) -> Worker:
+    """A ZMQ-mode worker whose process is a stub running ``script`` through the
+    harness's own output redirection."""
+    monkeypatch.setenv(ENV_SHOW_WORKER_LOGS, "0")
+    worker = Worker(
+        model_id="org/model",
+        engine="vllm",
+        port=31002,
+        gpu_ids=[0],
+        mode=ConnectionMode.ZMQ,
+        log_dir=str(tmp_path / "e2e-logs"),
+    )
+    worker.process = worker._spawn_process([sys.executable, "-c", script], env=dict(os.environ))
+    return worker
+
+
+def test_a_worker_that_dies_during_the_readiness_wait_ends_it_with_its_death_report(
+    fake_router, tmp_path, monkeypatch
+):
+    # The stand-in holds the worker back, as the router never sees an engine
+    # that died before dialling in; the wait used to run to its bound.
+    worker = _dialing_worker(tmp_path, monkeypatch, DYING_LAUNCHER)
+    gateway = Gateway()
+    started = time.perf_counter()
+    try:
+        with pytest.raises(RuntimeError, match="died during startup") as excinfo:
+            gateway.start(
+                worker_urls=[DIALING_WORKER],
+                workers=[worker],
+                model_path="m",
+                timeout=30,
+                extra_args=["--fake", "hold-last"],
+                log_dir=str(tmp_path),
+            )
+        elapsed = time.perf_counter() - started
+        # The launch failed: the router is gone, as after a timeout.
+        assert gateway.process is None
+    finally:
+        gateway.shutdown()
+        if worker._log_file is not None:
+            worker._log_file.close()
+    # The exit ends the wait within one poll interval, not at the bound.
+    assert elapsed < 10, f"waited {elapsed:.1f}s on a worker that had exited"
+    text = str(excinfo.value)
+    assert text == worker._death_report()
+    assert text.startswith(
+        f"Worker org/model (PID {worker.process.pid}) died during startup (exit status 1)"
+    )
+    assert "the log says: \"ImportError: cannot import name 'serve' from 'engine'\"" in text
+    assert "loading the engine" not in text
+    assert text.endswith("; log file worker-org__model_vllm_zmq_31002.log")
+
+
+def test_the_readiness_wait_stops_when_a_launched_worker_exits(tmp_path, monkeypatch):
+    worker = _dialing_worker(tmp_path, monkeypatch, "import sys; sys.exit(3)")
+    worker.process.wait(timeout=30)
+    started = time.perf_counter()
+    try:
+        with pytest.raises(RuntimeError, match=r"died during startup \(exit status 3\)"):
+            wait_for_workers_ready("http://127.0.0.1:9", 1, timeout=30, workers=[worker])
+    finally:
+        if worker._log_file is not None:
+            worker._log_file.close()
     assert time.perf_counter() - started < 10

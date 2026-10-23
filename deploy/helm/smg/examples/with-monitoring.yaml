@@ -1,4 +1,4 @@
-# Router with Prometheus ServiceMonitor and Grafana dashboard.
+# Router with Prometheus ServiceMonitor, Grafana dashboard and alerting rules.
 # Usage: helm install smg deploy/helm/smg -f deploy/helm/smg/examples/with-monitoring.yaml
 router:
   workerUrls:
@@ -14,3 +14,10 @@ grafana:
     enabled: true
     labels:
       grafana_dashboard: "1"
+prometheusRule:
+  enabled: true
+  labels:
+    release: prometheus
+  # Thresholds are the chart defaults; see values.yaml for the rationale.
+  # alerts:
+  #   ttftP99Seconds: 2

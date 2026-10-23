@@ -49,9 +49,10 @@ impl KvEventMonitor {
     ///
     /// Blocks on the disk and external tiers, in cache groups other than main
     /// attention, not local to the worker, or owned by a residency agent are
-    /// counted and skipped. Content hashes are computed under the event's
-    /// LoRA name and cache salt, so a salted block matches only a request
-    /// hashed under the same namespace.
+    /// counted and skipped, as is a store of blocks narrower than the worker's
+    /// block of record ([`WorkerIndexState::sub_block`]). Content hashes are
+    /// computed under the event's LoRA name and cache salt, so a salted block
+    /// matches only a request hashed under the same namespace.
     fn apply_stored(
         stored: &KvBlocksStored,
         worker_id: u32,
@@ -71,6 +72,9 @@ impl KvEventMonitor {
             worker_blocks.counters.untracked_tier += 1;
             return;
         };
+        if worker_blocks.sub_block(worker_id, &stored.blocks) {
+            return;
+        }
 
         let seed = namespace_seed(stored.lora_name.as_deref(), stored.cache_salt.as_deref());
         let blocks: Vec<StoredBlock> = stored
@@ -142,7 +146,13 @@ impl KvEventMonitor {
         indexer.apply_removed(worker_id, &seq_hashes, &mut worker_blocks.blocks);
     }
 
-    /// Drop every block of a worker from the indexer and forget its copies.
+    /// Drop every block of a worker from the indexer and forget its copies
+    /// and its block of record: a clear is the worker's new cache incarnation
+    /// (its publisher restarted or resynced), and a worker that comes back
+    /// with a narrower block than it stored before must index its stores as
+    /// they come, not count every one as a sub-block store. The dropped
+    /// record is kept until that first store, which is logged when it is
+    /// narrower ([`WorkerIndexState::sub_block`]).
     pub(super) fn apply_cleared(
         worker_id: u32,
         indexer: &KvIndex,
@@ -150,6 +160,8 @@ impl KvEventMonitor {
     ) {
         indexer.apply_cleared(worker_id, &mut worker_blocks.blocks);
         worker_blocks.copies.clear();
+        worker_blocks.record_before_clear = worker_blocks.block_of_record;
+        worker_blocks.block_of_record = 0;
     }
 }
 
@@ -225,6 +237,15 @@ pub(crate) struct WorkerIndexCounters {
     /// where fragmentation of the chain index is looked for first.
     pub(crate) parentless_stores: u64,
     pub(crate) parentless_blocks: u64,
+    /// Stores of blocks narrower than the worker's block of record, and the
+    /// blocks they carried: a hybrid engine's prefix entries at its hash
+    /// granularity (the prompt's tail inside its last block), or an engine's
+    /// last short page. Not indexed: a request is chunked at the block of
+    /// record and never matches one, and their parents are intermediate
+    /// hashes the engine does not publish, so indexed they would read as
+    /// parent-less stores and seed root chains that only collide.
+    pub(crate) sub_block_stores: u64,
+    pub(crate) sub_block_blocks: u64,
 }
 
 impl WorkerIndexCounters {
@@ -233,6 +254,14 @@ impl WorkerIndexCounters {
         (
             self.parentless_stores - before.parentless_stores,
             self.parentless_blocks - before.parentless_blocks,
+        )
+    }
+
+    /// Sub-block stores and blocks this state saw since `before`.
+    pub(super) fn sub_block_since(&self, before: &Self) -> (u64, u64) {
+        (
+            self.sub_block_stores - before.sub_block_stores,
+            self.sub_block_blocks - before.sub_block_blocks,
         )
     }
 }
@@ -281,6 +310,13 @@ pub(crate) struct WorkerIndexState {
     copies: HashMap<SequenceHash, Copies>,
     /// Cache groups whose kind is not main attention.
     non_main_groups: Vec<u32>,
+    /// Tokens per block of the widest block the worker's stores carried so
+    /// far, 0 until a store names a width: the worker's block of record.
+    block_of_record: i32,
+    /// The block of record a clear dropped, until the worker's first store
+    /// after it names a width: a narrower one is logged, since the model-level
+    /// size that chunks requests keeps the old width.
+    record_before_clear: i32,
     pub(crate) counters: WorkerIndexCounters,
 }
 
@@ -321,6 +357,47 @@ impl WorkerIndexState {
             self.counters.non_main_group += 1;
         }
         main
+    }
+
+    /// Whether a store names blocks narrower than the worker's block of
+    /// record, the widest block its stores carried so far; a wider store
+    /// raises the record first. Hybrid engines publish, beside the blocks of
+    /// their cache group, prefix entries at their hash granularity (a
+    /// fraction of the block, for a prefix boundary a later request can
+    /// resume at) under parents they never publish; the index can neither
+    /// match them (requests are chunked at the block of record) nor hang
+    /// them on the chain, so they are counted and left out. The engines
+    /// write one width per store, so the first block's width is the store's;
+    /// a width of zero is unknown and neither raises nor trips the record.
+    fn sub_block(&mut self, worker_id: u32, blocks: &[KvBlock]) -> bool {
+        let Some(width) = blocks
+            .first()
+            .map(|block| block.block_size)
+            .filter(|&width| width > 0)
+        else {
+            return false;
+        };
+        if self.record_before_clear > 0 {
+            if width < self.record_before_clear {
+                warn!(
+                    worker_id,
+                    before = self.record_before_clear,
+                    after = width,
+                    "the first KV event store after a clear names a narrower block than the \
+                     worker's previous record: its stores are indexed, but requests are chunked \
+                     at the model's learned block size until the model's last worker leaves"
+                );
+            }
+            self.record_before_clear = 0;
+        }
+        if width > self.block_of_record {
+            self.block_of_record = width;
+        } else if width < self.block_of_record {
+            self.counters.sub_block_stores += 1;
+            self.counters.sub_block_blocks += blocks.len() as u64;
+            return true;
+        }
+        false
     }
 
     /// Count a store on `tier`, before the indexer applies it. A second copy
@@ -1032,6 +1109,155 @@ mod tests {
         assert!(
             !routable(&indexer, w1, &hashes),
             "the cap bounds the extra removals"
+        );
+    }
+
+    fn stored_width(hash: i64, width: i32, tokens: &[u32], parent: Option<i64>) -> KvBlocksStored {
+        KvBlocksStored {
+            blocks: vec![KvBlock {
+                block_hash: hash,
+                token_ids: tokens.to_vec(),
+                block_size: width,
+                ..Default::default()
+            }],
+            parent_block_hash: parent,
+            ..Default::default()
+        }
+    }
+
+    /// A hybrid engine registers the prompt's tail inside its last block as a
+    /// prefix entry at its hash granularity: a one-block store narrower than
+    /// the block of record whose parent is an intermediate hash it never
+    /// publishes. It is counted and left out of the index, never a
+    /// parent-less store or a root chain of its own.
+    #[test]
+    fn a_sub_block_store_is_counted_and_not_indexed() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let first: Vec<u32> = (0..32).collect();
+        KvEventMonitor::apply_stored(&stored_width(1, 32, &first, None), w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 1);
+
+        // The tail entry: four tokens under a parent the chain never named.
+        KvEventMonitor::apply_stored(
+            &stored_width(77, 4, &[1, 2, 3, 4], Some(555)),
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert_eq!(
+            indexer.current_size(),
+            1,
+            "a sub-block entry is not indexed"
+        );
+        assert_eq!(wb.counters.sub_block_stores, 1);
+        assert_eq!(wb.counters.sub_block_blocks, 1);
+        assert_eq!(wb.counters.parentless_stores, 0, "not a parent-less store");
+        assert_eq!(wb.counters.parentless_blocks, 0);
+
+        // The chain goes on from the full block as if the entry never came.
+        let second: Vec<u32> = (32..64).collect();
+        KvEventMonitor::apply_stored(
+            &stored_width(2, 32, &second, Some(1)),
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert_eq!(indexer.current_size(), 2);
+        assert_eq!(wb.counters.parentless_stores, 0);
+
+        // The engine's eventual removal of the entry finds nothing to take out.
+        KvEventMonitor::apply_removed(
+            &KvBlocksRemoved {
+                block_hashes: vec![77],
+                ..Default::default()
+            },
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert_eq!(indexer.current_size(), 2);
+        assert_eq!(wb.counters.sub_block_stores, 1);
+    }
+
+    /// The block of record is the widest block the worker stored so far: a
+    /// narrower store before any wider one is indexed as it comes, a wider
+    /// store raises the record, and a width of zero says nothing either way.
+    #[test]
+    fn the_block_of_record_is_the_widest_block_stored() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        KvEventMonitor::apply_stored(
+            &stored_width(1, 4, &[1, 2, 3, 4], None),
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert_eq!(indexer.current_size(), 1, "nothing to compare against yet");
+        KvEventMonitor::apply_stored(&stored_width(2, 0, &[5, 6], None), w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 2, "an unknown width is indexed");
+        let full: Vec<u32> = (10..42).collect();
+        KvEventMonitor::apply_stored(&stored_width(3, 32, &full, None), w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 3, "a wider block raises the record");
+        KvEventMonitor::apply_stored(
+            &stored_width(4, 4, &[7, 8, 9, 10], Some(3)),
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert_eq!(
+            indexer.current_size(),
+            3,
+            "narrower than the record: left out"
+        );
+        KvEventMonitor::apply_stored(&stored_width(5, 0, &[11], Some(3)), w1, &indexer, &mut wb);
+        assert_eq!(
+            indexer.current_size(),
+            4,
+            "an unknown width is still indexed"
+        );
+        assert_eq!(wb.counters.sub_block_stores, 1);
+        assert_eq!(wb.counters.sub_block_blocks, 1);
+        assert_eq!(wb.counters.parentless_stores, 0);
+    }
+
+    /// A clear is the worker's new cache incarnation (its publisher restarted
+    /// or resynced): the block of record goes with the blocks, so a worker
+    /// that comes back with a narrower block indexes its stores as they come
+    /// instead of counting every one as a sub-block store.
+    #[test]
+    fn a_clear_resets_the_block_of_record() {
+        let indexer = KvIndex::chain();
+        let w1 = indexer.intern_worker("http://w1:8000").unwrap();
+        let mut wb = WorkerIndexState::default();
+        let full: Vec<u32> = (10..42).collect();
+        KvEventMonitor::apply_stored(&stored_width(1, 32, &full, None), w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 1);
+        KvEventMonitor::apply_cleared(w1, &indexer, &mut wb);
+        assert_eq!(indexer.current_size(), 0);
+        assert_eq!(
+            wb.record_before_clear, 32,
+            "kept for the first store's log line"
+        );
+        KvEventMonitor::apply_stored(
+            &stored_width(2, 4, &[1, 2, 3, 4], None),
+            w1,
+            &indexer,
+            &mut wb,
+        );
+        assert_eq!(
+            indexer.current_size(),
+            1,
+            "the restarted worker's narrower block is indexed, not left out"
+        );
+        assert_eq!(wb.counters.sub_block_stores, 0);
+        assert_eq!(wb.counters.sub_block_blocks, 0);
+        assert_eq!(wb.block_of_record, 4);
+        assert_eq!(
+            wb.record_before_clear, 0,
+            "the first store after the clear settles it"
         );
     }
 }

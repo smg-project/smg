@@ -7,7 +7,7 @@ use std::{sync::Arc, time::Instant};
 
 use futures::future::try_join_all;
 use llm_tokenizer::{
-    stop::{SequenceDecoderOutput, StopSequenceDecoder},
+    stop::{SequenceDecoderOutput, SequenceDecoderStep, StopSequenceDecoder},
     traits::Tokenizer,
 };
 use openai_protocol::{
@@ -29,7 +29,9 @@ use crate::routers::{
         context::{DispatchMetadata, ExecutionResult},
         proto_wrapper::ProtoGenerateComplete,
         regular::symphony::{
-            engine_finish, finished, telemetry::Who, Assignment, Delta, Reader, SymphonyError,
+            engine_finish, finished,
+            telemetry::{self, Who},
+            Assignment, Delta, Reader, SymphonyError,
         },
         spec::{ChatResponseSpec, CompletionResponseSpec, MessagesResponseSpec},
         utils,
@@ -251,7 +253,7 @@ impl ResponseProcessor {
         // on the older path; the text it releases is the last token's.
         let tail = stop_decoder
             .finish()
-            .map_err(|e| format!("Failed to finish token decoding: {e}"))?;
+            .map_err(|e| reader.failed(format!("Failed to finish token decoding: {e}")))?;
         utils::warn_detokenize_recoveries(request_id, index as u32, stop_decoder);
         if let SequenceDecoderOutput::Text(text) | SequenceDecoderOutput::StoppedWithText(text) =
             tail
@@ -310,7 +312,8 @@ impl ResponseProcessor {
     /// sequence the decoder or the engine matched is the stop reason, as on the older path; the
     /// thinking tokens are the engine's, or the reasoning text's, when the request asked for
     /// thinking. A call whose arguments no `tool_use` input holds refuses the message
-    /// (`SymphonyError::InputRefused`, the call named), rather than leave as `{}` without a word.
+    /// (`SymphonyError::InputRefused`, the call named), rather than leave as `{}` without a word;
+    /// the caller counts the refusal under the table ([`telemetry::record_refused`]).
     fn read_messages_with_symphony(
         dispatch: &DispatchMetadata,
         assignment: &Assignment,
@@ -327,7 +330,7 @@ impl ResponseProcessor {
         let stopped = reader.read(stop_decoder, complete.output_ids(), &mut delta, &mut events)?;
         let tail = stop_decoder
             .finish()
-            .map_err(|e| SymphonyError::Read(format!("Failed to finish token decoding: {e}")))?;
+            .map_err(|e| reader.failed(format!("Failed to finish token decoding: {e}")))?;
         utils::warn_detokenize_recoveries(&dispatch.request_id, 0, stop_decoder);
         if let SequenceDecoderOutput::Text(text) | SequenceDecoderOutput::StoppedWithText(text) =
             tail
@@ -802,6 +805,7 @@ impl ResponseProcessor {
             .map_err(|e| match e {
                 // The output's own doing: the model wrote arguments no tool_use input holds.
                 SymphonyError::InputRefused(why) => {
+                    telemetry::record_refused(telemetry::table_label(assignment.format.name()));
                     warn!(function = "process_non_streaming_messages_response", error = %why, "the message's tool_use input cannot carry the model's arguments");
                     error::internal_error("symphony_tool_use_input_refused", why)
                 }
@@ -1247,23 +1251,17 @@ fn decode_complete(
     index: u32,
 ) -> Result<Decoded, DecodeFailure> {
     stop_decoder.reset();
-    let outputs = stop_decoder
-        .process_tokens(output_ids)
-        .map_err(|e| DecodeFailure::Process(e.to_string()))?;
-
     let mut text = String::new();
     let mut stopped = false;
     let mut held = false;
-    let mut token_ends = Vec::with_capacity(outputs.len());
-    for output in outputs {
-        match output {
-            SequenceDecoderOutput::Text(t) => text.push_str(&t),
-            SequenceDecoderOutput::StoppedWithText(t) => {
-                text.push_str(&t);
-                stopped = true;
-            }
-            SequenceDecoderOutput::Stopped => stopped = true,
-            SequenceDecoderOutput::Held => held = true,
+    let mut token_ends = Vec::with_capacity(output_ids.len());
+    for &token_id in output_ids {
+        match stop_decoder
+            .process_token_into(token_id, &mut text)
+            .map_err(|e| DecodeFailure::Process(e.to_string()))?
+        {
+            SequenceDecoderStep::Held => held = true,
+            step => stopped |= step.stopped(),
         }
         token_ends.push(text.len());
         if stopped {
@@ -1272,11 +1270,13 @@ fn decode_complete(
     }
 
     let tail = stop_decoder
-        .finish()
+        .finish_into(&mut text)
         .map_err(|e| DecodeFailure::Finish(e.to_string()))?;
     utils::warn_detokenize_recoveries(request_id, index, stop_decoder);
-    if let SequenceDecoderOutput::Text(t) | SequenceDecoderOutput::StoppedWithText(t) = tail {
-        text.push_str(&t);
+    if matches!(
+        tail,
+        SequenceDecoderStep::Text | SequenceDecoderStep::StoppedWithText
+    ) {
         if let Some(last) = token_ends.last_mut() {
             *last = text.len();
         }
@@ -1637,7 +1637,7 @@ mod responses_finish_reason_tests {
     mod scripted_tokenizer {
         include!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/tests/common/scripted_tokenizer.rs"
+            "/test_harness/src/scripted_tokenizer.rs"
         ));
     }
 

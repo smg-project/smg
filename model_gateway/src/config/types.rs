@@ -101,6 +101,9 @@ pub struct RouterConfig {
     /// routes always remain available on the main `port` regardless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check_port: Option<u16>,
+    /// Optional capacity thresholds for PD/EPD readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pd_readiness: Option<PdReadinessConfig>,
     /// Port of the admin listener. When set, the control-plane routes (the
     /// admin, worker-registry and RL routes) are served on it, with the probe
     /// routes, and the data listener answers 404 for them. `None` keeps the
@@ -383,6 +386,14 @@ pub struct RouterConfig {
     /// instead. When unset, falls back to `SMG_MM_TURBOJPEG`, then `prefer`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mm_turbojpeg: Option<TurboJpegPolicy>,
+    /// Video download timeout in milliseconds; positive. Falls back to
+    /// `SMG_MM_VIDEO_FETCH_TIMEOUT_MS`, then 30000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_video_fetch_timeout_ms: Option<u64>,
+    /// Image/audio download timeout in milliseconds; positive. Falls back to
+    /// `SMG_MM_FETCH_TIMEOUT_MS`, then 10000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_fetch_timeout_ms: Option<u64>,
     /// Listener IP for the RDMA metadata exchange, a plain IPv4 or IPv6 address
     /// (the workers connect to it as written, so `ConfigValidator` refuses
     /// anything else); when unset, falls back to `SMG_RDMA_LISTEN_IP`, and
@@ -600,6 +611,52 @@ pub struct RouterConfig {
     /// When set, wraps all storage backends with hook-based interceptors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_hook_wasm_path: Option<String>,
+}
+
+/// Capacity threshold for one PD role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReadinessRoleConfig {
+    /// Desired fleet size used as the stable percentage denominator. Has no
+    /// effect unless `min_healthy_percent` is also set.
+    pub expected_workers: Option<usize>,
+    /// Absolute safety floor, independent of the percentage threshold.
+    pub min_healthy_workers: usize,
+    /// Minimum healthy percentage of `expected_workers`.
+    pub min_healthy_percent: Option<u8>,
+}
+
+impl Default for ReadinessRoleConfig {
+    /// Preserve the one-healthy-worker requirement without a percentage gate.
+    fn default() -> Self {
+        Self {
+            expected_workers: None,
+            min_healthy_workers: 1,
+            min_healthy_percent: None,
+        }
+    }
+}
+
+impl ReadinessRoleConfig {
+    /// Effective number of healthy workers required for this role.
+    pub fn required_workers(self) -> usize {
+        let percentage_required =
+            self.expected_workers
+                .zip(self.min_healthy_percent)
+                .map_or(0, |(expected, percent)| {
+                    let percent = usize::from(percent);
+                    (expected / 100) * percent + ((expected % 100) * percent).div_ceil(100)
+                });
+        self.min_healthy_workers.max(percentage_required)
+    }
+}
+
+/// Independent readiness thresholds for the two PD pipeline roles.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PdReadinessConfig {
+    pub prefill: ReadinessRoleConfig,
+    pub decode: ReadinessRoleConfig,
 }
 
 /// How a request's tenant is resolved on the serving path. The tenant scopes
@@ -1287,8 +1344,8 @@ pub enum PolicyConfig {
         /// when a request's token count is unknown at routing time.
         #[serde(default = "default_least_load_mean_prefill")]
         mean_prefill_tokens: u32,
-        /// Throughput (tokens/s) for prefill workers, and fallback when other
-        /// workers report no live `gen_throughput`. Set to per-replica input
+        /// Throughput (tokens/s) for prefill workers, and fallback for other
+        /// workers when no candidate reports a live `gen_throughput`. Set to per-replica input
         /// tokens/s for prefill, output tokens/s otherwise; co-tunes with
         /// `kv_pressure_weight`. The CLI shares one value across roles; use
         /// programmatically constructed `prefill_policy` / `decode_policy` for
@@ -1763,11 +1820,14 @@ pub struct HealthCheckConfig {
     pub check_interval_secs: u64,
     pub endpoint: String,
     pub disable_health_check: bool,
-    /// Recover failed workers by removal: they re-enter through service
-    /// discovery once their engine returns. Off, a Failed worker stays
-    /// registered and probed, and rejoins in place when it answers again.
+    /// Recover failed workers by removal: a removed worker re-enters through
+    /// service discovery once its engine returns. Unset, removal follows
+    /// discovery and takes only the workers a provider discovered; `true`
+    /// removes any local worker that fails, `false` none, and a Failed worker
+    /// then stays registered and probed, and rejoins in place when it answers
+    /// again. See [`resolve_worker_auto_recovery`].
     #[serde(default, alias = "worker_auto_recovery")]
-    pub remove_unhealthy_workers: bool,
+    pub remove_unhealthy_workers: Option<bool>,
     /// Seconds to keep a Ready worker in `Draining` after `RemoveWorker`
     /// is submitted before the registry entry is removed. Lets in-flight
     /// requests complete naturally. Set to `0` to skip draining and
@@ -1780,17 +1840,40 @@ fn default_drain_settle_secs() -> u64 {
     5
 }
 
-/// Resolve `--worker-auto-recovery`'s conditional default: an explicit
-/// setting always wins; otherwise it follows service discovery.
+/// Which Failed workers the health checker removes. Mesh-imported workers
+/// are never removed under any scope: their owner manages them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnhealthyRemovalScope {
+    /// None: a Failed worker stays registered and probed, and rejoins in
+    /// place when its engine answers again.
+    Disabled,
+    /// The workers a discovery provider registered, which it registers again
+    /// once their engine returns. Static and API-added workers stay.
+    DiscoveryOwned,
+    /// Every local worker, static and API-added ones included, though
+    /// nothing re-adds those.
+    AllLocal,
+}
+
+/// Resolve `--worker-auto-recovery` into the removal scope. An explicit
+/// setting wins: `true` removes any local worker that fails, `false` none.
+/// Unset, it follows service discovery, and takes only what discovery can
+/// give back.
 ///
-/// The recovery mechanism is removal — a terminally failed worker is dropped
-/// from the registry so discovery re-registers and re-probes it once its
-/// engine returns. With discovery on, that loop completes and recovery is
-/// pure upside; with discovery off, nothing re-adds the worker, so removal
-/// would silently and permanently shrink a static fleet and must stay
-/// opt-in.
-pub fn resolve_worker_auto_recovery(explicit: Option<bool>, service_discovery: bool) -> bool {
-    explicit.unwrap_or(service_discovery)
+/// The recovery mechanism is removal: a terminally failed worker is dropped
+/// from the registry so its provider re-registers and re-probes it once its
+/// engine returns. A static or API-added worker has no provider to re-add
+/// it, so removing one would shrink the fleet for good: under discovery's
+/// default it stays, and recovers in place.
+pub fn resolve_worker_auto_recovery(
+    explicit: Option<bool>,
+    service_discovery: bool,
+) -> UnhealthyRemovalScope {
+    match (explicit, service_discovery) {
+        (Some(true), _) => UnhealthyRemovalScope::AllLocal,
+        (None, true) => UnhealthyRemovalScope::DiscoveryOwned,
+        (Some(false), _) | (None, false) => UnhealthyRemovalScope::Disabled,
+    }
 }
 
 impl Default for HealthCheckConfig {
@@ -1802,7 +1885,7 @@ impl Default for HealthCheckConfig {
             check_interval_secs: 60,
             endpoint: "/health".to_string(),
             disable_health_check: false,
-            remove_unhealthy_workers: false,
+            remove_unhealthy_workers: None,
             drain_settle_secs: default_drain_settle_secs(),
         }
     }
@@ -1905,6 +1988,7 @@ impl Default for RouterConfig {
             pd_pairing_mode: PdPairingMode::default(),
             host: "0.0.0.0".to_string(),
             port: 3001,
+            pd_readiness: None,
             health_check_port: None,
             admin_port: None,
             admin_host: None,
@@ -1953,6 +2037,8 @@ impl Default for RouterConfig {
             mm_allowed_media_domains: None,
             mm_allow_private_media_hosts: false,
             mm_turbojpeg: None,
+            mm_video_fetch_timeout_ms: None,
+            mm_fetch_timeout_ms: None,
             rdma_listen_ip: None,
             rdma_slot_ttl_s: None,
             log_mm_timing: false,
@@ -2037,6 +2123,17 @@ impl RouterConfig {
     /// Validate the configuration
     pub fn validate(&self) -> ConfigResult<()> {
         ConfigValidator::validate(self)
+    }
+
+    /// Which Failed workers the health checker removes: the setting as
+    /// given, resolved against whether a discovery provider is selected. The
+    /// CLI, the Python binding and a configuration file all keep the setting
+    /// unresolved, so it is resolved here alone.
+    pub fn unhealthy_removal_scope(&self) -> UnhealthyRemovalScope {
+        resolve_worker_auto_recovery(
+            self.health_check.remove_unhealthy_workers,
+            self.discovery.is_some(),
+        )
     }
 
     /// Get the routing mode type as a string
@@ -2273,6 +2370,7 @@ mod tests {
     }
 
     #[test]
+    /// Old configs preserve defaults and explicit media settings round-trip.
     fn test_multimodal_settings_serde_roundtrip_and_backward_compat() {
         // Unset by default, and the optional ones stay out of serialized output.
         let config = RouterConfig::default();
@@ -2282,6 +2380,8 @@ mod tests {
             "mm_pixel_cache_mb",
             "mm_allowed_media_domains",
             "mm_turbojpeg",
+            "mm_fetch_timeout_ms",
+            "mm_video_fetch_timeout_ms",
             "rdma_listen_ip",
             "rdma_slot_ttl_s",
         ] {
@@ -2301,6 +2401,8 @@ mod tests {
         assert_eq!(without.mm_allowed_media_domains, None);
         assert!(!without.mm_allow_private_media_hosts);
         assert_eq!(without.mm_turbojpeg, None);
+        assert_eq!(without.mm_fetch_timeout_ms, None);
+        assert_eq!(without.mm_video_fetch_timeout_ms, None);
         assert_eq!(without.rdma_listen_ip, None);
         assert_eq!(without.rdma_slot_ttl_s, None);
         assert!(!without.log_mm_timing);
@@ -2314,6 +2416,8 @@ mod tests {
             .mm_allowed_media_domains(Some(vec!["media.example".to_string()]))
             .mm_allow_private_media_hosts(true)
             .mm_turbojpeg(Some(TurboJpegPolicy::Require))
+            .mm_fetch_timeout_ms(Some(60000))
+            .mm_video_fetch_timeout_ms(Some(120000))
             .rdma_listen_ip(Some("10.0.0.7"))
             .rdma_slot_ttl_s(Some(600))
             .log_mm_timing(true)
@@ -2331,6 +2435,8 @@ mod tests {
         );
         assert!(with.mm_allow_private_media_hosts);
         assert_eq!(with.mm_turbojpeg, Some(TurboJpegPolicy::Require));
+        assert_eq!(with.mm_fetch_timeout_ms, Some(60000));
+        assert_eq!(with.mm_video_fetch_timeout_ms, Some(120000));
         assert_eq!(with.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(with.rdma_slot_ttl_s, Some(600));
         assert!(with.log_mm_timing);
@@ -2500,6 +2606,44 @@ mod tests {
         assert_eq!(with.pd_admission_wait_secs, 0);
     }
 
+    /// Unset, removal follows discovery and takes only the workers a
+    /// provider can give back; an explicit setting wins either way.
+    #[test]
+    fn unhealthy_removal_follows_discovery_unless_set() {
+        use UnhealthyRemovalScope::{AllLocal, Disabled, DiscoveryOwned};
+        let scope = |explicit, discovery: bool| {
+            let config = RouterConfig {
+                health_check: HealthCheckConfig {
+                    remove_unhealthy_workers: explicit,
+                    ..Default::default()
+                },
+                discovery: discovery.then(|| {
+                    DiscoveryConfig::File(FileDiscoveryConfig {
+                        path: "/run/smg/workers.json".into(),
+                        check_interval_secs: DEFAULT_DISCOVERY_CHECK_INTERVAL_SECS,
+                    })
+                }),
+                ..Default::default()
+            };
+            config.unhealthy_removal_scope()
+        };
+        assert_eq!(scope(None, true), DiscoveryOwned);
+        assert_eq!(scope(None, false), Disabled);
+        assert_eq!(scope(Some(true), true), AllLocal);
+        assert_eq!(scope(Some(true), false), AllLocal);
+        assert_eq!(scope(Some(false), true), Disabled);
+        assert_eq!(scope(Some(false), false), Disabled);
+
+        // A configuration file that leaves it out keeps it unset.
+        let mut json = serde_json::to_value(RouterConfig::default()).unwrap();
+        json["health_check"]
+            .as_object_mut()
+            .unwrap()
+            .remove("remove_unhealthy_workers");
+        let read: RouterConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(read.health_check.remove_unhealthy_workers, None);
+    }
+
     #[test]
     fn alias_field_spellings_deserialize_and_serialize_canonically() {
         // Config files may use the intent-revealing spellings; alias in,
@@ -2519,7 +2663,7 @@ mod tests {
             serde_json::Value::Bool(true),
         );
         let cfg: RouterConfig = serde_json::from_value(json).unwrap();
-        assert!(cfg.health_check.remove_unhealthy_workers);
+        assert_eq!(cfg.health_check.remove_unhealthy_workers, Some(true));
         let out = serde_json::to_string(&cfg).unwrap();
         assert!(out.contains("routing_key_override"));
         assert!(out.contains("remove_unhealthy_workers"));

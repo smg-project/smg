@@ -22,6 +22,7 @@
 //! requests, tokens and latencies observed at the points the request path
 //! already passes, on a listener of their own.
 
+mod admin;
 pub mod engine_hash;
 mod engine_link;
 mod error;
@@ -30,14 +31,17 @@ pub mod kv_events;
 pub mod kv_history;
 pub mod kv_state;
 pub mod kv_wire;
+mod load_report;
 mod load_tracker;
 mod metrics;
 mod proto_json;
 mod requests;
 mod server;
+mod servicer;
 mod servicer_config;
 pub mod sglang;
 mod stop_match;
+mod stream;
 #[cfg(test)]
 mod testing;
 mod tokenizer_bundle;

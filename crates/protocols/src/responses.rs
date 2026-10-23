@@ -690,7 +690,7 @@ pub struct CustomToolGrammar {
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum CustomToolGrammarSyntax {
-    /// Lark grammar (https://lark-parser.readthedocs.io/).
+    /// Lark grammar (<https://lark-parser.readthedocs.io/>).
     Lark,
     /// Regular expression.
     Regex,
@@ -2250,7 +2250,7 @@ pub struct McpToolInfo {
 /// Structured `mcp_call.error`: a `type`-tagged union of protocol,
 /// tool-execution, and HTTP failures. OpenAI removed the legacy plain-string
 /// shape from the wire; stored/replayed string errors still deserialize via
-/// [`mcp_call_error_compat`].
+/// `mcp_call_error_compat`.
 #[expect(
     clippy::enum_variant_names,
     reason = "variant names mirror the spec's `*_error` tag set"

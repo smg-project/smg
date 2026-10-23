@@ -15,7 +15,7 @@ use crate::{
 /// Handles the Mistral-specific format:
 /// `[TOOL_CALLS] [{"name": "func", "arguments": {...}}, ...]`
 ///
-/// Reference: https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3?chat_template=default
+/// Reference: <https://huggingface.co/mistralai/Mistral-7B-Instruct-v0.3?chat_template=default>
 pub struct MistralParser {
     /// Parser for handling incomplete JSON during streaming
     partial_json: PartialJson,
