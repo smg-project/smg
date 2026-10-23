@@ -414,7 +414,6 @@ impl VllmServicerServer {
     /// request. `set_serving(false)` is the drain switch and closes admission
     /// as well.
     pub fn set_ready(&self, ready: bool) {
-        self.state.shared.registry.set_warming(!ready);
         self.state.shared.set_ready(ready);
     }
 
