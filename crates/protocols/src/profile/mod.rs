@@ -337,7 +337,15 @@ impl ProviderProfile {
     /// OpenAI profiles rewrite nothing of their own, so a relay may forward
     /// their requests as the client wrote them.
     pub fn normalizes_chat(self) -> bool {
-        self.is_vendor_contract()
+        // Exhaustive on purpose: a new profile has to say here whether
+        // `normalize_chat` rewrites its requests, or it does not compile.
+        match self {
+            ProviderProfile::Kimi
+            | ProviderProfile::Minimax
+            | ProviderProfile::Zai
+            | ProviderProfile::DeepSeek => true,
+            ProviderProfile::Generic | ProviderProfile::OpenAi => false,
+        }
     }
 
     /// Shape the request for dispatch under this profile: the provider's own
