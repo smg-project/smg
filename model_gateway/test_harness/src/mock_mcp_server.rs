@@ -1,4 +1,3 @@
-// tests/common/mock_mcp_server.rs - Mock MCP server for testing
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
