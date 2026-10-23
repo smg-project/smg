@@ -412,6 +412,7 @@ class TestMmSettings:
         assert not [r for r in caplog.records if "deprecated" in r.getMessage()]
 
     def test_from_args_reads_the_launcher_namespace(self):
+        """Read all current flags while accepting older launcher namespaces."""
         args = types.SimpleNamespace(
             mm_processor="redis",
             mm_max_inflight=None,
@@ -422,6 +423,8 @@ class TestMmSettings:
             mm_sidecar_max_queue=None,
             mm_sidecar_namespace="ns",
             mm_turbojpeg=None,
+            mm_fetch_timeout_ms=None,
+            mm_video_fetch_timeout_ms=None,
             model="m",
         )
         settings = mm_processor.MmSettings.from_args(args)
@@ -1117,3 +1120,27 @@ class TestServicerWiring:
             "VllmEngineServicer initialized (mm_processor=off, source=flag)" in r.getMessage()
             for r in caplog.records
         )
+
+
+@pytest.mark.parametrize(
+    "name,default", [("fetch_timeout_ms", 10000), ("video_fetch_timeout_ms", 30000)]
+)
+def test_fetch_timeout_precedence_and_validation(name, default, caplog):
+    """Both download budgets use flag > env > default and reject invalid input."""
+    parser = argparse.ArgumentParser()
+    mm_processor.add_mm_arguments(parser)
+    flag = "--mm-" + name.replace("_", "-")
+    env_name = "SMG_VLLM_MM_" + name.upper()
+    requested = mm_processor.MmSettings.from_args(parser.parse_args([]))
+    assert getattr(requested.resolve(env={}), name) == default
+    assert getattr(requested.resolve(env={env_name: " "}), name) == default
+    assert getattr(requested.resolve(env={env_name: "120000"}), name) == 120000
+    assert not [r for r in caplog.records if "deprecated" in r.getMessage()]
+    explicit = mm_processor.MmSettings.from_args(parser.parse_args([flag, "60000"]))
+    assert getattr(explicit.resolve(env={env_name: "invalid"}), name) == 60000
+    for raw in ("0", "-1", "invalid", "1.5"):
+        with pytest.raises(ValueError, match=env_name):
+            requested.resolve(env={env_name: raw})
+    for raw in ("0", "-1"):
+        with pytest.raises(ValueError, match=flag):
+            mm_processor.MmSettings.from_args(parser.parse_args([flag, raw])).resolve(env={})

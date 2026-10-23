@@ -428,6 +428,18 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Image/audio download timeout in milliseconds; unset uses env/default.
+    pub fn mm_fetch_timeout_ms(mut self, timeout: Option<u64>) -> Self {
+        self.config.mm_fetch_timeout_ms = timeout;
+        self
+    }
+
+    /// Video download timeout in milliseconds; unset uses env/default.
+    pub fn mm_video_fetch_timeout_ms(mut self, timeout: Option<u64>) -> Self {
+        self.config.mm_video_fetch_timeout_ms = timeout;
+        self
+    }
+
     /// Serve cached pixels over RDMA (legacy switch for the RDMA lane).
     pub fn mm_pixel_rdma(mut self, enabled: bool) -> Self {
         self.config.mm_pixel_rdma = enabled;

@@ -471,6 +471,8 @@ class RouterArgs:
     # media itself (every redirect hop included); None allows any host the
     # address policy passes
     mm_allowed_media_domains: list[str] | None = None
+    # Image/audio download budget in milliseconds; None uses SMG_MM_FETCH_TIMEOUT_MS, then 10000
+    mm_fetch_timeout_ms: int | None = None
     # Per-request image-count limit replacing model spec limits; None keeps spec limits
     mm_per_request_image_limit: int | None = None
     # Pixel cache budget (MiB) for router-side preprocessed media; None falls
@@ -485,6 +487,8 @@ class RouterArgs:
     # loaded: prefer (the pure-Rust fallback decoder, behind one warning) |
     # require (start-up fails); None falls back to SMG_MM_TURBOJPEG, then prefer
     mm_turbojpeg: str | None = None
+    # Video download budget in milliseconds; None uses SMG_MM_VIDEO_FETCH_TIMEOUT_MS, then 30000
+    mm_video_fetch_timeout_ms: int | None = None
     model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
     model_id_from: str | None = None
     model_path: str | None = None
@@ -1725,6 +1729,24 @@ class RouterArgs:
                 "Allow client-supplied media URLs that name or resolve to a loopback,"
                 " link-local or private address (an internal media origin); by default"
                 " such URLs are refused. Falls back to SMG_MM_ALLOW_PRIVATE_MEDIA_HOSTS"
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-fetch-timeout-ms",
+            type=_positive_int,
+            default=RouterArgs.mm_fetch_timeout_ms,
+            help=(
+                "Image/audio download timeout in milliseconds; positive. "
+                "Falls back to SMG_MM_FETCH_TIMEOUT_MS, then 10000."
+            ),
+        )
+        parser.add_argument(
+            f"--{prefix}mm-video-fetch-timeout-ms",
+            type=_positive_int,
+            default=RouterArgs.mm_video_fetch_timeout_ms,
+            help=(
+                "Video download timeout in milliseconds; positive. "
+                "Falls back to SMG_MM_VIDEO_FETCH_TIMEOUT_MS, then 30000."
             ),
         )
         parser.add_argument(

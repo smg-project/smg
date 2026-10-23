@@ -639,6 +639,20 @@ class TestParseRouterArgs:
                 parse_router_args([flag, "-1"])
         assert parse_router_args(["--mm-pixel-cache-mb", "0"]).mm_pixel_cache_mb == 0
 
+    @pytest.mark.parametrize("name", ["fetch_timeout_ms", "video_fetch_timeout_ms"])
+    def test_media_fetch_timeout_flags(self, name):
+        """Positive millisecond overrides reach the binding; unset preserves fallback."""
+        flag = "--mm-" + name.replace("_", "-")
+        assert getattr(parse_router_args([]), "mm_" + name) is None
+        args = parse_router_args([flag, "60000"])
+        assert getattr(args, "mm_" + name) == 60000
+        with patch("smg.router._Router") as native:
+            Router.from_args(args)
+        assert native.call_args.kwargs["mm_" + name] == 60000
+        for raw in ("0", "-1", "invalid", "1.5"):
+            with pytest.raises(SystemExit):
+                parse_router_args([flag, raw])
+
     def test_rdma_listen_ip_takes_an_ip_address_only(self):
         """The RDMA listener address is parsed as the router validates it: a plain IPv4
         or IPv6 literal (padding dropped, blank is unset); a non-address, a hostname, a

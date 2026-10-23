@@ -536,11 +536,13 @@ struct Router {
     mesh_tls_key: Option<String>,
     mm_allow_private_media_hosts: bool,
     mm_allowed_media_domains: Option<Vec<String>>,
+    mm_fetch_timeout_ms: Option<u64>,
     mm_per_request_image_limit: Option<usize>,
     mm_pixel_cache_mb: Option<usize>,
     mm_pixel_rdma: bool,
     mm_processing: Option<String>,
     mm_turbojpeg: Option<String>,
+    mm_video_fetch_timeout_ms: Option<u64>,
     model_aliases: HashMap<String, String>,
     model_id_from: Option<String>,
     model_path: Option<String>,
@@ -1237,6 +1239,8 @@ impl Router {
             .mm_allowed_media_domains(self.mm_allowed_media_domains.clone())
             .mm_allow_private_media_hosts(self.mm_allow_private_media_hosts)
             .mm_turbojpeg(mm_turbojpeg)
+            .mm_video_fetch_timeout_ms(self.mm_video_fetch_timeout_ms)
+            .mm_fetch_timeout_ms(self.mm_fetch_timeout_ms)
             .rdma_listen_ip(self.rdma_listen_ip.clone())
             .rdma_slot_ttl_s(self.rdma_slot_ttl_s)
             .log_mm_timing(self.log_mm_timing)
@@ -1379,11 +1383,13 @@ impl Router {
         mesh_tls_key = None,
         mm_allow_private_media_hosts = false,
         mm_allowed_media_domains = None,
+        mm_fetch_timeout_ms = None,
         mm_per_request_image_limit = None,
         mm_pixel_cache_mb = None,
         mm_pixel_rdma = false,
         mm_processing = None,
         mm_turbojpeg = None,
+        mm_video_fetch_timeout_ms = None,
         model_aliases = HashMap::new(),
         model_id_from = None,
         model_path = None,
@@ -1591,11 +1597,13 @@ impl Router {
         mesh_tls_key: Option<String>,
         mm_allow_private_media_hosts: bool,
         mm_allowed_media_domains: Option<Vec<String>>,
+        mm_fetch_timeout_ms: Option<u64>,
         mm_per_request_image_limit: Option<usize>,
         mm_pixel_cache_mb: Option<usize>,
         mm_pixel_rdma: bool,
         mm_processing: Option<String>,
         mm_turbojpeg: Option<String>,
+        mm_video_fetch_timeout_ms: Option<u64>,
         model_aliases: HashMap<String, String>,
         model_id_from: Option<String>,
         model_path: Option<String>,
@@ -1840,11 +1848,13 @@ impl Router {
             mesh_tls_key,
             mm_allow_private_media_hosts,
             mm_allowed_media_domains,
+            mm_fetch_timeout_ms,
             mm_per_request_image_limit,
             mm_pixel_cache_mb,
             mm_pixel_rdma,
             mm_processing,
             mm_turbojpeg,
+            mm_video_fetch_timeout_ms,
             model_aliases,
             model_id_from,
             model_path,

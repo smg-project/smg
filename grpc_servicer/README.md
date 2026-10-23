@@ -116,6 +116,25 @@ defaults a 50 MB item clears the router and stops at the worker's 32 MiB, so
 that flag is the one to raise; the router's `--max-payload-size` (default
 512 MiB) must also hold the whole request body.
 
+Media URL download budgets can be set with `--mm-fetch-timeout-ms` (images
+and audio, default **10000**) and `--mm-video-fetch-timeout-ms` (video,
+default **30000**). Both take positive integer milliseconds and cover the
+fetch from connection through the last byte, not decoding or inference.
+Set them on the process that downloads the media:
+
+- **Router preprocessing** (shared by vLLM, SGLang and TokenSpeed): the Rust
+  and Python router CLIs accept both flags, with environment fallbacks
+  `SMG_MM_FETCH_TIMEOUT_MS` and `SMG_MM_VIDEO_FETCH_TIMEOUT_MS`.
+- **vLLM Rust worker**, `--servicer-impl rust --mm-processor smg`: the same
+  flags use `SMG_VLLM_MM_FETCH_TIMEOUT_MS` and
+  `SMG_VLLM_MM_VIDEO_FETCH_TIMEOUT_MS` as environment fallbacks.
+
+An explicit flag takes precedence over its environment variable. Unset
+values retain the defaults above. These settings do not change downloads
+performed by vLLM's own `inprocess` or `redis` processors; configure those
+through the engine's media loader settings. SGLang and TokenSpeed currently
+use the Router's media pipeline, so set the budgets on the Router for them.
+
 On the router side, `--mm-processing` selects `auto` (default: forward when
 every registered worker of the model advertises `mm_processor` and the model's
 spec opts in, or every one of those workers runs the router's own pipeline,

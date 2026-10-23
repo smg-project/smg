@@ -383,6 +383,14 @@ pub struct RouterConfig {
     /// instead. When unset, falls back to `SMG_MM_TURBOJPEG`, then `prefer`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mm_turbojpeg: Option<TurboJpegPolicy>,
+    /// Video download timeout in milliseconds; positive. Falls back to
+    /// `SMG_MM_VIDEO_FETCH_TIMEOUT_MS`, then 30000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_video_fetch_timeout_ms: Option<u64>,
+    /// Image/audio download timeout in milliseconds; positive. Falls back to
+    /// `SMG_MM_FETCH_TIMEOUT_MS`, then 10000.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm_fetch_timeout_ms: Option<u64>,
     /// Listener IP for the RDMA metadata exchange, a plain IPv4 or IPv6 address
     /// (the workers connect to it as written, so `ConfigValidator` refuses
     /// anything else); when unset, falls back to `SMG_RDMA_LISTEN_IP`, and
@@ -1979,6 +1987,8 @@ impl Default for RouterConfig {
             mm_allowed_media_domains: None,
             mm_allow_private_media_hosts: false,
             mm_turbojpeg: None,
+            mm_video_fetch_timeout_ms: None,
+            mm_fetch_timeout_ms: None,
             rdma_listen_ip: None,
             rdma_slot_ttl_s: None,
             log_mm_timing: false,
@@ -2310,6 +2320,7 @@ mod tests {
     }
 
     #[test]
+    /// Old configs preserve defaults and explicit media settings round-trip.
     fn test_multimodal_settings_serde_roundtrip_and_backward_compat() {
         // Unset by default, and the optional ones stay out of serialized output.
         let config = RouterConfig::default();
@@ -2319,6 +2330,8 @@ mod tests {
             "mm_pixel_cache_mb",
             "mm_allowed_media_domains",
             "mm_turbojpeg",
+            "mm_fetch_timeout_ms",
+            "mm_video_fetch_timeout_ms",
             "rdma_listen_ip",
             "rdma_slot_ttl_s",
         ] {
@@ -2338,6 +2351,8 @@ mod tests {
         assert_eq!(without.mm_allowed_media_domains, None);
         assert!(!without.mm_allow_private_media_hosts);
         assert_eq!(without.mm_turbojpeg, None);
+        assert_eq!(without.mm_fetch_timeout_ms, None);
+        assert_eq!(without.mm_video_fetch_timeout_ms, None);
         assert_eq!(without.rdma_listen_ip, None);
         assert_eq!(without.rdma_slot_ttl_s, None);
         assert!(!without.log_mm_timing);
@@ -2351,6 +2366,8 @@ mod tests {
             .mm_allowed_media_domains(Some(vec!["media.example".to_string()]))
             .mm_allow_private_media_hosts(true)
             .mm_turbojpeg(Some(TurboJpegPolicy::Require))
+            .mm_fetch_timeout_ms(Some(60000))
+            .mm_video_fetch_timeout_ms(Some(120000))
             .rdma_listen_ip(Some("10.0.0.7"))
             .rdma_slot_ttl_s(Some(600))
             .log_mm_timing(true)
@@ -2368,6 +2385,8 @@ mod tests {
         );
         assert!(with.mm_allow_private_media_hosts);
         assert_eq!(with.mm_turbojpeg, Some(TurboJpegPolicy::Require));
+        assert_eq!(with.mm_fetch_timeout_ms, Some(60000));
+        assert_eq!(with.mm_video_fetch_timeout_ms, Some(120000));
         assert_eq!(with.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(with.rdma_slot_ttl_s, Some(600));
         assert!(with.log_mm_timing);

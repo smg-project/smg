@@ -864,6 +864,16 @@ struct WorkerArgs {
     #[arg(long, value_parser = parse_mm_turbojpeg, help_heading = "Multimodal")]
     mm_turbojpeg: Option<TurboJpegPolicy>,
 
+    /// Video download timeout in milliseconds; positive.
+    /// Falls back to `SMG_MM_VIDEO_FETCH_TIMEOUT_MS`, then 30000.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Multimodal")]
+    mm_video_fetch_timeout_ms: Option<u64>,
+
+    /// Image/audio download timeout in milliseconds; positive.
+    /// Falls back to `SMG_MM_FETCH_TIMEOUT_MS`, then 10000.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..), help_heading = "Multimodal")]
+    mm_fetch_timeout_ms: Option<u64>,
+
     /// Listener IP for the RDMA pixel lane's metadata exchange, a plain IPv4
     /// or IPv6 address (no hostname, port or brackets: the workers connect to
     /// it as written); without one the lane stays on the inline path. Falls
@@ -2875,6 +2885,8 @@ impl CliArgs {
             .mm_allowed_media_domains(self.workers.mm_allowed_media_domains.clone())
             .mm_allow_private_media_hosts(self.workers.mm_allow_private_media_hosts)
             .mm_turbojpeg(self.workers.mm_turbojpeg)
+            .mm_video_fetch_timeout_ms(self.workers.mm_video_fetch_timeout_ms)
+            .mm_fetch_timeout_ms(self.workers.mm_fetch_timeout_ms)
             .rdma_listen_ip(self.workers.rdma_listen_ip.clone())
             .rdma_slot_ttl_s(self.workers.rdma_slot_ttl_s)
             .log_mm_timing(self.workers.log_mm_timing)
@@ -5225,6 +5237,16 @@ mod tests {
         assert!(Cli::try_parse_from(["smg", "--cache-ttl-secs", "0"]).is_err());
     }
 
+    /// Millisecond fetch budgets accept only positive integers at the CLI boundary.
+    #[test]
+    fn mm_fetch_timeout_flags_reject_invalid_values() {
+        for flag in ["--mm-fetch-timeout-ms", "--mm-video-fetch-timeout-ms"] {
+            for value in ["0", "-1", "invalid", "1.5"] {
+                assert!(Cli::try_parse_from(["smg", flag, value]).is_err());
+            }
+        }
+    }
+
     /// The media placement and engine-side media flags must reach both
     /// `RouterConfig` and the wrapped `ServerConfig.router_config`.
     #[test]
@@ -5232,6 +5254,10 @@ mod tests {
         let cli = cli_args_from(&[
             "--mm-processing",
             "worker",
+            "--mm-fetch-timeout-ms",
+            "60000",
+            "--mm-video-fetch-timeout-ms",
+            "120000",
             "--mm-pixel-cache-mb",
             "256",
             "--mm-pixel-rdma",
@@ -5251,6 +5277,8 @@ mod tests {
         let router_config = cli.to_router_config(vec![], vec![]).unwrap();
         assert_eq!(router_config.mm_processing, Some(MmProcessingMode::Worker));
         assert_eq!(router_config.mm_pixel_cache_mb, Some(256));
+        assert_eq!(router_config.mm_fetch_timeout_ms, Some(60000));
+        assert_eq!(router_config.mm_video_fetch_timeout_ms, Some(120000));
         assert!(router_config.mm_pixel_rdma);
         assert_eq!(router_config.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(router_config.rdma_slot_ttl_s, Some(600));
@@ -5263,6 +5291,8 @@ mod tests {
         let nested = &server_config.router_config;
         assert_eq!(nested.mm_processing, Some(MmProcessingMode::Worker));
         assert_eq!(nested.mm_pixel_cache_mb, Some(256));
+        assert_eq!(nested.mm_fetch_timeout_ms, Some(60000));
+        assert_eq!(nested.mm_video_fetch_timeout_ms, Some(120000));
         assert!(nested.mm_pixel_rdma);
         assert_eq!(nested.rdma_listen_ip.as_deref(), Some("10.0.0.7"));
         assert_eq!(nested.rdma_slot_ttl_s, Some(600));
@@ -5285,6 +5315,8 @@ mod tests {
         assert_eq!(router_config.mm_allowed_media_domains, None);
         assert!(!router_config.mm_allow_private_media_hosts);
         assert_eq!(router_config.mm_turbojpeg, None);
+        assert_eq!(router_config.mm_fetch_timeout_ms, None);
+        assert_eq!(router_config.mm_video_fetch_timeout_ms, None);
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(server_config.router_config.mm_processing, None);

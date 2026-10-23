@@ -430,6 +430,10 @@ impl MultimodalComponents {
         let connector_config = MediaConnectorConfig {
             allowed_domains: settings.allowed_media_domains.value.clone(),
             allow_private_hosts: settings.allow_private_media_hosts.value,
+            fetch_timeout: std::time::Duration::from_millis(settings.fetch_timeout_ms.value),
+            video_fetch_timeout: std::time::Duration::from_millis(
+                settings.video_fetch_timeout_ms.value,
+            ),
             ..MediaConnectorConfig::default()
         };
         // The line shows the allow-list as the connector enforces it (trimmed,
@@ -749,6 +753,65 @@ mod tests {
             components.pixel_cache.is_none(),
             "0 MiB keeps the cache off"
         );
+    }
+
+    /// The shared router connector applies configured budgets to real stalled
+    /// image, audio and video downloads, without needing any engine or decoder.
+    #[tokio::test]
+    async fn components_enforce_media_fetch_timeouts() {
+        use std::time::Duration;
+
+        use llm_multimodal::{ImageFetchConfig, MediaFault, MediaSource, VideoFetchConfig};
+
+        use crate::config::RouterConfig;
+
+        // Leave connections queued without an HTTP response. The listener lives
+        // until all fetches finish, so connection refusal cannot pass this test.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/media", listener.local_addr().unwrap());
+        let settings = MultimodalSettings::resolve_with(
+            &RouterConfig {
+                mm_fetch_timeout_ms: Some(50),
+                mm_video_fetch_timeout_ms: Some(100),
+                mm_allow_private_media_hosts: true,
+                ..RouterConfig::default()
+            },
+            |_| Ok(None),
+        )
+        .unwrap();
+        let components = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &settings,
+        )
+        .unwrap();
+        let connector = &components.media_connector;
+        for modality in ["image", "audio", "video"] {
+            let source = MediaSource::Url(url.clone());
+            let fetch = async {
+                match modality {
+                    "image" => connector
+                        .fetch_image(source, ImageFetchConfig::default())
+                        .await
+                        .map(|_| ()),
+                    "audio" => connector.fetch_audio(source).await.map(|_| ()),
+                    _ => connector
+                        .fetch_video(source, VideoFetchConfig::default())
+                        .await
+                        .map(|_| ()),
+                }
+            };
+            let error = tokio::time::timeout(Duration::from_secs(2), fetch)
+                .await
+                .expect("configured budget must expire before the default")
+                .unwrap_err();
+            assert_eq!(error.fault(), MediaFault::Transient, "{modality}: {error}");
+            assert!(
+                error.to_string().contains("timed out"),
+                "{modality}: {error}"
+            );
+        }
     }
 
     /// Under `require` the components come up exactly when the library did:
