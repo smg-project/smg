@@ -15,7 +15,7 @@ NATIVE_HASHES = {}
 
 
 def counters(text):
-    values = {"outputs": 0.0, "fallback": 0.0, "lines": []}
+    values = {"outputs": 0.0, "clean_outputs": 0.0, "fallback": 0.0, "lines": []}
     for line in text.splitlines():
         for key, metric in (
             ("outputs", "smg_symphony_outputs_total"),
@@ -26,6 +26,8 @@ def counters(text):
                 value = float(match[1])
                 require(math.isfinite(value) and value >= 0, "invalid parser counter")
                 values[key] += value
+                if key == "outputs" and re.search(r'(?:\{|,)outcome="clean"(?:,|\})', line):
+                    values["clean_outputs"] += value
                 values["lines"].append(line)
     return values
 
@@ -106,7 +108,7 @@ class ParserProof:
                 record["after"] = counters(response.text)
                 record["delta"] = {
                     key: record["after"][key] - record["before"][key]
-                    for key in ("outputs", "fallback")
+                    for key in ("outputs", "clean_outputs", "fallback")
                 }
                 require(all(value >= 0 for value in record["delta"].values()), "counter reset")
                 self.records.append(record)
@@ -127,8 +129,8 @@ class ParserProof:
             if row["nodeid"] in self.recipe["tool_cases"].get(row["model"], [])
         ]
         require(
-            any(row["delta"]["outputs"] > 0 for row in tool_records),
-            "no actual Symphony tool output",
+            any(row["delta"]["clean_outputs"] > 0 for row in tool_records),
+            "no actual clean Symphony tool output",
         )
         for model in self.recipe["tool_cases"]:
             observed = [row for row in tool_records if row["model"] == model]
