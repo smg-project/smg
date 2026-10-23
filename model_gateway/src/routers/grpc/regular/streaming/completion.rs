@@ -4,11 +4,7 @@
 //! record. Moved out of `streaming.rs` as is; the processor's completion
 //! entry points stay there and drive it.
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-    time::Instant,
-};
+use std::{sync::Arc, time::Instant};
 
 use bytes::BytesMut;
 use llm_tokenizer::{
@@ -23,7 +19,7 @@ use crate::{
     routers::{
         common::sse::SseSender,
         grpc::{
-            common::response_formatting::CompletionTokenTracker,
+            common::{response_formatting::CompletionTokenTracker, ChoiceMap, ChoiceSet},
             context,
             proto_wrapper::{
                 ProtoGenerateComplete, ProtoGenerateStreamChunk, ProtoResponseVariant, ProtoStream,
@@ -83,24 +79,24 @@ pub(super) struct CompletionStream<'a> {
     first_token_time: Option<Instant>,
 
     // Per-choice state (per index, for n>1 support)
-    stop_decoders: HashMap<u32, StopSequenceDecoder>,
-    is_firsts: HashMap<u32, bool>,
+    stop_decoders: ChoiceMap<StopSequenceDecoder>,
+    is_firsts: ChoiceMap<bool>,
     /// Indices whose local stop decoder fired: "stop" is emitted even if the
     /// backend's eventual Complete carries "length" (the local stop sequence
     /// fired first), and later engine output for the index is ignored.
-    stopped_indices: HashSet<u32>,
+    stopped_indices: ChoiceSet,
     /// Indices that received a `Complete` message -- tracked separately
     /// from `reasoning_tokens` (which exists for a different purpose and
     /// only incidentally gets exactly one insert per completed index
     /// today) so the completeness gate doesn't silently break if that
     /// insert behavior ever changes. A choice is closed by its Complete or
     /// by its local stop (whose usage is as settled, see `read_chunk`).
-    completed_indices: HashSet<u32>,
+    completed_indices: ChoiceSet,
     /// Stopped indices the engine streamed a chunk for after their stop: it
     /// is generating past the stop, which only a stop it cannot see does (an
     /// engine that saw the stop ends the choice on that step and sends its
     /// Complete next).
-    tailed_indices: HashSet<u32>,
+    tailed_indices: ChoiceSet,
     /// The engine was streaming past a stop when every choice had closed:
     /// the loop stopped polling it, and the driver aborts it instead of
     /// marking it completed (see [`Self::release_engine`]).
@@ -120,9 +116,9 @@ pub(super) struct CompletionStream<'a> {
     /// messages rather than the sum (same prompt tokenized once, not per-choice).
     total_prompt: u32,
     total_cached: u32,
-    reasoning_tokens: HashMap<u32, u32>,
-    spec_accepted: HashMap<u32, u32>,
-    spec_drafted: HashMap<u32, u32>,
+    reasoning_tokens: ChoiceMap<u32>,
+    spec_accepted: ChoiceMap<u32>,
+    spec_drafted: ChoiceMap<u32>,
     total_completion: CompletionTokenTracker,
 }
 
@@ -167,20 +163,20 @@ impl<'a> CompletionStream<'a> {
             index_offset,
             tx,
             first_token_time: None,
-            stop_decoders: HashMap::new(),
-            is_firsts: HashMap::new(),
-            stopped_indices: HashSet::new(),
-            completed_indices: HashSet::new(),
-            tailed_indices: HashSet::new(),
+            stop_decoders: ChoiceMap::default(),
+            is_firsts: ChoiceMap::default(),
+            stopped_indices: ChoiceSet::default(),
+            completed_indices: ChoiceSet::default(),
+            tailed_indices: ChoiceSet::default(),
             engine_outlived: false,
             tail_tokens: 0,
             frame,
             sse_buffer: BytesMut::with_capacity(4096),
             total_prompt: 0,
             total_cached: 0,
-            reasoning_tokens: HashMap::new(),
-            spec_accepted: HashMap::new(),
-            spec_drafted: HashMap::new(),
+            reasoning_tokens: ChoiceMap::default(),
+            spec_accepted: ChoiceMap::default(),
+            spec_drafted: ChoiceMap::default(),
             total_completion: CompletionTokenTracker::new(),
         }
     }

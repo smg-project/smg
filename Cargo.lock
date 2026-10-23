@@ -7749,6 +7749,7 @@ dependencies = [
  "rmcp",
  "rmp-serde",
  "rsa",
+ "rustc-hash 2.1.3",
  "rustix",
  "rustls",
  "rustls-pemfile",

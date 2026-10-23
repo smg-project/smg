@@ -125,6 +125,7 @@ http-body-util = "0.1"
 futures-util = "0.3"
 pin-project-lite = "0.2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+rustc-hash = "2"
 tracing-log = "0.2"
 tracing-appender = "0.2.5"
 opentelemetry = "0.32"

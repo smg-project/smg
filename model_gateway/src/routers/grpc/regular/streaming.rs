@@ -2,11 +2,7 @@
 //!
 //! This module contains shared streaming logic for both Regular and PD router.
 
-use std::{
-    collections::{hash_map::Entry, HashMap, HashSet},
-    sync::Arc,
-    time::Instant,
-};
+use std::{collections::hash_map::Entry, sync::Arc, time::Instant};
 
 use axum::response::Response;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -56,6 +52,7 @@ use crate::{
                 responses::{
                     body_guards, build_sse_response_from_stream, build_sse_response_guarded,
                 },
+                ChoiceMap, ChoiceSet,
             },
             context,
             proto_wrapper::{
@@ -81,7 +78,7 @@ use self::completion::{CompletionStream, CompletionStreamOutcome, CompletionStre
 /// authorize settlement, even when intermediate chunks already report counts.
 #[derive(Default)]
 struct ChatStreamUsage {
-    choices: HashMap<u32, ChatStreamTokenCounts>,
+    choices: ChoiceMap<ChatStreamTokenCounts>,
     /// The gateway's reasoning parser runs for this request and counts the
     /// tokens it routes to reasoning (reported even when zero).
     reasoning_parsed: bool,
@@ -574,18 +571,18 @@ impl StreamingProcessor {
         let mut first_token_time: Option<Instant> = None;
 
         // Track state per index for n>1 case
-        let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
-        let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+        let mut accumulated_texts: ChoiceMap<String> = ChoiceMap::default();
+        let mut completion_tokens_map: ChoiceMap<u32> = ChoiceMap::default();
         // Same prompt for every index; the last Complete's value is as good as any.
         let mut prompt_tokens: u32 = 0;
         // The cache hit is a property of that shared prompt too (max, not sum);
         // reasoning is each choice's own, one entry per index.
         let mut cached_tokens: u32 = 0;
-        let mut reasoning_tokens_map: HashMap<u32, u32> = HashMap::new();
+        let mut reasoning_tokens_map: ChoiceMap<u32> = ChoiceMap::default();
         // Indices that received a `Complete` message -- the only source of
         // authoritative usage. Chunks alone (tracked in `completion_tokens_map`)
         // don't count: an index can start generating and never finish.
-        let mut completed_indices: HashSet<u32> = HashSet::new();
+        let mut completed_indices: ChoiceSet = ChoiceSet::default();
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut sse_encoder = SseEncoder::new();
 
@@ -786,20 +783,20 @@ impl StreamingProcessor {
         let mut first_token_time: Option<Instant> = None;
 
         // Track state per index for n>1 case
-        let mut accumulated_texts: HashMap<u32, String> = HashMap::new();
-        let mut accumulated_output_logprobs: HashMap<u32, Option<Vec<Vec<Option<f64>>>>> =
-            HashMap::new();
-        let mut completion_tokens_map: HashMap<u32, u32> = HashMap::new();
+        let mut accumulated_texts: ChoiceMap<String> = ChoiceMap::default();
+        let mut accumulated_output_logprobs: ChoiceMap<Option<Vec<Vec<Option<f64>>>>> =
+            ChoiceMap::default();
+        let mut completion_tokens_map: ChoiceMap<u32> = ChoiceMap::default();
         // Same prompt for every index; the last Complete's value is as good as any.
         let mut prompt_tokens: u32 = 0;
         // The cache hit is a property of that shared prompt too (max, not sum);
         // reasoning is each choice's own, one entry per index.
         let mut cached_tokens: u32 = 0;
-        let mut reasoning_tokens_map: HashMap<u32, u32> = HashMap::new();
+        let mut reasoning_tokens_map: ChoiceMap<u32> = ChoiceMap::default();
         // Indices that received a `Complete` message -- the only source of
         // authoritative usage. Chunks alone (tracked in `completion_tokens_map`)
         // don't count: an index can start generating and never finish.
-        let mut completed_indices: HashSet<u32> = HashSet::new();
+        let mut completed_indices: ChoiceSet = ChoiceSet::default();
         // Reusable SSE encoder shared across every chunk emitted for this stream.
         let mut sse_encoder = SseEncoder::new();
 
@@ -1046,7 +1043,7 @@ impl StreamingProcessor {
         delta: Option<&str>,
         chunk_tokens: u32,
         index: u32,
-        reasoning_parsers: &mut HashMap<u32, Box<dyn ReasoningParser>>,
+        reasoning_parsers: &mut ChoiceMap<Box<dyn ReasoningParser>>,
         thinking_override: bool,
         think_in_prefill: bool,
         // Resolved once per request by the caller: re-resolving here could
@@ -1134,7 +1131,7 @@ impl StreamingProcessor {
     fn process_specific_function_stream(
         delta: &str,
         index: u32,
-        has_tool_calls: &mut HashMap<u32, bool>,
+        has_tool_calls: &mut ChoiceMap<bool>,
         tool_choice: Option<&ToolChoice>,
         model: &str,
         history_tool_calls_count: usize,
@@ -1199,8 +1196,8 @@ impl StreamingProcessor {
         &self,
         delta: &str,
         index: u32,
-        tool_parsers: &mut HashMap<u32, Box<dyn ToolParser>>,
-        has_tool_calls: &mut HashMap<u32, bool>,
+        tool_parsers: &mut ChoiceMap<Box<dyn ToolParser>>,
+        has_tool_calls: &mut ChoiceMap<bool>,
         tools: &[Tool],
         // Resolved once per request by the caller (see process_reasoning_stream).
         tool_parser_name: Option<&str>,
@@ -1730,7 +1727,7 @@ impl StreamingProcessor {
     /// Process Messages API streaming chunks from a single stream.
     ///
     /// Implements the Anthropic streaming protocol with content block
-    /// state tracking. Always n=1 (no per-index HashMap). The phases are
+    /// state tracking. Always n=1 (no per-choice map). The phases are
     /// the methods of [`MessagesStream`], run in order.
     #[expect(clippy::too_many_arguments)]
     pub async fn process_messages_streaming_chunks(
@@ -2308,22 +2305,22 @@ struct ChatStream<'a> {
     opens_tool_call: bool,
 
     // Per-choice state (per index, for n>1 support)
-    is_firsts: HashMap<u32, bool>,
-    finish_reasons: HashMap<u32, String>,
-    matched_stops: HashMap<u32, Option<Value>>,
+    is_firsts: ChoiceMap<bool>,
+    finish_reasons: ChoiceMap<String>,
+    matched_stops: ChoiceMap<Option<Value>>,
     /// Indices whose local stop decoder fired: their finish reason is pinned
     /// to "stop" and later engine output for the index is ignored.
-    stopped_indices: HashSet<u32>,
+    stopped_indices: ChoiceSet,
     /// Indices whose engine `Complete` came. A choice is closed by its
     /// Complete or by its local stop; once every expected choice is closed
     /// while a stopped one streams on without its Complete, the engine has
     /// outlived the client's stream (see [`Self::engine_outlived_now`]).
-    completed_indices: HashSet<u32>,
+    completed_indices: ChoiceSet,
     /// Stopped indices the engine streamed a chunk for after their stop: it
     /// is generating past the stop, which only a stop it cannot see does (an
     /// engine that saw the stop ends the choice on that step and sends its
     /// Complete next).
-    tailed_indices: HashSet<u32>,
+    tailed_indices: ChoiceSet,
     /// The engine was streaming past a stop when every choice had closed:
     /// the loop stopped polling it, and the driver aborts it instead of
     /// marking it completed (see [`Self::release_engine`]).
@@ -2331,30 +2328,30 @@ struct ChatStream<'a> {
     /// Tokens the engine streamed for choices after their local stop, read
     /// before the abort: the tail generated for nobody.
     tail_tokens: u64,
-    prompt_tokens: HashMap<u32, u32>,
+    prompt_tokens: ChoiceMap<u32>,
     completion_tokens: CompletionTokenTracker,
-    cached_tokens: HashMap<u32, u32>,
-    reasoning_tokens: HashMap<u32, u32>,
+    cached_tokens: ChoiceMap<u32>,
+    reasoning_tokens: ChoiceMap<u32>,
     /// Tokens the gateway's reasoning parser routed to reasoning, and tokens
     /// of chunks that decoded to no text yet (counted with the chunk that
     /// releases their text).
-    parsed_reasoning_tokens: HashMap<u32, u32>,
-    held_tokens: HashMap<u32, u32>,
-    spec_accepted: HashMap<u32, u32>,
-    spec_drafted: HashMap<u32, u32>,
+    parsed_reasoning_tokens: ChoiceMap<u32>,
+    held_tokens: ChoiceMap<u32>,
+    spec_accepted: ChoiceMap<u32>,
+    spec_drafted: ChoiceMap<u32>,
     /// Parser state (lazy initialization per index); the parsers are this
     /// stream's own, nothing else reaches them.
-    reasoning_parsers: HashMap<u32, Box<dyn ReasoningParser>>,
-    tool_parsers: HashMap<u32, Box<dyn ToolParser>>,
-    has_tool_calls: HashMap<u32, bool>,
+    reasoning_parsers: ChoiceMap<Box<dyn ReasoningParser>>,
+    tool_parsers: ChoiceMap<Box<dyn ToolParser>>,
+    has_tool_calls: ChoiceMap<bool>,
     /// Per-index stop decoders (each index needs its own state for n>1 support).
-    stop_decoders: HashMap<u32, StopSequenceDecoder>,
+    stop_decoders: ChoiceMap<StopSequenceDecoder>,
     /// Symphony reads this response when request building assigned it a table
     /// (see `regular::symphony`): one reader per choice in place of both
     /// parsers, seeded with the prompt it replays. The role chunk, the stop
     /// decoder, the finish chunks and the usage are the same; only the
     /// reading of the tokens differs.
-    readers: HashMap<u32, Reader>,
+    readers: ChoiceMap<Reader>,
     /// The step's delta and the stream's event buffer, when Symphony reads
     /// the response: a step's events fill the buffer and borrow the delta's
     /// text, and the buffer is recycled once the step's chunks are out (the
@@ -2491,27 +2488,27 @@ impl<'a> ChatStream<'a> {
             used_json_schema,
             is_specific_function,
             opens_tool_call: forces_tool_call(spec),
-            is_firsts: HashMap::new(),
-            finish_reasons: HashMap::new(),
-            matched_stops: HashMap::new(),
-            stopped_indices: HashSet::new(),
-            completed_indices: HashSet::new(),
-            tailed_indices: HashSet::new(),
+            is_firsts: ChoiceMap::default(),
+            finish_reasons: ChoiceMap::default(),
+            matched_stops: ChoiceMap::default(),
+            stopped_indices: ChoiceSet::default(),
+            completed_indices: ChoiceSet::default(),
+            tailed_indices: ChoiceSet::default(),
             engine_outlived: false,
             tail_tokens: 0,
-            prompt_tokens: HashMap::new(),
+            prompt_tokens: ChoiceMap::default(),
             completion_tokens: CompletionTokenTracker::new(),
-            cached_tokens: HashMap::new(),
-            reasoning_tokens: HashMap::new(),
-            parsed_reasoning_tokens: HashMap::new(),
-            held_tokens: HashMap::new(),
-            spec_accepted: HashMap::new(),
-            spec_drafted: HashMap::new(),
-            reasoning_parsers: HashMap::new(),
-            tool_parsers: HashMap::new(),
-            has_tool_calls: HashMap::new(),
-            stop_decoders: HashMap::new(),
-            readers: HashMap::new(),
+            cached_tokens: ChoiceMap::default(),
+            reasoning_tokens: ChoiceMap::default(),
+            parsed_reasoning_tokens: ChoiceMap::default(),
+            held_tokens: ChoiceMap::default(),
+            spec_accepted: ChoiceMap::default(),
+            spec_drafted: ChoiceMap::default(),
+            reasoning_parsers: ChoiceMap::default(),
+            tool_parsers: ChoiceMap::default(),
+            has_tool_calls: ChoiceMap::default(),
+            stop_decoders: ChoiceMap::default(),
+            readers: ChoiceMap::default(),
             delta: Delta::default(),
             spare: Events::new(),
             final_indices: None,

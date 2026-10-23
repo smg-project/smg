@@ -4,10 +4,9 @@
 //! - Usage calculation from gRPC responses
 //! - ChatCompletionResponse construction
 
-use std::collections::HashMap;
-
 use openai_protocol::{common::Usage, generate::GenerateResponse};
 
+use super::ChoiceMap;
 use crate::{
     rate_limit::UsageSettlement,
     routers::grpc::proto_wrapper::{ProtoGenerateComplete, ProtoGenerateStreamChunk},
@@ -169,17 +168,17 @@ pub(crate) fn effective_weight_version<'a>(
 /// - cumulative streams send the count in the Complete message, and the
 ///   running count in every chunk before it
 pub(crate) struct CompletionTokenTracker {
-    tokens: HashMap<u32, u32>,
+    tokens: ChoiceMap<u32>,
     /// The running count a cumulative stream reported in its latest chunk:
     /// how far it had come, for a stream that ends before its Complete.
-    reported: HashMap<u32, u32>,
+    reported: ChoiceMap<u32>,
 }
 
 impl CompletionTokenTracker {
     pub fn new() -> Self {
         Self {
-            tokens: HashMap::new(),
-            reported: HashMap::new(),
+            tokens: ChoiceMap::default(),
+            reported: ChoiceMap::default(),
         }
     }
 

@@ -1,7 +1,7 @@
 //! Harmony streaming response processor
 
 use std::{
-    collections::{hash_map::Entry::Vacant, HashMap, HashSet},
+    collections::{hash_map::Entry::Vacant, HashMap},
     sync::Arc,
     time::Instant,
 };
@@ -46,6 +46,7 @@ use crate::{
                         attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter,
                     },
                 },
+                ChoiceMap, ChoiceSet,
             },
             context,
             proto_wrapper::{
@@ -201,8 +202,8 @@ impl HarmonyStreamingProcessor {
         router_stop_strings: Vec<String>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
-        let mut prompt_tokens = HashMap::new();
-        let mut cached_tokens = HashMap::new();
+        let mut prompt_tokens = ChoiceMap::default();
+        let mut cached_tokens = ChoiceMap::default();
         Self::process_chat_decode_stream(
             grpc_stream,
             &dispatch,
@@ -232,8 +233,8 @@ impl HarmonyStreamingProcessor {
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
         // Phase 1: Process prefill stream (collect metadata)
-        let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
-        let mut cached_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut prompt_tokens: ChoiceMap<u32> = ChoiceMap::default();
+        let mut cached_tokens: ChoiceMap<u32> = ChoiceMap::default();
 
         drain_prefill(&mut prefill_stream, prefill_guards, false, |complete| {
             prompt_tokens.insert(complete.index(), complete.prompt_tokens());
@@ -273,8 +274,8 @@ impl HarmonyStreamingProcessor {
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
-        prompt_tokens: &mut HashMap<u32, u32>,
-        cached_tokens: &mut HashMap<u32, u32>,
+        prompt_tokens: &mut ChoiceMap<u32>,
+        cached_tokens: &mut ChoiceMap<u32>,
         router_stop_strings: &[String],
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), utils::StreamFailure> {
@@ -1053,30 +1054,30 @@ struct ChatDecode {
     start_time: Instant,
     first_token_time: Option<Instant>,
     // Per-index state management (for n>1 support)
-    parsers: HashMap<u32, HarmonyParserAdapter>,
-    is_firsts: HashMap<u32, bool>,
-    matched_stops: HashMap<u32, Option<serde_json::Value>>,
+    parsers: ChoiceMap<HarmonyParserAdapter>,
+    is_firsts: ChoiceMap<bool>,
+    matched_stops: ChoiceMap<Option<serde_json::Value>>,
     // Router-enforced string stops (direct-ZMQ): per-index, per-channel scanners. Once an index
     // stops, its further deltas are swallowed and the engine's own Complete is not re-emitted.
-    analysis_scanners: HashMap<u32, TextStopScanner>,
-    final_scanners: HashMap<u32, TextStopScanner>,
-    router_stopped: HashSet<u32>,
+    analysis_scanners: ChoiceMap<TextStopScanner>,
+    final_scanners: ChoiceMap<TextStopScanner>,
+    router_stopped: ChoiceSet,
     completion_tokens: CompletionTokenTracker,
     // The engine's own reasoning and speculative counters per decode `Complete`, and the
     // reasoning tokens the Harmony parser counted over every index: the usage chunk is built
     // from the same counters as the non-streamed answer.
-    reasoning_tokens: HashMap<u32, u32>,
-    spec_accepted: HashMap<u32, u32>,
-    spec_drafted: HashMap<u32, u32>,
+    reasoning_tokens: ChoiceMap<u32>,
+    spec_accepted: ChoiceMap<u32>,
+    spec_drafted: ChoiceMap<u32>,
     parsed_reasoning_tokens: u32,
     // Indices that received a *decode* `Complete` -- unlike `prompt_tokens` (which may already
     // be populated from the prefill phase before the loop even starts, in PD mode), this is
     // only ever set from this stream's own Complete messages, so it can't be fooled by prefill
     // data into thinking decode produced authoritative usage it didn't.
-    decode_completed_indices: HashSet<u32>,
+    decode_completed_indices: ChoiceSet,
     // Router-stopped indices the engine streamed a chunk for after their stop: it is generating
     // past the stop (an engine that ends the choice on that step sends its Complete next).
-    tailed: HashSet<u32>,
+    tailed: ChoiceSet,
     // The engine was streaming past a stop when every choice had closed (its Complete came, or
     // the router's stop ended it): the loop stopped polling it, and the driver aborts it instead
     // of marking it completed (see `release_engine`).
@@ -1093,19 +1094,19 @@ impl ChatDecode {
         Self {
             start_time: Instant::now(),
             first_token_time: None,
-            parsers: HashMap::new(),
-            is_firsts: HashMap::new(),
-            matched_stops: HashMap::new(),
-            analysis_scanners: HashMap::new(),
-            final_scanners: HashMap::new(),
-            router_stopped: HashSet::new(),
+            parsers: ChoiceMap::default(),
+            is_firsts: ChoiceMap::default(),
+            matched_stops: ChoiceMap::default(),
+            analysis_scanners: ChoiceMap::default(),
+            final_scanners: ChoiceMap::default(),
+            router_stopped: ChoiceSet::default(),
             completion_tokens: CompletionTokenTracker::new(),
-            reasoning_tokens: HashMap::new(),
-            spec_accepted: HashMap::new(),
-            spec_drafted: HashMap::new(),
+            reasoning_tokens: ChoiceMap::default(),
+            spec_accepted: ChoiceMap::default(),
+            spec_drafted: ChoiceMap::default(),
             parsed_reasoning_tokens: 0,
-            decode_completed_indices: HashSet::new(),
-            tailed: HashSet::new(),
+            decode_completed_indices: ChoiceSet::default(),
+            tailed: ChoiceSet::default(),
             engine_outlived: false,
             tail_tokens: 0,
             encoder: SseEncoder::new(),
@@ -1176,8 +1177,8 @@ impl ChatDecode {
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
         router_stop_strings: &[String],
-        prompt_tokens: &mut HashMap<u32, u32>,
-        cached_tokens: &mut HashMap<u32, u32>,
+        prompt_tokens: &mut ChoiceMap<u32>,
+        cached_tokens: &mut ChoiceMap<u32>,
     ) -> Result<(), utils::StreamFailure> {
         let index = chunk.index();
 
@@ -1330,8 +1331,8 @@ impl ChatDecode {
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
         tx: &SseSender,
-        prompt_tokens: &mut HashMap<u32, u32>,
-        cached_tokens: &mut HashMap<u32, u32>,
+        prompt_tokens: &mut ChoiceMap<u32>,
+        cached_tokens: &mut ChoiceMap<u32>,
     ) -> Result<(), utils::StreamFailure> {
         let index = complete.index();
         self.decode_completed_indices.insert(index);
@@ -1453,8 +1454,8 @@ impl ChatDecode {
     /// metrics.
     async fn finish(
         mut self,
-        prompt_tokens: &HashMap<u32, u32>,
-        cached_tokens: &HashMap<u32, u32>,
+        prompt_tokens: &ChoiceMap<u32>,
+        cached_tokens: &ChoiceMap<u32>,
         reservation: Option<Arc<SharedReservationHandle>>,
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
