@@ -2349,12 +2349,11 @@ mod tests {
 
     /// Through the running loop, against a `/health` that is held: the probe
     /// the contact brings forward reads the hold and the worker stays
-    /// demoted, and nothing probes it again without a signal (a failure
-    /// returns the schedule to the interval); once the health answers, the
-    /// scheduled probe promotes it. A second contact sends no signal: the
-    /// first cleared the unreachable veto that sends one.
+    /// demoted; the contact's probe re-arms the deadline an interval out: no
+    /// further probe without a signal. Once the health answers, the scheduled
+    /// probe promotes it.
     #[tokio::test]
-    async fn a_demoted_worker_returns_on_the_health_read_its_contact_brings_forward() {
+    async fn a_demoted_worker_stays_out_on_its_contacts_read_and_returns_on_the_scheduled_one() {
         let serving = Arc::new(AtomicBool::new(false));
         let hits = Arc::new(AtomicUsize::new(0));
         let url = start_health_stub(serving.clone(), hits.clone()).await;
@@ -2390,7 +2389,7 @@ mod tests {
         assert_eq!(
             hits.load(Ordering::SeqCst),
             1,
-            "a failed probe returns the schedule to the interval: no probe without a signal"
+            "the contact's probe re-arms the deadline an interval out: no further probe without a signal"
         );
 
         serving.store(true, Ordering::SeqCst);

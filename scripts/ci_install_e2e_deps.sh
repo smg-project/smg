@@ -13,7 +13,26 @@ if [ -f ".venv/bin/activate" ]; then
 fi
 
 echo "Installing e2e test dependencies..."
-$RETRY 3 10 python3 -m pip install e2e_test/
+# Resolve the mock's HTTP dependencies with the installed engine's requirements.
+engine_http_requirements="$(python3 -c '
+import importlib.metadata
+import re
+
+for engine in ("vllm", "tensorrt-llm", "sglang", "tokenspeed"):
+    try:
+        requirements = importlib.metadata.requires(engine)
+    except importlib.metadata.PackageNotFoundError:
+        continue
+    for requirement in requirements or ():
+        name = re.split(r"[\[<>=!~;\s]", requirement, maxsplit=1)[0].lower()
+        if name in {"mcp", "fastapi", "starlette"}:
+            print(requirement)
+')"
+engine_http_args=()
+if [ -n "$engine_http_requirements" ]; then
+    mapfile -t engine_http_args <<< "$engine_http_requirements"
+fi
+$RETRY 3 10 python3 -m pip install e2e_test/ "${engine_http_args[@]}"
 
 # Install SmgClient (pure Python client for cross-SDK parity testing)
 echo "Installing smg-client..."
