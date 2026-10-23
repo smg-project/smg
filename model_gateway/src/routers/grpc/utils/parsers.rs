@@ -484,7 +484,7 @@ pub fn chat_reasoning_starts_in_rendered_prefill(
     reasoning_starts_in_prefill(
         request.chat_template_kwargs.as_ref(),
         request.effective_reasoning_effort(),
-        request.effective_thinking_toggle(),
+        request.thinking_toggle(),
         continued_final_message,
         tokenizer,
         ProviderProfile::for_model(&request.model),
@@ -617,12 +617,13 @@ pub fn tool_constraints_for_worker(
 /// Resolve the user's effective thinking preference: the answer of a
 /// renderer that resolves the mode by its own rule, else the generic
 /// precedence of [`resolve_thinking_pref`]. `provider` reads the protocol's
-/// `reasoning_effort` by its contract, both halves of it: the effort's own
-/// reading, and whether an explicit effort outranks a typed `disabled`
-/// toggle, applied here to `thinking` so a caller passing the raw
-/// `thinking.type` arms the parser the way the prompt was rendered
-/// (`ChatCompletionRequest::effective_thinking_toggle` applies the same
-/// rule, so an already-effective toggle passes through unchanged).
+/// `reasoning_effort` by its contract; the typed `thinking.type` toggle
+/// ranks above that reading under every profile (a renderer's native
+/// template effort still ranks above the toggle, see
+/// [`resolve_thinking_pref`]), so under a renderer without native efforts an
+/// explicit `disabled` next to an effort disarms the parser the way the
+/// prompt was rendered (`ChatCompletionRequest::template_thinking` resolves
+/// the render the same way).
 pub fn resolve_user_thinking(
     kwargs: Option<&std::collections::HashMap<String, Value>>,
     reasoning_effort: Option<&str>,
@@ -630,9 +631,6 @@ pub fn resolve_user_thinking(
     tokenizer: &dyn Tokenizer,
     provider: ProviderProfile,
 ) -> Option<bool> {
-    let thinking = thinking.filter(|&on| {
-        on || reasoning_effort.is_none() || !provider.effort_outranks_thinking_disabled()
-    });
     let effort_thinking = provider.thinking_from_reasoning_effort(reasoning_effort);
     if let Some(mode) = rendered_thinking_mode(
         kwargs,
@@ -1837,7 +1835,7 @@ mod tests {
             resolve_user_thinking(None, Some("none"), None, &tok, ProviderProfile::Kimi),
             Some(false)
         );
-        // The typed toggle, as the profile read it, still ranks above the effort.
+        // The typed toggle still ranks above the profile's reading of the effort.
         assert_eq!(
             resolve_user_thinking(
                 None,
@@ -1848,8 +1846,8 @@ mod tests {
             ),
             Some(true)
         );
-        // The profile's other half applies here too: a raw `disabled` next to
-        // an explicit effort is demoted under MiniMax, honoured elsewhere.
+        // A typed `disabled` next to an explicit effort is honoured under
+        // MiniMax as everywhere else: the parser is not armed.
         assert_eq!(
             resolve_user_thinking(
                 None,
@@ -1858,7 +1856,7 @@ mod tests {
                 &tok,
                 ProviderProfile::Minimax
             ),
-            None
+            Some(false)
         );
         assert_eq!(
             resolve_user_thinking(None, None, Some(false), &tok, ProviderProfile::Minimax),
@@ -1874,6 +1872,66 @@ mod tests {
             ),
             Some(false)
         );
+    }
+
+    /// An explicit `thinking.type: disabled` wins over `reasoning_effort` at
+    /// any level, through the request: the prompt renders thinking off and
+    /// the parser is not armed. The effort alone leaves the template's
+    /// default; `enabled` arms. (A template with the tri-state toggle, off by
+    /// default, under the one profile whose contract reads no effort value
+    /// as off.)
+    #[test]
+    fn thinking_disabled_wins_over_reasoning_effort() {
+        let tok = llm_tokenizer::MockTokenizer::new()
+            .with_thinking_toggle(ThinkingToggle::DefaultOff)
+            .with_thinking_key_name(ThinkingKeyName::ThinkingMode);
+        let request = |fields: Value| -> ChatCompletionRequest {
+            let mut value = serde_json::json!({
+                "model": "MiniMax-M3",
+                "messages": [{"role": "user", "content": "Hi"}],
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().cloned().unwrap_or_default());
+            serde_json::from_value(value).expect("chat request")
+        };
+        for (fields, rendered, armed) in [
+            (
+                serde_json::json!({"thinking": {"type": "disabled"}}),
+                Some(false),
+                false,
+            ),
+            (
+                serde_json::json!({"reasoning_effort": "high", "thinking": {"type": "disabled"}}),
+                Some(false),
+                false,
+            ),
+            (
+                serde_json::json!({"reasoning_effort": "low", "thinking": {"type": "disabled"}}),
+                Some(false),
+                false,
+            ),
+            (
+                serde_json::json!({"thinking": {"type": "disabled", "effort": "high"}}),
+                Some(false),
+                false,
+            ),
+            (serde_json::json!({"reasoning_effort": "high"}), None, false),
+            (
+                serde_json::json!({"thinking": {"type": "enabled"}}),
+                Some(true),
+                true,
+            ),
+        ] {
+            let request = request(fields.clone());
+            assert_eq!(request.template_thinking(), rendered, "{fields}");
+            assert_eq!(
+                chat_reasoning_starts_in_prefill(&request, &tok),
+                armed,
+                "{fields}"
+            );
+        }
     }
 
     #[test]

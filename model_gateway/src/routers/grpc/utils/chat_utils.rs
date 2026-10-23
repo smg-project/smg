@@ -480,8 +480,8 @@ fn build_chat_template_kwargs(request: &ChatCompletionRequest) -> HashMap<String
 }
 
 /// The thinking preference the prompt is rendered with: the typed toggle,
-/// else the effective effort, both as the request's provider profile reads
-/// them (`ChatCompletionRequest::template_thinking`).
+/// else the effective effort as the request's provider profile reads it
+/// (`ChatCompletionRequest::template_thinking`).
 fn resolve_template_thinking(request: &ChatCompletionRequest) -> Option<bool> {
     request.template_thinking()
 }

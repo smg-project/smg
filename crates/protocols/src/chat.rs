@@ -461,26 +461,17 @@ impl ChatCompletionRequest {
         self.thinking.as_ref().and_then(ThinkingParam::toggle)
     }
 
-    /// [`Self::thinking_toggle`] as the request's provider profile reads it:
-    /// a profile whose contract lets an explicit effort outrank
-    /// `thinking.type: disabled` ([`ProviderProfile::effort_outranks_thinking_disabled`])
-    /// drops that toggle from a request that carries an effort.
-    pub fn effective_thinking_toggle(&self) -> Option<bool> {
-        let toggle = self.thinking_toggle();
-        if toggle == Some(false)
-            && self.effective_reasoning_effort().is_some()
-            && ProviderProfile::for_model(&self.model).effort_outranks_thinking_disabled()
-        {
-            return None;
-        }
-        toggle
-    }
-
-    /// The thinking preference the prompt is rendered with: the effective
-    /// typed toggle, else the provider profile's reading of the effective
-    /// `reasoning_effort` ([`ProviderProfile::thinking_from_reasoning_effort`]).
+    /// The thinking preference the prompt is rendered with: the typed
+    /// `thinking.type` toggle, else the provider profile's reading of the
+    /// effective `reasoning_effort`
+    /// ([`ProviderProfile::thinking_from_reasoning_effort`]). An explicit
+    /// toggle wins over the profile's reading of any effort, as it does in
+    /// the engine's own server, which keeps a `chat_template_kwargs` toggle
+    /// over the one it would derive from `reasoning_effort`; a renderer with
+    /// a native template effort still ranks that effort above the toggle
+    /// when it reads the prompt (the gateway's parser precedence).
     pub fn template_thinking(&self) -> Option<bool> {
-        self.effective_thinking_toggle().or_else(|| {
+        self.thinking_toggle().or_else(|| {
             ProviderProfile::for_model(&self.model)
                 .thinking_from_reasoning_effort(self.effective_reasoning_effort())
         })
@@ -1466,9 +1457,10 @@ mod tests {
     }
 
     /// The MiniMax contract reads `reasoning_effort` by its own rule: `none`
-    /// (the default depth) and `minimal` (`low`) keep thinking on, and an
-    /// explicit effort outranks `thinking.type: disabled`; every other
-    /// profile keeps the OpenAI reading and honours the toggle.
+    /// (the default depth) and `minimal` (`low`) keep thinking on; every
+    /// other profile keeps the OpenAI reading. An explicit `thinking.type:
+    /// disabled` wins over any effort under every profile, as an explicit
+    /// toggle wins over the effort in the engine's own server.
     #[test]
     fn minimax_profile_keeps_thinking_on_for_every_effort() {
         let request = |model: &str, fields: Value| -> ChatCompletionRequest {
@@ -1491,8 +1483,8 @@ mod tests {
                     json!({"reasoning_effort": effort, "thinking": {"type": "disabled"}})
                 )
                 .template_thinking(),
-                None,
-                "MiniMax {effort} outranks thinking.disabled"
+                Some(false),
+                "MiniMax {effort}: thinking.disabled wins"
             );
         }
         assert_eq!(
