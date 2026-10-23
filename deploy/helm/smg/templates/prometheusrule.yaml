@@ -1,7 +1,7 @@
 {{- if .Values.prometheusRule.enabled }}
 {{- $a := .Values.prometheusRule.alerts }}
-{{- /* The matcher that selects this release's series: every expression carries it and keeps namespace and job through its aggregation, so several releases on one Prometheus alert apart and a firing alert names its gateway. */}}
-{{- $job := .Values.prometheusRule.jobSelector | default (printf "job=%q" (printf "%s-router" (include "smg.fullname" .))) }}
+{{- /* The matcher that selects this release's series: its namespace and the job label the scraped Service gets. The namespace keeps a same-named release in another namespace out (a rule that read it would mask absent() and evaluate that fleet too). Every expression carries the matcher and keeps namespace and job through its aggregation, so several releases on one Prometheus alert apart and a firing alert names its gateway. */}}
+{{- $job := .Values.prometheusRule.jobSelector | default (printf "namespace=%q, job=%q" .Release.Namespace (printf "%s-router" (include "smg.fullname" .))) }}
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:

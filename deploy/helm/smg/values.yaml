@@ -358,9 +358,11 @@ prometheusRule:
   labels: {}
   # -- The label matcher that selects this release's series (every alert
   #    carries it and keeps namespace and job through its aggregation, so
-  #    several releases on one Prometheus alert apart), e.g. job="smg-router".
-  #    Empty: the Service name the ServiceMonitor scrapes (<fullname>-router),
-  #    which is the Operator's default job label.
+  #    several releases on one Prometheus alert apart), e.g.
+  #    namespace="team-a", job="smg-router".
+  #    Empty: this release's namespace and the Service name the ServiceMonitor
+  #    scrapes (<fullname>-router, the Operator's default job label); the
+  #    namespace keeps a same-named release in another namespace out.
   jobSelector: ""
   alerts:
     errorRatio: 0.05
