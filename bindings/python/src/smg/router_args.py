@@ -2357,7 +2357,7 @@ class RouterArgs:
         # Health check configuration
         health_group.add_argument(
             f"--{prefix}decode-expected-workers",
-            type=int,
+            type=_positive_int,
             default=None,
             help="Desired decode fleet size, used only as the fixed percentage denominator",
         )
@@ -2371,13 +2371,13 @@ class RouterArgs:
         )
         health_group.add_argument(
             f"--{prefix}decode-min-ready-workers",
-            type=int,
+            type=_positive_int,
             default=None,
             help="Minimum healthy decode workers required (default 1)",
         )
         health_group.add_argument(
             f"--{prefix}prefill-expected-workers",
-            type=int,
+            type=_positive_int,
             default=None,
             help="Desired prefill fleet size, used only as the fixed percentage denominator",
         )
@@ -2391,7 +2391,7 @@ class RouterArgs:
         )
         health_group.add_argument(
             f"--{prefix}prefill-min-ready-workers",
-            type=int,
+            type=_positive_int,
             default=None,
             help="Minimum healthy prefill workers required (default 1)",
         )

@@ -52,6 +52,14 @@ class TestRouterArgs:
         with pytest.raises(ValueError, match="expected_workers"):
             Router.from_args(args).start()
 
+    @pytest.mark.parametrize("role", ["prefill", "decode"])
+    @pytest.mark.parametrize("flag", ["expected-workers", "min-ready-workers"])
+    @pytest.mark.parametrize("count", ["0", "-1"])
+    def test_pd_readiness_invalid_worker_count(self, role, flag, count):
+        """Invalid counts fail parsing before conversion to the unsigned native type."""
+        with pytest.raises(SystemExit):
+            parse_router_args([f"--{role}-{flag}", count])
+
     def test_default_values(self):
         """Test that RouterArgs has correct default values."""
         args = RouterArgs()

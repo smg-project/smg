@@ -325,7 +325,13 @@ impl ProbeState {
     /// Build the `/readiness` response from cached state only: one drain
     /// flag load plus one snapshot pointer load — no registry access.
     ///
-    /// PD/EPD responses expose the cached per-role capacity decision.
+    /// While draining, readiness reports not-ready with reason `"draining"`
+    /// so load balancers stop routing new connections during shutdown
+    /// (liveness intentionally stays OK). Under worker-side media placement,
+    /// the ready body names models no worker processes media for under
+    /// `models_without_media_processing`; status stays ready because the pod
+    /// serves everything else. PD/EPD responses additionally expose the
+    /// cached per-role capacity decision.
     pub fn readiness_response(&self) -> Response {
         if self.inflight_tracker.is_draining() {
             return mark_probe(

@@ -1387,7 +1387,7 @@ impl ConfigValidator {
     fn validate_readiness_role(role: &str, threshold: ReadinessRoleConfig) -> ConfigResult<()> {
         if threshold.min_healthy_workers == 0 {
             return Err(ConfigError::InvalidValue {
-                field: format!("readiness_{role}_min_healthy_workers"),
+                field: format!("pd_readiness.{role}.min_healthy_workers"),
                 value: "0".to_string(),
                 reason: "Must be > 0".to_string(),
             });
@@ -1396,7 +1396,7 @@ impl ConfigValidator {
         if threshold.min_healthy_percent.is_some() && threshold.expected_workers.is_none() {
             return Err(ConfigError::MissingRequired {
                 field: format!(
-                    "readiness_{role}_expected_workers (required when a percentage is set)"
+                    "pd_readiness.{role}.expected_workers (required when a percentage is set)"
                 ),
             });
         }
@@ -1404,14 +1404,14 @@ impl ConfigValidator {
         if let Some(expected) = threshold.expected_workers {
             if expected == 0 {
                 return Err(ConfigError::InvalidValue {
-                    field: format!("readiness_{role}_expected_workers"),
+                    field: format!("pd_readiness.{role}.expected_workers"),
                     value: "0".to_string(),
                     reason: "Must be > 0".to_string(),
                 });
             }
             if threshold.min_healthy_workers > expected {
                 return Err(ConfigError::InvalidValue {
-                    field: format!("readiness_{role}_min_healthy_workers"),
+                    field: format!("pd_readiness.{role}.min_healthy_workers"),
                     value: threshold.min_healthy_workers.to_string(),
                     reason: format!("Must not exceed expected worker count ({expected})"),
                 });
@@ -1421,7 +1421,7 @@ impl ConfigValidator {
         if let Some(percent) = threshold.min_healthy_percent {
             if !(1..=100).contains(&percent) {
                 return Err(ConfigError::InvalidValue {
-                    field: format!("readiness_{role}_min_healthy_percent"),
+                    field: format!("pd_readiness.{role}.min_healthy_percent"),
                     value: percent.to_string(),
                     reason: "Must be in 1..=100".to_string(),
                 });
@@ -2319,9 +2319,6 @@ mod tests {
     use super::*;
     use crate::worker::ConnectionMode;
 
-    /// The OTLP endpoint is validated as the URL the exporter dials, so an
-    /// unbracketed IPv6 literal is a configuration error with the bracketed
-    /// form in the message instead of an "invalid URI" abort at startup.
     /// Serialized thresholds survive round trips and reject invalid values for either role.
     #[test]
     fn pd_readiness_config_round_trip_and_validation() {
@@ -2361,7 +2358,11 @@ mod tests {
             ] {
                 value["pd_readiness"] = serde_json::json!({role: threshold});
                 let config: RouterConfig = serde_json::from_value(value.clone()).unwrap();
-                assert_eq!(ConfigValidator::validate(&config).is_ok(), valid, "{value}");
+                let result = ConfigValidator::validate(&config);
+                assert_eq!(result.is_ok(), valid, "{value}");
+                if let Err(error) = result {
+                    assert!(error.to_string().contains(&format!("pd_readiness.{role}.")));
+                }
                 let restored: RouterConfig =
                     serde_json::from_value(serde_json::to_value(&config).unwrap()).unwrap();
                 assert_eq!(restored.pd_readiness, config.pd_readiness);
@@ -2369,6 +2370,9 @@ mod tests {
         }
     }
 
+    /// The OTLP endpoint is validated as the URL the exporter dials, so an
+    /// unbracketed IPv6 literal is a configuration error with the bracketed
+    /// form in the message instead of an "invalid URI" abort at startup.
     #[test]
     fn otlp_endpoint_must_be_a_url_the_exporter_can_dial() {
         let trace = |endpoint: &str| TraceConfig {
