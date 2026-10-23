@@ -1,5 +1,5 @@
 //! Exactness of the gateway's index backends (`crates/kv_index/docs/kv-router-leap.md`,
-//! guardrails 1 to 3): the positional indexer and the chain index, fed through
+//! guardrails 1 to 3): the chain index, fed through
 //! the monitor's own apply path, must answer every lookup exactly as the
 //! reference indexer does, after every batch, and hold exactly the same blocks.
 //!
@@ -40,7 +40,7 @@ use super::{
 use crate::worker::kv_event_monitor::{KvEventMonitor, WorkerIndexState};
 
 // ---------------------------------------------------------------------------
-// The three backends side by side
+// The two backends side by side
 // ---------------------------------------------------------------------------
 
 struct Backend {
@@ -100,18 +100,17 @@ impl Backend {
     }
 }
 
-/// The production backends next to the reference, fed identically.
-struct Trio {
+/// The production backend next to the reference, fed identically.
+struct Pair {
     backends: Vec<Backend>,
     lookups: usize,
 }
 
-impl Trio {
+impl Pair {
     fn new() -> Self {
         Self {
             backends: vec![
                 Backend::new(KvIndex::reference()),
-                Backend::new(KvIndex::positional(64)),
                 Backend::new(KvIndex::chain()),
             ],
             lookups: 0,
@@ -151,7 +150,7 @@ impl Trio {
     /// Every backend answers every query as the reference does, holds the
     /// reference's blocks and counts them the same way.
     fn check(&mut self, queries: &[Vec<ContentHash>], label: &str) {
-        let (reference, production) = self.backends.split_first().expect("three backends");
+        let (reference, production) = self.backends.split_first().expect("two backends");
         for backend in production {
             let name = backend.index.name();
             for query in queries {
@@ -460,20 +459,20 @@ fn replay_stream(shape: Shape, seed: u64, requests: usize) -> Replayed {
         "{label}: every payload decodes"
     );
     let worker = format!("grpc://{label}");
-    let mut trio = Trio::new();
-    trio.add_worker(&worker);
+    let mut pair = Pair::new();
+    pair.add_worker(&worker);
     let prompts: BTreeSet<Vec<u32>> = stream.prompts.iter().cloned().collect();
     let mut chains = Chains::default();
     let mut checkpoints = stream.checkpoints.iter().peekable();
     let mut agreements = 0;
     for (index, batch) in batches.iter().enumerate() {
         chains.note(batch);
-        trio.apply(&worker, batch);
+        pair.apply(&worker, batch);
         while let Some(checkpoint) = checkpoints.next_if(|checkpoint| checkpoint.after == index + 1)
         {
             let at = format!("{label} batch {index}");
-            trio.check(&query_set(&chains.seen), &at);
-            agreements += trio.agree(&worker, &prompts, &checkpoint.held, &at);
+            pair.check(&query_set(&chains.seen), &at);
+            agreements += pair.agree(&worker, &prompts, &checkpoint.held, &at);
         }
     }
     assert!(
@@ -485,7 +484,7 @@ fn replay_stream(shape: Shape, seed: u64, requests: usize) -> Replayed {
         carried: Carried::count(&batches),
         publishers: publishers.len(),
         checkpoints: stream.checkpoints.len(),
-        lookups: trio.lookups,
+        lookups: pair.lookups,
         agreements,
     }
 }
@@ -746,7 +745,7 @@ impl Corpus {
 
     /// Store a chain: a shared prompt prefix with a novel suffix (the common
     /// case) or something entirely new, in one event or split at a parent.
-    fn store_new(&mut self, trio: &mut Trio) {
+    fn store_new(&mut self, pair: &mut Pair) {
         let worker = self.worker();
         let mut token_blocks = if self.rng.chance(3, 4) {
             let prompt = &self.prompts[self.rng.below(self.prompts.len())];
@@ -767,7 +766,7 @@ impl Corpus {
         } else {
             vec![stored(None, &blocks, None)]
         };
-        trio.apply(&worker, &batch(events));
+        pair.apply(&worker, &batch(events));
         let chain = Chain {
             alive: vec![true; blocks.len()],
             blocks,
@@ -785,7 +784,7 @@ impl Corpus {
     /// Decode extends the chain after its last block, while that block is
     /// held (an engine extends what it holds; a store naming an evicted parent
     /// is the gateway's fallback regime, which has its own test below).
-    fn extend(&mut self, trio: &mut Trio) {
+    fn extend(&mut self, pair: &mut Pair) {
         let Some((worker, at)) = self.pick_chain() else {
             return;
         };
@@ -804,7 +803,7 @@ impl Corpus {
         token_blocks.extend(fresh);
         let blocks = chain_of(&token_blocks);
         let new = &blocks[blocks.len() - more..];
-        trio.apply(&worker, &batch(vec![stored(parent, new, None)]));
+        pair.apply(&worker, &batch(vec![stored(parent, new, None)]));
         let held = &mut self.held.get_mut(&worker).expect("held")[at];
         held.blocks.extend_from_slice(new);
         held.alive.resize(held.blocks.len(), true);
@@ -813,7 +812,7 @@ impl Corpus {
     }
 
     /// A sibling diverges from a chain's prefix, possibly on another worker.
-    fn sibling(&mut self, trio: &mut Trio) {
+    fn sibling(&mut self, pair: &mut Pair) {
         let Some((worker, at)) = self.pick_chain() else {
             return;
         };
@@ -851,7 +850,7 @@ impl Corpus {
             events.push(stored(None, &blocks[..keep], None));
         }
         events.push(stored(Some(blocks[keep - 1].hash), &blocks[keep..], None));
-        trio.apply(&target, &batch(events));
+        pair.apply(&target, &batch(events));
         let chain = Chain {
             alive: vec![true; blocks.len()],
             blocks,
@@ -862,7 +861,7 @@ impl Corpus {
 
     /// Evict from the tail, or punch a hole in the middle or at the head
     /// while the blocks after it stay (what block-level LRU eviction does).
-    fn evict(&mut self, trio: &mut Trio) {
+    fn evict(&mut self, pair: &mut Pair) {
         let Some((worker, at)) = self.pick_chain() else {
             return;
         };
@@ -889,12 +888,12 @@ impl Corpus {
         for &i in &victims {
             chain.alive[i] = false;
         }
-        trio.apply(&worker, &batch(vec![removed(hashes, None)]));
+        pair.apply(&worker, &batch(vec![removed(hashes, None)]));
     }
 
     /// Store a dead block again after its parent (or at the head), as an
     /// engine does when the request comes back.
-    fn heal(&mut self, trio: &mut Trio) {
+    fn heal(&mut self, pair: &mut Pair) {
         let Some((worker, at)) = self.pick_chain() else {
             return;
         };
@@ -910,12 +909,12 @@ impl Corpus {
         let block = chain.blocks[dead].clone();
         chain.alive[dead] = true;
         self.heals += 1;
-        trio.apply(&worker, &batch(vec![stored(parent, &[block], None)]));
+        pair.apply(&worker, &batch(vec![stored(parent, &[block], None)]));
     }
 
     /// A second physical copy of a held prefix (vLLM re-prefills the last
     /// block of an exact resend) followed later by its own removal.
-    fn duplicate(&mut self, trio: &mut Trio) {
+    fn duplicate(&mut self, pair: &mut Pair) {
         let Some((worker, at)) = self.pick_chain() else {
             return;
         };
@@ -926,14 +925,14 @@ impl Corpus {
         }
         let blocks = chain.blocks[..keep].to_vec();
         let last = blocks[keep - 1].hash;
-        trio.apply(&worker, &batch(vec![stored(None, &blocks, None)]));
+        pair.apply(&worker, &batch(vec![stored(None, &blocks, None)]));
         // One copy of the last block goes away: the block must stay indexed.
-        trio.apply(&worker, &batch(vec![removed(vec![last], None)]));
+        pair.apply(&worker, &batch(vec![removed(vec![last], None)]));
     }
 
     /// HiCache write-through: a host copy of a held prefix, the device copy
     /// evicted (the block stays through the host copy), then the host copy.
-    fn host_copy(&mut self, trio: &mut Trio) {
+    fn host_copy(&mut self, pair: &mut Pair) {
         let Some((worker, at)) = self.pick_chain() else {
             return;
         };
@@ -944,16 +943,16 @@ impl Corpus {
         }
         let blocks = chain.blocks[..keep].to_vec();
         let hashes: Vec<i64> = blocks.iter().map(|block| block.hash).collect();
-        trio.apply(
+        pair.apply(
             &worker,
             &batch(vec![stored(None, &blocks, Some(KvCacheTier::Host))]),
         );
-        trio.apply(
+        pair.apply(
             &worker,
             &batch(vec![removed(hashes.clone(), Some(KvCacheTier::Device))]),
         );
         if self.rng.chance(1, 2) {
-            trio.apply(
+            pair.apply(
                 &worker,
                 &batch(vec![removed(hashes, Some(KvCacheTier::Host))]),
             );
@@ -963,51 +962,51 @@ impl Corpus {
         }
     }
 
-    fn clear(&mut self, trio: &mut Trio) {
+    fn clear(&mut self, pair: &mut Pair) {
         let worker = self.worker();
-        trio.apply(&worker, &batch(vec![cleared()]));
+        pair.apply(&worker, &batch(vec![cleared()]));
         self.held.remove(&worker);
     }
 
-    fn replace_worker(&mut self, trio: &mut Trio) {
+    fn replace_worker(&mut self, pair: &mut Pair) {
         let worker = self.worker();
-        trio.remove_worker(&worker);
+        pair.remove_worker(&worker);
         self.held.remove(&worker);
-        trio.add_worker(&worker);
+        pair.add_worker(&worker);
     }
 
-    fn step(&mut self, trio: &mut Trio) {
+    fn step(&mut self, pair: &mut Pair) {
         match self.rng.below(100) {
-            0..=24 => self.store_new(trio),
-            25..=39 => self.extend(trio),
-            40..=54 => self.sibling(trio),
-            55..=74 => self.evict(trio),
-            75..=84 => self.heal(trio),
-            85..=89 => self.duplicate(trio),
-            90..=94 => self.host_copy(trio),
-            95..=97 => self.clear(trio),
-            _ => self.replace_worker(trio),
+            0..=24 => self.store_new(pair),
+            25..=39 => self.extend(pair),
+            40..=54 => self.sibling(pair),
+            55..=74 => self.evict(pair),
+            75..=84 => self.heal(pair),
+            85..=89 => self.duplicate(pair),
+            90..=94 => self.host_copy(pair),
+            95..=97 => self.clear(pair),
+            _ => self.replace_worker(pair),
         }
     }
 }
 
 fn run_corpus(seed: u64, workers: usize, steps: usize, checkpoint: usize) -> (Corpus, usize) {
-    let mut trio = Trio::new();
+    let mut pair = Pair::new();
     let mut corpus = Corpus::new(seed, workers);
     for worker in corpus.workers.clone() {
-        trio.add_worker(&worker);
+        pair.add_worker(&worker);
     }
     for step in 0..steps {
-        corpus.step(&mut trio);
+        corpus.step(&mut pair);
         if step % checkpoint == checkpoint - 1 {
-            trio.check(
+            pair.check(
                 &query_set(&corpus.chains),
                 &format!("seed {seed} step {step}"),
             );
         }
     }
-    trio.check(&query_set(&corpus.chains), &format!("seed {seed} end"));
-    (corpus, trio.lookups)
+    pair.check(&query_set(&corpus.chains), &format!("seed {seed} end"));
+    (corpus, pair.lookups)
 }
 
 #[test]
@@ -1029,9 +1028,9 @@ fn synthetic_corpus_with_holes_scores_identically_on_every_backend() {
 /// interned into a freed id to inherit.
 #[test]
 fn a_hash_stored_again_at_its_true_position_after_a_fallback() {
-    let mut trio = Trio::new();
+    let mut pair = Pair::new();
     let worker = "grpc://w0:9000";
-    trio.add_worker(worker);
+    pair.add_worker(worker);
     let token_blocks = Corpus::new(7, 1).fresh_blocks(6);
     let blocks = chain_of(&token_blocks);
     let contents: Vec<ContentHash> = token_blocks
@@ -1040,30 +1039,30 @@ fn a_hash_stored_again_at_its_true_position_after_a_fallback() {
         .collect();
     // b0..b3 held, b2 and b3 evicted, then the engine extends after b3: the
     // parent is unknown to the index, the fallback puts b4 and b5 at 0 and 1.
-    trio.apply(worker, &batch(vec![stored(None, &blocks[..4], None)]));
-    trio.apply(
+    pair.apply(worker, &batch(vec![stored(None, &blocks[..4], None)]));
+    pair.apply(
         worker,
         &batch(vec![removed(vec![blocks[2].hash, blocks[3].hash], None)]),
     );
-    trio.apply(
+    pair.apply(
         worker,
         &batch(vec![stored(Some(blocks[3].hash), &blocks[4..], None)]),
     );
     let mislaid: Vec<ContentHash> = contents[4..].to_vec();
-    trio.check(&[mislaid.clone(), contents.clone()], "after the fallback");
+    pair.check(&[mislaid.clone(), contents.clone()], "after the fallback");
     assert_eq!(
-        trio.backends[0].scores(&mislaid, false).get(worker),
+        pair.backends[0].scores(&mislaid, false).get(worker),
         Some(&2),
         "the fallback placed the pair at the head"
     );
     // The engine recomputes the chain and announces it whole: b4 and b5 move
     // to positions 4 and 5.
-    trio.apply(worker, &batch(vec![stored(None, &blocks, None)]));
-    trio.check(
+    pair.apply(worker, &batch(vec![stored(None, &blocks, None)]));
+    pair.check(
         &[mislaid.clone(), contents.clone()],
         "after the true-position store",
     );
-    for backend in &trio.backends {
+    for backend in &pair.backends {
         let name = backend.index.name();
         assert_eq!(
             backend.scores(&contents, false).get(worker),
@@ -1081,9 +1080,9 @@ fn a_hash_stored_again_at_its_true_position_after_a_fallback() {
         );
     }
     // The worker leaves and another takes its id: nothing comes with it.
-    trio.remove_worker(worker);
-    trio.add_worker("grpc://w9:9000");
-    for backend in &trio.backends {
+    pair.remove_worker(worker);
+    pair.add_worker("grpc://w9:9000");
+    for backend in &pair.backends {
         let name = backend.index.name();
         assert!(
             backend.scores(&contents, false).is_empty(),
@@ -1099,9 +1098,9 @@ fn a_hash_stored_again_at_its_true_position_after_a_fallback() {
 /// lookup through it still hits, until its last copy goes.
 #[test]
 fn a_second_copy_inside_a_longer_store_pins_the_block_until_its_last_removal() {
-    let mut trio = Trio::new();
+    let mut pair = Pair::new();
     let worker = "grpc://w0:9000";
-    trio.add_worker(worker);
+    pair.add_worker(worker);
     let token_blocks = Corpus::new(9, 1).fresh_blocks(7);
     let blocks = chain_of(&token_blocks);
     let contents: Vec<ContentHash> = token_blocks
@@ -1110,25 +1109,25 @@ fn a_second_copy_inside_a_longer_store_pins_the_block_until_its_last_removal() {
         .collect();
     // The preamble b0..b3; b4 b5 under b3; then b4 b5 b6 under b3: second
     // copies of b4 and b5 and the first copy of b6.
-    trio.apply(worker, &batch(vec![stored(None, &blocks[..4], None)]));
-    trio.apply(
+    pair.apply(worker, &batch(vec![stored(None, &blocks[..4], None)]));
+    pair.apply(
         worker,
         &batch(vec![stored(Some(blocks[3].hash), &blocks[4..6], None)]),
     );
-    trio.apply(
+    pair.apply(
         worker,
         &batch(vec![stored(Some(blocks[3].hash), &blocks[4..7], None)]),
     );
     let queries = [contents[..6].to_vec(), contents.clone()];
-    trio.check(&queries, "two copies");
+    pair.check(&queries, "two copies");
     // One copy each of b5 and b4 goes, tail first: the chain still hits
     // through b6.
-    trio.apply(
+    pair.apply(
         worker,
         &batch(vec![removed(vec![blocks[5].hash, blocks[4].hash], None)]),
     );
-    trio.check(&queries, "one copy left");
-    for backend in &trio.backends {
+    pair.check(&queries, "one copy left");
+    for backend in &pair.backends {
         let name = backend.index.name();
         assert_eq!(
             backend.scores(&contents, false).get(worker),
@@ -1138,12 +1137,12 @@ fn a_second_copy_inside_a_longer_store_pins_the_block_until_its_last_removal() {
         assert_eq!(backend.counts()[worker], 7, "{name}");
     }
     // The last copies go: the chain is cut at b4; b6 stays, unreachable.
-    trio.apply(
+    pair.apply(
         worker,
         &batch(vec![removed(vec![blocks[5].hash, blocks[4].hash], None)]),
     );
-    trio.check(&queries, "no copy left");
-    for backend in &trio.backends {
+    pair.check(&queries, "no copy left");
+    for backend in &pair.backends {
         let name = backend.index.name();
         assert_eq!(
             backend.scores(&contents, false).get(worker),
@@ -1164,15 +1163,15 @@ fn a_second_copy_inside_a_longer_store_pins_the_block_until_its_last_removal() {
 /// of it adds nothing).
 #[test]
 fn chain_index_lookups_change_nothing() {
-    let mut trio = Trio::new();
+    let mut pair = Pair::new();
     let mut corpus = Corpus::new(11, 4);
     for worker in corpus.workers.clone() {
-        trio.add_worker(&worker);
+        pair.add_worker(&worker);
     }
     for _ in 0..200 {
-        corpus.step(&mut trio);
+        corpus.step(&mut pair);
     }
-    let chain = trio
+    let chain = pair
         .backends
         .iter()
         .find(|backend| backend.index.name() == "chain")
@@ -1206,7 +1205,7 @@ fn chain_index_lookups_change_nothing() {
 /// bounded, recycled).
 #[test]
 fn chain_index_releases_state_on_clear_and_worker_removal() {
-    let mut trio = Trio {
+    let mut pair = Pair {
         backends: vec![Backend::new(KvIndex::chain())],
         lookups: 0,
     };
@@ -1214,12 +1213,12 @@ fn chain_index_releases_state_on_clear_and_worker_removal() {
     for cycle in 0..3 {
         let mut corpus = Corpus::new(100, 4);
         for worker in corpus.workers.clone() {
-            trio.add_worker(&worker);
+            pair.add_worker(&worker);
         }
         for _ in 0..300 {
-            corpus.step(&mut trio);
+            corpus.step(&mut pair);
         }
-        let chain = &mut trio.backends[0];
+        let chain = &mut pair.backends[0];
         assert!(
             chain.index.current_size() > 0,
             "cycle {cycle}: nothing indexed"

@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
@@ -17,6 +17,7 @@ use crate::{
         MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
     },
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{DeepseekV41Processor, PreProcessorConfig, VisionPreProcessor},
 };
 
 /// The placeholder text inlined at each image's position; the multimodal
@@ -64,10 +65,20 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
     }
 
     /// The V4.1 renderer inlines the placeholder at each image part's
-    /// position (vLLM `_normalize_messages`, SGLang `process_image_messages`),
-    /// so part order is protocol-visible.
+    /// position, so part order is protocol-visible: a string template of the
+    /// family gets the media parts where the request put them. The family's
+    /// own renderer takes the parts and places them itself, whatever this
+    /// says, and its profile wins over any template, so this is read only
+    /// for a model of the family served without it.
     fn media_part_order(&self) -> MediaPartOrder {
         MediaPartOrder::Authored
+    }
+
+    /// `<｜deepseek_image｜>` (the config's `image_token_id`) is the single
+    /// token the serving engine's prompt updates target, so a worker can
+    /// expand it itself.
+    fn worker_expandable(&self, modality: Modality) -> bool {
+        matches!(modality, Modality::Image)
     }
 
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
@@ -88,8 +99,21 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
         )]))
     }
 
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(DeepseekV41Processor::from_preprocessor_config(
+                preprocessor_config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn prompt_replacements(
@@ -99,17 +123,15 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let image_token_id = Self::image_token_id(metadata)?;
         let placeholder = self.placeholder_token(metadata)?;
-        Ok(preprocessed
-            .feature_token_counts
-            .iter()
-            .map(|&count| {
-                // Every span position carries image_token_id; the roles live
-                // in `types`. All of them are embed positions (delimiters get
-                // the learned vectors from embed_multimodal, not the embed
-                // table).
-                PromptReplacement::repeated(Modality::Image, &placeholder, image_token_id, count)
-            })
-            .collect())
+        // Every span position carries image_token_id; the roles live in
+        // `types`. All of them are embed positions (delimiters get the
+        // learned vectors from embed_multimodal, not the embed table).
+        Ok(PromptReplacement::repeated_per_item(
+            Modality::Image,
+            &placeholder,
+            image_token_id,
+            &preprocessed.feature_token_counts,
+        ))
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
@@ -147,6 +169,7 @@ impl ModelProcessorSpec for DeepseekV41VisionSpec {
 #[cfg(test)]
 mod tests {
     use ndarray::Array2;
+    use serde_json::{json, Value};
 
     use super::*;
     use crate::registry::test_helpers::TestTokenizer;
@@ -169,16 +192,29 @@ mod tests {
         )
     }
 
+    /// The image anchor is the one token the serving engine expands, so
+    /// images may be forwarded to a worker that processes media itself.
+    #[test]
+    fn deepseek_v41_images_can_be_expanded_by_a_worker() {
+        assert!(DeepseekV41VisionSpec.worker_expandable(Modality::Image));
+        for modality in [Modality::Video, Modality::Audio, Modality::ImageEmbeds] {
+            assert!(
+                !DeepseekV41VisionSpec.worker_expandable(modality),
+                "{modality}"
+            );
+        }
+    }
+
     #[test]
     fn matches_deepseek_v41_model_type_and_ids() {
         let tokenizer = TestTokenizer::new(&[]);
         let config = json!({"model_type": "deepseek_v41", "image_token_id": IMAGE_TOKEN_ID});
         assert!(DeepseekV41VisionSpec.matches(&metadata(&tokenizer, &config)));
         assert_eq!(
-            crate::VisionProcessorRegistry::with_defaults()
-                .find("/models/local-checkpoint", Some("deepseek_v41"))
+            DeepseekV41VisionSpec
+                .vision_processor(&config, &PreProcessorConfig::default(), Modality::Image)
                 .map(|processor| processor.model_name()),
-            Some("deepseek_v41")
+            Ok("deepseek_v41")
         );
         for model_id in ["deepseek-ai/DeepSeek-V4.1-Flash", "DEEPSEEK_V41-local"] {
             let neutral = json!({});

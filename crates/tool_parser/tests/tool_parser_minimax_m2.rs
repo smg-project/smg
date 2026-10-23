@@ -22,6 +22,7 @@ fn update_task_tools() -> Vec<Tool> {
                 "required": ["taskId", "subject"]
             }),
             strict: None,
+            extra: Default::default(),
         },
     }]
 }
@@ -69,6 +70,7 @@ async fn test_minimax_integer_arg_coerced_with_schema() {
                 "properties": { "taskId": {"type": "integer"} }
             }),
             strict: None,
+            extra: Default::default(),
         },
     }];
 
@@ -589,6 +591,7 @@ async fn test_minimax_streaming_closes_outer_object_after_nested_value() {
                 "properties": {"data": {"type": "object"}}
             }),
             strict: None,
+            extra: Default::default(),
         },
     }];
     let input = r#"<minimax:tool_call><invoke name="process"><parameter name="data">{"host":"db.example"}</parameter></invoke></minimax:tool_call>"#;

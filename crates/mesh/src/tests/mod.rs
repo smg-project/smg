@@ -6,4 +6,5 @@
 mod chunking_integration;
 #[cfg(test)]
 mod crdt_integration;
+pub(crate) mod mtls_certs;
 pub(crate) mod test_utils;

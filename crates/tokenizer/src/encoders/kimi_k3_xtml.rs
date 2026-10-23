@@ -15,9 +15,8 @@
 //! `<|sep|>`, `<|end_of_msg|>` and media anchors with special tokens allowed,
 //! everything else — tag names, attribute pieces, message text of every role,
 //! reasoning, tool arguments, internal system messages — as ordinary BPE. A
-//! marker string inside message text therefore never becomes a control id
-//! (the one exception is the gateway's `<|media_pad|>` anchor, see below), and
-//! attribute pieces (`" role"`, `="`, value, `"`) are separate BPE units.
+//! marker string inside message text therefore never becomes a control id,
+//! and attribute pieces (`" role"`, `="`, value, `"`) are separate BPE units.
 //! `render_kimi_k3_xtml_prompt` reproduces that segmentation piece by piece
 //! for the tiktoken backend, which encodes it and hands the caller a deferred
 //! encode; [`apply_kimi_k3_xtml_with_effort_default`] is that prompt joined
@@ -33,12 +32,59 @@
 //! gateway passes content parts through (OpenAI format), each image part
 //! becomes one `<|media_pad|>` control anchor at its authored position, and
 //! prompt expansion replaces it — see `llm_multimodal::registry::kimi_k3`. A
-//! literal anchor inside string content is kept as a control segment too.
+//! literal anchor spelled inside message text stays text, as the checkpoint's
+//! own encoder keeps it.
+
+use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
 use serde_json::{Map, Value};
 
-use crate::chat_template::ChatTemplateParams;
+use super::RendererProfile;
+pub(crate) use super::{join_segments, PromptSegment};
+use crate::{
+    chat_template::{
+        ChatTemplateContentFormat, ChatTemplateParams, ThinkingKeyName, ThinkingToggle,
+    },
+    traits::RendererCapabilities,
+};
+
+/// What this renderer answers around a render (see [`RendererProfile`]).
+pub(crate) const PROFILE: RendererProfile = RendererProfile {
+    // Content parts are rendered positionally, so the gateway passes them
+    // through in the request's order (a parts-format renderer: the
+    // multimodal spec's `MediaPartOrder` is not consulted).
+    content_format: Some(ChatTemplateContentFormat::OpenAI),
+    // No Jinja template; the native renderer defaults thinking ON (the
+    // reference's `build_chat_segments(thinking=True)`).
+    thinking_toggle: ThinkingToggle::DefaultOn,
+    thinking_key_name: ThinkingKeyName::Thinking,
+    // The levels the encoder renders as a `thinking-effort` directive;
+    // `"none"` switches thinking off (the engine's own server maps the kwarg
+    // the same way before rendering), so the reasoning parser is armed from
+    // the kwarg like the prompt is.
+    native_effort_values: &["low", "high", "max"],
+    native_effort_off_values: &[],
+    // The generation-prompt tail opens `<think>` when thinking is on (the
+    // default), so completions start mid-reasoning.
+    think_in_prefill: true,
+    // The encoder parses `arguments` itself; the gateway forwards them as
+    // written. The engine's own server rewrites `enable_thinking` into the
+    // encoder's `thinking` before rendering, so the renderer and the parser
+    // read the alias. `build_chat_segments` declares every tool it is given
+    // and renders `tool_choice=none` as an internal system message that
+    // forbids the call (the served entry point forwards both as sent), so the
+    // gateway keeps the tools of such a request.
+    capabilities: RendererCapabilities {
+        raw_tool_call_arguments: true,
+        enable_thinking_alias: true,
+        declares_tools_under_tool_choice_none: true,
+        ..RendererProfile::NO_CAPABILITIES
+    },
+    // The encoder resolves the mode by its own rule; the parser is armed
+    // from the same answer the prompt was rendered with.
+    thinking_mode: Some(resolve_thinking),
+};
 
 const OPEN_TOKEN: &str = "<|open|>";
 const CLOSE_TOKEN: &str = "<|close|>";
@@ -46,38 +92,6 @@ const SEP_TOKEN: &str = "<|sep|>";
 const END_OF_MSG_TOKEN: &str = "<|end_of_msg|>";
 /// The gateway's per-image anchor (`KimiK3VisionSpec::placeholder_token`).
 const MEDIA_ANCHOR: &str = "<|media_pad|>";
-
-/// One piece of a rendered prompt, tagged with how special-token strings in
-/// it must be encoded: the reference's `EncodeSegment { text, allow_special }`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PromptSegment {
-    pub(crate) text: String,
-    /// `true`: special-token strings map to their control ids (structural
-    /// markers emitted by the renderer). `false`: ordinary BPE, so a literal
-    /// marker string inside message text stays text.
-    pub(crate) allow_special: bool,
-}
-
-impl PromptSegment {
-    pub(crate) fn control(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            allow_special: true,
-        }
-    }
-
-    pub(crate) fn text(text: impl Into<String>) -> Self {
-        Self {
-            text: text.into(),
-            allow_special: false,
-        }
-    }
-}
-
-/// The flat prompt string: segment texts concatenated in order.
-pub(crate) fn join_segments(segments: &[PromptSegment]) -> String {
-    segments.iter().map(|s| s.text.as_str()).collect()
-}
 
 /// A rendered prompt and the span of its response-channel opener.
 #[derive(Debug)]
@@ -90,7 +104,7 @@ pub(crate) struct RenderedXtml {
 /// The effort the reference applies when a request names none.
 ///
 /// `build_chat_segments` injects no directive; the served entry point above it
-/// (`tokenization_kimi.apply_chat_template`, which vLLM calls) first runs
+/// (`tokenization_kimi.apply_chat_template`, which the serving engine calls) first runs
 /// `kwargs.setdefault("thinking_effort", "max")`.
 pub const DEFAULT_THINKING_EFFORT: &str = "max";
 
@@ -101,7 +115,9 @@ pub const DEFAULT_THINKING_EFFORT: &str = "max";
 ///
 /// `params.tools` (when non-empty) produces the leading `tool-declare` system
 /// message. `params.add_generation_prompt` appends the assistant generation
-/// prompt tail. Thinking mode is resolved from `template_kwargs["thinking"]`
+/// prompt tail. Thinking mode is resolved from `template_kwargs["thinking"]`,
+/// then the engine's `enable_thinking` alias and a `reasoning_effort` of `"none"` in
+/// the kwargs (the rewrites the engine's own server applies before rendering),
 /// then `params.thinking`, defaulting to `true` to match the Python
 /// `build_chat_segments(thinking=True)` default; it selects `think` vs
 /// `response` for both the generation-prompt tail and (per-turn) any prior
@@ -128,7 +144,7 @@ pub fn apply_kimi_k3_xtml_with_effort_default(
 /// plus the caller's `continue_final_message` prefill, appended as one control
 /// piece so marker strings in the prefill keep their control ids. That is
 /// what the flat encode of `rendered + prefill` produced before segments
-/// existed and what SGLang's prefix append does: the rendering always ends in
+/// existed and what the serving engine's prefix append does: the rendering always ends in
 /// a control piece (`<|sep|>` after the generation prompt), so no BPE merge
 /// crosses the seam and the prefill's ids equal the flat encode of the same
 /// prefill byte for byte. A prefill of ordinary text encodes the same either
@@ -143,6 +159,38 @@ pub(crate) fn render_kimi_k3_xtml_prompt(
         push_control(&mut out.segments, prefix);
     }
     Ok(out)
+}
+
+/// The thinking mode the renderer renders, resolved as the engine's own
+/// server resolves it before calling the checkpoint's `apply_chat_template`
+/// (the engine's K3 renderer rewrites the kwargs first): an explicit `thinking`
+/// kwarg wins, then the engine's `enable_thinking` alias, then a `reasoning_effort`
+/// of `"none"` in the kwargs, then the request-level toggle the gateway
+/// derived; absent all of them, the encoder's `build_chat_segments(thinking=True)`
+/// default. Any other effort word leaves the mode alone (it only picks the
+/// `thinking-effort` directive). The gateway arms its reasoning parser from
+/// this answer too (`Tokenizer::native_thinking_mode`), so the prompt and the
+/// parser never disagree.
+pub fn resolve_thinking(
+    template_kwargs: Option<&HashMap<String, Value>>,
+    thinking: Option<bool>,
+) -> bool {
+    let kwarg_bool = |key: &str| {
+        template_kwargs
+            .and_then(|k| k.get(key))
+            .and_then(Value::as_bool)
+    };
+    kwarg_bool("thinking")
+        .or_else(|| kwarg_bool("enable_thinking"))
+        .or_else(|| {
+            template_kwargs
+                .and_then(|k| k.get("reasoning_effort"))
+                .and_then(Value::as_str)
+                .filter(|effort| *effort == "none")
+                .map(|_| false)
+        })
+        .or(thinking)
+        .unwrap_or(true)
 }
 
 fn render_xtml(
@@ -162,12 +210,7 @@ fn render_xtml(
         .filter(|t| !t.is_empty())
         .map(|t| deep_sort(&Value::Array(t.to_vec())));
 
-    let thinking = params
-        .template_kwargs
-        .and_then(|k| k.get("thinking"))
-        .and_then(Value::as_bool)
-        .or(params.thinking)
-        .unwrap_or(true);
+    let thinking = resolve_thinking(params.template_kwargs, params.thinking);
 
     let mut out: Vec<PromptSegment> = Vec::new();
 
@@ -178,52 +221,13 @@ fn render_xtml(
     // Effort directive (`thinking-effort` internal system message). Only emitted
     // while thinking is on, mirroring the Python reference (both the validation
     // and the emit are gated on `thinking`).
-    //
-    // Precedence:
-    //   1. An explicit `thinking_effort` (via `chat_template_kwargs`) wins and is
-    //      validated strictly — a provided-but-unsupported value is a hard error,
-    //      matching the reference `assert thinking_effort in _VALID_THINKING_EFFORTS`.
-    //   2. Otherwise the OpenAI-standard top-level `reasoning_effort` level is
-    //      used, but only when it names a supported K3 effort (`low`/`high`/`max`).
-    //      `minimal`/`none` already switch thinking off upstream and `medium` has
-    //      no K3 equivalent, so such values emit no directive rather than erroring
-    //      on an otherwise-valid OpenAI field.
-    //   3. Absent both, `default_effort` — `None` for the bare port, `Some("max")`
-    //      for the served entry point. See [`DEFAULT_THINKING_EFFORT`].
-    //
-    // `preserve_thinking` is not read by the reference renderer and is ignored.
     if thinking {
-        if let Some(effort_val) = params
-            .template_kwargs
-            .and_then(|k| k.get("thinking_effort"))
-            .filter(|v| !v.is_null())
-        {
-            match effort_val.as_str() {
-                Some(effort @ ("low" | "high" | "max")) => {
-                    push_thinking_effort(&mut out, effort);
-                }
-                _ => {
-                    return Err(anyhow!(
-                        "Unsupported thinking_effort={effort_val}; \
-                         supported values are [\"high\", \"low\", \"max\"]."
-                    ));
-                }
-            }
-        } else if let Some(effort) = params
-            .template_kwargs
-            .and_then(|k| k.get("reasoning_effort"))
-            .and_then(Value::as_str)
-            .filter(|e| matches!(*e, "low" | "high" | "max"))
-            .or(default_effort)
-        {
-            push_thinking_effort(&mut out, effort);
-        }
+        push_effort_directive(&mut out, params.template_kwargs, default_effort)?;
     }
 
     // Tracks the most recent assistant `tool_calls` so tool messages can resolve
     // a missing name by position, mirroring the Python module-local state.
-    let mut current_tool_calls: Option<&Vec<Value>> = None;
-    let mut tool_index: usize = 0;
+    let mut cursor = ToolCallCursor::default();
 
     for message in &normalized {
         let obj = match message.as_object() {
@@ -232,84 +236,12 @@ fn render_xtml(
         };
         let role = obj.get("role").and_then(Value::as_str).unwrap_or("");
         match role {
-            "user" => {
-                let mut attrs = vec![("role", "user".to_string())];
-                if let Some(name) = nonempty_name(obj) {
-                    attrs.push(("name", name));
-                }
-                push_open_tag(&mut out, "message", &attrs);
-                push_content(&mut out, obj.get("content"));
-                push_close_tag(&mut out, "message");
-                push_end_of_msg(&mut out);
-            }
-            "system" => {
-                if let Some(tools) = obj
-                    .get("tools")
-                    .filter(|t| t.as_array().is_some_and(|a| !a.is_empty()))
-                {
-                    // Dynamic tool declaration; already deep-sorted by
-                    // `normalize_message`.
-                    push_tool_declare(&mut out, tools, true)?;
-                } else {
-                    let mut attrs = vec![("role", "system".to_string())];
-                    if let Some(name) = nonempty_name(obj) {
-                        attrs.push(("name", name));
-                    }
-                    push_open_tag(&mut out, "message", &attrs);
-                    push_content(&mut out, obj.get("content"));
-                    push_close_tag(&mut out, "message");
-                    push_end_of_msg(&mut out);
-                }
-            }
-            "tool" => {
-                tool_index += 1;
-                let mut tool_name = obj
-                    .get("tool")
-                    .and_then(Value::as_str)
-                    .or_else(|| obj.get("name").and_then(Value::as_str))
-                    .map(str::to_string);
-                if tool_name.is_none() {
-                    if let Some(tcs) = current_tool_calls {
-                        if tool_index <= tcs.len() {
-                            let tc = &tcs[tool_index - 1];
-                            let fnobj = function_or_self(tc);
-                            tool_name = fnobj
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .map(str::to_string);
-                        }
-                    }
-                }
-                let tool_name = tool_name.ok_or_else(|| {
-                    anyhow!(
-                        "Kimi K3 tool messages need a resolvable tool name: carry `tool`/`name`, \
-                         or match a preceding assistant tool_call by order."
-                    )
-                })?;
-                push_open_tag(
-                    &mut out,
-                    "message",
-                    &[
-                        ("role", "tool".to_string()),
-                        ("tool", tool_name),
-                        ("index", tool_index.to_string()),
-                    ],
-                );
-                push_content(&mut out, obj.get("content"));
-                push_close_tag(&mut out, "message");
-                push_end_of_msg(&mut out);
-            }
+            "user" => push_user_message(&mut out, obj),
+            "system" => push_system_message(&mut out, obj)?,
+            "tool" => push_tool_message(&mut out, obj, &mut cursor)?,
             "assistant" => {
-                current_tool_calls = obj.get("tool_calls").and_then(Value::as_array);
-                tool_index = 0;
-                let mut attrs = vec![("role", "assistant".to_string())];
-                if let Some(name) = nonempty_name(obj) {
-                    attrs.push(("name", name));
-                }
-                push_open_tag(&mut out, "message", &attrs);
-                render_assistant_segments(&mut out, obj, thinking)?;
-                push_close_tag(&mut out, "message");
-                push_end_of_msg(&mut out);
+                cursor.start_turn(obj);
+                push_assistant_message(&mut out, obj, thinking)?;
             }
             // Unknown roles produce no output, matching the Python loop's lack
             // of a matching branch.
@@ -320,25 +252,7 @@ fn render_xtml(
     // Post-loop `tool_choice` / `response_format` internal system messages,
     // emitted after the conversation and before the generation-prompt tail to
     // mirror `build_chat_segments`.
-    match params
-        .template_kwargs
-        .and_then(|kwargs| kwargs.get("tool_choice"))
-        .and_then(Value::as_str)
-    {
-        Some("required") => push_internal_system_message(
-            &mut out,
-            "tool-choice",
-            "The system is invoked with `tool_choice=required`.\n\
-             You MUST call tools in the next message.",
-        ),
-        Some("none") => push_internal_system_message(
-            &mut out,
-            "tool-choice",
-            "The system is invoked with `tool_choice=none`.\n\
-             You MUST NOT call any tools in the next message.",
-        ),
-        _ => {}
-    }
+    push_tool_choice(&mut out, params.template_kwargs);
 
     if let Some(response_format) = params
         .template_kwargs
@@ -347,18 +261,226 @@ fn render_xtml(
         push_response_format(&mut out, response_format, params.template_kwargs)?;
     }
 
-    let mut pending = 0..0;
-    if params.add_generation_prompt {
-        push_open_tag(&mut out, "message", &[("role", "assistant".to_string())]);
-        let start = out.len();
-        push_open_tag(&mut out, if thinking { "think" } else { "response" }, &[]);
-        pending = start..out.len();
-    }
+    let pending = if params.add_generation_prompt {
+        push_generation_prompt(&mut out, thinking)
+    } else {
+        0..0
+    };
 
     Ok(RenderedXtml {
         segments: out,
         pending,
     })
+}
+
+/// The `thinking-effort` directive of a request, when it names an effort or
+/// the entry point has a default (the caller emits it only while thinking is
+/// on).
+///
+/// Precedence:
+///   1. An explicit `thinking_effort` (via `chat_template_kwargs`) wins and is
+///      validated strictly — a provided-but-unsupported value is a hard error,
+///      matching the reference `assert thinking_effort in _VALID_THINKING_EFFORTS`.
+///   2. Otherwise the OpenAI-standard top-level `reasoning_effort` level is
+///      used, but only when it names a supported K3 effort (`low`/`high`/`max`).
+///      `minimal`/`none` already switch thinking off upstream and `medium` has
+///      no K3 equivalent, so such values emit no directive rather than erroring
+///      on an otherwise-valid OpenAI field.
+///   3. Absent both, `default_effort` — `None` for the bare port, `Some("max")`
+///      for the served entry point. See [`DEFAULT_THINKING_EFFORT`].
+///
+/// `preserve_thinking` is not read by the reference renderer and is ignored.
+fn push_effort_directive(
+    out: &mut Vec<PromptSegment>,
+    template_kwargs: Option<&HashMap<String, Value>>,
+    default_effort: Option<&str>,
+) -> Result<()> {
+    if let Some(effort_val) = template_kwargs
+        .and_then(|k| k.get("thinking_effort"))
+        .filter(|v| !v.is_null())
+    {
+        match effort_val.as_str() {
+            Some(effort @ ("low" | "high" | "max")) => {
+                push_thinking_effort(out, effort);
+            }
+            _ => {
+                return Err(anyhow!(
+                    "Unsupported thinking_effort={effort_val}; \
+                     supported values are [\"high\", \"low\", \"max\"]."
+                ));
+            }
+        }
+    } else if let Some(effort) = template_kwargs
+        .and_then(|k| k.get("reasoning_effort"))
+        .and_then(Value::as_str)
+        .filter(|e| matches!(*e, "low" | "high" | "max"))
+        .or(default_effort)
+    {
+        push_thinking_effort(out, effort);
+    }
+    Ok(())
+}
+
+/// A `message` tag's attributes: the role and, when the message carries a
+/// non-empty `name`, the name.
+fn message_attrs(role: &str, obj: &Map<String, Value>) -> Vec<(&'static str, String)> {
+    let mut attrs = vec![("role", role.to_string())];
+    if let Some(name) = nonempty_name(obj) {
+        attrs.push(("name", name));
+    }
+    attrs
+}
+
+/// A whole `message` element: the open tag with `attrs`, the content, the
+/// close tag and the end-of-message marker.
+fn push_message(out: &mut Vec<PromptSegment>, attrs: &[(&str, String)], content: Option<&Value>) {
+    push_open_tag(out, "message", attrs);
+    push_content(out, content);
+    push_close_tag(out, "message");
+    push_end_of_msg(out);
+}
+
+/// A user message: a `message` element with its role and name.
+fn push_user_message(out: &mut Vec<PromptSegment>, obj: &Map<String, Value>) {
+    push_message(out, &message_attrs("user", obj), obj.get("content"));
+}
+
+/// A system message: a dynamic tool declaration when it carries tools
+/// (already deep-sorted by `normalize_message`), a `message` element with its
+/// role and name otherwise.
+fn push_system_message(out: &mut Vec<PromptSegment>, obj: &Map<String, Value>) -> Result<()> {
+    if let Some(tools) = obj
+        .get("tools")
+        .filter(|t| t.as_array().is_some_and(|a| !a.is_empty()))
+    {
+        push_tool_declare(out, tools, true)?;
+    } else {
+        push_message(out, &message_attrs("system", obj), obj.get("content"));
+    }
+    Ok(())
+}
+
+/// The most recent assistant turn's `tool_calls` and how many tool results
+/// have followed it, so a tool message without a name resolves one by
+/// position (the Python module-local state).
+#[derive(Default)]
+struct ToolCallCursor<'a> {
+    current_tool_calls: Option<&'a Vec<Value>>,
+    tool_index: usize,
+}
+
+impl<'a> ToolCallCursor<'a> {
+    /// An assistant turn: its tool calls are the current ones, the result
+    /// count starts over.
+    fn start_turn(&mut self, assistant: &'a Map<String, Value>) {
+        self.current_tool_calls = assistant.get("tool_calls").and_then(Value::as_array);
+        self.tool_index = 0;
+    }
+
+    /// The next tool result's index among the turn's results, from one.
+    fn next_index(&mut self) -> usize {
+        self.tool_index += 1;
+        self.tool_index
+    }
+
+    /// The name of the call the result at `index` answers, by position, when
+    /// the current turn made that many calls and the call names a function.
+    fn name_by_position(&self, index: usize) -> Option<String> {
+        let tcs = self.current_tool_calls?;
+        if index <= tcs.len() {
+            let tc = &tcs[index - 1];
+            let fnobj = function_or_self(tc);
+            fnobj
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        } else {
+            None
+        }
+    }
+}
+
+/// A tool message: a `message` element with the tool's name (its own `tool`
+/// or `name`, else the call it answers by position) and its index among the
+/// turn's results.
+fn push_tool_message(
+    out: &mut Vec<PromptSegment>,
+    obj: &Map<String, Value>,
+    cursor: &mut ToolCallCursor<'_>,
+) -> Result<()> {
+    let tool_index = cursor.next_index();
+    let tool_name = obj
+        .get("tool")
+        .and_then(Value::as_str)
+        .or_else(|| obj.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .or_else(|| cursor.name_by_position(tool_index))
+        .ok_or_else(|| {
+            anyhow!(
+                "Kimi K3 tool messages need a resolvable tool name: carry `tool`/`name`, \
+                 or match a preceding assistant tool_call by order."
+            )
+        })?;
+    push_message(
+        out,
+        &[
+            ("role", "tool".to_string()),
+            ("tool", tool_name),
+            ("index", tool_index.to_string()),
+        ],
+        obj.get("content"),
+    );
+    Ok(())
+}
+
+/// An assistant message: a `message` element with its role and name whose
+/// body is the turn's channels ([`render_assistant_segments`]).
+fn push_assistant_message(
+    out: &mut Vec<PromptSegment>,
+    obj: &Map<String, Value>,
+    thinking: bool,
+) -> Result<()> {
+    push_open_tag(out, "message", &message_attrs("assistant", obj));
+    render_assistant_segments(out, obj, thinking)?;
+    push_close_tag(out, "message");
+    push_end_of_msg(out);
+    Ok(())
+}
+
+/// The `tool-choice` internal system message a `required` or `none` tool
+/// choice in the kwargs asks for.
+fn push_tool_choice(
+    out: &mut Vec<PromptSegment>,
+    template_kwargs: Option<&HashMap<String, Value>>,
+) {
+    match template_kwargs
+        .and_then(|kwargs| kwargs.get("tool_choice"))
+        .and_then(Value::as_str)
+    {
+        Some("required") => push_internal_system_message(
+            out,
+            "tool-choice",
+            "The system is invoked with `tool_choice=required`.\n\
+             You MUST call tools in the next message.",
+        ),
+        Some("none") => push_internal_system_message(
+            out,
+            "tool-choice",
+            "The system is invoked with `tool_choice=none`.\n\
+             You MUST NOT call any tools in the next message.",
+        ),
+        _ => {}
+    }
+}
+
+/// The generation-prompt tail: the assistant message opened and the channel
+/// the turn starts in (`think` or `response`) opened; the span of that
+/// opener is what the reference bills as pending.
+fn push_generation_prompt(out: &mut Vec<PromptSegment>, thinking: bool) -> std::ops::Range<usize> {
+    push_open_tag(out, "message", &[("role", "assistant".to_string())]);
+    let start = out.len();
+    push_open_tag(out, if thinking { "think" } else { "response" }, &[]);
+    start..out.len()
 }
 
 // ---------------------------------------------------------------------------
@@ -377,17 +499,12 @@ fn push_text(out: &mut Vec<PromptSegment>, text: &str) {
     }
 }
 
-/// Message text (`_append_text` in the reference): ordinary BPE, except that
-/// the gateway's `<|media_pad|>` anchors must survive as control tokens for
-/// prompt expansion, so the text is split around them.
+/// Message text (`_append_text` in the reference): ordinary BPE, special
+/// spellings included. A `<|media_pad|>` typed in a message stays text, as
+/// the checkpoint's own encoder keeps it; the anchors the media pipeline
+/// expands come from image parts only (`push_content`).
 fn push_message_text(out: &mut Vec<PromptSegment>, text: &str) {
-    let mut rest = text;
-    while let Some(pos) = rest.find(MEDIA_ANCHOR) {
-        push_text(out, &rest[..pos]);
-        push_control(out, MEDIA_ANCHOR);
-        rest = &rest[pos + MEDIA_ANCHOR.len()..];
-    }
-    push_text(out, rest);
+    push_text(out, text);
 }
 
 fn escape_attr_value(value: &str) -> String {
@@ -516,7 +633,7 @@ fn push_thinking_effort(out: &mut Vec<PromptSegment>, effort: &str) {
 fn push_response_format(
     out: &mut Vec<PromptSegment>,
     response_format: &Value,
-    template_kwargs: Option<&std::collections::HashMap<String, Value>>,
+    template_kwargs: Option<&HashMap<String, Value>>,
 ) -> Result<()> {
     let response_type = response_format
         .get("type")
@@ -999,6 +1116,45 @@ mod tests {
         }
     }
 
+    /// The rule the prompt is rendered with, which the parser is armed from:
+    /// `none` is the only effort word that switches thinking off, so a typed
+    /// `disabled` beats an on word and a kwargs `minimal` keeps the default.
+    #[test]
+    fn thinking_is_resolved_by_the_renderer_s_own_rule() {
+        let kw = |pairs: &[(&str, Value)]| -> HashMap<String, Value> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect()
+        };
+        assert!(resolve_thinking(None, None));
+        assert!(!resolve_thinking(None, Some(false)));
+        let high = kw(&[("reasoning_effort", json!("high"))]);
+        assert!(!resolve_thinking(Some(&high), Some(false)));
+        assert!(resolve_thinking(Some(&high), None));
+        let minimal = kw(&[("reasoning_effort", json!("minimal"))]);
+        assert!(resolve_thinking(Some(&minimal), None));
+        let none = kw(&[("reasoning_effort", json!("none"))]);
+        assert!(!resolve_thinking(Some(&none), Some(true)));
+        let off = kw(&[
+            ("thinking", json!(false)),
+            ("reasoning_effort", json!("high")),
+        ]);
+        assert!(!resolve_thinking(Some(&off), Some(true)));
+        let alias = kw(&[
+            ("enable_thinking", json!(true)),
+            ("reasoning_effort", json!("none")),
+        ]);
+        assert!(resolve_thinking(Some(&alias), Some(false)));
+
+        // The rendered tail follows the same answer.
+        let messages = vec![json!({"role": "user", "content": "Hi"})];
+        let rendered = apply_kimi_k3_xtml(&messages, &params_kw(Some(false), &high, true)).unwrap();
+        assert!(rendered.ends_with("<|open|>response<|sep|>"), "{rendered}");
+        let rendered = apply_kimi_k3_xtml(&messages, &params_kw(None, &minimal, true)).unwrap();
+        assert!(rendered.ends_with("<|open|>think<|sep|>"), "{rendered}");
+    }
+
     #[test]
     fn thinking_defaults_on_when_unspecified() {
         let messages = vec![json!({"role": "user", "content": "Hi"})];
@@ -1133,20 +1289,24 @@ mod tests {
         assert_eq!(&segments[..expected.len()], &expected[..]);
     }
 
+    /// A `<|media_pad|>` spelling typed in message text stays text, as the
+    /// checkpoint's own encoder keeps it (it scans message text for no
+    /// marker and encodes it with special tokens disallowed); the anchor
+    /// segment the media pipeline expands comes from an image part only.
     #[test]
-    fn media_anchors_in_message_text_are_control_segments() {
+    fn media_anchor_spellings_in_message_text_stay_text() {
         let messages = vec![json!({"role": "user", "content": "see <|media_pad|> here"})];
         let segments = render_xtml(&messages, &params(Some(true), None), None)
             .unwrap()
             .segments;
         assert_eq!(
-            segments[7..10].to_vec(),
+            segments[7..9].to_vec(),
             vec![
-                PromptSegment::text("see "),
-                PromptSegment::control(MEDIA_ANCHOR),
-                PromptSegment::text(" here"),
+                PromptSegment::text("see <|media_pad|> here"),
+                PromptSegment::control(CLOSE_TOKEN),
             ]
         );
+        assert!(!control_texts(&segments).contains(&MEDIA_ANCHOR));
     }
 
     #[test]
@@ -1420,6 +1580,102 @@ mod tests {
                 "<|open|>call tool=\"get_weather\" index=\"1\"<|sep|><|close|>call<|sep|>"
             ),
             "got: {rendered}"
+        );
+    }
+
+    // --- Thinking toggles the engine's own server honours before rendering ----
+    // The engine's K3 renderer rewrites the kwargs before `apply_chat_template`:
+    // `enable_thinking` becomes `thinking` and a `reasoning_effort` of `"none"`
+    // switches thinking off; an explicit `thinking` kwarg outranks both.
+
+    #[test]
+    fn enable_thinking_alias_switches_the_channel_off_like_thinking() {
+        let messages = vec![
+            json!({"role": "user", "content": "What is 17 times 3?"}),
+            json!({"role": "assistant", "content": "51.", "reasoning_content": "17*3 = 51."}),
+            json!({"role": "user", "content": "And times 4?"}),
+        ];
+        let alias = HashMap::from([("enable_thinking".to_string(), json!(false))]);
+        let native = HashMap::from([("thinking".to_string(), json!(false))]);
+        let with_alias =
+            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(None, &alias, true))
+                .unwrap();
+        let with_native =
+            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(None, &native, true))
+                .unwrap();
+        assert_eq!(
+            with_alias, with_native,
+            "enable_thinking=false must render like thinking=false"
+        );
+        assert!(
+            with_alias.ends_with("<|open|>response<|sep|>"),
+            "generation prompt opens the response channel: {with_alias}"
+        );
+        assert!(
+            !with_alias.contains("thinking-effort"),
+            "no effort directive while thinking is off: {with_alias}"
+        );
+        assert!(
+            !with_alias.contains("<|open|>think<|sep|>"),
+            "the prior assistant turn's think channel is dropped: {with_alias}"
+        );
+
+        // The alias set by the caller outranks the request-level toggle the
+        // gateway derived from a top-level `reasoning_effort`.
+        let on = HashMap::from([("enable_thinking".to_string(), json!(true))]);
+        let with_on =
+            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(Some(false), &on, true))
+                .unwrap();
+        assert!(
+            with_on.ends_with("<|open|>think<|sep|>"),
+            "enable_thinking=true keeps thinking on: {with_on}"
+        );
+    }
+
+    #[test]
+    fn thinking_kwarg_wins_over_the_enable_thinking_alias() {
+        let messages = vec![json!({"role": "user", "content": "Hi"})];
+        let kwargs = HashMap::from([
+            ("enable_thinking".to_string(), json!(false)),
+            ("thinking".to_string(), json!(true)),
+        ]);
+        let rendered =
+            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(None, &kwargs, true))
+                .unwrap();
+        assert!(
+            rendered.ends_with("<|open|>think<|sep|>"),
+            "thinking=true outranks the alias: {rendered}"
+        );
+    }
+
+    #[test]
+    fn kwargs_reasoning_effort_none_switches_thinking_off() {
+        let messages = vec![json!({"role": "user", "content": "Hi"})];
+        let kwargs = HashMap::from([("reasoning_effort".to_string(), json!("none"))]);
+        let rendered =
+            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(None, &kwargs, true))
+                .unwrap();
+        assert!(
+            rendered.ends_with("<|open|>response<|sep|>"),
+            "reasoning_effort=none in the kwargs switches thinking off: {rendered}"
+        );
+        assert!(
+            !rendered.contains("thinking-effort"),
+            "no effort directive while thinking is off: {rendered}"
+        );
+
+        // `enable_thinking=true` beside it keeps thinking on, as on the engine
+        // (the alias is applied before the effort word is read).
+        let both = HashMap::from([
+            ("reasoning_effort".to_string(), json!("none")),
+            ("enable_thinking".to_string(), json!(true)),
+        ]);
+        let rendered =
+            apply_kimi_k3_xtml_with_effort_default(&messages, &params_kw(Some(false), &both, true))
+                .unwrap();
+        assert!(
+            rendered.ends_with("<|open|>think<|sep|>"),
+            "enable_thinking=true outranks reasoning_effort=none: {rendered}"
         );
     }
 

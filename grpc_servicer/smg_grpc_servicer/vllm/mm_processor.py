@@ -8,15 +8,17 @@ imported lazily inside the backends.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import dataclasses
 import inspect
 import json
 import logging
 import os
+import re
 import time
 import uuid
-from collections.abc import Awaitable, Iterable, Mapping, Sequence
+from collections.abc import Awaitable, Iterable, Mapping, MutableMapping, Sequence
 from typing import Any
 
 from smg_grpc_servicer.mm_sidecar_protocol import (
@@ -44,12 +46,14 @@ from smg_grpc_servicer.mm_sidecar_protocol import (
     hello_schemes,
     resolve_namespace,
 )
+from smg_grpc_servicer.vllm import config_view
 from smg_grpc_servicer.vllm.media_refs import (
     BASE_SCHEMES,
     FETCHABLE_MODALITIES,
     advertised_schemes,
     parse_scheme_list,
 )
+from smg_grpc_servicer.vllm.short_side_floor import FloorRule, floor_rule, raise_to_floor_off_loop
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +62,8 @@ PROCESSOR_FLAG = "--mm-processor"
 ENV_MAX_INFLIGHT = "SMG_VLLM_MM_MAX_INFLIGHT"
 ENV_MAX_ITEM_BYTES = "SMG_VLLM_MM_MAX_ITEM_BYTES"
 ENV_MAX_ITEMS = "SMG_VLLM_MM_MAX_ITEMS"
+ENV_TURBOJPEG = "SMG_VLLM_MM_TURBOJPEG"
+TURBOJPEG_FLAG = "--mm-turbojpeg"
 
 MODE_OFF = "off"
 MODE_INPROCESS = "inprocess"
@@ -65,6 +71,11 @@ MODE_REDIS = "redis"
 # smg's own media pipeline, inside the Rust servicer only.
 MODE_SMG = "smg"
 VALID_MODES = (MODE_OFF, MODE_INPROCESS, MODE_REDIS, MODE_SMG)
+# What smg's own pipeline does when libjpeg-turbo cannot be loaded: decode
+# JPEGs with the pure-Rust fallback (prefer, the default) or refuse to start.
+TURBOJPEG_PREFER = "prefer"
+TURBOJPEG_REQUIRE = "require"
+VALID_TURBOJPEG = (TURBOJPEG_PREFER, TURBOJPEG_REQUIRE)
 
 DEFAULT_MAX_INFLIGHT = 64
 DEFAULT_MAX_ITEM_BYTES = 32 * 1024 * 1024
@@ -84,6 +95,15 @@ def resolve_mm_processor_mode(env: Mapping[str, str] = os.environ) -> str:
     if raw not in VALID_MODES:
         raise ValueError(
             f"{PROCESSOR_FLAG} / {ENV_PROCESSOR}={raw!r} is not one of {'|'.join(VALID_MODES)}"
+        )
+    return raw
+
+
+def resolve_mm_turbojpeg(env: Mapping[str, str] = os.environ) -> str:
+    raw = (env.get(ENV_TURBOJPEG) or TURBOJPEG_PREFER).strip().lower()
+    if raw not in VALID_TURBOJPEG:
+        raise ValueError(
+            f"{TURBOJPEG_FLAG} / {ENV_TURBOJPEG}={raw!r} is not one of {'|'.join(VALID_TURBOJPEG)}"
         )
     return raw
 
@@ -126,7 +146,7 @@ def enforce_item_bytes(items: Sequence[Any], max_bytes: int) -> None:
         if size is not None and size > max_bytes:
             raise ValueError(
                 f"media_refs[{index}]: inline payload is {size} bytes, above the "
-                f"{max_bytes}-byte cap ({ENV_MAX_ITEM_BYTES})"
+                f"{max_bytes}-byte cap (the worker's --mm-max-item-bytes, {ENV_MAX_ITEM_BYTES})"
             )
 
 
@@ -232,10 +252,41 @@ def _require_inprocess_apis(engine) -> None:
         )
 
 
+def _fetcher_splits_data_url_at_first_semicolon(version: str) -> bool:
+    """Whether the engine's fetcher of ``version`` reads a data URL's encoding
+    as the segment after the first ';' of its media-type part (releases before
+    0.27.0) rather than after the last one (0.27.0 on, which accepts RFC 2397
+    parameters before ``;base64``). ``True`` when the version does not parse:
+    the stricter reading."""
+    parts = re.findall(r"\d+", version)
+    if len(parts) < 2:
+        return True
+    return (int(parts[0]), int(parts[1])) < (0, 27)
+
+
+def _is_unencoded_data_url(url: str, *, first_semicolon: bool) -> bool:
+    """A data URL the engine's fetcher refuses as not implemented: one whose
+    payload it does not read as base64. Mirrors the installed fetcher's own
+    check (see :func:`_fetcher_splits_data_url_at_first_semicolon`), so the arm
+    that reads that refusal as the caller's matches exactly the case it is
+    meant for on the version that runs."""
+    if url[:5].lower() != "data:":
+        return False
+    spec, sep, _ = url[5:].partition(",")
+    if first_semicolon:
+        _, semi, encoding = spec.partition(";")
+    else:
+        _, semi, encoding = spec.rpartition(";")
+    return bool(sep) and (not semi or encoding != "base64")
+
+
 class InProcessMediaProcessor:
     """Fetch with vLLM's MediaConnector and process with the engine's own renderer."""
 
     name = MODE_INPROCESS
+    # The served family's short-side floor (`floor_rule`), applied to a
+    # fetched image before the engine's processor sees it; None raises nothing.
+    _short_side_floor: FloorRule | None = None
 
     def __init__(
         self,
@@ -247,6 +298,14 @@ class InProcessMediaProcessor:
         max_video_frames: int = DEFAULT_MAX_VIDEO_FRAMES,
     ) -> None:
         _require_inprocess_apis(engine)
+        import vllm
+
+        # The fetcher's reading of a data URL's encoding changed in 0.27.0;
+        # the arm in _fetch that reads its refusal as the caller's follows the
+        # installed release.
+        self._data_url_first_semicolon = _fetcher_splits_data_url_at_first_semicolon(
+            vllm.__version__
+        )
         from vllm import envs
         from vllm.exceptions import VLLMClientError
         from vllm.multimodal.media.connector import MEDIA_CONNECTOR_REGISTRY
@@ -273,6 +332,13 @@ class InProcessMediaProcessor:
         self._video_processor = get_video_processor_cls_name(model_config)
         self.schemes = advertised_schemes(model_config.allowed_local_media_path)
         self.accepted_schemes = parse_scheme_list(self.schemes)
+        self._short_side_floor = floor_rule(model_config)
+        if self._short_side_floor is not None:
+            logger.info(
+                "images below a %d px short side are raised to it before the engine's "
+                "processor, as the router's own pipeline does for this model family",
+                self._short_side_floor.floor,
+            )
         if not model_config.allowed_media_domains:
             logger.warning(
                 "%s=inprocess with no --allowed-media-domains: this worker will fetch media "
@@ -319,13 +385,20 @@ class InProcessMediaProcessor:
     async def _fetch(self, index: int, item):
         """Fetch one item, keeping the fetcher's own verdict on whose fault it is.
 
-        A bad URL or unusable media is the caller's and terminal. A timeout, a
-        refused connection or an origin 5xx is not: the same request can
-        succeed elsewhere or later, so it leaves here as retryable.
+        A bad URL or unusable media is the caller's and terminal, and so is a
+        data URL in a form the fetcher does not take (one that is not base64,
+        which it refuses as not implemented): no other worker takes it either.
+        A timeout, a refused connection, an origin 5xx or a loader the worker
+        lacks (whatever the reference, a base64 data URL included) is not: the
+        same request can succeed elsewhere or later, so it leaves here as
+        retryable.
         """
         try:
             if item.modality == "image":
-                return await self._connector.fetch_image_async(item.url)
+                image = await self._connector.fetch_image_async(item.url)
+                return await raise_to_floor_off_loop(image, self._short_side_floor)
+            if item.modality == "audio":
+                return await self._connector.fetch_audio_async(item.url)
             if item.modality == "video":
                 return await self._connector.fetch_video_async(
                     item.url, video_processor=self._video_processor
@@ -333,6 +406,15 @@ class InProcessMediaProcessor:
         except (self._caller_error, ValueError):
             raise
         except Exception as e:
+            # The fetcher refuses a non-base64 data URL as not implemented: no
+            # worker takes that form, so it is the caller's and terminal. A
+            # "not implemented" on any other reference, a base64 data URL
+            # included, is the worker's (a loader it lacks), and stays
+            # retryable like every other failure.
+            if isinstance(e, NotImplementedError) and _is_unencoded_data_url(
+                item.url, first_semicolon=self._data_url_first_semicolon
+            ):
+                raise ValueError(f"media_refs[{index}]: {e}") from e
             logger.warning("media_refs[%d]: fetch failed for %s: %s", index, item.modality, e)
             raise MmProcessorUnavailable(f"media_refs[{index}]: fetch failed: {e}") from e
         raise ValueError(f"unsupported media modality {item.modality!r}")
@@ -383,7 +465,9 @@ def resolved_mm_limits(mm_config) -> dict[str, dict[str, Any]]:
 
 
 def fingerprint_from_model_config(model_config) -> Fingerprint:
-    """The one derivation the worker and the sidecar share."""
+    """The one derivation the worker and the sidecar share. The processor
+    kwargs are read where the engine keeps them (:func:`.config_view.mm_processor_kwargs`),
+    as the Rust launcher reads them for the worker-side pipeline."""
     import vllm
     from vllm import envs
 
@@ -395,7 +479,7 @@ def fingerprint_from_model_config(model_config) -> Fingerprint:
         video_backend=envs.VLLM_VIDEO_LOADER_BACKEND,
         media_io_kwargs=json.dumps(mm_config.media_io_kwargs or {}, sort_keys=True, default=str),
         mm_processor_kwargs=json.dumps(
-            mm_config.mm_processor_kwargs or {}, sort_keys=True, default=str
+            config_view.mm_processor_kwargs(model_config), sort_keys=True, default=str
         ),
         limit_per_prompt=json.dumps(resolved_mm_limits(mm_config), sort_keys=True, default=str),
     )
@@ -661,10 +745,15 @@ _MM_SETTING_SPECS: dict[str, tuple[str, str, Any]] = {
     "sidecar_timeout_ms": ("--mm-sidecar-timeout-ms", ENV_TIMEOUT_MS, DEFAULT_TIMEOUT_MS),
     "sidecar_max_queue": ("--mm-sidecar-max-queue", ENV_MAX_QUEUE, DEFAULT_MAX_QUEUE),
     "sidecar_namespace": ("--mm-sidecar-namespace", ENV_NAMESPACE, None),
+    "turbojpeg": (TURBOJPEG_FLAG, ENV_TURBOJPEG, TURBOJPEG_PREFER),
 }
 _MM_INT_SETTINGS = frozenset(
     {"max_inflight", "max_item_bytes", "max_items", "sidecar_timeout_ms", "sidecar_max_queue"}
 )
+# The variables that are not legacy spellings of their flag: documented beside
+# it as a supported way to set the value (as the router's SMG_MM_TURBOJPEG
+# is), so no deprecation line when the launcher defines the flag.
+_ENV_NOT_LEGACY = frozenset({"turbojpeg"})
 
 
 @dataclasses.dataclass(frozen=True)
@@ -683,12 +772,19 @@ class MmSettings:
     sidecar_timeout_ms: int | None = None
     sidecar_max_queue: int | None = None
     sidecar_namespace: str | None = None
+    turbojpeg: str | None = None
     sources: Mapping[str, str] = dataclasses.field(default_factory=dict, compare=False)
+    # The settings whose flag the launcher defines (`from_args`), set or not.
+    # For the rest the environment variable is the documented way to set them,
+    # so `resolve` reads it without a deprecation line.
+    flags_defined: frozenset[str] = dataclasses.field(default_factory=frozenset, compare=False)
 
     @classmethod
     def from_args(cls, args) -> MmSettings:
-        """The `--mm-*` values of a launcher namespace; absent flags ask for nothing."""
-        return cls(**{name: getattr(args, f"mm_{name}", None) for name in _MM_SETTING_SPECS})
+        """The `--mm-*` values of a launcher namespace; absent flags ask for
+        nothing, and are remembered as absent (see `flags_defined`)."""
+        defined = frozenset(name for name in _MM_SETTING_SPECS if hasattr(args, f"mm_{name}"))
+        return cls(**{name: getattr(args, f"mm_{name}") for name in defined}, flags_defined=defined)
 
     @property
     def resolved(self) -> bool:
@@ -713,6 +809,11 @@ class MmSettings:
         `only` limits resolution to the named settings (the rest stay unset
         and unvalidated), for a process that uses a subset; `flags` renames
         the flag a deprecation line points at, for a parser with its own.
+
+        An environment variable logs a deprecation line only when the launcher
+        offers the flag it stands in for (`flags_defined`, or a name in
+        `flags`): on a launcher without the flag the variable is the one way to
+        set the value, and is read as such.
         """
         if self.resolved:
             return self
@@ -732,17 +833,138 @@ class MmSettings:
                 continue
             from_env = _read_env(name, env, env_name)
             if from_env is not None:
-                logger.warning(
-                    "%s is deprecated in favour of %s; env support ends in the next minor release",
-                    env_name,
-                    flag,
-                )
+                if (
+                    name in self.flags_defined or name in (flags or {})
+                ) and name not in _ENV_NOT_LEGACY:
+                    logger.warning(
+                        "%s is deprecated in favour of %s; env support ends in the next minor release",
+                        env_name,
+                        flag,
+                    )
                 values[name] = from_env
                 sources[name] = SOURCE_ENV
                 continue
             values[name] = default
             sources[name] = SOURCE_DEFAULT
-        return MmSettings(**values, sources=sources)
+        return MmSettings(**values, sources=sources, flags_defined=self.flags_defined)
+
+
+_MM_FLAG_HELP: dict[str, str] = {
+    "processor": (
+        "Worker-side media processing: off (the router preprocesses media), inprocess or "
+        "redis (vLLM's own processors on this worker), smg (smg's pipeline; Rust servicer only)."
+    ),
+    "max_inflight": "Media requests this worker processes at once.",
+    "max_item_bytes": "Cap on an inline (data:) media item's decoded size, in bytes.",
+    "max_items": "Media items a request may carry per modality.",
+    "redis_url": "The media sidecar's Redis URL (--mm-processor redis).",
+    "sidecar_timeout_ms": "How long to wait for the sidecar's result, in milliseconds.",
+    "sidecar_max_queue": "Jobs the sidecar queue holds before this worker refuses more.",
+    "sidecar_namespace": "The Redis key namespace shared with the sidecar.",
+    "turbojpeg": (
+        "What smg's own pipeline (--mm-processor smg) does when libjpeg-turbo cannot be loaded: "
+        "prefer decodes JPEGs with the pure-Rust fallback, whose pixels differ by a few levels; "
+        "require refuses to start."
+    ),
+}
+
+
+def _choice(value: str) -> str:
+    """A choice flag's value as `_validate_flag` reads it, before argparse
+    checks it against `choices` (which it does after `type`): any case, with
+    the blanks around it dropped, so `--mm-turbojpeg REQUIRE` is the policy
+    the help promises and not a rejected spelling."""
+    return value.strip().lower()
+
+
+def add_mm_arguments(parser: argparse.ArgumentParser) -> list[str]:
+    """Define the `--mm-*` flags `MmSettings.from_args` reads on a launcher
+    parser that lacks them; a flag the parser already has (a `vllm serve` that
+    defines its own) is left as it is. Returns the flags added."""
+    actions = parser._option_string_actions  # noqa: SLF001 — argparse's registry of option strings
+    added: list[str] = []
+    for name, (flag, env_name, _default) in _MM_SETTING_SPECS.items():
+        if flag in actions:
+            continue
+        kwargs: dict[str, Any] = {
+            "dest": f"mm_{name}",
+            "default": None,
+            "help": f"{_MM_FLAG_HELP[name]} Unset falls back to ${env_name}.",
+        }
+        if name == "processor":
+            kwargs["type"] = _choice
+            kwargs["choices"] = list(VALID_MODES)
+        elif name == "turbojpeg":
+            kwargs["type"] = _choice
+            kwargs["choices"] = list(VALID_TURBOJPEG)
+        elif name in _MM_INT_SETTINGS:
+            kwargs["type"] = int
+        parser.add_argument(flag, **kwargs)
+        added.append(flag)
+    return added
+
+
+# The `--mm-*` settings the launcher parsed in this process, kept for a
+# servicer the launcher builds without its namespace (upstream's gRPC launcher
+# constructs `VllmEngineServicer(async_llm, start_time)`): read when the
+# servicer is given none, so a flag's value keeps `source=flag` and
+# `flags_defined` keeps the deprecation line for a variable behind a flag.
+_launcher_settings: MmSettings | None = None
+
+
+def remember_launcher_settings(settings: MmSettings | None) -> None:
+    """Keep the launcher's parsed `--mm-*` settings for `launcher_settings`."""
+    global _launcher_settings  # noqa: PLW0603 — one launcher per process
+    _launcher_settings = settings
+
+
+def launcher_settings() -> MmSettings | None:
+    """The `--mm-*` settings the launcher parsed in this process, if any."""
+    return _launcher_settings
+
+
+# What the environment held for the `SMG_VLLM_MM_*` variables before the
+# first carry of this process, put back before every later carry: each carry
+# leaves the operator's environment plus this parse's flags, so a flag one
+# parse set and the next dropped does not live on as a variable the operator
+# never set.
+_environ_before_carry: dict[str, str | None] | None = None
+
+
+def carry_mm_flags(args: Any, environ: MutableMapping[str, str] = os.environ) -> MmSettings:
+    """What the plugin does with a gRPC launcher's parsed `--mm-*` flags: keep
+    them for the servicer this process builds (`launcher_settings`), and
+    carry the set values into the environment for anything that reads only
+    that; a later parse replaces both. Returns the settings kept."""
+    global _environ_before_carry  # noqa: PLW0603 — one launcher per process
+    names = [env_name for _flag, env_name, _default in _MM_SETTING_SPECS.values()]
+    if _environ_before_carry is None:
+        _environ_before_carry = {name: environ.get(name) for name in names}
+    else:
+        for name, before in _environ_before_carry.items():
+            if before is None:
+                environ.pop(name, None)
+            else:
+                environ[name] = before
+    settings = MmSettings.from_args(args)
+    remember_launcher_settings(settings)
+    export_mm_flags(args, environ)
+    return settings
+
+
+def export_mm_flags(args: Any, environ: MutableMapping[str, str] = os.environ) -> dict[str, str]:
+    """Carry a parsed namespace's `--mm-*` values into the environment, for a
+    servicer the launcher builds without its namespace (upstream's gRPC
+    launcher constructs `VllmEngineServicer(async_llm, start_time)`): that
+    servicer resolves from the environment and finds the flags' values there.
+    Returns what was exported."""
+    exported: dict[str, str] = {}
+    for name, (_flag, env_name, _default) in _MM_SETTING_SPECS.items():
+        value = getattr(args, f"mm_{name}", None)
+        if value is not None:
+            environ[env_name] = str(value)
+            exported[env_name] = str(value)
+    return exported
 
 
 def _validate_flag(name: str, flag: str, value: Any) -> Any:
@@ -751,6 +973,11 @@ def _validate_flag(name: str, flag: str, value: Any) -> Any:
         if mode not in VALID_MODES:
             raise ValueError(f"{flag}={value!r} is not one of {'|'.join(VALID_MODES)}")
         return mode
+    if name == "turbojpeg":
+        policy = str(value).strip().lower()
+        if policy not in VALID_TURBOJPEG:
+            raise ValueError(f"{flag}={value!r} is not one of {'|'.join(VALID_TURBOJPEG)}")
+        return policy
     if name in _MM_INT_SETTINGS:
         if int(value) <= 0:
             raise ValueError(f"{flag}={value} must be positive")
@@ -763,10 +990,49 @@ def _read_env(name: str, env: Mapping[str, str], env_name: str) -> Any:
     if name == "processor":
         raw = env.get(env_name)
         return resolve_mm_processor_mode(env) if raw is not None and raw.strip() else None
+    if name == "turbojpeg":
+        raw = env.get(env_name)
+        return resolve_mm_turbojpeg(env) if raw is not None and raw.strip() else None
     if name in _MM_INT_SETTINGS:
         return env_int_opt(env, env_name)
     raw = env.get(env_name)
     return raw if raw else None
+
+
+# Why the Python servicer refuses `smg`: the one text, wherever the refusal comes.
+SMG_MODE_REFUSAL = (
+    f"{PROCESSOR_FLAG}={MODE_SMG} is smg's own media pipeline, which runs inside the "
+    "Rust servicer (--servicer-impl rust / SMG_VLLM_SERVICER_IMPL=rust); the Python "
+    f"servicer serves {MODE_INPROCESS} or {MODE_REDIS}"
+)
+
+
+def require_python_servicer_mode(
+    settings: MmSettings | None = None, env: Mapping[str, str] = os.environ
+) -> str:
+    """The processor mode the Python servicer is asked for (flag > env > default),
+    refused when it is the Rust servicer's own pipeline, with every other
+    `--mm-*` setting, and the video frame budget variable for the modes that
+    read it, validated as the servicer's constructor will validate them.
+
+    For a launcher to call before it builds the engine: the settings are known
+    from the flags and the environment long before any weights load, and a
+    refusal that comes after a full model load (what the servicer's own
+    resolve gives, as it runs once the engine exists) is a crash loop under a
+    restart policy, each turn paying the load. Logs no deprecation line for a
+    variable behind a flag: the servicer's own resolve does that once.
+    """
+    requested = settings or MmSettings()
+    # Every setting, as the servicer's constructor resolves them all; without
+    # `flags_defined`, so the deprecation line stays the servicer's to log.
+    requested = MmSettings(**{name: getattr(requested, name) for name in _MM_SETTING_SPECS})
+    mode = requested.resolve(env).processor
+    if mode == MODE_SMG:
+        raise ValueError(SMG_MODE_REFUSAL)
+    if mode in (MODE_INPROCESS, MODE_REDIS):
+        # The frame budget the processors read at construction, checked the same way.
+        env_int(env, ENV_MAX_VIDEO_FRAMES, DEFAULT_MAX_VIDEO_FRAMES, minimum=0)
+    return mode
 
 
 def build_mm_processor(
@@ -775,7 +1041,9 @@ def build_mm_processor(
     """Construct the configured backend, or None when worker-side processing is off.
 
     `settings` are the launcher's flags (already resolved or not); without them
-    everything comes from the env, as before.
+    everything comes from the env, as before. A launcher with the servicer
+    switch refused `smg` before it built the engine
+    (`require_python_servicer_mode`); the check here is for one without it.
     """
     resolved = (settings or MmSettings()).resolve(env)
     if missing := _MM_SETTING_SPECS.keys() - resolved.sources.keys():
@@ -784,11 +1052,7 @@ def build_mm_processor(
     if mode == MODE_OFF:
         return None
     if mode == MODE_SMG:
-        raise ValueError(
-            f"{PROCESSOR_FLAG}={MODE_SMG} is smg's own media pipeline, which runs inside the "
-            "Rust servicer (--servicer-impl rust / SMG_VLLM_SERVICER_IMPL=rust); the Python "
-            f"servicer serves {MODE_INPROCESS} or {MODE_REDIS}"
-        )
+        raise ValueError(SMG_MODE_REFUSAL)
     model_config = getattr(engine, "model_config", None)
     if model_config is None or not getattr(model_config, "is_multimodal_model", False):
         logger.warning("mm_processor=%s ignored: the served model is not multimodal", mode)

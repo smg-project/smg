@@ -1,7 +1,7 @@
 //! Gateway seam over the ZMQ engine adapter (`engine-zmq-adapter`).
 //!
 //! The adapter speaks each engine's own proto; the gateway holds requests in
-//! its per-engine wrapper ([`ProtoGenerateRequest`]) and reports metadata in
+//! its per-engine wrapper (`ProtoGenerateRequest`) and reports metadata in
 //! its per-runtime enums, so the variant dispatch lives here, next to the
 //! other transport glue, and nowhere else.
 

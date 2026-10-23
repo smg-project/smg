@@ -1,0 +1,7 @@
+target
+corpus
+artifacts
+coverage
+logs
+prepared
+Cargo.lock

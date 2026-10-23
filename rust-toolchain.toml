@@ -1,0 +1,12 @@
+# The toolchain the repository builds and tests with: the image build installs
+# it from this file (docker/Dockerfile), a contributor gets it on the first
+# `cargo` call in the checkout. The same release is named by hand in
+# scripts/ci_install_rust.sh (the CI runners), .github/actions/publish-crate,
+# pr-test-mlx.yml, release-pypi.yml, release-pypi-dev.yml and
+# nightly-artifacts.yml (the toolchain actions and maturin-action inputs);
+# a bump changes this file, `rust-version` in Cargo.toml and every one of
+# those (grep for the release). rustfmt runs on nightly (`cargo +nightly fmt`),
+# which this pin does not affect.
+[toolchain]
+channel = "1.98.0"
+components = ["clippy", "rustfmt"]

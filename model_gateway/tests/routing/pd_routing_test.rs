@@ -42,7 +42,7 @@ mod pd_routing_tests {
                     "http://127.0.0.1:19803".to_string(),
                 ],
             )
-            .power_of_two_policy(1)
+            .power_of_two_policy()
             .host("127.0.0.1")
             .port(3800)
             .max_payload_size(256 * 1024 * 1024)
@@ -233,11 +233,11 @@ mod pd_routing_tests {
         assert_eq!(alias_json["model"], "mock-model");
 
         // The part the response body cannot show: what the gateway forwarded.
-        for (leg, recorder) in [("prefill", &prefill_recorder), ("decode", &decode_recorder)] {
+        for (role, recorder) in [("prefill", &prefill_recorder), ("decode", &decode_recorder)] {
             let forwarded = recorder.only_body();
             assert_eq!(
                 forwarded["model"], CANONICAL_MODEL,
-                "{leg} worker must receive the canonical model ID, got {}",
+                "{role} worker must receive the canonical model ID, got {}",
                 forwarded["model"]
             );
         }

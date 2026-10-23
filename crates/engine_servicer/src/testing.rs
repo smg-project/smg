@@ -1,9 +1,35 @@
-//! The deadline every servicer test's wait on the servicer runs under.
+//! Helpers the servicer tests share: the configuration they start from and
+//! the deadline every wait on the servicer runs under.
 
-use std::{future::Future, panic::Location};
+use std::{
+    future::Future,
+    io::{Read, Write},
+    net::{SocketAddr, TcpStream},
+    panic::Location,
+    path::Path,
+    time::Duration,
+};
 
 use engine_zmq_client::mock_engine::MOCK_DEADLINE;
 use tokio::time::timeout;
+
+use crate::ServicerConfig;
+
+/// The servicer configuration every servicer test starts from: an ephemeral
+/// port, the engine's data-plane sockets under the test's own directory,
+/// one engine, no tokenizer directory, a ten-second silence bound on the
+/// start and no ceiling.
+pub(crate) fn servicer_config(dir: &Path, handshake: &str) -> ServicerConfig {
+    ServicerConfig {
+        engine_startup_timeout: Duration::from_secs(10),
+        engine_startup_ceiling: None,
+        ..ServicerConfig::new(
+            "127.0.0.1:0",
+            format!("ipc://{}", dir.join("engine").display()),
+            handshake,
+        )
+    }
+}
 
 /// A wait on the servicer (a response stream's next message, a watch's next
 /// event) under the mock engine's deadline: a servicer that stalls fails the
@@ -22,3 +48,154 @@ pub(crate) trait Bounded: Future + Sized {
 }
 
 impl<F: Future> Bounded for F {}
+
+/// `count` publishers bound on consecutive ports from the returned base, as
+/// a data-parallel engine lays its ranks' publishers out (rank `r` on the
+/// base port plus `r`).
+pub(crate) async fn consecutive_publishers(count: u16) -> (u16, Vec<zeromq::PubSocket>) {
+    use zeromq::prelude::*;
+
+    for _ in 0..20 {
+        let Some(base) = portpicker::pick_unused_port() else {
+            continue;
+        };
+        let Some(last) = base.checked_add(count.saturating_sub(1)) else {
+            continue;
+        };
+        if (base..=last).any(|port| !portpicker::is_free_tcp(port)) {
+            continue;
+        }
+        let mut publishers = Vec::with_capacity(usize::from(count));
+        for port in base..=last {
+            let mut publisher = zeromq::PubSocket::new();
+            if publisher
+                .bind(&format!("tcp://127.0.0.1:{port}"))
+                .await
+                .is_err()
+            {
+                break;
+            }
+            publishers.push(publisher);
+        }
+        if publishers.len() == usize::from(count) {
+            return (base, publishers);
+        }
+    }
+    panic!("no run of {count} consecutive free ports");
+}
+
+/// One HTTP/1.1 GET against a listener (a servicer's metrics endpoint):
+/// the status code and the body. A dependency-free client, so the servicer
+/// crate's tests need no HTTP client of their own.
+pub(crate) fn http_get(address: SocketAddr, path: &str) -> (u16, String) {
+    let mut stream = TcpStream::connect(address).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    )
+    .expect("request written");
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).expect("response read");
+    let (head, body) = raw.split_once("\r\n\r\n").expect("a header block");
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("a status code");
+    (status, body.to_string())
+}
+
+/// A Prometheus exposition reduced to what a golden comparison pins: every
+/// `# HELP`, `# TYPE` and sample line but the histogram buckets (pinned by
+/// [`assert_bucket_edges`]), sorted (the exporter renders families in hash
+/// order), with the values that depend on the clock (`_sum` of a latency
+/// histogram, the start time, the scrape duration) replaced by `<v>`; the
+/// counters, the gauges and the `_count`s stay literal.
+pub(crate) fn golden_exposition(body: &str) -> Vec<String> {
+    let timed = |name: &str| {
+        name.ends_with("_seconds_sum")
+            || name == "smg_servicer_start_time_seconds"
+            || name == "smg_servicer_metrics_scrape_seconds"
+    };
+    let mut lines: Vec<String> = body
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.contains("_bucket{"))
+        .map(|line| {
+            if line.starts_with('#') {
+                return line.to_string();
+            }
+            let (series, _value) = line.rsplit_once(' ').expect("a sample has a value");
+            let name = series.split('{').next().unwrap_or(series);
+            if timed(name) {
+                format!("{series} <v>")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+    lines.sort();
+    lines.dedup();
+    lines
+}
+
+/// The exposition `body` reduced by [`golden_exposition`] equals `expected`
+/// (the golden text, one line each, in any order); the whole actual text is
+/// in the failure so a reviewed change can be pasted.
+pub(crate) fn assert_golden(body: &str, expected: &str) {
+    let actual = golden_exposition(body).join("\n");
+    let mut expected: Vec<&str> = expected
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    expected.sort_unstable();
+    expected.dedup();
+    assert_eq!(
+        actual,
+        expected.join("\n"),
+        "the exposition differs; actual:\n{actual}\n"
+    );
+}
+
+/// Every histogram family of the exposition carries its table's bucket edges
+/// (rank 0's series): the engine's own tables for the latencies, the 1-2-5
+/// series up to `max_model_len` for the token counts.
+pub(crate) fn assert_bucket_edges(body: &str, max_model_len: u32) {
+    use crate::metrics::{
+        names, one_two_five_buckets, INTER_TOKEN_BUCKETS, PARAMS_N_BUCKETS,
+        REQUEST_LATENCY_BUCKETS, TTFT_BUCKETS,
+    };
+
+    let tokens = one_two_five_buckets(max_model_len);
+    let families: [(&str, &[f64]); 8] = [
+        (names::TIME_TO_FIRST_TOKEN_SECONDS, TTFT_BUCKETS),
+        (names::E2E_REQUEST_LATENCY_SECONDS, REQUEST_LATENCY_BUCKETS),
+        (
+            names::REQUEST_TIME_PER_OUTPUT_TOKEN_SECONDS,
+            INTER_TOKEN_BUCKETS,
+        ),
+        (names::INTER_TOKEN_LATENCY_SECONDS, INTER_TOKEN_BUCKETS),
+        (names::REQUEST_PROMPT_TOKENS, &tokens),
+        (names::REQUEST_GENERATION_TOKENS, &tokens),
+        (names::REQUEST_PARAMS_MAX_TOKENS, &tokens),
+        (names::REQUEST_PARAMS_N, PARAMS_N_BUCKETS),
+    ];
+    for (name, edges) in families {
+        let prefix = format!("{name}_bucket{{");
+        let mut seen: Vec<f64> = body
+            .lines()
+            .filter(|line| line.starts_with(&prefix) && line.contains("rank=\"0\""))
+            .filter_map(|line| {
+                let (_, rest) = line.split_once("le=\"")?;
+                let (le, _) = rest.split_once('"')?;
+                le.parse::<f64>().ok()
+            })
+            .collect();
+        seen.retain(|le| le.is_finite());
+        seen.sort_by(f64::total_cmp);
+        assert_eq!(seen, edges, "the bucket edges of {name}");
+    }
+}

@@ -120,6 +120,7 @@ impl From<&sglang_proto::SchedulerLoad> for common::EngineLoad {
 impl From<&tokenspeed_proto::SchedulerLoad> for common::EngineLoad {
     fn from(load: &tokenspeed_proto::SchedulerLoad) -> Self {
         Self {
+            active_token_usage: load.active_token_usage,
             cache_hit_rate: Some(load.cache_hit_rate),
             num_used_tokens: Some(load.num_used_tokens),
             max_total_num_tokens: Some(load.max_total_num_tokens),
@@ -159,6 +160,7 @@ impl From<&common::EngineLoad> for SchedulerLoadSnapshot {
         let signed = |value: u32| i32::try_from(value).unwrap_or(i32::MAX);
         let disagg = record.disaggregation.as_ref();
         Self {
+            active_token_usage: record.active_token_usage,
             num_running_reqs: signed(record.running_requests),
             num_waiting_reqs: signed(record.waiting_requests),
             num_waiting_uncached_tokens: record.waiting_uncached_tokens.map_or(0, signed),
@@ -312,6 +314,7 @@ mod tests {
             max_running_requests: 64,
             num_waiting_uncached_tokens: 0,
             token_usage: 0.25,
+            active_token_usage: Some(0.125),
             gen_throughput: 900.0,
             cache_hit_rate: 0.6,
             utilization: 0.25,

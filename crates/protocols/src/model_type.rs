@@ -22,7 +22,7 @@ bitflags! {
         const EMBEDDINGS  = 1 << 3;
         /// Rerank API (/v1/rerank)
         const RERANK      = 1 << 4;
-        /// SGLang Generate API (/generate)
+        /// The native Generate API (/generate)
         const GENERATE    = 1 << 5;
         /// Vision/multimodal support (images in input)
         const VISION      = 1 << 6;
@@ -333,7 +333,7 @@ pub enum Endpoint {
     Embeddings,
     /// Rerank endpoint (/v1/rerank)
     Rerank,
-    /// SGLang generate endpoint (/generate)
+    /// The native generate endpoint (/generate)
     Generate,
     /// Models listing endpoint (/v1/models)
     Models,

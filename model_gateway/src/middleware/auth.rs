@@ -4,8 +4,24 @@
 //! "close" to a valid token produces an unrelated hash, so there's no
 //! byte-at-a-time timing signal to recover from a plain hash-keyed lookup,
 //! unlike comparing raw secrets.
+//!
+//! A bearer that is one of the gateway's own keys ends here: once the caller
+//! is identified ([`DataPlaneCaller`]) the `Authorization` header is removed
+//! from the request, and so is the same key presented under a provider's own
+//! header name (`x-api-key`, `x-goog-api-key`), so no route behind this
+//! middleware reads the gateway's key as the caller's credential for an
+//! upstream. Those upstreams (a self-hosted worker, a third-party provider)
+//! get their own configured key, as they do for a request that carried no
+//! header: the HTTP and PD routers' upstream calls and the external providers apply
+//! the caller's header, else the configured key; an upstream configured
+//! without a key is reached with none. A bearer that is not a gateway key is
+//! refused before that, so a request that reaches a route with its
+//! `Authorization` still on it was not authenticated by this middleware (auth
+//! disabled). The public GET proxies (model and server info, the health
+//! probe) sit outside it: they forward the caller's header as they did and
+//! add no credential of their own, since there "no header" means anonymous.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     body::Body,
@@ -13,17 +29,24 @@ use axum::{
     http::{header, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
+    Json,
 };
+use serde_json::json;
 use sha2::{Digest, Sha256};
+use smg_auth::bearer_token;
 
+use super::logging::AccessLogRecord;
 use crate::{
     config::TenantApiKeyEntry,
     tenant::{authenticated_tenant_key_from_sha256, DataPlaneCaller, TenantIdentity, TenantKey},
 };
 
+/// The configured keys by hash. Built once and read-only after: the map
+/// is shared, so the clone axum takes of the middleware's state on every
+/// request is a reference count, whatever the number of keys.
 #[derive(Clone)]
 pub struct AuthConfig {
-    keys: HashMap<[u8; 32], TenantKey>,
+    keys: Arc<HashMap<[u8; 32], TenantKey>>,
 }
 
 impl AuthConfig {
@@ -53,7 +76,9 @@ impl AuthConfig {
             );
         }
 
-        Self { keys }
+        Self {
+            keys: Arc::new(keys),
+        }
     }
 
     /// Whether any key is configured. Empty means [`auth_middleware`]
@@ -77,8 +102,15 @@ fn hash_key(key: &str) -> [u8; 32] {
     Sha256::digest(key.as_bytes()).into()
 }
 
+/// The header names a provider reads its own key from, which an SDK may fill
+/// with the gateway's key beside the bearer (`x-api-key` for the Messages
+/// API's providers, `x-goog-api-key` for Gemini's).
+const PROVIDER_KEY_HEADERS: [&str; 2] = ["x-api-key", "x-goog-api-key"];
+
 /// Middleware to validate Bearer token against configured API key(s).
-/// Only active when the router has at least one key configured.
+/// Only active when the router has at least one key configured. A matched
+/// key leaves the request with the caller's identity in its place (see the
+/// module doc).
 pub async fn auth_middleware(
     State(auth_config): State<AuthConfig>,
     mut request: Request<Body>,
@@ -89,7 +121,7 @@ pub async fn auth_middleware(
             .headers()
             .get(header::AUTHORIZATION)
             .and_then(|h| h.to_str().ok())
-            .and_then(|h| h.strip_prefix("Bearer "))
+            .and_then(bearer_token)
             .map(hash_key);
 
         let tenant_key = token_hash
@@ -97,12 +129,39 @@ pub async fn auth_middleware(
             .and_then(|hash| auth_config.keys.get(hash));
 
         let Some(tenant_key) = tenant_key else {
-            return StatusCode::UNAUTHORIZED.into_response();
+            return unauthorized(token_hash.is_some());
         };
+
+        // The access log, when it carries the key: by its fingerprint, never
+        // the key.
+        if let (Some(record), Some(hash)) = (
+            request.extensions().get::<AccessLogRecord>(),
+            token_hash.as_ref(),
+        ) {
+            record.key_id(hash);
+        }
 
         request
             .extensions_mut()
             .insert(DataPlaneCaller::new(tenant_key.clone()));
+        // The gateway's key is spent: it identifies the caller and nothing
+        // else, and it must not travel on as an upstream's credential; a
+        // gateway key presented a second time under a provider's own header
+        // name goes with it (every value of a repeated header is read, since
+        // the removal takes the whole name), where a caller's own provider
+        // key there stays.
+        request.headers_mut().remove(header::AUTHORIZATION);
+        for name in PROVIDER_KEY_HEADERS {
+            let is_a_gateway_key = request
+                .headers()
+                .get_all(name)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .any(|value| auth_config.contains_token(value.trim()));
+            if is_a_gateway_key {
+                request.headers_mut().remove(name);
+            }
+        }
     }
 
     next.run(request).await
@@ -110,8 +169,45 @@ pub async fn auth_middleware(
 
 /// Unconditionally rejects with 401 — for route groups that must never fall
 /// back to open just because their auth config happens to be empty.
-pub async fn deny_all_middleware(_request: Request<Body>, _next: Next) -> Response {
-    StatusCode::UNAUTHORIZED.into_response()
+pub async fn deny_all_middleware(request: Request<Body>, _next: Next) -> Response {
+    let token_presented = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(bearer_token)
+        .is_some();
+    unauthorized(token_presented)
+}
+
+/// The serving plane's 401: the `WWW-Authenticate` challenge RFC 6750
+/// requires (`error="invalid_token"` when a token was presented but is not a
+/// configured key) and an OpenAI-style error body, so SDK clients surface a
+/// message instead of a blank error.
+fn unauthorized(token_presented: bool) -> Response {
+    let (challenge, message) = if token_presented {
+        (
+            "Bearer realm=\"data-plane\", error=\"invalid_token\"",
+            "Invalid API key",
+        )
+    } else {
+        (
+            "Bearer realm=\"data-plane\"",
+            "Missing API key: send it as `Authorization: Bearer <key>`",
+        )
+    };
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, challenge)],
+        Json(json!({
+            "error": {
+                "message": message,
+                "type": "invalid_request_error",
+                "param": null,
+                "code": "invalid_api_key",
+            }
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -127,6 +223,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use crate::routers::common::header_utils::extract_auth_header;
 
     async fn handler(request: Request<Body>) -> impl IntoResponse {
         request
@@ -140,6 +237,233 @@ mod tests {
         Router::new()
             .route("/", get(handler))
             .route_layer(from_fn_with_state(auth_config, auth_middleware))
+    }
+
+    /// Whether the request still carries an `Authorization` header when it
+    /// reaches the route.
+    async fn authorization_seen(request: Request<Body>) -> impl IntoResponse {
+        if request.headers().contains_key(header::AUTHORIZATION) {
+            "present"
+        } else {
+            "absent"
+        }
+    }
+
+    fn header_reporting_app(auth_config: AuthConfig) -> Router {
+        Router::new()
+            .route("/", get(authorization_seen))
+            .route_layer(from_fn_with_state(auth_config, auth_middleware))
+    }
+
+    /// The provider key headers the route still sees, by name and value.
+    async fn provider_keys_seen(request: Request<Body>) -> impl IntoResponse {
+        PROVIDER_KEY_HEADERS
+            .iter()
+            .filter_map(|name| {
+                request
+                    .headers()
+                    .get(*name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(|value| format!("{name}={value}"))
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A gateway key presented under a provider's own header name beside the
+    /// bearer ends at the middleware too, wherever it sits among a repeated
+    /// header's values; a caller's own provider key in those headers (bring
+    /// your own key) stays.
+    #[tokio::test]
+    async fn a_gateway_key_under_a_providers_header_name_ends_at_the_middleware_too() {
+        let app = || {
+            Router::new()
+                .route("/", get(provider_keys_seen))
+                .route_layer(from_fn_with_state(
+                    AuthConfig::new(Some("shared-secret".to_string())),
+                    auth_middleware,
+                ))
+        };
+        let twice = Request::builder()
+            .uri("/")
+            .header(header::AUTHORIZATION, "Bearer shared-secret")
+            .header("x-api-key", "shared-secret")
+            .header("x-goog-api-key", "shared-secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = app().oneshot(twice).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "");
+
+        let own = Request::builder()
+            .uri("/")
+            .header(header::AUTHORIZATION, "Bearer shared-secret")
+            .header("x-api-key", "providers-own-key")
+            .body(Body::empty())
+            .unwrap();
+        let response = app().oneshot(own).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "x-api-key=providers-own-key");
+
+        // The caller's own key first, the gateway's key in a later value of
+        // the same header: the whole name goes, since one value is the
+        // gateway's and a header is removed by name.
+        let repeated = Request::builder()
+            .uri("/")
+            .header(header::AUTHORIZATION, "Bearer shared-secret")
+            .header("x-api-key", "providers-own-key")
+            .header("x-api-key", "shared-secret")
+            .body(Body::empty())
+            .unwrap();
+        let response = app().oneshot(repeated).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, "");
+    }
+
+    async fn authorization_after(auth_config: AuthConfig, bearer: Option<&str>) -> String {
+        let mut request = Request::builder().uri("/");
+        if let Some(bearer) = bearer {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        }
+        let response = header_reporting_app(auth_config)
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_text(response).await
+    }
+
+    /// A matched gateway key ends at the middleware: the route sees the
+    /// caller's identity and no `Authorization` header, so nothing downstream
+    /// forwards the gateway's key to an upstream as the caller's credential.
+    #[tokio::test]
+    async fn a_matched_gateway_key_does_not_travel_past_the_middleware() {
+        let shared = AuthConfig::new(Some("shared-secret".to_string()));
+        assert_eq!(
+            authorization_after(shared, Some("shared-secret")).await,
+            "absent"
+        );
+
+        let tenant = AuthConfig::with_tenant_keys(
+            None,
+            &[TenantApiKeyEntry {
+                tenant_id: "team-red".to_string(),
+                key: "team-red-secret".to_string(),
+            }],
+        );
+        assert_eq!(
+            authorization_after(tenant, Some("team-red-secret")).await,
+            "absent"
+        );
+    }
+
+    /// The credential a route sends upstream, as the HTTP router and the
+    /// external router compute it (`header_utils::extract_auth_header`:
+    /// the caller's header, else the upstream's configured key).
+    async fn upstream_credential(request: Request<Body>) -> impl IntoResponse {
+        let configured = "provider-key".to_string();
+        extract_auth_header(Some(request.headers()), Some(&configured))
+            .and_then(|value| value.to_str().ok().map(str::to_string))
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    /// The same credential for an upstream configured without a key.
+    async fn upstream_credential_without_a_key(request: Request<Body>) -> impl IntoResponse {
+        extract_auth_header(Some(request.headers()), None)
+            .and_then(|value| value.to_str().ok().map(str::to_string))
+            .unwrap_or_else(|| "none".to_string())
+    }
+
+    async fn upstream_credential_after(auth_config: AuthConfig, bearer: Option<&str>) -> String {
+        let mut request = Request::builder().uri("/");
+        if let Some(bearer) = bearer {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        }
+        let response = Router::new()
+            .route("/", get(upstream_credential))
+            .route("/without-a-key", get(upstream_credential_without_a_key))
+            .route_layer(from_fn_with_state(auth_config, auth_middleware))
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_text(response).await
+    }
+
+    /// What leaves for the upstream: under gateway auth the configured
+    /// provider key, never the gateway key the caller presented; without
+    /// gateway auth the caller's own key, as before, and the configured key
+    /// when the caller sent none.
+    #[tokio::test]
+    async fn the_upstream_gets_its_configured_key_under_gateway_auth_and_the_callers_without() {
+        let gateway = AuthConfig::with_tenant_keys(
+            Some("shared-secret".to_string()),
+            &[TenantApiKeyEntry {
+                tenant_id: "team-red".to_string(),
+                key: "team-red-secret".to_string(),
+            }],
+        );
+        assert_eq!(
+            upstream_credential_after(gateway.clone(), Some("shared-secret")).await,
+            "Bearer provider-key"
+        );
+        assert_eq!(
+            upstream_credential_after(gateway, Some("team-red-secret")).await,
+            "Bearer provider-key"
+        );
+        assert_eq!(
+            upstream_credential_after(AuthConfig::new(None), Some("callers-own-provider-key"))
+                .await,
+            "Bearer callers-own-provider-key"
+        );
+        assert_eq!(
+            upstream_credential_after(AuthConfig::new(None), None).await,
+            "Bearer provider-key"
+        );
+        // An upstream configured without a key is reached with none under
+        // gateway auth: a worker that served on the forwarded gateway key is
+        // registered with its own key from now.
+        assert_eq!(
+            upstream_credential_without_a_key_after(
+                AuthConfig::new(Some("shared-secret".to_string())),
+                Some("shared-secret")
+            )
+            .await,
+            "none"
+        );
+    }
+
+    async fn upstream_credential_without_a_key_after(
+        auth_config: AuthConfig,
+        bearer: Option<&str>,
+    ) -> String {
+        let mut request = Request::builder().uri("/without-a-key");
+        if let Some(bearer) = bearer {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+        }
+        let response = Router::new()
+            .route("/without-a-key", get(upstream_credential_without_a_key))
+            .route_layer(from_fn_with_state(auth_config, auth_middleware))
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        body_text(response).await
+    }
+
+    /// With no key configured the middleware authenticates nothing and leaves
+    /// the header where it is: a caller's own upstream key still passes
+    /// through.
+    #[tokio::test]
+    async fn without_a_configured_key_the_header_stays_on_the_request() {
+        assert_eq!(
+            authorization_after(AuthConfig::new(None), Some("a-providers-own-key")).await,
+            "present"
+        );
+        assert_eq!(
+            authorization_after(AuthConfig::new(None), None).await,
+            "absent"
+        );
     }
 
     async fn body_text(response: Response) -> String {
@@ -273,6 +597,87 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn bearer_scheme_is_matched_case_insensitively() {
+        let auth_config = AuthConfig::new(Some("shared-secret".to_string()));
+
+        for scheme in ["bearer", "BEARER"] {
+            let response = app(auth_config.clone())
+                .oneshot(
+                    Request::builder()
+                        .uri("/")
+                        .header(header::AUTHORIZATION, format!("{scheme} shared-secret"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK, "scheme {scheme}");
+        }
+    }
+
+    fn challenge(response: &Response) -> String {
+        response
+            .headers()
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn missing_key_gets_a_bearer_challenge_and_a_message() {
+        let response = app(AuthConfig::new(Some("shared-secret".to_string())))
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(challenge(&response), "Bearer realm=\"data-plane\"");
+        let body: serde_json::Value = serde_json::from_str(&body_text(response).await).unwrap();
+        assert_eq!(body["error"]["code"], "invalid_api_key");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "{body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_key_gets_an_invalid_token_challenge() {
+        let response = app(AuthConfig::new(Some("shared-secret".to_string())))
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(header::AUTHORIZATION, "Bearer not-a-configured-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            challenge(&response),
+            "Bearer realm=\"data-plane\", error=\"invalid_token\""
+        );
+    }
+
+    #[tokio::test]
+    async fn deny_all_carries_the_challenge() {
+        let response = Router::new()
+            .route("/", get(handler))
+            .route_layer(axum::middleware::from_fn(deny_all_middleware))
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(challenge(&response), "Bearer realm=\"data-plane\"");
     }
 
     #[test]

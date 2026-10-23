@@ -648,7 +648,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::core::config::Tool as McpTool;
+    use crate::core::config::{test_support::sse_server, Tool as McpTool};
 
     #[test]
     fn test_session_creation_keeps_servers() {
@@ -905,38 +905,16 @@ mod tests {
     // --- Builtin server filtering tests ---
 
     fn create_builtin_orchestrator() -> McpOrchestrator {
-        use crate::core::config::{BuiltinToolType, McpConfig, McpServerConfig, McpTransport};
+        use crate::core::config::{BuiltinToolType, McpConfig, McpServerConfig};
 
         let config = McpConfig {
             servers: vec![
                 McpServerConfig {
-                    name: "brave-builtin".to_string(),
-                    transport: McpTransport::Sse {
-                        url: "http://localhost:8001/sse".to_string(),
-                        token: None,
-                        headers: HashMap::new(),
-                    },
-                    proxy: None,
-                    required: false,
-                    tools: None,
                     builtin_type: Some(BuiltinToolType::WebSearchPreview),
                     builtin_tool_name: Some("brave_web_search".to_string()),
-                    internal: false,
+                    ..sse_server("brave-builtin", "http://localhost:8001/sse")
                 },
-                McpServerConfig {
-                    name: "regular-server".to_string(),
-                    transport: McpTransport::Sse {
-                        url: "http://localhost:3000/sse".to_string(),
-                        token: None,
-                        headers: HashMap::new(),
-                    },
-                    proxy: None,
-                    required: false,
-                    tools: None,
-                    builtin_type: None,
-                    builtin_tool_name: None,
-                    internal: false,
-                },
+                sse_server("regular-server", "http://localhost:3000/sse"),
             ],
             ..Default::default()
         };
@@ -974,22 +952,14 @@ mod tests {
 
     #[test]
     fn test_is_builtin_tool_scoped_to_builtin_binding_only() {
-        use crate::core::config::{BuiltinToolType, McpConfig, McpServerConfig, McpTransport};
+        use crate::core::config::{BuiltinToolType, McpConfig, McpServerConfig};
 
         let orchestrator = McpOrchestrator::new_test_with_config(McpConfig {
             servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: HashMap::new(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
                 builtin_type: Some(BuiltinToolType::WebSearchPreview),
                 builtin_tool_name: Some("brave_web_search".to_string()),
                 internal: true,
+                ..sse_server("internal-server", "http://localhost:3000/sse")
             }],
             ..Default::default()
         });
@@ -1024,22 +994,13 @@ mod tests {
 
     #[test]
     fn test_is_builtin_tool_classifies_image_generation() {
-        use crate::core::config::{BuiltinToolType, McpConfig, McpServerConfig, McpTransport};
+        use crate::core::config::{BuiltinToolType, McpConfig, McpServerConfig};
 
         let orchestrator = McpOrchestrator::new_test_with_config(McpConfig {
             servers: vec![McpServerConfig {
-                name: "image-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: HashMap::new(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
                 builtin_type: Some(BuiltinToolType::ImageGeneration),
                 builtin_tool_name: Some("generate_image".to_string()),
-                internal: false,
+                ..sse_server("image-server", "http://localhost:3000/sse")
             }],
             ..Default::default()
         });
@@ -1177,22 +1138,12 @@ mod tests {
 
     #[test]
     fn test_is_internal_tool_for_internal_server() {
-        use crate::core::config::{McpConfig, McpServerConfig, McpTransport};
+        use crate::core::config::{McpConfig, McpServerConfig};
 
         let config = McpConfig {
             servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: HashMap::new(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
                 internal: true,
+                ..sse_server("internal-server", "http://localhost:3000/sse")
             }],
             ..Default::default()
         };
@@ -1222,22 +1173,12 @@ mod tests {
 
     #[test]
     fn test_is_internal_tool_for_alias_targeting_internal_server() {
-        use crate::core::config::{McpConfig, McpServerConfig, McpTransport};
+        use crate::core::config::{McpConfig, McpServerConfig};
 
         let config = McpConfig {
             servers: vec![McpServerConfig {
-                name: "internal-server".to_string(),
-                transport: McpTransport::Sse {
-                    url: "http://localhost:3000/sse".to_string(),
-                    token: None,
-                    headers: HashMap::new(),
-                },
-                proxy: None,
-                required: false,
-                tools: None,
-                builtin_type: None,
-                builtin_tool_name: None,
                 internal: true,
+                ..sse_server("internal-server", "http://localhost:3000/sse")
             }],
             ..Default::default()
         };
@@ -1270,37 +1211,14 @@ mod tests {
 
     #[test]
     fn test_is_internal_server_label_checks_all_bindings_for_shared_label() {
-        use crate::core::config::{McpConfig, McpServerConfig, McpTransport};
+        use crate::core::config::{McpConfig, McpServerConfig};
 
         let config = McpConfig {
             servers: vec![
+                sse_server("public-server", "http://localhost:3000/sse"),
                 McpServerConfig {
-                    name: "public-server".to_string(),
-                    transport: McpTransport::Sse {
-                        url: "http://localhost:3000/sse".to_string(),
-                        token: None,
-                        headers: HashMap::new(),
-                    },
-                    proxy: None,
-                    required: false,
-                    tools: None,
-                    builtin_type: None,
-                    builtin_tool_name: None,
-                    internal: false,
-                },
-                McpServerConfig {
-                    name: "internal-server".to_string(),
-                    transport: McpTransport::Sse {
-                        url: "http://localhost:3001/sse".to_string(),
-                        token: None,
-                        headers: HashMap::new(),
-                    },
-                    proxy: None,
-                    required: false,
-                    tools: None,
-                    builtin_type: None,
-                    builtin_tool_name: None,
                     internal: true,
+                    ..sse_server("internal-server", "http://localhost:3001/sse")
                 },
             ],
             ..Default::default()

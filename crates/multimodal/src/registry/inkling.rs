@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
     audio::{AudioPreProcessor, InklingAudioProcessor},
@@ -9,7 +9,7 @@ use crate::{
         MediaPartOrder, ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult,
     },
     types::{EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId},
-    vision::PreProcessorConfig,
+    vision::{processors::InklingImageProcessor, PreProcessorConfig, VisionPreProcessor},
 };
 
 pub(super) struct InklingSpec;
@@ -104,18 +104,37 @@ impl ModelProcessorSpec for InklingSpec {
         Ok(limits)
     }
 
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(
+                InklingImageProcessor::from_preprocessor_config(preprocessor_config).map_err(
+                    |error| ModelRegistryError::InvalidPreprocessorConfig {
+                        spec: self.name(),
+                        modality,
+                        reason: error.to_string(),
+                    },
+                )?,
+            )),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn audio_processor(
         &self,
         model_config: &Value,
         _preprocessor_config: &PreProcessorConfig,
-    ) -> Option<Box<dyn AudioPreProcessor>> {
-        Some(Box::new(InklingAudioProcessor::from_model_config(
+    ) -> RegistryResult<Option<Box<dyn AudioPreProcessor>>> {
+        Ok(Some(Box::new(InklingAudioProcessor::from_model_config(
             model_config,
-        )))
+        ))))
     }
 
     fn prompt_replacements(
@@ -271,6 +290,7 @@ mod tests {
         let config = json!({"audio_config": {"n_mel_bins": 8}});
         let processor = InklingSpec
             .audio_processor(&config, &PreProcessorConfig::default())
+            .unwrap()
             .expect("inkling spec must provide an audio processor");
 
         let clip = Arc::new(AudioClip::new(

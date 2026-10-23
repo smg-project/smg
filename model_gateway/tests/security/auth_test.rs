@@ -381,3 +381,101 @@ mod mtls_tests {
         ctx.shutdown().await;
     }
 }
+
+/// Failed JWT setup must not select build_app's shared-key/open fallback.
+#[tokio::test]
+async fn failed_jwt_initialization_keeps_admin_routes_protected() {
+    use smg_auth::{ApiKeyEntry, ControlPlaneAuthConfig, ControlPlaneAuthState, JwtConfig, Role};
+
+    use crate::common::test_app::create_test_app_with_context_and_auth;
+
+    for (index, shared_key) in [None, Some("gateway-shared-key")].into_iter().enumerate() {
+        let mut config = TestRouterConfig::round_robin(4310 + index as u16);
+        config.api_key = shared_key.map(str::to_owned);
+        let ctx = AppTestContext::new_with_config(config, vec![]).await;
+        for with_keys in [false, true] {
+            let auth_config = ControlPlaneAuthConfig {
+                jwt: Some(
+                    JwtConfig::new("https://issuer.example.com", "audience")
+                        .with_jwks_uri("https://127.0.0.1/jwks"),
+                ),
+                api_keys: if with_keys {
+                    vec![
+                        ApiKeyEntry::new("admin", "Admin", "cp-admin-key", Role::Admin),
+                        ApiKeyEntry::new("user", "User", "cp-user-key", Role::User),
+                    ]
+                } else {
+                    vec![]
+                },
+                audit_enabled: false,
+            };
+            let auth = ControlPlaneAuthState::try_init(Some(&auth_config)).await;
+            let app = create_test_app_with_context_and_auth(
+                ctx.router.clone(),
+                ctx.app_context.clone(),
+                auth,
+            );
+            for (method, path) in [("GET", "/workers"), ("POST", "/flush_cache")] {
+                for token in [
+                    None,
+                    Some("gateway-shared-key"),
+                    Some("unknown-key"),
+                    Some("a.b.c"),
+                ] {
+                    let mut request = Request::builder().method(method).uri(path);
+                    if let Some(token) = token {
+                        request = request.header(AUTH_HEADER, format!("Bearer {token}"));
+                    }
+                    let response = app
+                        .clone()
+                        .oneshot(request.body(Body::empty()).unwrap())
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::UNAUTHORIZED,
+                        "{path}, shared_key={shared_key:?}, with_keys={with_keys}, token={token:?}"
+                    );
+                }
+            }
+            // With the keys the admin key passes, the user key reads but may
+            // not mutate; without them every key is rejected.
+            let denied = StatusCode::UNAUTHORIZED;
+            for (token, method, path, status) in [
+                ("cp-admin-key", "GET", "/workers", StatusCode::OK),
+                ("cp-user-key", "GET", "/workers", StatusCode::OK),
+                ("cp-user-key", "POST", "/flush_cache", StatusCode::FORBIDDEN),
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .method(method)
+                            .uri(path)
+                            .header(AUTH_HEADER, format!("Bearer {token}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    if with_keys { status } else { denied },
+                    "{method} {path}, shared_key={shared_key:?}, with_keys={with_keys}, token={token}"
+                );
+            }
+            let health = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(health.status(), StatusCode::OK);
+        }
+        ctx.shutdown().await;
+    }
+}

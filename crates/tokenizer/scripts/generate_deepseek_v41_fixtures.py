@@ -2,19 +2,26 @@
 """Record DeepSeek-V4.1 render fixtures from the reference encoders.
 
 Oracle `hf` (the default): oracle/deepseek_v41_encoding.py (HF encoding.py @
-517ef625df, the revision vLLM and SGLang ported). The effort tiers are
+517ef625df, the revision the serving engines ported). The effort tiers are
 overridden to the engine table (spec D1). Token ids come from the real
 tokenizer.json.
 
-Oracle `vllm_python`: vLLM's port of that encoder, imported from the clone at
+Oracle `hf` at the current revision: cases that pass `encoder_revision` render
+with the checkpoint's own `encoding/encoding.py` beside the tests directory,
+at the revision the third argument names; the fixture records that revision
+and its effort table (50/75/100 since the refresh of 2026-09, the table the
+chat template the checkpoint added later carries too) next to the recorded
+ones. Without the third argument those cases keep their recorded text.
+
+Oracle `vllm_python`: the serving engine's port of that encoder, imported from the clone at
 VLLM_REPO_DIR (never vendored) and named in the fixture with the clone's HEAD
 commit. It records the shapes the HF encoder cannot render, today a developer
-message it keeps (vLLM and SGLang render it as a user turn; the HF encoder has
+message it keeps (the serving engines render it as a user turn; the HF encoder has
 no developer branch). Without VLLM_REPO_DIR those cases keep their recorded
-text and a warning says so. Its cases take string content only: vLLM flattens
+text and a warning says so. Its cases take string content only: the engine flattens
 content parts in its tokenizer wrapper, not in the encoder.
 
-Usage: generate_deepseek_v41_fixtures.py <checkpoint>/encoding/tests <checkpoint>/tokenizer.json
+Usage: generate_deepseek_v41_fixtures.py <checkpoint>/encoding/tests <checkpoint>/tokenizer.json [<checkpoint revision>]
 """
 
 import hashlib
@@ -34,13 +41,16 @@ enc.DEFAULT_REASONING_EFFORT = "high"
 
 HF_TESTS = Path(sys.argv[1])  # .../DeepSeek-V4.1-Flash/encoding/tests
 TOKENIZER = Path(sys.argv[2])  # .../DeepSeek-V4.1-Flash/tokenizer.json
+# The checkpoint directory's revision, for the cases its own encoder records.
+CURRENT_REVISION = sys.argv[3] if len(sys.argv) > 3 else None
+CURRENT_SOURCE = HF_TESTS.parent / "encoding.py"
 OUT = Path(__file__).parents[1] / "tests" / "fixtures" / "deepseek_v41"
 RENDER_FIXTURES = OUT / "render_fixtures.json"
 
-# Repo-relative path of vLLM's encoder inside the clone at VLLM_REPO_DIR.
+# Repo-relative path of the engine's encoder inside the clone at VLLM_REPO_DIR.
 VLLM_SOURCE = "vllm/tokenizers/deepseek_v41_encoding.py"
 
-# The content-part spellings vLLM's `_normalize_messages` accepts. The reference
+# The content-part spellings the engine's `_normalize_messages` accepts. The reference
 # encoder knows only `text` and `image_url`/`image`; a part in any other spelling
 # would silently vanish from its prompt.
 TEXT_PART_TYPES = ("text", "input_text", "output_text")
@@ -70,10 +80,11 @@ def read_head_commit(repo):
 
 
 def load_vllm_encoder():
-    """vLLM's encoder module and the clone's HEAD commit, or (None, None) with
-    a warning when VLLM_REPO_DIR is unset. Its effort table must already be
-    the engine table: the Rust renderer's tiers follow vLLM (spec D1), so a
-    change there is a decision to make, not something to record quietly."""
+    """The engine's encoder module and the clone's HEAD commit, or (None, None) with
+    a warning when VLLM_REPO_DIR is unset. Its effort table must still be the
+    first published one, which its cases are recorded under: the Rust renderer
+    reads the table from the checkpoint revision it serves, so a change in the
+    engine's port is a new revision to record, not something to record quietly."""
     repo = os.environ.get("VLLM_REPO_DIR")
     if not repo:
         print(
@@ -90,18 +101,49 @@ def load_vllm_encoder():
         or module.DEFAULT_REASONING_EFFORT != "high"
     ):
         raise ValueError(
-            f"{VLLM_SOURCE} no longer uses the engine effort table {ENGINE_TIERS} with default "
-            "'high'; revisit spec D1 and the Rust ReasoningEffort::budget table before recording"
+            f"{VLLM_SOURCE} no longer uses the effort table {ENGINE_TIERS} with default 'high'; "
+            "record its cases under the revision it follows now (see EffortTable in the Rust "
+            "renderer) before regenerating"
         )
     return module, read_head_commit(repo)
 
 
+def load_current_encoder():
+    """The checkpoint's own encoder (`encoding/encoding.py` beside the tests
+    directory), or None with a warning when no revision was given for it. Its
+    effort table is recorded as it is: the Rust renderer reads the table from
+    the checkpoint, so a change there is a new revision to record, not a
+    decision."""
+    if CURRENT_REVISION is None:
+        print(
+            "warning: no checkpoint revision given; current-revision cases keep their recorded text",
+            file=sys.stderr,
+        )
+        return None
+    spec = importlib.util.spec_from_file_location(
+        "hf_deepseek_v41_encoding_current", CURRENT_SOURCE
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 VLLM, VLLM_REVISION = load_vllm_encoder()
+CURRENT = load_current_encoder()
+CURRENT_TIERS = None if CURRENT is None else CURRENT.REASONING_EFFORT_MAPPINGS
 RECORDED = {}
-if VLLM is None and RENDER_FIXTURES.exists():
+RECORDED_CURRENT = {}
+if (VLLM is None or CURRENT is None) and RENDER_FIXTURES.exists():
     previous = json.loads(RENDER_FIXTURES.read_text())
-    RECORDED = {c["name"]: c["text"] for c in previous["cases"] if c["oracle"] == "vllm_python"}
-    VLLM_REVISION = previous["vllm_revision"]
+    if VLLM is None:
+        RECORDED = {c["name"]: c["text"] for c in previous["cases"] if c["oracle"] == "vllm_python"}
+        VLLM_REVISION = previous["vllm_revision"]
+    if CURRENT is None:
+        RECORDED_CURRENT = {
+            c["name"]: c["text"] for c in previous["cases"] if "encoder_revision" in c
+        }
+        CURRENT_REVISION = previous["current_revision"]
+        CURRENT_TIERS = previous["current_effort_tiers"]
 
 
 def load_hf_case(path):
@@ -120,7 +162,7 @@ def oracle_part(part):
     `input_text`/`output_text` become `text`; `input_image`/`image_pil` become
     `image_url`. No payload reaches the prompt, but the oracle insists on an
     image source: `input_image` carries its URL as a string, and `image_pil`
-    holds a PIL object in vLLM, which JSON cannot hold, so the oracle gets the
+    holds a PIL object in the engine, which JSON cannot hold, so the oracle gets the
     spelling itself as a stand-in. The oracle then substitutes the image
     placeholder and joins the parts, so it stays the byte authority for both.
     The fixture records the request as sent, spellings included: the renderer
@@ -143,7 +185,7 @@ def oracle_messages(messages):
 
 def attach_tools(msgs, tools):
     """Rule D4, as `inject_tools_into_first_system_message` (huggingface.rs)
-    and vLLM's `apply_chat_template` do it: the request's tools land on the
+    and the engine's `apply_chat_template` do it: the request's tools land on the
     FIRST system message wherever it sits; without one, an empty system
     message is inserted at index 0 and carries them."""
     system = next((msg for msg in msgs if msg["role"] == "system"), None)
@@ -153,8 +195,14 @@ def attach_tools(msgs, tools):
     system["tools"] = tools
 
 
-def encode(oracle, name, msgs, thinking_mode, drop_thinking, reasoning_effort):
-    if oracle == "hf":
+def encode(oracle, name, msgs, thinking_mode, drop_thinking, reasoning_effort, current=False):
+    if oracle == "hf" and current:
+        if CURRENT is None:
+            if name not in RECORDED_CURRENT:
+                raise SystemExit(f"{name}: never recorded and no checkpoint revision was given")
+            return RECORDED_CURRENT[name]
+        module = CURRENT
+    elif oracle == "hf":
         module = enc
     elif oracle == "vllm_python":
         if VLLM is None:
@@ -181,16 +229,21 @@ def case(
     drop_thinking=True,
     continue_final_message=False,
     oracle="hf",
+    current=False,
 ):
+    """One case; `current` records it with the checkpoint's own encoder at the
+    current revision (oracle `hf` only) and names that revision on the case."""
     msgs = oracle_messages(messages)
     if tools:
         attach_tools(msgs, tools)
     if continue_final_message:
         msgs[-1]["wo_eos"] = True
-    text = encode(oracle, name, msgs, thinking_mode, drop_thinking, reasoning_effort)
+    text = encode(oracle, name, msgs, thinking_mode, drop_thinking, reasoning_effort, current)
+    revision = {"encoder_revision": CURRENT_REVISION} if current else {}
     return {
         "name": name,
         "oracle": oracle,
+        **revision,
         "messages": messages,
         "tools": tools,
         "thinking_mode": thinking_mode,
@@ -375,7 +428,7 @@ cases += [
     ),
     # A developer message before the last user turn is dropped by drop_thinking,
     # which is the only developer shape the HF encoder can render; the kept
-    # shapes are recorded from vLLM's port at the end of this list.
+    # shapes are recorded from the engine's port at the end of this list.
     case("developer_then_user_thinking", DEVELOPER_THEN_USER, thinking_mode="thinking"),
     case(
         "two_user_turns",
@@ -397,8 +450,8 @@ cases += [
             }
         ],
     ),
-    # vLLM-only spellings (see oracle_part). `image_pil` carries a PIL object in
-    # vLLM, which JSON cannot hold; no image payload reaches the prompt anyway.
+    # Engine-only spellings (see oracle_part). `image_pil` carries a PIL object in
+    # the engine, which JSON cannot hold; no image payload reaches the prompt anyway.
     case(
         "input_image_and_image_pil_spellings",
         [
@@ -498,8 +551,8 @@ cases += [
         thinking_mode="thinking",
     ),
     # A kept developer message (chat mode; thinking with tools, where
-    # drop_thinking is off) renders as a <｜User｜> turn in vLLM and SGLang;
-    # the HF encoder raises on it, so vLLM's port records these two. With
+    # drop_thinking is off) renders as a <｜User｜> turn in the serving engines;
+    # the HF encoder raises on it, so the engine's port records these two. With
     # tools, D4 puts them on a synthesised leading system message.
     case("developer_then_user_chat", DEVELOPER_THEN_USER, oracle="vllm_python"),
     case(
@@ -508,6 +561,33 @@ cases += [
         tools=LOOKUP_TOOL,
         thinking_mode="thinking",
         oracle="vllm_python",
+    ),
+    # The same requests as thinking_default_effort, thinking_low and
+    # continue_final_message under the current revision's effort table (the
+    # gateway's pipeline test renders the continued message through it); last,
+    # so the recorded cases keep their positions in both files.
+    case(
+        "thinking_default_effort_current",
+        [{"role": "user", "content": "q"}],
+        thinking_mode="thinking",
+        current=True,
+    ),
+    case(
+        "thinking_low_current",
+        [{"role": "user", "content": "q"}],
+        thinking_mode="thinking",
+        reasoning_effort="low",
+        current=True,
+    ),
+    case(
+        "continue_final_message_current",
+        [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "reasoning_content": "r", "content": "Sure,"},
+        ],
+        thinking_mode="thinking",
+        continue_final_message=True,
+        current=True,
     ),
 ]
 
@@ -519,9 +599,11 @@ RENDER_FIXTURES.write_text(
         {
             "source": "deepseek-ai/DeepSeek-V4.1-Flash encoding/encoding.py",
             "revision": "517ef625df",
+            "effort_tiers": ENGINE_TIERS,
+            "current_revision": CURRENT_REVISION,
+            "current_effort_tiers": CURRENT_TIERS,
             "vllm_source": VLLM_SOURCE,
             "vllm_revision": VLLM_REVISION,
-            "effort_tiers": ENGINE_TIERS,
             "cases": cases,
         },
         ensure_ascii=False,

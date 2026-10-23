@@ -153,3 +153,19 @@ fn test_bug_fix_exact_scenario() {
     // Should consume all characters (10 bytes)
     assert_eq!(consumed, 10, "Should consume all 10 characters");
 }
+
+#[test]
+fn test_surrogate_pair_escape_decodes_to_one_char() {
+    // `\ud83c\udf0d` is one character (U+1F30D) written as a UTF-16 pair, as
+    // ensure_ascii encoders emit it; serde_json reads the same text the same way.
+    let parser = PartialJson::new(32, true);
+    let input = r#"{"e": "\ud83c\udf0d", "f": 1}"#;
+
+    let (obj, consumed) = parser.parse_value(input, true).unwrap();
+
+    assert_eq!(
+        obj,
+        serde_json::from_str::<serde_json::Value>(input).unwrap()
+    );
+    assert_eq!(consumed, input.len());
+}

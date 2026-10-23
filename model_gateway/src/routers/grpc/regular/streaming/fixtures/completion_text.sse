@@ -1,0 +1,6 @@
+data: {"id":"cmpl-fixture","object":"text_completion","created":1700000000,"choices":[{"text":"Hello","index":0,"finish_reason":null}],"model":"fixture-model"}
+
+data: {"id":"cmpl-fixture","object":"text_completion","created":1700000000,"choices":[{"text":", world","index":0,"finish_reason":null}],"model":"fixture-model"}
+
+data: {"id":"cmpl-fixture","object":"text_completion","created":1700000000,"choices":[{"text":"","index":0,"finish_reason":"stop"}],"model":"fixture-model"}
+

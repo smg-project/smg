@@ -52,10 +52,18 @@ as of `tokenizer/src/*`.
 - Loads `tokenizer.json` (or similar) using `tokenizers::Tokenizer::from_file`.
 - Caches vocab forward and reverse maps for `token_to_id`/`id_to_token` support.
 - Extracts special tokens using common patterns (e.g. `<s>`, `[CLS]`).
+- Adds special tokens on request the way the checkpoint's configuration prescribes: `encode(text, true)`
+  carries the configured BOS/EOS when `tokenizer_config.json` sets `add_bos_token` / `add_eos_token`
+  to `true`, through the post-processor the `transformers` Llama-style fast classes install at load
+  (`update_post_processor`), even where `tokenizer.json` alone has none or a plain `ByteLevel` one;
+  `encode(text, false)` gives the ids of the file alone. The serving engine's tokenizer, not the bare
+  file, is the reference, so a cross-check against the `tokenizers` crate compares with
+  `HuggingFaceTokenizer::tokenizers_pipeline()` (the same post-processor) or with the flag off.
 - Supports optional chat templates: either auto-discovered next to the tokenizer via
   `tokenizer_config.json` or overridable with an explicit template path.
-- Exposes `apply_chat_template` which renders a minijinja template given JSON message payloads and
-  template parameters.
+- Exposes `apply_chat_template` for JSON message payloads and template parameters.
+- GLM-5.3 and GLM-5.3-Flash use native Rust chat rendering when checkpoint metadata and
+  the template matches the current official one. Any other template keeps MiniJinja.
 
 ### TiktokenTokenizer (`tiktoken.rs`)
 - Wraps the `tiktoken-rs` `CoreBPE` builders (`cl100k_base`, `p50k_base`, `p50k_edit`, `r50k_base`).
@@ -93,8 +101,8 @@ as of `tokenizer/src/*`.
 
 ## Chat Template Support (`chat_template.rs`)
 - Detects whether a template expects raw string content or the structured OpenAI-style `content`
-  list by walking the minijinja AST. This matches the Python-side detection logic used elsewhere in
-  SGLang.
+  list by walking the minijinja AST. This matches the Python-side detection logic of the serving
+  engines.
 - `ChatTemplateProcessor` (constructed per call) renders templates against JSON `messages` and
   `ChatTemplateParams` (system prompt, tools, EOS token handling, etc.). Errors surface as
   `anyhow::Error`, keeping parity with Hugging Face error messages.
@@ -218,6 +226,8 @@ The gateway exports process-lifetime totals across tokenizer instances on `/metr
 | `smg_tokenizer_cache_lookups_total` | `layer=l0` or `l1`, `result=hit` or `miss` | One outcome per lookup, including L1 misses without special-token boundaries |
 | `smg_tokenizer_cache_evictions_total` | `layer=l0` or `l1` | Entries actually removed for capacity, excluding clear, drop and replacement |
 | `smg_tokenizer_cache_reused_bytes_total` | `layer=l0` or `l1` | UTF-8 input bytes served by hits: whole input for L0, matched prefix for L1 |
+| `smg_tokenizer_encode_path_loads_total` | `path=v1`, `native` or `tokenizers` | Hugging Face tokenizers loaded, by the encode path chosen at load (see `encode_path.rs`); a tokenizer loaded twice counts twice |
+| `smg_tokenizer_encode_fallbacks_total` | `reason=not_nfc` or `piece_declined` | Inputs the direct byte-level encoder gave up to `tokenizers` after the load's choice |
 
 Labels are fixed; no model IDs or prompt text are retained. L0 hits bypass L1,
 so each layer's hit ratio uses its own lookup count. Disabled layers have no
@@ -237,3 +247,10 @@ sum by (layer) (rate(smg_tokenizer_cache_lookups_total[5m]))
 Compare this with `rate(smg_tokenizer_cache_evictions_total[5m])` when tuning
 capacity, and `rate(smg_tokenizer_cache_reused_bytes_total[5m])` to distinguish
 small prefix hits from reuse of large prompts.
+
+`smg_tokenizer_encode_path_loads_total` says which encoder each loaded
+tokenizer's encodes go through (the load also logs the path once, with the
+reasons the faster paths declined); a non-zero `tokenizers` series under the
+`tokenizers-v1` feature names the tokenizers the opt-in pipeline does not take.
+`smg_tokenizer_encode_fallbacks_total` counts the inputs that still left the
+direct encoder afterwards, each encoded a second time by `tokenizers`.

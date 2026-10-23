@@ -13,6 +13,7 @@ import sys
 import threading
 import uuid
 from collections.abc import AsyncGenerator
+from contextlib import aclosing
 from typing import Any
 
 import grpc
@@ -41,7 +42,28 @@ from sglang.srt.utils import get_or_create_event_loop, kill_process_tree
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.utils import get_exception_traceback
 
+from smg_grpc_servicer.trace_context import trace_headers
+
 logger = logging.getLogger(__name__)
+
+
+def _validate_token_ids_logprobs(values: list[list[float]], token_ids: list[list[int]]) -> None:
+    """Reject a selected-score payload that would lose entries when zipped."""
+    try:
+        if len(values) != len(token_ids):
+            raise ValueError(
+                "Malformed selected-token logprobs: values and IDs have different row counts"
+            )
+        if any(len(row_values) != len(row_ids) for row_values, row_ids in zip(values, token_ids)):
+            raise ValueError(
+                "Malformed selected-token logprobs: a row has different values and IDs lengths"
+            )
+    except TypeError as exc:
+        # A missing or scalar row is a request error too. Letting TypeError
+        # escape the shared batch handler would also strand valid siblings.
+        raise ValueError(
+            "Malformed selected-token logprobs: values and IDs must contain candidate rows"
+        ) from exc
 
 
 class _GrpcCommunicator:
@@ -159,6 +181,8 @@ class GrpcReqState:
     input_top_logprobs_idx: list[list[int]] = dataclasses.field(default_factory=list)
     output_top_logprobs_val: list[list[float]] = dataclasses.field(default_factory=list)
     output_top_logprobs_idx: list[list[int]] = dataclasses.field(default_factory=list)
+    output_token_ids_logprobs_val: list[list[float]] = dataclasses.field(default_factory=list)
+    output_token_ids_logprobs_idx: list[list[int]] = dataclasses.field(default_factory=list)
 
     # Session state
     session_id: str | None = None
@@ -233,6 +257,10 @@ class GrpcRequestManager:
 
         # disaggregation mode
         self.disaggregation_mode = DisaggregationMode(server_args.disaggregation_mode)
+        # Tracing: each request's trace starts from the Router's context in the
+        # call's metadata (as the tokenizer manager starts it from an HTTP
+        # request's headers), see `_req_stats_init`.
+        self.enable_trace = _tracing_enabled()
 
         # Bootstrap server (passed from serve_grpc, not started here)
         self.bootstrap_server = bootstrap_server
@@ -286,8 +314,15 @@ class GrpcRequestManager:
         n = getattr(obj.sampling_params, "n", 1)
 
         if n <= 1:
-            async for response in self._handle_single_request(obj, request_id, grpc_context):
-                yield response
+            # Closing this stream closes the handler with it: a consumer that
+            # leaves after an output (the health probe does, on its first)
+            # has the request's state released before its close returns,
+            # not when the garbage collector finalizes the abandoned handler.
+            async with aclosing(
+                self._handle_single_request(obj, request_id, grpc_context)
+            ) as responses:
+                async for response in responses:
+                    yield response
             return
 
         # N>1 handling - two-phase approach
@@ -347,6 +382,8 @@ class GrpcRequestManager:
             # Streaming mode: multiplex responses with index for ordering
             logger.debug(f"Streaming mode: multiplexing {n} streams")
             rid_to_index = {rid: i for i, rid in enumerate(request_ids)}
+            # The sub-requests still running, by their handler generator.
+            live = dict(zip(generators, request_ids))
 
             # Create async tasks for all generators
             task_map = {}
@@ -354,30 +391,78 @@ class GrpcRequestManager:
                 task = asyncio.create_task(generator.__anext__())
                 task_map[task] = generator
 
-            # Process responses as they arrive
-            while task_map:
-                done, _ = await asyncio.wait(task_map.keys(), return_when=asyncio.FIRST_COMPLETED)
+            # Process responses as they arrive. The consumer may leave at any
+            # point (the client cancelled, the stream was closed downstream):
+            # ``asyncio.wait`` does not cancel the tasks it waits on, so the
+            # sub-requests still running are aborted and closed on the way out,
+            # as a single request's cancel aborts it.
+            try:
+                while task_map:
+                    done, _ = await asyncio.wait(
+                        task_map.keys(), return_when=asyncio.FIRST_COMPLETED
+                    )
 
-                for task in done:
-                    generator = task_map.pop(task)
-                    try:
-                        response = await task
+                    for task in done:
+                        generator = task_map.pop(task)
+                        try:
+                            response = await task
 
-                        # Add index for client-side ordering
-                        if isinstance(response, dict):
-                            response_rid = response.get("request_id", "")
-                            if response_rid in rid_to_index:
-                                response["index"] = rid_to_index[response_rid]
+                            # Add index for client-side ordering
+                            if isinstance(response, dict):
+                                response_rid = response.get("request_id", "")
+                                if response_rid in rid_to_index:
+                                    response["index"] = rid_to_index[response_rid]
 
-                        yield response
+                            yield response
 
-                        # Create next task for this generator
-                        next_task = asyncio.create_task(generator.__anext__())
-                        task_map[next_task] = generator
+                            # Create next task for this generator
+                            next_task = asyncio.create_task(generator.__anext__())
+                            task_map[next_task] = generator
 
-                    except StopAsyncIteration:
-                        # This generator is finished
-                        pass
+                        except StopAsyncIteration:
+                            # This generator is finished
+                            live.pop(generator, None)
+            finally:
+                if live:
+                    await self._abort_sub_requests(live, task_map)
+
+    async def _abort_sub_requests(
+        self,
+        live: dict[AsyncGenerator, str],
+        task_map: dict[asyncio.Task, AsyncGenerator],
+    ) -> None:
+        """Abort the sub-requests of a multiplexed n>1 stream whose consumer left
+        while they were still running, and close their handlers.
+
+        A handler waiting on the scheduler has a pending task: cancelling it
+        delivers the cancel to the handler, which runs its own path (abort at
+        the scheduler, cleanup, the root span ended). A handler parked at its
+        yield, its output read by the consumer or not yet read, is past the
+        point a cancel reaches: its abort is sent here, then the handler is
+        closed and cleans up as it does on any exit.
+        """
+        task_of = {generator: task for task, generator in task_map.items()}
+        pending = [task for task in task_of.values() if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.wait(pending)
+        for generator, request_id in live.items():
+            task = task_of.get(generator)
+            if task is not None and not task.cancelled() and task.exception() is not None:
+                # the handler finished or failed on its own (StopAsyncIteration
+                # when the loop had not consumed its end yet); the exception is
+                # retrieved here, so the loop does not log it
+                pass
+            # The request's own state decides: a handler that took the cancel
+            # (pending, or cancelled before it resumed: the cancel is thrown
+            # in at its ``yield``) removed it on its abort path; a handler
+            # parked at its ``yield`` with no task, or whose task already
+            # completed with an unread output, is still registered and is
+            # aborted here.
+            if request_id in self.rid_to_state:
+                await self.abort_request(request_id)
+            await generator.aclose()
 
     async def _handle_single_request(
         self,
@@ -430,9 +515,16 @@ class GrpcRequestManager:
             self._cleanup_request_state(request_id)
 
     def _cleanup_request_state(self, request_id: str):
-        """Clean up local request state (does not notify scheduler)."""
-        if request_id in self.rid_to_state:
-            del self.rid_to_state[request_id]
+        """Drop the request's local state (the scheduler is not notified) and,
+        when no terminal output finished its time stats, finish them here: the
+        client cancelled mid-stream, the scheduler refused or aborted the
+        request, or the dispatch failed. The finish ends the request's root
+        trace span and the slices still open under it, as the terminal output
+        would have; a span left open never reaches the collector and keeps the
+        request's trace context alive."""
+        state = self.rid_to_state.pop(request_id, None)
+        if state is not None and not state.time_stats.finished_time:
+            state.time_stats.set_finished_time()
 
     async def embedding_request(
         self,
@@ -461,7 +553,7 @@ class GrpcRequestManager:
             await self._send_to_scheduler(obj)
             state.time_stats.set_api_server_dispatch_finish_time()
         except Exception as e:
-            del self.rid_to_state[request_id]
+            self._cleanup_request_state(request_id)
             future.set_exception(e)
             return future
 
@@ -474,9 +566,7 @@ class GrpcRequestManager:
             except Exception as e:
                 future.set_exception(e)
             finally:
-                # Clean up
-                if request_id in self.rid_to_state:
-                    del self.rid_to_state[request_id]
+                self._cleanup_request_state(request_id)
 
         asyncio.create_task(wait_for_result())
         return future
@@ -494,6 +584,10 @@ class GrpcRequestManager:
         # Mark state as finished immediately to stop processing scheduler outputs
         state = self.rid_to_state.get(request_id)
         if state:
+            # The request's root span ends here, once: the scheduler's final
+            # abort output reaches a state already finished (or gone).
+            if self.enable_trace and not state.finished:
+                state.time_stats.set_finished_time()
             state.finished = True
             state.stream_finished = True
             logger.debug(f"Marked request {request_id} as aborted locally")
@@ -576,18 +670,23 @@ class GrpcRequestManager:
         return True
 
     async def _handle_tokenizer_loop(self):
-        """Process communicator responses from the scheduler's send_to_tokenizer path.
+        """Process outputs from the scheduler's send_to_tokenizer path.
 
         The scheduler sends communicator responses (ProfileReqOutput,
-        FlushCacheReqOutput, ...) directly to tokenizer_ipc_name, not through
-        the detokenizer. This loop only runs when recv_from_tokenizer is a
-        dedicated socket — in skip_tokenizer_init mode those responses arrive
-        on recv_from_scheduler and are dispatched by handle_loop instead.
+        FlushCacheReqOutput, ...) and busy-path health signals directly to
+        tokenizer_ipc_name, not through the detokenizer. This loop only runs
+        when recv_from_tokenizer is a dedicated socket — in skip_tokenizer_init
+        mode those responses arrive on recv_from_scheduler and are dispatched
+        by handle_loop instead.
         """
         while not self.gracefully_exit:
             try:
                 recv_obj = await self.recv_from_tokenizer.recv_pyobj()
-                if not self._dispatch_communicator_output(recv_obj):
+                if isinstance(recv_obj, HealthCheckOutput):
+                    self.last_receive_tstamp = real_time()
+                    if getattr(recv_obj, "rid", None):
+                        await self._handle_health_check_output(recv_obj)
+                elif not self._dispatch_communicator_output(recv_obj):
                     logger.warning(f"Unknown type on tokenizer socket: {type(recv_obj)}")
             except zmq.error.Again:
                 if self.gracefully_exit:
@@ -614,29 +713,41 @@ class GrpcRequestManager:
         Convert and accumulate logprobs from batch output to state.
         Follows the same logic as tokenizer_manager.convert_logprob_style.
         """
-        # Early exit if no input logprobs at all
-        if batch_out.input_token_logprobs_val is None:
-            return
+        selected_values = getattr(batch_out, "output_token_ids_logprobs_val", None) or []
+        selected_ids = getattr(batch_out, "output_token_ids_logprobs_idx", None) or []
+        if selected_values or selected_ids:
+            batch_size = len(batch_out.rids)
+            if len(selected_values) != batch_size or len(selected_ids) != batch_size:
+                raise ValueError(
+                    "Malformed selected-token logprobs: batch columns do not match request count"
+                )
+            _validate_token_ids_logprobs(
+                selected_values[batch_index] or [], selected_ids[batch_index] or []
+            )
 
-        # Accumulate input token logprobs (only if list is non-empty)
-        if len(batch_out.input_token_logprobs_val) > 0:
-            state.input_token_logprobs_val.extend(batch_out.input_token_logprobs_val[batch_index])
-            state.input_token_logprobs_idx.extend(batch_out.input_token_logprobs_idx[batch_index])
-
-        # Always accumulate output token logprobs
-        state.output_token_logprobs_val.extend(batch_out.output_token_logprobs_val[batch_index])
-        state.output_token_logprobs_idx.extend(batch_out.output_token_logprobs_idx[batch_index])
-
-        # Handle top logprobs if requested
+        # Each column is independent: prefill-only scoring may have a selected
+        # candidate row with neither input nor sampled-token logprobs.
+        columns = [
+            "input_token_logprobs_val",
+            "input_token_logprobs_idx",
+            "output_token_logprobs_val",
+            "output_token_logprobs_idx",
+            "output_token_ids_logprobs_val",
+            "output_token_ids_logprobs_idx",
+        ]
         if state.obj.top_logprobs_num > 0:
-            # Accumulate input top logprobs (only if list is non-empty)
-            if len(batch_out.input_top_logprobs_val) > 0:
-                state.input_top_logprobs_val.extend(batch_out.input_top_logprobs_val[batch_index])
-                state.input_top_logprobs_idx.extend(batch_out.input_top_logprobs_idx[batch_index])
-
-            # Always accumulate output top logprobs
-            state.output_top_logprobs_val.extend(batch_out.output_top_logprobs_val[batch_index])
-            state.output_top_logprobs_idx.extend(batch_out.output_top_logprobs_idx[batch_index])
+            columns.extend(
+                (
+                    "input_top_logprobs_val",
+                    "input_top_logprobs_idx",
+                    "output_top_logprobs_val",
+                    "output_top_logprobs_idx",
+                )
+            )
+        for name in columns:
+            column = getattr(batch_out, name, None)
+            if column and batch_index < len(column) and column[batch_index]:
+                getattr(state, name).extend(column[batch_index])
 
     async def _handle_batch_output(self, batch_out: BatchTokenIDOutput):
         """Handle batch generation output from scheduler."""
@@ -689,7 +800,20 @@ class GrpcRequestManager:
             # Use getattr for safe access - not all request types have return_logprob
             # (e.g., TokenizedEmbeddingReqInput)
             if getattr(state.obj, "return_logprob", False):
-                self._convert_logprob_style(state, batch_out, i)
+                try:
+                    self._convert_logprob_style(state, batch_out, i)
+                except ValueError as exc:
+                    # Raising out of this loop would strand the waiting client.
+                    # Finish with an engine error and stop any remaining decode.
+                    output_data["error"] = str(exc)
+                    output_data["finished"] = True
+                    output_data["meta_info"]["finish_reason"] = {
+                        "type": "abort",
+                        "message": str(exc),
+                        "status_code": 500,
+                    }
+                    if not finished:
+                        await self.abort_request(rid)
 
             # Send input logprobs based if available
             if (
@@ -716,24 +840,37 @@ class GrpcRequestManager:
                     }
 
             # Send output logprobs if available
-            if (
-                getattr(state.obj, "return_logprob", False)
-                and batch_out.output_token_logprobs_val
-                and i < len(batch_out.output_token_logprobs_val)
+            if getattr(state.obj, "return_logprob", False) and (
+                (
+                    batch_out.output_token_logprobs_val
+                    and i < len(batch_out.output_token_logprobs_val)
+                )
+                or state.output_token_ids_logprobs_val
             ):
                 if state.obj.stream:
                     # For streaming: send incremental logprobs (only new tokens in this chunk)
                     # NOTE: this is different than TokenizerManager, which always accumulates
                     def get_part(attr_name):
                         source_list = getattr(batch_out, attr_name, None)
-                        return source_list[i] if source_list and i < len(source_list) else []
+                        return (
+                            (source_list[i] or []) if source_list and i < len(source_list) else []
+                        )
 
                     output_data["output_logprobs"] = {
-                        "token_logprobs_val": batch_out.output_token_logprobs_val[i],
+                        "token_logprobs_val": get_part("output_token_logprobs_val"),
                         "token_logprobs_idx": get_part("output_token_logprobs_idx"),
                         "top_logprobs_val": get_part("output_top_logprobs_val"),
                         "top_logprobs_idx": get_part("output_top_logprobs_idx"),
+                        "token_ids_logprobs_val": get_part("output_token_ids_logprobs_val"),
+                        "token_ids_logprobs_idx": get_part("output_token_ids_logprobs_idx"),
                     }
+                    if finished and state.output_token_ids_logprobs_val:
+                        # The final stream chunk stays incremental. Complete
+                        # carries every selected row accumulated for the request.
+                        output_data["complete_token_ids_logprobs"] = {
+                            "token_ids_logprobs_val": state.output_token_ids_logprobs_val,
+                            "token_ids_logprobs_idx": state.output_token_ids_logprobs_idx,
+                        }
                 elif output_data["finished"]:
                     # Non-streaming: send cumulative output logprobs in final chunk
                     output_data["output_logprobs"] = {
@@ -741,6 +878,8 @@ class GrpcRequestManager:
                         "token_logprobs_idx": state.output_token_logprobs_idx,
                         "top_logprobs_val": state.output_top_logprobs_val,
                         "top_logprobs_idx": state.output_top_logprobs_idx,
+                        "token_ids_logprobs_val": state.output_token_ids_logprobs_val,
+                        "token_ids_logprobs_idx": state.output_token_ids_logprobs_idx,
                     }
 
             # Update state for accumulation
@@ -843,7 +982,10 @@ class GrpcRequestManager:
 
         state = self.rid_to_state[recv_obj.rid]
 
-        # Mark as finished
+        # Mark as finished; a scheduler-initiated abort ends the request's
+        # root span here, once (a client cancel ended it in abort_request).
+        if self.enable_trace and not state.finished:
+            state.time_stats.set_finished_time()
         state.finished = True
         state.stream_finished = True
 
@@ -1078,8 +1220,16 @@ class GrpcRequestManager:
         calibrate_time_diff()
         # Create and register request state
         # TODO: support log_request
-        # TODO: support request tracing
         time_stats = APIServerReqTimeStats(disagg_mode=self.disaggregation_mode)
+        if self.enable_trace:
+            # The request's trace starts from the Router's W3C context in the
+            # call's metadata, as the tokenizer manager starts it from an HTTP
+            # request's headers: the engine's spans for the request become
+            # children of the Router's span.
+            metadata = grpc_context.invocation_metadata() if grpc_context is not None else ()
+            time_stats.init_trace_ctx(
+                obj.rid, getattr(obj, "bootstrap_room", None), trace_headers(metadata)
+            )
         state = GrpcReqState(
             request_id=obj.rid,
             grpc_context=grpc_context,
@@ -1097,6 +1247,58 @@ class GrpcRequestManager:
 
         self.rid_to_state[obj.rid] = state
         time_stats.set_created_time()
+        if self.enable_trace:
+            # The Router tokenized upstream: the tokenize slice the stats open
+            # with ends at once. The scheduler takes the stats over on its copy
+            # of the request, as it does behind the tokenizer manager, so its
+            # slices join the same trace.
+            time_stats.set_tokenize_finish_time()
+            obj.time_stats = time_stats
+
+
+def _tracing_enabled() -> bool:
+    """Whether the engine was started with tracing (``--enable-trace``), from
+    the runtime context this process published."""
+    try:
+        from sglang.srt.runtime_context import get_observability
+    except ImportError:  # an SGLang without the observability bag: no tracing
+        return False
+    return bool(get_observability().enable_trace)
+
+
+def init_request_tracing(thread_label: str = "gRPC Servicer") -> bool:
+    """Initialize SGLang's tracing in this process when the engine was started
+    with it, as SGLang's own HTTP frontend does in the process that fills the
+    tokenizer manager's role: the request manager starts each request's trace
+    (`GrpcRequestManager._req_stats_init`). Returns whether tracing is on."""
+    if not _tracing_enabled():
+        return False
+    try:
+        from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
+        from sglang.srt.runtime_context import get_disagg, get_observability
+    except ImportError as e:  # an SGLang without the tracing modules
+        logger.warning(f"Request tracing unavailable in this SGLang: {e}")
+        return False
+
+    observability = get_observability()
+    try:
+        process_tracing_init(
+            observability.otlp_traces_endpoint,
+            observability.otlp_service_name,
+            trace_modules=observability.trace_modules,
+        )
+    except RuntimeError as e:
+        # SGLang reports a missing OpenTelemetry or a collector it cannot
+        # reach this way; the servicer serves without request traces.
+        logger.warning(f"Request tracing not started: {e}")
+        return False
+    mode = get_disagg().disaggregation_mode
+    if mode == "prefill":
+        thread_label = "Prefill " + thread_label
+    elif mode == "decode":
+        thread_label = "Decode " + thread_label
+    trace_set_thread_info(thread_label)
+    return True
 
 
 async def print_exception_wrapper(func):

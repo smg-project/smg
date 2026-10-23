@@ -11,6 +11,7 @@
 
 use bytes::Bytes;
 
+use self::handshake::EngineCoreReadyResponse;
 use crate::{codec::OpaqueValue, Result};
 
 pub mod handshake;
@@ -27,7 +28,7 @@ pub mod vllm;
 pub struct EngineLoad {
     /// Requests currently in model-execution batches.
     pub num_running: u64,
-    /// Requests waiting in the scheduler queue.
+    /// Total waiting requests, including deferred requests.
     pub num_waiting: u64,
     /// KV-cache usage ratio (`1.0` == 100%).
     pub kv_cache_usage: f64,
@@ -123,6 +124,17 @@ pub trait EngineProtocol: Send + Sync + 'static {
 
     /// The request's id (the registry routing key).
     fn request_id(request: &Self::Request) -> &str;
+    /// The prompt tokens of an add-request: what the engine has to prefill
+    /// before the request's first output.
+    fn prompt_tokens(request: &Self::Request) -> u64;
+    /// Whether the engine reports this request on every scheduler step that
+    /// decodes it, so an engine silent with such a request in flight is a
+    /// scheduler that is not stepping: the connector counts the silence it
+    /// reports over these requests only. A request the engine reports at
+    /// intervals (one that does not stream, whose output comes at its end or
+    /// every forced interval; one streamed every so many tokens) is quiet
+    /// while healthy, and is left out of that count.
+    fn reported_every_step(request: &Self::Request) -> bool;
     /// SMG-pinned DP rank, if any (else the sole engine is used).
     fn data_parallel_rank(request: &Self::Request) -> Option<u32>;
     /// Reject fields this client cannot represent on the wire.
@@ -146,6 +158,17 @@ pub trait EngineProtocol: Send + Sync + 'static {
         _args: &[OpaqueValue],
     ) -> Result<Option<(Bytes, Vec<u8>)>> {
         Ok(None)
+    }
+    /// Check the positional layouts the engine declared at its handshake
+    /// ([`EngineCoreReadyResponse::positional_layouts`], the field order of
+    /// each array-encoded struct it decodes) against the prefixes this
+    /// protocol's encoders fill, once per engine before its first request: a
+    /// struct whose field order moved under this client is named here, with
+    /// the field that differs, instead of failing every request it is sent
+    /// in. `Ok(())` for an engine that declares no layouts, and for a
+    /// protocol with no positional request structs to check.
+    fn check_layouts(_ready: &EngineCoreReadyResponse) -> Result<()> {
+        Ok(())
     }
     /// Decode one output message (frame 0 plus ordered aux frames) into a batch.
     fn decode_batch(frames: &[Bytes]) -> Result<EngineBatch<Self::Output>>;

@@ -12,7 +12,7 @@ use openai_protocol::messages::{
     ToolChoice, ToolReferenceBlock, ToolResultBlock, ToolResultContent, ToolResultContentBlock,
     ToolSearchToolResultBlock, ToolUseBlock, WebSearchToolResultBlock,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use smg_mcp::{McpToolSession, ToolEntry, ToolExecutionInput};
 use tracing::{debug, info, warn};
 
@@ -129,7 +129,9 @@ pub(crate) fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolUseBlock> 
     content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::ToolUse { id, name, input } => Some(ToolUseBlock {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => Some(ToolUseBlock {
                 id: id.clone(),
                 name: name.clone(),
                 input: input.clone(),
@@ -461,7 +463,7 @@ fn convert_tool_entry_to_anthropic_tool(entry: &ToolEntry, defer_loading: bool) 
                 .collect()
         });
 
-    let additional: HashMap<String, Value> = schema_map
+    let additional: Map<String, Value> = schema_map
         .into_iter()
         .filter(|(k, _)| k != "type" && k != "properties" && k != "required")
         .collect();
@@ -480,6 +482,7 @@ fn convert_tool_entry_to_anthropic_tool(entry: &ToolEntry, defer_loading: bool) 
         input_schema,
         defer_loading: defer_loading.then_some(true),
         cache_control: None,
+        extra: Default::default(),
     }
 }
 
@@ -494,7 +497,9 @@ fn build_assistant_content_blocks(content: &[ContentBlock]) -> Vec<InputContentB
                     citations: citations.clone(),
                 }));
             }
-            ContentBlock::ToolUse { id, name, input } => {
+            ContentBlock::ToolUse {
+                id, name, input, ..
+            } => {
                 blocks.push(InputContentBlock::ToolUse(ToolUseBlock {
                     id: id.clone(),
                     name: name.clone(),
@@ -596,5 +601,44 @@ fn extract_output_from_value(output: &Value) -> String {
             .join("\n")
     } else {
         output.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+    use smg_mcp::Tool as McpTool;
+
+    use super::*;
+
+    #[test]
+    fn mcp_tool_schema_keeps_the_servers_key_order() {
+        // More keys than a hash map would keep in order by chance.
+        let names = [
+            "zeta", "alpha", "mu", "beta", "omega", "delta", "kappa", "gamma",
+        ];
+        let properties: Map<String, Value> = names
+            .iter()
+            .map(|name| (name.to_string(), json!({"type": "string"})))
+            .collect();
+        let schema = json!({
+            "type": "object",
+            "properties": properties,
+            "required": ["mu", "alpha"],
+            "title": "Lookup",
+            "additionalProperties": false,
+            "$defs": {}
+        });
+        let tool = McpTool::new(
+            "lookup".to_string(),
+            "look a value up",
+            schema.as_object().unwrap().clone(),
+        );
+        let entry = ToolEntry::from_server_tool("server", tool);
+        let custom = convert_tool_entry_to_anthropic_tool(&entry, false);
+        assert_eq!(
+            serde_json::to_string(&custom.input_schema).unwrap(),
+            serde_json::to_string(&schema).unwrap()
+        );
     }
 }

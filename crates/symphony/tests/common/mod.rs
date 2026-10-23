@@ -1,7 +1,62 @@
 //! Shared by the integration tests: the ways an output is cut into deltas, feeding a parser, and
 //! the output bytes each event accounts for.
 
+use std::path::PathBuf;
+
 use symphony::{EngineFinish, Event, Events, Input, ParseError, Parser};
+
+/// The directory of bellwether's shape patterns in the tree `BELLWETHER_FIXTURES` names: what
+/// Python's `regex` module says about the patterns public response templates write, which
+/// `bellwether patterns` records and `bellwether unpack` writes as `patterns/` beside the models'
+/// sets. None, with the reason printed, when the variable is not set or the pinned commit does not
+/// hold them yet: a test that needs them returns then, and the run says so.
+#[expect(
+    clippy::print_stderr,
+    reason = "the skip notice is test diagnostic output"
+)]
+pub fn patterns() -> Option<PathBuf> {
+    let Some(root) = std::env::var_os("BELLWETHER_FIXTURES").map(PathBuf::from) else {
+        eprintln!(
+            "skipping: BELLWETHER_FIXTURES is not set; point it at the tree `bellwether unpack` writes"
+        );
+        return None;
+    };
+    let dir = root.join("patterns");
+    if !dir.is_dir() {
+        eprintln!(
+            "awaiting fixtures: {} is not in the fixture pin yet (bellwether's shape patterns, \
+             recorded by `bellwether patterns`)",
+            dir.display()
+        );
+        return None;
+    }
+    Some(dir)
+}
+
+/// The number in a call id the engine minted, `call_` and 24 lowercase hex characters; `None` for
+/// an id of any other shape.
+pub fn minted_id(id: &str) -> Option<u128> {
+    let hex = id.strip_prefix("call_")?;
+    if hex.len() != 24
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    u128::from_str_radix(hex, 16).ok()
+}
+
+/// A call id as a replay's record keeps it: a minted id by its shape alone, since the ids count
+/// from a nonce drawn per engine and two replays of one output never share one; any other id as
+/// it is.
+pub fn id_shape(id: &str) -> String {
+    if minted_id(id).is_some() {
+        "call_<24 hex>".to_string()
+    } else {
+        id.to_string()
+    }
+}
 
 /// The ways to replay `text`, each named: whole, character by character, thirty seeded plans of
 /// one to eight characters and, for a text of at most `every_split_up_to` bytes, every two-way
@@ -58,13 +113,13 @@ fn seeded_plans(chars: &[usize]) -> Vec<Vec<usize>> {
 }
 
 /// The output bytes `event` accounts for.
-pub fn bytes_of(event: &Event) -> &str {
+pub fn bytes_of<'a>(event: &'a Event<'_>) -> &'a str {
     match event {
-        Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-        Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
+        Event::Content(t) | Event::Reasoning(t) => &t.text,
+        Event::Dropped { text, .. } | Event::Malformed { text, .. } => &text.text,
         Event::ToolCallStart { source, .. }
         | Event::ToolCallArguments { source, .. }
-        | Event::ToolCallEnd { source, .. } => source.text.as_str(),
+        | Event::ToolCallEnd { source, .. } => &source.text,
         Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
     }
 }
@@ -95,7 +150,7 @@ pub fn replay(
     cuts: &[usize],
     finish: &EngineFinish,
     empty_between: bool,
-) -> Result<Vec<Event>, ParseError> {
+) -> Result<Vec<Event<'static>>, ParseError> {
     replay_after(parser, "", text, cuts, finish, empty_between)
 }
 
@@ -108,7 +163,7 @@ pub fn replay_after(
     cuts: &[usize],
     finish: &EngineFinish,
     empty_between: bool,
-) -> Result<Vec<Event>, ParseError> {
+) -> Result<Vec<Event<'static>>, ParseError> {
     let mut out = Events::new();
     parser.feed(
         Input::Prompt {
@@ -136,5 +191,5 @@ pub fn replay_after(
         },
         &mut out,
     )?;
-    Ok(out.drain())
+    Ok(out.into_owned().drain())
 }

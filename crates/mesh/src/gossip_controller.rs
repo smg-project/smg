@@ -17,15 +17,18 @@
 //!    every outgoing stream (in either direction) consumes.
 //! 4. **Periodic housekeeping**: chunk-assembler GC, retry-manager pruning.
 //!
-//! Per-peer outbound sender tasks also live here. They are spawned by
+//! Per-peer outbound stream tasks also live here. They are spawned by
 //! [`GossipController::event_loop`] when this node initiates a stream to a
 //! peer. The peer's name is captured as a `String` at task-spawn time, so
 //! these senders never need to learn peer identity at runtime — contrast
 //! with the inbound senders in `gossip_service.rs`, which must learn the
-//! counterparty from the first inbound frame.
+//! counterparty from the first inbound frame. What both ends do with an open
+//! stream (the sender's round, the inbound frames) is
+//! [`transport::peer_stream`](crate::transport::peer_stream).
 
 use std::{
     collections::{BTreeMap, HashMap},
+    future::Future,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -38,17 +41,17 @@ use anyhow::Result;
 use parking_lot::RwLock;
 use rand::seq::{IndexedRandom, SliceRandom};
 use tokio::sync::{mpsc, watch, Mutex};
-use tonic::transport::{ClientTlsConfig, Endpoint};
+use tonic::transport::Endpoint;
 use tracing as log;
 use tracing::{instrument, Instrument};
 
 use super::{
-    mtls::MTLSManager,
+    mtls::{tls_server_name, MTLSManager},
     service::{
         broadcast_node_states,
         gossip::{
-            gossip_client::GossipClient, gossip_message, stream_message::Payload as StreamPayload,
-            NodeState, NodeStatus, Ping, PingReq, StateSync, StreamMessage, StreamMessageType,
+            gossip_client::GossipClient, gossip_message, NodeState, NodeStatus, Ping, PingReq,
+            StateSync, StreamMessage,
         },
         try_ping, ClusterState,
     },
@@ -57,16 +60,15 @@ use crate::{
     crdt_kv::CrdtWatermark,
     metrics,
     transport::{
-        crdt_batch::{
-            build_crdt_batches, crdt_ack_to_watermark, dispatch_crdt_batch, wrap_crdt_ack,
-            wrap_crdt_batch,
-        },
-        limits::{MAX_MESSAGE_SIZE, MAX_STREAM_CHUNK_BYTES, STREAM_IDLE_TIMEOUT},
-        sync_stream::{
-            build_heartbeat, build_peer_stream_batches, dispatch_stream_batch, wrap_stream_batch,
-        },
+        limits::MAX_MESSAGE_SIZE,
+        peer_stream::{handle_frame, next_frame, send_round, Frame, RoundOutcome, SenderState},
+        sync_stream::build_heartbeat,
     },
 };
+
+/// The name the configured join peer (`--mesh-peer-urls`) goes by until
+/// its answer names it: in the dial's log lines and in the retry table.
+const INIT_PEER_NAME: &str = "init_peer";
 
 /// The per-node event loop driver. Holds the cluster-state reference,
 /// self-identity, init-peer address, mTLS config, the live set of
@@ -130,137 +132,202 @@ impl GossipController {
 
     #[instrument(fields(name = %self.self_name), skip(self, signal))]
     pub async fn event_loop(self, mut signal: watch::Receiver<bool>) -> Result<()> {
-        let init_state = self.state.clone();
-        let read_state = self.state.clone();
-        let mut cnt: u64 = 0;
-
-        // Track retry managers for each peer
-        use std::collections::HashMap;
+        let mut round: u64 = 0;
         let mut retry_managers: HashMap<String, RetryManager> = HashMap::new();
 
         loop {
-            log::info!("Round {} Status:{:?}", cnt, read_state.read());
-
-            // Clean up finished sync_stream connections
-            {
-                let mut connections = self.sync_connections.lock().await;
-                connections.retain(|peer_name, handle| {
-                    if handle.is_finished() {
-                        log::info!(
-                            "Sync stream connection to {} has finished, removing",
-                            peer_name
-                        );
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
-
-            // Get available peers from cluster state
-            let mut map = init_state.read().clone();
-            map.retain(|k, v| {
-                k.ne(&self.self_name.to_string())
-                    && v.status != NodeStatus::Down as i32
-                    && v.status != NodeStatus::Leaving as i32
-            });
-
-            let peer = if cnt == 0 && map.is_empty() {
-                // Only use init_peer if cluster state is empty (no service discovery)
-                self.init_peer.map(|init_peer| NodeState {
-                    name: "init_peer".to_string(),
-                    address: init_peer.to_string(),
-                    status: NodeStatus::Suspected as i32,
-                    version: 1,
-                    metadata: HashMap::new(),
-                })
-            } else {
-                // Use nodes from cluster state (from service discovery or gossip)
-                let random_nodes = get_random_values_refs(&map, 1);
-                random_nodes.first().map(|&node| node.clone())
-            };
-            cnt += 1;
-
-            // Chunk assembler GC: every 5 rounds (~5s), drop partial
-            // assemblies older than 30s. Partial chunks the receiver has
-            // been holding for a full assembly timeout are assumed lost;
-            // the sender will re-publish on its own retry cycle with a
-            // fresh generation.
-            if cnt.is_multiple_of(5) {
-                if let Some(mesh_kv) = &self.mesh_kv {
-                    mesh_kv.chunk_assembler().gc(Duration::from_secs(30));
-                }
-            }
-
-            // Periodic retry-manager cleanup every 60 rounds (~60s).
-            if cnt.is_multiple_of(60) {
-                retry_managers.retain(|peer_name, _| map.contains_key(peer_name));
-            }
-
-            // Stream round collection: drain stream namespace buffers and
-            // drain callbacks exactly once per round (destructive). Per-peer
-            // senders filter targeted_entries by their own peer_id and
-            // broadcast drain_entries to all peers. Empty batch if no
-            // MeshKV is attached (legacy path pre-Step 3).
-            if let Some(mesh_kv) = &self.mesh_kv {
-                let stream_batch = mesh_kv.collect_round_batch();
-                *self.current_stream_batch.write() = Arc::new(stream_batch);
-            }
+            log::info!("Round {} Status:{:?}", round, self.state.read());
+            self.reap_finished_streams().await;
+            let targets = self.probe_targets();
+            let peer = self.peer_to_dial(&targets);
+            round += 1;
+            self.periodic_gc(round, &targets, &mut retry_managers);
+            self.collect_stream_batch();
 
             tokio::select! {
-
                 _ = signal.changed() => {
                     log::info!("Gossip app_server {} at {} is shutting down", self.self_name, self.self_addr);
                     break;
                 }
 
                 () = tokio::time::sleep(Duration::from_secs(1)) => {
-                    if let Some(peer) = peer {
-                        let peer_name = peer.name.clone();
-
-                        // Get or create retry manager for this peer
-                        let retry_manager = retry_managers
-                            .entry(peer_name.clone())
-                            .or_default();
-
-                        // Check if we should retry based on backoff
-                        if retry_manager.should_retry() {
-                            match self.connect_to_peer(peer.clone()).await {
-                                Ok(()) => {
-                                    // Success - reset retry state
-                                    retry_manager.reset();
-                                    log::info!("Successfully connected to peer {}", peer_name);
-                                }
-                                Err(e) => {
-                                    // Failure - record attempt and calculate next delay
-                                    retry_manager.record_attempt();
-                                    let next_delay = retry_manager.next_delay();
-                                    let attempt = retry_manager.attempt_count();
-                                    log::warn!(
-                                        "Error connecting to peer {} (attempt {}): {}. Next retry in {:?}",
-                                        peer_name,
-                                        attempt,
-                                        e,
-                                        next_delay
-                                    );
-                                }
-                            }
-                        } else {
-                            // Still in backoff period, skip this attempt
-                            let next_delay = retry_manager.next_delay();
+                    let Some(peer) = peer else {
+                        log::info!("No peer address available to connect");
+                        continue;
+                    };
+                    let outcome = Self::dial_with_backoff(
+                        &mut retry_managers,
+                        &peer,
+                        |peer| self.connect_to_peer(peer),
+                        || self.has_another_member(),
+                    )
+                    .await;
+                    match outcome {
+                        DialOutcome::Connected => {
+                            log::info!("Successfully connected to peer {}", peer.name);
+                        }
+                        DialOutcome::JoinPeerAlone { next_delay } => {
                             log::debug!(
-                                "Skipping connection to peer {} (backoff: {:?} remaining)",
-                                peer_name,
+                                "The join peer answered but the table has nobody else to probe; next dial in {:?}",
                                 next_delay
                             );
                         }
-                    } else {
-                        log::info!("No peer address available to connect");
+                        DialOutcome::Failed {
+                            error,
+                            attempt,
+                            next_delay,
+                        } => {
+                            log::warn!(
+                                "Error connecting to peer {} (attempt {}): {}. Next retry in {:?}",
+                                peer.name,
+                                attempt,
+                                error,
+                                next_delay
+                            );
+                        }
+                        DialOutcome::BackingOff { next_delay } => {
+                            log::debug!(
+                                "Skipping connection to peer {} (backoff: {:?} remaining)",
+                                peer.name,
+                                next_delay
+                            );
+                        }
                     }
                 }
             }
         }
         Ok(())
+    }
+
+    // ---- The round's phases ----
+
+    /// Drop the handles of sync-stream tasks that have ended, so a peer whose
+    /// stream closed is dialled again.
+    async fn reap_finished_streams(&self) {
+        let mut connections = self.sync_connections.lock().await;
+        connections.retain(|peer_name, handle| {
+            if handle.is_finished() {
+                log::info!(
+                    "Sync stream connection to {} has finished, removing",
+                    peer_name
+                );
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// The members this round may dial: the table without this node and
+    /// without the members marked Down or Leaving (see `is_probe_target`).
+    fn probe_targets(&self) -> BTreeMap<String, NodeState> {
+        let mut targets = self.state.read().clone();
+        targets.retain(|name, node| self.is_probe_target(name, node));
+        targets
+    }
+
+    /// The peer this round dials: a random probe target, or, while the table
+    /// holds nobody else, the configured join peer as a Suspected placeholder
+    /// named `init_peer`: at the start, and again should every other member
+    /// be gone, under its backoff like any peer. Members a service discovery
+    /// wrote into the table take precedence.
+    fn peer_to_dial(&self, targets: &BTreeMap<String, NodeState>) -> Option<NodeState> {
+        if targets.is_empty() {
+            return self.init_peer.map(|init_peer| NodeState {
+                name: INIT_PEER_NAME.to_string(),
+                address: init_peer.to_string(),
+                status: NodeStatus::Suspected as i32,
+                version: 1,
+                metadata: HashMap::new(),
+            });
+        }
+        let random_nodes = get_random_values_refs(targets, 1);
+        random_nodes.first().map(|&node| node.clone())
+    }
+
+    /// The round's housekeeping. Every fifth round (~5 s) the chunk
+    /// assembler drops partial assemblies older than 30 s: partial chunks
+    /// the receiver has held for a full assembly timeout are assumed lost,
+    /// and the sender re-publishes on its own retry cycle with a fresh
+    /// generation. Every sixtieth round (~60 s) the retry managers of peers
+    /// no longer in the table go; the join peer's entry stays, as it is never
+    /// in the table under its placeholder name and its backoff must not
+    /// restart every minute.
+    fn periodic_gc(
+        &self,
+        round: u64,
+        targets: &BTreeMap<String, NodeState>,
+        retry_managers: &mut HashMap<String, RetryManager>,
+    ) {
+        if round.is_multiple_of(5) {
+            if let Some(mesh_kv) = &self.mesh_kv {
+                mesh_kv.chunk_assembler().gc(Duration::from_secs(30));
+            }
+        }
+        if round.is_multiple_of(60) {
+            retry_managers.retain(|peer_name, _| {
+                targets.contains_key(peer_name) || peer_name == INIT_PEER_NAME
+            });
+        }
+    }
+
+    /// Stream round collection: drain the stream namespace buffers and the
+    /// drain callbacks exactly once per round (destructive) into the slot
+    /// the per-peer senders read. Per-peer senders filter the targeted
+    /// entries by their own peer id and broadcast the drained entries to all
+    /// peers. Nothing is collected without a MeshKV attached.
+    fn collect_stream_batch(&self) {
+        if let Some(mesh_kv) = &self.mesh_kv {
+            let stream_batch = mesh_kv.collect_round_batch();
+            *self.current_stream_batch.write() = Arc::new(stream_batch);
+        }
+    }
+
+    /// One dial of `peer` under its retry manager's backoff: nothing is
+    /// dialled while the manager still backs off from an earlier failure;
+    /// otherwise `connect` runs. Its success resets the manager, unless the
+    /// peer is the join peer and `has_another_member` finds the table still
+    /// without a member to probe (the join peer is this node itself, or it
+    /// is leaving): that counts as an attempt, so the next dial waits out
+    /// the backoff instead of coming every round. A failure records the
+    /// attempt and lengthens the next wait. The outcome is what the round
+    /// logs.
+    async fn dial_with_backoff<F, Fut>(
+        retry_managers: &mut HashMap<String, RetryManager>,
+        peer: &NodeState,
+        connect: F,
+        has_another_member: impl FnOnce() -> bool,
+    ) -> DialOutcome
+    where
+        F: FnOnce(NodeState) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        let retry_manager = retry_managers.entry(peer.name.clone()).or_default();
+        if !retry_manager.should_retry() {
+            return DialOutcome::BackingOff {
+                next_delay: retry_manager.next_delay(),
+            };
+        }
+        match connect(peer.clone()).await {
+            Ok(()) if peer.name == INIT_PEER_NAME && !has_another_member() => {
+                retry_manager.record_attempt();
+                DialOutcome::JoinPeerAlone {
+                    next_delay: retry_manager.next_delay(),
+                }
+            }
+            Ok(()) => {
+                retry_manager.reset();
+                DialOutcome::Connected
+            }
+            Err(error) => {
+                retry_manager.record_attempt();
+                DialOutcome::Failed {
+                    error,
+                    attempt: retry_manager.attempt_count(),
+                    next_delay: retry_manager.next_delay(),
+                }
+            }
+        }
     }
 
     async fn connect_to_peer(&self, peer: NodeState) -> Result<()> {
@@ -386,6 +453,7 @@ impl GossipController {
                             vec![unreachable_node],
                             target_nodes,
                             None, // Use default timeout
+                            self.mtls_manager.clone(),
                         )
                         .await;
 
@@ -405,6 +473,22 @@ impl GossipController {
         log::info!("Successfully connected to peer {}", peer_addr);
 
         Ok(())
+    }
+
+    /// Whether `node` is one to probe: another node, neither `Down` nor
+    /// `Leaving`.
+    fn is_probe_target(&self, name: &str, node: &NodeState) -> bool {
+        name != self.self_name
+            && node.status != NodeStatus::Down as i32
+            && node.status != NodeStatus::Leaving as i32
+    }
+
+    /// Whether the membership table holds a node to probe.
+    fn has_another_member(&self) -> bool {
+        self.state
+            .read()
+            .iter()
+            .any(|(name, node)| self.is_probe_target(name, node))
     }
 
     /// Determine if this node should initiate sync_stream connection
@@ -440,8 +524,6 @@ impl GossipController {
         #[expect(clippy::disallowed_methods, reason = "handle is returned to caller (spawn_sync_stream_handler) and stored in sync_connections map for lifecycle tracking")]
         tokio::spawn(
             async move {
-                use tokio_stream::StreamExt;
-
                 // Log active connection count at handler start
                 let active_connections = sync_connections.lock().await.len();
                 log::debug!(
@@ -450,11 +532,12 @@ impl GossipController {
                     "Sync stream handler started"
                 );
 
+                // This end's frame counter: every frame sent or received
+                // advances it.
                 let sequence = Arc::new(AtomicU64::new(0));
 
                 // Per-peer CRDT send watermark (per-key acked versions). The
-                // incremental sender filters by it; the inbound loop advances it
-                // on CrdtAck and emits acks for received batches.
+                // sender filters by it; the inbound loop advances it on CrdtAck.
                 let acked: Arc<RwLock<CrdtWatermark>> =
                     Arc::new(RwLock::new(CrdtWatermark::new()));
 
@@ -466,7 +549,9 @@ impl GossipController {
                     return;
                 }
 
-                // Spawn a task to periodically broadcast v2 stream batches.
+                // The periodic sender: the shared round every second, with
+                // this end's round metrics around it. The peer is known from
+                // the start, so every round can carry its targeted entries.
                 let incremental_sender_handle = {
                     let tx_incremental = tx.clone();
                     let self_name_incremental = self_name.clone();
@@ -478,95 +563,28 @@ impl GossipController {
                     #[expect(clippy::disallowed_methods, reason = "incremental sender handle is stored and aborted when the parent sync_stream handler exits")]
                     tokio::spawn(async move {
                         let mut interval = tokio::time::interval(Duration::from_secs(1));
-                        // Skip re-emission of an unchanged stream batch (main
-                        // loop hasn't collected a new one since last tick).
-                        let mut last_stream_batch: Option<Arc<crate::kv::RoundBatch>> = None;
+                        let mut sender = SenderState::default();
 
                         loop {
                             interval.tick().await;
 
                             let round_start = Instant::now();
-
-                            // Stream batches: drain-portion (broadcast) +
-                            // targeted entries addressed to this peer. On
-                            // channel full, the round's stream traffic for
-                            // this peer is dropped — no retry (at-most-once).
-                            // Application regenerates on its own retry cycle.
                             let stream_batch = stream_batch_handle.read().clone();
-                            let fresh_batch = last_stream_batch
-                                .as_ref()
-                                .is_none_or(|last| !Arc::ptr_eq(last, &stream_batch));
-                            if fresh_batch {
-                                last_stream_batch = Some(stream_batch.clone());
-                                for batch in build_peer_stream_batches(
-                                    &stream_batch,
-                                    &peer_name_incremental,
-                                ) {
-                                    let msg = wrap_stream_batch(
-                                        batch,
-                                        shared_sequence.fetch_add(1, Ordering::Relaxed),
-                                        &self_name_incremental,
-                                    );
-                                    match tx_incremental.try_send(msg) {
-                                        Ok(()) => {}
-                                        Err(mpsc::error::TrySendError::Full(_)) => {
-                                            log::debug!(
-                                                peer = %peer_name_incremental,
-                                                "stream batch dropped on backpressure"
-                                            );
-                                            // TODO(metrics): bump
-                                            // stream_dropped_on_backpressure
-                                            break;
-                                        }
-                                        Err(mpsc::error::TrySendError::Closed(_)) => {
-                                            log::warn!(
-                                                peer = %peer_name_incremental,
-                                                "stream sender: channel closed, stopping"
-                                            );
-                                            return;
-                                        }
-                                    }
-                                }
-                            }
-
-                            // CRDT op-log: evaluated every tick (acks shrink the
-                            // delta even when the stream batch is unchanged).
-                            // Send only ops this peer has not acked; the
-                            // watermark advances solely on CrdtAck, so unacked
-                            // keys retry next round.
-                            let crdt_ops: Vec<_> = {
-                                let acked = acked_incremental.read();
-                                stream_batch
-                                    .crdt_ops
-                                    .operations()
-                                    .iter()
-                                    .filter(|op| acked.allows(op))
-                                    .cloned()
-                                    .collect()
-                            };
-                            for crdt_batch in build_crdt_batches(&crdt_ops, MAX_STREAM_CHUNK_BYTES) {
-                                let msg = wrap_crdt_batch(
-                                    crdt_batch,
-                                    shared_sequence.fetch_add(1, Ordering::Relaxed),
-                                    &self_name_incremental,
+                            let outcome = send_round(
+                                &mut sender,
+                                &stream_batch,
+                                Some(&peer_name_incremental),
+                                &acked_incremental,
+                                &self_name_incremental,
+                                &mut || shared_sequence.fetch_add(1, Ordering::Relaxed),
+                                &tx_incremental,
+                            );
+                            if outcome == RoundOutcome::Closed {
+                                log::warn!(
+                                    peer = %peer_name_incremental,
+                                    "stream sender: channel closed, stopping"
                                 );
-                                match tx_incremental.try_send(msg) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Full(_)) => {
-                                        log::debug!(
-                                            peer = %peer_name_incremental,
-                                            "crdt batch dropped on backpressure"
-                                        );
-                                        break;
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => {
-                                        log::warn!(
-                                            peer = %peer_name_incremental,
-                                            "crdt sender: channel closed, stopping"
-                                        );
-                                        return;
-                                    }
-                                }
+                                return;
                             }
 
                             let round_elapsed = round_start.elapsed();
@@ -586,98 +604,27 @@ impl GossipController {
                 };
 
                 // Handle incoming messages
-                loop {
-                    match tokio::time::timeout(STREAM_IDLE_TIMEOUT, incoming_stream.next()).await {
-                        Ok(Some(Ok(msg))) => {
-                            sequence.fetch_add(1, Ordering::Relaxed);
-
-                            match msg.message_type() {
-                                StreamMessageType::Heartbeat => {
-                                    log::trace!("Received heartbeat from {}", peer_name);
-                                    let heartbeat = build_heartbeat(
-                                        sequence.fetch_add(1, Ordering::Relaxed),
-                                        &self_name,
-                                    );
-                                    if tx.send(heartbeat).await.is_err() {
-                                        log::warn!("Failed to send heartbeat to {}", peer_name);
-                                        break;
-                                    }
-                                }
-                                StreamMessageType::Ack => {
-                                    log::trace!(
-                                        "Received ACK from {} (seq: {})",
-                                        peer_name,
-                                        msg.sequence
-                                    );
-                                }
-                                StreamMessageType::Nack => {
-                                    log::warn!(
-                                        "Received NACK from {} (seq: {})",
-                                        peer_name,
-                                        msg.sequence
-                                    );
-                                }
-                                StreamMessageType::IncrementalUpdate
-                                | StreamMessageType::SnapshotRequest
-                                | StreamMessageType::SnapshotChunk
-                                | StreamMessageType::SnapshotComplete => {
-                                    log::debug!(
-                                        peer = %peer_name,
-                                        message_type = ?msg.message_type(),
-                                        "ignoring v1 wire message (state-sync removed)",
-                                    );
-                                }
-                                StreamMessageType::StreamBatch => {
-                                    if let Some(mesh_kv) = &mesh_kv {
-                                        if let Some(StreamPayload::StreamBatch(batch)) =
-                                            msg.payload
-                                        {
-                                            dispatch_stream_batch(
-                                                mesh_kv,
-                                                &msg.peer_id,
-                                                batch.entries,
-                                            );
-                                        }
-                                    }
-                                }
-                                StreamMessageType::CrdtBatch => {
-                                    if let Some(mesh_kv) = &mesh_kv {
-                                        if let Some(StreamPayload::CrdtBatch(batch)) = msg.payload {
-                                            // Merge, then ack the per-key
-                                            // versions so the peer can advance
-                                            // its send watermark. Ack loss is
-                                            // fine (peer resends), so drop on a
-                                            // full channel rather than block.
-                                            let ack = dispatch_crdt_batch(mesh_kv, batch);
-                                            if !ack.is_empty() {
-                                                let _ = tx.try_send(wrap_crdt_ack(
-                                                    &ack,
-                                                    sequence.fetch_add(1, Ordering::Relaxed),
-                                                    &self_name,
-                                                ));
-                                            }
-                                        }
-                                    }
-                                }
-                                // CRDT delivery ack: advance this peer's send watermark.
-                                StreamMessageType::CrdtAck => {
-                                    if let Some(StreamPayload::CrdtAck(ack)) = msg.payload {
-                                        acked.write().merge_max(&crdt_ack_to_watermark(ack));
-                                    }
-                                }
-                            }
+                while let Some(msg) = next_frame(&mut incoming_stream, &peer_name).await {
+                    sequence.fetch_add(1, Ordering::Relaxed);
+                    let frame = handle_frame(
+                        msg,
+                        &peer_name,
+                        &self_name,
+                        mesh_kv.as_deref(),
+                        &acked,
+                        &mut || sequence.fetch_add(1, Ordering::Relaxed),
+                        &tx,
+                    )
+                    .await;
+                    match frame {
+                        Frame::Continue => {}
+                        Frame::Ack { sequence, .. } => {
+                            log::trace!("Received ACK from {} (seq: {})", peer_name, sequence);
                         }
-                        Ok(Some(Err(e))) => {
-                            log::error!("Error receiving from sync_stream with {}: {}", peer_name, e);
-                            break;
+                        Frame::Nack { sequence } => {
+                            log::warn!("Received NACK from {} (seq: {})", peer_name, sequence);
                         }
-                        Ok(None) => break,
-                        Err(_) => {
-                            log::warn!(
-                                "sync_stream to {peer_name} idle timeout ({STREAM_IDLE_TIMEOUT:?}) — closing"
-                            );
-                            break;
-                        }
+                        Frame::Closed => break,
                     }
                 }
 
@@ -733,22 +680,16 @@ impl GossipController {
             .map_err(|e| anyhow::anyhow!("Invalid peer endpoint {connect_url}: {e}"))?;
 
         if let Some(mtls_manager) = self.mtls_manager.clone() {
-            let tls_domain = endpoint
-                .uri()
-                .host()
-                .map(str::to_owned)
-                .unwrap_or_else(|| peer_name.clone());
-            let ca_certificate = mtls_manager
-                .load_ca_certificate()
+            let tls_domain = endpoint.uri().host().map_or_else(
+                || peer_name.clone(),
+                |host| tls_server_name(host).to_owned(),
+            );
+            let tls = mtls_manager
+                .client_tls_config(&tls_domain)
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to load mTLS CA certificate: {e}"))?;
-
+                .map_err(|e| anyhow::anyhow!("Failed to load the mTLS identity: {e}"))?;
             endpoint = endpoint
-                .tls_config(
-                    ClientTlsConfig::new()
-                        .domain_name(tls_domain)
-                        .ca_certificate(ca_certificate),
-                )
+                .tls_config(tls)
                 .map_err(|e| anyhow::anyhow!("Failed to configure TLS endpoint: {e}"))?;
         }
 
@@ -808,6 +749,28 @@ fn get_random_values_refs<K, V>(map: &BTreeMap<K, V>, k: usize) -> Vec<&V> {
     let mut rng = rand::rng();
 
     values.sample(&mut rng, k).copied().collect()
+}
+
+/// What one round's dial of a peer came to (see
+/// `GossipController::dial_with_backoff`).
+#[derive(Debug)]
+enum DialOutcome {
+    /// The peer answered; its retry state is reset.
+    Connected,
+    /// The join peer answered but added no member to probe; the attempt is
+    /// recorded and the next dial waits `next_delay`.
+    JoinPeerAlone { next_delay: Duration },
+    /// The dial failed; the attempt is recorded and the next one waits
+    /// `next_delay`.
+    Failed {
+        error: anyhow::Error,
+        attempt: u32,
+        next_delay: Duration,
+    },
+    /// Still inside the backoff of an earlier failure; nothing was dialled.
+    /// `next_delay` is the slot's whole wait, not what is left of it (the
+    /// round's line has always reported it as the backoff remaining).
+    BackingOff { next_delay: Duration },
 }
 
 /// Exponential backoff calculator used by the per-peer reconnect loop.
@@ -939,5 +902,200 @@ mod retry_manager_tests {
     fn should_retry_before_any_attempt() {
         let mgr = RetryManager::default();
         assert!(mgr.should_retry());
+    }
+}
+
+#[cfg(test)]
+mod dial_tests {
+    use std::{
+        collections::HashMap,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::{Duration, Instant},
+    };
+
+    use super::{
+        DialOutcome, GossipController, NodeState, NodeStatus, RetryManager, INIT_PEER_NAME,
+    };
+
+    fn node(name: &str) -> NodeState {
+        NodeState {
+            name: name.to_string(),
+            address: "127.0.0.1:1".to_string(),
+            status: NodeStatus::Alive as i32,
+            version: 1,
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// A connect that answers or refuses, counting its calls.
+    fn connect(
+        calls: &Arc<AtomicUsize>,
+        answer: bool,
+    ) -> impl FnOnce(NodeState) -> std::future::Ready<anyhow::Result<()>> {
+        let calls = Arc::clone(calls);
+        move |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            std::future::ready(if answer {
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("refused"))
+            })
+        }
+    }
+
+    /// A member answering resets its retry state; a failure records the
+    /// attempt and backs off; a dial inside that backoff runs no connect at
+    /// all; the backoff over, the next dial runs and its success starts the
+    /// peer afresh.
+    #[tokio::test]
+    async fn a_dial_connects_fails_or_backs_off_and_the_retry_state_follows() {
+        let mut retry_managers: HashMap<String, RetryManager> = HashMap::new();
+        let peer = node("peer-a");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let member_present = || true;
+
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &peer,
+            connect(&calls, true),
+            member_present,
+        )
+        .await;
+        assert!(matches!(outcome, DialOutcome::Connected), "{outcome:?}");
+        assert_eq!(retry_managers["peer-a"].attempt_count(), 0);
+
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &peer,
+            connect(&calls, false),
+            member_present,
+        )
+        .await;
+        match outcome {
+            DialOutcome::Failed {
+                attempt,
+                next_delay,
+                ..
+            } => {
+                assert_eq!(attempt, 1);
+                assert_eq!(next_delay, Duration::from_secs(1));
+            }
+            other => panic!("expected a failure, got {other:?}"),
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &peer,
+            connect(&calls, true),
+            member_present,
+        )
+        .await;
+        assert!(
+            matches!(outcome, DialOutcome::BackingOff { next_delay } if next_delay == Duration::from_secs(1)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "a dial in backoff runs no connect"
+        );
+        assert_eq!(retry_managers["peer-a"].attempt_count(), 1);
+
+        retry_managers.get_mut("peer-a").unwrap().last_attempt =
+            Some(Instant::now() - Duration::from_secs(2));
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &peer,
+            connect(&calls, true),
+            member_present,
+        )
+        .await;
+        assert!(matches!(outcome, DialOutcome::Connected), "{outcome:?}");
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        assert_eq!(retry_managers["peer-a"].attempt_count(), 0);
+        assert!(retry_managers["peer-a"].should_retry());
+    }
+
+    /// The join peer answering with nobody else in the table counts as an
+    /// attempt (the next dial waits out the backoff); answering with a
+    /// member in the table is a connection like any other.
+    #[tokio::test]
+    async fn the_join_peer_answering_alone_records_an_attempt() {
+        let mut retry_managers: HashMap<String, RetryManager> = HashMap::new();
+        let join_peer = node(INIT_PEER_NAME);
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &join_peer,
+            connect(&calls, true),
+            || false,
+        )
+        .await;
+        assert!(
+            matches!(outcome, DialOutcome::JoinPeerAlone { next_delay } if next_delay == Duration::from_secs(1)),
+            "{outcome:?}"
+        );
+        assert_eq!(retry_managers[INIT_PEER_NAME].attempt_count(), 1);
+        assert!(!retry_managers[INIT_PEER_NAME].should_retry());
+
+        retry_managers.get_mut(INIT_PEER_NAME).unwrap().last_attempt =
+            Some(Instant::now() - Duration::from_secs(2));
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &join_peer,
+            connect(&calls, true),
+            || true,
+        )
+        .await;
+        assert!(matches!(outcome, DialOutcome::Connected), "{outcome:?}");
+        assert_eq!(retry_managers[INIT_PEER_NAME].attempt_count(), 0);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// Two failures in a row double the wait, and each peer keeps its own
+    /// retry state.
+    #[tokio::test]
+    async fn repeated_failures_lengthen_the_wait_per_peer() {
+        let mut retry_managers: HashMap<String, RetryManager> = HashMap::new();
+        let peer_a = node("peer-a");
+        let peer_b = node("peer-b");
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &peer_a,
+            connect(&calls, false),
+            || true,
+        )
+        .await;
+        retry_managers.get_mut("peer-a").unwrap().last_attempt =
+            Some(Instant::now() - Duration::from_secs(5));
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &peer_a,
+            connect(&calls, false),
+            || true,
+        )
+        .await;
+        assert!(
+            matches!(outcome, DialOutcome::Failed { attempt: 2, next_delay, .. } if next_delay == Duration::from_secs(2)),
+            "{outcome:?}"
+        );
+
+        let outcome = GossipController::dial_with_backoff(
+            &mut retry_managers,
+            &peer_b,
+            connect(&calls, true),
+            || true,
+        )
+        .await;
+        assert!(matches!(outcome, DialOutcome::Connected), "{outcome:?}");
+        assert_eq!(retry_managers["peer-b"].attempt_count(), 0);
+        assert_eq!(retry_managers["peer-a"].attempt_count(), 2);
     }
 }

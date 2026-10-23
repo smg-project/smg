@@ -309,11 +309,11 @@ impl std::str::FromStr for RuntimeType {
 ///
 /// Different providers have different API formats and requirements.
 /// `None` (when used as `Option<ProviderType>`) means native/passthrough —
-/// no transformation needed (local SGLang backends).
+/// no transformation needed (local engine backends).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderType {
-    /// OpenAI API — strip SGLang-specific fields.
+    /// OpenAI API — strip the engine-specific fields.
     #[serde(alias = "openai")]
     OpenAI,
     /// xAI/Grok — special handling for input items.
@@ -596,6 +596,69 @@ impl JsonSchema for WorkerModels {
     }
 }
 
+/// When the gateway hands a worker's engine a grammar: only when the request
+/// asks for one (a forced tool choice or a JSON response format), which every
+/// worker does unless told otherwise, or on every turn, for a model trained
+/// to be read through one. Set on the worker spec, as the `constrained_decoding`
+/// worker label, or reported by the engine's servicer in server info; the spec
+/// wins over the labels, and a configured label over a discovered one
+/// ([`ConstrainedDecoding::of`]).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ConstrainedDecoding {
+    /// A grammar only when the request asks for one.
+    #[default]
+    Requested,
+    /// A grammar on every turn.
+    Always,
+}
+
+impl ConstrainedDecoding {
+    /// The worker label that carries the policy when it is not on the spec.
+    pub const LABEL: &'static str = "constrained_decoding";
+    /// The label's value for [`Self::Requested`].
+    pub const REQUESTED: &'static str = "requested";
+    /// The label's value for [`Self::Always`].
+    pub const ALWAYS: &'static str = "always";
+
+    /// The policy a label value names, or why it names none.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim() {
+            Self::REQUESTED => Ok(Self::Requested),
+            Self::ALWAYS => Ok(Self::Always),
+            other => Err(format!(
+                "constrained_decoding must be '{}' or '{}', not '{other}'",
+                Self::REQUESTED,
+                Self::ALWAYS
+            )),
+        }
+    }
+
+    /// The policy a worker's `constrained_decoding` label names; anything
+    /// else, the label's absence included, is [`Self::Requested`].
+    pub fn from_label(value: Option<&str>) -> Self {
+        value
+            .and_then(|value| Self::parse(value).ok())
+            .unwrap_or_default()
+    }
+
+    /// The label value for the policy.
+    pub fn as_label(self) -> &'static str {
+        match self {
+            Self::Requested => Self::REQUESTED,
+            Self::Always => Self::ALWAYS,
+        }
+    }
+
+    /// A worker's policy: the spec's when set, else its label's.
+    pub fn of(spec: &WorkerSpec) -> Self {
+        spec.constrained_decoding
+            .unwrap_or_else(|| Self::from_label(spec.labels.get(Self::LABEL).map(String::as_str)))
+    }
+}
+
 // ── Core identity ────────────────────────────────────────────────────
 
 /// Core worker identity and configuration.
@@ -677,13 +740,13 @@ pub struct WorkerSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_role: Option<String>,
 
-    /// KV transfer engine id (vLLM `kv_transfer_config.engine_id`; Mooncake PD).
+    /// KV transfer engine id (the engine's `kv_transfer_config.engine_id`; Mooncake PD).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_engine_id: Option<String>,
 
     /// KV cache block size (tokens per block) for event-driven routing.
     /// When set, overrides the router-level default for this worker's model.
-    /// Typically matches the backend engine's page size (e.g. 16 for SGLang).
+    /// Typically matches the backend engine's page size (e.g. 16 for one of the engines).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kv_block_size: Option<usize>,
     /// Explicit PD pairing protocol. A prefill and a decode with this set
@@ -696,6 +759,13 @@ pub struct WorkerSpec {
     /// descriptor from the worker's discovered labels.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pairing_protocol: Option<String>,
+    /// When the gateway hands this worker's engine a grammar: `always` for a
+    /// model read through one on every turn, `requested` (the default) for a
+    /// grammar only when the request asks. The same value can arrive as a
+    /// `constrained_decoding` worker label or from the engine's servicer in
+    /// server info; this field wins ([`ConstrainedDecoding::of`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constrained_decoding: Option<ConstrainedDecoding>,
 
     /// Per-worker health check overrides (partial — only `Some` fields override router defaults).
     #[serde(default, skip_serializing_if = "HealthCheckUpdate::is_empty")]
@@ -769,6 +839,7 @@ impl WorkerSpec {
             kv_engine_id: None,
             kv_block_size: None,
             pairing_protocol: None,
+            constrained_decoding: None,
             health: HealthCheckUpdate::default(),
             http_pool: HttpPoolConfig::default(),
             resilience: ResilienceUpdate::default(),
@@ -841,12 +912,14 @@ impl std::str::FromStr for TransportMode {
     }
 }
 
-/// Where media is fetched and preprocessed for vLLM gRPC workers.
+/// Where media is fetched and preprocessed for one engine's gRPC workers.
 ///
 /// - `Auto`: forward media references when every worker serving the model
 ///   advertises worker-side processing; otherwise preprocess on the router.
 /// - `Router`: always preprocess on the router (kill switch).
-/// - `Worker`: always forward references; fail when no capable worker exists.
+/// - `Worker`: forward references; a request carrying per-item hints is
+///   preprocessed on the router, which applies them; fail when no capable
+///   worker exists.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize, schemars::JsonSchema,
 )]
@@ -1108,7 +1181,9 @@ impl HealthCheckUpdate {
 /// Per-worker HTTP connection configuration.
 /// All fields optional — `None` means "use router/global default".
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema,
+)]
 pub struct HttpPoolConfig {
     /// Max idle connections per host (default: 500).
     pub pool_max_idle_per_host: Option<usize>,
@@ -1342,7 +1417,7 @@ pub struct StopProfileRequest {
 
 /// Per-DP-rank load snapshot from a backend.
 ///
-/// Contains core metrics from the sglang `/v1/loads` endpoint or `GetLoads` gRPC RPC.
+/// Contains core metrics from the engine's `/v1/loads` endpoint or the `GetLoads` gRPC RPC.
 /// Each snapshot represents one data-parallel rank's scheduler state.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
@@ -1365,6 +1440,10 @@ pub struct SchedulerLoadSnapshot {
     pub max_total_num_tokens: i32,
     /// Token usage ratio (0.0–1.0).
     pub token_usage: f64,
+    /// Non-evictable KV occupancy, excluding retained, reclaimable prefix cache.
+    /// Older backends omit this; pressure then uses their legacy token usage.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_token_usage: Option<f64>,
     pub gen_throughput: f64,
     pub cache_hit_rate: f64,
     pub utilization: f64,
@@ -1375,7 +1454,7 @@ pub struct SchedulerLoadSnapshot {
     pub queues: Option<EngineQueueMetricsSnapshot>,
     /// PD disaggregation signals, populated only when the backend reports a
     /// `disagg` section. `None` for HTTP or older engines. Canonical schema
-    /// other engines map into; SGLang derives the queue depths from its
+    /// other engines map into; one engine derives the queue depths from its
     /// per-stage DisaggregationMetrics counters.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kv_transfer_latency_ms: Option<f64>,
@@ -1481,6 +1560,18 @@ impl WorkerLoadResponse {
         self.loads.iter().map(|l| l.token_usage).sum::<f64>() / self.loads.len() as f64
     }
 
+    /// Average non-evictable KV pressure, with the legacy fallback per rank.
+    pub fn effective_kv_pressure(&self) -> f64 {
+        if self.loads.is_empty() {
+            return 0.0;
+        }
+        self.loads
+            .iter()
+            .map(|load| load.active_token_usage.unwrap_or(load.token_usage))
+            .sum::<f64>()
+            / self.loads.len() as f64
+    }
+
     /// Total used tokens summed across all DP ranks.
     pub fn total_used_tokens(&self) -> i64 {
         self.loads.iter().map(|l| l.num_used_tokens as i64).sum()
@@ -1507,6 +1598,11 @@ impl WorkerLoadResponse {
             .iter()
             .map(|l| l.num_waiting_uncached_tokens as i64)
             .sum()
+    }
+
+    /// Total running requests summed across all DP ranks.
+    pub fn total_running_reqs(&self) -> i64 {
+        self.loads.iter().map(|l| l.num_running_reqs as i64).sum()
     }
 
     /// Total waiting (queued) requests summed across all DP ranks.
@@ -1897,5 +1993,78 @@ mod aggregate_rollup_tests {
 
         assert_eq!(aggregate.total_running_reqs, i32::MAX);
         assert_eq!(aggregate.total_reqs, i32::MAX);
+    }
+}
+
+#[cfg(test)]
+mod constrained_decoding_tests {
+    use super::*;
+
+    /// A label names one of the two policies or nothing; the spec's typed
+    /// value wins over the label; absent everywhere, a worker is `requested`.
+    #[test]
+    fn constrained_decoding_resolves_spec_then_label() {
+        assert_eq!(
+            ConstrainedDecoding::parse("always"),
+            Ok(ConstrainedDecoding::Always)
+        );
+        assert_eq!(
+            ConstrainedDecoding::parse(" requested "),
+            Ok(ConstrainedDecoding::Requested)
+        );
+        assert!(ConstrainedDecoding::parse("sometimes")
+            .unwrap_err()
+            .contains("'requested' or 'always'"));
+        assert_eq!(
+            ConstrainedDecoding::from_label(None),
+            ConstrainedDecoding::Requested
+        );
+        assert_eq!(
+            ConstrainedDecoding::from_label(Some("always")),
+            ConstrainedDecoding::Always
+        );
+        assert_eq!(
+            ConstrainedDecoding::from_label(Some("sometimes")),
+            ConstrainedDecoding::Requested
+        );
+        assert_eq!(ConstrainedDecoding::Always.as_label(), "always");
+
+        let mut spec = WorkerSpec::new("http://w:8000");
+        assert_eq!(
+            ConstrainedDecoding::of(&spec),
+            ConstrainedDecoding::Requested
+        );
+        spec.labels
+            .insert(ConstrainedDecoding::LABEL.to_string(), "always".to_string());
+        assert_eq!(ConstrainedDecoding::of(&spec), ConstrainedDecoding::Always);
+        spec.constrained_decoding = Some(ConstrainedDecoding::Requested);
+        assert_eq!(
+            ConstrainedDecoding::of(&spec),
+            ConstrainedDecoding::Requested
+        );
+    }
+
+    /// The spec field round-trips through JSON in the label's spelling and is
+    /// left out when unset.
+    #[test]
+    fn constrained_decoding_serializes_as_its_label_value() {
+        let mut spec = WorkerSpec::new("http://w:8000");
+        assert!(!serde_json::to_string(&spec)
+            .unwrap()
+            .contains("constrained_decoding"));
+        spec.constrained_decoding = Some(ConstrainedDecoding::Always);
+        let json = serde_json::to_value(&spec).unwrap();
+        assert_eq!(json["constrained_decoding"], "always");
+        let parsed: WorkerSpec =
+            serde_json::from_str(r#"{"url":"http://w:8000","constrained_decoding":"requested"}"#)
+                .unwrap();
+        assert_eq!(
+            parsed.constrained_decoding,
+            Some(ConstrainedDecoding::Requested)
+        );
+        assert!(serde_json::from_str::<WorkerSpec>(
+            r#"{"url":"http://w:8000","constrained_decoding":"sometimes"}"#
+        )
+        .is_err());
     }
 }

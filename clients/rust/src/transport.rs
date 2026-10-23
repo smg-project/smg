@@ -14,6 +14,10 @@ pub(crate) struct Transport {
 const RETRYABLE_STATUSES: &[u16] = &[429, 500, 503];
 
 impl Transport {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "this crate bundles reqwest's own TLS provider (its `rustls` feature); the lint guards the crates built with `rustls-no-provider`"
+    )]
     pub(crate) fn new(config: &ClientConfig) -> Result<Self, SmgError> {
         let mut builder = Client::builder().timeout(config.timeout);
 

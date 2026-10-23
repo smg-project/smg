@@ -231,27 +231,35 @@ fn is_likely_sentencepiece(buffer: &[u8]) -> bool {
     false
 }
 
-/// Helper function to discover chat template files in a directory
+/// The chat template file beside a tokenizer, resolved as the engine's own
+/// tokenizer resolves it: `chat_template.jinja` outranks the `chat_template`
+/// field of `tokenizer_config.json`, which transformers' tokenizer reads next.
+/// `chat_template.json` is the processor's legacy template file, which that
+/// tokenizer never reads: a checkpoint may ship it beside a config template
+/// and the two can differ, so it serves only a config without one. Any other
+/// `.jinja` file comes last. `None` leaves the config's template, or none.
 pub fn discover_chat_template_in_dir(dir: &Path) -> Option<String> {
     use std::fs;
 
-    // Priority 1: Look for chat_template.json (contains Jinja in JSON format)
-    let json_template_path = dir.join("chat_template.json");
-    if json_template_path.exists() {
-        return json_template_path.to_str().map(|s| s.to_string());
-    }
-
-    // Priority 2: Look for chat_template.jinja (standard Jinja file)
     let jinja_path = dir.join("chat_template.jinja");
     if jinja_path.exists() {
         return jinja_path.to_str().map(|s| s.to_string());
     }
 
-    // Priority 3: Look for any .jinja file (for models with non-standard naming)
+    if config_has_chat_template(dir) {
+        return None;
+    }
+
+    let json_template_path = dir.join("chat_template.json");
+    if json_template_path.exists() {
+        return json_template_path.to_str().map(|s| s.to_string());
+    }
+
+    // Any .jinja file (for models with non-standard naming)
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
             if let Some(name) = entry.file_name().to_str() {
-                if name.ends_with(".jinja") && name != "chat_template.jinja" {
+                if name.ends_with(".jinja") {
                     return entry.path().to_str().map(|s| s.to_string());
                 }
             }
@@ -259,6 +267,21 @@ pub fn discover_chat_template_in_dir(dir: &Path) -> Option<String> {
     }
 
     None
+}
+
+/// Whether `tokenizer_config.json` in `dir` carries a `chat_template` the
+/// loaders read: a string. A named-template list (the form some checkpoints
+/// ship) is not read by them, so it must not stand in the way of the file
+/// fallbacks.
+fn config_has_chat_template(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("tokenizer_config.json"))
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .is_some_and(|config| {
+            config
+                .get("chat_template")
+                .is_some_and(serde_json::Value::is_string)
+        })
 }
 
 /// Helper function to resolve and log chat template selection
@@ -381,60 +404,49 @@ pub async fn create_tokenizer_async_with_chat_template(
     // Try to download tokenizer files from HuggingFace
     match download_tokenizer_from_hf(model_name_or_path).await {
         Ok(cache_dir) => {
-            // Look for tokenizer.json in the cache directory
-            let tokenizer_path = cache_dir.join("tokenizer.json");
-            if tokenizer_path.exists() {
-                // Resolve chat template: provided path takes precedence over auto-discovery
-                let final_chat_template = resolve_and_log_chat_template(
-                    chat_template_path,
-                    &cache_dir,
-                    model_name_or_path,
-                );
-
-                let tokenizer_path_str = tokenizer_path.to_str().ok_or_else(|| {
-                    Error::msg(format!(
-                        "Tokenizer path is not valid UTF-8: {tokenizer_path:?}"
-                    ))
-                })?;
-                create_tokenizer_with_chat_template(
-                    tokenizer_path_str,
-                    final_chat_template.as_deref(),
-                )
-            } else if has_tiktoken_file(&cache_dir) {
-                Ok(Arc::new(TiktokenTokenizer::from_dir_with_chat_template(
-                    &cache_dir,
-                    chat_template_path,
-                )?))
-            } else {
-                // Try other common tokenizer file names
-                let possible_files = ["tokenizer_config.json", "vocab.json"];
-                for file_name in &possible_files {
-                    let file_path = cache_dir.join(file_name);
-                    if file_path.exists() {
-                        // Resolve chat template: provided path takes precedence over auto-discovery
-                        let final_chat_template = resolve_and_log_chat_template(
-                            chat_template_path,
-                            &cache_dir,
-                            model_name_or_path,
-                        );
-
-                        let file_path_str = file_path.to_str().ok_or_else(|| {
-                            Error::msg(format!("File path is not valid UTF-8: {file_path:?}"))
-                        })?;
-                        return create_tokenizer_with_chat_template(
-                            file_path_str,
-                            final_chat_template.as_deref(),
-                        );
-                    }
-                }
-                Err(Error::msg(format!(
-                    "Downloaded model '{model_name_or_path}' but couldn't find a suitable tokenizer file"
-                )))
-            }
+            create_tokenizer_from_downloaded_dir(&cache_dir, model_name_or_path, chat_template_path)
         }
         Err(e) => Err(Error::msg(format!(
             "Failed to download tokenizer from HuggingFace: {e}"
         ))),
+    }
+}
+
+/// The tokenizer of a checkpoint downloaded from the Hub, from the files in
+/// its cache directory: `tokenizer.json`, else a tiktoken vocabulary, else the
+/// layouts the directory loader knows (`vocab.json` + `merges.txt`).
+fn create_tokenizer_from_downloaded_dir(
+    cache_dir: &Path,
+    model_name_or_path: &str,
+    chat_template_path: Option<&str>,
+) -> Result<Arc<dyn traits::Tokenizer>> {
+    // Look for tokenizer.json in the cache directory
+    let tokenizer_path = cache_dir.join("tokenizer.json");
+    if tokenizer_path.exists() {
+        // Resolve chat template: provided path takes precedence over auto-discovery
+        let final_chat_template =
+            resolve_and_log_chat_template(chat_template_path, cache_dir, model_name_or_path);
+
+        let tokenizer_path_str = tokenizer_path.to_str().ok_or_else(|| {
+            Error::msg(format!(
+                "Tokenizer path is not valid UTF-8: {tokenizer_path:?}"
+            ))
+        })?;
+        create_tokenizer_with_chat_template(tokenizer_path_str, final_chat_template.as_deref())
+    } else if has_tiktoken_file(cache_dir) {
+        Ok(Arc::new(TiktokenTokenizer::from_dir_with_chat_template(
+            cache_dir,
+            chat_template_path,
+        )?))
+    } else {
+        // A checkpoint that ships neither, such as the vocab.json + merges.txt
+        // pair of the Qwen2 family, is the directory loader's: it gets the
+        // directory, not one of the files (a tokenizer_config.json is not a
+        // tokenizer), and names the layouts it accepts when none is there.
+        let cache_dir_str = cache_dir
+            .to_str()
+            .ok_or_else(|| Error::msg(format!("Cache path is not valid UTF-8: {cache_dir:?}")))?;
+        create_tokenizer_with_chat_template(cache_dir_str, chat_template_path)
     }
 }
 
@@ -527,10 +539,112 @@ pub fn get_tokenizer_info(file_path: &str) -> Result<TokenizerType> {
     reason = "diagnostic output in tests for CI skip messages and download results"
 )]
 mod tests {
+    use serde_json::json;
+
     use super::{
-        create_tokenizer, create_tokenizer_async, create_tokenizer_from_file, is_likely_json,
-        is_likely_openai_model,
+        create_tokenizer, create_tokenizer_async, create_tokenizer_from_downloaded_dir,
+        create_tokenizer_from_file, is_likely_json, is_likely_openai_model,
     };
+
+    /// A downloaded checkpoint that ships `vocab.json` + `merges.txt` and no
+    /// `tokenizer.json` (Qwen3-Omni) loads from its cache directory, and gives
+    /// the ids of a `tokenizer.json` holding the same vocabulary, merges and
+    /// added tokens with the family's normalizer and pre-tokenizer.
+    #[test]
+    fn a_downloaded_vocab_and_merges_pair_loads_like_its_tokenizer_json() {
+        let vocab = json!({
+            "H": 0, "e": 1, "l": 2, "o": 3, "Ġ": 4, "w": 5, "r": 6, "d": 7, "!": 8,
+            "ll": 9, "He": 10, "Hell": 11, "Hello": 12,
+            "Ġw": 13, "Ġwo": 14, "Ġwor": 15, "Ġworl": 16, "Ġworld": 17
+        });
+        let merges = [
+            ["l", "l"],
+            ["H", "e"],
+            ["He", "ll"],
+            ["Hell", "o"],
+            ["Ġ", "w"],
+            ["Ġw", "o"],
+            ["Ġwo", "r"],
+            ["Ġwor", "l"],
+            ["Ġworl", "d"],
+        ];
+        let added = |id: u32, content: &str, special: bool| {
+            json!({"id": id, "content": content, "single_word": false, "lstrip": false,
+                   "rstrip": false, "normalized": false, "special": special})
+        };
+
+        let downloaded = tempfile::tempdir().unwrap();
+        std::fs::write(
+            downloaded.path().join("vocab.json"),
+            serde_json::to_vec(&vocab).unwrap(),
+        )
+        .unwrap();
+        let mut merges_txt = String::from("#version: 0.2\n");
+        for [left, right] in &merges {
+            merges_txt += &format!("{left} {right}\n");
+        }
+        std::fs::write(downloaded.path().join("merges.txt"), merges_txt).unwrap();
+        std::fs::write(
+            downloaded.path().join("tokenizer_config.json"),
+            serde_json::to_vec(&json!({
+                "tokenizer_class": "Qwen2Tokenizer",
+                "add_prefix_space": false,
+                "added_tokens_decoder": {
+                    "18": added(18, "<|im_start|>", true),
+                    "19": added(19, "<tool_call>", false)
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let as_json = tempfile::tempdir().unwrap();
+        std::fs::write(
+            as_json.path().join("tokenizer.json"),
+            serde_json::to_vec(&json!({
+                "version": "1.0",
+                "added_tokens": [added(18, "<|im_start|>", true), added(19, "<tool_call>", false)],
+                "normalizer": {"type": "NFC"},
+                "pre_tokenizer": {"type": "Sequence", "pretokenizers": [
+                    {"type": "Split",
+                     "pattern": {"Regex": crate::huggingface::QWEN2_PRETOKENIZE_REGEX},
+                     "behavior": "Isolated", "invert": false},
+                    {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": false,
+                     "use_regex": false}
+                ]},
+                "post_processor": {"type": "ByteLevel", "add_prefix_space": true,
+                                   "trim_offsets": false, "use_regex": true},
+                "decoder": {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true,
+                            "use_regex": true},
+                "model": {"type": "BPE", "dropout": null, "unk_token": null,
+                          "continuing_subword_prefix": "", "end_of_word_suffix": "",
+                          "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+                          "vocab": vocab, "merges": merges}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let pair = create_tokenizer_from_downloaded_dir(downloaded.path(), "org/model", None)
+            .unwrap_or_else(|e| panic!("the downloaded pair does not load: {e}"));
+        let reference = create_tokenizer(as_json.path().to_str().unwrap()).unwrap();
+        assert_eq!(
+            pair.encode("Hello world!", false).unwrap().token_ids(),
+            [12, 17, 8]
+        );
+        for text in [
+            "Hello world!",
+            "<|im_start|>Hello<tool_call> world",
+            "Hello  world\n\n!",
+            "",
+        ] {
+            assert_eq!(
+                pair.encode(text, false).unwrap().token_ids(),
+                reference.encode(text, false).unwrap().token_ids(),
+                "{text:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_json_detection() {
@@ -651,5 +765,57 @@ mod tests {
         assert!(!is_likely_openai_model("adapter-v2"));
         assert!(!is_likely_openai_model("oracle-7b"));
         assert!(!is_likely_openai_model("open-llama"));
+    }
+
+    /// A checkpoint may ship the processor's legacy `chat_template.json`
+    /// beside a `tokenizer_config.json` template, and the two can differ: the
+    /// tokenizer's own template is what the engine's tokenizer renders with, a
+    /// `chat_template.jinja` outranks it, and the legacy file serves a config
+    /// without one.
+    #[test]
+    fn discovery_prefers_the_tokenizer_s_own_template_over_the_legacy_processor_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        let discover = |path: &std::path::Path| super::discover_chat_template_in_dir(path);
+        std::fs::write(
+            path.join("chat_template.json"),
+            r#"{"chat_template": "processor"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            path.join("tokenizer_config.json"),
+            r#"{"chat_template": "tokenizer"}"#,
+        )
+        .unwrap();
+        assert_eq!(discover(path), None);
+
+        std::fs::write(path.join("chat_template.jinja"), "file").unwrap();
+        assert_eq!(
+            discover(path).as_deref(),
+            path.join("chat_template.jinja").to_str()
+        );
+
+        std::fs::remove_file(path.join("chat_template.jinja")).unwrap();
+        std::fs::write(
+            path.join("tokenizer_config.json"),
+            r#"{"tokenizer_class": "PreTrainedTokenizerFast"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            discover(path).as_deref(),
+            path.join("chat_template.json").to_str()
+        );
+
+        // A named-template list in the config is not a template the loaders
+        // read, so the legacy file still serves such a checkpoint.
+        std::fs::write(
+            path.join("tokenizer_config.json"),
+            r#"{"chat_template": [{"name": "default", "template": "a"}, {"name": "tool_use", "template": "b"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            discover(path).as_deref(),
+            path.join("chat_template.json").to_str()
+        );
     }
 }

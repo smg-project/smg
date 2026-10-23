@@ -1,7 +1,9 @@
 //! Shared, immutable worker-load snapshots.
 //!
-//! `WorkerMonitor`'s group loops publish per-worker load reports and routing
-//! hot paths read them. The publication contract:
+//! `WorkerMonitor` publishes per-worker load reports here (a group's poll
+//! tick, a window of pushed records) and the routing hot paths read them:
+//! this is the one feed the load-aware policies score on, next to the
+//! dispatch credit they book themselves. The publication contract:
 //!
 //! - **Readers** grab the current snapshot as one `Arc` clone and scan
 //!   immutable data: no channel lock is held while scanning, and no map is
@@ -22,6 +24,10 @@
 //! - **Evictions batch.** They queue here and the monitor's debounced
 //!   flusher applies the whole backlog in a single rebuild, so removing N
 //!   workers costs one publish, not N.
+//! - **Every report carries its sample instant.** An entry records when the
+//!   engine's state behind it was sampled (the report's own instant, else
+//!   the publish instant), so a policy that books dispatches locally can
+//!   release the ones a report already reflects when it reads the report.
 
 use std::{
     collections::HashMap,
@@ -29,6 +35,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Weak,
     },
+    time::Instant,
 };
 
 use openai_protocol::worker::{WorkerLoadResponse, WorkerStatus};
@@ -40,12 +47,16 @@ use super::{registry::WorkerRegistry, Worker};
 /// Subscription handle to the published load snapshots. `borrow().clone()`
 /// yields an `Arc<LoadSnapshot>`; the watch guard must not be held across a
 /// scan.
-pub(crate) type LoadReceiver = watch::Receiver<Arc<LoadSnapshot>>;
+pub type LoadReceiver = watch::Receiver<Arc<LoadSnapshot>>;
 
 /// One worker's published load and the incarnation that produced it.
 #[derive(Clone)]
 struct LoadEntry {
     load: Arc<WorkerLoadResponse>,
+    /// When the engine's state behind the report was sampled, on this
+    /// process's clock: the report's own instant, else the publish instant
+    /// (the latest the sample can have been taken).
+    sampled_at: Instant,
     /// The exact worker the report came from, so an eviction removes only
     /// its own incarnation's entry and never a same-URL replacement's fresh
     /// one.
@@ -54,7 +65,7 @@ struct LoadEntry {
 
 /// An immutable point-in-time view of every published worker load.
 #[derive(Default)]
-pub(crate) struct LoadSnapshot {
+pub struct LoadSnapshot {
     entries: HashMap<Arc<str>, LoadEntry>,
 }
 
@@ -67,8 +78,15 @@ impl std::fmt::Debug for LoadSnapshot {
 }
 
 impl LoadSnapshot {
-    pub(crate) fn get(&self, url: &str) -> Option<&WorkerLoadResponse> {
+    pub fn get(&self, url: &str) -> Option<&WorkerLoadResponse> {
         self.entries.get(url).map(|entry| &*entry.load)
+    }
+
+    /// A worker's report with the instant its sample was taken.
+    pub fn report(&self, url: &str) -> Option<(&WorkerLoadResponse, Instant)> {
+        self.entries
+            .get(url)
+            .map(|entry| (&*entry.load, entry.sampled_at))
     }
 
     #[cfg(test)]
@@ -86,14 +104,17 @@ impl LoadSnapshot {
         self.entries.is_empty()
     }
 
-    /// Test-only: a snapshot with the given loads and no live sources.
+    /// Test-only: a snapshot with the given loads and no live sources, each
+    /// report sampled now unless it says otherwise.
     #[cfg(test)]
     pub(crate) fn from_loads_for_test(loads: Vec<(String, WorkerLoadResponse)>) -> Arc<Self> {
+        let published_at = Instant::now();
         let entries = loads
             .into_iter()
             .map(|(url, load)| {
                 let dangling: Weak<super::worker::BasicWorker> = Weak::new();
                 let entry = LoadEntry {
+                    sampled_at: load.sampled_at.unwrap_or(published_at),
                     load: Arc::new(load),
                     source: dangling,
                 };
@@ -101,6 +122,31 @@ impl LoadSnapshot {
             })
             .collect();
         Arc::new(Self { entries })
+    }
+}
+
+/// Test-only publisher standing in for the monitor: hands a policy the feed
+/// and publishes each map of reports as the whole snapshot.
+#[cfg(test)]
+pub(crate) struct TestFeed(watch::Sender<Arc<LoadSnapshot>>);
+
+#[cfg(test)]
+impl TestFeed {
+    pub(crate) fn attached_to(policy: &dyn crate::policies::LoadBalancingPolicy) -> Self {
+        let (tx, rx) = watch::channel(Arc::new(LoadSnapshot::default()));
+        policy.set_load_receiver(Some(rx));
+        Self(tx)
+    }
+
+    /// Publish `loads` as the current snapshot; a report without a sample
+    /// instant is sampled now.
+    pub(crate) fn publish(&self, loads: &HashMap<String, WorkerLoadResponse>) {
+        let loads = loads
+            .iter()
+            .map(|(url, load)| (url.clone(), load.clone()))
+            .collect();
+        self.0
+            .send_replace(LoadSnapshot::from_loads_for_test(loads));
     }
 }
 
@@ -152,11 +198,13 @@ impl LoadState {
         group_urls: &[String],
         fresh: Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)>,
     ) {
+        let published_at = Instant::now();
         let admitted: Vec<(Arc<str>, LoadEntry)> = fresh
             .into_iter()
             .filter(|(worker, _)| self.is_current_incarnation(worker))
             .map(|(worker, load)| {
                 let entry = LoadEntry {
+                    sampled_at: load.sampled_at.unwrap_or(published_at),
                     load,
                     source: Arc::downgrade(&worker),
                 };

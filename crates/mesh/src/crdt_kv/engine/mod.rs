@@ -18,6 +18,7 @@ use std::{sync::Arc, time::Duration};
 use super::operation::{CrdtChange, Operation};
 
 mod lww;
+mod op_log;
 mod rate_limit;
 
 pub(super) use lww::LwwEngine;

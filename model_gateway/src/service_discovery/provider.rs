@@ -1,20 +1,27 @@
 //! The contract between a worker-discovery provider and the shared reconciler.
 //!
-//! A provider turns its source — Kubernetes Pods today; files, Slurm and Consul
-//! next — into these types and nothing else. The reconciler sees only these, so
-//! it never learns which kind of source produced a worker beyond the
-//! [`DiscoveryKind`] it is handed.
+//! A provider turns its source — Kubernetes Pods, a JSON manifest, Slurm jobs
+//! or a Consul service — into these types and nothing else. The reconciler
+//! sees only these, so it never learns which kind of source produced a worker
+//! beyond the [`DiscoveryKind`] it is handed.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, net::Ipv6Addr};
 
 use openai_protocol::worker::WorkerType;
 
-use crate::{observability::metrics::metrics_labels, worker::endpoint::Endpoint};
+use crate::{
+    config::RoutingMode,
+    observability::metrics::metrics_labels,
+    worker::{endpoint::Endpoint, EndpointError},
+};
 
 /// Which provider produced a snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum DiscoveryKind {
     Kubernetes,
+    File,
+    Slurm,
+    Consul,
 }
 
 impl DiscoveryKind {
@@ -27,6 +34,9 @@ impl DiscoveryKind {
     pub(super) fn as_label(self) -> &'static str {
         match self {
             DiscoveryKind::Kubernetes => "kubernetes",
+            DiscoveryKind::File => "file",
+            DiscoveryKind::Slurm => "slurm",
+            DiscoveryKind::Consul => "consul",
         }
     }
 
@@ -34,8 +44,75 @@ impl DiscoveryKind {
     pub(super) fn metric_label(self) -> &'static str {
         match self {
             DiscoveryKind::Kubernetes => metrics_labels::DISCOVERY_KUBERNETES,
+            DiscoveryKind::File => metrics_labels::DISCOVERY_FILE,
+            DiscoveryKind::Slurm => metrics_labels::DISCOVERY_SLURM,
+            DiscoveryKind::Consul => metrics_labels::DISCOVERY_CONSUL,
         }
     }
+}
+
+/// The worker types a routing mode accepts, for a provider whose records name
+/// their own type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Roles {
+    Regular,
+    PrefillDecode,
+    EncodePrefillDecode,
+}
+
+impl Roles {
+    /// `None` for a mode with no worker pools to fill.
+    pub(super) fn of(mode: &RoutingMode) -> Option<Self> {
+        match mode {
+            RoutingMode::Regular { .. } => Some(Self::Regular),
+            RoutingMode::PrefillDecode { .. } => Some(Self::PrefillDecode),
+            RoutingMode::EncodePrefillDecode { .. } => Some(Self::EncodePrefillDecode),
+            RoutingMode::OpenAI { .. }
+            | RoutingMode::Anthropic { .. }
+            | RoutingMode::Gemini { .. } => None,
+        }
+    }
+
+    pub(super) fn allows(self, worker_type: WorkerType) -> bool {
+        matches!(
+            (self, worker_type),
+            (Self::Regular, WorkerType::Regular)
+                | (
+                    Self::PrefillDecode,
+                    WorkerType::Prefill | WorkerType::Decode
+                )
+                | (
+                    Self::EncodePrefillDecode,
+                    WorkerType::Encode | WorkerType::Prefill | WorkerType::Decode
+                )
+        )
+    }
+
+    /// The type of a record that names none. Regular routing has only one; a
+    /// disaggregated record must say which pool it joins.
+    pub(super) fn default_type(self) -> Option<WorkerType> {
+        (self == Self::Regular).then_some(WorkerType::Regular)
+    }
+
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Self::Regular => "regular",
+            Self::PrefillDecode => "prefill-decode",
+            Self::EncodePrefillDecode => "encode-prefill-decode",
+        }
+    }
+}
+
+/// The endpoint of a server on `host` (a name or an address, IPv6 bracketed
+/// or not) and `port`, with no scheme, so registration probes for HTTP and
+/// gRPC both.
+pub(super) fn endpoint_at(host: &str, port: u16) -> Result<Endpoint, EndpointError> {
+    let authority = if host.parse::<Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    };
+    Endpoint::parse(&authority)
 }
 
 /// One worker exactly as a provider describes it: the whole contract between a
@@ -49,7 +126,8 @@ impl DiscoveryKind {
 pub(super) struct DiscoveredWorker {
     /// The provider's stable identity for this worker instance, unique within a
     /// snapshot. A different value at an endpoint means a different instance
-    /// there, which the reconciler replaces.
+    /// there, which the reconciler removes and re-registers. The same instance
+    /// republished with a different [`Self::fingerprint`] is updated in place.
     ///
     /// Kubernetes uses `{pod_uid}:{port}`: one Pod can serve several ports, and
     /// a Pod *recreated* at the same address — a rescheduled StatefulSet Pod,
@@ -87,6 +165,11 @@ impl DiscoveredWorker {
     /// spelling decides how the worker is registered (`h:p` dual-probes HTTP
     /// and gRPC; `grpc://h:p` does not). Two spellings that parse to the same
     /// endpoint render, and so hash, identically.
+    ///
+    /// The reconciler stamps this on every worker it registers. When the stamp
+    /// on the same instance no longer matches the published record, it
+    /// re-registers the record with an Upsert, which updates the worker in
+    /// place: no removal and no drain, unlike a new `discovery_id`.
     ///
     /// Never log this next to the endpoint: the rendered form can carry
     /// credentials, and the pair would let a reader test guesses offline.

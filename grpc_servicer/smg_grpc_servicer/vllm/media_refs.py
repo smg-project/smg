@@ -8,11 +8,11 @@ from urllib.parse import urlsplit
 
 from smg_grpc_proto.generated import common_pb2
 
-# Modalities the worker can process from a reference. Audio is excluded until a
-# router spec opts in and an e2e model exists.
+# Modalities processed by vLLM's native worker processor.
 _MODALITY_NAMES: dict[int, str] = {
     common_pb2.IMAGE: "image",
     common_pb2.VIDEO: "video",
+    common_pb2.AUDIO: "audio",
 }
 
 FETCHABLE_MODALITIES = tuple(_MODALITY_NAMES.values())

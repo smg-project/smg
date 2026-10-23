@@ -2,16 +2,17 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use openai_protocol::responses::{
     generate_id, MessagePhase, ResponseInput, ResponseInputOutputItem, ResponsesRequest,
     StringOrContentParts,
 };
 use serde_json::{json, Value};
 use smg_data_connector::{
-    with_request_context, ConversationId, ConversationItem, ConversationItemId,
-    ConversationItemStorage, ConversationStorage, NewConversationItem,
-    RequestContext as StorageRequestContext, ResponseId, ResponseStorage, StoredResponse,
+    with_request_context, AddedAtSequence, ConditionalStore, ConversationId, ConversationItem,
+    ConversationItemId, ConversationItemStorage, ConversationStorage, NewConversationItem,
+    RequestContext as StorageRequestContext, ResponseId, ResponseStorage, ResponseStorageError,
+    StorageFailure, StoredResponse,
 };
 use tracing::{debug, info, warn};
 
@@ -142,10 +143,13 @@ pub fn split_stored_message_content(raw: Value) -> (Value, Option<MessagePhase>)
 
 /// Create a conversation item and optionally link it to a conversation.
 /// Sets default "completed" status if not provided.
+/// `added_at` stamps the link; a caller linking several items takes the stamps from one
+/// [`AddedAtSequence`], so the conversation lists them in the order they were linked.
 pub async fn create_and_link_item(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conv_id_opt: Option<&ConversationId>,
     mut new_item: NewConversationItem,
+    added_at: DateTime<Utc>,
 ) -> Result<(), String> {
     if new_item.status.is_none() {
         new_item.status = Some("completed".to_string());
@@ -158,7 +162,7 @@ pub async fn create_and_link_item(
 
     if let Some(conv_id) = conv_id_opt {
         item_storage
-            .link_item(conv_id, &created.id, Utc::now())
+            .link_item(conv_id, &created.id, added_at)
             .await
             .map_err(|e| format!("Failed to link item: {e}"))?;
 
@@ -231,7 +235,7 @@ pub fn build_stored_response(
 }
 
 /// Extract and normalize input items from ResponseInput
-fn extract_input_items(input: &ResponseInput) -> Result<Vec<Value>, String> {
+pub fn extract_input_items(input: &ResponseInput) -> Result<Vec<Value>, String> {
     let items = match input {
         ResponseInput::Text(text) => {
             // Convert simple text to message item
@@ -336,6 +340,7 @@ fn item_to_new_conversation_item(
     item_value: &Value,
     response_id: Option<String>,
     _is_input: bool,
+    tenant: Option<&str>,
 ) -> NewConversationItem {
     let item_type = item_value
         .get("type")
@@ -377,27 +382,45 @@ fn item_to_new_conversation_item(
             .get("status")
             .and_then(|v| v.as_str())
             .map(String::from),
+        tenant: tenant.map(str::to_string),
     }
 }
 
-/// Link all input and output items to a conversation
+/// Link all input and output items to a conversation; the items carry the
+/// caller's `tenant`.
 async fn link_items_to_conversation(
     item_storage: &Arc<dyn ConversationItemStorage>,
     conv_id: &ConversationId,
     input_items: &[Value],
     output_items: &[Value],
     response_id: &str,
+    tenant: Option<&str>,
 ) -> Result<(), String> {
     let response_id_opt = Some(response_id.to_string());
+    // The inputs, then the outputs, each stamped later than the one before: the conversation
+    // lists this response's turns in the order they were exchanged.
+    let mut stamps = AddedAtSequence::new();
 
     for item in input_items {
-        let new_item = item_to_new_conversation_item(item, response_id_opt.clone(), true);
-        create_and_link_item(item_storage, Some(conv_id), new_item).await?;
+        let new_item = item_to_new_conversation_item(item, response_id_opt.clone(), true, tenant);
+        create_and_link_item(
+            item_storage,
+            Some(conv_id),
+            new_item,
+            stamps.next_added_at(),
+        )
+        .await?;
     }
 
     for item in output_items {
-        let new_item = item_to_new_conversation_item(item, response_id_opt.clone(), false);
-        create_and_link_item(item_storage, Some(conv_id), new_item).await?;
+        let new_item = item_to_new_conversation_item(item, response_id_opt.clone(), false, tenant);
+        create_and_link_item(
+            item_storage,
+            Some(conv_id),
+            new_item,
+            stamps.next_added_at(),
+        )
+        .await?;
     }
 
     Ok(())
@@ -416,14 +439,50 @@ pub async fn persist_conversation_items(
     response_storage: Arc<dyn ResponseStorage>,
     response_json: &Value,
     original_body: &ResponsesRequest,
+    tenant: Option<&str>,
     request_context: Option<StorageRequestContext>,
-) -> Result<(), String> {
+) -> Result<(), PersistError> {
     let inner = persist_conversation_items_inner(
         conversation_storage,
         item_storage,
         response_storage,
         response_json,
         original_body,
+        tenant,
+        false,
+    );
+    match request_context {
+        Some(ctx) => with_request_context(ctx, inner).await,
+        None => inner.await,
+    }
+    .map(|_| ())
+}
+
+/// [`persist_conversation_items`] for a response whose record may have been
+/// closed while it ran (a background response: cancelled on any gateway
+/// sharing the store): the response is stored with
+/// one conditional write, refused once the record is closed or gone, and
+/// nothing is linked then. `Ok(true)` when it was stored, or when the record
+/// already held this persist's object (the same status and output items: an
+/// earlier attempt's write that landed while its answer was lost): the items
+/// are linked then.
+pub async fn persist_conversation_items_if_open(
+    conversation_storage: Arc<dyn ConversationStorage>,
+    item_storage: Arc<dyn ConversationItemStorage>,
+    response_storage: Arc<dyn ResponseStorage>,
+    response_json: &Value,
+    original_body: &ResponsesRequest,
+    tenant: Option<&str>,
+    request_context: Option<StorageRequestContext>,
+) -> Result<bool, PersistError> {
+    let inner = persist_conversation_items_inner(
+        conversation_storage,
+        item_storage,
+        response_storage,
+        response_json,
+        original_body,
+        tenant,
+        true,
     );
     match request_context {
         Some(ctx) => with_request_context(ctx, inner).await,
@@ -431,16 +490,110 @@ pub async fn persist_conversation_items(
     }
 }
 
+/// The step of a persist that failed. Only a failed write of the response
+/// record leaves nothing stored: the conversation lookup and the linking of the
+/// turn's items run after it, once, and a caller that retries the whole persist
+/// after they failed would store the record again and link the items twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistStep {
+    /// The request's input or the response could not be turned into a record.
+    Input,
+    /// The response record itself; nothing is stored when it fails.
+    ResponseRecord,
+    /// The lookup of the conversation to link into; the record is stored.
+    ConversationLookup,
+    /// The linking of the turn's items into the conversation; the record is stored.
+    Linking,
+}
+
+/// A failed persist: the step that failed, whether the same persist can
+/// succeed later and the message. Retryable is a record write that failed
+/// because the store is not available (`is_unavailable`: unreachable or past
+/// its bound); a refusal the store or a storage hook answered, and a record the
+/// input itself makes unstorable (no id, no output), are not retried.
+#[derive(Debug, Clone)]
+pub struct PersistError {
+    pub step: PersistStep,
+    pub retryable: bool,
+    pub message: String,
+}
+
+impl PersistError {
+    fn new(step: PersistStep, retryable: bool, message: impl Into<String>) -> Self {
+        Self {
+            step,
+            retryable,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for PersistError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PersistError {}
+
+/// Whether `status` is a result the run that produced the response writes at
+/// its end (whole or truncated). The runner's status watch reads a record in
+/// one of these as the work's own terminal write, and the persist's check for
+/// its own earlier write accepts a record in one of these without output
+/// items. The run writes its own `failed` object through the persist too, so
+/// the status alone does not tell a write of this run from a close elsewhere;
+/// the output items do.
+pub fn is_result_status(status: &str) -> bool {
+    matches!(status, "completed" | "incomplete")
+}
+
+/// The ids of `output`'s items, in order (items without an id are left out).
+fn output_item_ids(output: &[Value]) -> Vec<String> {
+    output
+        .iter()
+        .filter_map(|item| item.get("id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Whether a closed record's object `current` is the one this persist writes
+/// (`status`, the ids of its output items): an earlier attempt's write that
+/// landed while its answer was lost. Only the run itself produces its output
+/// items, so a record closed with the same status and the same items holds
+/// this run's own write, not a close from elsewhere (a cancel, or a `failed`
+/// written over the record's earlier, empty output). A record without output
+/// items is this run's own only when its status is a result
+/// ([`is_result_status`]): a `failed` object without output cannot be told
+/// from a failure written elsewhere and stays refused.
+fn holds_this_write(current: &Value, status: Option<&str>, output_ids: &[String]) -> bool {
+    let Some(status) = status else {
+        return false;
+    };
+    if current["status"].as_str() != Some(status) {
+        return false;
+    }
+    let current_ids = current["output"]
+        .as_array()
+        .map(|items| output_item_ids(items))
+        .unwrap_or_default();
+    current_ids == output_ids && (!output_ids.is_empty() || is_result_status(status))
+}
+
+/// `tenant` is the caller's tenant: the stored response is scoped to it, and
+/// the response's items are linked into the request's conversation only when
+/// that conversation is visible to it.
 async fn persist_conversation_items_inner(
     conversation_storage: Arc<dyn ConversationStorage>,
     item_storage: Arc<dyn ConversationItemStorage>,
     response_storage: Arc<dyn ResponseStorage>,
     response_json: &Value,
     original_body: &ResponsesRequest,
-) -> Result<(), String> {
+    tenant: Option<&str>,
+    if_open: bool,
+) -> Result<bool, PersistError> {
     // Respect store=false: skip persistence entirely (matches official API behavior)
     if !original_body.store.unwrap_or(true) {
-        return Ok(());
+        return Ok(false);
     }
 
     // Clone once, then strip multi-MB base64 from any `image_generation_call`
@@ -461,12 +614,13 @@ async fn persist_conversation_items_inner(
     let response_id_str = response_json
         .get("id")
         .and_then(|v| v.as_str())
-        .ok_or_else(|| "Response missing id field".to_string())?
+        .ok_or_else(|| PersistError::new(PersistStep::Input, false, "Response missing id field"))?
         .to_string();
     let response_id = ResponseId::from(response_id_str.as_str());
 
     // Parse and normalize input items from request
-    let input_items = extract_input_items(&original_body.input)?;
+    let input_items = extract_input_items(&original_body.input)
+        .map_err(|e| PersistError::new(PersistStep::Input, false, e))?;
 
     // Cloning the array here is shallow against compacted items — base64
     // image payloads have already been stripped above.
@@ -474,28 +628,99 @@ async fn persist_conversation_items_inner(
         .get("output")
         .and_then(|v| v.as_array())
         .cloned()
-        .ok_or_else(|| "No output array in response".to_string())?;
+        .ok_or_else(|| {
+            PersistError::new(PersistStep::Input, false, "No output array in response")
+        })?;
+    // What tells this persist's object apart once it is stored (see
+    // [`holds_this_write`]).
+    let written_status = response_json
+        .get("status")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let written_output_ids = output_item_ids(&output_items);
 
     // Build and store response (consumes `response_json`).
     let mut stored_response = build_stored_response(response_json, original_body);
     stored_response.id = response_id.clone();
     stored_response.input = Value::Array(input_items.clone());
+    stored_response.tenant = tenant.map(str::to_string);
 
-    response_storage
-        .store_response(stored_response)
-        .await
-        .map_err(|e| format!("Failed to store response: {e}"))?;
+    let store_error = |e: ResponseStorageError| {
+        PersistError::new(
+            PersistStep::ResponseRecord,
+            e.is_unavailable(),
+            format!("Failed to store response: {e}"),
+        )
+    };
+    if if_open {
+        match response_storage
+            .store_response_if_open(stored_response)
+            .await
+            .map_err(store_error)?
+        {
+            ConditionalStore::Stored => {}
+            ConditionalStore::Closed(current) => {
+                let closed_with = current.raw_response["status"].as_str().unwrap_or("");
+                if holds_this_write(
+                    &current.raw_response,
+                    written_status.as_deref(),
+                    &written_output_ids,
+                ) {
+                    // The record already holds this run's object: an earlier
+                    // attempt's write landed while its answer was lost (a
+                    // call that ran out of its bound after the store had
+                    // taken the write, a failure past the write). This is no
+                    // close from elsewhere, and the items still wait for
+                    // their linking.
+                    debug!(
+                        response_id = %response_id.0,
+                        status = closed_with,
+                        "Response record already holds this result; linking its items"
+                    );
+                } else {
+                    debug!(
+                        response_id = %response_id.0,
+                        status = closed_with,
+                        "Response record already closed; its late result is not stored"
+                    );
+                    return Ok(false);
+                }
+            }
+            ConditionalStore::Missing => {
+                debug!(
+                    response_id = %response_id.0,
+                    "Response record gone; its late result is not stored"
+                );
+                return Ok(false);
+            }
+        }
+    } else {
+        response_storage
+            .store_response(stored_response)
+            .await
+            .map_err(store_error)?;
+    }
 
     // Check if conversation is provided and validate it exists
     let conv_id_opt = if let Some(conv_ref) = &original_body.conversation {
         let conv_id = ConversationId::from(conv_ref.as_id());
         match conversation_storage.get_conversation(&conv_id).await {
-            Ok(Some(_)) => Some(conv_id),
+            Ok(Some(conversation)) if conversation.is_visible_to(tenant) => Some(conv_id),
+            Ok(Some(_)) => {
+                warn!(conversation_id = %conv_id.0, "Conversation belongs to another tenant, skipping item linking");
+                None
+            }
             Ok(None) => {
                 warn!(conversation_id = %conv_id.0, "Conversation not found, skipping item linking");
                 None
             }
-            Err(e) => return Err(format!("Failed to get conversation: {e}")),
+            Err(e) => {
+                return Err(PersistError::new(
+                    PersistStep::ConversationLookup,
+                    false,
+                    format!("Failed to get conversation: {e}"),
+                ))
+            }
         }
     } else {
         None
@@ -509,8 +734,10 @@ async fn persist_conversation_items_inner(
             &input_items,
             &output_items,
             &response_id_str,
+            tenant,
         )
-        .await?;
+        .await
+        .map_err(|e| PersistError::new(PersistStep::Linking, false, e))?;
         info!(
             conversation_id = %conv_id.0,
             response_id = %response_id.0,
@@ -527,7 +754,7 @@ async fn persist_conversation_items_inner(
         );
     }
 
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -545,6 +772,7 @@ mod tests {
             content,
             status: Some("completed".to_string()),
             created_at: Utc::now(),
+            tenant: None,
         }
     }
 
@@ -588,7 +816,8 @@ mod tests {
             "revised_prompt": "cat",
         });
 
-        let new_item = item_to_new_conversation_item(&input_item, None, /* is_input */ true);
+        let new_item =
+            item_to_new_conversation_item(&input_item, None, /* is_input */ true, None);
         assert_eq!(new_item.item_type, "image_generation_call");
         assert_eq!(
             new_item
@@ -613,11 +842,169 @@ mod tests {
             "status": "completed",
         });
 
-        let new_item = item_to_new_conversation_item(&input_item, None, /* is_input */ true);
+        let new_item =
+            item_to_new_conversation_item(&input_item, None, /* is_input */ true, None);
         assert_eq!(new_item.item_type, "message");
         assert_eq!(
             new_item.content,
             json!([{"type": "input_text", "text": "hi"}])
         );
+    }
+
+    /// A background record closed with the object this persist writes (the
+    /// status and the output items) holds an earlier attempt's write that
+    /// landed while its answer was lost: the persist goes on to link the
+    /// items, for a result and for the run's own `failed` object alike. A
+    /// record closed with anything else (a cancel from elsewhere, another
+    /// status, other items, a `failed` without items that could be a failure
+    /// written elsewhere) refuses the persist and links nothing.
+    #[tokio::test]
+    async fn a_record_that_holds_this_runs_result_is_linked_and_a_close_from_elsewhere_is_not() {
+        use smg_data_connector::{
+            ListParams, MemoryConversationItemStorage, MemoryConversationStorage,
+            MemoryResponseStorage, NewConversation, SortOrder,
+        };
+
+        let conversations: Arc<dyn ConversationStorage> =
+            Arc::new(MemoryConversationStorage::new());
+        let items: Arc<dyn ConversationItemStorage> =
+            Arc::new(MemoryConversationItemStorage::new());
+        let responses: Arc<dyn ResponseStorage> = Arc::new(MemoryResponseStorage::new());
+        let conversation = conversations
+            .create_conversation(NewConversation::default())
+            .await
+            .unwrap();
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model": "m",
+            "input": "hi",
+            "background": true,
+            "conversation": conversation.id.0,
+        }))
+        .unwrap();
+        let result = |id: &str, status: &str, items: &[&str]| {
+            let output: Vec<Value> = items
+                .iter()
+                .map(|item| {
+                    json!({
+                        "type": "message",
+                        "id": item,
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [{"type": "output_text", "text": "hello", "annotations": []}]
+                    })
+                })
+                .collect();
+            json!({
+                "id": id,
+                "object": "response",
+                "model": "m",
+                "status": status,
+                "background": true,
+                "output": output
+            })
+        };
+        // What the store holds under each id when the persist runs.
+        for (id, status, items) in [
+            ("resp_own", "completed", &["msg_own"][..]),
+            ("resp_bare", "completed", &[]),
+            ("resp_failed_own", "failed", &["msg_failed"]),
+            ("resp_cancelled", "cancelled", &["msg_own"]),
+            ("resp_other_status", "completed", &["msg_own"]),
+            ("resp_other_items", "completed", &["msg_theirs"]),
+            ("resp_failed_bare", "failed", &[]),
+        ] {
+            let mut stored = build_stored_response(result(id, status, items), &request);
+            stored.id = ResponseId::from(id);
+            responses.store_response(stored).await.unwrap();
+        }
+        let linked = |id: &'static str| {
+            let items = items.clone();
+            let conversation_id = conversation.id.clone();
+            async move {
+                items
+                    .list_items(
+                        &conversation_id,
+                        ListParams {
+                            limit: 20,
+                            order: SortOrder::Asc,
+                            after: None,
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|item| item.response_id.as_deref() == Some(id))
+                    .count()
+            }
+        };
+        let persist = |id: &'static str, status: &'static str, output: &'static [&'static str]| {
+            let (conversations, items, responses) =
+                (conversations.clone(), items.clone(), responses.clone());
+            let request = request.clone();
+            async move {
+                persist_conversation_items_if_open(
+                    conversations,
+                    items,
+                    responses,
+                    &result(id, status, output),
+                    &request,
+                    None,
+                    None,
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        assert!(
+            persist("resp_own", "completed", &["msg_own"]).await,
+            "the record holds this run's result: stored"
+        );
+        assert_eq!(
+            linked("resp_own").await,
+            2,
+            "the input and the output are linked"
+        );
+        assert!(
+            persist("resp_bare", "completed", &[]).await,
+            "a result without output items is still this run's"
+        );
+        assert_eq!(linked("resp_bare").await, 1, "the input is linked");
+        assert!(
+            persist("resp_failed_own", "failed", &["msg_failed"]).await,
+            "the run's own failed object, with its items, is this run's write"
+        );
+        assert_eq!(linked("resp_failed_own").await, 2);
+        for (id, status, items, why) in [
+            (
+                "resp_cancelled",
+                "completed",
+                &["msg_own"][..],
+                "a cancel from elsewhere refuses the result",
+            ),
+            (
+                "resp_other_status",
+                "incomplete",
+                &["msg_own"],
+                "another status is not this write",
+            ),
+            (
+                "resp_other_items",
+                "completed",
+                &["msg_own"],
+                "other output items are not this write",
+            ),
+            (
+                "resp_failed_bare",
+                "failed",
+                &[],
+                "a failed object without items could be a failure written elsewhere",
+            ),
+        ] {
+            assert!(!persist(id, status, items).await, "{why}");
+            assert_eq!(linked(id).await, 0, "{why}");
+        }
+        assert!(is_result_status("completed") && is_result_status("incomplete"));
+        assert!(!is_result_status("cancelled") && !is_result_status("failed"));
     }
 }

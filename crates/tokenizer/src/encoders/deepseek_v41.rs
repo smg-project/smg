@@ -1,7 +1,7 @@
-// Ported from vLLM's `vllm/tokenizers/deepseek_v41_encoding.py` (itself a port
+// Ported from the serving engine's `tokenizers/deepseek_v41_encoding.py` (itself a port
 // of the `encoding/encoding.py` shipped with deepseek-ai/DeepSeek-V4.1-Flash),
 // function by function and in the same order, plus the message normalisation
-// that vLLM keeps in `vllm/tokenizers/deepseek_v41.py::_normalize_messages`.
+// that the engine keeps in `tokenizers/deepseek_v41.py::_normalize_messages`.
 //
 // V4.1 differs from V4 (`deepseek_v4.rs`) in four places: the DSML tag strings
 // carry a leading space (` invoke`, ` parameter`, ` calls`), the reasoning
@@ -9,40 +9,60 @@
 // mid-conversation system messages count as user turns, and image content
 // parts collapse to [`IMAGE_PLACEHOLDER`].
 
-use std::fmt::Write as _;
-
-use serde_json::{json, Value};
+use serde_json::Value;
 
 // `DsEncodingError` lives in `deepseek_common` (shared with V4); re-exported
 // here because it is part of this module's public API, and `pub(super)` items
 // are not reachable from outside `encoders` on their own.
 pub use super::deepseek_common::DsEncodingError;
-// Message-shape preprocessing, drop-thinking and DSML argument rendering are
-// identical to V4 except for the tag strings and the last-user definition; see
-// `deepseek_common` for the shared implementation and its own doc comments.
-use super::deepseek_common::{
-    at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml, merge_tool_messages,
-    sort_tool_results_by_call_order, DsmlTags,
+pub use super::deepseek_common::{
+    BOS_TOKEN, DSML_TOKEN, EOS_TOKEN, THINKING_END_TOKEN, THINKING_START_TOKEN,
 };
 // Reuse the public ThinkingMode enum from the V3.2 module to keep the
 // "thinking" / "chat" mode invariant identical across DeepSeek versions.
 pub use super::deepseek_v32::ThinkingMode;
+// Message-shape preprocessing, drop-thinking, DSML argument rendering and the
+// tools template are V4's too, apart from the tag strings and the last-turn
+// definition; see `deepseek_common` for the shared implementation and its
+// own doc comments.
+use super::{
+    deepseek_common::{
+        after_last_user, at_or_after_last_user, drop_thinking_messages, encode_arguments_to_dsml,
+        has_tools, merge_tool_messages, render_v4_tools_template, sort_tool_results_by_call_order,
+        task_sp_token, to_json, tool_calls_from_openai_format, tool_schemas,
+        tools_from_openai_format, DsmlTags,
+    },
+    RendererProfile,
+};
+// The family's special tokens: the private markers for this module, the
+// public ones re-exported under this renderer's path (the formatter keeps
+// every `use` in this block; the version's own constants follow the imports).
+use super::{
+    deepseek_common::{
+        mark_grounding_tokens, ASSISTANT, BOS, DSML, EOS, LATEST_REMINDER, THINKING_END,
+        THINKING_START, USER,
+    },
+    marks::{self, control},
+};
+use crate::{
+    chat_template::{ChatTemplateContentFormat, ThinkingKeyName, ThinkingToggle},
+    traits::RendererCapabilities,
+};
 
 // ---------------------------------------------------------------------------
-// Special-token constants — copied verbatim from the Python source.
+// Special-token constants: this version's own; the family's shared ones are
+// the `deepseek_common` re-exports above. Copied verbatim from the Python
+// source.
 // ---------------------------------------------------------------------------
-pub const BOS_TOKEN: &str = "<｜begin▁of▁sentence｜>";
-pub const EOS_TOKEN: &str = "<｜end▁of▁sentence｜>";
-pub const THINKING_START_TOKEN: &str = "<think>";
-pub const THINKING_END_TOKEN: &str = "</think>";
-pub const DSML_TOKEN: &str = "｜DSML｜";
+
 /// What every image content part renders as; the image payload itself is the
 /// serving layer's business, the prompt only carries this marker.
 pub const IMAGE_PLACEHOLDER: &str = "<｜deepseek_image｜>";
-const USER_SP_TOKEN: &str = "<｜User｜>";
-const ASSISTANT_SP_TOKEN: &str = "<｜Assistant｜>";
-const SYSTEM_SP_TOKEN: &str = "<｜System｜>";
-const LATEST_REMINDER_SP_TOKEN: &str = "<｜latest_reminder｜>";
+/// The placeholder as the renderer writes it for an image part: a control
+/// token of its own (the spelling typed in text is refused, see
+/// `validate_no_image_sp_tokens`).
+const IMAGE: &str = control!("<｜deepseek_image｜>");
+const SYSTEM: &str = control!("<｜System｜>");
 /// V4.1's DSML dialect: a leading space on the block name and on both tags
 /// (V4 uses bare `tool_calls`/`invoke`/`parameter`).
 const TOOL_CALLS_BLOCK_NAME: &str = " calls";
@@ -50,38 +70,120 @@ const DSML_TAGS: DsmlTags = DsmlTags {
     invoke: " invoke",
     parameter: " parameter",
 };
-// Quick-instruction "task" tokens (`<｜action｜>`, `<｜query｜>`, etc.)
-const TASK_ACTION: &str = "<｜action｜>";
-const TASK_QUERY: &str = "<｜query｜>";
-const TASK_AUTHORITY: &str = "<｜authority｜>";
-const TASK_DOMAIN: &str = "<｜domain｜>";
-const TASK_TITLE: &str = "<｜title｜>";
-const TASK_READ_URL: &str = "<｜read_url｜>";
-fn task_sp_token(task: &str) -> Option<&'static str> {
-    match task {
-        "action" => Some(TASK_ACTION),
-        "query" => Some(TASK_QUERY),
-        "authority" => Some(TASK_AUTHORITY),
-        "domain" => Some(TASK_DOMAIN),
-        "title" => Some(TASK_TITLE),
-        "read_url" => Some(TASK_READ_URL),
-        _ => None,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Reasoning effort
 // ---------------------------------------------------------------------------
-/// The effort names the Python encoder accepts (`REASONING_EFFORT_MAPPINGS`).
-pub const NATIVE_EFFORT_VALUES: &[&str] = &["low", "high", "xhigh", "max"];
+/// The effort names the renderer takes as levels: the checkpoint's chat
+/// template's (`low`/`medium`/`high`/`max`) and the `xhigh` of its first
+/// published encoder (`REASONING_EFFORT_MAPPINGS`).
+pub const NATIVE_EFFORT_VALUES: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+/// What this renderer answers around a render (see [`RendererProfile`]).
+pub(crate) const PROFILE: RendererProfile = RendererProfile {
+    // Message parts are preserved (OpenAI wire format) so the gateway passes
+    // `image_url` / `image` parts through as a list instead of flattening to
+    // a string, in the request's order (a parts-format renderer: the
+    // multimodal spec's `MediaPartOrder` is not consulted); the encoder turns
+    // each part into a placeholder at its position.
+    content_format: Some(ChatTemplateContentFormat::OpenAI),
+    // Thinking defaults ON: `reasoning_effort: "none"` or an explicit
+    // `thinking: false` (or the engine's `enable_thinking` alias, see the
+    // capabilities) turns it off.
+    thinking_toggle: ThinkingToggle::DefaultOn,
+    thinking_key_name: ThinkingKeyName::Thinking,
+    native_effort_values: NATIVE_EFFORT_VALUES,
+    // Switches off on the protocol's `none` / `minimal`: no words of its own.
+    native_effort_off_values: &[],
+    // `<｜Assistant｜><think>` ends the prompt when thinking is on.
+    think_in_prefill: true,
+    // The shim honours the engine's `enable_thinking` alias, renders a
+    // trailing assistant message itself when `add_generation_prompt` is
+    // false, and parses tool-call `arguments` strings with the reference's
+    // tolerance.
+    capabilities: RendererCapabilities {
+        enable_thinking_alias: true,
+        native_assistant_continuation: true,
+        raw_tool_call_arguments: true,
+        declares_tools_under_tool_choice_none: false,
+        ..RendererProfile::NO_CAPABILITIES
+    },
+    thinking_mode: None,
+};
 pub const REASONING_EFFORT_TEMPLATE: &str =
     "Reasoning Effort: {budget} (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
 const DEFAULT_REASONING_EFFORT: ReasoningEffort = ReasoningEffort::High;
 
-/// Reasoning effort for the V4.1 numeric prompt prefix.
+/// Which budgets the effort names stand for: the checkpoint's own encoder
+/// (`encoding/encoding.py`, its `REASONING_EFFORT_MAPPINGS`) moved them once.
+///
+/// The first published encoder mapped low/high/xhigh/max to 25/50/75/100.
+/// The refresh that followed maps low/high/max to 50/75/100 and has no
+/// `xhigh`; the chat template the checkpoint ships since carries the same
+/// numbers and a `medium` of its own at 62. A checkpoint directory without
+/// its encoder (a tokenizer directory streamed from a worker carries none)
+/// gets the rescaled table, the one the checkpoint carries today.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EffortTable {
+    /// low 25, high 50, xhigh 75, max 100; `medium`, which this encoder
+    /// has no budget for, renders `high`'s.
+    Original,
+    /// low 50, medium 62, high 75, max 100 (the chat template's numbers);
+    /// `xhigh` renders `high`'s budget.
+    #[default]
+    Rescaled,
+}
+
+impl EffortTable {
+    /// The budget `effort` renders under this table.
+    pub const fn budget(self, effort: ReasoningEffort) -> u8 {
+        match (self, effort) {
+            (_, ReasoningEffort::Budget(budget)) => budget,
+            (_, ReasoningEffort::Max) => 100,
+            (Self::Original, ReasoningEffort::Low) => 25,
+            (Self::Original, ReasoningEffort::Medium | ReasoningEffort::High) => 50,
+            (Self::Original, ReasoningEffort::XHigh) => 75,
+            (Self::Rescaled, ReasoningEffort::Low) => 50,
+            (Self::Rescaled, ReasoningEffort::Medium) => 62,
+            (Self::Rescaled, ReasoningEffort::High | ReasoningEffort::XHigh) => 75,
+        }
+    }
+
+    /// Identify the table from the checkpoint's own `encoding/encoding.py`
+    /// source: the budget its `REASONING_EFFORT_MAPPINGS` gives `low`, 25 in
+    /// the first published encoder. Any other value, or no readable mapping,
+    /// is the rescaled table.
+    pub fn detect_from_encoder_source(source: &str) -> Self {
+        const MAPPINGS: &str = "REASONING_EFFORT_MAPPINGS";
+        const LOW: &str = "\"low\"";
+        let Some(mappings) = source.find(MAPPINGS) else {
+            return Self::Rescaled;
+        };
+        let after = &source[mappings + MAPPINGS.len()..];
+        let Some(low) = after.find(LOW) else {
+            return Self::Rescaled;
+        };
+        let Some(value) = after[low + LOW.len()..].trim_start().strip_prefix(':') else {
+            return Self::Rescaled;
+        };
+        let digits: String = value
+            .trim_start()
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        match digits.parse::<u8>() {
+            Ok(25) => Self::Original,
+            _ => Self::Rescaled,
+        }
+    }
+}
+
+/// Reasoning effort for the V4.1 numeric prompt prefix; what each name
+/// renders is the [`EffortTable`]'s.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReasoningEffort {
     Low,
+    Medium,
     High,
     XHigh,
     Max,
@@ -90,22 +192,11 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
-    /// Spec D1: engine table. Flip these four numbers if vLLM/SGLang adopt
-    /// DeepSeek's 50/75/100.
-    pub const fn budget(self) -> u8 {
-        match self {
-            Self::Low => 25,
-            Self::High => 50,
-            Self::XHigh => 75,
-            Self::Max => 100,
-            Self::Budget(n) => n,
-        }
-    }
-
     /// Parse one of [`NATIVE_EFFORT_VALUES`].
     fn from_native(value: &str) -> Option<Self> {
         match value {
             "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
             "high" => Some(Self::High),
             "xhigh" => Some(Self::XHigh),
             "max" => Some(Self::Max),
@@ -116,7 +207,7 @@ impl ReasoningEffort {
 
 /// Parse the request's `reasoning_effort` field.
 ///
-/// `None` = not present. Strings low/high/xhigh/max, integers 1..=100. The
+/// `None` = not present. Strings low/medium/high/xhigh/max, integers 1..=100. The
 /// thinking switch (`"none"`/`"minimal"`, see
 /// `openai_protocol::chat::thinking_from_reasoning_effort`) is handled by the
 /// caller — those mean "thinking off", not an effort level — so they land here
@@ -140,58 +231,28 @@ pub fn parse_reasoning_effort(value: &Value) -> Result<Option<ReasoningEffort>, 
 }
 
 /// Mirrors `render_reasoning_effort`: the prefix exists in thinking mode, at
-/// index 0, only.
+/// index 0, only; the budget is `table`'s for the effort, `high`'s when none
+/// was given.
 fn render_reasoning_effort(
     index: usize,
     thinking_mode: ThinkingMode,
     effort: Option<ReasoningEffort>,
+    table: EffortTable,
 ) -> String {
     if index != 0 || thinking_mode != ThinkingMode::Thinking {
         return String::new();
     }
-    let budget = effort.unwrap_or(DEFAULT_REASONING_EFFORT).budget();
+    let budget = table.budget(effort.unwrap_or(DEFAULT_REASONING_EFFORT));
     REASONING_EFFORT_TEMPLATE.replace("{budget}", &budget.to_string())
 }
 
 // ---------------------------------------------------------------------------
 // Templates
 // ---------------------------------------------------------------------------
-/// Mirrors V4.1's `TOOLS_TEMPLATE`.
-fn render_tools_template(tool_schemas: &str) -> String {
-    let dsml = DSML_TOKEN;
-    let tcb = TOOL_CALLS_BLOCK_NAME;
-    let invoke = DSML_TAGS.invoke;
-    let parameter = DSML_TAGS.parameter;
-    let tstart = THINKING_START_TOKEN;
-    let tend = THINKING_END_TOKEN;
-    format!(
-"## Tools
-
-You have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<{dsml}{tcb}>\" block like the following:
-
-<{dsml}{tcb}>
-<{dsml}{invoke} name=\"$TOOL_NAME\">
-<{dsml}{parameter} name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</{dsml}{parameter}>
-...
-</{dsml}{invoke}>
-<{dsml}{invoke} name=\"$TOOL_NAME2\">
-...
-</{dsml}{invoke}>
-</{dsml}{tcb}>
-
-String parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.
-
-If thinking_mode is enabled (triggered by {tstart}), you MUST output your complete reasoning inside {tstart}...{tend} BEFORE any tool calls or final response.
-
-Otherwise, output directly after {tend} with tool calls or final response.
-
-### Available Tool Schemas
-
-{tool_schemas}
-
-You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
-"
-    )
+/// Mirrors V4.1's `TOOLS_TEMPLATE`: the V4 family's text with this dialect's
+/// block name and spaced tags.
+fn render_tools(tools: &[Value]) -> String {
+    render_v4_tools_template(TOOL_CALLS_BLOCK_NAME, &DSML_TAGS, &tool_schemas(tools))
 }
 
 fn render_response_format(schema: &Value) -> String {
@@ -202,53 +263,15 @@ fn render_response_format(schema: &Value) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// JSON helpers (mirror V4)
-// ---------------------------------------------------------------------------
-// Python's `to_json` is `json.dumps(value, ensure_ascii=False)`: spaced
-// separators, raw UTF-8. Compact `serde_json::to_string` would change the
-// prompt bytes vLLM trained on.
-fn to_json(value: &Value) -> String {
-    crate::json_dumps::to_string(value)
-}
-fn tools_from_openai_format(tools: &[Value]) -> Vec<Value> {
-    tools
-        .iter()
-        .filter_map(|tool| tool.get("function").cloned())
-        .collect()
-}
-fn tool_calls_from_openai_format(tool_calls: &[Value]) -> Vec<Value> {
-    tool_calls
-        .iter()
-        .filter_map(|tool_call| {
-            let function = tool_call.get("function")?;
-            Some(json!({
-                "name": function.get("name").cloned().unwrap_or(Value::Null),
-                "arguments": function.get("arguments").cloned().unwrap_or(Value::Null),
-            }))
-        })
-        .collect()
-}
-fn render_tools(tools: &[Value]) -> String {
-    let schemas: Vec<String> = tools.iter().map(to_json).collect();
-    render_tools_template(&schemas.join("\n"))
-}
-/// Python's `if msg.get("tools"):` — absent, null and `[]` are all falsy.
-fn has_tools(msg: &Value) -> bool {
-    msg.get("tools")
-        .and_then(|v| v.as_array())
-        .is_some_and(|tools| !tools.is_empty())
-}
-
-// ---------------------------------------------------------------------------
 // Image/content-part normalisation
 // ---------------------------------------------------------------------------
-// vLLM's `_normalize_messages` plus the reference encoder's
+// The engine's `_normalize_messages` plus the reference encoder's
 // `process_image_messages`: list content collapses to a single string in which
 // every image part became `IMAGE_PLACEHOLDER`, parts joined by a blank line.
 // The image payloads themselves are not collected here — SMG's multimodal path
 // carries them separately, the prompt only needs the marker.
 
-/// Mirrors vLLM's `_normalize_messages` flattening plus the HF
+/// Mirrors the engine's `_normalize_messages` flattening plus the HF
 /// `_validate_no_image_sp_tokens` check (see the header comment above): list
 /// content collapses to the text V4.1 encodes, and no text may carry the image
 /// placeholder.
@@ -301,7 +324,7 @@ fn flatten_content_parts(parts: &[Value]) -> Result<String, DsEncodingError> {
                 }
                 texts.push(text);
             }
-            "image" | "image_url" | "input_image" | "image_pil" => texts.push(IMAGE_PLACEHOLDER),
+            "image" | "image_url" | "input_image" | "image_pil" => texts.push(IMAGE),
             other => return Err(DsEncodingError::UnsupportedContentPart(other.to_string())),
         }
     }
@@ -311,9 +334,11 @@ fn flatten_content_parts(parts: &[Value]) -> Result<String, DsEncodingError> {
 // ---------------------------------------------------------------------------
 // render_message — direct port of the V4.1 Python function with the same name.
 // ---------------------------------------------------------------------------
-/// Mirrors V4.1's `find_last_user_index`: unlike V4, a mid-conversation system
-/// message counts as a user turn. Returns `None` where Python returns -1.
-fn find_last_user_index(messages: &[Value]) -> Option<usize> {
+/// Mirrors V4.1's `find_last_user_index` under a name of its own, since the
+/// rule differs from [`super::deepseek_common::find_last_user_index`]: a
+/// mid-conversation system message counts as a user turn here. Returns
+/// `None` where Python returns -1.
+fn find_last_turn_index(messages: &[Value]) -> Option<usize> {
     for index in (0..messages.len()).rev() {
         let role = messages[index].get("role").and_then(|v| v.as_str());
         let counts = matches!(role, Some("user") | Some("developer"))
@@ -325,242 +350,311 @@ fn find_last_user_index(messages: &[Value]) -> Option<usize> {
     None
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "mirrors the Python render_message function 1:1 for sync-ability"
-)]
+/// One message as the renderer reads it: the fields of the OpenAI-shape
+/// value, read once, with the tools and tool calls in the encoder's shape
+/// and empty lists dropped the way Python's truthiness drops them.
+struct Turn<'m> {
+    index: usize,
+    msg: &'m Value,
+    role: &'m str,
+    content: &'m str,
+    tools: Option<Vec<Value>>,
+    /// Python `if response_format:` — absent, null and `{}` are all falsy.
+    response_format: Option<&'m Value>,
+    tool_calls: Option<Vec<Value>>,
+    reasoning_content: &'m str,
+    wo_eos: bool,
+}
+
+impl<'m> Turn<'m> {
+    fn read(index: usize, messages: &'m [Value]) -> Result<Self, DsEncodingError> {
+        let Some(msg) = messages.get(index) else {
+            return Err(DsEncodingError::IndexOutOfRange {
+                index,
+                len: messages.len(),
+            });
+        };
+        let tools = msg
+            .get("tools")
+            .and_then(|v| v.as_array())
+            .map(|tools| tools_from_openai_format(tools))
+            .filter(|tools| !tools.is_empty());
+        let tool_calls = msg
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .map(|tool_calls| tool_calls_from_openai_format(tool_calls))
+            .filter(|tool_calls| !tool_calls.is_empty());
+        Ok(Self {
+            index,
+            msg,
+            role: text(msg, "role"),
+            content: text(msg, "content"),
+            tools,
+            response_format: msg
+                .get("response_format")
+                .filter(|v| !v.is_null() && v.as_object().is_none_or(|map| !map.is_empty())),
+            tool_calls,
+            reasoning_content: text(msg, "reasoning_content"),
+            wo_eos: msg.get("wo_eos").and_then(|v| v.as_bool()).unwrap_or(false),
+        })
+    }
+}
+
+/// A string field of a message, empty when absent or not a string, as the
+/// reference's `msg.get(key, "")` reads it.
+fn text<'m>(msg: &'m Value, key: &str) -> &'m str {
+    msg.get(key).and_then(|v| v.as_str()).unwrap_or("")
+}
+
+/// Mirrors the reference's `render_message`: one turn's text, by role in the
+/// reference's order, then the transition to the next turn.
 fn render_message(
     index: usize,
     messages: &[Value],
     thinking_mode: ThinkingMode,
     drop_thinking: bool,
     reasoning_effort: Option<ReasoningEffort>,
+    effort_table: EffortTable,
 ) -> Result<String, DsEncodingError> {
-    if index >= messages.len() {
-        return Err(DsEncodingError::IndexOutOfRange {
-            index,
-            len: messages.len(),
-        });
-    }
-    let msg = &messages[index];
-    let last_user_idx = find_last_user_index(messages);
-
-    let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-    let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-    let tools_raw = msg.get("tools").and_then(|v| v.as_array());
-    // Python `if response_format:` — absent, null and `{}` are all falsy.
-    let response_format = msg
-        .get("response_format")
-        .filter(|v| !v.is_null() && v.as_object().is_none_or(|map| !map.is_empty()));
-    let tool_calls_raw = msg.get("tool_calls").and_then(|v| v.as_array());
-    let reasoning_content = msg
-        .get("reasoning_content")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let wo_eos = msg.get("wo_eos").and_then(|v| v.as_bool()).unwrap_or(false);
-    let tools_owned = tools_raw.map(|tools| tools_from_openai_format(tools));
-    let tools = tools_owned.as_deref().filter(|tools| !tools.is_empty());
-    let tool_calls_owned =
-        tool_calls_raw.map(|tool_calls| tool_calls_from_openai_format(tool_calls));
-    let tool_calls = tool_calls_owned
-        .as_deref()
-        .filter(|tool_calls| !tool_calls.is_empty());
-
-    // Reasoning effort prefix: index 0, thinking mode only.
-    let reasoning_effort_prompt = render_reasoning_effort(index, thinking_mode, reasoning_effort);
-    // The system token leads the conversation when there is a reasoning effort
-    // prompt or the first message is a system message.
-    let mut prompt = String::new();
-    if index == 0 && (!reasoning_effort_prompt.is_empty() || role == "system") {
-        prompt.push_str(SYSTEM_SP_TOKEN);
-    }
-    prompt.push_str(&reasoning_effort_prompt);
-
-    match role {
-        "system" => {
-            if index > 0 {
-                // Mid-conversation system message.
-                prompt.push_str(SYSTEM_SP_TOKEN);
-            }
-            prompt.push_str(content);
-            if let Some(tools) = tools {
-                prompt.push_str("\n\n");
-                prompt.push_str(&render_tools(tools));
-            }
-            if let Some(schema) = response_format {
-                prompt.push_str("\n\n");
-                prompt.push_str(&render_response_format(schema));
-            }
-        }
-
-        "developer" => {
-            if content.is_empty() {
-                return Err(DsEncodingError::InvalidMessage {
-                    role: role.to_string(),
-                    msg: msg.to_string(),
-                });
-            }
-            let mut content_developer = String::new();
-            content_developer.push_str(USER_SP_TOKEN);
-            content_developer.push_str(content);
-            if let Some(tools) = tools {
-                content_developer.push_str("\n\n");
-                content_developer.push_str(&render_tools(tools));
-            }
-            if let Some(schema) = response_format {
-                content_developer.push_str("\n\n");
-                content_developer.push_str(&render_response_format(schema));
-            }
-            prompt.push_str(&content_developer);
-        }
-
-        "user" => {
-            prompt.push_str(USER_SP_TOKEN);
-            // Handle content blocks (tool results mixed with text).
-            let content_blocks = msg
-                .get("content_blocks")
-                .and_then(|v| v.as_array())
-                .filter(|blocks| !blocks.is_empty());
-            if let Some(content_blocks) = content_blocks {
-                let mut parts: Vec<String> = Vec::with_capacity(content_blocks.len());
-                for block in content_blocks {
-                    let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                    match block_type {
-                        "text" => {
-                            let text = block.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                            parts.push(text.to_string());
-                        }
-                        "tool_result" => {
-                            let tool_content = match block.get("content") {
-                                Some(Value::Array(items)) => {
-                                    let mut text_parts: Vec<String> =
-                                        Vec::with_capacity(items.len());
-                                    for item in items {
-                                        let item_type =
-                                            item.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                                        if item_type == "text" {
-                                            text_parts.push(
-                                                item.get("text")
-                                                    .and_then(|v| v.as_str())
-                                                    .unwrap_or("")
-                                                    .to_string(),
-                                            );
-                                        } else {
-                                            text_parts.push(format!("[Unsupported {item_type}]"));
-                                        }
-                                    }
-                                    text_parts.join("\n\n")
-                                }
-                                Some(Value::String(text)) => text.clone(),
-                                Some(other) => to_json(other),
-                                None => String::new(),
-                            };
-                            parts.push(format!("<tool_result>{tool_content}</tool_result>"));
-                        }
-                        other => parts.push(format!("[Unsupported {other}]")),
-                    }
-                }
-                prompt.push_str(&parts.join("\n\n"));
-            } else {
-                prompt.push_str(content);
-            }
-        }
-
+    let turn = Turn::read(index, messages)?;
+    let last_user_idx = find_last_turn_index(messages);
+    let mut prompt = render_prefix(&turn, thinking_mode, reasoning_effort, effort_table);
+    match turn.role {
+        "system" => render_system(&turn, &mut prompt),
+        "developer" => render_developer(&turn, &mut prompt)?,
+        "user" => render_user(&turn, &mut prompt),
         "latest_reminder" => {
-            prompt.push_str(LATEST_REMINDER_SP_TOKEN);
-            prompt.push_str(content);
+            prompt.push_str(LATEST_REMINDER);
+            prompt.push_str(turn.content);
         }
-        "tool" => {
-            return Err(DsEncodingError::UnmergedToolRole(index));
-        }
-
-        "assistant" => {
-            let mut thinking_part = String::new();
-            let mut tc_content = String::new();
-            if let Some(tool_calls) = tool_calls {
-                let mut tc_list = Vec::with_capacity(tool_calls.len());
-                for tool_call in tool_calls {
-                    let name = tool_call.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let arguments = tool_call.get("arguments").unwrap_or(&Value::Null);
-                    let args = encode_arguments_to_dsml(arguments, &DSML_TAGS);
-                    tc_list.push(format!(
-                        "<{DSML_TOKEN}{invoke} name=\"{name}\">\n{args}\n</{DSML_TOKEN}{invoke}>",
-                        invoke = DSML_TAGS.invoke,
-                    ));
-                }
-                let joined = tc_list.join("\n");
-                let _ = write!(
-                    tc_content,
-                    "\n\n<{DSML_TOKEN}{TOOL_CALLS_BLOCK_NAME}>\n{joined}\n</{DSML_TOKEN}{TOOL_CALLS_BLOCK_NAME}>"
-                );
-            }
-            // prev_has_task: if the previous message had a task, this is a task
-            // output (no thinking).
-            let prev_has_task = index >= 1
-                && messages[index - 1]
-                    .get("task")
-                    .is_some_and(|task| !task.is_null());
-            if thinking_mode == ThinkingMode::Thinking && !prev_has_task {
-                // Python: `not drop_thinking or index > last_user_idx`, where a
-                // conversation without a user turn has last_user_idx == -1.
-                let after_last_user = match last_user_idx {
-                    Some(last) => index > last,
-                    None => true,
-                };
-                if !drop_thinking || after_last_user {
-                    thinking_part.push_str(reasoning_content);
-                    thinking_part.push_str(THINKING_END_TOKEN);
-                }
-            }
-            prompt.push_str(&thinking_part);
-            prompt.push_str(content);
-            prompt.push_str(&tc_content);
-            if !wo_eos {
-                prompt.push_str(EOS_TOKEN);
-            }
-        }
+        "tool" => return Err(DsEncodingError::UnmergedToolRole(index)),
+        "assistant" => render_assistant(
+            &turn,
+            messages,
+            thinking_mode,
+            drop_thinking,
+            last_user_idx,
+            &mut prompt,
+        ),
         other => return Err(DsEncodingError::UnknownRole(other.to_string())),
     }
+    push_transition(
+        &turn,
+        messages,
+        thinking_mode,
+        drop_thinking,
+        last_user_idx,
+        &mut prompt,
+    )?;
+    Ok(prompt)
+}
 
-    // Append transition tokens based on what follows.
-    if let Some(next) = messages.get(index + 1) {
-        let next_role = next.get("role").and_then(|v| v.as_str()).unwrap_or("");
-        if !matches!(next_role, "assistant" | "latest_reminder") {
-            return Ok(prompt);
+/// The system token when the conversation opens with a reasoning-effort
+/// prompt or a system message, then the reasoning-effort prompt (index 0,
+/// thinking mode only).
+fn render_prefix(
+    turn: &Turn<'_>,
+    thinking_mode: ThinkingMode,
+    reasoning_effort: Option<ReasoningEffort>,
+    effort_table: EffortTable,
+) -> String {
+    let reasoning_effort_prompt =
+        render_reasoning_effort(turn.index, thinking_mode, reasoning_effort, effort_table);
+    let mut prompt = String::new();
+    if turn.index == 0 && (!reasoning_effort_prompt.is_empty() || turn.role == "system") {
+        prompt.push_str(SYSTEM);
+    }
+    prompt.push_str(&reasoning_effort_prompt);
+    prompt
+}
+
+/// A system turn: a mid-conversation one carries its own system token; the
+/// tools and the response format follow the content.
+fn render_system(turn: &Turn<'_>, prompt: &mut String) {
+    if turn.index > 0 {
+        prompt.push_str(SYSTEM);
+    }
+    prompt.push_str(turn.content);
+    push_tools_and_response_format(turn, prompt);
+}
+
+/// A developer turn renders as a user turn; an empty one is an error.
+fn render_developer(turn: &Turn<'_>, prompt: &mut String) -> Result<(), DsEncodingError> {
+    if turn.content.is_empty() {
+        return Err(DsEncodingError::InvalidMessage {
+            role: turn.role.to_string(),
+            msg: turn.msg.to_string(),
+        });
+    }
+    prompt.push_str(USER);
+    prompt.push_str(turn.content);
+    push_tools_and_response_format(turn, prompt);
+    Ok(())
+}
+
+/// The tools template and the response format of a system or developer
+/// turn, each after a blank line, when the turn has them.
+fn push_tools_and_response_format(turn: &Turn<'_>, prompt: &mut String) {
+    if let Some(tools) = &turn.tools {
+        prompt.push_str("\n\n");
+        prompt.push_str(&render_tools(tools));
+    }
+    if let Some(schema) = turn.response_format {
+        prompt.push_str("\n\n");
+        prompt.push_str(&render_response_format(schema));
+    }
+}
+
+/// A user turn: its content blocks (text and the tool results
+/// `merge_tool_messages` folded in) joined by blank lines, else its content.
+fn render_user(turn: &Turn<'_>, prompt: &mut String) {
+    prompt.push_str(USER);
+    let blocks = turn
+        .msg
+        .get("content_blocks")
+        .and_then(|v| v.as_array())
+        .filter(|blocks| !blocks.is_empty());
+    match blocks {
+        Some(blocks) => {
+            let parts: Vec<String> = blocks.iter().map(render_content_block).collect();
+            prompt.push_str(&parts.join("\n\n"));
+        }
+        None => prompt.push_str(turn.content),
+    }
+}
+
+/// One content block: its text, a tool result in its tags, or an
+/// `[Unsupported ...]` marker, as the reference renders them.
+fn render_content_block(block: &Value) -> String {
+    match text(block, "type") {
+        "text" => text(block, "text").to_string(),
+        "tool_result" => format!(
+            "<tool_result>{}</tool_result>",
+            tool_result_text(block.get("content"))
+        ),
+        other => format!("[Unsupported {other}]"),
+    }
+}
+
+/// A tool result's content as text: a list of parts joined by blank lines
+/// (text parts as they are, any other as an `[Unsupported ...]` marker), a
+/// string as it is, any other value as JSON, nothing when absent.
+fn tool_result_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::Array(items)) => {
+            let parts: Vec<String> = items
+                .iter()
+                .map(|item| match text(item, "type") {
+                    "text" => text(item, "text").to_string(),
+                    other => format!("[Unsupported {other}]"),
+                })
+                .collect();
+            parts.join("\n\n")
+        }
+        Some(Value::String(content)) => content.clone(),
+        Some(other) => to_json(other),
+        None => String::new(),
+    }
+}
+
+/// An assistant turn: its reasoning closed by the think-end token (in
+/// thinking mode, kept after the last user turn or everywhere when thinking
+/// is not dropped, never for a task output), its content, its tool calls
+/// block, and the end token unless `wo_eos`.
+fn render_assistant(
+    turn: &Turn<'_>,
+    messages: &[Value],
+    thinking_mode: ThinkingMode,
+    drop_thinking: bool,
+    last_user_idx: Option<usize>,
+    prompt: &mut String,
+) {
+    // A task output: the previous message named a task.
+    let prev_has_task = turn.index >= 1
+        && messages[turn.index - 1]
+            .get("task")
+            .is_some_and(|task| !task.is_null());
+    if thinking_mode == ThinkingMode::Thinking
+        && !prev_has_task
+        && (!drop_thinking || after_last_user(turn.index, last_user_idx))
+    {
+        prompt.push_str(&mark_grounding_tokens(turn.reasoning_content));
+        prompt.push_str(THINKING_END);
+    }
+    prompt.push_str(&mark_grounding_tokens(turn.content));
+    if let Some(tool_calls) = &turn.tool_calls {
+        prompt.push_str(&tool_calls_block(tool_calls));
+    }
+    if !turn.wo_eos {
+        prompt.push_str(EOS);
+    }
+}
+
+/// The tool calls block after a blank line: each call's invoke tags around
+/// its DSML arguments, inside the dialect's block tags.
+fn tool_calls_block(tool_calls: &[Value]) -> String {
+    let calls: Vec<String> = tool_calls
+        .iter()
+        .map(|tool_call| {
+            let name = text(tool_call, "name");
+            let arguments = tool_call.get("arguments").unwrap_or(&Value::Null);
+            let args = encode_arguments_to_dsml(arguments, &DSML_TAGS);
+            format!(
+                "<{DSML}{invoke} name=\"{name}\">\n{args}\n</{DSML}{invoke}>",
+                invoke = DSML_TAGS.invoke,
+            )
+        })
+        .collect();
+    let joined = calls.join("\n");
+    format!("\n\n<{DSML}{TOOL_CALLS_BLOCK_NAME}>\n{joined}\n</{DSML}{TOOL_CALLS_BLOCK_NAME}>")
+}
+
+/// What follows the turn: nothing when a next message exists and is not an
+/// assistant or latest-reminder turn; otherwise (the last turn included: the
+/// generation prompt) a task's token (the action task behind the assistant
+/// header and a think token); else, after a user, developer or
+/// mid-conversation system turn, the assistant header and the think token
+/// that opens the reasoning (thinking mode, kept at or after the last user
+/// turn or everywhere when thinking is not dropped) or closes it.
+fn push_transition(
+    turn: &Turn<'_>,
+    messages: &[Value],
+    thinking_mode: ThinkingMode,
+    drop_thinking: bool,
+    last_user_idx: Option<usize>,
+    prompt: &mut String,
+) -> Result<(), DsEncodingError> {
+    if let Some(next) = messages.get(turn.index + 1) {
+        if !matches!(text(next, "role"), "assistant" | "latest_reminder") {
+            return Ok(());
         }
     }
-
-    let task = msg.get("task").filter(|task| !task.is_null());
+    let task = turn.msg.get("task").filter(|task| !task.is_null());
     if let Some(task) = task {
         let task = task.as_str().unwrap_or("");
         let sp_token =
             task_sp_token(task).ok_or_else(|| DsEncodingError::InvalidTask(task.to_string()))?;
         if task == "action" {
-            // Action task: append Assistant + thinking token + action sp token.
-            prompt.push_str(ASSISTANT_SP_TOKEN);
+            prompt.push_str(ASSISTANT);
             prompt.push_str(if thinking_mode == ThinkingMode::Thinking {
-                THINKING_START_TOKEN
+                THINKING_START
             } else {
-                THINKING_END_TOKEN
+                THINKING_END
             });
-            prompt.push_str(sp_token);
-        } else {
-            // Non-action tasks: append the task sp token directly after the message.
-            prompt.push_str(sp_token);
         }
-    } else if matches!(role, "user" | "developer") || (role == "system" && index > 0) {
-        // Normal generation: append Assistant + thinking token
-        // (mid-conversation system messages also trigger the assistant header).
-        prompt.push_str(ASSISTANT_SP_TOKEN);
+        prompt.push_str(sp_token);
+    } else if matches!(turn.role, "user" | "developer") || (turn.role == "system" && turn.index > 0)
+    {
+        prompt.push_str(ASSISTANT);
         let opens_thinking = thinking_mode == ThinkingMode::Thinking
-            && (!drop_thinking || at_or_after_last_user(index, last_user_idx));
-        if opens_thinking {
-            prompt.push_str(THINKING_START_TOKEN);
+            && (!drop_thinking || at_or_after_last_user(turn.index, last_user_idx));
+        prompt.push_str(if opens_thinking {
+            THINKING_START
         } else {
-            prompt.push_str(THINKING_END_TOKEN);
-        }
+            THINKING_END
+        });
     }
-    Ok(prompt)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -575,6 +669,8 @@ pub struct EncodeParams {
     pub add_default_bos_token: bool,
     pub drop_thinking: bool,
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// The checkpoint revision's effort table (see [`EffortTable`]).
+    pub effort_table: EffortTable,
 }
 impl Default for EncodeParams {
     fn default() -> Self {
@@ -582,6 +678,7 @@ impl Default for EncodeParams {
             add_default_bos_token: true,
             drop_thinking: true,
             reasoning_effort: None,
+            effort_table: EffortTable::Rescaled,
         }
     }
 }
@@ -599,23 +696,39 @@ pub fn encode_messages(
     thinking_mode: ThinkingMode,
     params: &EncodeParams,
 ) -> Result<String, DsEncodingError> {
-    // Normalise multimodal content parts into text before anything else.
-    let normalized = process_image_messages(messages)?;
-    // Preprocess: merge tool messages and sort tool results.
+    render_messages(messages, thinking_mode, params)
+        .map(|marked| marks::strip(&marked).into_owned())
+}
+
+/// [`encode_messages`] with the renderer's own control tokens marked (see
+/// `marks`): the form the tokenizer wrapper encodes by segments, so that a
+/// control-token spelling typed in a message stays text. Request strings
+/// lose any mark a client wrote into them first.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "the same signature as `encode_messages`"
+)]
+pub(crate) fn render_messages(
+    messages: &[Value],
+    thinking_mode: ThinkingMode,
+    params: &EncodeParams,
+) -> Result<String, DsEncodingError> {
+    let messages = marks::without_marks(messages);
+    let normalized = process_image_messages(&messages)?;
     let merged = merge_tool_messages(&normalized);
     let mut full_messages = sort_tool_results_by_call_order(merged);
     let mut prompt = if params.add_default_bos_token {
-        BOS_TOKEN.to_string()
+        BOS.to_string()
     } else {
         String::new()
     };
-    // Resolve drop_thinking: if any message has tools defined, never drop.
+    // Thinking is never dropped from a conversation that defines tools.
     let mut effective_drop_thinking = params.drop_thinking;
     if full_messages.iter().any(has_tools) {
         effective_drop_thinking = false;
     }
     if thinking_mode == ThinkingMode::Thinking && effective_drop_thinking {
-        let last_user_idx = find_last_user_index(&full_messages);
+        let last_user_idx = find_last_turn_index(&full_messages);
         full_messages = drop_thinking_messages(&full_messages, last_user_idx);
     }
     for idx in 0..full_messages.len() {
@@ -625,6 +738,7 @@ pub fn encode_messages(
             thinking_mode,
             effective_drop_thinking,
             params.reasoning_effort,
+            params.effort_table,
         )?);
     }
     Ok(prompt)
@@ -647,6 +761,7 @@ mod tests {
             add_default_bos_token: true,
             drop_thinking: true,
             reasoning_effort: effort,
+            effort_table: EffortTable::Rescaled,
         }
     }
 
@@ -660,35 +775,105 @@ mod tests {
     }
 
     #[test]
-    fn thinking_mode_prefixes_effort_line_with_default_50() {
+    fn thinking_mode_prefixes_effort_line_with_the_tables_default() {
+        // No effort given: `high` of the table, 75 under the rescaled one
+        // (what the checkpoint's template writes) and 50 under the original.
         let out = encode_messages(&[user("q")], ThinkingMode::Thinking, &params(None)).unwrap();
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>");
+        let original = EncodeParams {
+            effort_table: EffortTable::Original,
+            ..params(None)
+        };
+        let out = encode_messages(&[user("q")], ThinkingMode::Thinking, &original).unwrap();
         assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>");
     }
 
     #[test]
-    fn effort_tiers_follow_engine_table() {
-        for (tier, n) in [
-            (ReasoningEffort::Low, 25),
-            (ReasoningEffort::High, 50),
-            (ReasoningEffort::XHigh, 75),
-            (ReasoningEffort::Max, 100),
-            (ReasoningEffort::Budget(42), 42),
+    fn effort_tiers_follow_the_checkpoints_table() {
+        // The first published encoder's table and the rescaled one the
+        // checkpoint carries since (its chat template agrees, and adds
+        // `medium` at 62; the first encoder has no `medium`, so it renders
+        // `high`'s budget there); an integer budget renders as given under
+        // both.
+        for (table, tiers) in [
+            (
+                EffortTable::Original,
+                [
+                    (ReasoningEffort::Low, 25),
+                    (ReasoningEffort::Medium, 50),
+                    (ReasoningEffort::High, 50),
+                    (ReasoningEffort::XHigh, 75),
+                    (ReasoningEffort::Max, 100),
+                    (ReasoningEffort::Budget(42), 42),
+                ],
+            ),
+            (
+                EffortTable::Rescaled,
+                [
+                    (ReasoningEffort::Low, 50),
+                    (ReasoningEffort::Medium, 62),
+                    (ReasoningEffort::High, 75),
+                    (ReasoningEffort::XHigh, 75),
+                    (ReasoningEffort::Max, 100),
+                    (ReasoningEffort::Budget(42), 42),
+                ],
+            ),
         ] {
-            let out =
-                encode_messages(&[user("q")], ThinkingMode::Thinking, &params(Some(tier))).unwrap();
-            assert!(
-                out.contains(&format!("Reasoning Effort: {n} (range")),
-                "{tier:?}"
-            );
+            for (tier, n) in tiers {
+                let encode_params = EncodeParams {
+                    effort_table: table,
+                    ..params(Some(tier))
+                };
+                let out =
+                    encode_messages(&[user("q")], ThinkingMode::Thinking, &encode_params).unwrap();
+                assert!(
+                    out.contains(&format!("Reasoning Effort: {n} (range")),
+                    "{table:?} {tier:?}: {out}"
+                );
+            }
         }
     }
 
     #[test]
-    fn parse_effort_rejects_minimal_medium_floats_and_out_of_range() {
+    fn effort_table_detected_from_the_encoders_mapping() {
+        let original = "REASONING_EFFORT_MAPPINGS: Dict[str, int] = {\n    \"low\": 25,\n    \"high\": 50,\n    \"xhigh\": 75,\n    \"max\": 100,\n}\n";
+        let rescaled = "REASONING_EFFORT_MAPPINGS: Dict[str, int] = {\n    \"low\": 50,\n    \"high\": 75,\n    \"max\": 100,\n}\n";
+        assert_eq!(
+            EffortTable::detect_from_encoder_source(original),
+            EffortTable::Original
+        );
+        assert_eq!(
+            EffortTable::detect_from_encoder_source(rescaled),
+            EffortTable::Rescaled
+        );
+        // One-line spelling, and a mention of the name before the mapping.
+        assert_eq!(
+            EffortTable::detect_from_encoder_source(
+                "# see REASONING_EFFORT_MAPPINGS below\nREASONING_EFFORT_MAPPINGS = {\"low\": 25, \"max\": 100}"
+            ),
+            EffortTable::Original
+        );
+        // No mapping, no `low`, or a value that is not a budget: the rescaled table.
+        for source in [
+            "",
+            "REASONING_EFFORT_MAPPINGS = {}",
+            "REASONING_EFFORT_MAPPINGS = {\"low\": x}",
+        ] {
+            assert_eq!(
+                EffortTable::detect_from_encoder_source(source),
+                EffortTable::Rescaled,
+                "{source:?}"
+            );
+        }
+        assert_eq!(EffortTable::default(), EffortTable::Rescaled);
+    }
+
+    #[test]
+    fn parse_effort_rejects_minimal_none_floats_and_out_of_range() {
         for bad in [
             json!("minimal"),
-            json!("medium"),
             json!("none"),
+            json!("turbo"),
             json!(0),
             json!(101),
             json!(1.5),
@@ -700,6 +885,11 @@ mod tests {
         assert_eq!(
             parse_reasoning_effort(&json!("xhigh")).unwrap(),
             Some(ReasoningEffort::XHigh)
+        );
+        // The chat template's own level.
+        assert_eq!(
+            parse_reasoning_effort(&json!("medium")).unwrap(),
+            Some(ReasoningEffort::Medium)
         );
         assert_eq!(
             parse_reasoning_effort(&json!(7)).unwrap(),
@@ -838,7 +1028,7 @@ mod tests {
             json!({"role": "assistant", "reasoning_content": "r", "content": "Sure,", "wo_eos": true}),
         ];
         let out = encode_messages(&msgs, ThinkingMode::Thinking, &params(None)).unwrap();
-        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 50 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>r</think>Sure,");
+        assert_eq!(out, "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>q<｜Assistant｜><think>r</think>Sure,");
     }
 
     #[test]
@@ -874,7 +1064,15 @@ mod tests {
     #[test]
     fn bare_tool_role_reaching_render_message_errors() {
         let msgs = [json!({"role": "tool", "content": "x"})];
-        let err = render_message(0, &msgs, ThinkingMode::Chat, true, None).unwrap_err();
+        let err = render_message(
+            0,
+            &msgs,
+            ThinkingMode::Chat,
+            true,
+            None,
+            EffortTable::Rescaled,
+        )
+        .unwrap_err();
         assert!(matches!(err, DsEncodingError::UnmergedToolRole(0)), "{err}");
     }
 
@@ -885,7 +1083,10 @@ mod tests {
         assert!(matches!(err, DsEncodingError::UnknownRole(ref r) if r == "moderator"));
     }
 
-    /// Acceptance oracle: every prompt recorded from the reference encoder.
+    /// Acceptance oracle: every prompt recorded from the reference encoder,
+    /// under the effort table of the revision that recorded it (the file's
+    /// `revision` for the cases without an `encoder_revision` of their own,
+    /// its `current_revision` for the others).
     #[test]
     fn render_fixtures_match_recorded_text() {
         const FIXTURES: &str =
@@ -893,10 +1094,29 @@ mod tests {
 
         let doc: Value = serde_json::from_str(FIXTURES).unwrap();
         let cases = doc["cases"].as_array().unwrap();
-        assert_eq!(cases.len(), 29, "fixture case count");
+        assert_eq!(cases.len(), 32, "fixture case count");
+        let recorded_low = |tiers: &Value| tiers["low"].as_u64().unwrap();
+        let table_of = |tiers: &Value| match recorded_low(tiers) {
+            25 => EffortTable::Original,
+            50 => EffortTable::Rescaled,
+            other => panic!("no effort table gives low a budget of {other}"),
+        };
+        let recorded_table = table_of(&doc["effort_tiers"]);
+        let current_table = table_of(&doc["current_effort_tiers"]);
+        assert_ne!(
+            recorded_table, current_table,
+            "the fixture pins two revisions"
+        );
 
         for case in cases {
             let name = case["name"].as_str().unwrap();
+            let effort_table = match case.get("encoder_revision").and_then(Value::as_str) {
+                None => recorded_table,
+                Some(revision) if Some(revision) == doc["current_revision"].as_str() => {
+                    current_table
+                }
+                Some(revision) => panic!("case {name}: unknown encoder revision {revision}"),
+            };
             let mut messages: Vec<Value> = case["messages"].as_array().unwrap().clone();
 
             // Rule D4, as the generator and the shim's
@@ -928,6 +1148,7 @@ mod tests {
                 add_default_bos_token: true,
                 drop_thinking: case["drop_thinking"].as_bool().unwrap_or(true),
                 reasoning_effort: parse_reasoning_effort(&case["reasoning_effort"]).unwrap(),
+                effort_table,
             };
 
             let out = encode_messages(&messages, thinking_mode, &encode_params).unwrap();

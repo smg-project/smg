@@ -1,15 +1,18 @@
 mod common;
 
 use std::{
+    pin::Pin,
     sync::{
         atomic::{AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
 
 use axum::{body::Body, extract::Request, http::StatusCode};
 use common::mock_worker::{HealthStatus, MockWorker, MockWorkerConfig, WorkerType};
+use futures::Stream;
+use opentelemetry::trace::TraceContextExt;
 use opentelemetry_proto::tonic::collector::trace::v1::{
     trace_service_server::{TraceService, TraceServiceServer},
     ExportTraceServiceRequest, ExportTraceServiceResponse,
@@ -20,14 +23,17 @@ use serial_test::serial;
 use smg::{
     config::{RouterConfig, TraceConfig},
     observability::{logging, otel_trace},
-    routers::RouterFactory,
+    routers::{grpc::client::GrpcClient, RouterFactory},
     workflow::Job,
 };
+use smg_grpc_client::{common_proto, tokenspeed_proto as ts};
 use tokio::sync::oneshot;
 use tonic::{metadata::MetadataMap, transport::Server, Request as TonicRequest, Response, Status};
 use tower::ServiceExt;
-use tracing::info_span;
+use tracing::{info_span, instrument::WithSubscriber, Instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 use tracing_subscriber::prelude::*;
+use ts::token_speed_scheduler_server::{TokenSpeedScheduler, TokenSpeedSchedulerServer};
 
 #[derive(Clone)]
 struct TestOtelCollector {
@@ -376,4 +382,204 @@ async fn test_grpc_trace_context_injection() {
     let _ = shutdown_tx.send(());
 
     println!("test_grpc_trace_context_injection: All assertions passed!");
+}
+
+// ============================================================================
+// The engine clients the gateway connects carry the trace context
+// ============================================================================
+
+type GenStream = Pin<Box<dyn Stream<Item = Result<ts::GenerateResponse, Status>> + Send>>;
+type KvEventStream = Pin<Box<dyn Stream<Item = Result<common_proto::KvEventBatch, Status>> + Send>>;
+type TokenizerStream =
+    Pin<Box<dyn Stream<Item = Result<common_proto::GetTokenizerChunk, Status>> + Send>>;
+
+/// A TokenSpeed engine stub that records the `traceparent` of every generate
+/// call's metadata and answers nothing else.
+#[derive(Clone, Default)]
+struct MetadataStub {
+    traceparents: Arc<Mutex<Vec<Option<String>>>>,
+}
+
+#[tonic::async_trait]
+impl TokenSpeedScheduler for MetadataStub {
+    type GenerateStream = GenStream;
+    type SubscribeKvEventsStream = KvEventStream;
+    type GetTokenizerStream = TokenizerStream;
+
+    async fn generate(
+        &self,
+        request: TonicRequest<ts::GenerateRequest>,
+    ) -> Result<Response<Self::GenerateStream>, Status> {
+        let traceparent = request
+            .metadata()
+            .get("traceparent")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        self.traceparents
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(traceparent);
+        Ok(Response::new(Box::pin(futures::stream::empty())))
+    }
+
+    async fn health_check(
+        &self,
+        _request: TonicRequest<ts::HealthCheckRequest>,
+    ) -> Result<Response<ts::HealthCheckResponse>, Status> {
+        Ok(Response::new(ts::HealthCheckResponse {
+            healthy: true,
+            message: "ok".to_string(),
+        }))
+    }
+
+    async fn abort(
+        &self,
+        _request: TonicRequest<ts::AbortRequest>,
+    ) -> Result<Response<ts::AbortResponse>, Status> {
+        Ok(Response::new(ts::AbortResponse {
+            success: true,
+            message: String::new(),
+        }))
+    }
+
+    async fn get_model_info(
+        &self,
+        _request: TonicRequest<ts::GetModelInfoRequest>,
+    ) -> Result<Response<ts::GetModelInfoResponse>, Status> {
+        Err(Status::unimplemented("metadata stub"))
+    }
+
+    async fn get_server_info(
+        &self,
+        _request: TonicRequest<ts::GetServerInfoRequest>,
+    ) -> Result<Response<ts::GetServerInfoResponse>, Status> {
+        Err(Status::unimplemented("metadata stub"))
+    }
+
+    async fn get_loads(
+        &self,
+        _request: TonicRequest<ts::GetLoadsRequest>,
+    ) -> Result<Response<ts::GetLoadsResponse>, Status> {
+        Err(Status::unimplemented("metadata stub"))
+    }
+
+    async fn subscribe_kv_events(
+        &self,
+        _request: TonicRequest<common_proto::SubscribeKvEventsRequest>,
+    ) -> Result<Response<Self::SubscribeKvEventsStream>, Status> {
+        Err(Status::unimplemented("metadata stub"))
+    }
+
+    async fn flush_cache(
+        &self,
+        _request: TonicRequest<common_proto::FlushCacheRequest>,
+    ) -> Result<Response<common_proto::FlushCacheResponse>, Status> {
+        Err(Status::unimplemented("metadata stub"))
+    }
+
+    async fn start_profile(
+        &self,
+        _request: TonicRequest<common_proto::StartProfileRequest>,
+    ) -> Result<Response<common_proto::ProfileResponse>, Status> {
+        Err(Status::unimplemented("metadata stub"))
+    }
+
+    async fn stop_profile(
+        &self,
+        _request: TonicRequest<common_proto::StopProfileRequest>,
+    ) -> Result<Response<common_proto::ProfileResponse>, Status> {
+        Err(Status::unimplemented("metadata stub"))
+    }
+
+    async fn get_tokenizer(
+        &self,
+        _request: TonicRequest<common_proto::GetTokenizerRequest>,
+    ) -> Result<Response<Self::GetTokenizerStream>, Status> {
+        Err(Status::unimplemented("metadata stub"))
+    }
+}
+
+#[expect(
+    clippy::disallowed_methods,
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test stub; the server lives for the test"
+)]
+async fn spawn_metadata_stub(stub: MetadataStub) -> u16 {
+    let port = pick_unused_port().expect("free port for the metadata stub");
+    let addr = format!("127.0.0.1:{port}").parse().expect("stub addr");
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(TokenSpeedSchedulerServer::new(stub))
+            .serve(addr)
+            .await
+            .expect("metadata stub server");
+    });
+    for _ in 0..100 {
+        if tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .is_ok()
+        {
+            return port;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("metadata stub on port {port} never came up");
+}
+
+/// A generate call made under the gateway's upstream span carries that span's
+/// W3C trace context in its gRPC metadata: the client `GrpcClient::connect`
+/// builds injects it, so the engine side can continue the gateway's trace.
+#[tokio::test]
+#[serial]
+async fn engine_calls_carry_the_current_span_trace_context() {
+    let port = pick_unused_port().expect("Failed to pick unused port");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let _collector = start_collector(port, shutdown_rx)
+        .await
+        .expect("Failed to start collector");
+    let collector_endpoint = format!("0.0.0.0:{port}");
+    if !otel_trace::is_otel_enabled() {
+        otel_trace::otel_tracing_init(true, Some(&collector_endpoint)).expect("OTEL init");
+    }
+    let stub = MetadataStub::default();
+    let stub_port = spawn_metadata_stub(stub.clone()).await;
+
+    let otel_layer = otel_trace::get_otel_layer().expect("Failed to get OTEL layer");
+    let subscriber = tracing_subscriber::registry().with(otel_layer);
+    let trace_id = async {
+        let span = info_span!(target: "smg::otel-trace", "grpc_execute");
+        let trace_id = span.context().span().span_context().trace_id().to_string();
+        let client = GrpcClient::connect(&format!("grpc://127.0.0.1:{stub_port}"), "tokenspeed")
+            .instrument(span.clone())
+            .await
+            .expect("connect to the stub");
+        let stream = client
+            .as_tokenspeed()
+            .generate(ts::GenerateRequest {
+                request_id: "trace-context-1".to_string(),
+                ..Default::default()
+            })
+            .instrument(span)
+            .await
+            .expect("generate against the stub");
+        stream.mark_completed();
+        trace_id
+    }
+    .with_subscriber(subscriber)
+    .await;
+
+    let traceparents = stub
+        .traceparents
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(traceparents.len(), 1, "one generate call");
+    let traceparent = traceparents[0]
+        .as_deref()
+        .expect("the generate call carries traceparent");
+    let parts: Vec<&str> = traceparent.split('-').collect();
+    assert_eq!(parts.len(), 4, "traceparent {traceparent}");
+    assert_eq!(parts[1], trace_id, "traceparent {traceparent}");
+    let _ = shutdown_tx.send(());
 }

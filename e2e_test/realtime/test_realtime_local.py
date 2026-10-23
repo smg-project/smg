@@ -81,7 +81,7 @@ def realtime_gateway():
 
 @pytest.fixture()
 def ws_url(realtime_gateway):
-    return f"ws://{realtime_gateway.host}:{realtime_gateway.port}/v1/realtime?model={MODEL}"
+    return f"{realtime_gateway.ws_base_url}/v1/realtime?model={MODEL}"
 
 
 @pytest.fixture()
@@ -187,7 +187,7 @@ class TestRealtimeLocalWebSocket:
         """No ?model= query -> the gateway rejects the upgrade."""
 
         async def _run():
-            url = f"ws://{realtime_gateway.host}:{realtime_gateway.port}/v1/realtime"
+            url = f"{realtime_gateway.ws_base_url}/v1/realtime"
             with pytest.raises(websockets.exceptions.InvalidStatus):
                 async with websockets.connect(url, additional_headers=ws_headers):
                     pass

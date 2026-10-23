@@ -3,9 +3,11 @@
 Run with: pytest grpc_servicer/tests/test_vllm_mm_processor.py
 """
 
+import argparse
 import asyncio
 import importlib.util
 import logging
+import os
 import sys
 import types
 from dataclasses import dataclass
@@ -139,7 +141,13 @@ class TestItemBytes:
             _Item("image", "data:image/png;base64,AAAAAAAA"),
         ]
         mm_processor.enforce_item_bytes(items, 6)
-        with pytest.raises(ValueError, match="media_refs\\[1\\].*6 bytes, above the 5-byte cap"):
+        with pytest.raises(
+            ValueError,
+            match=(
+                "media_refs\\[1\\].*6 bytes, above the 5-byte cap "
+                "\\(the worker's --mm-max-item-bytes, SMG_VLLM_MM_MAX_ITEM_BYTES\\)"
+            ),
+        ):
             mm_processor.enforce_item_bytes(items, 5)
 
 
@@ -167,12 +175,12 @@ class TestItemCount:
             mm_processor.enforce_item_count(items, {"image": 1, "video": 0})
 
     def test_limits_follow_the_engine_by_default(self):
-        cfg = self._MmConfig({"image": 200, "video": 4})
-        assert mm_processor.item_limits(cfg) == {"image": 200, "video": 4}
+        cfg = self._MmConfig({"image": 200, "video": 4, "audio": 3})
+        assert mm_processor.item_limits(cfg) == {"image": 200, "video": 4, "audio": 3}
 
     def test_override_applies_to_every_kind(self):
-        cfg = self._MmConfig({"image": 200, "video": 4})
-        assert mm_processor.item_limits(cfg, 2) == {"image": 2, "video": 2}
+        cfg = self._MmConfig({"image": 200, "video": 4, "audio": 3})
+        assert mm_processor.item_limits(cfg, 2) == {"image": 2, "video": 2, "audio": 2}
 
 
 class TestBuildProcessor:
@@ -197,6 +205,59 @@ class TestBuildProcessor:
         assert mm_processor.MmSettings(processor="smg").resolve(env={}).processor == "smg"
         with pytest.raises(ValueError, match="Rust servicer"):
             mm_processor.build_mm_processor(self._Engine(), env={"SMG_VLLM_MM_PROCESSOR": "smg"})
+
+    def test_smg_mode_is_refused_before_any_engine_exists(self, caplog):
+        # The launcher's settings alone decide: the same refusal, with no
+        # engine built and no model loaded, in the flag and the env form.
+        MmSettings = mm_processor.MmSettings
+        check = mm_processor.require_python_servicer_mode
+        with pytest.raises(ValueError, match="Rust servicer") as flagged:
+            check(MmSettings(processor="smg"), env={})
+        with pytest.raises(ValueError, match="Rust servicer") as exported:
+            check(MmSettings(), env={"SMG_VLLM_MM_PROCESSOR": "smg"})
+        with pytest.raises(ValueError, match="Rust servicer") as late:
+            mm_processor.build_mm_processor(self._Engine(), env={"SMG_VLLM_MM_PROCESSOR": "smg"})
+        assert str(flagged.value) == str(exported.value) == str(late.value)
+        assert str(late.value) == mm_processor.SMG_MODE_REFUSAL
+        # A resolved settings object gets the same verdict.
+        with pytest.raises(ValueError, match="Rust servicer"):
+            check(MmSettings(processor="smg").resolve(env={}), env={})
+        # The modes the Python servicer serves pass, flag over env, default off.
+        assert check(MmSettings(processor="inprocess"), env={}) == "inprocess"
+        assert check(MmSettings(processor="inprocess"), env={"SMG_VLLM_MM_PROCESSOR": "smg"}) == (
+            "inprocess"
+        )
+        assert check(MmSettings(), env={"SMG_VLLM_MM_PROCESSOR": "redis"}) == "redis"
+        assert check(MmSettings(), env={}) == "off"
+        assert check(None, env={}) == "off"
+        with pytest.raises(ValueError, match="is not one of"):
+            check(MmSettings(), env={"SMG_VLLM_MM_PROCESSOR": "sidecar"})
+        # Every other setting is validated as the servicer's constructor
+        # validates it, whatever the mode: a knob it cannot use is refused
+        # before the load too.
+        with pytest.raises(ValueError, match="--mm-max-inflight=0 must be positive"):
+            check(MmSettings(processor="off", max_inflight=0), env={})
+        with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_ITEM_BYTES='abc' is not an integer"):
+            check(MmSettings(), env={"SMG_VLLM_MM_MAX_ITEM_BYTES": "abc"})
+        with pytest.raises(ValueError, match="SMG_VLLM_MM_SIDECAR_MAX_QUEUE='-1' must be positive"):
+            check(MmSettings(processor="inprocess"), env={"SMG_VLLM_MM_SIDECAR_MAX_QUEUE": "-1"})
+        assert check(MmSettings(processor="off", max_inflight=8), env={}) == "off"
+        # So is the frame budget the processors read at construction, for the
+        # modes that read it.
+        frames = "SMG_VLLM_MM_MAX_VIDEO_FRAMES"
+        with pytest.raises(ValueError, match=f"{frames}='abc' is not an integer"):
+            check(MmSettings(processor="inprocess"), env={frames: "abc"})
+        with pytest.raises(ValueError, match=f"{frames}='-1' must be at least 0"):
+            check(MmSettings(processor="redis"), env={frames: "-1"})
+        assert check(MmSettings(processor="inprocess"), env={frames: "0"}) == "inprocess"
+        assert check(MmSettings(processor="off"), env={frames: "abc"}) == "off"
+        # No deprecation line of its own for the variable behind a defined
+        # flag: the servicer's own resolve logs that once, later.
+        caplog.set_level(logging.WARNING)
+        ns = argparse.Namespace(mm_processor=None, mm_max_items=None)
+        env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_ITEMS": "2"}
+        assert check(MmSettings.from_args(ns), env=env) == "inprocess"
+        assert "deprecated" not in caplog.text
 
     def test_invalid_item_cap_is_rejected_before_construction(self):
         env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_ITEM_BYTES": "0"}
@@ -246,19 +307,31 @@ class TestMmSettings:
         assert resolved.sidecar_timeout_ms == 30_000
         assert resolved.sidecar_max_queue == 256
         assert resolved.sidecar_namespace is None
+        assert resolved.turbojpeg == "prefer"
         assert resolved.source == "default"
         assert set(resolved.sources.values()) == {"default"}
         assert resolved.resolved
 
+    @staticmethod
+    def _launcher_with_the_flags(**values):
+        """A namespace as a launcher that defines every `--mm-*` flag parses it."""
+        return types.SimpleNamespace(
+            **{f"mm_{name}": values.get(name) for name in mm_processor._MM_SETTING_SPECS},
+            model="m",
+        )
+
     def test_env_fills_what_the_flags_left_unset(self, caplog):
+        """The launcher defines the flags, the operator set the variables: the
+        values apply, each with a line pointing at the flag it stands in for."""
         env = {
             "SMG_VLLM_MM_PROCESSOR": " Redis ",
             "SMG_VLLM_MM_MAX_ITEM_BYTES": "4096",
             "SMG_VLLM_MM_SIDECAR_TIMEOUT_MS": "1000",
             "SMG_VLLM_MM_MAX_ITEMS": "3",
         }
+        settings = mm_processor.MmSettings.from_args(self._launcher_with_the_flags())
         with caplog.at_level("WARNING", logger=self.LOGGER):
-            resolved = mm_processor.MmSettings().resolve(env=env)
+            resolved = settings.resolve(env=env)
         assert resolved.processor == "redis"
         assert resolved.max_item_bytes == 4096
         assert resolved.sidecar_timeout_ms == 1000
@@ -274,6 +347,50 @@ class TestMmSettings:
         ) in messages
         assert sum("SMG_VLLM_MM_PROCESSOR is deprecated" in m for m in messages) == 1
         assert sum("is deprecated in favour of" in m for m in messages) == 4
+
+    def test_env_alone_on_a_launcher_without_the_flags_logs_no_deprecation(self, caplog):
+        """A launcher that defines no `--mm-*` flag (upstream's stock gRPC
+        launcher without this package's plugin, a servicer built without a
+        namespace): the variables are its one way to set the values, and are
+        read as such, without a deprecation line pointing at a flag it lacks."""
+        env = {"SMG_VLLM_MM_PROCESSOR": "smg", "SMG_VLLM_MM_MAX_ITEM_BYTES": "4096"}
+        older_launcher = types.SimpleNamespace(model="m")
+        with caplog.at_level("WARNING", logger=self.LOGGER):
+            bare = mm_processor.MmSettings().resolve(env=env)
+            older = mm_processor.MmSettings.from_args(older_launcher).resolve(env=env)
+        assert not [r for r in caplog.records if "deprecated" in r.getMessage()]
+        for resolved in (bare, older):
+            assert (resolved.processor, resolved.max_item_bytes) == ("smg", 4096)
+            assert resolved.source == "env" and resolved.sources["max_item_bytes"] == "env"
+            assert resolved.flags_defined == frozenset()
+
+    def test_the_turbojpeg_variable_is_not_deprecated_beside_its_flag(self, caplog):
+        """`SMG_VLLM_MM_TURBOJPEG` is documented beside `--mm-turbojpeg` as a
+        supported way to set the policy (as the router's `SMG_MM_TURBOJPEG`
+        is), not a legacy spelling of it: a launcher that defines the flag
+        reads the variable without a deprecation line."""
+        settings = mm_processor.MmSettings.from_args(self._launcher_with_the_flags())
+        with caplog.at_level("WARNING", logger=self.LOGGER):
+            resolved = settings.resolve(env={"SMG_VLLM_MM_TURBOJPEG": "require"})
+        assert not [r for r in caplog.records if "deprecated" in r.getMessage()]
+        assert (resolved.turbojpeg, resolved.sources["turbojpeg"]) == ("require", "env")
+
+    def test_the_deprecation_line_follows_the_flags_the_launcher_defines(self, caplog):
+        """A launcher with some of the flags: the variable behind a flag it
+        defines logs the line, the variable behind one it lacks does not."""
+        settings = mm_processor.MmSettings.from_args(
+            types.SimpleNamespace(mm_processor=None, model="m")
+        )
+        env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_INFLIGHT": "7"}
+        with caplog.at_level("WARNING", logger=self.LOGGER):
+            resolved = settings.resolve(env=env)
+        assert [r.getMessage() for r in caplog.records] == [
+            "SMG_VLLM_MM_PROCESSOR is deprecated in favour of --mm-processor; env support ends"
+            " in the next minor release"
+        ]
+        assert (resolved.processor, resolved.max_inflight) == ("inprocess", 7)
+        assert resolved.sources["processor"] == resolved.sources["max_inflight"] == "env"
+        assert settings.flags_defined == resolved.flags_defined == frozenset({"processor"})
 
     def test_flags_win_over_env_and_log_no_deprecation(self, caplog):
         requested = mm_processor.MmSettings(
@@ -304,16 +421,19 @@ class TestMmSettings:
             mm_sidecar_timeout_ms=None,
             mm_sidecar_max_queue=None,
             mm_sidecar_namespace="ns",
+            mm_turbojpeg=None,
             model="m",
         )
         settings = mm_processor.MmSettings.from_args(args)
         assert settings == mm_processor.MmSettings(
             processor="redis", redis_url="redis://cache:6379/1", sidecar_namespace="ns"
         )
-        # An older launcher namespace without the flags asks for nothing.
-        assert mm_processor.MmSettings.from_args(types.SimpleNamespace(model="m")) == (
-            mm_processor.MmSettings()
-        )
+        assert settings.flags_defined == frozenset(mm_processor._MM_SETTING_SPECS)
+        # An older launcher namespace without the flags asks for nothing, and
+        # is remembered as a launcher without them.
+        older = mm_processor.MmSettings.from_args(types.SimpleNamespace(model="m"))
+        assert older == mm_processor.MmSettings()
+        assert older.flags_defined == frozenset()
 
     def test_flag_values_are_validated_like_env_values(self):
         with pytest.raises(ValueError, match="--mm-processor='sidecar' is not one of"):
@@ -322,6 +442,30 @@ class TestMmSettings:
             mm_processor.MmSettings(max_item_bytes=0).resolve(env={})
         with pytest.raises(ValueError, match="SMG_VLLM_MM_MAX_INFLIGHT"):
             mm_processor.MmSettings().resolve(env={"SMG_VLLM_MM_MAX_INFLIGHT": "0"})
+
+    def test_turbojpeg_policy_reads_prefer_or_require_and_refuses_the_rest(self):
+        """The TurboJPEG policy: `prefer` by default, either value in any case
+        from the flag or the variable, anything else refused at start."""
+        assert mm_processor.MmSettings().resolve(env={}).turbojpeg == "prefer"
+        resolved = mm_processor.MmSettings(turbojpeg=" Require ").resolve(env={})
+        assert (resolved.turbojpeg, resolved.sources["turbojpeg"]) == ("require", "flag")
+        resolved = mm_processor.MmSettings().resolve(env={"SMG_VLLM_MM_TURBOJPEG": "REQUIRE"})
+        assert (resolved.turbojpeg, resolved.sources["turbojpeg"]) == ("require", "env")
+        blank = mm_processor.MmSettings().resolve(env={"SMG_VLLM_MM_TURBOJPEG": "  "})
+        assert (blank.turbojpeg, blank.sources["turbojpeg"]) == ("prefer", "default")
+        with pytest.raises(ValueError, match="--mm-turbojpeg='required' is not one of"):
+            mm_processor.MmSettings(turbojpeg="required").resolve(env={})
+        with pytest.raises(ValueError, match="SMG_VLLM_MM_TURBOJPEG='required' is not one of"):
+            mm_processor.MmSettings().resolve(env={"SMG_VLLM_MM_TURBOJPEG": "required"})
+        parser = argparse.ArgumentParser()
+        assert "--mm-turbojpeg" in mm_processor.add_mm_arguments(parser)
+        assert parser.parse_args(["--mm-turbojpeg", "require"]).mm_turbojpeg == "require"
+        # argparse checks `choices` after `type`: the flag reads in any case
+        # with blanks around it, as `_validate_flag` reads the value.
+        assert parser.parse_args(["--mm-turbojpeg", " REQUIRE "]).mm_turbojpeg == "require"
+        assert parser.parse_args(["--mm-processor", "SMG"]).mm_processor == "smg"
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--mm-turbojpeg", "required"])
 
     def test_a_subset_resolves_only_itself_under_its_own_flag_names(self, caplog):
         env = {
@@ -363,11 +507,99 @@ class TestMmSettings:
 
     def test_resolving_twice_is_stable_and_quiet(self, caplog):
         env = {"SMG_VLLM_MM_PROCESSOR": "redis"}
+        settings = mm_processor.MmSettings.from_args(self._launcher_with_the_flags())
         with caplog.at_level("WARNING", logger=self.LOGGER):
-            once = mm_processor.MmSettings().resolve(env=env)
+            once = settings.resolve(env=env)
             again = once.resolve(env={})
         assert again == once
+        assert again.flags_defined == settings.flags_defined
         assert sum("deprecated" in r.getMessage() for r in caplog.records) == 1
+
+
+class TestLauncherFlags:
+    """The `--mm-*` flags on a launcher parser that lacks them, and their
+    carry-over to a servicer built without the namespace."""
+
+    LOGGER = "mm_processor"
+
+    def test_add_mm_arguments_defines_what_from_args_reads(self, caplog):
+        parser = argparse.ArgumentParser(prog="grpc_server")
+        parser.add_argument("--port", type=int, default=50051)
+        added = mm_processor.add_mm_arguments(parser)
+        assert added == [flag for flag, _env, _default in mm_processor._MM_SETTING_SPECS.values()]
+        args = parser.parse_args(
+            ["--mm-processor", "smg", "--mm-max-item-bytes", "4096", "--mm-sidecar-namespace", "ns"]
+        )
+        settings = mm_processor.MmSettings.from_args(args)
+        assert settings == mm_processor.MmSettings(
+            processor="smg", max_item_bytes=4096, sidecar_namespace="ns"
+        )
+        assert settings.flags_defined == frozenset(mm_processor._MM_SETTING_SPECS)
+        # The flag wins over the variable, quietly; a flag left out takes the
+        # variable, with the line that points at the flag.
+        env = {"SMG_VLLM_MM_PROCESSOR": "redis", "SMG_VLLM_MM_MAX_INFLIGHT": "9"}
+        with caplog.at_level("WARNING", logger=self.LOGGER):
+            resolved = settings.resolve(env=env)
+        assert (resolved.processor, resolved.max_inflight) == ("smg", 9)
+        assert (resolved.sources["processor"], resolved.sources["max_inflight"]) == ("flag", "env")
+        assert [r.getMessage() for r in caplog.records] == [
+            "SMG_VLLM_MM_MAX_INFLIGHT is deprecated in favour of --mm-max-inflight; env support"
+            " ends in the next minor release"
+        ]
+        # A parser that has the flags already (a `vllm serve` with its own) gets none twice.
+        assert mm_processor.add_mm_arguments(parser) == []
+        assert "--mm-processor" in parser.format_help()
+        # Bad values are the parser's errors, as for any flag.
+        for argv in (["--mm-processor", "sidecar"], ["--mm-max-inflight", "many"]):
+            with pytest.raises(SystemExit):
+                parser.parse_args(argv)
+
+    def test_carry_mm_flags_keeps_the_settings_for_a_servicer_built_without_them(
+        self, monkeypatch, caplog
+    ):
+        """Upstream's launcher builds the servicer without its namespace: the
+        settings the plugin kept from the parse are what the servicer resolves
+        when given none, so a flag's value stays `source=flag` and a variable
+        behind a flag the launcher has still gets its deprecation line; the
+        set values reach the environment as well."""
+        monkeypatch.setattr(mm_processor, "_launcher_settings", None)
+        monkeypatch.setattr(mm_processor, "_environ_before_carry", None)
+        monkeypatch.setenv("SMG_VLLM_MM_PROCESSOR", "off")
+        assert mm_processor.launcher_settings() is None
+        parser = argparse.ArgumentParser(prog="grpc_server")
+        mm_processor.add_mm_arguments(parser)
+        kept = mm_processor.carry_mm_flags(parser.parse_args(["--mm-processor", "inprocess"]))
+        assert mm_processor.launcher_settings() is kept
+        assert kept.flags_defined == frozenset(mm_processor._MM_SETTING_SPECS)
+        assert os.environ["SMG_VLLM_MM_PROCESSOR"] == "inprocess"
+        # The servicer's own expression, given no settings.
+        env = {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_INFLIGHT": "7"}
+        with caplog.at_level("WARNING", logger=self.LOGGER):
+            resolved = (
+                None or mm_processor.launcher_settings() or mm_processor.MmSettings()
+            ).resolve(env=env)
+        assert (resolved.processor, resolved.source) == ("inprocess", "flag")
+        assert (resolved.max_inflight, resolved.sources["max_inflight"]) == (7, "env")
+        assert [r.getMessage() for r in caplog.records] == [
+            "SMG_VLLM_MM_MAX_INFLIGHT is deprecated in favour of --mm-max-inflight; env support"
+            " ends in the next minor release"
+        ]
+
+    def test_export_mm_flags_carries_the_values_to_a_servicer_without_the_namespace(self):
+        parser = argparse.ArgumentParser(prog="grpc_server")
+        mm_processor.add_mm_arguments(parser)
+        args = parser.parse_args(["--mm-processor", "inprocess", "--mm-max-items", "2"])
+        environ = {"SMG_VLLM_MM_PROCESSOR": "redis"}
+        exported = mm_processor.export_mm_flags(args, environ)
+        assert exported == {"SMG_VLLM_MM_PROCESSOR": "inprocess", "SMG_VLLM_MM_MAX_ITEMS": "2"}
+        assert environ == exported
+        # A servicer built without the namespace resolves the same values, quietly.
+        resolved = mm_processor.MmSettings().resolve(env=environ)
+        assert (resolved.processor, resolved.max_items, resolved.source) == ("inprocess", 2, "env")
+        # Flags left out export nothing: the environment keeps its own values.
+        untouched = {"SMG_VLLM_MM_MAX_INFLIGHT": "5"}
+        assert mm_processor.export_mm_flags(parser.parse_args([]), untouched) == {}
+        assert untouched == {"SMG_VLLM_MM_MAX_INFLIGHT": "5"}
 
 
 class TestInProcessConstruction:
@@ -448,6 +680,23 @@ class TestInProcessConstruction:
         self._stub_vllm(monkeypatch, loaded, video_io=False)
         mm_processor.InProcessMediaProcessor(self._engine({"image": {}}), max_video_frames=64)
         assert loaded["media_io_kwargs"] == {"image": {}}
+
+    def test_the_served_familys_short_side_floor_is_read_at_construction(self, monkeypatch, caplog):
+        caplog.set_level(logging.INFO)
+        self._stub_vllm(monkeypatch, {})
+        engine = self._engine(None)
+        engine.model_config.model = "/models/ckpt"
+        engine.model_config.hf_config = types.SimpleNamespace(model_type="minimax_m3_vl")
+        p = mm_processor.InProcessMediaProcessor(engine)
+        assert p._short_side_floor.floor == 112
+        assert (p._short_side_floor.factor, p._short_side_floor.max_pixels) == (28, 451584)
+        assert "images below a 112 px short side are raised" in caplog.text
+        caplog.clear()
+        engine = self._engine(None)
+        engine.model_config.model = "Qwen/Qwen3-VL-8B-Instruct"
+        engine.model_config.hf_config = types.SimpleNamespace(model_type="qwen3_vl")
+        assert mm_processor.InProcessMediaProcessor(engine)._short_side_floor is None
+        assert "short side" not in caplog.text
 
 
 class TestRedisClient:
@@ -548,6 +797,7 @@ class TestFetchErrorClassification:
         p._connector = self._Connector(exc)
         p._video_processor = None
         p._caller_error = self._CallerError
+        p._data_url_first_semicolon = False
         return p
 
     def test_transport_failures_are_retryable(self):
@@ -562,6 +812,83 @@ class TestFetchErrorClassification:
         p = self.processor(self._CallerError("415 Unsupported Media Type"))
         with pytest.raises(self._CallerError, match="^415 Unsupported Media Type$"):
             run(p._fetch(0, _Item("image", "https://a/1.png")))
+
+    def test_a_reference_form_the_fetcher_does_not_take_is_the_callers_fault(self):
+        """A data URL that is not base64: the fetcher refuses it as not
+        implemented, which no other worker would take either, so it leaves as
+        the caller's error (INVALID_ARGUMENT, no retry), not as unavailable."""
+        p = self.processor(NotImplementedError("Only base64 data URLs are supported for now."))
+        with pytest.raises(
+            ValueError, match="^media_refs\\[0\\]: Only base64 data URLs are supported for now\\.$"
+        ):
+            run(p._fetch(0, _Item("image", "data:image/jpeg,%FF%D8%FF%E0garbage")))
+
+    def test_a_not_implemented_failure_on_a_remote_reference_stays_retryable(self):
+        """Only a data URL turns the fetcher's "not implemented" into the caller's
+        error: on a remote reference it is the worker's (a loader it lacks) and
+        stays retryable, with the fetch-failed warning."""
+        p = self.processor(NotImplementedError("load_bytes is not implemented"))
+        with pytest.raises(
+            mm_processor.MmProcessorUnavailable,
+            match="^media_refs\\[0\\]: fetch failed: load_bytes is not implemented$",
+        ):
+            run(p._fetch(0, _Item("image", "https://a/1.png")))
+
+    def test_a_not_implemented_failure_on_a_base64_data_url_stays_retryable(self):
+        """A well-formed base64 data URL passes the fetcher's encoding check; a
+        "not implemented" after that is a loader the worker lacks, the worker's
+        fault, and stays retryable like the same failure on a remote reference."""
+        p = self.processor(NotImplementedError())
+        with pytest.raises(
+            mm_processor.MmProcessorUnavailable, match="^media_refs\\[0\\]: fetch failed: $"
+        ):
+            run(p._fetch(0, _Item("image", "data:image/png;base64,iVBORw0KGgo=")))
+
+    def test_the_unencoded_data_url_check_mirrors_the_fetchers(self):
+        check = mm_processor._is_unencoded_data_url
+        for unencoded in [
+            "data:image/jpeg,%FF%D8%FF%E0garbage",
+            "data:,plain",
+            "data:image/png;charset=utf-8,abc",
+            "DATA:image/jpeg;BASE64x,abc",
+        ]:
+            assert check(unencoded, first_semicolon=False), unencoded
+            assert check(unencoded, first_semicolon=True), unencoded
+        for other in [
+            "data:image/png;base64,iVBORw0KGgo=",
+            "data:video/mp4;base64,AAAA",
+            "data:image/png;base64",
+            "https://a/1.png",
+            "file:///tmp/a.png",
+        ]:
+            assert not check(other, first_semicolon=False), other
+            assert not check(other, first_semicolon=True), other
+        # An RFC 2397 parameter before ;base64: taken from 0.27.0 on, refused
+        # before it, and the check says so for each.
+        for parameterised in [
+            "data:image/png;charset=utf-8;base64,iVBORw0KGgo=",
+            "data:image/svg+xml;charset=utf-8;base64,PHN2Zz4=",
+        ]:
+            assert not check(parameterised, first_semicolon=False), parameterised
+            assert check(parameterised, first_semicolon=True), parameterised
+
+    def test_the_fetchers_data_url_reading_follows_its_version(self):
+        split_first = mm_processor._fetcher_splits_data_url_at_first_semicolon
+        for before in ["0.20.0", "0.26.9", "0.26.9.post1"]:
+            assert split_first(before), before
+        for after in ["0.27.0", "0.27.1rc1", "0.31.0", "1.0.0"]:
+            assert not split_first(after), after
+        assert split_first("unknown"), "an unparsed version takes the stricter reading"
+
+    def test_a_parameterised_base64_data_url_an_older_fetcher_refuses_is_the_callers_fault(self):
+        """Before 0.27.0 the fetcher refuses a base64 data URL that carries an
+        RFC 2397 parameter as not implemented; on that release the refusal is
+        read as the caller's, like any other form the fetcher does not take,
+        so the request is not retried into the same refusal."""
+        p = self.processor(NotImplementedError("Only base64 data URLs are supported for now."))
+        p._data_url_first_semicolon = True
+        with pytest.raises(ValueError, match="^media_refs\\[0\\]: Only base64 data URLs"):
+            run(p._fetch(0, _Item("image", "data:image/png;charset=utf-8;base64,iVBORw0KGgo=")))
 
     def test_value_errors_pass_through(self):
         p = self.processor(ValueError("domain not allowed"))
@@ -609,8 +936,9 @@ class TestProcess:
         p._connector = self._Connector(fetch_exc)
         p._video_processor = None
         p._max_item_bytes = mm_processor.DEFAULT_MAX_ITEM_BYTES
-        p._item_limits = dict.fromkeys(("image", "video"), max_items)
+        p._item_limits = dict.fromkeys(("image", "video", "audio"), max_items)
         p._caller_error = self._CallerError
+        p._data_url_first_semicolon = False
         return p
 
     def test_item_cap_rejects_before_any_fetch(self):
@@ -630,6 +958,14 @@ class TestProcess:
         with pytest.raises(mm_processor.MmProcessorUnavailable, match="fetch failed"):
             run(p.process([1, 2, 3], None, [_Item("image", "https://a/1.png")], 0.0))
 
+    def test_a_non_base64_data_url_is_the_callers_fault_and_not_retried(self):
+        p = self.processor(
+            self._Renderer(),
+            fetch_exc=NotImplementedError("Only base64 data URLs are supported for now."),
+        )
+        with pytest.raises(ValueError, match="Only base64 data URLs are supported for now"):
+            run(p.process([1, 2, 3], None, [_Item("image", "data:image/jpeg,%FF%D8garbage")], 0.0))
+
     def test_fetched_media_reaches_the_renderer_uncached(self):
         renderer = self._Renderer()
         p = self.processor(renderer)
@@ -640,10 +976,72 @@ class TestProcess:
         assert renderer.calls[0]["prompt_token_ids"] == [1, 2, 3]
         assert len(renderer.calls[0]["multi_modal_data"]["image"]) == 1
 
+    def test_native_audio_waveform_and_rate_reach_renderer(self):
+        renderer = self._Renderer()
+        p = self.processor(renderer)
+        waveform = ([0.25, -0.25], 16000)
+
+        async def fetch_audio(url):
+            assert url == "data:audio/wav;base64,AAAA"
+            return waveform
+
+        p._connector.fetch_audio_async = fetch_audio
+        out = run(
+            p.process([258881], "<|audio|>", [_Item("audio", "data:audio/wav;base64,AAAA")], 0.0)
+        )
+        assert out["skip_mm_cache"] is True
+        assert renderer.calls[0]["multi_modal_data"]["audio"] == [waveform]
+        assert renderer.calls[0]["prompt_token_ids"] == [258881]
+
+    def test_audio_limit_zero_rejects_before_fetch(self):
+        p = self.processor(self._Renderer(), max_items=0)
+        with pytest.raises(ValueError, match="1 audio items.*limit of 0"):
+            run(p.process([258881], None, [_Item("audio", "https://a/x.wav")], 0.0))
+        assert p._connector.fetched == []
+
     def test_placeholder_validation_is_a_client_error(self):
         p = self.processor(self._Renderer(RuntimeError("Expected 1 image placeholders, found 0")))
         with pytest.raises(ValueError, match="multimodal placeholder validation failed: Expected"):
             run(p.process([1, 2, 3], None, [_Item("image", "https://a/1.png")], 0.0))
+
+    def test_a_fetched_image_below_the_familys_floor_is_raised_before_the_renderer(self):
+        from smg_grpc_servicer.vllm.short_side_floor import FloorRule
+
+        M3_RULE = FloorRule(floor=112, factor=28, min_pixels=3136, max_pixels=451584)
+
+        class _Image:
+            def __init__(self, width, height):
+                self.size = (width, height)
+
+            def resize(self, size, resample):
+                assert resample == 3  # bicubic
+                return _Image(*size)
+
+        for size, floor, expected in [
+            ((16, 16), M3_RULE, (112, 112)),
+            ((1, 1), M3_RULE, (112, 112)),
+            ((400, 20), M3_RULE, (2240, 112)),
+            ((400, 112), M3_RULE, (400, 112)),
+            ((16, 16), None, (16, 16)),
+        ]:
+            renderer = self._Renderer()
+            p = self.processor(renderer)
+            fetched = _Image(*size)
+
+            async def fetch_image(url, fetched=fetched):
+                return fetched
+
+            p._connector.fetch_image_async = fetch_image
+            p._short_side_floor = floor
+            run(p.process([1, 2, 3], None, [_Item("image", "https://a/1.png")], 0.0))
+            (image,) = renderer.calls[0]["multi_modal_data"]["image"]
+            assert image.size == expected
+            if expected == size:
+                assert image is fetched
+
+    def test_a_processor_built_without_init_raises_nothing(self):
+        # The class default: a processor stood up without __init__ has no floor.
+        assert self.processor(self._Renderer())._short_side_floor is None
 
 
 class TestServicerWiring:
@@ -662,6 +1060,41 @@ class TestServicerWiring:
         servicer = VllmEngineServicer(_Engine(), start_time=0.0)
         assert servicer._mm_processor is None
         assert servicer._mm_settings.source == "default"
+
+    def test_a_servicer_built_without_settings_takes_the_launchers(self, monkeypatch, caplog):
+        """Upstream's launcher builds the servicer without its namespace: it
+        resolves the settings the plugin kept from the parse, so a flag's value
+        is reported as such and a variable behind a flag the launcher has still
+        gets its deprecation line."""
+        pytest.importorskip("vllm")
+        # The servicer reads the slot of the installed module, not of the copy
+        # this file loads from its path.
+        from smg_grpc_servicer.vllm import mm_processor as installed
+        from smg_grpc_servicer.vllm.servicer import VllmEngineServicer
+
+        parsed = types.SimpleNamespace(
+            **{f"mm_{name}": None for name in installed._MM_SETTING_SPECS}, model="m"
+        )
+        parsed.mm_processor = "off"
+        monkeypatch.setattr(installed, "_launcher_settings", installed.MmSettings.from_args(parsed))
+        monkeypatch.delenv("SMG_VLLM_MM_PROCESSOR", raising=False)
+        monkeypatch.setenv("SMG_VLLM_MM_MAX_INFLIGHT", "3")
+
+        class _Engine:
+            vllm_config = type("VC", (), {"kv_events_config": None})()
+            model_config = type("MC", (), {"is_multimodal_model": False})()
+
+        with caplog.at_level("WARNING", logger="mm_processor"):
+            servicer = VllmEngineServicer(_Engine(), start_time=0.0)
+        assert servicer._mm_processor is None
+        assert servicer._mm_settings.source == "flag"
+        assert servicer._mm_limit == 3
+        assert servicer._mm_settings.sources["max_inflight"] == "env"
+        assert any(
+            "SMG_VLLM_MM_MAX_INFLIGHT is deprecated in favour of --mm-max-inflight"
+            in r.getMessage()
+            for r in caplog.records
+        )
 
     def test_launcher_settings_take_precedence_and_name_their_source(self, monkeypatch, caplog):
         pytest.importorskip("vllm")

@@ -4,7 +4,7 @@
 //! - [`model`]: a trivially-correct implementation of the §6/§7
 //!   contract — per-holder chain forests with literal lineage
 //!   vectors. Slow, obvious, and the referee for everything else.
-//! - [`oracle`]: `kv_index::PositionalIndexer` behind the engine's
+//! - [`oracle`]: `kv_index::ChainIndex` behind the engine's
 //!   replicated glue (per-holder reverse maps, interning), applied
 //!   through the same operation stream.
 //! - [`workload`]: a seeded deterministic generator producing

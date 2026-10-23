@@ -1179,18 +1179,16 @@ fn index(batches: &[KvEventBatch]) -> ReferenceIndexer {
                 Some(kv_cache_event::Data::Stored(stored)) => {
                     apply_stored(&mut indexer, worker, stored);
                 }
-                Some(kv_cache_event::Data::Removed(removed)) => {
-                    if device_tier(removed.tier) {
-                        let hashes: Vec<SequenceHash> = removed
-                            .block_hashes
-                            .iter()
-                            .map(|&hash| SequenceHash::from(hash))
-                            .collect();
-                        indexer.apply_removed(worker, &hashes);
-                    }
+                Some(kv_cache_event::Data::Removed(removed)) if device_tier(removed.tier) => {
+                    let hashes: Vec<SequenceHash> = removed
+                        .block_hashes
+                        .iter()
+                        .map(|&hash| SequenceHash::from(hash))
+                        .collect();
+                    indexer.apply_removed(worker, &hashes);
                 }
                 Some(kv_cache_event::Data::Cleared(_)) => indexer.apply_cleared(worker),
-                None => {}
+                Some(kv_cache_event::Data::Removed(_)) | None => {}
             }
         }
     }

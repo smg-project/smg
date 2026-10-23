@@ -44,8 +44,8 @@ impl PdWire {
     }
 }
 
-/// Why no prefill in a snapshot can pair with any decode: each leg's distinct
-/// pairing keys and the components the legs disagreed on, sorted.
+/// Why no prefill in a snapshot can pair with any decode: each pool's distinct
+/// pairing keys and the components the pools disagreed on, sorted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PairingRefusal {
     pub prefill: Vec<String>,
@@ -57,9 +57,9 @@ pub(crate) struct PairingRefusal {
 /// least one compatible decode, that prefill's partners.
 #[derive(Debug)]
 pub(crate) struct PdPairIndex {
-    /// The prefill pool as the snapshot holds it, for leg verdicts.
+    /// The prefill pool as the snapshot holds it, for role verdicts.
     pub prefill_pool: Arc<[Arc<dyn Worker>]>,
-    /// The decode pool as the snapshot holds it, for leg verdicts.
+    /// The decode pool as the snapshot holds it, for role verdicts.
     pub decode_pool: Arc<[Arc<dyn Worker>]>,
     /// Prefill workers with at least one compatible decode, in pool order.
     pub prefill: Arc<[Arc<dyn Worker>]>,
@@ -118,7 +118,7 @@ impl PdPairIndex {
         }
     }
 
-    /// Whether some prefill can pair at all: both legs have workers and at
+    /// Whether some prefill can pair at all: both pools have workers and at
     /// least one pair is compatible. Availability is not consulted.
     pub(crate) fn can_pair(&self) -> bool {
         !self.prefill.is_empty()
@@ -130,15 +130,15 @@ impl PdPairIndex {
     }
 }
 
-/// The distinct pairing keys of one leg, sorted.
-fn pairing_keys(leg: &[Arc<dyn Worker>]) -> Vec<String> {
-    let mut keys: Vec<String> = leg.iter().map(|w| w.pd_pairing().key()).collect();
+/// The distinct pairing keys of one pool, sorted.
+fn pairing_keys(pool: &[Arc<dyn Worker>]) -> Vec<String> {
+    let mut keys: Vec<String> = pool.iter().map(|w| w.pd_pairing().key()).collect();
     keys.sort();
     keys.dedup();
     keys
 }
 
-/// The distinct components on which the legs' descriptors disagree, sorted.
+/// The distinct components on which the pools' descriptors disagree, sorted.
 fn pairing_mismatches(
     prefill: &[Arc<dyn Worker>],
     decode: &[Arc<dyn Worker>],
@@ -277,7 +277,7 @@ mod tests {
                 mismatches: vec!["transport".to_string()],
             })
         );
-        // A leg with no workers at all is not a refusal.
+        // A pool with no workers at all is not a refusal.
         assert!(PdPairIndex::empty().refusal.is_none());
     }
 }

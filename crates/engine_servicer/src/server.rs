@@ -48,12 +48,19 @@ pub(crate) fn record_error(slot: &SharedError, message: String) {
 
 /// Worker threads for a servicer runtime, overridable with
 /// `SMG_SERVICER_WORKER_THREADS`. The per-token work here is small (decode a
-/// batch, fan it out, encode a frame), and a runtime sized to the machine
-/// (tokio's default: one worker per hardware thread, 144 on a large host)
-/// turns every engine output batch into a cross-thread wake-up storm: at 512
-/// concurrent streams it burned about 18 cores where four threads burn under
-/// one, at the same throughput.
-const DEFAULT_WORKER_THREADS: usize = 4;
+/// batch, fan it out, encode a frame), and all of it ends on the one HTTP/2
+/// connection the gateway holds, whose stream store is one mutex that every
+/// per-token send takes several times. With several workers each stream's
+/// send takes that lock from whichever core runs the stream's task: at 32 to
+/// 128 concurrent streams a fifth to a quarter of the servicer's CPU went
+/// into the lock bouncing between cores, and every engine output batch woke
+/// tasks across threads. One worker does the same work in about 40 % less
+/// CPU per token at the same inter-token latency, and carries tens of
+/// thousands of tokens per second. A runtime sized to the machine (tokio's
+/// default: one worker per hardware thread, 144 on a large host) was worse
+/// still: at 512 concurrent streams it burned about 18 cores where four
+/// threads burned under one, at the same throughput.
+const DEFAULT_WORKER_THREADS: usize = 1;
 const WORKER_THREADS_ENV: &str = "SMG_SERVICER_WORKER_THREADS";
 
 fn parse_worker_threads(value: Option<&str>) -> usize {
@@ -61,6 +68,16 @@ fn parse_worker_threads(value: Option<&str>) -> usize {
         .and_then(|value| value.trim().parse::<usize>().ok())
         .filter(|&threads| threads > 0)
         .unwrap_or(DEFAULT_WORKER_THREADS)
+}
+
+/// The runtime a [`ServerThread`] drives its server on.
+#[derive(Clone, Copy)]
+enum RuntimeShape {
+    /// The request runtime: [`DEFAULT_WORKER_THREADS`] workers (or the
+    /// override), each on its own thread.
+    Servicer,
+    /// A current-thread runtime on the server's own thread alone.
+    CurrentThread,
 }
 
 /// A gRPC server on a dedicated runtime thread: `start` returns once the
@@ -89,6 +106,34 @@ impl ServerThread {
         F: FnOnce(TcpListener, Shutdown, SharedError) -> Fut + Send + 'static,
         Fut: Future<Output = Result<(), String>>,
     {
+        Self::start_inner(name, bind_address, RuntimeShape::Servicer, serve)
+    }
+
+    /// [`Self::start`] on a current-thread runtime: everything the server
+    /// does runs on its own OS thread, and nothing of it touches the
+    /// request runtime's workers (the metrics listener).
+    pub(crate) fn start_current_thread<F, Fut>(
+        name: &str,
+        bind_address: &str,
+        serve: F,
+    ) -> Result<Self, ServicerError>
+    where
+        F: FnOnce(TcpListener, Shutdown, SharedError) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>>,
+    {
+        Self::start_inner(name, bind_address, RuntimeShape::CurrentThread, serve)
+    }
+
+    fn start_inner<F, Fut>(
+        name: &str,
+        bind_address: &str,
+        shape: RuntimeShape,
+        serve: F,
+    ) -> Result<Self, ServicerError>
+    where
+        F: FnOnce(TcpListener, Shutdown, SharedError) -> Fut + Send + 'static,
+        Fut: Future<Output = Result<(), String>>,
+    {
         let (started_tx, started_rx) = mpsc::sync_channel(1);
         let (done_tx, done_rx) = mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<Duration>();
@@ -106,14 +151,19 @@ impl ServerThread {
         let thread = thread::Builder::new()
             .name(name.to_string())
             .spawn(move || {
-                let runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(parse_worker_threads(
-                        std::env::var(WORKER_THREADS_ENV).ok().as_deref(),
-                    ))
-                    .thread_name("smg-servicer-rt")
-                    .enable_all()
-                    .build()
-                {
+                let mut builder = match shape {
+                    RuntimeShape::Servicer => {
+                        let mut builder = tokio::runtime::Builder::new_multi_thread();
+                        builder
+                            .worker_threads(parse_worker_threads(
+                                std::env::var(WORKER_THREADS_ENV).ok().as_deref(),
+                            ))
+                            .thread_name("smg-servicer-rt");
+                        builder
+                    }
+                    RuntimeShape::CurrentThread => tokio::runtime::Builder::new_current_thread(),
+                };
+                let runtime = match builder.enable_all().build() {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = started_tx.send(Err(format!("failed to create runtime: {error}")));
@@ -251,6 +301,14 @@ pub fn init_tracing(level: Option<&str>) -> Result<(), ServicerError> {
 #[cfg(test)]
 mod worker_threads_tests {
     use super::{parse_worker_threads, DEFAULT_WORKER_THREADS};
+
+    /// One worker by default: every stream's per-token send then takes the
+    /// connection's lock from the same core, and no engine output batch
+    /// wakes tasks across threads.
+    #[test]
+    fn one_worker_by_default() {
+        assert_eq!(parse_worker_threads(None), 1);
+    }
 
     #[test]
     fn worker_threads_default_and_override() {

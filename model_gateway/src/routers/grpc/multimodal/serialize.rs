@@ -3,9 +3,7 @@
 
 use std::{collections::HashMap, time::Instant};
 
-use llm_multimodal::{
-    EncoderDtype, EncoderInputView, ModelSpecificValue, PreprocessedEncoderInputs,
-};
+use llm_multimodal::{EncoderDtype, EncoderInput, EncoderInputView, ModelSpecificValue};
 use tracing::{info, warn};
 
 use super::log_mm_timing_enabled;
@@ -15,14 +13,45 @@ use crate::routers::grpc::proto_wrapper::{
 
 /// Serialize the primary encoder input to raw little-endian bytes in `dtype`,
 /// returning the shape and the dtype the bytes were actually written in,
-/// which is what the receiver must be told to read them at.
-pub(super) fn serialize_encoder_input(
-    preprocessed: &PreprocessedEncoderInputs,
+/// which is what the receiver must be told to read them at. Bytes the
+/// preprocessor already laid out in `dtype` move into the result.
+pub(super) fn serialize_encoder_input_owned(
+    encoder_input: EncoderInput,
     dtype: &str,
-) -> (Vec<u8>, Vec<u32>, String) {
-    let input = preprocessed.encoder_input.view();
+) -> anyhow::Result<(Vec<u8>, Vec<u32>, String)> {
     let dtype = wire_dtype(dtype, true);
-    (input.write_as(dtype), shape_u32(&input), dtype.to_string())
+    let shape = shape_u32(&encoder_input.view());
+    let bytes = encoder_input
+        .into_bytes_as(dtype)
+        .map_err(|message| anyhow::Error::new(WireMismatch(message)))?;
+    Ok((bytes, shape, dtype.to_string()))
+}
+
+/// An encoder input laid out for one wire dtype and asked for in another at
+/// assembly: the dtype was resolved over the pool the selection draws from, so
+/// only a change of that pool between the two steps produces it. It is the
+/// gateway's own transient error, not the worker's and not the client's: the
+/// request builders answer it with a retryable status.
+#[derive(Debug)]
+pub(crate) struct WireMismatch(String);
+
+impl std::fmt::Display for WireMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the images were prepared for another encoder dtype than the selected worker reads: {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for WireMismatch {}
+
+impl WireMismatch {
+    /// Whether an assembly error is a wire mismatch (anywhere in its chain).
+    pub(crate) fn is(error: &anyhow::Error) -> bool {
+        error.chain().any(|cause| cause.is::<WireMismatch>())
+    }
 }
 
 /// One item's encoder input for TokenSpeed: written straight into shared
@@ -32,48 +61,101 @@ pub(super) fn serialize_tokenspeed_encoder_input(
     dtype: &str,
     shm_enabled: bool,
     shm_min_bytes: usize,
-) -> TokenSpeedTensor {
+) -> anyhow::Result<TokenSpeedTensor> {
+    let (dtype, shape) = tokenspeed_wire_shape(input, dtype)?;
+    if let Some(tensor) = tokenspeed_shm_tensor(input, dtype, &shape, shm_enabled, shm_min_bytes) {
+        return Ok(tensor);
+    }
+    let bytes = input
+        .try_write_as(dtype)
+        .map_err(|message| anyhow::Error::new(WireMismatch(message)))?;
+    Ok(TokenSpeedTensor::inline(bytes, shape, dtype.to_string()))
+}
+
+/// [`serialize_tokenspeed_encoder_input`] for an input the caller hands over
+/// whole: bytes already in the wire dtype move into the payload instead of
+/// being written again.
+pub(super) fn serialize_tokenspeed_encoder_input_owned(
+    input: EncoderInput,
+    dtype: &str,
+    shm_enabled: bool,
+    shm_min_bytes: usize,
+) -> anyhow::Result<TokenSpeedTensor> {
+    let view = input.view();
+    let (dtype, shape) = tokenspeed_wire_shape(&view, dtype)?;
+    if let Some(tensor) = tokenspeed_shm_tensor(&view, dtype, &shape, shm_enabled, shm_min_bytes) {
+        return Ok(tensor);
+    }
+    let bytes = input
+        .into_bytes_as(dtype)
+        .map_err(|message| anyhow::Error::new(WireMismatch(message)))?;
+    Ok(TokenSpeedTensor::inline(bytes, shape, dtype.to_string()))
+}
+
+/// The dtype TokenSpeed reads for `dtype` and the input's shape in it,
+/// checked before any segment is created for it.
+fn tokenspeed_wire_shape(
+    input: &EncoderInputView<'_>,
+    dtype: &str,
+) -> anyhow::Result<(EncoderDtype, Vec<u32>)> {
     // TokenSpeed reads float widths only.
     let dtype = wire_dtype(dtype, false);
-    let shape = shape_u32(input);
-    let nbytes = input.len() * dtype.element_size();
+    input
+        .writable_as(dtype)
+        .map_err(|message| anyhow::Error::new(WireMismatch(message)))?;
+    Ok((dtype, shape_u32(input)))
+}
 
-    if shm_enabled && nbytes >= shm_min_bytes {
-        let started = Instant::now();
-        match write_tokenspeed_shm_with(nbytes, |output| {
-            input
-                .write_into(dtype, output)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
-        }) {
-            Ok(handle) => {
-                if log_mm_timing_enabled() {
-                    info!(
-                        nbytes,
-                        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-                        "smg_mm_timing tokenspeed_shm_write_direct"
-                    );
-                }
-                return TokenSpeedTensor::shm(handle, shape, dtype.to_string());
-            }
-            Err(error) => {
-                use crate::observability::metrics::Metrics;
-                warn!(
-                    ?error,
+/// The input written straight into a shared-memory segment when the transport
+/// takes one of its size; `None` leaves it to the bytes path.
+fn tokenspeed_shm_tensor(
+    input: &EncoderInputView<'_>,
+    dtype: EncoderDtype,
+    shape: &[u32],
+    shm_enabled: bool,
+    shm_min_bytes: usize,
+) -> Option<TokenSpeedTensor> {
+    let nbytes = input.len() * dtype.element_size();
+    if !shm_enabled || nbytes < shm_min_bytes {
+        return None;
+    }
+    let started = Instant::now();
+    match write_tokenspeed_shm_with(nbytes, |output| {
+        input
+            .write_into(dtype, output)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+    }) {
+        Ok(handle) => {
+            if log_mm_timing_enabled() {
+                info!(
                     nbytes,
-                    %dtype,
-                    "Failed to write TokenSpeed encoder input directly to SHM; falling back to bytes path"
+                    elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                    "smg_mm_timing tokenspeed_shm_write_direct"
                 );
-                Metrics::record_mm_shm_write_failure("tokenspeed");
             }
+            Some(TokenSpeedTensor::shm(
+                handle,
+                shape.to_vec(),
+                dtype.to_string(),
+            ))
+        }
+        Err(error) => {
+            use crate::observability::metrics::Metrics;
+            warn!(
+                ?error,
+                nbytes,
+                %dtype,
+                "Failed to write TokenSpeed encoder input directly to SHM; falling back to bytes path"
+            );
+            Metrics::record_mm_shm_write_failure("tokenspeed");
+            None
         }
     }
-
-    TokenSpeedTensor::inline(input.write_as(dtype), shape, dtype.to_string())
 }
 
 /// The dtype `asked` names, or `float32` for one the receiver may not share:
 /// a name it does not know, and `uint8` where only float widths are read.
-fn wire_dtype(asked: &str, uint8_allowed: bool) -> EncoderDtype {
+pub(super) fn wire_dtype(asked: &str, uint8_allowed: bool) -> EncoderDtype {
     match asked.parse::<EncoderDtype>() {
         Ok(EncoderDtype::Uint8) if !uint8_allowed => {
             warn!(
@@ -152,7 +234,9 @@ pub(super) fn model_specific_to_tensor_bytes(value: &ModelSpecificValue) -> Opti
 
 #[cfg(test)]
 mod tests {
-    use llm_multimodal::{f32_to_bf16_bits, f32_to_f16_bits, EncoderInput, PixelNorm};
+    use llm_multimodal::{
+        f32_to_bf16_bits, f32_to_f16_bits, EncoderInput, PixelNorm, PreprocessedEncoderInputs,
+    };
     use ndarray::{ArrayD, IxDyn, ShapeBuilder};
 
     use super::*;
@@ -172,8 +256,9 @@ mod tests {
             EncoderInput::bytes(
                 ArrayD::from_shape_vec(IxDyn(&[1, 6]), vec![0u8, 255, 51, 102, 153, 204]).unwrap(),
                 PixelNorm {
-                    scale: [0.5; 3],
-                    bias: [-1.0; 3],
+                    scale: 1.0,
+                    offset: [2.0; 3],
+                    divisor: [2.0; 3],
                     channel_block: 2,
                 },
             ),
@@ -184,6 +269,26 @@ mod tests {
 
     fn le_bytes<T: IntoIterator<Item = u16>>(values: T) -> Vec<u8> {
         values.into_iter().flat_map(u16::to_le_bytes).collect()
+    }
+
+    /// A wire written for another dtype than the worker reads is the typed
+    /// mismatch, on the owned path and on the per-item path alike.
+    #[test]
+    fn a_wire_dtype_mismatch_is_the_typed_error() {
+        let norm = PixelNorm {
+            scale: 1.0,
+            offset: [0.0; 3],
+            divisor: [1.0; 3],
+            channel_block: 1,
+        };
+        let wire =
+            EncoderInput::wire(vec![0u8; 12], EncoderDtype::BFloat16, vec![2, 3], norm).unwrap();
+        let error = serialize_encoder_input_owned(wire.clone(), "float32").unwrap_err();
+        assert!(WireMismatch::is(&error), "{error:#}");
+        let error = serialize_tokenspeed_encoder_input(&wire.view(), "float32", false, usize::MAX)
+            .unwrap_err();
+        assert!(WireMismatch::is(&error), "{error:#}");
+        assert!(serialize_encoder_input_owned(wire, "bfloat16").is_ok());
     }
 
     #[test]
@@ -197,7 +302,8 @@ mod tests {
             ("bfloat16", f32_to_bf16_bits as fn(f32) -> u16),
             ("float16", f32_to_f16_bits as fn(f32) -> u16),
         ] {
-            let (actual, _, written) = serialize_encoder_input(&preprocessed, dtype);
+            let (actual, _, written) =
+                serialize_encoder_input_owned(preprocessed.encoder_input.clone(), dtype).unwrap();
             assert_eq!(written, dtype);
             assert_eq!(actual, le_bytes(values.iter().map(|&value| convert(value))));
         }
@@ -219,7 +325,8 @@ mod tests {
             // share, so the widest dtype is used and reported as such.
             ("float64", "float32", 4),
         ] {
-            let (data, shape, dtype) = serialize_encoder_input(&preprocessed, asked);
+            let (data, shape, dtype) =
+                serialize_encoder_input_owned(preprocessed.encoder_input.clone(), asked).unwrap();
 
             assert_eq!(dtype, expected_dtype, "asked for {asked}");
             assert_eq!(shape, vec![2, 2]);
@@ -238,13 +345,15 @@ mod tests {
             .map(|&v| v as f32 * 0.5 - 1.0)
             .collect();
 
-        let (data, shape, dtype) = serialize_encoder_input(&preprocessed, "uint8");
+        let (data, shape, dtype) =
+            serialize_encoder_input_owned(preprocessed.encoder_input.clone(), "uint8").unwrap();
         assert_eq!(
             (data, shape, dtype.as_str()),
             (vec![0, 255, 51, 102, 153, 204], vec![1, 6], "uint8")
         );
 
-        let (data, _, dtype) = serialize_encoder_input(&preprocessed, "float32");
+        let (data, _, dtype) =
+            serialize_encoder_input_owned(preprocessed.encoder_input.clone(), "float32").unwrap();
         assert_eq!(dtype, "float32");
         let floats: Vec<f32> = data
             .as_chunks::<4>()
@@ -259,7 +368,8 @@ mod tests {
             "uint8",
             false,
             usize::MAX,
-        );
+        )
+        .unwrap();
         assert_eq!(tensor.dtype, "float32");
         assert_eq!(tensor.shape, vec![1, 6]);
     }
@@ -307,12 +417,14 @@ mod tests {
 
         // Below the threshold: stays inline even with SHM enabled.
         let tensor =
-            serialize_tokenspeed_encoder_input(&below.encoder_input.view(), "float32", true, 16);
+            serialize_tokenspeed_encoder_input(&below.encoder_input.view(), "float32", true, 16)
+                .unwrap();
         assert!(matches!(tensor.storage, TokenSpeedTensorStorage::Inline(_)));
 
         // At/above the threshold: uses SHM (/dev/shm is writable on Linux CI).
         let tensor =
-            serialize_tokenspeed_encoder_input(&at.encoder_input.view(), "float32", true, 16);
+            serialize_tokenspeed_encoder_input(&at.encoder_input.view(), "float32", true, 16)
+                .unwrap();
         match tensor.storage {
             TokenSpeedTensorStorage::Shm(handle) => {
                 let path = Path::new("/dev/shm").join(&handle.name);

@@ -3,17 +3,21 @@
 //! This module provides functionality to apply chat templates to messages,
 //! similar to HuggingFace transformers' apply_chat_template method.
 
-use std::{collections::HashMap, fs, io};
+use std::{borrow::Cow, collections::HashMap, fs, io, iter, sync::OnceLock};
 
 use anyhow::{anyhow, Result};
+use chrono::{
+    format::{strftime::StrftimeItems, Item},
+    DateTime, FixedOffset, Local, TimeZone,
+};
 use minijinja::{
     context,
     machinery::{
-        ast::{Expr, Stmt},
+        ast::{BinOpKind, Call, CallArg, Expr, ForLoop, IfCond, Macro, Set, Stmt, UnaryOpKind},
         parse, WhitespaceConfig,
     },
     syntax::SyntaxConfig,
-    value::Kwargs,
+    value::{Kwargs, ValueKind},
     Environment, Error as MinijinjaError, ErrorKind, Value,
 };
 use serde::Serialize;
@@ -117,11 +121,7 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
     }
 
     let has_enable_thinking = template.contains("enable_thinking");
-    // Trailing space prevents matching "thinking_mode", "thinking_budget", etc.
-    let has_thinking_var = template.contains("if thinking ")
-        || template.contains("thinking is ")
-        || template.contains("thinking ==")
-        || template.contains("set thinking ");
+    let has_thinking_var = mentions_thinking_variable(template);
 
     if !has_enable_thinking && !has_thinking_var {
         return (ThinkingToggle::None, None);
@@ -145,132 +145,453 @@ pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<Thinkin
         return (ThinkingToggle::DefaultOff, Some(key_name));
     }
 
+    // Gemma4 assigns its default through a Jinja filter. A filter on a
+    // message field or another variable does not set the thinking switch.
+    let compact: String = template.split_whitespace().collect();
+    if compact.contains("setenable_thinking=enable_thinking|default(false)")
+        || compact.contains("setthinking=thinking|default(false)")
+    {
+        return (ThinkingToggle::DefaultOff, Some(key_name));
+    }
+
     // All other models default to thinking ON
     (ThinkingToggle::DefaultOn, Some(key_name))
 }
 
+/// Whether the template reads a variable named exactly `thinking` (`if
+/// thinking ...`, `thinking is ...`, `thinking == ...`, `set thinking ...`).
+/// The word must stand alone: `clear_thinking is defined` (GLM-5.3) or
+/// `thinking_mode`/`thinking_budget` name other variables, and a template
+/// that only reads those has no thinking switch.
+fn mentions_thinking_variable(template: &str) -> bool {
+    template.match_indices("thinking").any(|(start, matched)| {
+        let before = &template[..start];
+        let after = &template[start + matched.len()..];
+        if before
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            return false;
+        }
+        after.starts_with(" is ")
+            || after.starts_with(" ==")
+            || ((before.ends_with("if ") || before.ends_with("set ")) && after.starts_with(' '))
+    })
+}
+
 /// Detect the content format expected by a Jinja2 chat template
 ///
-/// This implements the same detection logic as SGLang's detect_jinja_template_content_format
-/// which uses AST parsing to look for content iteration patterns.
+/// The rule is the serving engine's own content-format detection, so that
+/// the gateway hands string content as a one-item text part list to the
+/// same templates as the engine does (see [`ChatTemplateState::apply`]). A
+/// template is of the "openai" format when it has a loop over a message's
+/// content, a message being a loop variable over `messages` or over a
+/// variable assigned from it (a namespace attribute included, `{% set
+/// ns.rest = messages[1:] %}`): the loop runs over `message.content` (also
+/// through a filter, a test or a slice), over a macro parameter the template
+/// fills with a message's content, or, outside any macro, over a variable
+/// named `content`. Any other template is of the "string" format, one that
+/// does not parse included; a type test, a `length` filter or an index on the
+/// content does not make the "openai" format, as it does not on the engine.
 ///
 /// Returns:
 /// - ChatTemplateContentFormat::OpenAI if template expects structured content (list of parts)
 /// - ChatTemplateContentFormat::String if template expects simple string content
 pub fn detect_chat_template_content_format(template: &str) -> ChatTemplateContentFormat {
-    // Use AST-based detection (enabled by default)
     detect_all_with_ast(template).0
 }
 
-/// Flags tracking which OpenAI-style patterns we've seen
-#[derive(Default, Debug, Clone, Copy)]
-struct Flags {
-    saw_iteration: bool,
-    saw_structure: bool,
-    saw_assignment: bool,
-    saw_macro: bool,
+/// A loop or assignment target that is not a plain name where the engine's
+/// walk asserts one; the engine then falls back to its default, the "string"
+/// format.
+struct NotAName;
+
+/// The nodes of a template the engine's rule reads, in document order: each
+/// loop with the macros it sits in (outermost first), the assignments, the
+/// macros and the calls.
+#[derive(Default)]
+struct Nodes<'a> {
+    loops: Vec<(&'a ForLoop<'a>, Vec<&'a Macro<'a>>)>,
+    sets: Vec<&'a Set<'a>>,
+    macros: Vec<&'a Macro<'a>>,
+    calls: Vec<&'a Call<'a>>,
 }
 
-impl Flags {
-    fn any(self) -> bool {
-        // `saw_assignment` alone (e.g. `set content = message.content`) is NOT sufficient
-        // to classify as OpenAI format. Many string-format templates (Qwen3, etc.) use this
-        // pattern to extract content into a local variable, then check `content is string`.
-        // Without iteration or structural access, the template handles string content only.
-        self.saw_iteration || self.saw_structure || self.saw_macro
+impl<'a> Nodes<'a> {
+    fn of(ast: &'a Stmt<'a>) -> Self {
+        let mut nodes = Self::default();
+        nodes.stmt(ast, &mut Vec::new());
+        nodes
     }
-}
 
-/// Single-pass AST detector with scope tracking
-struct Detector<'a> {
-    ast: &'a Stmt<'a>,
-    /// Message loop vars currently in scope (e.g., `message`, `m`, `msg`)
-    scope: std::collections::VecDeque<String>,
-    scope_set: std::collections::HashSet<String>,
-    flags: Flags,
-    /// Whether `<think>` appears inside an `add_generation_prompt` if-block
-    think_in_prefill: bool,
-}
-
-impl<'a> Detector<'a> {
-    fn new(ast: &'a Stmt<'a>) -> Self {
-        Self {
-            ast,
-            scope: std::collections::VecDeque::new(),
-            scope_set: std::collections::HashSet::new(),
-            flags: Flags::default(),
-            think_in_prefill: false,
+    fn stmts(&mut self, stmts: &'a [Stmt<'a>], macros: &mut Vec<&'a Macro<'a>>) {
+        for stmt in stmts {
+            self.stmt(stmt, macros);
         }
     }
 
-    fn run(mut self) -> (Flags, bool) {
-        self.walk_stmt(self.ast);
-        (self.flags, self.think_in_prefill)
-    }
-
-    fn push_scope(&mut self, var: String) {
-        self.scope.push_back(var.clone());
-        self.scope_set.insert(var);
-    }
-
-    fn pop_scope(&mut self) {
-        if let Some(v) = self.scope.pop_back() {
-            self.scope_set.remove(&v);
+    fn stmt(&mut self, stmt: &'a Stmt<'a>, macros: &mut Vec<&'a Macro<'a>>) {
+        match stmt {
+            Stmt::Template(t) => self.stmts(&t.children, macros),
+            Stmt::EmitExpr(e) => self.expr(&e.expr),
+            Stmt::EmitRaw(_) | Stmt::Continue(_) | Stmt::Break(_) => {}
+            Stmt::ForLoop(fl) => {
+                self.loops.push((fl, macros.clone()));
+                self.expr(&fl.target);
+                self.expr(&fl.iter);
+                self.stmts(&fl.body, macros);
+                self.stmts(&fl.else_body, macros);
+                if let Some(filter) = &fl.filter_expr {
+                    self.expr(filter);
+                }
+            }
+            Stmt::IfCond(ic) => {
+                self.expr(&ic.expr);
+                self.stmts(&ic.true_body, macros);
+                self.stmts(&ic.false_body, macros);
+            }
+            Stmt::WithBlock(w) => {
+                for (target, value) in &w.assignments {
+                    self.expr(target);
+                    self.expr(value);
+                }
+                self.stmts(&w.body, macros);
+            }
+            Stmt::Set(s) => {
+                self.sets.push(s);
+                self.expr(&s.target);
+                self.expr(&s.expr);
+            }
+            Stmt::SetBlock(s) => {
+                self.expr(&s.target);
+                if let Some(filter) = &s.filter {
+                    self.expr(filter);
+                }
+                self.stmts(&s.body, macros);
+            }
+            Stmt::AutoEscape(a) => {
+                self.expr(&a.enabled);
+                self.stmts(&a.body, macros);
+            }
+            Stmt::FilterBlock(f) => {
+                self.expr(&f.filter);
+                self.stmts(&f.body, macros);
+            }
+            Stmt::Block(b) => self.stmts(&b.body, macros),
+            Stmt::Import(i) => {
+                self.expr(&i.expr);
+                self.expr(&i.name);
+            }
+            Stmt::FromImport(f) => {
+                self.expr(&f.expr);
+                for (name, alias) in &f.names {
+                    self.expr(name);
+                    if let Some(alias) = alias {
+                        self.expr(alias);
+                    }
+                }
+            }
+            Stmt::Extends(e) => self.expr(&e.name),
+            Stmt::Include(i) => self.expr(&i.name),
+            Stmt::Macro(m) => {
+                self.macros.push(m);
+                for default in &m.defaults {
+                    self.expr(default);
+                }
+                macros.push(m);
+                self.stmts(&m.body, macros);
+                macros.pop();
+            }
+            // A `{% call %}` block is a call with a body, not a macro of the
+            // template (jinja2 keeps the two apart).
+            Stmt::CallBlock(cb) => {
+                self.call(&cb.call);
+                self.stmts(&cb.macro_decl.body, macros);
+            }
+            Stmt::Do(d) => self.call(&d.call),
         }
     }
 
-    fn is_var_access(expr: &Expr, varname: &str) -> bool {
-        matches!(expr, Expr::Var(v) if v.id == varname)
+    fn call(&mut self, call: &'a Call<'a>) {
+        self.calls.push(call);
+        self.expr(&call.expr);
+        self.args(&call.args);
     }
 
-    fn is_const_str(expr: &Expr, value: &str) -> bool {
-        matches!(expr, Expr::Const(c) if c.value.as_str() == Some(value))
+    fn args(&mut self, args: &'a [CallArg<'a>]) {
+        for arg in args {
+            match arg {
+                CallArg::Pos(e)
+                | CallArg::Kwarg(_, e)
+                | CallArg::PosSplat(e)
+                | CallArg::KwargSplat(e) => {
+                    self.expr(e);
+                }
+            }
+        }
     }
 
-    fn is_numeric_const(expr: &Expr) -> bool {
-        matches!(expr, Expr::Const(c) if c.value.is_number())
-    }
-
-    /// Check if expr is varname.content or varname["content"]
-    fn is_var_dot_content(expr: &Expr, varname: &str) -> bool {
+    fn expr(&mut self, expr: &'a Expr<'a>) {
         match expr {
-            Expr::GetAttr(g) => Self::is_var_access(&g.expr, varname) && g.name == "content",
+            Expr::Var(_) | Expr::Const(_) => {}
+            Expr::Slice(s) => {
+                self.expr(&s.expr);
+                for bound in [&s.start, &s.stop, &s.step].into_iter().flatten() {
+                    self.expr(bound);
+                }
+            }
+            Expr::UnaryOp(u) => self.expr(&u.expr),
+            Expr::BinOp(b) => {
+                self.expr(&b.left);
+                self.expr(&b.right);
+            }
+            Expr::Compare(c) => {
+                self.expr(&c.expr);
+                for op in &c.ops {
+                    self.expr(&op.expr);
+                }
+            }
+            Expr::IfExpr(i) => {
+                self.expr(&i.test_expr);
+                self.expr(&i.true_expr);
+                if let Some(e) = &i.false_expr {
+                    self.expr(e);
+                }
+            }
+            Expr::Filter(f) => {
+                if let Some(e) = &f.expr {
+                    self.expr(e);
+                }
+                self.args(&f.args);
+            }
+            Expr::Test(t) => {
+                self.expr(&t.expr);
+                self.args(&t.args);
+            }
+            Expr::GetAttr(g) => self.expr(&g.expr),
             Expr::GetItem(g) => {
-                Self::is_var_access(&g.expr, varname)
-                    && Self::is_const_str(&g.subscript_expr, "content")
+                self.expr(&g.expr);
+                self.expr(&g.subscript_expr);
             }
-            // Unwrap filters/tests that just wrap the same expr
-            Expr::Filter(f) => f
-                .expr
-                .as_ref()
-                .is_some_and(|e| Self::is_var_dot_content(e, varname)),
-            Expr::Test(t) => Self::is_var_dot_content(&t.expr, varname),
-            _ => false,
+            Expr::Call(c) => self.call(c),
+            Expr::List(l) => {
+                for item in &l.items {
+                    self.expr(item);
+                }
+            }
+            Expr::Map(m) => {
+                for e in m.keys.iter().chain(&m.values) {
+                    self.expr(e);
+                }
+            }
         }
     }
+}
 
-    /// Check if expr accesses .content on any variable in our scope, or any descendant of it.
-    fn is_any_scope_var_content(&self, expr: &Expr) -> bool {
-        let mut current_expr = expr;
-        loop {
-            // Check if current level matches <scopeVar>.content
-            if self
-                .scope_set
+/// Whether `expr` reads the variable `varname` itself (`key` None) or its
+/// `key` entry (`varname.key`, `varname['key']`), through filters, tests and
+/// slices: the engine's `_is_var_or_elems_access`.
+fn is_var_or_elems_access(expr: &Expr<'_>, varname: &str, key: Option<&str>) -> bool {
+    match expr {
+        Expr::Filter(f) => f
+            .expr
+            .as_ref()
+            .is_some_and(|e| is_var_or_elems_access(e, varname, key)),
+        Expr::Test(t) => is_var_or_elems_access(&t.expr, varname, key),
+        Expr::Slice(s) => is_var_or_elems_access(&s.expr, varname, key),
+        Expr::Var(v) => key.is_none() && v.id == varname,
+        // The base of the attribute is the name itself, as in the engine's
+        // `_is_attr_access`; the wrappers above are allowed around the whole
+        // access only. Without a key, a namespace attribute path is the name.
+        Expr::GetAttr(g) => match key {
+            Some(key) => g.name == key && is_var(&g.expr, varname),
+            None => attr_path(expr).as_deref() == Some(varname),
+        },
+        Expr::GetItem(g) => key.is_some_and(|key| {
+            matches!(&g.subscript_expr, Expr::Const(c) if c.value.as_str() == Some(key))
+                && is_var(&g.expr, varname)
+        }),
+        _ => false,
+    }
+}
+
+/// Whether `expr` is the plain name `varname`, or the namespace attribute
+/// path `varname` spells (`ns.rest`): the engine's `_is_var_access`, plus
+/// the namespace attributes [`names_assigned_from`] records.
+fn is_var(expr: &Expr<'_>, varname: &str) -> bool {
+    match expr {
+        Expr::Var(v) => v.id == varname,
+        Expr::GetAttr(_) => attr_path(expr).as_deref() == Some(varname),
+        _ => false,
+    }
+}
+
+/// The dotted path of a chain of attribute accesses on a plain name
+/// (`ns.rest`), the way a namespace attribute is written; `None` for any
+/// other expression.
+fn attr_path(expr: &Expr<'_>) -> Option<String> {
+    match expr {
+        Expr::Var(v) => Some(v.id.to_string()),
+        Expr::GetAttr(g) => attr_path(&g.expr).map(|base| format!("{base}.{}", g.name)),
+        _ => None,
+    }
+}
+
+/// `root` and every name assigned from it or from such a name, through
+/// filters, tests and slices: the engine's `_iter_nodes_assign_var_or_elems`.
+/// A namespace attribute assigned that way (`{% set ns.rest = messages[1:] %}`,
+/// which a template loops over as `ns.rest`) is recorded by its dotted path,
+/// where the engine's walk stops; any other target that is not a name stops
+/// this one too.
+fn names_assigned_from<'a>(sets: &[&'a Set<'a>], root: &'a str) -> Result<Vec<String>, NotAName> {
+    let mut names = vec![root.to_string()];
+    let mut queue = std::collections::VecDeque::from([root.to_string()]);
+    while let Some(related) = queue.pop_front() {
+        for set in sets {
+            if !is_var_or_elems_access(&set.expr, &related, None) {
+                continue;
+            }
+            let target = match &set.target {
+                Expr::Var(target) => target.id.to_string(),
+                Expr::GetAttr(_) => attr_path(&set.target).ok_or(NotAName)?,
+                _ => return Err(NotAName),
+            };
+            if !names.contains(&target) {
+                names.push(target.clone());
+                queue.push_back(target);
+            }
+        }
+    }
+    Ok(names)
+}
+
+/// The loop variables of the loops over a messages name: the engine's
+/// `_iter_nodes_assign_messages_item`.
+fn message_loop_vars<'a>(
+    loops: &[(&'a ForLoop<'a>, Vec<&'a Macro<'a>>)],
+    messages_names: &[String],
+) -> Result<Vec<&'a str>, NotAName> {
+    let mut vars = Vec::new();
+    for (fl, _) in loops {
+        if messages_names
+            .iter()
+            .any(|name| is_var_or_elems_access(&fl.iter, name, None))
+        {
+            let Expr::Var(target) = &fl.target else {
+                return Err(NotAName);
+            };
+            vars.push(target.id);
+        }
+    }
+    Ok(vars)
+}
+
+/// Whether the template has a loop over a message's content: the engine's
+/// `_iter_nodes_assign_content_item`, which decides its content format.
+fn iterates_message_content(ast: &Stmt<'_>) -> Result<bool, NotAName> {
+    let nodes = Nodes::of(ast);
+    let messages_names = names_assigned_from(&nodes.sets, "messages")?;
+    let message_vars = message_loop_vars(&nodes.loops, &messages_names)?;
+    let is_message_content = |expr: &Expr<'_>| {
+        message_vars
+            .iter()
+            .any(|var| is_var_or_elems_access(expr, var, Some("content")))
+    };
+
+    // The parameters of each macro that a call fills with a message's content.
+    let fed_params: Vec<(&Macro<'_>, std::collections::HashSet<&str>)> = nodes
+        .macros
+        .iter()
+        .map(|m| {
+            let param = |index: usize| match m.args.get(index) {
+                Some(Expr::Var(v)) => Some(v.id),
+                _ => None,
+            };
+            let mut fed = std::collections::HashSet::new();
+            for call in nodes
+                .calls
                 .iter()
-                .any(|v| Self::is_var_dot_content(current_expr, v))
+                .filter(|call| matches!(&call.expr, Expr::Var(callee) if callee.id == m.name))
             {
-                return true;
+                let mut position = 0;
+                for arg in &call.args {
+                    match arg {
+                        CallArg::Pos(value) => {
+                            if let Some(name) =
+                                param(position).filter(|_| is_message_content(value))
+                            {
+                                fed.insert(name);
+                            }
+                            position += 1;
+                        }
+                        CallArg::Kwarg(name, value) => {
+                            if (0..m.args.len()).any(|i| param(i) == Some(name))
+                                && is_message_content(value)
+                            {
+                                fed.insert(*name);
+                            }
+                        }
+                        CallArg::PosSplat(_) | CallArg::KwargSplat(_) => {}
+                    }
+                }
             }
-            // Walk up the expression tree
-            match current_expr {
-                Expr::GetAttr(g) => current_expr = &g.expr,
-                Expr::GetItem(g) => current_expr = &g.expr,
-                _ => return false,
+            (*m, fed)
+        })
+        .collect();
+
+    for (fl, enclosing) in &nodes.loops {
+        let matched = if is_message_content(&fl.iter) {
+            true
+        } else if let Expr::Var(iter) = &fl.iter {
+            // Inside a macro, the innermost macro with fed parameters decides;
+            // outside any macro, a variable named `content` does.
+            let fed = enclosing.iter().rev().find_map(|m| {
+                fed_params
+                    .iter()
+                    .find(|(fed_macro, fed)| std::ptr::eq(*fed_macro, *m) && !fed.is_empty())
+                    .map(|(_, fed)| fed)
+            });
+            match fed {
+                Some(fed) => fed.contains(iter.id),
+                None => enclosing.is_empty() && iter.id == "content",
             }
+        } else {
+            false
+        };
+        if matched {
+            if !matches!(fl.target, Expr::Var(_)) {
+                return Err(NotAName);
+            }
+            return Ok(true);
         }
     }
+    Ok(false)
+}
 
-    /// Check if an expression references a variable by name (walks through BinOp/UnaryOp).
+/// Whether `<think>` appears inside an `add_generation_prompt` if-block.
+struct ThinkDetector {
+    think_in_prefill: bool,
+    /// Whether the `add_generation_prompt` if-block opens a `<think>` block
+    /// it does not close, so a completion starts inside reasoning.
+    prefill_opens_think_block: bool,
+}
+
+impl ThinkDetector {
+    fn run(ast: &Stmt<'_>) -> (bool, bool) {
+        let mut detector = Self {
+            think_in_prefill: false,
+            prefill_opens_think_block: false,
+        };
+        detector.walk_stmt(ast);
+        (
+            detector.think_in_prefill,
+            detector.prefill_opens_think_block,
+        )
+    }
+
+    /// Check if an expression references a variable by name (walks through
+    /// BinOp/UnaryOp/Test).
     fn expr_references_var(expr: &Expr, name: &str) -> bool {
         match expr {
             Expr::Var(v) => v.id == name,
@@ -279,6 +600,7 @@ impl<'a> Detector<'a> {
                     || Self::expr_references_var(&b.right, name)
             }
             Expr::UnaryOp(u) => Self::expr_references_var(&u.expr, name),
+            Expr::Test(t) => Self::expr_references_var(&t.expr, name),
             _ => false,
         }
     }
@@ -307,6 +629,125 @@ impl<'a> Detector<'a> {
         false
     }
 
+    /// Whether a `<think>` block is open after the generation prompt an `if`
+    /// writes, starting from `open` (the state the generation-prompt blocks
+    /// before it left; a template may write the prompt in several of them).
+    /// A block whose condition is decided by `add_generation_prompt` alone
+    /// (see [`Self::generation_prompt_truth`]) carries the state through the
+    /// body that runs for a generation prompt; a block whose condition also
+    /// depends on something else may run either body, so the block is open
+    /// after it when either body leaves it open; `None` for a condition that
+    /// does not mention the variable.
+    fn generation_prompt_open_after(ic: &IfCond, open: bool) -> Option<bool> {
+        match Self::generation_prompt_truth(&ic.expr) {
+            Some(true) => Some(Self::think_block_open_after(&ic.true_body, open)),
+            Some(false) => Some(Self::think_block_open_after(&ic.false_body, open)),
+            None if Self::expr_references_var(&ic.expr, "add_generation_prompt") => Some(
+                Self::think_block_open_after(&ic.true_body, open)
+                    || Self::think_block_open_after(&ic.false_body, open),
+            ),
+            None => None,
+        }
+    }
+
+    /// The truth of a condition when `add_generation_prompt` is true: `Some`
+    /// when the variable alone decides it (the variable itself, `not`, `and`,
+    /// `or`, `==` / `!=` against a boolean, `is true` / `is false` /
+    /// `is defined`), `None` when it depends on anything else.
+    fn generation_prompt_truth(expr: &Expr) -> Option<bool> {
+        match expr {
+            Expr::Var(v) if v.id == "add_generation_prompt" => Some(true),
+            Expr::UnaryOp(u) if matches!(u.op, UnaryOpKind::Not) => {
+                Self::generation_prompt_truth(&u.expr).map(|truth| !truth)
+            }
+            Expr::BinOp(b) => match b.op {
+                BinOpKind::ScAnd => match (
+                    Self::generation_prompt_truth(&b.left),
+                    Self::generation_prompt_truth(&b.right),
+                ) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                },
+                BinOpKind::ScOr => match (
+                    Self::generation_prompt_truth(&b.left),
+                    Self::generation_prompt_truth(&b.right),
+                ) {
+                    (Some(true), _) | (_, Some(true)) => Some(true),
+                    (Some(false), Some(false)) => Some(false),
+                    _ => None,
+                },
+                BinOpKind::Eq | BinOpKind::Ne => {
+                    let (side, constant) = match (&b.left, &b.right) {
+                        (side, Expr::Const(constant)) | (Expr::Const(constant), side) => {
+                            (side, constant)
+                        }
+                        _ => return None,
+                    };
+                    if !matches!(constant.value.kind(), ValueKind::Bool) {
+                        return None;
+                    }
+                    let equal = Self::generation_prompt_truth(side)? == constant.value.is_true();
+                    Some(if matches!(b.op, BinOpKind::Eq) {
+                        equal
+                    } else {
+                        !equal
+                    })
+                }
+                _ => None,
+            },
+            Expr::Test(t) => {
+                let truth = Self::generation_prompt_truth(&t.expr)?;
+                match t.name {
+                    "defined" => Some(true),
+                    "undefined" | "none" => Some(false),
+                    "true" => Some(truth),
+                    "false" => Some(!truth),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether the literal text a list of statements writes leaves a
+    /// `<think>` block open at its end, starting from `open`: the text is
+    /// read in order, a `<think>` opens and a `</think>` closes; either
+    /// branch of a nested `if` may run, so the block is open after it when
+    /// either branch leaves it open, and text after the `if` still counts.
+    /// A closed `<think>\n\n</think>` (a non-thinking template) opens nothing.
+    fn think_block_open_after(stmts: &[Stmt], mut open: bool) -> bool {
+        for stmt in stmts {
+            match stmt {
+                Stmt::EmitRaw(raw) => open = Self::think_block_open_after_text(raw.raw, open),
+                Stmt::EmitExpr(e) => {
+                    if let Expr::Const(c) = &e.expr {
+                        if let Some(s) = c.value.as_str() {
+                            open = Self::think_block_open_after_text(s, open);
+                        }
+                    }
+                }
+                Stmt::IfCond(ic) => {
+                    open = Self::think_block_open_after(&ic.true_body, open)
+                        || Self::think_block_open_after(&ic.false_body, open);
+                }
+                _ => {}
+            }
+        }
+        open
+    }
+
+    /// `open` after `text`: the later of its last `<think>` and its last
+    /// `</think>` decides; a text with neither leaves it as it was.
+    fn think_block_open_after_text(text: &str, open: bool) -> bool {
+        match (text.rfind("<think>"), text.rfind("</think>")) {
+            (None, None) => open,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (Some(start), Some(end)) => start > end,
+        }
+    }
+
     fn walk_stmt(&mut self, stmt: &Stmt) {
         match stmt {
             Stmt::Template(t) => {
@@ -314,46 +755,22 @@ impl<'a> Detector<'a> {
                     self.walk_stmt(ch);
                 }
             }
-            // {% for message in messages %}
             Stmt::ForLoop(fl) => {
-                // Detect "for X in messages" → push X into scope
-                if let Expr::Var(iter) = &fl.iter {
-                    if iter.id == "messages" {
-                        if let Expr::Var(target) = &fl.target {
-                            self.push_scope(target.id.to_string());
-                        }
-                    }
-                }
-
-                // Also detect "for ... in message.content" or "for ... in content"
-                // - Iterating directly over <scopeVar>.content => OpenAI style
-                if self.is_any_scope_var_content(&fl.iter) {
-                    self.flags.saw_iteration = true;
-                }
-                // - Iterating over a local var named "content"
-                if matches!(&fl.iter, Expr::Var(v) if v.id == "content") {
-                    self.flags.saw_iteration = true;
-                }
-
                 for b in &fl.body {
                     self.walk_stmt(b);
                 }
-
-                // Pop scope if we pushed it
-                if let Expr::Var(iter) = &fl.iter {
-                    if iter.id == "messages" && matches!(&fl.target, Expr::Var(_)) {
-                        self.pop_scope();
-                    }
-                }
             }
             Stmt::IfCond(ic) => {
-                self.inspect_expr_for_structure(&ic.expr);
-
                 // Detect <think> inside {% if add_generation_prompt [and ...] %} body
                 if !self.think_in_prefill
                     && Self::expr_references_var(&ic.expr, "add_generation_prompt")
                 {
                     self.think_in_prefill = Self::body_has_think_tag(&ic.true_body);
+                }
+                if let Some(open) =
+                    Self::generation_prompt_open_after(ic, self.prefill_opens_think_block)
+                {
+                    self.prefill_opens_think_block = open;
                 }
 
                 for b in &ic.true_body {
@@ -363,103 +780,7 @@ impl<'a> Detector<'a> {
                     self.walk_stmt(b);
                 }
             }
-            Stmt::EmitExpr(e) => {
-                self.inspect_expr_for_structure(&e.expr);
-            }
-            // {% set content = message.content %}
-            Stmt::Set(s)
-                if Self::is_var_access(&s.target, "content")
-                    && self.is_any_scope_var_content(&s.expr) =>
-            {
-                self.flags.saw_assignment = true;
-            }
-            Stmt::Macro(m) => {
-                // Heuristic: macro that checks type (via `is` test) and also has any loop
-                let mut has_type_check = false;
-                let mut has_loop = false;
-                Self::scan_macro_body(&m.body, &mut has_type_check, &mut has_loop);
-                if has_type_check && has_loop {
-                    self.flags.saw_macro = true;
-                }
-            }
             _ => {}
-        }
-    }
-
-    fn inspect_expr_for_structure(&mut self, expr: &Expr) {
-        if self.flags.saw_structure {
-            return;
-        }
-
-        match expr {
-            // content[0] or message.content[0]
-            Expr::GetItem(gi)
-                if (matches!(&gi.expr, Expr::Var(v) if v.id == "content")
-                    || self.is_any_scope_var_content(&gi.expr))
-                    && Self::is_numeric_const(&gi.subscript_expr) =>
-            {
-                self.flags.saw_structure = true;
-            }
-            // content|length or message.content|length
-            Expr::Filter(f) => {
-                if f.name == "length" {
-                    if let Some(inner) = &f.expr {
-                        // Box derefs automatically, so `&**inner` is `&Expr`
-                        let inner_ref: &Expr = inner;
-                        let is_content_var = matches!(inner_ref, Expr::Var(v) if v.id == "content");
-                        if is_content_var || self.is_any_scope_var_content(inner_ref) {
-                            self.flags.saw_structure = true;
-                        }
-                    }
-                } else if let Some(inner) = &f.expr {
-                    let inner_ref: &Expr = inner;
-                    self.inspect_expr_for_structure(inner_ref);
-                }
-            }
-            // Type tests like `content is iterable` or `message.content is string`
-            // These are used for branching (e.g., Llama 3.1 uses them for tool output formatting),
-            // not as indicators that the template expects structured content. Keep walking.
-            Expr::Test(t) => self.inspect_expr_for_structure(&t.expr),
-            Expr::GetAttr(g) => {
-                // Keep walking; nested expressions can hide structure checks
-                self.inspect_expr_for_structure(&g.expr);
-            }
-            // Handle binary operations like: if (message.content is string) and other_cond
-            Expr::BinOp(op) => {
-                self.inspect_expr_for_structure(&op.left);
-                self.inspect_expr_for_structure(&op.right);
-            }
-            // Handle unary operations like: if not (message.content is string)
-            Expr::UnaryOp(op) => {
-                self.inspect_expr_for_structure(&op.expr);
-            }
-            _ => {}
-        }
-    }
-
-    fn scan_macro_body(body: &[Stmt], has_type_check: &mut bool, has_loop: &mut bool) {
-        for s in body {
-            if *has_type_check && *has_loop {
-                return;
-            }
-
-            match s {
-                Stmt::IfCond(ic) => {
-                    if matches!(&ic.expr, Expr::Test(_)) {
-                        *has_type_check = true;
-                    }
-                    Self::scan_macro_body(&ic.true_body, has_type_check, has_loop);
-                    Self::scan_macro_body(&ic.false_body, has_type_check, has_loop);
-                }
-                Stmt::ForLoop(fl) => {
-                    *has_loop = true;
-                    Self::scan_macro_body(&fl.body, has_type_check, has_loop);
-                }
-                Stmt::Template(t) => {
-                    Self::scan_macro_body(&t.children, has_type_check, has_loop);
-                }
-                _ => {}
-            }
         }
     }
 }
@@ -472,36 +793,40 @@ fn detect_all(
     bool,
     ThinkingToggle,
     Option<ThinkingKeyName>,
+    bool,
 ) {
     let (thinking_toggle, thinking_key_name) = detect_thinking_toggle(template);
-    let (content_format, think_in_prefill) = detect_all_with_ast(template);
+    let (content_format, think_in_prefill, prefill_opens_think_block) =
+        detect_all_with_ast(template);
     (
         content_format,
         think_in_prefill,
         thinking_toggle,
         thinking_key_name,
+        prefill_opens_think_block,
     )
 }
 
-/// AST detection of content format and think-in-prefill.
-fn detect_all_with_ast(template: &str) -> (ChatTemplateContentFormat, bool) {
+/// AST detection of content format, think-in-prefill and whether the
+/// generation prompt leaves a think block open.
+fn detect_all_with_ast(template: &str) -> (ChatTemplateContentFormat, bool, bool) {
+    let template = plain_generation_blocks(template);
     let ast = match parse(
-        template,
+        &template,
         "template",
         SyntaxConfig {},
         WhitespaceConfig::default(),
     ) {
         Ok(ast) => ast,
-        Err(_) => return (ChatTemplateContentFormat::String, false),
+        Err(_) => return (ChatTemplateContentFormat::String, false, false),
     };
 
-    let (flags, think_in_prefill) = Detector::new(&ast).run();
-    let content_format = if flags.any() {
-        ChatTemplateContentFormat::OpenAI
-    } else {
-        ChatTemplateContentFormat::String
+    let content_format = match iterates_message_content(&ast) {
+        Ok(true) => ChatTemplateContentFormat::OpenAI,
+        Ok(false) | Err(NotAName) => ChatTemplateContentFormat::String,
     };
-    (content_format, think_in_prefill)
+    let (think_in_prefill, prefill_opens_think_block) = ThinkDetector::run(&ast);
+    (content_format, think_in_prefill, prefill_opens_think_block)
 }
 
 /// Parameters for chat template application
@@ -519,23 +844,40 @@ pub struct ChatTemplateParams<'a> {
     /// this value as a default. An explicit `template_kwargs` entry for that
     /// key still wins.
     pub thinking: Option<bool>,
+    /// The instant the template's `strftime_now` writes, for a render that
+    /// must come out the same each time; `None` is the clock (see
+    /// [`render_instant`]).
+    pub now: Option<DateTime<FixedOffset>>,
+    /// Leave the final message open for the model to continue, as
+    /// transformers' `continue_final_message` does: the conversation is
+    /// rendered with that message and cut right after its text. Not
+    /// compatible with `add_generation_prompt`. Where the template cannot
+    /// continue the message, its text follows the generation prompt instead
+    /// (`ChatTemplateOutput::continued_final_message` says which happened),
+    /// and a message that also has `reasoning_content` is refused.
+    pub continue_final_message: bool,
 }
 
-/// JSON separator pair passed through HuggingFace's `tojson` filter.
+/// The initial size of a `tojson` output buffer: room for a function schema
+/// of the usual size without a reallocation.
+const TOJSON_BUFFER_BYTES: usize = 1024;
+
+/// JSON separator pair passed through HuggingFace's `tojson` filter. The
+/// defaults are the static bytes; only a `separators` argument owns its own.
 #[derive(Debug, Clone)]
 struct JsonSeparators {
-    item: Vec<u8>,
-    key: Vec<u8>,
+    item: Cow<'static, [u8]>,
+    key: Cow<'static, [u8]>,
 }
 
 impl JsonSeparators {
     fn python_default(indent: Option<i64>) -> Self {
         // Python's json.dumps defaults to `(', ', ': ')` for compact output
         // and `(',', ': ')` when pretty indentation is enabled.
-        let item = if indent.is_some() { "," } else { ", " };
+        let item: &'static [u8] = if indent.is_some() { b"," } else { b", " };
         Self {
-            item: item.as_bytes().to_vec(),
-            key: b": ".to_vec(),
+            item: Cow::Borrowed(item),
+            key: Cow::Borrowed(b": "),
         }
     }
 }
@@ -766,8 +1108,8 @@ fn parse_separators(
         .ok_or_else(|| invalid_tojson_option("key separator must be a string"))?;
 
     Ok(JsonSeparators {
-        item: item.as_bytes().to_vec(),
-        key: key.as_bytes().to_vec(),
+        item: Cow::Owned(item.as_bytes().to_vec()),
+        key: Cow::Owned(key.as_bytes().to_vec()),
     })
 }
 
@@ -788,7 +1130,9 @@ fn serialize_with_python_json<T: Serialize>(
         .transpose()?;
 
     let formatter = PythonJsonFormatter::new(indent, separators, ensure_ascii);
-    let mut buf = Vec::new();
+    // Sized for a tool schema up front: a buffer grown from empty is
+    // reallocated at every doubling on the way to the same size.
+    let mut buf = Vec::with_capacity(TOJSON_BUFFER_BYTES);
     let mut serializer = serde_json::Serializer::with_formatter(&mut buf, formatter);
     value.serialize(&mut serializer).map_err(|e| {
         MinijinjaError::new(
@@ -802,6 +1146,12 @@ fn serialize_with_python_json<T: Serialize>(
             format!("Invalid UTF-8 in JSON output: {e}"),
         )
     })
+}
+
+/// Compact JSON spelling shared by the Jinja filter and native renderers.
+pub(crate) fn compact_python_json(value: &JsonValue) -> Result<String> {
+    serialize_with_python_json(value, None, JsonSeparators::python_default(None), false)
+        .map_err(Into::into)
 }
 
 /// Custom tojson filter compatible with HuggingFace transformers' implementation.
@@ -824,30 +1174,28 @@ fn tojson_filter(value: Value, kwargs: Kwargs) -> std::result::Result<Value, Min
     // Ensure all kwargs are consumed to avoid "unknown keyword argument" errors
     kwargs.assert_all_used()?;
 
-    let json_value: serde_json::Value = serde_json::to_value(&value).map_err(|e| {
-        MinijinjaError::new(
-            ErrorKind::InvalidOperation,
-            format!("Failed to convert to JSON value: {e}"),
-        )
-    })?;
-
-    // Serialize with options
-    let json_str: std::result::Result<String, MinijinjaError> = {
-        let sorted_json;
-        let value_to_serialize = if sort_keys.unwrap_or(false) {
-            sorted_json = sort_json_keys(&json_value);
-            &sorted_json
-        } else {
-            &json_value
-        };
-
-        let separators = parse_separators(separators, indent)?;
+    let separators = parse_separators(separators, indent)?;
+    let ensure_ascii = ensure_ascii.unwrap_or(false);
+    // The template value is written straight into its JSON text: its serde
+    // form is what a `serde_json::Value` built from it would serialize as
+    // (the same `Serialize` impl drives both, in the same key order), so
+    // the tree is built only when the keys are to be sorted, which needs
+    // the value as a whole.
+    let json_str = if sort_keys.unwrap_or(false) {
+        let json_value: serde_json::Value = serde_json::to_value(&value).map_err(|e| {
+            MinijinjaError::new(
+                ErrorKind::InvalidOperation,
+                format!("Failed to convert to JSON value: {e}"),
+            )
+        })?;
         serialize_with_python_json(
-            value_to_serialize,
+            &sort_json_keys(&json_value),
             indent,
             separators,
-            ensure_ascii.unwrap_or(false),
+            ensure_ascii,
         )
+    } else {
+        serialize_with_python_json(&value, indent, separators, ensure_ascii)
     };
 
     json_str.map(Value::from_safe_string)
@@ -876,11 +1224,138 @@ fn raise_exception(message: String) -> std::result::Result<String, MinijinjaErro
     Err(MinijinjaError::new(ErrorKind::InvalidOperation, message))
 }
 
+/// Transformers' `{% generation %}` ... `{% endgeneration %}` block marks the
+/// assistant tokens for a training mask and renders its body unchanged; the
+/// engine here has no such statement and would refuse the whole template. The
+/// block becomes `{% if true %}` ... `{% endif %}`: the same body, and the same
+/// whitespace handling, as both are block tags (`trim_blocks`, `lstrip_blocks`,
+/// and each tag's own `-` or `+` modifier, which is kept as written).
+fn plain_generation_blocks(template: &str) -> Cow<'_, str> {
+    if !template.contains("generation") {
+        return Cow::Borrowed(template);
+    }
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(start) = rest.find("{%") {
+        out.push_str(&rest[..start]);
+        rest = &rest[start..];
+        match generation_tag(rest) {
+            Some((len, replacement)) => {
+                out.push_str(&replacement);
+                rest = &rest[len..];
+            }
+            None => {
+                out.push_str("{%");
+                rest = &rest[2..];
+            }
+        }
+    }
+    out.push_str(rest);
+    if out == template {
+        Cow::Borrowed(template)
+    } else {
+        Cow::Owned(out)
+    }
+}
+
+/// When `tag`, which starts with `{%`, is a `generation` or `endgeneration`
+/// block tag: its length, and the `if true` or `endif` tag that stands in for
+/// it with the same whitespace modifiers.
+fn generation_tag(tag: &str) -> Option<(usize, String)> {
+    fn modifier(body: &str) -> (&str, &str) {
+        match body.as_bytes().first() {
+            Some(b'-') => ("-", &body[1..]),
+            Some(b'+') => ("+", &body[1..]),
+            _ => ("", body),
+        }
+    }
+    let (left, body) = modifier(tag.strip_prefix("{%")?);
+    let body = body.trim_start();
+    let (word, body) = ["endgeneration", "generation"]
+        .iter()
+        .find_map(|word| body.strip_prefix(word).map(|body| (*word, body)))?;
+    let (right, body) = modifier(body.trim_start());
+    let body = body.strip_prefix("%}")?;
+    let statement = if word == "generation" {
+        "if true"
+    } else {
+        "endif"
+    };
+    Some((
+        tag.len() - body.len(),
+        format!("{{%{left} {statement} {right}%}}"),
+    ))
+}
+
+/// Jinja2's `dict()` is Python's: it builds a map from nothing, from a
+/// mapping or from an iterable of key/value pairs, keyword arguments are
+/// written over the result, and a repeated key keeps its first position with
+/// its last value. Templates merge a schema's `$defs` entry into the property
+/// that references it as `dict((defs | items | list) + (spec | items | list))`;
+/// minijinja's own `dict` takes a mapping only and answers the pair list with
+/// a bare "invalid operation".
+fn dict_function(
+    value: Option<Value>,
+    kwargs: Kwargs,
+) -> std::result::Result<Value, MinijinjaError> {
+    let mut pairs: Vec<(Value, Value)> = Vec::new();
+    match value {
+        None => {}
+        Some(value) if value.is_undefined() => {}
+        Some(value) if value.kind() == ValueKind::Map => {
+            if let Some(iter) = value.as_object().and_then(|object| object.try_iter_pairs()) {
+                pairs.extend(iter);
+            }
+        }
+        Some(value) => {
+            let not_iterable = |kind: ValueKind| {
+                MinijinjaError::new(
+                    ErrorKind::InvalidOperation,
+                    format!("dict() takes a mapping or an iterable of key/value pairs, not {kind}"),
+                )
+            };
+            if value.is_none() {
+                return Err(not_iterable(value.kind()));
+            }
+            let items = value.try_iter().map_err(|_| not_iterable(value.kind()))?;
+            for (index, item) in items.enumerate() {
+                let pair: Vec<Value> = item
+                    .try_iter()
+                    .map_err(|_| {
+                        MinijinjaError::new(
+                            ErrorKind::InvalidOperation,
+                            format!("cannot convert dictionary update sequence element #{index} to a sequence"),
+                        )
+                    })?
+                    .collect();
+                let [key, item_value] = <[Value; 2]>::try_from(pair).map_err(|pair| {
+                    MinijinjaError::new(
+                        ErrorKind::InvalidOperation,
+                        format!(
+                            "dictionary update sequence element #{index} has length {}; 2 is required",
+                            pair.len()
+                        ),
+                    )
+                })?;
+                pairs.push((key, item_value));
+            }
+        }
+    }
+    for name in kwargs.args() {
+        pairs.push((Value::from(name), kwargs.peek::<Value>(name)?));
+    }
+    Ok(Value::from_iter(pairs))
+}
+
 /// Build a pre-configured `Environment<'static>` with the given template string,
 /// Python-compat method callback, and custom `tojson` filter already registered.
 /// The template is stored under the name `"chat"` using owned storage so the
 /// environment carries no borrows.
 fn build_environment(template: String) -> Result<Environment<'static>> {
+    let template = match plain_generation_blocks(&template) {
+        Cow::Borrowed(_) => template,
+        Cow::Owned(rewritten) => rewritten,
+    };
     let mut env = Environment::new();
 
     // Match HuggingFace's Jinja2 defaults: trim_blocks and lstrip_blocks are
@@ -901,8 +1376,20 @@ fn build_environment(template: String) -> Result<Environment<'static>> {
     // like ensure_ascii, separators, and sort_keys that HuggingFace templates use
     env.add_filter("tojson", tojson_filter);
     env.add_function("raise_exception", raise_exception);
+    // Jinja2's dict() also builds a map from key/value pairs; minijinja's takes a mapping only
+    env.add_function("dict", dict_function);
+    env.add_test("iterable", is_iterable);
 
     Ok(env)
+}
+
+/// Jinja2's `iterable` test: `iter(value)` succeeds. minijinja iterates
+/// `none` as an empty sequence and would call it iterable; in Python
+/// `iter(None)` raises, so `none is iterable` is false, which the templates
+/// that guard with `tools is iterable and tools | length > 0` rely on when
+/// the request carries no tools. An undefined value is iterable in both.
+fn is_iterable(value: &Value) -> bool {
+    !value.is_none() && value.try_iter().is_ok()
 }
 
 /// Render the `"chat"` template in the given environment against messages and params.
@@ -913,26 +1400,404 @@ fn special_token_value(token: Option<&str>) -> Value {
     token.map_or(Value::UNDEFINED, Value::from)
 }
 
+/// transformers' `strftime_now(format)`: `now` written with the strftime
+/// `format`, as `datetime.now().strftime(format)` writes the local time.
+fn strftime(
+    now: &DateTime<FixedOffset>,
+    format: &str,
+) -> std::result::Result<String, MinijinjaError> {
+    let items: Vec<Item<'_>> = StrftimeItems::new(format).collect();
+    if items.contains(&Item::Error) {
+        return Err(MinijinjaError::new(
+            ErrorKind::InvalidOperation,
+            format!("strftime_now: {format:?} is not a valid strftime format"),
+        ));
+    }
+    Ok(now.format_with_items(items.iter()).to_string())
+}
+
+/// The instant `strftime_now` writes when the render names none: the local
+/// time now, as transformers' `datetime.now()`; or, when the environment sets
+/// `SOURCE_DATE_EPOCH` (seconds since the Unix epoch, the reproducible-builds
+/// convention), that instant in local time, read once, so a prompt that writes
+/// the date can be reproduced on another day.
+fn render_instant() -> DateTime<FixedOffset> {
+    static SOURCE_DATE_EPOCH: OnceLock<Option<DateTime<FixedOffset>>> = OnceLock::new();
+    SOURCE_DATE_EPOCH
+        .get_or_init(|| {
+            let seconds = std::env::var("SOURCE_DATE_EPOCH")
+                .ok()?
+                .trim()
+                .parse()
+                .ok()?;
+            Local
+                .timestamp_opt(seconds, 0)
+                .single()
+                .map(|instant| instant.fixed_offset())
+        })
+        .unwrap_or_else(|| Local::now().fixed_offset())
+}
+
+/// Whether the template mentions the `developer` role at all (the engine's
+/// `_detect_developer_role_support`): a template that never names it has no
+/// branch for it, and the renderer rewrites developer messages to system ones.
+fn detect_developer_role_support(template: &str) -> bool {
+    template.contains("\"developer\"") || template.contains("'developer'")
+}
+
+/// Whether the template mentions the `root` role at all (the MiniMax M3
+/// template reads a leading `root` message into its high-priority system
+/// slot; the vendor's earlier templates read `system` only): a template that
+/// never names it has no branch for it and would drop the message, so the
+/// renderer rewrites root messages to system ones.
+fn detect_root_role_support(template: &str) -> bool {
+    template.contains("\"root\"") || template.contains("'root'")
+}
+
+/// The messages with every `developer` message rewritten as a `system`
+/// message without its `tools` field (the engine's `_convert_developer_to_system`),
+/// then the system messages merged into one at the front when a system
+/// message is not the first message (the engine's `_consolidate_system_messages`,
+/// which follows the rewrite in its renderer). `None` when no message has
+/// the role, so the caller keeps its slice.
+pub(crate) fn developer_messages_as_system(
+    messages: &[serde_json::Value],
+) -> Option<Vec<serde_json::Value>> {
+    let is_developer =
+        |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()) == Some("developer");
+    if !messages.iter().any(is_developer) {
+        return None;
+    }
+    let rewritten = messages
+        .iter()
+        .map(|m| {
+            if !is_developer(m) {
+                return m.clone();
+            }
+            let mut rewritten = m.clone();
+            if let Some(fields) = rewritten.as_object_mut() {
+                fields.insert(
+                    "role".to_string(),
+                    serde_json::Value::String("system".to_string()),
+                );
+                fields.remove("tools");
+            }
+            rewritten
+        })
+        .collect();
+    Some(consolidate_system_messages(rewritten))
+}
+
+/// The messages with every `root` message rewritten as a `system` message,
+/// then the system messages merged into one at the front when a system
+/// message is not the first message (the rule of
+/// [`developer_messages_as_system`]), so a template that reads one leading
+/// system message keeps a system message that followed the root. `None`
+/// when no message has the role, so the caller keeps its slice.
+pub(crate) fn root_messages_as_system(
+    messages: &[serde_json::Value],
+) -> Option<Vec<serde_json::Value>> {
+    let is_root = |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()) == Some("root");
+    if !messages.iter().any(is_root) {
+        return None;
+    }
+    let rewritten = messages
+        .iter()
+        .map(|m| {
+            if !is_root(m) {
+                return m.clone();
+            }
+            let mut rewritten = m.clone();
+            if let Some(fields) = rewritten.as_object_mut() {
+                fields.insert(
+                    "role".to_string(),
+                    serde_json::Value::String("system".to_string()),
+                );
+            }
+            rewritten
+        })
+        .collect();
+    Some(consolidate_system_messages(rewritten))
+}
+
+/// The engine's `_consolidate_system_messages`, for the templates that want the
+/// system message first: the messages unchanged when the only system message
+/// is the first one; otherwise one system message at the front carrying the
+/// non-empty system texts joined by blank lines (a parts list contributes its
+/// text parts joined by newlines), then the other messages in their order.
+fn consolidate_system_messages(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let is_system =
+        |m: &serde_json::Value| m.get("role").and_then(|r| r.as_str()) == Some("system");
+    if !messages
+        .iter()
+        .enumerate()
+        .any(|(index, m)| index > 0 && is_system(m))
+    {
+        return messages;
+    }
+    let mut system_texts: Vec<String> = Vec::new();
+    let mut others = Vec::with_capacity(messages.len());
+    for message in messages {
+        if !is_system(&message) {
+            others.push(message);
+            continue;
+        }
+        let text = match message.get("content") {
+            Some(serde_json::Value::String(text)) => text.clone(),
+            Some(serde_json::Value::Array(parts)) => parts
+                .iter()
+                .filter_map(|part| match part {
+                    serde_json::Value::String(text) => Some(text.as_str()),
+                    serde_json::Value::Object(fields) => {
+                        fields.get("text").and_then(serde_json::Value::as_str)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        if !text.is_empty() {
+            system_texts.push(text);
+        }
+    }
+    let merged = serde_json::json!({"role": "system", "content": system_texts.join("\n\n")});
+    iter::once(merged).chain(others).collect()
+}
+
+/// The marker transformers appends to the continued text before rendering;
+/// the prompt is cut where it lands.
+const CONTINUE_FINAL_MESSAGE_TAG: &str = "CONTINUE_FINAL_MESSAGE_TAG ";
+
+/// Python's `str.isspace`, which transformers' `strip`/`rstrip` and the
+/// checkpoints' whitespace runs go by: Unicode white space plus the
+/// separators U+001C..=U+001F.
+pub(crate) fn python_isspace(c: char) -> bool {
+    c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c)
+}
+
+/// The marker for one render: transformers' own, unless the request already
+/// carries its words (in a message, a tool, a document or a template kwarg);
+/// then the words followed by one more underscore than ever follows them
+/// there. Either way only the final message carries the marker.
+fn continuation_marker(messages: &[JsonValue], params: &ChatTemplateParams) -> Cow<'static, str> {
+    let words = CONTINUE_FINAL_MESSAGE_TAG.trim_end();
+    fn longest_run(text: &str, words: &str, longest: &mut Option<usize>) {
+        for (at, _) in text.match_indices(words) {
+            let run = text[at + words.len()..]
+                .bytes()
+                .take_while(|&b| b == b'_')
+                .count();
+            *longest = Some(longest.map_or(run, |n| n.max(run)));
+        }
+    }
+    fn walk(value: &JsonValue, words: &str, longest: &mut Option<usize>) {
+        match value {
+            JsonValue::String(text) => longest_run(text, words, longest),
+            JsonValue::Array(items) => items.iter().for_each(|item| walk(item, words, longest)),
+            JsonValue::Object(fields) => fields.iter().for_each(|(key, item)| {
+                longest_run(key, words, longest);
+                walk(item, words, longest);
+            }),
+            _ => {}
+        }
+    }
+    let mut longest = None;
+    for value in messages
+        .iter()
+        .chain(params.tools.into_iter().flatten())
+        .chain(params.documents.into_iter().flatten())
+    {
+        walk(value, words, &mut longest);
+    }
+    for (key, value) in params.template_kwargs.into_iter().flatten() {
+        longest_run(key, words, &mut longest);
+        walk(value, words, &mut longest);
+    }
+    match longest {
+        Some(n) => Cow::Owned(format!("{words}{} ", "_".repeat(n + 1))),
+        None => Cow::Borrowed(CONTINUE_FINAL_MESSAGE_TAG),
+    }
+}
+
+/// The text the final message is continued from: its string content, or
+/// the text of its last part that has one.
+fn final_text(message: &JsonValue) -> Option<&str> {
+    match message.get("content")? {
+        JsonValue::Array(parts) => parts.iter().rev().find_map(|part| part.get("text")),
+        content => Some(content),
+    }?
+    .as_str()
+}
+
+/// Append `marker` to the text the final message is continued from.
+fn tag_final_message(message: &mut JsonValue, marker: &str) -> Result<()> {
+    let text = match message.get_mut("content") {
+        Some(JsonValue::Array(parts)) => parts.iter_mut().rev().find_map(|p| p.get_mut("text")),
+        content => content,
+    };
+    let Some(JsonValue::String(text)) = text else {
+        return Err(anyhow!("the final message has no text to continue"));
+    };
+    text.push_str(marker);
+    Ok(())
+}
+
+/// Cut a rendering of the tagged conversation right after the continued
+/// text: at `marker`, and also past the whitespace before it when the
+/// template trimmed the marker's trailing space. The text must end right
+/// there (whitespace aside), so the cut belongs to the final message;
+/// transformers only checks that the text appears somewhere in the prompt.
+fn cut_at_final_message(mut rendered: String, text: &str, marker: &str) -> Result<String> {
+    let tag_at = rendered
+        .rfind(marker.trim_end())
+        .filter(|&at| {
+            rendered[..at]
+                .trim_end_matches(python_isspace)
+                .ends_with(text.trim_matches(python_isspace))
+        })
+        .ok_or_else(|| anyhow!("the final message does not appear in the rendered chat"))?;
+    let cut = if rendered[tag_at..].starts_with(marker) {
+        tag_at
+    } else {
+        rendered[..tag_at].trim_end_matches(python_isspace).len()
+    };
+    rendered.truncate(cut);
+    Ok(rendered)
+}
+
+/// Render with the final message left open, following transformers'
+/// `continue_final_message`: mark the end of the message's text, render the
+/// whole conversation without a generation prompt, and cut at the marker.
+///
+/// Where transformers raises instead (no text to continue, the template
+/// fails on the message, or the text never reaches the prompt, as with a
+/// template that renders no assistant turns), or would cut anywhere but
+/// right after the final message's text, the message is left out and
+/// its text appended after the generation prompt, which is how every
+/// continued message rendered before. Speech-recognition prompts rely on
+/// this: their forced-language prefill follows a generation prompt the
+/// template opens but whose turn it never renders. Only the text survives
+/// that, so a message that also has `reasoning_content` is refused there
+/// instead. The flag says which happened: true when the message was
+/// continued.
+fn render_continuing_final_message(
+    env: &Environment<'_>,
+    messages: &[JsonValue],
+    params: ChatTemplateParams,
+) -> Result<(String, bool)> {
+    continue_final_message(messages, params, |messages, params| {
+        render_messages(env, messages.iter(), params).map(|(text, _)| text)
+    })
+}
+
+/// Continue a message with the same marker, cut and fallback rules for both
+/// Jinja and native renderers. The supplied renderer receives no continuation flag.
+pub(crate) fn continue_final_message(
+    messages: &[JsonValue],
+    params: ChatTemplateParams,
+    render: impl Fn(&[JsonValue], ChatTemplateParams) -> Result<String>,
+) -> Result<(String, bool)> {
+    if params.add_generation_prompt {
+        return Err(anyhow!(
+            "continue_final_message and add_generation_prompt are not compatible"
+        ));
+    }
+    let Some((last, head)) = messages.split_last() else {
+        return Err(anyhow!("no final message to continue"));
+    };
+    let marker = continuation_marker(messages, &params);
+    let continued = (|| {
+        let text =
+            final_text(last).ok_or_else(|| anyhow!("the final message has no text to continue"))?;
+        let mut tagged = last.clone();
+        tag_final_message(&mut tagged, &marker)?;
+        let params = ChatTemplateParams {
+            continue_final_message: false,
+            ..params
+        };
+        let mut tagged_messages = head.to_vec();
+        tagged_messages.push(tagged);
+        let rendered = render(&tagged_messages, params)?;
+        cut_at_final_message(rendered, text, &marker)
+    })();
+    let reason = match continued {
+        Ok(prompt) => return Ok((prompt, true)),
+        Err(reason) => reason,
+    };
+    if last
+        .get("reasoning_content")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|reasoning| !reasoning.is_empty())
+    {
+        return Err(anyhow!(
+            "{reason}: only its text could follow the generation prompt, and its \
+             reasoning_content would be lost"
+        ));
+    }
+    tracing::debug!(%reason, "appending the continued message after the generation prompt");
+    let mut prompt = render(
+        head,
+        ChatTemplateParams {
+            add_generation_prompt: true,
+            continue_final_message: false,
+            ..params
+        },
+    )?;
+    match last.get("content") {
+        Some(JsonValue::String(text)) => prompt.push_str(text),
+        Some(JsonValue::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| part.get("text")?.as_str())
+            .for_each(|text| prompt.push_str(text)),
+        _ => {}
+    }
+    Ok((prompt, false))
+}
+
+/// Render the chat, and say whether the prompt continues the final message
+/// (see [`render_continuing_final_message`]).
 fn render_chat_template(
     env: &Environment<'_>,
     messages: &[serde_json::Value],
     params: ChatTemplateParams,
-) -> Result<String> {
+) -> Result<(String, bool)> {
+    if params.continue_final_message {
+        return render_continuing_final_message(env, messages, params);
+    }
+    render_messages(env, messages.iter(), params)
+}
+
+/// Render `messages` through the template with the generation prompt the
+/// params ask for; the flag says the prompt does not continue a message.
+fn render_messages<'a>(
+    env: &Environment<'_>,
+    messages: impl Iterator<Item = &'a JsonValue>,
+    params: ChatTemplateParams,
+) -> Result<(String, bool)> {
     let tmpl = env
         .get_template("chat")
         .map_err(|e| anyhow!("Failed to get template: {e}"))?;
 
-    // Convert messages to minijinja::Value (messages already processed by router)
-    let minijinja_messages: Vec<Value> = messages.iter().map(Value::from_serialize).collect();
+    // transformers adds `strftime_now` to the template environment; here it is
+    // a callable of the render context, bound to the render's instant.
+    let now = params.now.unwrap_or_else(render_instant);
+    let strftime_now = Value::from_function(move |format: String| strftime(&now, &format));
 
-    // Use Value::UNDEFINED for missing optional params so they are truly "undefined"
-    // in the template context, matching HuggingFace Python behavior. Many chat templates
-    // use `{% if tools is defined %}` guards — passing null (none) instead of undefined
-    // would bypass those guards since `none` IS defined, causing `tools | length` to fail.
-    let tools_value = params.tools.map_or(Value::UNDEFINED, Value::from_serialize);
+    // Convert messages to minijinja::Value (messages already processed by router)
+    let minijinja_messages: Vec<Value> = messages.map(Value::from_serialize).collect();
+
+    // transformers renders with `tools=None` and `documents=None` when the
+    // request carries none: the names are defined and hold none. A template
+    // may test them either way (`tools is none`, `tools is defined and tools`,
+    // `tools is iterable`); undefined would send a template that tests
+    // `is none` down its tools branch with nothing to write.
+    let tools_value = params
+        .tools
+        .map_or_else(|| Value::from(()), Value::from_serialize);
     let documents_value = params
         .documents
-        .map_or(Value::UNDEFINED, Value::from_serialize);
+        .map_or_else(|| Value::from(()), Value::from_serialize);
 
     // Inject special tokens (bos_token, eos_token, etc.) into context.
     // Use UNDEFINED for missing tokens so `{% if bos_token is defined %}` works correctly.
@@ -949,6 +1814,7 @@ fn render_chat_template(
     let base_context = context! {
         messages => &minijinja_messages,
         add_generation_prompt => params.add_generation_prompt,
+        strftime_now => strftime_now,
         tools => tools_value,
         documents => documents_value,
         bos_token => bos_value,
@@ -972,7 +1838,36 @@ fn render_chat_template(
         .render(&ctx)
         .map_err(|e| anyhow!("Failed to render template: {e}"))?;
 
-    Ok(rendered)
+    Ok((rendered, false))
+}
+
+/// The messages with every string `content` of a non-tool message replaced by
+/// a one-item text part list, or `None` when no message has one.
+pub(crate) fn string_content_as_text_parts(
+    messages: &[serde_json::Value],
+) -> Option<Vec<serde_json::Value>> {
+    fn needs_wrap(message: &serde_json::Value) -> bool {
+        message
+            .get("content")
+            .is_some_and(serde_json::Value::is_string)
+            && message.get("role").and_then(serde_json::Value::as_str) != Some("tool")
+    }
+    if !messages.iter().any(needs_wrap) {
+        return None;
+    }
+    let wrapped = messages
+        .iter()
+        .map(|message| {
+            if !needs_wrap(message) {
+                return message.clone();
+            }
+            let mut message = message.clone();
+            let text = message["content"].take();
+            message["content"] = serde_json::json!([{ "type": "text", "text": text }]);
+            message
+        })
+        .collect();
+    Some(wrapped)
 }
 
 /// Chat template processor using Jinja2 - simple wrapper like HuggingFace
@@ -1001,23 +1896,8 @@ impl ChatTemplateProcessor {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<String> {
-        render_chat_template(&self.env, messages, params)
+        render_chat_template(&self.env, messages, params).map(|(prompt, _)| prompt)
     }
-}
-
-/// Load chat template from tokenizer config JSON
-pub fn load_chat_template_from_config(config_path: &str) -> Result<Option<String>> {
-    let content = fs::read_to_string(config_path)?;
-    let config: serde_json::Value = serde_json::from_str(&content)?;
-
-    // Look for chat_template in the config
-    if let Some(template) = config.get("chat_template") {
-        if let Some(template_str) = template.as_str() {
-            return Ok(Some(template_str.to_string()));
-        }
-    }
-
-    Ok(None)
 }
 
 /// Load chat template from a file (.jinja or .json containing Jinja).
@@ -1070,6 +1950,22 @@ pub struct ChatTemplateState {
     thinking_key_name: Option<ThinkingKeyName>,
     /// Whether the template injects `<think>` in the generation prompt.
     think_in_prefill: bool,
+    /// Whether the generation prompt opens a `<think>` block it does not
+    /// close, so a completion starts inside reasoning; a closed block (a
+    /// non-thinking template) does not count.
+    prefill_opens_think_block: bool,
+    /// Whether the template has a branch for the `developer` role. When it
+    /// has none, `apply` renders developer messages as system messages, as
+    /// the engine's HF renderer does, instead of letting the template drop them.
+    developer_role_supported: bool,
+    /// Whether the template has a branch for the `root` role (the MiniMax M3
+    /// template). When it has none, `apply` renders root messages as system
+    /// messages, the way such a request was dispatched before the MiniMax
+    /// profile kept the role, instead of letting the template drop them.
+    root_role_supported: bool,
+    /// Whether the template writes a history tool call's `arguments` as the
+    /// text the request sent (see [`Self::raw_tool_call_arguments`]).
+    raw_tool_call_arguments: bool,
 }
 
 impl std::fmt::Debug for ChatTemplateState {
@@ -1085,16 +1981,31 @@ impl std::fmt::Debug for ChatTemplateState {
 
 impl ChatTemplateState {
     pub fn new(template: Option<String>) -> Result<Self> {
-        let (content_format, think_in_prefill, thinking_toggle, thinking_key_name) =
-            template.as_ref().map(|t| detect_all(t)).unwrap_or_default();
+        let (
+            content_format,
+            think_in_prefill,
+            thinking_toggle,
+            thinking_key_name,
+            prefill_opens_think_block,
+        ) = template.as_ref().map(|t| detect_all(t)).unwrap_or_default();
+        let developer_role_supported = template
+            .as_deref()
+            .is_none_or(detect_developer_role_support);
+        let root_role_supported = template.as_deref().is_none_or(detect_root_role_support);
         let env = template.map(build_environment).transpose()?;
-        Ok(Self {
+        let mut state = Self {
             env,
             content_format,
             thinking_toggle,
             thinking_key_name,
             think_in_prefill,
-        })
+            prefill_opens_think_block,
+            developer_role_supported,
+            root_role_supported,
+            raw_tool_call_arguments: false,
+        };
+        state.raw_tool_call_arguments = state.writes_tool_call_arguments_as_text();
+        Ok(state)
     }
 
     /// Create a `ChatTemplateState` with no template set.
@@ -1108,6 +2019,10 @@ impl ChatTemplateState {
             thinking_toggle: ThinkingToggle::None,
             thinking_key_name: None,
             think_in_prefill: false,
+            prefill_opens_think_block: false,
+            developer_role_supported: true,
+            root_role_supported: true,
+            raw_tool_call_arguments: false,
         }
     }
 
@@ -1116,6 +2031,20 @@ impl ChatTemplateState {
         messages: &[serde_json::Value],
         params: ChatTemplateParams,
     ) -> Result<String> {
+        self.apply_with_continuation(messages, params)
+            .map(|(prompt, _)| prompt)
+    }
+
+    /// [`Self::apply`], also saying whether the prompt continues the final
+    /// message: false unless `continue_final_message` was asked for and the
+    /// template could continue the message instead of appending its text
+    /// after the generation prompt (see
+    /// [`ChatTemplateParams::continue_final_message`]).
+    pub fn apply_with_continuation(
+        &self,
+        messages: &[serde_json::Value],
+        params: ChatTemplateParams,
+    ) -> Result<(String, bool)> {
         let env = self.env.as_ref().ok_or_else(|| {
             anyhow!(
                 "Cannot use chat template functions because tokenizer.chat_template is not set \
@@ -1124,6 +2053,56 @@ impl ChatTemplateState {
                  https://huggingface.co/docs/transformers/main/en/chat_templating",
             )
         })?;
+
+        // The serving engine hands an "openai"-format template every message's string content
+        // as a one-item text part list (`_parse_chat_message_content`: a `str`
+        // becomes `[{"type": "text", "text": ...}]`, and in that format the
+        // parts stay dicts), so such a template always takes its parts branch.
+        // Render the same way, so that a template whose two branches differ (a
+        // separator after every part, a truthiness check on the content)
+        // produces the engine's prompt for string content too. A tool result
+        // stays a string: the engine joins its text parts back into one.
+        let wrapped = (self.content_format == ChatTemplateContentFormat::OpenAI)
+            .then(|| string_content_as_text_parts(messages))
+            .flatten();
+        let messages = wrapped.as_deref().unwrap_or(messages);
+
+        // A template without a `root` branch (the MiniMax templates before
+        // M3) has no branch that reads the role and would drop a root
+        // message: it gets the message as the leading system message
+        // instead, the way such a request was dispatched before the MiniMax
+        // profile kept the role, and a system message after the root merges
+        // into that one rather than being lost (the consolidation below).
+        // Before the developer step, so a developer message merged next
+        // comes after the root's text.
+        let root_converted;
+        let messages: &[serde_json::Value] = if self.root_role_supported {
+            messages
+        } else {
+            match root_messages_as_system(messages) {
+                Some(rewritten) => {
+                    root_converted = rewritten;
+                    &root_converted
+                }
+                None => messages,
+            }
+        };
+
+        // A template without a `developer` branch renders nothing for a
+        // developer message; the engine's renderer hands such a template the message
+        // as a system message, and so does this one (`tools` on it dropped).
+        let converted;
+        let messages: &[serde_json::Value] = if self.developer_role_supported {
+            messages
+        } else {
+            match developer_messages_as_system(messages) {
+                Some(rewritten) => {
+                    converted = rewritten;
+                    &converted
+                }
+                None => messages,
+            }
+        };
 
         // Apply the resolved thinking preference under the template's own toggle
         // key (`enable_thinking` vs `thinking`, per detection). Skip entirely
@@ -1167,14 +2146,25 @@ impl ChatTemplateState {
     }
 
     pub fn set(&mut self, template: String) -> Result<()> {
-        let (content_format, think_in_prefill, thinking_toggle, thinking_key_name) =
-            detect_all(&template);
+        let (
+            content_format,
+            think_in_prefill,
+            thinking_toggle,
+            thinking_key_name,
+            prefill_opens_think_block,
+        ) = detect_all(&template);
+        let developer_role_supported = detect_developer_role_support(&template);
+        let root_role_supported = detect_root_role_support(&template);
         let env = build_environment(template)?;
+        self.developer_role_supported = developer_role_supported;
+        self.root_role_supported = root_role_supported;
         self.content_format = content_format;
         self.thinking_toggle = thinking_toggle;
         self.thinking_key_name = thinking_key_name;
         self.think_in_prefill = think_in_prefill;
+        self.prefill_opens_think_block = prefill_opens_think_block;
         self.env = Some(env);
+        self.raw_tool_call_arguments = self.writes_tool_call_arguments_as_text();
         Ok(())
     }
 
@@ -1209,11 +2199,359 @@ impl ChatTemplateState {
     pub fn think_in_prefill(&self) -> bool {
         self.think_in_prefill
     }
+
+    /// Whether the generation prompt opens a `<think>` block it does not
+    /// close (see `Tokenizer::prefill_opens_think_block`).
+    pub fn prefill_opens_think_block(&self) -> bool {
+        self.prefill_opens_think_block
+    }
+
+    /// Whether the template writes a history tool call's `arguments` as the
+    /// text the request sent: the Jinja renderer's answer to
+    /// `RendererCapabilities::raw_tool_call_arguments`. The API carries the
+    /// arguments as a JSON string and the gateway parses them into the object
+    /// the Transformers docs say a template reads; a template that writes
+    /// them by string concatenation (`'<sep>' + tool['function']['arguments']
+    /// + '<end>'`) cannot render that object, so the string must reach it as
+    /// written. Resolved when the template is bound (see
+    /// [`Self::writes_tool_call_arguments_as_text`]).
+    pub fn raw_tool_call_arguments(&self) -> bool {
+        self.raw_tool_call_arguments
+    }
+
+    /// Decide [`Self::raw_tool_call_arguments`] by the template's behaviour,
+    /// not its source: one history call rendered with the arguments as the
+    /// string and as the object. The template takes the text only when the
+    /// object fails to render and the string renders, so a template that
+    /// takes the object (`tojson`, indexing, an `is string` branch) and one
+    /// that renders neither keep the parsed form the gateway hands every
+    /// template today.
+    fn writes_tool_call_arguments_as_text(&self) -> bool {
+        if self.env.is_none() {
+            return false;
+        }
+        let renders = |arguments: serde_json::Value| {
+            let messages = [
+                serde_json::json!({"role": "user", "content": "probe"}),
+                serde_json::json!({"role": "assistant", "content": "", "tool_calls": [{
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {"name": "probe", "arguments": arguments},
+                }]}),
+                serde_json::json!({"role": "tool", "tool_call_id": "call_0", "content": "probe"}),
+            ];
+            self.apply(&messages, ChatTemplateParams::default()).is_ok()
+        };
+        renders(serde_json::json!("{\"probe\": 1}")) && !renders(serde_json::json!({"probe": 1}))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A history call's `arguments` reach a template as the text the request
+    /// sent only when the template writes them that way: one that concatenates
+    /// them cannot render the parsed object; one that serializes or indexes
+    /// the object, or branches on its type, and one without a tool-call branch
+    /// keep the object.
+    #[test]
+    fn a_template_that_concatenates_tool_call_arguments_takes_them_as_text() {
+        let state = ChatTemplateState::new(Some(CONCATENATING_CALLS.to_string())).unwrap();
+        assert!(state.raw_tool_call_arguments());
+
+        let indexing = "{% for m in messages %}{% if m.tool_calls %}{% for t in m.tool_calls %}\
+                        <call>{{ t.function.name }}:{% for k, v in t.function.arguments | items %}\
+                        {{ k }}={{ v }}{% endfor %}</call>{% endfor %}{% else %}{{ m.content }}\
+                        {% endif %}{% endfor %}";
+        let branching = "{% for m in messages %}{% if m.tool_calls %}{% for t in m.tool_calls %}\
+                         <call>{{ t.function.name }}:{% if t.function.arguments is string %}\
+                         {{ t.function.arguments }}{% else %}{{ t.function.arguments | tojson }}\
+                         {% endif %}</call>{% endfor %}{% else %}{{ m.content }}{% endif %}{% endfor %}";
+        let without_calls = "{% for m in messages %}{{ m.content }}{% endfor %}";
+        for template in [SERIALIZING_CALLS, indexing, branching, without_calls] {
+            let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+            assert!(!state.raw_tool_call_arguments(), "{template}");
+        }
+        assert!(!ChatTemplateState::empty().raw_tool_call_arguments());
+        assert!(!ChatTemplateState::new(None)
+            .unwrap()
+            .raw_tool_call_arguments());
+    }
+
+    /// A replacement template answers for itself.
+    #[test]
+    fn a_replacement_template_refreshes_the_tool_call_arguments_answer() {
+        let mut state = ChatTemplateState::new(Some(SERIALIZING_CALLS.to_string())).unwrap();
+        assert!(!state.raw_tool_call_arguments());
+        state.set(CONCATENATING_CALLS.to_string()).unwrap();
+        assert!(state.raw_tool_call_arguments());
+        state.set(SERIALIZING_CALLS.to_string()).unwrap();
+        assert!(!state.raw_tool_call_arguments());
+    }
+
+    /// A template that writes a history call by string concatenation, as the
+    /// DeepSeek V3 line's templates do.
+    const CONCATENATING_CALLS: &str =
+        "{% for m in messages %}{% if m.tool_calls %}{% for t in m.tool_calls %}\
+         {{ '<call>' + t.function.name + ':' + t.function.arguments + '</call>' }}\
+         {% endfor %}{% else %}{{ m.content }}{% endif %}{% endfor %}";
+    /// A template that serializes the arguments object, as most do.
+    const SERIALIZING_CALLS: &str =
+        "{% for m in messages %}{% if m.tool_calls %}{% for t in m.tool_calls %}\
+         <call>{{ t.function.name }}:{{ t.function.arguments | tojson }}</call>\
+         {% endfor %}{% else %}{{ m.content }}{% endif %}{% endfor %}";
+
+    /// Transformers' `{% generation %}` block (the assistant-token mask marker)
+    /// renders its body; the engine here has no such statement, so the block
+    /// is rewritten to a plain `if` before parsing, and the content-format
+    /// detection parses such a template as well.
+    #[test]
+    fn generation_blocks_render_their_body() {
+        let template = "{%- for m in messages -%}\n{%- if m.role == 'assistant' -%}\n\
+                        {% generation %}\n<a>{{ m.content }}</a>\n{%- endgeneration -%}\n\
+                        {%- else -%}\n<u>{{ m.content }}</u>\n{%- endif -%}\n{%- endfor -%}";
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let messages = [
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "assistant", "content": "yo"}),
+        ];
+        let rendered = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(rendered, "<u>hi</u><a>yo</a>");
+
+        let parts_template = "{% for message in messages %}{% if message['role'] == 'user' %}USER: \
+                              {% for content in message['content'] | selectattr('type', 'equalto', 'text') %}\
+                              {% generation %}{{ content['text'] + ' ' }}{% endgeneration %}{% endfor %}\
+                              {% endif %}{% endfor %}";
+        assert_eq!(
+            detect_chat_template_content_format(parts_template),
+            ChatTemplateContentFormat::OpenAI
+        );
+    }
+
+    /// A template that keeps the messages it loops over in a namespace
+    /// attribute (`ns.rest = messages[1:]`) and renders each message's
+    /// content through a macro that walks its parts is of the "openai"
+    /// format: its parts reach the template, which writes the media anchors
+    /// itself. Any other non-name assignment target still falls back to the
+    /// "string" format.
+    #[test]
+    fn namespace_message_lists_are_followed_to_their_content_loop() {
+        let template = "{%- macro render_content(content) -%}\
+                        {%- if content is string -%}{{ content }}\
+                        {%- else -%}{%- for part in content -%}\
+                        {%- if part.get('type', '') in ['image', 'image_url'] -%}<|patch|>\
+                        {%- elif part.get('type', '') == 'text' -%}{{ part.get('text', '') }}\
+                        {%- endif -%}{%- endfor -%}{%- endif -%}{%- endmacro -%}\
+                        {%- set ns = namespace(rest=messages) -%}\
+                        {%- if messages and messages[0]['role'] == 'system' -%}\
+                        {%- set ns.rest = messages[1:] -%}{%- endif -%}\
+                        {%- for message in ns.rest -%}\
+                        <|start|>{{ message['role'] }}<|message|>{{ render_content(message['content']) }}<|eot|>\
+                        {%- endfor -%}";
+        assert_eq!(
+            detect_chat_template_content_format(template),
+            ChatTemplateContentFormat::OpenAI
+        );
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let messages = [serde_json::json!({"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": "what is this?"}
+        ]})];
+        let rendered = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<|start|>user<|message|><|patch|>what is this?<|eot|>"
+        );
+
+        // A plain string-content template with the same namespace shape stays string-format.
+        let plain = "{%- set ns = namespace(rest=messages) -%}{%- for message in ns.rest -%}\
+                     {{ message['content'] }}{%- endfor -%}";
+        assert_eq!(
+            detect_chat_template_content_format(plain),
+            ChatTemplateContentFormat::String
+        );
+    }
+
+    /// The rewrite keeps each tag's whitespace modifiers and leaves a template
+    /// without the block untouched.
+    #[test]
+    fn generation_tags_are_rewritten_with_their_modifiers() {
+        assert_eq!(
+            plain_generation_blocks(
+                "{%- generation -%}x{% endgeneration %}y{%+ generation %}z{%-endgeneration-%}"
+            ),
+            "{%- if true -%}x{% endif %}y{%+ if true %}z{%- endif -%}"
+        );
+        assert!(matches!(
+            plain_generation_blocks("{% if add_generation_prompt %}a{% endif %}"),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    /// transformers' `strftime_now(format)`: the render's instant written with
+    /// the format; a template may guard it with `is defined`; a render that
+    /// names no instant writes today; an invalid format is an error.
+    #[test]
+    fn strftime_now_writes_the_render_instant() {
+        let template = "{%- if strftime_now is defined -%}Current date: \
+                        {{ strftime_now('%Y-%m-%d') }}. {{ strftime_now('%H:%M') }}{%- endif -%}";
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let messages: [serde_json::Value; 0] = [];
+        let now = DateTime::parse_from_rfc3339("2026-10-07T09:30:00+02:00").unwrap();
+        let params = ChatTemplateParams {
+            now: Some(now),
+            ..Default::default()
+        };
+        let rendered = processor.apply_chat_template(&messages, params).unwrap();
+        assert_eq!(rendered, "Current date: 2026-10-07. 09:30");
+
+        let today = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            today.len(),
+            "Current date: 2026-10-07. 09:30".len(),
+            "{today}"
+        );
+
+        let invalid = ChatTemplateProcessor::new("{{ strftime_now('%Q') }}".to_string()).unwrap();
+        let error = invalid
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("strftime_now"), "{error}");
+    }
+
+    /// Jinja2's `dict()` is Python's: it builds a map from nothing, from a
+    /// mapping or from an iterable of key/value pairs, keyword arguments are
+    /// written over the result, and a repeated key keeps its first position
+    /// with its last value. A template merges a schema's `$defs` entry into
+    /// the property that references it as `dict((a | items | list) + (b |
+    /// items | list))`; the engine's own `dict` takes a mapping only.
+    #[test]
+    fn dict_builds_a_map_from_pairs_as_python_does() {
+        let template = "{{ dict([('a', 1), ('b', 2), ('a', 3)]) | tojson }}|\
+                        {{ dict({'x': 1}, y=2) | tojson }}|{{ dict() | tojson }}|\
+                        {{ dict((messages[0].defs | items | list) + \
+                        (messages[0].spec | items | rejectattr('0', 'equalto', '$ref') | list)) | tojson }}";
+        let messages = [serde_json::json!({
+            "role": "user",
+            "defs": {"type": "string", "pattern": "^[A-Z]{3}$"},
+            "spec": {"$ref": "#/$defs/airport", "description": "IATA code"},
+        })];
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let rendered = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            r#"{"a": 3, "b": 2}|{"x": 1, "y": 2}|{}|{"type": "string", "pattern": "^[A-Z]{3}$", "description": "IATA code"}"#
+        );
+
+        // An element that is not a key/value pair is an error, as in Python.
+        let processor = ChatTemplateProcessor::new("{{ dict([['a']]) }}".to_string()).unwrap();
+        let error = processor
+            .apply_chat_template(&[], ChatTemplateParams::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("2 is required"), "{error}");
+    }
+
+    /// `tojson` writes the template value straight into its text; the text is
+    /// Python's `json.dumps` of the value under each option, and the same as
+    /// a `serde_json::Value` built from the template value would serialize
+    /// as (the path the sorted form still takes).
+    #[test]
+    fn tojson_writes_the_value_as_python_and_as_its_tree_would() {
+        let value = serde_json::json!({
+            "name": "Zoë", "n": 1, "big": 18446744073709551615u64, "neg": -5, "f": 1.5,
+            "whole": 2.0, "t": true, "none": null,
+            "list": [1, "two", [3.25, {"k": "v"}]],
+            "nested": {"b": 1, "a": {"c": [], "d": {}}},
+            "esc": "quote\" back\\ tab\t nl\n ctl\u{1} emoji😀",
+        });
+        let template = "{{ messages[0].v | tojson }}\n\
+                        {{ messages[0].v | tojson(ensure_ascii=True) }}\n\
+                        {{ messages[0].v | tojson(indent=2) }}\n\
+                        {{ messages[0].v | tojson(separators=(',', ':')) }}\n\
+                        {{ messages[0].v | tojson(sort_keys=True) }}";
+        let messages = [serde_json::json!({"role": "user", "v": value})];
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let rendered = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        // Each line is `json.dumps(v, ensure_ascii=False, ...)` with that option.
+        let want = [
+            r#"{"name": "Zoë", "n": 1, "big": 18446744073709551615, "neg": -5, "f": 1.5, "whole": 2.0, "t": true, "none": null, "list": [1, "two", [3.25, {"k": "v"}]], "nested": {"b": 1, "a": {"c": [], "d": {}}}, "esc": "quote\" back\\ tab\t nl\n ctl\u0001 emoji😀"}"#,
+            r#"{"name": "Zo\u00eb", "n": 1, "big": 18446744073709551615, "neg": -5, "f": 1.5, "whole": 2.0, "t": true, "none": null, "list": [1, "two", [3.25, {"k": "v"}]], "nested": {"b": 1, "a": {"c": [], "d": {}}}, "esc": "quote\" back\\ tab\t nl\n ctl\u0001 emoji\ud83d\ude00"}"#,
+            "{\n  \"name\": \"Zoë\",\n  \"n\": 1,\n  \"big\": 18446744073709551615,\n  \"neg\": -5,\n  \"f\": 1.5,\n  \"whole\": 2.0,\n  \"t\": true,\n  \"none\": null,\n  \"list\": [\n    1,\n    \"two\",\n    [\n      3.25,\n      {\n        \"k\": \"v\"\n      }\n    ]\n  ],\n  \"nested\": {\n    \"b\": 1,\n    \"a\": {\n      \"c\": [],\n      \"d\": {}\n    }\n  },\n  \"esc\": \"quote\\\" back\\\\ tab\\t nl\\n ctl\\u0001 emoji😀\"\n}",
+            r#"{"name":"Zoë","n":1,"big":18446744073709551615,"neg":-5,"f":1.5,"whole":2.0,"t":true,"none":null,"list":[1,"two",[3.25,{"k":"v"}]],"nested":{"b":1,"a":{"c":[],"d":{}}},"esc":"quote\" back\\ tab\t nl\n ctl\u0001 emoji😀"}"#,
+            r#"{"big": 18446744073709551615, "esc": "quote\" back\\ tab\t nl\n ctl\u0001 emoji😀", "f": 1.5, "list": [1, "two", [3.25, {"k": "v"}]], "n": 1, "name": "Zoë", "neg": -5, "nested": {"a": {"c": [], "d": {}}, "b": 1}, "none": null, "t": true, "whole": 2.0}"#,
+        ];
+        assert_eq!(rendered, want.join("\n"));
+
+        // The direct write and the write of the tree agree byte for byte.
+        let given = Value::from_serialize(&messages[0]["v"]);
+        for (indent, ensure_ascii) in [
+            (None, false),
+            (None, true),
+            (Some(2), false),
+            (Some(0), true),
+        ] {
+            let direct = serialize_with_python_json(
+                &given,
+                indent,
+                JsonSeparators::python_default(indent),
+                ensure_ascii,
+            )
+            .unwrap();
+            let tree: serde_json::Value = serde_json::to_value(&given).unwrap();
+            let through_tree = serialize_with_python_json(
+                &tree,
+                indent,
+                JsonSeparators::python_default(indent),
+                ensure_ascii,
+            )
+            .unwrap();
+            assert_eq!(
+                direct, through_tree,
+                "indent {indent:?} ensure_ascii {ensure_ascii}"
+            );
+        }
+    }
+
+    /// transformers renders with `tools=None` and `documents=None` when the
+    /// request carries none, so a template that tests `tools is none` (Olmo 3)
+    /// takes its no-tools branch, and one that guards with `is defined and
+    /// tools` does too.
+    #[test]
+    fn absent_tools_and_documents_are_none_as_transformers_passes_them() {
+        let template = "{% if tools is none %}no tools{% else %}{{ tools | tojson }}{% endif %}|\
+                        {% if tools is defined and tools %}has tools{% else %}none{% endif %}|\
+                        {% if tools is iterable and tools | length > 0 %}iterable{% else %}not iterable{% endif %}|\
+                        {% if documents is none %}no documents{% endif %}";
+        let processor = ChatTemplateProcessor::new(template.to_string()).unwrap();
+        let messages: [serde_json::Value; 0] = [];
+        let rendered = processor
+            .apply_chat_template(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(rendered, "no tools|none|not iterable|no documents");
+
+        let tools = [serde_json::json!({"type": "function", "function": {"name": "f"}})];
+        let params = ChatTemplateParams {
+            tools: Some(&tools),
+            ..Default::default()
+        };
+        let rendered = processor.apply_chat_template(&messages, params).unwrap();
+        assert_eq!(
+            rendered,
+            "[{\"type\": \"function\", \"function\": {\"name\": \"f\"}}]|has tools|iterable|no documents"
+        );
+    }
 
     #[test]
     fn test_chat_template_state_no_template() {
@@ -1228,6 +2566,315 @@ mod tests {
         let mut state = ChatTemplateState::new(None).unwrap();
         state.set("{{ messages }}".to_string()).unwrap();
         assert_eq!(state.content_format(), ChatTemplateContentFormat::String);
+    }
+
+    #[test]
+    fn developer_message_renders_as_system_when_the_template_has_no_developer_branch() {
+        // The template names system/user/assistant only: a developer message
+        // would render nothing. The engine's renderer turns it into a system message.
+        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}\
+                        {% if messages[0].tools is defined %}TOOLS{% endif %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "developer", "content": "Be terse.", "tools": [{"name": "t"}]}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(rendered, "<sys>Be terse.</sys><usr>hi</usr>");
+    }
+
+    /// With a system message of its own in the request, the rewritten
+    /// developer message is no longer the first message: the two merge into
+    /// one system turn at the front, as the engine's renderer merges them.
+    #[test]
+    fn a_developer_message_after_a_system_message_merges_into_one_system_turn() {
+        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "system", "content": "You are terse."}),
+            serde_json::json!({"role": "developer", "content": "Answer in French."}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<sys>You are terse.\n\nAnswer in French.</sys><usr>hi</usr>"
+        );
+    }
+
+    /// A developer message in the middle of the conversation becomes the
+    /// system turn at the front; the other messages keep their order, and a
+    /// parts list contributes its text parts.
+    #[test]
+    fn a_developer_message_after_an_assistant_turn_moves_to_the_front() {
+        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>\
+                        {% elif m.role == 'assistant' %}<ast>{{ m.content }}</ast>{% endif %}{% endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "hi"}),
+            serde_json::json!({"role": "assistant", "content": "hello"}),
+            serde_json::json!({"role": "developer", "content": [
+                {"type": "text", "text": "Be brief."},
+                {"type": "text", "text": "No lists."},
+            ]}),
+            serde_json::json!({"role": "user", "content": "go on"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<sys>Be brief.\nNo lists.</sys><usr>hi</usr><ast>hello</ast><usr>go on</usr>"
+        );
+    }
+
+    /// A template that never names the `root` role (the MiniMax templates
+    /// before M3 read `messages[0].role == "system"` only) would drop a root
+    /// message: it gets the message as the leading system message instead.
+    #[test]
+    fn a_root_message_renders_as_the_system_message_when_the_template_has_no_root_branch() {
+        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "root", "content": "Answer in French."}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(rendered, "<sys>Answer in French.</sys><usr>hi</usr>");
+    }
+
+    /// A system message after the root is not lost on such a template: the
+    /// two merge into one system turn, the root's text first.
+    #[test]
+    fn a_system_message_after_a_root_merges_into_one_system_turn_without_a_root_branch() {
+        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "root", "content": "Answer in French."}),
+            serde_json::json!({"role": "system", "content": "You are terse."}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<sys>Answer in French.\n\nYou are terse.</sys><usr>hi</usr>"
+        );
+    }
+
+    /// A root followed by a developer message on a template with neither
+    /// branch: both become the one system turn, the root's text first.
+    #[test]
+    fn a_root_and_a_developer_message_merge_root_first_without_either_branch() {
+        let template = "{% for m in messages %}{% if m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "root", "content": "Answer in French."}),
+            serde_json::json!({"role": "developer", "content": "Be brief."}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<sys>Answer in French.\n\nBe brief.</sys><usr>hi</usr>"
+        );
+    }
+
+    #[test]
+    fn a_root_message_reaches_a_template_that_handles_the_role() {
+        let template = "{% for m in messages %}{% if m.role == 'root' %}<root>{{ m.content }}</root>\
+                        {% elif m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "root", "content": "Answer in French."}),
+            serde_json::json!({"role": "system", "content": "You are terse."}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(
+            rendered,
+            "<root>Answer in French.</root><sys>You are terse.</sys><usr>hi</usr>"
+        );
+    }
+
+    #[test]
+    fn developer_message_reaches_a_template_that_handles_the_role() {
+        let template = "{% for m in messages %}{% if m.role == 'developer' %}<dev>{{ m.content }}</dev>\
+                        {% elif m.role == 'system' %}<sys>{{ m.content }}</sys>\
+                        {% elif m.role == 'user' %}<usr>{{ m.content }}</usr>{% endif %}{% endfor %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        let messages = vec![
+            serde_json::json!({"role": "developer", "content": "Be terse."}),
+            serde_json::json!({"role": "user", "content": "hi"}),
+        ];
+        let rendered = state
+            .apply(&messages, ChatTemplateParams::default())
+            .unwrap();
+        assert_eq!(rendered, "<dev>Be terse.</dev><usr>hi</usr>");
+    }
+
+    /// A non-thinking template without a switch whose generation prompt
+    /// writes an empty, closed think block: `<think>` is in the prefill, but
+    /// the completion starts in content, so the parser must not be armed.
+    #[test]
+    fn a_closed_think_block_in_the_generation_prompt_does_not_open_reasoning() {
+        let closed = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                      {%- if add_generation_prompt -%}<|im_start|>assistant\n<think>\n\n</think>\n\n{%- endif -%}";
+        let state = ChatTemplateState::new(Some(closed.to_string())).unwrap();
+        assert_eq!(state.thinking_toggle(), ThinkingToggle::None);
+        assert!(
+            state.think_in_prefill(),
+            "the loose flag still sees the tag"
+        );
+        assert!(!state.prefill_opens_think_block());
+
+        // Opened in one branch, closed in another: the open branch counts.
+        let branched = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|>\
+                        {%- if clear_thinking is defined and clear_thinking -%}<think></think>\
+                        {%- else -%}<think>{%- endif -%}{%- endif -%}";
+        let state = ChatTemplateState::new(Some(branched.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+
+        // Both branches open a block and the prompt closes it after them.
+        let closed_after_branches = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|>\
+                        {%- if clear_thinking is defined and clear_thinking -%}<think>\
+                        {%- else -%}<think>\n{%- endif -%}</think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(closed_after_branches.to_string())).unwrap();
+        assert!(!state.prefill_opens_think_block());
+
+        // A block opened only when there is no generation prompt is not the
+        // prompt's; the else branch of that condition is.
+        let not_prompt = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if not add_generation_prompt -%}<think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(not_prompt.to_string())).unwrap();
+        assert!(!state.prefill_opens_think_block());
+        let else_prompt = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if not add_generation_prompt -%}done{%- else -%}<|assistant|><think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(else_prompt.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+
+        // A comparison is not a positive reference either: this true body
+        // runs without a generation prompt.
+        let compared = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt == false -%}<think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(compared.to_string())).unwrap();
+        assert!(!state.prefill_opens_think_block());
+        let conjunction = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt and messages -%}<|assistant|><think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(conjunction.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+
+        // The prompt written in two generation-prompt blocks: the second may
+        // close what the first opened, or open what the first left closed.
+        let open_then_closed = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}\
+                        {%- if add_generation_prompt -%}\n\n</think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(open_then_closed.to_string())).unwrap();
+        assert!(!state.prefill_opens_think_block());
+        let closed_then_open = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|><think></think>{%- endif -%}\
+                        {%- if add_generation_prompt -%}<think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(closed_then_open.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+
+        // Two blocks that run on different requests (a conjunction each):
+        // either may leave the block open, so the prompt counts as opening
+        // whichever order they come in; a block that always runs still closes
+        // what an earlier one opened.
+        let exclusive = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt and thinking -%}<|assistant|><think>{%- endif -%}\
+                        {%- if add_generation_prompt and not thinking -%}<|assistant|><think></think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(exclusive.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+        let maybe_then_closed = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt and thinking -%}<|assistant|><think>{%- endif -%}\
+                        {%- if add_generation_prompt -%}</think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(maybe_then_closed.to_string())).unwrap();
+        assert!(!state.prefill_opens_think_block());
+
+        // Conditions the variable alone decides: `not (add_generation_prompt
+        // == false)` (the parse of the unparenthesised form) and
+        // `add_generation_prompt == true` run their true body for a
+        // generation prompt; `add_generation_prompt or x` always runs too, so
+        // it closes what an earlier block opened; `not (add_generation_prompt
+        // or x)` always runs its false body.
+        let negated_comparison = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if not add_generation_prompt == false -%}<think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(negated_comparison.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+        let eq_true = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt == true -%}<|assistant|><think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(eq_true.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+        let or_closes = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}\
+                        {%- if add_generation_prompt or continue_final_message -%}</think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(or_closes.to_string())).unwrap();
+        assert!(!state.prefill_opens_think_block());
+        let not_or = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if not (add_generation_prompt or continue_final_message) -%}done\
+                        {%- else -%}<|assistant|><think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(not_or.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+
+        // A test on the variable inside a condition something else also
+        // decides: the block may run, so what it opens counts.
+        let is_true_and = "{%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt is true and not tools -%}<|assistant|><think>{%- endif -%}";
+        let state = ChatTemplateState::new(Some(is_true_and.to_string())).unwrap();
+        assert!(state.prefill_opens_think_block());
+    }
+
+    #[test]
+    fn clear_thinking_is_not_a_thinking_switch() {
+        // GLM-5.3: the template reads `clear_thinking` and `reasoning_effort`
+        // and always opens the think block; it has no switch.
+        let template =
+            "{%- set clear_thinking = clear_thinking if clear_thinking is defined else false -%}\
+                        {%- for m in messages -%}{{ m.content }}{%- endfor -%}\
+                        {%- if add_generation_prompt -%}<|assistant|><think>{%- endif -%}";
+        assert_eq!(
+            detect_thinking_toggle(template),
+            (ThinkingToggle::None, None)
+        );
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(state.thinking_toggle(), ThinkingToggle::None);
+        assert!(state.think_in_prefill());
+        assert!(state.prefill_opens_think_block());
+
+        // A real `thinking` variable is still a switch, in each spelling.
+        for template in [
+            "{% if thinking is defined and not thinking %}off{% endif %}",
+            "{% if thinking == false %}off{% endif %}",
+            "{% if thinking %}on{% endif %}",
+            "{% set thinking = thinking %}",
+        ] {
+            assert_eq!(
+                detect_thinking_toggle(template),
+                (ThinkingToggle::DefaultOn, Some(ThinkingKeyName::Thinking)),
+                "{template}"
+            );
+        }
     }
 
     #[test]
@@ -1361,6 +3008,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(out, "True");
+    }
+
+    #[test]
+    fn gemma4_filter_default_keeps_thinking_off() {
+        let template = "{%- set enable_thinking = enable_thinking | default(false) -%}{% if enable_thinking %}<|channel>thought\n{% endif %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(state.thinking_toggle(), ThinkingToggle::DefaultOff);
+        assert_eq!(
+            state.thinking_key_name(),
+            Some(ThinkingKeyName::EnableThinking)
+        );
+        for (thinking, expected) in [
+            (None, ""),
+            (Some(false), ""),
+            (Some(true), "<|channel>thought\n"),
+        ] {
+            assert_eq!(
+                state
+                    .apply(
+                        &[],
+                        ChatTemplateParams {
+                            thinking,
+                            ..Default::default()
+                        }
+                    )
+                    .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn thinking_filter_on_other_values_does_not_change_the_switch_default() {
+        for template in [
+            "{{ message.thinking | default(false) }}{% if enable_thinking %}<think>{% endif %}",
+            "{{ other_thinking | default(false) }}{% if thinking %}<think>{% endif %}",
+        ] {
+            assert_eq!(
+                detect_thinking_toggle(template).0,
+                ThinkingToggle::DefaultOn
+            );
+        }
+        assert_eq!(
+            detect_thinking_toggle(
+                "{% set thinking = thinking | default(false) %}{% if thinking %}<think>{% endif %}"
+            ),
+            (ThinkingToggle::DefaultOff, Some(ThinkingKeyName::Thinking))
+        );
     }
 
     #[test]

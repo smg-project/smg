@@ -12,7 +12,7 @@
 
 use openai_protocol::messages::{
     ContentBlock, ContentBlockDelta, CreateMessageRequest, ErrorResponse, Message, MessageDelta,
-    MessageDeltaUsage, MessageStreamEvent, StopReason, Usage,
+    MessageDeltaUsage, MessageStreamEvent, StopReason, ToolUseCaller, Usage,
 };
 use serde_json::{json, Value};
 
@@ -57,6 +57,7 @@ fn make_skeleton_message(id: &str) -> Message {
         model: "claude-sonnet-4-5-20250929".to_string(),
         stop_reason: None,
         stop_sequence: None,
+        stop_details: None,
         usage: Usage {
             input_tokens: 25,
             output_tokens: 0,
@@ -65,7 +66,10 @@ fn make_skeleton_message(id: &str) -> Message {
             cache_creation: None,
             server_tool_use: None,
             service_tier: None,
+            inference_geo: None,
+            output_tokens_details: None,
         },
+        container: None,
     }
 }
 
@@ -112,6 +116,7 @@ fn test_content_block_start_tool_use() {
             id: "toolu_01A09q90qw90lq917835lq9".to_string(),
             name: "get_weather".to_string(),
             input: json!({}),
+            caller: ToolUseCaller::Direct,
         },
     })
     .unwrap();
@@ -119,6 +124,7 @@ fn test_content_block_start_tool_use() {
     assert_eq!(v["content_block"]["id"], "toolu_01A09q90qw90lq917835lq9");
     assert_eq!(v["content_block"]["name"], "get_weather");
     assert_eq!(v["content_block"]["input"], json!({}));
+    assert_eq!(v["content_block"]["caller"], json!({"type": "direct"}));
 }
 
 #[test]
@@ -188,6 +194,8 @@ fn test_message_delta_end_turn() {
         delta: MessageDelta {
             stop_reason: Some(StopReason::EndTurn),
             stop_sequence: None,
+            stop_details: None,
+            container: None,
         },
         usage: MessageDeltaUsage {
             output_tokens: 15,
@@ -195,6 +203,7 @@ fn test_message_delta_end_turn() {
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
             server_tool_use: None,
+            output_tokens_details: None,
         },
     })
     .unwrap();
@@ -275,7 +284,9 @@ fn test_non_streaming_tool_use_response() {
     assert_eq!(msg.stop_reason, Some(StopReason::ToolUse));
     assert_eq!(msg.content.len(), 2);
     match &msg.content[1] {
-        ContentBlock::ToolUse { id, name, input } => {
+        ContentBlock::ToolUse {
+            id, name, input, ..
+        } => {
             assert_eq!(id, "toolu_01A09q90qw90lq917835lq9");
             assert_eq!(name, "get_weather");
             assert_eq!(input["location"], "San Francisco, CA");
@@ -521,6 +532,8 @@ fn test_message_delta_stop_sequence() {
         delta: MessageDelta {
             stop_reason: Some(StopReason::StopSequence),
             stop_sequence: Some("###END###".to_string()),
+            stop_details: None,
+            container: None,
         },
         usage: MessageDeltaUsage {
             output_tokens: 42,
@@ -528,6 +541,7 @@ fn test_message_delta_stop_sequence() {
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
             server_tool_use: None,
+            output_tokens_details: None,
         },
     };
     let v: Value = serde_json::to_value(&event).unwrap();

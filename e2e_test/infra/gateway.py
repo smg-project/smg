@@ -5,10 +5,11 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import IO, TYPE_CHECKING, Any
 
 import httpx
 
@@ -16,11 +17,15 @@ from .constants import (
     DEFAULT_HOST,
     DEFAULT_ROUTER_TIMEOUT,
     ENV_SHOW_ROUTER_LOGS,
+    get_parser,
     get_zmq_engine_count,
+    host_port,
 )
 from .process_utils import (
+    ProcessExitedError,
     get_open_port,
     kill_process_tree,
+    port_is_free,
     release_port,
     wait_for_health,
     wait_for_workers_ready,
@@ -93,17 +98,21 @@ class Gateway:
         self.host = host
         self._port_auto_allocated = port is None
         self._prometheus_port_auto_allocated = prometheus_port is None
-        self.port = port or get_open_port()
-        self.prometheus_port = prometheus_port or get_open_port()
-        self.base_url = f"http://{self.host}:{self.port}"
-        self.metrics_url = f"http://{self.host}:{self.prometheus_port}"
+        self.port = port or get_open_port(host=host)
+        self.prometheus_port = prometheus_port or get_open_port(host=host)
+        self.base_url = f"http://{host_port(self.host, self.port)}"
+        self.metrics_url = f"http://{host_port(self.host, self.prometheus_port)}"
 
         self.process: subprocess.Popen | None = None
         self.model_path: str | None = None
         self.policy: str = "round_robin"
         self.log_level: str = "warn"
         self.log_dir: str | None = None
-        # The leg workers a PD/EPD gateway was started with (tests kill and restart them).
+        # The router's captured output (None while it goes to the terminal).
+        self.log_path: str | None = None
+        self._log_file: IO[Any] | None = None
+        self._log_is_temporary = False
+        # The PD workers a PD/EPD gateway was started with (tests kill and restart them).
         self.encode_workers: list[Worker] = []
         self.prefill_workers: list[Worker] = []
         self.decode_workers: list[Worker] = []
@@ -118,6 +127,11 @@ class Gateway:
     def is_running(self) -> bool:
         """Check if the gateway process is running."""
         return self.process is not None and self.process.poll() is None
+
+    @property
+    def ws_base_url(self) -> str:
+        """``ws://host:port`` of this gateway (an IPv6 host in brackets)."""
+        return f"ws://{host_port(self.host, self.port)}"
 
     def start(
         self,
@@ -261,7 +275,74 @@ class Gateway:
                 extra_args=extra_args,
                 num_workers=len(worker_urls),
                 log_msg=f"gateway with {len(worker_urls)} worker(s)",
+                worker_urls=worker_urls,
             )
+
+    def _ensure_ports_free(self) -> None:
+        """Re-check the auto-allocated ports right before the launch.
+
+        They were reserved by number when this gateway was constructed, often
+        minutes before the launch (the engines start in between), and any
+        process that picks its own ports can have taken one since. A taken
+        port is re-allocated; the router would otherwise exit at once with
+        "Address already in use".
+        """
+        if self._port_auto_allocated and not port_is_free(self.port, self.host):
+            old = self.port
+            release_port(old)
+            self.port = get_open_port(host=self.host)
+            self.base_url = f"http://{host_port(self.host, self.port)}"
+            logger.warning("Router port %d was taken since reservation; using %d", old, self.port)
+        if self._prometheus_port_auto_allocated and not port_is_free(
+            self.prometheus_port, self.host
+        ):
+            old = self.prometheus_port
+            release_port(old)
+            self.prometheus_port = get_open_port(host=self.host)
+            self.metrics_url = f"http://{host_port(self.host, self.prometheus_port)}"
+            logger.warning(
+                "Metrics port %d was taken since reservation; using %d", old, self.prometheus_port
+            )
+
+    def _open_log_file(self) -> IO[Any]:
+        """The file the router's output goes to when it is not shown.
+
+        It goes under the log dir given to ``start``, else under
+        ``E2E_LOG_DIR`` (the directory a failed lane's logs are uploaded
+        from, as for the workers). Without either it is a private, uniquely
+        named file in the temp dir, removed at shutdown unless the launch
+        failed (the error names it then).
+        """
+        log_dir = self.log_dir or os.environ.get("E2E_LOG_DIR")
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+            path = os.path.join(log_dir, f"router-{self.port}.log")
+            self._log_file = open(path, "w", encoding="utf-8")
+            self._log_is_temporary = False
+        else:
+            # Created exclusively with a random suffix and mode 0600: a shared
+            # temp dir may hold another user's file or a symlink at a
+            # predictable name.
+            fd, path = tempfile.mkstemp(prefix=f"smg-router-{self.port}-", suffix=".log")
+            self._log_file = os.fdopen(fd, "w", encoding="utf-8")
+            self._log_is_temporary = True
+        self.log_path = path
+        return self._log_file
+
+    def read_log(self) -> str:
+        """The router's captured output so far; empty when it goes to the terminal."""
+        if self.log_path is None:
+            return ""
+        with open(self.log_path, encoding="utf-8", errors="replace") as log:
+            return log.read()
+
+    def _output_tail(self, lines: int = 40) -> str:
+        if self.log_path is None:
+            return "its output is in the test log above (SHOW_ROUTER_LOGS=1)"
+        tail = self.read_log().splitlines()[-lines:]
+        if not tail:
+            return f"its output file {self.log_path} is empty"
+        return f"last {len(tail)} lines of {self.log_path}:\n" + "\n".join(tail)
 
     def _launch(
         self,
@@ -271,8 +352,14 @@ class Gateway:
         extra_args: list[str] | None,
         num_workers: int | None = None,
         log_msg: str = "",
+        worker_urls: list[str] | None = None,
     ) -> None:
-        """Launch the gateway process and wait for it to become ready."""
+        """Launch the gateway process and wait for it to become ready.
+
+        The wait ends early when the process exits: the exit code and the
+        tail of its output are the error, not a readiness timeout.
+        """
+        self._ensure_ports_free()
         cmd = self._build_base_cmd()
         cmd.extend(mode_args)
 
@@ -282,22 +369,43 @@ class Gateway:
         logger.info("Starting %s on port %d", log_msg or "gateway", self.port)
         logger.debug("Gateway command: %s", " ".join(cmd))
 
-        stdout_target = None if show_output else subprocess.DEVNULL
-        stderr_target = None if show_output else subprocess.DEVNULL
+        stdout_target: int | IO[Any] | None = None
+        stderr_target: int | IO[Any] | None = None
+        if not show_output:
+            try:
+                stdout_target = self._open_log_file()
+            except OSError:
+                self.shutdown()
+                raise
+            stderr_target = subprocess.STDOUT
 
-        self.process = subprocess.Popen(
-            cmd,
-            env=self._env,
-            stdout=stdout_target,
-            stderr=stderr_target,
-            start_new_session=True,
-        )
+        try:
+            self.process = subprocess.Popen(
+                cmd,
+                env=self._env,
+                stdout=stdout_target,
+                stderr=stderr_target,
+                start_new_session=True,
+            )
+        except Exception:
+            self._close_log_file()
+            raise
 
         try:
             if num_workers is not None:
-                wait_for_workers_ready(self.base_url, num_workers, timeout=timeout)
+                wait_for_workers_ready(
+                    self.base_url,
+                    num_workers,
+                    timeout=timeout,
+                    process=self.process,
+                    expected_urls=worker_urls,
+                )
             else:
-                wait_for_health(self.base_url, timeout=timeout)
+                wait_for_health(self.base_url, timeout=timeout, process=self.process)
+        except ProcessExitedError as e:
+            detail = self._output_tail()
+            self.shutdown()
+            raise ProcessExitedError(f"{e}; {detail}") from e
         except TimeoutError:
             self.shutdown()
             raise
@@ -305,12 +413,30 @@ class Gateway:
         self._started = True
         logger.info("Gateway ready at %s", self.base_url)
 
+    def _close_log_file(self) -> None:
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+            except OSError:
+                pass
+            self._log_file = None
+
     def shutdown(self) -> None:
         """Shutdown the gateway and release auto-allocated ports."""
         if self.process is not None:
-            logger.info("Shutting down gateway (PID %d)", self.process.pid)
-            kill_process_tree(self.process.pid)
+            # An exited router has nothing left to signal (poll() reaps it).
+            if self.process.poll() is None:
+                logger.info("Shutting down gateway (PID %d)", self.process.pid)
+                kill_process_tree(self.process.pid)
             self.process = None
+        self._close_log_file()
+        if self._log_is_temporary and self._started and self.log_path is not None:
+            # A launch that succeeded leaves no file behind in the temp dir.
+            try:
+                os.unlink(self.log_path)
+            except OSError:
+                pass
+            self.log_path = None
 
         if self._port_auto_allocated:
             release_port(self.port)
@@ -340,6 +466,10 @@ class Gateway:
         ]
         if self.log_dir:
             cmd.extend(["--log-dir", self.log_dir])
+        # The lane's parser (E2E_PARSER); unset, the gateway keeps its default.
+        parser = get_parser()
+        if parser:
+            cmd.extend(["--parser", parser])
         return cmd
 
     def _build_cloud_args(self, cloud_backend: str, history_backend: str) -> list[str]:
@@ -452,15 +582,18 @@ class Gateway:
         labels: dict[str, str] | None = None,
         worker_type: str | None = None,
         bootstrap_port: int | None = None,
+        spec: dict | None = None,
     ) -> tuple[bool, str | None]:
         """Add a worker to the gateway. Returns (success, worker_id or error).
 
         ``labels`` are attached to the worker's ``WorkerSpec`` (e.g.
         ``{"realtime": "true"}`` to make it eligible for realtime routing).
         ``worker_type`` (``"prefill"``/``"decode"``/``"encode"``) and the
-        prefill ``bootstrap_port`` register a disaggregated leg at runtime.
+        prefill ``bootstrap_port`` register a disaggregated worker at runtime.
+        ``spec`` adds other ``WorkerSpec`` fields (``kv_connector``,
+        ``kv_role``, ``runtime_type``, ``connection_mode``).
         """
-        body: dict = {"url": worker_url}
+        body: dict = {"url": worker_url, **(spec or {})}
         if labels:
             body["labels"] = labels
         if worker_type:

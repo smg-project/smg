@@ -8,15 +8,17 @@ Rust relay applies (``crates/engine_servicer/src/kv_wire.rs``; the relay tests
 on both sides build the same engine wire shapes in code and expect the same
 output of them).
 
-What the gateway sees is one stream with its own contiguous sequence numbers
-and the rank on every batch. Recovery is the relay's: a gap on a rank is
-filled from that rank's replay endpoint before anything later is forwarded;
-a replay that cannot be verified (history truncated, timeout, malformed) and
-a publisher restart (its counter starts over) end the stream with
-``DATA_LOSS``, which the gateway answers by clearing the worker and
-resubscribing from zero. A non-zero ``start_sequence_number`` is refused with
-``OUT_OF_RANGE`` for the same reason: the relay's numbering is per call. A
-zero cursor is live only: nothing is kept between calls, so there is no
+What the gateway sees is one stream carrying every rank's batches under
+that rank's own sequence numbers, the rank on every batch: the gateway keeps
+one admission cursor per rank, so a numbering shared across the ranks would
+read as a gap on every rank whenever they interleave. Recovery is the
+relay's: a gap on a rank is filled from that rank's replay endpoint before
+anything later is forwarded; a replay that cannot be verified (history
+truncated, timeout, malformed) and a publisher restart (its counter starts
+over) end the stream with ``DATA_LOSS``, which the gateway answers by
+clearing the worker and resubscribing from zero. A non-zero
+``start_sequence_number`` is refused with ``OUT_OF_RANGE``: nothing is kept
+between calls to resume from. A zero cursor is live only: there is no
 history and no state snapshot to serve (the Rust relay in
 ``crates/engine_servicer`` keeps both for the servicer's lifetime and serves a
 ``KvSnapshotChunk`` snapshot once its history window has rolled).
@@ -26,7 +28,9 @@ keys: batches are ``[ts, events, rank]``, events are tagged maps (``type``) or
 the legacy tag-first arrays, unknown keys are ignored, missing or unreadable
 fields cost that event and not the batch, and ``token_ids`` cells may be an
 int or a ``[token, next_token]`` bigram (Eagle-family speculative decoding),
-folded to their tokens.
+folded to their tokens. A payload that does not decode at all is relayed as
+an empty batch under its sequence, as the Rust relay relays it, so the
+gateway sees no gap for it.
 
 Hash identity: an integer hash is used as is (vLLM sends the low 64 bits of
 the digest unsigned, SGLang the high 64 bits signed; both are 64-bit patterns
@@ -67,6 +71,15 @@ from typing import TYPE_CHECKING, Any
 import grpc
 import msgspec
 from smg_grpc_proto.generated import common_pb2
+
+from smg_grpc_servicer.load_record import (
+    HEARTBEAT_BACKOFF,
+    HEARTBEAT_INTERVAL,
+    LOAD_TICK,
+    LoadRecorder,
+    LoadSource,
+    poll_timeout_for,
+)
 
 if TYPE_CHECKING:
     import zmq
@@ -142,6 +155,7 @@ class Engine(Enum):
 
     VLLM = "vllm"
     SGLANG = "sglang"
+    TOKENSPEED = "tokenspeed"
 
 
 # ---------------------------------------------------------------------------
@@ -1033,6 +1047,10 @@ async def relay(
     normalizer: Normalizer | None = None,
     hash_check: str | None = None,
     on_counts: Callable[[Counts], Awaitable[None] | None] | None = None,
+    load_source: LoadSource | None = None,
+    load_tick: float = LOAD_TICK,
+    heartbeat_interval: float = HEARTBEAT_INTERVAL,
+    heartbeat_backoff: float = HEARTBEAT_BACKOFF,
 ) -> AsyncIterator[common_pb2.KvEventBatch]:
     """Relay every rank in ``sources`` into one ``KvEventBatch`` stream.
 
@@ -1041,6 +1059,12 @@ async def relay(
     ``SMG_KV_EVENT_HASH_CHECK`` environment variable) turns engine-hash
     verification on; ``on_counts`` is called with the stream's counters when
     it ends.
+
+    ``load_source`` (the servicer's ``GetLoads`` figures as a record, see
+    :mod:`smg_grpc_servicer.load_record`) puts the engine's load on every
+    batch and sends ``load_only`` batches while no batch flows, at the
+    intervals given; without it the stream carries cache events only and the
+    gateway keeps polling the worker.
     """
     import zmq
     import zmq.asyncio
@@ -1064,24 +1088,34 @@ async def relay(
         )
     streams: dict[Any, _RankStream] = {}
     poller = zmq.asyncio.Poller()
-    relay_seq = 0
     sent_headers = False
+    recorder = LoadRecorder.optional(
+        load_source,
+        load_tick=load_tick,
+        heartbeat_interval=heartbeat_interval,
+        heartbeat_backoff=heartbeat_backoff,
+    )
+    poll_timeout = poll_timeout_for(recorder, recv_timeout)
+
+    def stamped(proto: common_pb2.KvEventBatch) -> common_pb2.KvEventBatch:
+        return recorder.stamp(proto) if recorder is not None else proto
 
     def forward(payload: bytes, stream: _RankStream, seq: int, kind: str):
-        nonlocal relay_seq
         try:
             batch = decode_batch(payload)
         except Exception as error:  # noqa: BLE001 - one bad payload must not end the stream
             logger.warning(
-                "Failed to decode %s KV event batch %d from rank %d: %s",
+                "Failed to decode %s KV event batch %d from rank %d; relaying it empty: %s",
                 kind,
                 seq,
                 stream.source.rank,
                 error,
             )
-            return None
-        relay_seq += 1
-        return normalizer.normalize_batch(batch, relay_seq, stream.source.rank)
+            empty = common_pb2.KvEventBatch(sequence_number=seq)
+            empty.dp_rank = stream.source.rank
+            return empty
+        # The rank's own sequence, as the publisher numbered it.
+        return normalizer.normalize_batch(batch, seq, stream.source.rank)
 
     try:
         for source in sources:
@@ -1102,7 +1136,11 @@ async def relay(
         sent_headers = True
 
         while not context.cancelled():
-            ready = await poller.poll(timeout=int(recv_timeout * 1000))
+            ready = await poller.poll(timeout=int(poll_timeout * 1000))
+            if not ready and recorder is not None:
+                heartbeat = recorder.heartbeat()
+                if heartbeat is not None:
+                    yield heartbeat
             for socket, _ in ready:
                 stream = streams[socket]
                 frames = await socket.recv_multipart()
@@ -1138,7 +1176,7 @@ async def relay(
                             stream.cursor = replayed_seq
                             stream.replayed = (cursor + 1, replayed_seq)
                             if proto is not None:
-                                yield proto
+                                yield stamped(proto)
                         if stream.cursor < seq - 1:
                             raise RelayFailure(
                                 f"KV event replay of rank {stream.source.rank} ended at "
@@ -1151,7 +1189,7 @@ async def relay(
                     stream.replayed = None  # the live stream is past the replay's range
                 proto = forward(frames[2], stream, seq, "live")
                 if proto is not None:
-                    yield proto
+                    yield stamped(proto)
     except asyncio.CancelledError:
         pass
     except RelayFailure as error:

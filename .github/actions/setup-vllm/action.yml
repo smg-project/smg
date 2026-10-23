@@ -6,6 +6,8 @@ runs:
   steps:
     - name: Setup Python venv
       shell: bash
+      env:
+        SMG_CI_BACKEND: vllm
       run: bash scripts/ci_setup_python_venv.sh
 
     - name: Install vLLM

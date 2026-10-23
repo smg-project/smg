@@ -11,16 +11,17 @@
 //!   per accepted stream that share a few small pieces of state:
 //!   - **Inbound-handler task** — reads frames the dialer sends.
 //!     The first non-empty `msg.peer_id` is written into
-//!     `learned_peer: Arc<RwLock<Option<String>>>`. Dispatches
-//!     received `StreamBatch` payloads into local `MeshKV` via
-//!     [`dispatch_stream_batch`](crate::transport::sync_stream::dispatch_stream_batch).
-//!     Idle-timeout wraps `incoming.next()` so unhealthy peers don't
-//!     pin the task indefinitely.
+//!     `learned_peer: Arc<RwLock<Option<String>>>` and later frames are
+//!     held to it. Each frame is handled by
+//!     [`handle_frame`](crate::transport::peer_stream::handle_frame), the
+//!     same way the dialer handles its own; the idle timeout around
+//!     `incoming.next()` lives in
+//!     [`next_frame`](crate::transport::peer_stream::next_frame).
 //!   - **Inbound-sender task** — every 1 Hz, reads the shared
 //!     [`RoundBatch`](crate::kv::RoundBatch) slot produced by
-//!     [`gossip_controller`](crate::gossip_controller)'s event loop,
-//!     filters targeted entries for the learned peer, and emits
-//!     `StreamBatch` envelopes on this stream.
+//!     [`gossip_controller`](crate::gossip_controller)'s event loop and
+//!     runs [`send_round`](crate::transport::peer_stream::send_round)
+//!     for the learned peer.
 //!
 //! Asymmetry with the outbound side: the dialer (gossip_controller)
 //! knows its counterparty by name at task-spawn time. The acceptor
@@ -31,12 +32,14 @@
 
 use std::{net::SocketAddr, pin::Pin, sync::Arc, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use futures::Stream;
 use tokio::sync::mpsc;
-use tokio_stream::StreamExt;
 use tonic::{
-    transport::{server::TcpIncoming, Server},
+    transport::{
+        server::{Router, TcpIncoming},
+        Server,
+    },
     Response, Status,
 };
 use tracing as log;
@@ -44,29 +47,54 @@ use tracing::instrument;
 
 use super::{
     crdt_kv::CrdtWatermark,
-    metrics::{record_ack, record_nack, record_peer_reconnect, update_peer_connections},
+    metrics::{peer_connection_opened, record_ack, record_nack, record_peer_reconnect},
     mtls::MTLSManager,
     partition::PartitionDetector,
     service::{
         gossip::{
             self,
             gossip_server::{Gossip, GossipServer},
-            GossipMessage, NodeState, NodeStatus, NodeUpdate, PingReq, StreamBatch, StreamMessage,
-            StreamMessageType,
+            GossipMessage, NodeState, NodeStatus, NodeUpdate, PingReq, StreamMessage,
         },
         try_ping, ClusterState,
     },
     transport::{
-        crdt_batch::{
-            build_crdt_batches, crdt_ack_to_watermark, dispatch_crdt_batch, wrap_crdt_ack,
-            wrap_crdt_batch,
-        },
-        limits::{MAX_MESSAGE_SIZE, MAX_STREAM_CHUNK_BYTES, STREAM_IDLE_TIMEOUT},
-        sync_stream::{
-            build_heartbeat, build_peer_stream_batches, dispatch_stream_batch, wrap_stream_batch,
-        },
+        limits::MAX_MESSAGE_SIZE,
+        peer_stream::{handle_frame, next_frame, send_round, Frame, RoundOutcome, SenderState},
     },
 };
+
+/// Where a prepared gossip server accepts: a listener its caller bound, or
+/// the configured address, bound when it serves.
+enum Incoming {
+    Listener(TcpIncoming),
+    Address(SocketAddr),
+}
+
+/// A gossip server built by [`GossipService::prepare`] and not yet serving:
+/// its TLS configuration, when the node has TLS material, is already built.
+/// [`serve`](Self::serve) runs it until the shutdown signal completes.
+pub struct PreparedGossipServer {
+    router: Router,
+    incoming: Incoming,
+}
+
+impl PreparedGossipServer {
+    /// Serves until `signal` completes.
+    pub async fn serve<F: std::future::Future<Output = ()>>(self, signal: F) -> Result<()> {
+        match self.incoming {
+            Incoming::Listener(incoming) => {
+                self.router
+                    .serve_with_incoming_shutdown(incoming, signal)
+                    .await?;
+            }
+            Incoming::Address(addr) => {
+                self.router.serve_with_shutdown(addr, signal).await?;
+            }
+        }
+        Ok(())
+    }
+}
 
 /// Server-side handler for the proto-defined `Gossip` service.
 ///
@@ -147,40 +175,57 @@ impl GossipService {
         self
     }
 
-    pub async fn serve_ping_with_shutdown<F: std::future::Future<Output = ()>>(
-        self,
-        signal: F,
-    ) -> Result<()> {
-        let listen_addr = self.listen_addr;
-        let service = GossipServer::new(self)
-            .max_decoding_message_size(MAX_MESSAGE_SIZE)
-            .max_encoding_message_size(MAX_MESSAGE_SIZE)
-            .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
-            .send_compressed(tonic::codec::CompressionEncoding::Gzip);
-
-        Server::builder()
-            .add_service(service)
-            .serve_with_shutdown(listen_addr, signal)
-            .await?;
-        Ok(())
+    /// The tonic server for this service: with the node's TLS material, the
+    /// server's TLS configuration is built here, from the files the mTLS
+    /// manager reads, so material that exists but cannot be used fails here,
+    /// not where the server is polled.
+    async fn server_builder(&self) -> Result<Server> {
+        let mut server = Server::builder();
+        if let Some(mtls_manager) = &self.mtls_manager {
+            let tls = mtls_manager
+                .server_tls_config()
+                .await
+                .context("the mesh TLS material cannot be read")?;
+            server = server.tls_config(tls).context(
+                "the mesh TLS material cannot be used for the mesh listener (the node \
+                 certificate, its private key or the CA certificate)",
+            )?;
+            log::info!(
+                "Mesh listener {} is prepared to serve TLS with the node certificate",
+                self.listen_addr
+            );
+        }
+        Ok(server)
     }
 
-    pub async fn serve_ping_with_listener<F: std::future::Future<Output = ()>>(
+    /// This service's server, built but not serving: on `listener` when one
+    /// is given (the caller bound it), else on the configured listen address,
+    /// bound when it serves. Everything that can fail before the server
+    /// serves happens here, the TLS configuration first of all, so a caller
+    /// learns of it before it serves anything itself.
+    pub async fn prepare(
         self,
-        listener: tokio::net::TcpListener,
-        signal: F,
-    ) -> Result<()> {
-        let incoming = TcpIncoming::from(listener);
+        listener: Option<tokio::net::TcpListener>,
+    ) -> Result<PreparedGossipServer> {
+        let incoming = match listener {
+            // The socket option the address path sets (tonic's server
+            // default): TCP_NODELAY on every accepted connection; no
+            // keepalive either way.
+            Some(listener) => {
+                Incoming::Listener(TcpIncoming::from(listener).with_nodelay(Some(true)))
+            }
+            None => Incoming::Address(self.listen_addr),
+        };
+        let mut server = self.server_builder().await?;
         let service = GossipServer::new(self)
             .max_decoding_message_size(MAX_MESSAGE_SIZE)
             .max_encoding_message_size(MAX_MESSAGE_SIZE)
             .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
             .send_compressed(tonic::codec::CompressionEncoding::Gzip);
-        Server::builder()
-            .add_service(service)
-            .serve_with_incoming_shutdown(incoming, signal)
-            .await?;
-        Ok(())
+        Ok(PreparedGossipServer {
+            router: server.add_service(service),
+            incoming,
+        })
     }
 
     fn merge_state(&self, incoming_nodes: Vec<NodeState>) -> bool {
@@ -272,9 +317,9 @@ impl Gossip for GossipService {
         let acked: Arc<parking_lot::RwLock<CrdtWatermark>> =
             Arc::new(parking_lot::RwLock::new(CrdtWatermark::new()));
 
-        // Server-side stream sender: periodically emit fresh stream batches
-        // (broadcast drain_entries + targeted entries addressed to the
-        // learned peer). Skipped when no current_stream_batch is attached.
+        // Server-side stream sender: the shared round every second, for the
+        // peer once it is learned (until then only the CRDT ops go out).
+        // Skipped when no current_stream_batch is attached.
         let sender_handle = if let Some(stream_batch_handle) = self.current_stream_batch.clone() {
             let tx_sender = tx.clone();
             let self_name_sender = self_name.clone();
@@ -287,7 +332,7 @@ impl Gossip for GossipService {
             Some(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(1));
                 let mut sequence_counter: u64 = 0;
-                let mut last_stream_batch: Option<Arc<crate::kv::RoundBatch>> = None;
+                let mut sender = SenderState::default();
 
                 loop {
                     interval.tick().await;
@@ -302,59 +347,21 @@ impl Gossip for GossipService {
                     }
 
                     let stream_batch = stream_batch_handle.read().clone();
-
-                    // Stream batches: gated by learned peer + Arc-freshness. A
-                    // skipped tick leaves `last_stream_batch` untouched so the
-                    // same RoundBatch is re-evaluated later.
-                    let stream_tick = {
-                        let guard = learned_peer_sender.read();
-                        plan_sender_tick(
-                            last_stream_batch.as_ref(),
-                            &stream_batch,
-                            guard.as_deref(),
-                        )
-                    };
-                    if let SenderTick::Emit(batches) = stream_tick {
-                        last_stream_batch = Some(stream_batch.clone());
-                        for batch in batches {
+                    let peer = learned_peer_sender.read().clone();
+                    let outcome = send_round(
+                        &mut sender,
+                        &stream_batch,
+                        peer.as_deref(),
+                        &acked_sender,
+                        &self_name_sender,
+                        &mut || {
                             sequence_counter += 1;
-                            let msg = wrap_stream_batch(batch, sequence_counter, &self_name_sender);
-                            match tx_sender.try_send(Ok(msg)) {
-                                Ok(()) => {}
-                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                    log::debug!("server-side stream batch dropped on backpressure");
-                                    break;
-                                }
-                                Err(mpsc::error::TrySendError::Closed(_)) => return,
-                            }
-                        }
-                    }
-
-                    // CRDT op-log: evaluated every tick (acks shrink the delta
-                    // even when the RoundBatch is unchanged). Send only ops the
-                    // peer has not acked; the watermark advances solely on
-                    // CrdtAck, so unacked keys retry next round.
-                    let crdt_ops: Vec<_> = {
-                        let acked = acked_sender.read();
-                        stream_batch
-                            .crdt_ops
-                            .operations()
-                            .iter()
-                            .filter(|op| acked.allows(op))
-                            .cloned()
-                            .collect()
-                    };
-                    for crdt_batch in build_crdt_batches(&crdt_ops, MAX_STREAM_CHUNK_BYTES) {
-                        sequence_counter += 1;
-                        let msg = wrap_crdt_batch(crdt_batch, sequence_counter, &self_name_sender);
-                        match tx_sender.try_send(Ok(msg)) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                log::debug!("server-side crdt batch dropped on backpressure");
-                                break;
-                            }
-                            Err(mpsc::error::TrySendError::Closed(_)) => return,
-                        }
+                            sequence_counter
+                        },
+                        &tx_sender,
+                    );
+                    if outcome == RoundOutcome::Closed {
+                        return;
                     }
                 }
             }))
@@ -369,30 +376,15 @@ impl Gossip for GossipService {
             reason = "server-side inbound handler bound to sync_stream lifetime; terminates when the stream closes"
         )]
         tokio::spawn(async move {
-            // Close the stream if no inbound message arrives within
-            // STREAM_IDLE_TIMEOUT — protects against idle clients
-            // pinning the server-side task and mpsc channel indefinitely.
+            // The dialer's name comes with its first frame; the stream is
+            // counted under that name only, so no series carries a
+            // placeholder for the time before the name is known. The count
+            // lives in `counted` and goes when the task ends, however it ends.
             let mut peer_id = String::new();
-            update_peer_connections(&peer_id, true);
+            let mut counted = None;
             let mut sequence: u64 = 0;
 
-            loop {
-                let msg = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, incoming.next()).await {
-                    Ok(Some(Ok(msg))) => msg,
-                    Ok(Some(Err(e))) => {
-                        log::error!("Error receiving stream message: {}", e);
-                        break;
-                    }
-                    Ok(None) => break,
-                    Err(_) => {
-                        log::warn!(
-                            peer = %peer_id,
-                            "sync_stream idle timeout ({STREAM_IDLE_TIMEOUT:?}) — closing"
-                        );
-                        break;
-                    }
-                };
-
+            while let Some(msg) = next_frame(&mut incoming, &peer_id).await {
                 // Bind peer_id to the first non-empty inbound id. A later
                 // frame whose msg.peer_id (empty or otherwise) doesn't
                 // match is treated as identity change and closes the
@@ -401,7 +393,7 @@ impl Gossip for GossipService {
                 if peer_id.is_empty() {
                     if !msg.peer_id.is_empty() {
                         peer_id = msg.peer_id.clone();
-                        update_peer_connections(&peer_id, true);
+                        counted = Some(peer_connection_opened(&peer_id));
                         *learned_peer_inbound.write() = Some(peer_id.clone());
                     }
                 } else if msg.peer_id != peer_id {
@@ -414,65 +406,34 @@ impl Gossip for GossipService {
                 }
                 sequence = sequence.max(msg.sequence);
 
-                match msg.message_type() {
-                    StreamMessageType::Heartbeat => {
-                        let heartbeat = build_heartbeat(sequence, &self_name);
-                        if tx.send(Ok(heartbeat)).await.is_err() {
-                            break;
-                        }
-                    }
-                    StreamMessageType::Ack => {
-                        if let Some(gossip::stream_message::Payload::Ack(ack)) = &msg.payload {
-                            record_ack(&peer_id, ack.success);
-                        }
-                    }
-                    StreamMessageType::Nack => record_nack(&peer_id),
-                    StreamMessageType::StreamBatch => {
-                        if let (
-                            Some(mesh_kv),
-                            Some(gossip::stream_message::Payload::StreamBatch(batch)),
-                        ) = (&mesh_kv, msg.payload)
-                        {
-                            dispatch_stream_batch(mesh_kv, &msg.peer_id, batch.entries);
-                        }
-                    }
-                    StreamMessageType::CrdtBatch => {
-                        if let (
-                            Some(mesh_kv),
-                            Some(gossip::stream_message::Payload::CrdtBatch(batch)),
-                        ) = (&mesh_kv, msg.payload)
-                        {
-                            // Merge, then ack the per-key versions back so the
-                            // peer can advance its send watermark. Ack loss is
-                            // fine — the peer resends unacked keys next round —
-                            // so drop it on a full channel rather than block.
-                            let ack = dispatch_crdt_batch(mesh_kv, batch);
-                            if !ack.is_empty() {
-                                let _ = tx.try_send(Ok(wrap_crdt_ack(&ack, sequence, &self_name)));
-                            }
-                        }
-                    }
-                    // CRDT delivery ack: advance this peer's send watermark.
-                    StreamMessageType::CrdtAck => {
-                        if let Some(gossip::stream_message::Payload::CrdtAck(ack)) = msg.payload {
-                            acked_inbound.write().merge_max(&crdt_ack_to_watermark(ack));
-                        }
-                    }
-                    StreamMessageType::IncrementalUpdate
-                    | StreamMessageType::SnapshotRequest
-                    | StreamMessageType::SnapshotChunk
-                    | StreamMessageType::SnapshotComplete => {
-                        log::debug!(
-                            peer = %peer_id,
-                            message_type = ?msg.message_type(),
-                            "ignoring v1 wire message (state-sync removed)",
-                        );
-                    }
+                let frame = handle_frame(
+                    msg,
+                    &peer_id,
+                    &self_name,
+                    mesh_kv.as_deref(),
+                    &acked_inbound,
+                    &mut || sequence,
+                    &tx,
+                )
+                .await;
+                match frame {
+                    Frame::Continue | Frame::Ack { success: None, .. } => {}
+                    Frame::Ack {
+                        success: Some(success),
+                        ..
+                    } => record_ack(&peer_id, success),
+                    Frame::Nack { .. } => record_nack(&peer_id),
+                    Frame::Closed => break,
                 }
             }
 
-            update_peer_connections(&peer_id, false);
-            record_peer_reconnect(&peer_id);
+            // The stream is over: its count goes with the guard, and its end
+            // is counted under the name it was learned as. A stream that
+            // closed before its first frame named the dialer was never a peer
+            // connection: nothing is recorded for it.
+            if counted.take().is_some() {
+                record_peer_reconnect(&peer_id);
+            }
             if let Some(handle) = sender_handle {
                 handle.abort();
             }
@@ -485,177 +446,274 @@ impl Gossip for GossipService {
     }
 }
 
-/// Outcome of one tick of the inbound sender task.
-///
-/// The task only marks a `RoundBatch` consumed (advances
-/// `last_stream_batch`) when [`SenderTick::Emit`] is returned. The two
-/// skip variants preserve `last_stream_batch` so the same `Arc` is
-/// retried on the next tick — important because before peer identity
-/// is learned, we cannot build the correct per-peer batch, and consuming
-/// the batch anyway would silently drop its targeted entries.
-#[derive(Debug)]
-enum SenderTick {
-    /// Peer identity not yet known. Wait until the inbound handler
-    /// records the dialer's `peer_id` from the first frame.
-    SkipPeerUnknown,
-    /// Round batch unchanged since the last successful emit.
-    SkipBatchUnchanged,
-    /// Build successful — emit these batches and advance the watermark.
-    Emit(Vec<StreamBatch>),
-}
-
-/// Decide what one tick of the inbound sender should do.
-///
-/// Splitting this from the async task body makes the per-tick decision
-/// pinnable in unit tests without standing up an interval timer, a
-/// real mpsc, or a tokio runtime. The async loop is responsible for
-/// freshness-watermark advancement and channel I/O; this function is
-/// responsible only for the "what should we do this tick" decision.
-fn plan_sender_tick(
-    last_stream_batch: Option<&Arc<crate::kv::RoundBatch>>,
-    current_stream_batch: &Arc<crate::kv::RoundBatch>,
-    learned_peer: Option<&str>,
-) -> SenderTick {
-    let peer_id = match learned_peer {
-        Some(peer) if !peer.is_empty() => peer,
-        _ => return SenderTick::SkipPeerUnknown,
-    };
-    let fresh = last_stream_batch.is_none_or(|last| !Arc::ptr_eq(last, current_stream_batch));
-    if !fresh {
-        return SenderTick::SkipBatchUnchanged;
-    }
-    SenderTick::Emit(build_peer_stream_batches(current_stream_batch, peer_id))
-}
-
 #[cfg(test)]
-mod sender_tick_tests {
-    use bytes::Bytes;
+mod tests {
+    //! The acceptor's connection accounting, read the way an operator reads
+    //! it: the text of a Prometheus recorder installed for the test thread
+    //! (the gateway installs the same recorder type for the process), with
+    //! the mesh nodes on a current-thread runtime so every task of theirs
+    //! records into it.
 
-    use super::*;
-    use crate::kv::RoundBatch;
+    use std::{future::Future, net::SocketAddr, time::Duration};
 
-    fn round_batch_with(
-        drain: Vec<(&str, &[u8])>,
-        targeted: Vec<(&str, &str, &[u8])>,
-    ) -> Arc<RoundBatch> {
-        Arc::new(RoundBatch {
-            drain_entries: drain
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), Bytes::copy_from_slice(v)))
-                .collect(),
-            targeted_entries: targeted
-                .into_iter()
-                .map(|(t, k, v)| (t.to_string(), k.to_string(), Bytes::copy_from_slice(v)))
-                .collect(),
-            crdt_ops: Arc::default(),
-        })
+    use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+    use tokio::sync::mpsc;
+    use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+
+    use crate::{
+        service::gossip::{gossip_client::GossipClient, StreamMessage},
+        tests::test_utils::{bind_node, wait_for},
+        transport::sync_stream::build_heartbeat,
+        MeshServerBuilder, MeshServerHandler,
+    };
+
+    const PEER_GAUGE: &str = "router_mesh_peer_connections";
+
+    /// Runs `scenario` on a current-thread runtime under a Prometheus
+    /// recorder installed for this thread; the rendered text, the way
+    /// `/metrics` serves it, once the scenario is done.
+    fn metrics_of<F, Fut>(scenario: F) -> String
+    where
+        F: FnOnce(PrometheusHandle) -> Fut,
+        Fut: Future<Output = ()>,
+    {
+        let (rendered, ()) = metrics_and_result_of(scenario);
+        rendered
     }
 
-    fn batch_keys(batches: &[StreamBatch]) -> Vec<String> {
-        batches
-            .iter()
-            .flat_map(|b| b.entries.iter().map(|e| e.key.clone()))
+    /// [`metrics_of`] for a scenario with a result of its own: the rendered
+    /// text and that result.
+    fn metrics_and_result_of<F, Fut, T>(scenario: F) -> (String, T)
+    where
+        F: FnOnce(PrometheusHandle) -> Fut,
+        Fut: Future<Output = T>,
+    {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        let result = metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            rt.block_on(scenario(handle.clone()))
+        });
+        (handle.render(), result)
+    }
+
+    /// The peer gauge's lines of a rendered scrape.
+    fn peer_gauge_lines(rendered: &str) -> Vec<&str> {
+        rendered
+            .lines()
+            .filter(|line| line.starts_with(PEER_GAUGE))
             .collect()
     }
 
-    #[test]
-    fn skips_when_peer_unknown_and_keeps_watermark_unchanged() {
-        // Original race: with learned_peer = None the previous code
-        // would consume the batch with peer_id = "", drop targeted
-        // entries, and advance last_stream_batch — so the next tick
-        // (after peer identity arrived) would see an unchanged Arc and
-        // never re-send the lost targeted entries.
-        let rb = round_batch_with(
-            vec![("td:foo", b"d")],
-            vec![("peer_X", "tree:req:abc", b"r")],
-        );
-        let decision = plan_sender_tick(None, &rb, None);
-        assert!(matches!(decision, SenderTick::SkipPeerUnknown));
+    /// A mesh node on an ephemeral loopback port, joining `init_peer` when
+    /// given.
+    async fn node(name: &str, init_peer: Option<SocketAddr>) -> (SocketAddr, MeshServerHandler) {
+        let (listener, addr) = bind_node().await;
+        let (server, handler) =
+            MeshServerBuilder::new(name.to_string(), addr, addr, init_peer).build();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test node runs in the background for the duration of the assertion"
+        )]
+        tokio::spawn(async move {
+            if let Err(e) = server.start_with_listener(listener).await {
+                tracing::error!("Mesh node failed: {e}");
+            }
+        });
+        (addr, handler)
     }
 
+    /// Two members: A, the lower name, dials the sync stream; B accepts it
+    /// and records the peer gauge. The gauge appears under A's name and
+    /// under nothing else: no series with an empty `peer` for the time
+    /// before A's first frame named it.
     #[test]
-    fn skips_when_peer_is_empty_string() {
-        // Defensive: an empty learned_peer string must not be treated
-        // as a valid identity, even though the underlying string-equality
-        // would otherwise let a targeted entry with target == "" leak
-        // through.
-        let rb = round_batch_with(vec![], vec![("", "tree:req:weird", b"r")]);
-        let decision = plan_sender_tick(None, &rb, Some(""));
-        assert!(matches!(decision, SenderTick::SkipPeerUnknown));
-    }
+    fn the_peer_gauge_carries_the_dialers_name_and_no_empty_label() {
+        let rendered = metrics_of(|metrics| async move {
+            let (addr_a, handler_a) = node("A", None).await;
+            let (_addr_b, handler_b) = node("B", Some(addr_a)).await;
+            wait_for(
+                || {
+                    peer_gauge_lines(&metrics.render())
+                        .iter()
+                        .any(|line| line.contains("peer=\"A\"") && line.ends_with(" 1"))
+                },
+                Duration::from_secs(20),
+                "B accepts A's sync stream",
+            )
+            .await;
+            handler_a.shutdown();
+            handler_b.shutdown();
+        });
 
-    #[test]
-    fn emits_drain_and_targeted_once_peer_is_known() {
-        // First tick (peer unknown) returns SkipPeerUnknown. After the
-        // inbound handler learns the peer, a second tick on the same
-        // Arc must emit both drain and the matching targeted entry.
-        let rb = round_batch_with(
-            vec![("td:foo", b"d")],
-            vec![("peer_X", "tree:req:abc", b"r")],
-        );
-        let pre = plan_sender_tick(None, &rb, None);
-        assert!(matches!(pre, SenderTick::SkipPeerUnknown));
-
-        // last_stream_batch was left unchanged by the skip, so we still
-        // pass None here — modeling the watermark not having advanced.
-        let post = plan_sender_tick(None, &rb, Some("peer_X"));
-        let SenderTick::Emit(batches) = post else {
-            panic!("expected Emit after peer learned, got {post:?}");
-        };
-        let keys = batch_keys(&batches);
-        assert!(keys.contains(&"td:foo".to_string()), "drain entry emitted");
+        let lines = peer_gauge_lines(&rendered);
         assert!(
-            keys.contains(&"tree:req:abc".to_string()),
-            "targeted entry for peer_X emitted"
+            !lines.iter().any(|line| line.contains("peer=\"\"")),
+            "a peer series without a name: {lines:?}"
         );
     }
 
+    /// A stream that closes before its first frame named the dialer was
+    /// never a peer connection: neither the gauge nor the reconnect count is
+    /// recorded for it, so no series with an empty `peer` is left behind.
     #[test]
-    fn does_not_resend_same_arc_after_consume() {
-        // After a successful Emit, the loop advances last_stream_batch
-        // to the same Arc. The next tick must report SkipBatchUnchanged
-        // and emit nothing.
-        let rb = round_batch_with(vec![("td:foo", b"d")], vec![]);
-        let decision = plan_sender_tick(Some(&rb), &rb, Some("peer_X"));
-        assert!(matches!(decision, SenderTick::SkipBatchUnchanged));
-    }
+    fn a_stream_closed_before_naming_its_peer_leaves_no_series() {
+        let rendered = metrics_of(|_| async move {
+            let (addr, handler) = node("A", None).await;
+            wait_for(
+                || std::net::TcpStream::connect(addr).is_ok(),
+                Duration::from_secs(5),
+                "mesh listener started",
+            )
+            .await;
+            let mut client = GossipClient::connect(format!("http://{addr}"))
+                .await
+                .expect("connect to the mesh listener");
+            // An outbound stream that ends at once: the acceptor reads no
+            // frame. Its response stream ends once its handler has run its
+            // close path, which is what the assertion is about.
+            let response = client
+                .sync_stream(tokio_stream::iter(Vec::<StreamMessage>::new()))
+                .await
+                .expect("open the sync stream");
+            let mut inbound = response.into_inner();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while inbound.next().await.is_some() {}
+            })
+            .await
+            .expect("the acceptor closes its side of a stream the dialer ended");
+            handler.shutdown();
+        });
 
-    #[test]
-    fn emits_only_targeted_entries_for_learned_peer() {
-        // Targeted-entry filtering still works correctly: a batch with
-        // entries for multiple peers must only emit entries addressed to
-        // this stream's learned peer (plus drain entries which broadcast).
-        let rb = round_batch_with(
-            vec![("td:bcast", b"b")],
-            vec![
-                ("peer_X", "tree:req:x", b"x"),
-                ("peer_Y", "tree:req:y", b"y"),
-            ],
-        );
-        let SenderTick::Emit(batches) = plan_sender_tick(None, &rb, Some("peer_X")) else {
-            panic!("expected Emit");
-        };
-        let keys = batch_keys(&batches);
-        assert!(keys.contains(&"td:bcast".to_string()));
-        assert!(keys.contains(&"tree:req:x".to_string()));
         assert!(
-            !keys.contains(&"tree:req:y".to_string()),
-            "must not include entries addressed to other peers"
+            !rendered.contains("peer=\"\""),
+            "a series without a peer name:\n{rendered}"
         );
     }
 
+    /// A stream whose dialer named itself and then ended: the acceptor's
+    /// series for that name reads 1 while the stream is open and 0 after,
+    /// the closed stream is counted under that name, and no series carries
+    /// an empty `peer` at any point.
     #[test]
-    fn drain_only_batch_still_emits_when_peer_learned() {
-        // Regression guard: a batch with only drain entries and no
-        // targeted entries should still emit after peer is learned —
-        // we do not want a future "skip when no targeted for this peer"
-        // optimization to reintroduce the original race for drain entries.
-        let rb = round_batch_with(vec![("td:foo", b"d"), ("td:bar", b"d")], vec![]);
-        let SenderTick::Emit(batches) = plan_sender_tick(None, &rb, Some("peer_X")) else {
-            panic!("expected Emit for drain-only batch");
-        };
-        let keys = batch_keys(&batches);
-        assert!(keys.contains(&"td:foo".to_string()));
-        assert!(keys.contains(&"td:bar".to_string()));
+    fn a_named_stream_that_closed_reads_zero_under_its_name() {
+        let rendered = metrics_of(|_| async move {
+            let (addr, handler) = node("A", None).await;
+            wait_for(
+                || std::net::TcpStream::connect(addr).is_ok(),
+                Duration::from_secs(5),
+                "mesh listener started",
+            )
+            .await;
+            let mut client = GossipClient::connect(format!("http://{addr}"))
+                .await
+                .expect("connect to the mesh listener");
+            // One heartbeat naming the dialer, then the end of the stream.
+            let response = client
+                .sync_stream(tokio_stream::iter(vec![build_heartbeat(1, "probe")]))
+                .await
+                .expect("open the sync stream");
+            let mut inbound = response.into_inner();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while inbound.next().await.is_some() {}
+            })
+            .await
+            .expect("the acceptor closes its side of a stream the dialer ended");
+            handler.shutdown();
+        });
+
+        assert!(
+            rendered.contains("router_mesh_peer_connections{peer=\"probe\"} 0"),
+            "the closed stream's series does not read 0 under its name:\n{rendered}"
+        );
+        assert!(
+            rendered.contains("router_mesh_peer_reconnects_total{peer=\"probe\"} 1"),
+            "the closed stream is not counted under its name:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains("peer=\"\""),
+            "a series without a peer name:\n{rendered}"
+        );
+    }
+
+    /// The peer gauge's line for `peer` in a rendered scrape.
+    fn peer_gauge_line(rendered: &str, peer: &str) -> Option<String> {
+        let prefix = format!("{PEER_GAUGE}{{peer=\"{peer}\"}} ");
+        rendered
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .map(str::to_owned)
+    }
+
+    /// Two accepted streams from one dialer overlap, as they do when the
+    /// dialer redials before the acceptor's handler of the old stream has
+    /// timed out: the gauge counts the open streams, so it reads 2 while
+    /// both are open and 1 once the first closed, not 0 while a stream is
+    /// live.
+    #[test]
+    fn overlapping_streams_of_one_dialer_add_up() {
+        let (_, (while_both_open, after_first_closed)) =
+            metrics_and_result_of(|metrics| async move {
+                let (addr, handler) = node("A", None).await;
+                wait_for(
+                    || std::net::TcpStream::connect(addr).is_ok(),
+                    Duration::from_secs(5),
+                    "mesh listener started",
+                )
+                .await;
+                let mut client = GossipClient::connect(format!("http://{addr}"))
+                    .await
+                    .expect("connect to the mesh listener");
+                // Each stream names the dialer with one heartbeat; the acceptor's
+                // answer to it is the sign that its handler learned the name.
+                let mut open = Vec::new();
+                for _ in 0..2 {
+                    let (tx, rx) = mpsc::channel::<StreamMessage>(4);
+                    let mut inbound = client
+                        .sync_stream(ReceiverStream::new(rx))
+                        .await
+                        .expect("open the sync stream")
+                        .into_inner();
+                    tx.send(build_heartbeat(1, "probe"))
+                        .await
+                        .expect("send the heartbeat");
+                    tokio::time::timeout(Duration::from_secs(10), inbound.next())
+                        .await
+                        .expect("the acceptor answers the heartbeat")
+                        .expect("a frame")
+                        .expect("a frame, not a status");
+                    open.push((tx, inbound));
+                }
+                let while_both_open = metrics.render();
+
+                // The first stream ends; its response stream ends once the
+                // acceptor's handler has run its close path.
+                let (tx_first, mut inbound_first) = open.remove(0);
+                drop(tx_first);
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    while inbound_first.next().await.is_some() {}
+                })
+                .await
+                .expect("the acceptor closes its side of a stream the dialer ended");
+                let after_first_closed = metrics.render();
+
+                drop(open);
+                handler.shutdown();
+                (while_both_open, after_first_closed)
+            });
+
+        assert_eq!(
+            peer_gauge_line(&after_first_closed, "probe").as_deref(),
+            Some("router_mesh_peer_connections{peer=\"probe\"} 1"),
+            "one stream is still open after the first closed:\n{after_first_closed}"
+        );
+        assert_eq!(
+            peer_gauge_line(&while_both_open, "probe").as_deref(),
+            Some("router_mesh_peer_connections{peer=\"probe\"} 2"),
+            "two streams were open:\n{while_both_open}"
+        );
     }
 }

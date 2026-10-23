@@ -1,0 +1,715 @@
+//! Kimi K3: a turn of tagged regions. The template writes every region between an `<|open|>` tag
+//! and a `<|close|>` tag, each a special token followed by the region's word and the `<|sep|>`
+//! token: the thought between `<|open|>think<|sep|>` and `<|close|>think<|sep|>`, the answer
+//! between `<|open|>response<|sep|>` and `<|close|>response<|sep|>`, the calls of one turn between
+//! `<|open|>tools<|sep|>` and `<|close|>tools<|sep|>`, each call between
+//! `<|open|>call tool="…" index="N"<|sep|>` and `<|close|>call<|sep|>`, and the whole turn closed
+//! by `<|close|>message<|sep|>`. As recorded for `moonshotai/Kimi-K3`.
+//!
+//! Notes on this table, and on what it leaves open: `docs/tables.md`.
+
+use crate::{
+    format::{CallSyntax, Emits, Format},
+    tagged::attributed::Tags,
+};
+
+/// The Kimi K3 table.
+pub fn kimi_k3() -> Format {
+    let format = Format::new("kimi_k3")
+        .terminal("think_open", "<|open|>think<|sep|>")
+        .terminal("think_close", "<|close|>think<|sep|>")
+        .terminal("response_open", "<|open|>response<|sep|>")
+        .terminal("response_close", "<|close|>response<|sep|>")
+        .terminal("tools_open", "<|open|>tools<|sep|>")
+        .terminal("tools_close", "<|close|>tools<|sep|>")
+        .terminal("call_open", "<|open|>call tool=\"")
+        .terminal("call_close", Tags::XTML.invoke_close)
+        .terminal("message_close", "<|close|>message<|sep|>");
+    // The special tokens the tags are built of, declared once beside the assembler that reads
+    // them (`Tags::XTML.structural_tokens`): the engine and the assembler drop the same cut tails.
+    let format = Tags::XTML
+        .structural_tokens
+        .iter()
+        .fold(format, |format, token| format.structural_token(token));
+    format
+        .state("message", Emits::Wrapper)
+        .state("reasoning", Emits::Reasoning)
+        .state("content", Emits::Content)
+        .state("tools", Emits::Wrapper)
+        .state("call", Emits::Arguments)
+        .transition("message", "think_open", "reasoning")
+        .transition("reasoning", "think_close", "message")
+        .transition("reasoning", "response_open", "content")
+        .transition("reasoning", "tools_open", "tools")
+        .transition("reasoning", "message_close", "message")
+        .transition("message", "response_open", "content")
+        .transition("content", "response_close", "message")
+        .transition("content", "message_close", "message")
+        .transition("content", "tools_open", "tools")
+        .transition("message", "tools_open", "tools")
+        .transition("tools", "call_open", "call")
+        .transition("call", "call_close", "tools")
+        .transition("call", "call_open", "call")
+        .transition("call", "tools_close", "message")
+        .transition("call", "message_close", "message")
+        .transition("tools", "tools_close", "message")
+        .transition("tools", "message_close", "message")
+        .transition("message", "message_close", "message")
+        .calls(CallSyntax::Attributed(Tags::XTML))
+        .opens_turn("<|open|>message role=\"assistant\"<|sep|>")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{
+        ids::CallIds,
+        testing::{arguments_of, bytes, content, drive, drive_to, reasoning},
+    };
+
+    fn ids() -> CallIds {
+        CallIds::from_nonce("0123456789abcdef00000000").expect("24 hex")
+    }
+    use crate::{
+        engine::Engine,
+        event::{DropReason, Event, MalformedReason, Text},
+        input::EngineFinish,
+        Declared,
+    };
+
+    /// The generation prompt's tail: the assistant's message opened, and its thought.
+    const PROMPT: &str = "<|open|>message role=\"assistant\"<|sep|><|open|>think<|sep|>";
+
+    /// A recorded output: an empty thought, an empty answer, one call with a string and an object.
+    const OUTPUT: &str = concat!(
+        "<|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|>",
+        "<|open|>tools<|sep|><|open|>call tool=\"ChaDri_change_drink\" index=\"1\"<|sep|>",
+        "<|open|>argument key=\"drink_id\" type=\"string\"<|sep|>latte<|close|>argument<|sep|>",
+        "<|open|>argument key=\"new_preferences\" type=\"object\"<|sep|>",
+        "{\"size\": \"large\", \"temperature\": \"hot\"}<|close|>argument<|sep|>",
+        "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+    );
+
+    fn run(prompt: &str, pieces: &[&str]) -> Vec<Event<'static>> {
+        drive(
+            &mut Engine::with_call_ids(Arc::new(kimi_k3()), Declared::default(), ids()),
+            prompt,
+            pieces,
+        )
+    }
+
+    fn ends<'a>(events: &'a [Event<'_>]) -> Vec<&'a str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallEnd { source, .. } => Some(&*source.text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn dropped(text: &str) -> Event<'static> {
+        Event::Dropped {
+            text: Text::uncounted(text.to_owned()),
+            why: DropReason::Wrapper,
+        }
+    }
+
+    #[test]
+    fn a_recorded_output_gives_its_call_with_its_types_and_every_byte() {
+        let events = run(PROMPT, &[OUTPUT]);
+        assert_eq!(bytes(&events), OUTPUT);
+        assert_eq!(
+            events[..7],
+            [
+                Event::ReasoningStart,
+                dropped("<|close|>think<|sep|>"),
+                Event::ReasoningEnd,
+                dropped("<|open|>response<|sep|>"),
+                dropped("<|close|>response<|sep|>"),
+                dropped("<|open|>tools<|sep|>"),
+                dropped("<|open|>call tool=\""),
+            ]
+        );
+        assert_eq!(
+            events[7],
+            Event::ToolCallStart {
+                index: 0,
+                id: ids().id(0),
+                name: "ChaDri_change_drink".into(),
+                source: Text::uncounted("ChaDri_change_drink\" index=\"1\"<|sep|>"),
+            }
+        );
+        assert_eq!(
+            arguments_of(&events, 0),
+            r#"{"drink_id": "latte", "new_preferences": {"size": "large", "temperature": "hot"}}"#
+        );
+        assert_eq!(ends(&events), [Tags::XTML.invoke_close]);
+        assert_eq!(content(&events), "");
+        assert!(events.contains(&dropped("<|close|>tools<|sep|>")));
+        assert!(events.contains(&dropped("<|close|>message<|sep|>")));
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn a_thought_and_an_answer_are_the_regions_bytes_exactly() {
+        let output = concat!(
+            "Janet sells 16 - 3 - 4 = 9 eggs a day.\nShe makes $18.<|close|>think<|sep|>",
+            "<|open|>response<|sep|>18<|close|>response<|sep|><|close|>message<|sep|>"
+        );
+        let events = run(PROMPT, &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(
+            events[..3],
+            [
+                Event::ReasoningStart,
+                Event::Reasoning(Text::uncounted(
+                    "Janet sells 16 - 3 - 4 = 9 eggs a day.\nShe makes $18."
+                )),
+                dropped("<|close|>think<|sep|>"),
+            ]
+        );
+        assert_eq!(events[3], Event::ReasoningEnd);
+        assert_eq!(content(&events), "18");
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn a_string_value_streams_as_it_arrives_and_a_typed_value_is_written_at_its_close() {
+        let pieces = [
+            "<|close|>think<|sep|><|open|>response<|sep|><|close|>response<|sep|>",
+            "<|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"city\" type=\"string\"<|sep|>Par",
+            "is<|close|>argument<|sep|><|open|>argument key=\"n\" type=\"number\"<|sep|>1",
+            "2<|close|>argument<|sep|><|close|>call<|sep|>",
+            "<|close|>tools<|sep|><|close|>message<|sep|>",
+        ];
+        let events = run(PROMPT, &pieces);
+        let fragments: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallArguments { json, .. } => Some(json.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fragments,
+            ["{\"city\": \"", "Par", "is", "\"", ", \"n\": 12", "}"]
+        );
+        assert_eq!(bytes(&events), pieces.concat());
+    }
+
+    #[test]
+    fn every_chunking_says_the_same_and_accounts_for_every_byte() {
+        let whole = run(PROMPT, &[OUTPUT]);
+        let whole_arguments = arguments_of(&whole, 0);
+        for cut in 1..OUTPUT.len() {
+            if !OUTPUT.is_char_boundary(cut) {
+                continue;
+            }
+            let events = run(PROMPT, &[&OUTPUT[..cut], &OUTPUT[cut..]]);
+            assert_eq!(bytes(&events), OUTPUT, "cut at {cut}");
+            assert_eq!(arguments_of(&events, 0), whole_arguments, "cut at {cut}");
+            assert!(
+                matches!(events.last(), Some(Event::Finish { tool_calls: 1, .. })),
+                "cut at {cut}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_calls_in_one_block_take_their_own_indexes_and_only_the_call_tag_is_an_end() {
+        // Three ways a call ends: its own closing tag, which the end carries; the next call's
+        // opening and the block's close, which the engine drops as the region's.
+        let output = concat!(
+            "<|close|>think<|sep|><|open|>tools<|sep|>",
+            "<|open|>call tool=\"f\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"a\" type=\"boolean\"<|sep|>true<|close|>argument<|sep|>",
+            "<|close|>call<|sep|>",
+            "<|open|>call tool=\"g\" index=\"2\"<|sep|>",
+            "<|open|>call tool=\"h\" index=\"3\"<|sep|>",
+            "<|open|>argument key=\"b\" type=\"string\"<|sep|>x",
+            "<|close|>tools<|sep|><|close|>message<|sep|>"
+        );
+        let events = run(PROMPT, &[output]);
+        assert_eq!(bytes(&events), output);
+        let starts: Vec<(u32, &str)> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ToolCallStart { index, name, .. } => Some((*index, name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, [(0, "f"), (1, "g"), (2, "h")]);
+        assert_eq!(arguments_of(&events, 0), r#"{"a": true}"#);
+        assert_eq!(arguments_of(&events, 1), "{}");
+        // The block's close cut `h` inside a string: nothing is closed for a value the model
+        // never closed, and the one word of no bytes before the end says so.
+        assert_eq!(arguments_of(&events, 2), r#"{"b": "x"#);
+        let ended = events
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { index: 2, .. }))
+            .expect("the third call ends");
+        assert!(matches!(
+            &events[ended - 1],
+            Event::Malformed { text, .. } if text.text.is_empty()
+        ));
+        assert_eq!(ends(&events), [Tags::XTML.invoke_close, "", ""]);
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 3, .. })
+        ));
+    }
+
+    #[test]
+    fn the_end_of_turn_tag_closes_whatever_is_open() {
+        // A thought, an answer and a call each cut by `<|close|>message<|sep|>`: the region ends,
+        // and the tag is wrapping.
+        let thought = "A thought.<|close|>message<|sep|>";
+        let events = run(PROMPT, &[thought]);
+        assert_eq!(bytes(&events), thought);
+        assert_eq!(
+            events[..4],
+            [
+                Event::ReasoningStart,
+                Event::Reasoning(Text::uncounted("A thought.")),
+                dropped("<|close|>message<|sep|>"),
+                Event::ReasoningEnd,
+            ]
+        );
+
+        let answer = "<|close|>think<|sep|><|open|>response<|sep|>Hi<|close|>message<|sep|>";
+        let events = run(PROMPT, &[answer]);
+        assert_eq!(bytes(&events), answer);
+        assert_eq!(content(&events), "Hi");
+
+        let call = concat!(
+            "<|close|>think<|sep|><|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"a\" type=\"null\"<|sep|>null<|close|>argument<|sep|>",
+            "<|close|>message<|sep|>"
+        );
+        let events = run(PROMPT, &[call]);
+        assert_eq!(bytes(&events), call);
+        assert_eq!(arguments_of(&events, 0), r#"{"a": null}"#);
+        assert_eq!(ends(&events), [""]);
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn a_region_opened_inside_the_thought_ends_it() {
+        let output = concat!(
+            "Let me call.<|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>",
+            "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|>"
+        );
+        let events = run(PROMPT, &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(
+            events[..4],
+            [
+                Event::ReasoningStart,
+                Event::Reasoning(Text::uncounted("Let me call.")),
+                dropped("<|open|>tools<|sep|>"),
+                Event::ReasoningEnd,
+            ]
+        );
+        assert_eq!(arguments_of(&events, 0), "{}");
+
+        // The answer's opening ends the thought the same way, at every cut.
+        let answer =
+            "A plan.<|open|>response<|sep|>Hi<|close|>response<|sep|><|close|>message<|sep|>";
+        for cut in 0..answer.len() {
+            let pieces: Vec<&str> = if cut == 0 {
+                vec![answer]
+            } else {
+                vec![&answer[..cut], &answer[cut..]]
+            };
+            let events = run(PROMPT, &pieces);
+            assert_eq!(bytes(&events), answer, "cut at {cut}");
+            assert_eq!(
+                events[..4],
+                [
+                    Event::ReasoningStart,
+                    Event::Reasoning(Text::uncounted("A plan.")),
+                    dropped("<|open|>response<|sep|>"),
+                    Event::ReasoningEnd,
+                ],
+                "cut at {cut}"
+            );
+            assert_eq!(content(&events), "Hi", "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn a_tools_block_opened_inside_the_answer_ends_it() {
+        let output = concat!(
+            "<|close|>think<|sep|><|open|>response<|sep|>Hi<|open|>tools<|sep|>",
+            "<|open|>call tool=\"f\" index=\"1\"<|sep|><|close|>call<|sep|><|close|>tools<|sep|>",
+            "<|close|>message<|sep|>"
+        );
+        let events = run(PROMPT, &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(content(&events), "Hi");
+        assert_eq!(arguments_of(&events, 0), "{}");
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn text_between_the_regions_is_reported_and_whitespace_there_is_wrapping() {
+        let output = concat!(
+            "<|close|>think<|sep|>\nHello<|open|>response<|sep|>Hi<|close|>response<|sep|>",
+            "<|close|>message<|sep|>"
+        );
+        let events = run(PROMPT, &[output]);
+        assert_eq!(bytes(&events), output);
+        assert_eq!(content(&events), "Hi");
+        assert!(events.contains(&dropped("\n")));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::TextBetweenCalls } if text.text == "Hello"
+        )));
+    }
+
+    #[test]
+    fn a_partial_argument_close_at_the_stop_is_a_cut_tag_not_the_values_text() {
+        // `<|close|>argument` begins no engine terminal, so it reaches the assembler, whose scanner
+        // holds it as the start of the argument's close. At the model's own stop it is a tag the
+        // end cut short, never the value's text: the string closes on its own bytes, the call
+        // ends, and the tail is dropped after it, every byte in its place.
+        let output = concat!(
+            "<|close|>think<|sep|><|open|>tools<|sep|>",
+            "<|open|>call tool=\"f\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"x\" type=\"string\"<|sep|>Paris<|close|>argument"
+        );
+        let stopped = run(PROMPT, &[output]);
+        assert_eq!(
+            arguments_of(&stopped, 0),
+            r#"{"x": "Paris"}"#,
+            "{stopped:?}"
+        );
+        assert_eq!(bytes(&stopped), output);
+        let end = stopped
+            .iter()
+            .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+            .unwrap_or_else(|| panic!("the call ends: {stopped:?}"));
+        let tail = stopped
+            .iter()
+            .position(|event| *event == dropped("<|close|>argument"))
+            .unwrap_or_else(|| panic!("the tail is dropped: {stopped:?}"));
+        assert!(
+            end < tail,
+            "the call's bytes leave before the tail: {stopped:?}"
+        );
+        assert!(stopped.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+        )));
+        // Cut by the token limit, nothing closes: the prefix as written, every byte kept.
+        let cut = drive_to(
+            &mut Engine::with_call_ids(Arc::new(kimi_k3()), Declared::default(), ids()),
+            PROMPT,
+            &[output],
+            EngineFinish::Length,
+        );
+        assert_eq!(bytes(&cut), output);
+        assert!(
+            arguments_of(&cut, 0).starts_with(r#"{"x": "Paris"#),
+            "{cut:?}"
+        );
+    }
+
+    #[test]
+    fn a_stream_cut_inside_a_call_ends_the_call_with_its_arguments_cut() {
+        let output = concat!(
+            "<|close|>think<|sep|><|open|>tools<|sep|>",
+            "<|open|>call tool=\"f\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"x\" type=\"number\"<|sep|>1"
+        );
+        // The model's own end of output there ends the call as its closing tag would: the value
+        // held for its close is reported, the object closes without it, and one word says the
+        // stop closed the call.
+        let stopped = run(PROMPT, &[output]);
+        assert_eq!(arguments_of(&stopped, 0), "{}");
+        assert!(stopped.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+        )));
+        // A partial structural terminal at the end of the output (`<|close|>` begins the
+        // argument's, the call's and the tools' close) is a tag the end cut short: it is dropped,
+        // and the call ends as the stream's end ends it, the stop closing the string the model
+        // left open and saying so, a cut leaving it open.
+        let output = concat!(
+            "<|close|>think<|sep|><|open|>tools<|sep|>",
+            "<|open|>call tool=\"f\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"x\" type=\"string\"<|sep|>Paris<|close|>"
+        );
+        let stopped = run(PROMPT, &[output]);
+        assert_eq!(arguments_of(&stopped, 0), r#"{"x": "Paris"}"#);
+        assert!(stopped.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+        )));
+        assert_eq!(bytes(&stopped), output);
+        let cut = drive_to(
+            &mut Engine::with_call_ids(Arc::new(kimi_k3()), Declared::default(), ids()),
+            PROMPT,
+            &[output],
+            EngineFinish::Length,
+        );
+        assert_eq!(arguments_of(&cut, 0), r#"{"x": "Paris"#);
+        assert_eq!(bytes(&cut), output);
+        // Cut by the token limit, nothing closes.
+        let output = concat!(
+            "<|close|>think<|sep|><|open|>tools<|sep|>",
+            "<|open|>call tool=\"f\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"x\" type=\"number\"<|sep|>1"
+        );
+        let events = drive_to(
+            &mut Engine::with_call_ids(Arc::new(kimi_k3()), Declared::default(), ids()),
+            PROMPT,
+            &[output],
+            EngineFinish::Length,
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Malformed {
+                why: MalformedReason::UnterminatedRegion,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::ToolCallEnd { index: 0, source } if source.text.is_empty()
+        )));
+        assert!(matches!(
+            events.last(),
+            Some(Event::Finish { tool_calls: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn an_earlier_turns_regions_in_the_prompt_move_nothing() {
+        // The replay starts at the last assistant message tag, so an earlier turn's call block,
+        // closed or not, and a user's quoted tag are not entered.
+        for earlier in [
+            concat!(
+                "<|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>",
+                "<|close|>call<|sep|>",
+                "<|close|>tools<|sep|>"
+            ),
+            "<|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>",
+        ] {
+            let prompt = format!(
+                "<|open|>message role=\"user\"<|sep|>q<|close|>message<|sep|>\
+                 <|open|>message role=\"assistant\"<|sep|><|close|>think<|sep|>{earlier}\
+                 <|close|>message<|sep|><|open|>message role=\"user\"<|sep|>\
+                 Why <|open|>tools<|sep|>?<|close|>message<|sep|>{PROMPT}"
+            );
+            let events = run(&prompt, &["A thought.<|close|>think<|sep|>"]);
+            assert_eq!(events[0], Event::ReasoningStart, "{earlier:?}");
+            assert_eq!(
+                events[1],
+                Event::Reasoning(Text::uncounted("A thought.")),
+                "{earlier:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_call_that_named_nothing_is_reported_however_it_ended() {
+        for (output, ending) in [
+            (
+                concat!(
+                    "<|close|>think<|sep|><|open|>tools<|sep|><|open|>call tool=\"",
+                    "<|close|>tools<|sep|>"
+                ),
+                "<|close|>tools<|sep|>",
+            ),
+            (
+                concat!(
+                    "<|close|>think<|sep|><|open|>tools<|sep|><|open|>call tool=\"",
+                    "<|open|>call tool=\"g\" index=\"2\"<|sep|><|close|>call<|sep|>",
+                    "<|close|>tools<|sep|>"
+                ),
+                "<|open|>call tool=\"",
+            ),
+            (
+                "<|close|>think<|sep|><|open|>tools<|sep|><|open|>call tool=\"<|close|>call<|sep|>",
+                "<|close|>call<|sep|>",
+            ),
+        ] {
+            let events = run(PROMPT, &[output]);
+            assert_eq!(bytes(&events), output, "{ending}");
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    Event::Malformed { text, .. } if text.text == ending
+                )),
+                "{ending}: {events:?}"
+            );
+        }
+    }
+
+    /// The generation prompt's tail with thinking off: the assistant's message opened, and its
+    /// answer's region.
+    const PROMPT_THINKING_OFF: &str =
+        "<|open|>message role=\"assistant\"<|sep|><|open|>response<|sep|>";
+
+    /// A short answer and the turn's closing structure, one token each: how a cut by
+    /// `max_tokens` lands between them.
+    const PONG: [&str; 10] = [
+        "P",
+        "ong",
+        ".",
+        "<|close|>",
+        "response",
+        "<|sep|>",
+        "<|close|>",
+        "message",
+        "<|sep|>",
+        "",
+    ];
+
+    #[test]
+    fn a_tag_the_end_of_the_output_cut_short_is_dropped_not_released_as_content() {
+        // The output cut after 8 of the turn's 10 tokens ends in `<|close|>message`, a tag the
+        // cut left unfinished (smg-lab #116): it begins with a whole `<|close|>` token, which the
+        // model cannot write as text, so it is wrapping, never content. Cut after 7 the same
+        // holds for the bare `<|close|>`; cut after 6, or whole, the answer stands alone.
+        for cut in [6, 7, 8, 9] {
+            let events = run(PROMPT_THINKING_OFF, &PONG[..cut]);
+            assert_eq!(
+                content(&events),
+                "Pong.",
+                "cut after {cut} tokens: {events:?}"
+            );
+            assert_eq!(
+                bytes(&events),
+                PONG[..cut].concat(),
+                "cut after {cut} tokens: every byte accounted for"
+            );
+        }
+        let events = run(PROMPT_THINKING_OFF, &PONG[..8]);
+        assert!(
+            events.contains(&dropped("<|close|>message")),
+            "the tag cut short is dropped as wrapping: {events:?}"
+        );
+        let events = run(PROMPT_THINKING_OFF, &PONG[..7]);
+        assert!(
+            events.contains(&dropped("<|close|>")),
+            "the structural token alone is a tag cut short too: {events:?}"
+        );
+    }
+
+    #[test]
+    fn a_thought_cut_inside_its_closing_tag_keeps_the_thought_alone() {
+        // Thinking on: the prompt opened the thought, the cut falls inside `<|close|>think<|sep|>`.
+        // The thought is the thought; the unfinished tag reaches neither field.
+        let events = run(PROMPT, &["Thought", "<|close|>", "think"]);
+        assert_eq!(reasoning(&events), "Thought", "{events:?}");
+        assert_eq!(content(&events), "", "{events:?}");
+        assert!(events.contains(&dropped("<|close|>think")), "{events:?}");
+        assert_eq!(bytes(&events), "Thought<|close|>think");
+    }
+
+    #[test]
+    fn a_tail_shorter_than_a_structural_token_stays_text_at_the_end() {
+        // Inside a structural token the bytes so far may be text (`<|clo` could be the model's
+        // own, and no stream splits the token anyway), so they stay, as every parser keeps a
+        // partial marker at the end of the output.
+        let events = run(PROMPT_THINKING_OFF, &["Pong.", "<|clo"]);
+        assert_eq!(content(&events), "Pong.<|clo", "{events:?}");
+    }
+
+    #[test]
+    fn a_call_cut_after_an_arguments_close_keeps_every_byte_in_order() {
+        // The output cut right after the `<|close|>` of a number argument, inside a call: the
+        // assembler still holds the argument's bytes, which came before the cut tag, so the call
+        // ends first (its bytes, malformed, and its end) and the cut tag is dropped after them;
+        // every byte in exactly one event, in the output's order, and none of it content. Cut
+        // by the token limit the argument is the call's unfinished bytes; at the model's own
+        // stop the call ends as its closing tag would end it, the held number reported, the
+        // object closed without it, and the one word says the stop closed the call.
+        let tokens = [
+            "<|open|>tools<|sep|><|open|>call tool=\"f\" index=\"1\"<|sep|>",
+            "<|open|>argument key=\"n\" type=\"number\"<|sep|>",
+            "1.5",
+            "<|close|>",
+        ];
+        let in_order = |events: &[Event<'static>]| {
+            assert_eq!(bytes(events), tokens.concat(), "{events:?}");
+            assert_eq!(content(events), "", "{events:?}");
+            let end = events
+                .iter()
+                .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+                .unwrap_or_else(|| panic!("the call ends: {events:?}"));
+            let cut = events
+                .iter()
+                .position(|event| *event == dropped("<|close|>"))
+                .unwrap_or_else(|| panic!("the cut tag is dropped: {events:?}"));
+            assert!(
+                end < cut,
+                "the call's bytes leave before the cut tag: {events:?}"
+            );
+        };
+        let events = drive_to(
+            &mut Engine::with_call_ids(Arc::new(kimi_k3()), Declared::default(), ids()),
+            PROMPT_THINKING_OFF,
+            &tokens,
+            EngineFinish::Length,
+        );
+        in_order(&events);
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::Malformed { text, why: MalformedReason::UnterminatedRegion }
+                    if text.text == "<|open|>argument key=\"n\" type=\"number\"<|sep|>1.5"
+            )),
+            "the unfinished argument is the call's malformed bytes: {events:?}"
+        );
+        let stopped = run(PROMPT_THINKING_OFF, &tokens);
+        in_order(&stopped);
+        assert_eq!(arguments_of(&stopped, 0), "{}");
+        assert!(
+            stopped.iter().any(|event| matches!(
+                event,
+                Event::Malformed { text, why: MalformedReason::TagCutShort }
+                    if text.text == "<|open|>argument key=\"n\" type=\"number\"<|sep|>1.5"
+            )),
+            "the held number is reported: {stopped:?}"
+        );
+        assert!(stopped.iter().any(|event| matches!(
+            event,
+            Event::Malformed { text, why: MalformedReason::OpenAtTheStop } if text.text.is_empty()
+        )));
+    }
+
+    #[test]
+    fn a_cut_tag_the_state_keeps_as_text_when_whole_stays_text() {
+        // Content has no row for the thought's close, so a whole `<|close|>think<|sep|>` there is
+        // text, where the model put it; the same tag cut short is text too, not a drop: the cut
+        // is judged as the whole tag would be. (In the thought, where the table has the row, the
+        // cut tag is dropped: `a_thought_cut_inside_its_closing_tag_keeps_the_thought_alone`.)
+        let whole = run(
+            PROMPT_THINKING_OFF,
+            &["Pong.", "<|close|>", "think", "<|sep|>"],
+        );
+        assert_eq!(content(&whole), "Pong.<|close|>think<|sep|>", "{whole:?}");
+        let cut = run(PROMPT_THINKING_OFF, &["Pong.", "<|close|>", "think"]);
+        assert_eq!(content(&cut), "Pong.<|close|>think", "{cut:?}");
+        assert_eq!(bytes(&cut), "Pong.<|close|>think");
+    }
+}

@@ -9,15 +9,18 @@ use validator::{Validate, ValidationError};
 
 use super::{
     common::{
-        default_true, validate_json_schema_shape, validate_stop, ChatLogProbs,
-        ContextManagementEntry, ConversationRef, Detail, Function, FunctionChoice,
-        GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo, ResponsePrompt,
-        StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
-        ToolChoiceValue as ChatToolChoiceValue, ToolReference, UsageInfo,
+        default_true, strict_schema_missing_additional_properties, validate_json_schema_shape,
+        validate_stop, ChatLogProbs, ContextManagementEntry, ConversationRef, Detail, Function,
+        FunctionChoice, GenerationRequest, PromptCacheRetention, PromptTokenUsageInfo,
+        ResponsePrompt, StreamOptions, StringOrArray, ToolChoice as ChatToolChoice,
+        ToolChoiceValue as ChatToolChoiceValue, ToolReference, Usage, UsageInfo,
     },
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
-use crate::{builders::ResponsesResponseBuilder, validated::Normalizable};
+use crate::{
+    builders::ResponsesResponseBuilder, common::invalid, profile::is_openai_vendor_model,
+    validated::Normalizable,
+};
 
 // ============================================================================
 // Responses API Tool Choice
@@ -268,15 +271,6 @@ impl Default for ResponsesToolChoice {
 }
 
 impl ResponsesToolChoice {
-    /// Serialize tool_choice to string for ResponsesResponse payloads.
-    ///
-    /// Returns the JSON-serialized tool_choice or `"auto"` as default.
-    pub fn serialize_to_string(tool_choice: Option<&ResponsesToolChoice>) -> String {
-        tool_choice
-            .map(|tc| serde_json::to_string(tc).unwrap_or_else(|_| "auto".to_string()))
-            .unwrap_or_else(|| "auto".to_string())
-    }
-
     /// Return the pinned function name for the `Function` variant, regardless
     /// of which wire shape (spec-flat `name` or legacy nested `function.name`)
     /// was used at deserialize time. `None` for any non-`Function` variant.
@@ -529,12 +523,27 @@ pub enum NamespaceTool {
 }
 
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct FunctionTool {
     /// Flatten to match Responses API tool JSON shape.
     #[serde(flatten)]
     pub function: Function,
+}
+
+/// A function tool rejects keys outside its schema, as the sibling tool
+/// structs do with `deny_unknown_fields`. The function object collects such
+/// keys in [`Function::extra`] (the chat API keeps them for the template), and
+/// serde does not support `deny_unknown_fields` on a struct that flattens a
+/// struct with a flattened map of its own, so the check is made here.
+impl<'de> Deserialize<'de> for FunctionTool {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const FIELDS: &[&str] = &["name", "description", "parameters", "strict"];
+        let function = Function::deserialize(deserializer)?;
+        if let Some(key) = function.extra.keys().next() {
+            return Err(serde::de::Error::unknown_field(key, FIELDS));
+        }
+        Ok(Self { function })
+    }
 }
 
 /// File search tool configuration.
@@ -1588,12 +1597,23 @@ impl ReasoningEffort {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningSummary {
     Auto,
     Concise,
     Detailed,
+}
+
+impl ReasoningSummary {
+    /// The wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Concise => "concise",
+            Self::Detailed => "detailed",
+        }
+    }
 }
 
 // ============================================================================
@@ -1616,14 +1636,13 @@ impl StringOrContentParts {
             Self::Array(parts) => {
                 let mut text = String::new();
                 for part in parts {
-                    match part {
-                        ResponseContentPart::InputText { text: part }
-                        | ResponseContentPart::OutputText { text: part, .. } => text.push_str(part),
-                        _ => return Err(
+                    let Some(part) = part.text() else {
+                        return Err(
                             "Multimodal function output is not supported by this text-only backend"
                                 .to_string(),
-                        ),
-                    }
+                        );
+                    };
+                    text.push_str(part);
                 }
                 Ok(text)
             }
@@ -2184,6 +2203,17 @@ pub enum ResponseContentPart {
     /// `ResponseOutputRefusal`).
     #[serde(rename = "refusal")]
     Refusal { refusal: String },
+}
+
+impl ResponseContentPart {
+    /// The text a part carries toward the prompt: an input or output text
+    /// part's text; none for an image, a file or a refusal.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::OutputText { text, .. } | Self::InputText { text } => Some(text),
+            Self::InputImage { .. } | Self::InputFile { .. } | Self::Refusal { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -2747,12 +2777,22 @@ pub enum ServiceTier {
     Priority,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Default, schemars::JsonSchema)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, Default, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Truncation {
     Auto,
     #[default]
     Disabled,
+}
+
+impl Truncation {
+    /// The wire value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Disabled => "disabled",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize, schemars::JsonSchema)]
@@ -2792,11 +2832,22 @@ pub struct IncompleteDetails {
     pub reason: IncompleteReason,
 }
 
-#[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+/// The `reasoning` block of a Response object. The public API returns it on
+/// every response, both keys present (`null` when the request set none), so
+/// neither key is skipped here.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ReasoningInfo {
     pub effort: Option<String>,
     pub summary: Option<String>,
+}
+
+impl From<&ResponseReasoningParam> for ReasoningInfo {
+    fn from(param: &ResponseReasoningParam) -> Self {
+        Self {
+            effort: param.effort.map(|effort| effort.as_str().to_string()),
+            summary: param.summary.map(|summary| summary.as_str().to_string()),
+        }
+    }
 }
 
 // ============================================================================
@@ -2804,10 +2855,39 @@ pub struct ReasoningInfo {
 // ============================================================================
 
 /// Text configuration for structured output requests
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct TextConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<TextFormat>,
+
+    /// Spec: `text.verbosity` (`"low"` | `"medium"` | `"high"`). Accepted on
+    /// the request and echoed on the response, where the public API reports
+    /// `"medium"` when the request set none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verbosity: Option<Verbosity>,
+}
+
+impl TextConfig {
+    /// The shape the public API reports on a Response object: `format`
+    /// defaults to `{"type": "text"}` and `verbosity` to `"medium"`.
+    pub fn with_response_defaults(self) -> Self {
+        Self {
+            format: self.format.or(Some(TextFormat::Text)),
+            verbosity: self.verbosity.or(Some(Verbosity::Medium)),
+        }
+    }
+}
+
+/// `text.verbosity` tiers of the Responses API.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Verbosity {
+    Low,
+    #[default]
+    Medium,
+    High,
 }
 
 /// Text format: text (default), json_object (legacy), or json_schema (recommended)
@@ -2855,15 +2935,20 @@ pub enum IncludeField {
 // Usage Types (Responses API format)
 // ============================================================================
 
-/// OpenAI Responses API usage format (different from standard UsageInfo)
-#[serde_with::skip_serializing_none]
+/// OpenAI Responses API usage format (different from standard UsageInfo).
+///
+/// The public schema marks `input_tokens_details` and `output_tokens_details`
+/// required, so both blocks are always on the wire (zeros when nothing was
+/// cached or no reasoning tokens were counted).
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ResponseUsage {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub total_tokens: u32,
-    pub input_tokens_details: Option<InputTokensDetails>,
-    pub output_tokens_details: Option<OutputTokensDetails>,
+    #[serde(default)]
+    pub input_tokens_details: InputTokensDetails,
+    #[serde(default)]
+    pub output_tokens_details: OutputTokensDetails,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
@@ -2873,7 +2958,7 @@ pub enum ResponsesUsage {
     Modern(ResponseUsage),
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct InputTokensDetails {
     pub cached_tokens: u32,
 }
@@ -2886,7 +2971,7 @@ impl From<&PromptTokenUsageInfo> for InputTokensDetails {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct OutputTokensDetails {
     pub reasoning_tokens: u32,
 }
@@ -2901,10 +2986,11 @@ impl UsageInfo {
             input_tokens_details: self
                 .prompt_tokens_details
                 .as_ref()
-                .map(InputTokensDetails::from),
-            output_tokens_details: self.reasoning_tokens.map(|tokens| OutputTokensDetails {
-                reasoning_tokens: tokens,
-            }),
+                .map(InputTokensDetails::from)
+                .unwrap_or_default(),
+            output_tokens_details: OutputTokensDetails {
+                reasoning_tokens: self.reasoning_tokens.unwrap_or(0),
+            },
         }
     }
 }
@@ -2915,6 +3001,33 @@ impl From<UsageInfo> for ResponseUsage {
     }
 }
 
+/// The usage of an answer as the Responses API reports it, from the usage of
+/// a chat-style answer: the three counts with both detail objects present,
+/// zero included, the cached and reasoning counts read from the details the
+/// usage carries. A response's final object and its `response.completed`
+/// event build their usage here, so the two are the same.
+impl From<&Usage> for ResponseUsage {
+    fn from(usage: &Usage) -> Self {
+        Self {
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            input_tokens_details: usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(InputTokensDetails::from)
+                .unwrap_or_default(),
+            output_tokens_details: OutputTokensDetails {
+                reasoning_tokens: usage
+                    .completion_tokens_details
+                    .as_ref()
+                    .and_then(|details| details.reasoning_tokens)
+                    .unwrap_or(0),
+            },
+        }
+    }
+}
+
 impl ResponseUsage {
     /// Convert back to standard UsageInfo format
     pub fn to_usage_info(&self) -> UsageInfo {
@@ -2922,14 +3035,10 @@ impl ResponseUsage {
             prompt_tokens: self.input_tokens,
             completion_tokens: self.output_tokens,
             total_tokens: self.total_tokens,
-            reasoning_tokens: self
-                .output_tokens_details
-                .as_ref()
-                .map(|details| details.reasoning_tokens),
-            prompt_tokens_details: self.input_tokens_details.as_ref().map(|details| {
-                PromptTokenUsageInfo {
-                    cached_tokens: details.cached_tokens,
-                }
+            reasoning_tokens: Some(self.output_tokens_details.reasoning_tokens),
+            prompt_tokens_details: Some(PromptTokenUsageInfo {
+                cached_tokens: self.input_tokens_details.cached_tokens,
+                audio_tokens: None,
             }),
         }
     }
@@ -2975,12 +3084,26 @@ fn default_temperature() -> Option<f32> {
 // Request/Response Types
 // ============================================================================
 
+/// The body of `POST /v1/responses`.
+///
+/// Unknown top-level parameters are rejected (`deny_unknown_fields`), as the
+/// public API rejects them with `unknown_parameter`; a parameter the gateway
+/// accepts must be declared here, including the sampling extensions below.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 #[validate(schema(function = "validate_responses_cross_parameters"))]
 pub struct ResponsesRequest {
     /// Fields to include in the response
     #[serde(skip_serializing_if = "Option::is_none")]
     pub include: Option<Vec<IncludeField>>,
+
+    /// Run the response in the background. Spec: body param `background`.
+    /// The request answers at once with a `queued` Response object that is
+    /// polled with `GET /v1/responses/{id}` and cancelled with
+    /// `POST /v1/responses/{id}/cancel`; it needs the response stored
+    /// (`store` true or omitted), as an unstored response could not be polled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<bool>,
 
     /// Input content - can be string or structured items
     #[validate(custom(function = "validate_response_input"))]
@@ -2990,7 +3113,10 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
 
-    /// Maximum number of output tokens
+    /// Maximum number of output tokens. At least 1, as `max_tokens` on the
+    /// chat endpoint: the vendors' Responses contracts accept small values
+    /// (a one-word answer under 8), so the public API's own floor of 16 is
+    /// not imposed on the models served here.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[validate(range(min = 1))]
     pub max_output_tokens: Option<u32>,
@@ -3000,8 +3126,10 @@ pub struct ResponsesRequest {
     #[validate(range(min = 1))]
     pub max_tool_calls: Option<u32>,
 
-    /// Additional metadata
+    /// Additional metadata: at most 16 pairs, keys up to 64 characters,
+    /// string values up to 512 characters (the public API's limits)
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_metadata"))]
     pub metadata: Option<HashMap<String, Value>>,
 
     /// Model to use
@@ -3136,17 +3264,24 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_management: Option<Vec<ContextManagementEntry>>,
 
-    /// Top-k sampling parameter (SGLang extension)
+    /// Client-side tracing metadata (Codex sends installation / session /
+    /// thread / turn ids and a W3C traceparent here on every request).
+    /// Accepted so such clients are not rejected with `unknown_parameter`;
+    /// never serialized, so it does not reach the workers.
+    #[serde(default, skip_serializing)]
+    pub client_metadata: Option<HashMap<String, Value>>,
+
+    /// Top-k sampling parameter (an engine extension)
     #[serde(default = "default_top_k")]
     #[validate(custom(function = "validate_top_k_value"))]
     pub top_k: i32,
 
-    /// Min-p sampling parameter (SGLang extension)
+    /// Min-p sampling parameter (an engine extension)
     #[serde(default)]
     #[validate(range(min = 0.0, max = 1.0))]
     pub min_p: f32,
 
-    /// Repetition penalty (SGLang extension)
+    /// Repetition penalty (an engine extension)
     #[serde(default = "default_repetition_penalty")]
     #[validate(range(min = 0.0, max = 2.0))]
     pub repetition_penalty: f32,
@@ -3163,6 +3298,7 @@ impl Default for ResponsesRequest {
     fn default() -> Self {
         Self {
             include: None,
+            background: None,
             input: ResponseInput::Text(String::new()),
             instructions: None,
             max_output_tokens: None,
@@ -3195,6 +3331,7 @@ impl Default for ResponsesRequest {
             safety_identifier: None,
             stream_options: None,
             context_management: None,
+            client_metadata: None,
             top_k: default_top_k(),
             min_p: 0.0,
             repetition_penalty: default_repetition_penalty(),
@@ -3259,47 +3396,17 @@ impl GenerationRequest for ResponsesRequest {
 
                 for item in items {
                     match item {
-                        ResponseInputOutputItem::Message { content, .. } => {
-                            for part in content {
-                                let text = match part {
-                                    ResponseContentPart::OutputText { text, .. } => {
-                                        Some(text.as_str())
-                                    }
-                                    ResponseContentPart::InputText { text } => Some(text.as_str()),
-                                    // Non-text parts (images, files, refusals) contribute no
-                                    // prompt text; skip without appending.
-                                    ResponseContentPart::InputImage { .. }
-                                    | ResponseContentPart::InputFile { .. }
-                                    | ResponseContentPart::Refusal { .. } => None,
-                                };
-                                if let Some(t) = text {
-                                    append_text(t);
-                                }
-                            }
-                        }
+                        ResponseInputOutputItem::Message { content, .. } => content
+                            .iter()
+                            .filter_map(ResponseContentPart::text)
+                            .for_each(&mut append_text),
                         ResponseInputOutputItem::SimpleInputMessage { content, .. } => {
                             match content {
-                                StringOrContentParts::String(s) => {
-                                    append_text(s.as_str());
-                                }
-                                StringOrContentParts::Array(parts) => {
-                                    for part in parts {
-                                        let text = match part {
-                                            ResponseContentPart::OutputText { text, .. } => {
-                                                Some(text.as_str())
-                                            }
-                                            ResponseContentPart::InputText { text } => {
-                                                Some(text.as_str())
-                                            }
-                                            ResponseContentPart::InputImage { .. }
-                                            | ResponseContentPart::InputFile { .. }
-                                            | ResponseContentPart::Refusal { .. } => None,
-                                        };
-                                        if let Some(t) = text {
-                                            append_text(t);
-                                        }
-                                    }
-                                }
+                                StringOrContentParts::String(s) => append_text(s.as_str()),
+                                StringOrContentParts::Array(parts) => parts
+                                    .iter()
+                                    .filter_map(ResponseContentPart::text)
+                                    .for_each(&mut append_text),
                             }
                         }
                         ResponseInputOutputItem::Reasoning { content, .. } => {
@@ -3349,11 +3456,12 @@ impl GenerationRequest for ResponsesRequest {
 pub fn validate_conversation_id(conv: &ConversationRef) -> Result<(), ValidationError> {
     let conv_id = conv.as_id();
     if !conv_id.starts_with("conv_") {
-        let mut error = ValidationError::new("invalid_conversation_id");
-        error.message = Some(std::borrow::Cow::Owned(format!(
-            "Invalid 'conversation': '{conv_id}'. Expected an ID that begins with 'conv_'."
-        )));
-        return Err(error);
+        return Err(invalid(
+            "invalid_conversation_id",
+            format!(
+                "Invalid 'conversation': '{conv_id}'. Expected an ID that begins with 'conv_'."
+            ),
+        ));
     }
 
     // Check if the conversation ID contains only valid characters
@@ -3362,11 +3470,12 @@ pub fn validate_conversation_id(conv: &ConversationRef) -> Result<(), Validation
         .all(|c| c.is_alphanumeric() || c == '_' || c == '-');
 
     if !is_valid {
-        let mut error = ValidationError::new("invalid_conversation_id");
-        error.message = Some(std::borrow::Cow::Owned(format!(
-            "Invalid 'conversation': '{conv_id}'. Expected an ID that contains letters, numbers, underscores, or dashes, but this value contained additional characters."
-        )));
-        return Err(error);
+        return Err(invalid(
+            "invalid_conversation_id",
+            format!(
+                "Invalid 'conversation': '{conv_id}'. Expected an ID that contains letters, numbers, underscores, or dashes, but this value contained additional characters."
+            ),
+        ));
     }
     Ok(())
 }
@@ -3378,16 +3487,21 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
     };
 
     let has_tools = request.tools.as_ref().is_some_and(|t| !t.is_empty());
+    // `none` and `auto` name no tool, so they stand without tools (with nothing
+    // to call, `auto` answers in text as an omitted `tool_choice` does); Codex
+    // sends `tools: []` with `tool_choice: "auto"` when it compacts a
+    // conversation.
     let is_some_choice = !matches!(
         tool_choice,
-        ResponsesToolChoice::Options(ToolChoiceOptions::None)
+        ResponsesToolChoice::Options(ToolChoiceOptions::None | ToolChoiceOptions::Auto)
     );
 
     // Check if tool_choice requires tools but none are provided
     if is_some_choice && !has_tools {
-        let mut e = ValidationError::new("tool_choice_requires_tools");
-        e.message = Some("Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.".into());
-        return Err(e);
+        return Err(invalid(
+            "tool_choice_requires_tools",
+            "Invalid value for 'tool_choice': 'tool_choice' is only allowed when 'tools' are specified.",
+        ));
     }
 
     // Validate tool references exist when tools are present
@@ -3425,14 +3539,12 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
                     _ => false,
                 });
                 if !found {
-                    let mut e = ValidationError::new("tool_choice_function_not_found");
-                    e.message = Some(
+                    return Err(invalid(
+                        "tool_choice_function_not_found",
                         format!(
-                            "Invalid value for 'tool_choice': function '{name}' not found in 'tools'.",
-                        )
-                        .into(),
-                    );
-                    return Err(e);
+                            "Invalid value for 'tool_choice': function '{name}' not found in 'tools'."
+                        ),
+                    ));
                 }
             }
         }
@@ -3443,28 +3555,24 @@ fn validate_tool_choice_with_tools(request: &ResponsesRequest) -> Result<(), Val
         } => {
             // Validate mode is "auto" or "required"
             if mode != "auto" && mode != "required" {
-                let mut e = ValidationError::new("tool_choice_invalid_mode");
-                e.message = Some(
+                return Err(invalid(
+                    "tool_choice_invalid_mode",
                     format!(
                         "Invalid value for 'tool_choice.mode': must be 'auto' or 'required', got '{mode}'."
-                    )
-                    .into(),
-                );
-                return Err(e);
+                    ),
+                ));
             }
 
             // Validate that all function tool references exist
             for tool_ref in allowed_tools {
                 if let ToolReference::Function { name } = tool_ref {
                     if !function_tool_names.contains(&name.as_str()) {
-                        let mut e = ValidationError::new("tool_choice_tool_not_found");
-                        e.message = Some(
+                        return Err(invalid(
+                            "tool_choice_tool_not_found",
                             format!(
                                 "Invalid value for 'tool_choice.tools': tool '{name}' not found in 'tools'."
-                            )
-                            .into(),
-                        );
-                        return Err(e);
+                            ),
+                        ));
                     }
                 }
                 // Note: MCP and hosted tools don't need existence validation here
@@ -3490,33 +3598,166 @@ fn validate_responses_cross_parameters(request: &ResponsesRequest) -> Result<(),
     // 1. Validate tool_choice requires tools (enhanced)
     validate_tool_choice_with_tools(request)?;
 
-    // 2. Validate top_logprobs requires include field
-    if request.top_logprobs.is_some() {
-        let has_logprobs_include = request
-            .include
-            .as_ref()
-            .is_some_and(|inc| inc.contains(&IncludeField::MessageOutputTextLogprobs));
-
-        if !has_logprobs_include {
-            let mut e = ValidationError::new("top_logprobs_requires_include");
-            e.message = Some(
-                "top_logprobs requires include field with 'message.output_text.logprobs'".into(),
-            );
-            return Err(e);
-        }
-    }
+    // 2. `top_logprobs` without `include: ["message.output_text.logprobs"]` is
+    //    accepted as the public API accepts it: the logprobs are simply not
+    //    attached to the output text.
 
     // 3. Validate conversation and previous_response_id are mutually exclusive
     if request.conversation.is_some() && request.previous_response_id.is_some() {
-        let mut e = ValidationError::new("mutually_exclusive_parameters");
-        e.message = Some("Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.".into());
-        return Err(e);
+        return Err(invalid(
+            "mutually_exclusive_parameters",
+            "Mutually exclusive parameters. Ensure you are only providing one of: 'previous_response_id' or 'conversation'.",
+        ));
     }
+
+    // 4. The public OpenAI API's rules on request content beyond the schema
+    //    hold for OpenAI's own models only; a self-hosted model passes these
+    //    shapes through to the engine, whose grammar compiler decides what it
+    //    can constrain (see `profile::is_openai_vendor_model`).
+    if is_openai_vendor_model(&request.model) {
+        validate_openai_structured_output_rules(request)?;
+    }
+
+    // 5. `background: true` with `store: false` is a valid pair, as in the
+    //    public API: the gateway keeps such a response for its polling
+    //    window, then retains nothing of it.
 
     // Tool-result-only continuations are valid; validate_response_input checks
     // individual items without requiring a message already held in history.
 
     Ok(())
+}
+
+/// The public OpenAI API's structured-output rules: a strict function schema or
+/// a strict `json_schema` text format pins `additionalProperties: false` on
+/// every object node, and a `json_object` format needs the word "json"
+/// somewhere in the prompt (instructions or input text).
+fn validate_openai_structured_output_rules(
+    request: &ResponsesRequest,
+) -> Result<(), ValidationError> {
+    for tool in request.tools.as_deref().unwrap_or_default() {
+        let ResponseTool::Function(function_tool) = tool else {
+            continue;
+        };
+        let function = &function_tool.function;
+        if function.strict == Some(true) {
+            if let Some(path) = strict_schema_missing_additional_properties(&function.parameters) {
+                return Err(invalid(
+                    "invalid_function_parameters",
+                    format!(
+                        "Invalid schema for function '{}': In context={path}, 'additionalProperties' is required to be supplied and to be false.",
+                        function.name
+                    ),
+                ));
+            }
+        }
+    }
+
+    match request.text.as_ref().and_then(|t| t.format.as_ref()) {
+        Some(TextFormat::JsonSchema {
+            name,
+            schema,
+            strict: Some(true),
+            ..
+        }) => {
+            if let Some(path) = strict_schema_missing_additional_properties(schema) {
+                return Err(invalid(
+                    "invalid_json_schema",
+                    format!(
+                        "Invalid schema for response_format '{name}': In context={path}, 'additionalProperties' is required to be supplied and to be false."
+                    ),
+                ));
+            }
+        }
+        Some(TextFormat::JsonObject) if !request_mentions_json(request) => {
+            return Err(invalid(
+                "json_object_requires_json_in_input",
+                "Response input messages must contain the word 'json' in some form to use 'text.format' of type 'json_object'.",
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Whether the instructions or any input text mention "json" (case-insensitive).
+fn request_mentions_json(request: &ResponsesRequest) -> bool {
+    let mentions = |text: &str| text.to_ascii_lowercase().contains("json");
+    if request.instructions.as_deref().is_some_and(mentions) {
+        return true;
+    }
+    match &request.input {
+        ResponseInput::Text(text) => mentions(text),
+        ResponseInput::Items(items) => items.iter().any(|item| {
+            match item {
+            ResponseInputOutputItem::Message { content, .. } => content.iter().any(|part| {
+                matches!(part, ResponseContentPart::InputText { text } if mentions(text))
+            }),
+            ResponseInputOutputItem::SimpleInputMessage { content, .. } => match content {
+                StringOrContentParts::String(text) => mentions(text),
+                StringOrContentParts::Array(parts) => parts.iter().any(|part| {
+                    matches!(part, ResponseContentPart::InputText { text } if mentions(text))
+                }),
+            },
+            _ => false,
+        }
+        }),
+    }
+}
+
+/// The public API's metadata limits: 16 pairs, 64-character keys, 512-character string values.
+const MAX_METADATA_PAIRS: usize = 16;
+const MAX_METADATA_KEY_CHARS: usize = 64;
+const MAX_METADATA_VALUE_CHARS: usize = 512;
+
+fn validate_metadata(metadata: &HashMap<String, Value>) -> Result<(), ValidationError> {
+    if metadata.len() > MAX_METADATA_PAIRS {
+        return Err(invalid(
+            "object_above_max_properties",
+            format!(
+                "Invalid 'metadata': too many properties. The object has {} properties, but the maximum is {MAX_METADATA_PAIRS}.",
+                metadata.len()
+            ),
+        ));
+    }
+    for (key, value) in metadata {
+        if key.chars().count() > MAX_METADATA_KEY_CHARS {
+            return Err(invalid(
+                "string_above_max_length",
+                format!(
+                    "Invalid 'metadata': a key is too long. Expected a key with a maximum length of {MAX_METADATA_KEY_CHARS}, but got one of {} characters instead.",
+                    key.chars().count()
+                ),
+            ));
+        }
+        if let Some(text) = value.as_str() {
+            if text.chars().count() > MAX_METADATA_VALUE_CHARS {
+                return Err(invalid(
+                    "string_above_max_length",
+                    format!(
+                        "Invalid 'metadata.{key}': string too long. Expected a string with maximum length {MAX_METADATA_VALUE_CHARS}, but got a string with length {} instead.",
+                        text.chars().count()
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The roles an input message may carry.
+const INPUT_MESSAGE_ROLES: [&str; 4] = ["assistant", "system", "developer", "user"];
+
+fn validate_input_message_role(role: &str) -> Result<(), ValidationError> {
+    if INPUT_MESSAGE_ROLES.contains(&role) {
+        return Ok(());
+    }
+    Err(invalid(
+        "invalid_value",
+        format!(
+            "Invalid value: '{role}'. Supported values are: 'assistant', 'system', 'developer', and 'user'."
+        ),
+    ))
 }
 
 // ============================================================================
@@ -3528,16 +3769,12 @@ fn validate_response_input(input: &ResponseInput) -> Result<(), ValidationError>
     match input {
         ResponseInput::Text(text) => {
             if text.is_empty() {
-                let mut e = ValidationError::new("input_text_empty");
-                e.message = Some("Input text cannot be empty".into());
-                return Err(e);
+                return Err(invalid("input_text_empty", "Input text cannot be empty"));
             }
         }
         ResponseInput::Items(items) => {
             if items.is_empty() {
-                let mut e = ValidationError::new("input_items_empty");
-                e.message = Some("Input items cannot be empty".into());
-                return Err(e);
+                return Err(invalid("input_items_empty", "Input items cannot be empty"));
             }
             // Validate each item has valid content
             for item in items {
@@ -3551,26 +3788,33 @@ fn validate_response_input(input: &ResponseInput) -> Result<(), ValidationError>
 /// Validates individual input items have valid content
 fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), ValidationError> {
     match item {
-        ResponseInputOutputItem::Message { content, .. } => {
+        ResponseInputOutputItem::Message { content, role, .. } => {
+            validate_input_message_role(role)?;
             if content.is_empty() {
-                let mut e = ValidationError::new("message_content_empty");
-                e.message = Some("Message content cannot be empty".into());
-                return Err(e);
+                return Err(invalid(
+                    "message_content_empty",
+                    "Message content cannot be empty",
+                ));
             }
         }
-        ResponseInputOutputItem::SimpleInputMessage { content, .. } => match content {
-            StringOrContentParts::String(s) if s.is_empty() => {
-                let mut e = ValidationError::new("message_content_empty");
-                e.message = Some("Message content cannot be empty".into());
-                return Err(e);
+        ResponseInputOutputItem::SimpleInputMessage { content, role, .. } => {
+            validate_input_message_role(role)?;
+            match content {
+                StringOrContentParts::String(s) if s.is_empty() => {
+                    return Err(invalid(
+                        "message_content_empty",
+                        "Message content cannot be empty",
+                    ));
+                }
+                StringOrContentParts::Array(parts) if parts.is_empty() => {
+                    return Err(invalid(
+                        "message_content_empty",
+                        "Message content parts cannot be empty",
+                    ));
+                }
+                _ => {}
             }
-            StringOrContentParts::Array(parts) if parts.is_empty() => {
-                let mut e = ValidationError::new("message_content_empty");
-                e.message = Some("Message content parts cannot be empty".into());
-                return Err(e);
-            }
-            _ => {}
-        },
+        }
         ResponseInputOutputItem::Reasoning { .. } => {
             // Reasoning content can be empty - no validation needed
         }
@@ -3589,14 +3833,16 @@ fn validate_input_item(item: &ResponseInputOutputItem) -> Result<(), ValidationE
         ResponseInputOutputItem::CustomToolCall { .. } => {}
         ResponseInputOutputItem::CustomToolCallOutput { output, .. } => match output {
             CustomToolCallOutputContent::Text(s) if s.is_empty() => {
-                let mut e = ValidationError::new("custom_tool_call_output_empty");
-                e.message = Some("Custom tool call output cannot be empty".into());
-                return Err(e);
+                return Err(invalid(
+                    "custom_tool_call_output_empty",
+                    "Custom tool call output cannot be empty",
+                ));
             }
             CustomToolCallOutputContent::Parts(parts) if parts.is_empty() => {
-                let mut e = ValidationError::new("custom_tool_call_output_empty");
-                e.message = Some("Custom tool call output parts cannot be empty".into());
-                return Err(e);
+                return Err(invalid(
+                    "custom_tool_call_output_empty",
+                    "Custom tool call output parts cannot be empty",
+                ));
             }
             _ => {}
         },
@@ -3647,14 +3893,39 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
     let mut seen_mcp_labels: HashSet<String> = HashSet::new();
 
     for (idx, tool) in tools.iter().enumerate() {
+        match tool {
+            // Function parameters are a JSON Schema object (the strict-mode
+            // pin on additionalProperties is a public-API rule applied under
+            // the OpenAI vendor profile in the cross-parameter validation).
+            ResponseTool::Function(function_tool) => {
+                let function = &function_tool.function;
+                if !function.parameters.is_object() {
+                    return Err(invalid(
+                        "invalid_type",
+                        format!(
+                            "Invalid type for 'tools[{idx}].parameters': expected an object, but got {} instead.",
+                            json_type_name(&function.parameters)
+                        ),
+                    ));
+                }
+            }
+            // The hosted local_shell tool is not served by the gateway, and the
+            // public API no longer accepts it either.
+            ResponseTool::LocalShell => {
+                return Err(invalid(
+                    "tool_not_supported",
+                    format!("Invalid 'tools[{idx}]': the local_shell tool is not supported."),
+                ));
+            }
+            _ => {}
+        }
         if let ResponseTool::Mcp(mcp) = tool {
             let raw_label = mcp.server_label.as_str();
             if raw_label.is_empty() {
-                let mut e = ValidationError::new("missing_required_parameter");
-                e.message = Some(
-                    format!("Missing required parameter: 'tools[{idx}].server_label'.").into(),
-                );
-                return Err(e);
+                return Err(invalid(
+                    "missing_required_parameter",
+                    format!("Missing required parameter: 'tools[{idx}].server_label'."),
+                ));
             }
 
             // OpenAI spec-compatible validation: require a non-empty label that starts with a
@@ -3664,38 +3935,32 @@ fn validate_response_tools(tools: &[ResponseTool]) -> Result<(), ValidationError
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
             if !valid {
-                let mut e = ValidationError::new("invalid_server_label");
-                e.message = Some(
+                return Err(invalid(
+                    "invalid_server_label",
                     format!(
                         "Invalid input {raw_label}: 'server_label' must start with a letter and consist of only letters, digits, '-' and '_'"
-                    )
-                    .into(),
-                );
-                return Err(e);
+                    ),
+                ));
             }
 
             let normalized = raw_label.to_lowercase();
             if !seen_mcp_labels.insert(normalized) {
-                let mut e = ValidationError::new("mcp_tool_duplicate_server_label");
-                e.message = Some(
-                    format!("Duplicate MCP server_label '{raw_label}' found in 'tools' parameter.")
-                        .into(),
-                );
-                return Err(e);
+                return Err(invalid(
+                    "mcp_tool_duplicate_server_label",
+                    format!("Duplicate MCP server_label '{raw_label}' found in 'tools' parameter."),
+                ));
             }
 
             // One of `server_url` or `connector_id` is required, and the two
             // are mutually exclusive. Reject payloads that set both so
             // downstream target resolution is unambiguous.
             if mcp.server_url.is_some() && mcp.connector_id.is_some() {
-                let mut e = ValidationError::new("mcp_tool_conflicting_targets");
-                e.message = Some(
+                return Err(invalid(
+                    "mcp_tool_conflicting_targets",
                     format!(
                         "MCP tool with server_label '{raw_label}' sets both 'server_url' and 'connector_id'; exactly one is required."
-                    )
-                    .into(),
-                );
-                return Err(e);
+                    ),
+                ));
             }
         }
     }
@@ -3708,6 +3973,18 @@ fn validate_text_format(text: &TextConfig) -> Result<(), ValidationError> {
         validate_json_schema_shape(name, schema)?;
     }
     Ok(())
+}
+
+/// The JSON type name used in validation messages.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 /// Normalize a SimpleInputMessage to a proper Message item
@@ -3750,6 +4027,117 @@ pub fn normalize_input_item(item: &ResponseInputOutputItem) -> ResponseInputOutp
     }
 }
 
+/// `items` without the tool outputs whose call is not among them. The newest
+/// items of a long conversation can begin between a call and its output, and
+/// an output of a call the model never made is no history an engine-side
+/// builder renders (one refuses it, a chat template sees a tool result nothing
+/// asked for). Every other item keeps its place.
+pub fn without_outputs_of_missing_calls(
+    items: Vec<ResponseInputOutputItem>,
+) -> Vec<ResponseInputOutputItem> {
+    let calls: HashSet<String> = items
+        .iter()
+        .filter_map(tool_call_id)
+        .map(str::to_string)
+        .collect();
+    items
+        .into_iter()
+        .filter(|item| tool_output_call_id(item).is_none_or(|call_id| calls.contains(call_id)))
+        .collect()
+}
+
+/// `items` from their first turn boundary on: the first message the client
+/// sent (a user, developer or system message), or, when no client message is
+/// among them (one long turn of the model's calls), the first tool call with
+/// its output (one an output among them answers, one that carries its
+/// output, a hosted call with its output or its failure), with the reasoning
+/// right before that call. The newest items of a long conversation can begin
+/// inside a turn, with the tail of a turn whose request is not among them:
+/// the answer to a question the model does not see, the output of a call it
+/// did not make. What is before the first boundary is left out, a call with
+/// its output before the client's first message included (it is the tail of
+/// the turn the cut split, and a strict chat template reads a conversation
+/// that opens with the client); items with no boundary come back as they are.
+pub fn from_turn_boundary(items: Vec<ResponseInputOutputItem>) -> Vec<ResponseInputOutputItem> {
+    let boundary = items.iter().position(is_client_message).or_else(|| {
+        let answered: HashSet<&str> = items.iter().filter_map(tool_output_call_id).collect();
+        items
+            .iter()
+            .position(|item| is_answered_call(item, &answered))
+    });
+    let Some(boundary) = boundary else {
+        return items;
+    };
+    let mut start = boundary;
+    if !is_client_message(&items[boundary]) {
+        // the reasoning that led to the call is the call's
+        while start > 0 && matches!(items[start - 1], ResponseInputOutputItem::Reasoning { .. }) {
+            start -= 1;
+        }
+    }
+    if start == 0 {
+        return items;
+    }
+    items.into_iter().skip(start).collect()
+}
+
+/// Whether `item` is a message the client sent (a user, developer or system
+/// message): the start of a turn.
+fn is_client_message(item: &ResponseInputOutputItem) -> bool {
+    match item {
+        ResponseInputOutputItem::Message { role, .. }
+        | ResponseInputOutputItem::SimpleInputMessage { role, .. } => role.as_str() != "assistant",
+        _ => false,
+    }
+}
+
+/// Whether `item` is a tool call with its output: a call an output among the
+/// items answers (`answered` holds their call ids), a call that carries its
+/// output, or a hosted call whose output, or whose failure, is in the item
+/// (one still in progress is a call without its output).
+fn is_answered_call(item: &ResponseInputOutputItem, answered: &HashSet<&str>) -> bool {
+    match item {
+        ResponseInputOutputItem::FunctionToolCall {
+            output: Some(_), ..
+        } => true,
+        ResponseInputOutputItem::McpCall {
+            output,
+            error,
+            status,
+            ..
+        } => output.is_some() || error.is_some() || status.as_deref() == Some("failed"),
+        _ => tool_call_id(item).is_some_and(|call_id| answered.contains(call_id)),
+    }
+}
+
+/// The call id of a tool call the model made that a separate output item
+/// answers.
+fn tool_call_id(item: &ResponseInputOutputItem) -> Option<&str> {
+    match item {
+        ResponseInputOutputItem::FunctionToolCall { call_id, .. }
+        | ResponseInputOutputItem::CustomToolCall { call_id, .. }
+        | ResponseInputOutputItem::ComputerCall { call_id, .. }
+        | ResponseInputOutputItem::ShellCall { call_id, .. }
+        | ResponseInputOutputItem::ApplyPatchCall { call_id, .. }
+        | ResponseInputOutputItem::LocalShellCall { call_id, .. } => Some(call_id),
+        _ => None,
+    }
+}
+
+/// The call id a tool output item answers (a local shell output names its
+/// call's id as `id`).
+fn tool_output_call_id(item: &ResponseInputOutputItem) -> Option<&str> {
+    match item {
+        ResponseInputOutputItem::FunctionCallOutput { call_id, .. }
+        | ResponseInputOutputItem::CustomToolCallOutput { call_id, .. }
+        | ResponseInputOutputItem::ComputerCallOutput { call_id, .. }
+        | ResponseInputOutputItem::ShellCallOutput { call_id, .. }
+        | ResponseInputOutputItem::ApplyPatchCallOutput { call_id, .. } => Some(call_id),
+        ResponseInputOutputItem::LocalShellCallOutput { id, .. } => Some(id),
+        _ => None,
+    }
+}
+
 pub fn generate_id(prefix: &str) -> String {
     use rand::Rng;
     let mut rng = rand::rng();
@@ -3760,6 +4148,15 @@ pub fn generate_id(prefix: &str) -> String {
     format!("{prefix}_{hex_string}")
 }
 
+/// The Response object of `POST /v1/responses`.
+///
+/// The public API returns every field of this object on every response
+/// (`null` when a request parameter was not set), and the public schema marks
+/// `error`, `instructions`, `top_p`, `incomplete_details`, `temperature`,
+/// `tool_choice` and `tools` required; the `serialize_always` fields below
+/// therefore stay on the wire as `null` instead of being skipped. Only
+/// `conversation` is omitted when the response is not linked to one, as the
+/// public API does.
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 #[non_exhaustive]
@@ -3777,10 +4174,12 @@ pub struct ResponsesResponse {
     /// Completion timestamp (unix seconds). `None` until the response reaches
     /// a terminal state (`completed`, `incomplete`, `failed`, `cancelled`).
     #[serde(default)]
+    #[serialize_always]
     pub completed_at: Option<i64>,
 
     /// Whether the response was created in background mode.
     #[serde(default)]
+    #[serialize_always]
     pub background: Option<bool>,
 
     /// Conversation this response is linked to, if any.
@@ -3791,16 +4190,25 @@ pub struct ResponsesResponse {
     pub status: ResponseStatus,
 
     /// Error information if status is failed
+    #[serialize_always]
     pub error: Option<Value>,
 
     /// Incomplete details if the response was truncated (`incomplete` status).
+    #[serialize_always]
     pub incomplete_details: Option<IncompleteDetails>,
 
     /// System instructions used
+    #[serialize_always]
     pub instructions: Option<String>,
 
     /// Max output tokens setting
+    #[serialize_always]
     pub max_output_tokens: Option<u32>,
+
+    /// Maximum number of built-in tool calls allowed for the response.
+    #[serde(default)]
+    #[serialize_always]
+    pub max_tool_calls: Option<u32>,
 
     /// Model name
     pub model: String,
@@ -3814,43 +4222,85 @@ pub struct ResponsesResponse {
     pub parallel_tool_calls: bool,
 
     /// Previous response ID if this is a continuation
+    #[serialize_always]
     pub previous_response_id: Option<String>,
 
+    /// Prompt cache key the request carried.
+    #[serde(default)]
+    #[serialize_always]
+    pub prompt_cache_key: Option<String>,
+
+    /// Prompt cache retention the request carried.
+    #[serde(default)]
+    #[serialize_always]
+    pub prompt_cache_retention: Option<PromptCacheRetention>,
+
     /// Reasoning information
+    #[serialize_always]
     pub reasoning: Option<ReasoningInfo>,
+
+    /// Service tier the response was processed with.
+    #[serde(default)]
+    #[serialize_always]
+    pub service_tier: Option<ServiceTier>,
 
     /// Whether the response is stored
     #[serde(default = "default_true")]
     pub store: bool,
 
     /// Temperature setting used
+    #[serialize_always]
     pub temperature: Option<f32>,
 
     /// Text format settings
+    #[serialize_always]
     pub text: Option<TextConfig>,
 
-    /// Tool choice setting
-    #[serde(default = "default_tool_choice")]
-    pub tool_choice: String,
+    /// Tool choice setting, echoed as the request sent it: a bare string
+    /// (`"auto"`, `"none"`, `"required"`) or the object form (`{"type":
+    /// "function", "name": ...}`, `{"type": "allowed_tools", ...}`, a hosted
+    /// tool type), as the public API returns it.
+    #[serde(default)]
+    pub tool_choice: ResponsesToolChoice,
 
     /// Available tools
     #[serde(default)]
     pub tools: Vec<ResponseTool>,
 
+    /// Number of top logprobs requested (0 when none).
+    #[serde(default)]
+    #[serialize_always]
+    pub top_logprobs: Option<u32>,
+
     /// Top-p setting used
+    #[serialize_always]
     pub top_p: Option<f32>,
 
     /// Truncation strategy used
+    #[serialize_always]
     pub truncation: Option<String>,
 
     /// Usage information
+    #[serialize_always]
     pub usage: Option<ResponsesUsage>,
 
     /// User identifier
+    #[serialize_always]
     pub user: Option<String>,
 
     /// Safety identifier for content moderation
+    #[serialize_always]
     pub safety_identifier: Option<String>,
+
+    /// Frequency penalty used (0.0 when the request set none).
+    #[serde(default)]
+    #[serialize_always]
+    pub frequency_penalty: Option<f32>,
+
+    /// Presence penalty used (0.0 when the request set none).
+    #[serde(default)]
+    #[serialize_always]
+    pub presence_penalty: Option<f32>,
 
     /// Additional metadata
     #[serde(default)]
@@ -3859,10 +4309,6 @@ pub struct ResponsesResponse {
 
 fn default_object_type() -> String {
     "response".to_string()
-}
-
-fn default_tool_choice() -> String {
-    "auto".to_string()
 }
 
 impl ResponsesResponse {
@@ -4038,6 +4484,277 @@ impl ResponseReasoningContent {
 mod tests {
     use super::*;
 
+    /// The outputs of calls not among the items go; every other item keeps
+    /// its place.
+    #[test]
+    fn without_outputs_of_missing_calls_keeps_the_outputs_of_the_calls_present() {
+        let items: Vec<ResponseInputOutputItem> = serde_json::from_value(serde_json::json!([
+            {"type": "function_call_output", "call_id": "call_gone", "output": "1"},
+            {"type": "message", "id": "msg_1", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call", "call_id": "call_kept", "name": "calc",
+             "arguments": "{}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call_kept", "output": "2"},
+            {"type": "custom_tool_call_output", "call_id": "call_gone_too", "output": "3"},
+            {"type": "local_shell_call_output", "id": "call_gone_shell", "output": "4"},
+            {"type": "message", "id": "msg_2", "role": "assistant",
+             "content": [{"type": "output_text", "text": "ok", "annotations": []}]},
+        ]))
+        .expect("the items deserialize");
+
+        let kept = without_outputs_of_missing_calls(items);
+
+        let kinds: Vec<String> = kept
+            .iter()
+            .map(|item| {
+                serde_json::to_value(item).expect("an item serializes")["type"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "message",
+                "function_call",
+                "function_call_output",
+                "message"
+            ]
+        );
+        assert!(matches!(
+            &kept[2],
+            ResponseInputOutputItem::FunctionCallOutput { call_id, .. } if call_id == "call_kept"
+        ));
+    }
+
+    fn items(value: Value) -> Vec<ResponseInputOutputItem> {
+        serde_json::from_value(value).expect("the items deserialize")
+    }
+
+    /// The kind of each item, with the role of a message.
+    fn kinds(items: &[ResponseInputOutputItem]) -> Vec<String> {
+        items
+            .iter()
+            .map(|item| match item {
+                ResponseInputOutputItem::Message { role, .. }
+                | ResponseInputOutputItem::SimpleInputMessage { role, .. } => {
+                    format!("message:{role}")
+                }
+                other => serde_json::to_value(other).expect("an item serializes")["type"]
+                    .as_str()
+                    .unwrap_or("?")
+                    .to_string(),
+            })
+            .collect()
+    }
+
+    /// A window that begins with the tail of a turn (the output of a call
+    /// before it, the assistant's answer) begins at the client's next
+    /// message, whichever role the client wrote it as; everything from there
+    /// on keeps its place.
+    #[test]
+    fn from_turn_boundary_begins_at_the_first_client_message() {
+        let items = items(serde_json::json!([
+            {"type": "function_call_output", "call_id": "call_gone", "output": "1"},
+            {"type": "message", "id": "msg_1", "role": "assistant",
+             "content": [{"type": "output_text", "text": "the tail of a turn", "annotations": []}]},
+            {"role": "developer", "content": "a note"},
+            {"type": "message", "id": "msg_2", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]},
+            {"type": "function_call", "call_id": "call_kept", "name": "calc",
+             "arguments": "{}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call_kept", "output": "2"},
+        ]));
+
+        let kept = from_turn_boundary(items);
+
+        assert_eq!(
+            kinds(&kept),
+            [
+                "message:developer",
+                "message:user",
+                "function_call",
+                "function_call_output"
+            ]
+        );
+    }
+
+    /// A window with no client message (one long turn of the model's calls)
+    /// begins at its first call with its output, with the reasoning that led
+    /// to it: the output of the call before them and the model's aside go,
+    /// the rest keeps its place, an open call at the end included.
+    #[test]
+    fn from_turn_boundary_begins_at_a_call_with_its_output_and_its_reasoning() {
+        let items = items(serde_json::json!([
+            {"type": "function_call_output", "call_id": "call_gone", "output": "1"},
+            {"type": "message", "id": "msg_1", "role": "assistant",
+             "content": [{"type": "output_text", "text": "let me check", "annotations": []}]},
+            {"type": "reasoning", "id": "rs_1", "summary": [],
+             "content": [{"type": "reasoning_text", "text": "thinking"}]},
+            {"type": "function_call", "call_id": "call_kept", "name": "calc",
+             "arguments": "{}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call_kept", "output": "2"},
+            {"type": "function_call", "call_id": "call_open", "name": "calc",
+             "arguments": "{}", "status": "in_progress"},
+        ]));
+
+        let kept = from_turn_boundary(items);
+
+        assert_eq!(
+            kinds(&kept),
+            [
+                "reasoning",
+                "function_call",
+                "function_call_output",
+                "function_call"
+            ]
+        );
+    }
+
+    /// A call with its output before the client's first message is the tail
+    /// of the turn the cut split: the window begins at that message, not at
+    /// the call, whichever row the cut landed on.
+    #[test]
+    fn from_turn_boundary_passes_a_call_with_its_output_before_the_first_client_message() {
+        let items = items(serde_json::json!([
+            {"type": "function_call", "call_id": "call_13", "name": "calc",
+             "arguments": "{}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call_13", "output": "1"},
+            {"type": "message", "id": "msg_1", "role": "assistant",
+             "content": [{"type": "output_text", "text": "the answer of turn 13", "annotations": []}]},
+            {"type": "message", "id": "msg_2", "role": "user",
+             "content": [{"type": "input_text", "text": "turn 14"}]},
+            {"type": "function_call", "call_id": "call_14", "name": "calc",
+             "arguments": "{}", "status": "completed"},
+            {"type": "function_call_output", "call_id": "call_14", "output": "2"},
+        ]));
+
+        let kept = from_turn_boundary(items);
+
+        assert_eq!(
+            kinds(&kept),
+            ["message:user", "function_call", "function_call_output"]
+        );
+    }
+
+    /// A hosted call with its output, or with its failure, is a boundary; one
+    /// still in progress is a call without its output and is none. A window
+    /// with no boundary, and one already at a boundary, come back as they are.
+    #[test]
+    fn from_turn_boundary_takes_a_hosted_call_and_keeps_a_window_without_one() {
+        let answer = |text: &str| {
+            serde_json::json!({"type": "message", "id": "msg", "role": "assistant",
+                "content": [{"type": "output_text", "text": text, "annotations": []}]})
+        };
+        let hosted = items(serde_json::json!([
+            answer("the tail of a turn"),
+            {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "docs",
+             "arguments": "{}", "output": "found", "status": "completed"},
+            answer("found it"),
+        ]));
+        assert_eq!(
+            kinds(&from_turn_boundary(hosted)),
+            ["mcp_call", "message:assistant"]
+        );
+
+        let failed = items(serde_json::json!([
+            answer("the tail of a turn"),
+            {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "docs",
+             "arguments": "{}", "status": "failed"},
+            answer("it failed"),
+        ]));
+        assert_eq!(
+            kinds(&from_turn_boundary(failed)),
+            ["mcp_call", "message:assistant"]
+        );
+
+        let in_progress = items(serde_json::json!([
+            answer("the tail of a turn"),
+            {"type": "mcp_call", "id": "mcp_1", "name": "search", "server_label": "docs",
+             "arguments": "{}", "status": "in_progress"},
+            answer("still looking"),
+        ]));
+        assert_eq!(
+            kinds(&from_turn_boundary(in_progress)),
+            ["message:assistant", "mcp_call", "message:assistant"]
+        );
+
+        let tail_only = items(serde_json::json!([
+            answer("the tail of a turn"),
+            {"type": "reasoning", "id": "rs_1", "summary": [],
+             "content": [{"type": "reasoning_text", "text": "thinking"}]},
+        ]));
+        assert_eq!(
+            kinds(&from_turn_boundary(tail_only)),
+            ["message:assistant", "reasoning"]
+        );
+
+        let whole = items(serde_json::json!([
+            {"type": "message", "id": "msg_1", "role": "user",
+             "content": [{"type": "input_text", "text": "hi"}]},
+            answer("hello"),
+        ]));
+        assert_eq!(
+            kinds(&from_turn_boundary(whole)),
+            ["message:user", "message:assistant"]
+        );
+    }
+
+    /// The Responses API usage of a chat-style usage: both detail objects
+    /// present, zero included, the cached and reasoning counts from the
+    /// details the usage carries.
+    #[test]
+    fn response_usage_from_a_usage_carries_both_detail_objects() {
+        let usage = serde_json::to_value(ResponseUsage::from(
+            &Usage::from_counts(71, 16)
+                .with_cached_tokens(5)
+                .with_reasoning_tokens(3),
+        ))
+        .expect("a JSON usage");
+        assert_eq!(
+            usage,
+            serde_json::json!({
+                "input_tokens": 71,
+                "output_tokens": 16,
+                "total_tokens": 87,
+                "input_tokens_details": {"cached_tokens": 5},
+                "output_tokens_details": {"reasoning_tokens": 3},
+            })
+        );
+        let plain = serde_json::to_value(ResponseUsage::from(&Usage::from_counts(71, 16)))
+            .expect("a JSON usage");
+        assert_eq!(
+            plain["input_tokens_details"],
+            serde_json::json!({"cached_tokens": 0})
+        );
+        assert_eq!(
+            plain["output_tokens_details"],
+            serde_json::json!({"reasoning_tokens": 0})
+        );
+    }
+
+    /// Codex puts `client_metadata` on every request: it must parse, and it
+    /// must not be forwarded to the workers.
+    #[test]
+    fn client_metadata_is_accepted_and_not_forwarded() {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m",
+            "input": "hi",
+            "client_metadata": {"session_id": "s", "x-codex-window-id": "s:0"},
+        }))
+        .expect("client_metadata parses");
+        assert_eq!(
+            request
+                .client_metadata
+                .as_ref()
+                .and_then(|m| m.get("session_id")),
+            Some(&Value::from("s"))
+        );
+        let forwarded = serde_json::to_value(&request).expect("a JSON request");
+        assert!(forwarded.get("client_metadata").is_none());
+    }
+
     /// Lock `as_str()` to the canonical serde tag for the unit variants
     /// — drift between the two would produce inconsistent wire labels
     /// across dispatch paths and serializers.
@@ -4091,5 +4808,112 @@ mod tests {
         }
         let param: ResponseReasoningParam = serde_json::from_value(serde_json::json!({})).unwrap();
         assert_eq!(param.effort, Some(ReasoningEffort::Medium));
+    }
+
+    /// The routing text of a Responses request: a text input as is; the
+    /// items' text parts in order, joined by one space, images, files and
+    /// refusals skipped; a simple message's string or its parts; a reasoning
+    /// item's text.
+    #[test]
+    fn the_routing_text_reads_every_text_part_once_in_order() {
+        let request = ResponsesRequest {
+            input: ResponseInput::Items(vec![
+                ResponseInputOutputItem::Message {
+                    id: "m1".to_string(),
+                    role: "user".to_string(),
+                    content: vec![
+                        ResponseContentPart::InputText {
+                            text: "one".to_string(),
+                        },
+                        ResponseContentPart::InputImage {
+                            detail: None,
+                            file_id: None,
+                            image_url: Some("https://a/1.png".to_string()),
+                        },
+                        ResponseContentPart::OutputText {
+                            text: "two".to_string(),
+                            annotations: vec![],
+                            logprobs: None,
+                        },
+                        ResponseContentPart::Refusal {
+                            refusal: "no".to_string(),
+                        },
+                    ],
+                    status: None,
+                    phase: None,
+                },
+                ResponseInputOutputItem::SimpleInputMessage {
+                    content: StringOrContentParts::String("three".to_string()),
+                    role: "user".to_string(),
+                    r#type: None,
+                    phase: None,
+                },
+                ResponseInputOutputItem::SimpleInputMessage {
+                    content: StringOrContentParts::Array(vec![
+                        ResponseContentPart::InputFile {
+                            detail: None,
+                            file_data: None,
+                            file_id: Some("f".to_string()),
+                            file_url: None,
+                            filename: None,
+                        },
+                        ResponseContentPart::InputText {
+                            text: "four".to_string(),
+                        },
+                    ]),
+                    role: "user".to_string(),
+                    r#type: None,
+                    phase: None,
+                },
+                ResponseInputOutputItem::Reasoning {
+                    id: "r1".to_string(),
+                    summary: vec![],
+                    content: vec![ResponseReasoningContent::ReasoningText {
+                        text: "five".to_string(),
+                    }],
+                    encrypted_content: None,
+                    status: None,
+                },
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            request.extract_text_for_routing(),
+            "one two three four five"
+        );
+
+        let text = ResponsesRequest {
+            input: ResponseInput::Text("plain".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(text.extract_text_for_routing(), "plain");
+    }
+
+    /// Text-only content takes the text parts and refuses any other part.
+    #[test]
+    fn text_only_content_refuses_a_part_without_text() {
+        let with_image = StringOrContentParts::Array(vec![
+            ResponseContentPart::InputText {
+                text: "a".to_string(),
+            },
+            ResponseContentPart::InputImage {
+                detail: None,
+                file_id: None,
+                image_url: Some("https://a/1.png".to_string()),
+            },
+        ]);
+        assert!(with_image.to_text_only().is_err());
+
+        let text = StringOrContentParts::Array(vec![
+            ResponseContentPart::InputText {
+                text: "a".to_string(),
+            },
+            ResponseContentPart::OutputText {
+                text: "b".to_string(),
+                annotations: vec![],
+                logprobs: None,
+            },
+        ]);
+        assert_eq!(text.to_text_only().unwrap(), "ab");
     }
 }

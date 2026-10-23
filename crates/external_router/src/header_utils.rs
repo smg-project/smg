@@ -404,6 +404,10 @@ pub fn should_forward_request_header(name: &str) -> bool {
         || name.eq_ignore_ascii_case("traceparent")
         || name.eq_ignore_ascii_case("tracestate")
         || name.eq_ignore_ascii_case("x-smg-routing-key")
+        // SGLang's scheduling priority, read by an engine started with
+        // SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES. The other x-override-* headers stay
+        // blocked: the engine would apply them over the PD, DP-rank and rid fields.
+        || name.eq_ignore_ascii_case("x-override-priority")
         || name
             .get(..REQUEST_ID_PREFIX.len())
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case(REQUEST_ID_PREFIX))
@@ -411,6 +415,8 @@ pub fn should_forward_request_header(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use rustls::crypto::ring;
+
     use super::*;
 
     #[test]
@@ -426,9 +432,20 @@ mod tests {
         assert!(is_smg_owned_error_code_header("X-SMG-Error-Code"));
     }
 
+    /// The tests' HTTP client, the process-level TLS crypto provider
+    /// installed first; the request builders under test come from it.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a test binary's client factory; the process TLS crypto provider is installed first"
+    )]
+    fn client() -> reqwest::Client {
+        let _ = ring::default_provider().install_default();
+        reqwest::Client::new()
+    }
+
     #[test]
     fn apply_forwarded_request_headers_user_auth_wins_without_duplicate() {
-        let client = reqwest::Client::new();
+        let client = client();
         let mut headers = HeaderMap::new();
         headers.insert(
             http::header::AUTHORIZATION,
@@ -462,7 +479,7 @@ mod tests {
 
     #[test]
     fn apply_forwarded_request_headers_falls_back_to_worker_key() {
-        let client = reqwest::Client::new();
+        let client = client();
         let headers = HeaderMap::new(); // caller sent no Authorization
         let worker_key = "worker-key".to_string();
 
@@ -541,6 +558,8 @@ mod tests {
         assert!(should_forward_request_header("X-SMG-Routing-Key"));
         assert!(should_forward_request_header("anthropic-version"));
         assert!(should_forward_request_header("Anthropic-Beta"));
+        assert!(should_forward_request_header("x-override-priority"));
+        assert!(should_forward_request_header("X-Override-Priority"));
     }
 
     #[test]
@@ -558,6 +577,16 @@ mod tests {
         assert!(!should_forward_request_header("cookie"));
         assert!(!should_forward_request_header("x-custom-header"));
         assert!(!should_forward_request_header("x-api-key"));
+        // Of the engine's x-override-* headers only the priority is forwarded.
+        assert!(!should_forward_request_header("x-override-rid"));
+        assert!(!should_forward_request_header("x-override-bootstrap-host"));
+        assert!(!should_forward_request_header("x-override-bootstrap-port"));
+        assert!(!should_forward_request_header("x-override-bootstrap-room"));
+        assert!(!should_forward_request_header("x-override-routed-dp-rank"));
+        assert!(!should_forward_request_header(
+            "x-override-disagg-prefill-dp-rank"
+        ));
+        assert!(!should_forward_request_header("x-override-conversation-id"));
     }
 
     #[test]

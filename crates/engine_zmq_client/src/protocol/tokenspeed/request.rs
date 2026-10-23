@@ -10,9 +10,12 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 
-use crate::protocol::{
-    positional::{drain_trailing, expect_tag, next_field},
-    tokenspeed::{multimodal::TokenSpeedWireMmInputs, sampling::SamplingParams},
+use crate::{
+    codec::tensor::{TensorFields, WireArrayData},
+    protocol::{
+        positional::{drain_trailing, expect_tag, next_field},
+        tokenspeed::{multimodal::TokenSpeedWireMmInputs, sampling::SamplingParams},
+    },
 };
 
 /// The msgspec tag for [`TokenizedGenerateReqInput`] (element 0 on the wire).
@@ -113,6 +116,17 @@ impl Default for TokenizedGenerateReqInput {
             input_ids_unpadded: None,
             multimodal_inputs: None,
         }
+    }
+}
+
+impl TensorFields for TokenizedGenerateReqInput {
+    /// The multimodal payload's tensors; a text request has none.
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        self.multimodal_inputs.for_each_tensor(visit);
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        self.multimodal_inputs.for_each_tensor_mut(visit);
     }
 }
 

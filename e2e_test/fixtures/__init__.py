@@ -3,6 +3,7 @@
 This package contains modular pytest fixtures split by responsibility:
 - hooks.py: Pytest collection hooks and marker registration
 - setup_backend.py: Backend setup fixtures (class/function-scoped)
+- mock_answers.py: The answers a test states for the mock engine
 - markers.py: Helper utilities for marker extraction
 
 """
@@ -11,6 +12,7 @@ This package contains modular pytest fixtures split by responsibility:
 from .hooks import (
     pytest_collection_modifyitems,
     pytest_configure,
+    pytest_runtest_makereport,
     pytest_runtest_setup,
     pytest_sessionfinish,
 )
@@ -19,17 +21,20 @@ from .hooks import (
 from .markers import get_marker_kwargs, get_marker_value
 
 # Fixtures (imported by conftest.py)
+from .mock_answers import mock_answers
 from .setup_backend import backend_router, setup_backend
 
 __all__ = [
     # Hooks
     "pytest_collection_modifyitems",
     "pytest_configure",
+    "pytest_runtest_makereport",
     "pytest_runtest_setup",
     "pytest_sessionfinish",
     # Backend fixtures
     "setup_backend",
     "backend_router",
+    "mock_answers",
     # Marker helpers
     "get_marker_value",
     "get_marker_kwargs",

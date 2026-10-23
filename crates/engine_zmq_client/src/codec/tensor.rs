@@ -3,6 +3,8 @@
 //
 // Mirrors Python `vllm/v1/serial_utils.py` `encode_ndarray`/`encode_tensor`.
 
+use std::{collections::BTreeMap, fmt};
+
 use bytemuck::{cast_slice, Pod};
 use bytes::Bytes;
 use half::{bf16, f16};
@@ -10,9 +12,12 @@ use rmpv::Value;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
-use super::dtype::{
-    convert_to_u32, decode_error, decode_f32_vec, decode_float_vec, decode_i32_vec, decode_i64_vec,
-    parse_dtype, Endianness, ScalarType,
+use super::{
+    dtype::{
+        convert_to_u32, decode_error, decode_f32_vec, decode_float_vec, decode_i32_vec,
+        decode_i64_vec, parse_dtype, Endianness, ScalarType,
+    },
+    encode_msgpack,
 };
 use crate::error::Result;
 
@@ -179,10 +184,9 @@ impl WireNdArray {
         }
     }
 
-    // NOTE: send-side aux-frame extraction (moving large inline tensors into
-    // ordered aux frames) is added with the typed multimodal module — text
-    // requests carry no tensors. The receive-side resolution below is used now
-    // (logprobs arrays may arrive as aux frames).
+    // The send side moves large tensors into aux frames through
+    // `encode_with_aux_frames`; the receive side resolves them with
+    // `resolve_array_bytes` (logprobs arrays may arrive as aux frames too).
 }
 
 /// Validate that the shape product matches the data length.
@@ -267,6 +271,128 @@ impl Serialize for WireArrayData {
             }
         }
     }
+}
+
+/// Tensors of at least this many bytes leave the primary msgpack payload and
+/// travel as auxiliary frames of the same message, sharing their [`Bytes`]
+/// storage ([`encode_with_aux_frames`]); smaller ones stay inline, where the
+/// copy into the payload costs less than the clone of the payload's metadata
+/// the extraction takes.
+pub const TENSOR_AUX_MIN_BYTES: usize = 32 * 1024;
+
+/// A wire value that carries tensors. A request payload implements it over
+/// its own shape (nested lists, maps, masks); the send side moves large
+/// tensors into auxiliary frames through it without knowing that shape.
+pub trait TensorFields {
+    /// Visit every tensor payload, in wire order.
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData));
+    /// Visit every tensor payload mutably, in the same order.
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData));
+}
+
+impl TensorFields for WireNdArray {
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        visit(&self.data);
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        visit(&mut self.data);
+    }
+}
+
+impl<T: TensorFields> TensorFields for Option<T> {
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        if let Some(value) = self {
+            value.for_each_tensor(visit);
+        }
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        if let Some(value) = self {
+            value.for_each_tensor_mut(visit);
+        }
+    }
+}
+
+impl<T: TensorFields> TensorFields for Vec<T> {
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        for value in self {
+            value.for_each_tensor(visit);
+        }
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        for value in self {
+            value.for_each_tensor_mut(visit);
+        }
+    }
+}
+
+impl<K, T: TensorFields> TensorFields for BTreeMap<K, T> {
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        for value in self.values() {
+            value.for_each_tensor(visit);
+        }
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        for value in self.values_mut() {
+            value.for_each_tensor_mut(visit);
+        }
+    }
+}
+
+/// Where a payload's tensors go on the wire, decided by one scan before
+/// anything is cloned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TensorPlacement {
+    /// Every tensor stays inline: none reaches [`TENSOR_AUX_MIN_BYTES`], or
+    /// the payload already addresses auxiliary frames (a caller's own
+    /// indices, which a second extraction would rebase).
+    Inline,
+    /// At least one tensor leaves the payload as an auxiliary frame.
+    AuxFrames,
+}
+
+/// The placement of `payload`'s tensors.
+pub fn tensor_placement<T: TensorFields + ?Sized>(payload: &T) -> TensorPlacement {
+    let mut large = false;
+    let mut indexed = false;
+    payload.for_each_tensor(&mut |data| match data {
+        WireArrayData::AuxIndex(_) => indexed = true,
+        WireArrayData::RawView(bytes) => large |= bytes.len() >= TENSOR_AUX_MIN_BYTES,
+    });
+    if large && !indexed {
+        TensorPlacement::AuxFrames
+    } else {
+        TensorPlacement::Inline
+    }
+}
+
+/// Encode `payload` as msgpack with its large tensors as auxiliary frames, in
+/// visiting order and addressed one-based (frame 0 is the payload itself). A
+/// payload whose tensors stay inline ([`tensor_placement`]) is encoded as it
+/// is, without a clone; `payload` is never changed either way.
+pub fn encode_with_aux_frames<T>(payload: &T) -> Result<(Vec<u8>, Vec<Bytes>)>
+where
+    T: Serialize + Clone + TensorFields + fmt::Debug,
+{
+    if tensor_placement(payload) == TensorPlacement::Inline {
+        return Ok((encode_msgpack(payload)?, Vec::new()));
+    }
+    // Tensor storage is `Bytes`: the clone shares every buffer, and the
+    // frames below share them again.
+    let mut wire = payload.clone();
+    let mut frames = Vec::new();
+    wire.for_each_tensor_mut(&mut |data| {
+        if let WireArrayData::RawView(bytes) = data {
+            if bytes.len() >= TENSOR_AUX_MIN_BYTES {
+                frames.push(bytes.clone());
+                *data = WireArrayData::AuxIndex(frames.len());
+            }
+        }
+    });
+    Ok((encode_msgpack(&wire)?, frames))
 }
 
 /// A decoded rank-2 array with its dimensions.
@@ -585,6 +711,59 @@ mod tests {
         let wire = WireNdArray::from_i64(vec![1], vec![7]).unwrap();
         let error = decode_tensor_f32(wire, "t", &[]).unwrap_err();
         assert!(error.to_string().contains("expected dtype in"), "{error}");
+    }
+
+    /// A tensor leaves the payload at the auxiliary size and not below it;
+    /// a payload that already addresses frames keeps every tensor where it
+    /// is; the frames come in visiting order and share the tensors' storage,
+    /// and the payload the caller holds is untouched.
+    #[test]
+    fn large_tensors_leave_the_payload_as_frames_in_order_without_a_copy() {
+        let tensor = |n: usize| WireNdArray::from_raw("uint8", vec![n], vec![n as u8; n]);
+        let small = vec![tensor(0), tensor(255), tensor(TENSOR_AUX_MIN_BYTES - 1)];
+        assert_eq!(tensor_placement(&small), TensorPlacement::Inline);
+        let (payload, frames) = encode_with_aux_frames(&small).unwrap();
+        assert!(frames.is_empty());
+        assert_eq!(payload, encode_msgpack(&small).unwrap());
+
+        let mixed = vec![
+            tensor(TENSOR_AUX_MIN_BYTES),
+            tensor(16),
+            tensor(2 * TENSOR_AUX_MIN_BYTES),
+        ];
+        assert_eq!(tensor_placement(&mixed), TensorPlacement::AuxFrames);
+        let inline = encode_msgpack(&mixed).unwrap();
+        let (payload, frames) = encode_with_aux_frames(&mixed).unwrap();
+        assert_eq!(
+            frames.iter().map(Bytes::len).collect::<Vec<_>>(),
+            vec![TENSOR_AUX_MIN_BYTES, 2 * TENSOR_AUX_MIN_BYTES]
+        );
+        let storage = |array: &WireNdArray| array.data.as_raw_view().unwrap().as_ptr();
+        assert_eq!(frames[0].as_ptr(), storage(&mixed[0]));
+        assert_eq!(frames[1].as_ptr(), storage(&mixed[2]));
+        assert!(payload.len() < 64, "{} bytes", payload.len());
+        assert_eq!(
+            encode_msgpack(&mixed).unwrap(),
+            inline,
+            "the caller's value"
+        );
+        let decoded: Vec<WireNdArray> = rmp_serde::from_slice(&payload).unwrap();
+        assert_eq!(decoded[0].data, WireArrayData::AuxIndex(1));
+        assert_eq!(decoded[1].data, mixed[1].data);
+        assert_eq!(decoded[2].data, WireArrayData::AuxIndex(2));
+        let mut all = vec![Bytes::from(payload)];
+        all.extend(frames);
+        assert_eq!(
+            resolve_array_bytes(decoded[2].data.clone(), "t", &all).unwrap(),
+            *mixed[2].data.as_raw_view().unwrap()
+        );
+
+        let mut indexed = mixed.clone();
+        indexed[1].data = WireArrayData::AuxIndex(1);
+        assert_eq!(tensor_placement(&indexed), TensorPlacement::Inline);
+        let (payload, frames) = encode_with_aux_frames(&indexed).unwrap();
+        assert!(frames.is_empty());
+        assert_eq!(payload, encode_msgpack(&indexed).unwrap());
     }
 
     #[test]

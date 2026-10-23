@@ -3,7 +3,7 @@
 //!
 //! serde_json only ships compact (`{"a":1}`) and pretty (multi-line) formatters,
 //! neither of which matches `json.dumps`. The DeepSeek-V4.1 reference parser
-//! (and vLLM Python, SGLang) hand tool-call `arguments` back as `json.dumps`
+//! (and the serving engines' Python parsers) hand tool-call `arguments` back as `json.dumps`
 //! output, so a compact string would differ byte-for-byte from theirs. This is
 //! the same formatter `llm-tokenizer` uses for prompt rendering (`json_dumps.rs`),
 //! duplicated here so the parser crate does not pull in the tokenizer crate.

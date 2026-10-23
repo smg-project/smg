@@ -11,7 +11,7 @@ use crate::{
 /// An `AppContext` with an uninitialized worker job queue: submitted jobs are
 /// accepted and queued but never processed, so tests observe what discovery
 /// *submits* without spawning workflow background tasks.
-pub(super) fn create_test_app_context() -> Arc<AppContext> {
+pub(crate) fn create_test_app_context() -> Arc<AppContext> {
     use crate::{
         config::RouterConfig, middleware::TokenBucket,
         observability::inflight_tracker::InFlightRequestTracker,
@@ -29,7 +29,7 @@ pub(super) fn create_test_app_context() -> Arc<AppContext> {
     // Jobs submitted during tests will queue but not be processed
     Arc::new(AppContext {
         gateway_auth: AuthConfig::new(None),
-        client: reqwest::Client::new(),
+        client: crate::clients::http_client(),
         router_config: router_config.clone(),
         rate_limiter: Some(Arc::new(TokenBucket::new(1000, 1000))),
         rate_limit_manager: None,
@@ -56,6 +56,7 @@ pub(super) fn create_test_app_context() -> Arc<AppContext> {
         mcp_format_registry: openai_bridge::FormatRegistry::new(),
         tokenizer_registry: Arc::new(llm_tokenizer::registry::TokenizerRegistry::new()),
         multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
+        tokenizer_load_failures: Arc::default(),
         wasm_manager: None,
         worker_client_cache: Arc::new(crate::worker::WorkerHttpClientCache::new(&router_config)),
         worker_service: Arc::new(WorkerService::new(

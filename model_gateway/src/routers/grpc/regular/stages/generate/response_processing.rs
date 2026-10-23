@@ -2,17 +2,20 @@
 
 use std::{sync::Arc, time::Instant};
 
-use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use crate::routers::{
-    error,
-    grpc::{
-        common::stages::{helpers, ProcessStage, RateLimitCell},
-        context::{DispatchContext, FinalResponse},
-        regular::{processor, streaming},
-        spec::ResponseSpec,
+use crate::{
+    observability::metrics::metrics_labels,
+    routers::{
+        error,
+        grpc::{
+            common::stages::RateLimitCell,
+            context::{DispatchContext, FinalResponse},
+            regular::{processor, streaming},
+            spec::ResponseSpec,
+            utils::StreamSource,
+        },
     },
 };
 
@@ -36,9 +39,11 @@ impl GenerateResponseProcessingStage {
     }
 }
 
-#[async_trait]
-impl ProcessStage for GenerateResponseProcessingStage {
-    async fn process(
+impl GenerateResponseProcessingStage {
+    /// The stage's work. The chat+generate dispatcher calls this directly, so
+    /// the stage's future lives inline in the dispatcher's: one box per stage
+    /// call, not a second one for a boxed trait method.
+    pub(crate) async fn process_result(
         &self,
         ctx: &mut DispatchContext,
         spec: ResponseSpec,
@@ -94,14 +99,19 @@ impl ProcessStage for GenerateResponseProcessingStage {
         if is_streaming {
             // Reserved (if tenant rate limiting is enabled): settled with real
             // usage inside the streaming processor on success, or abandoned
-            // via the attached ReservationAttachment's Drop below on early
-            // disconnect/error.
+            // on early disconnect/error by the reservation's safety net the
+            // processor hands the response body (ReservationAttachment's Drop).
             let reservation = ctx
                 .rate_limit_cell
                 .as_deref()
                 .and_then(RateLimitCell::take_for_streaming_handoff);
 
             // Streaming: Use StreamingProcessor and return SSE response
+            let source = StreamSource::new(
+                ctx.workers.as_ref(),
+                &dispatch,
+                metrics_labels::ENDPOINT_GENERATE,
+            );
             let response = self
                 .streaming_processor
                 .clone()
@@ -110,14 +120,11 @@ impl ProcessStage for GenerateResponseProcessingStage {
                     generate_request,
                     dispatch,
                     tokenizer,
-                    reservation.clone(),
+                    reservation,
+                    ctx.load_guards.take(),
+                    source,
                 )
                 .await;
-
-            // Attach load guards (and the reservation's disconnect/error
-            // safety net) to the response body for proper RAII lifecycle.
-            let response =
-                helpers::attach_response_guards(response, ctx.load_guards.take(), reservation);
 
             return Ok(Some(response));
         }
@@ -151,9 +158,5 @@ impl ProcessStage for GenerateResponseProcessingStage {
         ctx.response.final_response = Some(FinalResponse::Generate(result_array));
 
         Ok(None)
-    }
-
-    fn name(&self) -> &'static str {
-        "GenerateResponseProcessing"
     }
 }

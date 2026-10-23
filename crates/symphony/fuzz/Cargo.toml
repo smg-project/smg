@@ -1,0 +1,95 @@
+[package]
+name = "smg-symphony-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Coverage-guided fuzz targets for the Symphony parser"
+license = "Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[lib]
+name = "symphony_fuzz"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+openai-protocol = { path = "../../protocols" }
+symphony = { path = "..", package = "smg-symphony" }
+
+# Its own workspace: the targets build on nightly with coverage instrumentation, which the
+# repository's workspace does not require of its members.
+[workspace]
+members = ["."]
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+
+[[bin]]
+name = "any_table"
+path = "fuzz_targets/any_table.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "json_calls"
+path = "fuzz_targets/json_calls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tagged_calls"
+path = "fuzz_targets/tagged_calls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "keyed_calls"
+path = "fuzz_targets/keyed_calls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "attributed_calls"
+path = "fuzz_targets/attributed_calls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "message_calls"
+path = "fuzz_targets/message_calls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "xml_calls"
+path = "fuzz_targets/xml_calls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gemma_calls"
+path = "fuzz_targets/gemma_calls.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "pythonic_calls"
+path = "fuzz_targets/pythonic_calls.rs"
+test = false
+doc = false
+bench = false

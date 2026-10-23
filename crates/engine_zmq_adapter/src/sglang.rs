@@ -17,12 +17,14 @@ use engine_zmq_client::{
     },
 };
 use futures::Stream;
-use smg_grpc_client::{sglang_proto, vllm_proto as vllm};
+use smg_grpc_client::{constraint_failed_status, sglang_proto, vllm_proto as vllm};
 use tracing::warn;
 
 use crate::{
+    context_window::admit_prompt,
     fanout::fan_out_n,
     stream::{poll_mapped, MappedGenerateStream, StreamState},
+    structured_outputs::ConstraintRef,
 };
 
 /// Streaming generate output for one SGLang sub-request, mapping each
@@ -44,6 +46,11 @@ pub struct SglangGenerateStream {
     /// Whether the prompt logprobs went out on a chunk already (the proto
     /// carries them in the first token-bearing chunk only).
     input_logprobs_emitted: bool,
+    /// Selected candidate rows have no slot in the vLLM-proto intermediate.
+    /// Retain both views for the SGLang response: deltas on chunks, cumulative
+    /// rows on completion (including prefill-only scores with no output ids).
+    selected_logprobs: Vec<sglang_proto::TopLogProbs>,
+    selected_logprobs_delta: Vec<sglang_proto::TopLogProbs>,
 }
 
 impl SglangGenerateStream {
@@ -55,12 +62,51 @@ impl SglangGenerateStream {
             pending: None,
             reasoning_tokens: 0,
             input_logprobs_emitted: false,
+            selected_logprobs: Vec::new(),
+            selected_logprobs_delta: Vec::new(),
         }
     }
 
     /// Reasoning tokens the scheduler has counted for this choice so far.
     pub fn reasoning_tokens(&self) -> u32 {
         self.reasoning_tokens
+    }
+
+    /// The engine-side id of this choice's request.
+    pub fn request_id(&self) -> &str {
+        self.inner.request_id()
+    }
+
+    /// The data-parallel rank this choice's request went to; `None` for an
+    /// engine whose identity names no index.
+    pub fn engine_index(&self) -> Option<u32> {
+        self.inner.engine_index()
+    }
+
+    /// Convert a stream item without discarding SGLang-only score rows.
+    pub fn to_sglang_response(
+        &self,
+        request_id: &str,
+        response: vllm::GenerateResponse,
+    ) -> sglang_proto::GenerateResponse {
+        use sglang_proto::generate_response::Response;
+        let mut response = to_sglang_response(request_id, response, self.reasoning_tokens);
+        let (logprobs, selected) = match response.response.as_mut() {
+            Some(Response::Chunk(chunk)) => {
+                (&mut chunk.output_logprobs, &self.selected_logprobs_delta)
+            }
+            Some(Response::Complete(complete)) => {
+                (&mut complete.output_logprobs, &self.selected_logprobs)
+            }
+            None => return response,
+        };
+        if !selected.is_empty() {
+            logprobs
+                .get_or_insert_with(Default::default)
+                .token_ids_logprobs
+                .clone_from(selected);
+        }
+        response
     }
 
     /// Attach the accumulated prompt logprobs: once on the first token-bearing
@@ -96,6 +142,13 @@ impl SglangGenerateStream {
             }
             None => {}
         }
+    }
+
+    /// Whether the engine already finished this choice and its terminal
+    /// `Complete` is parked behind the chunk just yielded (the finish tick
+    /// carried new tokens).
+    pub fn has_parked_complete(&self) -> bool {
+        self.pending.is_some()
     }
 
     /// End this choice as aborted: the engine's own parked `Complete` when it
@@ -148,6 +201,7 @@ pub fn to_sglang_response(
             token_logprobs: lp.token_logprobs,
             token_ids: lp.token_ids,
             top_logprobs: top(lp.top_logprobs),
+            token_ids_logprobs: Vec::new(),
         })
     };
     let input_logprobs = |logprobs: Option<vllm::InputLogProbs>| {
@@ -216,6 +270,9 @@ impl MappedGenerateStream for SglangGenerateStream {
         &mut self,
         output: SglangOutput,
     ) -> Result<vllm::GenerateResponse, tonic::Status> {
+        if let Some(error) = output.selected_logprobs_error {
+            return Err(tonic::Status::internal(error));
+        }
         let state = &mut self.state;
         // The scheduler reports per-request counts directly (cumulative for
         // completions).
@@ -228,6 +285,17 @@ impl MappedGenerateStream for SglangGenerateStream {
         state.completion_tokens = output.completion_tokens;
         state.output_ids.extend(output.output_ids.iter().copied());
         self.reasoning_tokens = output.reasoning_tokens;
+        self.selected_logprobs_delta = output
+            .output_token_ids_logprobs_val
+            .iter()
+            .zip(&output.output_token_ids_logprobs_idx)
+            .map(|(values, token_ids)| sglang_proto::TopLogProbs {
+                values: values.iter().map(|&value| value as f32).collect(),
+                token_ids: token_ids.clone(),
+            })
+            .collect();
+        self.selected_logprobs
+            .extend(self.selected_logprobs_delta.iter().cloned());
         // Prompt logprobs ride the prefill tick (once per request; chunked
         // prefill may split them), in SGLang's shape: no value for the first
         // prompt token, ranked candidates per position when asked.
@@ -288,11 +356,19 @@ impl MappedGenerateStream for SglangGenerateStream {
 
         // SGLang has no separate error finish: a request it could not serve
         // (rejected by the plugin's validation, refused at admission, dropped
-        // from a full queue) ends as `abort` with the reason and, when the
-        // request is at fault, HTTP 400. The frontend never asked for it (its
-        // own aborts drop the stream first), so it is an error to the caller,
-        // not an empty success, with the status mapped as SGLang's gRPC
-        // servicer maps it.
+        // from a full queue) ends as `abort` with the reason and an HTTP-style
+        // status (400 when the request is at fault). The frontend never asked
+        // for it (its own aborts drop the stream first), so it is an error to
+        // the caller, not an empty success, with the status mapped by the one
+        // table the engine's front ends share (`scheduler_abort_status`). The
+        // one abort the scheduler itself attributes to the request's grammar
+        // (the plugin's `err_type` stamp on the scheduler's own grammar
+        // failure, see `GRAMMAR_REJECTED_ERR_TYPE`) is the constraint failing
+        // the request: the constraint-failure status every wire ends such a
+        // request with, which a router answers for the constraint and never
+        // replays. Every other abort, a status-less one included (the
+        // scheduler aborts every running request the same bare way on an
+        // abort-all), keeps the table's status: the wire does not say more.
         if output.finish_reason.as_deref() == Some("abort") {
             let message = format!(
                 "the scheduler aborted the request: {}",
@@ -301,11 +377,10 @@ impl MappedGenerateStream for SglangGenerateStream {
                     .as_deref()
                     .unwrap_or("no reason reported")
             );
-            return Err(match output.finish_status {
-                Some(400) => tonic::Status::invalid_argument(message),
-                Some(503) => tonic::Status::unavailable(message),
-                _ => tonic::Status::internal(message),
-            });
+            if output.finish_err_type.as_deref() == Some(GRAMMAR_REJECTED_ERR_TYPE) {
+                return Err(constraint_failed_status(message));
+            }
+            return Err(scheduler_abort_status(output.finish_status, message));
         }
         let finish = output.finish_reason.map(|reason| {
             (
@@ -365,24 +440,32 @@ pub(crate) fn fan_out_sglang_requests(
 /// Translate an SGLang proto `GenerateRequest` into the scheduler's
 /// `TokenizedGenerateReqInput`. ZMQ mode requires pre-tokenized input (SMG
 /// tokenizes upstream). The slim output carries sampled and prompt logprobs
-/// with their ranked candidates; what it has no columns for (hidden states,
-/// per-token-id logprobs, which the Python servicer drops silently) and what
+/// with their ranked and selected candidates; what it has no columns for
+/// (hidden states) and what
 /// the wire does not carry (multimodal payloads, PD bootstrap fields) is
-/// refused rather than silently dropped.
+/// refused rather than silently dropped. `max_model_len` is the context
+/// window the scheduler reported at the handshake: an empty prompt, or one
+/// that fills the window, is refused before it reaches the scheduler
+/// ([`admit_prompt`]).
 pub(crate) fn translate_request_sglang(
     req: sglang_proto::GenerateRequest,
+    max_model_len: u64,
 ) -> Result<TokenizedGenerateReqInput, String> {
     let input_ids = req
         .tokenized
         .map(|tokenized| tokenized.input_ids)
         .ok_or_else(|| "ZMQ mode requires pre-tokenized input; no input provided".to_string())?;
+    // The scheduler's own bound on the prompt applies only after admission
+    // (an abort with its reason; a cut down to the bound for a scheduler
+    // started with `--allow-auto-truncate`, whose servicer then passes no
+    // window here) and nothing of its own refuses an empty prompt. An unset
+    // `max_new_tokens` stays unset: the scheduler caps it at the remaining
+    // context itself.
+    admit_prompt(input_ids.len(), max_model_len)?;
     if req.mm_inputs.is_some() {
         return Err(
             "multimodal inputs are not supported over the SGLang ZMQ backend yet".to_string(),
         );
-    }
-    if !req.token_ids_logprob.is_empty() {
-        return Err("token_ids_logprob is not supported over the SGLang ZMQ backend".to_string());
     }
     if req.return_hidden_states {
         return Err("hidden states are not supported over the SGLang ZMQ backend".to_string());
@@ -406,6 +489,7 @@ pub(crate) fn translate_request_sglang(
         return_logprob: req.return_logprob,
         logprob_start_len: req.logprob_start_len,
         top_logprobs_num: u32::try_from(req.top_logprobs_num).unwrap_or(0),
+        token_ids_logprob: (!req.token_ids_logprob.is_empty()).then_some(req.token_ids_logprob),
         stream: req.stream,
         // Forwarded as the Python servicer forwards them: the scheduler
         // resolves the adapter id and runs the processor it was started with.
@@ -622,6 +706,44 @@ pub(crate) fn translate_sampling_sglang(sp: sglang_proto::SamplingParams) -> Sgl
     params
 }
 
+/// The request's constraint as the shared refusal reads it
+/// ([`crate::structured_outputs::refuse_unenforceable_constraint`]): the
+/// proto `constraint` one-of by kind, with its text.
+pub(crate) fn constraint_ref(sp: &sglang_proto::SamplingParams) -> Option<ConstraintRef<'_>> {
+    use sglang_proto::sampling_params::Constraint;
+    Some(match sp.constraint.as_ref()? {
+        Constraint::JsonSchema(schema) => ConstraintRef::JsonSchema(schema),
+        Constraint::Regex(regex) => ConstraintRef::Regex(regex),
+        Constraint::EbnfGrammar(grammar) => ConstraintRef::Ebnf(grammar),
+        Constraint::StructuralTag(tag) => ConstraintRef::StructuralTag(tag),
+    })
+}
+
+/// The `err_type` the plugin stamps on the scheduler's abort of a request
+/// whose grammar rejected a sampled token (`req.grammar.accept_token` raised
+/// in the scheduler's own grammar paths; the scheduler leaves that finish a
+/// bare `FINISH_ABORT()` that nothing on the wire tells from an abort-all).
+/// One name on both sides of the wire: the plugin's `GRAMMAR_REJECTED_ERR_TYPE`
+/// (`smg_grpc_servicer.sglang`) stamps it, this wire reads it.
+pub(crate) const GRAMMAR_REJECTED_ERR_TYPE: &str = "GrammarRejectedToken";
+
+/// The gRPC status for a request the scheduler aborted with an HTTP-style
+/// status: the table the engine's Python servicer uses for the same status,
+/// so the two front ends of one engine answer alike. 400 is the caller's
+/// fault, 404 a missing resource, 408 and 504 a deadline, 429 a full queue,
+/// 503 an unavailable engine; anything else, a missing status included, is
+/// internal.
+pub(crate) fn scheduler_abort_status(status: Option<u16>, message: String) -> tonic::Status {
+    match status {
+        Some(400) => tonic::Status::invalid_argument(message),
+        Some(404) => tonic::Status::not_found(message),
+        Some(408 | 504) => tonic::Status::deadline_exceeded(message),
+        Some(429) => tonic::Status::resource_exhausted(message),
+        Some(503) => tonic::Status::unavailable(message),
+        _ => tonic::Status::internal(message),
+    }
+}
+
 /// Normalize an SGLang finish reason into the canonical set the gateway's
 /// response layer exact-matches (`stop`, `length`, `abort`).
 pub(crate) fn normalize_finish_reason(reason: &str) -> &'static str {
@@ -657,6 +779,31 @@ mod tests {
     use super::*;
     use crate::{client::ZmqEngineClient, eos::EosTokenIds};
 
+    /// The translation under the mock scheduler's context window.
+    fn translate(req: sglang_proto::GenerateRequest) -> Result<WireRequest, String> {
+        translate_request_sglang(req, default_ready_response().max_model_len)
+    }
+
+    #[test]
+    fn a_scheduler_abort_carries_the_status_its_http_code_means() {
+        let rows = [
+            (Some(400), tonic::Code::InvalidArgument),
+            (Some(404), tonic::Code::NotFound),
+            (Some(408), tonic::Code::DeadlineExceeded),
+            (Some(429), tonic::Code::ResourceExhausted),
+            (Some(500), tonic::Code::Internal),
+            (Some(503), tonic::Code::Unavailable),
+            (Some(504), tonic::Code::DeadlineExceeded),
+            (Some(418), tonic::Code::Internal),
+            (None, tonic::Code::Internal),
+        ];
+        for (status, code) in rows {
+            let got = scheduler_abort_status(status, "why".to_string());
+            assert_eq!(got.code(), code, "{status:?}");
+            assert_eq!(got.message(), "why");
+        }
+    }
+
     #[test]
     fn sglang_sampling_translation_keeps_the_api_form_and_maps_the_constraint() {
         let params = translate_sampling_sglang(sglang_proto::SamplingParams {
@@ -686,7 +833,7 @@ mod tests {
         assert_eq!(params.n, 1);
         assert_eq!(params.json_schema.as_deref(), Some("{}"));
         assert_eq!(params.logit_bias.unwrap()["5"], 1.5);
-        assert!(!params.is_normalized);
+        assert!(params.stop_regex.is_none() && params.custom_params.is_none());
     }
 
     #[test]
@@ -699,13 +846,13 @@ mod tests {
             }),
             ..Default::default()
         };
-        assert!(translate_request_sglang(sglang_proto::GenerateRequest {
+        assert!(translate(sglang_proto::GenerateRequest {
             tokenized: None,
             ..base.clone()
         })
         .is_err());
         assert_eq!(
-            translate_request_sglang(sglang_proto::GenerateRequest {
+            translate(sglang_proto::GenerateRequest {
                 top_logprobs_num: 3,
                 ..base.clone()
             })
@@ -713,23 +860,18 @@ mod tests {
             .top_logprobs_num,
             3
         );
-        assert!(translate_request_sglang(sglang_proto::GenerateRequest {
+        assert!(translate(sglang_proto::GenerateRequest {
             return_hidden_states: true,
             ..base.clone()
         })
         .is_err());
-        assert!(translate_request_sglang(sglang_proto::GenerateRequest {
-            token_ids_logprob: vec![5],
-            ..base.clone()
-        })
-        .is_err());
-        assert!(translate_request_sglang(sglang_proto::GenerateRequest {
+        assert!(translate(sglang_proto::GenerateRequest {
             disaggregated_params: Some(sglang_proto::DisaggregatedParams::default()),
             ..base.clone()
         })
         .is_err());
         // Forwarded as the Python servicer forwards them.
-        let forwarded = translate_request_sglang(sglang_proto::GenerateRequest {
+        let forwarded = translate(sglang_proto::GenerateRequest {
             lora_id: "adapter".into(),
             custom_logit_processor: "proc".into(),
             sampling_params: Some(sglang_proto::SamplingParams {
@@ -758,7 +900,7 @@ mod tests {
             )]))
         );
         // Prompt logprobs ride the wire now.
-        let prompt = translate_request_sglang(sglang_proto::GenerateRequest {
+        let prompt = translate(sglang_proto::GenerateRequest {
             return_logprob: true,
             logprob_start_len: 0,
             top_logprobs_num: 2,
@@ -768,7 +910,7 @@ mod tests {
         assert!(prompt.return_logprob && prompt.logprob_start_len == 0);
         // Output logprobs only: `-1` is the builders' "no prompt logprobs"
         // (the proto default of 0 would ask for them from the first token).
-        let ok = translate_request_sglang(sglang_proto::GenerateRequest {
+        let ok = translate(sglang_proto::GenerateRequest {
             return_logprob: true,
             logprob_start_len: -1,
             stream: true,
@@ -778,6 +920,85 @@ mod tests {
         .unwrap();
         assert_eq!(ok.rid, "r");
         assert!(ok.return_logprob && ok.stream && ok.require_reasoning);
+    }
+
+    /// Prompt bounds apply before the scheduler, with or without an output
+    /// limit, under the window the handshake reported; the request's own
+    /// limit is kept as it is (an unset one stays the scheduler's to cap).
+    #[test]
+    fn sglang_validates_prompt_length_even_with_explicit_max_new_tokens() {
+        let request = |prompt_len: usize, sampling: Option<sglang_proto::SamplingParams>| {
+            sglang_proto::GenerateRequest {
+                request_id: "r".into(),
+                tokenized: Some(sglang_proto::TokenizedInput {
+                    input_ids: vec![1; prompt_len],
+                    original_text: String::new(),
+                }),
+                sampling_params: sampling,
+                ..Default::default()
+            }
+        };
+        for sampling in [
+            None,
+            Some(sglang_proto::SamplingParams::default()),
+            Some(sglang_proto::SamplingParams {
+                max_new_tokens: Some(16_384),
+                ..Default::default()
+            }),
+        ] {
+            for (prompt_len, max_model_len, accepted) in [
+                (0, 4, false),
+                (3, 4, true),
+                (4, 4, false),
+                (5, 4, false),
+                (1_049_692, 1_048_576, false),
+                // A scheduler that reported no window bounds nothing but
+                // emptiness.
+                (1_049_692, 0, true),
+                (0, 0, false),
+            ] {
+                let result =
+                    translate_request_sglang(request(prompt_len, sampling.clone()), max_model_len);
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "prompt_len={prompt_len}, max_model_len={max_model_len}, max_new_tokens={:?}",
+                    sampling.as_ref().and_then(|sp| sp.max_new_tokens)
+                );
+                match result {
+                    Err(error) => assert!(error.contains("prompt"), "{error}"),
+                    Ok(wire) => {
+                        if let Some(sp) = sampling.as_ref() {
+                            assert_eq!(wire.sampling_params.max_new_tokens, sp.max_new_tokens);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sglang_scoring_request_keeps_selected_ids_without_generating_tokens() {
+        let request = translate(sglang_proto::GenerateRequest {
+            request_id: "score".into(),
+            tokenized: Some(sglang_proto::TokenizedInput {
+                input_ids: vec![1, 2],
+                original_text: String::new(),
+            }),
+            sampling_params: Some(sglang_proto::SamplingParams {
+                max_new_tokens: Some(0),
+                ..Default::default()
+            }),
+            return_logprob: true,
+            logprob_start_len: -1,
+            token_ids_logprob: vec![5, 42],
+            ..Default::default()
+        })
+        .expect("selected-token scoring is supported");
+        assert_eq!(request.token_ids_logprob, Some(vec![5, 42]));
+        assert_eq!(request.sampling_params.max_new_tokens, Some(0));
+        assert!(request.return_logprob);
+        assert_eq!(request.logprob_start_len, -1);
     }
 
     #[test]
@@ -829,6 +1050,17 @@ mod tests {
         );
         let client = client.expect("adapter connect");
         let engine = engine.expect("mock engine");
+
+        let unsupported = client
+            .generate_sglang(sglang_proto::GenerateRequest {
+                token_ids_logprob: vec![5],
+                ..Default::default()
+            })
+            .await
+            .err()
+            .expect("the merged direct ZMQ path cannot carry selected scores");
+        assert_eq!(unsupported.code(), tonic::Code::Unimplemented);
+        assert!(unsupported.message().contains("SGLang gRPC servicer"));
 
         #[expect(
             clippy::disallowed_methods,
@@ -887,6 +1119,8 @@ mod tests {
                     .await
                     .unwrap();
             }
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
 
         let req = sglang_proto::GenerateRequest {
@@ -1012,6 +1246,8 @@ mod tests {
                 .send_frames(vec![bytes::Bytes::from(encode_msgpack(&done).unwrap())])
                 .await
                 .unwrap();
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
         let req = sglang_proto::GenerateRequest {
             request_id: "r1".to_string(),
@@ -1103,6 +1339,8 @@ mod tests {
                     .await
                     .unwrap();
             }
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
         for (rid, code) in [
             ("r2", tonic::Code::InvalidArgument),
@@ -1122,6 +1360,139 @@ mod tests {
             assert!(
                 error.message().contains("input_ids are required"),
                 "{error}"
+            );
+        }
+        engine_task.await.unwrap();
+    }
+
+    /// The scheduler's own attribution decides what an abort of a constrained
+    /// request is: the abort the plugin stamped as the grammar's rejection of
+    /// a sampled token (`GRAMMAR_REJECTED_ERR_TYPE`, bare as the scheduler's
+    /// main grammar paths leave it, or with the 500 its PD decode path adds)
+    /// is the constraint-failure status every wire ends such a request with,
+    /// the scheduler's words kept. The same bare abort without the stamp (an
+    /// abort-all, a session's end, a plugin that predates the column) stays
+    /// the internal error it was, and an abort with a status and another name
+    /// keeps the status table's entry.
+    #[tokio::test]
+    async fn only_the_abort_the_scheduler_attributes_to_the_grammar_is_the_constraint_failing() {
+        use smg_grpc_client::is_constraint_failure;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let (client, engine) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                1,
+                "m".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::Sglang,
+                Duration::from_secs(10)
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        let (client, engine) = (client.unwrap(), engine.unwrap());
+        // (rid, the plugin's err_type column, the status, the message, the code)
+        let cases = [
+            (
+                "r4",
+                Some(Some(GRAMMAR_REJECTED_ERR_TYPE)),
+                None,
+                "the grammar rejected a sampled token",
+                tonic::Code::FailedPrecondition,
+            ),
+            (
+                "r5",
+                Some(Some(GRAMMAR_REJECTED_ERR_TYPE)),
+                Some(500),
+                "Grammar accept_token failed for req r5 with token 7: Tokens not accepted: 7",
+                tonic::Code::FailedPrecondition,
+            ),
+            // The bare abort of an abort-all, from a plugin without the column.
+            ("r6", None, None, "Aborted", tonic::Code::Internal),
+            // The same bare abort, the column present and empty for it.
+            ("r7", Some(None), None, "Aborted", tonic::Code::Internal),
+            (
+                "r8",
+                Some(Some("BadRequestError")),
+                Some(400),
+                "invalid stop_regex",
+                tonic::Code::InvalidArgument,
+            ),
+        ];
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "engine task ends after responding"
+        )]
+        let engine_task = tokio::spawn(async move {
+            let (mut input, mut output) = engine.split();
+            for (rid, err_type, status, message, _) in cases {
+                let _ = input.recv_frames().await.unwrap();
+                let aborted = BatchTokenIDSlimOutput {
+                    rids: vec![rid.into()],
+                    output_ids: vec![vec![]],
+                    finished_reasons: vec!["abort".into()],
+                    finished_messages: vec![Some(message.into())],
+                    finished_matched: vec![None],
+                    prompt_tokens: vec![3],
+                    completion_tokens: vec![0],
+                    cached_tokens: vec![0],
+                    output_token_logprobs_val: vec![vec![]],
+                    output_token_logprobs_idx: vec![vec![]],
+                    finished_status: vec![status],
+                    finished_err_types: err_type
+                        .map(|name| vec![name.map(str::to_string)])
+                        .unwrap_or_default(),
+                    ..Default::default()
+                };
+                output
+                    .send_frames(vec![bytes::Bytes::from(encode_msgpack(&aborted).unwrap())])
+                    .await
+                    .unwrap();
+            }
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
+        });
+        for (rid, _, _, message, code) in cases {
+            let req = sglang_proto::GenerateRequest {
+                request_id: rid.to_string(),
+                tokenized: Some(sglang_proto::TokenizedInput {
+                    input_ids: vec![1, 2, 3],
+                    original_text: String::new(),
+                }),
+                sampling_params: Some(sglang_proto::SamplingParams {
+                    max_new_tokens: Some(8),
+                    constraint: Some(sglang_proto::sampling_params::Constraint::JsonSchema(
+                        r#"{"type":"object"}"#.to_string(),
+                    )),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let mut stream = client.generate_sglang(req).await.expect("generate");
+            let error = stream.next().await.expect("an item").expect_err("an error");
+            assert_eq!(error.code(), code, "{rid}");
+            let constraint = code == tonic::Code::FailedPrecondition;
+            assert_eq!(is_constraint_failure(&error), constraint, "{rid}: {error}");
+            assert!(
+                error
+                    .message()
+                    .ends_with(&format!("the scheduler aborted the request: {message}")),
+                "{rid}: {error}"
+            );
+            assert_eq!(
+                error.message().starts_with(
+                    "the engine could not continue the request under its constraint: "
+                ),
+                constraint,
+                "{rid}: {error}"
             );
         }
         engine_task.await.unwrap();

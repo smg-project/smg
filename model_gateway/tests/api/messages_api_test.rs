@@ -40,6 +40,7 @@ async fn test_v1_messages_proxy_success() {
         .method("POST")
         .uri("/v1/messages")
         .header(CONTENT_TYPE, "application/json")
+        .header("anthropic-version", "2023-06-01")
         .body(Body::from(serde_json::to_string(&payload).unwrap()))
         .unwrap();
 
@@ -89,6 +90,7 @@ async fn test_v1_messages_proxy_streaming() {
         .method("POST")
         .uri("/v1/messages")
         .header(CONTENT_TYPE, "application/json")
+        .header("anthropic-version", "2023-06-01")
         .body(Body::from(serde_json::to_string(&payload).unwrap()))
         .unwrap();
 
@@ -145,11 +147,57 @@ async fn test_v1_messages_proxy_propagates_upstream_error() {
         .method("POST")
         .uri("/v1/messages")
         .header(CONTENT_TYPE, "application/json")
+        .header("anthropic-version", "2023-06-01")
         .body(Body::from(serde_json::to_string(&payload).unwrap()))
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    ctx.shutdown().await;
+}
+
+/// A request without `anthropic-version` is served (this gateway's own SDK
+/// clients send none); a malformed version is refused before anything is
+/// routed, on every backend that takes the buffered path.
+#[tokio::test]
+async fn test_v1_messages_takes_a_missing_anthropic_version_and_refuses_a_malformed_one() {
+    let ctx = AppTestContext::new(vec![MockWorkerConfig {
+        port: 18304,
+        worker_type: WorkerType::Regular,
+        health_status: HealthStatus::Healthy,
+        response_delay_ms: 0,
+        fail_rate: 0.0,
+    }])
+    .await;
+
+    let app = ctx.create_app();
+
+    let payload = json!({
+        "model": "mock-model",
+        "max_tokens": 64,
+        "messages": [{"role": "user", "content": "Hello!"}]
+    });
+
+    for (version, expected) in [
+        (None, StatusCode::OK),
+        (Some("1999-01-01"), StatusCode::BAD_REQUEST),
+        (Some("2023-02-30"), StatusCode::BAD_REQUEST),
+        (Some("2023-06-01"), StatusCode::OK),
+    ] {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header(CONTENT_TYPE, "application/json");
+        if let Some(version) = version {
+            req = req.header("anthropic-version", version);
+        }
+        let req = req
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), expected, "anthropic-version {version:?}");
+    }
 
     ctx.shutdown().await;
 }

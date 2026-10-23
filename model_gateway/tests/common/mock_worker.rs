@@ -12,8 +12,12 @@ use std::{
 };
 
 use axum::{
+    body::{Body, Bytes},
     extract::{Json, Multipart, Path, State},
-    http::{StatusCode, Version},
+    http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        HeaderMap, HeaderValue, StatusCode, Version,
+    },
     response::{
         sse::{Event, KeepAlive},
         IntoResponse, Response, Sse,
@@ -170,6 +174,7 @@ fn clear_scheduler_controls(port: u16) {
 pub struct RequestRecorder {
     bodies: Mutex<Vec<serde_json::Value>>,
     versions: Mutex<Vec<Version>>,
+    authorizations: Mutex<Vec<Option<String>>>,
 }
 
 impl RequestRecorder {
@@ -184,6 +189,21 @@ impl RequestRecorder {
     )]
     pub fn versions(&self) -> Vec<Version> {
         self.versions
+            .lock()
+            .expect("request recorder mutex poisoned")
+            .clone()
+    }
+
+    /// The `authorization` header of every RL control request received,
+    /// oldest first, bodyless requests and simulated failures included (so
+    /// not aligned with [`Self::bodies`], which only has the requests that
+    /// carried JSON). `None` is a request that arrived without the header.
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper - panicking on failure is intentional"
+    )]
+    pub fn authorizations(&self) -> Vec<Option<String>> {
+        self.authorizations
             .lock()
             .expect("request recorder mutex poisoned")
             .clone()
@@ -250,6 +270,86 @@ fn record_request(port: u16, version: Version, body: &serde_json::Value) {
             versions.push(version);
         }
     }
+}
+
+/// Record the `authorization` header of one RL control request: every
+/// control request, before the failure simulation and whether or not it
+/// carried a body.
+fn record_authorization(port: u16, value: Option<String>) {
+    let recorder = request_recorders_table()
+        .lock()
+        .ok()
+        .and_then(|table| table.get(&port).cloned());
+    if let Some(recorder) = recorder {
+        if let Ok(mut authorizations) = recorder.authorizations.lock() {
+            authorizations.push(value);
+        }
+    }
+}
+
+/// A scripted SSE body for the streaming routes of the mock worker that will
+/// bind `port`: the exact bytes, chunk by chunk, so a test can compare what
+/// the gateway relays byte for byte (the mock's own streams carry an id and a
+/// timestamp that change per run). Set before the worker starts, like
+/// [`set_scheduler_controls`]; the chat, completions and generate routes
+/// answer a streaming request with it when one is set.
+#[derive(Clone, Default)]
+pub struct StreamScript {
+    pub chunks: Vec<Vec<u8>>,
+}
+
+static STREAM_SCRIPTS: OnceLock<Mutex<HashMap<u16, StreamScript>>> = OnceLock::new();
+
+fn stream_scripts_table() -> &'static Mutex<HashMap<u16, StreamScript>> {
+    STREAM_SCRIPTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Script the streaming routes of the mock worker that will bind `port`.
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+pub fn set_stream_script(port: u16, script: StreamScript) {
+    stream_scripts_table()
+        .lock()
+        .expect("stream scripts mutex poisoned")
+        .insert(port, script);
+}
+
+fn stream_script_for(port: u16) -> Option<StreamScript> {
+    stream_scripts_table()
+        .lock()
+        .ok()
+        .and_then(|table| table.get(&port).cloned())
+}
+
+/// Remove a port's script on teardown, tolerant of a poisoned mutex since
+/// it runs from `Drop`.
+fn clear_stream_script(port: u16) {
+    if let Ok(mut table) = stream_scripts_table().lock() {
+        table.remove(&port);
+    }
+}
+
+/// The scripted body as an SSE response: each chunk one frame of the body,
+/// with the worker id header the route writes when it has one.
+fn scripted_sse_response(script: StreamScript, worker_id: Option<String>) -> Response {
+    let frames = stream::iter(
+        script
+            .chunks
+            .into_iter()
+            .map(|chunk| Ok::<_, Infallible>(Bytes::from(chunk))),
+    );
+    let mut response = Body::from_stream(frames).into_response();
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    if let Some(worker_id) = worker_id {
+        if let Ok(value) = HeaderValue::from_str(&worker_id) {
+            response.headers_mut().insert("x-worker-id", value);
+        }
+    }
+    response
 }
 
 /// Remove a port's recorder on teardown so a later worker reusing the port
@@ -422,6 +522,7 @@ impl Drop for MockWorker {
         if let Some(port) = self.named_port {
             clear_scheduler_controls(port);
             clear_request_recorder(port);
+            clear_stream_script(port);
         }
     }
 }
@@ -618,6 +719,9 @@ async fn generate_handler(
         .unwrap_or(false);
 
     if is_stream {
+        if let Some(script) = stream_script_for(config.port) {
+            return scripted_sse_response(script, Some(worker_id));
+        }
         let stream_delay = config.response_delay_ms;
 
         // Check if it's a batch request
@@ -744,6 +848,9 @@ async fn chat_completions_handler(
         .as_secs();
 
     if is_stream {
+        if let Some(script) = stream_script_for(config.port) {
+            return scripted_sse_response(script, None);
+        }
         let request_id = format!("chatcmpl-{}", Uuid::now_v7());
 
         let stream = stream::once(async move {
@@ -957,6 +1064,9 @@ async fn completions_handler(
         .as_secs();
 
     if is_stream {
+        if let Some(script) = stream_script_for(config.port) {
+            return scripted_sse_response(script, None);
+        }
         let request_id = format!("cmpl-{}", Uuid::now_v7());
 
         let stream = stream::once(async move {
@@ -1518,9 +1628,17 @@ async fn responses_handler(
 async fn rl_control_handler(
     State(config): State<Arc<RwLock<MockWorkerConfig>>>,
     version: Version,
+    headers: HeaderMap,
     body: Option<Json<serde_json::Value>>,
 ) -> Response {
     let config = config.read().await;
+    record_authorization(
+        config.port,
+        headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
+    );
 
     if should_fail(&config) {
         return (

@@ -16,13 +16,15 @@ use subtle::ConstantTimeEq;
 pub enum Role {
     /// Full access to all control plane APIs (workers, wasm, tokenizers, etc.)
     Admin,
-    /// Access to inference/data plane APIs only (default for backward compatibility)
+    /// Read-only access to the control plane APIs: the GET and HEAD requests
+    /// (listing workers, loads, tokenizers, modules). Every mutating request
+    /// requires `Admin`. The default for tokens without a mapped role.
     #[default]
     User,
 }
 
 impl Role {
-    /// Check if this role has admin privileges for control plane APIs.
+    /// Check if this role has admin privileges (every control plane method).
     pub fn is_admin(self) -> bool {
         matches!(self, Role::Admin)
     }
@@ -53,7 +55,11 @@ impl std::str::FromStr for Role {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JwtConfig {
     /// OIDC issuer URL (e.g., "https://login.microsoftonline.com/{tenant}/v2.0")
-    /// Used to discover JWKS endpoint via .well-known/openid-configuration
+    /// Used to discover JWKS endpoint via .well-known/openid-configuration.
+    /// Exactly the issuer identifier the provider publishes (the `issuer` of
+    /// its discovery document, the `iss` of its tokens), terminating slash
+    /// included when the identifier has one: a discovery document naming
+    /// another issuer is refused, as a token with another `iss` is.
     pub issuer: String,
 
     /// Expected audience claim (usually the client ID or API identifier)

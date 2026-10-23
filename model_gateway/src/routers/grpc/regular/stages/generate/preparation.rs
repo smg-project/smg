@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::response::Response;
 use llm_tokenizer::traits::Tokenizer;
 use openai_protocol::{common::InputIds, generate::GenerateRequest};
@@ -11,7 +10,6 @@ use tracing::error;
 use crate::routers::{
     error,
     grpc::{
-        common::stages::PipelineStage,
         context::{PreparationOutput, RequestContext},
         utils,
     },
@@ -23,16 +21,14 @@ use crate::routers::{
 /// This is a direct extraction without architectural changes.
 pub(crate) struct GeneratePreparationStage;
 
-#[async_trait]
-impl PipelineStage for GeneratePreparationStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+impl GeneratePreparationStage {
+    /// The stage's work. The chat+generate dispatcher calls this directly, so
+    /// the stage's future lives inline in the dispatcher's: one box per stage
+    /// call, not a second one for a boxed trait method.
+    pub(crate) async fn prepare(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         let request = ctx.generate_request_arc();
         self.prepare_generate(ctx, &request).await?;
         Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        "GeneratePreparation"
     }
 }
 

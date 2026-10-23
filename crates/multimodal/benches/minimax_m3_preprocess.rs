@@ -8,7 +8,7 @@ use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use image::{DynamicImage, RgbImage};
 use llm_multimodal::vision::{
     preprocessor_config::PreProcessorConfig, processors::MiniMaxM3VisionProcessor,
-    VisionPreProcessor,
+    VideoClipOptions, VisionPreProcessor,
 };
 use rayon::prelude::*;
 
@@ -25,8 +25,7 @@ fn config() -> PreProcessorConfig {
 
 /// How much of an image batch is spent deep-copying the decoded frames.
 fn bench_clone_overhead(c: &mut Criterion) {
-    let processor = MiniMaxM3VisionProcessor::new();
-    let cfg = config();
+    let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config()).unwrap();
 
     let mut group = c.benchmark_group("m3_image_batch");
     for &count in &[1usize, 4, 20] {
@@ -36,7 +35,7 @@ fn bench_clone_overhead(c: &mut Criterion) {
             BenchmarkId::new("preprocess_only", count),
             &images,
             |b, imgs| {
-                b.iter(|| processor.preprocess(imgs, &cfg).unwrap());
+                b.iter(|| processor.preprocess(imgs).unwrap());
             },
         );
         group.bench_with_input(
@@ -45,7 +44,7 @@ fn bench_clone_overhead(c: &mut Criterion) {
             |b, imgs| {
                 b.iter(|| {
                     let copies: Vec<DynamicImage> = imgs.to_vec();
-                    processor.preprocess(&copies, &cfg).unwrap()
+                    processor.preprocess(&copies).unwrap()
                 });
             },
         );
@@ -55,8 +54,8 @@ fn bench_clone_overhead(c: &mut Criterion) {
 
 /// Several video clips in one request: one at a time versus all at once.
 fn bench_video_clips(c: &mut Criterion) {
-    let processor = MiniMaxM3VisionProcessor::new();
-    let cfg = config();
+    let processor = MiniMaxM3VisionProcessor::from_preprocessor_config(&config()).unwrap();
+    let clip = VideoClipOptions::sampled_at(2.0);
 
     let mut group = c.benchmark_group("m3_video_clips");
     group.sample_size(20);
@@ -69,7 +68,7 @@ fn bench_video_clips(c: &mut Criterion) {
             b.iter(|| {
                 batch
                     .iter()
-                    .map(|frames| processor.preprocess_video(frames, &cfg).unwrap())
+                    .map(|frames| processor.preprocess_video(frames, &clip).unwrap())
                     .collect::<Vec<_>>()
             });
         });
@@ -77,7 +76,7 @@ fn bench_video_clips(c: &mut Criterion) {
             b.iter(|| {
                 batch
                     .par_iter()
-                    .map(|frames| processor.preprocess_video(frames, &cfg).unwrap())
+                    .map(|frames| processor.preprocess_video(frames, &clip).unwrap())
                     .collect::<Vec<_>>()
             });
         });

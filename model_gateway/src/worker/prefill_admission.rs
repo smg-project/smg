@@ -187,7 +187,7 @@ where
     };
 
     // The selection verdict is kept so an unavailable fleet answers with the
-    // leg's own reason (a shed, a missing leg) rather than a generic one.
+    // role's own reason (a shed, a missing role) rather than a generic one.
     let mut verdict = None;
     let admitted = admission
         .admit(routing_key, |capacity| match select(Some(capacity)) {

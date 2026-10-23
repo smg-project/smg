@@ -158,3 +158,29 @@ def test_rust_lane_refuses_a_vllm_without_the_hook(monkeypatch):
     )
     with pytest.raises(RuntimeError, match="no hook"):
         w._build_env()
+
+
+def test_vllm_workers_select_the_prebuilt_flashinfer_allreduce(monkeypatch):
+    from infra.constants import ENV_VLLM_SERVICER_IMPL
+
+    monkeypatch.delenv(ENV_VLLM_SERVICER_IMPL, raising=False)
+    monkeypatch.delenv("SMG_VLLM_SERVICER_IMPL", raising=False)
+    monkeypatch.delenv("VLLM_FLASHINFER_ALLREDUCE_BACKEND", raising=False)
+    w = Worker(
+        model_id=_VLLM_MODEL, engine="vllm", port=50111, gpu_ids=[0], mode=ConnectionMode.GRPC
+    )
+    # vLLM's auto backend picks the MNNVL kernel on Hopper, which FlashInfer's
+    # per-architecture jit-cache wheel does not carry, and the pods cannot
+    # JIT-compile it; the TRT-LLM kernel is prebuilt there.
+    assert w._build_env()["VLLM_FLASHINFER_ALLREDUCE_BACKEND"] == "trtllm"
+
+    # An operator's explicit choice wins over the harness default.
+    monkeypatch.setenv("VLLM_FLASHINFER_ALLREDUCE_BACKEND", "mnnvl")
+    assert w._build_env()["VLLM_FLASHINFER_ALLREDUCE_BACKEND"] == "mnnvl"
+
+    # Other engines are not told anything about vLLM's all-reduce.
+    monkeypatch.delenv("VLLM_FLASHINFER_ALLREDUCE_BACKEND", raising=False)
+    s = Worker(
+        model_id=_VLLM_MODEL, engine="sglang", port=50112, gpu_ids=[0], mode=ConnectionMode.GRPC
+    )
+    assert "VLLM_FLASHINFER_ALLREDUCE_BACKEND" not in s._build_env()

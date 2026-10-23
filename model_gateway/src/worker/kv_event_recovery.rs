@@ -1,5 +1,4 @@
-//! Admission state for one KV-event stream rank: cursors, gap recovery and
-//! the live tail held during an out-of-band resync.
+//! Admission state for one KV-event stream rank: cursors and gap recovery.
 //!
 //! Every engine publisher (one per data-parallel rank) numbers its batches
 //! with its own monotonic sequence. The subscriber keeps one [`RankState`] per
@@ -29,17 +28,9 @@
 //! from the next one. The monitor applies the chunks as a `snapshot` resync
 //! outside the admission rules above and sets the rank's cursor to each
 //! chunk's stamp ([`RankState::resync_to`]); nothing is buffered because the
-//! stream is ordered.
-//!
-//! The tail buffer serves a snapshot resync delivered on a side channel: live
-//! batches arriving while the snapshot is in flight are held, bounded, and
-//! applied in order after it. No servicer sends one out of band today, so the
-//! monitor never enters that mode; the logic is here, tested, for the
-//! protocol in `crates/kv_index/docs/recovery-protocol.md`.
-
-use std::collections::VecDeque;
-
-use smg_grpc_client::common_proto::KvEventBatch;
+//! stream is ordered. A snapshot delivered on a side channel, with live
+//! batches held meanwhile, is not implemented: no servicer serves one, and
+//! this module carries nothing for it until one does.
 
 /// A sequence this far below the cursor is a restarted publisher, not a late
 /// duplicate: replays start at the sequence we asked for, so legitimate
@@ -49,9 +40,6 @@ pub(crate) const RESTART_WINDOW: u64 = 1_024;
 /// Missed batches beyond this clear the rank instead of keeping its state:
 /// the same decision the servicers make when their replay buffer overflows.
 const GAP_CLEAR_THRESHOLD: u64 = 1_024;
-
-/// Live batches held while a snapshot resync is in flight.
-const TAIL_LIMIT: usize = 1_024;
 
 /// Where the rank's cursor stands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -88,8 +76,6 @@ pub(crate) enum Admission {
     /// state is kept (`cleared == false`) or dropped (`cleared == true`); then
     /// apply the batch.
     Unrecovered { missed: u64, cleared: bool },
-    /// A snapshot resync is in flight: queue the batch in the tail.
-    Buffered,
 }
 
 /// How the rank got where it is, for metrics.
@@ -123,10 +109,6 @@ pub(crate) struct RankState {
     replay: Option<PendingReplay>,
     /// Set when a gap could not be recovered; cleared by a resync.
     degraded: bool,
-    /// Live batches held during a snapshot resync, oldest first.
-    tail: VecDeque<KvEventBatch>,
-    snapshot_inflight: bool,
-    tail_overflowed: bool,
     /// No batch received yet on the current connection.
     fresh: bool,
 }
@@ -164,17 +146,10 @@ impl RankState {
         self.replay
     }
 
-    pub(crate) fn tail_len(&self) -> usize {
-        self.tail.len()
-    }
-
     /// Decide what to do with a batch carrying `seq`; `clears` says whether
     /// it carries the engine's own cache clear.
     pub(crate) fn admit(&mut self, seq: u64, clears: bool) -> Admission {
         let fresh = std::mem::replace(&mut self.fresh, false);
-        if self.snapshot_inflight {
-            return Admission::Buffered;
-        }
         match self.cursor {
             Cursor::Initial => {
                 self.cursor = Cursor::Live(seq);
@@ -230,66 +205,6 @@ impl RankState {
         }
     }
 
-    /// Hold a live batch while a snapshot is in flight. Returns `false` when
-    /// the tail is full; the batch is dropped and the resync must be redone.
-    pub(crate) fn buffer_live(&mut self, batch: KvEventBatch) -> bool {
-        if self.tail.len() >= TAIL_LIMIT {
-            self.tail_overflowed = true;
-            return false;
-        }
-        self.tail.push_back(batch);
-        true
-    }
-
-    /// Enter snapshot mode: live batches are buffered until
-    /// [`finish_snapshot`](Self::finish_snapshot).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "entered once a servicer serves snapshots out of band (docs/recovery-protocol.md)"
-        )
-    )]
-    pub(crate) fn begin_snapshot(&mut self) {
-        self.snapshot_inflight = true;
-        self.tail.clear();
-        self.tail_overflowed = false;
-        self.replay = None;
-    }
-
-    /// The snapshot (complete through `through_seq`) has been applied. Returns
-    /// the buffered live batches that come after it, in order and without
-    /// duplicates, and sets the cursor to the last of them. `None` means the
-    /// tail overflowed while waiting and the snapshot has to be taken again.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "entered once a servicer serves snapshots out of band (docs/recovery-protocol.md)"
-        )
-    )]
-    pub(crate) fn finish_snapshot(&mut self, through_seq: u64) -> Option<Vec<KvEventBatch>> {
-        self.snapshot_inflight = false;
-        self.degraded = false;
-        if self.tail_overflowed {
-            self.tail.clear();
-            self.tail_overflowed = false;
-            self.cursor = Cursor::Live(through_seq);
-            return None;
-        }
-        let mut cursor = through_seq;
-        let mut out = Vec::new();
-        for batch in self.tail.drain(..) {
-            if batch.sequence_number <= cursor {
-                continue;
-            }
-            cursor = batch.sequence_number;
-            out.push(batch);
-        }
-        self.cursor = Cursor::Live(cursor);
-        Some(out)
-    }
-
     /// A snapshot chunk stamped `seq` was applied: the cursor stands there,
     /// whatever it was, and nothing is pending or degraded any more.
     pub(crate) fn resync_to(&mut self, seq: u64) {
@@ -297,9 +212,6 @@ impl RankState {
         self.replay = None;
         self.degraded = false;
         self.fresh = false;
-        self.tail.clear();
-        self.snapshot_inflight = false;
-        self.tail_overflowed = false;
     }
 
     /// The relay's snapshot could not cover the engine's whole life
@@ -316,26 +228,12 @@ impl RankState {
         self.cursor = Cursor::Initial;
         self.replay = None;
         self.degraded = false;
-        self.tail.clear();
-        self.snapshot_inflight = false;
-        self.tail_overflowed = false;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn batch(seq: u64) -> KvEventBatch {
-        KvEventBatch {
-            sequence_number: seq,
-            timestamp: 0.0,
-            events: vec![],
-            dp_rank: None,
-            snapshot: None,
-            load: None,
-        }
-    }
 
     #[test]
     fn first_batch_sets_the_cursor_wherever_it_is() {
@@ -539,43 +437,5 @@ mod tests {
         assert_eq!(rank.cursor(), Cursor::Initial);
         assert_eq!(rank.resume_from(), 0);
         assert_eq!(rank.admit(7, false), Admission::Apply);
-    }
-
-    #[test]
-    fn snapshot_mode_buffers_live_batches_and_replays_the_tail_in_order() {
-        let mut rank = RankState::default();
-        for seq in 1..=5 {
-            rank.admit(seq, false);
-        }
-        rank.begin_snapshot();
-        assert_eq!(rank.admit(6, false), Admission::Buffered);
-        assert!(rank.buffer_live(batch(6)));
-        assert!(rank.buffer_live(batch(7)));
-        assert!(rank.buffer_live(batch(7)));
-        assert!(rank.buffer_live(batch(8)));
-        assert_eq!(rank.tail_len(), 4);
-        // The snapshot covered everything through 6.
-        let tail = rank.finish_snapshot(6).expect("tail intact");
-        let seqs: Vec<u64> = tail.iter().map(|b| b.sequence_number).collect();
-        assert_eq!(seqs, vec![7, 8]);
-        assert_eq!(rank.cursor(), Cursor::Live(8));
-        assert_eq!(rank.admit(9, false), Admission::Apply);
-        assert!(!rank.is_degraded());
-    }
-
-    #[test]
-    fn a_tail_overflow_is_bounded_and_forces_another_snapshot() {
-        let mut rank = RankState::default();
-        rank.admit(1, false);
-        rank.begin_snapshot();
-        for seq in 2..=(TAIL_LIMIT as u64 + 1) {
-            assert!(rank.buffer_live(batch(seq)));
-        }
-        assert_eq!(rank.tail_len(), TAIL_LIMIT);
-        assert!(!rank.buffer_live(batch(TAIL_LIMIT as u64 + 2)));
-        assert_eq!(rank.tail_len(), TAIL_LIMIT);
-        assert!(rank.finish_snapshot(1).is_none());
-        assert_eq!(rank.tail_len(), 0);
-        assert_eq!(rank.cursor(), Cursor::Live(1));
     }
 }

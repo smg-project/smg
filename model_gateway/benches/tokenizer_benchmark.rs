@@ -29,6 +29,15 @@ use llm_tokenizer::{
     traits::*,
 };
 
+// The gateway binary runs on jemalloc (see `src/main.rs`). The benchmark links
+// the same allocator so that its numbers describe the binary that ships rather
+// than the system allocator: the two differ by up to 2x on a full decode of a
+// large vocabulary, which the allocator's placement of the vocabulary tables
+// decides, not the tokenizer code.
+#[cfg(all(not(target_env = "msvc"), not(target_env = "musl")))]
+#[global_allocator]
+static GLOBAL_ALLOCATOR: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 // Cache the tokenizer path for the entire benchmark run
 static TOKENIZER_PATH: OnceLock<PathBuf> = OnceLock::new();
 
@@ -1360,6 +1369,7 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
     let l0_only_config = CacheConfig {
         enable_l0: true,
         l0_max_entries: 10_000,
+        l0_max_memory: usize::MAX,
         enable_l1: false,
         l1_max_memory: 0,
     };
@@ -1410,6 +1420,7 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
     let l0_l1_config = CacheConfig {
         enable_l0: true,
         l0_max_entries: 10_000,
+        l0_max_memory: usize::MAX,
         enable_l1: true,
         l1_max_memory: 50 * 1024 * 1024,
     };
@@ -1499,6 +1510,7 @@ fn bench_l1_cache_chat_template(c: &mut Criterion) {
     let l1_only_config = CacheConfig {
         enable_l0: false,
         l0_max_entries: 0,
+        l0_max_memory: usize::MAX,
         enable_l1: true,
         l1_max_memory: 50 * 1024 * 1024,
     };

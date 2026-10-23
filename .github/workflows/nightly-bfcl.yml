@@ -1,7 +1,7 @@
 # Nightly BFCL A/B — official Berkeley Function Calling Leaderboard run comparing
 # SMG's parsing frontend (SMG -> vLLM gRPC) against pure vLLM, same model/engine/
-# checkpoint/sampling. Track B of docs/proposals/2026-06-10-bfcl-nightly-parser-
-# verification.md. Informational/non-blocking — never a merge gate.
+# checkpoint/sampling. Track B of the parser-verification proposal.
+# Informational/non-blocking — never a merge gate.
 #
 # Runs weekly (Mondays 07:17 UTC) over non_live + live + multi_turn (static,
 # reproducible; excludes the agentic/executable categories that need
@@ -11,6 +11,9 @@
 # On PRs that touch this pipeline it runs a quick non-live sanity subset for
 # merge confidence. The A/B mechanics were validated manually on an H100 box
 # (see scripts/bfcl/README.md "Validation status").
+# AMD legs run models from the H100 and Blackwell legs on an AMD Instinct self-hosted runner; until
+# one is registered and the repo variable SMG_RUN_AMD_LEGS is "true", only a
+# dispatch that asks for them (`only`, or `hardware: amd`) runs them.
 name: Nightly BFCL
 
 on:
@@ -26,9 +29,18 @@ on:
   workflow_dispatch:
     inputs:
       only:
-        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m3|glm-5.3-flash); empty = all"
+        description: "Run only this matrix leg (qwen3.8|gpt-oss|deepseek-v4.1|minimax-m3|glm-5.3-flash|gpt-oss-amd|qwen3.8-amd|deepseek-v4.1-amd|minimax-m3-amd|glm-5.3-flash-amd); empty = all"
         required: false
         default: ""
+      hardware:
+        description: "Run only the legs on this hardware; both = NVIDIA and AMD"
+        required: false
+        type: choice
+        options:
+          - both
+          - nvidia
+          - amd
+        default: both
       model:
         description: "Override HF model id (weights) for the selected leg; empty = matrix default. Override model and bfcl_model together — mismatched weights/handler pair if only one is overridden."
         required: false
@@ -117,9 +129,13 @@ jobs:
       - id: build
         env:
           ONLY: ${{ github.event.inputs.only }}
+          HARDWARE: ${{ github.event.inputs.hardware }}
           EVENT_NAME: ${{ github.event_name }}
           MODEL_OVERRIDE: ${{ github.event.inputs.model }}
           BFCL_OVERRIDE: ${{ github.event.inputs.bfcl_model }}
+          # AMD legs: the AMD runner's label, and "true" once that runner is online.
+          AMD_RUNNER: ${{ vars.SMG_RUNNER_AMD_GPU_8 }}
+          AMD_ENABLED: ${{ vars.SMG_RUN_AMD_LEGS }}
         run: |
           set -euo pipefail
           # Enforce the paired-override contract: `model` and `bfcl_model` must be
@@ -132,6 +148,15 @@ jobs:
           fi
           python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os
+          amd_runner = os.environ.get("AMD_RUNNER") or "8-gpu-mi300x"
+          # vLLM's ROCm image of the CI pin (scripts/ci_install_vllm.sh).
+          amd_image = "vllm/vllm-openai-rocm:v0.31.0@sha256:749f6f3f944f12af49966ac523c1f8573e4b229594b541954bd5f879b4496b1f"
+          # vLLM's ROCm nightlies, for the AMD legs whose models need ROCm fixes newer
+          # than the pin, each on the channel its model's vLLM recipe names; all are
+          # main at vllm-project/vllm@3f1bcfd8 (2026-10-15). The AMD legs cannot take
+          # a per-commit wheel (vllm_commit) — those are CUDA builds.
+          amd_nightly_rocm100_image = "vllm/vllm-openai-rocm:nightly-rocm100-3f1bcfd82bb2e93fcd364fc7a5491718453a77e2@sha256:5b69e07038150da74968bf7755176f1ab9f5109f46634c166a91bfa355969549"
+          amd_nightly_image = "vllm/vllm-openai-rocm:nightly-3f1bcfd82bb2e93fcd364fc7a5491718453a77e2@sha256:1b61c6c8cf063a6ee08651c82e14169eb39fa800cc1691a5f3eebcecfbe6648c"
           # max_model_len "auto": largest window that fits in GPU memory (capped at
           # native max). A fixed 32768 400'd on multi_turn_long_context (>32k prompts).
           #
@@ -167,12 +192,14 @@ jobs:
               # DeepSeek-V4.1-Flash is ~765GB on disk (552B backbone + 196B int8 Engram,
               # all GPU-resident), so it outgrows a TP=4 half-node and runs SEQUENTIAL
               # on the whole node (the only such leg). SMG: deepseek_v41 tool/reasoning parsers
-              # + native renderer (#2524/#2525/#2527). vLLM: V4.1 is on main only
-              # (vllm-project/vllm#56208 + #56228, 2026-09-10), not in the 0.27.1 CI
-              # pin, so this leg installs a per-commit main wheel (vllm_commit below).
+              # + native renderer (#2524/#2525/#2527). vLLM: V4.1 landed in 0.30.0
+              # (vllm-project/vllm#56208 + #56228 + #56214, 2026-09-10/11), so the CI
+              # pin now has it. This leg still installs the per-commit main wheel it
+              # was validated on (vllm_commit below); moving it onto the release pin
+              # is a separate change that needs a run on this leg.
               {"name": "deepseek-v4.1", "runner": "blackwell", "tp": 8,
                "gpu_a": "0,1,2,3,4,5,6,7", "gpu_b": "",  # sequential: arm B reuses GPU_A (whole node)
-               "model": "deepseek-ai/DeepSeek-V4.1-Flash", "bfcl_model": "deepseek-ai/DeepSeek-V4.1-Flash-FC",
+               "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017", "bfcl_model": "deepseek-ai/DeepSeek-V4.1-Flash-1017-FC",
                "vllm_tool": "deepseek_v41", "vllm_reason": "deepseek_v41",
                "smg_tool": "deepseek_v41", "smg_reason": "deepseek_v41",
                # No kv-cache/block-size flags: vLLM's V4.1 sparse-MLA path maps
@@ -184,7 +211,7 @@ jobs:
                # DeepseekV41ForCausalLM — #56228 alone ships the classes unregistered
                # and vLLM rejects the arch at startup. Pinned past the 09-11..09-15 V4.1
                # fixes. Both arms get the same wheel, so the A/B stays engine-identical.
-               # Drop once the CI pin moves to a release with V4.1.
+               # Drop once this leg has run on the 0.31.0 pin, which has V4.1.
                "vllm_commit": "a31ec3a68bbbedd4b5d59490c762bcf32abf1a17",
                "vllm_version": "0.29.1rc1.dev185+ga31ec3a68",
                # 765GB load + first-run JIT kernels on a new arch: generous ceiling.
@@ -196,7 +223,7 @@ jobs:
               # MiniMax-M3 (427B/26B-active VLM MoE, MSA sparse attention). The official
               # MXFP8 checkpoint (~444GB) fits a TP=4 half-node; nvidia/MiniMax-M3-NVFP4
               # (~224GB, ModelOpt 4-bit, small drops vs FP8) is the fallback if headroom
-              # ever bites. Served by the stock CI vLLM pin (0.27.1 has M3, mxfp8 and the
+              # ever bites. Served by the stock CI vLLM pin (0.31.0 has M3, mxfp8 and the
               # minimax_m3 parsers) — no per-commit wheel. Flags per the vLLM recipe
               # (models/MiniMaxAI/MiniMax-M3.yaml): --block-size 128 is mandatory (MSA
               # sparse_block_size) and the mxfp8 variant sets indexer_kv_dtype fp8.
@@ -234,8 +261,103 @@ jobs:
                # arms serially); arms are concurrent here, so this is generous.
                "run_timeout": "7200",
                "model_cache": "/raid/models", "arm_mode": "concurrent", "max_model_len": "auto"},
+              # AMD legs (MI300X, 192 GB per GPU): the H100 legs' models and parsers,
+              # both arms concurrent, in vLLM's ROCm image of the same CI pin.
+              # gpt-oss-120b runs each arm on one GPU (TP=1: GPU 0 + GPU 1).
+              # Qwen3.8-27B runs each arm on half the node (TP=4: GPUs 0-3 + 4-7):
+              # at TP=1 its arms had generated 94% of the 17 categories when the
+              # 5-hour cap stopped them (2026-10-19). It also needs AITER's attention:
+              # without it the image picks ROCM_ATTN, whose fallback for this model
+              # (head size 256, 784-token hybrid blocks) slows decode on long
+              # contexts, so multi_turn_long_context alone outlasted the cap even at
+              # TP=4. ROCM_AITER_FA with AITER on is what vLLM's recipe for the same
+              # architecture (Qwen3.6-27B) sets on MI300X.
+              {"name": "gpt-oss-amd", "runner": amd_runner, "vendor": "amd", "tp": 1,
+               "image": amd_image, "gpu_a": "0", "gpu_b": "1",
+               "model": "openai/gpt-oss-120b", "bfcl_model": "openai/gpt-oss-120b-FC",
+               "vllm_tool": "openai", "vllm_reason": "",
+               "smg_tool": "", "smg_reason": "",
+               "vllm_extra": "", "gpu_mem": "0.85", "startup_timeout": "900",
+               "run_timeout": "7200",
+               "model_cache": "/models", "arm_mode": "concurrent", "max_model_len": "auto"},
+              {"name": "qwen3.8-amd", "runner": amd_runner, "vendor": "amd", "tp": 4,
+               "image": amd_image, "gpu_a": "0,1,2,3", "gpu_b": "4,5,6,7",
+               "model": "Qwen/Qwen3.8-27B", "bfcl_model": "Qwen/Qwen3.8-27B-FC",
+               "vllm_tool": "qwen3_xml", "vllm_reason": "qwen3",
+               "smg_tool": "qwen_xml", "smg_reason": "qwen3",
+               "vllm_extra": "--attention-backend ROCM_AITER_FA",
+               "vllm_env": "VLLM_ROCM_USE_AITER=1",
+               "gpu_mem": "0.85", "startup_timeout": "900",
+               "run_timeout": "18000",
+               "model_cache": "/models", "arm_mode": "concurrent", "max_model_len": "auto"},
+              # DeepSeek-V4.1-Flash with the Blackwell leg's parsers and tokenizer mode,
+              # in the configuration vLLM's recipe marks verified on MI300X
+              # (recipes.vllm.ai/deepseek-ai/DeepSeek-V4.1-Flash): TP=4 with the
+              # Engram tables (~183 GiB per arm) in pinned host memory, ~81 GiB of
+              # weights per GPU, so unlike on Blackwell the arms fit half the node each
+              # and run concurrent. gfx942 workarounds from the recipe: piecewise graph
+              # capture segfaults every worker, so breakable CUDA graphs are off and
+              # only full decode graphs are captured; AITER on, MoE on AITER. The
+              # recipe serves from the ROCm 10.0 nightly channel (the AITER mHC path of
+              # vllm-project/vllm#56503); v0.31.0 has none of this.
+              {"name": "deepseek-v4.1-amd", "runner": amd_runner, "vendor": "amd", "tp": 4,
+               "image": amd_nightly_rocm100_image, "gpu_a": "0,1,2,3", "gpu_b": "4,5,6,7",
+               "model": "deepseek-ai/DeepSeek-V4.1-Flash-1017", "bfcl_model": "deepseek-ai/DeepSeek-V4.1-Flash-1017-FC",
+               "vllm_tool": "deepseek_v41", "vllm_reason": "deepseek_v41",
+               "smg_tool": "deepseek_v41", "smg_reason": "deepseek_v41",
+               "vllm_extra": '--tokenizer-mode deepseek_v41 --trust-remote-code --moe-backend aiter --engram-config {"cpu_offload":true} --compilation-config {"cudagraph_mode":"FULL_DECODE_ONLY"}',
+               "vllm_env": "VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MOE=1 AITER_TRITON_LOG_LEVEL=ERROR VLLM_USE_BREAKABLE_CUDAGRAPH=0 VLLM_ENGINE_READY_TIMEOUT_S=3600",
+               # 765GB load + first-run kernel JIT, as on the Blackwell leg.
+               "gpu_mem": "0.90", "startup_timeout": "3600",
+               # Per-arm cap: concurrent arms get the job's full budget after startup.
+               "run_timeout": "14400",
+               "model_cache": "/models", "arm_mode": "concurrent", "max_model_len": "auto"},
+              # MiniMax-M3, the Blackwell leg's official MXFP8 checkpoint (~444GB) and
+              # parsers, in the MI300X command of vLLM's recipe, which marks MI300X
+              # verified (recipes.vllm.ai/MiniMaxAI/MiniMax-M3). MI300X has no MX matrix
+              # cores and the command uses plain TP=8, the whole node, so unlike on
+              # Blackwell the arms run sequential. --block-size 128 is mandatory (MSA
+              # sparse_block_size), MSA runs on TRITON_ATTN, the vision tower is skipped
+              # (BFCL is text-only), and the indexer KV stays at its bf16 default (the
+              # command does not set the Blackwell leg's fp8). Env: AITER on but not for
+              # MHA, no breakable CUDA graphs, hipBLASLt GEMMs, and the command's RCCL
+              # channel and HW-queue settings. In the ROCm nightly the recipe names.
+              {"name": "minimax-m3-amd", "runner": amd_runner, "vendor": "amd", "tp": 8,
+               "image": amd_nightly_image,
+               "gpu_a": "0,1,2,3,4,5,6,7", "gpu_b": "",  # sequential: arm B reuses GPU_A (whole node)
+               "model": "MiniMaxAI/MiniMax-M3-MXFP8", "bfcl_model": "MiniMaxAI/MiniMax-M3-MXFP8-FC",
+               "vllm_tool": "minimax_m3", "vllm_reason": "minimax_m3",
+               "smg_tool": "minimax_m3", "smg_reason": "minimax_m3",
+               "vllm_extra": "--trust-remote-code --block-size 128 --attention-backend TRITON_ATTN --language-model-only --async-scheduling --max-num-batched-tokens 16384",
+               "vllm_env": "VLLM_ROCM_USE_AITER=1 VLLM_ROCM_USE_AITER_MHA=0 VLLM_USE_BREAKABLE_CUDAGRAPH=0 TORCH_BLAS_PREFER_HIPBLASLT=1 NCCL_MIN_NCHANNELS=112 GPU_MAX_HW_QUEUES=2 VLLM_ENGINE_READY_TIMEOUT_S=3600",
+               "gpu_mem": "0.90", "startup_timeout": "3000",
+               # Sequential: both arms and both startups share the 360m job.
+               "run_timeout": "7200",
+               "model_cache": "/models", "arm_mode": "sequential", "max_model_len": "auto"},
+              # GLM-5.3-Flash, the Blackwell leg's native-FP8 checkpoint (~306GiB) and
+              # parsers, TP=4 per arm with both arms concurrent as on Blackwell. Flags
+              # and env from the AMD settings of vLLM's recipe
+              # (recipes.vllm.ai/zai-org/GLM-5.3-Flash): sparse MLA on
+              # ROCM_AITER_MLA_SPARSE with AITER on, and a BF16 KV cache, since the
+              # recipe takes fp8 KV on Blackwell only; its gfx950-only AITER switches
+              # are left off. The recipe marks MI355X verified but not MI300X. Its ROCm
+              # fixes run through vllm-project/vllm#59412 (2026-10-08), after v0.31.0,
+              # so the leg runs in the ROCm nightly the recipe names.
+              {"name": "glm-5.3-flash-amd", "runner": amd_runner, "vendor": "amd", "tp": 4,
+               "image": amd_nightly_image, "gpu_a": "0,1,2,3", "gpu_b": "4,5,6,7",
+               "model": "zai-org/GLM-5.3-Flash", "bfcl_model": "zai-org/GLM-5.3-Flash-FC",
+               "vllm_tool": "glm47", "vllm_reason": "glm45",
+               "smg_tool": "glm47_moe", "smg_reason": "glm45",
+               "vllm_extra": "--trust-remote-code --attention-backend ROCM_AITER_MLA_SPARSE --max-num-seqs 512",
+               "vllm_env": "VLLM_ROCM_USE_AITER=1 VLLM_ENGINE_READY_TIMEOUT_S=3600",
+               # FP8 load + KDA/sparse-MLA kernel JIT, as on the Blackwell leg.
+               "gpu_mem": "0.90", "startup_timeout": "3600",
+               # Per-arm cap: concurrent arms get the job's full budget after startup.
+               "run_timeout": "14400",
+               "model_cache": "/models", "arm_mode": "concurrent", "max_model_len": "auto"},
           ]
           only = os.environ.get("ONLY", "")
+          hardware = os.environ.get("HARDWARE") or "both"
           valid_names = [l["name"] for l in legs]
           if only:
               legs = [l for l in legs if l["name"] == only]
@@ -243,6 +365,11 @@ jobs:
           # below are a tiny non-live subset for every leg.
           if only and not legs:
               raise SystemExit(f"unknown leg {only!r}; valid: {valid_names}")
+          # A leg without "vendor" runs on NVIDIA.
+          if hardware != "both":
+              legs = [l for l in legs if l.get("vendor", "nvidia") == hardware]
+              if not legs:
+                  raise SystemExit(f"leg {only!r} does not run on {hardware}")
           # Scheduled runs take the H100 legs only: the `blackwell` runner has served
           # no job since 2026-09-18, and a leg queued against an offline label sits in
           # GitHub's queue for its 24h maximum and is cancelled, which marks the whole
@@ -251,6 +378,15 @@ jobs:
           # legs stay one click away once the runner is back.
           if os.environ.get("EVENT_NAME") == "schedule":
               legs = [l for l in legs if l["runner"] != "blackwell"]
+          # The AMD legs need AMD's runner. Until it is online (SMG_RUN_AMD_LEGS
+          # = "true") they run only when a dispatch asks for them (`only`, or
+          # `hardware: amd`), for the same 24h-queue reason, and never on
+          # pull_request: that runner takes code from main only.
+          amd_requested = bool(only) or hardware == "amd"
+          if os.environ.get("EVENT_NAME") == "pull_request" or (
+              os.environ.get("AMD_ENABLED") != "true" and not amd_requested
+          ):
+              legs = [l for l in legs if l.get("vendor") != "amd"]
           print("matrix=" + json.dumps({"include": legs}))
           PY
 
@@ -263,6 +399,14 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
     runs-on: ${{ matrix.runner }}
+    # The AMD legs run in their image, which brings its own ROCm, so the runner
+    # needs only Docker and the GPUs; the other legs run on the host.
+    container: ${{ matrix.vendor == 'amd' && fromJSON(format('{{"image":"{0}","options":"{1}"}}', matrix.image, vars.SMG_AMD_CONTAINER_OPTIONS || '--device=/dev/kfd --device=/dev/dri --group-add video --ipc=host --shm-size=32g --volume /models:/models --env HF_HOME=/models --env HF_TOKEN')) || '' }}
+    # In a container, steps default to sh (dash in the vLLM image); they are
+    # written for bash, which the legs on the host get as `bash -e {0}`.
+    defaults:
+      run:
+        shell: bash -e {0}
     # Generous: the nightly set adds multi_turn (state simulation), much slower
     # than the single-turn AST/live categories. The sequential deepseek-v4.1 leg needs
     # the most headroom — two whole-node arms (startup + scoring) run serially,
@@ -289,7 +433,11 @@ jobs:
           name: smg-wheel
           path: wheel
       - name: Setup vLLM env (provides vllm + grpc servicer + smg)
+        if: matrix.vendor != 'amd'
         uses: ./.github/actions/setup-vllm
+      - name: Setup vLLM env in its ROCm image (AMD legs)
+        if: matrix.vendor == 'amd'
+        run: bash scripts/ci_setup_vllm_rocm_image.sh
       - name: Override vLLM with a per-commit main wheel (legs newer than the CI pin)
         # A leg whose model the pinned vLLM release (scripts/ci_install_vllm.sh)
         # cannot serve sets vllm_commit + vllm_version to a wheels.vllm.ai build.
@@ -337,12 +485,15 @@ jobs:
           BFCL_VLLM_REASONING_PARSER: ${{ github.event.inputs.reasoning_parser || matrix.vllm_reason }}
           BFCL_SMG_REASONING_PARSER: ${{ github.event.inputs.reasoning_parser || matrix.smg_reason }}
           BFCL_VLLM_EXTRA: ${{ matrix.vllm_extra }}
+          # Engine env vars for both arms' vLLM processes (empty for most legs).
+          BFCL_VLLM_ENV: ${{ matrix.vllm_env }}
           BFCL_TP: ${{ matrix.tp }}
           BFCL_MAX_MODEL_LEN: ${{ matrix.max_model_len }}
           BFCL_GPU_MEM_UTIL: ${{ matrix.gpu_mem }}
           ARM_MODE: ${{ matrix.arm_mode }}
           GPU_A: ${{ matrix.gpu_a }}
           GPU_B: ${{ matrix.gpu_b }}
+          GPU_VENDOR: ${{ matrix.vendor || 'nvidia' }}
           # Per-leg health-wait budget: big MoEs need minutes for load + compile + quant.
           BFCL_STARTUP_TIMEOUT: ${{ matrix.startup_timeout }}
           RUN_TIMEOUT: ${{ github.event.inputs.run_timeout || matrix.run_timeout }}
@@ -371,14 +522,17 @@ jobs:
           # a prior cancelled/killed leg whose always() teardown was skipped (a detached
           # vLLM/smg::router that the pidfile group-kill missed and that pins GPU mem).
           # Safe here: we hold the host lock, so no other bfcl leg is running; node-wide
-          # nuke (kills by GPU occupancy) is accepted on these hosts.
-          bash scripts/ci_killall_sglang.sh nuke_gpus 9>&- || true
+          # nuke (kills by GPU occupancy) is accepted on these hosts. The default
+          # nuke reads nvidia-smi; AMD hosts use the script's ROCm mode.
+          NUKE=(nuke_gpus)
+          [ "$GPU_VENDOR" = amd ] && NUKE=(rocm nuke_gpus)
+          bash scripts/ci_killall_sglang.sh "${NUKE[@]}" 9>&- || true
           # Tear this leg's servers down AND nuke GPUs before releasing the lock, so the
           # next leg starts clean. Both run inside the lock (never hit the next leg). The
           # always() Teardown step is a leg-scoped backstop for when this trap can't run.
           cleanup() {
             bash scripts/bfcl/launch_arm.sh stop 9>&- || true
-            bash scripts/ci_killall_sglang.sh nuke_gpus 9>&- || true
+            bash scripts/ci_killall_sglang.sh "${NUKE[@]}" 9>&- || true
           }
           trap cleanup EXIT
           trap 'cleanup; exit 143' INT TERM
@@ -470,6 +624,23 @@ jobs:
           else
             echo "no $ROOT"
           fi
+      # In a container job (the AMD legs) the runner maps only the start of a
+      # multi-line `path` to the container's runner.temp, so listing the files
+      # one per line uploaded just the first. Gather them under one directory.
+      - name: Stage results for upload
+        if: always()
+        run: |
+          set -uo pipefail
+          OUT="$RUNNER_TEMP/bfcl_artifact"
+          rm -rf "$OUT" && mkdir -p "$OUT"
+          cd "$RUNNER_TEMP"
+          for f in bfcl_ab.md bfcl_ab.json bfcl_transcripts.tgz; do
+            [ -e "$f" ] && cp "$f" "$OUT/"
+          done
+          if [ -d bfcl_ab ]; then
+            find bfcl_ab -path '*/score/*' -type f -exec cp --parents {} "$OUT/" \;
+          fi
+          echo "staged: $(find "$OUT" -type f | wc -l) files, $(du -sh "$OUT" | cut -f1)"
       - name: Upload results (summary + per-case scores + transcripts)
         if: always()
         uses: actions/upload-artifact@v7
@@ -477,11 +648,7 @@ jobs:
           name: bfcl-ab-${{ matrix.name }}-${{ github.run_id }}
           # Summary + per-category score files (which list each failed case for
           # both arms) + a tarball of both arms' raw per-turn transcripts.
-          path: |
-            ${{ runner.temp }}/bfcl_ab.md
-            ${{ runner.temp }}/bfcl_ab.json
-            ${{ runner.temp }}/bfcl_ab/*/score/**
-            ${{ runner.temp }}/bfcl_transcripts.tgz
+          path: ${{ runner.temp }}/bfcl_artifact/
           if-no-files-found: warn
           retention-days: 30
       - name: Upload arm logs (failure only)
@@ -498,4 +665,6 @@ jobs:
         # Backstop to the in-step trap: kill THIS leg's process groups via its
         # pidfiles. NOT a node-wide GPU nuke — these hosts run other orgs' runner
         # agents, so killing by GPU occupancy would take down their jobs too.
+        env:
+          BFCL_RUN_DIR: ${{ runner.temp }}/bfcl_run
         run: bash scripts/bfcl/launch_arm.sh stop || true

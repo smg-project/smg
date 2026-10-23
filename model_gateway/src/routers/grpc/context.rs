@@ -4,7 +4,7 @@
 //! request building is its last reader and [`RequestContext::into_dispatch`]
 //! yields the request-free [`DispatchContext`] the dispatch phase runs on.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
 use axum::http::HeaderMap;
 use llm_multimodal::registry::transcription::TranscriptionFamily;
@@ -13,6 +13,7 @@ use openai_protocol::{
     chat::{ChatCompletionRequest, ChatCompletionResponse},
     classify::{ClassifyRequest, ClassifyResponse},
     completion::{CompletionRequest, CompletionResponse},
+    decisions::{DecisionResponse, DecisionsRequest},
     embedding::{EmbeddingRequest, EmbeddingResponse},
     generate::{GenerateRequest, GenerateResponse},
     messages::{CreateMessageRequest, Message},
@@ -25,26 +26,37 @@ use tracing::{debug, error};
 
 use super::{
     backend_client::BackendClient,
-    common::stages::{
-        encode::EncodeDispatchPlan,
-        helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask},
-        RateLimitCell,
+    common::{
+        response_formatting::TokenCounts,
+        stages::{
+            encode::EncodeDispatchPlan,
+            helpers::{IdStamp, SamplingBaseline, SamplingDefaultsMask, ToolConstraintStamp},
+            RateLimitCell,
+        },
     },
     multimodal::{InflightPermit, MediaPlan, MultimodalComponents, MultimodalIntermediate},
     proto_wrapper::{
         EncodeItemBootstrapInfo, ProtoEmbedComplete, ProtoEmbedRequest, ProtoGenerateRequest,
         ProtoInputLogProbs, ProtoRequest, ProtoStream,
     },
+    regular::stages::decisions::scoring::{DecisionPrompt, DecisionScoring},
     spec::ResponseSpec,
-    utils::ParserResolver,
+    utils::{ParserResolver, WorkerDecoding},
 };
 use crate::{
+    config::ParserChoice,
     middleware::TenantRequestMeta,
+    observability::{cache_trace, metrics::Metrics},
     policies::CacheNamespace,
-    routers::{common::pd_admission::PdAdmissionGuard, error::internal_error},
+    routers::{
+        common::{attempt_ledger::AttemptLedger, pd_admission::PdAdmissionGuard},
+        error::internal_error,
+        grpc::regular::symphony::{template::Templates, PreparedConstraint},
+    },
     worker::{
         ConnectionMode, PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
     },
+    workflow::TokenizerLoadFailures,
 };
 
 /// Ingress-phase request context: owns the parsed request.
@@ -83,6 +95,7 @@ pub(crate) enum RequestType {
     Responses(Arc<ResponsesRequest>),
     Embedding(Arc<EmbeddingRequest>),
     Classify(Arc<ClassifyRequest>),
+    Decisions(Arc<DecisionsRequest>),
     Messages(Arc<CreateMessageRequest>),
     /// Audio transcription: the request plus its uploaded audio. The
     /// preparation stage turns these into a chat-shaped backend request
@@ -113,10 +126,24 @@ impl RequestType {
             Self::Responses(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Embedding(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Classify(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Decisions(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Messages(request) => replace(&mut Arc::make_mut(request).model, model_id),
             Self::Transcription { request, .. } => {
                 replace(&mut Arc::make_mut(request).model, model_id);
             }
+        }
+    }
+
+    /// Parallel samples the request asks for: 1 when unset, or when the
+    /// surface has no such parameter. With more than one, a disaggregated
+    /// decode side recomputes the prompt locally instead of pulling the
+    /// prefill side's KV.
+    pub fn sampling_n(&self) -> u32 {
+        match self {
+            Self::Chat(r) => r.choices(),
+            Self::Completion(r) => r.choices(),
+            Self::Generate(r) => r.choices(),
+            _ => 1,
         }
     }
 
@@ -130,7 +157,7 @@ impl RequestType {
             Self::Embedding(r) => r.rid.as_deref(),
             Self::Classify(r) => r.rid.as_deref(),
             Self::Messages(r) => r.rid.as_deref(),
-            Self::Responses(_) | Self::Transcription { .. } => None,
+            Self::Responses(_) | Self::Decisions(_) | Self::Transcription { .. } => None,
         }
     }
 }
@@ -144,6 +171,7 @@ impl std::fmt::Display for RequestType {
             Self::Responses(_) => write!(f, "Responses"),
             Self::Embedding(_) => write!(f, "Embedding"),
             Self::Classify(_) => write!(f, "Classify"),
+            Self::Decisions(_) => write!(f, "Decisions"),
             Self::Messages(_) => write!(f, "Messages"),
             Self::Transcription { .. } => write!(f, "Transcription"),
         }
@@ -158,6 +186,7 @@ impl std::fmt::Display for FinalResponse {
             Self::Completion(_) => write!(f, "Completion"),
             Self::Embedding(_) => write!(f, "Embedding"),
             Self::Classify(_) => write!(f, "Classify"),
+            Self::Decisions(_) => write!(f, "Decisions"),
             Self::Messages(_) => write!(f, "Messages"),
             Self::Transcription { .. } => write!(f, "Transcription"),
         }
@@ -175,6 +204,22 @@ pub(crate) struct SharedComponents {
     pub parser_resolver: ParserResolver,
     /// Multimodal processing components (initialized at router creation)
     pub multimodal: Option<Arc<MultimodalComponents>>,
+    /// Whether the gateway loads tokenizers itself, at start-up and when a
+    /// worker registers. While it does, a served model without a registered
+    /// tokenizer is a transient not-ready state (the one `/readiness` reports
+    /// as "tokenizer not yet registered"), not a fault of the gateway.
+    pub tokenizer_autoload: bool,
+    /// The served models whose tokenizer load was skipped or failed for good,
+    /// as the registration workflow recorded them: a request for one of them
+    /// is answered 503 `tokenizer_load_failed` without a retry hint, instead
+    /// of the not-ready 503 of a load in flight.
+    pub tokenizer_load_failures: Arc<TokenizerLoadFailures>,
+    /// Which parser reads a chat completion's or a message's output unless the request's
+    /// `X-SMG-Parser` header says otherwise (see `regular::symphony`).
+    pub parser: ParserChoice,
+    /// The tables the registered tokenizers' response templates compile into, which the parser
+    /// name `hf` selects (see `regular::symphony::template`).
+    pub templates: Arc<Templates>,
 }
 
 /// Ingress-phase state (evolves through preparation, worker selection,
@@ -183,6 +228,13 @@ pub(crate) struct SharedComponents {
 pub(crate) struct ProcessingState {
     // Stage 1: Preparation outputs
     pub preparation: Option<PreparationOutput>,
+
+    /// The parser for this chat completion or message. Preparation sets the request's choice,
+    /// from its `X-SMG-Parser` header or the configured default; request building then sets the
+    /// parser that reads the response, Symphony when a table takes the request and legacy
+    /// otherwise, which the response reports as `x-smg-parser`. `None` on the other endpoints,
+    /// which keep the legacy parsers.
+    pub parser: Option<ParserChoice>,
 
     /// Owned here rather than inside `PreparationOutput` so EPD's `EncodeStage`
     /// can borrow it for the with-pixels encode serialization before request
@@ -196,6 +248,20 @@ pub(crate) struct ProcessingState {
     /// Set once request building attached media references, so retry
     /// re-selection stays pinned to workers that accept them.
     pub media_refs_forwarded: bool,
+
+    /// The selected worker's constrained decoding, set when request building
+    /// let its policy choose the request's constraint
+    /// (`regular::symphony::constraint::WorkerConstraint::by_policy`), so retry
+    /// re-selection stays on workers that decide alike
+    /// (`utils::WorkerDecoding::decides_alike`).
+    pub constraint_decided_on: Option<WorkerDecoding>,
+
+    /// With forwarded references: which of the workers that process them the
+    /// plan may use (the gateway's own pipeline alone for a family only it
+    /// expands, the engine's own processors alone for audio, either
+    /// otherwise). Set in preparation with `multimodal_refs`; worker
+    /// selection and the retry pin read it.
+    pub media_refs_pipeline: PipelinePin,
 
     /// `Some` iff the request is multimodal EPD and worker selection produced
     /// encode assignments. Request building injects the bootstrap info and drops
@@ -225,7 +291,7 @@ pub(crate) struct ProcessingState {
     pub clients: Option<ClientSelection>,
 
     /// Prefill admission slot, taken during PD/EPD worker selection and
-    /// handed to the dispatch that runs the Prefill leg.
+    /// handed to the dispatch that runs the Prefill side.
     pub pd_prefill_guard: Option<PrefillLoadGuard>,
 
     // Response processing state seeded during ingress (stop decoder, router
@@ -236,6 +302,8 @@ pub(crate) struct ProcessingState {
 /// Worker-selection inputs that outlive the parsed request.
 #[derive(Default)]
 pub(crate) struct RoutingSnapshot {
+    /// Exact context checks retained for initial selection and retries.
+    pub context_requirements: super::common::stages::ContextRequirements,
     /// Captured only when a configured policy actually consumes request text.
     pub routing_text: Option<String>,
     /// Routing-affinity token proxy (first prompt for batched completions).
@@ -244,23 +312,36 @@ pub(crate) struct RoutingSnapshot {
     pub rid_key: Option<String>,
     /// The request's cache namespace, derived once at first selection.
     pub cache_namespace: Option<CacheNamespace>,
+    /// The request carries pixel media (an image or a video), noted at first
+    /// selection: a retry keeps the workers that take it (regular mode's
+    /// single worker; the prefill side of prefill/decode mode, see worker
+    /// selection's `prefill_side_needs_vision`) on ones with a vision encoder,
+    /// as the first attempt did.
+    pub needs_vision: bool,
+    /// The request's disaggregated decode side needs a worker with a vision
+    /// encoder (worker selection's `decode_side_needs_vision`: prefill/decode
+    /// mode only), noted at first selection so a retry re-selects under the
+    /// same demand.
+    pub decode_needs_vision: bool,
 }
 
-pub(crate) use crate::routers::common::placement::WireConstraint;
+pub(crate) use crate::routers::common::placement::{PipelinePin, WireConstraint};
 
 impl WireConstraint {
-    fn of(workers: &WorkerSelection, requires_media_refs: bool) -> Self {
+    fn of(workers: &WorkerSelection, requires_media_refs: bool, pipeline: PipelinePin) -> Self {
         match workers {
             WorkerSelection::Single { worker } => Self {
                 runtime: worker.metadata().spec.runtime_type,
                 connection: *worker.connection_mode(),
                 requires_media_refs,
+                pipeline,
             },
-            // Disaggregated legs are gRPC-only.
+            // Disaggregated workers are gRPC-only.
             WorkerSelection::Disaggregated { runtime_type, .. } => Self {
                 runtime: *runtime_type,
                 connection: ConnectionMode::Grpc,
                 requires_media_refs,
+                pipeline,
             },
         }
     }
@@ -274,6 +355,22 @@ impl WireConstraint {
 /// [`RequestContext::into_dispatch`]. `ResponseSpec` is the only
 /// request-derived input past this point.
 pub(crate) struct DispatchContext {
+    pub root_request_id: Option<String>,
+    /// The id the request-id middleware gave the request, for a line written
+    /// about it outside its span (a retry's re-selection); always present,
+    /// unlike `root_request_id`, which cache tracing alone fills.
+    pub request_id: Option<String>,
+    pub cache_trace: Option<String>,
+    /// The parser that read a chat completion, for the response's `x-smg-parser` header.
+    pub parser: Option<ParserChoice>,
+    pub attempt: u32,
+    /// The request's bookkeeping across attempts: circuit-breaker charges
+    /// and the workers whose answer was definitive.
+    pub ledger: AttemptLedger,
+    /// Engines (base URLs) a failed attempt of this request dispatched to;
+    /// a retry's re-selection skips them while another available worker is
+    /// left (see `placement::PlacementInputs::tried`).
+    pub tried: Vec<String>,
     /// Canonical model ID (routing, registries).
     pub model_id: String,
     /// Model the response reports, captured from the request at the build
@@ -284,12 +381,15 @@ pub(crate) struct DispatchContext {
     pub rate_limit_cell: Option<Arc<RateLimitCell>>,
     pub routing: RoutingSnapshot,
     pub wire: WireConstraint,
+    /// The selected worker's constrained decoding, when its policy chose the
+    /// plan's constraint; a retry re-selects only workers that decide alike.
+    pub constraint_decided_on: Option<WorkerDecoding>,
     pub tokenizer: Option<Arc<dyn Tokenizer>>,
     pub workers: Option<WorkerSelection>,
     pub sticky_key: Option<String>,
     pub clients: Option<ClientSelection>,
     /// Consumed by the first dispatch; retries re-dispatch only the
-    /// prefill/decode legs against the already-running encode jobs.
+    /// prefill/decode sides against the already-running encode jobs.
     pub encode_outputs: Option<EncodeOutputs>,
     pub multimodal_inflight: Option<InflightPermit>,
     pub dispatch: Option<DispatchMetadata>,
@@ -305,6 +405,55 @@ impl DispatchContext {
     pub fn tokenizer_arc(&self) -> Option<Arc<dyn Tokenizer>> {
         self.tokenizer.clone()
     }
+}
+
+/// An output one pipeline stage leaves on the context for the stages after
+/// it, with the failure those stages report when it is not there.
+pub(crate) trait StageOutput {
+    /// The code and the message of that failure: one pair per output,
+    /// whichever stage notices it missing.
+    const NOT_COMPLETED: (&'static str, &'static str);
+}
+
+impl StageOutput for PreparationOutput {
+    const NOT_COMPLETED: (&'static str, &'static str) =
+        ("preparation_not_completed", "Preparation not completed");
+}
+
+impl StageOutput for WorkerSelection {
+    const NOT_COMPLETED: (&'static str, &'static str) = (
+        "worker_selection_not_completed",
+        "Worker selection not completed",
+    );
+}
+
+impl StageOutput for ClientSelection {
+    const NOT_COMPLETED: (&'static str, &'static str) = (
+        "client_acquisition_not_completed",
+        "Client acquisition not completed",
+    );
+}
+
+impl<T: StageOutput> StageOutput for &T {
+    const NOT_COMPLETED: (&'static str, &'static str) = T::NOT_COMPLETED;
+}
+
+impl<T: StageOutput> StageOutput for &mut T {
+    const NOT_COMPLETED: (&'static str, &'static str) = T::NOT_COMPLETED;
+}
+
+/// `output` as the stage `function` found it on the context, or the failure
+/// every stage reports when the earlier stage that produces it has not run:
+/// logged once, under the output's one code, whichever stage noticed.
+pub(crate) fn stage_output<T: StageOutput>(
+    output: Option<T>,
+    function: &'static str,
+) -> Result<T, axum::response::Response> {
+    output.ok_or_else(|| {
+        let (code, message) = T::NOT_COMPLETED;
+        error!(function = function, "{message}");
+        internal_error(code, message)
+    })
 }
 
 /// Everything request building hands the dispatch phase.
@@ -324,6 +473,12 @@ pub(crate) struct AttemptStamp {
     /// Pre-default values of the masked fields, so re-application never
     /// carries a previous attempt's worker defaults forward.
     pub sampling_baseline: Option<SamplingBaseline>,
+    /// The tool constraint as each attempt's worker must take it: a forced
+    /// call's before any worker shaped it, with the tool parser that shapes
+    /// it, or what derives the table's `auto` tag for a worker's grammar
+    /// start; retry attempts re-shape it for the newly selected worker's
+    /// engine, as the build did for the first.
+    pub tool_constraint: Option<ToolConstraintStamp>,
     /// Mode::PrefillDecode only (mirrors the build stage's flag).
     pub inject_pd_metadata: bool,
 }
@@ -480,15 +635,25 @@ impl ExecutionPlan {
 /// Each request type produces its own variant, eliminating optional fields
 /// that are always None for certain pipelines.
 pub(crate) enum PreparationOutput {
+    Decisions {
+        items: Vec<DecisionPrompt>,
+        scoring: DecisionScoring,
+    },
     Chat {
         token_ids: Vec<u32>,
         processed_messages: super::ProcessedMessages,
-        tool_constraints: Option<(String, String)>,
+        /// Request building decides on the selected worker
+        /// (`regular::symphony::worker_constraint`).
+        tool_constraints: PreparedConstraint,
     },
     Messages {
         token_ids: Vec<u32>,
         processed_messages: super::ProcessedMessages,
-        tool_constraints: Option<(String, String)>,
+        tool_constraints: PreparedConstraint,
+        /// The response spec, built by preparation: the template rendered
+        /// the view of its chat tools that `tool_choice` leaves (see
+        /// `MessagesResponseSpec`).
+        spec: Box<super::spec::MessagesResponseSpec>,
     },
     /// Transcription reuses the chat backend request shape. The chat-shaped
     /// request is synthesized here (inside the pipeline) from the family's
@@ -540,6 +705,9 @@ impl PreparationOutput {
     /// first prompt's tokens as the routing-affinity proxy.
     pub fn token_ids(&self) -> &[u32] {
         match self {
+            Self::Decisions { items, .. } => {
+                items.first().map_or(&[], |item| item.token_ids.as_slice())
+            }
             Self::Chat { token_ids, .. }
             | Self::Messages { token_ids, .. }
             | Self::Transcription { token_ids, .. }
@@ -558,6 +726,7 @@ impl PreparationOutput {
     /// request's real input cost is the sum of every prompt in the batch.
     pub fn total_input_token_count(&self) -> usize {
         match self {
+            Self::Decisions { items, .. } => items.iter().map(|item| item.token_ids.len()).sum(),
             Self::Completion { items, .. } => items.iter().map(|item| item.token_ids.len()).sum(),
             other => other.token_ids().len(),
         }
@@ -568,6 +737,11 @@ impl PreparationOutput {
     /// engine request, so the window applies per item, not to their sum.
     pub fn max_input_token_count(&self) -> usize {
         match self {
+            Self::Decisions { items, .. } => items
+                .iter()
+                .map(|item| item.token_ids.len())
+                .max()
+                .unwrap_or(0),
             Self::Completion { items, .. } => items
                 .iter()
                 .map(|item| item.token_ids.len())
@@ -581,6 +755,7 @@ impl PreparationOutput {
     /// Chat/Messages borrow from processed_messages.text to avoid a redundant clone.
     pub fn routing_text(&self) -> Option<&str> {
         match self {
+            Self::Decisions { items, .. } => items.first().map(|item| item.text.as_str()),
             Self::Chat {
                 processed_messages, ..
             }
@@ -653,7 +828,7 @@ pub(crate) enum LoadGuards {
     Single {
         _guard: WorkerLoadGuard,
     },
-    /// Disaggregated guards cover the decode leg only. The Prefill load is
+    /// Disaggregated guards cover the decode side only. The Prefill load is
     /// a `PrefillLoadGuard` that drops when the Prefill phase ends.
     Disaggregated {
         _decode: WorkerLoadGuard,
@@ -666,11 +841,29 @@ pub(crate) enum LoadGuards {
     /// A disaggregated dispatch whose bootstrap rooms the PD admission gate
     /// claimed before it was allowed to send. The claim rides with the guards
     /// so it is released on every path the dispatch can end on — an early
-    /// error, a failed leg, a client disconnect, a retry, or completion.
+    /// error, a failed side, a client disconnect, a retry, or completion.
     Admitted {
         _admission: PdAdmissionGuard,
         _guards: Box<LoadGuards>,
     },
+    /// The dispatch's upstream span rides with the guards, so it ends when
+    /// they are released: at the response stream's last frame, the client's
+    /// disconnect, an upstream error or a retry, not at dispatch.
+    Traced {
+        _span: StreamSpan,
+        _guards: Box<LoadGuards>,
+    },
+}
+
+/// A span held open across a response stream. Released, it is entered once
+/// more: the OpenTelemetry layer stamps a span's end at its last exit, not
+/// at its close, so a span merely held would still end at dispatch.
+pub(crate) struct StreamSpan(tracing::Span);
+
+impl Drop for StreamSpan {
+    fn drop(&mut self) {
+        let _last_exit = self.0.enter();
+    }
 }
 
 impl LoadGuards {
@@ -695,6 +888,14 @@ impl LoadGuards {
                 _guards: Box::new(guards),
             },
             None => guards,
+        }
+    }
+
+    /// Keep `span` open for as long as the guards are held.
+    pub fn traced(span: tracing::Span, guards: Self) -> Self {
+        Self::Traced {
+            _span: StreamSpan(span),
+            _guards: Box::new(guards),
         }
     }
 
@@ -735,8 +936,14 @@ pub(crate) struct ResponseState {
     /// Final processed response
     pub final_response: Option<FinalResponse>,
 
-    /// Rendered prompt tokens the client-facing usage drops; settlement adds them back.
-    pub unbilled_prompt_tokens: u32,
+    /// The engine's counters of a non-streamed chat or messages answer, as
+    /// the response stage recorded them for the settlement: the
+    /// client-facing usage drops the rendered prompt tokens the provider
+    /// does not bill and may carry the gateway parser's reasoning split
+    /// instead of the engine's count, and the Messages shape reports no
+    /// cache hits at all. `None` for the shapes whose response carries the
+    /// engine's counters unchanged (completion, generate, decisions).
+    pub engine_counts: Option<TokenCounts>,
 
     /// Responses API iteration result (Harmony only, for tool loop orchestration)
     pub responses_iteration_result: Option<super::harmony::ResponsesIterationResult>,
@@ -776,7 +983,9 @@ impl RequestContext {
             // preparation by capability check, never handed off here.
             RequestType::Transcription { .. } => false,
             // Embeddings and classification never stream.
-            RequestType::Embedding(_) | RequestType::Classify(_) => false,
+            RequestType::Embedding(_) | RequestType::Classify(_) | RequestType::Decisions(_) => {
+                false
+            }
         };
         Self {
             input: RequestInput {
@@ -810,7 +1019,7 @@ impl RequestContext {
             headers,
             model_id,
             streaming,
-            tenant_request_meta: _,
+            tenant_request_meta,
             rate_limit_cell,
         } = input;
         // The model the response reports. `RequestContext::new` already
@@ -825,10 +1034,12 @@ impl RequestContext {
             RequestType::Responses(req) => req.model.clone(),
             RequestType::Embedding(req) => req.model.clone(),
             RequestType::Classify(req) => req.model.clone(),
+            RequestType::Decisions(req) => req.model.clone(),
             RequestType::Messages(req) => req.model.clone(),
             RequestType::Transcription { request, .. } => request.model.clone(),
         };
         drop(request_type);
+        let parser = state.parser;
         drop(components);
         let routing = state.routing_snapshot.ok_or_else(|| {
             error!(
@@ -840,21 +1051,30 @@ impl RequestContext {
                 "Routing snapshot not captured",
             )
         })?;
-        let wire = state
-            .workers
-            .as_ref()
-            .map(|workers| WireConstraint::of(workers, state.media_refs_forwarded))
-            .ok_or_else(|| {
-                error!(
-                    function = "RequestContext::into_dispatch",
-                    "Worker selection not completed"
-                );
-                internal_error(
-                    "worker_selection_not_completed",
-                    "Worker selection not completed",
-                )
-            })?;
+        let wire = WireConstraint::of(
+            stage_output(state.workers.as_ref(), "RequestContext::into_dispatch")?,
+            state.media_refs_forwarded,
+            if state.media_refs_forwarded {
+                state.media_refs_pipeline
+            } else {
+                PipelinePin::Any
+            },
+        );
+        let request_id =
+            super::common::stages::helpers::middleware_request_id(tenant_request_meta.as_ref())
+                .map(str::to_owned);
         Ok(DispatchContext {
+            root_request_id: if cache_trace::enabled() {
+                request_id.clone()
+            } else {
+                None
+            },
+            request_id,
+            cache_trace: None,
+            parser,
+            attempt: 0,
+            ledger: AttemptLedger::default(),
+            tried: Vec::new(),
             model_id,
             dispatch_model,
             streaming,
@@ -862,6 +1082,7 @@ impl RequestContext {
             rate_limit_cell,
             routing,
             wire,
+            constraint_decided_on: state.constraint_decided_on,
             tokenizer: state.tokenizer,
             workers: state.workers,
             sticky_key: state.sticky_key,
@@ -940,6 +1161,21 @@ impl RequestContext {
     ) -> Self {
         Self::new(
             RequestType::Responses(request),
+            headers,
+            model_id,
+            components,
+        )
+    }
+
+    /// Create context for a Decisions scoring request.
+    pub fn for_decisions(
+        request: Arc<DecisionsRequest>,
+        headers: Option<HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        Self::new(
+            RequestType::Decisions(request),
             headers,
             model_id,
             components,
@@ -1094,37 +1330,65 @@ impl WorkerSelection {
         }
     }
 
-    /// Record circuit breaker outcome for all workers based on HTTP status code.
-    pub fn record_outcome(&self, status_code: u16) {
+    /// The workers this selection dispatches to: the one worker, or the
+    /// prefill and decode sides.
+    pub fn workers(&self) -> impl Iterator<Item = &Arc<dyn Worker>> {
+        let (first, second) = match self {
+            Self::Single { worker } => (worker, None),
+            Self::Disaggregated {
+                prefill, decode, ..
+            } => (prefill, Some(decode)),
+        };
+        std::iter::once(first).chain(second)
+    }
+
+    /// The engines (base URLs) this selection dispatches to: the one worker,
+    /// or the prefill and decode sides.
+    pub fn engines(&self) -> impl Iterator<Item = &str> {
+        self.workers().map(|worker| worker.base_url())
+    }
+
+    /// Record an attempt's circuit-breaker outcome on every worker, through
+    /// the request's ledger (one failure charge per request per worker).
+    pub fn record_outcome(&self, ledger: &AttemptLedger, status_code: u16) {
         match self {
-            Self::Single { worker } => worker.record_outcome(status_code),
+            Self::Single { worker } => ledger.record_outcome(worker.as_ref(), status_code),
             Self::Disaggregated {
                 prefill, decode, ..
             } => {
                 // EPD encode dispatch is asynchronous and supervised by
-                // RequestExecution; this records only the prefill/decode leg.
-                prefill.record_outcome(status_code);
-                decode.record_outcome(status_code);
+                // RequestExecution; this records only the prefill/decode side.
+                ledger.record_outcome(prefill.as_ref(), status_code);
+                ledger.record_outcome(decode.as_ref(), status_code);
             }
         }
     }
 
     /// Record circuit breaker outcomes for disaggregated dispatch (individual tracking)
-    pub fn record_prefill_decode_outcomes(&self, prefill_status: u16, decode_status: u16) {
+    pub fn record_prefill_decode_outcomes(
+        &self,
+        ledger: &AttemptLedger,
+        prefill_status: Option<u16>,
+        decode_status: Option<u16>,
+    ) {
         if let Self::Disaggregated {
             prefill, decode, ..
         } = self
         {
-            prefill.record_outcome(prefill_status);
-            decode.record_outcome(decode_status);
+            if let Some(status) = prefill_status {
+                ledger.record_outcome(prefill.as_ref(), status);
+            }
+            if let Some(status) = decode_status {
+                ledger.record_outcome(decode.as_ref(), status);
+            }
         }
     }
 
     /// Record circuit breaker outcome for prefill worker only (sequential PD)
-    pub fn record_outcome_prefill(&self, status_code: u16) {
+    pub fn record_outcome_prefill(&self, ledger: &AttemptLedger, status_code: u16) {
         match self {
             Self::Disaggregated { prefill, .. } => {
-                prefill.record_outcome(status_code);
+                ledger.record_outcome(prefill.as_ref(), status_code);
             }
             Self::Single { .. } => {
                 debug!("record_outcome_prefill called on Single worker selection, ignoring");
@@ -1133,10 +1397,10 @@ impl WorkerSelection {
     }
 
     /// Record circuit breaker outcome for decode worker only (sequential PD)
-    pub fn record_outcome_decode(&self, status_code: u16) {
+    pub fn record_outcome_decode(&self, ledger: &AttemptLedger, status_code: u16) {
         match self {
             Self::Disaggregated { decode, .. } => {
-                decode.record_outcome(status_code);
+                ledger.record_outcome(decode.as_ref(), status_code);
             }
             Self::Single { .. } => {
                 debug!("record_outcome_decode called on Single worker selection, ignoring");
@@ -1189,6 +1453,15 @@ impl WorkerSelection {
 /// Some methods are kept for API completeness even if currently unused.
 #[expect(dead_code)]
 impl ClientSelection {
+    /// The client that builds the request: the single engine's, or the
+    /// prefill's when disaggregated.
+    pub fn builder(&self) -> &BackendClient {
+        match self {
+            Self::Single { client } => client,
+            Self::Disaggregated { prefill, .. } => prefill,
+        }
+    }
+
     pub fn single(&self) -> Option<&BackendClient> {
         match self {
             Self::Single { client } => Some(client),
@@ -1210,6 +1483,40 @@ impl ClientSelection {
         }
     }
 
+    /// The single engine's client for an executor of single dispatches, or
+    /// the client-shape mismatch answer, logged under `function`. Client
+    /// acquisition shapes the selection after the worker selection the plan
+    /// kind comes from, so no executor meets the mismatch; the answer says
+    /// so if one ever does.
+    pub fn single_or_mismatch(
+        &mut self,
+        function: &'static str,
+    ) -> Result<&mut BackendClient, axum::response::Response> {
+        self.single_mut().ok_or_else(|| {
+            error!(function, "Expected single client but got disaggregated");
+            internal_error(
+                "expected_single_client_got_disaggregated",
+                "Expected single client but got disaggregated",
+            )
+        })
+    }
+
+    /// The prefill and decode clients for an executor of disaggregated
+    /// dispatches, or the client-shape mismatch answer, logged under
+    /// `function` (see [`Self::single_or_mismatch`]).
+    pub fn disaggregated_or_mismatch(
+        &mut self,
+        function: &'static str,
+    ) -> Result<(&mut BackendClient, &mut BackendClient), axum::response::Response> {
+        self.disaggregated_mut().ok_or_else(|| {
+            error!(function, "Expected disaggregated clients but got single");
+            internal_error(
+                "expected_disaggregated_clients_got_single",
+                "Expected disaggregated clients but got single",
+            )
+        })
+    }
+
     pub fn prefill_client(&self) -> Option<&BackendClient> {
         match self {
             Self::Disaggregated { prefill, .. } => Some(prefill),
@@ -1217,21 +1524,7 @@ impl ClientSelection {
         }
     }
 
-    pub fn prefill_client_mut(&mut self) -> Option<&mut BackendClient> {
-        match self {
-            Self::Disaggregated { prefill, .. } => Some(prefill),
-            Self::Single { .. } => None,
-        }
-    }
-
     pub fn decode_client(&self) -> Option<&BackendClient> {
-        match self {
-            Self::Disaggregated { decode, .. } => Some(decode),
-            Self::Single { .. } => None,
-        }
-    }
-
-    pub fn decode_client_mut(&mut self) -> Option<&mut BackendClient> {
         match self {
             Self::Disaggregated { decode, .. } => Some(decode),
             Self::Single { .. } => None,
@@ -1249,7 +1542,7 @@ pub(crate) enum ExecutionResult {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
         /// Guards indexed by fan-out sample. Each starts as `Some` and is taken
-        /// when that sample completes; siblings retain their guards. A leg
+        /// when that sample completes; siblings retain their guards. A side
         /// whose prefill already ran to completion in the execution stage
         /// (sequential PD) carries `None` — there is no live guard to release.
         prefill_guards: Vec<Option<PrefillLoadGuard>>,
@@ -1272,18 +1565,47 @@ pub(crate) enum ExecutionResult {
 }
 
 /// Timing context threaded from PD execution into the streaming layer so the
-/// first decode token can be measured against prefill start.
+/// first decode token can be measured against the prefill and decode dispatch
+/// instants.
 #[derive(Clone)]
 pub(crate) struct PdTiming {
     /// Monotonic instant the prefill RPC was dispatched.
-    pub prefill_start: std::time::Instant,
+    pub prefill_start: Instant,
+    /// Monotonic instant the decode RPC was dispatched. Sequential dispatch
+    /// sends decode once prefill is drained and relayed; parallel dispatch
+    /// sends both sides together, so this is the prefill instant.
+    pub decode_sent: Instant,
     /// Backend runtime label (e.g. "sglang", "vllm") for the PD metric set.
     pub runtime: &'static str,
+}
+
+impl PdTiming {
+    /// Record the PD time-to-first-token pair at the first decode token: the
+    /// end-to-end value from the prefill dispatch (`smg_pd_ttft_seconds`) and
+    /// the decode phase from the decode dispatch (`smg_pd_decode_ttft_seconds`),
+    /// off one clock reading so that the prefill, relay and decode phases add
+    /// up to the end-to-end value exactly.
+    pub(crate) fn record_first_decode_token(&self, backend_type: &'static str, model: &str) {
+        let now = Instant::now();
+        Metrics::record_pd_ttft(
+            backend_type,
+            model,
+            self.runtime,
+            now.duration_since(self.prefill_start),
+        );
+        Metrics::record_pd_decode_ttft(
+            backend_type,
+            model,
+            self.runtime,
+            now.duration_since(self.decode_sent),
+        );
+    }
 }
 
 /// Final processed response
 #[derive(Debug)]
 pub(crate) enum FinalResponse {
+    Decisions(DecisionResponse),
     Chat(ChatCompletionResponse),
     /// Generate response is a Vec of GenerateResponse (n=1 returns single item, n>1 returns multiple)
     Generate(Vec<GenerateResponse>),
@@ -1293,8 +1615,8 @@ pub(crate) enum FinalResponse {
     Embedding(EmbeddingResponse),
     /// Classification response
     Classify(ClassifyResponse),
-    /// Messages API response
-    Messages(Message),
+    /// Messages API response (boxed: the object outgrew the other variants)
+    Messages(Box<Message>),
     /// Transcription: the decoded transcript plus its wire format.
     Transcription {
         text: String,
@@ -1304,7 +1626,110 @@ pub(crate) enum FinalResponse {
 
 #[cfg(test)]
 mod tests {
+    use smg_grpc_client::VllmEngineClient;
+
     use super::*;
+    use crate::routers::grpc::{client::GrpcClient, test_engine::mock_engine};
+
+    /// The status of a failure a stage reports and the code of its JSON
+    /// error object.
+    async fn failure_shape(failure: axum::response::Response) -> (http::StatusCode, String) {
+        let status = failure.status();
+        let body = axum::body::to_bytes(failure.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        let code = body["error"]["code"]
+            .as_str()
+            .unwrap_or_else(|| panic!("an error code: {body}"))
+            .to_owned();
+        (status, code)
+    }
+
+    /// The failure a read of a missing output reports (the outputs have no
+    /// `Debug` to `expect_err` against).
+    fn failure_of<T>(read: Result<T, axum::response::Response>) -> axum::response::Response {
+        match read {
+            Ok(_) => panic!("the output was there"),
+            Err(failure) => failure,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_preparation_output_is_one_failure_whichever_stage_reads_it() {
+        let mut slot: Option<PreparationOutput> = None;
+        for failure in [
+            failure_of(stage_output(slot.as_ref(), "a_stage")),
+            failure_of(stage_output(slot.take(), "another_stage")),
+        ] {
+            assert_eq!(
+                failure_shape(failure).await,
+                (
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "preparation_not_completed".to_owned()
+                )
+            );
+        }
+
+        slot = Some(completion_prep(&["a prompt"], None));
+        assert!(matches!(
+            stage_output(slot.as_ref(), "a_stage"),
+            Ok(PreparationOutput::Completion { .. })
+        ));
+        assert!(matches!(
+            stage_output(slot.take(), "the_last_reader"),
+            Ok(PreparationOutput::Completion { .. })
+        ));
+        assert!(slot.is_none(), "the taking reader consumes the output");
+    }
+
+    #[tokio::test]
+    async fn a_missing_worker_selection_is_one_failure_whichever_stage_reads_it() {
+        use crate::worker::{BasicWorkerBuilder, WorkerType};
+
+        let mut slot: Option<WorkerSelection> = None;
+        let failure = failure_of(stage_output(slot.as_ref(), "a_stage"));
+        assert_eq!(
+            failure_shape(failure).await,
+            (
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "worker_selection_not_completed".to_owned()
+            )
+        );
+
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill-selected")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode-selected")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        slot = Some(pd_selection(&prefill, &decode));
+        assert!(matches!(
+            stage_output(slot.as_ref(), "a_stage"),
+            Ok(WorkerSelection::Disaggregated { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_missing_client_selection_is_one_failure_whichever_stage_reads_it() {
+        let mut slot: Option<ClientSelection> = None;
+        for failure in [
+            failure_of(stage_output(slot.as_ref(), "a_stage")),
+            failure_of(stage_output(slot.as_mut(), "the_dispatch")),
+        ] {
+            assert_eq!(
+                failure_shape(failure).await,
+                (
+                    http::StatusCode::INTERNAL_SERVER_ERROR,
+                    "client_acquisition_not_completed".to_owned()
+                )
+            );
+        }
+    }
 
     fn completion_prep(texts: &[&str], joined: Option<&str>) -> PreparationOutput {
         PreparationOutput::Completion {
@@ -1535,7 +1960,7 @@ mod tests {
     }
 
     #[test]
-    fn load_guards_report_completion_for_each_leg_they_hold() {
+    fn load_guards_report_completion_for_each_side_they_hold() {
         use crate::worker::{BasicWorkerBuilder, RequestCompletionSink, WorkerType};
         #[derive(Debug, Default)]
         struct CompletionSpy(std::sync::Mutex<Vec<String>>);
@@ -1575,8 +2000,8 @@ mod tests {
         ));
         assert_eq!(spy.0.lock().unwrap().as_slice(), ["grpc://single"]);
 
-        // The disaggregated path: the decode leg completes with the guards,
-        // the prefill leg with its own guard when the prefill phase ends.
+        // The disaggregated path: the decode side completes with the guards,
+        // the prefill side with its own guard when the prefill phase ends.
         let guards = LoadGuards::new(&pd_selection(&prefill, &decode), None);
         let prefill_guard = PrefillLoadGuard::Unbounded {
             _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
@@ -1602,5 +2027,43 @@ mod tests {
             3,
         ));
         assert_eq!(spy.0.lock().unwrap().len(), before + 3);
+    }
+
+    /// The client-shape mismatch answers an executor takes from the
+    /// selection: one status and code per shape, whichever executor asks;
+    /// a selection of the asked shape hands its clients out.
+    #[tokio::test]
+    async fn a_selection_of_the_other_shape_answers_the_mismatch() {
+        let (url, server) = mock_engine("test-model").await;
+        let client = VllmEngineClient::connect(&url)
+            .await
+            .expect("connect mock engine");
+        let client = BackendClient::Grpc(GrpcClient::Vllm(client));
+        let mut single = ClientSelection::Single {
+            client: client.clone(),
+        };
+        assert!(single.single_or_mismatch("an_executor").is_ok());
+        assert_eq!(
+            failure_shape(failure_of(single.disaggregated_or_mismatch("an_executor"))).await,
+            (
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "expected_disaggregated_clients_got_single".to_owned()
+            )
+        );
+        let mut disaggregated = ClientSelection::Disaggregated {
+            prefill: client.clone(),
+            decode: client,
+        };
+        assert!(disaggregated
+            .disaggregated_or_mismatch("an_executor")
+            .is_ok());
+        assert_eq!(
+            failure_shape(failure_of(disaggregated.single_or_mismatch("an_executor"))).await,
+            (
+                http::StatusCode::INTERNAL_SERVER_ERROR,
+                "expected_single_client_got_disaggregated".to_owned()
+            )
+        );
+        server.abort();
     }
 }

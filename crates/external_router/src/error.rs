@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use axum::{
     http::{HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
@@ -7,6 +9,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
+use smg_data_connector::StorageFailure;
 
 #[derive(Serialize)]
 struct ErrorResponse<'a> {
@@ -71,6 +74,25 @@ pub fn method_not_allowed(code: impl Into<String>, message: impl Into<String>) -
     create_error(StatusCode::METHOD_NOT_ALLOWED, code, message)
 }
 
+/// The answer to a failed history store call. A store that is not available
+/// (a call that exceeded the store's bound, no connection to be had, the
+/// connection gone or timed out, the server shutting down or refusing
+/// connections) is a `503 storage_unavailable`: the client may retry and the
+/// metric label names the dependency. Any other failure (the store's own
+/// refusal, a hook's rejection, a record that cannot be decoded, an invalid
+/// chain) keeps the endpoint's own 500 `code`. `context` opens the message.
+pub fn storage_failure(
+    code: &str,
+    context: impl Display,
+    error: &(impl StorageFailure + Display),
+) -> Response {
+    if error.is_unavailable() {
+        service_unavailable("storage_unavailable", format!("{context}: {error}"))
+    } else {
+        internal_error(code, format!("{context}: {error}"))
+    }
+}
+
 pub fn create_error(
     status: StatusCode,
     code: impl Into<String>,
@@ -89,7 +111,7 @@ pub fn create_error(
         headers,
         Json(ErrorResponse {
             error: ErrorDetail {
-                error_type: status_code_to_str(status),
+                error_type: error_type_for_status(status),
                 code: &code_str,
                 message: &message_str,
                 param: None,
@@ -101,10 +123,21 @@ pub fn create_error(
     response
 }
 
-fn status_code_to_str(status_code: StatusCode) -> &'static str {
-    status_code
-        .canonical_reason()
-        .unwrap_or("Unknown Status Code")
+/// The `error.type` of the OpenAI-shaped envelope for a status.
+///
+/// The public API's vocabulary, which clients switch on to decide between
+/// fixing the request, re-authenticating, backing off and retrying: a 4xx is
+/// an `invalid_request_error` (the public API files its 404s there too, the
+/// detail in `code`, e.g. `model_not_found`, and its 401s, with the code
+/// `invalid_api_key`), except the two statuses with a word of their own;
+/// every 5xx is a `server_error`.
+pub fn error_type_for_status(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::FORBIDDEN => "permission_error",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limit_error",
+        status if status.is_server_error() => "server_error",
+        _ => "invalid_request_error",
+    }
 }
 
 pub fn model_not_found(model: &str) -> Response {
@@ -177,6 +210,111 @@ pub fn sanitize_error_body(body: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reason phrase ("Bad Request", "Not Found") is not a `type` the SDKs
+    /// know; the envelope's `type` is the public vocabulary, `code` stays the
+    /// gateway's string and `param` is present (null when no field is named).
+    #[tokio::test]
+    async fn envelope_type_is_the_public_vocabulary_for_every_status_class() {
+        for (status, expected) in [
+            (StatusCode::BAD_REQUEST, "invalid_request_error"),
+            (StatusCode::NOT_FOUND, "invalid_request_error"),
+            (StatusCode::METHOD_NOT_ALLOWED, "invalid_request_error"),
+            (StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error"),
+            (StatusCode::FAILED_DEPENDENCY, "invalid_request_error"),
+            (StatusCode::UNAUTHORIZED, "invalid_request_error"),
+            (StatusCode::FORBIDDEN, "permission_error"),
+            (StatusCode::TOO_MANY_REQUESTS, "rate_limit_error"),
+            (StatusCode::INTERNAL_SERVER_ERROR, "server_error"),
+            (StatusCode::NOT_IMPLEMENTED, "server_error"),
+            (StatusCode::BAD_GATEWAY, "server_error"),
+            (StatusCode::SERVICE_UNAVAILABLE, "server_error"),
+            (StatusCode::GATEWAY_TIMEOUT, "server_error"),
+        ] {
+            let response = create_error(status, "some_code", "what went wrong");
+            assert_eq!(response.status(), status);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"]["type"], expected, "{status}");
+            assert_eq!(json["error"]["code"], "some_code", "{status}");
+            assert_eq!(json["error"]["message"], "what went wrong", "{status}");
+            assert!(
+                json["error"].get("param").is_some_and(Value::is_null),
+                "{status}: param must be present and null, got {json}"
+            );
+        }
+    }
+
+    /// A store call that exceeded its bound is answered 503 `storage_unavailable`
+    /// (a `server_error`), any other store failure with the endpoint's own 500
+    /// code; the message opens with the endpoint's context.
+    #[tokio::test]
+    async fn a_timed_out_store_call_is_answered_as_unavailable() {
+        use smg_data_connector::ResponseStorageError;
+
+        for (error, status, code) in [
+            (
+                ResponseStorageError::Timeout(
+                    "the postgres get_response call exceeded its bound of 5 s".to_string(),
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_unavailable",
+            ),
+            (
+                ResponseStorageError::Unavailable(
+                    "no connection from the pool: error connecting to server: Connection refused"
+                        .to_string(),
+                ),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_unavailable",
+            ),
+            // The store answered (a constraint, a refused statement, a hook's
+            // refusal): the endpoint's own failure, not an outage to retry.
+            (
+                ResponseStorageError::StorageError("db error".to_string()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+            ),
+            (
+                ResponseStorageError::Rejected("tenant".to_string()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+            ),
+        ] {
+            let response = storage_failure("storage_error", "Failed to get response", &error);
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers().get(HEADER_X_SMG_ERROR_CODE).unwrap(),
+                code
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let json: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"]["type"], "server_error");
+            assert_eq!(json["error"]["code"], code);
+            assert_eq!(
+                json["error"]["message"],
+                format!("Failed to get response: {error}")
+            );
+        }
+    }
+
+    #[test]
+    fn model_not_found_is_an_invalid_request_error_with_the_code() {
+        let response = model_not_found("gpt-nope");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            extract_error_code_from_response(&response),
+            "model_not_found"
+        );
+        assert_eq!(
+            error_type_for_status(response.status()),
+            "invalid_request_error"
+        );
+    }
 
     #[test]
     fn extract_error_code_reads_gateway_minted_code() {

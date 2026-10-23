@@ -144,6 +144,7 @@ async fn test_cache_produces_identical_tokens() {
     let l0_only_config = CacheConfig {
         enable_l0: true,
         l0_max_entries: 10_000,
+        l0_max_memory: usize::MAX,
         enable_l1: false,
         l1_max_memory: 0,
     };
@@ -151,6 +152,7 @@ async fn test_cache_produces_identical_tokens() {
     let l1_only_config = CacheConfig {
         enable_l0: false,
         l0_max_entries: 0,
+        l0_max_memory: usize::MAX,
         enable_l1: true,
         l1_max_memory: 50 * 1024 * 1024,
     };
@@ -158,6 +160,7 @@ async fn test_cache_produces_identical_tokens() {
     let l0_l1_config = CacheConfig {
         enable_l0: true,
         l0_max_entries: 10_000,
+        l0_max_memory: usize::MAX,
         enable_l1: true,
         l1_max_memory: 50 * 1024 * 1024,
     };
@@ -336,6 +339,7 @@ async fn test_cache_correctness_with_edge_cases() {
     let cached_config = CacheConfig {
         enable_l0: true,
         l0_max_entries: 10_000,
+        l0_max_memory: usize::MAX,
         enable_l1: true,
         l1_max_memory: 50 * 1024 * 1024,
     };

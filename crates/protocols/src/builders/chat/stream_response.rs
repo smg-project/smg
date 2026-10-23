@@ -2,8 +2,6 @@
 //!
 //! Provides an ergonomic fluent API for constructing streaming chat completion responses.
 
-use std::borrow::Cow;
-
 use crate::{
     chat::*,
     common::{FunctionCallDelta, ToolCallDelta, Usage},
@@ -96,7 +94,9 @@ impl ChatCompletionStreamResponseBuilder {
         self
     }
 
-    /// Add a choice delta that sets `role` and `content`
+    /// Add a choice delta that sets `role` and `content`: a stream's first
+    /// chunk only, since the role is sent once; the content chunks after it
+    /// go through `add_choice_content_with_logprobs`, which sets no role.
     pub fn add_choice_content(
         mut self,
         index: u32,
@@ -118,18 +118,18 @@ impl ChatCompletionStreamResponseBuilder {
         self
     }
 
-    /// Add a choice delta that sets `role`, `content`, and `logprobs`
+    /// Add a choice delta that sets `content` and `logprobs` without a `role`
+    /// (the role is sent once, in the first chunk of the stream)
     pub fn add_choice_content_with_logprobs(
         mut self,
         index: u32,
-        role: impl Into<String>,
         content: impl Into<String>,
         logprobs: Option<crate::common::ChatLogProbs>,
     ) -> Self {
         self.choices.push(ChatStreamChoice {
             index,
             delta: ChatMessageDelta {
-                role: Some(role.into()),
+                role: None,
                 content: Some(content.into()),
                 tool_calls: None,
                 reasoning_content: None,
@@ -158,53 +158,6 @@ impl ChatCompletionStreamResponseBuilder {
         self
     }
 
-    /// Add a choice delta that appends a tool-call *arguments delta*
-    /// Uses `Cow` so you can pass `&str` or `String` without extra clones
-    pub fn add_choice_tool_args(
-        mut self,
-        index: u32,
-        args_delta: impl Into<Cow<'static, str>>,
-    ) -> Self {
-        self.choices.push(ChatStreamChoice {
-            index,
-            delta: ChatMessageDelta {
-                role: Some("assistant".to_string()),
-                content: None,
-                tool_calls: Some(vec![ToolCallDelta {
-                    index: 0,
-                    id: None,
-                    tool_type: None,
-                    function: Some(FunctionCallDelta {
-                        name: None,
-                        arguments: Some(args_delta.into().into_owned()),
-                    }),
-                }]),
-                reasoning_content: None,
-            },
-            logprobs: None,
-            finish_reason: None,
-            matched_stop: None,
-        });
-        self
-    }
-
-    /// Add a choice delta that sets reasoning content (for models that stream reasoning)
-    pub fn add_choice_reasoning(mut self, index: u32, reasoning: impl Into<String>) -> Self {
-        self.choices.push(ChatStreamChoice {
-            index,
-            delta: ChatMessageDelta {
-                role: Some("assistant".to_string()),
-                content: None,
-                tool_calls: None,
-                reasoning_content: Some(reasoning.into()),
-            },
-            logprobs: None,
-            finish_reason: None,
-            matched_stop: None,
-        });
-        self
-    }
-
     /// Add a choice delta for tool call with function name and ID
     pub fn add_choice_tool_name(
         mut self,
@@ -215,7 +168,7 @@ impl ChatCompletionStreamResponseBuilder {
         self.choices.push(ChatStreamChoice {
             index,
             delta: ChatMessageDelta {
-                role: Some("assistant".to_string()),
+                role: None,
                 content: None,
                 tool_calls: Some(vec![ToolCallDelta {
                     index: 0,
@@ -245,7 +198,7 @@ impl ChatCompletionStreamResponseBuilder {
         self.choices.push(ChatStreamChoice {
             index,
             delta: ChatMessageDelta {
-                role: Some("assistant".to_string()),
+                role: None,
                 content: None,
                 tool_calls: Some(vec![tool_call_delta]),
                 reasoning_content: None,

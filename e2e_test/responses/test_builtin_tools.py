@@ -20,6 +20,7 @@ import openai
 import pytest
 import yaml
 from infra import BRAVE_MCP_HOST, BRAVE_MCP_PORT, BRAVE_MCP_URL
+from infra.streams import collect_streamed_response
 
 logger = logging.getLogger(__name__)
 
@@ -447,10 +448,11 @@ class TestMcpWebSearchStreamingEvents:
             stream=True,
         )
 
-        events = list(resp)
+        streamed = collect_streamed_response(resp)
+        events = streamed.events
         assert len(events) > 0
 
-        event_types = [event.type for event in events]
+        event_types = streamed.event_types
         logger.info("MCP streaming event types: %s", sorted(set(event_types)))
 
         # Core streaming events
@@ -470,10 +472,9 @@ class TestMcpWebSearchStreamingEvents:
         assert "response.mcp_call.completed" in event_types, "Should have mcp_call.completed event"
 
         # Verify final response
-        completed_events = [e for e in events if e.type == "response.completed"]
-        assert len(completed_events) == 1
+        assert len(streamed.completed_events) == 1
 
-        final_response = completed_events[0].response
+        final_response = streamed.final_response
         assert final_response.status == "completed"
         assert final_response.output is not None
 
@@ -525,8 +526,8 @@ class TestWebSearchStreamingEvents:
             stream=True,
         )
 
-        events = list(resp)
-        event_types = [event.type for event in events]
+        streamed = collect_streamed_response(resp)
+        event_types = streamed.event_types
         logger.info("web_search_preview streaming event types: %s", sorted(set(event_types)))
 
         # Core streaming events
@@ -561,8 +562,7 @@ class TestWebSearchStreamingEvents:
         )
 
         # Verify final response
-        completed_events = [e for e in events if e.type == "response.completed"]
-        final_response = completed_events[0].response
+        final_response = streamed.final_response
         assert final_response.status == "completed"
 
         # Verify web_search_call in final output (not mcp_call)
@@ -611,8 +611,8 @@ class TestWebSearchStreamingEvents:
             stream=True,
         )
 
-        events = list(resp)
-        event_types = [event.type for event in events]
+        streamed = collect_streamed_response(resp)
+        event_types = streamed.event_types
 
         # Find positions of key events
         def find_first(event_type: str) -> int:
@@ -745,8 +745,8 @@ class TestWebSearchStreamingEventsGrpc:
             stream=True,
         )
 
-        events = list(resp)
-        event_types = [event.type for event in events]
+        streamed = collect_streamed_response(resp)
+        event_types = streamed.event_types
         logger.info("web_search_preview streaming event types (gRPC): %s", sorted(set(event_types)))
 
         # Core streaming events
@@ -781,8 +781,7 @@ class TestWebSearchStreamingEventsGrpc:
         )
 
         # Verify final response
-        completed_events = [e for e in events if e.type == "response.completed"]
-        final_response = completed_events[0].response
+        final_response = streamed.final_response
         assert final_response.status == "completed"
 
         # Verify web_search_call in final output (not mcp_call)
@@ -820,8 +819,8 @@ class TestWebSearchStreamingEventsGrpc:
             stream=True,
         )
 
-        events = list(resp)
-        event_types = [event.type for event in events]
+        streamed = collect_streamed_response(resp)
+        event_types = streamed.event_types
 
         # Find positions of key events
         def find_first(event_type: str) -> int:

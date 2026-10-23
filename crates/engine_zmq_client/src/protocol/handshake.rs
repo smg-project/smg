@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::codec::{dtype::ModelDtype, OpaqueValue};
 
@@ -104,6 +104,26 @@ pub struct EngineCoreReadyResponse {
     /// KV-event publisher configuration, if configured.
     #[serde(default)]
     pub kv_events_config: Option<KvEventsConfig>,
+    /// Optional TokenSpeed diagnostic capture identities; absent on older engines.
+    #[serde(default)]
+    pub cache_trace_epochs: Vec<String>,
+    /// The field order of each positional (array-encoded) struct the engine
+    /// decodes, by struct name, as the engine's own declaration has it (a
+    /// tagged struct's tag is not counted). A protocol whose requests are
+    /// positional checks the prefixes it encodes against it once, at connect
+    /// time ([`EngineProtocol::check_layouts`](crate::protocol::EngineProtocol::check_layouts)).
+    /// Empty from an engine that declares none, whether it leaves the key
+    /// out or sends it as nil.
+    #[serde(default, deserialize_with = "nil_as_empty_map")]
+    pub positional_layouts: BTreeMap<String, Vec<String>>,
+}
+
+/// A map an engine may send as nil (a Python `None` in a struct that omits
+/// nothing): the same as leaving the key out.
+fn nil_as_empty_map<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Vec<String>>, D::Error> {
+    Ok(Option::<BTreeMap<String, Vec<String>>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 /// Frontend-owned ZMQ addresses sent to the engine during handshake init.
@@ -173,6 +193,35 @@ mod tests {
         assert_eq!(resp.data_parallel_rank, 0);
         // Optional trailing field defaults when omitted.
         assert!(resp.kv_events_config.is_none());
+        assert!(resp.positional_layouts.is_empty());
+    }
+
+    #[test]
+    fn ready_response_reads_the_declared_positional_layouts() {
+        let json = serde_json::json!({
+            "max_model_len": 4096u64,
+            "num_gpu_blocks": 1000u64,
+            "block_size": 16u64,
+            "dp_stats_address": serde_json::Value::Null,
+            "dtype": "bfloat16",
+            "vllm_version": "engine-1.0",
+            "world_size": 1u64,
+            "data_parallel_size": 1u64,
+            "positional_layouts": {"SamplingParams": ["max_new_tokens", "stop"]},
+        });
+        let bytes = rmp_serde::to_vec_named(&json).unwrap();
+        let resp: EngineCoreReadyResponse = decode_msgpack(&bytes).unwrap();
+        assert_eq!(
+            resp.positional_layouts["SamplingParams"],
+            vec!["max_new_tokens".to_string(), "stop".to_string()]
+        );
+        // An engine that sends the key as nil declares nothing, like one
+        // that leaves it out.
+        let mut json = json;
+        json["positional_layouts"] = serde_json::Value::Null;
+        let bytes = rmp_serde::to_vec_named(&json).unwrap();
+        let resp: EngineCoreReadyResponse = decode_msgpack(&bytes).unwrap();
+        assert!(resp.positional_layouts.is_empty());
     }
 
     #[test]
@@ -209,9 +258,11 @@ mod tests {
             "world_size": 2u64,
             "data_parallel_size": 2u64,
             "kv_cache_size_tokens": 426176u64,
+            "cache_trace_epochs": ["capture-epoch"],
         });
         let bytes = rmp_serde::to_vec_named(&json).unwrap();
         let resp: EngineCoreReadyResponse = decode_msgpack(&bytes).unwrap();
         assert_eq!(resp.block_size, 64);
+        assert_eq!(resp.cache_trace_epochs, vec!["capture-epoch"]);
     }
 }

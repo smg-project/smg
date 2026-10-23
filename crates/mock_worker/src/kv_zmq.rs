@@ -83,11 +83,21 @@ pub(crate) struct KvZmqConfig {
     pub(crate) wire: Wire,
 }
 
+/// The `tcp://` endpoint of `host:port` as ZMQ spells it: an IPv6 literal in
+/// brackets (`tcp://[::1]:5557`), an IPv4 address, a name or `*` as they are.
+fn tcp_endpoint(host: &str, port: u16) -> String {
+    if host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("tcp://[{host}]:{port}")
+    } else {
+        format!("tcp://{host}:{port}")
+    }
+}
+
 /// Bind the sockets and publish the engine's events until its event channel
 /// closes.
 pub(crate) async fn serve(engine: Engine, cfg: KvZmqConfig) {
     let mut publisher = PubSocket::new();
-    let endpoint = format!("tcp://{}:{}", cfg.host, cfg.port);
+    let endpoint = tcp_endpoint(&cfg.host, cfg.port);
     if let Err(e) = publisher.bind(&endpoint).await {
         tracing::error!("kv-events publisher failed to bind {endpoint}: {e}");
         return;
@@ -95,7 +105,7 @@ pub(crate) async fn serve(engine: Engine, cfg: KvZmqConfig) {
     let mut replay = None;
     if cfg.replay {
         let mut router = RouterSocket::new();
-        let replay_endpoint = format!("tcp://{}:{}", cfg.host, cfg.port.saturating_add(1));
+        let replay_endpoint = tcp_endpoint(&cfg.host, cfg.port.saturating_add(1));
         if let Err(e) = router.bind(&replay_endpoint).await {
             tracing::error!("kv-events replay failed to bind {replay_endpoint}: {e}");
             return;
@@ -1002,5 +1012,40 @@ mod tests {
         }
         assert_eq!(restarted, Some(0), "the sequence restarted from 0");
         drop(receivers);
+    }
+}
+
+#[cfg(test)]
+mod endpoint_tests {
+    use zeromq::{prelude::Socket, PubSocket};
+
+    use super::tcp_endpoint;
+
+    #[test]
+    fn an_ipv6_host_is_bracketed() {
+        assert_eq!(tcp_endpoint("::1", 5557), "tcp://[::1]:5557");
+        assert_eq!(tcp_endpoint("fd00::1", 5558), "tcp://[fd00::1]:5558");
+    }
+
+    #[test]
+    fn ipv4_hosts_names_and_the_wildcard_pass_through() {
+        assert_eq!(tcp_endpoint("127.0.0.1", 5557), "tcp://127.0.0.1:5557");
+        assert_eq!(tcp_endpoint("localhost", 5557), "tcp://localhost:5557");
+        assert_eq!(tcp_endpoint("*", 5557), "tcp://*:5557");
+    }
+
+    #[tokio::test]
+    async fn the_publisher_binds_an_ipv6_host() {
+        // Nothing to assert on a host without an IPv6 loopback.
+        if std::net::TcpListener::bind("[::1]:0").is_err() {
+            return;
+        }
+        let mut publisher = PubSocket::new();
+        let bound = publisher.bind(&tcp_endpoint("::1", 0)).await.unwrap();
+        assert_eq!(
+            bound.to_string().split("]:").next(),
+            Some("tcp://[::1"),
+            "{bound}"
+        );
     }
 }

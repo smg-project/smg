@@ -7,9 +7,8 @@ use openai_protocol::{
     chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
     common::{ChatLogProbs, ToolCall, Usage},
     responses::{
-        InputTokensDetails, OutputTokensDetails, ResponseContentPart, ResponseOutputItem,
-        ResponseReasoningContent, ResponseStatus, ResponseUsage, ResponsesRequest,
-        ResponsesResponse, ResponsesUsage,
+        ResponseContentPart, ResponseOutputItem, ResponseReasoningContent, ResponseStatus,
+        ResponseUsage, ResponsesRequest, ResponsesResponse, ResponsesUsage,
     },
 };
 use tracing::error;
@@ -26,6 +25,31 @@ use crate::routers::{
         context::{DispatchMetadata, ExecutionResult},
     },
 };
+
+/// The usage of a Harmony chat completion: the engine's counters through
+/// the chat usage builder the regular path uses, with the reasoning tokens
+/// the Harmony parser counted on the analysis and commentary channels, every
+/// detail counter present. The streamed answer's usage chunk and the
+/// non-streamed answer both build their usage here, so a request's two
+/// usage objects are the same.
+pub(super) fn chat_usage(
+    counts: response_formatting::TokenCounts,
+    parsed_reasoning_tokens: u32,
+) -> Usage {
+    response_formatting::chat_usage(counts.usage(), Some(parsed_reasoning_tokens), 0)
+}
+
+/// The usage of one Responses API iteration: the engine's counters with the
+/// reasoning tokens the Harmony parser counted, under the chat path's rule
+/// (the details are always reported, zero included; an engine that counts
+/// reasoning itself is not overruled); the same object whether the iteration
+/// streamed or not.
+pub(super) fn iteration_usage(
+    counts: response_formatting::TokenCounts,
+    parsed_reasoning_tokens: u32,
+) -> Usage {
+    response_formatting::with_parsed_reasoning_tokens(counts.usage(), Some(parsed_reasoning_tokens))
+}
 
 /// Processor for non-streaming Harmony responses
 ///
@@ -44,13 +68,17 @@ impl HarmonyResponseProcessor {
     /// `router_stop_strings` is non-empty only when the router must enforce
     /// string `stop` sequences itself (direct-ZMQ backends: the engine sees
     /// token ids only).
+    ///
+    /// Returns the response with the engine's counters it was built from:
+    /// the response's usage may carry the parser's reasoning count where
+    /// the engine reports none; the settlement takes the counters.
     pub async fn process_non_streaming_chat_response(
         &self,
         execution_result: ExecutionResult,
         chat_request: Arc<ChatCompletionRequest>,
         dispatch: DispatchMetadata,
         router_stop_strings: &[String],
-    ) -> Result<ChatCompletionResponse, Response> {
+    ) -> Result<(ChatCompletionResponse, response_formatting::TokenCounts), Response> {
         let request_logprobs = chat_request.logprobs;
 
         // Collect all completed responses (one per choice)
@@ -98,8 +126,8 @@ impl HarmonyResponseProcessor {
                     )
                 })?;
 
-            // Convert output logprobs if present
-            let logprobs: Option<ChatLogProbs> = if request_logprobs {
+            // Convert output logprobs if present (narrowed to the content below)
+            let mut logprobs: Option<ChatLogProbs> = if request_logprobs {
                 let encoding = try_harmony_encoding()
                     .map_err(|e| error::internal_error("harmony_encoding_unavailable", e))?;
                 complete
@@ -142,10 +170,23 @@ impl HarmonyResponseProcessor {
                 }
             }
 
+            // The logprobs cover the tokens of `message.content` only, as a
+            // stream's content deltas do: not the analysis, the tool calls,
+            // the channel markers, or the text a stop sequence cut off.
+            if let Some(ChatLogProbs::Detailed {
+                content: Some(items),
+                ..
+            }) = &mut logprobs
+            {
+                retain_final_text_tokens(items, &parsed.final_text_tokens, final_text.len());
+            }
+
             // Build response message (assistant)
             let message = ChatCompletionMessage {
                 role: "assistant".to_string(),
                 content: (!final_text.is_empty()).then_some(final_text),
+                refusal: None,
+                annotations: Vec::new(),
                 tool_calls,
                 reasoning_content: analysis,
             };
@@ -163,20 +204,40 @@ impl HarmonyResponseProcessor {
             });
         }
 
-        // Build usage from proto fields
-        let usage = response_formatting::build_usage(&all_responses)
-            .with_reasoning_tokens(total_reasoning_tokens);
+        // The usage from the engine's counters, built as the streamed answer
+        // builds its usage chunk: with the reasoning tokens the parser
+        // counted and every detail counter present as the OpenAI API sends it.
+        let counts = response_formatting::TokenCounts::of(&all_responses);
+        let usage = chat_usage(counts, total_reasoning_tokens);
 
         // Final ChatCompletionResponse
-        Ok(
-            ChatCompletionResponse::builder(&dispatch.request_id, &chat_request.model)
-                .created(dispatch.created)
-                .choices(choices)
-                .usage(usage)
-                .maybe_system_fingerprint(dispatch.weight_version.as_deref())
-                .build(),
-        )
+        let response = ChatCompletionResponse::builder(&dispatch.request_id, &chat_request.model)
+            .created(dispatch.created)
+            .choices(choices)
+            .usage(usage)
+            .maybe_system_fingerprint(dispatch.weight_version.as_deref())
+            .build();
+        Ok((response, counts))
     }
+}
+
+/// Keep the items of the output tokens that carry the first `content_len`
+/// bytes of the final text (`final_text_tokens` as `parse_complete` gives it).
+fn retain_final_text_tokens<T>(
+    items: &mut Vec<T>,
+    final_text_tokens: &[Option<usize>],
+    content_len: usize,
+) {
+    let mut tokens = final_text_tokens.iter();
+    let mut start = 0;
+    items.retain(|_| match tokens.next() {
+        Some(Some(bytes)) => {
+            let keep = start < content_len;
+            start += bytes;
+            keep
+        }
+        _ => false,
+    });
 }
 
 impl Default for HarmonyResponseProcessor {
@@ -287,9 +348,12 @@ impl HarmonyResponseProcessor {
             );
         }
 
-        // Build usage (needed for both ToolCallsFound and Completed)
-        let usage = response_formatting::build_usage(std::slice::from_ref(complete))
-            .with_reasoning_tokens(parsed.reasoning_token_count);
+        // The usage of the iteration, as the streamed iteration builds it
+        // (needed for both ToolCallsFound and Completed).
+        let usage = iteration_usage(
+            response_formatting::TokenCounts::of(std::slice::from_ref(complete)),
+            parsed.reasoning_token_count,
+        );
 
         // Check for tool calls in commentary channel
         if let Some(tool_calls) = parsed.commentary {
@@ -346,25 +410,68 @@ impl HarmonyResponseProcessor {
             .status(ResponseStatus::Completed)
             .output(output)
             .maybe_text(responses_request.text.clone())
-            .usage(ResponsesUsage::Modern(ResponseUsage {
-                input_tokens: usage.prompt_tokens,
-                output_tokens: usage.completion_tokens,
-                total_tokens: usage.total_tokens,
-                input_tokens_details: usage
-                    .prompt_tokens_details
-                    .as_ref()
-                    .map(InputTokensDetails::from),
-                output_tokens_details: usage.completion_tokens_details.as_ref().and_then(|d| {
-                    d.reasoning_tokens.map(|tokens| OutputTokensDetails {
-                        reasoning_tokens: tokens,
-                    })
-                }),
-            }))
+            .usage(ResponsesUsage::Modern(ResponseUsage::from(&usage)))
             .build();
 
         Ok(ResponsesIterationResult::Completed {
             response: Box::new(response),
             usage,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retain_keeps_the_final_text_tokens_up_to_the_content() {
+        // Tokens: a marker, "Hel", a held byte, "lo", " STOP", " more", a stop token.
+        let tokens = [None, Some(3), Some(0), Some(2), Some(5), Some(5), None];
+        let mut items: Vec<usize> = (0..tokens.len()).collect();
+        retain_final_text_tokens(&mut items, &tokens, 15);
+        assert_eq!(items, [1, 2, 3, 4, 5]);
+        // A stop sequence cut the content after "Hello STOP".
+        let mut items: Vec<usize> = (0..tokens.len()).collect();
+        retain_final_text_tokens(&mut items, &tokens, 10);
+        assert_eq!(items, [1, 2, 3, 4]);
+        // No content, no logprobs.
+        let mut items: Vec<usize> = (0..tokens.len()).collect();
+        retain_final_text_tokens(&mut items, &tokens, 0);
+        assert!(items.is_empty());
+    }
+
+    fn counts(reasoning: u32) -> response_formatting::TokenCounts {
+        response_formatting::TokenCounts {
+            prompt: 10,
+            completion: 5,
+            cached: 0,
+            reasoning,
+            spec_accepted: 0,
+            spec_drafted: 0,
+        }
+    }
+
+    fn reasoning_of(usage: &Usage) -> Option<u32> {
+        usage
+            .completion_tokens_details
+            .as_ref()
+            .and_then(|details| details.reasoning_tokens)
+    }
+
+    #[test]
+    fn both_helpers_resolve_the_reasoning_count_the_same_way() {
+        // The engine reported none: the parser's count is used, zero included.
+        for parsed in [0, 3] {
+            assert_eq!(reasoning_of(&chat_usage(counts(0), parsed)), Some(parsed));
+            assert_eq!(
+                reasoning_of(&iteration_usage(counts(0), parsed)),
+                Some(parsed)
+            );
+        }
+        // The engine counted reasoning itself: its count stands on both paths.
+        assert_eq!(reasoning_of(&chat_usage(counts(7), 3)), Some(7));
+        assert_eq!(reasoning_of(&iteration_usage(counts(7), 3)), Some(7));
+        assert_eq!(reasoning_of(&iteration_usage(counts(7), 0)), Some(7));
     }
 }

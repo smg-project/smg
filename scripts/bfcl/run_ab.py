@@ -75,6 +75,9 @@ def parse_arm(spec: str, project_root: Path) -> Arm:
     parsed = urlparse(url if "://" in url else f"http://{url}")
     host = parsed.hostname or "127.0.0.1"
     port = str(parsed.port or 80)
+    # urlparse strips the brackets of an IPv6 literal; URLs want them back.
+    if ":" in host:
+        host = f"[{host}]"
     return Arm(
         name=name,
         base_url=url,

@@ -52,8 +52,8 @@ impl DsmlDialect {
         }
     }
 
-    /// V4.1 parsing rules, from the reference parser (`encoding.py`), vLLM
-    /// Python and SGLang: exactly the `"\n\n"` separator before the block is
+    /// V4.1 parsing rules, from the reference parser (`encoding.py`) and the
+    /// serving engines' parsers: exactly the `"\n\n"` separator before the block is
     /// stripped from the content; `arguments` are serialised like Python's
     /// `json.dumps`; an invoke outside a block is accepted; text after the
     /// tool section is dropped; unknown tool names are forwarded unfiltered.
@@ -123,6 +123,11 @@ pub struct DeepSeekDsmlParser {
 
 /// The DSML sentinel every tag starts with (`<` + this + tag name).
 const DSML_TOKEN: &str = "｜DSML｜";
+
+/// An opening tag's first bytes, `<` + the sentinel: one BPE token in the
+/// model's tokenizer, so a live stream delivers it whole; the closing tags
+/// start with `</` + the sentinel instead and do not contain it.
+const DSML_OPEN: &str = "<｜DSML｜";
 
 /// DeepSeek end-of-sentence marker. Some engines emit this as raw text at the
 /// end of a truncated turn; it must never bleed into tool-call argument bytes.
@@ -251,6 +256,59 @@ impl DeepSeekDsmlParser {
         }
     }
 
+    /// The end tags of this dialect and the end-of-sentence marker: the
+    /// engine's own markup, never content.
+    fn end_tags(&self) -> [&str; 4] {
+        [
+            self.block_close.as_str(),
+            self.invoke_end_tag.as_str(),
+            self.parameter_end_tag.as_str(),
+            EOS_TOKEN,
+        ]
+    }
+
+    /// `text` without its complete end tags. The block close goes with the
+    /// whitespace around it (the newline the model puts between the last
+    /// invoke and the close, and any after the close), as the one-shot path,
+    /// which reads the content before the block only, never sees them.
+    fn without_end_tags(&self, text: &str) -> String {
+        let mut text = text.to_string();
+        while let Some(at) = text.find(self.block_close.as_str()) {
+            let start = text[..at].trim_end().len();
+            let after = at + self.block_close.len();
+            let end = text.len() - text[after..].trim_start().len();
+            text.replace_range(start..end, "");
+        }
+        for tag in [
+            self.invoke_end_tag.as_str(),
+            self.parameter_end_tag.as_str(),
+            EOS_TOKEN,
+        ] {
+            text = text.replace(tag, "");
+        }
+        text
+    }
+
+    /// Bytes at the end of `text` that are not content yet: a suffix that
+    /// could still become an opener's sentinel or an end tag once the next
+    /// piece arrives (`</｜DSML｜`, `tool`, `_c`, `all`, `s`, `>` come as separate
+    /// pieces), and the run of whitespace before it. Whitespace waits for the
+    /// next piece because the one-shot path trims it in front of a block and
+    /// the block close takes it after the last invoke; text that follows
+    /// instead is flushed with it, and a stream that ends on it without a
+    /// tool call gives it back through
+    /// [`ToolParser::take_unstreamed_normal_text`]. The visible text of a
+    /// stream is the one-shot path's content whatever the piece boundaries.
+    fn held_suffix_len(&self, text: &str) -> usize {
+        let [block_close, invoke_end, parameter_end, eos] = self.end_tags();
+        let partial = longest_partial_suffix(
+            text,
+            &[DSML_OPEN, block_close, invoke_end, parameter_end, eos],
+        );
+        let before = &text[..text.len() - partial];
+        partial + (before.len() - before.trim_end().len())
+    }
+
     /// Serialise an arguments object the way this dialect's reference does:
     /// Python `json.dumps` spacing for V4.1, compact JSON for V3.2/V4.
     fn dump_arguments(&self, params: serde_json::Map<String, Value>) -> String {
@@ -295,11 +353,11 @@ impl DeepSeekDsmlParser {
     fn parse_parameters_from_dsml(&self, invoke_content: &str, allow_partial: bool) -> String {
         let trimmed = invoke_content.trim();
 
-        // Direct JSON path (also the shape SGLang's grammar emits under a
+        // Direct JSON path (also the shape one engine's grammar emits under a
         // structural-tag constraint). The text is the arguments object and is
         // passed through as written — a compact body stays compact rather
         // than being re-spaced like DSML parameters — so streaming deltas stay
-        // consistent (SGLang does the same).
+        // consistent (that engine's parser does the same).
         if trimmed.starts_with('{') {
             if allow_partial {
                 // `strip_dsml_trailing` handles partial `</｜DSML｜invoke>` prefixes
@@ -335,7 +393,7 @@ impl DeepSeekDsmlParser {
         }
 
         // Partial parameter matching for streaming
-        // Following SGLang: strip DSML fragments from remaining content BEFORE
+        // Following the engine's parser: strip DSML fragments from remaining content BEFORE
         // running the partial regex, so the regex captures a clean value.
         if allow_partial {
             // Find where the last complete parameter match ended
@@ -633,13 +691,13 @@ impl DeepSeekDsmlParser {
     }
 
     /// The V4.1 tool-call grammar as an xgrammar structural tag, mirroring
-    /// vLLM's `deepseek_v41` builder for a forced tool choice
+    /// the serving engine's `deepseek_v41` builder for a forced tool choice
     /// (`tool_choice: required` or a named function): a blank line, the
     /// `<｜DSML｜ calls>` block, at least one invoke of a listed tool, and the
     /// block close. Each parameter constrains the DSML syntax only — a
     /// `string="true"` body is any text without a closing tag, a
     /// `string="false"` body is any JSON value; parameter names and schemas
-    /// are not lowered (vLLM leaves that as a TODO too). `at_least_one` is
+    /// are not lowered (the engine's builder leaves that as a TODO too). `at_least_one` is
     /// wired to `tool_choice` by the registry; like the Kimi builders,
     /// `stop_after_first` is left unset so a single listed tool may still be
     /// called more than once.
@@ -769,54 +827,44 @@ impl ToolParser for DeepSeekDsmlParser {
             return Ok(self.parse_incremental_v41());
         }
 
-        let current_text = self.buffer.clone();
-
-        // Check for DSML markers or partial DSML prefixes.
-        //
-        // `<｜DSML｜` is a single BPE token in DeepSeek's tokenizer (id 128793),
-        // so real streams deliver it atomically. We flag the stream as DSML as
-        // soon as the sentinel appears anywhere in the buffer — we don't wait
-        // for a complete outer `<｜DSML｜{function,tool}_calls>` opener, because
-        // live backends chunk the opener into per-token pieces after the
-        // sentinel (e.g. `<｜DSML｜` + `tool` + `_c` + `all` + `s` + `>`).
-        // Without this, chunk 2 of a live stream would flush the buffer on the
-        // passthrough path and lose the sentinel, turning every subsequent
-        // chunk into plain text. (See regression test
-        // `test_deepseek_dsml_v4_streaming_bpe_chunked_opener`.)
-        let has_dsml = current_text.contains("<｜DSML｜");
-        let has_partial_prefix = current_text.ends_with('<')
-            || current_text.ends_with("<｜")
-            || current_text.ends_with("</")
-            || current_text.ends_with("</｜");
-
-        if !has_dsml && !has_partial_prefix {
-            let mut normal_text = std::mem::take(&mut self.buffer);
-            for end_token in [
-                self.block_close.as_str(),
-                self.invoke_end_tag.as_str(),
-                self.parameter_end_tag.as_str(),
-                EOS_TOKEN,
-            ] {
-                normal_text = normal_text.replace(end_token, "");
-            }
+        // The stream is in its tool section as soon as an opener's sentinel
+        // is anywhere in the buffer: live backends deliver the sentinel whole
+        // and the rest of the opener in per-token pieces (`<｜DSML｜` + `tool` +
+        // `_c` + `all` + `s` + `>`), so waiting for a complete opener would
+        // flush the sentinel as text and lose the tool call (regression test
+        // `test_deepseek_dsml_v4_streaming_bpe_chunked_opener`).
+        if !self.buffer.contains(DSML_OPEN) {
+            // Content, less the engine's own markup: complete end tags go
+            // (with the whitespace around a block close), and what could still
+            // become a tag, or pads one, waits for the next piece. The block
+            // close arrives in the same pieces as the opener; flushing them
+            // as they came put `</｜DSML｜tool_calls>` in the visible text.
+            let taken = std::mem::take(&mut self.buffer);
+            let text = self.without_end_tags(&taken);
+            let emit_end = text.len() - self.held_suffix_len(&text);
+            self.buffer = text[emit_end..].to_string();
             return Ok(StreamingParseResult {
-                normal_text,
+                normal_text: text[..emit_end].to_string(),
                 calls: vec![],
             });
         }
 
-        // If we have partial prefix but no actual DSML content, buffer and wait
-        if !has_dsml && has_partial_prefix {
-            return Ok(StreamingParseResult::default());
+        // Text in front of the first opener, before any invoke has streamed,
+        // is the content before the block, read as the one-shot path reads it
+        // (trailing whitespace trimmed); between invokes it is the block's own
+        // newlines, which are nobody's.
+        let mut normal_text = String::new();
+        if self.current_tool_id == -1 {
+            if let Some(idx) = self.buffer.find(DSML_OPEN) {
+                normal_text = self.buffer[..idx].trim_end().replace(EOS_TOKEN, "");
+                self.buffer.drain(..idx);
+            }
         }
 
         let tool_indices = helpers::get_tool_indices(tools);
         let calls = self.stream_invokes(Some(&tool_indices));
 
-        Ok(StreamingParseResult {
-            normal_text: String::new(),
-            calls,
-        })
+        Ok(StreamingParseResult { normal_text, calls })
     }
 
     fn has_tool_markers(&self, text: &str) -> bool {
@@ -844,13 +892,15 @@ impl ToolParser for DeepSeekDsmlParser {
 
     fn take_unstreamed_normal_text(&mut self) -> String {
         // V4.1 holds back a suffix that could still become the separator plus
-        // a tool opener; V3.2/V4 hold `<`/`</` prefixes and, once the DSML
-        // sentinel has arrived, everything from it on. At end of stream the
-        // held text is content when no tool syntax ever started, and is
-        // dropped otherwise: a truncated opener or invoke is not content (the
-        // remaining arguments of a truncated invoke come from
-        // `get_unstreamed_tool_args`).
-        if self.in_tool_section || self.buffer.contains("<｜DSML｜") {
+        // a tool opener; V3.2/V4 hold a suffix that could still become an
+        // opener's sentinel, an end tag or the EOS marker (with the whitespace
+        // before it, see `held_suffix_len`) and, once the DSML sentinel has
+        // arrived, everything from it on. At end of stream the held text is
+        // content when no tool syntax ever started (the trailing whitespace of
+        // a plain stream comes back here), and is dropped otherwise: a
+        // truncated opener or invoke is not content (the remaining arguments
+        // of a truncated invoke come from `get_unstreamed_tool_args`).
+        if self.in_tool_section || self.buffer.contains(DSML_OPEN) {
             self.buffer.clear();
             return String::new();
         }

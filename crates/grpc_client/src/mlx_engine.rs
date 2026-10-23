@@ -1,4 +1,4 @@
-use std::{collections::HashMap, future::Future, pin::Pin};
+use std::collections::HashMap;
 
 use openai_protocol::{
     chat::ChatCompletionRequest, completion::CompletionRequest, generate::GenerateRequest,
@@ -6,9 +6,9 @@ use openai_protocol::{
     sampling_params::SamplingParams as GenerateSamplingParams,
 };
 use tonic::{transport::Channel, Request};
-use tracing::{debug, warn};
+use tracing::debug;
 
-use crate::{AbortOnDropClient, BoxedTraceInjector};
+use crate::BoxedTraceInjector;
 
 // Include the generated protobuf code
 #[expect(clippy::allow_attributes)]
@@ -28,42 +28,14 @@ pub struct MlxEngineClient {
     trace_injector: BoxedTraceInjector,
 }
 
-impl AbortOnDropClient for MlxEngineClient {
-    fn abort_for_drop(
-        self,
-        request_id: String,
-    ) -> Pin<Box<dyn Future<Output = Result<(), tonic::Status>> + Send>> {
-        Box::pin(async move {
-            self.abort_request(request_id, "Stream dropped".to_string())
-                .await
-        })
-    }
-}
+crate::impl_abort_for_drop_with_reason!(MlxEngineClient);
 
 impl MlxEngineClient {
-    crate::impl_engine_client_basics!(proto::mlx_engine_client::MlxEngineClient<Channel>, "MLX");
-
-    /// Submit a generation request (returns auto-aborting streaming response)
-    pub async fn generate(
-        &self,
-        req: proto::GenerateRequest,
-    ) -> Result<AbortOnDropStream, tonic::Status> {
-        let request_id = req.request_id.clone();
-        let mut client = self.client.clone();
-        let mut request = Request::new(req);
-
-        if let Err(e) = self.trace_injector.inject(request.metadata_mut()) {
-            warn!("Failed to inject trace context: {}", e);
-        }
-
-        let response = client.generate(request).await?;
-
-        Ok(AbortOnDropStream::new(
-            response.into_inner(),
-            request_id,
-            self.clone(),
-        ))
-    }
+    crate::impl_engine_client_basics!(
+        proto,
+        proto::mlx_engine_client::MlxEngineClient<Channel>,
+        "MLX"
+    );
 
     /// Abort a request
     pub async fn abort_request(
@@ -330,7 +302,7 @@ impl MlxEngineClient {
             frequency_penalty: request.frequency_penalty.unwrap_or(0.0),
             presence_penalty: request.presence_penalty.unwrap_or(0.0),
             repetition_penalty: request.repetition_penalty.unwrap_or(1.0),
-            max_tokens: request.max_completion_tokens,
+            max_tokens: request.output_token_cap(),
             stop_token_ids: request.stop_token_ids.clone().unwrap_or_default(),
             ignore_eos: request.ignore_eos,
             logprobs,
@@ -340,7 +312,7 @@ impl MlxEngineClient {
     }
 
     fn build_sampling_params_from_completion(request: &CompletionRequest) -> proto::SamplingParams {
-        let logprobs = request.logprobs.map(|v| v.min(5) as i32);
+        let logprobs = request.logprobs.map(|v| v.min(20) as i32);
 
         proto::SamplingParams {
             temperature: request.temperature,
@@ -450,5 +422,39 @@ fn convert_logit_bias(bias: Option<&HashMap<String, f32>>) -> HashMap<i32, f32> 
             .filter_map(|(k, v)| k.parse::<i32>().ok().map(|id| (id, *v)))
             .collect(),
         None => HashMap::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channel::testing::refused_endpoint;
+
+    #[test]
+    fn plain_sampling_seed_is_forwarded_when_it_fits() {
+        let seeded = |seed| GenerateSamplingParams {
+            sampling_seed: seed,
+            ..Default::default()
+        };
+        assert_eq!(
+            MlxEngineClient::build_sampling_params_from_plain(Some(&seeded(Some(7)))).seed,
+            Some(7)
+        );
+        assert_eq!(
+            MlxEngineClient::build_sampling_params_from_plain(Some(&seeded(Some(u64::MAX)))).seed,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_fails_on_a_malformed_or_refused_endpoint() {
+        let malformed = MlxEngineClient::connect("not an endpoint").await;
+        assert!(
+            malformed.is_err(),
+            "a malformed endpoint fails before the dial"
+        );
+        let refused = refused_endpoint();
+        let result = MlxEngineClient::connect(&refused.url).await;
+        assert!(result.is_err(), "a refused dial fails the connect");
     }
 }

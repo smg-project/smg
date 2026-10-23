@@ -72,7 +72,8 @@ impl PipelineStage for TranscriptionPreparationStage {
         // expansion + tokenize + stop decoder), then store the transcription
         // variant carrying the synthesized request and response contract.
         let (token_ids, processed_messages, _tool_constraints) =
-            prepare_chat_like(ctx, &chat_request).await?;
+            // A transcription carries no images: no pool to resolve a wire dtype over.
+            prepare_chat_like(ctx, &chat_request, &[]).await?;
 
         ctx.state.preparation = Some(PreparationOutput::Transcription {
             token_ids,

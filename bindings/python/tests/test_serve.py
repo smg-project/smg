@@ -1675,3 +1675,63 @@ class TestServeOrchestrator:
         assert launched_envs[1]["CUDA_VISIBLE_DEVICES"] == "2,3"
         assert launched_envs[0]["PYTHONUNBUFFERED"] == "1"
         assert launched_envs[1]["PYTHONUNBUFFERED"] == "1"
+
+
+class TestIpv6WorkerHosts:
+    """Worker URLs, health-check targets and the port probe handle an IPv6 worker host."""
+
+    @pytest.mark.parametrize(("mode", "scheme"), [("grpc", "grpc"), ("http", "http")])
+    def test_worker_url_brackets_ipv6_literals(self, mode, scheme):
+        launcher = VllmWorkerLauncher()
+        args = argparse.Namespace(connection_mode=mode)
+        assert launcher.worker_url(args, "::1", 31000) == f"{scheme}://[::1]:31000"
+        assert launcher.worker_url(args, "fd00::1", 31000) == f"{scheme}://[fd00::1]:31000"
+        assert launcher.worker_url(args, "[::1]", 31000) == f"{scheme}://[::1]:31000"
+        assert launcher.worker_url(args, "127.0.0.1", 31000) == f"{scheme}://127.0.0.1:31000"
+        assert launcher.worker_url(args, "localhost", 31000) == f"{scheme}://localhost:31000"
+
+    def test_http_health_check_url_brackets_ipv6_literals(self):
+        launcher = VllmWorkerLauncher()
+        args = argparse.Namespace(connection_mode="http")
+        with patch("smg.serve._http_health_check", return_value=True) as check:
+            assert launcher.health_check(args, "fd00::1", 8000, 1.0)
+            assert launcher.health_check(args, "127.0.0.1", 8000, 1.0)
+        assert [c.args[0] for c in check.call_args_list] == [
+            "http://[fd00::1]:8000/health",
+            "http://127.0.0.1:8000/health",
+        ]
+
+    def test_grpc_health_check_dials_a_bracketed_target(self):
+        pytest.importorskip("grpc")
+        with patch("grpc.insecure_channel", side_effect=RuntimeError("stop")) as channel:
+            assert _grpc_health_check("::1", 31000, 1.0) is False
+            assert _grpc_health_check("worker-0", 31000, 1.0) is False
+        assert [c.args[0] for c in channel.call_args_list] == ["[::1]:31000", "worker-0:31000"]
+
+    def test_port_busy_on_ipv6_loopback_is_not_available(self):
+        import socket
+
+        try:
+            holder = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            holder.bind(("::1", 0))
+        except OSError:
+            pytest.skip("no IPv6 loopback on this host")
+        with holder:
+            port = holder.getsockname()[1]
+            assert _is_port_available(port) is False
+
+    def test_port_busy_on_ipv4_loopback_is_not_available(self):
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as holder:
+            holder.bind(("127.0.0.1", 0))
+            port = holder.getsockname()[1]
+            assert _is_port_available(port) is False
+
+    def test_free_port_is_available(self):
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        assert _is_port_available(port) is True

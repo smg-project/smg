@@ -178,6 +178,7 @@ async fn test_json_array_streaming_required_mode() {
             description: Some("Get weather".to_string()),
             parameters: serde_json::json!({}),
             strict: None,
+            extra: Default::default(),
         },
     }];
 
@@ -252,6 +253,7 @@ async fn test_json_array_multiple_tools_streaming() {
                 description: Some("Get weather".to_string()),
                 parameters: serde_json::json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -261,6 +263,7 @@ async fn test_json_array_multiple_tools_streaming() {
                 description: Some("Get news".to_string()),
                 parameters: serde_json::json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         },
     ];
@@ -316,6 +319,7 @@ async fn test_json_array_closing_bracket_separate_chunk() {
             description: Some("Get weather".to_string()),
             parameters: json!({}),
             strict: None,
+            extra: Default::default(),
         },
     }];
 
@@ -376,6 +380,7 @@ async fn test_json_single_object_with_trailing_text() {
             description: Some("Get weather".to_string()),
             parameters: serde_json::json!({}),
             strict: None,
+            extra: Default::default(),
         },
     }];
 
@@ -429,6 +434,7 @@ async fn test_json_single_object_with_bracket_in_text() {
             description: Some("Get weather".to_string()),
             parameters: serde_json::json!({}),
             strict: None,
+            extra: Default::default(),
         },
     }];
 
@@ -480,6 +486,7 @@ async fn test_json_array_bracket_in_text_after_tools() {
             description: Some("Get weather".to_string()),
             parameters: serde_json::json!({}),
             strict: None,
+            extra: Default::default(),
         },
     }];
 

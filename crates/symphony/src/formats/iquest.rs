@@ -39,7 +39,8 @@ mod tests {
         event::{Event, Events},
         input::{EngineFinish, Input},
         parser::Parser,
-        tagged::Declared,
+        testing::{bytes, drive},
+        Declared,
     };
 
     fn declared() -> Declared {
@@ -53,6 +54,7 @@ mod tests {
                     "days": {"type": "integer"},
                 }}),
                 strict: None,
+                extra: Default::default(),
             },
         }])
     }
@@ -64,51 +66,8 @@ mod tests {
         "</iquest_tool_call><iquest_tool_call>get_weather</iquest_tool_call>"
     );
 
-    fn run(prompt: &str, output: &str) -> Vec<Event> {
-        let mut parser = Engine::new(iquest(), declared());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        parser
-            .feed(
-                Input::Delta {
-                    token_ids: &[],
-                    text: output,
-                    spans: &[],
-                },
-                &mut out,
-            )
-            .expect("delta");
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
-    }
-
-    fn bytes(events: &[Event]) -> String {
-        events
-            .iter()
-            .map(|e| match e {
-                Event::Content(t) | Event::Reasoning(t) => t.text.as_str(),
-                Event::Dropped { text, .. } | Event::Malformed { text, .. } => text.text.as_str(),
-                Event::ToolCallStart { source, .. }
-                | Event::ToolCallArguments { source, .. }
-                | Event::ToolCallEnd { source, .. } => source.text.as_str(),
-                Event::ReasoningStart | Event::ReasoningEnd | Event::Finish { .. } => "",
-            })
-            .collect()
+    fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
+        drive(&mut Engine::new(iquest(), declared()), prompt, &[output])
     }
 
     fn arguments(events: &[Event]) -> Vec<(String, String)> {
@@ -142,14 +101,14 @@ mod tests {
         let reasoning: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
+                Event::Reasoning(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();
         let content: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Content(text) => Some(text.text.as_str()),
+                Event::Content(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();
@@ -178,7 +137,7 @@ mod tests {
         let reasoning: String = events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(text) => Some(text.text.as_str()),
+                Event::Reasoning(text) => Some(&*text.text),
                 _ => None,
             })
             .collect();

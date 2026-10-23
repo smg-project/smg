@@ -1,0 +1,61 @@
+# Templates transformers 5.18.0 accepts that this crate refuses to load, with
+# the reason it gives (template id, tab, reason): a construct its parser does
+# not run, or one its reader does not read. The load test fails when a
+# template is refused for another reason, or loads although it is listed.
+behaviour/bad-value-parser	content_args: value_parser
+behaviour/close-zero-width	regex: inline flags (?m)
+behaviour/content-args-not-dict	content_args: not a dict
+behaviour/kv-lines-empty-sep	content_args: kv_sep
+behaviour/kv-lines-none-sep	content_args: line_sep
+behaviour/negated-class-alternation	regex: alternatives that can end in a negated class of one character
+behaviour/open-and-close-empty	empty match
+behaviour/optional-backreference	regex: backreference inside an optional group
+behaviour/repeats-default-list	shared value
+behaviour/value-parser-not-dict	content_args: value_parser
+behaviour/xml-alternative-key	content_args: tag_pattern group that can be unset
+behaviour/xml-alternative-value	content_args: tag_pattern group that can be unset
+behaviour/xml-bad-tag-pattern	regex: missing )
+behaviour/xml-optional-value	content_args: tag_pattern group that can be unset
+behaviour/xml-optional-value-parsed	content_args: tag_pattern group that can be unset
+dialect/034	regex: a group name outside ASCII
+dialect/038	regex: inline flags (?i)
+dialect/039	regex: inline flags (?i)
+dialect/041	regex: inline flags (?-s)
+dialect/042	regex: inline flags (?m)
+dialect/043	regex: inline flags (?m)
+dialect/045	regex: inline flags (?a)
+dialect/047	regex: inline flags (?L)
+dialect/050	regex: version 1 behaviour (?V1)
+dialect/052	regex: atomic group
+dialect/053	regex: branch reset group
+dialect/054	regex: group call
+dialect/055	regex: possessive quantifier
+dialect/056	regex: fuzzy matching
+dialect/058	regex: a named character \N{...}
+dialect/060	regex: a Unicode property \p{...}
+dialect/061	regex: Unicode property or POSIX class \pL
+dialect/065	regex: escape \K
+dialect/066	regex: escape \G
+dialect/067	regex: escape \X
+dialect/068	regex: Unicode property or POSIX class \h
+dialect/069	regex: escape \R
+dialect/070	regex: escape \m
+dialect/071	regex: escape \M
+dialect/073	regex: escape \B
+dialect/079	regex: inline flags (?m)
+dialect/093	regex: backreference in an open or close pattern
+dialect/098	regex: verb (*FAIL)
+dialect/100	regex: inline flags (?e)
+dialect/103	regex: look-around
+dialect/104	regex: look-around
+dialect/111	regex: repeat of a group or an assertion
+dialect/112	regex: repeat of a group or an assertion
+dialect/113	regex: repeat of a group or an assertion
+load/anchor-pattern-empty-match	empty match
+load/string-delims-empty	content_args: string_delims
+load/string-delims-shape	content_args: string_delims
+load/tag-pattern-empty-match	empty match
+synthetic/lookahead-open	regex: look-around
+synthetic/multiline-caret-open	regex: inline flags (?m)
+synthetic/posix-name	regex: Unicode property or POSIX class [:alpha:]
+synthetic/transform-aliased	shared value

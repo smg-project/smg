@@ -17,24 +17,24 @@ use tracing::{debug, error, trace};
 
 use super::{
     common::{
-        apply_mcp_tool_call_limit, build_next_request, convert_mcp_tools_to_chat_tools,
-        extract_all_tool_calls_from_chat, has_unfinished_mcp_call, load_conversation_history,
-        prepare_chat_tools_and_choice, ExtractedToolCall, McpToolCallLimit, ResponsesCallContext,
+        build_next_request, convert_mcp_tools_to_chat_tools, dispatch_arguments,
+        extract_all_tool_calls_from_chat, has_unfinished_mcp_call, partition_tool_calls,
+        prepare_tool_choice, record_mcp_call, McpToolCallLimit, ResponsesCallContext,
         ToolLoopState,
     },
     conversions,
 };
 use crate::{
-    observability::metrics::{metrics_labels, Metrics},
+    observability::metrics::Metrics,
     routers::{
         common::{
-            mcp_utils::{prepare_hosted_dispatch_args, DEFAULT_MAX_ITERATIONS},
+            mcp_utils::DEFAULT_MAX_ITERATIONS,
             openai_bridge::{self, ResponseFormat},
         },
         error,
         grpc::common::responses::{
-            collect_user_function_names, ensure_mcp_connection, persist_response_if_needed,
-            ResponsesContext,
+            collect_user_function_names, ensure_mcp_connection, load_history,
+            persist_response_if_needed, NotStored, ResponsesContext,
         },
     },
 };
@@ -51,8 +51,10 @@ pub(super) async fn route_responses_internal(
     request: Arc<ResponsesRequest>,
     params: ResponsesCallContext,
 ) -> Result<ResponsesResponse, Response> {
-    // 1. Load conversation history and build modified request
-    let modified_request = load_conversation_history(ctx, &request).await?;
+    // 1. Load conversation history (as the caller's tenant may see it) and
+    //    build modified request
+    let tenant = crate::tenant::storage_tenant(&params.tenant_request_meta);
+    let modified_request = load_history(ctx.history_stores(), &request, tenant.as_deref()).await?;
 
     // 2. Check MCP connection and get whether MCP tools are present
     let (has_mcp_tools, mcp_servers) = ensure_mcp_connection(
@@ -72,16 +74,19 @@ pub(super) async fn route_responses_internal(
         execute_without_mcp(ctx, &modified_request, &request, params).await?
     };
 
-    // 5. Persist response to storage if store=true
+    // 5. Persist response to storage if store=true; a foreground response the
+    // client expects stored is answered as stored or not at all.
     persist_response_if_needed(
         ctx.conversation_storage.clone(),
         ctx.conversation_item_storage.clone(),
         ctx.response_storage.clone(),
         &responses_response,
         &request,
+        tenant.as_deref(),
         ctx.request_context.clone(),
     )
-    .await;
+    .await
+    .map_err(NotStored::into_response)?;
 
     Ok(responses_response)
 }
@@ -148,7 +153,9 @@ pub(super) async fn execute_tool_loop(
     params: &ResponsesCallContext,
     mcp_servers: Vec<McpServerBinding>,
 ) -> Result<ResponsesResponse, Response> {
-    let mut state = ToolLoopState::new(original_request);
+    // The loop is rebuilt on the loaded request: a stored turn's tool calls
+    // and outputs stay in front of the calls this loop executes.
+    let mut state = ToolLoopState::new(&current_request);
 
     // Configuration: max iterations as safety limit
     let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
@@ -176,22 +183,24 @@ pub(super) async fn execute_tool_loop(
     );
 
     loop {
-        // Convert to chat request
-        let mut chat_request = conversions::responses_to_chat(&current_request).map_err(|e| {
-            error!(
-                function = "tool_loop",
-                iteration = state.iteration,
-                error = %e,
-                "Failed to convert ResponsesRequest to ChatCompletionRequest in tool loop"
-            );
-            error::bad_request(
-                "convert_request_failed",
-                format!("Failed to convert request: {e}"),
-            )
-        })?;
+        // Convert to chat request, the MCP tools in its tool list
+        let mut chat_request =
+            conversions::responses_to_chat_with_mcp_tools(&current_request, &mcp_chat_tools)
+                .map_err(|e| {
+                    error!(
+                        function = "tool_loop",
+                        iteration = state.iteration,
+                        error = %e,
+                        "Failed to convert ResponsesRequest to ChatCompletionRequest in tool loop"
+                    );
+                    error::bad_request(
+                        "convert_request_failed",
+                        format!("Failed to convert request: {e}"),
+                    )
+                })?;
 
-        // Prepare tools and tool_choice for this iteration
-        prepare_chat_tools_and_choice(&mut chat_request, &mcp_chat_tools, state.iteration);
+        // Prepare tool_choice for this iteration
+        prepare_tool_choice(&mut chat_request, state.iteration);
 
         // Execute chat pipeline (errors already have proper HTTP status codes)
         let chat_response = ctx
@@ -283,36 +292,9 @@ pub(super) async fn execute_tool_loop(
             // Record tool loop iteration metric
             Metrics::record_mcp_tool_iteration(&current_request.model);
 
-            trace!(
-                "Tool loop iteration {}: found {} tool call(s)",
-                state.iteration,
-                tool_calls.len()
-            );
+            let (mcp_tool_calls, function_tool_calls, tool_call_limit) =
+                partition_tool_calls(tool_calls, &session, &state, max_tool_calls, false);
 
-            // Separate MCP and function tool calls using session-exposed names.
-            let (mut mcp_tool_calls, function_tool_calls): (Vec<ExtractedToolCall>, Vec<_>) =
-                tool_calls
-                    .into_iter()
-                    .partition(|tc| session.has_exposed_tool(tc.name.as_str()));
-
-            trace!(
-                "Separated tool calls: {} MCP, {} function",
-                mcp_tool_calls.len(),
-                function_tool_calls.len()
-            );
-
-            // Only execute calls that fit; preserve their results before ending
-            // the response when this batch exceeds the remaining allowance.
-            let tool_call_limit =
-                apply_mcp_tool_call_limit(&mut mcp_tool_calls, state.total_calls, max_tool_calls);
-
-            // Convert tool calls to execution inputs, merging caller-declared
-            // hosted-tool config from `original_request.tools` into dispatch args.
-            // Non-object model payloads coerce to `{}` so the merge actually
-            // applies instead of silently dropping the caller's config. The
-            // request-level `user` is also forwarded into hosted-tool args.
-            let request_tools = original_request.tools.as_deref().unwrap_or(&[]);
-            let request_user = original_request.user.as_deref();
             // Resolve `response_format` once per call here and zip it through
             // to the output processing pass — looking it up twice (once for
             // arg prep, once for transform) allocates two extra `Arc<str>`s
@@ -320,22 +302,13 @@ pub(super) async fn execute_tool_loop(
             let prepared: Vec<(ToolExecutionInput, ResponseFormat)> = mcp_tool_calls
                 .into_iter()
                 .map(|tc| {
-                    let mut arguments =
-                        match serde_json::from_str::<serde_json::Value>(&tc.arguments) {
-                            Ok(serde_json::Value::Object(map)) => serde_json::Value::Object(map),
-                            _ => json!({}),
-                        };
                     let response_format = openai_bridge::lookup_tool_format(
                         &session,
                         &ctx.mcp_format_registry,
                         &tc.name,
                     );
-                    prepare_hosted_dispatch_args(
-                        &mut arguments,
-                        response_format,
-                        request_tools,
-                        request_user,
-                    );
+                    let arguments =
+                        dispatch_arguments(response_format, original_request, &tc.arguments);
                     let input = ToolExecutionInput {
                         call_id: tc.call_id,
                         tool_name: tc.name,
@@ -367,30 +340,14 @@ pub(super) async fn execute_tool_loop(
                     !result.is_error
                 );
 
-                Metrics::record_mcp_tool_duration(
-                    &current_request.model,
-                    &result.tool_name,
-                    result.duration,
-                );
-                Metrics::record_mcp_tool_call(
-                    &current_request.model,
-                    &result.tool_name,
-                    if result.is_error {
-                        metrics_labels::RESULT_ERROR
-                    } else {
-                        metrics_labels::RESULT_SUCCESS
-                    },
-                );
-
                 let output_item = openai_bridge::transform_tool_output(&result, response_format);
                 let output_str = result.output.to_string();
-                state.record_call(
-                    result.call_id,
-                    result.tool_name,
-                    result.arguments_str,
+                record_mcp_call(
+                    &mut state,
+                    &current_request.model,
+                    result,
                     output_str,
                     output_item,
-                    !result.is_error,
                 );
 
                 // Increment total calls counter

@@ -50,6 +50,10 @@ SMG_REASONING_PARSER="${BFCL_SMG_REASONING_PARSER:-}"
 # BFCL_VLLM_EXTRA="--enforce-eager" — skips CUDA-graph capture, which has been
 # more stable under sustained bfcl load on shared/contended GPUs.
 VLLM_EXTRA="${BFCL_VLLM_EXTRA:-}"
+# Extra environment for every vLLM process (both arms), as space-separated
+# NAME=VALUE words, e.g. BFCL_VLLM_ENV="VLLM_ROCM_USE_AITER=1" — engine knobs
+# that vLLM reads only from the environment, set per matrix leg.
+VLLM_ENV="${BFCL_VLLM_ENV:-}"
 
 # Ports. Default to an OS-assigned free port (resolved per-arm in the case
 # below) so concurrent arms/jobs sharing a host — e.g. bin-packed CI runners
@@ -103,8 +107,9 @@ free_port() {  # OS-assigned free TCP port (same idiom as the e2e infra's get_op
 case "$ARM" in
   a)
     ARM_A_PORT="${ARM_A_PORT:-$(free_port)}"
+    # shellcheck disable=SC2206  # intentional word-split of VLLM_ENV
     declare -a cmd=(
-      CUDA_VISIBLE_DEVICES="$GPU" "$VLLM_BIN" serve "$MODEL_SRC"
+      CUDA_VISIBLE_DEVICES="$GPU" $VLLM_ENV "$VLLM_BIN" serve "$MODEL_SRC"
       --served-model-name "$MODEL"
       --enable-auto-tool-choice --tool-call-parser "$VLLM_TOOL_PARSER"
       --host 0.0.0.0 --port "$ARM_A_PORT"
@@ -126,8 +131,9 @@ case "$ARM" in
     ARM_B_GW_PORT="${ARM_B_GW_PORT:-$(free_port)}"
     ARM_B_METRICS_PORT="${ARM_B_METRICS_PORT:-$(free_port)}"
     # 1) vLLM gRPC worker (raw-token; SMG will own template+parsing).
+    # shellcheck disable=SC2206  # intentional word-split of VLLM_ENV
     declare -a wcmd=(
-      CUDA_VISIBLE_DEVICES="$GPU" "$VLLM_PYTHON" -m vllm.entrypoints.grpc_server
+      CUDA_VISIBLE_DEVICES="$GPU" $VLLM_ENV "$VLLM_PYTHON" -m vllm.entrypoints.grpc_server
       --model "$MODEL_SRC" --served-model-name "$MODEL"
       --host 0.0.0.0 --port "$ARM_B_GRPC_PORT"
       --tensor-parallel-size "$TP" --max-model-len "$MAX_MODEL_LEN"

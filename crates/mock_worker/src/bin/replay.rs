@@ -10,6 +10,14 @@
 //! label) and the engine-reported `cached_tokens`. When the mock fleet's admin
 //! API is given, every request is joined with the fleet's record of it, which
 //! carries the arrival-time oracle: the most cached tokens any worker held.
+//! A thinking model's streamed `reasoning_content` counts as output for TTFT
+//! and ITL (reported separately as `reasoning_tokens`), and
+//! `--chat-template-kwargs` reaches the chat template, e.g. to turn thinking off.
+//! Requests share HTTP/1.1 keep-alive connections by default (`--connections
+//! pooled`); `--connections fresh` gives every request a connection of its
+//! own, for tail-sensitive runs, so a request is never queued behind a stream
+//! in flight on a reused connection, which would show as one stream's worth
+//! of TTFT on an otherwise idle gateway.
 
 // A command-line tool: the summary goes to stdout, progress to stderr.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
@@ -95,6 +103,92 @@ struct Args {
     /// Rows of the per-request decision table written to `t4.md`.
     #[arg(long, default_value_t = 40)]
     t4_rows: usize,
+    /// JSON object sent as `chat_template_kwargs` in every request body, for
+    /// example `{"enable_thinking":false}` on a model that reasons by default;
+    /// nothing is sent when absent.
+    #[arg(long, value_parser = parse_json_object)]
+    chat_template_kwargs: Option<Value>,
+    /// How requests use connections: `pooled` (the default) reuses HTTP/1.1
+    /// keep-alive connections, fewer handshakes, but a request can be handed
+    /// a connection whose previous response is still streaming and then
+    /// waits for that stream to end before the gateway reads it (rare: a
+    /// few per hundred thousand streamed requests); `fresh` opens a
+    /// connection per request and has it closed after the response, so a
+    /// request never shares a connection with a stream in flight, the
+    /// choice for tail-sensitive runs (max TTFT, stall hunting).
+    #[arg(long, value_enum, default_value_t = Connections::Pooled)]
+    connections: Connections,
+}
+
+/// The addresses a URL's host name resolves to now, for the client to pin:
+/// a connection then never waits on a name lookup, which is one per
+/// connection otherwise, one per request with `Connections::Fresh`, and a
+/// lost lookup costs a resolver timeout of seconds. A host that is already
+/// an address, or one that does not resolve here, is left to the client.
+async fn pinned_addresses(url: &str) -> Option<(String, Vec<std::net::SocketAddr>)> {
+    let url = reqwest::Url::parse(url).ok()?;
+    let host = url.host_str()?.trim_matches(['[', ']']).to_string();
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    let port = url.port_or_known_default()?;
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .ok()?
+        .collect();
+    (!addrs.is_empty()).then_some((host, addrs))
+}
+
+/// How the replayer's requests use connections.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Connections {
+    /// A connection per request, closed after the response.
+    Fresh,
+    /// HTTP/1.1 keep-alive connections reused from a pool.
+    Pooled,
+}
+
+/// The HTTP client for `connections`. With `Fresh` no idle connection is
+/// kept and every request asks the server to close after the response
+/// (`Connection: close`), so the server's side carries the TIME_WAIT and the
+/// client's ephemeral ports stay free at rate; with `Pooled` up to
+/// `max_inflight` keep-alive connections are kept and reused. The `pins`
+/// are host names resolved once, so that no connection waits on a lookup.
+fn http_client(
+    connections: Connections,
+    max_inflight: usize,
+    pins: &[(String, Vec<std::net::SocketAddr>)],
+) -> reqwest::Result<reqwest::Client> {
+    let mut builder = http_client_builder().timeout(Duration::from_secs(600));
+    for (host, addrs) in pins {
+        builder = builder.resolve_to_addrs(host, addrs);
+    }
+    match connections {
+        Connections::Fresh => {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::CONNECTION,
+                reqwest::header::HeaderValue::from_static("close"),
+            );
+            builder
+                .pool_max_idle_per_host(0)
+                .default_headers(headers)
+                .build()
+        }
+        Connections::Pooled => builder.pool_max_idle_per_host(max_inflight).build(),
+    }
+}
+
+/// A client builder with the process-level TLS crypto provider installed
+/// (`ring`, the only backend compiled in, unless one is there already):
+/// the tool's clients all come from here.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the tool's one direct client construction; the process TLS crypto provider is installed first"
+)]
+fn http_client_builder() -> reqwest::ClientBuilder {
+    mock_worker::tls::install_crypto_provider();
+    reqwest::Client::builder()
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -124,8 +218,11 @@ struct ReqResult {
     itl_mean_ms: Option<f64>,
     itl_p99_ms: Option<f64>,
     tokens_seen: u32,
+    /// Reasoning deltas (`reasoning_content`) the stream showed: they count
+    /// for TTFT and ITL like text, separately from `tokens_seen`.
+    reasoning_tokens: u32,
     /// Output tokens the engine counted but the stream never showed as text
-    /// (an incomplete UTF-8 piece the detokenizer holds back).
+    /// or reasoning (an incomplete UTF-8 piece the detokenizer holds back).
     invisible_tokens: u32,
     /// The gateway's `x-request-id` (the response id without its uuid tail).
     gateway_request_id: String,
@@ -415,6 +512,36 @@ fn parse_speedup(raw: &str) -> Result<f64, String> {
     }
 }
 
+/// `--chat-template-kwargs` must be a JSON object.
+fn parse_json_object(raw: &str) -> Result<Value, String> {
+    match serde_json::from_str::<Value>(raw) {
+        Ok(v) if v.is_object() => Ok(v),
+        Ok(_) => Err(format!("expected a JSON object, got {raw}")),
+        Err(e) => Err(format!("not JSON: {e}")),
+    }
+}
+
+/// The streaming chat completion for one trace row.
+fn request_body(
+    model: &str,
+    prompt: &str,
+    max_tokens: u32,
+    chat_template_kwargs: Option<&Value>,
+) -> Value {
+    let mut body = json!({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0,
+        "stream": true,
+        "stream_options": {"include_usage": true},
+    });
+    if let Some(kwargs) = chat_template_kwargs {
+        body["chat_template_kwargs"] = kwargs.clone();
+    }
+    body
+}
+
 /// When a row stamped `trace_ts_ms` is due, relative to the window's first
 /// row at `t0_ms`, at `speedup`. A row stamped before the first one (an
 /// unsorted or hand-edited trace, or a window that starts on a reordered
@@ -450,6 +577,7 @@ struct Job {
     body_prompt: String,
     max_output: u32,
     sent_at_ms: f64,
+    chat_template_kwargs: Option<Value>,
 }
 
 async fn run_one(job: Job) -> ReqResult {
@@ -462,16 +590,15 @@ async fn run_one(job: Job) -> ReqResult {
         body_prompt,
         max_output,
         sent_at_ms,
+        chat_template_kwargs,
     } = job;
     let max_tokens = row.output_length.clamp(1, max_output);
-    let body = json!({
-        "model": model,
-        "messages": [{"role": "user", "content": body_prompt}],
-        "max_tokens": max_tokens,
-        "temperature": 0,
-        "stream": true,
-        "stream_options": {"include_usage": true},
-    });
+    let body = request_body(
+        &model,
+        &body_prompt,
+        max_tokens,
+        chat_template_kwargs.as_ref(),
+    );
     let mut result = ReqResult {
         row: row_index,
         trace_ts_ms: row.timestamp,
@@ -541,12 +668,14 @@ async fn run_one(job: Job) -> ReqResult {
 struct StreamObserver {
     request_id: String,
     worker: String,
-    /// The first chunk that carried a token or the finish: a one-token
-    /// answer whose token has no visible text still arrives here.
+    /// The first chunk that carried a token (text or reasoning) or the
+    /// finish: a one-token answer whose token has no visible text still
+    /// arrives here.
     first_signal: Option<Instant>,
     last_token: Option<Instant>,
     itls: Vec<f64>,
     tokens_seen: u32,
+    reasoning_tokens: u32,
     prompt_tokens: u32,
     completion_tokens: u32,
     cached_tokens: u32,
@@ -569,16 +698,26 @@ impl StreamObserver {
             .get("choices")
             .and_then(Value::as_array)
             .and_then(|c| c.first());
-        let has_content = choice
-            .and_then(|c| c.get("delta"))
-            .and_then(|d| d.get("content"))
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.is_empty());
+        let delta = choice.and_then(|c| c.get("delta"));
+        let non_empty = |key: &str| {
+            delta
+                .and_then(|d| d.get(key))
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        };
+        let has_content = non_empty("content");
+        // A thinking model streams its reasoning first: `reasoning_content`
+        // on chat deltas (`reasoning` on some engines). It is output too.
+        let has_reasoning = non_empty("reasoning_content") || non_empty("reasoning");
         let finished = choice
             .and_then(|c| c.get("finish_reason"))
             .is_some_and(|f| !f.is_null());
-        if has_content {
-            self.tokens_seen += 1;
+        if has_content || has_reasoning {
+            if has_content {
+                self.tokens_seen += 1;
+            } else {
+                self.reasoning_tokens += 1;
+            }
             if let Some(prev) = self.last_token {
                 self.itls.push((now - prev).as_secs_f64() * 1000.0);
             }
@@ -606,9 +745,10 @@ impl StreamObserver {
         }
     }
 
-    /// Fold the observations into the result. A stream that showed no text
-    /// but finished with a counted output token is a served request whose
-    /// token was invisible; one with no token at all is `no-tokens`.
+    /// Fold the observations into the result. A stream that showed neither
+    /// text nor reasoning but finished with a counted output token is a
+    /// served request whose token was invisible; one with no token at all is
+    /// `no-tokens`.
     fn finish(self, started: Instant, result: &mut ReqResult) {
         result.request_id = self.request_id;
         result.worker = self.worker;
@@ -616,6 +756,8 @@ impl StreamObserver {
         result.completion_tokens = self.completion_tokens;
         result.cached_tokens = self.cached_tokens;
         result.tokens_seen = self.tokens_seen;
+        result.reasoning_tokens = self.reasoning_tokens;
+        let shown = self.tokens_seen + self.reasoning_tokens;
         result.ttft_ms = self
             .first_signal
             .map(|t| (t - started).as_secs_f64() * 1000.0);
@@ -625,11 +767,11 @@ impl StreamObserver {
             result.itl_mean_ms = Some(mean(&self.itls));
             result.itl_p99_ms = Some(percentile(&sorted, 0.99));
         }
-        if result.completion_tokens < self.tokens_seen {
+        if result.completion_tokens < shown {
             // No usage arrived: count what was seen.
-            result.completion_tokens = self.tokens_seen;
+            result.completion_tokens = shown;
         }
-        if self.tokens_seen == 0 && self.completion_tokens > 0 && result.ttft_ms.is_some() {
+        if shown == 0 && self.completion_tokens > 0 && result.ttft_ms.is_some() {
             result.invisible_tokens = self.completion_tokens;
         }
         if result.status == "ok" && (result.ttft_ms.is_none() || result.completion_tokens == 0) {
@@ -949,6 +1091,7 @@ async fn sample_fleet(
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    mock_worker::tls::install_crypto_provider();
     let args = Args::parse();
     let text = fs::read_to_string(&args.trace)
         .with_context(|| format!("reading {}", args.trace.display()))?;
@@ -967,10 +1110,13 @@ async fn main() -> Result<()> {
         return Err(anyhow!("no rows selected"));
     }
     let t0 = rows[0].timestamp;
-    let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(args.max_inflight)
-        .timeout(Duration::from_secs(600))
-        .build()?;
+    let mut pins = Vec::new();
+    for url in std::iter::once(&args.gateway).chain(args.admin.iter()) {
+        if let Some(pin) = pinned_addresses(url).await {
+            pins.push(pin);
+        }
+    }
+    let client = http_client(args.connections, args.max_inflight, &pins)?;
     let url = format!("{}/v1/chat/completions", args.gateway.trim_end_matches('/'));
     let inflight = Arc::new(Semaphore::new(args.max_inflight));
     let mut set: JoinSet<ReqResult> = JoinSet::new();
@@ -1013,6 +1159,7 @@ async fn main() -> Result<()> {
             body_prompt: prompt,
             max_output: args.max_output,
             sent_at_ms: start.elapsed().as_secs_f64() * 1000.0,
+            chat_template_kwargs: args.chat_template_kwargs.clone(),
         };
         set.spawn(async move {
             let _permit = permit;
@@ -1162,6 +1309,7 @@ async fn main() -> Result<()> {
         "ok": ok.len(),
         "errors": scored.len() - ok.len(),
         "invisible_token_requests": ok.iter().filter(|r| r.invisible_tokens > 0).count(),
+        "reasoning_tokens": ok.iter().map(|r| u64::from(r.reasoning_tokens)).sum::<u64>(),
         "speedup": args.speedup,
         "wall_s": wall_s,
         "req_per_s": ok.len() as f64 / wall_s,
@@ -1187,10 +1335,10 @@ async fn main() -> Result<()> {
         args.out.join("summary.json"),
         serde_json::to_string_pretty(&summary)?,
     )?;
-    let mut csv = String::from("row,trace_ts_ms,trace_input_length,sent_at_ms,status,request_id,worker,prompt_tokens,completion_tokens,cached_tokens,oracle_tokens,queued_ms,ttft_ms,latency_ms,itl_mean_ms,itl_p99_ms,tokens_seen,invisible_tokens,gateway_request_id,branch,credit_tokens,agree\n");
+    let mut csv = String::from("row,trace_ts_ms,trace_input_length,sent_at_ms,status,request_id,worker,prompt_tokens,completion_tokens,cached_tokens,oracle_tokens,queued_ms,ttft_ms,latency_ms,itl_mean_ms,itl_p99_ms,tokens_seen,reasoning_tokens,invisible_tokens,gateway_request_id,branch,credit_tokens,agree\n");
     for r in &results {
         csv.push_str(&format!(
-            "{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{:.1},{},{},{},{},{},{},{},{}\n",
+            "{},{},{},{:.1},{},{},{},{},{},{},{},{},{},{:.1},{},{},{},{},{},{},{},{},{}\n",
             r.row,
             r.trace_ts_ms,
             r.trace_input_length,
@@ -1208,6 +1356,7 @@ async fn main() -> Result<()> {
             r.itl_mean_ms.map(|v| format!("{v:.2}")).unwrap_or_default(),
             r.itl_p99_ms.map(|v| format!("{v:.2}")).unwrap_or_default(),
             r.tokens_seen,
+            r.reasoning_tokens,
             r.invisible_tokens,
             r.gateway_request_id,
             r.branch,
@@ -1281,10 +1430,7 @@ mod tests {
         let path = dir.join("fleet.csv");
         let (stop, rx) = watch::channel(false);
         // The test server is local: no proxy from the environment.
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .build()
-            .expect("client");
+        let client = http_client_builder().no_proxy().build().expect("client");
         let mut sampler: JoinSet<Result<usize>> = JoinSet::new();
         sampler.spawn(sample_fleet(
             client,
@@ -1440,6 +1586,202 @@ mod tests {
         // No usage arrived: the stream is still a served one, counted as seen.
         assert_eq!(result.status, "ok");
         assert_eq!(result.completion_tokens, 3);
+    }
+
+    /// A chat completion chunk whose delta carries the given field.
+    fn delta_chunk(field: &str, text: &str) -> Value {
+        serde_json::from_str(&format!(
+            r#"{{"id":"chatcmpl-r","choices":[{{"index":0,"delta":{{"{field}":"{text}"}},"finish_reason":null}}]}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn reasoning_deltas_count_for_ttft_and_itl() {
+        // A thinking model: two reasoning deltas, then one of text, then the
+        // finish and the usage, as the gateway streams them.
+        let finish: Value = serde_json::from_str(
+            r#"{"id":"chatcmpl-r","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        let usage: Value = serde_json::from_str(
+            r#"{"id":"chatcmpl-r","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":3,"total_tokens":13}}"#,
+        )
+        .unwrap();
+        let started = Instant::now();
+        let mut observer = StreamObserver::default();
+        observer.observe(
+            &delta_chunk("reasoning_content", "think"),
+            started + Duration::from_millis(40),
+        );
+        observer.observe(
+            &delta_chunk("reasoning_content", "more"),
+            started + Duration::from_millis(60),
+        );
+        observer.observe(
+            &delta_chunk("content", "answer"),
+            started + Duration::from_millis(80),
+        );
+        observer.observe(&finish, started + Duration::from_millis(81));
+        observer.observe(&usage, started + Duration::from_millis(82));
+        let mut result = ReqResult {
+            status: "ok".to_string(),
+            ..Default::default()
+        };
+        observer.finish(started, &mut result);
+        assert_eq!(result.status, "ok");
+        assert!((result.ttft_ms.unwrap() - 40.0).abs() < 1.0);
+        assert!((result.itl_mean_ms.unwrap() - 20.0).abs() < 1.0);
+        assert_eq!(result.reasoning_tokens, 2);
+        assert_eq!(result.tokens_seen, 1);
+        assert_eq!(result.completion_tokens, 3);
+        assert_eq!(result.invisible_tokens, 0);
+    }
+
+    #[test]
+    fn a_reasoning_only_stream_is_served_not_invisible() {
+        // The output budget ran out inside the reasoning: no text at all.
+        let finish: Value = serde_json::from_str(
+            r#"{"id":"chatcmpl-r","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#,
+        )
+        .unwrap();
+        let usage: Value = serde_json::from_str(
+            r#"{"id":"chatcmpl-r","choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#,
+        )
+        .unwrap();
+        let started = Instant::now();
+        let mut observer = StreamObserver::default();
+        observer.observe(
+            &delta_chunk("reasoning", "a"),
+            started + Duration::from_millis(30),
+        );
+        observer.observe(
+            &delta_chunk("reasoning", "b"),
+            started + Duration::from_millis(50),
+        );
+        observer.observe(&finish, started + Duration::from_millis(500));
+        observer.observe(&usage, started + Duration::from_millis(501));
+        let mut result = ReqResult {
+            status: "ok".to_string(),
+            ..Default::default()
+        };
+        observer.finish(started, &mut result);
+        assert_eq!(result.status, "ok");
+        // The first reasoning delta is the first token, not the finish.
+        assert!((result.ttft_ms.unwrap() - 30.0).abs() < 1.0);
+        assert!((result.itl_mean_ms.unwrap() - 20.0).abs() < 1.0);
+        assert_eq!(result.reasoning_tokens, 2);
+        assert_eq!(result.tokens_seen, 0);
+        assert_eq!(result.invisible_tokens, 0);
+    }
+
+    #[test]
+    fn chat_template_kwargs_are_forwarded_only_when_given() {
+        let plain = request_body("m", "hi", 5, None);
+        assert!(plain.get("chat_template_kwargs").is_none());
+        assert_eq!(plain["max_tokens"], 5);
+        let kwargs = parse_json_object(r#"{"enable_thinking": false}"#).unwrap();
+        let body = request_body("m", "hi", 5, Some(&kwargs));
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(body["messages"][0]["content"], "hi");
+        assert!(parse_json_object("[1]").is_err());
+        assert!(parse_json_object("nope").is_err());
+    }
+
+    /// A one-route HTTP/1.1 server that records, per request, the client's
+    /// port and whether the request asked for the connection to close; it
+    /// keeps a connection open until the client closes it or asked it to.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test server tasks end with the test's runtime"
+    )]
+    async fn recording_server() -> (String, Arc<std::sync::Mutex<Vec<(u16, bool)>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!("http://{}/", listener.local_addr().expect("addr"));
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, peer)) = listener.accept().await else {
+                    return;
+                };
+                let log = log.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut byte = [0u8; 1];
+                    loop {
+                        // One request head at a time (the bodies are empty).
+                        buf.clear();
+                        while !buf.ends_with(b"\r\n\r\n") {
+                            match socket.read(&mut byte).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(_) => buf.push(byte[0]),
+                            }
+                        }
+                        let head = String::from_utf8_lossy(&buf).to_ascii_lowercase();
+                        let close = head.contains("connection: close");
+                        log.lock().unwrap().push((peer.port(), close));
+                        let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                        if socket.write_all(response.as_bytes()).await.is_err() || close {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (url, seen)
+    }
+
+    #[tokio::test]
+    async fn fresh_connections_are_never_shared_between_requests() {
+        let (url, seen) = recording_server().await;
+        let client = http_client(Connections::Fresh, 16, &[]).expect("client");
+        for _ in 0..3 {
+            let response = client.get(&url).send().await.expect("send");
+            assert_eq!(response.text().await.expect("body"), "ok");
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3);
+        assert!(
+            seen.iter().all(|(_, close)| *close),
+            "every request asks the server to close: {seen:?}"
+        );
+        let ports: std::collections::BTreeSet<u16> = seen.iter().map(|(port, _)| *port).collect();
+        assert_eq!(ports.len(), 3, "a connection per request: {seen:?}");
+    }
+
+    #[tokio::test]
+    async fn host_names_are_pinned_once_and_addresses_left_alone() {
+        assert!(pinned_addresses("http://127.0.0.1:1/").await.is_none());
+        assert!(pinned_addresses("http://[::1]:1/").await.is_none());
+        assert!(pinned_addresses("not a url").await.is_none());
+        let (host, addrs) = pinned_addresses("http://localhost:1/")
+            .await
+            .expect("localhost resolves");
+        assert_eq!(host, "localhost");
+        assert!(!addrs.is_empty());
+        assert!(addrs.iter().all(|a| a.ip().is_loopback()), "{addrs:?}");
+    }
+
+    #[tokio::test]
+    async fn pooled_connections_are_reused_between_requests() {
+        let (url, seen) = recording_server().await;
+        let client = http_client(Connections::Pooled, 16, &[]).expect("client");
+        for _ in 0..3 {
+            let response = client.get(&url).send().await.expect("send");
+            assert_eq!(response.text().await.expect("body"), "ok");
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 3);
+        assert!(
+            seen.iter().all(|(_, close)| !*close),
+            "keep-alive requests: {seen:?}"
+        );
+        let ports: std::collections::BTreeSet<u16> = seen.iter().map(|(port, _)| *port).collect();
+        assert_eq!(ports.len(), 1, "one connection reused: {seen:?}");
     }
 
     #[test]

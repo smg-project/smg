@@ -22,7 +22,7 @@
 # Built by ci-tokenspeed-image.yml using the published nightly version date.
 # CUDA tooling supports runtime JIT; wheel installation needs no GPU.
 
-ARG BASE_IMAGE=ubuntu:24.04
+ARG BASE_IMAGE=ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
 FROM ${BASE_IMAGE}
 
 WORKDIR /opt/smg-ci
@@ -42,7 +42,7 @@ RUN bash scripts/ci_apt_mirror.sh \
         python3 python3-dev python3-venv python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-COPY scripts/ci_setup_python_venv.sh scripts/ci_install_tokenspeed.sh scripts/ci_install_flashinfer.py scripts/ci_ensure_python_headers.sh scripts/
+COPY scripts/ci_setup_python_venv.sh scripts/ci_install_tokenspeed.sh scripts/ci_tokenspeed_scheduler_pin.py scripts/ci_install_flashinfer.py scripts/ci_ensure_python_headers.sh scripts/
 COPY .github/versions/tokenspeed.ref .github/versions/tokenspeed.ref
 
 ARG TOKENSPEED_VERSION

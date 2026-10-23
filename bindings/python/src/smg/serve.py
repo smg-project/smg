@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import errno
 import logging
 import os
 import random
@@ -30,6 +31,16 @@ logger = logging.getLogger("smg.serve")
 # created 0700 (single-owner) so a shared /tmp cannot leak another user's
 # sockets into this router. Override with SMG_ZMQ_SOCKET_DIR.
 _ZMQ_SOCKET_DIR = os.environ.get("SMG_ZMQ_SOCKET_DIR", f"/tmp/smg-zmq-{os.getuid()}")
+
+
+def _bracket_if_ipv6(host: str) -> str:
+    """Return ``host`` ready for a ``host:port`` join or a URL authority: an IPv6
+    literal in brackets; IPv4 addresses, hostnames and already-bracketed literals
+    as they are. ``--worker-host ::1`` otherwise yields ``grpc://::1:<port>`` (which
+    the router rejects) and ``::1:<port>`` (which grpc cannot dial)."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
 
 
 def _zmq_ipc_url(port: int) -> str:
@@ -129,16 +140,16 @@ class WorkerLauncher(ABC):
             # host:port to probe. The router's own health checker gates
             # readiness, so the launcher just proceeds to start the router.
             return True
-        return _http_health_check(f"http://{host}:{port}/health", timeout)
+        return _http_health_check(f"http://{_bracket_if_ipv6(host)}:{port}/health", timeout)
 
     def worker_url(self, args: argparse.Namespace, host: str, port: int) -> str:
         """Return the URL used by the router to reach this worker."""
         mode = getattr(args, "connection_mode", "grpc")
         if mode == "grpc":
-            return f"grpc://{host}:{port}"
+            return f"grpc://{_bracket_if_ipv6(host)}:{port}"
         if mode == "zmq":
             return _zmq_ipc_url(port)
-        return f"http://{host}:{port}"
+        return f"http://{_bracket_if_ipv6(host)}:{port}"
 
     def _get_tp_size(self, args: argparse.Namespace) -> int:
         """Return tensor-parallel size for GPU assignment. Default 1."""
@@ -635,7 +646,7 @@ def _grpc_health_check(host: str, port: int, timeout: float) -> bool:
         return False
 
     try:
-        channel = grpc.insecure_channel(f"{host}:{port}")
+        channel = grpc.insecure_channel(f"{_bracket_if_ipv6(host)}:{port}")
         try:
             stub = health_pb2_grpc.HealthStub(channel)
             request = health_pb2.HealthCheckRequest(service="")
@@ -647,7 +658,7 @@ def _grpc_health_check(host: str, port: int, timeout: float) -> bool:
         # vLLM doesn't implement gRPC health service — fall back to channel ready
         if hasattr(e, "code") and e.code() == grpc.StatusCode.UNIMPLEMENTED:
             try:
-                channel = grpc.insecure_channel(f"{host}:{port}")
+                channel = grpc.insecure_channel(f"{_bracket_if_ipv6(host)}:{port}")
                 try:
                     grpc.channel_ready_future(channel).result(timeout=timeout)
                     return True
@@ -693,13 +704,22 @@ def _find_available_ports(base_port: int, count: int) -> list[int]:
 
 
 def _is_port_available(port: int) -> bool:
-    """Return True if *port* is free on localhost."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+    """Return True if *port* is free on localhost for both address families a
+    worker may bind: a port busy on ``[::1]`` is not free. A family without a
+    loopback address (IPv6 disabled) is skipped, not treated as busy."""
+    for family, address in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
         try:
-            s.bind(("127.0.0.1", port))
-            return True
+            s = socket.socket(family, socket.SOCK_STREAM)
         except OSError:
-            return False
+            continue
+        with s:
+            try:
+                s.bind((address, port))
+            except OSError as e:
+                if e.errno == errno.EADDRNOTAVAIL:
+                    continue
+                return False
+    return True
 
 
 # ---------------------------------------------------------------------------

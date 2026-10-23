@@ -16,7 +16,7 @@
   <a href="https://lightseek.org/smg/"><img src="https://img.shields.io/badge/docs-latest-brightgreen.svg" alt="Docs"></a>
   <a href="https://discord.lightseek.org"><img src="https://img.shields.io/badge/Discord-Join%20Us-5865F2?logo=discord&logoColor=white" alt="Discord"></a>
   <a href="https://slack.lightseek.org"><img src="https://img.shields.io/badge/Slack-Join%20Us-4A154B?logo=slack&logoColor=white" alt="Slack"></a>
-  <a href="https://deepwiki.com/smg-project/smg"><img src="https://deepwiki.com/badge.svg" alt="Ask DeepWiki"></a>
+  <a href="https://deepwiki.com/smg-project/smg"><img src="https://img.shields.io/badge/Ask-DeepWiki-blue.svg" alt="Ask DeepWiki"></a>
   <a href="https://pytorch.org/blog/lightseek-smg/"><img src="https://img.shields.io/badge/PyTorch-Technical%20Blog-EE4C2C?logo=pytorch&logoColor=white" alt="PyTorch Blog"></a>
 </p>
 
@@ -94,12 +94,12 @@ That's it. SMG is now load-balancing requests across your workers.
 | **[10 Routing Policies](https://lightseek.org/smg/concepts/routing/load-balancing)** | cache_aware, least_load, power_of_two, consistent_hashing, prefix_hash, bucket, round_robin, random, manual, passthrough |
 | **[gRPC Pipeline](https://lightseek.org/smg/concepts/architecture/grpc-pipeline)** | Native streaming gRPC to the engines with prefill/decode and encode disaggregation and DP-aware routing |
 | **[Kubernetes Discovery](https://lightseek.org/smg/getting-started/service-discovery)** | Native pod watchers with label selectors, per-role prefill/decode/encode selectors, and router peer discovery |
-| **[Model Parsers](https://lightseek.org/smg/getting-started/tokenization-and-parsing)** | 21 tool-call parsers and 16 reasoning parsers with automatic model detection — DeepSeek, Qwen, Kimi, GLM, Llama, Mistral, Command, Nemotron, and more |
+| **[Model Parsers](https://lightseek.org/smg/getting-started/tokenization-and-parsing-apis)** | 21 tool-call parsers and 16 reasoning parsers with automatic model detection — DeepSeek, Qwen, Kimi, GLM, Llama, Mistral, Command, Nemotron, and more |
 | **[MCP Integration](https://lightseek.org/smg/concepts/extensibility/mcp)** | Tool discovery and execution over stdio, SSE, and streamable HTTP, with approval policies and audit logging |
 | **[High Availability](https://lightseek.org/smg/concepts/architecture/high-availability)** | Mesh networking with SWIM gossip and CRDT-replicated state for multi-node deployments |
 | **[Chat History](https://lightseek.org/smg/concepts/data/chat-history)** | Pluggable storage with schema migrations: PostgreSQL, Oracle, Redis, or in-memory |
 | **[WASM Plugins](https://lightseek.org/smg/concepts/extensibility/wasm-plugins)** | Extend request and response handling with custom WebAssembly middleware |
-| **[Resilience](https://lightseek.org/smg/concepts/reliability/index)** | Circuit breakers, retries with backoff and jitter, rate limiting, and priority admission scheduling |
+| **[Resilience](https://lightseek.org/smg/concepts/reliability)** | Circuit breakers, retries with backoff and jitter, rate limiting, and priority admission scheduling |
 
 ## Documentation
 

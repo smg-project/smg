@@ -106,9 +106,13 @@ if [ -n "$TRTLLM_LIB_DIR" ]; then
     export LD_LIBRARY_PATH="${TRTLLM_LIB_DIR}:${LD_LIBRARY_PATH:-}"
 fi
 
-# Persist LD_LIBRARY_PATH for subsequent CI steps
+# Later CI steps run in a new shell, so retain the toolkit as well as its libraries.
 if [ -n "${GITHUB_ENV:-}" ]; then
+    echo "CUDA_HOME=$CUDA_HOME" >> "$GITHUB_ENV"
     echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH" >> "$GITHUB_ENV"
+fi
+if [ -n "${GITHUB_PATH:-}" ]; then
+    echo "$CUDA_HOME/bin" >> "$GITHUB_PATH"
 fi
 
 # ── Verification ─────────────────────────────────────────────────────────────

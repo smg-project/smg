@@ -9,10 +9,7 @@ use std::{
 use anyhow::Result;
 use parking_lot::RwLock;
 use tokio::sync::watch;
-use tonic::{
-    transport::{ClientTlsConfig, Endpoint},
-    Request,
-};
+use tonic::{transport::Endpoint, Request};
 use tracing as log;
 
 use crate::transport::limits::MAX_MESSAGE_SIZE;
@@ -29,8 +26,8 @@ use gossip::{
 
 use crate::{
     gossip_controller::GossipController,
-    gossip_service::GossipService,
-    mtls::{MTLSConfig, MTLSManager},
+    gossip_service::{GossipService, PreparedGossipServer},
+    mtls::{tls_server_name, MTLSConfig, MTLSManager},
     partition::PartitionDetector,
 };
 
@@ -57,6 +54,9 @@ pub struct MeshServerHandler {
     /// namespaces (broadcast/targeted) and publish values that reach
     /// peers via the gossip loop.
     mesh_kv: Arc<crate::kv::MeshKV>,
+    /// The node's TLS identity when the mesh has one: the `Leaving`
+    /// broadcast dials the members with it, as the probes do.
+    mtls_manager: Option<Arc<MTLSManager>>,
 }
 
 impl MeshServerHandler {
@@ -84,29 +84,25 @@ impl MeshServerHandler {
         log::info!("Graceful shutdown for node {}", self.self_name);
 
         let maybe_leaving = {
-            let state = self.state.read();
-
-            if let Some(self_node) = state.get(&self.self_name) {
-                let mut self_node = self_node.clone();
-                if self_node.status == NodeStatus::Leaving as i32 {
-                    None
-                } else {
+            let mut state = self.state.write();
+            // Broadcast targets: the live members other than this node.
+            let alive_nodes = state
+                .values()
+                .filter(|node| {
+                    node.status == NodeStatus::Alive as i32 && node.name != self.self_name
+                })
+                .cloned()
+                .collect::<Vec<NodeState>>();
+            match state.get_mut(&self.self_name) {
+                Some(self_node) if self_node.status != NodeStatus::Leaving as i32 => {
+                    // Written into this node's own table first: a probe it
+                    // still answers before its loop stops says Leaving too,
+                    // instead of turning a member's view of it back to Alive.
                     self_node.status = NodeStatus::Leaving as i32;
                     self_node.version += 1;
-
-                    let alive_nodes = state
-                        .values()
-                        .filter(|node| {
-                            node.status == NodeStatus::Alive as i32 && node.name != self.self_name
-                            // exclude self from broadcast targets
-                        })
-                        .cloned()
-                        .collect::<Vec<NodeState>>();
-
-                    Some((self_node, alive_nodes))
+                    Some((self_node.clone(), alive_nodes))
                 }
-            } else {
-                None
+                _ => None,
             }
         };
         let (leaving_node, alive_nodes) = match maybe_leaving {
@@ -127,6 +123,7 @@ impl MeshServerHandler {
             vec![leaving_node],
             alive_nodes,
             Some(Duration::from_secs(3)),
+            self.mtls_manager.clone(),
         )
         .await;
 
@@ -220,6 +217,7 @@ impl MeshServerBuilder {
                 signal_tx,
                 partition_detector: Some(partition_detector),
                 mesh_kv,
+                mtls_manager: self.mtls_manager.clone(),
             },
         )
     }
@@ -276,10 +274,25 @@ impl MeshServer {
     }
 
     pub async fn start(self) -> Result<()> {
-        self.start_inner(None).await
+        self.prepare(None).await?.serve().await
     }
 
     pub async fn start_with_listener(self, listener: tokio::net::TcpListener) -> Result<()> {
+        self.prepare_with_listener(listener).await?.serve().await
+    }
+
+    /// Everything this server does before it serves from `listener`, which
+    /// the caller bound on the configured bind address: the listener against
+    /// that address, the gossip service and its controller, the tonic server
+    /// with the TLS configuration from the node's material. Every failure the
+    /// mesh server can raise before it serves surfaces here, so a caller can
+    /// refuse its own start on it instead of learning of it from the task
+    /// the server runs in, after it serves. [`PreparedMeshServer::serve`]
+    /// runs the result.
+    pub async fn prepare_with_listener(
+        self,
+        listener: tokio::net::TcpListener,
+    ) -> Result<PreparedMeshServer> {
         let bound_addr = listener
             .local_addr()
             .map_err(|e| anyhow::anyhow!("Failed to read listener local addr: {e}"))?;
@@ -290,18 +303,13 @@ impl MeshServer {
                 self.bind_addr
             ));
         }
-        self.start_inner(Some(listener)).await
+        self.prepare(Some(listener)).await
     }
 
-    async fn start_inner(self, listener: Option<tokio::net::TcpListener>) -> Result<()> {
-        log::info!(
-            "Mesh server listening on {} and advertising {}",
-            self.bind_addr,
-            self.advertise_addr
-        );
-        let self_name = self.self_name.clone();
-        let advertise_address = self.advertise_addr;
-
+    async fn prepare(
+        self,
+        listener: Option<tokio::net::TcpListener>,
+    ) -> Result<PreparedMeshServer> {
         #[expect(
             clippy::expect_used,
             reason = "partition_detector is always set to Some by MeshServerBuilder::build() before start() is called"
@@ -329,27 +337,54 @@ impl MeshServer {
             service = service.with_mtls_manager(mtls_manager);
         }
 
+        let server = service.prepare(listener).await?;
+        Ok(PreparedMeshServer {
+            self_name: self.self_name,
+            bind_addr: self.bind_addr,
+            advertise_addr: self.advertise_addr,
+            signal_rx: self.signal_rx,
+            controller,
+            server,
+        })
+    }
+}
+
+/// A mesh server with everything that can fail before it serves already
+/// done ([`MeshServer::prepare_with_listener`]); [`serve`](Self::serve) runs
+/// it for the life of the process.
+pub struct PreparedMeshServer {
+    self_name: String,
+    bind_addr: SocketAddr,
+    advertise_addr: SocketAddr,
+    signal_rx: watch::Receiver<bool>,
+    controller: GossipController,
+    server: PreparedGossipServer,
+}
+
+impl PreparedMeshServer {
+    /// Serves the gossip service and runs the gossip loop until the handler
+    /// signals shutdown or either of them fails.
+    pub async fn serve(self) -> Result<()> {
+        log::info!(
+            "Mesh server listening on {} and advertising {}",
+            self.bind_addr,
+            self.advertise_addr
+        );
         let mut service_shutdown = self.signal_rx.clone();
 
         #[expect(
             clippy::disallowed_methods,
             reason = "handle is awaited immediately below via tokio::select!, bounded by shutdown signal"
         )]
-        let server_handle = if let Some(tcp_listener) = listener {
-            tokio::spawn(service.serve_ping_with_listener(tcp_listener, async move {
-                _ = service_shutdown.changed().await;
-            }))
-        } else {
-            tokio::spawn(service.serve_ping_with_shutdown(async move {
-                _ = service_shutdown.changed().await;
-            }))
-        };
+        let server_handle = tokio::spawn(self.server.serve(async move {
+            _ = service_shutdown.changed().await;
+        }));
         tokio::time::sleep(Duration::from_secs(1)).await;
         #[expect(
             clippy::disallowed_methods,
             reason = "handle is awaited immediately below via tokio::select!, bounded by shutdown signal"
         )]
-        let app_handle = tokio::spawn(controller.event_loop(self.signal_rx.clone()));
+        let app_handle = tokio::spawn(self.controller.event_loop(self.signal_rx.clone()));
 
         tokio::select! {
             res = server_handle => res??,
@@ -358,19 +393,21 @@ impl MeshServer {
 
         log::info!(
             "Mesh server {} at {} is shutting down",
-            self_name,
-            advertise_address
+            self.self_name,
+            self.advertise_addr
         );
         Ok(())
     }
 }
 
-/// Broadcast node state updates to target nodes
+/// Broadcast node state updates to target nodes, each dialed with the node's
+/// TLS identity when the mesh has one (`mtls_manager`), as the probes are.
 /// Returns (success_count, total_count)
 pub async fn broadcast_node_states(
     nodes_to_broadcast: Vec<NodeState>,
     target_nodes: Vec<NodeState>,
     timeout: Option<Duration>,
+    mtls_manager: Option<Arc<MTLSManager>>,
 ) -> (usize, usize) {
     if nodes_to_broadcast.is_empty() || target_nodes.is_empty() {
         log::debug!(
@@ -385,6 +422,7 @@ pub async fn broadcast_node_states(
     for target_node in &target_nodes {
         let target_node_clone = target_node.clone();
         let nodes_for_task = nodes_to_broadcast.clone();
+        let mtls_manager = mtls_manager.clone();
         #[expect(
             clippy::disallowed_methods,
             reason = "broadcast tasks are collected and awaited via join_all with a timeout immediately below"
@@ -396,7 +434,7 @@ pub async fn broadcast_node_states(
             let ping_payload = gossip_message::Payload::Ping(Ping {
                 state_sync: Some(state_sync),
             });
-            match try_ping(&target_node_clone, Some(ping_payload), None).await {
+            match try_ping(&target_node_clone, Some(ping_payload), mtls_manager).await {
                 Ok(_) => {
                     log::debug!("Successfully broadcasted to {}", target_node_clone.name);
                     Ok(())
@@ -473,28 +511,23 @@ pub async fn try_ping(
             ))
         })?;
 
-        let tls_domain = endpoint
-            .uri()
-            .host()
-            .map(str::to_owned)
-            .unwrap_or_else(|| peer_name.clone());
-        let ca_certificate = mtls_manager.load_ca_certificate().await.map_err(|e| {
-            tonic::Status::unavailable(format!(
-                "Failed to load mTLS CA certificate for {peer_name}: {e}"
-            ))
-        })?;
-
-        endpoint = endpoint
-            .tls_config(
-                ClientTlsConfig::new()
-                    .domain_name(tls_domain)
-                    .ca_certificate(ca_certificate),
-            )
+        let tls_domain = endpoint.uri().host().map_or_else(
+            || peer_name.clone(),
+            |host| tls_server_name(host).to_owned(),
+        );
+        let tls = mtls_manager
+            .client_tls_config(&tls_domain)
+            .await
             .map_err(|e| {
                 tonic::Status::unavailable(format!(
-                    "Failed to configure TLS endpoint for {peer_name}: {e}"
+                    "Failed to load the mTLS identity for {peer_name}: {e}"
                 ))
             })?;
+        endpoint = endpoint.tls_config(tls).map_err(|e| {
+            tonic::Status::unavailable(format!(
+                "Failed to configure TLS endpoint for {peer_name}: {e}"
+            ))
+        })?;
     }
 
     let channel = endpoint.connect().await.map_err(|e| {
@@ -555,15 +588,26 @@ macro_rules! mesh_run {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Once;
+    use std::{
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
+        sync::Once,
+    };
 
+    use rustls::crypto::ring;
+    use tokio::net::TcpListener;
+    use tonic::transport::{
+        server::TcpIncoming, Certificate, ClientTlsConfig, Identity, Server, ServerTlsConfig,
+    };
     use tracing as log;
     use tracing_subscriber::{
         filter::LevelFilter, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter,
     };
 
-    use super::*;
-    use crate::tests::test_utils::{bind_node, wait_for};
+    use super::{gossip::gossip_server::GossipServer, *};
+    use crate::tests::{
+        mtls_certs::MtlsTestCerts,
+        test_utils::{bind_node, wait_for},
+    };
 
     static INIT: Once = Once::new();
     fn init() {
@@ -697,5 +741,433 @@ mod tests {
         }
 
         log::info!("All nodes converged to expected state");
+    }
+
+    /// A member whose join peer is not up at its first round keeps dialing
+    /// it: B starts with A's address while nothing listens there, A comes up
+    /// a few rounds later, and the two still find each other.
+    #[tokio::test]
+    async fn a_member_keeps_dialing_its_join_peer_until_it_is_up() {
+        init();
+        // A's address, reserved by a bind that is released at once: B's
+        // first dials are refused, as they are while the peer is not up yet.
+        let (listener_a, addr_a) = bind_node().await;
+        drop(listener_a);
+        let (listener_b, addr_b) = bind_node().await;
+        let handler_b = mesh_run!("B", listener_b, addr_b, Some(addr_a));
+
+        // B's first round and its dial pass before A binds its address.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(
+            handler_b.state.read().len(),
+            1,
+            "B found a member while nothing listened on A's address"
+        );
+        let listener_a = TcpListener::bind(addr_a)
+            .await
+            .expect("A's address is free again");
+        let handler_a = mesh_run!("A", listener_a, addr_a, None);
+
+        wait_for(
+            || handler_a.state.read().len() == 2 && handler_b.state.read().len() == 2,
+            Duration::from_secs(20),
+            "B joins A once A is up",
+        )
+        .await;
+        handler_a.shutdown();
+        handler_b.shutdown();
+    }
+
+    /// A gossip peer answering over TLS with the test node certificate (IP
+    /// SANs for both loopback addresses), bound to an ephemeral port of
+    /// `loopback`.
+    async fn gossip_peer_over_tls(loopback: IpAddr, certs: &MtlsTestCerts) -> SocketAddr {
+        let listener = TcpListener::bind((loopback, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let service =
+            GossipService::new(Arc::new(RwLock::new(BTreeMap::new())), addr, addr, "peer");
+        let identity = Identity::from_pem(
+            std::fs::read(&certs.node_cert_path).unwrap(),
+            std::fs::read(&certs.node_key_path).unwrap(),
+        );
+        let server = Server::builder()
+            .tls_config(ServerTlsConfig::new().identity(identity))
+            .unwrap()
+            .add_service(
+                GossipServer::new(service)
+                    .max_decoding_message_size(MAX_MESSAGE_SIZE)
+                    .max_encoding_message_size(MAX_MESSAGE_SIZE)
+                    .accept_compressed(tonic::codec::CompressionEncoding::Gzip)
+                    .send_compressed(tonic::codec::CompressionEncoding::Gzip),
+            )
+            .serve_with_incoming(TcpIncoming::from(listener));
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test peer runs in the background for the duration of the assertion"
+        )]
+        tokio::spawn(server);
+        addr
+    }
+
+    /// The process-level crypto provider rustls needs before any TLS
+    /// configuration is built: the gateway installs it at start-up, the test
+    /// binary does it itself, and before the peer's server is built, since a
+    /// build with both rustls backends enabled (the workspace's test build)
+    /// cannot pick one on its own.
+    fn install_crypto_provider() {
+        let _ = ring::default_provider().install_default();
+    }
+
+    /// `try_ping` with mTLS on, the way the gossip loop dials a peer.
+    async fn mtls_ping(
+        peer: SocketAddr,
+        certs: &MtlsTestCerts,
+    ) -> Result<NodeUpdate, tonic::Status> {
+        install_crypto_provider();
+        let mtls = MTLSManager::new(MTLSConfig {
+            ca_cert_path: certs.ca_cert_path.clone(),
+            server_cert_path: certs.node_cert_path.clone(),
+            server_key_path: certs.node_key_path.clone(),
+            require_client_cert: false,
+        });
+        try_ping(
+            &NodeState {
+                name: "peer".to_string(),
+                address: peer.to_string(),
+                status: NodeStatus::Alive as i32,
+                version: 1,
+                metadata: HashMap::new(),
+            },
+            Some(gossip_message::Payload::Ping(Ping {
+                state_sync: Some(StateSync { nodes: vec![] }),
+            })),
+            Some(Arc::new(mtls)),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn mtls_ping_reaches_an_ipv6_peer_by_its_ip_san() {
+        init();
+        install_crypto_provider();
+        // Nothing to assert on a host without an IPv6 loopback.
+        if std::net::TcpListener::bind("[::1]:0").is_err() {
+            return;
+        }
+        let certs = MtlsTestCerts::generate();
+        let peer = gossip_peer_over_tls(Ipv6Addr::LOCALHOST.into(), &certs).await;
+
+        let update = mtls_ping(peer, &certs)
+            .await
+            .unwrap_or_else(|e| panic!("ping over TLS to {peer} failed: {e}"));
+
+        assert_eq!(update.address, peer.to_string());
+    }
+
+    #[tokio::test]
+    async fn mtls_ping_reaches_an_ipv4_peer_by_its_ip_san() {
+        init();
+        install_crypto_provider();
+        let certs = MtlsTestCerts::generate();
+        let peer = gossip_peer_over_tls(Ipv4Addr::LOCALHOST.into(), &certs).await;
+
+        let update = mtls_ping(peer, &certs)
+            .await
+            .unwrap_or_else(|e| panic!("ping over TLS to {peer} failed: {e}"));
+
+        assert_eq!(update.address, peer.to_string());
+    }
+
+    fn mtls_config(certs: &MtlsTestCerts) -> MTLSConfig {
+        MTLSConfig {
+            ca_cert_path: certs.ca_cert_path.clone(),
+            server_cert_path: certs.node_cert_path.clone(),
+            server_key_path: certs.node_key_path.clone(),
+            require_client_cert: true,
+        }
+    }
+
+    fn node_state(name: &str, addr: SocketAddr) -> NodeState {
+        NodeState {
+            name: name.to_string(),
+            address: addr.to_string(),
+            status: NodeStatus::Alive as i32,
+            version: 1,
+            metadata: HashMap::new(),
+        }
+    }
+
+    /// A mesh node with mTLS on (client certificates required), bound to an
+    /// ephemeral port of `ip`, joining `init_peer` when given.
+    async fn mtls_node(
+        name: &str,
+        ip: IpAddr,
+        init_peer: Option<SocketAddr>,
+        certs: &MtlsTestCerts,
+    ) -> (SocketAddr, MeshServerHandler) {
+        let listener = TcpListener::bind((ip, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server, handler) = MeshServerBuilder::new(name.to_string(), addr, addr, init_peer)
+            .with_mtls(mtls_config(certs))
+            .build();
+        let name = name.to_string();
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test node runs in the background for the duration of the assertion"
+        )]
+        tokio::spawn(async move {
+            if let Err(e) = server.start_with_listener(listener).await {
+                tracing::error!("Mesh node {name} failed: {e}");
+            }
+        });
+        wait_for(
+            || std::net::TcpStream::connect(addr).is_ok(),
+            Duration::from_secs(5),
+            "mesh listener started",
+        )
+        .await;
+        (addr, handler)
+    }
+
+    /// Two nodes with mTLS on `ip`: B joins A (the gossip ping), then a value
+    /// put on A reaches B (the sync stream).
+    async fn mesh_forms_with_mtls_over(ip: IpAddr) {
+        init();
+        let _ = ring::default_provider().install_default();
+        let certs = MtlsTestCerts::generate();
+        let (addr_a, handler_a) = mtls_node("A", ip, None, &certs).await;
+        let (_addr_b, handler_b) = mtls_node("B", ip, Some(addr_a), &certs).await;
+
+        wait_for(
+            || handler_a.state.read().len() == 2 && handler_b.state.read().len() == 2,
+            Duration::from_secs(20),
+            "A and B see each other over mTLS",
+        )
+        .await;
+
+        handler_a
+            .mesh_kv()
+            .configs()
+            .put("config:tls", b"on".to_vec());
+        wait_for(
+            || handler_b.mesh_kv().configs().get("config:tls").as_deref() == Some(b"on".as_slice()),
+            Duration::from_secs(20),
+            "A's value reaches B over the sync stream",
+        )
+        .await;
+
+        handler_a.shutdown();
+        handler_b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn mesh_forms_with_mtls_over_ipv4() {
+        mesh_forms_with_mtls_over(Ipv4Addr::LOCALHOST.into()).await;
+    }
+
+    #[tokio::test]
+    async fn mesh_forms_with_mtls_over_ipv6() {
+        // Nothing to assert on a host without an IPv6 loopback.
+        if std::net::TcpListener::bind("[::1]:0").is_err() {
+            return;
+        }
+        mesh_forms_with_mtls_over(Ipv6Addr::LOCALHOST.into()).await;
+    }
+
+    /// A member that leaves tells its peers so with the node's TLS identity
+    /// on the dial: B's `Leaving` reaches A under mTLS, whose listener refuses
+    /// a dial without a certificate from the CA.
+    #[tokio::test]
+    async fn a_leaving_member_tells_its_peers_over_mtls() {
+        init();
+        let _ = ring::default_provider().install_default();
+        let certs = MtlsTestCerts::generate();
+        let ip: IpAddr = Ipv4Addr::LOCALHOST.into();
+        let (addr_a, handler_a) = mtls_node("A", ip, None, &certs).await;
+        let (_addr_b, handler_b) = mtls_node("B", ip, Some(addr_a), &certs).await;
+        wait_for(
+            || handler_a.state.read().len() == 2 && handler_b.state.read().len() == 2,
+            Duration::from_secs(20),
+            "A and B see each other over mTLS",
+        )
+        .await;
+
+        handler_b.graceful_shutdown().await.expect("B leaves");
+
+        let b_on_a = handler_a.state.read().get("B").cloned();
+        assert_eq!(
+            b_on_a.as_ref().map(|node| node.status),
+            Some(NodeStatus::Leaving as i32),
+            "A does not show B as Leaving after B's broadcast: {b_on_a:?}"
+        );
+        // B's own table says so too, so a probe B still answers before its
+        // loop stops cannot turn a member's view of B back to Alive.
+        let b_on_b = handler_b.state.read().get("B").cloned();
+        assert_eq!(
+            b_on_b.as_ref().map(|node| node.status),
+            Some(NodeStatus::Leaving as i32),
+            "B's own table does not show B as Leaving: {b_on_b:?}"
+        );
+        handler_a.shutdown();
+    }
+
+    /// The status broadcast itself, with no gossip loop on the sending side
+    /// to carry the news another way: against a member over mTLS, a dial
+    /// without the node's identity is refused and delivers nothing, a dial
+    /// with it is accepted and the member records the status.
+    #[tokio::test]
+    async fn a_status_broadcast_dials_with_the_node_tls_identity() {
+        init();
+        let _ = ring::default_provider().install_default();
+        let certs = MtlsTestCerts::generate();
+        let (addr_a, handler_a) = mtls_node("A", Ipv4Addr::LOCALHOST.into(), None, &certs).await;
+        let mut leaving_b = node_state("B", SocketAddr::from((Ipv4Addr::LOCALHOST, 1)));
+        leaving_b.status = NodeStatus::Leaving as i32;
+        let timeout = Some(Duration::from_secs(3));
+
+        let without_identity = broadcast_node_states(
+            vec![leaving_b.clone()],
+            vec![node_state("A", addr_a)],
+            timeout,
+            None,
+        )
+        .await;
+        assert_eq!(
+            without_identity,
+            (0, 1),
+            "a broadcast dialed without the identity was accepted by an mTLS member"
+        );
+        assert!(
+            handler_a.state.read().get("B").is_none(),
+            "A recorded a status from a refused dial: {:?}",
+            handler_a.state.read().get("B")
+        );
+
+        let with_identity = broadcast_node_states(
+            vec![leaving_b],
+            vec![node_state("A", addr_a)],
+            timeout,
+            Some(Arc::new(MTLSManager::new(mtls_config(&certs)))),
+        )
+        .await;
+        assert_eq!(
+            with_identity,
+            (1, 1),
+            "a broadcast dialed with the identity was refused by an mTLS member"
+        );
+        let b_on_a = handler_a.state.read().get("B").cloned();
+        assert_eq!(
+            b_on_a.as_ref().map(|node| node.status),
+            Some(NodeStatus::Leaving as i32),
+            "A did not record B's status from the broadcast: {b_on_a:?}"
+        );
+        handler_a.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_dialer_without_a_client_certificate_is_refused() {
+        init();
+        let _ = ring::default_provider().install_default();
+        let certs = MtlsTestCerts::generate();
+        let (addr_a, handler_a) = mtls_node("A", Ipv4Addr::LOCALHOST.into(), None, &certs).await;
+
+        let trusting_only = ClientTlsConfig::new()
+            .domain_name(addr_a.ip().to_string())
+            .ca_certificate(Certificate::from_pem(
+                std::fs::read(&certs.ca_cert_path).unwrap(),
+            ));
+        let endpoint = Endpoint::from_shared(format!("https://{addr_a}"))
+            .unwrap()
+            .tls_config(trusting_only)
+            .unwrap()
+            .connect_timeout(Duration::from_secs(5));
+        let ping = GossipMessage {
+            payload: Some(gossip_message::Payload::Ping(Ping { state_sync: None })),
+        };
+        let refused = match endpoint.connect().await {
+            Err(_) => true,
+            Ok(channel) => gossip_client::GossipClient::new(channel)
+                .ping_server(Request::new(ping))
+                .await
+                .is_err(),
+        };
+
+        assert!(
+            refused,
+            "a dialer without a client certificate must be refused"
+        );
+        handler_a.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_dialer_with_a_foreign_ca_is_refused() {
+        init();
+        let _ = ring::default_provider().install_default();
+        let certs = MtlsTestCerts::generate();
+        let foreign = MtlsTestCerts::generate();
+        let (addr_a, handler_a) = mtls_node("A", Ipv4Addr::LOCALHOST.into(), None, &certs).await;
+
+        let result = try_ping(
+            &node_state("A", addr_a),
+            Some(gossip_message::Payload::Ping(Ping { state_sync: None })),
+            Some(Arc::new(MTLSManager::new(mtls_config(&foreign)))),
+        )
+        .await;
+
+        assert!(result.is_err(), "a foreign CA must be refused: {result:?}");
+        handler_a.shutdown();
+    }
+
+    /// Material the node can read but not use fails the preparation, before
+    /// anything serves: the listener goes with the error and its port answers
+    /// nobody. The caller refuses its own start on that error, where it used
+    /// to learn of it from the task the running server failed in.
+    #[tokio::test]
+    async fn unusable_tls_material_fails_the_preparation_before_anything_serves() {
+        init();
+        install_crypto_provider();
+        let certs = MtlsTestCerts::generate();
+        std::fs::write(&certs.node_cert_path, "not a certificate\n").unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (server, _handler) = MeshServerBuilder::new("node".to_string(), addr, addr, None)
+            .with_mtls(mtls_config(&certs))
+            .build();
+
+        let error = match server.prepare_with_listener(listener).await {
+            Ok(_) => panic!("a mesh server was prepared from unusable TLS material"),
+            Err(e) => format!("{e:#}"),
+        };
+
+        assert!(
+            error.contains("mesh TLS material"),
+            "the error does not say what is wrong: {error}"
+        );
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "the mesh port answers after the failed preparation"
+        );
+    }
+
+    /// The listener handed in must be bound on the configured address: a
+    /// mismatch fails the preparation, not the first poll of a running task.
+    #[tokio::test]
+    async fn a_listener_on_another_address_fails_the_preparation() {
+        init();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let other = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let configured = other.local_addr().unwrap();
+        let (server, _handler) =
+            MeshServerBuilder::new("node".to_string(), configured, configured, None).build();
+
+        let error = match server.prepare_with_listener(listener).await {
+            Ok(_) => panic!("a mesh server was prepared on a listener bound elsewhere"),
+            Err(e) => e.to_string(),
+        };
+
+        assert!(
+            error.contains("mismatch"),
+            "the error does not name the mismatch: {error}"
+        );
     }
 }

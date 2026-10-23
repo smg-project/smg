@@ -13,11 +13,11 @@ use tracing::warn;
 use crate::{
     context::{current_request_context, with_extra_columns},
     core::{
-        Conversation, ConversationId, ConversationItem, ConversationItemId, ConversationItemResult,
-        ConversationItemStorage, ConversationItemStorageError, ConversationMetadata,
-        ConversationResult, ConversationStorage, ConversationStorageError, ListParams,
-        NewConversation, NewConversationItem, ResponseChain, ResponseId, ResponseResult,
-        ResponseStorage, ResponseStorageError, StoredResponse,
+        ConditionalStore, Conversation, ConversationId, ConversationItem, ConversationItemId,
+        ConversationItemResult, ConversationItemStorage, ConversationItemStorageError,
+        ConversationMetadata, ConversationResult, ConversationStorage, ConversationStorageError,
+        ListParams, NewConversation, NewConversationItem, ResponseChain, ResponseId,
+        ResponseResult, ResponseStorage, ResponseStorageError, StoredResponse,
     },
     hooks::{BeforeHookResult, ExtraColumns, StorageHook, StorageOperation},
 };
@@ -27,7 +27,8 @@ use crate::{
 // ────────────────────────────────────────────────────────────────────────────
 
 /// Run the before-hook, returning the extra columns on success or mapping
-/// `Reject` / errors to the appropriate storage error via `map_err`.
+/// `Reject` to the store's `Rejected` error via `map_err` (a refusal on purpose,
+/// never the store being unavailable); a hook that fails is logged and skipped.
 async fn run_before<E>(
     hook: &dyn StorageHook,
     op: StorageOperation,
@@ -76,6 +77,10 @@ impl HookedConversationStorage {
 
 #[async_trait]
 impl ConversationStorage for HookedConversationStorage {
+    fn stored_record_count(&self) -> Option<usize> {
+        self.inner.stored_record_count()
+    }
+
     async fn create_conversation(
         &self,
         input: NewConversation,
@@ -85,7 +90,7 @@ impl ConversationStorage for HookedConversationStorage {
             &*self.hook,
             StorageOperation::CreateConversation,
             &payload,
-            ConversationStorageError::StorageError,
+            ConversationStorageError::Rejected,
         )
         .await?;
 
@@ -114,7 +119,7 @@ impl ConversationStorage for HookedConversationStorage {
             &*self.hook,
             StorageOperation::GetConversation,
             &payload,
-            ConversationStorageError::StorageError,
+            ConversationStorageError::Rejected,
         )
         .await?;
 
@@ -143,7 +148,7 @@ impl ConversationStorage for HookedConversationStorage {
             &*self.hook,
             StorageOperation::UpdateConversation,
             &payload,
-            ConversationStorageError::StorageError,
+            ConversationStorageError::Rejected,
         )
         .await?;
 
@@ -169,7 +174,7 @@ impl ConversationStorage for HookedConversationStorage {
             &*self.hook,
             StorageOperation::DeleteConversation,
             &payload,
-            ConversationStorageError::StorageError,
+            ConversationStorageError::Rejected,
         )
         .await?;
 
@@ -206,6 +211,10 @@ impl HookedConversationItemStorage {
 
 #[async_trait]
 impl ConversationItemStorage for HookedConversationItemStorage {
+    fn stored_record_count(&self) -> Option<usize> {
+        self.inner.stored_record_count()
+    }
+
     async fn create_item(
         &self,
         item: NewConversationItem,
@@ -215,7 +224,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::CreateItem,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -245,7 +254,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::LinkItem,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -278,7 +287,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::LinkItems,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -308,7 +317,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::ListItems,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -336,7 +345,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::GetItem,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -365,7 +374,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::IsItemLinked,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -394,7 +403,7 @@ impl ConversationItemStorage for HookedConversationItemStorage {
             &*self.hook,
             StorageOperation::DeleteItem,
             &payload,
-            ConversationItemStorageError::StorageError,
+            ConversationItemStorageError::Rejected,
         )
         .await?;
 
@@ -430,13 +439,17 @@ impl HookedResponseStorage {
 
 #[async_trait]
 impl ResponseStorage for HookedResponseStorage {
+    fn stored_record_count(&self) -> Option<usize> {
+        self.inner.stored_record_count()
+    }
+
     async fn store_response(&self, response: StoredResponse) -> ResponseResult<ResponseId> {
         let payload = serde_json::to_value(&response).unwrap_or_default();
         let extra = run_before(
             &*self.hook,
             StorageOperation::StoreResponse,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
@@ -455,6 +468,81 @@ impl ResponseStorage for HookedResponseStorage {
         Ok(result)
     }
 
+    /// A store that may be refused by the record's status: the before-hook
+    /// of [`Self::store_response`] runs for every attempt; the after-hook
+    /// runs only when the record was written, with the response's id as its
+    /// result, as a plain store's does (a hook that mirrors or audits writes
+    /// sees one contract on both paths, and nothing for a refused write).
+    async fn store_response_if_open(
+        &self,
+        response: StoredResponse,
+    ) -> ResponseResult<ConditionalStore> {
+        let payload = serde_json::to_value(&response).unwrap_or_default();
+        let id = serde_json::to_value(&response.id).unwrap_or_default();
+        let extra = run_before(
+            &*self.hook,
+            StorageOperation::StoreResponse,
+            &payload,
+            ResponseStorageError::StorageError,
+        )
+        .await?;
+
+        let result =
+            with_extra_columns(extra.clone(), self.inner.store_response_if_open(response)).await?;
+
+        if matches!(result, ConditionalStore::Stored) {
+            run_after(
+                &*self.hook,
+                StorageOperation::StoreResponse,
+                &payload,
+                &id,
+                &extra,
+            )
+            .await;
+        }
+
+        Ok(result)
+    }
+
+    /// A status transition: the store hooks run as for a store, the
+    /// after-hook only when the object was written, with the id as its
+    /// result; the record's other columns are not rewritten, so a hook that
+    /// supplies none (a transition under no request) resets nothing.
+    async fn update_response_object_if_open(
+        &self,
+        id: &ResponseId,
+        raw_response: serde_json::Value,
+    ) -> ResponseResult<ConditionalStore> {
+        let payload = serde_json::json!({ "id": id, "raw_response": raw_response });
+        let id_json = serde_json::to_value(id).unwrap_or_default();
+        let extra = run_before(
+            &*self.hook,
+            StorageOperation::StoreResponse,
+            &payload,
+            ResponseStorageError::StorageError,
+        )
+        .await?;
+
+        let result = with_extra_columns(
+            extra.clone(),
+            self.inner.update_response_object_if_open(id, raw_response),
+        )
+        .await?;
+
+        if matches!(result, ConditionalStore::Stored) {
+            run_after(
+                &*self.hook,
+                StorageOperation::StoreResponse,
+                &payload,
+                &id_json,
+                &extra,
+            )
+            .await;
+        }
+
+        Ok(result)
+    }
+
     async fn get_response(
         &self,
         response_id: &ResponseId,
@@ -464,7 +552,7 @@ impl ResponseStorage for HookedResponseStorage {
             &*self.hook,
             StorageOperation::GetResponse,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
@@ -489,7 +577,7 @@ impl ResponseStorage for HookedResponseStorage {
             &*self.hook,
             StorageOperation::DeleteResponse,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
@@ -517,7 +605,7 @@ impl ResponseStorage for HookedResponseStorage {
             &*self.hook,
             StorageOperation::GetResponseChain,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
@@ -539,23 +627,65 @@ impl ResponseStorage for HookedResponseStorage {
         Ok(result)
     }
 
+    /// The lookup by output item id is a read of the response it finds, so the
+    /// `GetResponse` hooks run on the found response's id, the policy of
+    /// [`get_response`](Self::get_response); no hook operation of its own, so a
+    /// hook that never heard of the lookup still sees it as the response read
+    /// it is. The id has to be found before a hook can judge it, so a read the
+    /// hook rejects is answered as a miss: the caller learns no more about an
+    /// item it may not read than about one that does not exist.
+    async fn find_response_by_output_item(
+        &self,
+        item_id: &str,
+    ) -> ResponseResult<Option<StoredResponse>> {
+        let Some(found) = self.inner.find_response_by_output_item(item_id).await? else {
+            return Ok(None);
+        };
+        let payload = serde_json::to_value(&found.id).unwrap_or_default();
+        let Ok(extra) = run_before(
+            &*self.hook,
+            StorageOperation::GetResponse,
+            &payload,
+            ResponseStorageError::Rejected,
+        )
+        .await
+        else {
+            return Ok(None);
+        };
+
+        let result = Some(found);
+        let result_json = serde_json::to_value(&result).unwrap_or_default();
+        run_after(
+            &*self.hook,
+            StorageOperation::GetResponse,
+            &payload,
+            &result_json,
+            &extra,
+        )
+        .await;
+
+        Ok(result)
+    }
+
     async fn list_identifier_responses(
         &self,
         identifier: &str,
+        tenant: Option<&str>,
         limit: Option<usize>,
     ) -> ResponseResult<Vec<StoredResponse>> {
-        let payload = serde_json::json!({ "identifier": identifier, "limit": limit });
+        let payload =
+            serde_json::json!({ "identifier": identifier, "tenant": tenant, "limit": limit });
         let extra = run_before(
             &*self.hook,
             StorageOperation::ListIdentifierResponses,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
         let result = self
             .inner
-            .list_identifier_responses(identifier, limit)
+            .list_identifier_responses(identifier, tenant, limit)
             .await?;
 
         let result_json = serde_json::to_value(&result).unwrap_or_default();
@@ -571,17 +701,39 @@ impl ResponseStorage for HookedResponseStorage {
         Ok(result)
     }
 
-    async fn delete_identifier_responses(&self, identifier: &str) -> ResponseResult<usize> {
-        let payload = serde_json::json!({ "identifier": identifier });
+    async fn expire_response(
+        &self,
+        response_id: &ResponseId,
+        after: std::time::Duration,
+    ) -> ResponseResult<()> {
+        self.inner.expire_response(response_id, after).await
+    }
+
+    /// Delegated without the hooks: the sweep is the store's own housekeeping
+    /// over records whose clients asked for nothing to be kept, and it names no
+    /// record before the store finds them, so no hook runs for its deletions.
+    async fn delete_unstored_older_than(&self, cutoff: DateTime<Utc>) -> ResponseResult<usize> {
+        self.inner.delete_unstored_older_than(cutoff).await
+    }
+
+    async fn delete_identifier_responses(
+        &self,
+        identifier: &str,
+        tenant: Option<&str>,
+    ) -> ResponseResult<usize> {
+        let payload = serde_json::json!({ "identifier": identifier, "tenant": tenant });
         let extra = run_before(
             &*self.hook,
             StorageOperation::DeleteIdentifierResponses,
             &payload,
-            ResponseStorageError::StorageError,
+            ResponseStorageError::Rejected,
         )
         .await?;
 
-        let result = self.inner.delete_identifier_responses(identifier).await?;
+        let result = self
+            .inner
+            .delete_identifier_responses(identifier, tenant)
+            .await?;
 
         let result_json = serde_json::to_value(result).unwrap_or_default();
         run_after(
@@ -610,6 +762,7 @@ mod tests {
     use super::*;
     use crate::{
         context::{with_request_context, RequestContext},
+        core::StorageFailure,
         hooks::HookError,
         memory::{MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage},
     };
@@ -620,6 +773,7 @@ mod tests {
     struct MockHook {
         before_count: AtomicUsize,
         after_count: AtomicUsize,
+        after_results: parking_lot::Mutex<Vec<serde_json::Value>>,
         reject_before: parking_lot::Mutex<Option<String>>,
     }
 
@@ -628,8 +782,14 @@ mod tests {
             Self {
                 before_count: AtomicUsize::new(0),
                 after_count: AtomicUsize::new(0),
+                after_results: parking_lot::Mutex::new(Vec::new()),
                 reject_before: parking_lot::Mutex::new(None),
             }
+        }
+
+        /// The `result` of every after-hook call, in order.
+        fn after_results(&self) -> Vec<serde_json::Value> {
+            self.after_results.lock().clone()
         }
 
         fn set_reject(&self, msg: &str) {
@@ -665,10 +825,11 @@ mod tests {
             _operation: StorageOperation,
             _context: Option<&RequestContext>,
             _payload: &serde_json::Value,
-            _result: &serde_json::Value,
+            result: &serde_json::Value,
             extra: &ExtraColumns,
         ) -> Result<ExtraColumns, HookError> {
             self.after_count.fetch_add(1, Ordering::SeqCst);
+            self.after_results.lock().push(result.clone());
             Ok(extra.clone())
         }
     }
@@ -704,6 +865,13 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("not allowed"));
+        // A refusal on purpose: the store is fine, so it is not the 503 of a
+        // store that is not available.
+        assert!(
+            matches!(err, ConversationStorageError::Rejected(_)),
+            "{err:?}"
+        );
+        assert!(!err.is_unavailable(), "{err}");
         assert_eq!(hook.before_calls(), 1);
         assert_eq!(hook.after_calls(), 0); // after not called on rejection
     }
@@ -792,6 +960,62 @@ mod tests {
         assert_eq!(hook.after_calls(), 1);
     }
 
+    fn response_with_output_item(item_id: &str) -> StoredResponse {
+        let mut stored = StoredResponse::new(None);
+        stored.raw_response = json!({
+            "id": "resp_1",
+            "output": [{"type": "message", "id": item_id, "role": "assistant",
+                        "status": "completed", "content": []}]
+        });
+        stored
+    }
+
+    #[tokio::test]
+    async fn hooked_response_output_item_lookup_runs_the_response_read_hooks() {
+        let inner = Arc::new(MemoryResponseStorage::new());
+        let id = inner
+            .store_response(response_with_output_item("msg_1"))
+            .await
+            .unwrap();
+
+        let hook = Arc::new(MockHook::new());
+        let hooked = HookedResponseStorage::new(inner, hook.clone());
+
+        let found = hooked.find_response_by_output_item("msg_1").await.unwrap();
+        assert_eq!(found.map(|r| r.id), Some(id));
+        assert_eq!(hook.before_calls(), 1);
+        assert_eq!(hook.after_calls(), 1);
+
+        // an unknown item reads no response: the hooks do not run
+        let missing = hooked
+            .find_response_by_output_item("msg_unknown")
+            .await
+            .unwrap();
+        assert!(missing.is_none());
+        assert_eq!(hook.before_calls(), 1);
+        assert_eq!(hook.after_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn hooked_response_reject_prevents_output_item_lookup() {
+        let inner = Arc::new(MemoryResponseStorage::new());
+        inner
+            .store_response(response_with_output_item("msg_1"))
+            .await
+            .unwrap();
+
+        let hook = Arc::new(MockHook::new());
+        hook.set_reject("denied");
+        let hooked = HookedResponseStorage::new(inner, hook.clone());
+
+        // A read the hook rejects is a miss, not an error: the caller cannot
+        // tell a response it may not read from one that does not exist.
+        let denied = hooked.find_response_by_output_item("msg_1").await.unwrap();
+        assert!(denied.is_none());
+        assert_eq!(hook.before_calls(), 1);
+        assert_eq!(hook.after_calls(), 0);
+    }
+
     // ── Item tests ───────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -808,6 +1032,7 @@ mod tests {
                 role: Some("user".to_string()),
                 content: json!([]),
                 status: Some("completed".to_string()),
+                tenant: None,
             })
             .await
             .unwrap();
@@ -1042,18 +1267,22 @@ mod tests {
             async fn list_identifier_responses(
                 &self,
                 identifier: &str,
+                tenant: Option<&str>,
                 limit: Option<usize>,
             ) -> Result<Vec<StoredResponse>, ResponseStorageError> {
                 self.inner
-                    .list_identifier_responses(identifier, limit)
+                    .list_identifier_responses(identifier, tenant, limit)
                     .await
             }
 
             async fn delete_identifier_responses(
                 &self,
                 identifier: &str,
+                tenant: Option<&str>,
             ) -> Result<usize, ResponseStorageError> {
-                self.inner.delete_identifier_responses(identifier).await
+                self.inner
+                    .delete_identifier_responses(identifier, tenant)
+                    .await
             }
         }
 
@@ -1289,7 +1518,7 @@ mod tests {
         assert_eq!(hook.after_calls(), 2);
 
         let listed = hooked
-            .list_identifier_responses("user-1", None)
+            .list_identifier_responses("user-1", None, None)
             .await
             .unwrap();
         assert_eq!(listed.len(), 2, "should list both responses for user-1");
@@ -1297,6 +1526,102 @@ mod tests {
         // list_identifier_responses triggers its own before/after hook
         assert_eq!(hook.before_calls(), 3);
         assert_eq!(hook.after_calls(), 3);
+    }
+
+    #[tokio::test]
+    async fn hooked_conditional_store_runs_the_store_hooks_and_keeps_a_closed_record() {
+        let inner = Arc::new(MemoryResponseStorage::new());
+        let hook = Arc::new(MockHook::new());
+        let hooked = HookedResponseStorage::new(inner, hook.clone());
+
+        let record = |status: &str| {
+            let mut stored = StoredResponse::new(None);
+            stored.id = ResponseId::from("resp_1");
+            stored.raw_response = json!({"background": true, "status": status});
+            stored
+        };
+        hooked.store_response(record("queued")).await.unwrap();
+        assert!(matches!(
+            hooked
+                .store_response_if_open(record("cancelled"))
+                .await
+                .unwrap(),
+            ConditionalStore::Stored
+        ));
+        assert!(matches!(
+            hooked
+                .store_response_if_open(record("completed"))
+                .await
+                .unwrap(),
+            ConditionalStore::Closed(current) if current.raw_response["status"] == "cancelled"
+        ));
+        assert_eq!(hook.before_calls(), 3, "each store runs the before-hook");
+        assert_eq!(
+            hook.after_calls(),
+            2,
+            "the after-hook runs for the two writes, not for the refused one"
+        );
+        assert_eq!(
+            hook.after_results(),
+            vec![json!("resp_1"), json!("resp_1")],
+            "the after-hook's result is the response's id, as for a plain store"
+        );
+        let stored = hooked
+            .get_response(&ResponseId::from("resp_1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.raw_response["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn hooked_transition_runs_the_store_hooks_and_moves_the_object_alone() {
+        let inner = Arc::new(MemoryResponseStorage::new());
+        let hook = Arc::new(MockHook::new());
+        let hooked = HookedResponseStorage::new(inner, hook.clone());
+
+        let mut stored = StoredResponse::new(None);
+        stored.id = ResponseId::from("resp_1");
+        stored.safety_identifier = Some("user-1".to_string());
+        stored.raw_response = json!({"background": true, "status": "queued"});
+        hooked.store_response(stored).await.unwrap();
+        assert!(matches!(
+            hooked
+                .update_response_object_if_open(
+                    &ResponseId::from("resp_1"),
+                    json!({"background": true, "status": "failed"})
+                )
+                .await
+                .unwrap(),
+            ConditionalStore::Stored
+        ));
+        assert!(matches!(
+            hooked
+                .update_response_object_if_open(
+                    &ResponseId::from("resp_1"),
+                    json!({"background": true, "status": "completed"})
+                )
+                .await
+                .unwrap(),
+            ConditionalStore::Closed(current) if current.raw_response["status"] == "failed"
+        ));
+        assert_eq!(hook.before_calls(), 3, "each attempt runs the before-hook");
+        assert_eq!(
+            hook.after_results(),
+            vec![json!("resp_1"), json!("resp_1")],
+            "the after-hook runs for the two writes, with the id"
+        );
+        let stored = hooked
+            .get_response(&ResponseId::from("resp_1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.raw_response["status"], "failed");
+        assert_eq!(
+            stored.safety_identifier.as_deref(),
+            Some("user-1"),
+            "the rest of the record stays"
+        );
     }
 
     #[tokio::test]
@@ -1318,14 +1643,17 @@ mod tests {
         assert_eq!(hook.after_calls(), 2);
 
         // Delete all responses for user-1
-        let deleted = hooked.delete_identifier_responses("user-1").await.unwrap();
+        let deleted = hooked
+            .delete_identifier_responses("user-1", None)
+            .await
+            .unwrap();
         assert_eq!(deleted, 2, "should delete both responses");
         assert_eq!(hook.before_calls(), 3);
         assert_eq!(hook.after_calls(), 3);
 
         // Verify list is now empty
         let listed = hooked
-            .list_identifier_responses("user-1", None)
+            .list_identifier_responses("user-1", None, None)
             .await
             .unwrap();
         assert!(listed.is_empty(), "no responses should remain after delete");
@@ -1397,6 +1725,7 @@ mod tests {
                 role: Some("user".to_string()),
                 content: json!("hello"),
                 status: None,
+                tenant: None,
             })
             .await
             .unwrap();
@@ -1470,6 +1799,7 @@ mod tests {
                 role: Some("user".to_string()),
                 content: json!("test"),
                 status: None,
+                tenant: None,
             })
             .await
             .unwrap();

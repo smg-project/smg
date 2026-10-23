@@ -593,6 +593,7 @@ mod qwen_xml_tests {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         }]
     }
@@ -707,6 +708,7 @@ mod qwen_xml_tests {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         }];
 

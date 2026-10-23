@@ -29,10 +29,10 @@ fn collect_eos_ids(cfg: &Value, ids: &mut BTreeSet<TokenIdType>) {
 /// generation_config.json). We merge both into a deduplicated, sorted list so
 /// the StopDecoder can strip any of them before decoding.
 ///
-/// This matches how vllm and sglang resolve EOS:
-/// - vllm: `hf_config.eos_token_id` (from config.json via AutoConfig) +
+/// This matches how the serving engines resolve EOS:
+/// - one engine's server: `hf_config.eos_token_id` (from config.json via AutoConfig) +
 ///   `generation_config.eos_token_id` (merged in `update_from_generation_config`)
-/// - sglang: `model_info["eos_token_ids"]` (from model config, includes both sources)
+/// - another's: `model_info["eos_token_ids"]` (from model config, includes both sources)
 pub fn load_eos_token_ids(dir: &Path) -> Vec<TokenIdType> {
     let mut ids = BTreeSet::new();
 

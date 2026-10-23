@@ -11,6 +11,16 @@ updates:
       interval: weekly
 
   - package-ecosystem: docker
-    directory: /
+    # The Dockerfiles live in docker/; their base images are pinned by digest
+    # and this entry keeps the digests current (tag bumps are done by hand:
+    # a new Ubuntu release changes glibc and package names). Dependabot
+    # rewrites FROM lines only; two more places carry the ubuntu:24.04 digest
+    # and move with docker/Dockerfile by hand: the ARG default of
+    # ci-tokenspeed.Dockerfile and the base-image fallback of
+    # .github/workflows/ci-tokenspeed-image.yml.
+    directory: /docker
     schedule:
       interval: weekly
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]

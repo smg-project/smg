@@ -12,7 +12,9 @@ use axum::{
 };
 use bytes::Bytes;
 use futures::StreamExt;
-use openai_protocol::messages::{ContentBlock, MessageDeltaUsage, StopReason, ToolUseBlock};
+use openai_protocol::messages::{
+    ContentBlock, MessageDeltaUsage, StopReason, ToolUseBlock, ToolUseCaller,
+};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
@@ -394,6 +396,7 @@ impl BlockAccumulator {
                         id: id.clone(),
                         name: name.clone(),
                         input,
+                        caller: ToolUseCaller::Direct,
                     },
                     Some(tool_use),
                 )

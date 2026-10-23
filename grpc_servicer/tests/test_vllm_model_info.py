@@ -8,6 +8,7 @@ import json
 import logging
 from types import SimpleNamespace
 
+import pytest
 from smg_grpc_proto import vllm_engine_pb2
 from smg_grpc_servicer.vllm import model_info
 
@@ -36,6 +37,109 @@ def _model_config(**overrides):
     for key, value in overrides.items():
         setattr(config, key, value)
     return config
+
+
+def test_constrained_decoding_start_follows_the_reasoning_parser():
+    # No structured-outputs section (an older vLLM): neither fact is known,
+    # and the Router keeps the grammar shape that fits either kind of engine.
+    bare = SimpleNamespace(model_config=_model_config())
+    assert model_info.engine_reasoning_parser(bare) == ""
+    assert model_info.constrained_decoding_start(bare) == ""
+    # A section that predates the reasoning parser attribute says nothing either.
+    older = SimpleNamespace(
+        model_config=_model_config(), structured_outputs_config=SimpleNamespace(backend="auto")
+    )
+    assert model_info.engine_reasoning_parser(older) == ""
+    assert model_info.constrained_decoding_start(older) == ""
+    # Without a reasoning parser the grammar runs from the first token.
+    no_parser = SimpleNamespace(
+        model_config=_model_config(),
+        structured_outputs_config=SimpleNamespace(reasoning_parser="", enable_in_reasoning=False),
+    )
+    assert model_info.engine_reasoning_parser(no_parser) == ""
+    assert model_info.constrained_decoding_start(no_parser) == "first_token"
+    # With one, vLLM's structured-output manager holds the grammar back until
+    # the parser has seen the thought's end...
+    gated = SimpleNamespace(
+        model_config=_model_config(),
+        structured_outputs_config=SimpleNamespace(
+            reasoning_parser="glm45", enable_in_reasoning=False
+        ),
+    )
+    assert model_info.engine_reasoning_parser(gated) == "glm45"
+    assert model_info.constrained_decoding_start(gated) == "after_reasoning"
+    # ...unless the operator asked for structured output inside the reasoning.
+    in_reasoning = SimpleNamespace(
+        model_config=_model_config(),
+        structured_outputs_config=SimpleNamespace(
+            reasoning_parser="glm45", enable_in_reasoning=True
+        ),
+    )
+    assert model_info.engine_reasoning_parser(in_reasoning) == "glm45"
+    assert model_info.constrained_decoding_start(in_reasoning) == "first_token"
+    # Both ride in `GetServerInfo` as the proto names them.
+    fields = vllm_engine_pb2.GetServerInfoResponse.DESCRIPTOR.fields_by_name
+    assert fields["engine_reasoning_parser"].number == 23
+    assert fields["constrained_decoding_start"].number == 24
+    info = vllm_engine_pb2.GetServerInfoResponse(
+        engine_reasoning_parser=model_info.engine_reasoning_parser(gated),
+        constrained_decoding_start=model_info.constrained_decoding_start(gated),
+    )
+    parsed = vllm_engine_pb2.GetServerInfoResponse.FromString(info.SerializeToString())
+    assert parsed.engine_reasoning_parser == "glm45"
+    assert parsed.constrained_decoding_start == "after_reasoning"
+    assert vllm_engine_pb2.GetServerInfoResponse().constrained_decoding_start == ""
+
+
+def test_mm_item_limits_follow_the_engines_per_prompt_limits():
+    # A text model, and a multimodal config without vLLM's accessor, advertise
+    # nothing: the Router keeps its own caps.
+    assert model_info.mm_item_limits(SimpleNamespace(model_config=_model_config())) == ""
+    bare = _model_config(is_multimodal_model=True, multimodal_config=SimpleNamespace())
+    assert model_info.mm_item_limits(SimpleNamespace(model_config=bare)) == ""
+    # The resolved --limit-mm-per-prompt of the modalities a vLLM worker takes,
+    # as sorted pairs the Router parses.
+    limits = {"image": 8, "video": 2, "audio": 1}
+    config = _model_config(
+        is_multimodal_model=True,
+        multimodal_config=SimpleNamespace(get_limit_per_prompt=limits.__getitem__),
+    )
+    label = model_info.mm_item_limits(SimpleNamespace(model_config=config))
+    assert label == "image=8,video=2"
+    info = vllm_engine_pb2.GetServerInfoResponse(mm_item_limits=label)
+    parsed = vllm_engine_pb2.GetServerInfoResponse.FromString(info.SerializeToString())
+    assert parsed.mm_item_limits == "image=8,video=2"
+
+
+def test_mm_encoder_budget_is_the_engines_own(caplog):
+    # A text model has none.
+    assert model_info.mm_encoder_budget(SimpleNamespace(model_config=_model_config())) == 0
+    assert model_info.mm_encoder_budget(None) == 0
+    # A multimodal engine's budget comes from vLLM's own helper over its config,
+    # as the number the scheduler places one item under.
+    config = SimpleNamespace(model_config=_model_config(is_multimodal_model=True))
+    seen = []
+
+    def factory(vllm_config):
+        seen.append(vllm_config)
+        return SimpleNamespace(get_encoder_budget=lambda: 192000)
+
+    assert model_info.mm_encoder_budget(config, budget_factory=factory) == 192000
+    assert seen == [config]
+
+    # A helper that cannot tell (or a vLLM without one) leaves the item's size
+    # to the engine, as before, and says so.
+    def failing(vllm_config):
+        raise RuntimeError("no dummy data for this processor")
+
+    with caplog.at_level(logging.WARNING):
+        assert model_info.mm_encoder_budget(config, budget_factory=failing) == 0
+        assert model_info.mm_encoder_budget(config) == 0  # no vLLM in this environment
+    assert sum("encoder budget" in r.getMessage() for r in caplog.records) == 2
+    # The proto carries it as it is.
+    info = vllm_engine_pb2.GetServerInfoResponse(mm_encoder_budget=192000)
+    parsed = vllm_engine_pb2.GetServerInfoResponse.FromString(info.SerializeToString())
+    assert parsed.mm_encoder_budget == 192000
 
 
 def test_model_facts_build_the_proto_as_they_are(caplog):
@@ -139,3 +243,79 @@ def test_server_facts_build_the_proto_as_they_are(monkeypatch):
     assert (facts["kv_connector"], facts["kv_role"], facts["kv_engine_id"]) == ("", "", "")
     assert "block_size" not in facts and "model_dtype" not in facts
     vllm_engine_pb2.GetServerInfoResponse(**facts)
+
+
+def test_server_facts_project_a_multi_connector_onto_the_child_that_moves_the_kv():
+    """A wrapper around a store child and an offloading tier is reported as the
+    store child, the parent's engine id and role kept: the router pairs and
+    serves the deployment under the store's profile, not as an unknown
+    connector named ``MultiConnector``."""
+    config = SimpleNamespace(
+        model_config=_model_config(dtype="torch.bfloat16"),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="MultiConnector",
+            kv_role="kv_producer",
+            engine_id="eng-a",
+            kv_connector_extra_config={
+                "connectors": [
+                    {"kv_connector": "MooncakeStoreConnector"},
+                    {"kv_connector": "OffloadingConnector"},
+                ]
+            },
+        ),
+    )
+    facts = model_info.server_facts(config)
+    response = vllm_engine_pb2.GetServerInfoResponse(**facts)
+    assert response.kv_connector == "MooncakeStoreConnector"
+    assert response.kv_role == "kv_producer"
+    assert response.kv_engine_id == "eng-a"
+
+
+def test_server_facts_carry_the_running_window():
+    config = SimpleNamespace(
+        model_config=_model_config(),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+        scheduler_config=SimpleNamespace(max_num_seqs=64),
+    )
+    assert model_info.running_window(config) == 64
+    facts = model_info.server_facts(config)
+    assert facts["max_num_seqs"] == 64
+    response = vllm_engine_pb2.GetServerInfoResponse(**facts)
+    assert response.max_num_seqs == 64
+    parsed = vllm_engine_pb2.GetServerInfoResponse.FromString(response.SerializeToString())
+    assert parsed.max_num_seqs == 64
+    # A config without a resolved window reports the proto default, which the
+    # router reads as "no window" (and says so), never an invented figure.
+    assert model_info.running_window(SimpleNamespace()) == 0
+    for window in (None, 0, -1, True, "64"):
+        config = SimpleNamespace(scheduler_config=SimpleNamespace(max_num_seqs=window))
+        assert model_info.running_window(config) == 0, window
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected"),
+    [
+        ("torch.bfloat16", "bfloat16"),
+        ("torch.float16", "float16"),
+        ("float32", "float32"),
+        ("torch.float32", "float32"),
+        ("bfloat16", "bfloat16"),
+        ("float16", "float16"),
+        ("torch.float64", ""),
+        ("float64", ""),
+        ("torch.uint8", ""),
+        ("unknown", ""),
+        ("", ""),
+        (None, ""),
+    ],
+)
+def test_server_facts_report_encoder_dtype_without_changing_model_dtype(dtype, expected):
+    config = SimpleNamespace(
+        model_config=_model_config(dtype=dtype),
+        parallel_config=SimpleNamespace(data_parallel_size=1),
+    )
+    response = vllm_engine_pb2.GetServerInfoResponse(**model_info.server_facts(config))
+    parsed = vllm_engine_pb2.GetServerInfoResponse.FromString(response.SerializeToString())
+    assert parsed.multimodal_encoder_dtype == expected
+    assert parsed.model_dtype == (dtype or "")

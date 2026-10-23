@@ -1,13 +1,14 @@
 //! Multimodal model configuration: the shared config-file registry and the
-//! per-router component bundle (media connector + processor/model registries).
+//! per-router component bundle (media connector + model registry).
 
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, fmt, path::Path, sync::Arc};
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
 use llm_multimodal::{
-    MediaConnector, MediaConnectorConfig, Modality, ModelRegistry, PreProcessorConfig,
-    VisionProcessorRegistry,
+    registry::{ModelRegistryError, RegistryResult},
+    MediaConnector, MediaConnectorConfig, Modality, ModelProcessorSpec, ModelRegistry,
+    PreProcessorConfig, VisionPreProcessor,
 };
 use openai_protocol::worker::MmProcessingMode;
 use tracing::{debug, warn};
@@ -15,11 +16,13 @@ use tracing::{debug, warn};
 use super::{
     inflight::MultimodalInflight,
     pixel_cache::{pixel_cache_with_budget, PixelCache},
+    process::preprocessor_config_for,
     settings::MultimodalSettings,
 };
+use crate::worker::http_client::build_with;
 
 /// Cached model configuration files loaded from the tokenizer directory.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct MultimodalModelConfig {
     /// Model config.json (HuggingFace format)
     pub config: serde_json::Value,
@@ -27,6 +30,122 @@ pub(crate) struct MultimodalModelConfig {
     pub preprocessor_config: PreProcessorConfig,
     /// Video-specific preprocessor config, when provided by the model repo.
     pub video_preprocessor_config: Option<PreProcessorConfig>,
+    /// The vision processors built from these configs, by the name of the
+    /// spec that built them (see [`Self::vision_processors`]).
+    vision_processors: DashMap<&'static str, Arc<VisionProcessors>>,
+}
+
+impl MultimodalModelConfig {
+    pub(crate) fn new(
+        config: serde_json::Value,
+        preprocessor_config: PreProcessorConfig,
+        video_preprocessor_config: Option<PreProcessorConfig>,
+    ) -> Self {
+        Self {
+            config,
+            preprocessor_config,
+            video_preprocessor_config,
+            vision_processors: DashMap::new(),
+        }
+    }
+
+    /// The vision processors `spec` builds from these configs: built by the
+    /// first request that needs them and shared by every later one, so each
+    /// processor resolves the configs once per loaded model rather than once
+    /// per request.
+    pub(crate) fn vision_processors(&self, spec: &dyn ModelProcessorSpec) -> Arc<VisionProcessors> {
+        self.vision_processors
+            .entry(spec.name())
+            .or_insert_with(|| Arc::new(VisionProcessors::build(spec, self)))
+            .clone()
+    }
+
+    /// These configs with `processors` standing for what `spec` would build.
+    #[cfg(test)]
+    pub(crate) fn with_vision_processors(
+        self,
+        spec: &'static str,
+        processors: VisionProcessors,
+    ) -> Self {
+        self.vision_processors.insert(spec, Arc::new(processors));
+        self
+    }
+}
+
+/// The vision processors one spec builds from a model's configs: the image
+/// processor from the image preprocessor config, the video processor from the
+/// video one, or the error the spec reported building either.
+pub(crate) struct VisionProcessors {
+    spec: &'static str,
+    image: RegistryResult<Arc<dyn VisionPreProcessor>>,
+    video: RegistryResult<Arc<dyn VisionPreProcessor>>,
+}
+
+impl VisionProcessors {
+    fn build(spec: &dyn ModelProcessorSpec, model_config: &MultimodalModelConfig) -> Self {
+        let build = |modality| {
+            spec.vision_processor(
+                &model_config.config,
+                preprocessor_config_for(model_config, modality),
+                modality,
+            )
+            .map(Arc::from)
+        };
+        Self {
+            spec: spec.name(),
+            image: build(Modality::Image),
+            video: build(Modality::Video),
+        }
+    }
+
+    /// One processor standing for both of a spec's, for tests that observe
+    /// its calls.
+    #[cfg(test)]
+    pub(crate) fn of(spec: &'static str, processor: Arc<dyn VisionPreProcessor>) -> Self {
+        Self {
+            spec,
+            image: Ok(processor.clone()),
+            video: Ok(processor),
+        }
+    }
+
+    /// The image processor, or why the spec has none.
+    pub(crate) fn image(&self) -> Result<&Arc<dyn VisionPreProcessor>> {
+        self.processor(&self.image, Modality::Image)
+    }
+
+    /// The video processor, or why the spec has none.
+    pub(crate) fn video(&self) -> Result<&Arc<dyn VisionPreProcessor>> {
+        self.processor(&self.video, Modality::Video)
+    }
+
+    fn processor<'a>(
+        &self,
+        built: &'a RegistryResult<Arc<dyn VisionPreProcessor>>,
+        modality: Modality,
+    ) -> Result<&'a Arc<dyn VisionPreProcessor>> {
+        built.as_ref().map_err(|error| {
+            anyhow::anyhow!(
+                "The {modality} processor of model spec {} cannot be built: {error}",
+                self.spec
+            )
+        })
+    }
+}
+
+impl fmt::Debug for VisionProcessors {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fn name(
+            built: &RegistryResult<Arc<dyn VisionPreProcessor>>,
+        ) -> Result<&'static str, &ModelRegistryError> {
+            built.as_ref().map(|processor| processor.model_name())
+        }
+        f.debug_struct("VisionProcessors")
+            .field("spec", &self.spec)
+            .field("image", &name(&self.image))
+            .field("video", &name(&self.video))
+            .finish()
+    }
 }
 
 /// Shared cache of multimodal model configuration files keyed by tokenizer UUID.
@@ -107,11 +226,11 @@ impl MultimodalConfigRegistry {
         });
         let video_preprocessor_config = load_video_preprocessor_config(&base_dir);
 
-        let model_config = Arc::new(MultimodalModelConfig {
+        let model_config = Arc::new(MultimodalModelConfig::new(
             config,
             preprocessor_config,
             video_preprocessor_config,
-        });
+        ));
 
         self.configs
             .insert(tokenizer_id.to_string(), model_config.clone());
@@ -200,6 +319,12 @@ pub(crate) fn load_video_preprocessor_config(base_dir: &Path) -> Option<PreProce
 }
 
 pub(crate) fn load_image_preprocessor_config(base_dir: &Path) -> Option<PreProcessorConfig> {
+    with_feature_extractor_section(load_image_processor_section(base_dir), base_dir)
+}
+
+/// The image processor's config: the flat `preprocessor_config.json`, else
+/// the `image_processor` section of `processor_config.json`.
+fn load_image_processor_section(base_dir: &Path) -> Option<PreProcessorConfig> {
     let image_path = base_dir.join("preprocessor_config.json");
     if let Some(config) = load_preprocessor_config_file(&image_path, "preprocessor_config.json") {
         return Some(config);
@@ -237,10 +362,41 @@ pub(crate) fn load_image_preprocessor_config(base_dir: &Path) -> Option<PreProce
         .ok()
 }
 
+/// A `processor_config.json` that nests the audio feature extractor next to
+/// the image and video processors keeps the extractor's parameters
+/// (`sampling_rate`, `samples_per_token`, ...) in its `feature_extractor`
+/// section. Audio processors read them from the preprocessor config's
+/// extras, where a flat `preprocessor_config.json` would have put them, so
+/// the section's entries are merged in under the keys the image config does
+/// not set; a model with the section and no image config gets the defaults
+/// plus the section.
+fn with_feature_extractor_section(
+    config: Option<PreProcessorConfig>,
+    base_dir: &Path,
+) -> Option<PreProcessorConfig> {
+    let processor_path = base_dir.join("processor_config.json");
+    let section = std::fs::read_to_string(&processor_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(
+            |processor_config| match processor_config.get("feature_extractor") {
+                Some(serde_json::Value::Object(section)) => Some(section.clone()),
+                _ => None,
+            },
+        );
+    let Some(section) = section else {
+        return config;
+    };
+    let mut config = config.unwrap_or_default();
+    for (key, value) in section {
+        config.extra.entry(key).or_insert(value);
+    }
+    Some(config)
+}
+
 /// Shared multimodal components injected at router creation time.
 pub(crate) struct MultimodalComponents {
     pub media_connector: Arc<MediaConnector>,
-    pub vision_processor_registry: Arc<VisionProcessorRegistry>,
     pub model_registry: Arc<ModelRegistry>,
     /// Shared reference to the app-level multimodal config cache.
     pub config_registry: Arc<MultimodalConfigRegistry>,
@@ -252,6 +408,10 @@ pub(crate) struct MultimodalComponents {
     pub processing: MmProcessingMode,
     /// Cap on preprocessed media bytes in flight; `None` leaves it unbounded.
     pub inflight: Option<Arc<MultimodalInflight>>,
+    /// The engine's own video frame budget, for the specs that sample a clip
+    /// the way its loader does (the worker-side pipeline knows it; `None`
+    /// keeps each spec's own constant).
+    pub video_frame_budget: Option<usize>,
 }
 
 impl MultimodalComponents {
@@ -264,19 +424,50 @@ impl MultimodalComponents {
         max_inflight_bytes: Option<usize>,
         settings: &MultimodalSettings,
     ) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .context("Failed to create reqwest client")?;
-        let media_connector = MediaConnector::new(client, MediaConnectorConfig::default())
-            .context("Failed to create MediaConnector")?;
+        // The router fetches client-supplied media URLs itself here: the
+        // connector's host policy (the allow-list and the address policy)
+        // comes from the same resolved settings as the placement mode.
+        let connector_config = MediaConnectorConfig {
+            allowed_domains: settings.allowed_media_domains.value.clone(),
+            allow_private_hosts: settings.allow_private_media_hosts.value,
+            ..MediaConnectorConfig::default()
+        };
+        // The line shows the allow-list as the connector enforces it (trimmed,
+        // a list with no names being none), not as it was spelled.
+        tracing::info!(
+            allowed_media_domains =
+                ?llm_multimodal::effective_allowed_domains(connector_config.allowed_domains.as_deref()),
+            allow_private_media_hosts = connector_config.allow_private_hosts,
+            allow_private_media_hosts_source = settings.allow_private_media_hosts.source.as_str(),
+            "media fetch policy for router-side processing"
+        );
+        let media_connector = build_with(
+            || crate::clients::http_client_builder().timeout(std::time::Duration::from_secs(30)),
+            false,
+            "media HTTP client",
+            |client| MediaConnector::new(client, connector_config.clone()),
+        )
+        .map_err(anyhow::Error::msg)?;
 
         super::report_jpeg_decoder();
+        super::enforce_jpeg_decoder_policy(settings.turbojpeg.value)?;
+        tracing::info!(
+            policy = %settings.turbojpeg.value,
+            source = settings.turbojpeg.source.as_str(),
+            "TurboJPEG policy"
+        );
         let processing = settings.processing.value;
         tracing::info!(
             mode = %processing,
             source = settings.processing.source.as_str(),
             "multimodal processing mode"
+        );
+        // The switch is the way back to the two-pass write: say where it
+        // stands and who set it, so a rollback that did not take is seen.
+        tracing::info!(
+            on = settings.one_pass_wire.value,
+            source = settings.one_pass_wire.source.as_str(),
+            "multimodal one-pass wire write"
         );
 
         let inflight = max_inflight_bytes
@@ -297,7 +488,6 @@ impl MultimodalComponents {
 
         Ok(Self {
             media_connector: Arc::new(media_connector),
-            vision_processor_registry: Arc::new(VisionProcessorRegistry::with_defaults()),
             model_registry: Arc::new(ModelRegistry::default()),
             config_registry,
             pixel_cache: pixel_cache_with_budget(settings.pixel_cache_mb.value),
@@ -306,6 +496,7 @@ impl MultimodalComponents {
                 .unwrap_or_default(),
             processing,
             inflight,
+            video_frame_budget: None,
         })
     }
 }
@@ -393,6 +584,67 @@ mod tests {
     }
 
     #[test]
+    fn load_image_preprocessor_config_merges_the_feature_extractor_section() {
+        let tmp = TempDir::new().unwrap();
+        fs::write(
+            tmp.path().join("processor_config.json"),
+            r#"{"feature_extractor":{"feature_extractor_type":"AudioFeatureExtractor","sampling_rate":24000,"samples_per_token":1920,"padding_value":0.0},
+                "image_processor":{"image_processor_type":"NestedImageProcessor","do_resize":true}}"#,
+        )
+        .unwrap();
+
+        let nested = load_image_preprocessor_config(tmp.path())
+            .expect("the image section with the extractor section merged in");
+        assert_eq!(
+            nested.image_processor_type.as_deref(),
+            Some("NestedImageProcessor")
+        );
+        assert_eq!(nested.do_resize, Some(true));
+        assert_eq!(nested.get_extra::<usize>("sampling_rate"), Some(24_000));
+        assert_eq!(nested.get_extra::<usize>("samples_per_token"), Some(1_920));
+        assert_eq!(
+            nested
+                .get_extra::<String>("feature_extractor_type")
+                .as_deref(),
+            Some("AudioFeatureExtractor")
+        );
+
+        // The image config's own keys win over the extractor section's.
+        fs::write(
+            tmp.path().join("preprocessor_config.json"),
+            r#"{"image_processor_type":"LegacyImageProcessor","sampling_rate":16000}"#,
+        )
+        .unwrap();
+        let legacy = load_image_preprocessor_config(tmp.path()).expect("legacy image config");
+        assert_eq!(
+            legacy.image_processor_type.as_deref(),
+            Some("LegacyImageProcessor")
+        );
+        assert_eq!(legacy.get_extra::<usize>("sampling_rate"), Some(16_000));
+        assert_eq!(legacy.get_extra::<usize>("samples_per_token"), Some(1_920));
+
+        // An extractor section without any image config: defaults plus the section.
+        fs::remove_file(tmp.path().join("preprocessor_config.json")).unwrap();
+        fs::write(
+            tmp.path().join("processor_config.json"),
+            r#"{"feature_extractor":{"sampling_rate":24000}}"#,
+        )
+        .unwrap();
+        let audio_only = load_image_preprocessor_config(tmp.path())
+            .expect("the extractor section alone is a config");
+        assert_eq!(audio_only.image_processor_type, None);
+        assert_eq!(audio_only.get_extra::<usize>("sampling_rate"), Some(24_000));
+
+        // No section: nothing is merged and a missing image config stays missing.
+        fs::write(
+            tmp.path().join("processor_config.json"),
+            r#"{"video_processor":{"image_processor_type":"VideoProcessor"}}"#,
+        )
+        .unwrap();
+        assert!(load_image_preprocessor_config(tmp.path()).is_none());
+    }
+
+    #[test]
     fn load_image_preprocessor_config_preserves_legacy_precedence_and_falls_back() {
         let tmp = TempDir::new().unwrap();
         fs::write(
@@ -434,14 +686,12 @@ mod tests {
     #[tokio::test]
     async fn registry_remove_drops_cached_entry() {
         let reg = MultimodalConfigRegistry::new();
-        let cfg = Arc::new(MultimodalModelConfig {
-            config: serde_json::json!({"model_type":"phi3_v"}),
-            preprocessor_config: PreProcessorConfig::from_json(
-                r#"{"image_processor_type":"Phi3VImageProcessor"}"#,
-            )
-            .unwrap(),
-            video_preprocessor_config: None,
-        });
+        let cfg = Arc::new(MultimodalModelConfig::new(
+            serde_json::json!({"model_type":"phi3_v"}),
+            PreProcessorConfig::from_json(r#"{"image_processor_type":"Phi3VImageProcessor"}"#)
+                .unwrap(),
+            None,
+        ));
         reg.insert("tok-uuid-rm".to_string(), cfg.clone());
         assert!(reg.get("tok-uuid-rm").is_some());
 
@@ -458,14 +708,12 @@ mod tests {
         // consulting `tokenizer_source` (which in IGW points to an
         // unreachable worker-only path).
         let reg = MultimodalConfigRegistry::new();
-        let cfg = Arc::new(MultimodalModelConfig {
-            config: serde_json::json!({"model_type":"phi3_v"}),
-            preprocessor_config: PreProcessorConfig::from_json(
-                r#"{"image_processor_type":"Phi3VImageProcessor"}"#,
-            )
-            .unwrap(),
-            video_preprocessor_config: None,
-        });
+        let cfg = Arc::new(MultimodalModelConfig::new(
+            serde_json::json!({"model_type":"phi3_v"}),
+            PreProcessorConfig::from_json(r#"{"image_processor_type":"Phi3VImageProcessor"}"#)
+                .unwrap(),
+            None,
+        ));
         reg.insert("tok-uuid-3".to_string(), cfg.clone());
 
         let bad_source = "/nonexistent/worker-only/path-that-would-fail";
@@ -501,6 +749,37 @@ mod tests {
             components.pixel_cache.is_none(),
             "0 MiB keeps the cache off"
         );
+    }
+
+    /// Under `require` the components come up exactly when the library did:
+    /// a host without it is refused with the library and the gauge named, a
+    /// host with it starts as before.
+    #[test]
+    fn a_required_turbojpeg_is_refused_exactly_when_the_library_is_missing() {
+        use llm_multimodal::jpeg_turbo::{turbojpeg_available, TurboJpegPolicy};
+
+        use super::super::settings::{Setting, SettingSource};
+
+        let settings = MultimodalSettings {
+            turbojpeg: Setting {
+                value: TurboJpegPolicy::Require,
+                source: SettingSource::Flag,
+            },
+            ..MultimodalSettings::default()
+        };
+        let result = MultimodalComponents::new(
+            Arc::new(MultimodalConfigRegistry::new()),
+            None,
+            None,
+            &settings,
+        );
+        if turbojpeg_available() {
+            assert!(result.is_ok(), "{:#}", result.err().unwrap());
+        } else {
+            let error = format!("{:#}", result.err().expect("refused without the library"));
+            assert!(error.contains("libturbojpeg.so.0"), "{error}");
+            assert!(error.contains("smg_mm_turbojpeg_available"), "{error}");
+        }
     }
 
     fn components(max_inflight_bytes: Option<usize>) -> Result<MultimodalComponents> {

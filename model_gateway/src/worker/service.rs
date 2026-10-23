@@ -4,7 +4,7 @@
 //! and business logic for worker management. The service orchestrates
 //! WorkerRegistry and JobQueue operations.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     http::StatusCode,
@@ -18,7 +18,11 @@ use tracing::warn;
 use crate::{
     config::{validate_worker_url, RouterConfig},
     routers::provider_support,
-    worker::{registry::WorkerId, worker::worker_to_info, WorkerRegistry, WorkerType},
+    worker::{
+        registry::WorkerId,
+        worker::{merge_labels, worker_to_info},
+        WorkerRegistry, WorkerType,
+    },
     workflow::{Job, JobQueue, WorkerRegistrationMode},
 };
 
@@ -30,6 +34,172 @@ fn validate_worker_url_request(url: &str) -> Result<(), WorkerServiceError> {
     validate_worker_url(url).map_err(|e| WorkerServiceError::BadRequest {
         message: e.to_string(),
     })
+}
+
+/// Longest URL a registration takes: longer ones are not addresses of a
+/// worker but a mistake or a probe, and every log line and metric label
+/// derived from the URL would carry them.
+const MAX_WORKER_URL_BYTES: usize = 2048;
+/// Most labels a worker carries (an engine reports a few dozen); held at
+/// registration, at the admin check of a PATCH and again where the PATCH
+/// merges into the worker.
+pub(crate) const MAX_WORKER_LABELS: usize = 128;
+const MAX_LABEL_KEY_BYTES: usize = 128;
+const MAX_LABEL_VALUE_BYTES: usize = 4096;
+/// Labels the routers read as the decode window, a positive count
+/// (`Worker::max_running_requests`, which saturates a figure wider than
+/// 65535); any other value is read as "not reported", silently.
+const WINDOW_LABELS: [&str; 2] = ["max_running_requests", "max_num_seqs"];
+/// Labels the routers read as a positive count.
+const COUNT_LABELS: [&str; 1] = ["dp_size"];
+/// Labels the routers read as a boolean, spelled `"true"` or `"false"`; any
+/// other spelling is read as unset, silently.
+const BOOLEAN_LABELS: [&str; 2] = ["supports_vision", "realtime"];
+
+fn bad_request(message: String) -> WorkerServiceError {
+    WorkerServiceError::BadRequest { message }
+}
+
+/// The bounds a registration body must satisfy before any job is queued:
+/// the URL's length; the labels' count, charset and size and the shape of
+/// the labels the routers read as numbers or booleans; the fields the routers
+/// rely on (a positive, finite cost; a KV block size and a data-parallel size
+/// of at least 1; a rank only with a size and below it; a bootstrap port
+/// that is a port). A violation is a `400 Bad Request` naming the field.
+fn validate_spec(spec: &WorkerSpec) -> Result<(), WorkerServiceError> {
+    if spec.url.len() > MAX_WORKER_URL_BYTES {
+        return Err(bad_request(format!(
+            "url is {} bytes long; at most {MAX_WORKER_URL_BYTES} are accepted",
+            spec.url.len()
+        )));
+    }
+    validate_labels(&spec.labels)?;
+    validate_cost(spec.cost)?;
+    if spec.kv_block_size == Some(0) {
+        return Err(bad_request(
+            "kv_block_size must be at least 1 (tokens per KV block)".to_string(),
+        ));
+    }
+    if spec.bootstrap_port == Some(0) {
+        return Err(bad_request(
+            "bootstrap_port must be a port from 1 to 65535".to_string(),
+        ));
+    }
+    match (spec.dp_rank, spec.dp_size) {
+        (Some(_), None) => Err(bad_request(
+            "dp_rank needs dp_size: the rank is a position in a data-parallel group of that size"
+                .to_string(),
+        )),
+        (_, Some(0)) => Err(bad_request("dp_size must be at least 1".to_string())),
+        (Some(rank), Some(size)) if rank >= size => Err(bad_request(format!(
+            "dp_rank {rank} is not below dp_size {size}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The bounds of an update: the fields it may change, under the same rules.
+fn validate_update(update: &WorkerUpdateRequest) -> Result<(), WorkerServiceError> {
+    if let Some(cost) = update.cost {
+        validate_cost(cost)?;
+    }
+    if let Some(labels) = &update.labels {
+        validate_labels(labels)?;
+    }
+    Ok(())
+}
+
+/// The cost weighs the worker in the policies' arithmetic: finite and above 0.
+fn validate_cost(cost: f32) -> Result<(), WorkerServiceError> {
+    if !cost.is_finite() || cost <= 0.0 {
+        return Err(bad_request(format!(
+            "cost must be a finite number above 0 (baseline 1.0), not {cost}"
+        )));
+    }
+    Ok(())
+}
+
+/// A rejected key as the error shows it: whole when short, else its first
+/// characters and its length, so a key the size of the payload limit does
+/// not come back as a body (or a log line) of that size.
+fn shown_key(key: &str) -> String {
+    const SHOWN: usize = 64;
+    if key.chars().count() <= SHOWN {
+        return format!("{key:?}");
+    }
+    let head: String = key.chars().take(SHOWN).collect();
+    format!("{head:?}... ({} bytes)", key.len())
+}
+
+/// The labels a PATCH would leave on the worker: the request's merged into
+/// the existing ones (`UpdateWorkerPropertiesStep` keeps every key it does not
+/// name, except a running window under the other name when the request sets
+/// one, see `merge_labels`), held to the same cap as a registration, so repeated updates cannot
+/// grow a worker past it; an update that adds no key (a rewrite of keys the
+/// worker has) passes, so a worker over the cap through the labels discovered
+/// at registration can still be updated. This is the early check against the
+/// labels the worker has when the request arrives, for a clear 400; the merge
+/// runs later in the queued job, where `UpdateWorkerPropertiesStep` holds the
+/// cap again, under the same condition, over the labels it actually merges,
+/// so PATCHes queued together cannot pass it between them.
+fn validate_merged_labels(
+    existing: &HashMap<String, String>,
+    update: &HashMap<String, String>,
+) -> Result<(), WorkerServiceError> {
+    let merged = merge_labels(existing, update).len();
+    if merged > existing.len() && merged > MAX_WORKER_LABELS {
+        return Err(bad_request(format!(
+            "{merged} labels on the worker after this update ({} now, {} new); at most \
+             {MAX_WORKER_LABELS} are accepted",
+            existing.len(),
+            merged - existing.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_labels(labels: &HashMap<String, String>) -> Result<(), WorkerServiceError> {
+    if labels.len() > MAX_WORKER_LABELS {
+        return Err(bad_request(format!(
+            "{} labels; at most {MAX_WORKER_LABELS} are accepted",
+            labels.len()
+        )));
+    }
+    for (key, value) in labels {
+        if key.is_empty()
+            || key.len() > MAX_LABEL_KEY_BYTES
+            || !key.chars().all(|c| c.is_ascii_graphic())
+        {
+            return Err(bad_request(format!(
+                "label key {} must be 1 to {MAX_LABEL_KEY_BYTES} printable ASCII characters \
+                 without spaces",
+                shown_key(key)
+            )));
+        }
+        if value.len() > MAX_LABEL_VALUE_BYTES || value.chars().any(char::is_control) {
+            return Err(bad_request(format!(
+                "label '{key}' must be at most {MAX_LABEL_VALUE_BYTES} bytes without control \
+                 characters"
+            )));
+        }
+        let key_str = key.as_str();
+        if WINDOW_LABELS.contains(&key_str) && !value.parse::<u64>().is_ok_and(|n| n >= 1) {
+            return Err(bad_request(format!(
+                "label '{key}' must be a positive count, not {value:?}"
+            )));
+        }
+        if COUNT_LABELS.contains(&key_str) && !value.parse::<u64>().is_ok_and(|n| n >= 1) {
+            return Err(bad_request(format!(
+                "label '{key}' must be a positive integer, not {value:?}"
+            )));
+        }
+        if BOOLEAN_LABELS.contains(&key_str) && value != "true" && value != "false" {
+            return Err(bad_request(format!(
+                "label '{key}' must be \"true\" or \"false\", not {value:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Error types for worker service operations
@@ -296,14 +466,16 @@ impl WorkerService {
         &self,
         config: WorkerSpec,
     ) -> Result<CreateWorkerResult, WorkerServiceError> {
+        validate_spec(&config)?;
         validate_worker_url_request(&config.url)?;
         Self::require_provider_router(&config)?;
 
         if self.router_config.api_key.is_some() && config.api_key.is_none() {
             warn!(
-                "Adding worker {} without API key while router has API key configured. \
-                Worker will be accessible without authentication. \
-                If the worker requires the same API key as the router, please specify it explicitly.",
+                "Adding worker {} without an API key while the gateway has one configured: \
+                the gateway's key ends at its auth middleware, so requests reach this worker \
+                with no credential. If the worker requires a key (the gateway's or its own), \
+                register it with that key explicitly.",
                 config.url
             );
         }
@@ -381,6 +553,7 @@ impl WorkerService {
                     worker_id: worker_id_raw.to_string(),
                 })?;
         let url = existing.url().to_string();
+        validate_spec(&config)?;
         Self::require_provider_router(&config)?;
 
         // A data-parallel router expands one spec into one worker per rank,
@@ -536,6 +709,7 @@ impl WorkerService {
         update: WorkerUpdateRequest,
     ) -> Result<UpdateWorkerResult, WorkerServiceError> {
         let worker_id = Self::parse_worker_id(worker_id_raw)?;
+        validate_update(&update)?;
 
         let url = self
             .worker_registry
@@ -543,6 +717,11 @@ impl WorkerService {
             .ok_or_else(|| WorkerServiceError::NotFound {
                 worker_id: worker_id_raw.to_string(),
             })?;
+        if let (Some(labels), Some(worker)) =
+            (&update.labels, self.worker_registry.get_by_url(&url))
+        {
+            validate_merged_labels(&worker.metadata().spec.labels, labels)?;
+        }
 
         let job = Job::UpdateWorker {
             url: url.clone(),
@@ -710,5 +889,246 @@ mod tests {
 
         // The 202 was never sent, so nothing may keep the URL reserved (#1533).
         assert!(registry.get_url_by_id(&reserved).is_none());
+    }
+
+    /// A registration whose labels or fields the routers could not read is
+    /// refused at the boundary with a 400 naming the field, before any job
+    /// is queued; one they can read passes the boundary (and stops at the
+    /// uninitialized queue of this harness).
+    #[tokio::test]
+    async fn create_worker_refuses_labels_and_fields_the_routers_cannot_read() {
+        let service = make_service(Arc::new(WorkerRegistry::new()));
+        let url = "grpc://10.0.0.5:8000";
+        let thousand: serde_json::Map<String, serde_json::Value> =
+            (0..1000).map(|i| (format!("k{i}"), json!("v"))).collect();
+        let refused = [
+            (
+                json!({"url": url, "labels": {"max_running_requests": "abc"}}),
+                "max_running_requests",
+            ),
+            (
+                json!({"url": url, "labels": {"max_running_requests": "0"}}),
+                "max_running_requests",
+            ),
+            (
+                json!({"url": url, "labels": {"dp_size": "zero"}}),
+                "dp_size",
+            ),
+            (
+                json!({"url": url, "labels": {"supports_vision": "maybe"}}),
+                "supports_vision",
+            ),
+            (
+                json!({"url": url, "labels": {"note": "x".repeat(4097)}}),
+                "note",
+            ),
+            (json!({"url": url, "labels": thousand}), "labels"),
+            (
+                json!({"url": url, "labels": {"key with space\nnewline": "v"}}),
+                "label key",
+            ),
+            (json!({"url": url, "cost": 0}), "cost"),
+            (json!({"url": url, "cost": -1.0}), "cost"),
+            (json!({"url": url, "kv_block_size": 0}), "kv_block_size"),
+            (json!({"url": url, "dp_rank": 1}), "dp_rank"),
+            (json!({"url": url, "dp_rank": 2, "dp_size": 2}), "dp_rank"),
+            (json!({"url": url, "bootstrap_port": 0}), "bootstrap_port"),
+            (
+                json!({"url": format!("grpc://{}:1", "a".repeat(2049))}),
+                "url",
+            ),
+        ];
+        for (body, field) in refused {
+            let spec: WorkerSpec =
+                serde_json::from_value(body.clone()).expect("a spec the type takes");
+            let err = service
+                .create_worker(spec)
+                .await
+                .expect_err(&body.to_string());
+            assert!(
+                matches!(err, WorkerServiceError::BadRequest { .. }),
+                "{body}: {err}"
+            );
+            assert!(err.to_string().contains(field), "{body}: {err}");
+        }
+        // A window wider than 65535 passes the boundary: the routers saturate
+        // it. A window set here is the worker's only window, kept as set on
+        // every dp-aware rank worker; only a discovered one is divided per rank.
+        let spec: WorkerSpec = serde_json::from_value(json!({
+            "url": url, "cost": 2.5, "kv_block_size": 16, "dp_rank": 1, "dp_size": 2,
+            "labels": {
+                "max_running_requests": "256", "max_num_seqs": "70000",
+                "supports_vision": "true", "served_model_name": "m"
+            }
+        }))
+        .expect("a valid spec");
+        assert!(matches!(
+            service
+                .create_worker(spec)
+                .await
+                .expect_err("queue is uninitialized"),
+            WorkerServiceError::QueueNotInitialized
+        ));
+    }
+
+    /// An update is held to the same rules for the fields it may change.
+    #[tokio::test]
+    async fn update_worker_refuses_a_cost_or_labels_the_routers_cannot_read() {
+        let registry = Arc::new(WorkerRegistry::new());
+        register_worker(&registry, "grpc://10.0.0.5:8000", Some("m"));
+        let id = registry.reserve_id_for_url("grpc://10.0.0.5:8000");
+        let service = make_service(Arc::clone(&registry));
+        for body in [
+            json!({"cost": 0}),
+            json!({"cost": -2.0}),
+            json!({"labels": {"supports_vision": "yes"}}),
+            json!({"labels": {"max_running_requests": "many"}}),
+        ] {
+            let update: WorkerUpdateRequest =
+                serde_json::from_value(body.clone()).expect("an update the type takes");
+            let err = service
+                .update_worker(id.as_str(), update)
+                .await
+                .expect_err(&body.to_string());
+            assert!(
+                matches!(err, WorkerServiceError::BadRequest { .. }),
+                "{body}: {err}"
+            );
+        }
+        let update: WorkerUpdateRequest =
+            serde_json::from_value(json!({"cost": 1.5, "labels": {"max_running_requests": "64"}}))
+                .expect("a valid update");
+        assert!(matches!(
+            service
+                .update_worker(id.as_str(), update)
+                .await
+                .expect_err("queue is uninitialized"),
+            WorkerServiceError::QueueNotInitialized
+        ));
+    }
+
+    /// The early check counts the labels the merge leaves: a window set by
+    /// the update replaces a discovered one under the other name, so swapping
+    /// the window's name on a full worker passes (as the step would take it),
+    /// while a new key on a full worker is refused.
+    #[test]
+    fn the_early_cap_check_counts_the_labels_the_merge_leaves() {
+        let mut full: HashMap<String, String> = (1..MAX_WORKER_LABELS)
+            .map(|i| (format!("k{i}"), "v".to_string()))
+            .collect();
+        full.insert("max_num_seqs".to_string(), "256".to_string());
+        assert_eq!(full.len(), MAX_WORKER_LABELS);
+        let swap = HashMap::from([("max_running_requests".to_string(), "512".to_string())]);
+        assert!(validate_merged_labels(&full, &swap).is_ok());
+        assert_eq!(merge_labels(&full, &swap).len(), MAX_WORKER_LABELS);
+        let new_key = HashMap::from([("k_new".to_string(), "v".to_string())]);
+        let message = validate_merged_labels(&full, &new_key)
+            .expect_err("a 129th label")
+            .to_string();
+        assert!(
+            message.contains("129 labels on the worker after this update (128 now, 1 new)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("new); at most 128 are accepted"),
+            "{message}"
+        );
+    }
+
+    /// The label cap holds for the worker, not the request: a PATCH merges
+    /// its labels into the existing ones, so one that would leave more than
+    /// the cap on the worker is refused, while one that only rewrites keys
+    /// the worker has is taken.
+    #[tokio::test]
+    async fn update_worker_holds_the_label_cap_over_the_merged_labels() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let full: HashMap<String, String> = (0..MAX_WORKER_LABELS)
+            .map(|i| (format!("k{i}"), "v".to_string()))
+            .collect();
+        let worker = BasicWorkerBuilder::new("grpc://10.0.0.6:8000")
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("m"))
+            .labels(full)
+            .build();
+        registry.register(Arc::new(worker)).unwrap();
+        let id = registry.reserve_id_for_url("grpc://10.0.0.6:8000");
+        let service = make_service(Arc::clone(&registry));
+        let one_more: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"k_new": "v"}})).expect("an update");
+        let err = service
+            .update_worker(id.as_str(), one_more)
+            .await
+            .expect_err("a 129th label");
+        assert!(
+            matches!(&err, WorkerServiceError::BadRequest { message } if message.contains("129 labels on the worker")),
+            "{err}"
+        );
+        let rewrite: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"k0": "w", "k1": "w"}})).expect("an update");
+        assert!(matches!(
+            service
+                .update_worker(id.as_str(), rewrite)
+                .await
+                .expect_err("queue is uninitialized"),
+            WorkerServiceError::QueueNotInitialized
+        ));
+    }
+
+    /// A worker over the cap through the labels discovered at registration
+    /// still takes an update that adds no key through the endpoint: a rewrite
+    /// of keys it has reaches the queue, a new key is refused by name.
+    #[tokio::test]
+    async fn update_worker_over_the_cap_takes_a_rewrite_through_the_endpoint() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let over: HashMap<String, String> = (0..MAX_WORKER_LABELS + 20)
+            .map(|i| (format!("k{i}"), "v".to_string()))
+            .collect();
+        let worker = BasicWorkerBuilder::new("grpc://10.0.0.7:8000")
+            .worker_type(WorkerType::Regular)
+            .model(ModelCard::new("m"))
+            .labels(over)
+            .build();
+        registry.register(Arc::new(worker)).unwrap();
+        let id = registry.reserve_id_for_url("grpc://10.0.0.7:8000");
+        let service = make_service(Arc::clone(&registry));
+        let rewrite: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"k3": "w"}})).expect("an update");
+        assert!(matches!(
+            service
+                .update_worker(id.as_str(), rewrite)
+                .await
+                .expect_err("queue is uninitialized"),
+            WorkerServiceError::QueueNotInitialized
+        ));
+        let adds: WorkerUpdateRequest =
+            serde_json::from_value(json!({"labels": {"k_new": "v"}})).expect("an update");
+        let err = service
+            .update_worker(id.as_str(), adds)
+            .await
+            .expect_err("a new key on a worker over the cap");
+        assert!(
+            matches!(&err, WorkerServiceError::BadRequest { message } if message.contains("149 labels on the worker") && message.contains("1 new")),
+            "{err}"
+        );
+    }
+
+    /// A rejected key is not echoed whole: a key the size of the payload
+    /// limit comes back as its first characters and its length.
+    #[test]
+    fn a_rejected_label_key_is_shown_truncated() {
+        let long = "k".repeat(1 << 20);
+        let labels: HashMap<String, String> = [(long.clone(), "v".to_string())].into();
+        let err = validate_labels(&labels).expect_err("a key over the cap");
+        let WorkerServiceError::BadRequest { message } = err else {
+            panic!("expected a bad request, got {err}");
+        };
+        assert!(message.len() < 512, "{} bytes", message.len());
+        assert!(
+            message.contains(&format!("({} bytes)", long.len())),
+            "{message}"
+        );
+        let short: HashMap<String, String> = [("has space".to_string(), "v".to_string())].into();
+        let err = validate_labels(&short).expect_err("a key with a space");
+        assert!(err.to_string().contains("\"has space\""), "{err}");
     }
 }

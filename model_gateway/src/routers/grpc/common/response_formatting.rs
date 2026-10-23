@@ -8,39 +8,109 @@ use std::collections::HashMap;
 
 use openai_protocol::common::Usage;
 
-use crate::routers::grpc::proto_wrapper::{ProtoGenerateComplete, ProtoGenerateStreamChunk};
+use crate::{
+    rate_limit::UsageSettlement,
+    routers::grpc::proto_wrapper::{ProtoGenerateComplete, ProtoGenerateStreamChunk},
+};
 
-/// Build usage information from collected gRPC responses
+/// The token counters of one request, aggregated over its choices the way
+/// the engines report them. The `n>1` choices of a chat/generate request
+/// share exactly one prompt, and `cached_tokens` is a property of that same
+/// prompt (how much of it hit the KV cache), so `prompt` and `cached` take
+/// the max over the choices: summing would charge the prompt once per choice
+/// instead of once per request. Each choice is its own generation, so
+/// `completion`, `reasoning` (each choice's own reasoning trace) and the
+/// speculative counts sum. (Completion's own batched usage computation does
+/// this per prompt and sums across prompts.)
 ///
-/// Sums completion_tokens (and reasoning_tokens, each choice's own
-/// independent reasoning trace) across all responses, since each is a
-/// distinct generation. `prompt_tokens` and `cached_tokens` take the max
-/// instead: chat/generate requests have exactly one prompt shared by every
-/// `n>1` choice -- cached_tokens is a property of that same prompt (how much
-/// of it hit the KV cache), not of the individual completion -- and each
-/// response reports that same full length, so summing would charge it once
-/// per choice instead of once per request (Completion's own batched usage
-/// computation already does this correctly per-prompt; mirrored here).
-pub(crate) fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
-    let total_prompt_tokens: u32 = responses
-        .iter()
-        .map(|r| r.prompt_tokens())
-        .max()
-        .unwrap_or(0);
-    let total_completion_tokens: u32 = responses.iter().map(|r| r.completion_tokens()).sum();
-    let total_cached_tokens: u32 = responses
-        .iter()
-        .map(|r| r.cached_tokens())
-        .max()
-        .unwrap_or(0);
-    let total_reasoning_tokens: u32 = responses.iter().map(|r| r.reasoning_tokens()).sum();
-    let total_spec_accepted: u32 = responses.iter().map(|r| r.spec_accepted_tokens()).sum();
-    let total_spec_drafted: u32 = responses.iter().map(|r| r.spec_draft_tokens()).sum();
+/// Every path that aggregates the engine's frames itself builds its usage
+/// from these counters, so the streamed and the non-streamed answer of a
+/// request carry one and the same usage object.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TokenCounts {
+    pub prompt: u32,
+    pub completion: u32,
+    pub cached: u32,
+    pub reasoning: u32,
+    pub spec_accepted: u32,
+    pub spec_drafted: u32,
+}
 
-    Usage::from_counts(total_prompt_tokens, total_completion_tokens)
-        .with_cached_tokens(total_cached_tokens)
-        .with_reasoning_tokens(total_reasoning_tokens)
-        .with_speculative_tokens(total_spec_accepted, total_spec_drafted)
+impl TokenCounts {
+    /// The counters of the `Complete` frames of one request.
+    pub(crate) fn of(responses: &[ProtoGenerateComplete]) -> Self {
+        Self {
+            prompt: responses
+                .iter()
+                .map(|r| r.prompt_tokens())
+                .max()
+                .unwrap_or(0),
+            completion: responses.iter().map(|r| r.completion_tokens()).sum(),
+            cached: responses
+                .iter()
+                .map(|r| r.cached_tokens())
+                .max()
+                .unwrap_or(0),
+            reasoning: responses.iter().map(|r| r.reasoning_tokens()).sum(),
+            spec_accepted: responses.iter().map(|r| r.spec_accepted_tokens()).sum(),
+            spec_drafted: responses.iter().map(|r| r.spec_draft_tokens()).sum(),
+        }
+    }
+
+    /// The usage object the counters make: the counts with the cached,
+    /// reasoning and speculative details the engine reported. The usage of
+    /// a legacy completion, streamed or not, is this object.
+    pub(crate) fn usage(self) -> Usage {
+        Usage::from_counts(self.prompt, self.completion)
+            .with_cached_tokens(self.cached)
+            .with_reasoning_tokens(self.reasoning)
+            .with_speculative_tokens(self.spec_accepted, self.spec_drafted)
+    }
+
+    /// The settlement of the request's reservation: the engine's counts as
+    /// they are, before the client-facing usage drops unbilled prompt
+    /// tokens or substitutes the gateway parser's reasoning split.
+    pub(crate) fn settlement(self) -> UsageSettlement {
+        UsageSettlement {
+            actual_input_tokens: self.prompt,
+            completion_tokens: self.completion,
+            cached_input_tokens: self.cached,
+            reasoning_tokens: self.reasoning,
+        }
+    }
+}
+
+/// The usage of a chat completion from `engine_usage`, the usage the
+/// engine's counters make: the rendered prompt tokens the provider does not
+/// bill are dropped, the reasoning the gateway's own parser split off is
+/// accounted (`parsed_reasoning`, see `with_parsed_reasoning_tokens`), and
+/// every detail counter is present as the OpenAI API sends it on every chat
+/// completion, zero where nothing was counted. The streamed answer's usage
+/// chunk and the non-streamed answer both build their usage here, so a
+/// request's two usage objects are the same.
+pub(crate) fn chat_usage(
+    engine_usage: Usage,
+    parsed_reasoning: Option<u32>,
+    unbilled_prompt_tokens: u32,
+) -> Usage {
+    with_parsed_reasoning_tokens(
+        engine_usage.with_unbilled_prompt_tokens(unbilled_prompt_tokens),
+        parsed_reasoning,
+    )
+    .with_complete_details()
+}
+
+/// Account for the reasoning the gateway's own reasoning parser split off:
+/// `parsed` is the number of output tokens it routed to `reasoning_content`
+/// for the request, `None` when it did not run. Like an engine with a
+/// reasoning parser, the details are then always reported, zero included; an
+/// engine that counts reasoning itself is not overruled, whatever its count.
+pub(crate) fn with_parsed_reasoning_tokens(mut usage: Usage, parsed: Option<u32>) -> Usage {
+    if let Some(parsed) = parsed {
+        let details = usage.completion_tokens_details.get_or_insert_default();
+        details.reasoning_tokens.get_or_insert(parsed);
+    }
+    usage
 }
 
 /// The version to report on a generate response: what the engine stamped on
@@ -65,24 +135,33 @@ pub(crate) fn effective_weight_version<'a>(
 ///
 /// Handles the two chunk conventions (`ChunkSemantics`):
 /// - delta streams send per-chunk token counts (must accumulate)
-/// - cumulative streams send the count in the Complete message
+/// - cumulative streams send the count in the Complete message, and the
+///   running count in every chunk before it
 pub(crate) struct CompletionTokenTracker {
     tokens: HashMap<u32, u32>,
+    /// The running count a cumulative stream reported in its latest chunk:
+    /// how far it had come, for a stream that ends before its Complete.
+    reported: HashMap<u32, u32>,
 }
 
 impl CompletionTokenTracker {
     pub fn new() -> Self {
         Self {
             tokens: HashMap::new(),
+            reported: HashMap::new(),
         }
     }
 
     /// Record tokens from a streaming chunk.
     /// Delta streams accumulate the chunk's token count; cumulative streams
-    /// report it in Complete instead, so this is a no-op for them.
+    /// report it in Complete instead, so a chunk of theirs only notes the
+    /// running count it carries.
     pub fn record_chunk(&mut self, chunk: &ProtoGenerateStreamChunk) {
         if chunk.chunk_semantics().is_delta() {
             *self.tokens.entry(chunk.index()).or_insert(0) += chunk.token_ids().len() as u32;
+        } else {
+            self.reported
+                .insert(chunk.index(), chunk.completion_tokens());
         }
     }
 
@@ -99,9 +178,37 @@ impl CompletionTokenTracker {
         }
     }
 
+    /// Settle a choice the gateway's own stop ended, as its Complete would
+    /// have: a delta stream keeps the count it accumulated, a cumulative
+    /// stream takes the running count its latest chunk reported. The choice
+    /// is counted through the step in which the stop matched, as the engine's
+    /// own server counts a stopped request. An engine that ends the choice on
+    /// that same step still sends its Complete, recorded as usual (the same
+    /// step, in the engine's own count); the Complete of a choice the engine
+    /// generated past the stop carries the tail's count, and the stream does
+    /// not pass it on.
+    pub fn record_local_stop(&mut self, index: u32) {
+        let reported = self.reported.get(&index).copied().unwrap_or(0);
+        let known = self.tokens.entry(index).or_insert(0);
+        *known = (*known).max(reported);
+    }
+
     /// Get total completion tokens across all indices
     pub fn total(&self) -> u32 {
         self.tokens.values().sum()
+    }
+
+    /// Completion tokens delivered so far across all indices: the count
+    /// [`total`](Self::total) knows, else the running count a cumulative
+    /// stream last reported. How far a stream that ends before its Complete
+    /// had come.
+    pub fn delivered(&self) -> u32 {
+        let mut per_index = self.reported.clone();
+        for (index, tokens) in &self.tokens {
+            let known = per_index.entry(*index).or_insert(0);
+            *known = (*known).max(*tokens);
+        }
+        per_index.values().sum()
     }
 }
 
@@ -110,6 +217,11 @@ mod tests {
     use smg_grpc_client::{tokenspeed_proto as tokenspeed, vllm_proto as vllm};
 
     use super::*;
+
+    /// The usage the counters of `responses` make.
+    fn build_usage(responses: &[ProtoGenerateComplete]) -> Usage {
+        TokenCounts::of(responses).usage()
+    }
 
     fn complete(
         prompt_tokens: u32,
@@ -141,6 +253,101 @@ mod tests {
         assert_eq!(
             usage.completion_tokens, 10,
             "each choice generates its own completion -- must be summed"
+        );
+    }
+
+    #[test]
+    fn parsed_reasoning_tokens_are_reported_once_the_parser_ran() {
+        let reasoning_tokens = |usage: Usage| {
+            usage
+                .completion_tokens_details
+                .and_then(|d| d.reasoning_tokens)
+        };
+        let usage = build_usage(&[complete(10, 8, 4)]);
+        assert_eq!(reasoning_tokens(usage.clone()), None);
+        assert_eq!(
+            reasoning_tokens(with_parsed_reasoning_tokens(usage.clone(), None)),
+            None,
+            "no reasoning parser: nothing to report"
+        );
+        assert_eq!(
+            reasoning_tokens(with_parsed_reasoning_tokens(usage.clone(), Some(0))),
+            Some(0),
+            "the parser ran and found no reasoning: zero, not absent"
+        );
+        assert_eq!(
+            reasoning_tokens(with_parsed_reasoning_tokens(usage, Some(7))),
+            Some(7)
+        );
+        let engine_counted = Usage::from_counts(10, 4).with_reasoning_tokens(5);
+        assert_eq!(
+            reasoning_tokens(with_parsed_reasoning_tokens(engine_counted, Some(3))),
+            Some(5),
+            "an engine that counts reasoning itself is not overruled"
+        );
+        let engine_counted_fewer = Usage::from_counts(10, 4).with_reasoning_tokens(3);
+        assert_eq!(
+            reasoning_tokens(with_parsed_reasoning_tokens(engine_counted_fewer, Some(5))),
+            Some(3),
+            "nor when its count is lower than the parser's"
+        );
+    }
+
+    #[test]
+    fn token_counts_usage_carries_the_cached_reasoning_and_speculative_details() {
+        let usage = TokenCounts {
+            prompt: 10,
+            completion: 5,
+            cached: 4,
+            reasoning: 3,
+            spec_accepted: 2,
+            spec_drafted: 3,
+        }
+        .usage();
+
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 5);
+        assert_eq!(usage.total_tokens, 15);
+        assert_eq!(
+            usage
+                .prompt_tokens_details
+                .as_ref()
+                .map(|details| details.cached_tokens),
+            Some(4)
+        );
+        let details = usage
+            .completion_tokens_details
+            .expect("the reasoning and speculative details");
+        assert_eq!(details.reasoning_tokens, Some(3));
+        assert_eq!(details.accepted_prediction_tokens, Some(2));
+        assert_eq!(details.rejected_prediction_tokens, Some(1));
+    }
+
+    #[test]
+    fn chat_usage_has_every_detail_counter_and_no_unbilled_prompt_tokens() {
+        let usage = serde_json::to_value(chat_usage(build_usage(&[complete(10, 8, 4)]), None, 3))
+            .expect("a JSON usage");
+        assert_eq!(
+            usage,
+            serde_json::json!({
+                "prompt_tokens": 7,
+                "completion_tokens": 4,
+                "total_tokens": 11,
+                "prompt_tokens_details": {"cached_tokens": 7, "audio_tokens": 0},
+                "completion_tokens_details": {
+                    "reasoning_tokens": 0,
+                    "audio_tokens": 0,
+                    "accepted_prediction_tokens": 0,
+                    "rejected_prediction_tokens": 0,
+                },
+            })
+        );
+        let parsed = chat_usage(build_usage(&[complete(10, 8, 4)]), Some(2), 0);
+        assert_eq!(
+            parsed
+                .completion_tokens_details
+                .and_then(|details| details.reasoning_tokens),
+            Some(2)
         );
     }
 
@@ -198,6 +405,36 @@ mod tests {
     }
 
     #[test]
+    fn delivered_tokens_follow_a_stream_that_ends_before_complete() {
+        // Cumulative stream: a chunk carries the running count; the total is
+        // unknown until Complete, the delivered count is not.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_chunk(&ProtoGenerateStreamChunk::TokenSpeed(
+            tokenspeed::GenerateStreamChunk {
+                token_ids: vec![5],
+                completion_tokens: 41,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(tracker.total(), 0, "no authoritative count before Complete");
+        assert_eq!(
+            tracker.delivered(),
+            41,
+            "the running count the engine reported"
+        );
+        tracker.record_complete(&complete(0, 0, 42));
+        assert_eq!((tracker.total(), tracker.delivered()), (42, 42));
+
+        // Delta stream: the accumulated chunks are both.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_chunk(&ProtoGenerateStreamChunk::Vllm(vllm::GenerateStreamChunk {
+            token_ids: vec![1, 2, 3],
+            ..Default::default()
+        }));
+        assert_eq!((tracker.total(), tracker.delivered()), (3, 3));
+    }
+
+    #[test]
     fn engine_reported_version_beats_dispatch_which_beats_default() {
         assert_eq!(effective_weight_version(Some("v7"), Some("v3")), "v7");
         assert_eq!(effective_weight_version(None, Some("v3")), "v3");
@@ -207,5 +444,53 @@ mod tests {
             "default",
             "an empty registration label is unset"
         );
+    }
+
+    /// A choice the gateway's own stop ended is settled as its Complete would
+    /// have settled it: a delta stream keeps what it accumulated, a cumulative
+    /// stream takes the running count its latest chunk reported; the count is
+    /// through the step the stop matched in, never the engine's tail.
+    #[test]
+    fn a_local_stop_settles_the_count_the_stream_had_reached() {
+        // Cumulative stream: the running count of the latest chunk.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_chunk(&ProtoGenerateStreamChunk::TokenSpeed(
+            tokenspeed::GenerateStreamChunk {
+                token_ids: vec![5],
+                completion_tokens: 41,
+                ..Default::default()
+            },
+        ));
+        assert_eq!(tracker.total(), 0, "no settled count before the stop");
+        tracker.record_local_stop(0);
+        assert_eq!((tracker.total(), tracker.delivered()), (41, 41));
+
+        // Delta stream: the accumulated chunks.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_chunk(&ProtoGenerateStreamChunk::Vllm(vllm::GenerateStreamChunk {
+            token_ids: vec![1, 2, 3],
+            ..Default::default()
+        }));
+        tracker.record_local_stop(0);
+        assert_eq!((tracker.total(), tracker.delivered()), (3, 3));
+
+        // A choice that stopped before any chunk settled at zero.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_local_stop(2);
+        assert_eq!((tracker.total(), tracker.delivered()), (0, 0));
+
+        // The Complete of an engine that ended the choice on the stop's step
+        // is recorded as usual: the engine's own count of that step.
+        let mut tracker = CompletionTokenTracker::new();
+        tracker.record_chunk(&ProtoGenerateStreamChunk::TokenSpeed(
+            tokenspeed::GenerateStreamChunk {
+                token_ids: vec![5],
+                completion_tokens: 41,
+                ..Default::default()
+            },
+        ));
+        tracker.record_local_stop(0);
+        tracker.record_complete(&complete(0, 0, 42));
+        assert_eq!(tracker.total(), 42, "the engine's own count of the step");
     }
 }

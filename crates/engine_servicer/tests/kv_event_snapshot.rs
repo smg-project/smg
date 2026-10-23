@@ -19,7 +19,7 @@
     clippy::print_stderr
 )]
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use engine_servicer::{
     engine_hash::{self, Digest32, EngineHash},
@@ -568,7 +568,7 @@ fn snapshots_of_the_generated_streams_equal_their_live_sets() {
         }
         let through = batches.iter().map(|b| b.sequence_number).max().unwrap();
         let chunks: Vec<KvEventBatch> =
-            SnapshotChunks::new(state.snapshot(), through, 1.0, 0).collect();
+            SnapshotChunks::at(state.snapshot(), through, 1.0, 0).collect();
 
         let want = reference(&batches);
         let got = emitted(&chunks);
@@ -585,12 +585,29 @@ fn snapshots_of_the_generated_streams_equal_their_live_sets() {
         );
         assert!(chunks.len() > 1, "{name}: the live set spans chunks");
 
-        // Framing: the clear first, every chunk marked, stamps up to `through`.
+        // Framing: the clear first, every chunk marked, each rank's chunks
+        // stamped consecutively up to its cut (`through` for every rank here).
         assert!(matches!(
             chunks[0].events[0].data,
             Some(kv_cache_event::Data::Cleared(_))
         ));
         let count = chunks.len() as u32;
+        let mut behind: HashMap<Option<i32>, u64> = HashMap::new();
+        for chunk in chunks.iter().rev() {
+            let position = behind.entry(chunk.dp_rank).or_insert(0);
+            assert_eq!(
+                chunk.sequence_number,
+                through - *position,
+                "{name}: stamp of rank {:?} chunk {}",
+                chunk.dp_rank,
+                chunk
+                    .snapshot
+                    .as_ref()
+                    .map(|marker| marker.index)
+                    .unwrap_or_default()
+            );
+            *position += 1;
+        }
         for (index, chunk) in chunks.iter().enumerate() {
             let marker = chunk.snapshot.as_ref().expect("marked");
             assert_eq!(
@@ -599,11 +616,6 @@ fn snapshots_of_the_generated_streams_equal_their_live_sets() {
                 "{name}"
             );
             assert_eq!(marker.blocks, state.blocks(), "{name}");
-            assert_eq!(
-                chunk.sequence_number,
-                through + 1 - u64::from(count) + index as u64,
-                "{name}: stamp of chunk {index}"
-            );
             let blocks: usize = stores(std::slice::from_ref(chunk))
                 .iter()
                 .map(|(_, stored)| stored.blocks.len())
@@ -665,7 +677,7 @@ fn snapshots_at_every_cut_of_a_stream_follow_the_reference() {
         state.apply(batch);
         replay(&mut want, batch);
         let chunks: Vec<KvEventBatch> =
-            SnapshotChunks::new(state.snapshot(), batch.sequence_number, 1.0, 0).collect();
+            SnapshotChunks::at(state.snapshot(), batch.sequence_number, 1.0, 0).collect();
         assert_eq!(
             emitted(&chunks),
             want,

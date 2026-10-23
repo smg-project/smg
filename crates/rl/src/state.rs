@@ -12,11 +12,11 @@ pub struct RlState {
 
 impl RlState {
     /// Build the state. The control plane owns no HTTP client: every call
-    /// goes through the client the gateway negotiated for the target worker
-    /// (see [`crate::RlWorkerInfo::http_client`]), with the control deadline
-    /// applied per request. Breakers and load counters live on the gateway's
-    /// worker objects, not on the client, so control calls leave them
-    /// untouched.
+    /// goes through the client the gateway resolved for the target worker's
+    /// control endpoint (see [`crate::RlWorkerInfo::control_client`]), with
+    /// the control deadline applied per request. Breakers and load counters
+    /// live on the gateway's worker objects, not on the client, so control
+    /// calls leave them untouched.
     pub fn new(view: Arc<dyn RlWorkerView>, config: RlConfig) -> Self {
         Self { view, config }
     }

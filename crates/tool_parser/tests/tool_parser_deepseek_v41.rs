@@ -1,7 +1,7 @@
 //! DeepSeek-V4.1 DSML tool-call parser: spaced tags, reference parsing rules.
 //!
-//! Parity cases ported from vLLM `tests/parser/engine/test_deepseek_v41.py`
-//! (parallel calls at chunk sizes 1/7/10000) and SGLang
+//! Parity cases ported from one serving engine's `tests/parser/engine/test_deepseek_v41.py`
+//! (parallel calls at chunk sizes 1/7/10000) and another's
 //! `test_deepseekv41_detector.py` (nested JSON string, list values, JSON-body
 //! invoke, chunk sizes 1..1000).
 
@@ -213,6 +213,7 @@ async fn streaming_forwards_unknown_tool_names() {
             description: None,
             parameters: json!({"type": "object"}),
             strict: None,
+            extra: Default::default(),
         },
     }];
     let mut parser = DeepSeekDsmlParser::v41();
@@ -320,6 +321,7 @@ fn factory_maps_v41_names_ahead_of_v4_and_registers_a_structural_tag() {
     assert!(!registry.has_structural_tag("deepseek_v4"));
     for model in [
         "deepseek-ai/DeepSeek-V4.1-Flash",
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017",
         "deepseek-ai/DeepSeek-V41-Flash",
         "deepseek-v4.1-flash",
         "DeepSeek_V41",
@@ -353,6 +355,7 @@ fn structural_tag_mirrors_vllm_forced_grammar() {
             description: None,
             parameters: json!({"type": "object", "properties": {"city": {"type": "string"}}}),
             strict: None,
+            extra: Default::default(),
         },
     }];
     let tag = DeepSeekDsmlParser::build_v41_structural_tag(&tools, true);

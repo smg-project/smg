@@ -52,3 +52,57 @@ class TestEncodeModeGetLoads:
 
         assert response.dp_rank_count == 0
         assert len(response.loads) == 0
+
+
+def test_snapshot_geometry_and_active_pressure_survive_dp_filter():
+    servicer = _bare_servicer("null")
+    args = SimpleNamespace(prefix_granularity=64, max_num_seqs=16)
+    snapshots = [
+        SimpleNamespace(
+            dp_rank=rank,
+            num_running_reqs=1,
+            num_waiting_reqs=2,
+            num_active_pages=4,
+            num_used_pages=8,
+            max_total_pages=16,
+        )
+        for rank in (0, 1)
+    ]
+
+    async def get_load():
+        return [SimpleNamespace(dp_rank=rank) for rank in (0, 1)]
+
+    servicer.async_llm = SimpleNamespace(
+        server_args=args,
+        get_load=get_load,
+        load_snapshot_store=SimpleNamespace(fresh_snapshots=lambda: snapshots),
+    )
+    # Native LCM blocks are not prefix pages; raw launch grain is irrelevant.
+    servicer.scheduler_info = {"max_total_num_tokens": 16384}
+    response = asyncio.run(
+        servicer.GetLoads(servicer_mod.tokenspeed_scheduler_pb2.GetLoadsRequest(dp_rank=1), None)
+    )
+    assert response.dp_rank_count == 1
+    load = response.loads[0]
+    assert load.dp_rank == 1
+    assert load.num_running_reqs == 1
+    assert load.num_waiting_reqs == 2
+    assert load.num_total_reqs == 3
+    assert load.num_used_tokens == 8192
+    assert load.max_total_num_tokens == 16384
+    assert load.token_usage == 0.5
+    assert load.HasField("active_token_usage")
+    assert load.active_token_usage == 0.25
+    assert load.max_running_requests == 16
+    assert response.aggregate.avg_token_usage == 0.5
+
+    # get_load() projects nothing until all DP ranks have fresh snapshots.
+    async def incomplete_load():
+        return []
+
+    servicer.async_llm.get_load = incomplete_load
+    snapshots.pop()
+    response = asyncio.run(
+        servicer.GetLoads(servicer_mod.tokenspeed_scheduler_pb2.GetLoadsRequest(), None)
+    )
+    assert not response.loads

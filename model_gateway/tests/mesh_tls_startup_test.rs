@@ -1,0 +1,633 @@
+//! Two gateway processes with the mesh on and mTLS configured form a mesh
+//! over the loopback: the mesh listener serves TLS with the node certificate
+//! and the peer joins through it.
+//!
+//! The gateways run as separate processes on purpose. The crypto provider
+//! rustls uses is process-level, this test binary installs none, and a
+//! gateway that left the choice to its embedder never brought its mesh
+//! listener up: the panic surfaced only as "Mesh server failed" in its log
+//! while `/health` kept answering.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::allow_attributes)]
+
+mod common;
+
+use std::{
+    fs::{self, File},
+    io::{self, Read, Write},
+    net::{Ipv4Addr, SocketAddr, TcpStream},
+    path::PathBuf,
+    process::{Child, Command, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+use common::{
+    gateway_launch::{base_args, free_ports, launch_with, serial, Until, EXIT_TIMEOUT},
+    test_certs::TestCertificates,
+};
+use openssl::ssl::{HandshakeError, SslConnector, SslFiletype, SslMethod};
+
+const IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
+/// The bound on every wait on a socket (connect, read, write): a peer that
+/// stalls fails the probe instead of hanging the test.
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a gateway gets to answer `/health`.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(90);
+/// How long the mesh gets to come up once both gateways are healthy.
+const MESH_TIMEOUT: Duration = Duration::from_secs(30);
+/// How many port picks a pair of gateways gets (`spawn_pair`).
+const SPAWN_ATTEMPTS: usize = 3;
+/// How long a peer gets to show a stopping gateway as `Leaving`: the
+/// broadcast's own bound is 3 s, and the peer logs its view once a second.
+const LEAVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How a gateway's mesh runs: with mutual TLS, or in the clear.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mesh {
+    /// The TLS flags on: the listener serves TLS and requires a peer
+    /// certificate; the start-up waits for a TLS handshake with it.
+    Mtls,
+    /// No TLS flags; the start-up waits for the listener to accept.
+    Plain,
+}
+
+/// A gateway process; killed when dropped, so a failed assertion leaves none.
+struct Gateway {
+    name: &'static str,
+    child: Child,
+    log_path: PathBuf,
+    http_port: u16,
+    mesh_port: u16,
+    metrics_port: u16,
+}
+
+impl Gateway {
+    fn log(&self) -> String {
+        fs::read_to_string(&self.log_path).unwrap_or_default()
+    }
+
+    /// Whether the process is gone: a failed bind of the HTTP or the metrics
+    /// port ends the start-up.
+    fn exited(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
+    /// Whether another process took one of the gateway's ports between the
+    /// pick and the gateway's own bind. The HTTP and metrics listeners report
+    /// the OS error; the mesh server reports its failure without it, so a
+    /// failed mesh server counts when its port is held by someone else.
+    fn lost_a_port(&self) -> bool {
+        let log = self.log();
+        log.contains("Address already in use")
+            || (log.contains("Mesh server failed") && connect(self.mesh_port).is_ok())
+    }
+
+    /// Waits for `/health`, then for the mesh listener's verdict: a TLS
+    /// handshake with `probe` under mTLS, an accepted connection in the clear
+    /// (its "ready"; nothing is logged for a bound listener), or `Mesh server
+    /// failed`, which the mesh server logs about a second after its
+    /// listener's task started, so possibly after `/health` answers. The
+    /// reason when the start-up ended otherwise; a lost port ends the wait
+    /// too and is the caller's to handle.
+    fn start_up(
+        &mut self,
+        certs: &TestCertificates,
+        probe: &(PathBuf, PathBuf),
+        mesh: Mesh,
+    ) -> Option<&'static str> {
+        wait_until(STARTUP_TIMEOUT, || {
+            healthy(self) || self.lost_a_port() || self.exited()
+        });
+        if !healthy(self) {
+            return if self.lost_a_port() {
+                None
+            } else if self.exited() {
+                Some("exited before it was healthy")
+            } else {
+                Some("did not come up")
+            };
+        }
+        wait_until(MESH_TIMEOUT, || {
+            let ready = match mesh {
+                Mesh::Mtls => matches!(
+                    mesh_handshake(self.mesh_port, certs, Some(probe)),
+                    Ok(Handshake::Accepted(_))
+                ),
+                Mesh::Plain => connect(self.mesh_port).is_ok(),
+            };
+            ready || self.log().contains("Mesh server failed")
+        });
+        None
+    }
+}
+
+impl Drop for Gateway {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A gateway with the mesh on, with this node's identity under mTLS, on
+/// `ports` (HTTP, mesh, metrics), dialing `peer_mesh_port` when given; its
+/// output goes to `<name>.log` next to the certificates.
+fn spawn_gateway(
+    name: &'static str,
+    certs: &TestCertificates,
+    ports: [u16; 3],
+    peer_mesh_port: Option<u16>,
+    mesh: Mesh,
+) -> Gateway {
+    let (cert, key) = certs.node_identity(name).expect("node identity");
+    let [http_port, mesh_port, metrics_port] = ports;
+    let ip = IP.to_string();
+    let log_path = certs.temp_dir.path().join(format!("{name}.log"));
+    let log = File::create(&log_path).expect("log file");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_smg"));
+    command
+        .args(["--host", &ip, "--port", &http_port.to_string()])
+        .args(["--prometheus-host", &ip])
+        .args(["--prometheus-port", &metrics_port.to_string()])
+        .args(["--enable-mesh", "--mesh-server-name", name])
+        .args(["--mesh-host", &ip, "--mesh-port", &mesh_port.to_string()])
+        .args(["--log-level", "info"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone().expect("log handle")))
+        .stderr(Stdio::from(log));
+    if mesh == Mesh::Mtls {
+        command
+            .args(["--mesh-tls-ca-cert", certs.ca_cert_str()])
+            .arg("--mesh-tls-cert")
+            .arg(&cert)
+            .arg("--mesh-tls-key")
+            .arg(&key);
+    }
+    if let Some(port) = peer_mesh_port {
+        command.args(["--mesh-peer-urls", &format!("{IP}:{port}")]);
+    }
+    let child = command.spawn().expect("spawn the gateway");
+    Gateway {
+        name,
+        child,
+        log_path,
+        http_port,
+        mesh_port,
+        metrics_port,
+    }
+}
+
+/// Both gateways healthy with their mesh listeners' verdict in, B dialing
+/// A's mesh port. The pair is respawned on fresh ports when a gateway lost
+/// one of its ports between the pick and its bind, at most `SPAWN_ATTEMPTS`
+/// times.
+fn spawn_pair(
+    certs: &TestCertificates,
+    probe: &(PathBuf, PathBuf),
+    mesh: Mesh,
+) -> (Gateway, Gateway) {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let [http_a, mesh_a, metrics_a, http_b, mesh_b, metrics_b] = free_ports::<6>();
+        let mut a = spawn_gateway("nodea", certs, [http_a, mesh_a, metrics_a], None, mesh);
+        let mut b = spawn_gateway(
+            "nodeb",
+            certs,
+            [http_b, mesh_b, metrics_b],
+            Some(mesh_a),
+            mesh,
+        );
+        let failures = [
+            a.start_up(certs, probe, mesh),
+            b.start_up(certs, probe, mesh),
+        ];
+        if a.lost_a_port() || b.lost_a_port() {
+            assert!(
+                attempts < SPAWN_ATTEMPTS,
+                "no gateway pair kept its ports in {SPAWN_ATTEMPTS} picks\n{}",
+                logs(&[&a, &b])
+            );
+            // Both are dropped here, so killed; fresh ports next.
+            continue;
+        }
+        for (gateway, failure) in [&a, &b].into_iter().zip(failures) {
+            assert!(
+                failure.is_none(),
+                "{} {}\n{}",
+                gateway.name,
+                failure.unwrap_or_default(),
+                logs(&[&a, &b])
+            );
+        }
+        return (a, b);
+    }
+}
+
+/// A connection to the loopback `port` with `IO_TIMEOUT` on the connect and
+/// on every read and write.
+fn connect(port: u16) -> io::Result<TcpStream> {
+    let stream = TcpStream::connect_timeout(&SocketAddr::from((IP, port)), IO_TIMEOUT)?;
+    stream.set_read_timeout(Some(IO_TIMEOUT))?;
+    stream.set_write_timeout(Some(IO_TIMEOUT))?;
+    Ok(stream)
+}
+
+/// A plain HTTP/1.1 GET on the loopback; the whole response, headers first.
+fn http_get(port: u16, path: &str) -> Option<String> {
+    let mut stream = connect(port).ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {IP}\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    Some(response)
+}
+
+fn healthy(gateway: &Gateway) -> bool {
+    http_get(gateway.http_port, "/health").is_some_and(|r| r.starts_with("HTTP/1.1 200"))
+}
+
+/// Whether `gateway` reports a live mesh connection with `peer`
+/// (`router_mesh_peer_connections{peer="<peer>"} 1` in its metrics).
+fn peer_connected(gateway: &Gateway, peer: &str) -> bool {
+    let label = format!("peer=\"{peer}\"");
+    http_get(gateway.metrics_port, "/metrics").is_some_and(|metrics| {
+        metrics.lines().any(|line| {
+            line.starts_with("router_mesh_peer_connections")
+                && line.contains(&label)
+                && line.trim_end().ends_with(" 1")
+        })
+    })
+}
+
+/// The `router_mesh_peer_connections` lines of `gateway`'s metrics whose
+/// `peer` label is empty: a series for the time before a stream's dialer was
+/// named, which no gateway may carry. `None` when the metrics endpoint did
+/// not answer: a failure of its own, not an empty list.
+fn nameless_peer_series(gateway: &Gateway) -> Option<Vec<String>> {
+    let metrics = http_get(gateway.metrics_port, "/metrics")?;
+    Some(
+        metrics
+            .lines()
+            .filter(|line| {
+                line.starts_with("router_mesh_peer_connections") && line.contains("peer=\"\"")
+            })
+            .map(str::to_owned)
+            .collect(),
+    )
+}
+
+/// `member`'s status in `gateway`'s latest view of the membership (its last
+/// `Round <n> Status` log line), such as `Alive` or `Leaving`; `None` while
+/// no round line names the member.
+fn status_on(gateway: &Gateway, member: &str) -> Option<String> {
+    let log = gateway.log();
+    let round = log.lines().rev().find(|line| {
+        line.contains("Status:{") && line.contains(&format!("\"{member}\": NodeState"))
+    })?;
+    let entry = &round[round.find(&format!("\"{member}\": NodeState"))?..];
+    let status = &entry[entry.find("status: ")? + "status: ".len()..];
+    Some(
+        status
+            .chars()
+            .take_while(char::is_ascii_alphabetic)
+            .collect(),
+    )
+}
+
+/// SIGTERM to `gateway`, the way an orchestrator stops it.
+fn terminate(gateway: &Gateway) {
+    let status = Command::new("kill")
+        .args(["-TERM", &gateway.child.id().to_string()])
+        .status()
+        .expect("send SIGTERM");
+    assert!(status.success(), "kill -TERM failed: {status}");
+}
+
+/// What the mesh listener made of a handshake.
+#[derive(Debug)]
+enum Handshake {
+    /// Negotiated: the protocol version and the ALPN protocol.
+    Accepted(String),
+    /// Ended by the listener with a TLS alert: OpenSSL's reason for it, such
+    /// as "tlsv13 alert certificate required".
+    Refused(String),
+}
+
+/// The alert in an OpenSSL error, when the error is one the peer sent.
+fn alert_reason(error: &openssl::ssl::Error) -> Option<String> {
+    error
+        .ssl_error()?
+        .errors()
+        .iter()
+        .filter_map(|e| e.reason())
+        .find(|reason| reason.contains("alert"))
+        .map(str::to_owned)
+}
+
+/// A TLS handshake with the mesh listener on `port`, as a peer would open
+/// it: the CA as the trust root, `identity` presented as the client
+/// certificate when given. Every wait on the socket is bounded by
+/// `IO_TIMEOUT`; `Err` is a transport failure (nothing listening, a stalled
+/// peer, a connection closed without a verdict), not the listener's answer.
+fn mesh_handshake(
+    port: u16,
+    certs: &TestCertificates,
+    identity: Option<&(PathBuf, PathBuf)>,
+) -> Result<Handshake, String> {
+    let mut builder = SslConnector::builder(SslMethod::tls()).map_err(|e| e.to_string())?;
+    builder
+        .set_ca_file(&certs.ca_cert_path)
+        .map_err(|e| e.to_string())?;
+    if let Some((cert, key)) = identity {
+        builder
+            .set_certificate_chain_file(cert)
+            .map_err(|e| e.to_string())?;
+        builder
+            .set_private_key_file(key, SslFiletype::PEM)
+            .map_err(|e| e.to_string())?;
+    }
+    builder
+        .set_alpn_protos(b"\x02h2")
+        .map_err(|e| e.to_string())?;
+    let tcp = connect(port).map_err(|e| format!("connect: {e}"))?;
+    // The node certificates carry `localhost` as a DNS SAN next to the
+    // loopback addresses: the socket targets the address, the TLS stack
+    // verifies the name.
+    let mut tls = match builder.build().connect("localhost", tcp) {
+        Ok(tls) => tls,
+        Err(HandshakeError::Failure(stream)) => {
+            return alert_reason(stream.error())
+                .map(Handshake::Refused)
+                .ok_or_else(|| format!("handshake: {}", stream.error()));
+        }
+        Err(HandshakeError::WouldBlock(_)) => {
+            return Err(format!(
+                "handshake: the listener stalled for {IO_TIMEOUT:?}"
+            ));
+        }
+        Err(HandshakeError::SetupFailure(e)) => return Err(format!("handshake setup: {e}")),
+    };
+    if identity.is_none() {
+        // In TLS 1.3 the client's side of the handshake completes before the
+        // listener has judged the client certificate; its verdict is the
+        // first thing read.
+        return match tls.ssl_read(&mut [0u8; 1]) {
+            Err(e) => alert_reason(&e)
+                .map(Handshake::Refused)
+                .ok_or_else(|| format!("no verdict from the listener: {e}")),
+            Ok(n) => Err(format!("{n} bytes from the listener instead of a verdict")),
+        };
+    }
+    let alpn = tls
+        .ssl()
+        .selected_alpn_protocol()
+        .map(|p| String::from_utf8_lossy(p).into_owned());
+    Ok(Handshake::Accepted(format!(
+        "{} alpn={alpn:?}",
+        tls.ssl().version_str()
+    )))
+}
+
+fn wait_until(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if condition() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn logs(gateways: &[&Gateway]) -> String {
+    gateways
+        .iter()
+        .map(|g| format!("--- {} ---\n{}", g.name, g.log()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn mesh_with_mtls_forms_between_two_gateway_processes() {
+    let certs = TestCertificates::generate().expect("test certificates");
+    let probe = certs.node_identity("probe").expect("probe identity");
+    let (a, b) = spawn_pair(&certs, &probe, Mesh::Mtls);
+
+    // The mesh listener serves TLS to a peer that presents a certificate
+    // from the CA.
+    let mut handshake = Err("not attempted".to_owned());
+    assert!(
+        wait_until(MESH_TIMEOUT, || {
+            handshake = mesh_handshake(a.mesh_port, &certs, Some(&probe));
+            handshake.is_ok()
+        }),
+        "no TLS handshake with {}'s mesh listener: {handshake:?}\n{}",
+        a.name,
+        logs(&[&a, &b])
+    );
+    assert!(
+        matches!(
+            &handshake,
+            Ok(Handshake::Accepted(negotiated))
+                if negotiated.starts_with("TLSv1.3")
+                    && negotiated.contains("alpn=Some(\"h2\")")
+        ),
+        "unexpected handshake with the mesh listener: {handshake:?}"
+    );
+
+    // Without a client certificate the peer is refused, and with the
+    // "certificate required" alert: not a plain close, not a stall.
+    let refusal = mesh_handshake(a.mesh_port, &certs, None);
+    assert!(
+        matches!(
+            &refusal,
+            Ok(Handshake::Refused(reason)) if reason.contains("certificate required")
+        ),
+        "a peer without a client certificate was not refused by {}'s mesh listener: \
+         {refusal:?}\n{}",
+        a.name,
+        logs(&[&a, &b])
+    );
+
+    // B joined A through it: a live peer connection on either side.
+    assert!(
+        wait_until(MESH_TIMEOUT, || peer_connected(&a, "nodeb")
+            || peer_connected(&b, "nodea")),
+        "the two gateways did not form a mesh\n{}",
+        logs(&[&a, &b])
+    );
+    for gateway in [&a, &b] {
+        assert!(
+            !gateway.log().contains("Mesh server failed"),
+            "{}'s mesh server failed\n{}",
+            gateway.name,
+            gateway.log()
+        );
+    }
+
+    // The accepting end names its peer from the first frame of the stream;
+    // no series is left behind for the time before that. Both endpoints have
+    // to answer: the formation check above proved only one of them did.
+    for gateway in [&a, &b] {
+        let nameless = nameless_peer_series(gateway);
+        assert!(
+            nameless.is_some(),
+            "{}'s /metrics did not answer\n{}",
+            gateway.name,
+            logs(&[&a, &b])
+        );
+        let nameless = nameless.expect("the endpoint answered");
+        assert!(
+            nameless.is_empty(),
+            "{} carries a peer series without a name: {nameless:?}\n{}",
+            gateway.name,
+            logs(&[&a, &b])
+        );
+    }
+}
+
+/// A gateway that is told to stop leaves the mesh before it drains: its peer
+/// sees it as `Leaving` within a few seconds of the signal, where it used to
+/// see it `Alive` until a probe failed, then `Suspected` and `Down`. In the
+/// clear: the mesh's status broadcasts do not yet dial with the node's TLS
+/// identity (a change of its own), so under mTLS a `Leaving` would not reach
+/// the peer's listener.
+#[test]
+fn a_stopping_gateway_leaves_the_mesh() {
+    let certs = TestCertificates::generate().expect("test certificates");
+    let probe = certs.node_identity("probe").expect("probe identity");
+    let (a, mut b) = spawn_pair(&certs, &probe, Mesh::Plain);
+    assert!(
+        wait_until(MESH_TIMEOUT, || peer_connected(&a, "nodeb")
+            || peer_connected(&b, "nodea")),
+        "the two gateways did not form a mesh\n{}",
+        logs(&[&a, &b])
+    );
+    assert!(
+        wait_until(MESH_TIMEOUT, || status_on(&a, "nodeb").as_deref()
+            == Some("Alive")),
+        "{} never saw {} alive: {:?}\n{}",
+        a.name,
+        b.name,
+        status_on(&a, "nodeb"),
+        logs(&[&a, &b])
+    );
+
+    terminate(&b);
+
+    assert!(
+        wait_until(LEAVE_TIMEOUT, || status_on(&a, "nodeb").as_deref()
+            == Some("Leaving")),
+        "{} did not see {} leave after its SIGTERM; its status there: {:?}\n{}",
+        a.name,
+        b.name,
+        status_on(&a, "nodeb"),
+        logs(&[&a, &b])
+    );
+    assert!(
+        wait_until(EXIT_TIMEOUT, || b.exited()),
+        "{} did not exit after its SIGTERM\n{}",
+        b.name,
+        logs(&[&a, &b])
+    );
+}
+
+/// Mesh TLS material the gateway can read but not use is refused before the
+/// HTTP listener binds, like a held mesh port: the mesh server used to fail
+/// on its first poll, a second after the gateway was serving outside the
+/// mesh (`Mesh server failed: ...` once, `/readiness` ready), because the
+/// flags check only that the files exist and the material is parsed when
+/// the server starts. Three shapes: a certificate file that holds no
+/// certificate, a key file that holds the certificate instead of the key,
+/// and a CA file with nothing in it (the client verifier cannot be built
+/// from it; the files are all readable).
+#[test]
+fn unusable_mesh_tls_material_refuses_the_start() {
+    let _serial = serial();
+    let certs = TestCertificates::generate().expect("test certificates");
+    let (cert, key) = certs.node_identity("nodec").expect("node identity");
+    let dir = certs.temp_dir.path();
+    let garbage = dir.join("garbage.pem");
+    fs::write(&garbage, "not a certificate\n").expect("write the file");
+    let empty_ca = dir.join("empty-ca.pem");
+    fs::write(&empty_ca, "").expect("write the file");
+    let path = |p: &std::path::Path| p.to_str().expect("a UTF-8 path").to_string();
+    let ca = path(&certs.ca_cert_path);
+    let cases: [(&str, [String; 3]); 3] = [
+        (
+            "cert-not-a-certificate",
+            [ca.clone(), path(&garbage), path(&key)],
+        ),
+        ("key-is-the-certificate", [ca, path(&cert), path(&cert)]),
+        (
+            "ca-without-a-certificate",
+            [path(&empty_ca), path(&cert), path(&key)],
+        ),
+    ];
+    let ip = IP.to_string();
+    for (name, [ca, cert, key]) in cases {
+        let [http_port, mesh_port, metrics_port] = free_ports();
+        let mut args = base_args(http_port, metrics_port);
+        args.extend(
+            [
+                "--enable-mesh",
+                "--mesh-host",
+                &ip,
+                "--mesh-port",
+                &mesh_port.to_string(),
+                "--mesh-tls-ca-cert",
+                &ca,
+                "--mesh-tls-cert",
+                &cert,
+                "--mesh-tls-key",
+                &key,
+            ]
+            .map(str::to_string),
+        );
+        // The metrics and probe listeners are up when the mesh server's
+        // preparation fails (they bind earlier, by design): the HTTP port is
+        // watched, the one a gateway outside the mesh used to serve on.
+        let launch = launch_with(
+            &args,
+            &[http_port],
+            Until::Bound,
+            &dir.join(format!("{name}.log")),
+        );
+        let log = &launch.log;
+        assert!(
+            launch.bound.is_none(),
+            "{name}: the HTTP port answered although the mesh TLS material is unusable\n{log}"
+        );
+        assert!(
+            launch.status.is_some(),
+            "{name}: the gateway neither exited nor served within {EXIT_TIMEOUT:?}\n{log}"
+        );
+        assert!(
+            launch.status.is_some_and(|status| !status.success()),
+            "{name}: the gateway exited successfully\n{log}"
+        );
+        assert!(
+            !log.contains("panicked"),
+            "{name}: a panic is not a configuration error\n{log}"
+        );
+        for text in [
+            "Failed to start the mesh server",
+            "--mesh-tls-",
+            "mesh TLS material",
+        ] {
+            assert!(
+                log.contains(text),
+                "{name}: the error does not name {text:?}\n{log}"
+            );
+        }
+        assert!(
+            !log.contains("Mesh server listening on"),
+            "{name}: the mesh server served\n{log}"
+        );
+    }
+}

@@ -7,6 +7,8 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
+use rustls::crypto::ring;
+
 // Tokenizer download configuration
 const TINYLLAMA_TOKENIZER_URL: &str =
     "https://huggingface.co/TinyLlama/TinyLlama-1.1B-Chat-v1.0/resolve/main/tokenizer.json";
@@ -15,6 +17,30 @@ const TINYLLAMA_TOKENIZER_FILENAME: &str = "tinyllama_tokenizer.json";
 
 // Global mutex to prevent concurrent downloads
 static DOWNLOAD_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// The blocking HTTP client of the download helpers. The client takes the
+/// process-level TLS crypto provider (reqwest's `rustls-no-provider`
+/// feature) and panics at build time when there is none, so `ring` is
+/// installed first; a provider installed earlier in the process stays.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test binary's client factory; the process TLS crypto provider is installed first"
+)]
+pub fn http_client() -> reqwest::blocking::Client {
+    let _ = ring::default_provider().install_default();
+    reqwest::blocking::Client::new()
+}
+
+/// A builder for a download client with settings of its own, the provider
+/// installed the same way.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test binary's client factory; the process TLS crypto provider is installed first"
+)]
+pub fn http_client_builder() -> reqwest::blocking::ClientBuilder {
+    let _ = ring::default_provider().install_default();
+    reqwest::blocking::Client::builder()
+}
 
 /// Downloads the TinyLlama tokenizer from HuggingFace if not already cached.
 /// Returns the path to the cached tokenizer file.
@@ -44,7 +70,7 @@ pub fn ensure_tokenizer_cached() -> PathBuf {
         println!("Downloading TinyLlama tokenizer from HuggingFace...");
 
         // Use blocking reqwest client since we're in tests/benchmarks
-        let client = reqwest::blocking::Client::new();
+        let client = http_client();
         let response = client
             .get(TINYLLAMA_TOKENIZER_URL)
             .send()
@@ -126,7 +152,7 @@ pub fn ensure_kimi_k3_cached() -> PathBuf {
             continue;
         }
         println!("Downloading Kimi-K3 {file} from HuggingFace...");
-        let client = reqwest::blocking::Client::new();
+        let client = http_client();
         let response = client
             .get(format!("{KIMI_K3_REPO}/{file}"))
             .send()
@@ -167,41 +193,47 @@ const DEEPSEEK_V41_REPO: &str =
     "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash/resolve/main";
 const DEEPSEEK_V41_CACHE_DIR: &str = ".tokenizer_cache/deepseek_v41";
 
-/// Downloads one DeepSeek-V4.1 tokenizer file from `base` into `dir/file`,
-/// mirroring the Kimi-K3 helper's approach: write to a `.part` file and
-/// rename into place, so a failed write never leaves a short file that a
-/// later run would trust. Only a transport failure (no connection, TLS,
-/// timeout) returns `false` so the caller can skip when offline; a reachable
-/// but wrong response (non-success status, short body) or an unwritable
-/// cache panics with the reason, so a moved or gated file fails loudly
-/// instead of silently disabling the parity gate.
+/// Downloads one tokenizer file of the model `label` from `base` into
+/// `dir/file`, mirroring the Kimi-K3 helper's approach: write to a `.part`
+/// file and rename into place, so a failed write never leaves a short file
+/// that a later run would trust. Only a transport failure (no connection,
+/// TLS, timeout) returns `false` so the caller can skip when offline; a
+/// reachable but wrong response (non-success status, short body) or an
+/// unwritable cache panics with the reason, so a moved or gated file fails
+/// loudly instead of silently disabling the parity gate.
 #[expect(
     clippy::print_stdout,
     clippy::panic,
     reason = "test helper — diagnostics and loud failures are intentional"
 )]
-fn download_deepseek_v41_file(base: &str, dir: &Path, file: &str, min_bytes: usize) -> bool {
-    println!("Downloading DeepSeek-V4.1 {file} from HuggingFace...");
-    let client = reqwest::blocking::Client::new();
+fn download_tokenizer_file(
+    label: &str,
+    base: &str,
+    dir: &Path,
+    file: &str,
+    min_bytes: usize,
+) -> bool {
+    println!("Downloading {label} {file} from HuggingFace...");
+    let client = http_client();
     let url = format!("{base}/{file}");
     let response = match client.get(&url).send() {
         Ok(response) => response,
         Err(error) => {
-            println!("DeepSeek-V4.1 download skipped (transport error): {error}");
+            println!("{label} download skipped (transport error): {error}");
             return false;
         }
     };
     let status = response.status();
     assert!(
         status.is_success(),
-        "DeepSeek-V4.1 {file} download failed: HTTP {status} from {url}"
+        "{label} {file} download failed: HTTP {status} from {url}"
     );
     let content = response
         .bytes()
-        .unwrap_or_else(|error| panic!("DeepSeek-V4.1 {file} download body error: {error}"));
+        .unwrap_or_else(|error| panic!("{label} {file} download body error: {error}"));
     assert!(
         content.len() >= min_bytes,
-        "DeepSeek-V4.1 {file} download is {} bytes, expected at least {min_bytes}",
+        "{label} {file} download is {} bytes, expected at least {min_bytes}",
         content.len()
     );
     let part = dir.join(format!("{file}.part"));
@@ -215,6 +247,8 @@ fn download_deepseek_v41_file(base: &str, dir: &Path, file: &str, min_bytes: usi
 /// A directory holding the DeepSeek-V4.1-Flash tokenizer files
 /// (`tokenizer.json`, `tokenizer_config.json`) plus a minimal `config.json`
 /// naming the architecture so renderer detection selects DeepSeek-V4.1.
+/// Without the checkpoint's `encoding/` directory the renderer uses the
+/// rescaled effort table the checkpoint carries today.
 ///
 /// `DEEPSEEK_V41_MODEL_DIR` points at a full checkpoint directory and skips
 /// the download; otherwise the two tokenizer files are fetched once from the
@@ -249,7 +283,13 @@ pub fn ensure_deepseek_v41_cached() -> Option<PathBuf> {
         if path.exists() {
             continue;
         }
-        if !download_deepseek_v41_file(DEEPSEEK_V41_REPO, &cache_dir, file, min_bytes) {
+        if !download_tokenizer_file(
+            "DeepSeek-V4.1",
+            DEEPSEEK_V41_REPO,
+            &cache_dir,
+            file,
+            min_bytes,
+        ) {
             return None;
         }
     }
@@ -264,6 +304,115 @@ pub fn ensure_deepseek_v41_cached() -> Option<PathBuf> {
             r#"{"architectures":["DeepseekV41ForCausalLM"],"model_type":"deepseek_v41","image_token_id":129264}"#,
         )
         .unwrap_or_else(|error| panic!("cannot write {}: {error}", config_path.display()));
+    }
+
+    Some(cache_dir)
+}
+
+const DEEPSEEK_V4_REPO: &str =
+    "https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731/resolve/main";
+const DEEPSEEK_V4_CACHE_DIR: &str = ".tokenizer_cache/deepseek_v4";
+
+/// A directory holding the DeepSeek-V4 tokenizer files (`tokenizer.json`,
+/// `tokenizer_config.json`; identical across the V4 checkpoints) plus a
+/// minimal `config.json` naming the architecture so renderer detection
+/// selects DeepSeek-V4. Without the checkpoint's `encoding/` directory the
+/// renderer uses the effort table the engine's own server renders.
+///
+/// `DEEPSEEK_V4_MODEL_DIR` points at a full checkpoint directory and skips
+/// the download; otherwise the two tokenizer files are fetched once from the
+/// public repository into `.tokenizer_cache/deepseek_v4/`. Returns `None`
+/// only when offline (the repository is unreachable) and no override is set;
+/// a local failure (unwritable cache directory or file) panics so the parity
+/// gate cannot be skipped silently.
+#[expect(
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "test helper — panics are intentional"
+)]
+pub fn ensure_deepseek_v4_cached() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("DEEPSEEK_V4_MODEL_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+
+    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
+    let _guard = mutex.lock().unwrap();
+
+    let cache_dir = PathBuf::from(DEEPSEEK_V4_CACHE_DIR);
+    if !cache_dir.exists() {
+        fs::create_dir_all(&cache_dir)
+            .unwrap_or_else(|error| panic!("cannot create {}: {error}", cache_dir.display()));
+    }
+
+    for (file, min_bytes) in [
+        ("tokenizer.json", 1_000_000),
+        ("tokenizer_config.json", 500),
+    ] {
+        let path = cache_dir.join(file);
+        if path.exists() {
+            continue;
+        }
+        if !download_tokenizer_file("DeepSeek-V4", DEEPSEEK_V4_REPO, &cache_dir, file, min_bytes) {
+            return None;
+        }
+    }
+
+    let config_path = cache_dir.join("config.json");
+    if !config_path.exists() {
+        fs::write(
+            &config_path,
+            r#"{"architectures":["DeepseekV4ForCausalLM"],"model_type":"deepseek_v4"}"#,
+        )
+        .unwrap_or_else(|error| panic!("cannot write {}: {error}", config_path.display()));
+    }
+
+    Some(cache_dir)
+}
+
+const MINIMAX_M3_REPO: &str =
+    "https://huggingface.co/MiniMaxAI/MiniMax-M3/resolve/f0e1c1e04d40177e4673a22097036854f536e9c0";
+const MINIMAX_M3_CACHE_DIR: &str = ".tokenizer_cache/minimax_m3";
+
+/// A directory holding the MiniMax-M3 tokenizer files (`tokenizer.json`,
+/// `tokenizer_config.json`) at the revision the render fixtures were recorded
+/// from.
+///
+/// `MINIMAX_M3_MODEL_DIR` points at a full checkpoint directory and skips the
+/// download; otherwise the two files are fetched once from the public
+/// repository into `.tokenizer_cache/minimax_m3/`. Returns `None` only when
+/// offline (the repository is unreachable) and no override is set; a local
+/// failure (unwritable cache directory or file) panics so the parity gate
+/// cannot be skipped silently.
+#[expect(
+    clippy::unwrap_used,
+    clippy::panic,
+    reason = "test helper — panics are intentional"
+)]
+pub fn ensure_minimax_m3_cached() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("MINIMAX_M3_MODEL_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+
+    let mutex = DOWNLOAD_MUTEX.get_or_init(|| Mutex::new(()));
+    let _guard = mutex.lock().unwrap();
+
+    let cache_dir = PathBuf::from(MINIMAX_M3_CACHE_DIR);
+    if !cache_dir.exists() {
+        fs::create_dir_all(&cache_dir)
+            .unwrap_or_else(|error| panic!("cannot create {}: {error}", cache_dir.display()));
+    }
+
+    for (file, min_bytes) in [
+        ("tokenizer.json", 9_000_000),
+        ("tokenizer_config.json", 500),
+    ] {
+        let path = cache_dir.join(file);
+        if path.exists() {
+            continue;
+        }
+        if !download_tokenizer_file("MiniMax-M3", MINIMAX_M3_REPO, &cache_dir, file, min_bytes) {
+            return None;
+        }
     }
 
     Some(cache_dir)

@@ -22,6 +22,7 @@ use crate::{
     routers::grpc::{
         client::{
             GenerateRequestBuildOptions, GrpcClient, HealthCheckResponse, ModelInfo, ServerInfo,
+            TokenSpeedMmBuilder, TokenSpeedPlainBuilder, VllmMmBuilder, VllmPlainBuilder,
         },
         common::stages::helpers,
         proto_wrapper::{
@@ -51,29 +52,9 @@ struct ZmqBuilders<V, T, S> {
     sglang: S,
 }
 
-/// A vLLM builder for a request kind carrying multimodal inputs and tool
-/// constraints (chat, messages).
-type VllmMmBuilder<B> = fn(
-    String,
-    &B,
-    String,
-    Vec<u32>,
-    Option<vllm_proto::MultimodalInputs>,
-    Option<(String, String)>,
-) -> Result<vllm_proto::GenerateRequest, String>;
-
-/// The TokenSpeed counterpart of [`VllmMmBuilder`].
-type TokenSpeedMmBuilder<B> = fn(
-    String,
-    &B,
-    String,
-    Vec<u32>,
-    Option<tokenspeed_proto::MultimodalInputs>,
-    Option<(String, String)>,
-) -> Result<tokenspeed_proto::GenerateRequest, String>;
-
-/// The SGLang counterpart of [`VllmMmBuilder`]; its builders take the
-/// multimodal inputs and constraints bundled as options.
+/// The SGLang counterpart of [`VllmMmBuilder`] without a client; the
+/// `_parts` builders take the multimodal inputs and constraints bundled as
+/// options.
 type SglangMmBuilder<B> = fn(
     String,
     &B,
@@ -82,17 +63,7 @@ type SglangMmBuilder<B> = fn(
     SglangGenerateRequestOptions,
 ) -> Result<sglang_proto::GenerateRequest, String>;
 
-/// A vLLM builder for a request kind with neither multimodal inputs nor tool
-/// constraints (completion, plain generate); `T` is the builder's text
-/// parameter.
-type VllmPlainBuilder<B, T> =
-    fn(String, &B, T, Vec<u32>) -> Result<vllm_proto::GenerateRequest, String>;
-
-/// The TokenSpeed counterpart of [`VllmPlainBuilder`].
-type TokenSpeedPlainBuilder<B, T> =
-    fn(String, &B, T, Vec<u32>) -> Result<tokenspeed_proto::GenerateRequest, String>;
-
-/// The SGLang counterpart of [`VllmPlainBuilder`].
+/// The SGLang counterpart of [`VllmPlainBuilder`] without a client.
 type SglangPlainBuilder<B, T> =
     fn(String, &B, T, Vec<u32>) -> Result<sglang_proto::GenerateRequest, String>;
 
@@ -414,7 +385,7 @@ fn build_zmq_request<B>(
         ZmqDialect::Vllm => {
             let vllm_mm = zmq_vllm_mm(options.multimodal_inputs)?;
             // The ZMQ wire carries one modality batch (see `zmq_vllm_mm`).
-            finish_vllm_request(vllm_mm.map(|mm| (mm, Vec::new())), |mm| {
+            let mut request = finish_vllm_request(vllm_mm.map(|mm| (mm, Vec::new())), |mm| {
                 vllm(
                     request_id,
                     body,
@@ -423,7 +394,9 @@ fn build_zmq_request<B>(
                     mm,
                     options.tool_constraints,
                 )
-            })
+            })?;
+            request.set_grammar_from_first_token(options.first_token_grammar);
+            Ok(request)
         }
         ZmqDialect::TokenSpeed => {
             let tokenspeed_mm = zmq_tokenspeed_mm(options.multimodal_inputs)?;
@@ -439,6 +412,13 @@ fn build_zmq_request<B>(
             })
         }
         // SGLang tensors ride inline (no SHM handles to release on failure).
+        // A grammar led with the thought for the first token needs no
+        // reasoning phase in front of it: the engine's grammar manager wraps
+        // its reasoner around a request's grammar only when the request asks
+        // for reasoning, and the gateway's own link cannot tell whether the
+        // engine runs one, so the request does not ask where the tag has the
+        // thought already. The engine's own reasoning-token count follows the
+        // flag; the gateway's parser fills in the count where it runs.
         ZmqDialect::Sglang => {
             let sglang_mm = zmq_sglang_mm(options.multimodal_inputs)?;
             let req = sglang(
@@ -449,7 +429,7 @@ fn build_zmq_request<B>(
                 SglangGenerateRequestOptions {
                     multimodal_inputs: sglang_mm,
                     tool_call_constraint: options.tool_constraints,
-                    require_reasoning: options.require_reasoning,
+                    require_reasoning: options.require_reasoning && !options.first_token_grammar,
                 },
             )?;
             Ok(ProtoGenerateRequest::Sglang(Box::new(req)))

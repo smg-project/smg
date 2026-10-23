@@ -132,9 +132,9 @@ message GenerateRequest {
   optional KvBootstrapInfo kv_bootstrap_info = 11;
 
   // Hard-pin to a specific attention-DP rank, bypassing load balancing.
-  // Disaggregation engines ignore a conflicting pin — the bootstrap_room
-  // residue (room % dp_size) stays the authoritative rank carrier. Only
-  // forwarded when the engine advertises attention-DP support (dp_size label).
+  // Each PD side carries its selected rank. The bootstrap_room still identifies
+  // the prefill KV source. Older engines without PD pin support ignore this
+  // field in disaggregation mode and dispatch by the room residue instead.
   optional int32 data_parallel_rank = 12;
 }
 
@@ -363,6 +363,13 @@ message GetServerInfoResponse {
 
   string tokenspeed_version = 7;
   google.protobuf.Timestamp start_time = 8;
+
+  // When the gateway hands this engine a grammar: "always" for a model read
+  // through one on every turn, "requested" for a grammar only when the request
+  // asks (a forced tool choice or a JSON response format), "" when the engine
+  // does not say, which the gateway treats as "requested". Flattened into the
+  // `constrained_decoding` worker label.
+  string constrained_decoding = 9;
 }
 
 // =====================
@@ -389,6 +396,8 @@ message SchedulerLoad {
   int32 num_running_reqs = 2;
   int32 num_waiting_reqs = 3;
   int32 num_total_reqs = 4;
+  // Native LCM caches express allocator occupancy as a token-budget equivalent;
+  // this is not an exact cached-token count. Legacy token-page engines use tokens.
   int32 num_used_tokens = 5;
   int32 max_total_num_tokens = 6;
   int32 max_running_requests = 7;
@@ -401,6 +410,9 @@ message SchedulerLoad {
   int32 num_waiting_uncached_tokens = 14;
 
   double token_usage = 8;
+  // Non-evictable KV occupancy. Retained prefix cache is reclaimable and must
+  // not make an otherwise idle worker appear overloaded. Absent on old workers.
+  optional double active_token_usage = 15;
   double gen_throughput = 9;
   double cache_hit_rate = 10;
   double utilization = 11;

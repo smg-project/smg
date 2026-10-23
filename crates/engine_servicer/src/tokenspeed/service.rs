@@ -35,6 +35,7 @@ impl TokenSpeedScheduler for TokenSpeedService {
     ) -> Result<Response<Self::GenerateStream>, Status> {
         generate::generate(&self.state, request.into_inner())
             .await
+            .inspect_err(|status| self.state.metrics.request_not_started(status))
             .map(Response::new)
     }
 

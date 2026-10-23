@@ -1,7 +1,7 @@
 //! Admission control for disaggregated (PD) dispatch, bounded by the decode
 //! engine's running window.
 //!
-//! SGLang-lineage engines start a bootstrap deadline on the prefill leg the
+//! SGLang-lineage engines start a bootstrap deadline on the prefill side the
 //! moment a request lands, and it clears only once the decode scheduler has
 //! *admitted* that request and answered with its KV manifest. Decode admission
 //! is bounded by the engine's running window (`--max-num-seqs` /
@@ -22,9 +22,29 @@
 //! them. Reading the in-flight count and then sending would let two dispatches
 //! both take the last free room, which is the burst this exists to stop.
 //!
+//! The wait is first come, first served. A dispatch takes a place in the
+//! decode worker's queue the moment it arrives ([`Worker::pd_enqueue`]) and
+//! claims only while no older place needs as few rooms as it does, so a room
+//! that frees goes to the request that has waited longest for one — not to
+//! whichever attempt happens to run first, which under a steady arrival rate
+//! is a newcomer's first try, made before any sleeping waiter wakes; a waiter
+//! that lost that race once kept losing it until the budget shed it. A
+//! request that needs more rooms than the ones behind it (a fan-out, a
+//! batch) does not hold them back while its rooms free one at a time: they
+//! pass it, and it claims when its rooms are free together, as before. The
+//! place is given back on every way out of the wait: a claim, the shed, a
+//! dispatch dropped mid-wait. The worker wakes the waits that may claim when
+//! rooms are released or a place ahead of them leaves, so the right one
+//! claims the moment it can; the queue and its notifiers live on the worker
+//! with its rooms, not in a registry of their own, and a request that finds
+//! nobody waiting still claims at once.
+//!
 //! Nothing here runs when the engine does not report a window: admission is
 //! not the gateway's to decide then, and dispatch behaves exactly as it did
-//! before this module existed.
+//! before this module existed. That is said once, loudly, when such a decode
+//! worker registers (`announce_decode_window`), and the window itself is
+//! published per worker, so a gate that is off is a value an operator can
+//! read rather than an absence of series.
 
 use std::{
     sync::{
@@ -35,23 +55,31 @@ use std::{
 };
 
 use axum::response::Response;
-use tokio::time::Instant;
-use tracing::debug;
+use tokio::{sync::Notify, time::Instant};
+use tracing::{debug, warn};
 
-use crate::{observability::metrics::Metrics, routers::common::overload, worker::Worker};
+use crate::{
+    observability::metrics::Metrics,
+    routers::common::overload,
+    worker::{Worker, WorkerType},
+};
 
 /// Default seconds a PD dispatch may wait for decode rooms. Well under the
-/// engines' bootstrap deadline (120 s on TokenSpeed), so a request that does
+/// engines' bootstrap deadline (120 s on one engine), so a request that does
 /// wait still dispatches with the whole deadline ahead of it.
 pub const DEFAULT_PD_ADMISSION_WAIT_SECS: u64 = 30;
 
-/// How often the wait retries its claim.
+/// How often the wait retries its claim when nothing wakes it.
 ///
-/// Polling, not a notifier: the event we would signal is a PD admission guard
-/// dropping, and a per-worker registry of notifiers would be process-wide
-/// mutable state with its own eviction problem. 50 ms is far finer than both
-/// the engine step that actually frees a room and the wait deadline below,
-/// and the sleep is asynchronous — a waiting request occupies no thread.
+/// The worker wakes the waits that may claim whenever rooms are released or
+/// a place ahead of them leaves ([`Worker::pd_wake`]), so the right waiter
+/// normally claims the moment it can and a freed room does not idle for a
+/// retry interval under a full window. The retry stays as the backstop — a
+/// worker without notifiers, and the deadline check: 50 ms is far finer than
+/// both the engine step that actually frees a room and the wait deadline
+/// below, and the sleep is asynchronous — a waiting request occupies no
+/// thread. The notifiers live on the worker with its rooms; there is no
+/// registry of them outside it, with the eviction problem that would bring.
 const CLAIM_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Seconds a PD dispatch waits for decode rooms before shedding.
@@ -74,8 +102,8 @@ fn admission_wait() -> Duration {
 /// A claim on `rooms` slots in the decode engine's running window.
 ///
 /// Rides in the dispatch's `LoadGuards`, so the rooms are released on every
-/// path the dispatch can end on: an error before the legs go out, a failed
-/// leg, a client disconnect mid-stream, a retry that re-selects, or normal
+/// path the dispatch can end on: an error before the sides go out, a failed
+/// side, a client disconnect mid-stream, a retry that re-selects, or normal
 /// completion.
 pub(crate) struct PdAdmissionGuard {
     worker: Arc<dyn Worker>,
@@ -97,6 +125,43 @@ impl std::fmt::Debug for PdAdmissionGuard {
     }
 }
 
+/// A place in the decode worker's admission queue ([`Worker::pd_enqueue`]),
+/// taken when the dispatch arrives and given back however its wait ends: a
+/// claim, the shed at the deadline, or the dispatch dropped mid-wait (its
+/// client gone). A place may claim only while no older one needs as few
+/// rooms, which is what makes the wait first come, first served; giving the
+/// place back promptly is what lets the next one through.
+struct Place<'a> {
+    worker: &'a dyn Worker,
+    place: u64,
+}
+
+impl<'a> Place<'a> {
+    fn take(worker: &'a dyn Worker, rooms: usize) -> Self {
+        Self {
+            worker,
+            place: worker.pd_enqueue(rooms),
+        }
+    }
+
+    /// Whether no older place still waiting needs as few rooms as this one:
+    /// the gate lets it claim only then.
+    fn may_claim(&self) -> bool {
+        self.worker.pd_may_claim(self.place)
+    }
+
+    /// The notifier the worker fires when this place is worth a new try.
+    fn wake(&self) -> Option<Arc<Notify>> {
+        self.worker.pd_wake(self.place)
+    }
+}
+
+impl Drop for Place<'_> {
+    fn drop(&mut self) {
+        self.worker.pd_dequeue(self.place);
+    }
+}
+
 /// How a claim was obtained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Claim {
@@ -108,29 +173,47 @@ enum Claim {
     Refused,
 }
 
-/// Retry `try_claim` until it succeeds or `wait` elapses.
+/// Retry `try_claim` until it succeeds or `wait` elapses: again as soon as
+/// `wake` fires, and at least every [`CLAIM_RETRY_INTERVAL`].
 ///
 /// The claim itself is what makes admission safe under concurrency, so this
 /// never reads a count: every attempt is the same all-or-nothing reservation,
 /// and the first one to succeed owns the rooms.
-async fn claim_within(wait: Duration, try_claim: impl Fn() -> bool) -> Claim {
-    if try_claim() {
-        return Claim::Immediate;
-    }
+async fn claim_within(
+    wait: Duration,
+    wake: Option<&Notify>,
+    try_claim: impl Fn() -> bool,
+) -> Claim {
     let deadline = Instant::now() + wait;
+    let mut first = true;
     loop {
+        // Registered before the try, so a room released between this try and
+        // the wait below still wakes it.
+        let woken = wake.map(Notify::notified);
+        if try_claim() {
+            return if first {
+                Claim::Immediate
+            } else {
+                Claim::Waited
+            };
+        }
+        first = false;
         let now = Instant::now();
         if now >= deadline {
             return Claim::Refused;
         }
-        tokio::time::sleep(CLAIM_RETRY_INTERVAL.min(deadline - now)).await;
-        if try_claim() {
-            return Claim::Waited;
+        let retry = tokio::time::sleep(CLAIM_RETRY_INTERVAL.min(deadline - now));
+        match woken {
+            Some(woken) => tokio::select! {
+                () = woken => {}
+                () = retry => {}
+            },
+            None => retry.await,
         }
     }
 }
 
-/// Gate one disaggregated dispatch on the decode leg's admission window,
+/// Gate one disaggregated dispatch on the decode side's admission window,
 /// claiming the `rooms` bootstrap rooms it is about to post.
 ///
 /// `Ok(Some(guard))` holds the claim; `Ok(None)` means the engine reports no
@@ -167,7 +250,19 @@ pub(crate) async fn admit_decode(
     }
 
     let wait = admission_wait();
-    let claim = claim_within(wait, || decode.try_admit_pd(rooms, window)).await;
+    // The place is taken before the first try, so a request that arrives
+    // while others of its size (or narrower) wait joins behind them even
+    // when a room happens to be free, and one that finds nobody it must
+    // yield to claims without a wait, as before. The guard gives the place
+    // back on every way out of the wait, the dispatch dropped mid-wait
+    // included.
+    let place = Place::take(decode.as_ref(), rooms);
+    let wake = place.wake();
+    let claim = claim_within(wait, wake.as_deref(), || {
+        place.may_claim() && decode.try_admit_pd(rooms, window)
+    })
+    .await;
+    drop(place);
     match claim {
         Claim::Immediate => Ok(Some(PdAdmissionGuard {
             worker: Arc::clone(decode),
@@ -205,9 +300,41 @@ pub(crate) async fn admit_decode(
     }
 }
 
+/// Announce a decode worker's admission bound as it registers.
+///
+/// `admit_decode` abstains for a worker that reports no window, which used to
+/// be invisible: the admission families only appear once the gate acts, so an
+/// operator who turned on PD in front of such engines saw no series and
+/// believed the bound existed (the vLLM servicer reported no window at all
+/// until it advertised `max_num_seqs`). Say it once where the worker joins,
+/// and publish the window (`smg_pd_admission_window`, 0 for none) so "off" is
+/// a number on the scrape. Workers of any other type are not the gate's.
+pub(crate) fn announce_decode_window(worker: &dyn Worker) {
+    if !matches!(worker.worker_type(), WorkerType::Decode) {
+        return;
+    }
+    let window = worker.max_running_requests();
+    Metrics::set_pd_admission_window(worker.url(), window);
+    match window {
+        Some(window) => debug!(
+            worker = worker.url(),
+            window, "PD admission bounds dispatch to this decode worker by its running window"
+        ),
+        None => warn!(
+            worker = worker.url(),
+            "PD admission is off for this decode worker: it reports no running window (no \
+             `max_num_seqs` or `max_running_requests` label), so a burst wider than its \
+             scheduler runs at once queues at the engine instead of waiting at the gateway"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        Mutex,
+    };
 
     use axum::http::{header::RETRY_AFTER, StatusCode};
     use futures::future::join_all;
@@ -354,7 +481,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(500)).await;
             claimed.store(0, AtomicOrdering::SeqCst);
         };
-        let gate = claim_within(Duration::from_secs(30), || {
+        let gate = claim_within(Duration::from_secs(30), None, || {
             claimed
                 .compare_exchange(0, 1, AtomicOrdering::SeqCst, AtomicOrdering::SeqCst)
                 .is_ok()
@@ -369,7 +496,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_full_window_sheds_at_the_deadline() {
         let started = Instant::now();
-        let claim = claim_within(Duration::from_secs(30), || false).await;
+        let claim = claim_within(Duration::from_secs(30), None, || false).await;
         assert_eq!(claim, Claim::Refused);
         assert!(
             started.elapsed() >= Duration::from_secs(30),
@@ -382,9 +509,271 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_zero_wait_sheds_without_sleeping() {
         let started = Instant::now();
-        let claim = claim_within(Duration::ZERO, || false).await;
+        let claim = claim_within(Duration::ZERO, None, || false).await;
         assert_eq!(claim, Claim::Refused);
         assert_eq!(started.elapsed(), Duration::ZERO);
+    }
+
+    /// A decode worker that reports no window is announced once, as a WARN,
+    /// with the gauge at zero; one that reports a window publishes it.
+    #[tracing_test::traced_test]
+    #[test]
+    fn an_unreported_window_is_announced_and_published_as_zero() {
+        use crate::observability::metrics::test_support::render_with_recorder;
+
+        let rendered = render_with_recorder(|| {
+            announce_decode_window(decode_worker("grpc://127.0.0.1:9907", None).as_ref());
+            announce_decode_window(decode_worker("grpc://127.0.0.1:9908", Some(64)).as_ref());
+        });
+        logs_assert(|lines: &[&str]| {
+            let warned: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.contains("PD admission is off for this decode worker"))
+                .collect();
+            match warned.as_slice() {
+                [line] if line.contains("grpc://127.0.0.1:9907") => Ok(()),
+                _ => Err(format!(
+                    "one warning, for the worker without a window, expected: {warned:?}"
+                )),
+            }
+        });
+        for (worker, value) in [("9907", " 0"), ("9908", " 64")] {
+            let line = rendered
+                .lines()
+                .find(|line| {
+                    line.starts_with("smg_pd_admission_window{")
+                        && line.contains(&format!("worker=\"grpc://127.0.0.1:{worker}\""))
+                })
+                .unwrap_or_else(|| panic!("no window gauge for {worker}:\n{rendered}"));
+            assert!(line.ends_with(value), "{line}");
+        }
+    }
+
+    /// Only decode workers carry the gate's window; a prefill worker without
+    /// one is not announced.
+    #[tracing_test::traced_test]
+    #[test]
+    fn only_decode_workers_are_announced() {
+        use crate::observability::metrics::test_support::render_with_recorder;
+
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://127.0.0.1:9909")
+                .model(ModelCard::new("m"))
+                .worker_type(WorkerType::Prefill)
+                .connection_mode(ConnectionMode::Grpc)
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build(),
+        );
+        let rendered = render_with_recorder(|| announce_decode_window(prefill.as_ref()));
+        assert!(!logs_contain("PD admission is off"));
+        assert!(!rendered.contains("smg_pd_admission_window{"), "{rendered}");
+    }
+
+    /// A room that frees goes to the request that has waited longest. With
+    /// the window full and two requests waiting, a newcomer that tries in the
+    /// instant the room frees — before either sleeping waiter wakes — claims
+    /// nothing: the first waiter is admitted, then the second, then the
+    /// newcomer.
+    #[tokio::test(start_paused = true)]
+    async fn a_freed_room_goes_to_the_oldest_waiter_not_to_a_newcomer() {
+        let decode = decode_worker("grpc://127.0.0.1:9910", Some(1));
+        let order = Mutex::new(Vec::new());
+        let holder = admit_decode(&decode, "m", 1)
+            .await
+            .expect("no shed")
+            .expect("a claim");
+
+        // Arrive after `at`; once admitted, hold the room a moment so who
+        // comes next is observable.
+        async fn arrive(
+            decode: &Arc<dyn Worker>,
+            order: &Mutex<Vec<&'static str>>,
+            name: &'static str,
+            at: Duration,
+        ) {
+            tokio::time::sleep(at).await;
+            let admission = admit_decode(decode, "m", 1)
+                .await
+                .expect("no shed")
+                .expect("a claim");
+            order.lock().unwrap().push(name);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            drop(admission);
+        }
+        // The room frees at 20 ms, and the newcomer tries in that same
+        // instant: well inside both waiters' retry interval.
+        let free_the_room = async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(holder);
+        };
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            futures::future::join4(
+                arrive(&decode, &order, "first waiter", Duration::ZERO),
+                arrive(&decode, &order, "second waiter", Duration::from_millis(10)),
+                free_the_room,
+                arrive(&decode, &order, "newcomer", Duration::from_millis(20)),
+            ),
+        )
+        .await
+        .expect("everyone is admitted well within the budget");
+
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["first waiter", "second waiter", "newcomer"],
+            "rooms are handed out in arrival order"
+        );
+        assert_eq!(decode.pd_admitted(), 0);
+    }
+
+    /// A dispatch that stops waiting (its client went away) gives its place
+    /// back: the waiter behind it is served when the room frees, not left
+    /// behind a place nobody holds until the budget sheds it.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiter_that_stops_waiting_gives_its_place_to_the_next() {
+        let decode = decode_worker("grpc://127.0.0.1:9911", Some(1));
+        let holder = admit_decode(&decode, "m", 1)
+            .await
+            .expect("no shed")
+            .expect("a claim");
+
+        // Both take their places with the window full; then the first is
+        // dropped mid-wait.
+        let mut abandoned = Box::pin(admit_decode(&decode, "m", 1));
+        assert!(futures::poll!(abandoned.as_mut()).is_pending());
+        let mut behind = Box::pin(admit_decode(&decode, "m", 1));
+        assert!(futures::poll!(behind.as_mut()).is_pending());
+        drop(abandoned);
+
+        drop(holder);
+        let started = Instant::now();
+        let admission = tokio::time::timeout(Duration::from_secs(5), behind)
+            .await
+            .expect("served, not stuck behind a place nobody holds")
+            .expect("no shed")
+            .expect("a claim");
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "woken by the release, not served at a later retry"
+        );
+        drop(admission);
+    }
+
+    /// A room released wakes the oldest waiter at once: it claims without
+    /// waiting for its next retry, so a freed room does not idle under a full
+    /// window.
+    #[tokio::test(start_paused = true)]
+    async fn a_released_room_wakes_the_oldest_waiter_at_once() {
+        let decode = decode_worker("grpc://127.0.0.1:9913", Some(1));
+        let holder = admit_decode(&decode, "m", 1)
+            .await
+            .expect("no shed")
+            .expect("a claim");
+        let mut waiter = Box::pin(admit_decode(&decode, "m", 1));
+        assert!(
+            futures::poll!(waiter.as_mut()).is_pending(),
+            "the window is full"
+        );
+
+        drop(holder);
+        let started = Instant::now();
+        let admission = waiter.await.expect("no shed").expect("a claim");
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "woken by the release, not by the retry interval"
+        );
+        drop(admission);
+    }
+
+    /// A request that needs more rooms than are free does not hold back the
+    /// narrower requests behind it: they take the rooms that free one at a
+    /// time, and the wide request claims when its rooms are free together.
+    #[tokio::test(start_paused = true)]
+    async fn a_wide_request_at_the_front_does_not_hold_back_the_narrow_ones_behind_it() {
+        let decode = decode_worker("grpc://127.0.0.1:9914", Some(2));
+        let first_room = admit_decode(&decode, "m", 1)
+            .await
+            .expect("no shed")
+            .expect("a claim");
+        let second_room = admit_decode(&decode, "m", 1)
+            .await
+            .expect("no shed")
+            .expect("a claim");
+
+        // The wide request is the oldest waiter, a narrow one behind it.
+        let mut wide = Box::pin(admit_decode(&decode, "m", 2));
+        assert!(futures::poll!(wide.as_mut()).is_pending());
+        let mut narrow = Box::pin(admit_decode(&decode, "m", 1));
+        assert!(futures::poll!(narrow.as_mut()).is_pending());
+
+        // One room frees: the narrow request takes it, the wide one waits on.
+        drop(first_room);
+        let narrow = tokio::time::timeout(Duration::from_secs(5), narrow)
+            .await
+            .expect("the narrow request is not held back by the wide one")
+            .expect("no shed")
+            .expect("a claim");
+        assert!(
+            futures::poll!(wide.as_mut()).is_pending(),
+            "two rooms are not free together yet"
+        );
+        assert_eq!(decode.pd_admitted(), 2);
+
+        // The other held room frees: still one room free, the wide one waits.
+        drop(second_room);
+        assert!(futures::poll!(wide.as_mut()).is_pending());
+
+        // The narrow request ends: its rooms are free together, it claims.
+        drop(narrow);
+        let wide = tokio::time::timeout(Duration::from_secs(5), wide)
+            .await
+            .expect("the wide request claims once its rooms are free together")
+            .expect("no shed")
+            .expect("a claim");
+        assert_eq!(decode.pd_admitted(), 2);
+        drop(wide);
+    }
+
+    /// The budget is still the bound: a waiter whose room never frees sheds
+    /// at the deadline, and its place goes with it, so the next request that
+    /// finds the room free claims it at once.
+    #[tokio::test(start_paused = true)]
+    async fn the_shed_at_the_deadline_gives_the_place_back() {
+        set_pd_admission_wait_secs(1);
+        let decode = decode_worker("grpc://127.0.0.1:9912", Some(1));
+        let holder = admit_decode(&decode, "m", 1)
+            .await
+            .expect("no shed")
+            .expect("a claim");
+
+        let started = Instant::now();
+        let response = admit_decode(&decode, "m", 1)
+            .await
+            .expect_err("a room that never frees sheds");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "the shed waits out the budget"
+        );
+
+        drop(holder);
+        let started = Instant::now();
+        let admission = admit_decode(&decode, "m", 1)
+            .await
+            .expect("no shed")
+            .expect("a claim");
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "a shed waiter holds no place"
+        );
+        drop(admission);
+        set_pd_admission_wait_secs(DEFAULT_PD_ADMISSION_WAIT_SECS);
     }
 
     /// The shed is the overload guard's 503, terminal for the retry layer and

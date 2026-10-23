@@ -1,0 +1,35 @@
+{
+  "id": "k3_tool_choice_none",
+  "request": {
+    "messages": [
+      {
+        "role": "user",
+        "content": "北京天气怎么样？"
+      }
+    ],
+    "reasoning_effort": "max",
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Get weather for a city",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "location": {
+                "type": "string",
+                "description": "City name"
+              }
+            },
+            "required": [
+              "location"
+            ]
+          }
+        }
+      }
+    ],
+    "tool_choice": "none"
+  },
+  "expected_prompt_tokens": 209
+}

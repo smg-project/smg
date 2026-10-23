@@ -13,6 +13,8 @@ use llm_multimodal::{
     TrackedMedia,
 };
 
+mod common;
+
 fn fixtures() -> Vec<String> {
     (0..70)
         .map(|index| {
@@ -37,8 +39,11 @@ fn fixtures() -> Vec<String> {
 async fn image_data_url_tracker() {
     let urls = fixtures();
     let connector = Arc::new(
-        MediaConnector::new(reqwest::Client::new(), MediaConnectorConfig::default())
-            .expect("connector"),
+        MediaConnector::new(
+            common::http_client_builder(),
+            MediaConnectorConfig::default(),
+        )
+        .expect("connector"),
     );
     for (count, unique) in [(1, 1), (8, 8), (32, 32), (70, 70), (70, 1)] {
         let url_bytes: usize = (0..count).map(|i| urls[i % unique].len()).sum();

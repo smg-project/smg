@@ -3,7 +3,7 @@
 //!
 //! serde_json only ships compact (`{"a":1}`) and pretty (multi-line) formatters,
 //! neither of which matches `json.dumps`. The DeepSeek V3.2/V4 prompt encoders
-//! embed tool schemas and argument values as JSON, and vLLM's reference encoder
+//! embed tool schemas and argument values as JSON, and the engine's reference encoder
 //! uses `json.dumps`, so compact output would shift the model off its training
 //! distribution. This adds just the spacing serde_json lacks.
 

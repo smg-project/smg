@@ -16,6 +16,7 @@ use crate::{
         state::{RequestState, StepResult},
     },
     header_utils::ApiProvider,
+    retry::{is_request_timeout, request_timeout_response},
 };
 
 /// POST the payload to the upstream worker and handle the response.
@@ -63,6 +64,15 @@ pub(crate) async fn non_stream_request_execution(
     // Send the request
     let response = match request_builder.send().await {
         Ok(r) => r,
+        // The request's own timeout is its end, not a worker fault to route
+        // around (see `request_timeout_response`).
+        Err(e) if is_request_timeout(&e) => {
+            worker.record_outcome(504);
+            tracing::warn!(url = %upstream_url, error = %e, "Request to worker timed out");
+            return Err(request_timeout_response(
+                "Upstream worker request timed out",
+            ));
+        }
         Err(e) => {
             let status = if e.is_timeout() { 504 } else { 502 };
             worker.record_outcome(status);
@@ -105,6 +115,12 @@ pub(crate) async fn non_stream_request_execution(
     // Parse response body
     let response_json: Value = match response.json().await {
         Ok(r) => r,
+        Err(e) if is_request_timeout(&e) => {
+            tracing::warn!(url = %upstream_url, error = %e, "Upstream response timed out");
+            return Err(request_timeout_response(
+                "Upstream worker response timed out",
+            ));
+        }
         Err(e) => {
             tracing::warn!(url = %upstream_url, error = %e, "Upstream returned invalid JSON");
             return Err(error::bad_gateway(

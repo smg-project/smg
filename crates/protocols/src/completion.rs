@@ -8,7 +8,7 @@ use super::{
     common::*,
     sampling_params::{validate_top_k_value, validate_top_p_value},
 };
-use crate::validated::Normalizable;
+use crate::{common::invalid, validated::Normalizable};
 
 // ============================================================================
 // Completions API (v1/completions) - DEPRECATED but still supported
@@ -18,7 +18,7 @@ use crate::validated::Normalizable;
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 #[validate(schema(function = "validate_completion_cross_parameters"))]
 pub struct CompletionRequest {
-    /// ID of the model to use (required for OpenAI, optional for some implementations, such as SGLang)
+    /// ID of the model to use (required for OpenAI, optional for some serving engines)
     pub model: String,
 
     /// The prompt(s) to generate completions for
@@ -41,7 +41,8 @@ pub struct CompletionRequest {
     pub logit_bias: Option<HashMap<String, f32>>,
 
     /// Include the log probabilities on the `logprobs` most likely tokens
-    #[validate(range(min = 0, max = 5))]
+    /// (0 to 20, as chat's `top_logprobs`)
+    #[validate(range(min = 0, max = 20))]
     pub logprobs: Option<u32>,
 
     /// The maximum number of tokens to generate
@@ -123,8 +124,9 @@ pub struct CompletionRequest {
     #[serde(default, skip_serializing_if = "is_false")]
     pub ignore_eos: bool,
 
-    /// Skip special tokens during detokenization
-    #[serde(default = "default_true")]
+    /// Skip special tokens during detokenization. Serialized only when
+    /// `false`: `true` is what the engine applies without the field.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub skip_special_tokens: bool,
 
     /// Path to LoRA adapter(s) for model customization
@@ -140,7 +142,7 @@ pub struct CompletionRequest {
     /// Sampling seed for deterministic outputs
     pub sampling_seed: Option<u64>,
 
-    /// Request ID forwarded to the backend for log correlation (SGLang extension)
+    /// Request ID forwarded to the backend for log correlation (an engine extension)
     pub rid: Option<String>,
 
     /// Additional fields including bootstrap info for PD routing
@@ -155,9 +157,7 @@ fn validate_completion_prompt(prompt: &StringOrArray) -> Result<(), validator::V
         StringOrArray::String(_) => {}
         StringOrArray::Array(arr) => {
             if arr.is_empty() {
-                let mut error = validator::ValidationError::new("prompt_empty");
-                error.message = Some("prompt array cannot be empty".into());
-                return Err(error);
+                return Err(invalid("prompt_empty", "prompt array cannot be empty"));
             }
         }
     }
@@ -169,46 +169,54 @@ fn validate_completion_cross_parameters(
     req: &CompletionRequest,
 ) -> Result<(), validator::ValidationError> {
     if req.stream_options.is_some() && !req.stream {
-        let mut error = validator::ValidationError::new("stream_options_requires_stream");
-        error.message =
-            Some("The 'stream_options' parameter is only allowed when 'stream' is enabled".into());
-        return Err(error);
+        return Err(invalid(
+            "stream_options_requires_stream",
+            "The 'stream_options' parameter is only allowed when 'stream' is enabled",
+        ));
     }
 
     if let (Some(min), Some(max)) = (req.min_tokens, req.max_tokens) {
         if min > max {
-            let mut error = validator::ValidationError::new("min_tokens_exceeds_max");
-            error.message = Some("min_tokens cannot exceed max_tokens".into());
-            return Err(error);
+            return Err(invalid(
+                "min_tokens_exceeds_max",
+                "min_tokens cannot exceed max_tokens",
+            ));
         }
     }
 
     let constraint_count =
         req.regex.is_some() as u8 + req.ebnf.is_some() as u8 + req.json_schema.is_some() as u8;
     if constraint_count > 1 {
-        let mut error = validator::ValidationError::new("multiple_constraints");
-        error.message = Some(
-            "only one structured output constraint (regex, ebnf, or json_schema) can be active at a time"
-                .into(),
-        );
-        return Err(error);
+        return Err(invalid(
+            "multiple_constraints",
+            "only one structured output constraint (regex, ebnf, or json_schema) can be active at a time",
+        ));
     }
 
     if let (Some(best_of), Some(n)) = (req.best_of, req.n) {
         if best_of <= n {
-            let mut error = validator::ValidationError::new("best_of_less_than_n");
-            error.message = Some("best_of must be greater than n".into());
-            return Err(error);
+            return Err(invalid(
+                "best_of_less_than_n",
+                "best_of must be greater than n",
+            ));
         }
     }
 
     if req.stream && req.best_of.is_some() {
-        let mut error = validator::ValidationError::new("best_of_not_supported_with_stream");
-        error.message = Some("best_of is not supported when stream is enabled".into());
-        return Err(error);
+        return Err(invalid(
+            "best_of_not_supported_with_stream",
+            "best_of is not supported when stream is enabled",
+        ));
     }
 
     Ok(())
+}
+
+impl CompletionRequest {
+    /// The choices per prompt the request asks for: `n`, one when absent or zero.
+    pub fn choices(&self) -> u32 {
+        self.n.filter(|&n| n > 0).unwrap_or(1)
+    }
 }
 
 impl GenerationRequest for CompletionRequest {
@@ -223,7 +231,7 @@ impl GenerationRequest for CompletionRequest {
     fn cache_partition(&self) -> CachePartition<'_> {
         CachePartition {
             // Engine extensions carried in the passthrough map, not typed
-            // fields: vLLM/SGLang `cache_salt`, SGLang `extra_key`.
+            // fields: the engines' `cache_salt`, one engine's `extra_key`.
             cache_salt: self.other.get("cache_salt").and_then(Value::as_str),
             extra_key: self.other.get("extra_key").and_then(Value::as_str),
             lora_path: self.lora_path.as_deref(),
@@ -305,10 +313,75 @@ mod tests {
         serde_json::from_value(value).expect("request must deserialize")
     }
 
+    fn logprobs_body(logprobs: u32) -> Value {
+        serde_json::json!({
+            "model": "m",
+            "prompt": "hello",
+            "echo": true,
+            "logprobs": logprobs,
+            "max_tokens": 1
+        })
+    }
+
+    /// `logprobs` takes up to 20 alternatives, the bound of chat's
+    /// `top_logprobs`; 21 crosses it.
+    #[test]
+    fn logprobs_takes_up_to_20_alternatives() {
+        for logprobs in [0, 5, 20] {
+            let request: CompletionRequest =
+                serde_json::from_value(logprobs_body(logprobs)).expect("request");
+            assert!(request.validate().is_ok(), "logprobs {logprobs}");
+        }
+        let request: CompletionRequest =
+            serde_json::from_value(logprobs_body(21)).expect("request");
+        let errors = request.validate().expect_err("logprobs 21 must be refused");
+        let error = &errors.field_errors()["logprobs"][0];
+        assert_eq!(error.code, "range");
+        assert_eq!(error.params["max"], 20);
+        assert_eq!(error.params["value"], 21);
+    }
+
+    /// Above 20 the body gets the public API's error for a crossed bound.
+    #[cfg(feature = "axum")]
+    #[tokio::test]
+    async fn logprobs_above_20_is_refused_with_the_public_error() {
+        use axum::{
+            body::Body,
+            extract::{FromRequest, Request},
+            http::StatusCode,
+        };
+
+        use crate::validated::ValidatedJson;
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(logprobs_body(21).to_string()))
+            .expect("request");
+        let Err(response) = ValidatedJson::<CompletionRequest>::from_request(request, &()).await
+        else {
+            panic!("logprobs 21 must be refused");
+        };
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("JSON body");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["code"], "integer_above_max_value");
+        assert_eq!(body["error"]["param"], "logprobs");
+    }
+
     #[test]
     fn default_sglang_flags_are_omitted_and_absent_reads_defaults() {
         let value = serde_json::to_value(req(serde_json::json!({}))).expect("serialize");
-        for field in ["no_stop_trim", "ignore_eos", "return_hidden_states"] {
+        for field in [
+            "no_stop_trim",
+            "ignore_eos",
+            "return_hidden_states",
+            "skip_special_tokens",
+        ] {
             assert!(value.get(field).is_none(), "{field} serialized at default");
         }
 
@@ -316,6 +389,7 @@ mod tests {
         assert!(!back.no_stop_trim);
         assert!(!back.ignore_eos);
         assert!(!back.return_hidden_states);
+        assert!(back.skip_special_tokens);
     }
 
     #[test]
@@ -323,16 +397,27 @@ mod tests {
         let value = serde_json::to_value(req(serde_json::json!({
             "no_stop_trim": true,
             "ignore_eos": true,
-            "return_hidden_states": true
+            "return_hidden_states": true,
+            "skip_special_tokens": false
         })))
         .expect("serialize");
         assert_eq!(value["no_stop_trim"], true);
         assert_eq!(value["ignore_eos"], true);
         assert_eq!(value["return_hidden_states"], true);
+        assert_eq!(value["skip_special_tokens"], false);
 
         let back: CompletionRequest = serde_json::from_value(value).expect("roundtrip");
         assert!(back.no_stop_trim);
         assert!(back.ignore_eos);
         assert!(back.return_hidden_states);
+        assert!(!back.skip_special_tokens);
+    }
+
+    /// `n` is the number of choices per prompt; absent and zero both mean one.
+    #[test]
+    fn a_completion_request_asks_for_at_least_one_choice() {
+        assert_eq!(req(serde_json::json!({})).choices(), 1);
+        assert_eq!(req(serde_json::json!({"n": 0})).choices(), 1);
+        assert_eq!(req(serde_json::json!({"n": 2})).choices(), 2);
     }
 }

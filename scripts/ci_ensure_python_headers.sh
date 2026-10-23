@@ -34,9 +34,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RETRY="bash ${SCRIPT_DIR}/ci_retry.sh"
 
-# sudo is absent when this runs as root inside `docker build`; degrade to
-# running the commands directly.
-if command -v sudo &> /dev/null; then SUDO="sudo"; else SUDO=""; fi
+# Image builds run as root, even when the base image also provides sudo.
+if [ "$(id -u)" != 0 ] && command -v sudo &> /dev/null; then SUDO="sudo"; else SUDO=""; fi
 
 PYTHON="${1:-}"
 if [ -z "$PYTHON" ]; then

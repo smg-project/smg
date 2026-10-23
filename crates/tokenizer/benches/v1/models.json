@@ -1,0 +1,26 @@
+[
+  {
+    "name": "minimax-m3",
+    "repo": "MiniMaxAI/MiniMax-M3",
+    "revision": "f0e1c1e04d40177e4673a22097036854f536e9c0",
+    "marker": "[e~["
+  },
+  {
+    "name": "glm-5.3",
+    "repo": "zai-org/GLM-5.3",
+    "revision": "c5087a76d148760811ffbdedfe6ff9f194e46e38",
+    "marker": "<|assistant|>"
+  },
+  {
+    "name": "qwen3-8b",
+    "repo": "Qwen/Qwen3-8B",
+    "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+    "marker": "<|im_end|>"
+  },
+  {
+    "name": "deepseek-v3.2",
+    "repo": "deepseek-ai/DeepSeek-V3.2",
+    "revision": "a7e62ac04ecb2c0a54d736dc46601c5606cf10a6",
+    "marker": "<｜end▁of▁sentence｜>"
+  }
+]

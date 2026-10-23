@@ -1,6 +1,6 @@
 [package]
 name = "smg-auth"
-version = "1.2.3"
+version = "1.2.4"
 edition = "2021"
 description = "Authentication and authorization for control plane APIs"
 license = "Apache-2.0"
@@ -22,7 +22,8 @@ chrono = { workspace = true, features = ["serde"] }
 http.workspace = true
 lru.workspace = true
 parking_lot.workspace = true
-reqwest = { workspace = true, features = ["rustls", "json"] }
+reqwest = { workspace = true, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 subtle.workspace = true
@@ -36,7 +37,10 @@ sha2 = "0.11"
 url = "2.5"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+base64 = "0.22"
+rsa = "0.9"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tower = { version = "0.5", features = ["util"] }
 
 [lints]
 workspace = true

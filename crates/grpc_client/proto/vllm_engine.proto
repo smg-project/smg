@@ -77,6 +77,13 @@ message SamplingParams {
   bool include_stop_str_in_output = 25;  // Whether to include stop strings in output
   map<int32, float> logit_bias = 26;  // Token ID to bias mapping (-100 to 100)
   optional int32 truncate_prompt_tokens = 27;  // Prompt truncation (-1 for model max)
+  // The constraint starts at the first generated token whatever reasoning
+  // parser the engine runs: the gateway led it with the model's thought and
+  // its close for a worker whose grammar starts there, so an engine that holds
+  // a grammar back until its reasoning parser has seen the close starts this
+  // one at once (vLLM: the request's `reasoning_ended`). Unset for a
+  // constraint the gateway did not shape, which starts where the engine does.
+  bool grammar_from_first_token = 28;
 
   // Structured outputs (one of) - matches vLLM's StructuredOutputsParams
   oneof constraint {
@@ -322,15 +329,15 @@ message GenerateComplete {
   uint32 spec_accepted_tokens = 13;
   uint32 spec_draft_tokens = 14;
 
-  // Identity of worker-processed media, returned by the prefill leg so the
-  // decode leg can be served without pixels: the expanded prompt ids plus one
+  // Identity of worker-processed media, returned by the prefill side so the
+  // decode side can be served without pixels: the expanded prompt ids plus one
   // pixel-less MultimodalInputs per modality (hashes, placeholders, grid
   // tensors). Absent on non-PD requests and from older servicers.
   MediaIdentity media_identity = 15;
 }
 
 // What the prefill worker learned about the media it processed, in the shape
-// the decode leg already accepts from a router-preprocessed request.
+// the decode side already accepts from a router-preprocessed request.
 message MediaIdentity {
   repeated uint32 prompt_token_ids = 1;
   MultimodalInputs mm_inputs = 2;
@@ -416,7 +423,7 @@ message GetServerInfoResponse {
 
   // PD pairing protocol: what a prefill and a decode must agree on for a KV
   // handoff to work. These mirror the factors vLLM's NIXL compatibility hash
-  // is built from, so the router can keep incompatible legs apart before the
+  // is built from, so the router can keep incompatible workers apart before the
   // engines reject each other at handshake.
   string kv_cache_dtype = 11;     // cache_config.cache_dtype ("auto", "fp8", ...)
   int32 block_size = 12;          // cache_config.block_size (0 until the engine resolves it)
@@ -447,6 +454,55 @@ message GetServerInfoResponse {
   // the pixels' own `uint8` bytes and would normalize anything else twice.
   // Flattened into the `mm_device_do_normalize` worker label.
   bool mm_device_do_normalize = 19;
+
+  // The scheduler's running window (`--max-num-seqs`): how many requests the
+  // engine runs at once. Flattened into the `max_num_seqs` worker label, the
+  // bound the router's PD admission gate claims decode rooms against and its
+  // fleet capacity accounting sums; 0 when unknown leaves both as they were.
+  int32 max_num_seqs = 20;
+
+  // The engine's own per-prompt media limits (vLLM's resolved
+  // `--limit-mm-per-prompt`) for the modalities a router request can carry,
+  // as sorted `<modality>=<count>` pairs: "image=8,video=2". Empty when the
+  // engine has none (a text model). Flattened into the `mm_item_limits`
+  // worker label, which the router's own media pipeline holds requests to.
+  string mm_item_limits = 21;
+
+  // Multimodal encoder input dtype, without the torch. prefix (e.g. bfloat16).
+  // Uses the model dtype, matching TokenSpeed; empty when unknown.
+  // Flattened into the worker label used to cast multimodal input tensors.
+  string multimodal_encoder_dtype = 22;
+
+  // The engine's reasoning parser (`--reasoning-parser`, as the structured
+  // outputs config carries it: "glm45", "deepseek_r1", ...); "" when it runs
+  // none. Flattened into the `engine_reasoning_parser` worker label, a name of
+  // its own: `reasoning_parser` is the per-model parser override the router
+  // reads off a worker's labels and validates against its own registry at
+  // registration, and the engine's parser names are the engine's, not the
+  // router's.
+  string engine_reasoning_parser = 23;
+
+  // Where the engine starts applying a request's grammar (structured outputs)
+  // on a prompt that ends inside the model's thinking block:
+  // "after_reasoning" when its structured-output manager waits until the
+  // reasoning parser has seen the thought's end (a reasoning parser is set and
+  // `enable_in_reasoning` is off), "first_token" when the grammar runs from the
+  // first generated token; "" when the engine's config does not say.
+  // Flattened into the `constrained_decoding_start` worker label, which shapes
+  // the router's forced tool-call grammar: the bare calls behind a reasoning
+  // parser's gate (the call is forced right there, as the engine's own server
+  // does), the thought and then the calls from the first token.
+  string constrained_decoding_start = 24;
+
+  // The engine's encoder budget in feature tokens: the most one media item
+  // may carry and still be scheduled (vLLM: the lesser of its encoder compute
+  // budget and its encoder cache size, the "budget of N tokens" of its
+  // encoder-cache start-up line; its own front end refuses an item above it).
+  // 0 when unknown, or not a multimodal model. Flattened into the
+  // `mm_encoder_budget` worker label, which the router's own media pipeline
+  // holds each item to; the worker-side pipeline takes the same number from
+  // its launcher.
+  int32 mm_encoder_budget = 25;
 }
 
 // =====================

@@ -1,10 +1,16 @@
 //! Observability utilities for logging, metrics, and tracing.
 
+pub(crate) mod cache_trace;
 pub mod events;
 pub mod gauge_histogram;
+pub mod heap_profile;
+pub(crate) mod history_metrics;
 pub mod inflight_tracker;
+pub mod log_format;
+pub mod log_throttle;
 pub mod logging;
 pub mod metrics;
 pub mod metrics_server;
 pub mod otel_trace;
 pub mod runtime_metrics;
+pub(crate) mod worker_metrics;

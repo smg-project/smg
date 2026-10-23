@@ -302,16 +302,265 @@ class TestRouterInitialization:
         from_args to pass it on: that must not start the router without
         discovery.
         """
-        args = RouterArgs(discovery_provider="file")
+        args = RouterArgs(discovery_provider="etcd")
 
         with (
-            patch("smg.router_args.DISCOVERY_PROVIDER_CHOICES", ["kubernetes", "file"]),
+            patch(
+                "smg.router_args.DISCOVERY_PROVIDER_CHOICES",
+                ["kubernetes", "file", "slurm", "consul", "etcd"],
+            ),
             patch("smg.router._Router") as rust_router,
-            pytest.raises(ValueError, match="cannot pass discovery provider 'file'"),
+            pytest.raises(ValueError, match="cannot pass discovery provider 'etcd'"),
         ):
             Router.from_args(args)
 
         rust_router.assert_not_called()
+
+    def test_from_args_passes_the_file_provider_as_a_discovery_mapping(self):
+        """The file provider reaches Rust through the tagged `discovery` mapping."""
+        args = RouterArgs(
+            discovery_provider="file",
+            discovery_file="/run/smg/workers.json",
+            worker_urls=["http://worker:8000"],
+        )
+
+        with patch("smg.router._Router") as rust_router:
+            Router.from_args(args)
+
+        kwargs = rust_router.call_args.kwargs
+        assert kwargs["discovery"] == {"provider": "file", "path": "/run/smg/workers.json"}
+        assert kwargs["service_discovery"] is False
+        assert kwargs["worker_urls"] == []
+        for key in ("discovery_provider", "discovery_file"):
+            assert key not in kwargs
+        # The mapping carries the file provider's interval; the constructor's
+        # own interval argument is Kubernetes'.
+        assert kwargs["discovery_check_interval_secs"] is None
+
+        args.discovery_check_interval_secs = 5
+        with patch("smg.router._Router") as rust_router:
+            Router.from_args(args)
+        assert rust_router.call_args.kwargs["discovery"]["check_interval_secs"] == 5
+
+    @pytest.mark.parametrize(
+        "args, message",
+        [
+            (RouterArgs(discovery_provider="file"), "needs discovery_file"),
+            (RouterArgs(discovery_file="/run/smg/workers.json"), "only to discovery_provider"),
+            (RouterArgs(discovery_check_interval_secs=5), "needs a discovery provider"),
+            (
+                RouterArgs(service_discovery=True, discovery_file="/run/smg/workers.json"),
+                "only to discovery_provider",
+            ),
+        ],
+    )
+    def test_from_args_rejects_an_incomplete_file_provider(self, args, message):
+        """The file flags only configure the file provider, which needs a manifest."""
+        with (
+            patch("smg.router._Router") as rust_router,
+            pytest.raises(ValueError, match=message),
+        ):
+            Router.from_args(args)
+
+        rust_router.assert_not_called()
+
+    def test_from_args_passes_the_slurm_provider_as_a_discovery_mapping(self):
+        """The Slurm provider reaches Rust through the tagged `discovery`
+        mapping, with only the settings that were given."""
+        args = RouterArgs(
+            discovery_provider="slurm",
+            slurm_prefill_job_name=["prefill-a", "prefill-b"],
+            slurm_decode_job_name=["decode"],
+            slurm_port=8000,
+            slurm_bootstrap_port=8998,
+            slurm_partition="gpu",
+            discovery_check_interval_secs=10,
+            pd_disaggregation=True,
+        )
+
+        with patch("smg.router._Router") as rust_router:
+            Router.from_args(args)
+
+        kwargs = rust_router.call_args.kwargs
+        assert kwargs["discovery"] == {
+            "provider": "slurm",
+            "prefill_job_names": ["prefill-a", "prefill-b"],
+            "decode_job_names": ["decode"],
+            "port": 8000,
+            "bootstrap_port": 8998,
+            "partition": "gpu",
+            "check_interval_secs": 10,
+        }
+        assert kwargs["service_discovery"] is False
+        for key in kwargs:
+            assert not key.startswith("slurm_"), key
+
+    @pytest.mark.parametrize(
+        "args, message",
+        [
+            (
+                RouterArgs(discovery_provider="slurm", slurm_job_name=["w"]),
+                "needs slurm_port",
+            ),
+            (RouterArgs(slurm_job_name=["w"]), "only to discovery_provider='slurm'"),
+            (
+                RouterArgs(
+                    discovery_provider="file",
+                    discovery_file="/run/smg/workers.json",
+                    slurm_port=8000,
+                ),
+                "only to discovery_provider='slurm'",
+            ),
+        ],
+    )
+    def test_from_args_rejects_misplaced_slurm_settings(self, args, message):
+        """The Slurm flags only configure the Slurm provider, which needs a port."""
+        with (
+            patch("smg.router._Router") as rust_router,
+            pytest.raises(ValueError, match=message),
+        ):
+            Router.from_args(args)
+
+        rust_router.assert_not_called()
+
+    def test_from_args_passes_the_consul_provider_as_a_discovery_mapping(self):
+        """The Consul provider reaches Rust through the tagged `discovery`
+        mapping, with only the settings that were given."""
+        args = RouterArgs(
+            discovery_provider="consul",
+            consul_service="smg-worker",
+            consul_datacenter="dc2",
+            discovery_check_interval_secs=10,
+            pd_disaggregation=True,
+        )
+
+        with patch("smg.router._Router") as rust_router:
+            Router.from_args(args)
+
+        kwargs = rust_router.call_args.kwargs
+        assert kwargs["discovery"] == {
+            "provider": "consul",
+            "service": "smg-worker",
+            "datacenter": "dc2",
+            "check_interval_secs": 10,
+        }
+        assert kwargs["service_discovery"] is False
+        for key in kwargs:
+            assert not key.startswith("consul_"), key
+
+    def test_from_args_passes_explicitly_empty_settings_on_for_rejection(self):
+        """An empty string is a value given, not an unset field: it reaches
+        Rust, whose validation refuses it, instead of falling back to a
+        default such as the agent's own datacenter."""
+        from smg.router import _discovery_arguments
+
+        consul = _discovery_arguments(
+            RouterArgs(
+                discovery_provider="consul",
+                consul_service="smg-worker",
+                consul_address="",
+                consul_datacenter="",
+            )
+        )
+        assert consul["discovery"] == {
+            "provider": "consul",
+            "service": "smg-worker",
+            "address": "",
+            "datacenter": "",
+        }
+        slurm = _discovery_arguments(
+            RouterArgs(
+                discovery_provider="slurm",
+                slurm_job_name=["w"],
+                slurm_port=8000,
+                slurm_user="",
+            )
+        )
+        assert slurm["discovery"]["user"] == ""
+        # An empty one given to another provider is misplaced, as any value.
+        with pytest.raises(ValueError, match="only to discovery_provider='consul'"):
+            _discovery_arguments(
+                RouterArgs(
+                    discovery_provider="file",
+                    discovery_file="/run/smg/workers.json",
+                    consul_datacenter="",
+                )
+            )
+
+    @pytest.mark.parametrize(
+        "args, message",
+        [
+            (RouterArgs(discovery_provider="consul"), "needs consul_service"),
+            (RouterArgs(consul_service="smg-worker"), "only to discovery_provider='consul'"),
+            (
+                RouterArgs(
+                    discovery_provider="slurm",
+                    slurm_job_name=["w"],
+                    slurm_port=8000,
+                    consul_address="http://consul:8500",
+                ),
+                "only to discovery_provider='consul'",
+            ),
+        ],
+    )
+    def test_from_args_rejects_misplaced_consul_settings(self, args, message):
+        """The Consul flags only configure the Consul provider, which needs a
+        service."""
+        with (
+            patch("smg.router._Router") as rust_router,
+            pytest.raises(ValueError, match=message),
+        ):
+            Router.from_args(args)
+
+        rust_router.assert_not_called()
+
+    def test_every_discovery_field_is_routed(self):
+        """A discovery field missing from from_args' table would reach _Router
+        as an argument it does not take."""
+        import dataclasses
+
+        from smg.router import _DISCOVERY_FIELDS
+
+        fields = {f.name for f in dataclasses.fields(RouterArgs)}
+        discovery = {f for f in fields if f.startswith(("slurm_", "consul_", "discovery_"))}
+        assert discovery == set(_DISCOVERY_FIELDS)
+
+    @pytest.mark.parametrize(
+        "selection",
+        [{"service_discovery": True}, {"discovery_provider": "kubernetes"}],
+    )
+    def test_from_args_passes_the_kubernetes_interval(self, selection):
+        """Kubernetes discovery takes the interval too, beside service_discovery."""
+        args = RouterArgs(**selection, discovery_check_interval_secs=15)
+
+        with patch("smg.router._Router") as rust_router:
+            Router.from_args(args)
+
+        kwargs = rust_router.call_args.kwargs
+        assert kwargs["service_discovery"] is True
+        assert kwargs["discovery_check_interval_secs"] == 15
+        assert "discovery" not in kwargs
+
+        with patch("smg.router._Router") as rust_router:
+            Router.from_args(RouterArgs(**selection))
+        assert rust_router.call_args.kwargs["discovery_check_interval_secs"] is None
+
+    def test_discovery_provider_file_enables_igw(self):
+        """IGW follows the file provider the same way it follows Kubernetes."""
+        args = RouterArgs(discovery_provider="file", discovery_file="/run/smg/workers.json")
+
+        with patch("smg.launch_router.Router") as router_mod:
+            captured_args = {}
+
+            def fake_from_args(router_args):
+                captured_args["enable_igw"] = router_args.enable_igw
+                return MagicMock()
+
+            router_mod.from_args = MagicMock(side_effect=fake_from_args)
+
+            launch_router(args)
+
+        assert captured_args["enable_igw"] is True
 
     def test_router_initialization_with_retry_config(self):
         """Test router initialization with retry configuration."""

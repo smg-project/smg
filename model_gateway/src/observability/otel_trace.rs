@@ -206,13 +206,25 @@ pub async fn flush_spans_async() -> Result<()> {
     Ok(())
 }
 
+/// The longest [`shutdown_otel`] waits for the spans still queued in the
+/// batch exporter to reach the collector (the SDK's own default, written
+/// here so the bound is known where it is paid). A collector that answers
+/// costs a round trip; one that does not costs this much, once, and the
+/// spans are lost as they would have been without the wait.
+pub const OTEL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Flush the spans still queued and shut the tracer down, within
+/// [`OTEL_SHUTDOWN_TIMEOUT`]; a no-op when tracing is off or already shut
+/// down. Called on every exit of the process that initialised the tracer, a
+/// clean stop and a failed start-up alike, while the runtime the exporter's
+/// connection lives on is still up.
 pub fn shutdown_otel() {
     // Use Acquire to ensure we see any prior OTEL operations
     if ENABLED.load(Ordering::Acquire) {
         // 0.32 removed `global::shutdown_tracer_provider`; shut down the stored
         // provider directly (its inner state is shared with the global provider).
         if let Some(provider) = PROVIDER.get() {
-            if let Err(e) = provider.shutdown() {
+            if let Err(e) = provider.shutdown_with_timeout(OTEL_SHUTDOWN_TIMEOUT) {
                 #[expect(clippy::print_stderr)]
                 {
                     eprintln!("[tracing] Failed to shut down OpenTelemetry: {e}");

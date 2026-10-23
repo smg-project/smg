@@ -18,17 +18,21 @@ The WASM module allows you to extend SMG functionality by deploying WebAssembly 
 The WASM module consists of several key components:
 
 ```
-src/wasm/
+crates/wasm/src/
+├── lib.rs              # Crate root: the public API
 ├── module.rs           # Data structures (metadata, types, attach points)
 ├── module_manager.rs   # Module lifecycle management (add/remove/list)
 ├── runtime.rs          # WASM execution engine and thread pool
-├── route.rs            # HTTP API endpoints for module management
 ├── spec.rs             # WASM interface types bindings and type conversions
+├── storage_spec.rs     # Interface bindings for the storage hooks (generated at compile time; `storage-hooks` feature)
+├── storage_hook.rs     # Storage hook bridge: wraps a component that exports the `storage-hook` world (`storage-hooks` feature)
 ├── types.rs            # Generic input/output types
 ├── errors.rs           # Error definitions
 ├── config.rs           # Runtime configuration
-└── interface/          # WebAssembly Interface Types definitions
+└── interface/          # WebAssembly Interface Types definitions (`spec.wit`, `storage/storage-hooks.wit`)
 ```
+
+The HTTP endpoints for module management live in the gateway crate, which re-exports this crate: `model_gateway/src/wasm/route.rs` and `model_gateway/src/wasm/mod.rs`.
 
 ### Execution Flow
 
@@ -62,7 +66,7 @@ The module uses the WebAssembly Component Model with WASM interface type for typ
 - **Response Processing**: `middleware-on-response::on-response(resp: Response) -> Action`
 - **Actions**: `Continue`, `Reject(status)`, or `Modify(modify-action)`
 
-See [`interface/`](./interface/) for the complete interface definition.
+See [`src/interface/`](./src/interface/) for the complete interface definition.
 
 ## Usage
 
@@ -205,11 +209,11 @@ wasm-tools component new target/wasm32-wasip2/release/my_module.wasm \
 
 ### WASM Interface Type
 
-Define your component using the WASM interface from `interface/spec.*`:
+Define your component using the WASM interface from `src/interface/spec.wit`:
 
 ```rust
 wit_bindgen::generate!({
-    path: "../../../wasm/src/interface",
+    path: "../../../crates/wasm/src/interface",
     world: "smg",
 });
 

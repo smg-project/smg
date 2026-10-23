@@ -77,6 +77,27 @@ pub(super) fn server_info(state: &State) -> ts::GetServerInfoResponse {
     let max_total_num_tokens = max_total_num_tokens(state);
     let mut scheduler_info = struct_from_json(&model.scheduler_info_json);
     if let Some(ready) = ready {
+        let epochs = state
+            .engine
+            .client
+            .get()
+            .map(ZmqEngineClient::cache_trace_epochs)
+            .unwrap_or_default();
+        scheduler_info.fields.insert(
+            "cache_trace_epochs".to_string(),
+            prost_types::Value {
+                kind: Some(prost_types::value::Kind::ListValue(
+                    prost_types::ListValue {
+                        values: epochs
+                            .into_iter()
+                            .map(|epoch| prost_types::Value {
+                                kind: Some(prost_types::value::Kind::StringValue(epoch)),
+                            })
+                            .collect(),
+                    },
+                )),
+            },
+        );
         scheduler_info.fields.insert(
             "max_total_num_tokens".to_string(),
             number(max_total_num_tokens),
@@ -112,6 +133,7 @@ pub(super) fn server_info(state: &State) -> ts::GetServerInfoResponse {
         max_total_num_tokens,
         tokenspeed_version: version,
         start_time: Some(Timestamp::from(state.started_at)),
+        constrained_decoding: model.constrained_decoding.clone(),
     }
 }
 
@@ -139,6 +161,9 @@ pub(super) fn loads(state: &State, dp_rank: Option<i32>) -> Result<ts::GetLoadsR
                 max_total_num_tokens,
                 max_running_requests,
                 token_usage: load.token_usage,
+                // The direct TokenSpeed wire reports active pages, excluding
+                // retained cache (unlike the Python legacy GetLoad projection).
+                active_token_usage: Some(load.token_usage),
                 ..Default::default()
             }
         })

@@ -89,6 +89,8 @@ pub fn default_ready_response() -> EngineCoreReadyResponse {
         kv_cache_size_tokens: None,
         kv_cache_max_concurrency: None,
         kv_events_config: None,
+        cache_trace_epochs: Vec::new(),
+        positional_layouts: std::collections::BTreeMap::new(),
     }
 }
 
@@ -293,14 +295,21 @@ async fn wait_for_endpoint(endpoint: &str) -> Result<()> {
     })
 }
 
-/// Connect a mock engine to a frontend-owned handshake endpoint: HELLO → INIT →
-/// READY, then register on the input socket with `ready_response` and open the
-/// output PUSH socket.
-pub async fn connect_to_frontend(
+/// A mock engine between HELLO and READY: the frontend has answered its HELLO
+/// with INIT, and the engine has not announced itself ready. A real engine
+/// loads its model here, for as long as that takes.
+pub struct MockEngineHandshake {
+    handshake: DealerSocket,
+    identity: PeerIdentity,
+    init: HandshakeInitMessage,
+}
+
+/// Dial a frontend-owned handshake endpoint and complete HELLO → INIT,
+/// stopping short of READY.
+pub async fn hello(
     handshake_address: &str,
     engine_id: impl Into<EngineId>,
-    ready_response: EngineCoreReadyResponse,
-) -> Result<MockEngine> {
+) -> Result<MockEngineHandshake> {
     let engine_id = engine_id.into();
     let identity = peer_identity(&engine_id)?;
 
@@ -314,7 +323,6 @@ pub async fn connect_to_frontend(
     )
     .await??;
 
-    // HELLO -> (INIT) -> READY.
     handshake
         .send(ZmqMessage::from(encode_msgpack(&ready_message("HELLO"))?))
         .await?;
@@ -327,52 +335,113 @@ pub async fn connect_to_frontend(
         });
     };
     let init: HandshakeInitMessage = decode_msgpack(init_frame.as_ref())?;
-    handshake
-        .send(ZmqMessage::from(encode_msgpack(&ready_message("READY"))?))
-        .await?;
-
-    let [input_address] = init.addresses.inputs.as_slice() else {
-        return Err(Error::UnexpectedHandshakeMessage {
-            message: format!(
-                "expected one input address, got {}",
-                init.addresses.inputs.len()
-            ),
-        });
-    };
-    let [output_address] = init.addresses.outputs.as_slice() else {
-        return Err(Error::UnexpectedHandshakeMessage {
-            message: format!(
-                "expected one output address, got {}",
-                init.addresses.outputs.len()
-            ),
-        });
-    };
-
-    // Register on the input socket: [ready_response] with the engine identity.
-    wait_for_endpoint(input_address).await?;
-    let mut input_options = SocketOptions::default();
-    input_options.peer_identity(identity);
-    let mut input = DealerSocket::with_options(input_options);
-    within(
-        "mock engine: connecting to the input endpoint",
-        input.connect(input_address),
-    )
-    .await??;
-    input
-        .send(ZmqMessage::from(encode_msgpack(&ready_response)?))
-        .await?;
-
-    wait_for_endpoint(output_address).await?;
-    let mut output = PushSocket::new();
-    within(
-        "mock engine: connecting to the output endpoint",
-        output.connect(output_address),
-    )
-    .await??;
-
-    Ok(MockEngine {
+    Ok(MockEngineHandshake {
+        handshake,
+        identity,
         init,
-        input: MockEngineInput { socket: input },
-        output: MockEngineOutput { socket: output },
     })
+}
+
+/// Connect a mock engine to a frontend-owned handshake endpoint: HELLO → INIT →
+/// READY, then register on the input socket with `ready_response` and open the
+/// output PUSH socket.
+pub async fn connect_to_frontend(
+    handshake_address: &str,
+    engine_id: impl Into<EngineId>,
+    ready_response: EngineCoreReadyResponse,
+) -> Result<MockEngine> {
+    hello(handshake_address, engine_id)
+        .await?
+        .ready(ready_response)
+        .await
+}
+
+impl MockEngineHandshake {
+    /// Dial the handshake endpoint again on a fresh socket with the same
+    /// identity, keeping the INIT already held: what a real engine's handshake
+    /// socket does by itself when the frontend binds again while the engine is
+    /// loading (libzmq reconnects a dialing socket transparently; this crate's
+    /// pure-Rust sockets do not, so the mock dials anew).
+    pub async fn redial(self, handshake_address: &str) -> Result<Self> {
+        let Self { identity, init, .. } = self;
+        wait_for_endpoint(handshake_address).await?;
+        let mut handshake_options = SocketOptions::default();
+        handshake_options.peer_identity(identity.clone());
+        let mut handshake = DealerSocket::with_options(handshake_options);
+        within(
+            "mock engine: dialing the handshake endpoint again",
+            handshake.connect(handshake_address),
+        )
+        .await??;
+        Ok(Self {
+            handshake,
+            identity,
+            init,
+        })
+    }
+
+    /// Announce READY, then register on the input socket with `ready_response`
+    /// and open the output PUSH socket.
+    pub async fn ready(self, ready_response: EngineCoreReadyResponse) -> Result<MockEngine> {
+        let Self {
+            mut handshake,
+            identity,
+            init,
+        } = self;
+        handshake
+            .send(ZmqMessage::from(encode_msgpack(&ready_message("READY"))?))
+            .await?;
+        Self::register(identity, init, ready_response).await
+    }
+
+    async fn register(
+        identity: PeerIdentity,
+        init: HandshakeInitMessage,
+        ready_response: EngineCoreReadyResponse,
+    ) -> Result<MockEngine> {
+        let [input_address] = init.addresses.inputs.as_slice() else {
+            return Err(Error::UnexpectedHandshakeMessage {
+                message: format!(
+                    "expected one input address, got {}",
+                    init.addresses.inputs.len()
+                ),
+            });
+        };
+        let [output_address] = init.addresses.outputs.as_slice() else {
+            return Err(Error::UnexpectedHandshakeMessage {
+                message: format!(
+                    "expected one output address, got {}",
+                    init.addresses.outputs.len()
+                ),
+            });
+        };
+
+        // Register on the input socket: [ready_response] with the engine identity.
+        wait_for_endpoint(input_address).await?;
+        let mut input_options = SocketOptions::default();
+        input_options.peer_identity(identity);
+        let mut input = DealerSocket::with_options(input_options);
+        within(
+            "mock engine: connecting to the input endpoint",
+            input.connect(input_address),
+        )
+        .await??;
+        input
+            .send(ZmqMessage::from(encode_msgpack(&ready_response)?))
+            .await?;
+
+        wait_for_endpoint(output_address).await?;
+        let mut output = PushSocket::new();
+        within(
+            "mock engine: connecting to the output endpoint",
+            output.connect(output_address),
+        )
+        .await??;
+
+        Ok(MockEngine {
+            init,
+            input: MockEngineInput { socket: input },
+            output: MockEngineOutput { socket: output },
+        })
+    }
 }

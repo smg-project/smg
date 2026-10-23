@@ -71,12 +71,85 @@ impl PairingMismatch {
     }
 }
 
+/// How a KV transport moves blocks between the workers of a pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvTransferProfile {
+    /// A rendezvous or side channel per pair: the prefill hands its blocks
+    /// to the one decode the request names (a bootstrap address, a peer's
+    /// side channel, a transfer id), so the gateway tags the sides and probes
+    /// the port the partners meet on.
+    P2p,
+    /// A store the deployment shares, keyed by prefix hash: the prefill
+    /// writes its blocks to the store and whichever decode follows reads
+    /// them back. Nothing is agreed per pair and nothing listens for a
+    /// partner, so the gateway mints nothing: it tags no side, hands no
+    /// bootstrap port and probes none; it only runs the decode after the
+    /// prefill. Whether the blocks arrive is the store's business.
+    Store,
+}
+
+/// How the two sides of a would-be pair report one component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Agreement {
+    /// Both report it, the same.
+    Agree,
+    /// Both report it, differently.
+    Differ,
+    /// One side reports it, the other does not.
+    OneSided,
+    /// Neither reports it.
+    Unreported,
+}
+
+impl Agreement {
+    fn of(mine: Option<&str>, theirs: Option<&str>) -> Self {
+        match (mine, theirs) {
+            (Some(a), Some(b)) if a == b => Self::Agree,
+            (Some(_), Some(_)) => Self::Differ,
+            (None, None) => Self::Unreported,
+            _ => Self::OneSided,
+        }
+    }
+
+    /// The verdict on a hard fact: a known difference is `differ`; a side
+    /// that does not report the fact leaves it unknown, which only `Strict`
+    /// refuses; a fact nobody reports is what `unreported` says of the
+    /// component.
+    fn hard_fact(
+        self,
+        differ: PairingMismatch,
+        name: &'static str,
+        strict: bool,
+        unreported: Unreported,
+    ) -> Option<PairingMismatch> {
+        let unknown = strict.then_some(PairingMismatch::Unknown(name));
+        match self {
+            Self::Differ => Some(differ),
+            Self::OneSided => unknown,
+            Self::Unreported if unreported == Unreported::Unknown => unknown,
+            Self::Agree | Self::Unreported => None,
+        }
+    }
+}
+
+/// What it means when neither side of a pair reports a component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Unreported {
+    /// The component always exists (a runtime, a transport): two workers
+    /// that name neither leave it unknown, which only `Strict` refuses.
+    Unknown,
+    /// The engines may not carry the fact (a KV layout fact): nothing to
+    /// compare.
+    NotAFact,
+}
+
 /// What one PD worker offers a rendezvous partner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PdPairing {
     runtime: RuntimeType,
     explicit: Option<String>,
     transport: Option<String>,
+    profile: Option<KvTransferProfile>,
     version: Option<String>,
     /// The reported KV layout facts by short name (see `LAYOUT_FACTS`).
     kv_layout: BTreeMap<&'static str, String>,
@@ -93,10 +166,13 @@ impl PdPairing {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        let transport = transport_of(spec);
+        let profile = profile_of(spec, transport.is_some());
         Self {
             runtime: spec.runtime_type,
             explicit,
-            transport: transport_of(spec),
+            transport,
+            profile,
             version: non_empty(labels.get("version")),
             kv_layout: kv_layout_of(labels),
         }
@@ -110,6 +186,12 @@ impl PdPairing {
     /// The KV transport, when known.
     pub fn transport(&self) -> Option<&str> {
         self.transport.as_deref()
+    }
+
+    /// How the transport moves blocks between the workers, when the transport
+    /// is known.
+    pub fn profile(&self) -> Option<KvTransferProfile> {
+        self.profile
     }
 
     /// The engine version, when reported.
@@ -164,57 +246,60 @@ impl PdPairing {
             return None;
         }
         let strict = mode == PdPairingMode::Strict;
-        let unknown = |name: &'static str| strict.then_some(PairingMismatch::Unknown(name));
-        match (self.runtime, other.runtime) {
-            (RuntimeType::Unspecified, _) | (_, RuntimeType::Unspecified) => {
-                if let Some(mismatch) = unknown("runtime") {
-                    return Some(mismatch);
-                }
-            }
-            (mine, theirs) if mine != theirs => return Some(PairingMismatch::Runtime),
-            _ => {}
+        // The hard facts, judged in this order by [`Agreement::hard_fact`].
+        // A worker whose runtime probe failed has an unknown runtime, not a
+        // different one.
+        let runtime = |runtime: RuntimeType| runtime.is_specified().then(|| runtime.as_str());
+        if let Some(mismatch) = Agreement::of(runtime(self.runtime), runtime(other.runtime))
+            .hard_fact(
+                PairingMismatch::Runtime,
+                "runtime",
+                strict,
+                Unreported::Unknown,
+            )
+        {
+            return Some(mismatch);
         }
         // Two explicit protocols are the operators' assertion, compared
-        // whole. One explicit protocol cannot be checked against derived
-        // facts: strict refuses, lenient falls through to the facts rather
-        // than pairing blindly.
-        match (&self.explicit, &other.explicit) {
-            (Some(a), Some(b)) => return (a != b).then_some(PairingMismatch::Explicit),
-            (None, None) => {}
-            _ => {
-                if let Some(mismatch) = unknown("pairing_protocol") {
-                    return Some(mismatch);
-                }
+        // whole: equal ones settle the pair. One explicit protocol cannot be
+        // checked against derived facts: strict refuses, lenient falls
+        // through to the facts rather than pairing blindly.
+        match Agreement::of(self.explicit.as_deref(), other.explicit.as_deref()) {
+            Agreement::Agree => return None,
+            Agreement::Differ => return Some(PairingMismatch::Explicit),
+            Agreement::OneSided if strict => {
+                return Some(PairingMismatch::Unknown("pairing_protocol"))
             }
+            Agreement::OneSided | Agreement::Unreported => {}
         }
-        match (&self.transport, &other.transport) {
-            (Some(a), Some(b)) if a != b => return Some(PairingMismatch::Transport),
-            (Some(_), Some(_)) => {}
-            _ => {
-                if let Some(mismatch) = unknown("transport") {
-                    return Some(mismatch);
-                }
-            }
+        if let Some(mismatch) = Agreement::of(self.transport.as_deref(), other.transport.as_deref())
+            .hard_fact(
+                PairingMismatch::Transport,
+                "transport",
+                strict,
+                Unreported::Unknown,
+            )
+        {
+            return Some(mismatch);
         }
         for (short, label, _) in LAYOUT_FACTS {
-            match (self.kv_layout.get(short), other.kv_layout.get(short)) {
-                (Some(a), Some(b)) if a != b => return Some(PairingMismatch::KvLayout(label)),
-                (Some(_), Some(_)) | (None, None) => {}
-                _ => {
-                    if let Some(mismatch) = unknown(label) {
-                        return Some(mismatch);
-                    }
-                }
+            let agreement = Agreement::of(
+                self.kv_layout.get(short).map(String::as_str),
+                other.kv_layout.get(short).map(String::as_str),
+            );
+            if let Some(mismatch) = agreement.hard_fact(
+                PairingMismatch::KvLayout(label),
+                label,
+                strict,
+                Unreported::NotAFact,
+            ) {
+                return Some(mismatch);
             }
         }
-        if strict {
-            if let (Some(mine), Some(theirs)) = (&self.version, &other.version) {
-                if mine != theirs {
-                    return Some(PairingMismatch::Version);
-                }
-            }
-        }
-        None
+        // The soft fact: a version difference counts only under `Strict`, and
+        // only when both sides report one.
+        let versions = Agreement::of(self.version.as_deref(), other.version.as_deref());
+        (strict && versions == Agreement::Differ).then_some(PairingMismatch::Version)
     }
 }
 
@@ -225,17 +310,64 @@ fn non_empty(value: Option<&String>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The connector a vLLM worker names: on its spec, else as a discovered label.
+fn vllm_connector(spec: &WorkerSpec) -> Option<String> {
+    spec.kv_connector
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| non_empty(spec.labels.get("kv_connector")))
+}
+
+/// The transfer profile by runtime: a vLLM connector's name says whether it
+/// writes to a store (see [`connector_profile`]); the transfer backends of
+/// SGLang and TokenSpeed all rendezvous per pair. Unknown when the transport
+/// is.
+fn profile_of(spec: &WorkerSpec, transport_known: bool) -> Option<KvTransferProfile> {
+    match spec.runtime_type {
+        RuntimeType::Vllm => vllm_connector(spec).map(|connector| connector_profile(&connector)),
+        RuntimeType::Sglang | RuntimeType::TokenSpeed => {
+            transport_known.then_some(KvTransferProfile::P2p)
+        }
+        RuntimeType::Trtllm
+        | RuntimeType::Mlx
+        | RuntimeType::Generic
+        | RuntimeType::External
+        | RuntimeType::Unspecified => None,
+    }
+}
+
+/// The connectors whose workers meet in a store the deployment shares, by
+/// exact name or family prefix: the Mooncake store, the shared-storage
+/// connector, the FlexKV and 3FS families. Connectors whose blocks stay in
+/// the engine (offloading) or whose disaggregated mode is a per-pair push
+/// the request has to address (the LMCache family) are not listed: they
+/// keep the unknown-connector handling.
+const STORE_CONNECTORS: [&str; 2] = ["MooncakeStoreConnector", "SharedStorageConnector"];
+const STORE_CONNECTOR_FAMILIES: [&str; 2] = ["FlexKV", "HF3FS"];
+
+/// The profile a connector's name implies. A name not in the store table
+/// is a rendezvous connector: what every P2P connector is, and what the
+/// request path's passthrough handling of an unknown connector assumes.
+pub fn connector_profile(connector: &str) -> KvTransferProfile {
+    let connector = connector.trim();
+    if STORE_CONNECTORS.contains(&connector)
+        || STORE_CONNECTOR_FAMILIES
+            .iter()
+            .any(|family| connector.starts_with(family))
+    {
+        KvTransferProfile::Store
+    } else {
+        KvTransferProfile::P2p
+    }
+}
+
 /// The KV transport by runtime: vLLM names a connector, SGLang a transfer
 /// backend, TokenSpeed has only Mooncake.
 fn transport_of(spec: &WorkerSpec) -> Option<String> {
     let labels = &spec.labels;
     match spec.runtime_type {
-        RuntimeType::Vllm => spec
-            .kv_connector
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .or_else(|| non_empty(labels.get("kv_connector")))
+        RuntimeType::Vllm => vllm_connector(spec)
             .map(|connector| normalise_connector(&connector))
             // MoRI-IO READ and WRITE engines cannot hand KV to each other.
             .map(|transport| {
@@ -259,18 +391,27 @@ fn transport_of(spec: &WorkerSpec) -> Option<String> {
     }
 }
 
-/// `NixlConnector` / `MooncakeConnector` (and their store variants) fold to
-/// the transport name; anything else is kept lower-cased.
+/// The transports a connector name may carry: `NixlConnector`,
+/// `MooncakeConnector` and `MoRIIOConnector`, with their variants, name the
+/// transport they contain.
+const CONNECTOR_TRANSPORTS: [&str; 3] = ["nixl", "mooncake", "moriio"];
+
+/// A connector name folded to its transport, and a store variant to
+/// `<transport>-store`: workers that meet in a store cannot hand KV to workers
+/// that rendezvous, so the two never pair. A name that carries no known
+/// transport is kept lower-cased, so two workers naming the same unknown
+/// connector still pair.
 fn normalise_connector(connector: &str) -> String {
     let lower = connector.to_ascii_lowercase();
-    if lower.contains("nixl") {
-        "nixl".to_string()
-    } else if lower.contains("mooncake") {
-        "mooncake".to_string()
-    } else if lower.contains("moriio") {
-        "moriio".to_string()
-    } else {
-        lower
+    let Some(family) = CONNECTOR_TRANSPORTS
+        .iter()
+        .find(|transport| lower.contains(*transport))
+    else {
+        return lower;
+    };
+    match connector_profile(connector) {
+        KvTransferProfile::P2p => (*family).to_string(),
+        KvTransferProfile::Store => format!("{family}-store"),
     }
 }
 
@@ -327,7 +468,95 @@ mod tests {
             RuntimeType::Vllm,
             &[("kv_connector", "MooncakeStoreConnector")],
         );
-        assert_eq!(PdPairing::derive(&s).transport(), Some("mooncake"));
+        assert_eq!(PdPairing::derive(&s).transport(), Some("mooncake-store"));
+    }
+
+    /// The connector's name says how its workers meet: the P2P connectors
+    /// rendezvous per pair, the store connectors meet in a shared store; the
+    /// other runtimes' transfer backends all rendezvous, and a worker with no
+    /// known transport has no profile.
+    #[test]
+    fn a_connectors_name_says_whether_its_workers_rendezvous_or_meet_in_a_store() {
+        let vllm = |connector: &str| {
+            let mut s = spec(RuntimeType::Vllm, &[]);
+            s.kv_connector = Some(connector.to_string());
+            PdPairing::derive(&s)
+        };
+        for (connector, profile) in [
+            ("MooncakeConnector", KvTransferProfile::P2p),
+            ("NixlConnector", KvTransferProfile::P2p),
+            ("NixlPullConnector", KvTransferProfile::P2p),
+            ("MoRIIOConnector", KvTransferProfile::P2p),
+            ("P2pNcclConnector", KvTransferProfile::P2p),
+            ("MooncakeStoreConnector", KvTransferProfile::Store),
+            ("SharedStorageConnector", KvTransferProfile::Store),
+            ("FlexKVConnectorV1", KvTransferProfile::Store),
+            ("HF3FSKVConnector", KvTransferProfile::Store),
+            // Their blocks stay in the engine, or their disaggregated mode is
+            // a per-pair push the request has to address: not a shared store.
+            ("OffloadingConnector", KvTransferProfile::P2p),
+            ("SimpleCPUOffloadConnector", KvTransferProfile::P2p),
+            ("LMCacheConnectorV1", KvTransferProfile::P2p),
+            ("LMCacheMPConnector", KvTransferProfile::P2p),
+        ] {
+            assert_eq!(connector_profile(connector), profile, "{connector}");
+            assert_eq!(vllm(connector).profile(), Some(profile), "{connector}");
+        }
+        let sglang = spec(
+            RuntimeType::Sglang,
+            &[("disaggregation_transfer_backend", "mooncake")],
+        );
+        assert_eq!(
+            PdPairing::derive(&sglang).profile(),
+            Some(KvTransferProfile::P2p)
+        );
+        assert_eq!(
+            PdPairing::derive(&spec(RuntimeType::TokenSpeed, &[])).profile(),
+            Some(KvTransferProfile::P2p)
+        );
+        assert_eq!(
+            PdPairing::derive(&spec(RuntimeType::Vllm, &[])).profile(),
+            None
+        );
+        assert_eq!(
+            PdPairing::derive(&spec(RuntimeType::Sglang, &[])).profile(),
+            None
+        );
+    }
+
+    /// A store variant of a rendezvous connector family is its own transport:
+    /// a store worker and a rendezvous worker cannot hand KV to each other, so they
+    /// never pair in a mode that compares transports.
+    #[test]
+    fn a_store_connector_is_its_own_transport_and_never_pairs_with_a_rendezvous_worker() {
+        let vllm = |connector: &str| {
+            let mut s = spec(RuntimeType::Vllm, &[]);
+            s.kv_connector = Some(connector.to_string());
+            PdPairing::derive(&s)
+        };
+        let store = vllm("MooncakeStoreConnector");
+        let rendezvous = vllm("MooncakeConnector");
+        assert_eq!(store.transport(), Some("mooncake-store"));
+        assert_eq!(store.key(), "vllm/mooncake-store/?");
+        assert_eq!(rendezvous.transport(), Some("mooncake"));
+        for mode in [PdPairingMode::Lenient, PdPairingMode::Strict] {
+            assert_eq!(
+                store.mismatch(&rendezvous, mode),
+                Some(PairingMismatch::Transport)
+            );
+            assert_eq!(
+                rendezvous.mismatch(&store, mode),
+                Some(PairingMismatch::Transport)
+            );
+            assert!(store.compatible(&store.clone(), mode));
+        }
+        assert!(store.compatible(&rendezvous, PdPairingMode::Off));
+        // A connector outside the Mooncake and NIXL families keeps its own
+        // name, as before.
+        assert_eq!(
+            vllm("SharedStorageConnector").transport(),
+            Some("sharedstorageconnector")
+        );
     }
 
     #[test]

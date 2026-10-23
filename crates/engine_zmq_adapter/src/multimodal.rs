@@ -85,15 +85,15 @@ impl Decoded {
 }
 
 /// The raw bytes behind a `TensorData`, from whichever transport carries them:
-/// inline, or a `/dev/shm` file the Router wrote (read once and unlinked, as
-/// the Python servicer's `mm_shm` does). Remote handles are not implemented.
-fn payload_bytes(
-    name: &str,
-    payload: Option<vllm::tensor_data::Payload>,
-) -> Result<Vec<u8>, String> {
+/// inline (a view of the request's bytes, not a copy), or a `/dev/shm` file
+/// the Router wrote (read once and unlinked, as the Python servicer's
+/// `mm_shm` does). Remote handles are not implemented.
+fn payload_bytes(name: &str, payload: Option<vllm::tensor_data::Payload>) -> Result<Bytes, String> {
     match payload {
         Some(vllm::tensor_data::Payload::Inline(data)) => Ok(data),
-        Some(vllm::tensor_data::Payload::Shm(handle)) => read_shm_payload(name, &handle),
+        Some(vllm::tensor_data::Payload::Shm(handle)) => {
+            read_shm_payload(name, &handle).map(Bytes::from)
+        }
         Some(vllm::tensor_data::Payload::Remote(_)) => Err(format!(
             "multimodal tensor {name:?}: TensorData.remote payload is not implemented yet"
         )),
@@ -103,6 +103,7 @@ fn payload_bytes(
 
 /// Whether a read `/dev/shm` tensor file is unlinked afterwards (the default;
 /// `TOKENSPEED_UNLINK_MM_SHM_AFTER_READ=0` keeps it, for debugging).
+#[cfg(unix)]
 fn unlink_shm_after_read() -> bool {
     static UNLINK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *UNLINK.get_or_init(|| {
@@ -129,9 +130,14 @@ fn validated_shm_name(name: &str) -> Result<&str, String> {
 /// regular file reached without following a symlink at the final component,
 /// and is unlinked after the read unless disabled.
 fn read_shm_payload(tensor: &str, handle: &common::ShmHandle) -> Result<Vec<u8>, String> {
+    let name = validated_shm_name(&handle.name)?;
+    read_shm_file(tensor, name, handle)
+}
+
+#[cfg(unix)]
+fn read_shm_file(tensor: &str, name: &str, handle: &common::ShmHandle) -> Result<Vec<u8>, String> {
     use rustix::fs::{FileType, Mode, OFlags};
 
-    let name = validated_shm_name(&handle.name)?;
     let path = std::path::Path::new("/dev/shm").join(name);
     let nbytes = usize::try_from(handle.nbytes)
         .map_err(|_| format!("multimodal tensor {tensor:?}: shm nbytes out of range"))?;
@@ -195,6 +201,13 @@ fn read_shm_payload(tensor: &str, handle: &common::ShmHandle) -> Result<Vec<u8>,
     read
 }
 
+#[cfg(not(unix))]
+fn read_shm_file(tensor: &str, name: &str, _handle: &common::ShmHandle) -> Result<Vec<u8>, String> {
+    Err(format!(
+        "multimodal tensor {tensor:?}: TensorData.shm {name:?} is not supported on this platform"
+    ))
+}
+
 /// Little-endian float32 bytes from a floating payload of `dtype`, so every
 /// floating tensor takes the one cast to the model dtype (the engine's own
 /// frontend casts whatever dtype it is handed).
@@ -245,7 +258,7 @@ fn decode_tensor(
         let f32_bytes = if tensor.dtype == "float32" {
             data
         } else {
-            to_f32_bytes(name, &tensor.dtype, &data)?
+            Bytes::from(to_f32_bytes(name, &tensor.dtype, &data)?)
         };
         let cast = WireTensor::from_f32_bytes_cast(model_dtype, shape.clone(), &f32_bytes)?;
         let WireArrayData::RawView(bytes) = cast.data else {
@@ -260,7 +273,7 @@ fn decode_tensor(
     let decoded = Decoded {
         dtype: tensor.dtype,
         shape,
-        bytes: Bytes::from(data),
+        bytes: data,
     };
     // Guard against a truncated or oversized inline payload: the engine would
     // otherwise reinterpret the raw buffer against the declared shape.
@@ -289,7 +302,7 @@ fn mm_key(key: &str, is_video: bool) -> String {
 }
 
 /// Whether a batch carries tensors the preprocessed path can use: pixels, or
-/// the grid-only form of a PD decode leg. A bare identity payload (hashes
+/// the grid-only form of a PD decode side. A bare identity payload (hashes
 /// only) is not, and rides `cache_salt` instead.
 fn has_preprocessed_payload(mm: &vllm::MultimodalInputs) -> bool {
     mm.pixel_values.is_some() || !mm.model_specific_tensors.is_empty()
@@ -311,7 +324,7 @@ fn identity_cache_salt(batches: &[vllm::MultimodalInputs]) -> Option<String> {
 /// become on the wire: per-item `mm_features` in prompt order, or, for a
 /// tensor-less identity payload, the `cache_salt` carrying the hashes. The
 /// rules are the Python servicer's: a pixel-less (grid-only) batch is a PD
-/// decode leg and needs remote KV, or the engine would run the encoder with
+/// decode side and needs remote KV, or the engine would run the encoder with
 /// nothing to encode.
 pub(crate) fn translate_batches(
     batches: Vec<vllm::MultimodalInputs>,
@@ -410,95 +423,15 @@ pub(crate) fn build_mm_features(
     for (key, decoded) in &tensors {
         let on_cpu = keep_on_cpu.contains(key);
         if batched.contains(key) {
-            if decoded.shape.first() != Some(&num_items) {
-                return Err(format!(
-                    "batched tensor {key:?} has leading dim {:?}, expected {num_items} items",
-                    decoded.shape.first()
-                ));
-            }
-            for (i, item) in items.iter_mut().enumerate() {
-                let mut tensor = decoded.slice_rows(i, i + 1)?;
-                tensor.shape.remove(0);
-                item.insert(
-                    key.clone(),
-                    MmFieldElem {
-                        data: Some(MmKwargValue::Tensor(tensor)),
-                        field: MmField::Batched(MmBatchedField {
-                            keep_on_cpu: on_cpu,
-                        }),
-                    },
-                );
-            }
+            attach_batched(key, decoded, &mut items, on_cpu)?;
         } else if let Some(sizes_key) = flat.get(key) {
             let sizes = tensors
                 .get(sizes_key)
                 .ok_or_else(|| format!("flat sizes tensor {sizes_key:?} missing for {key:?}"))?
                 .flat_i64()?;
-            if sizes.len() != num_items {
-                return Err(format!(
-                    "flat sizes tensor {sizes_key:?} has {} entries, expected {num_items}",
-                    sizes.len()
-                ));
-            }
-            // Cumulative row offsets, and the full per-item slice list every
-            // elem carries (the engine's flat field serializes all slices).
-            let mut bounds = Vec::with_capacity(num_items + 1);
-            let mut total = 0usize;
-            bounds.push(total);
-            for size in &sizes {
-                let size = usize::try_from(*size)
-                    .map_err(|_| format!("negative size in flat sizes tensor {sizes_key:?}"))?;
-                total = total.checked_add(size).ok_or_else(|| {
-                    format!("flat sizes tensor {sizes_key:?} sums past usize range")
-                })?;
-                bounds.push(total);
-            }
-            if decoded.shape.first() != Some(&total) {
-                return Err(format!(
-                    "flat tensor {key:?} has leading dim {:?}, expected {total} total rows",
-                    decoded.shape.first(),
-                ));
-            }
-            let slices: Vec<MmSlice> = bounds
-                .windows(2)
-                .map(|w| {
-                    MmSlice::Slice(SliceSpec {
-                        start: Some(w[0] as isize),
-                        stop: Some(w[1] as isize),
-                        step: None,
-                    })
-                })
-                .collect();
-            for (i, item) in items.iter_mut().enumerate() {
-                item.insert(
-                    key.clone(),
-                    MmFieldElem {
-                        data: Some(MmKwargValue::Tensor(
-                            decoded.slice_rows(bounds[i], bounds[i + 1])?,
-                        )),
-                        field: MmField::Flat(MmFlatField {
-                            slices: slices.clone(),
-                            dim: 0,
-                            keep_on_cpu: on_cpu,
-                        }),
-                    },
-                );
-            }
+            attach_flat(key, sizes_key, decoded, &sizes, &mut items, on_cpu)?;
         } else {
-            // Shared: the full tensor replicated per item (the servicer's
-            // fallback for keys in neither batched nor flat sets).
-            for item in &mut items {
-                item.insert(
-                    key.clone(),
-                    MmFieldElem {
-                        data: Some(MmKwargValue::Tensor(decoded.whole())),
-                        field: MmField::Shared(MmSharedField {
-                            batch_size: num_items,
-                            keep_on_cpu: on_cpu,
-                        }),
-                    },
-                );
-            }
+            attach_shared(key, decoded, &mut items, on_cpu);
         }
     }
 
@@ -526,6 +459,115 @@ pub(crate) fn build_mm_features(
     }
     features.sort_by_key(|f| f.mm_position.offset);
     Ok(features)
+}
+
+/// A batched tensor: row `i` is item `i`'s value, without the leading dim.
+fn attach_batched(
+    key: &str,
+    decoded: &Decoded,
+    items: &mut [MmKwargsItem],
+    keep_on_cpu: bool,
+) -> Result<(), String> {
+    let num_items = items.len();
+    if decoded.shape.first() != Some(&num_items) {
+        return Err(format!(
+            "batched tensor {key:?} has leading dim {:?}, expected {num_items} items",
+            decoded.shape.first()
+        ));
+    }
+    for (i, item) in items.iter_mut().enumerate() {
+        let mut tensor = decoded.slice_rows(i, i + 1)?;
+        tensor.shape.remove(0);
+        item.insert(
+            key.to_string(),
+            MmFieldElem {
+                data: Some(MmKwargValue::Tensor(tensor)),
+                field: MmField::Batched(MmBatchedField { keep_on_cpu }),
+            },
+        );
+    }
+    Ok(())
+}
+
+/// A flat tensor: item `i` is the run of rows between the cumulative bounds of
+/// the per-item sizes tensor; every elem carries the full per-item slice list
+/// (the engine's flat field serializes all slices).
+fn attach_flat(
+    key: &str,
+    sizes_key: &str,
+    decoded: &Decoded,
+    sizes: &[i64],
+    items: &mut [MmKwargsItem],
+    keep_on_cpu: bool,
+) -> Result<(), String> {
+    let num_items = items.len();
+    if sizes.len() != num_items {
+        return Err(format!(
+            "flat sizes tensor {sizes_key:?} has {} entries, expected {num_items}",
+            sizes.len()
+        ));
+    }
+    let mut bounds = Vec::with_capacity(num_items + 1);
+    let mut total = 0usize;
+    bounds.push(total);
+    for size in sizes {
+        let size = usize::try_from(*size)
+            .map_err(|_| format!("negative size in flat sizes tensor {sizes_key:?}"))?;
+        total = total
+            .checked_add(size)
+            .ok_or_else(|| format!("flat sizes tensor {sizes_key:?} sums past usize range"))?;
+        bounds.push(total);
+    }
+    if decoded.shape.first() != Some(&total) {
+        return Err(format!(
+            "flat tensor {key:?} has leading dim {:?}, expected {total} total rows",
+            decoded.shape.first(),
+        ));
+    }
+    let slices: Vec<MmSlice> = bounds
+        .windows(2)
+        .map(|w| {
+            MmSlice::Slice(SliceSpec {
+                start: Some(w[0] as isize),
+                stop: Some(w[1] as isize),
+                step: None,
+            })
+        })
+        .collect();
+    for (i, item) in items.iter_mut().enumerate() {
+        item.insert(
+            key.to_string(),
+            MmFieldElem {
+                data: Some(MmKwargValue::Tensor(
+                    decoded.slice_rows(bounds[i], bounds[i + 1])?,
+                )),
+                field: MmField::Flat(MmFlatField {
+                    slices: slices.clone(),
+                    dim: 0,
+                    keep_on_cpu,
+                }),
+            },
+        );
+    }
+    Ok(())
+}
+
+/// A shared tensor: the whole tensor on every item (the servicer's fallback
+/// for keys in neither the batched nor the flat set).
+fn attach_shared(key: &str, decoded: &Decoded, items: &mut [MmKwargsItem], keep_on_cpu: bool) {
+    let batch_size = items.len();
+    for item in items.iter_mut() {
+        item.insert(
+            key.to_string(),
+            MmFieldElem {
+                data: Some(MmKwargValue::Tensor(decoded.whole())),
+                field: MmField::Shared(MmSharedField {
+                    batch_size,
+                    keep_on_cpu,
+                }),
+            },
+        );
+    }
 }
 
 /// Boolean embed mask over a placeholder range: `true` where the prompt token
@@ -569,7 +611,7 @@ mod tests {
         vllm::TensorData {
             shape,
             dtype: dtype.to_string(),
-            payload: Some(vllm::tensor_data::Payload::Inline(data)),
+            payload: Some(vllm::tensor_data::Payload::Inline(data.into())),
         }
     }
 
@@ -823,6 +865,7 @@ mod tests {
     /// A `/dev/shm` payload is read at its offset, cast like an inline one,
     /// and unlinked once read (the Python servicer's `mm_shm` contract).
     #[test]
+    #[cfg(target_os = "linux")]
     fn shm_payloads_are_read_at_offset_and_unlinked() {
         let name = format!(
             "smg-adapter-test-{}-{}",
@@ -939,7 +982,7 @@ mod tests {
     /// batches merge in prompt order, a tensor-less identity payload becomes a
     /// cache salt, and a grid-only (pixel-less) batch needs remote KV.
     #[test]
-    fn translate_batches_merges_salts_and_gates_pixel_less_legs() {
+    fn translate_batches_merges_salts_and_gates_pixel_less_sides() {
         // Two batches: the second one's placeholders sit before the first's.
         let mut second = base_inputs();
         second.mm_placeholders = placeholders(&[(0, 1), (12, 1)]);
@@ -979,7 +1022,7 @@ mod tests {
         assert!(features.is_none());
         assert_eq!(salt.as_deref(), Some("mm:h0,h1"));
 
-        // Grid only (a PD decode leg): refused without remote KV, built with it.
+        // Grid only (a PD decode side): refused without remote KV, built with it.
         let grid_only = || {
             let mut mm = base_inputs();
             mm.pixel_values = None;
@@ -995,7 +1038,7 @@ mod tests {
         assert!(err.contains("requires remote KV"), "{err}");
         let (features, _) =
             translate_batches(vec![grid_only()], &[0; 9], ModelDtype::BFloat16, true)
-                .expect("decode leg");
+                .expect("decode side");
         let features = features.expect("grid features");
         assert_eq!(features.len(), 2);
         let item = features[0].data.as_ref().expect("item");
@@ -1059,5 +1102,69 @@ mod tests {
         let err = build_mm_features(mm, &prompt, ModelDtype::BFloat16)
             .expect_err("out-of-range placeholder");
         assert!(err.contains("exceeds prompt"), "{err}");
+    }
+
+    fn decoded(shape: Vec<u32>, dtype: &str, data: Vec<u8>) -> Decoded {
+        decode_tensor("t", inline_tensor(shape, dtype, data), ModelDtype::Float32).expect("decoded")
+    }
+
+    #[test]
+    fn attach_batched_puts_one_row_on_each_item_and_refuses_another_leading_dim() {
+        let tensor = decoded(vec![2, 3], "int64", i64_bytes(&[1, 2, 3, 4, 5, 6]));
+        let mut items = vec![MmKwargsItem::new(); 2];
+        attach_batched("ids", &tensor, &mut items, true).expect("attached");
+        assert_eq!(tensor_of(&items[1]["ids"]).shape, vec![3]);
+        assert!(matches!(
+            items[1]["ids"].field,
+            MmField::Batched(MmBatchedField { keep_on_cpu: true })
+        ));
+        let mut three = vec![MmKwargsItem::new(); 3];
+        assert_eq!(
+            attach_batched("ids", &tensor, &mut three, false).unwrap_err(),
+            "batched tensor \"ids\" has leading dim Some(2), expected 3 items"
+        );
+    }
+
+    #[test]
+    fn attach_flat_cuts_the_rows_by_cumulative_sizes_and_checks_the_sizes() {
+        let tensor = decoded(vec![5, 2], "float32", f32_bytes(&[0.0; 10]));
+        let mut items = vec![MmKwargsItem::new(); 2];
+        attach_flat("patches", "sizes", &tensor, &[2, 3], &mut items, false).expect("attached");
+        assert_eq!(tensor_of(&items[0]["patches"]).shape, vec![2, 2]);
+        assert_eq!(tensor_of(&items[1]["patches"]).shape, vec![3, 2]);
+        let MmField::Flat(flat) = &items[1]["patches"].field else {
+            panic!("expected flat field");
+        };
+        assert_eq!(flat.slices.len(), 2);
+        let mut fresh = vec![MmKwargsItem::new(); 2];
+        assert_eq!(
+            attach_flat("patches", "sizes", &tensor, &[2], &mut fresh, false).unwrap_err(),
+            "flat sizes tensor \"sizes\" has 1 entries, expected 2"
+        );
+        assert_eq!(
+            attach_flat("patches", "sizes", &tensor, &[2, 2], &mut fresh, false).unwrap_err(),
+            "flat tensor \"patches\" has leading dim Some(5), expected 4 total rows"
+        );
+        assert_eq!(
+            attach_flat("patches", "sizes", &tensor, &[-1, 6], &mut fresh, false).unwrap_err(),
+            "negative size in flat sizes tensor \"sizes\""
+        );
+    }
+
+    #[test]
+    fn attach_shared_puts_the_whole_tensor_on_every_item() {
+        let tensor = decoded(vec![2], "int64", i64_bytes(&[1, 1]));
+        let mut items = vec![MmKwargsItem::new(); 3];
+        attach_shared("grid", &tensor, &mut items, true);
+        for item in &items {
+            assert_eq!(tensor_of(&item["grid"]).shape, vec![2]);
+            assert!(matches!(
+                item["grid"].field,
+                MmField::Shared(MmSharedField {
+                    batch_size: 3,
+                    keep_on_cpu: true,
+                })
+            ));
+        }
     }
 }

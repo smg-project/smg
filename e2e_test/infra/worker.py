@@ -34,15 +34,22 @@ from .constants import (
     get_vllm_mm_processor,
     get_vllm_servicer_impl,
     get_zmq_engine_count,
+    host_port,
+    moriio_host,
     sglang_transfer_backend,
     vllm_kv_backend,
+    vllm_moriio_backend,
+    vllm_moriio_mode,
 )
 from .model_specs import get_model_spec
 from .process_utils import (
     detect_ib_device,
     detect_rdma_fabric_devices,
     get_open_port,
+    get_open_port_block,
+    gpu_compute_apps,
     gpu_memory_used_mib,
+    reserve_port,
     wait_for_gpu_memory_release,
     wait_for_health,
     wait_for_process_group_exit,
@@ -63,25 +70,39 @@ class Worker:
     worker_type: WorkerType = WorkerType.REGULAR
     bootstrap_port: int | None = None
     nixl_port: int | None = None
+    # MoRI-IO KV ports: the handshake port and the first of the notify ports
+    # (one per tensor-parallel rank, consecutive). SMG holds them as labels,
+    # so a restarted worker keeps them.
+    moriio_handshake_port: int | None = None
+    moriio_notify_port: int | None = None
     ib_device: str | None = None
     dist_init_addr: str | None = None
     dist_init_port: int | None = None
     log_dir: str | None = None
     extra_engine_args: list[str] | None = None
-    # Overrides the model spec's tp, so a PD pair can run asymmetric legs.
+    # Overrides the model spec's tp, so a PD pair can run asymmetric pools.
     tp: int | None = None
-    # KV transfer backend for this PD worker ("nixl" or "mooncake"); None
-    # takes the lane's default, so one fleet can mix transports.
+    # KV transfer backend for this PD worker ("nixl", "mooncake" or "moriio");
+    # None takes the lane's default, so one fleet can mix transports.
     kv_backend: str | None = None
+    # In-engine RL control app port (TokenSpeed gRPC workers). None allocates
+    # one at launch; SMG discovers it from the engine's server info.
+    rl_control_port: int | None = None
     # Environment for the engine process on top of the infra's own settings
     # (a deployment-injected SMG_PAIRING_PROTOCOL, for instance).
     extra_env: dict[str, str] | None = None
+    # Mock engine only: the port of the mock worker's admin API, where a test
+    # states the answers the worker's next requests get.
+    admin_port: int | None = None
+    # Whether the harness picked ``admin_port`` (and releases it at stop).
+    _admin_port_auto: bool = field(default=False, repr=False)
     process: subprocess.Popen | None = field(default=None, repr=False)
     # Where the engine's output lands when it is not shown on the terminal.
     log_path: str | None = field(default=None, repr=False)
     _log_file: IO[Any] | None = field(default=None, repr=False)
     # Used memory per GPU just before launch; ``stop`` waits for it to come back.
     _gpu_mem_baseline: dict[int, int] | None = field(default=None, repr=False)
+    _moriio_ports: list[int] = field(default_factory=list, repr=False)
 
     @property
     def base_url(self) -> str:
@@ -94,8 +115,8 @@ class Worker:
 
             return _zmq_ipc_url(self.port)
         if self.mode == ConnectionMode.GRPC:
-            return f"grpc://{DEFAULT_HOST}:{self.port}"
-        return f"http://{DEFAULT_HOST}:{self.port}"
+            return f"grpc://{host_port(DEFAULT_HOST, self.port)}"
+        return f"http://{host_port(DEFAULT_HOST, self.port)}"
 
     @property
     def worker_url(self) -> str:
@@ -105,7 +126,14 @@ class Worker:
     @property
     def http_url(self) -> str:
         """HTTP URL (used for health checks even on gRPC workers)."""
-        return f"http://{DEFAULT_HOST}:{self.port}"
+        return f"http://{host_port(DEFAULT_HOST, self.port)}"
+
+    @property
+    def admin_url(self) -> str | None:
+        """The mock worker's admin API, or ``None`` for an engine that has none."""
+        if self.admin_port is None:
+            return None
+        return f"http://{host_port(DEFAULT_HOST, self.admin_port)}"
 
     def start(
         self,
@@ -235,13 +263,18 @@ class Worker:
             held = wait_for_gpu_memory_release(self.gpu_ids, self._gpu_mem_baseline, timeout=30.0)
             if held:
                 # The wait gives up once the figure stops moving, usually well
-                # inside the 30 s cap; report what was actually waited.
+                # inside the 30 s cap; report what was actually waited, and
+                # the compute processes nvidia-smi lists on those GPUs. An empty
+                # list is not evidence of anything from inside a container (see
+                # gpu_compute_apps).
                 logger.warning(
-                    "Worker %s: GPU memory still held %.0fs after stop: used %s MiB, baseline %s MiB",
+                    "Worker %s: GPU memory still held %.0fs after stop: used %s MiB, "
+                    "baseline %s MiB, compute processes nvidia-smi lists there: %s",
                     self.model_id,
                     time.monotonic() - waited,
                     held,
                     self._gpu_mem_baseline,
+                    gpu_compute_apps(sorted(held)),
                 )
 
         # Clean up log file
@@ -256,6 +289,9 @@ class Worker:
         from .process_utils import release_port
 
         release_port(self.port)
+        if self.rl_control_port is not None:
+            release_port(self.rl_control_port)
+            self.rl_control_port = None
         if self.bootstrap_port is not None:
             release_port(self.bootstrap_port)
         if self.nixl_port is not None:
@@ -264,6 +300,12 @@ class Worker:
         if self.dist_init_port is not None:
             release_port(self.dist_init_port)
             self.dist_init_port = None
+        if self._admin_port_auto and self.admin_port is not None:
+            release_port(self.admin_port)
+            self.admin_port = None
+            self._admin_port_auto = False
+        for port in self._moriio_ports:
+            release_port(port)
 
     def is_alive(self) -> bool:
         """Check if the worker process is still running."""
@@ -308,6 +350,8 @@ class Worker:
             cmd = self._build_trtllm_cmd(model_path, tp_size, spec)
         elif self.engine == "mlx":
             cmd = self._build_mlx_cmd(model_path, spec)
+        elif self.engine == "mock":
+            cmd = self._build_mock_cmd(model_path, spec)
         elif self.engine == "tokenspeed":
             if self.mode == ConnectionMode.ZMQ:
                 cmd = self._build_tokenspeed_zmq_cmd(model_path, tp_size, spec)
@@ -425,15 +469,119 @@ class Worker:
         # PD disaggregation: KV transfer roles (backend via E2E_VLLM_KV_BACKEND)
         if self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
             kv_role = "kv_producer" if self.worker_type == WorkerType.PREFILL else "kv_consumer"
-            if self.effective_kv_backend() == "mooncake":
+            backend = self.effective_kv_backend()
+            config: dict[str, Any]
+            if backend == "mooncake":
                 config = {"kv_connector": "MooncakeConnector", "kv_role": kv_role}
+            elif backend == "moriio":
+                config = {
+                    "kv_connector": "MoRIIOConnector",
+                    "kv_role": kv_role,
+                    "kv_connector_extra_config": self._moriio_extra_config(tp_size),
+                }
             else:
-                config = {"kv_connector": "NixlConnector", "kv_role": kv_role}
+                config = {
+                    "kv_connector": "NixlConnector",
+                    "kv_role": kv_role,
+                    # A decode keeps a dead prefill's KV region mapped until it
+                    # forgets that peer, and the connector forgets idle peers
+                    # only after engine_ttl seconds (an hour by default). A
+                    # prefill restarted on the same GPU inside that window
+                    # fails its startup free-memory check: on 0.29.0, 53 GiB
+                    # of the dead worker stayed resident with the UCX IPC
+                    # cache already off (see _build_env). Forget idle peers
+                    # after a few seconds instead; the next request to one
+                    # re-runs the handshake, which is cheap at this scale.
+                    "kv_connector_extra_config": {"engine_ttl": 3},
+                }
             cmd.extend(["--kv-transfer-config", json.dumps(config)])
 
         extra = spec.get("vllm_args", [])
         if extra:
             cmd.extend(extra)
+        return cmd
+
+    def _moriio_extra_config(self, tp_size: int) -> dict:
+        """MoRIIOConnector settings: this worker's address and ports, the lane's mode."""
+        if self.moriio_handshake_port is None:
+            self.moriio_handshake_port = get_open_port_block(1)
+            self.moriio_notify_port = get_open_port_block(tp_size)
+            self._moriio_ports = [
+                self.moriio_handshake_port,
+                *range(self.moriio_notify_port, self.moriio_notify_port + tp_size),
+            ]
+        else:
+            for port in self._moriio_ports:
+                reserve_port(port)
+        return {
+            "host_ip": moriio_host(),
+            "http_port": str(self.port),
+            "handshake_port": str(self.moriio_handshake_port),
+            "notify_port": str(self.moriio_notify_port),
+            "read_mode": vllm_moriio_mode() == "read",
+            "backend": vllm_moriio_backend(),
+        }
+
+    def moriio_registration(self) -> dict:
+        """``POST /workers`` fields that let SMG's HTTP PD router hand KV to this worker.
+
+        A worker registered by URL alone carries no kv_connector, and SMG
+        assumes vLLM's default MoRI-IO ports unless the labels give others.
+        """
+        tp = self.tp or get_model_spec(self.model_id).get("tp", 1)
+        prefill = self.worker_type == WorkerType.PREFILL
+        return {
+            "runtime_type": "vllm",
+            "connection_mode": "http",
+            "kv_connector": "MoRIIOConnector",
+            "kv_role": "kv_producer" if prefill else "kv_consumer",
+            "labels": {
+                "moriio_mode": vllm_moriio_mode(),
+                "moriio_host": moriio_host(),
+                "moriio_handshake_port": str(self.moriio_handshake_port),
+                "moriio_notify_port": str(self.moriio_notify_port),
+                "tp_size": str(tp),
+            },
+        }
+
+    def _build_mock_cmd(self, model_path: str, spec: dict) -> list[str]:
+        """The scripted mock worker (``crates/mock_worker``) on this worker's wire.
+
+        It advertises the spec's model and tokenizer, so the gateway tokenizes
+        prompts with the model's files and decodes the ids the mock sends
+        back; the mock encodes a scripted text with the same files. The
+        binary is ``MOCK_WORKER_BIN`` or ``mock-worker`` on the PATH. Its
+        admin API, where a test states the answers, binds ``admin_port``.
+        """
+        if self.admin_port is None:
+            self.admin_port = get_open_port()
+            self._admin_port_auto = True
+        cmd = [
+            os.environ.get("MOCK_WORKER_BIN", "mock-worker"),
+            "--host",
+            DEFAULT_HOST,
+            "--model",
+            model_path,
+            "--tokenizer",
+            model_path,
+            "--context-length",
+            str(spec.get("context_length", 32768)),
+            "--admin-port",
+            str(self.admin_port),
+        ]
+        if self.mode == ConnectionMode.GRPC:
+            cmd += ["--grpc-base-port", str(self.port), "--grpc-count", "1"]
+        elif self.mode == ConnectionMode.ZMQ:
+            # The gateway binds the handshake it derives from the worker's
+            # ipc:// URL on the IPv4 loopback whatever the lane's host is
+            # (the ZMQ adapter's fixed loopback); the rank dials it, as an
+            # engine does.
+            from smg.serve import _zmq_handshake_port
+
+            handshake = f"tcp://127.0.0.1:{_zmq_handshake_port(self.base_url)}"
+            cmd += ["--zmq-handshake", handshake, "--zmq-count", "1"]
+        else:
+            cmd += ["--http-base-port", str(self.port), "--http-count", "1"]
         return cmd
 
     def _build_mlx_cmd(self, model_path: str, spec: dict) -> list[str]:
@@ -528,6 +676,14 @@ class Worker:
             # ``logprobs=True`` requests get real per-token data back.
             "--enable-output-logprobs",
         ]
+        # Only the port: without ``--rl-control-host`` the engine binds the
+        # control app on its own ``--host`` (the harness address the gateway
+        # already dials) and advertises that URL; a wildcard bind would not be
+        # advertised at all. ``ts serve`` always enables the control app, so
+        # every lane runs the engine as deployed.
+        if self.rl_control_port is None:
+            self.rl_control_port = get_open_port()
+        cmd.extend(["--rl-control-port", str(self.rl_control_port)])
         if self.worker_type in (WorkerType.ENCODE, WorkerType.PREFILL, WorkerType.DECODE):
             cmd.extend(["--disaggregation-mode", self.worker_type.value])
             if self.bootstrap_port is not None:
@@ -584,33 +740,41 @@ class Worker:
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
         env["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, self.gpu_ids))
-        # The vLLM gRPC servicer implementation is a flag inside the smg
-        # servicer package, read by upstream's entrypoint; the command stays.
-        if self.engine == "vllm" and self.mode == ConnectionMode.GRPC:
-            if get_vllm_servicer_impl() == "rust":
-                # A vLLM without the hook would run Python while the lane
-                # reports Rust coverage; refuse to start such a worker.
-                _require_rust_servicer_hook()
-                env["SMG_VLLM_SERVICER_IMPL"] = "rust"
+        if self.engine == "vllm":
+            # vLLM 0.31.0 runs tensor-parallel all-reduces through FlashInfer,
+            # whose auto backend picks the MNNVL kernel wherever NVLink
+            # multicast exists, H100 included. FlashInfer 0.7.0 ships its
+            # jit-cache as per-architecture wheels, and the Hopper wheel does
+            # not carry that kernel (its AOT list builds it for sm100/sm103
+            # only, where the 0.6.x single wheel carried it for every arch),
+            # so the worker JIT-compiles it with nvcc, which the pods do not
+            # have, and dies at the first all-reduce of the startup memory
+            # profile. The TRT-LLM backend is the same fused all-reduce
+            # integration and is prebuilt for Hopper. An explicit choice wins.
+            env.setdefault("VLLM_FLASHINFER_ALLREDUCE_BACKEND", "trtllm")
+
+        # The servicer implementation of a gRPC worker is a flag inside the smg
+        # servicer package, read by the engine's own entrypoint (the command
+        # stays): per engine, the variable the worker reads and the lane's
+        # choice for it. Built here, not at import, so the getters and the hook
+        # check are the module's current ones (a test replaces them).
+        servicer_impl = {
+            "vllm": ("SMG_VLLM_SERVICER_IMPL", get_vllm_servicer_impl),
+            "tokenspeed": ("SMG_TOKENSPEED_SERVICER_IMPL", get_tokenspeed_servicer_impl),
+            "sglang": ("SMG_SGLANG_SERVICER_IMPL", get_sglang_servicer_impl),
+        }
+        # The engines whose Rust servicer needs a hook in the engine package: a
+        # worker without it would run Python while the lane reports Rust coverage.
+        rust_servicer_needs_hook = {"vllm"}
+        if self.mode == ConnectionMode.GRPC and self.engine in servicer_impl:
+            variable, lane_choice = servicer_impl[self.engine]
+            if lane_choice() == "rust":
+                if self.engine in rust_servicer_needs_hook:
+                    _require_rust_servicer_hook()
+                env[variable] = "rust"
             else:
                 # The lane setting is authoritative over an inherited value.
-                env.pop("SMG_VLLM_SERVICER_IMPL", None)
-
-        # The TokenSpeed servicer implementation is likewise a flag inside the
-        # smg servicer package, read by its own entrypoint; the command stays.
-        if self.engine == "tokenspeed" and self.mode == ConnectionMode.GRPC:
-            if get_tokenspeed_servicer_impl() == "rust":
-                env["SMG_TOKENSPEED_SERVICER_IMPL"] = "rust"
-            else:
-                env.pop("SMG_TOKENSPEED_SERVICER_IMPL", None)
-
-        # The SGLang servicer implementation is a flag inside the smg servicer
-        # package too, read at the entry SGLang's --grpc-mode calls.
-        if self.engine == "sglang" and self.mode == ConnectionMode.GRPC:
-            if get_sglang_servicer_impl() == "rust":
-                env["SMG_SGLANG_SERVICER_IMPL"] = "rust"
-            else:
-                env.pop("SMG_SGLANG_SERVICER_IMPL", None)
+                env.pop(variable, None)
 
         if (
             self.engine == "vllm"
@@ -658,11 +822,16 @@ class Worker:
 
         # vLLM PD workers need per-worker side-channel ports for their KV backend
         if self.engine == "vllm" and self.worker_type in (WorkerType.PREFILL, WorkerType.DECODE):
-            if self.effective_kv_backend() == "mooncake":
+            backend = self.effective_kv_backend()
+            if backend == "mooncake":
                 # The producer's bootstrap server must listen on the port the
                 # gateway advertises in remote_bootstrap_addr
                 if self.bootstrap_port is not None:
                     env["VLLM_MOONCAKE_BOOTSTRAP_PORT"] = str(self.bootstrap_port)
+            elif backend == "moriio":
+                # The address the engine advertises; SMG hands the same one to
+                # the peer through the worker's moriio_host label.
+                env["VLLM_HOST_IP"] = moriio_host()
             else:
                 self.nixl_port = get_open_port()
                 env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(self.nixl_port)
@@ -672,6 +841,8 @@ class Worker:
                 # allocated 60 s after every prefill process had exited), and
                 # the prefill restarted on that GPU fails its free-memory
                 # check. Drop the cache so a mapping ends with its transfer.
+                # From vLLM 0.29.0 the reader keeps a mapping per peer anyway,
+                # so the engine_ttl in _build_vllm_base_cmd carries the rest.
                 env.setdefault("UCX_CUDA_IPC_CACHE", "n")
 
         if self.engine == "trtllm":
@@ -747,7 +918,7 @@ class Worker:
             )
 
         start = time.perf_counter()
-        channel = grpc.insecure_channel(f"{DEFAULT_HOST}:{self.port}")
+        channel = grpc.insecure_channel(host_port(DEFAULT_HOST, self.port))
         try:
             while time.perf_counter() - start < timeout:
                 if not self.is_alive():
@@ -817,10 +988,10 @@ def start_workers(
         mode: Connection mode (HTTP or GRPC).
         count: Number of workers to start.
         worker_type: Worker specialization (regular, prefill, decode).
-        timeout: Seconds to wait for each worker to become healthy.
+        timeout: Shared startup bound for all workers to become healthy.
         log_dir: Directory to store worker log files.
         gpu_offset: Starting GPU index for worker assignment.
-        wait_ready: If True (default), block until each worker is healthy.
+        wait_ready: If True (default), spawn all workers before waiting for health.
             If False, spawn processes and return immediately.
         gpus: GPUs per worker; defaults to the model spec's tp (e.g. DP needs dp*tp).
         extra_engine_args: Extra CLI args appended to the engine launch command.
@@ -877,7 +1048,7 @@ def start_workers(
                 WorkerType.DECODE,
             )
             dist_init_port = get_open_port() if is_ts_disagg else None
-            dist_init_addr = f"{DEFAULT_HOST}:{dist_init_port}" if dist_init_port else None
+            dist_init_addr = host_port(DEFAULT_HOST, dist_init_port) if dist_init_port else None
 
             worker = Worker(
                 model_id=model_id,
@@ -903,7 +1074,19 @@ def start_workers(
                 time.sleep(LAUNCH_STAGGER_DELAY)
 
             workers.append(worker)
-            worker.start(timeout=timeout, wait_ready=wait_ready)
+            # Each worker has its own GPU slice. Let model loading overlap
+            # instead of holding later workers' GPUs idle during this wait.
+            worker.start(timeout=timeout, wait_ready=False)
+        if wait_ready:
+            # Launch staggering must not shorten the last worker's load budget.
+            deadline = time.monotonic() + timeout
+            for worker in workers:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Workers for {model_id} did not become healthy within {timeout}s"
+                    )
+                worker.wait_ready(max(1, int(remaining)))
     except Exception:
         stop_workers(workers)
         raise

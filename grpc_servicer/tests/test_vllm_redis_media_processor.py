@@ -29,7 +29,7 @@ class _Item:
 
 
 class _MmConfig:
-    limits = {"image": 8, "video": 2}
+    limits = {"image": 8, "video": 2, "audio": 1}
 
     def get_limit_per_prompt(self, modality):
         return self.limits[modality]
@@ -303,6 +303,25 @@ class TestProcess:
 
 
 class TestItemCap:
+    def test_audio_references_are_forwarded_with_the_engine_item_limit(self, monkeypatch):
+        client = FakeRedis(responder=ok_result)
+        p = processor(client)
+        monkeypatch.setattr(p, "_rebuild", lambda result, text, arrival: result.job_id)
+        audio = _Item("audio", "https://a/input.wav")
+        image = _Item("image", "https://a/1.png")
+        job_id = run(p.process([1, 2, 3], "prompt", [audio, image], 1.0, request_id="req"))
+        assert len(client.pushed) == 1
+        job = proto.decode_job(client.pushed[0][1])
+        assert job.job_id == job_id
+        assert job.request_id == "req"
+        assert [(item.modality, item.url) for item in job.items] == [
+            ("audio", "https://a/input.wav"),
+            ("image", "https://a/1.png"),
+        ]
+        with pytest.raises(ValueError, match="2 audio items, above this worker's limit of 1"):
+            run(p.process([1, 2, 3], None, [audio, audio], 0.0))
+        assert len(client.pushed) == 1, "over-limit audio is rejected before queueing"
+
     def test_process_caps_item_count_before_queueing(self):
         client = FakeRedis(responder=ok_result)
         p = processor(client, max_items=1)

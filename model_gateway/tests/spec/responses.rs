@@ -488,11 +488,13 @@ fn test_validate_repetition_penalty_range() {
     }
 }
 
-/// Test max_output_tokens minimum validation
+/// `max_output_tokens` takes any count from 1, as `max_tokens` does on the
+/// chat endpoint (the public API's own floor of 16 is not imposed); 0 is
+/// refused.
 #[test]
 fn test_validate_max_output_tokens() {
     // Valid values
-    for val in [1, 100, 1000] {
+    for val in [1, 8, 16, 100, 1000] {
         let request = ResponsesRequest {
             input: ResponseInput::Text("test".to_string()),
             max_output_tokens: Some(val),
@@ -504,7 +506,7 @@ fn test_validate_max_output_tokens() {
         );
     }
 
-    // Invalid values
+    // Invalid value
     let request = ResponsesRequest {
         input: ResponseInput::Text("test".to_string()),
         max_output_tokens: Some(0),
@@ -816,6 +818,7 @@ fn test_validate_text_format_json_schema_empty_name() {
                 description: None,
                 strict: None,
             }),
+            verbosity: None,
         }),
         ..Default::default()
     };
@@ -839,6 +842,7 @@ fn test_validate_text_format_json_schema_schema_not_object() {
                     description: None,
                     strict: None,
                 }),
+                verbosity: None,
             }),
             ..Default::default()
         }
@@ -874,6 +878,7 @@ fn test_validate_tool_choice_requires_tools() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
@@ -896,17 +901,31 @@ fn test_validate_tool_choice_requires_tools() {
         "tool_choice=none without tools should be valid"
     );
 
-    // Invalid: tool_choice=auto without tools
+    // Valid: tool_choice=auto without tools (absent or empty list) is OK
+    for tools in [None, Some(vec![])] {
+        let request = ResponsesRequest {
+            input: ResponseInput::Text("test".to_string()),
+            tools,
+            tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
+            ..Default::default()
+        };
+        assert!(
+            request.validate().is_ok(),
+            "tool_choice=auto without tools should be valid"
+        );
+    }
+
+    // Invalid: tool_choice=required without tools
     let request = ResponsesRequest {
         input: ResponseInput::Text("test".to_string()),
-        tools: None,
-        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Auto)),
+        tools: Some(vec![]),
+        tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Required)),
         ..Default::default()
     };
     let result = request.validate();
     assert!(
         result.is_err(),
-        "tool_choice=auto without tools should be invalid"
+        "tool_choice=required without tools should be invalid"
     );
 
     if let Err(errors) = result {
@@ -918,84 +937,43 @@ fn test_validate_tool_choice_requires_tools() {
     }
 }
 
-/// Test top_logprobs requires include field
+/// `top_logprobs` is accepted with or without the logprobs include entry, as
+/// the public API accepts it (without the include entry the logprobs are
+/// simply not attached to the output text).
 #[test]
-fn test_validate_top_logprobs_requires_include() {
-    // Valid: top_logprobs with correct include field
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        top_logprobs: Some(5),
-        include: Some(vec![IncludeField::MessageOutputTextLogprobs]),
-        ..Default::default()
-    };
-    assert!(
-        request.validate().is_ok(),
-        "top_logprobs with include field should be valid"
-    );
-
-    // Invalid: top_logprobs without include field
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        top_logprobs: Some(5),
-        include: None,
-        ..Default::default()
-    };
-    let result = request.validate();
-    assert!(
-        result.is_err(),
-        "top_logprobs without include field should be invalid"
-    );
-
-    // Invalid: top_logprobs with wrong include field
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        top_logprobs: Some(5),
-        include: Some(vec![IncludeField::ReasoningEncryptedContent]),
-        ..Default::default()
-    };
-    let result = request.validate();
-    assert!(
-        result.is_err(),
-        "top_logprobs with wrong include field should be invalid"
-    );
+fn test_validate_top_logprobs_does_not_require_include() {
+    for include in [
+        Some(vec![IncludeField::MessageOutputTextLogprobs]),
+        None,
+        Some(vec![IncludeField::ReasoningEncryptedContent]),
+    ] {
+        let request = ResponsesRequest {
+            input: ResponseInput::Text("test".to_string()),
+            top_logprobs: Some(5),
+            include,
+            ..Default::default()
+        };
+        assert!(
+            request.validate().is_ok(),
+            "top_logprobs must validate regardless of include: {:?}",
+            request.include
+        );
+    }
 }
 
-/// Test previous_response_id format validation
-/// NOTE: Format validation removed - previous_response_id format is not validated
-/// response_id generated by the grpc router is not necessarily start with 'resp_'
+/// previous_response_id is opaque: the ids the gRPC router hands out need not
+/// start with "resp_", so the validator must not require the prefix.
 #[test]
-#[ignore]
-fn test_validate_previous_response_id_format() {
-    // Valid: starts with "resp_"
-    let request = ResponsesRequest {
-        input: ResponseInput::Text("test".to_string()),
-        previous_response_id: Some("resp_123abc".to_string()),
-        ..Default::default()
-    };
-    assert!(
-        request.validate().is_ok(),
-        "previous_response_id with resp_ prefix should be valid"
-    );
-
-    // Invalid: doesn't start with "resp_"
+fn test_validate_previous_response_id_accepts_any_format() {
     let request = ResponsesRequest {
         input: ResponseInput::Text("test".to_string()),
         previous_response_id: Some("response_123abc".to_string()),
         ..Default::default()
     };
-    let result = request.validate();
     assert!(
-        result.is_err(),
-        "previous_response_id without resp_ prefix should be invalid"
+        request.validate().is_ok(),
+        "a previous_response_id without the resp_ prefix is accepted"
     );
-
-    if let Err(errors) = result {
-        let error_msg = errors.to_string();
-        assert!(
-            error_msg.contains("previous_response_id") && error_msg.contains("resp_"),
-            "Error should mention previous_response_id format"
-        );
-    }
 }
 
 /// Test conversation and previous_response_id mutual exclusion
@@ -1173,6 +1151,7 @@ fn test_normalize_tool_choice_auto() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         tool_choice: None,
@@ -1234,6 +1213,7 @@ fn test_normalize_tool_choice_no_override() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         tool_choice: Some(ResponsesToolChoice::Options(ToolChoiceOptions::Required)),
@@ -1264,6 +1244,7 @@ fn test_normalize_parallel_tool_calls() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         parallel_tool_calls: None,
@@ -1316,6 +1297,7 @@ fn test_normalize_parallel_tool_calls_no_override() {
                 description: None,
                 parameters: json!({}),
                 strict: None,
+                extra: Default::default(),
             },
         })]),
         parallel_tool_calls: Some(false),

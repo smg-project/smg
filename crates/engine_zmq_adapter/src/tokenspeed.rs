@@ -20,8 +20,10 @@ use smg_grpc_client::{common_proto as common, tokenspeed_proto, vllm_proto as vl
 use tracing::warn;
 
 use crate::{
+    context_window::admit_prompt,
     fanout::fan_out_n,
     stream::{poll_mapped, MappedGenerateStream, StreamState},
+    structured_outputs::ConstraintRef,
 };
 
 /// Streaming generate output for one TokenSpeed sub-request, mapping each
@@ -52,6 +54,17 @@ impl TokenSpeedGenerateStream {
     /// The choice index this stream stamps on its responses.
     pub fn index(&self) -> u32 {
         self.index
+    }
+
+    /// The engine-side id of this choice's request.
+    pub fn request_id(&self) -> &str {
+        self.inner.request_id()
+    }
+
+    /// The data-parallel rank this choice's request went to; `None` for an
+    /// engine whose identity names no index.
+    pub fn engine_index(&self) -> Option<u32> {
+        self.inner.engine_index()
     }
 
     /// Whether the engine already finished this choice and its terminal
@@ -215,6 +228,13 @@ impl MappedGenerateStream for TokenSpeedGenerateStream {
 
         // An engine-side failure must surface as an error, not a normal
         // completion with empty output — mirroring the vLLM stream's guard.
+        // The slim wire carries the finish type alone (no message, status or
+        // abort code), and the engine has no abort code for its grammar
+        // anyway: an `abort` the frontend did not ask for is a pause or a
+        // capacity abort, an `error` a transfer or numerical failure. So a
+        // constrained request's finishes keep the shapes every request has;
+        // the constraint-failure status is raised only by a wire whose engine
+        // attributes the failure (see the SGLang stream).
         if output.finish_reason.as_deref() == Some("error") {
             return Err(tonic::Status::internal(
                 "engine finished the request with an error (see engine logs)",
@@ -265,11 +285,48 @@ pub(crate) fn fan_out_tokenspeed_requests(
     })
 }
 
+/// What a multimodal item's `image_grid_thw` / `video_grid_thw` tensors are
+/// for the model served: the inputs of MRoPE position tensors, which nothing
+/// on this wire derives, or the layout of the patches a vision tower reads
+/// while the language model keeps 1-D positions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GridTensors {
+    /// The grid feeds MRoPE positions (the Qwen-VL families: a rope config
+    /// with an `mrope_section`), or the model is not known either way: an
+    /// item that carries one is refused, since a 1-D fallback would silently
+    /// degrade grounding.
+    Positions,
+    /// The grid only describes the patch layout: the language model's rotary
+    /// positions are 1-D (Muse Spark's `rope_type: default`), so the item
+    /// passes through as the engine expects it.
+    PatchLayout,
+}
+
+impl GridTensors {
+    /// From the model facts' `mrope_positions`, which the launcher derives from
+    /// the checkpoint's text rope config (an `mrope_section` means MRoPE):
+    /// `Some(false)` is a patch layout; `Some(true)`, and `None` for a launcher
+    /// that does not say, keep the conservative reading.
+    pub fn for_model(mrope_positions: Option<bool>) -> Self {
+        match mrope_positions {
+            Some(false) => Self::PatchLayout,
+            Some(true) | None => Self::Positions,
+        }
+    }
+}
+
 /// Translate a TokenSpeed proto `GenerateRequest` into the wire
 /// `TokenizedGenerateReqInput`. ZMQ mode requires pre-tokenized input (SMG
-/// tokenizes upstream).
-pub(crate) fn translate_request_tokenspeed(
+/// tokenizes upstream). `grid_tensors` says whether a multimodal item's grid
+/// tensors are MRoPE positions, refused on this wire, or a patch layout that
+/// passes ([`GridTensors`]). `max_model_len` is the context window the
+/// scheduler reported at the handshake: an empty prompt, or one that fills
+/// the window, is refused before it reaches the scheduler
+/// ([`admit_prompt`]).
+pub(crate) fn translate_request_tokenspeed_for(
     req: tokenspeed_proto::GenerateRequest,
+    grid_tensors: GridTensors,
+    max_model_len: u64,
 ) -> Result<TokenizedGenerateReqInput, String> {
     let mut input_ids = match req.tokenized {
         Some(tokenized) => tokenized.input_ids,
@@ -279,11 +336,19 @@ pub(crate) fn translate_request_tokenspeed(
     };
     let (input_ids_unpadded, multimodal_inputs) = match req.mm_inputs {
         Some(mm) => {
-            let (unpadded, inputs) = translate_tokenspeed_multimodal(mm, &mut input_ids)?;
+            let (unpadded, inputs) =
+                translate_tokenspeed_multimodal(mm, &mut input_ids, grid_tensors)?;
             (Some(unpadded), Some(inputs))
         }
         None => (None, None),
     };
+    // The prompt as the scheduler will hold it (the multimodal translation
+    // keeps its length). The engine's own bound on the prompt lives in the
+    // frontend this wire bypasses; its scheduler admits any length and clamps
+    // the output budget, so the window is judged here as on every wire. An
+    // unset `max_new_tokens` stays unset: the scheduler caps it at the
+    // remaining context itself.
+    admit_prompt(input_ids.len(), max_model_len)?;
     // Over the ZMQ wire TokenSpeed returns only the single sampled-token logprob
     // per token: no top-k candidates (`top_logprobs_num > 1`) and no prompt
     // logprobs (`token_ids_logprob`). Reject both rather than silently return
@@ -328,6 +393,7 @@ pub(crate) fn translate_request_tokenspeed(
 pub(crate) fn translate_tokenspeed_multimodal(
     mm: tokenspeed_proto::MultimodalInputs,
     input_ids: &mut [u32],
+    grid_tensors: GridTensors,
 ) -> Result<(Vec<u32>, TokenSpeedWireMmInputs), String> {
     if mm.items.is_empty() {
         return Err("multimodal payload carried no items".to_string());
@@ -407,9 +473,11 @@ pub(crate) fn translate_tokenspeed_multimodal(
         // Nothing on the msgpack path computes `mrope_positions` (the engine's
         // InputProcessor is bypassed), and shipping nil silently degrades
         // image grounding to 1-D positions. For the known MRoPE families the
-        // grid tensors are the tell: fail loudly rather than succeed wrong.
+        // grid tensors are the tell: fail loudly rather than succeed wrong. A
+        // model whose grid only lays out the patches (`GridTensors::PatchLayout`)
+        // keeps 1-D positions, and its items pass.
         for key in ["image_grid_thw", "video_grid_thw"] {
-            if model_specific_data.contains_key(key) {
+            if grid_tensors == GridTensors::Positions && model_specific_data.contains_key(key) {
                 return Err(format!(
                     "multimodal item carries {key:?}: MRoPE position tensors are not \
                      derivable over the TokenSpeed ZMQ wire yet; use the gRPC transport \
@@ -446,7 +514,9 @@ pub(crate) fn translate_tokenspeed_multimodal(
     ))
 }
 
-/// Convert an inline proto tensor to the wire `(dtype, shape, ext)` tuple.
+/// Convert an inline proto tensor to the wire `(dtype, shape, data)` tuple,
+/// viewing the request's bytes rather than copying them: a tensor of the
+/// auxiliary size then travels to the engine as a frame sharing that view.
 /// SHM/remote payloads never reach this translate: ZMQ assembly runs with SHM
 /// disabled and RDMA staging off.
 pub(crate) fn wire_tensor_tokenspeed(
@@ -478,11 +548,7 @@ pub(crate) fn wire_tensor_tokenspeed(
             ));
         }
     }
-    Ok(WireTensor::from_raw_bytes(
-        tensor.dtype,
-        shape,
-        bytes.into(),
-    ))
+    Ok(WireTensor::from_raw_bytes(tensor.dtype, shape, bytes))
 }
 
 /// Byte width of the wire dtypes the gateway emits; `None` for dtypes we do
@@ -552,6 +618,19 @@ pub(crate) fn apply_tokenspeed_constraint(
     }
 }
 
+/// The request's constraint as the shared refusal reads it
+/// ([`crate::structured_outputs::refuse_unenforceable_constraint`]): the
+/// proto `constraint` one-of by kind, with its text.
+pub(crate) fn constraint_ref(sp: &tokenspeed_proto::SamplingParams) -> Option<ConstraintRef<'_>> {
+    use tokenspeed_proto::sampling_params::Constraint;
+    Some(match sp.constraint.as_ref()? {
+        Constraint::JsonSchema(schema) => ConstraintRef::JsonSchema(schema),
+        Constraint::Regex(regex) => ConstraintRef::Regex(regex),
+        Constraint::EbnfGrammar(grammar) => ConstraintRef::Ebnf(grammar),
+        Constraint::StructuralTag(tag) => ConstraintRef::StructuralTag(tag),
+    })
+}
+
 /// Normalize a TokenSpeed wire finish-reason string into the canonical set the
 /// gateway's response layer exact-matches (`stop`, `length`, `abort`, `error`) —
 /// the same set the vLLM path emits via [`finish_reason_str`]. TokenSpeed emits
@@ -585,6 +664,14 @@ mod tests {
 
     use super::*;
     use crate::{client::ZmqEngineClient, eos::EosTokenIds};
+
+    /// The translation under the mock scheduler's context window.
+    fn translate_for(
+        req: tokenspeed_proto::GenerateRequest,
+        grid_tensors: GridTensors,
+    ) -> Result<TokenizedGenerateReqInput, String> {
+        translate_request_tokenspeed_for(req, grid_tensors, default_ready_response().max_model_len)
+    }
 
     /// End-to-end over ipc:// for a TokenSpeed backend: the adapter frames a
     /// tagged `TokenizedGenerateReqInput`, and maps `BatchTokenIDOutSlim`
@@ -675,6 +762,8 @@ mod tests {
                 .send_frames(vec![bytes::Bytes::from(encode_msgpack(&done).unwrap())])
                 .await
                 .unwrap();
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
 
         let req = tokenspeed_proto::GenerateRequest {
@@ -803,13 +892,14 @@ mod tests {
         // logprob (count 0/1 in `top_logprobs_num` is the same case).
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.return_logprob = true;
-        let wire = translate_request_tokenspeed(req).expect("return_logprob accepted");
+        let wire = translate_for(req, GridTensors::Positions).expect("return_logprob accepted");
         assert!(wire.return_logprob);
 
         // Unset -> the flag stays false.
-        let wire = translate_request_tokenspeed(ts_tokenized_req(
-            tokenspeed_proto::SamplingParams::default(),
-        ))
+        let wire = translate_for(
+            ts_tokenized_req(tokenspeed_proto::SamplingParams::default()),
+            GridTensors::Positions,
+        )
         .expect("no logprobs accepted");
         assert!(!wire.return_logprob);
     }
@@ -819,18 +909,18 @@ mod tests {
         // Top-k logprobs (count > 1) cannot be honored over the wire.
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.top_logprobs_num = 5;
-        assert!(translate_request_tokenspeed(req).is_err());
+        assert!(translate_for(req, GridTensors::Positions).is_err());
 
         // Prompt (input) logprobs cannot be produced.
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
         req.token_ids_logprob = vec![1, 2];
-        assert!(translate_request_tokenspeed(req).is_err());
+        assert!(translate_for(req, GridTensors::Positions).is_err());
 
         // A bare count of 0/1 is the plain sampled-token case: accepted.
         for count in [0, 1] {
             let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
             req.top_logprobs_num = count;
-            assert!(translate_request_tokenspeed(req).is_ok());
+            assert!(translate_for(req, GridTensors::Positions).is_ok());
         }
     }
 
@@ -881,13 +971,15 @@ mod tests {
         // String stops are resolved upstream; any that reach here are dropped
         // (the token-only engine cannot match them) while stop token ids ride
         // through and the router-side decoder trims residual text.
-        let req =
-            translate_request_tokenspeed(ts_tokenized_req(tokenspeed_proto::SamplingParams {
+        let req = translate_for(
+            ts_tokenized_req(tokenspeed_proto::SamplingParams {
                 stop: vec!["</s>".to_string()],
                 stop_token_ids: vec![13],
                 ..Default::default()
-            }))
-            .expect("residual stop strings must not be rejected");
+            }),
+            GridTensors::Positions,
+        )
+        .expect("residual stop strings must not be rejected");
         assert_eq!(req.sampling_params.stop_token_ids, Some(vec![13]));
         assert_eq!(req.sampling_params.stop, None);
     }
@@ -899,20 +991,18 @@ mod tests {
             encoder_input: Some(tokenspeed_proto::TensorData {
                 shape: vec![2, 4],
                 dtype: "bfloat16".to_string(),
-                payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(vec![
-                    0u8;
-                    16
-                ])),
+                payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(
+                    vec![0u8; 16].into(),
+                )),
             }),
             model_specific_tensors: [(
                 "vit_grid".to_string(),
                 tokenspeed_proto::TensorData {
                     shape: vec![1, 3],
                     dtype: "uint32".to_string(),
-                    payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(vec![
-                        0u8;
-                        12
-                    ])),
+                    payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(
+                        vec![0u8; 12].into(),
+                    )),
                 },
             )]
             .into(),
@@ -931,7 +1021,7 @@ mod tests {
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
             items: vec![ts_mm_item(&0xDEAD_BEEFu64.to_le_bytes(), 1, 3)],
         });
-        let wire = translate_request_tokenspeed(req).expect("translated");
+        let wire = translate_for(req, GridTensors::Positions).expect("translated");
 
         let expected_pad = mm_pad_value(TokenSpeedWireModality::Image, 0xDEAD_BEEF);
         assert_eq!(
@@ -952,6 +1042,133 @@ mod tests {
         assert_eq!(item.model_specific_data["vit_grid"].dtype, "uint32");
     }
 
+    /// Prompt bounds apply before the scheduler, with or without an output
+    /// limit, under the window the handshake reported; the request's own
+    /// limit is kept as it is (an unset one stays the scheduler's to cap).
+    #[test]
+    fn tokenspeed_validates_prompt_length_even_with_explicit_max_new_tokens() {
+        for sampling in [
+            None,
+            Some(tokenspeed_proto::SamplingParams::default()),
+            Some(tokenspeed_proto::SamplingParams {
+                max_new_tokens: Some(16_384),
+                ..Default::default()
+            }),
+        ] {
+            for (prompt_len, max_model_len, accepted) in [
+                (0, 4, false),
+                (3, 4, true),
+                (4, 4, false),
+                (5, 4, false),
+                (1_049_692, 1_048_576, false),
+                // A scheduler that reported no window bounds nothing but
+                // emptiness.
+                (1_049_692, 0, true),
+                (0, 0, false),
+            ] {
+                let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+                req.sampling_params = sampling.clone();
+                req.tokenized.as_mut().unwrap().input_ids = vec![1; prompt_len];
+                let result =
+                    translate_request_tokenspeed_for(req, GridTensors::Positions, max_model_len);
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "prompt_len={prompt_len}, max_model_len={max_model_len}, max_new_tokens={:?}",
+                    sampling.as_ref().and_then(|sp| sp.max_new_tokens)
+                );
+                match result {
+                    Err(error) => assert!(error.contains("prompt"), "{error}"),
+                    Ok(wire) => assert_eq!(
+                        wire.sampling_params.max_new_tokens,
+                        sampling.as_ref().and_then(|sp| sp.max_new_tokens)
+                    ),
+                }
+            }
+        }
+    }
+
+    /// A multimodal prompt is judged as the scheduler will hold it, after the
+    /// pad substitution (which keeps its length): one that fills the window
+    /// is refused with its items in order, one position short of it passes.
+    #[test]
+    fn tokenspeed_judges_a_multimodal_prompt_after_its_translation() {
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        req.tokenized.as_mut().unwrap().input_ids = vec![10, 20, 30, 40, 50];
+        req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
+            items: vec![ts_mm_item(&0xDEAD_BEEFu64.to_le_bytes(), 1, 3)],
+        });
+        let error = translate_request_tokenspeed_for(req.clone(), GridTensors::Positions, 5)
+            .expect_err("the prompt fills the window");
+        assert!(error.contains("length 5"), "{error}");
+        assert!(error.contains("model length of 5"), "{error}");
+        let wire = translate_request_tokenspeed_for(req, GridTensors::Positions, 6)
+            .expect("one position left for output");
+        assert_eq!(wire.input_ids.len(), 5);
+        assert!(wire.multimodal_inputs.is_some());
+    }
+
+    #[test]
+    fn tokenspeed_translates_audio_items_as_the_engine_reads_them() {
+        // An audio item: the waveform rows travel as they were written
+        // (bfloat16 [samples, 1]) with the per-clip row count beside them;
+        // the pad value carries the audio tag; no token id is collected.
+        let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+        req.tokenized.as_mut().unwrap().input_ids = vec![1, 7, 100, 100, 100, 8, 2];
+        let samples: u32 = 1_920;
+        let item = tokenspeed_proto::MultimodalItem {
+            modality: common::Modality::Audio as i32,
+            content_hash: 0x0123_4567_89AB_CDEFu64.to_le_bytes().to_vec(),
+            encoder_input: Some(tokenspeed_proto::TensorData {
+                shape: vec![samples, 1],
+                dtype: "bfloat16".to_string(),
+                payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(
+                    vec![0x3Fu8; samples as usize * 2].into(),
+                )),
+            }),
+            model_specific_tensors: [(
+                "samples_per_audio".to_string(),
+                tokenspeed_proto::TensorData {
+                    shape: vec![1],
+                    dtype: "int64".to_string(),
+                    payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(
+                        (samples as i64).to_le_bytes().to_vec().into(),
+                    )),
+                },
+            )]
+            .into(),
+            placeholders: vec![tokenspeed_proto::PlaceholderRange {
+                offset: 2,
+                length: 3,
+            }],
+            placeholder_token_id: Some(100),
+        };
+        req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
+        let wire = translate_for(req, GridTensors::Positions).expect("translated");
+
+        let expected_pad = mm_pad_value(TokenSpeedWireModality::Audio, 0x0123_4567_89AB_CDEF);
+        assert_ne!(
+            expected_pad,
+            mm_pad_value(TokenSpeedWireModality::Image, 0x0123_4567_89AB_CDEF)
+        );
+        assert_eq!(
+            wire.input_ids,
+            vec![1, 7, expected_pad, expected_pad, expected_pad, 8, 2]
+        );
+        let mm = wire.multimodal_inputs.expect("mm payload");
+        assert_eq!(mm.im_token_id, None);
+        assert_eq!(mm.video_token_id, None);
+        let item = &mm.mm_items[0];
+        assert_eq!(item.modality, TokenSpeedWireModality::Audio);
+        assert_eq!(item.pad_value, expected_pad);
+        assert_eq!(item.offsets, vec![(2, 4)]);
+        assert_eq!(item.feature.dtype, "bfloat16");
+        assert_eq!(item.feature.shape, vec![samples as usize, 1]);
+        let rows = &item.model_specific_data["samples_per_audio"];
+        assert_eq!(rows.dtype, "int64");
+        assert_eq!(rows.shape, vec![1]);
+    }
+
     #[test]
     fn tokenspeed_multimodal_rejects_bad_items() {
         // Out-of-bounds placeholder: prompt has 3 tokens, range needs 4.
@@ -959,7 +1176,7 @@ mod tests {
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
             items: vec![ts_mm_item(b"12345678", 1, 3)],
         });
-        assert!(translate_request_tokenspeed(req)
+        assert!(translate_for(req, GridTensors::Positions)
             .unwrap_err()
             .contains("exceeds"));
 
@@ -968,7 +1185,7 @@ mod tests {
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs {
             items: vec![ts_mm_item(b"", 0, 1)],
         });
-        assert!(translate_request_tokenspeed(req)
+        assert!(translate_for(req, GridTensors::Positions)
             .unwrap_err()
             .contains("content hash"));
 
@@ -978,7 +1195,7 @@ mod tests {
         let mut item = ts_mm_item(b"12345678", 0, 1);
         item.encoder_input.as_mut().unwrap().shape = vec![3, 4];
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
-        assert!(translate_request_tokenspeed(req)
+        assert!(translate_for(req, GridTensors::Positions)
             .unwrap_err()
             .contains("byte length"));
 
@@ -987,7 +1204,7 @@ mod tests {
         let mut item = ts_mm_item(b"12345678", 0, 1);
         item.modality = common::Modality::Unspecified as i32;
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
-        assert!(translate_request_tokenspeed(req)
+        assert!(translate_for(req, GridTensors::Positions)
             .unwrap_err()
             .contains("modality"));
 
@@ -1000,14 +1217,52 @@ mod tests {
             tokenspeed_proto::TensorData {
                 shape: vec![1, 3],
                 dtype: "uint32".to_string(),
-                payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(vec![
-                    0u8;
-                    12
-                ])),
+                payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(
+                    vec![0u8; 12].into(),
+                )),
             },
         );
         req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
-        assert!(translate_request_tokenspeed(req)
+        assert!(translate_for(req, GridTensors::Positions)
+            .unwrap_err()
+            .contains("MRoPE"));
+    }
+
+    #[test]
+    fn a_patch_layout_grid_passes_for_a_model_whose_positions_are_one_dimensional() {
+        let grid = tokenspeed_proto::TensorData {
+            shape: vec![1, 3],
+            dtype: "uint32".to_string(),
+            payload: Some(tokenspeed_proto::tensor_data::Payload::Inline(
+                vec![0u8; 12].into(),
+            )),
+        };
+        let with_grid = || {
+            let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams::default());
+            let mut item = ts_mm_item(b"12345678", 0, 1);
+            item.model_specific_tensors
+                .insert("image_grid_thw".to_string(), grid.clone());
+            req.mm_inputs = Some(tokenspeed_proto::MultimodalInputs { items: vec![item] });
+            req
+        };
+        // The model's rope facts decide: a model whose grid only lays out the
+        // patches (1-D positions) keeps the tensor on the wire; one that
+        // needs MRoPE positions, or a launcher that does not say, is refused
+        // as before.
+        assert_eq!(
+            GridTensors::for_model(Some(false)),
+            GridTensors::PatchLayout
+        );
+        assert_eq!(GridTensors::for_model(Some(true)), GridTensors::Positions);
+        assert_eq!(GridTensors::for_model(None), GridTensors::Positions);
+        let wire = translate_for(with_grid(), GridTensors::PatchLayout)
+            .expect("a patch-layout grid passes");
+        let items = &wire
+            .multimodal_inputs
+            .expect("multimodal inputs on the wire")
+            .mm_items;
+        assert!(items[0].model_specific_data.contains_key("image_grid_thw"));
+        assert!(translate_for(with_grid(), GridTensors::Positions)
             .unwrap_err()
             .contains("MRoPE"));
     }
@@ -1123,6 +1378,8 @@ mod tests {
                 .send_frames(vec![bytes::Bytes::from(encode_msgpack(&done).unwrap())])
                 .await
                 .unwrap();
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
 
         let mut req = ts_tokenized_req(tokenspeed_proto::SamplingParams {
@@ -1162,5 +1419,122 @@ mod tests {
         assert_eq!(normalize_finish_reason("error"), "error");
         // An unknown wire value falls back to "stop".
         assert_eq!(normalize_finish_reason("garbage"), "stop");
+    }
+
+    /// This wire carries the finish type alone and its engine has no abort
+    /// code for its grammar: an `abort` on a constrained request is as often
+    /// a pause aborting every request in flight (the finish an RL driver
+    /// resubmits on) as anything else, an `error` a transfer or numerical
+    /// failure. Both keep the shape every request has, the `abort` a
+    /// `Complete` with finish reason `abort` and the `error` the engine's own
+    /// report; neither is the constraint-failure status, which only an
+    /// engine's own attribution raises.
+    #[tokio::test]
+    async fn an_abort_or_error_finish_of_a_constrained_request_keeps_the_engines_own_shape() {
+        use engine_zmq_client::{
+            codec::encode_msgpack, protocol::tokenspeed::output::BatchTokenIDOutSlim,
+        };
+        use smg_grpc_client::is_constraint_failure;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let (client, engine) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                1,
+                "m".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::TokenSpeed,
+                Duration::from_secs(10)
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        let client = client.expect("adapter connect");
+        let engine = engine.expect("mock engine");
+        let cases = [
+            ("r1", "abort", true),
+            ("r2", "error", true),
+            ("r3", "abort", false),
+            ("r4", "error", false),
+        ];
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "engine task ends after responding"
+        )]
+        let engine_task = tokio::spawn(async move {
+            let (mut input, mut output) = engine.split();
+            for (rid, finish, _) in cases {
+                let _ = input.recv_frames().await.unwrap();
+                let done = BatchTokenIDOutSlim {
+                    rids: vec![rid.into()],
+                    output_ids: vec![vec![]],
+                    finished_reasons: vec![finish.into()],
+                    prompt_tokens: vec![3],
+                    completion_tokens: vec![0],
+                    cached_tokens: vec![0],
+                    output_token_logprobs_val: vec![vec![]],
+                    output_token_logprobs_idx: vec![vec![]],
+                    ..Default::default()
+                };
+                output
+                    .send_frames(vec![bytes::Bytes::from(encode_msgpack(&done).unwrap())])
+                    .await
+                    .unwrap();
+            }
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
+        });
+
+        for (rid, finish, constrained) in cases {
+            let req = tokenspeed_proto::GenerateRequest {
+                request_id: rid.to_string(),
+                tokenized: Some(tokenspeed_proto::TokenizedInput {
+                    input_ids: vec![1, 2, 3],
+                    original_text: String::new(),
+                }),
+                sampling_params: Some(tokenspeed_proto::SamplingParams {
+                    max_new_tokens: Some(8),
+                    constraint: constrained.then(|| {
+                        tokenspeed_proto::sampling_params::Constraint::JsonSchema(
+                            r#"{"type":"object"}"#.to_string(),
+                        )
+                    }),
+                    ..Default::default()
+                }),
+                stream: true,
+                ..Default::default()
+            };
+            let mut stream = client.generate_tokenspeed(req).await.expect("generate");
+            let item = stream.next().await.expect("an item");
+            if finish == "error" {
+                let error = item.expect_err("an error");
+                assert_eq!(error.code(), tonic::Code::Internal, "{rid}");
+                assert_eq!(
+                    error.message(),
+                    "engine finished the request with an error (see engine logs)",
+                    "{rid}: the engine's own report, word for word"
+                );
+                assert!(!is_constraint_failure(&error), "{rid}: {error}");
+            } else {
+                match item.expect("a response").response {
+                    Some(vllm::generate_response::Response::Complete(complete)) => {
+                        assert_eq!(
+                            complete.finish_reason, "abort",
+                            "{rid} (constrained: {constrained})"
+                        );
+                    }
+                    other => panic!("{rid}: expected a Complete, got {other:?}"),
+                }
+            }
+        }
+        engine_task.await.unwrap();
     }
 }

@@ -1,0 +1,44 @@
+name: Cargo Audit Nightly
+
+# Audits main's Cargo.lock against the RustSec advisory database once a day.
+# The cargo-audit job of PR Test (SMG) runs on a pull request that changes the
+# dependency graph and on every push to main, so an advisory published after
+# the last change to main surfaces here first. Same script, same ignore list
+# (.cargo/audit.toml); a red run reaches the nightly triage issue
+# (nightly-triage.yml watches this workflow).
+
+on:
+  schedule:
+    # 05:30 UTC daily, before the nightly builds (06:00).
+    - cron: '30 5 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: cargo-audit-nightly
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ${{ vars.SMG_RUNNER_CPU || 'k8s-runner-cpu' }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # The advisory database is a git clone from github.com; the shared
+      # egress of the runners intermittently gets anonymous git refused, so
+      # carry the workflow token the way the pre-commit job does.
+      - name: Authenticate git for github.com
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git config --global \
+            url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf \
+            "https://github.com/"
+
+      - name: cargo audit
+        run: bash scripts/ci_cargo_audit.sh

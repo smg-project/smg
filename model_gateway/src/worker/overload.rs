@@ -35,7 +35,8 @@ pub const BRANCH_OVERLOADED_AT_DISPATCH: &str = "overloaded_at_dispatch";
 
 /// Decision-log branch: every worker selection could have used is over the
 /// thresholds and shedding is off, so the request goes to the least-loaded
-/// of them instead of being refused.
+/// of them instead of being refused (a cache-aware prefill pool of a
+/// prefill/decode pair is placed by its policy instead).
 pub const BRANCH_ALL_OVERLOADED_FALLBACK: &str = "all_overloaded_fallback";
 
 /// Decision-log branch: every worker selection could have used is vetoed and
@@ -44,7 +45,7 @@ pub const BRANCH_ALL_OVERLOADED_FALLBACK: &str = "all_overloaded_fallback";
 /// it never empties the pool.
 pub const BRANCH_ALL_STALLED_FALLBACK: &str = "all_stalled_fallback";
 
-/// Decision-log branch: the decode leg of a disaggregated pair was already
+/// Decision-log branch: the decode side of a disaggregated pair was already
 /// running its full engine window and no slot freed inside the admission wait.
 /// The pair is not overloaded by the threshold predicate above — the gateway
 /// simply has nowhere to put another bootstrap room.
@@ -118,7 +119,7 @@ impl OverloadThresholds {
             }
         }
         if let Some(threshold) = self.token_usage {
-            if load.effective_token_usage() >= threshold {
+            if load.effective_kv_pressure() >= threshold {
                 return true;
             }
         }

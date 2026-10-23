@@ -29,6 +29,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from .simple_eval_common import Eval
 
+from .constants import host_port
 from .simple_eval_common import ChatCompletionSampler, set_ulimit
 from .simple_eval_mmlu import MMLU_DATASET_URL
 
@@ -56,12 +57,8 @@ def _get_eval(eval_name: str, num_examples: int, num_threads: int) -> Eval:
         from .simple_eval_mmlu import MMLUEval
 
         return MMLUEval(MMLU_DATASET_URL, num_examples, num_threads)
-    elif eval_name == "mmmu_art_and_design":
-        from .simple_eval_mmmu import MMMU_ART_AND_DESIGN, MMMUEval
-
-        return MMMUEval(MMMU_ART_AND_DESIGN, num_threads)
     else:
-        raise ValueError(f"Unknown eval: {eval_name}. Supported: mmlu, mmmu_art_and_design")
+        raise ValueError(f"Unknown eval: {eval_name}. Supported: mmlu")
 
 
 def run_eval(args: Any) -> dict:
@@ -93,7 +90,7 @@ def run_eval(args: Any) -> dict:
     else:
         host = getattr(args, "host", "127.0.0.1")
         port = getattr(args, "port", 30000)
-        base_url = f"http://{host}:{port}/v1"
+        base_url = f"http://{host_port(host, port)}/v1"
 
     eval_name = getattr(args, "eval_name", "mmlu")
     num_examples = getattr(args, "num_examples", 64)

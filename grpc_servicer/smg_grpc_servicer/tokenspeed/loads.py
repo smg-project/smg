@@ -7,27 +7,25 @@ the same split the SGLang side uses.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 from smg_grpc_proto import tokenspeed_scheduler_pb2
+from smg_grpc_proto.generated import common_pb2
+
+from smg_grpc_servicer.load_record import engine_load_from
+from smg_grpc_servicer.tokenspeed.config_view import EngineConfigView
 
 
 def running_window(server_args: Any) -> int:
-    """The scheduler's configured admission window, or 0 when unknown.
+    """The per-rank scheduler admission window, or 0 when unknown.
 
-    ``GetLoadReqOutput`` carries no admission bound, so the window has to come
-    from the server args. TokenSpeed spells it ``max_num_seqs``; the protobuf
-    field is the one SGLang fills with the same number, so a frontend reads a
-    single name across both engines. It matters most on a disaggregated decode
-    worker: that window is exactly the bound its prefill peer's bootstrap
-    deadline is racing, and a frontend that cannot see it cannot pace its
-    dispatch.
+    TokenSpeed splits the global ``max_num_seqs`` across attention-DP ranks,
+    rounding down. Load records describe one rank, so their window must use
+    the same units as their running and waiting request counts.
     """
-    return int(
-        getattr(server_args, "max_num_seqs", 0)
-        or getattr(server_args, "max_running_requests", 0)
-        or 0
-    )
+    args = EngineConfigView(server_args).server_args
+    return args.running_window // (args.attention_dp_size or 1)
 
 
 def convert_load_to_protobuf(
@@ -55,3 +53,65 @@ def convert_load_to_protobuf(
         token_usage=(num_used_tokens / max_total_num_tokens if max_total_num_tokens > 0 else 0.0),
         max_running_requests=max_running_requests,
     )
+
+
+def convert_snapshot_to_protobuf(
+    snapshot: Any,
+    *,
+    max_total_num_tokens: int,
+    max_running_requests: int,
+) -> tokenspeed_scheduler_pb2.SchedulerLoad:
+    """Keep allocator occupancy separate from the model's admission capacity.
+
+    Native page counts are LCM allocator blocks, not prefix-sized token pages.
+    Hybrid packing and state reservations prevent an exact token count from
+    being derived from those blocks. Express used capacity as a token-budget
+    equivalent instead; admission/finish traces report actual cached tokens.
+    Cached blocks are resident but reclaimable; only active blocks exert pressure.
+    """
+    return tokenspeed_scheduler_pb2.SchedulerLoad(
+        dp_rank=int(snapshot.dp_rank),
+        num_running_reqs=int(snapshot.num_running_reqs),
+        num_waiting_reqs=int(snapshot.num_waiting_reqs),
+        num_total_reqs=int(snapshot.num_running_reqs + snapshot.num_waiting_reqs),
+        num_used_tokens=(
+            int(snapshot.num_used_pages) * max_total_num_tokens // snapshot.max_total_pages
+        ),
+        max_total_num_tokens=max_total_num_tokens,
+        token_usage=snapshot.num_used_pages / snapshot.max_total_pages,
+        active_token_usage=snapshot.num_active_pages / snapshot.max_total_pages,
+        max_running_requests=max_running_requests,
+    )
+
+
+def load_record(
+    snapshots: Iterable[Any],
+    dp_rank: int | None,
+    *,
+    max_total_num_tokens: int,
+    max_running_requests: int,
+) -> common_pb2.EngineLoad | None:
+    """The load record the KV-event stream carries for ``dp_rank`` (the
+    lowest fresh rank when the batch names none), from the engine's native
+    snapshot replica as ``GetLoads`` converts it (:func:`convert_snapshot_to_protobuf`);
+    ``None`` while no fresh snapshot exists, and for a named rank whose
+    snapshot has expired: its batches go without a record rather than with
+    another rank's figures (the rule ``GetLoads`` applies to a partial
+    replica). The scheduler reports no queued token-work on this wire, so
+    the record leaves it unset, as the poll does.
+    """
+    snapshots = list(snapshots)
+    if not snapshots:
+        return None
+    if dp_rank is None:
+        chosen = min(snapshots, key=lambda s: int(s.dp_rank))
+    else:
+        chosen = next((s for s in snapshots if int(s.dp_rank) == dp_rank), None)
+        if chosen is None:
+            return None
+    load = convert_snapshot_to_protobuf(
+        chosen,
+        max_total_num_tokens=max_total_num_tokens,
+        max_running_requests=max_running_requests,
+    )
+    return engine_load_from(load, queued_token_work=False)

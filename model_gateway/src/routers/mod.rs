@@ -3,16 +3,12 @@
 use std::fmt::Debug;
 
 use async_trait::async_trait;
-use axum::{
-    body::Body,
-    extract::Request,
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
-};
+use axum::{body::Body, extract::Request, http::HeaderMap, response::Response};
 use openai_protocol::{
     chat::ChatCompletionRequest,
     classify::ClassifyRequest,
     completion::CompletionRequest,
+    decisions::DecisionsRequest,
     embedding::EmbeddingRequest,
     generate::GenerateRequest,
     interactions::InteractionsRequest,
@@ -23,6 +19,7 @@ use openai_protocol::{
     },
     rerank::RerankRequest,
     responses::ResponsesRequest,
+    systemone::SystemOneRequest,
     transcription::{AudioFile, TranscriptionRequest},
 };
 
@@ -76,25 +73,23 @@ pub trait RouterTrait: Send + Sync + Debug {
 
     /// Route a health generate request
     async fn health_generate(&self, _req: Request<Body>) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
+        error::not_implemented(
+            "health_generate_not_implemented",
             "Health generate not implemented",
         )
-            .into_response()
     }
 
     /// Get server information
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Server info not implemented").into_response()
+        error::not_implemented("server_info_not_implemented", "Server info not implemented")
     }
 
     /// Get model information
     async fn get_model_info(&self, _req: Request<Body>) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
+        error::not_implemented(
+            "model_info_not_implemented",
             "Get model info not implemented",
         )
-            .into_response()
     }
 
     /// Route a generate request
@@ -109,11 +104,10 @@ pub trait RouterTrait: Send + Sync + Debug {
         _body: GenerateRequest,
         _model_id: &str,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
+        error::not_implemented(
+            "generate_not_implemented",
             "Generate endpoint not implemented",
         )
-            .into_response()
     }
 
     /// Route a chat completion request
@@ -124,11 +118,10 @@ pub trait RouterTrait: Send + Sync + Debug {
         _body: ChatCompletionRequest,
         _model_id: &str,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
+        error::not_implemented(
+            "chat_completions_not_implemented",
             "Chat completions not implemented",
         )
-            .into_response()
     }
 
     /// Route a completion request
@@ -139,11 +132,10 @@ pub trait RouterTrait: Send + Sync + Debug {
         _body: CompletionRequest,
         _model_id: &str,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
+        error::not_implemented(
+            "completions_not_implemented",
             "Completion endpoint not implemented",
         )
-            .into_response()
     }
 
     /// Route a responses request
@@ -154,20 +146,24 @@ pub trait RouterTrait: Send + Sync + Debug {
         _body: ResponsesRequest,
         _model_id: &str,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
+        error::not_implemented(
+            "responses_not_implemented",
             "Responses endpoint not implemented",
         )
-            .into_response()
     }
 
-    /// Cancel a background response by id
-    async fn cancel_response(&self, _headers: Option<&HeaderMap>, _response_id: &str) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
+    /// Cancel a background response by id, for the caller `tenant_meta`
+    /// describes (a response of another tenant answers as an unknown id does).
+    async fn cancel_response(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _response_id: &str,
+    ) -> Response {
+        error::not_implemented(
+            "cancel_response_not_implemented",
             "Cancel response not implemented",
         )
-            .into_response()
     }
 
     /// Route embedding requests (OpenAI-compatible /v1/embeddings)
@@ -178,7 +174,7 @@ pub trait RouterTrait: Send + Sync + Debug {
         _body: EmbeddingRequest,
         _model_id: &str,
     ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Embeddings not implemented").into_response()
+        error::not_implemented("embeddings_not_implemented", "Embeddings not implemented")
     }
 
     /// Route classification requests (OpenAI-compatible /v1/classify)
@@ -189,7 +185,35 @@ pub trait RouterTrait: Send + Sync + Debug {
         _body: ClassifyRequest,
         _model_id: &str,
     ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Classify not implemented").into_response()
+        error::not_implemented("classify_not_implemented", "Classify not implemented")
+    }
+
+    /// Route OpenAI Decisions requests on regular HTTP workers.
+    async fn route_decisions(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _body: DecisionsRequest,
+        _model_id: &str,
+    ) -> Response {
+        error::not_implemented(
+            "decisions_not_supported",
+            "Decisions is supported by regular HTTP and SGLang gRPC routers",
+        )
+    }
+
+    /// Route native SystemOne requests on regular HTTP workers.
+    async fn route_systemone(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _tenant_meta: &TenantRequestMeta,
+        _body: SystemOneRequest,
+        _model_id: &str,
+    ) -> Response {
+        error::not_implemented(
+            "systemone_not_supported",
+            "SystemOne is supported only by the regular HTTP router",
+        )
     }
 
     /// Route audio transcription requests (OpenAI-compatible /v1/audio/transcriptions).
@@ -206,11 +230,10 @@ pub trait RouterTrait: Send + Sync + Debug {
         _audio: AudioFile,
         _model_id: &str,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
+        error::not_implemented(
+            "audio_transcriptions_not_implemented",
             "Audio transcriptions not implemented",
         )
-            .into_response()
     }
 
     /// Route rerank requests
@@ -221,7 +244,7 @@ pub trait RouterTrait: Send + Sync + Debug {
         _body: RerankRequest,
         _model_id: &str,
     ) -> Response {
-        (StatusCode::NOT_IMPLEMENTED, "Rerank not implemented").into_response()
+        error::not_implemented("rerank_not_implemented", "Rerank not implemented")
     }
 
     /// Route Anthropic Messages API requests (/v1/messages)
@@ -232,11 +255,10 @@ pub trait RouterTrait: Send + Sync + Debug {
         _body: CreateMessageRequest,
         _model_id: &str,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
+        error::not_implemented(
+            "messages_not_implemented",
             "Messages API not yet implemented for this router",
         )
-            .into_response()
     }
 
     /// Route Anthropic Messages token counting (/v1/messages/count_tokens)
@@ -247,11 +269,10 @@ pub trait RouterTrait: Send + Sync + Debug {
         _body: CountMessageTokensRequest,
         _model_id: &str,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
+        error::not_implemented(
+            "count_message_tokens_not_implemented",
             "Messages token counting not implemented for this router",
         )
-            .into_response()
     }
 
     /// Route Gemini Interactions API requests (/v1/interactions)
@@ -262,11 +283,10 @@ pub trait RouterTrait: Send + Sync + Debug {
         _body: InteractionsRequest,
         _model_id: Option<&str>,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
+        error::not_implemented(
+            "interactions_not_implemented",
             "Interactions API not implemented for this router",
         )
-            .into_response()
     }
 
     /// Route a realtime session create request (/v1/realtime/sessions)
@@ -275,11 +295,10 @@ pub trait RouterTrait: Send + Sync + Debug {
         _headers: Option<&HeaderMap>,
         _body: &RealtimeSessionCreateRequest,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
+        error::not_implemented(
+            "realtime_sessions_not_implemented",
             "Realtime sessions not implemented",
         )
-            .into_response()
     }
 
     /// Route a realtime client secret create request (/v1/realtime/client_secrets)
@@ -288,11 +307,10 @@ pub trait RouterTrait: Send + Sync + Debug {
         _headers: Option<&HeaderMap>,
         _body: &RealtimeClientSecretCreateRequest,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
+        error::not_implemented(
+            "realtime_client_secrets_not_implemented",
             "Realtime client secrets not implemented",
         )
-            .into_response()
     }
 
     /// Route a realtime transcription session create request (/v1/realtime/transcription_sessions)
@@ -301,29 +319,26 @@ pub trait RouterTrait: Send + Sync + Debug {
         _headers: Option<&HeaderMap>,
         _body: &RealtimeTranscriptionSessionCreateRequest,
     ) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
+        error::not_implemented(
+            "realtime_transcription_sessions_not_implemented",
             "Realtime transcription sessions not implemented",
         )
-            .into_response()
     }
 
     /// Route a realtime WebSocket upgrade request
     async fn route_realtime_ws(&self, _req: Request<Body>, _model_id: &str) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
+        error::not_implemented(
+            "realtime_websocket_not_implemented",
             "Realtime WebSocket not implemented",
         )
-            .into_response()
     }
 
     /// Route a realtime WebRTC upgrade request
     async fn route_realtime_webrtc(&self, _req: Request<Body>, _model_id: &str) -> Response {
-        (
-            StatusCode::NOT_IMPLEMENTED,
+        error::not_implemented(
+            "realtime_webrtc_not_implemented",
             "Realtime WebRTC not implemented",
         )
-            .into_response()
     }
 
     /// Get router type name
@@ -337,6 +352,8 @@ pub trait RouterTrait: Send + Sync + Debug {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::StatusCode;
+
     use super::*;
 
     /// Minimal stub implementing RouterTrait so we can test the default
@@ -353,6 +370,204 @@ mod tests {
         }
         fn router_type(&self) -> &'static str {
             self.type_name
+        }
+    }
+
+    /// The status of an answer and the code and message of its JSON error object.
+    async fn error_shape(answer: Response) -> (StatusCode, String, String) {
+        let status = answer.status();
+        let body = axum::body::to_bytes(answer.into_body(), usize::MAX)
+            .await
+            .expect("drain body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json error body");
+        let field = |name: &str| {
+            body["error"][name]
+                .as_str()
+                .unwrap_or_else(|| panic!("error.{name} in {body}"))
+                .to_owned()
+        };
+        (status, field("code"), field("message"))
+    }
+
+    fn body<T: serde::de::DeserializeOwned>(json: serde_json::Value) -> T {
+        serde_json::from_value(json).expect("a request body")
+    }
+
+    /// Every default answer of the trait is the JSON error object, a 501
+    /// under the endpoint's own code, like the refusals the routers write.
+    #[tokio::test]
+    async fn every_default_answer_is_the_json_error_object_under_its_code() {
+        use serde_json::json;
+
+        use crate::middleware::{RouteRequestMeta, TenantKey};
+
+        let router = StubRouter { type_name: "stub" };
+        let meta = RouteRequestMeta::new(TenantKey::from("test-tenant"));
+        let empty = || Request::new(Body::empty());
+        let audio = AudioFile {
+            bytes: bytes::Bytes::new(),
+            file_name: "a.wav".to_owned(),
+            content_type: None,
+        };
+        let chat = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        let answers = [
+            (
+                router.health_generate(empty()).await,
+                "health_generate_not_implemented",
+                "Health generate not implemented",
+            ),
+            (
+                router.get_server_info(empty()).await,
+                "server_info_not_implemented",
+                "Server info not implemented",
+            ),
+            (
+                router.get_model_info(empty()).await,
+                "model_info_not_implemented",
+                "Get model info not implemented",
+            ),
+            (
+                router
+                    .route_generate(None, &meta, body(json!({"text": "hi"})), "m")
+                    .await,
+                "generate_not_implemented",
+                "Generate endpoint not implemented",
+            ),
+            (
+                router.route_chat(None, &meta, body(chat.clone()), "m").await,
+                "chat_completions_not_implemented",
+                "Chat completions not implemented",
+            ),
+            (
+                router
+                    .route_completion(None, &meta, body(json!({"model": "m", "prompt": "hi"})), "m")
+                    .await,
+                "completions_not_implemented",
+                "Completion endpoint not implemented",
+            ),
+            (
+                router
+                    .route_responses(None, &meta, body(json!({"model": "m", "input": "hi"})), "m")
+                    .await,
+                "responses_not_implemented",
+                "Responses endpoint not implemented",
+            ),
+            (
+                router.cancel_response(None, &meta, "resp_1").await,
+                "cancel_response_not_implemented",
+                "Cancel response not implemented",
+            ),
+            (
+                router
+                    .route_embeddings(None, &meta, body(json!({"model": "m", "input": "hi"})), "m")
+                    .await,
+                "embeddings_not_implemented",
+                "Embeddings not implemented",
+            ),
+            (
+                router
+                    .route_classify(None, &meta, body(json!({"model": "m", "input": "hi"})), "m")
+                    .await,
+                "classify_not_implemented",
+                "Classify not implemented",
+            ),
+            (
+                router
+                    .route_audio_transcriptions(
+                        None,
+                        &meta,
+                        &TranscriptionRequest::default(),
+                        audio,
+                        "m",
+                    )
+                    .await,
+                "audio_transcriptions_not_implemented",
+                "Audio transcriptions not implemented",
+            ),
+            (
+                router
+                    .route_rerank(
+                        None,
+                        &meta,
+                        body(json!({"query": "q", "documents": ["d"], "model": "m"})),
+                        "m",
+                    )
+                    .await,
+                "rerank_not_implemented",
+                "Rerank not implemented",
+            ),
+            (
+                router
+                    .route_messages(
+                        None,
+                        &meta,
+                        body(json!({"model": "m", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]})),
+                        "m",
+                    )
+                    .await,
+                "messages_not_implemented",
+                "Messages API not yet implemented for this router",
+            ),
+            (
+                router
+                    .route_messages_count_tokens(
+                        None,
+                        &meta,
+                        body(json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]})),
+                        "m",
+                    )
+                    .await,
+                "count_message_tokens_not_implemented",
+                "Messages token counting not implemented for this router",
+            ),
+            (
+                router
+                    .route_interactions(None, &meta, body(json!({"input": "hi"})), Some("m"))
+                    .await,
+                "interactions_not_implemented",
+                "Interactions API not implemented for this router",
+            ),
+            (
+                router
+                    .route_realtime_session(None, &body(json!({"type": "realtime"})))
+                    .await,
+                "realtime_sessions_not_implemented",
+                "Realtime sessions not implemented",
+            ),
+            (
+                router
+                    .route_realtime_client_secret(None, &body(json!({"session": {"type": "realtime"}})))
+                    .await,
+                "realtime_client_secrets_not_implemented",
+                "Realtime client secrets not implemented",
+            ),
+            (
+                router
+                    .route_realtime_transcription_session(None, &body(json!({"type": "transcription"})))
+                    .await,
+                "realtime_transcription_sessions_not_implemented",
+                "Realtime transcription sessions not implemented",
+            ),
+            (
+                router.route_realtime_ws(empty(), "m").await,
+                "realtime_websocket_not_implemented",
+                "Realtime WebSocket not implemented",
+            ),
+            (
+                router.route_realtime_webrtc(empty(), "m").await,
+                "realtime_webrtc_not_implemented",
+                "Realtime WebRTC not implemented",
+            ),
+        ];
+        for (answer, code, message) in answers {
+            assert_eq!(
+                error_shape(answer).await,
+                (
+                    StatusCode::NOT_IMPLEMENTED,
+                    code.to_owned(),
+                    message.to_owned()
+                )
+            );
         }
     }
 

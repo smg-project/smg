@@ -118,3 +118,44 @@ def test_pending_work_is_what_makes_silence_a_stall(build, caplog):
     with caplog.at_level(logging.DEBUG):
         assert _probe(servicer, service).status == SERVING
     assert _warnings(caplog) == []
+
+
+class _Context:
+    def __init__(self):
+        self.code = None
+        self.details = None
+
+    def set_code(self, code):
+        self.code = code
+
+    def set_details(self, details):
+        self.details = details
+
+
+async def _watch(servicer, service, context):
+    responses = []
+    async for response in servicer.Watch(SimpleNamespace(service=service), context):
+        responses.append(response)
+    return responses
+
+
+@pytest.mark.parametrize("make", BACKENDS)
+def test_watch_answers_an_unknown_service_without_failing_the_stream(make):
+    servicer, engine, service = make()
+    context = _Context()
+    (response,) = asyncio.run(_watch(servicer, "no.such.Service", context))
+    assert response.status == health_pb2.HealthCheckResponse.SERVICE_UNKNOWN
+    assert context.code is None, "a code on a streaming call fails the stream"
+    assert context.details is None
+    # The known services still answer through Check: serving here.
+    (response,) = asyncio.run(_watch(servicer, service, context))
+    assert response.status == SERVING
+    (response,) = asyncio.run(_watch(servicer, "", context))
+    assert response.status == SERVING
+    # Shutting down answers NOT_SERVING for every service, as Check does, the
+    # unknown ones included, and still without a code on the stream.
+    engine.gracefully_exit = True
+    for name in ("no.such.Service", service, ""):
+        (response,) = asyncio.run(_watch(servicer, name, context))
+        assert response.status == NOT_SERVING, name
+    assert context.code is None

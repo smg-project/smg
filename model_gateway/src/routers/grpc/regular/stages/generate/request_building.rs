@@ -1,16 +1,15 @@
 //! Generate request building stage: Build proto GenerateRequest for generate requests
 
-use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
 use crate::routers::{
     error,
     grpc::{
-        common::stages::{helpers, BuildStage},
+        common::stages::helpers,
         context::{
-            AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan, ExecutionPlanKind,
-            RequestContext,
+            stage_output, AttemptStamp, BuildOutput, ClientSelection, ExecutionPlan,
+            ExecutionPlanKind, RequestContext,
         },
         spec::{GenerateResponseSpec, ResponseSpec},
     },
@@ -33,27 +32,19 @@ impl GenerateRequestBuildingStage {
     }
 }
 
-#[async_trait]
-impl BuildStage for GenerateRequestBuildingStage {
-    async fn build(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
-        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
-            error!(
-                function = "GenerateRequestBuildingStage::build",
-                "Preparation not completed"
-            );
-            error::internal_error("preparation_not_completed", "Preparation not completed")
-        })?;
+impl GenerateRequestBuildingStage {
+    /// The stage's work, a plain function (nothing in it awaits); the
+    /// chat+generate dispatcher calls it directly.
+    pub(crate) fn build_plan(&self, ctx: &mut RequestContext) -> Result<BuildOutput, Response> {
+        let prep = stage_output(
+            ctx.state.preparation.as_ref(),
+            "GenerateRequestBuildingStage::build",
+        )?;
 
-        let clients = ctx.state.clients.as_ref().ok_or_else(|| {
-            error!(
-                function = "GenerateRequestBuildingStage::build",
-                "Client acquisition not completed"
-            );
-            error::internal_error(
-                "client_acquisition_not_completed",
-                "Client acquisition not completed",
-            )
-        })?;
+        let clients = stage_output(
+            ctx.state.clients.as_ref(),
+            "GenerateRequestBuildingStage::build",
+        )?;
 
         let generate_request = ctx.generate_request_arc();
 
@@ -71,12 +62,14 @@ impl BuildStage for GenerateRequestBuildingStage {
             disaggregated,
         );
 
-        // Build proto request using centralized dispatch
+        // Build proto request using centralized dispatch. A generate request
+        // carries no media: the ids are the prompt and the text stays off the
+        // wire (see `helpers::wire_prompt_text`).
         let mut proto_request = builder_client
             .build_generate_request(
                 request_id,
                 &generate_request,
-                prep.routing_text().map(String::from),
+                None,
                 prep.token_ids().to_vec(),
             )
             .map_err(|e| {
@@ -118,16 +111,16 @@ impl BuildStage for GenerateRequestBuildingStage {
                 sampling_mask,
                 sampling_baseline,
                 inject_pd_metadata: self.inject_pd_metadata,
+                tool_constraint: None,
             },
         })
     }
 
-    fn name(&self) -> &'static str {
-        "GenerateRequestBuilding"
-    }
-
+    /// Stable descriptor of the stage plus its mode-bearing args, compared
+    /// against golden literals in the pipeline parity test (through the
+    /// chat+generate dispatcher's own `signature`).
     #[cfg(test)]
-    fn signature(&self) -> String {
+    pub(crate) fn signature(&self) -> String {
         format!(
             "GenerateRequestBuildingStage(inject_pd_metadata={}, {:?})",
             self.inject_pd_metadata, self.plan_kind

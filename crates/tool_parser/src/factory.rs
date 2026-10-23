@@ -2,17 +2,17 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use openai_protocol::common::{Tool, ToolChoice, ToolChoiceValue};
+use openai_protocol::common::{Tool, ToolChoice};
 use parking_lot::RwLock;
 use serde_json::json;
 use tokio::sync::Mutex;
 
 use crate::{
     parsers::{
-        CohereParser, DeepSeek31Parser, DeepSeekDsmlParser, DeepSeekParser, Glm4MoeParser,
-        HyV4Parser, InklingParser, JsonParser, KimiK2Parser, KimiK3Parser, LlamaParser,
-        MinimaxM2Parser, MinimaxM3Parser, MistralParser, PassthroughParser, PythonicParser,
-        QwenParser, QwenXmlParser, SarashinaParser, Step3Parser,
+        CohereParser, DeepSeek31Parser, DeepSeekDsmlParser, DeepSeekParser, Gemma4Parser,
+        Glm4MoeParser, HyV4Parser, InklingParser, JsonParser, KimiK2Parser, KimiK3Parser,
+        LlamaParser, MinimaxM2Parser, MinimaxM3Parser, MistralParser, PassthroughParser,
+        PythonicParser, QwenParser, QwenXmlParser, SarashinaParser, Step3Parser,
     },
     traits::ToolParser,
 };
@@ -27,11 +27,58 @@ type ParserCreator = Arc<dyn Fn() -> Box<dyn ToolParser> + Send + Sync>;
 /// Takes (tools, at_least_one) and returns the full xgrammar structural tag value.
 type BuildStructuralTagFn = Arc<dyn Fn(&[Tool], bool) -> serde_json::Value + Send + Sync>;
 
-/// Function that builds the reasoning block a parser's structural tag is
-/// wrapped in when the prompt ends inside the model's thinking block: one
-/// xgrammar format element (a `tag` with an empty `begin`, free text, and the
-/// think-end token as `end`) the model must complete before the calls start.
-type ReasoningPrefixFn = fn() -> serde_json::Value;
+/// Function that builds what precedes a parser's forced calls when the prompt
+/// ends inside the model's thinking block, by where the engine starts the
+/// grammar ([`GrammarStart`]): one xgrammar format element, or `None` when
+/// nothing precedes the calls.
+type ReasoningPrefixFn = fn(GrammarStart) -> Option<serde_json::Value>;
+
+/// Where the engine that runs a forced call's grammar starts applying it on a
+/// prompt that ends inside the model's thinking block, as its worker
+/// advertises it (the `constrained_decoding_start` label).
+///
+/// An engine's own server picks the grammar's shape from this: it sends
+/// xgrammar's reasoning-aware tags (the thought, its close, then the calls)
+/// when it runs no reasoning parser and the bare calls when it does, because
+/// its grammar backend then waits for the thought's end; an engine with a
+/// reasoning parser set (and `enable_in_reasoning` off) waits the same way.
+/// The gateway reads the same fact from the worker and shapes the calls'
+/// prefix accordingly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GrammarStart {
+    /// The worker does not say (an older servicer, an engine without the
+    /// label): free text with nothing owed at its end precedes the calls,
+    /// which fits an engine of either kind.
+    #[default]
+    Unknown,
+    /// The engine applies the grammar only once its reasoning parser has
+    /// seen the model's own `</think>`: nothing precedes the calls, so the
+    /// call is forced right at that gate, as the engine's own server does.
+    AfterReasoning,
+    /// The engine applies the grammar from the first generated token: the
+    /// thought, its close and then the calls, so the call is not forced into
+    /// the thought.
+    FirstToken,
+}
+
+impl GrammarStart {
+    /// The worker label that carries it.
+    pub const LABEL: &'static str = "constrained_decoding_start";
+    /// The label's value for [`Self::AfterReasoning`].
+    pub const AFTER_REASONING: &'static str = "after_reasoning";
+    /// The label's value for [`Self::FirstToken`].
+    pub const FIRST_TOKEN: &'static str = "first_token";
+
+    /// The start a worker's `constrained_decoding_start` label names; anything
+    /// else, the label's absence included, is [`Self::Unknown`].
+    pub fn from_label(value: Option<&str>) -> Self {
+        match value {
+            Some(Self::AFTER_REASONING) => Self::AfterReasoning,
+            Some(Self::FIRST_TOKEN) => Self::FirstToken,
+            _ => Self::Unknown,
+        }
+    }
+}
 
 /// Constraint type returned by [`ParserRegistry::generate_tool_constraint`].
 #[derive(Debug, Clone)]
@@ -136,11 +183,16 @@ impl ParserRegistry {
     /// tag builder.
     ///
     /// When [`Self::generate_tool_constraint`] is called with `reasoning`
-    /// set, the parser's tag becomes `sequence[prefix, tag.format]`: the
-    /// model reasons, closes its thinking block, and only then emits the
-    /// forced call — the layout of xgrammar's built-in tags with
-    /// `reasoning=True`. Parsers without a prefix keep their unwrapped tag
-    /// whatever `reasoning` says.
+    /// set, the parser's tag becomes `sequence[prefix, tag.format]` with the
+    /// prefix for [`GrammarStart::Unknown`]: free text, then the forced call.
+    /// Unlike xgrammar's built-in tags with `reasoning=True`, that prefix is
+    /// not closed by the thought's end token: an engine that runs a reasoning
+    /// parser applies the grammar only after the model's own
+    /// `</think>` and would hold the model to a second one. Once the worker
+    /// that runs the grammar is known,
+    /// [`Self::structural_tag_for_grammar_start`] re-shapes the prefix for
+    /// where that engine starts the grammar. Parsers without a prefix keep
+    /// their unwrapped tag whatever `reasoning` says.
     pub fn register_reasoning_prefix(&self, name: &str, reasoning_prefix: ReasoningPrefixFn) {
         let mut entries = self.entries.write();
         let Some(existing) = entries.get(name).map(Arc::clone) else {
@@ -171,6 +223,61 @@ impl ParserRegistry {
                 .get(name)
                 .is_some_and(|entry| entry.reasoning_prefix.is_some())
         })
+    }
+
+    /// A forced call's structural tag, as [`Self::generate_tool_constraint`]
+    /// built it on a thinking prompt, re-shaped for where the engine that
+    /// will run it starts the grammar: for [`GrammarStart::AfterReasoning`]
+    /// the prefix is dropped (the grammar starts at the engine's gate, so the
+    /// first constrained token opens a call); for [`GrammarStart::FirstToken`]
+    /// the prefix becomes the parser's thought block, closed by `</think>`,
+    /// so the call follows the thought. `Ok(None)` leaves the tag as it is:
+    /// the start is unknown, the parser has no prefix, or the tag does not
+    /// carry one (a prompt outside the thinking block).
+    pub fn structural_tag_for_grammar_start(
+        &self,
+        configured_parser: Option<&str>,
+        tag: &str,
+        start: GrammarStart,
+    ) -> Result<Option<String>, String> {
+        if start == GrammarStart::Unknown {
+            return Ok(None);
+        }
+        let Some(prefix) = configured_parser.and_then(|name| {
+            self.entries
+                .read()
+                .get(name)
+                .and_then(|entry| entry.reasoning_prefix)
+        }) else {
+            return Ok(None);
+        };
+        let mut tag: serde_json::Value = serde_json::from_str(tag)
+            .map_err(|e| format!("Failed to parse structural tag: {e}"))?;
+        let Some(format) = tag.get_mut("format") else {
+            return Ok(None);
+        };
+        let wrapped = format["type"] == "sequence"
+            && format["elements"]
+                .as_array()
+                .is_some_and(|elements| elements.len() == 2)
+            && prefix(GrammarStart::Unknown)
+                .is_some_and(|unknown| format["elements"][0] == unknown);
+        if !wrapped {
+            return Ok(None);
+        }
+        let calls = format["elements"][1].take();
+        let shaped = match prefix(start) {
+            Some(prefix) => json!({
+                "format": {
+                    "type": "sequence",
+                    "elements": [prefix, calls],
+                }
+            }),
+            None => json!({ "format": calls }),
+        };
+        serde_json::to_string(&shaped)
+            .map(Some)
+            .map_err(|e| format!("Failed to serialize structural tag: {e}"))
     }
 
     /// Map a model name/pattern to a parser
@@ -233,9 +340,18 @@ impl ParserRegistry {
         configured.is_some_and(|p| self.has_structural_tag(p))
     }
 
+    /// Whether required/named responses retain model-native framing rather
+    /// than the generic JSON schema fallback. Gemma4 follows vLLM's native
+    /// choice handling without claiming structural-tag grammar support.
+    pub fn uses_native_tool_format(&self, configured: Option<&str>) -> bool {
+        self.has_structural_tag_for_parser(configured)
+            || configured.is_some_and(|p| p == "gemma4" && self.has_parser(p))
+    }
+
     /// Generate tool call constraint.
     ///
     /// If `configured_parser` supports structural tags → `StructuralTag(json)`.
+    /// Gemma4 emits its native format without a decoding constraint.
     /// Otherwise → `JsonSchema(schema)` for required/function tool_choice.
     /// Returns `Ok(None)` for auto/none tool_choice.
     ///
@@ -255,21 +371,27 @@ impl ParserRegistry {
             return Ok(None);
         }
 
-        let at_least_one = match tool_choice {
-            ToolChoice::Value(ToolChoiceValue::Required) => true,
-            ToolChoice::Function { .. } => true,
-            ToolChoice::AllowedTools { mode, .. } if mode == "required" => true,
-            _ => return Ok(None),
-        };
+        if !tool_choice.forces_call() {
+            return Ok(None);
+        }
+
+        // Like vLLM's Gemma4EngineToolParser.adjust_request, let Gemma4 emit
+        // native calls even for required/named choices instead of forcing JSON.
+        if configured_parser == Some("gemma4") && self.has_parser("gemma4") {
+            return Ok(None);
+        }
 
         // Try structural tag from configured parser
         if let Some(name) = configured_parser {
             let entries = self.entries.read();
             if let Some(entry) = entries.get(name) {
                 if let Some(build_fn) = entry.build_structural_tag.as_ref() {
-                    let mut tag = build_fn(tools, at_least_one);
+                    // A choice that forces a call asks the grammar for at least one.
+                    let mut tag = build_fn(tools, true);
                     if let (true, Some(prefix)) = (reasoning, entry.reasoning_prefix) {
-                        tag = wrap_in_reasoning_prefix(tag, prefix())?;
+                        if let Some(prefix) = prefix(GrammarStart::Unknown) {
+                            tag = wrap_in_reasoning_prefix(tag, prefix)?;
+                        }
                     }
                     let json_str = serde_json::to_string(&tag)
                         .map_err(|e| format!("Failed to serialize structural tag: {e}"))?;
@@ -370,6 +492,7 @@ impl ParserFactory {
         // Register default parsers
         registry.register_parser("passthrough", || Box::new(PassthroughParser::new()));
         registry.register_parser("json", || Box::new(JsonParser::new()));
+        registry.register_parser("gemma4", || Box::new(Gemma4Parser::new()));
         registry.register_parser_with_structural_tag(
             "mistral",
             || Box::new(MistralParser::new()),
@@ -417,7 +540,12 @@ impl ParserFactory {
             InklingParser::build_structural_tag,
         );
         registry.register_parser("minimax_m2", || Box::new(MinimaxM2Parser::new()));
-        registry.register_parser("minimax_m3", || Box::new(MinimaxM3Parser::new()));
+        registry.register_parser_with_structural_tag(
+            "minimax_m3",
+            || Box::new(MinimaxM3Parser::new()),
+            MinimaxM3Parser::build_structural_tag,
+        );
+        registry.register_reasoning_prefix("minimax_m3", MinimaxM3Parser::reasoning_prefix);
         registry.register_parser_with_structural_tag(
             "hy_v4",
             || Box::new(HyV4Parser::new()),
@@ -563,6 +691,8 @@ impl ParserFactory {
         // Other models
         registry.map_model("gemini-*", "json");
         registry.map_model("palm-*", "json");
+        registry.map_model("gemma-4*", "gemma4");
+        registry.map_model("gemma4*", "gemma4");
         registry.map_model("gemma-*", "json");
     }
 
@@ -625,8 +755,8 @@ impl Default for ParserFactory {
     }
 }
 
-/// `sequence[prefix, tag.format]`: the model's reasoning block, then the calls
-/// the builder produced. Needs the extended structural-tag shape (a top-level
+/// `sequence[prefix, tag.format]`: the free text a forced call follows on a
+/// thinking prompt, then the calls the builder produced. Needs the extended structural-tag shape (a top-level
 /// `format`), which every builder in this crate emits.
 fn wrap_in_reasoning_prefix(
     mut tag: serde_json::Value,

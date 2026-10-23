@@ -1,0 +1,48 @@
+{
+  "platform": "macOS-26.5.2-arm64-arm-64bit",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "base_sha": "fc27e1e23da4441f843a8987ee1392bc14179834",
+  "source_diff_sha256": "cc1c3d92793d51ba2100b606aca2e04c8c5965f307cf2e21a06e05a2891e0f78",
+  "profile": "workspace bench: opt-level=3, thin LTO, codegen-units=1",
+  "allocator": "system",
+  "duration_ms": 200,
+  "models": [
+    {
+      "name": "minimax-m3",
+      "repo": "MiniMaxAI/MiniMax-M3",
+      "revision": "f0e1c1e04d40177e4673a22097036854f536e9c0",
+      "marker": "[e~[",
+      "sha256": "bb1f1626cf01448f1e3b6036d0a061ffc66c91d9046aada14ea23a5441b5ad6e"
+    },
+    {
+      "name": "glm-5.3",
+      "repo": "zai-org/GLM-5.3",
+      "revision": "c5087a76d148760811ffbdedfe6ff9f194e46e38",
+      "marker": "<|assistant|>",
+      "sha256": "19e773648cb4e65de8660ea6365e10acca112d42a854923df93db4a6f333a82d"
+    },
+    {
+      "name": "qwen3-8b",
+      "repo": "Qwen/Qwen3-8B",
+      "revision": "b968826d9c46dd6066d109eabc6255188de91218",
+      "marker": "<|im_end|>",
+      "sha256": "aeb13307a71acd8fe81861d94ad54ab689df773318809eed3cbe794b4492dae4"
+    },
+    {
+      "name": "deepseek-v3.2",
+      "repo": "deepseek-ai/DeepSeek-V3.2",
+      "revision": "a7e62ac04ecb2c0a54d736dc46601c5606cf10a6",
+      "marker": "<\uff5cend\u2581of\u2581sentence\uff5c>",
+      "sha256": "cd050be35cae877f8f0aa847f45aa87e23835a56ca32b29b28545597852784e5"
+    }
+  ],
+  "binaries": {
+    "default": "c4fcb44e09e25d49660408a24291bf7fa80a0fd5ddfb856d2199644cf2f7710b",
+    "opt-in": "4131b6b21aa3e26e76581cba51378cbd050b13246b7f76f39c1432622a10dcdf"
+  },
+  "harness_sha256": "8bc51f9603e566eea62caac59530da5b8a5d51dac39b10a4616436853a3b446c",
+  "runner_sha256": "842635bab29537624a395811d5671bdce98f4b2aa0140a849d747d2ad92960cc",
+  "lock_sha256": "a1c3fb087b1f78e0cccf0781bbd6168c1623ea035b93717067a88989e9f46796",
+  "export_runner_sha256": "30260178fc20f2bd0fb57be70ef10a314aacd5448bccc6b3da569dcf2ecd423c",
+  "export_change": "CSV output uses LF line endings; measurement code unchanged"
+}

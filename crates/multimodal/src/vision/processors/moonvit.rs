@@ -30,7 +30,7 @@ use crate::vision::{
     transforms::{self, TransformError, TransparentBg, TransparentBgFillStage},
 };
 
-/// MoonViT resize/patchify parameters for a single model.
+/// MoonViT resize/patchify/normalize parameters for a single model.
 #[derive(Debug, Clone, Copy)]
 pub struct MoonVitParams {
     pub patch_size: usize,
@@ -39,6 +39,10 @@ pub struct MoonVitParams {
     pub in_patch_limit: usize,
     /// Maximum patches along one spatial dimension.
     pub patch_limit_on_one_side: usize,
+    /// Normalization mean (the config's, else CLIP's).
+    pub mean: [f64; 3],
+    /// Normalization std (the config's, else CLIP's).
+    pub std: [f64; 3],
 }
 
 impl MoonVitParams {
@@ -49,9 +53,8 @@ impl MoonVitParams {
 
     /// Overlay whatever the model's `preprocessor_config.json` supplies.
     ///
-    /// The registry hands out one shared processor instance built from
-    /// compiled-in defaults, so this is the only point where a model's real
-    /// limits can be applied. K2.5 and K3 ship different `in_patch_limit`
+    /// A processor resolves this once, when it is built for the model, over
+    /// its compiled-in defaults. K2.5 and K3 ship different `in_patch_limit`
     /// values (16384 vs 65536), which is exactly the kind of divergence that
     /// silently caps resolution if the defaults win.
     pub fn resolved(self, config: &PreProcessorConfig) -> Self {
@@ -67,6 +70,8 @@ impl MoonVitParams {
                 .get_extra::<usize>("patch_limit_on_one_side")
                 .unwrap_or(self.patch_limit_on_one_side)
                 .max(1),
+            mean: config.get_image_mean(),
+            std: config.get_image_std(),
         }
     }
 
@@ -126,7 +131,10 @@ pub struct ResizeConfig {
 /// composited at the configured stage; K3 ships `"after_resize"`, and the
 /// ordering is load-bearing because a chessboard is generated at the resolution
 /// of whatever it is painted onto. With `None` alpha is dropped *before* the
-/// resize, matching the reference's `.convert("RGB")` at load time.
+/// resize, matching the reference's `.convert("RGB")` at load time. A frame
+/// carries an alpha channel here only when the gateway decoded it under
+/// `TransparencyPolicy::KeepAlpha` (K3 asks for that through `keeps_alpha`;
+/// otherwise the destination engine's loader rule was applied at the decode).
 fn resize_pad_and_normalize(
     image: &DynamicImage,
     cfg: &ResizeConfig,
@@ -183,29 +191,14 @@ fn resize_pad_and_normalize(
     // Pooled: this per-image CHW buffer (tens of MB) is recycled by the
     // caller after patch extraction, keeping its pages mapped and hot.
     let mut data = scratch::take_f32(3 * canvas_pixels);
-    let (r_plane, rest) = data.split_at_mut(canvas_pixels);
-    let (g_plane, b_plane) = rest.split_at_mut(canvas_pixels);
-
-    // Pre-fill with normalized black: (0/255 - mean) / std = bias
-    r_plane.fill(bias[0]);
-    g_plane.fill(bias[1]);
-    b_plane.fill(bias[2]);
-
-    // Overwrite image region row-by-row using vectorized deinterleave
-    let rw = img_w.min(canvas_w);
-    let rh = img_h.min(canvas_h);
-    for y in 0..rh {
-        let src_row = &raw[y * img_w * 3..y * img_w * 3 + rw * 3];
-        let dst_offset = y * canvas_w;
-        transforms::deinterleave_rgb_to_planes(
-            src_row,
-            &mut r_plane[dst_offset..dst_offset + rw],
-            &mut g_plane[dst_offset..dst_offset + rw],
-            &mut b_plane[dst_offset..dst_offset + rw],
-            scale,
-            bias,
-        );
-    }
+    transforms::paint_rgb_onto_planes(
+        &raw,
+        (img_w, img_h),
+        (canvas_w, canvas_h),
+        scale,
+        bias,
+        &mut data,
+    );
 
     #[expect(
         clippy::expect_used,
@@ -258,7 +251,6 @@ fn extract_patches_into(tensor: &Array3<f32>, patch_size: usize, out: &mut Vec<f
 pub fn preprocess(
     params: MoonVitParams,
     images: &[DynamicImage],
-    config: &PreProcessorConfig,
     transparent_bg: Option<TransparentBg>,
 ) -> Result<PreprocessedEncoderInputs, TransformError> {
     if images.is_empty() {
@@ -266,8 +258,7 @@ pub fn preprocess(
     }
 
     let item_sizes: Vec<(u32, u32)> = images.iter().map(|img| img.dimensions()).collect();
-    let mean = config.get_image_mean();
-    let std = config.get_image_std();
+    let (mean, std) = (params.mean, params.std);
 
     // Pre-size the pooled batch buffer exactly (patch_features per patch =
     // 3 * patch_size^2; this is the data plane's hottest allocation).

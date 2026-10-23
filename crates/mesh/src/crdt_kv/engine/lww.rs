@@ -9,24 +9,24 @@
 //!   tombstone flag / GC clock
 //! - per-key locks (so same-key writes serialise with metadata updates)
 //! - a [`LamportClock`] for stamping local writes
-//! - an [`OperationLog`] for replication
+//! - an [`OpLogKeeper`] with the operation log for replication
 
 use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use dashmap::{mapref::entry::Entry as MapEntry, DashMap};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 use tracing::debug;
 
-use super::NamespaceCrdtEngine;
+use super::{
+    op_log::{changes, values_before, OpLogKeeper},
+    NamespaceCrdtEngine,
+};
 use crate::crdt_kv::{
     kv_store::KvStore,
-    operation::{CrdtChange, Operation, OperationLog},
+    operation::{CrdtChange, Operation},
     replica::{LamportClock, ReplicaId},
 };
 
@@ -90,10 +90,7 @@ pub(crate) struct LwwEngine {
     store: KvStore,
     metadata: Arc<DashMap<String, Vec<ValueMetadata>>>,
     key_locks: Arc<DashMap<String, Arc<Mutex<()>>>>,
-    log: Arc<RwLock<OperationLog>>,
-    /// Bumped on every log mutation (including relay-only appends);
-    /// invalidation key for shared op-log snapshots.
-    op_generation: Arc<AtomicU64>,
+    log: OpLogKeeper,
     clock: Arc<LamportClock>,
     replica_id: ReplicaId,
 }
@@ -104,18 +101,10 @@ impl LwwEngine {
             store: KvStore::new(),
             metadata: Arc::new(DashMap::new()),
             key_locks: Arc::new(DashMap::new()),
-            log: Arc::new(RwLock::new(OperationLog::new())),
-            op_generation: Arc::new(AtomicU64::new(0)),
+            log: OpLogKeeper::new("LwwEngine"),
             clock,
             replica_id,
         }
-    }
-
-    /// Compact once the log carries more than twice the live key count
-    /// (min 64): a compacted log holds one op per key, so this bounds
-    /// resident log memory at O(keys) while amortizing the fold.
-    fn compact_trigger(&self) -> usize {
-        (self.metadata.len() * 2).max(64)
     }
 
     fn key_lock_for(&self, key: &str) -> Arc<Mutex<()>> {
@@ -244,43 +233,21 @@ impl LwwEngine {
         removed
     }
 
+    /// A local write's op: appended, and past the keeper's trigger the log
+    /// is compacted per LWW rules (`lww_fold`) with the memory backstop.
     fn append_op(&self, op: Operation) {
-        let mut log = self.log.write();
-        log.append(op);
-        self.op_generation.fetch_add(1, Ordering::Release);
-        // The trigger floor is 64, so a short log skips the DashMap len()
-        // (an O(shards) scan) on this per-write path.
-        if log.len() > 64 && log.len() > self.compact_trigger() {
-            Self::compact_log(&mut log);
-            // Local-write path only: dropping oldest on the remote-merge path
-            // would shed remotely-learned keys (see the helper's docs).
-            let dropped = log.truncate_oldest_over_threshold();
-            if dropped > 0 {
-                tracing::warn!(
-                    dropped,
-                    total = log.len(),
-                    "LwwEngine log over threshold after compaction; dropped oldest \
-                     entries (out-of-spec distinct-key count)"
-                );
-            }
-        }
+        self.log.append(op, || self.metadata.len(), Self::lww_fold);
     }
 
     /// LWW per-key fold: the winning op is the one with the maximum
     /// `(timestamp, replica_id)` tuple. Tombstones and inserts share the
-    /// ordering - the newer wins regardless of kind.
+    /// ordering - the newer wins regardless of kind. Compaction never drops
+    /// keys outright - the truncate-oldest safety valve lives only on the
+    /// `append_op` local-write path.
     fn lww_fold(ops: &[Operation]) -> Option<Operation> {
         ops.iter()
             .max_by_key(|op| (op.timestamp(), op.replica_id()))
             .cloned()
-    }
-
-    /// Compact the log per LWW rules: collapse all ops for a key down to the
-    /// one with maximum `(timestamp, replica_id)`. Never drops keys outright -
-    /// the truncate-oldest safety valve lives only on the `append_op`
-    /// local-write path.
-    fn compact_log(log: &mut OperationLog) {
-        log.compact_by_key(Self::lww_fold);
     }
 }
 
@@ -353,11 +320,11 @@ impl NamespaceCrdtEngine for LwwEngine {
     }
 
     fn op_generation(&self) -> u64 {
-        self.op_generation.load(Ordering::Acquire)
+        self.log.generation()
     }
 
     fn export_ops(&self) -> Vec<Operation> {
-        self.log.read().operations().to_vec()
+        self.log.export()
     }
 
     fn apply_remote_ops(&self, ops: Vec<Operation>) -> Vec<CrdtChange> {
@@ -408,29 +375,11 @@ impl NamespaceCrdtEngine for LwwEngine {
         // `(replica_id, timestamp)` is a no-op. `unseen` was already filtered
         // against the local log above; append it directly and compact (no
         // truncate - this path must not drop remotely-learned keys).
-        {
-            let mut log = self.log.write();
-            for op in &unseen {
-                log.append(op.clone());
-            }
-            Self::compact_log(&mut log);
-            self.op_generation.fetch_add(1, Ordering::Release);
-        }
+        self.log.merge_batch(&unseen, Self::lww_fold);
 
         // Snapshot the observable value of every key this batch touches before
         // applying, so we emit a `CrdtChange` only when `get` actually changes.
-        // Keying off observable value (not op acceptance) suppresses spurious
-        // events from a newer-version op that rewrites byte-identical bytes or
-        // from a dominated op.
-        let mut before: std::collections::HashMap<String, Option<Vec<u8>>> =
-            std::collections::HashMap::new();
-        for op in &unseen {
-            // `contains_key` with a borrowed key avoids allocating a `String`
-            // for keys already snapshotted (a batch may repeat a key).
-            if !before.contains_key(op.key()) {
-                before.insert(op.key().to_string(), self.store.get(op.key()));
-            }
-        }
+        let before = values_before(&unseen, |key| self.store.get(key));
 
         // Apply unseen ops to live state. Lamport clock observes each remote
         // timestamp so subsequent local ticks beat it.
@@ -455,15 +404,9 @@ impl NamespaceCrdtEngine for LwwEngine {
             }
         }
 
-        // Emit one CrdtChange per key whose observable value changed, carrying
+        // One CrdtChange per key whose observable value changed, carrying
         // the canonical post-merge value (matching `get`).
-        before
-            .into_iter()
-            .filter_map(|(key, prior)| {
-                let value = self.store.get(&key);
-                (value != prior).then_some(CrdtChange { key, value })
-            })
-            .collect()
+        changes(before, |key| self.store.get(key))
     }
 
     fn gc_tombstones(&self, grace: Duration) -> usize {
@@ -508,13 +451,11 @@ impl NamespaceCrdtEngine for LwwEngine {
             // tracking metadata (the compaction trigger) and dead tombstones
             // stop gossiping. Newer concurrent ops for a reused key survive
             // the version filter.
-            let mut log = self.log.write();
-            log.retain_ops(|op| {
+            self.log.retain(|op| {
                 purged
                     .get(op.key())
                     .is_none_or(|gc_version| (op.timestamp(), op.replica_id()) > *gc_version)
             });
-            self.op_generation.fetch_add(1, Ordering::Release);
         }
         removed
     }

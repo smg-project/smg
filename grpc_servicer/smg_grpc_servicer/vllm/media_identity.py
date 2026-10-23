@@ -1,8 +1,8 @@
-"""The prefill leg's account of the media it processed, for the decode leg.
+"""The prefill side's account of the media it processed, for the decode side.
 
 With prefill/decode disaggregation only the prefill worker runs the media
 processor; its result travels back on the completion in the shape a
-router-preprocessed decode leg already accepts: expanded prompt ids and, per
+router-preprocessed decode side already accepts: expanded prompt ids and, per
 modality, hashes, placeholders and the grid tensors, never pixels. Engine-free:
 the processed input is read by shape, not by vLLM's types.
 """
@@ -21,7 +21,7 @@ from smg_grpc_servicer.tensor_wire import PROTO_DTYPE_MAP
 
 logger = logging.getLogger(__name__)
 
-# The per-item tensors a decode leg needs besides pixels: the M-RoPE grids and
+# The per-item tensors a decode side needs besides pixels: the M-RoPE grids and
 # the video timing that goes with them, in both spellings: `second_per_grid_ts`
 # from the Qwen-VL processors, `video_second_per_grid` from the Qwen-Omni
 # family and the router's own processors. The router's VLLM_MROPE_GRID_KEYS
@@ -78,7 +78,7 @@ def _im_token_id(prompt_token_ids: Sequence[int], ranges: Sequence[Any]) -> int 
 
 def build_media_identity(prompt: Mapping[str, Any]) -> vllm_engine_pb2.MediaIdentity | None:
     """The identity of a processed engine input, or None when it has no media
-    or a grid tensor cannot be carried (the decode leg then reprocesses)."""
+    or a grid tensor cannot be carried (the decode side then reprocesses)."""
     hashes = _first(prompt, "mm_hashes", "multi_modal_hashes") or {}
     placeholders = _first(prompt, "mm_placeholders", "multi_modal_placeholders") or {}
     kwargs = _first(prompt, "mm_kwargs", "multi_modal_kwargs") or {}
@@ -108,11 +108,11 @@ def build_media_identity(prompt: Mapping[str, Any]) -> vllm_engine_pb2.MediaIden
                 continue
             tensors = [_data(elem) for elem in elems]
             if len(tensors) != len(items) or any(t.shape != tensors[0].shape for t in tensors):
-                # Not one row per item: the batched layout the decode leg
+                # Not one row per item: the batched layout the decode side
                 # reads cannot carry it, so no identity at all.
                 logger.warning(
                     "media identity: %s grid tensor %s is not one row per item; "
-                    "the decode leg will reprocess the media",
+                    "the decode side will reprocess the media",
                     modality,
                     key,
                 )

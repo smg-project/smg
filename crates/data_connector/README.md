@@ -42,7 +42,7 @@ pub type StorageTuple = (
 
 | Backend | Variant | Description |
 |---------|---------|-------------|
-| **Memory** | `HistoryBackend::Memory` | In-process `HashMap`/`BTreeMap` storage. Default. No persistence across restarts. Suitable for development and testing. |
+| **Memory** | `HistoryBackend::Memory` | In-process `HashMap`/`BTreeMap` storage. Default. No persistence across restarts. Bounded by [`MemoryConfig`](#memoryconfig): the oldest records go when a count bound is crossed or a record is older than the retention. Suitable for development, testing and small deployments. |
 | **None / NoOp** | `HistoryBackend::None` | Accepts all writes silently, returns empty on reads. Use when persistence is intentionally disabled. |
 | **PostgreSQL** | `HistoryBackend::Postgres` | Production backend using `tokio-postgres` with `deadpool` connection pooling. Fully async. Tables are auto-created on first connection. |
 | **Redis** | `HistoryBackend::Redis` | Production backend using `deadpool-redis`. Supports optional TTL-based data retention (`retention_days`). |
@@ -102,12 +102,28 @@ Backend selection is controlled by the `HistoryBackend` enum
 (`"memory"`, `"none"`, `"oracle"`, `"postgres"`, `"redis"` when deserialized
 from JSON/YAML). Each database backend has a dedicated config struct.
 
+### `MemoryConfig`
+
+The memory backend keeps its records in the gateway's own memory, so it is
+bounded; the bounds are checked on every write and the oldest records go first.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `max_responses` | `usize` | `10_000` | Most stored responses kept (a stored response of a short exchange takes about 12 KB). |
+| `max_items` | `usize` | `100_000` | Most conversation items kept; an evicted item leaves every conversation that listed it (an item takes about 1.5 KB). |
+| `retention_secs` | `Option<u64>` | `Some(86_400)` | How long a record is kept; `None` or `0` keeps a record until a count bound drops it. Conversations follow the retention only. |
+
+The stores report their record counts through `stored_record_count()` (the
+gateway samples them into `smg_history_memory_records{kind}`); the other
+backends answer `None`.
+
 ### `PostgresConfig`
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `db_url` | `String` | Connection URL (`postgres://user:pass@host:port/dbname`). Validated for scheme, host, and database name. |
 | `pool_max` | `usize` | Maximum connections in the deadpool pool (default helper: 16). Must be > 0. |
+| `op_timeout_secs` | `u64` | Bound in seconds on one call to the store (pool wait, connect and the statement; default 5, must be > 0). A call past it fails as a `Timeout` error, which the gateway answers `503 storage_unavailable`. |
 | `schema` | `Option<SchemaConfig>` | Optional schema customization. See [Schema Configuration](#schema-configuration). |
 
 Call `validate()` to check the URL before use.
@@ -119,6 +135,7 @@ Call `validate()` to check the URL before use.
 | `url` | `String` | -- | Connection URL (`redis://` or `rediss://`). |
 | `pool_max` | `usize` | 16 | Maximum pool connections. |
 | `retention_days` | `Option<u64>` | `Some(30)` | TTL in days for stored data. `None` disables expiration. |
+| `op_timeout_secs` | `u64` | 5 | Bound in seconds on one call to the store (pool wait, connect and the command; must be > 0). Replaces the client library's own 500 ms response / 1 s connection defaults. A call past it fails as a `Timeout` error, which the gateway answers `503 storage_unavailable`. |
 | `schema` | `Option<SchemaConfig>` | `None` | Optional schema customization. See [Schema Configuration](#schema-configuration). |
 
 Call `validate()` to check the URL before use.
@@ -357,6 +374,27 @@ Responses support chaining via `previous_response_id` and can be queried by
 `safety_identifier` for content moderation workflows. The `ResponseChain`
 struct reconstructs the chronological sequence of related responses.
 
+### Tenant scope
+
+`StoredResponse` and `Conversation` carry an optional `tenant`: the identity
+the gateway resolved for the request that stored them (a tenant API key or a
+trusted tenant header, as its canonical key). Every backend persists it (a
+nullable `tenant` column on `responses`, `conversations` and `conversation_items`, a hash field in
+Redis). The rule, `tenant_scope_allows`, is the same for both record types:
+
+- a record stored under a tenant is served only to a caller of that tenant
+  (`is_visible_to`); the gateway answers another tenant's id as it answers an
+  unknown one;
+- a record stored under no tenant (no tenant identity configured, a caller the
+  gateway resolved no tenant for, or a row from before the column existed) is
+  served to every caller, as before.
+
+The listing and the deletion by `safety_identifier` take the caller's tenant
+and apply the same rule in the store's own query. Conversation items carry the
+tenant as well: an existing item is referenced (`item_reference`) or added
+under its own id only by its tenant. The gateway bounds a tenant id to 200
+characters, so the canonical key fits the column.
+
 ## ID Generation
 
 | ID Type | Format | Example |
@@ -375,6 +413,20 @@ struct reconstructs the chronological sequence of related responses.
 | `mcp_list_tools` | `mcpl` |
 | `function_call` | `fc` |
 | (other) | first 3 chars of the type, or `itm` if empty |
+
+## Start-up Contact
+
+With a Postgres or Redis history backend configured, `create_storage` makes one
+bounded contact with the store before anything else: a connection and one round
+trip (`SELECT 1` / `PING`) within the backend's store-call bound
+(`op_timeout_secs`, 5 s by default). A store that refuses the connection is a
+named error at once (the backend, the URL with its password masked, the cause);
+a store that accepts the connection and never answers is one when the bound
+passes (`did not answer within the start-up bound of 5 s`): the client library
+and the pool bound their own steps at twice the store-call bound, so the
+contact's verdict is the first to fire for either backend. The gateway exits
+before it binds its API port: it does not start without a history backend it
+cannot reach. Oracle's contact is bounded by its own `pool_timeout_secs`.
 
 ## Database Schema
 
@@ -414,12 +466,18 @@ subsystem schema (for example skills metadata or background-mode queue tables)
 must be managed by the subsystem that actually uses those tables rather than
 being forced on every history-backed deployment.
 
-On startup:
-1. Tables are created if they don't exist (`CREATE TABLE` / `CREATE TABLE IF NOT EXISTS`)
-2. The `_schema_versions` tracking table is created
-3. Pending migrations are checked:
+On startup (Postgres: in one transaction under an advisory lock, so gateways
+starting together on one database take turns and all come up):
+1. The `_schema_versions` tracking table is created
+2. The store's schema version is compared with the migrations the build knows: a database ahead of the build is refused (see "A database ahead of the build" below). Postgres does this here, before any history table is touched; Oracle after its history tables exist (step 3), as the first step of its migration run
+3. Tables are created if they don't exist (`CREATE TABLE` / `CREATE TABLE IF NOT EXISTS`)
+4. A fresh database (no responses table before this start) is recorded at the
+   latest version: its tables were just created in their final shape, so no
+   migration is pending and no `auto_migrate` is needed
+5. Pending migrations are checked:
    - If `auto_migrate: true` → migrations are applied automatically
    - If `auto_migrate: false` (default) → startup fails with actionable SQL if migrations are pending
+6. Indexes are created last, once the columns they cover exist
 
 Current core history migrations:
 
@@ -428,13 +486,24 @@ Current core history migrations:
 | 1 | Add `safety_identifier` column to responses |
 | 2 | Remove legacy `user_id` column from responses |
 | 3 | Drop redundant `output`, `metadata`, `instructions`, `tool_calls` columns from responses |
+| 4 | Add the nullable `tenant` column to responses, conversations and conversation items |
+
+#### A database ahead of the build
+
+A database whose `_schema_versions` is above the latest migration a build
+knows (a newer build migrated it forward; the gateway was rolled back) is
+refused at startup with a message that names both versions: the build does
+not know the shape of a newer schema and would otherwise start and fail its
+first read of a changed column. Upgrade the gateway, or set `version` to the
+database's version in the schema config to run the build against it anyway
+(logged once at startup).
 
 #### Controlling migrations
 
 | Config field | Type | Default | Description |
 |---|---|---|---|
-| `auto_migrate` | `bool` | `false` | Set to `true` to apply migrations automatically on startup. When `false`, startup fails with the exact SQL if migrations are pending. |
-| `version` | `u32` (optional) | `None` | Starting version — migrations up to this number are skipped. Use when your database is already at a known version. |
+| `auto_migrate` | `bool` | `false` | Set to `true` to apply migrations automatically on startup (the environment variable `DB_AUTO_MIGRATE=true` sets the default). When `false`, startup fails with the exact SQL if migrations are pending. |
+| `version` | `u32` (optional) | `None` | Starting version — migrations up to this number are skipped. Use when your database is already at a known version, or to run a build against a database whose schema version is ahead of it (refused at startup otherwise, see above). |
 
 Example: opt in to automatic migration:
 

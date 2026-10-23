@@ -76,6 +76,8 @@ impl KimiK3Processor {
                 merge_size: DEFAULT_MERGE_SIZE,
                 in_patch_limit: DEFAULT_IN_PATCH_LIMIT,
                 patch_limit_on_one_side: DEFAULT_PATCH_LIMIT_ON_ONE_SIDE,
+                mean: PreProcessorConfig::CLIP_MEAN,
+                std: PreProcessorConfig::CLIP_STD,
             },
             transparent_bg: Some(default_transparent_bg()),
         }
@@ -99,8 +101,7 @@ impl KimiK3Processor {
 
     /// Overlay the model's own transparency settings, if it ships any.
     ///
-    /// The registry hands out one shared instance, so this is the only point at
-    /// which a checkpoint's real config can take effect. An absent or malformed
+    /// Resolved once, when the processor is built for the model. An absent or malformed
     /// key keeps K3's shipped board rather than silently disabling compositing,
     /// because `preprocessor_config.json` is optional in this runtime (see
     /// `grpc::multimodal::config`). That diverges from the reference, which
@@ -127,6 +128,14 @@ impl KimiK3Processor {
 }
 
 impl VisionPreProcessor for KimiK3Processor {
+    /// K3's reference processor receives the image as stored, alpha channel
+    /// included (the serving engines' loaders keep the original image mode for
+    /// this model), and composites transparent pixels over its configured
+    /// chessboard after the resize; the gateway decodes its frames the same way.
+    fn keeps_alpha(&self) -> bool {
+        true
+    }
+
     fn default_mean(&self) -> [f64; 3] {
         KIMI_K3_MEAN
     }
@@ -138,28 +147,22 @@ impl VisionPreProcessor for KimiK3Processor {
     fn preprocess(
         &self,
         images: &[DynamicImage],
-        config: &PreProcessorConfig,
     ) -> Result<PreprocessedEncoderInputs, TransformError> {
-        moonvit::preprocess(
-            self.params.resolved(config),
-            images,
-            config,
-            self.resolved_transparent_bg(config),
-        )
+        moonvit::preprocess(self.params, images, self.transparent_bg)
     }
 
-    fn calculate_num_tokens(&self, width: u32, height: u32, config: &PreProcessorConfig) -> usize {
-        self.params
-            .resolved(config)
+    fn calculate_num_tokens(&self, width: u32, height: u32) -> Result<usize, TransformError> {
+        Ok(self
+            .params
             .compute_resize_config(width as usize, height as usize)
-            .num_tokens
+            .num_tokens)
     }
 
     fn model_name(&self) -> &'static str {
         "kimi-k3"
     }
 
-    fn get_processed_size(&self, _config: &PreProcessorConfig) -> Option<(u32, u32)> {
+    fn get_processed_size(&self) -> Option<(u32, u32)> {
         None
     }
 }
@@ -168,6 +171,12 @@ impl VisionPreProcessor for KimiK3Processor {
 mod tests {
     use image::{Rgb, RgbImage, Rgba, RgbaImage};
     use serde_json::json;
+
+    #[test]
+    fn k3_keeps_alpha_for_its_own_background_and_k25_does_not() {
+        assert!(KimiK3Processor::new().keeps_alpha());
+        assert!(!KimiK25Processor::new().keeps_alpha());
+    }
 
     use super::*;
     use crate::vision::processors::kimi_k25::{
@@ -204,12 +213,11 @@ mod tests {
     fn test_larger_patch_budget_keeps_more_resolution() {
         let k3 = KimiK3Processor::new();
         let k25 = KimiK25Processor::new();
-        let config = PreProcessorConfig::default();
 
         // 4000x3000 is well past both budgets, so the difference shows up
         // directly in how far each model downscales.
-        let k3_tokens = k3.calculate_num_tokens(4000, 3000, &config);
-        let k25_tokens = k25.calculate_num_tokens(4000, 3000, &config);
+        let k3_tokens = k3.calculate_num_tokens(4000, 3000).unwrap();
+        let k25_tokens = k25.calculate_num_tokens(4000, 3000).unwrap();
         assert!(
             k3_tokens > k25_tokens,
             "K3 should keep more tokens than K2.5 ({k3_tokens} vs {k25_tokens})"
@@ -218,11 +226,11 @@ mod tests {
 
     #[test]
     fn test_transparent_pixels_composite_over_chessboard() {
-        let p = KimiK3Processor::new();
+        let p = KimiK3Processor::from_preprocessor_config(&norm_config());
         // 56x56 is factor-aligned (28*2), so there is no padding to confuse the
         // check, and 8px squares tile it exactly.
         let image = DynamicImage::from(RgbaImage::from_pixel(56, 56, Rgba([0, 0, 0, 0])));
-        let result = p.preprocess(&[image], &norm_config()).unwrap();
+        let result = p.preprocess(&[image]).unwrap();
 
         let values: Vec<f32> = result
             .encoder_input_flat()
@@ -259,9 +267,9 @@ mod tests {
         // chessboard_square_on_top_left=true, so (0,0) is *white* and the
         // neighbouring square is grey. An inverted board would still pass a
         // "both values present" check, hence this one.
-        let p = KimiK3Processor::new();
+        let p = KimiK3Processor::from_preprocessor_config(&norm_config());
         let image = DynamicImage::from(RgbaImage::from_pixel(56, 56, Rgba([0, 0, 0, 0])));
-        let result = p.preprocess(&[image], &norm_config()).unwrap();
+        let result = p.preprocess(&[image]).unwrap();
 
         // Patch 0 is the top-left 14x14 block, channel-first: element 0 is
         // R at (0,0), and element 8 is R at (8,0) — the next square over.
@@ -272,9 +280,9 @@ mod tests {
 
     #[test]
     fn test_opaque_pixels_are_untouched() {
-        let p = KimiK3Processor::new();
+        let p = KimiK3Processor::from_preprocessor_config(&norm_config());
         let opaque = DynamicImage::from(RgbaImage::from_pixel(56, 56, Rgba([255, 255, 255, 255])));
-        let result = p.preprocess(&[opaque], &norm_config()).unwrap();
+        let result = p.preprocess(&[opaque]).unwrap();
         assert!(
             result
                 .encoder_input_flat()
@@ -286,10 +294,10 @@ mod tests {
 
     #[test]
     fn test_semi_transparent_blends_toward_background() {
-        let p = KimiK3Processor::new();
+        let p = KimiK3Processor::from_preprocessor_config(&norm_config());
         // Half-opaque black over the board: 0.5*0 + 0.5*bg → 90 or 127.
         let image = DynamicImage::from(RgbaImage::from_pixel(56, 56, Rgba([0, 0, 0, 128])));
-        let result = p.preprocess(&[image], &norm_config()).unwrap();
+        let result = p.preprocess(&[image]).unwrap();
         let values: Vec<f32> = result
             .encoder_input_flat()
             .iter()
@@ -313,11 +321,11 @@ mod tests {
         let config = norm_config();
         let image = DynamicImage::from(RgbImage::from_pixel(196, 140, Rgb([37, 211, 102])));
 
-        let k3 = KimiK3Processor::new()
-            .preprocess(std::slice::from_ref(&image), &config)
+        let k3 = KimiK3Processor::from_preprocessor_config(&config)
+            .preprocess(std::slice::from_ref(&image))
             .unwrap();
-        let k25 = KimiK25Processor::new()
-            .preprocess(&[image], &config)
+        let k25 = KimiK25Processor::from_preprocessor_config(&config)
+            .preprocess(&[image])
             .unwrap();
 
         assert_eq!(k3.encoder_input.shape(), k25.encoder_input.shape());
@@ -331,9 +339,9 @@ mod tests {
             "transparent_bg_config".to_string(),
             json!({ "pattern": "white" }),
         );
-        let p = KimiK3Processor::new();
+        let p = KimiK3Processor::from_preprocessor_config(&config);
         let image = DynamicImage::from(RgbaImage::from_pixel(56, 56, Rgba([0, 0, 0, 0])));
-        let result = p.preprocess(&[image], &config).unwrap();
+        let result = p.preprocess(&[image]).unwrap();
         assert!(
             result
                 .encoder_input_flat()
@@ -347,7 +355,6 @@ mod tests {
     fn test_fill_stage_before_resize_changes_output() {
         // The stage is not cosmetic: the board is drawn at the resolution of
         // whatever it is painted onto, so a downscaled image differs.
-        let p = KimiK3Processor::new();
         let mut config = norm_config();
         // Force a downscale so the two stages see different resolutions.
         config
@@ -355,13 +362,17 @@ mod tests {
             .insert("patch_limit_on_one_side".to_string(), json!(4));
 
         let image = DynamicImage::from(RgbaImage::from_pixel(560, 560, Rgba([0, 0, 0, 0])));
-        let after = p.preprocess(std::slice::from_ref(&image), &config).unwrap();
+        let after = KimiK3Processor::from_preprocessor_config(&config)
+            .preprocess(std::slice::from_ref(&image))
+            .unwrap();
 
         config.extra.insert(
             "transparent_bg_fill_stage".to_string(),
             json!("before_resize"),
         );
-        let before = p.preprocess(&[image], &config).unwrap();
+        let before = KimiK3Processor::from_preprocessor_config(&config)
+            .preprocess(&[image])
+            .unwrap();
 
         assert_eq!(after.encoder_input.shape(), before.encoder_input.shape());
         assert_ne!(
@@ -398,7 +409,9 @@ mod tests {
         assert_eq!(p.resolved_transparent_bg(&config), None);
 
         let image = DynamicImage::from(RgbaImage::from_pixel(56, 56, Rgba([0, 0, 0, 0])));
-        let result = p.preprocess(&[image], &config).unwrap();
+        let result = KimiK3Processor::from_preprocessor_config(&config)
+            .preprocess(&[image])
+            .unwrap();
         assert!(
             result
                 .encoder_input_flat()
@@ -414,12 +427,12 @@ mod tests {
         // premultiplies (verified against Pillow 11.2.1), so colour under fully
         // transparent pixels cannot bleed into neighbours: swapping it must not
         // change the tensor.
-        let p = KimiK3Processor::new();
         let mut config = norm_config();
         // Cap the long side at 2 * 14 px so a real downscale happens.
         config
             .extra
             .insert("patch_limit_on_one_side".to_string(), json!(2));
+        let p = KimiK3Processor::from_preprocessor_config(&config);
 
         let outputs = [[0, 0, 0], [255, 0, 255]].map(|hidden| {
             let mut img = RgbaImage::new(112, 112);
@@ -430,7 +443,7 @@ mod tests {
                     Rgba([hidden[0], hidden[1], hidden[2], 0])
                 };
             }
-            p.preprocess(&[DynamicImage::from(img)], &config).unwrap()
+            p.preprocess(&[DynamicImage::from(img)]).unwrap()
         });
 
         assert_eq!(
@@ -443,6 +456,6 @@ mod tests {
     #[test]
     fn test_empty_batch_errors() {
         let p = KimiK3Processor::new();
-        assert!(p.preprocess(&[], &PreProcessorConfig::default()).is_err());
+        assert!(p.preprocess(&[]).is_err());
     }
 }

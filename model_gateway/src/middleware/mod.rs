@@ -5,27 +5,41 @@
 //! reference, so this split is invisible to downstream callers.
 
 pub mod auth;
+pub mod body_limit;
+pub mod body_timeout;
 pub mod concurrency;
+pub mod edge_body;
 pub mod logging;
+pub mod messages_errors;
 pub mod metrics;
 pub mod request_id;
 pub mod scheduler;
+pub mod sse_keepalive;
 pub mod storage_context;
 pub mod tenant_resolution;
 pub mod token_bucket;
 pub mod wasm;
 
 pub use auth::{auth_middleware, deny_all_middleware, AuthConfig};
-pub use concurrency::{concurrency_limit_middleware, AdmissionQueue, TokenGuardBody};
+pub use body_limit::{RequestBodyLimit, RequestBodyLimitLayer};
+pub use body_timeout::{RequestBodyTimeoutLayer, RequestBodyTimeouts};
+pub use concurrency::{AdmissionQueue, ConcurrencyLimitLayer};
 pub use logging::{
-    create_logging_layer, ProbeResponse, RequestLogger, RequestSpan, ResponseLogger,
+    create_logging_layer, trace_context_on_response, AccessLogFields, AccessLogRecord,
+    ProbeResponse, ReportedRefusal, RequestLogger, RequestSpan, ResponseLogger,
     StreamFailureLogger,
+};
+pub use messages_errors::{
+    into_messages_envelope, messages_error_type, request_id_of, wants_messages_envelope,
+    MessagesErrorEnvelopeLayer,
 };
 pub use metrics::{HttpMetricsLayer, HttpMetricsMiddleware};
 pub use request_id::{RequestId, RequestIdLayer, RequestIdMiddleware};
+pub use sse_keepalive::{sse_keepalive_middleware, SseKeepAlive, SseKeepAliveLayer};
 pub use storage_context::storage_context_middleware;
 pub use tenant_resolution::{
-    ordinary_tenant_resolution_middleware, route_request_meta_middleware, TenantResolutionState,
+    ordinary_tenant_resolution_middleware, route_request_meta_middleware, RouteRequestMetaLayer,
+    RouteRequestMetaService, TenantResolutionState,
 };
 pub use token_bucket::TokenBucket;
 pub use wasm::wasm_middleware;

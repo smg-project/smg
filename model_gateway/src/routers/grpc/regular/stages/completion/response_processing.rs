@@ -12,13 +12,17 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use crate::routers::{
-    error,
-    grpc::{
-        common::stages::{helpers, ProcessStage, RateLimitCell},
-        context::{DispatchContext, FinalResponse},
-        regular::{processor, streaming},
-        spec::ResponseSpec,
+use crate::{
+    observability::metrics::metrics_labels,
+    routers::{
+        error,
+        grpc::{
+            common::stages::{ProcessStage, RateLimitCell},
+            context::{DispatchContext, FinalResponse},
+            regular::{processor, streaming},
+            spec::ResponseSpec,
+            utils::StreamSource,
+        },
     },
 };
 
@@ -94,13 +98,18 @@ impl ProcessStage for CompletionResponseProcessingStage {
         if is_streaming {
             // Reserved (if tenant rate limiting is enabled): settled with real
             // usage inside the streaming processor on success, or abandoned
-            // via the attached ReservationAttachment's Drop below on early
-            // disconnect/error.
+            // on early disconnect/error by the reservation's safety net the
+            // processor hands the response body (ReservationAttachment's Drop).
             let reservation = ctx
                 .rate_limit_cell
                 .as_deref()
                 .and_then(RateLimitCell::take_for_streaming_handoff);
 
+            let source = StreamSource::new(
+                ctx.workers.as_ref(),
+                &dispatch,
+                metrics_labels::ENDPOINT_COMPLETIONS,
+            );
             let response = self
                 .streaming_processor
                 .clone()
@@ -109,14 +118,11 @@ impl ProcessStage for CompletionResponseProcessingStage {
                     completion_request,
                     dispatch,
                     tokenizer,
-                    reservation.clone(),
+                    reservation,
+                    ctx.load_guards.take(),
+                    source,
                 )
                 .await;
-
-            // Attach load guards (and the reservation's disconnect/error
-            // safety net) to the response body for proper RAII lifecycle.
-            let response =
-                helpers::attach_response_guards(response, ctx.load_guards.take(), reservation);
 
             return Ok(Some(response));
         }
@@ -139,7 +145,6 @@ impl ProcessStage for CompletionResponseProcessingStage {
                 execution_result,
                 completion_request,
                 dispatch,
-                tokenizer,
                 stop_decoder,
             )
             .await?;

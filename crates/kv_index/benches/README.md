@@ -46,8 +46,8 @@ the last completion, drain included; latency is the lookup service time measured
   `--payload-home issuer` builds those payloads on the issuing thread instead of the main thread,
   so on a multi-socket machine the payloads live on the issuer's socket.
 
-Backends (`--backend`): `positional` (`PositionalIndexer`), `chain` (`ChainIndex`, or
-`ShardedChainIndex` with `--shards N`; `run` is its deprecated spelling), `reference` (the
+Backends (`--backend`): `chain` (`ChainIndex`, or `ShardedChainIndex` with `--shards N`; the
+default), `reference` (the
 single-threaded exactness reference; small corpora only) and `null` (no indexer: the harness's own
 ceiling on a layout). A new index plugs in by implementing `ReplayBackend`.
 
@@ -84,7 +84,7 @@ export is deterministic: two exports of the same arguments hash identically.
 
 | Flag | Meaning |
 | --- | --- |
-| `--backend`, `--jump-size`, `--max-workers`, `--shards`, `--lane-memory inherit\|local` | The index under test; `--shards` places each pinned event lane's workers on the shard of the lane's NUMA node; `--lane-memory local` makes a pinned lane prefer its own node for what it allocates. |
+| `--backend`, `--max-workers`, `--shards`, `--lane-memory inherit\|local` | The index under test; `--shards` places each pinned event lane's workers on the shard of the lane's NUMA node; `--lane-memory local` makes a pinned lane prefer its own node for what it allocates. |
 | `--benchmark-duration-ms` or `--offered-block-ops-per-sec` | The window, or the offered rate that sets it. |
 | `--query-lanes`, `--event-lanes`, `--issuer-threads`, `--query-issuer-threads` | Lane and issuer counts. |
 | `--issuer-cpus`, `--query-issuer-cpus`, `--backend-cpus`, `--pin-event-lanes`, `--issuer-by-lane` | Placement. Issuer CPUs inside the lane set are refused. |
@@ -116,10 +116,10 @@ Every indexer answers the same question as the single-threaded `ReferenceIndexer
 (`src/reference.rs`): after any replay, the set of (worker, position, block) and every lookup
 score equal the reference's. That is checked three ways:
 
-- `tests/exactness_positional.rs` and `tests/exactness_chain.rs` replay seeded corpora (new
-  conversations, extensions, siblings diverging at any position, tail and middle evictions,
-  clears, worker removal and arrival) into the positional and the chain index beside the
-  reference, compare every lookup kind after every 256 events and the full block set at the end;
+- `tests/exactness_chain.rs` replays seeded corpora (new conversations, extensions, siblings
+  diverging at any position, tail and middle evictions, clears, worker removal and arrival) into
+  the chain index beside the reference, compares every lookup kind after every 256 events and
+  the full block set at the end;
   `KV_INDEX_EXACTNESS_EVENTS`, `KV_INDEX_EXACTNESS_SEED` and `KV_INDEX_EXACTNESS_SHARDS` scale,
   reseed and shard them;
 - `tests/concurrency_chain.rs` runs 16 event lanes and 4 readers with worker replacement and

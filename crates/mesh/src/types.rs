@@ -24,4 +24,12 @@ pub struct WorkerState {
     /// old nodes that don't populate this field.
     #[serde(default)]
     pub spec: Vec<u8>,
+    /// Mesh server name of the node that published the entry: the key's
+    /// owner. Only the owner tombstones its keys, so an importer reads this
+    /// against the cluster state and leaves the keys of a node that is gone
+    /// alone. Empty on nodes that predate the field (owner unknown); a
+    /// positional record without it does not decode as this struct, so the
+    /// gateway adapter falls back to the previous layout for those.
+    #[serde(default)]
+    pub owner: String,
 }

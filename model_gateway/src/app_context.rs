@@ -4,19 +4,21 @@ use std::{
 };
 
 use llm_tokenizer::registry::TokenizerRegistry;
+use openai_protocol::profile::ProviderProfile;
 use reasoning_parser::ParserFactory as ReasoningParserFactory;
 use reqwest::Client;
 use smg_data_connector::{
     create_storage, ConversationItemStorage, ConversationStorage, ResponseStorage,
     StorageFactoryConfig,
 };
+use smg_external_router::realtime::webrtc::default_bind_addr;
 use smg_mcp::McpOrchestrator;
 use tokio::sync::broadcast::error::RecvError;
 use tool_parser::ParserFactory as ToolParserFactory;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
-    config::{KvIndexKind, RouterConfig},
+    config::{ParserChoice, RouterConfig},
     middleware::{AuthConfig, TokenBucket},
     observability::inflight_tracker::InFlightRequestTracker,
     policies::PolicyRegistry,
@@ -26,14 +28,19 @@ use crate::{
             openai_bridge::FormatRegistry, overload, pd_admission, realtime::RealtimeRegistry,
         },
         gateway::Gateway,
-        grpc::multimodal::MultimodalConfigRegistry,
+        grpc::{
+            multimodal::MultimodalConfigRegistry,
+            regular::symphony::{check_names, named_table},
+            utils::{Names, ALIASES},
+        },
     },
     wasm::{config::WasmRuntimeConfig, module_manager::WasmModuleManager},
     worker::{
+        http_client::{build_client, connect_timeout_secs_below, DEFAULT_CONNECT_TIMEOUT_SECS},
         liveness, KvEventMonitor, PrefillAdmission, WorkerHttpClientCache, WorkerMonitor,
         WorkerRegistry, WorkerService,
     },
-    workflow::{JobQueue, WorkflowEngines},
+    workflow::{JobQueue, TokenizerLoadFailures, WorkflowEngines},
 };
 
 /// Error type for AppContext builder
@@ -66,6 +73,11 @@ pub struct AppContext {
     pub rate_limiter: Option<Arc<TokenBucket>>,
     pub rate_limit_manager: Option<Arc<RateLimitManager>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
+    /// The served models whose tokenizer load was skipped or failed for good:
+    /// written by the tokenizer registration (a worker's autoload, an
+    /// operator's request), read where a request finds no tokenizer for its
+    /// model.
+    pub tokenizer_load_failures: Arc<TokenizerLoadFailures>,
     pub multimodal_config_registry: Arc<MultimodalConfigRegistry>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
     pub tool_parser_factory: Option<ToolParserFactory>,
@@ -129,6 +141,37 @@ fn start_prefill_admission_notifier(
     Ok(())
 }
 
+/// In-flight requests admitted per available core when
+/// `max_concurrent_requests` is unset.
+pub(crate) const DEFAULT_INFLIGHT_PER_CORE: usize = 1024;
+
+/// Floor of the derived in-flight bound, so a router with few cores still
+/// admits a fleet's worth of long-lived streams.
+pub(crate) const DEFAULT_INFLIGHT_FLOOR: usize = 4096;
+
+/// The in-flight bound used when `max_concurrent_requests` is unset (-1):
+/// 1024 per available core, at least 4096. Far above a healthy router's
+/// in-flight count (arrival rate x latency), and the point past which an
+/// overloaded router sheds instead of queueing without bound: every parked
+/// request holds its body and its encoding until it is served, so growth
+/// without a bound only ends at the memory limit.
+pub(crate) fn default_max_concurrent_requests() -> usize {
+    let cores = std::thread::available_parallelism().map_or(1, usize::from);
+    (cores * DEFAULT_INFLIGHT_PER_CORE).max(DEFAULT_INFLIGHT_FLOOR)
+}
+
+/// The admission bound `max_concurrent_requests` resolves to: none when
+/// admission control is off (0), the host-derived default when unset (-1),
+/// the value otherwise. The one place the sentinels are read, for the
+/// admission bucket and for the start-up checks that compare with it.
+pub(crate) fn effective_max_concurrent_requests(configured: i32) -> Option<usize> {
+    match configured {
+        0 => None,
+        n if n < 0 => Some(default_max_concurrent_requests()),
+        n => usize::try_from(n).ok(),
+    }
+}
+
 pub struct AppContextBuilder {
     client: Option<Client>,
     router_config: Option<RouterConfig>,
@@ -178,6 +221,40 @@ impl AppContext {
             .build()
             .map_err(|e| e.to_string())
         })
+    }
+}
+
+/// Whether a worker URL given in the configuration needs TLS. Discovered
+/// workers are not known yet when the shared client is built.
+fn has_https_worker(config: &RouterConfig) -> bool {
+    use crate::config::RoutingMode;
+
+    let https = |url: &str| url.starts_with("https://");
+    match &config.mode {
+        RoutingMode::Regular { worker_urls }
+        | RoutingMode::OpenAI { worker_urls }
+        | RoutingMode::Anthropic { worker_urls }
+        | RoutingMode::Gemini { worker_urls } => worker_urls.iter().any(|url| https(url)),
+        RoutingMode::PrefillDecode {
+            prefill_urls,
+            decode_urls,
+            ..
+        } => {
+            prefill_urls.iter().any(|(url, _)| https(url))
+                || decode_urls.iter().any(|url| https(url))
+        }
+        RoutingMode::EncodePrefillDecode {
+            encode_urls,
+            prefill_urls,
+            decode_urls,
+            ..
+        } => {
+            encode_urls
+                .iter()
+                .chain(prefill_urls)
+                .any(|(url, _)| https(url))
+                || decode_urls.iter().any(|url| https(url))
+        }
     }
 }
 
@@ -349,35 +426,71 @@ impl AppContextBuilder {
         let router_config = self
             .router_config
             .ok_or(AppContextBuildError::MissingField("router_config"))?;
+        // The configuration's liveness budgets (the stall, wedge and stale
+        // thresholds and the warm-up slice, see `worker::liveness`) take
+        // effect for every context built from it, the server's and a test's
+        // alike, here and nowhere else. They are process-wide and the first
+        // call wins, so the first context built in a process sets them.
+        liveness::configure_from(&router_config);
         let configured_reasoning_parser = router_config.reasoning_parser.clone();
         let configured_tool_parser = router_config.tool_call_parser.clone();
 
-        // Validate configured parser names against their registries at startup
-        if let (Some(name), Some(factory)) =
-            (&configured_reasoning_parser, &self.reasoning_parser_factory)
-        {
-            if !factory.registry().has_parser(name) {
-                tracing::error!(
-                    parser = %name,
-                    available = %factory.list_parsers().join(", "),
-                    "Unknown reasoning parser"
-                );
-                return Err(AppContextBuildError::InvalidConfig(format!(
-                    "unknown reasoning parser '{name}'"
-                )));
-            }
+        // The configured parser names are checked against the registries at startup: the
+        // legacy parsers', and Symphony's tables under `--parser symphony`
+        // (`regular::symphony::check_names`). A name whose factory is absent is not checked,
+        // as before.
+        let names = Names {
+            tool: configured_tool_parser.clone(),
+            reasoning: configured_reasoning_parser.clone(),
+        };
+        if let Err(why) = check_names(
+            router_config.parser,
+            &names,
+            self.tool_parser_factory.as_ref(),
+            self.reasoning_parser_factory.as_ref(),
+        ) {
+            let listed = |names: Option<Vec<String>>| names.unwrap_or_default().join(", ");
+            let legacy_tool_parsers =
+                listed(self.tool_parser_factory.as_ref().map(|f| f.list_parsers()));
+            let legacy_reasoning_parsers = listed(
+                self.reasoning_parser_factory
+                    .as_ref()
+                    .map(|f| f.list_parsers()),
+            );
+            let symphony_tables: Vec<&str> = symphony::formats::Table::ALL
+                .iter()
+                .map(|table| table.name())
+                .collect();
+            // The other names a table answers to: the legacy names that read a table's format,
+            // and the names no other list has, a launcher's for a family whose table has no
+            // older parser and an engine's exact name for a table.
+            let symphony_aliases: Vec<&str> = ALIASES.iter().map(|(alias, _)| *alias).collect();
+            tracing::error!(
+                tool_call_parser = ?names.tool,
+                reasoning_parser = ?names.reasoning,
+                legacy_tool_parsers = %legacy_tool_parsers,
+                legacy_reasoning_parsers = %legacy_reasoning_parsers,
+                symphony_tables = %symphony_tables.join(", "),
+                symphony_aliases = %symphony_aliases.join(", "),
+                "Unknown parser name"
+            );
+            return Err(AppContextBuildError::InvalidConfig(why.into()));
         }
-        if let (Some(name), Some(factory)) = (&configured_tool_parser, &self.tool_parser_factory) {
-            if !factory.has_parser(name) {
-                tracing::error!(
-                    parser = %name,
-                    available = %factory.list_parsers().join(", "),
-                    "Unknown tool-call parser"
-                );
-                return Err(AppContextBuildError::InvalidConfig(format!(
-                    "unknown tool-call parser '{name}'"
-                )));
-            }
+        if router_config.parser == ParserChoice::Symphony
+            && names.tool.is_some()
+            && named_table(&names).is_none()
+        {
+            tracing::warn!(
+                tool_call_parser = ?names.tool,
+                reasoning_parser = ?names.reasoning,
+                "The configured tool-call parser name selects no Symphony table, so under \
+                 --parser symphony every model the registry does not know is read by the legacy \
+                 parsers (the registry's table reads the models it knows, a worker's own labels \
+                 aside); a table's name, a legacy name that reads a table's format (qwen, \
+                 qwen_xml, ...), a launcher's name for a family whose table has no older \
+                 parser (muse), or an engine's exact name for a table (llama4_pythonic), reads \
+                 those models with that table"
+            );
         }
 
         let worker_registry = self
@@ -418,7 +531,11 @@ impl AppContextBuilder {
             &router_config.tenant_api_keys,
         );
 
-        let rl = crate::rl_adapter::build_rl_state(&worker_registry, &router_config);
+        let rl = crate::rl_adapter::build_rl_state(
+            &worker_registry,
+            &worker_client_cache,
+            &router_config,
+        );
 
         Ok(AppContext {
             gateway_auth,
@@ -432,6 +549,7 @@ impl AppContextBuilder {
                 .tokenizer_registry
                 .ok_or(AppContextBuildError::MissingField("tokenizer_registry"))?,
             multimodal_config_registry: Arc::new(MultimodalConfigRegistry::new()),
+            tokenizer_load_failures: Arc::new(TokenizerLoadFailures::new()),
             reasoning_parser_factory: self.reasoning_parser_factory,
             tool_parser_factory: self.tool_parser_factory,
             worker_registry,
@@ -480,6 +598,14 @@ impl AppContextBuilder {
         webrtc_bind_addr: Option<std::net::IpAddr>,
         webrtc_stun_server: Option<String>,
     ) -> Result<Self, String> {
+        // A served model aliased under a vendor name keeps that vendor's
+        // contract profile after the alias is resolved into the served name.
+        ProviderProfile::register_model_aliases(
+            router_config
+                .model_aliases
+                .iter()
+                .map(|(alias, canonical)| (alias.as_str(), canonical.as_str())),
+        );
         Ok(Self::new()
             .with_client(&router_config, request_timeout_secs)?
             .maybe_rate_limiter(&router_config)
@@ -498,7 +624,9 @@ impl AppContextBuilder {
             .await?
             .with_wasm_manager(&router_config)
             .with_kv_event_monitor(&router_config)
-            .webrtc_bind_addr(webrtc_bind_addr)
+            .webrtc_bind_addr(
+                webrtc_bind_addr.or_else(|| Some(default_bind_addr(&router_config.host))),
+            )
             .webrtc_stun_server(
                 webrtc_stun_server.or_else(|| Some("stun.l.google.com:19302".to_string())),
             )
@@ -512,76 +640,119 @@ impl AppContextBuilder {
     ///
     /// Uses the rustls TLS backend when TLS/mTLS is configured (client cert or
     /// CA certs provided) for PKCS#8 key support; plain HTTP skips TLS setup.
+    /// A host without a native CA root store is tolerated unless TLS is
+    /// needed (see [`build_client`]).
     fn with_client(mut self, config: &RouterConfig, timeout_secs: u64) -> Result<Self, String> {
         let has_tls_config = config.client_identity.is_some() || !config.ca_certificates.is_empty();
+        // With a client identity, a CA bundle or an HTTPS worker URL, TLS is
+        // needed: a missing root store is then an error, not worked around.
+        let tls_required = has_tls_config || has_https_worker(config);
 
         // Idle pooled connections must expire before the backend server's
-        // keep-alive closes them (vLLM/SGLang default: 5s), or checkout races
+        // keep-alive closes them (the engines' default: 5s), or checkout races
         // the server's FIN and non-idempotent sends fail.
         let pool_idle_timeout = match config.upstream_pool_idle_timeout_secs {
             0 => None,
             secs => Some(Duration::from_secs(secs)),
         };
-        let mut client_builder = Client::builder()
-            .pool_idle_timeout(pool_idle_timeout)
-            .pool_max_idle_per_host(500)
-            .timeout(Duration::from_secs(timeout_secs))
-            .connect_timeout(Duration::from_secs(10))
-            .tcp_nodelay(true)
-            .tcp_keepalive(Some(Duration::from_secs(30)));
-
-        // Force rustls backend when TLS is configured
+        // mTLS client identity and CA certificates for verifying worker TLS
+        // (both loaded during config creation), parsed once: the builder
+        // closure runs again if the first build fails for want of a root store.
+        let identity = config
+            .client_identity
+            .as_deref()
+            .map(reqwest::Identity::from_pem)
+            .transpose()
+            .map_err(|e| format!("Failed to create client identity: {e}"))?;
+        let ca_certificates = config
+            .ca_certificates
+            .iter()
+            .map(|pem| reqwest::Certificate::from_pem(pem))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to add CA certificate: {e}"))?;
         if has_tls_config {
-            client_builder = client_builder.use_rustls_tls();
             debug!("Using rustls TLS backend for TLS/mTLS connections");
         }
-
-        // Configure mTLS client identity if provided (certificates already loaded during config creation)
-        if let Some(identity_pem) = &config.client_identity {
-            let identity = reqwest::Identity::from_pem(identity_pem)
-                .map_err(|e| format!("Failed to create client identity: {e}"))?;
-            client_builder = client_builder.identity(identity);
+        if identity.is_some() {
             debug!("mTLS client authentication enabled");
         }
-
-        // Add CA certificates for verifying worker TLS (certificates already loaded during config creation)
-        for ca_cert in &config.ca_certificates {
-            let cert = reqwest::Certificate::from_pem(ca_cert)
-                .map_err(|e| format!("Failed to add CA certificate: {e}"))?;
-            client_builder = client_builder.add_root_certificate(cert);
-        }
-        if !config.ca_certificates.is_empty() {
+        if !ca_certificates.is_empty() {
             debug!(
                 "Added {} CA certificate(s) for worker verification",
-                config.ca_certificates.len()
+                ca_certificates.len()
             );
         }
 
-        let client = client_builder
-            .build()
-            .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+        let make_builder = || {
+            let mut client_builder = crate::clients::http_client_builder()
+                .pool_idle_timeout(pool_idle_timeout)
+                .pool_max_idle_per_host(500)
+                .timeout(Duration::from_secs(timeout_secs))
+                // Below the request timeout, as the worker clients keep it
+                // (`worker::http_client::connect_timeout_secs_below`): a dark
+                // external host fails as a connect timeout, not as the
+                // request's own (except under a 1 s request timeout, where the
+                // two timers race).
+                .connect_timeout(Duration::from_secs(connect_timeout_secs_below(
+                    DEFAULT_CONNECT_TIMEOUT_SECS,
+                    timeout_secs,
+                )))
+                .tcp_nodelay(true)
+                .tcp_keepalive(Some(Duration::from_secs(30)));
+            // Force rustls backend when TLS is configured
+            if has_tls_config {
+                client_builder = client_builder.use_rustls_tls();
+            }
+            if let Some(identity) = &identity {
+                client_builder = client_builder.identity(identity.clone());
+            }
+            for cert in &ca_certificates {
+                client_builder = client_builder.add_root_certificate(cert.clone());
+            }
+            client_builder
+        };
+        let client = build_client(make_builder, tls_required, "HTTP client")?;
 
         self.client = Some(client);
         Ok(self)
     }
 
-    /// Create rate limiter based on config
+    /// Create the admission bucket from config: an explicit
+    /// `max_concurrent_requests` is the cap, 0 disables admission control,
+    /// and the unset value (-1) takes the host-derived default so an
+    /// overloaded router sheds instead of queueing without bound.
     fn maybe_rate_limiter(mut self, config: &RouterConfig) -> Self {
-        self.rate_limiter = match config.max_concurrent_requests {
-            n if n <= 0 => None,
-            n => {
-                // No refill unless explicitly configured: the cap bounds
-                // standing concurrency, not admission rate.
-                let rate_limit_tokens = config
-                    .rate_limit_tokens_per_second
-                    .filter(|&t| t > 0)
-                    .unwrap_or(0);
-                Some(Arc::new(TokenBucket::new(
-                    n as usize,
-                    rate_limit_tokens as usize,
-                )))
+        let capacity = match effective_max_concurrent_requests(config.max_concurrent_requests) {
+            None => {
+                info!(
+                    "Admission bound disabled (max_concurrent_requests = 0): in-flight requests are unbounded"
+                );
+                self.rate_limiter = None;
+                return self;
+            }
+            Some(bound) if config.max_concurrent_requests < 0 => {
+                info!(
+                    "Admission bound: at most {bound} in-flight requests (default: {DEFAULT_INFLIGHT_PER_CORE} per available core, at least {DEFAULT_INFLIGHT_FLOOR}; --max-concurrent-requests overrides it, 0 disables it)"
+                );
+                bound
+            }
+            Some(bound) => {
+                info!(
+                    "Admission bound: at most {bound} in-flight requests (max_concurrent_requests)"
+                );
+                bound
             }
         };
+        // No refill unless explicitly configured: the cap bounds
+        // standing concurrency, not admission rate.
+        let rate_limit_tokens = config
+            .rate_limit_tokens_per_second
+            .filter(|&t| t > 0)
+            .unwrap_or(0);
+        self.rate_limiter = Some(Arc::new(TokenBucket::new(
+            capacity,
+            rate_limit_tokens as usize,
+        )));
         self
     }
 
@@ -656,6 +827,7 @@ impl AppContextBuilder {
             oracle: config.oracle.as_ref(),
             postgres: config.postgres.as_ref(),
             redis: config.redis.as_ref(),
+            memory: config.memory.as_ref(),
             hook,
         };
         let bundle = create_storage(storage_config).await?;
@@ -690,18 +862,6 @@ impl AppContextBuilder {
         if let Some(registry) = self.worker_registry.as_ref() {
             registry.set_overload_shed(config.worker_overload_shed);
         }
-        // Progress-based liveness thresholds (see `worker::liveness`).
-        liveness::configure(
-            Duration::from_secs(config.worker_stall_secs),
-            Duration::from_secs(config.worker_wedge_secs),
-        );
-        liveness::configure_warmup(liveness::Warmup {
-            secs: Duration::from_secs(config.worker_warmup_secs),
-            share: config.worker_warmup_share,
-            blocks: config.worker_warmup_blocks,
-            thin_ratio: config.worker_warmup_thin_ratio,
-            divert_every: config.worker_warmup_divert_every,
-        });
         // PD dispatch waits here, not in the decode engine's queue, when the
         // pair's running window is full.
         pd_admission::set_pd_admission_wait_secs(config.pd_admission_wait_secs);
@@ -792,26 +952,28 @@ impl AppContextBuilder {
                 _ => false,
             };
 
-        if is_cache_aware {
-            let monitor = Arc::new(KvEventMonitor::with_kind(config.kv_index, None));
-            debug!(
-                kv_index = config.kv_index.as_str(),
-                "Created KV event monitor for event-driven cache-aware routing"
+        if config.kv_index.is_some() {
+            warn!(
+                "--kv-index is deprecated: the chain index is the only KV index; the flag goes \
+                 in a later release"
             );
+        }
+        if is_cache_aware {
+            let monitor = Arc::new(KvEventMonitor::new());
+            debug!("Created KV event monitor for event-driven cache-aware routing");
             // The load records on the event streams are polls of the worker.
             if let Some(worker_monitor) = &self.worker_monitor {
                 monitor.set_load_sink(worker_monitor);
             }
-            if KvIndexKind::deprecated_alias_used() {
-                warn!("--kv-index run is the deprecated spelling of --kv-index chain");
+            if config.kv_indexer_ttl_secs.is_some_and(|ttl| ttl > 0)
+                || config.kv_indexer_max_entries.is_some_and(|max| max > 0)
+            {
+                warn!(
+                    "--kv-indexer-ttl-secs and --kv-indexer-max-entries are ignored: the chain \
+                     index has no prune, it holds what the engines report and shrinks with \
+                     their removals"
+                );
             }
-
-            // Optional indexer bounding: prune entries by last-touch TTL and/or
-            // capacity ceiling. Both default off (unbounded, prior behavior).
-            monitor.start_prune_task(
-                config.kv_indexer_ttl_secs.unwrap_or(0),
-                config.kv_indexer_max_entries.unwrap_or(0),
-            );
             monitor.start_stats_task();
 
             // Inject monitor into PolicyRegistry — propagates to default_policy
@@ -886,6 +1048,49 @@ mod tests {
         format!("http://{addr}/probe")
     }
 
+    /// Child-process body of the root-store test below (see
+    /// `worker::http_client::no_root_store`); a no-op unless the case
+    /// variable is set.
+    #[test]
+    fn child_with_client_without_native_roots() {
+        use crate::worker::http_client::no_root_store;
+
+        if std::env::var(no_root_store::CASE).is_err() {
+            return;
+        }
+        AppContextBuilder::new()
+            .with_client(&RouterConfig::default(), 5)
+            .expect("a gateway without TLS configuration starts without a root store");
+    }
+
+    #[test]
+    #[cfg_attr(
+        any(target_vendor = "apple", windows, target_os = "android"),
+        ignore = "the native verifier does not use SSL_CERT_FILE/SSL_CERT_DIR"
+    )]
+    fn the_gateway_client_builds_without_a_native_root_store() {
+        use crate::worker::http_client::no_root_store;
+
+        no_root_store::run(
+            &no_root_store::test_name(module_path!(), "child_with_client_without_native_roots"),
+            "plaintext",
+        );
+    }
+
+    #[test]
+    fn https_worker_urls_make_tls_required() {
+        use crate::config::RoutingMode;
+
+        let with_worker = |url: &str| RouterConfig {
+            mode: RoutingMode::Regular {
+                worker_urls: vec![url.to_string()],
+            },
+            ..RouterConfig::default()
+        };
+        assert!(!has_https_worker(&with_worker("http://worker:8000")));
+        assert!(has_https_worker(&with_worker("https://worker:8443")));
+    }
+
     fn built_client(upstream_http2: bool) -> Client {
         let config = RouterConfig {
             upstream_http2,
@@ -944,6 +1149,45 @@ mod tests {
 
         bucket.return_tokens_sync(1.0);
         assert!(bucket.try_acquire(1.0).is_ok());
+    }
+
+    /// With no explicit cap the admission bucket still exists, sized by the
+    /// host-derived default: the request past the bound is rejected instead
+    /// of queued without limit, and a completion frees a slot again.
+    #[test]
+    fn unset_concurrency_cap_gets_a_host_derived_bound() {
+        let bucket = AppContextBuilder::new()
+            .maybe_rate_limiter(&RouterConfig::default())
+            .rate_limiter
+            .expect("the unset cap must still bound in-flight requests");
+        let bound = default_max_concurrent_requests();
+        assert!(bound >= DEFAULT_INFLIGHT_FLOOR);
+
+        for admitted in 0..bound {
+            assert!(
+                bucket.try_acquire(1.0).is_ok(),
+                "request {admitted} is within the bound of {bound}"
+            );
+        }
+        assert!(
+            bucket.try_acquire(1.0).is_err(),
+            "the request past the bound must be rejected, not admitted"
+        );
+
+        bucket.return_tokens_sync(1.0);
+        assert!(bucket.try_acquire(1.0).is_ok());
+    }
+
+    #[test]
+    fn zero_concurrency_cap_disables_admission_control() {
+        let config = RouterConfig {
+            max_concurrent_requests: 0,
+            ..RouterConfig::default()
+        };
+        assert!(AppContextBuilder::new()
+            .maybe_rate_limiter(&config)
+            .rate_limiter
+            .is_none());
     }
 
     #[tokio::test]
@@ -1010,6 +1254,8 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         });
         let builder = AppContextBuilder::new()
             .with_client(&config, 5)
@@ -1055,6 +1301,8 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         }));
     }
 
@@ -1080,6 +1328,8 @@ mod tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         };
 
         let mut config = config_with_policy(PolicyConfig::Random);
@@ -1292,5 +1542,22 @@ policy:
         assert_eq!(selected.selected.url(), second.url());
         drop(selected);
         drop(occupied);
+    }
+}
+
+#[cfg(test)]
+mod effective_max_concurrent_requests_tests {
+    use super::{default_max_concurrent_requests, effective_max_concurrent_requests};
+
+    /// The three readings of `max_concurrent_requests`, pinned in one place
+    /// for the admission bucket and the start-up checks alike.
+    #[test]
+    fn the_sentinels_resolve_to_off_the_default_and_the_value() {
+        assert_eq!(effective_max_concurrent_requests(0), None);
+        assert_eq!(
+            effective_max_concurrent_requests(-1),
+            Some(default_max_concurrent_requests())
+        );
+        assert_eq!(effective_max_concurrent_requests(7), Some(7));
     }
 }

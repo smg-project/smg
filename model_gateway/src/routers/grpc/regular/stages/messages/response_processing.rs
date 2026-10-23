@@ -10,13 +10,17 @@ use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
-use crate::routers::{
-    error,
-    grpc::{
-        common::stages::{helpers, ProcessStage, RateLimitCell},
-        context::{DispatchContext, FinalResponse},
-        regular::{processor, streaming},
-        spec::ResponseSpec,
+use crate::{
+    observability::metrics::metrics_labels,
+    routers::{
+        error,
+        grpc::{
+            common::stages::{ProcessStage, RateLimitCell},
+            context::{DispatchContext, FinalResponse},
+            regular::{processor, streaming},
+            spec::ResponseSpec,
+            utils::StreamSource,
+        },
     },
 };
 
@@ -55,6 +59,7 @@ impl ProcessStage for MessageResponseProcessingStage {
                 "Wrong response spec",
             ));
         };
+        let messages_request = *messages_request;
 
         let is_streaming = ctx.streaming;
 
@@ -98,14 +103,19 @@ impl ProcessStage for MessageResponseProcessingStage {
 
             // Reserved (if tenant rate limiting is enabled): settled with real
             // usage inside the streaming processor on success, or abandoned
-            // via the attached ReservationAttachment's Drop below on early
-            // disconnect/error.
+            // on early disconnect/error by the reservation's safety net the
+            // processor hands the response body (ReservationAttachment's Drop).
             let reservation = ctx
                 .rate_limit_cell
                 .as_deref()
                 .and_then(RateLimitCell::take_for_streaming_handoff);
 
             // Streaming: use StreamingProcessor and return SSE response
+            let source = StreamSource::new(
+                ctx.workers.as_ref(),
+                &dispatch,
+                metrics_labels::ENDPOINT_MESSAGES,
+            );
             let response = self
                 .streaming_processor
                 .clone()
@@ -115,14 +125,11 @@ impl ProcessStage for MessageResponseProcessingStage {
                     dispatch,
                     tokenizer,
                     skip_special_tokens,
-                    reservation.clone(),
+                    reservation,
+                    ctx.load_guards.take(),
+                    source,
                 )
                 .await;
-
-            // Attach load guards (and the reservation's disconnect/error
-            // safety net) for RAII lifecycle.
-            let response =
-                helpers::attach_response_guards(response, ctx.load_guards.take(), reservation);
 
             return Ok(Some(response));
         }
@@ -139,7 +146,7 @@ impl ProcessStage for MessageResponseProcessingStage {
             )
         })?;
 
-        let response = self
+        let (response, counts) = self
             .processor
             .process_non_streaming_messages_response(
                 execution_result,
@@ -150,8 +157,9 @@ impl ProcessStage for MessageResponseProcessingStage {
             )
             .await?;
 
-        // Store the final response
-        ctx.response.final_response = Some(FinalResponse::Messages(response));
+        // Store the final response, and the engine's counters for the settlement
+        ctx.response.final_response = Some(FinalResponse::Messages(Box::new(response)));
+        ctx.response.engine_counts = Some(counts);
 
         Ok(None)
     }

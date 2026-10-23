@@ -19,6 +19,15 @@ message GetTokenizerChunk {
 message SubscribeKvEventsRequest {
   // Resume from this sequence number (0 = start from current state).
   uint64 start_sequence_number = 1;
+  // The subscriber takes load records before the publisher's first batch:
+  // `load_only` batches numbered 0 (it admits such a batch to no cursor),
+  // carrying the servicer's record from the subscription on, so the engine's
+  // silence on the first request it ever receives reaches the subscriber like
+  // any later one. A subscriber that predates `EngineLoad.load_only` leaves
+  // it unset and gets its first record with the publisher's first batch, as
+  // before: it would take that batch for a duplicate of a heartbeat
+  // numbered 0.
+  bool load_records_before_first_batch = 2;
 }
 
 message KvEventBatch {
@@ -52,6 +61,9 @@ message EngineLoad {
   optional uint32 waiting_uncached_tokens = 3;
   // KV-cache utilization in [0, 1], as GetLoads reports it.
   double token_usage = 4;
+  // Non-evictable KV occupancy, excluding reclaimable retained prefix cache.
+  // Part of the routing core: sent on every record when the engine reports it.
+  optional double active_token_usage = 18;
   // Tokens generated per second, as GetLoads reports it (0 when not known).
   double gen_throughput = 5;
   // The engine's admission window (max running requests); 0 when unknown.
@@ -76,6 +88,32 @@ message EngineLoad {
   optional EngineSpeculative speculative = 15;
   optional EngineLora lora = 16;
   optional EngineDisaggregation disaggregation = 17;
+  // Milliseconds since the engine last produced any output (a token, a
+  // completion, a scheduler step's stats) while the servicer held requests in
+  // flight on it that the engine reports on every step (a request it reports
+  // at intervals, one that does not stream or one streamed every so many
+  // tokens, is quiet while healthy and counts none); unset while no such
+  // request is in flight or when the servicer cannot tell. The servicer sees
+  // the engine's silence before any one
+  // request does: a subscriber that finds it past its wedge bound vetoes the
+  // worker without needing a pile of its own requests on it.
+  optional uint32 engine_silence_ms = 19;
+  // Whether the engine's wire reports every scheduler step: it has shown a
+  // scheduler step without any token (a stats-only step report), or the
+  // launcher that started the engine told the servicer its scheduler
+  // statistics are on, so `engine_silence_ms` is one step's silence at most
+  // while the engine serves; unset or false on a wire that carries token
+  // batches only, where the silence may be a whole prefill in progress. The
+  // subscriber allows for `prefill_pending_tokens` on both wires: the whole
+  // prefill on the one, the one step that starts a long prompt on the other
+  // (an encoder runs inside it over a clip's frames).
+  optional bool engine_reports_steps = 20;
+  // Prompt tokens of the requests the servicer has handed to the engine
+  // that have produced no output yet: the engine's prefill work in hand,
+  // across every client of the servicer. A subscriber judging the engine's
+  // silence allows for it at the prefill rate it has measured on the
+  // worker, whatever it has in flight there itself.
+  optional uint32 prefill_pending_tokens = 21;
 }
 
 // The sections below mirror the SGLang scheduler's GetLoads messages field

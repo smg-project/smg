@@ -39,8 +39,10 @@ impl SglangScheduler for SglangService {
         &self,
         request: Request<sg::GenerateRequest>,
     ) -> Result<Response<Self::GenerateStream>, Status> {
-        generate::generate(&self.state, request.into_inner())
+        let trace_headers = crate::trace_context::trace_headers(request.metadata());
+        generate::generate(&self.state, request.into_inner(), trace_headers)
             .await
+            .inspect_err(|status| self.state.metrics.request_not_started(status))
             .map(Response::new)
     }
 

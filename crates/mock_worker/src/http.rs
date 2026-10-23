@@ -10,6 +10,8 @@
 
 use std::{
     convert::Infallible,
+    future::{pending, Future},
+    io,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -19,6 +21,7 @@ use std::{
 use axum::{
     body::Bytes,
     extract::State,
+    http::StatusCode,
     response::{
         sse::{Event, Sse},
         IntoResponse, Response,
@@ -33,12 +36,17 @@ use tokio::{net::TcpListener, sync::mpsc};
 
 use crate::{
     config::Config,
+    drain::InFlight,
     engine::{self, Engine, NewRequest},
+    script::{self, Answer},
 };
 
 /// Per-listener HTTP state: shared config plus an optional engine simulator.
 struct AppState {
     cfg: Arc<Config>,
+    /// The worker's name in the process (`http:<port>`): what the admin API
+    /// and the script store address it by.
+    name: String,
     engine: Option<Engine>,
 }
 
@@ -56,6 +64,17 @@ fn router(state: Arc<AppState>) -> Router {
 
 /// Serve the mock HTTP worker contract on `port` until the process exits.
 pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
+    serve_until(cfg, host, port, pending()).await;
+}
+
+/// Serve on `port` until `shutdown` resolves, then stop accepting connections
+/// and let the requests in flight finish (the drain of a termination signal).
+pub async fn serve_until(
+    cfg: Arc<Config>,
+    host: String,
+    port: u16,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
     let listener = match TcpListener::bind((host.as_str(), port)).await {
         Ok(listener) => listener,
         Err(e) => {
@@ -63,12 +82,35 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
             return;
         }
     };
+    serve_with_listener_until(cfg, listener, shutdown).await;
+}
+
+/// Serve on an already-bound listener until the process exits. Callers that
+/// need a free port bind port 0 and read it back instead of picking one and
+/// binding it later.
+pub async fn serve_with_listener(cfg: Arc<Config>, listener: TcpListener) {
+    serve_with_listener_until(cfg, listener, pending()).await;
+}
+
+/// [`serve_with_listener`] with the shutdown of [`serve_until`].
+pub async fn serve_with_listener_until(
+    cfg: Arc<Config>,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) {
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    if let Err(e) = script::ensure_loaded(&cfg) {
+        tracing::error!("http worker {port} cannot load script: {e}");
+        return;
+    }
     // One simulated engine per listener (i.e. per virtual worker), registered
     // in the process fleet under `http:<port>` for the oracle and admin API.
+    let name = format!("http:{port}");
+    script::register(&name);
     let engine = cfg
         .realistic
-        .then(|| Engine::spawn_named(cfg.engine.clone(), format!("http:{port}"), true));
-    let state = Arc::new(AppState { cfg, engine });
+        .then(|| Engine::spawn_named(cfg.engine.clone(), name.clone(), true));
+    let state = Arc::new(AppState { cfg, name, engine });
     // TCP_NODELAY: without it Nagle holds each small SSE frame until the
     // gateway's delayed ACK (~40ms) arrives, which stalls every streamed
     // response on a pooled keep-alive connection and distorts ITL/CPU numbers.
@@ -77,7 +119,10 @@ pub async fn serve(cfg: Arc<Config>, host: String, port: u16) {
             tracing::warn!("http worker {port}: set_nodelay failed: {e}");
         }
     });
-    if let Err(e) = axum::serve(listener, router(state)).await {
+    if let Err(e) = axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown)
+        .await
+    {
         tracing::error!("http worker {port} stopped: {e}");
     }
 }
@@ -158,16 +203,64 @@ async fn completions(State(state): State<Arc<AppState>>, body: Bytes) -> Respons
 }
 
 async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Response {
-    let parsed: Option<Value> = serde_json::from_slice(&body).ok();
+    // In flight from here until the response is complete or its stream is
+    // done, so a shutdown knows what it waits for.
+    let in_flight = InFlight::enter();
+    let parsed: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     let stream_requested = parsed
-        .as_ref()
-        .and_then(|v| v.get("stream").and_then(Value::as_bool))
+        .get("stream")
+        .and_then(Value::as_bool)
         .unwrap_or(false);
+    // The prompt as this wire knows it: synthetic ids, one per whitespace
+    // word, the realistic engine's prompt and the script's key alike. The
+    // canned path does without them until something is scripted.
+    let prompt_ids = if script::active() || state.engine.is_some() {
+        synth_token_ids(&extract_prompt_text(&parsed))
+    } else {
+        Vec::new()
+    };
+
+    // A scripted answer, ahead of either engine mode: the worker's queue or
+    // the prompt's key decides ([`crate::script`]).
+    if let Some(answer) = script::take(&state.name, &prompt_ids) {
+        return scripted_response(
+            endpoint,
+            &state.cfg,
+            &parsed,
+            answer,
+            prompt_ids.len(),
+            stream_requested,
+            in_flight,
+        )
+        .await;
+    }
 
     // Realistic mode: drive the engine simulator.
     if let Some(engine) = &state.engine {
-        let parsed = parsed.unwrap_or(Value::Null);
-        let prompt_ids = synth_token_ids(&extract_prompt_text(&parsed));
+        // The fault hook's answer for this request, when one is armed: a
+        // stall, a status before admission, or a cut after some output.
+        let injected = engine.inject();
+        if let Some(fault) = injected {
+            if !fault.stall.is_zero() {
+                tokio::time::sleep(fault.stall).await;
+            }
+            if fault.status != 0 && fault.after_tokens.is_none() {
+                engine.record_failure();
+                return injected_error(fault.status);
+            }
+        }
+        // An HTTP worker has no engine-failure frame on its wire: an armed
+        // `finish=error` cuts with a 500 here.
+        let cut = injected.and_then(|fault| {
+            let status = if fault.finish_error {
+                500
+            } else {
+                fault.status
+            };
+            fault
+                .after_tokens
+                .map(|after| (after, status, engine.cut_counter()))
+        });
         let prompt_tokens = prompt_ids.len() as u32;
         let max_new = extract_max_tokens(&parsed).unwrap_or(state.cfg.output_tokens);
         let request_id = next_request_id();
@@ -180,11 +273,9 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
         });
         let model = state.cfg.model_id.clone();
         return if stream_requested {
-            realistic_sse(rx, model, endpoint).into_response()
+            realistic_sse(rx, model, endpoint, cut, in_flight).into_response()
         } else {
-            realistic_completion(rx, model, prompt_tokens, endpoint)
-                .await
-                .into_response()
+            realistic_completion(rx, model, prompt_tokens, endpoint, cut).await
         };
     }
 
@@ -194,7 +285,7 @@ async fn handle(endpoint: Endpoint, state: Arc<AppState>, body: Bytes) -> Respon
         tokio::time::sleep(state.cfg.gen_delay).await;
     }
     if stream_requested {
-        stream_chat(&state.cfg).into_response()
+        stream_chat(&state.cfg, in_flight).into_response()
     } else {
         Json(completion(&state.cfg)).into_response()
     }
@@ -221,7 +312,10 @@ fn completion(cfg: &Config) -> Value {
     })
 }
 
-fn stream_chat(cfg: &Config) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+fn stream_chat(
+    cfg: &Config,
+    in_flight: InFlight,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mut events: Vec<Result<Event, Infallible>> = Vec::new();
     for _ in 0..cfg.output_tokens {
         let frame = json!({
@@ -238,23 +332,289 @@ fn stream_chat(cfg: &Config) -> Sse<impl Stream<Item = Result<Event, Infallible>
     });
     events.push(Ok(Event::default().data(final_frame.to_string())));
     events.push(Ok(Event::default().data("[DONE]")));
-    Sse::new(stream::iter(events))
+    Sse::new(in_flight.until_done(stream::iter(events)))
+}
+
+// ── Scripted responses ──────────────────────────────────────────────────────
+
+/// Whether the request asked for logprobs: chat's `logprobs: true`, a
+/// completion's `logprobs: <n>` (`0` included: the sampled token's logprob
+/// with no alternatives, as the engines read it).
+fn wants_logprobs(endpoint: Endpoint, request: &Value) -> bool {
+    match (endpoint, request.get("logprobs")) {
+        (Endpoint::Chat, Some(value)) => value.as_bool().unwrap_or(false),
+        (Endpoint::Completions, Some(value)) => value.as_u64().is_some(),
+        (_, None) => false,
+    }
+}
+
+/// The usage block of a scripted answer.
+fn scripted_usage(answer: &Answer, prompt_len: usize) -> Value {
+    let prompt_tokens = answer.prompt_tokens(prompt_len);
+    let completion_tokens = answer.completion_tokens();
+    json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "prompt_tokens_details": { "cached_tokens": answer.cached_tokens },
+    })
+}
+
+/// The logprobs of some text pieces in the endpoint's shape: chat's
+/// `content` entries, a completion's parallel `tokens` and `token_logprobs`.
+fn scripted_logprobs(endpoint: Endpoint, pieces: &[String], logprobs: &[f32]) -> Value {
+    match endpoint {
+        Endpoint::Chat => json!({
+            "content": pieces.iter().zip(logprobs).map(|(piece, logprob)| json!({
+                "token": piece,
+                "logprob": logprob,
+                "bytes": Value::Null,
+                "top_logprobs": [],
+            })).collect::<Vec<Value>>(),
+        }),
+        Endpoint::Completions => json!({
+            "tokens": pieces,
+            "token_logprobs": logprobs,
+            "top_logprobs": pieces.iter().map(|_| json!({})).collect::<Vec<Value>>(),
+            "text_offset": [],
+        }),
+    }
+}
+
+/// The scripted answer in the endpoint's shape: one JSON body after the
+/// answer's pauses, or an SSE stream of one frame per cut of the text, the
+/// finish frame, the usage chunk when the request asked for it in its
+/// stream (a chunk of its own with no choices, as the engines send it) and
+/// `[DONE]`, with the pause before every frame but the first. The finish
+/// carries `matched_stop` when the answer names one.
+async fn scripted_response(
+    endpoint: Endpoint,
+    cfg: &Config,
+    request: &Value,
+    answer: Answer,
+    prompt_len: usize,
+    stream: bool,
+    in_flight: InFlight,
+) -> Response {
+    let want_logprobs = wants_logprobs(endpoint, request);
+    let usage = scripted_usage(&answer, prompt_len);
+    let model = cfg.model_id.clone();
+    let frames = answer.text_frames();
+    if stream {
+        let include_usage = request
+            .pointer("/stream_options/include_usage")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let usage = include_usage.then_some(usage);
+        return Sse::new(in_flight.until_done(scripted_frames(
+            endpoint,
+            model,
+            answer,
+            frames,
+            want_logprobs,
+            usage,
+        )))
+        .into_response();
+    }
+    let pauses = u32::try_from(frames.len().saturating_sub(1)).unwrap_or(u32::MAX);
+    if pauses > 0 && !answer.delay.is_zero() {
+        tokio::time::sleep(answer.delay * pauses).await;
+    }
+    let text = answer.text();
+    let mut choice = match endpoint {
+        Endpoint::Chat => json!({
+            "index": 0,
+            "message": {"role": "assistant", "content": text},
+            "finish_reason": answer.finish_reason,
+        }),
+        Endpoint::Completions => json!({
+            "index": 0,
+            "text": text,
+            "finish_reason": answer.finish_reason,
+        }),
+    };
+    if let Some(stop) = &answer.matched_stop {
+        choice["matched_stop"] = stop.to_json();
+    }
+    if let (true, Some(pieces), Some(logprobs)) =
+        (want_logprobs, &answer.output_text, &answer.logprobs)
+    {
+        if pieces.len() == logprobs.len() {
+            choice["logprobs"] = scripted_logprobs(endpoint, pieces, logprobs);
+        }
+    }
+    let body = match endpoint {
+        Endpoint::Chat => json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion",
+            "created": 0,
+            "model": model,
+            "choices": [choice],
+            "usage": usage,
+        }),
+        Endpoint::Completions => json!({
+            "id": "cmpl-mock",
+            "object": "text_completion",
+            "created": 0,
+            "model": model,
+            "choices": [choice],
+            "usage": usage,
+        }),
+    };
+    Json(body).into_response()
+}
+
+/// The frames of a scripted stream: the text frames, the finish frame, the
+/// usage chunk when asked for, `[DONE]`.
+fn scripted_frames(
+    endpoint: Endpoint,
+    model: String,
+    answer: Answer,
+    frames: Vec<script::Frame>,
+    want_logprobs: bool,
+    usage: Option<Value>,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    struct Scripted {
+        endpoint: Endpoint,
+        model: String,
+        answer: Answer,
+        frames: std::collections::VecDeque<script::Frame>,
+        want_logprobs: bool,
+        usage: Option<Value>,
+        started: bool,
+        finished: bool,
+        ended: bool,
+    }
+    let init = Scripted {
+        endpoint,
+        model,
+        answer,
+        frames: frames.into(),
+        want_logprobs,
+        usage,
+        started: false,
+        finished: false,
+        ended: false,
+    };
+    stream::unfold(init, |mut st| async move {
+        if st.ended {
+            return None;
+        }
+        if st.finished {
+            // The usage rides in a chunk of its own after the finish frame,
+            // with no choices, as the engines send it.
+            if let Some(usage) = st.usage.take() {
+                let mut chunk = scripted_chunk(st.endpoint, &st.model, Value::Null);
+                chunk["choices"] = json!([]);
+                chunk["usage"] = usage;
+                return Some((Ok(Event::default().data(chunk.to_string())), st));
+            }
+            st.ended = true;
+            return Some((Ok(Event::default().data("[DONE]")), st));
+        }
+        let Some(frame) = st.frames.pop_front() else {
+            st.finished = true;
+            let mut choice = match st.endpoint {
+                Endpoint::Chat => {
+                    json!({"index": 0, "delta": {}, "finish_reason": st.answer.finish_reason})
+                }
+                Endpoint::Completions => {
+                    json!({"index": 0, "text": "", "finish_reason": st.answer.finish_reason})
+                }
+            };
+            if let Some(stop) = &st.answer.matched_stop {
+                choice["matched_stop"] = stop.to_json();
+            }
+            let frame = scripted_chunk(st.endpoint, &st.model, choice);
+            return Some((Ok(Event::default().data(frame.to_string())), st));
+        };
+        if st.started && !st.answer.delay.is_zero() {
+            tokio::time::sleep(st.answer.delay).await;
+        }
+        let text = frame.text();
+        let mut choice = match st.endpoint {
+            // The first delta names the role, as an engine's does.
+            Endpoint::Chat if !st.started => {
+                json!({"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": Value::Null})
+            }
+            Endpoint::Chat => {
+                json!({"index": 0, "delta": {"content": text}, "finish_reason": Value::Null})
+            }
+            Endpoint::Completions => {
+                json!({"index": 0, "text": text, "finish_reason": Value::Null})
+            }
+        };
+        if st.want_logprobs
+            && !frame.logprobs.is_empty()
+            && frame.logprobs.len() == frame.pieces.len()
+        {
+            choice["logprobs"] = scripted_logprobs(st.endpoint, &frame.pieces, &frame.logprobs);
+        }
+        st.started = true;
+        let frame = scripted_chunk(st.endpoint, &st.model, choice);
+        Some((Ok(Event::default().data(frame.to_string())), st))
+    })
+}
+
+/// One streamed frame of the endpoint's shape around `choice`.
+fn scripted_chunk(endpoint: Endpoint, model: &str, choice: Value) -> Value {
+    match endpoint {
+        Endpoint::Chat => json!({
+            "id": "chatcmpl-mock",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": model,
+            "choices": [choice],
+        }),
+        Endpoint::Completions => json!({
+            "id": "cmpl-mock",
+            "object": "text_completion",
+            "created": 0,
+            "model": model,
+            "choices": [choice],
+        }),
+    }
 }
 
 // ── Realistic responses ─────────────────────────────────────────────────────
 
+/// The fault hook's answer: the status (an error status; anything else
+/// becomes 500) with an OpenAI-shaped error body.
+fn injected_error(status: u16) -> Response {
+    let code = StatusCode::from_u16(status)
+        .ok()
+        .filter(|code| code.is_client_error() || code.is_server_error())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    (
+        code,
+        Json(json!({"error": {"message": "injected", "type": "fault"}})),
+    )
+        .into_response()
+}
+
 /// Non-streaming: drain the engine's events and assemble one completion JSON.
+/// With `cut`, the answer is that status instead once the engine has produced
+/// more than the given number of tokens (the fault hook's `after_tokens`).
 async fn realistic_completion(
     mut rx: mpsc::UnboundedReceiver<engine::GenEvent>,
     model: String,
     prompt_tokens: u32,
     endpoint: Endpoint,
-) -> Json<Value> {
+    cut: Option<(u32, u16, Arc<AtomicU64>)>,
+) -> Response {
     let mut completion_tokens = 0u32;
     let mut cached_tokens = 0u32;
     while let Some(ev) = rx.recv().await {
         match ev {
-            engine::GenEvent::Token { .. } => completion_tokens += 1,
+            engine::GenEvent::Token { .. } => {
+                completion_tokens += 1;
+                if let Some((after, status, cut_total)) = &cut {
+                    if completion_tokens > *after {
+                        cut_total.fetch_add(1, Ordering::Relaxed);
+                        return injected_error(*status);
+                    }
+                }
+            }
             engine::GenEvent::Done {
                 completion_tokens: c,
                 cached_tokens: cached,
@@ -272,7 +632,7 @@ async fn realistic_completion(
         "cached_tokens": cached_tokens,
         "prompt_tokens_details": { "cached_tokens": cached_tokens },
     });
-    Json(match endpoint {
+    let body = match endpoint {
         Endpoint::Chat => json!({
             "id": "chatcmpl-mock",
             "object": "chat.completion",
@@ -297,31 +657,51 @@ async fn realistic_completion(
             }],
             "usage": usage,
         }),
-    })
+    };
+    Json(body).into_response()
 }
 
 /// Streaming: map the engine's events to SSE chunks, ending with a finish frame
 /// and `[DONE]`. Frame shape follows `endpoint` (chat delta vs completion text).
+/// With `cut`, the body ends in an error instead (no finish frame, no `[DONE]`:
+/// the connection is cut) once the engine has produced more than the given
+/// number of tokens (the fault hook's `after_tokens`).
 fn realistic_sse(
     rx: mpsc::UnboundedReceiver<engine::GenEvent>,
     model: String,
     endpoint: Endpoint,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    cut: Option<(u32, u16, Arc<AtomicU64>)>,
+    in_flight: InFlight,
+) -> Sse<impl Stream<Item = Result<Event, io::Error>>> {
+    Sse::new(in_flight.until_done(realistic_frames(rx, model, endpoint, cut)))
+}
+
+/// The frames of [`realistic_sse`].
+fn realistic_frames(
+    rx: mpsc::UnboundedReceiver<engine::GenEvent>,
+    model: String,
+    endpoint: Endpoint,
+    cut: Option<(u32, u16, Arc<AtomicU64>)>,
+) -> impl Stream<Item = Result<Event, io::Error>> {
     enum St {
         Active {
             rx: mpsc::UnboundedReceiver<engine::GenEvent>,
             model: String,
             endpoint: Endpoint,
+            served: u32,
+            cut: Option<(u32, u16, Arc<AtomicU64>)>,
         },
         Closing,
         Ended,
     }
 
-    let body = stream::unfold(
+    stream::unfold(
         St::Active {
             rx,
             model,
             endpoint,
+            served: 0,
+            cut,
         },
         |st| async move {
             match st {
@@ -329,8 +709,17 @@ fn realistic_sse(
                     mut rx,
                     model,
                     endpoint,
+                    served,
+                    cut,
                 } => match rx.recv().await {
                     Some(engine::GenEvent::Token { .. }) => {
+                        if let Some((after, status, cut_total)) = &cut {
+                            if served >= *after {
+                                cut_total.fetch_add(1, Ordering::Relaxed);
+                                let cut = io::Error::other(format!("injected {status}"));
+                                return Some((Err(cut), St::Ended));
+                            }
+                        }
                         let frame = token_chunk(endpoint, &model);
                         Some((
                             Ok(Event::default().data(frame.to_string())),
@@ -338,6 +727,8 @@ fn realistic_sse(
                                 rx,
                                 model,
                                 endpoint,
+                                served: served + 1,
+                                cut,
                             },
                         ))
                     }
@@ -351,8 +742,7 @@ fn realistic_sse(
                 St::Ended => None,
             }
         },
-    );
-    Sse::new(body)
+    )
 }
 
 /// One streamed token frame in the shape the requesting endpoint expects.
@@ -412,8 +802,10 @@ fn extract_prompt_text(v: &Value) -> String {
 
 /// Approximate a prompt's token ids from its text: one id per whitespace word,
 /// each a stable hash of the word. Identical leading words yield identical
-/// leading ids, so shared prefixes still produce cache hits.
-fn synth_token_ids(text: &str) -> Vec<u32> {
+/// leading ids, so shared prefixes still produce cache hits. These are also
+/// the ids an HTTP worker's script key is computed over
+/// ([`crate::script::script_key`]).
+pub fn synth_token_ids(text: &str) -> Vec<u32> {
     text.split_whitespace().map(hash_word).collect()
 }
 
@@ -438,4 +830,117 @@ fn extract_max_tokens(v: &Value) -> Option<u32> {
 fn next_request_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     format!("mock-http-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::StreamExt;
+
+    use super::*;
+
+    fn token() -> engine::GenEvent {
+        engine::GenEvent::Token {
+            token_id: 7,
+            prompt_tokens: 3,
+            cached_tokens: 0,
+        }
+    }
+
+    fn done(tokens: u32) -> engine::GenEvent {
+        engine::GenEvent::Done {
+            finish_reason: "stop",
+            prompt_tokens: 3,
+            completion_tokens: tokens,
+            cached_tokens: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cut_stream_ends_in_an_error_after_the_given_frames() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for _ in 0..3 {
+            tx.send(token()).unwrap();
+        }
+        tx.send(done(3)).unwrap();
+        drop(tx);
+        let cuts = Arc::new(AtomicU64::new(0));
+        let frames: Vec<Result<Event, io::Error>> = realistic_frames(
+            rx,
+            "m".to_string(),
+            Endpoint::Chat,
+            Some((1, 502, Arc::clone(&cuts))),
+        )
+        .collect()
+        .await;
+        assert_eq!(frames.len(), 2, "one token frame, then the cut");
+        assert_eq!(cuts.load(Ordering::Relaxed), 1, "the cut is counted once");
+        assert!(frames[0].is_ok());
+        assert!(
+            matches!(&frames[1], Err(e) if e.to_string() == "injected 502"),
+            "{:?}",
+            frames[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uncut_stream_still_finishes_with_done() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(token()).unwrap();
+        tx.send(done(1)).unwrap();
+        drop(tx);
+        let cuts = Arc::new(AtomicU64::new(0));
+        let frames: Vec<Result<Event, io::Error>> = realistic_frames(
+            rx,
+            "m".to_string(),
+            Endpoint::Chat,
+            Some((5, 502, Arc::clone(&cuts))),
+        )
+        .collect()
+        .await;
+        assert_eq!(frames.len(), 3, "token, finish, [DONE]");
+        assert!(frames.iter().all(Result::is_ok));
+        assert_eq!(cuts.load(Ordering::Relaxed), 0, "nothing was cut");
+    }
+
+    #[tokio::test]
+    async fn a_cut_completion_answers_the_status_and_counts_the_cut() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for _ in 0..3 {
+            tx.send(token()).unwrap();
+        }
+        tx.send(done(3)).unwrap();
+        drop(tx);
+        let cuts = Arc::new(AtomicU64::new(0));
+        let response = realistic_completion(
+            rx,
+            "m".to_string(),
+            3,
+            Endpoint::Chat,
+            Some((1, 502, Arc::clone(&cuts))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(cuts.load(Ordering::Relaxed), 1, "the cut is counted once");
+    }
+
+    #[tokio::test]
+    async fn an_injected_error_carries_the_status_and_an_error_body() {
+        let response = injected_error(503);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["error"]["type"], "fault");
+        assert_eq!(body["error"]["message"], "injected");
+        assert_eq!(
+            injected_error(999).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            injected_error(200).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(injected_error(429).status(), StatusCode::TOO_MANY_REQUESTS);
+    }
 }

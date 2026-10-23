@@ -25,7 +25,7 @@ pub struct EmbeddingRequest {
     /// Optional number of dimensions for the embedding
     pub dimensions: Option<u32>,
 
-    /// SGLang extension: request id for tracking
+    /// Engine extension: request id for tracking
     pub rid: Option<String>,
 }
 

@@ -222,6 +222,19 @@ impl HarmonyParserAdapter {
         (analysis, commentary, final_text)
     }
 
+    /// Whether `parse_messages` adds a complete message's text to `final_text`.
+    fn is_final_text(msg: &openai_harmony::chat::Message) -> bool {
+        let tool = msg.recipient.as_deref().is_some_and(|recipient| {
+            recipient.starts_with("functions.")
+                || recipient.starts_with("python")
+                || recipient.starts_with("browser")
+                || recipient.starts_with("container")
+        });
+        msg.author.role == Role::Assistant
+            && !tool
+            && !matches!(msg.channel.as_deref(), Some("analysis" | "commentary"))
+    }
+
     /// Parse complete response
     ///
     /// Parses all output token IDs and returns the complete channel output
@@ -232,12 +245,27 @@ impl HarmonyParserAdapter {
         finish_reason: String,
     ) -> Result<HarmonyChannelOutput, String> {
         let mut reasoning_token_count = 0u32;
+        let message_token = try_harmony_encoding()?
+            .tokenizer()
+            .encode_with_special_tokens("<|message|>");
+        // For each token in a message's content: the message's index and the
+        // bytes of text it released.
+        let mut content_tokens: Vec<Option<(usize, usize)>> = Vec::with_capacity(output_ids.len());
+        let mut in_content = false;
 
         // Feed all tokens to the parser
         for &token_id in output_ids {
+            let message = self.parser.messages().len();
             self.parser
                 .process(token_id)
                 .map_err(|e| format!("Failed to process token {token_id}: {e}"))?;
+            // A stop token ends the message: it is not content.
+            let same_message = self.parser.messages().len() == message;
+            content_tokens.push((in_content && same_message).then(|| {
+                let delta = self.parser.last_content_delta().ok().flatten();
+                (message, delta.map_or(0, |text| text.len()))
+            }));
+            in_content = same_message && (in_content || message_token == [token_id]);
 
             // Count reasoning tokens (analysis + commentary channels)
             if let Some(channel) = self.parser.current_channel() {
@@ -256,6 +284,24 @@ impl HarmonyParserAdapter {
         // Check for incomplete content in parser state
         Self::handle_incomplete_content(&self.parser, &mut analysis, &mut final_text);
 
+        // The tokens of the messages that make up `final_text`, by the rules
+        // of `parse_messages` and `handle_incomplete_content`.
+        let unfinished_is_final = matches!(
+            self.parser.current_channel().as_deref(),
+            Some("final") | None
+        );
+        let final_text_tokens = content_tokens
+            .into_iter()
+            .map(|token| {
+                token.and_then(|(message, bytes)| {
+                    messages
+                        .get(message)
+                        .map_or(unfinished_is_final, Self::is_final_text)
+                        .then_some(bytes)
+                })
+            })
+            .collect();
+
         // Determine finish reason: override to "tool_calls" if commentary has tool calls
         let final_finish_reason = if commentary.is_some() {
             "tool_calls".to_string()
@@ -269,6 +315,7 @@ impl HarmonyParserAdapter {
             final_text,
             finish_reason: final_finish_reason,
             reasoning_token_count,
+            final_text_tokens,
         })
     }
 
@@ -496,6 +543,7 @@ impl HarmonyParserAdapter {
             final_text,
             finish_reason: final_finish_reason,
             reasoning_token_count: self.reasoning_token_count,
+            final_text_tokens: Vec::new(),
         }
     }
 
@@ -511,5 +559,62 @@ impl HarmonyParserAdapter {
         self.prev_recipient = None;
         self.reasoning_token_count = 0;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse `output` as one completion; also give the text of each token
+    /// that `final_text_tokens` keeps.
+    fn parse(output: &str) -> (HarmonyChannelOutput, Vec<String>) {
+        let tokenizer = try_harmony_encoding()
+            .expect("harmony encoding must load")
+            .tokenizer();
+        let ids = tokenizer.encode_with_special_tokens(output);
+        let parsed = HarmonyParserAdapter::new()
+            .unwrap()
+            .parse_complete(&ids, "stop".to_string())
+            .unwrap();
+        assert_eq!(parsed.final_text_tokens.len(), ids.len());
+        let kept = ids
+            .iter()
+            .zip(&parsed.final_text_tokens)
+            .filter_map(|(id, bytes)| bytes.map(|_| tokenizer.decode_utf8([*id]).unwrap()))
+            .collect();
+        (parsed, kept)
+    }
+
+    #[test]
+    fn final_text_tokens_skip_the_analysis_and_the_markers() {
+        let (parsed, kept) = parse(
+            "<|channel|>analysis<|message|>Say hi.<|end|>\
+             <|start|>assistant<|channel|>final<|message|>Hello world<|return|>",
+        );
+        assert_eq!(parsed.analysis.as_deref(), Some("Say hi."));
+        assert_eq!(parsed.final_text, "Hello world");
+        assert_eq!(kept.concat(), "Hello world");
+        let bytes: usize = parsed.final_text_tokens.iter().flatten().sum();
+        assert_eq!(bytes, parsed.final_text.len());
+    }
+
+    #[test]
+    fn final_text_tokens_skip_a_tool_call() {
+        let (parsed, kept) = parse(
+            "<|channel|>analysis<|message|>Need weather.<|end|>\
+             <|start|>assistant<|channel|>commentary to=functions.get_weather \
+             <|constrain|>json<|message|>{\"city\":\"Paris\"}<|call|>",
+        );
+        assert!(parsed.commentary.is_some());
+        assert!(parsed.final_text.is_empty());
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn final_text_tokens_keep_an_unfinished_final_message() {
+        let (parsed, kept) = parse("<|channel|>final<|message|>Cut short");
+        assert_eq!(parsed.final_text, "Cut short");
+        assert_eq!(kept.concat(), "Cut short");
     }
 }

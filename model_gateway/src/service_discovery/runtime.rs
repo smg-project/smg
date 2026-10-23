@@ -5,7 +5,12 @@ use std::{error::Error, sync::Arc, time::Duration};
 
 use tokio::task;
 
-use super::kubernetes::{self, ModelIdSource, ServiceDiscoveryConfig};
+use super::{
+    consul::{self, ConsulProviderConfig},
+    file::{self, FileProviderConfig},
+    kubernetes::{self, ModelIdSource, ServiceDiscoveryConfig},
+    slurm::{self, SlurmProviderConfig},
+};
 use crate::{
     app_context::AppContext,
     config::{ConfigError, ConfigResult, DiscoveryConfig, KubernetesDiscoveryConfig, RoutingMode},
@@ -18,6 +23,9 @@ use crate::{
 #[derive(Debug, Clone)]
 pub enum RuntimeDiscoveryConfig {
     Kubernetes(ServiceDiscoveryConfig),
+    File(FileProviderConfig),
+    Slurm(SlurmProviderConfig),
+    Consul(ConsulProviderConfig),
 }
 
 impl RuntimeDiscoveryConfig {
@@ -32,6 +40,17 @@ impl RuntimeDiscoveryConfig {
         match discovery {
             DiscoveryConfig::Kubernetes(kubernetes) => {
                 Ok(Self::Kubernetes(kubernetes_runtime(kubernetes, mode)?))
+            }
+            DiscoveryConfig::File(file) => Ok(Self::File(FileProviderConfig::new(
+                file.path.clone(),
+                Duration::from_secs(file.check_interval_secs),
+                mode,
+            )?)),
+            DiscoveryConfig::Slurm(slurm) => {
+                Ok(Self::Slurm(SlurmProviderConfig::new(slurm, mode)?))
+            }
+            DiscoveryConfig::Consul(consul) => {
+                Ok(Self::Consul(ConsulProviderConfig::new(consul, mode)?))
             }
         }
     }
@@ -82,6 +101,13 @@ pub async fn start_service_discovery(
         RuntimeDiscoveryConfig::Kubernetes(config) => {
             Ok(kubernetes::start_kubernetes_discovery(config, app_context).await?)
         }
+        RuntimeDiscoveryConfig::File(config) => Ok(file::start_file_discovery(config, app_context)),
+        RuntimeDiscoveryConfig::Slurm(config) => {
+            Ok(slurm::start_slurm_discovery(config, app_context))
+        }
+        RuntimeDiscoveryConfig::Consul(config) => {
+            Ok(consul::start_consul_discovery(config, app_context)?)
+        }
     }
 }
 
@@ -96,8 +122,11 @@ mod tests {
     }
 
     fn kubernetes(config: &DiscoveryConfig, mode: &RoutingMode) -> ServiceDiscoveryConfig {
-        let RuntimeDiscoveryConfig::Kubernetes(runtime) =
-            RuntimeDiscoveryConfig::from_config(config, mode).unwrap();
+        let Ok(RuntimeDiscoveryConfig::Kubernetes(runtime)) =
+            RuntimeDiscoveryConfig::from_config(config, mode)
+        else {
+            panic!("expected Kubernetes runtime discovery");
+        };
         runtime
     }
 
@@ -160,6 +189,59 @@ mod tests {
         ] {
             assert!(kubernetes(&config, &mode).disaggregated_mode, "{mode:?}");
         }
+    }
+
+    #[test]
+    fn file_settings_reach_the_runtime() {
+        let config = DiscoveryConfig::File(crate::config::FileDiscoveryConfig {
+            path: "/run/smg/workers.json".into(),
+            check_interval_secs: 15,
+        });
+        let Ok(RuntimeDiscoveryConfig::File(runtime)) =
+            RuntimeDiscoveryConfig::from_config(&config, &regular())
+        else {
+            panic!("expected file runtime discovery");
+        };
+        assert_eq!(runtime.path, std::path::Path::new("/run/smg/workers.json"));
+        assert_eq!(runtime.check_interval, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn slurm_settings_reach_the_runtime() {
+        let config = DiscoveryConfig::Slurm(crate::config::SlurmDiscoveryConfig {
+            job_names: vec!["smg-worker".to_string()],
+            encode_job_names: vec![],
+            prefill_job_names: vec![],
+            decode_job_names: vec![],
+            port: 8000,
+            bootstrap_port: None,
+            user: None,
+            account: None,
+            partition: None,
+            check_interval_secs: 10,
+        });
+        let Ok(RuntimeDiscoveryConfig::Slurm(runtime)) =
+            RuntimeDiscoveryConfig::from_config(&config, &regular())
+        else {
+            panic!("expected Slurm runtime discovery");
+        };
+        assert_eq!(runtime.check_interval, Duration::from_secs(10));
+    }
+
+    #[test]
+    fn consul_settings_reach_the_runtime() {
+        let config = DiscoveryConfig::Consul(crate::config::ConsulDiscoveryConfig {
+            service: "smg-worker".to_string(),
+            address: Some("http://consul.internal:8500".to_string()),
+            datacenter: Some("dc2".to_string()),
+            check_interval_secs: 10,
+        });
+        let Ok(RuntimeDiscoveryConfig::Consul(runtime)) =
+            RuntimeDiscoveryConfig::from_config(&config, &regular())
+        else {
+            panic!("expected Consul runtime discovery");
+        };
+        assert_eq!(runtime.check_interval, Duration::from_secs(10));
     }
 
     #[test]

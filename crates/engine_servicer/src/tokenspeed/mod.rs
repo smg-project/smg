@@ -21,7 +21,10 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use engine_zmq_adapter::ZmqEngineClient;
+use engine_zmq_adapter::{
+    StructuredOutputBackend, StructuredOutputsBackendConfig, StructuredOutputsSupport,
+    ZmqEngineClient,
+};
 use futures::FutureExt;
 use llm_tokenizer::traits::Tokenizer;
 use smg_grpc_client::tokenspeed_proto::token_speed_scheduler_server::TokenSpeedSchedulerServer;
@@ -32,12 +35,17 @@ use tonic_health::pb::health_server::HealthServer;
 use tracing::{info, warn};
 
 use crate::{
-    engine_link::EngineLink, health::HealthReporter, requests::RequestRegistry, ServerThread,
-    ServicerError, Shutdown,
+    engine_link::EngineLink,
+    health::HealthReporter,
+    metrics::{Identity, MetricsListener, ServicerMetrics, ServicerState, Snapshot},
+    requests::RequestRegistry,
+    ServerThread, ServicerConfig, ServicerError, Shutdown,
 };
 
 /// The gRPC service name, as the health service reports it.
 pub const SERVICE_NAME: &str = "tokenspeed.grpc.scheduler.TokenSpeedScheduler";
+/// The `wire` label of this servicer's metrics.
+const WIRE: &str = "tokenspeed";
 
 /// What `GetModelInfo` and `GetServerInfo` report: the facts the Python
 /// servicer reads off TokenSpeed's `ModelConfig` and `ServerArgs`, which the
@@ -61,6 +69,12 @@ pub struct TokenSpeedModelInfo {
     pub supports_multimodal: bool,
     /// `smg.grpc.common.Modality` values.
     pub supported_modalities: Vec<i32>,
+    /// Whether the language model's rotary positions are MRoPE (the text rope
+    /// config carries an `mrope_section`), which the launcher reads off the
+    /// checkpoint: a multimodal item's grid tensors then feed positions this
+    /// wire cannot derive and are refused; `Some(false)` lets a patch-layout
+    /// grid through; `None` (a launcher that does not say) refuses as before.
+    pub mrope_positions: Option<bool>,
     pub model_dtype: String,
     pub multimodal_encoder_dtype: String,
     /// TokenSpeed's `ServerArgs` as a JSON object, reported as
@@ -71,6 +85,11 @@ pub struct TokenSpeedModelInfo {
     /// `shm_namespace_id`); the handshake supplies the capacity figures.
     pub scheduler_info_json: String,
     pub tokenspeed_version: String,
+    /// The engine's declared constrained-decoding policy (`always`, `requested`,
+    /// or "" when it declares none), reported as
+    /// `GetServerInfo.constrained_decoding` for the Router's `constrained_decoding`
+    /// label.
+    pub constrained_decoding: String,
     /// The scheduler's admission window (`max_num_seqs`), reported as
     /// `max_running_requests`; the handshake's figure is the fallback.
     pub max_running_requests: i32,
@@ -87,28 +106,46 @@ pub struct TokenSpeedModelInfo {
     pub kv_events_topic: String,
 }
 
+/// What the scheduler enforces of a structured request, read off the
+/// launcher's `server_args`: the `grammar_backend` the launcher resolved
+/// (TokenSpeed's `--grammar-backend`, `xgrammar` or `none`: `none` unless
+/// set, `xgrammar` for the checkpoints the engine defaults so). `none`
+/// enforces nothing: the scheduler refuses such a request at admission with
+/// a 400 that the slim wire reports as a bare `abort`, which reaches the
+/// caller as an empty answer. `xgrammar` compiles all four kinds, a JSON
+/// schema with the features it lacks dropped. A launcher that wrote no
+/// backend could not tell (a checkpoint default not resolved yet, or an
+/// older launcher), and a name this servicer does not know is not one the
+/// engine starts with: nothing is judged ahead of the engine then. The
+/// adapter refuses a constraint outside this before the scheduler, as on
+/// every wire.
+pub(super) fn structured_outputs_support(model: &TokenSpeedModelInfo) -> StructuredOutputsSupport {
+    use StructuredOutputsBackendConfig::{Other, Pinned};
+
+    let args: serde_json::Value = serde_json::from_str(&model.server_args_json).unwrap_or_default();
+    let backend = args
+        .get("grammar_backend")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    match backend {
+        "none" => StructuredOutputsSupport::DISABLED,
+        "xgrammar" => Pinned(StructuredOutputBackend::Xgrammar).into(),
+        _ => Other.into(),
+    }
+}
+
 /// How to bind, where the engines dial in, and what to advertise.
 #[derive(Debug, Clone)]
 pub struct TokenSpeedServicerConfig {
-    /// `host:port` for the gRPC listener.
-    pub bind_address: String,
-    /// `ipc://<path>` base for the data-plane sockets (`<path>-in.sock` and
-    /// `<path>-out.sock`), owned by this process's uid.
-    pub ipc_base_url: String,
-    /// `tcp://host:port` the headless scheduler dials for the handshake (its
-    /// `--data-parallel-address`/`--data-parallel-rpc-port`).
-    /// An `ipc://<path>` endpoint is accepted too: one per test, so parallel
-    /// tests never share a probed TCP port.
-    pub handshake_address: String,
-    /// Engines that will dial in (the attention data-parallel size).
-    pub engine_count: usize,
-    /// Local directory holding the model's tokenizer files; without it,
-    /// requests carrying string stops are refused.
-    pub tokenizer_dir: Option<String>,
+    /// The listener, the scheduler's endpoints, the tokenizer directory and
+    /// the start-up bounds. `handshake_address` is what the headless
+    /// scheduler dials (its `--data-parallel-address`/
+    /// `--data-parallel-rpc-port`), `engine_count` the attention
+    /// data-parallel size; without `tokenizer_dir`, requests carrying string
+    /// stops are refused.
+    pub servicer: ServicerConfig,
     pub model: TokenSpeedModelInfo,
-    /// Bound on the scheduler's startup handshake; see
-    /// [`crate::DEFAULT_ENGINE_STARTUP_TIMEOUT`].
-    pub engine_startup_timeout: Duration,
 }
 
 /// The servicer's `GetLoads` figures, read for the load record the relay
@@ -122,7 +159,11 @@ impl crate::kv_events::LoadSource for LoadFromState {
         let load = response.loads.first()?;
         // The engine reports no queued token-work on this wire yet: the
         // record's `waiting_uncached_tokens` stays unset.
-        Some(smg_grpc_client::common_proto::EngineLoad::from(load))
+        let mut record = smg_grpc_client::common_proto::EngineLoad::from(load);
+        record.engine_silence_ms = state.engine.output_silence_ms();
+        record.engine_reports_steps = state.engine.reports_steps();
+        record.prefill_pending_tokens = state.engine.prefill_pending_tokens();
+        Some(record)
     }
 }
 
@@ -135,18 +176,49 @@ pub(super) struct State {
     /// bundles it); `None` when none resolved.
     pub(super) tokenizer_dir: Option<String>,
     pub(super) engine: EngineLink,
+    /// The request, token and latency metrics.
+    pub(super) metrics: Arc<ServicerMetrics>,
     /// Loaded once alongside the engine connect; `Some(None)` records a load
     /// that failed (string stops are then refused).
     pub(super) tokenizer: OnceLock<Option<Arc<dyn Tokenizer>>>,
     pub(super) registry: Arc<RequestRegistry>,
-    /// Cleared by the lifecycle owner to drain: health flips to NOT_SERVING
-    /// while in-flight streams finish.
+    /// Cleared by the lifecycle owner to drain (`set_serving`, admission
+    /// closed with it) or to hold readiness alone (`set_ready`, admission
+    /// open): health answers NOT_SERVING either way.
     pub(super) serving: AtomicBool,
     pub(super) started: Instant,
     pub(super) started_at: SystemTime,
 }
 
 impl State {
+    /// The lifecycle state a scrape reports: the drain is read off the
+    /// registry (admission closed); a cleared serving flag with admission
+    /// open is readiness held back, not a drain.
+    fn lifecycle_state(&self) -> ServicerState {
+        if !self.registry.is_accepting() {
+            return ServicerState::Draining;
+        }
+        match (self.engine.client.get(), self.engine.error()) {
+            (Some(client), _) if client.is_alive() => {
+                if self.serving.load(Ordering::Acquire) {
+                    ServicerState::Serving
+                } else {
+                    ServicerState::WarmingUp
+                }
+            }
+            (Some(_), _) | (None, Some(_)) => ServicerState::EngineDown,
+            (None, None) => ServicerState::Starting,
+        }
+    }
+
+    /// What a metrics scrape reads off the servicer at that moment.
+    pub(super) fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            active: self.registry.active(),
+            state: Some(self.lifecycle_state()),
+        }
+    }
+
     pub(super) fn engine(&self) -> Result<&ZmqEngineClient, Status> {
         if let Some(client) = self.engine.client.get() {
             return Ok(client);
@@ -174,7 +246,13 @@ impl State {
 
     pub(super) fn health_message(&self) -> &'static str {
         if !self.serving.load(Ordering::Acquire) {
-            return "Draining";
+            // Admission still open: the lifecycle owner holds readiness for
+            // its own requests (the planned warm-up); closed: it drains.
+            return if self.registry.is_accepting() {
+                "Warming up"
+            } else {
+                "Draining"
+            };
         }
         match (self.engine.client.get(), self.engine.error()) {
             (Some(client), _) if client.is_alive() => "healthy",
@@ -190,6 +268,8 @@ impl State {
 pub struct TokenSpeedServicerServer {
     thread: ServerThread,
     state: Arc<State>,
+    /// The `/metrics` listener, when the configuration asked for one.
+    metrics_listener: Option<MetricsListener>,
 }
 
 impl TokenSpeedServicerServer {
@@ -211,39 +291,36 @@ impl TokenSpeedServicerServer {
         config: TokenSpeedServicerConfig,
         tokenizer: Option<Arc<dyn Tokenizer>>,
     ) -> Result<Self, ServicerError> {
-        let invalid = |message: &str| ServicerError::InvalidConfig(message.to_string());
-        if config.bind_address.rsplit_once(':').is_none() {
-            return Err(invalid("bind_address must be host:port"));
-        }
-        if !config.ipc_base_url.starts_with("ipc://") {
-            return Err(invalid("ipc_base_url must be ipc://<path>"));
-        }
-        if !config.handshake_address.starts_with("tcp://")
-            && !config.handshake_address.starts_with("ipc://")
-        {
-            return Err(invalid(
-                "handshake_address must be tcp://host:port or ipc://<path>",
+        config.servicer.validate()?;
+        if config.model.model_path.trim().is_empty() {
+            return Err(ServicerError::InvalidConfig(
+                "model_path must not be empty".to_string(),
             ));
         }
-        if config.engine_count == 0 {
-            return Err(invalid("engine_count must be positive"));
-        }
-        if config.engine_startup_timeout.is_zero() {
-            return Err(invalid("engine_startup_timeout must be positive"));
-        }
-        if config.model.model_path.trim().is_empty() {
-            return Err(invalid("model_path must not be empty"));
-        }
+        // One publisher per data-parallel rank: the launcher's width (the
+        // handshake's figure, which may differ, is not known yet).
         let kv_relay = crate::kv_events::KvEventRelay::for_publisher(
             &config.model.kv_events_endpoint,
             Some(&config.model.kv_events_replay_endpoint),
             &config.model.kv_events_topic,
+            u32::try_from(config.model.data_parallel_size).unwrap_or(1),
         );
+        let metrics = ServicerMetrics::new(
+            &Identity {
+                model: config.model.served_model_name.clone(),
+                wire: WIRE,
+                ranks: config.servicer.engine_count,
+                max_model_len: u32::try_from(config.model.max_context_length).unwrap_or(0),
+                matches_string_stops: true,
+            },
+            config.servicer.metrics_bind_address.is_some(),
+        )?;
         let state = Arc::new(State {
-            tokenizer_dir: config.tokenizer_dir.clone(),
+            tokenizer_dir: config.servicer.tokenizer_dir.clone(),
             model: config.model,
             kv_relay,
             engine: EngineLink::default(),
+            metrics,
             tokenizer: OnceLock::new(),
             registry: Arc::new(RequestRegistry::default()),
             serving: AtomicBool::new(true),
@@ -256,6 +333,26 @@ impl TokenSpeedServicerServer {
         if let Some(tokenizer) = tokenizer {
             let _ = state.tokenizer.set(Some(tokenizer));
         }
+        // The metrics listener binds beside the gRPC listener, before the
+        // scheduler connects: a scrape during its start answers.
+        let metrics_listener = config
+            .servicer
+            .metrics_bind_address
+            .as_deref()
+            .map(|address| {
+                let probe = Arc::downgrade(&state);
+                MetricsListener::start(
+                    address,
+                    Arc::clone(&state.metrics),
+                    Arc::new(move || {
+                        probe
+                            .upgrade()
+                            .map(|state| state.snapshot())
+                            .unwrap_or_default()
+                    }),
+                )
+            })
+            .transpose()?;
         let service = service::TokenSpeedService {
             state: Arc::clone(&state),
         };
@@ -266,15 +363,17 @@ impl TokenSpeedServicerServer {
         );
         let connect_state = Arc::clone(&state);
         let kv_relay = state.kv_relay.clone();
-        let TokenSpeedServicerConfig {
+        let silence = config.servicer.silence_bounds();
+        let ServicerConfig {
             bind_address,
             ipc_base_url,
             handshake_address,
             engine_count,
             tokenizer_dir,
             engine_startup_timeout,
+            engine_startup_ceiling,
             ..
-        } = config;
+        } = config.servicer;
         let thread = ServerThread::start(
             "smg-tokenspeed-servicer",
             &bind_address,
@@ -295,6 +394,8 @@ impl TokenSpeedServicerServer {
                     handshake_address,
                     engine_count,
                     engine_startup_timeout,
+                    engine_startup_ceiling,
+                    silence,
                     tokenizer_dir,
                     last_error,
                 ));
@@ -337,12 +438,23 @@ impl TokenSpeedServicerServer {
                 }
             },
         )?;
-        Ok(Self { thread, state })
+        Ok(Self {
+            thread,
+            state,
+            metrics_listener,
+        })
     }
 
     /// The bound `ip:port`.
     pub fn address(&self) -> String {
         self.thread.address().to_string()
+    }
+
+    /// The metrics listener's bound `ip:port`; `None` when none was asked for.
+    pub fn metrics_address(&self) -> Option<String> {
+        self.metrics_listener
+            .as_ref()
+            .map(|listener| listener.address().to_string())
     }
 
     pub fn running(&self) -> bool {
@@ -354,14 +466,40 @@ impl TokenSpeedServicerServer {
         self.state.engine.client.get().is_some()
     }
 
+    /// Report a sign of life from the scheduler process while the handshake
+    /// runs: the lifecycle owner that launched it calls this each time it
+    /// polls the process and finds it alive. Each report resets the
+    /// handshake's silence bound (`engine_startup_timeout`); the ceiling
+    /// (`engine_startup_ceiling`) still holds. A no-op once the scheduler is
+    /// connected.
+    pub fn note_engine_alive(&self) {
+        if !self.engine_ready() {
+            self.state.engine.liveness.touch();
+        }
+    }
+
     pub fn last_error(&self) -> Result<Option<String>, ServicerError> {
         self.thread.last_error()
     }
 
     /// Announce SERVING (`true`) or drain (`false`): health flips at once,
-    /// in-flight streams keep running until `stop`.
+    /// new admission closes while in-flight streams keep running until `stop`.
     pub fn set_serving(&self, serving: bool) {
+        self.state.registry.set_accepting(serving);
         self.state.serving.store(serving, Ordering::Release);
+    }
+
+    /// Hold (`false`) or release (`true`) readiness alone: health flips as
+    /// with `set_serving`, admission stays open, so the lifecycle owner's own
+    /// requests (its planned warm-up before SERVING) still reach the engine.
+    /// `set_serving(false)` is the drain switch and closes admission as well.
+    pub fn set_ready(&self, ready: bool) {
+        self.state.serving.store(ready, Ordering::Release);
+    }
+
+    /// Admitted requests still preprocessing, streaming, or unwinding an abort.
+    pub fn active_requests(&self) -> usize {
+        self.state.registry.active()
     }
 
     /// Signal shutdown and wait up to `timeout` for the server thread;
@@ -370,6 +508,13 @@ impl TokenSpeedServicerServer {
     pub fn stop(&self, timeout: Duration) -> Result<(), ServicerError> {
         self.set_serving(false);
         self.state.registry.cancel_all()?;
-        self.thread.stop(timeout)
+        let started = Instant::now();
+        let stopped = self.thread.stop(timeout);
+        // The metrics listener goes last, inside what is left of the budget,
+        // so a scrape during the drain still reads the servicer draining.
+        if let Some(listener) = &self.metrics_listener {
+            listener.stop(timeout.saturating_sub(started.elapsed()))?;
+        }
+        stopped
     }
 }

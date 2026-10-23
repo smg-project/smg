@@ -21,11 +21,14 @@ pub enum RlError {
     NoWorkersMatch(String),
     #[error("worker `{0}` not found")]
     WorkerNotFound(String),
-    #[error("worker `{worker_id}` uses connection mode `{mode}`, which cannot be proxied")]
-    UnsupportedConnectionMode {
+    #[error(
+        "worker `{worker_id}` has no control endpoint ({connection_mode} transport): {message}"
+    )]
+    NoControlEndpoint {
         worker_id: String,
         url: String,
-        mode: String,
+        connection_mode: String,
+        message: String,
     },
     #[error("upstream `{url}` unreachable: {message}")]
     UpstreamUnreachable {
@@ -50,7 +53,7 @@ impl RlError {
             Self::InvalidSelector { .. } => "invalid_selector",
             Self::NoWorkersMatch(_) => "no_workers_match",
             Self::WorkerNotFound(_) => "worker_not_found",
-            Self::UnsupportedConnectionMode { .. } => "unsupported_connection_mode",
+            Self::NoControlEndpoint { .. } => "no_control_endpoint",
             Self::UpstreamUnreachable { .. } => "upstream_unreachable",
             Self::UpstreamTimeout { .. } => "upstream_timeout",
         }
@@ -63,7 +66,7 @@ impl RlError {
             | Self::InvalidSelector { .. }
             | Self::NoWorkersMatch(_) => StatusCode::BAD_REQUEST,
             Self::WorkerNotFound(_) => StatusCode::NOT_FOUND,
-            Self::UnsupportedConnectionMode { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::NoControlEndpoint { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::UpstreamUnreachable { .. } => StatusCode::BAD_GATEWAY,
             Self::UpstreamTimeout { .. } => StatusCode::GATEWAY_TIMEOUT,
         }
@@ -76,14 +79,15 @@ impl RlError {
             Self::InvalidSelector { offset, .. } => body["offset"] = json!(offset),
             Self::NoWorkersMatch(selector) => body["selector"] = json!(selector),
             Self::WorkerNotFound(id) => body["id"] = json!(id),
-            Self::UnsupportedConnectionMode {
+            Self::NoControlEndpoint {
                 worker_id,
                 url,
-                mode,
+                connection_mode,
+                ..
             } => {
                 body["worker_id"] = json!(worker_id);
                 body["url"] = json!(url);
-                body["connection_mode"] = json!(mode);
+                body["connection_mode"] = json!(connection_mode);
             }
             Self::UpstreamUnreachable { worker_id, url, .. }
             | Self::UpstreamTimeout { worker_id, url, .. } => {
@@ -127,5 +131,16 @@ mod tests {
         };
         assert_eq!(e.status(), StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(e.to_json()["url"], "http://x");
+
+        let e = RlError::NoControlEndpoint {
+            worker_id: "g".into(),
+            url: "grpc://x:1".into(),
+            connection_mode: "grpc".into(),
+            message: "no `rl.control_url` label".into(),
+        };
+        assert_eq!(e.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(e.to_json()["error"], "no_control_endpoint");
+        assert_eq!(e.to_json()["connection_mode"], "grpc");
+        assert!(e.to_string().contains("no `rl.control_url` label"));
     }
 }

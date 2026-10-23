@@ -1,7 +1,8 @@
 [package]
 name = "smg-golang"
-version = "1.11.0"
+version = "1.13.0"
 edition = "2021"
+rust-version.workspace = true
 
 [lib]
 name = "smg_go"
@@ -9,6 +10,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 tokio = { version = "1.52.3", features = ["full"] }
+serde = { workspace = true }
 serde_json = { version = "1.0", default-features = false, features = [
     "std",
     "preserve_order",
@@ -59,7 +61,7 @@ strip = true
 
 [profile.dev]
 opt-level = 0
-debug = 1
+debug = "line-tables-only"
 split-debuginfo = "unpacked"
 incremental = true
 codegen-units = 256

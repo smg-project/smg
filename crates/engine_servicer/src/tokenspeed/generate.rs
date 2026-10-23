@@ -9,10 +9,12 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
+    time::Instant,
 };
 
 use engine_zmq_adapter::{
-    stops::take_tokenspeed_string_stops, to_tokenspeed_response, TokenSpeedGenerateStream,
+    stops::take_tokenspeed_string_stops, to_tokenspeed_response, GridTensors,
+    TokenSpeedGenerateStream,
 };
 use futures::{stream::SelectAll, Stream};
 use llm_tokenizer::stop::StopSequenceDecoder;
@@ -22,7 +24,8 @@ use tonic::Status;
 
 use super::State;
 use crate::{
-    requests::Registration,
+    metrics::{complete_finish_reason, ChoiceMetrics, RequestMetrics},
+    requests::{settle_shutdown, CancelReason, HeldTerminal, Registration},
     stop_match::{stop_decoder, StopMatcher},
     BoxStream,
 };
@@ -32,18 +35,11 @@ pub(super) async fn generate(
     state: &Arc<State>,
     mut req: ts::GenerateRequest,
 ) -> Result<BoxStream<ts::GenerateResponse>, Status> {
+    // The request's arrival, the instant its latencies are measured from.
+    let arrival = Instant::now();
     let client = state.engine()?;
     if req.request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is required"));
-    }
-    if req
-        .tokenized
-        .as_ref()
-        .is_none_or(|tokenized| tokenized.input_ids.is_empty())
-    {
-        return Err(Status::invalid_argument(
-            "tokenized.input_ids is required: the Router tokenizes before it dispatches",
-        ));
     }
     let request_id: Arc<str> = Arc::from(req.request_id.as_str());
     // Register before the submit: an `Abort` landing in the gap must find the
@@ -64,7 +60,27 @@ pub(super) async fn generate(
         .map(|params| take_tokenspeed_string_stops(params, tokenizer))
         .unwrap_or_default();
     let decoder = stop_decoder(tokenizer, &stops, skip_special_tokens)?;
-    let subs = client.generate_tokenspeed_streams(req).await?;
+    let prompt_tokens = req.tokenized.as_ref().map_or(0, |tokenized| {
+        u32::try_from(tokenized.input_ids.len()).unwrap_or(u32::MAX)
+    });
+    let (max_tokens, n) = req
+        .sampling_params
+        .as_ref()
+        .map_or((None, 1), |params| (params.max_new_tokens, params.n));
+    let subs = client
+        .generate_tokenspeed_streams_for_model(
+            req,
+            GridTensors::for_model(state.model.mrope_positions),
+        )
+        .await?;
+    let metrics = state.metrics.request(
+        arrival,
+        subs.first()
+            .and_then(TokenSpeedGenerateStream::engine_index),
+        prompt_tokens,
+        max_tokens,
+        n,
+    );
     let mut choices = SelectAll::new();
     for sub in subs {
         // Each choice decodes its own text: the matcher is per sequence.
@@ -78,12 +94,15 @@ pub(super) async fn generate(
             decoder,
             streaming,
             min_tokens,
+            metrics.choice(),
         ));
     }
     Ok(Box::pin(GenerateStream {
         choices,
         cancel,
         aborted: None,
+        cut: None,
+        metrics,
         _registration: registration,
     }))
 }
@@ -104,6 +123,8 @@ struct ChoiceStream {
     streaming: bool,
     /// A frontend-synthesized terminal `Complete` to yield next.
     pending: Option<vllm::GenerateResponse>,
+    /// This choice's observation of the request's metrics.
+    metrics: ChoiceMetrics,
 }
 
 impl ChoiceStream {
@@ -113,6 +134,7 @@ impl ChoiceStream {
         decoder: Option<StopSequenceDecoder>,
         streaming: bool,
         min_tokens: u32,
+        metrics: ChoiceMetrics,
     ) -> Self {
         Self {
             request_id,
@@ -120,6 +142,7 @@ impl ChoiceStream {
             stops: StopMatcher::new(decoder, min_tokens),
             streaming,
             pending: None,
+            metrics,
         }
     }
 
@@ -137,7 +160,42 @@ impl ChoiceStream {
         }
         let mut inner = self.inner.take()?;
         let complete = inner.complete_aborted();
+        if let Some(reason) = complete_finish_reason(&complete) {
+            self.metrics.ended(reason);
+        }
         Some(self.convert(complete))
+    }
+}
+
+impl HeldTerminal for ChoiceStream {
+    type Response = ts::GenerateResponse;
+
+    /// The terminal this choice already holds, when the engine (or a stop
+    /// string) finished it before the poll that would have yielded it: the
+    /// `Complete` it was about to yield, or the engine's parked one. `None`
+    /// for a choice still open, which is left as it is.
+    fn finished(&mut self) -> Option<ts::GenerateResponse> {
+        if let Some(complete) = self.pending.take() {
+            self.inner = None;
+            return Some(self.convert(complete));
+        }
+        let inner = self.inner.as_mut()?;
+        if !inner.has_parked_complete() {
+            return None;
+        }
+        // `complete_aborted` yields the parked `Complete` when there is one.
+        let complete = inner.complete_aborted();
+        if let Some(reason) = complete_finish_reason(&complete) {
+            self.metrics.ended(reason);
+        }
+        self.inner = None;
+        Some(self.convert(complete))
+    }
+
+    /// Whether this choice is still open: neither ended nor holding its
+    /// terminal.
+    fn is_open(&self) -> bool {
+        self.pending.is_none() && self.inner.is_some()
     }
 }
 
@@ -166,6 +224,7 @@ impl Stream for ChoiceStream {
                 }
                 Poll::Ready(Some(Err(status))) => {
                     this.inner = None;
+                    this.metrics.failed(status.code());
                     return Poll::Ready(Some(Err(status)));
                 }
                 Poll::Ready(Some(Ok(item))) => item,
@@ -173,13 +232,37 @@ impl Stream for ChoiceStream {
             let Some(vllm::generate_response::Response::Chunk(chunk)) = item.response.as_ref()
             else {
                 // The engine's own terminal `Complete` passes through as-is;
-                // the engine stream ends after it.
-                return Poll::Ready(Some(Ok(this.convert(item))));
+                // the engine stream ends after it, and the choice is no
+                // longer open once the `Complete` is out (a shutdown landing
+                // before the next poll must not cut it; the engine stream has
+                // already seen the finish, so dropping it sends no abort).
+                let mut ended = false;
+                if let Some(vllm::generate_response::Response::Complete(complete)) =
+                    item.response.as_ref()
+                {
+                    this.metrics.complete(
+                        &complete.finish_reason,
+                        complete.prompt_tokens,
+                        complete.cached_tokens,
+                    );
+                    ended = true;
+                }
+                let response = this.convert(item);
+                if ended {
+                    this.inner = None;
+                }
+                return Poll::Ready(Some(Ok(response)));
             };
+            this.metrics.chunk(
+                u32::try_from(chunk.token_ids.len()).unwrap_or(u32::MAX),
+                chunk.prompt_tokens,
+                chunk.cached_tokens,
+            );
             let matched = match this.stops.feed(&chunk.token_ids) {
                 Ok(matched) => matched,
                 Err(status) => {
                     this.inner = None;
+                    this.metrics.failed(status.code());
                     return Poll::Ready(Some(Err(status)));
                 }
             };
@@ -191,6 +274,7 @@ impl Stream for ChoiceStream {
                     // already holds the accumulated ids and logprobs.
                     if !inner.has_parked_complete() {
                         this.pending = Some(inner.complete_with_matched_stop(matched));
+                        this.metrics.string_stop();
                     }
                 }
                 if !this.streaming {
@@ -212,10 +296,16 @@ impl Stream for ChoiceStream {
 /// `Abort` RPC.
 struct GenerateStream {
     choices: SelectAll<ChoiceStream>,
-    cancel: oneshot::Receiver<()>,
+    cancel: oneshot::Receiver<CancelReason>,
     /// Set once aborted: the terminal `Complete` of every choice still open
     /// at that point, yielded before the stream ends.
     aborted: Option<VecDeque<ts::GenerateResponse>>,
+    /// The status a shutdown ends the stream with once `aborted` is drained,
+    /// when it cut a choice still open; `None` ends it plainly.
+    cut: Option<Status>,
+    /// The request's observation, recorded when the stream and its choices
+    /// are gone.
+    metrics: Arc<RequestMetrics>,
     _registration: Registration,
 }
 
@@ -226,13 +316,42 @@ impl Stream for GenerateStream {
         let this = self.get_mut();
         loop {
             if let Some(aborted) = this.aborted.as_mut() {
-                return Poll::Ready(aborted.pop_front().map(Ok));
+                if let Some(response) = aborted.pop_front() {
+                    return Poll::Ready(Some(Ok(response)));
+                }
+                // The completions the choices already held went out; a
+                // shutdown that cut a choice still open ends the stream with
+                // its status, a plain abort just ends it.
+                return Poll::Ready(this.cut.take().map(|status| {
+                    this.metrics.failed(status.code());
+                    Err(status)
+                }));
             }
-            // Either an `Abort` fired the sender or shutdown dropped the
-            // registry: both end the request as the Python servicer does, with
-            // each open choice's `Complete(finish_reason = "abort")`. Dropping
-            // the choices aborts the engine side.
-            if Pin::new(&mut this.cancel).poll(cx).is_ready() {
+            // The cancellation names its cause. An `Abort` RPC is the caller's
+            // own abort: the request ends as the Python servicer ends it, with
+            // each open choice's `Complete(finish_reason = "abort")`. A
+            // shutdown with the request still open is its engine side going
+            // away under it (the lifecycle owner stopping the pair after the
+            // engine exited, a drain whose grace ran out): no completion the
+            // caller could read as a short answer, so the stream ends with
+            // UNAVAILABLE, which the Router classes as the worker's failure.
+            // Either way dropping the choices aborts the engine side.
+            if let Poll::Ready(reason) = Pin::new(&mut this.cancel).poll(cx) {
+                if reason == Ok(CancelReason::Shutdown) {
+                    // A choice the engine (or a stop string) finished before
+                    // this poll keeps its completion; only a choice still
+                    // open is cut, and only then does the stream end with the
+                    // status (see `settle_shutdown`).
+                    let (finished, cut) = settle_shutdown(&mut this.choices);
+                    this.aborted = Some(finished);
+                    if cut {
+                        this.metrics.cut();
+                    }
+                    this.cut = cut.then(|| Status::unavailable(crate::requests::SHUTDOWN_MESSAGE));
+                    continue;
+                }
+                // The abort, or a sender dropped without a word (the registry
+                // entry went away): the completion it always was.
                 let aborted = this
                     .choices
                     .iter_mut()

@@ -1,7 +1,8 @@
 [package]
 name = "smg"
-version = "1.11.0"
+version = "1.13.0"
 edition = "2021"
+rust-version.workspace = true
 description = "High-performance model-routing gateway for large-scale LLM deployments"
 license = "Apache-2.0"
 repository = "https://github.com/smg-project/smg"
@@ -16,10 +17,15 @@ categories = ["web-programming", "network-programming"]
 
 [features]
 default = ["grpc-client", "jemalloc-stats", "providers"]
+tokenizers-v1 = ["llm-tokenizer/tokenizers-v1"]
 grpc-client = []
 grpc-server = []
 jemalloc-stats = ["tikv-jemallocator/stats", "dep:tikv-jemalloc-ctl"]
-jemalloc-profiling = ["tikv-jemallocator/profiling"]
+jemalloc-profiling = [
+    "tikv-jemallocator/profiling",
+    "dep:tikv-jemalloc-ctl",
+    "tikv-jemalloc-ctl/profiling",
+]
 opencv-video = ["llm-multimodal/opencv-video"]
 mm-rdma = ["smg-mm-rdma/nixl"]
 # Third-party provider routers, one feature each. A build picks the providers
@@ -58,6 +64,7 @@ dashmap.workspace = true
 futures.workspace = true
 http.workspace = true
 lru.workspace = true
+notify.workspace = true
 parking_lot.workspace = true
 prost.workspace = true
 prost-types.workspace = true
@@ -71,16 +78,18 @@ tracing-subscriber.workspace = true
 # Workspace dependencies (with extra features)
 axum = { workspace = true, features = ["macros", "multipart", "ws", "tracing"] }
 bytemuck = { workspace = true, features = ["derive"] }
-reqwest = { workspace = true, features = ["stream", "blocking", "json", "rustls", "multipart", "http2"] }
+reqwest = { workspace = true, features = ["stream", "blocking", "json", "rustls-no-provider", "multipart", "http2"] }
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["full"] }
 tokio-util.workspace = true
-uuid = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["serde", "fast-rng"] }
 
 # Workspace crates
 openai-protocol = { workspace = true, features = ["axum"] }
 reasoning-parser.workspace = true
 tool-parser.workspace = true
+smg-symphony.workspace = true
+smg-response-template = { workspace = true, features = ["symphony"] }
 wfaas.workspace = true
 llm-tokenizer.workspace = true
 smg-auth.workspace = true
@@ -88,7 +97,7 @@ smg-mcp.workspace = true
 smg-external-router = { workspace = true, default-features = false }
 kv-index.workspace = true
 smg-data-connector.workspace = true
-llm-multimodal = { workspace = true, default-features = false }
+llm-multimodal = { workspace = true, default-features = false, features = ["hf-hub"] }
 smg-mm-rdma.workspace = true
 smg-wasm = { workspace = true, features = ["storage-hooks"] }
 smg-mesh.workspace = true
@@ -106,12 +115,13 @@ memmap2 = "0.9"
 rayon = "1.12"
 rustix = { version = "1", features = ["fs", "process"] }
 tower = { version = "0.5", features = ["full"] }
-tower-http = { version = "0.7", features = ["trace", "compression-gzip", "cors", "timeout", "limit", "request-id", "util"] }
+tower-http = { version = "0.7", features = ["trace", "compression-gzip", "cors", "timeout", "request-id", "util"] }
 serde_json = { version = "1.0", default-features = false, features = ["std", "preserve_order", "raw_value"] }
 bytes = "1.12.0"
 http-body = "1.0"
 http-body-util = "0.1"
 futures-util = "0.3"
+pin-project-lite = "0.2"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 tracing-log = "0.2"
 tracing-appender = "0.2.5"
@@ -123,6 +133,8 @@ kube = { version = "3.0.1", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.27.0", features = ["v1_33"] }
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false, features = ["http-listener"] }
+metrics-util = { version = "0.20.4", default-features = false, features = ["registry"] }
+quanta = "0.12"
 regex = "1.12"
 memchr = "2.8"
 url = "2.5.8"
@@ -171,8 +183,7 @@ metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 http-body-util = "0.1"
 portpicker = "0.1"
 lazy_static = "1.5"
-wasm-encoder = "0.257"
-npyz = { version = "0.9", features = ["npz"] }
+wasm-encoder = "0.261"
 opentelemetry-proto = { version = "0.33", features = ["gen-tonic"] }
 serial_test = "3.5"
 rsa = { version = "0.9", features = ["sha2"] }
@@ -186,7 +197,7 @@ toml = "1.1"
 wasmtime-wasi = { workspace = true }
 lru = { workspace = true }
 wat = "1.252"
-zip = "8.6"
+zip = "9.0"
 # The KV-index exactness tests and the decision bench run the mock engine's
 # streams through the relay's decoder and normalizer into the gateway's index.
 engine-servicer.workspace = true
@@ -265,6 +276,16 @@ path = "benches/policy_selection.rs"
 name = "kv_index_decision"
 harness = false
 path = "benches/kv_index_decision.rs"
+
+[[bench]]
+name = "access_log"
+harness = false
+path = "benches/access_log.rs"
+
+[[bench]]
+name = "sse_rechunk"
+harness = false
+path = "benches/sse_rechunk.rs"
 
 [lints]
 workspace = true

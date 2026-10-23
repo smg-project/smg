@@ -27,6 +27,19 @@ spec:
         {{- if .Values.router.mesh.enabled }}
         sglang.ai/mesh-port: {{ .Values.router.mesh.port | quote }}
         {{- end }}
+        {{- /* The key is read from a file at start-up, so a rotated auth.apiKey
+             must roll the pods: the chart-managed Secret's content is on the pod
+             template. An existingSecret the chart does not see needs a rollout
+             restart. */}}
+        {{- if and .Values.auth.apiKey (not .Values.auth.existingSecret) }}
+        checksum/auth: {{ .Values.auth.apiKey | sha256sum }}
+        {{- end }}
+        {{- if include "smg.historySecretManaged" . }}
+        checksum/history-secret: {{ include (print $.Template.BasePath "/secret-history.yaml") . | sha256sum }}
+        {{- end }}
+        {{- if include "smg.oracleSecretManaged" . }}
+        checksum/oracle-secret: {{ include (print $.Template.BasePath "/secret-oracle.yaml") . | sha256sum }}
+        {{- end }}
         {{- with .Values.router.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -42,6 +55,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "smg.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ add (int .Values.router.shutdownGracePeriodSeconds) (int .Values.router.terminationGraceMarginSeconds) }}
       containers:
         - name: router
           image: "{{ include "smg.routerImage" . }}"
@@ -66,13 +80,13 @@ spec:
           {{- end }}
           livenessProbe:
             httpGet:
-              path: /health
+              path: {{ .Values.router.livenessProbe.path }}
               port: http
             initialDelaySeconds: {{ .Values.router.livenessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.router.livenessProbe.periodSeconds }}
           readinessProbe:
             httpGet:
-              path: /health
+              path: {{ .Values.router.readinessProbe.path }}
               port: http
             initialDelaySeconds: {{ .Values.router.readinessProbe.initialDelaySeconds }}
             periodSeconds: {{ .Values.router.readinessProbe.periodSeconds }}
@@ -100,15 +114,45 @@ spec:
                   name: {{ include "smg.fullname" . }}-hf-token
                   key: token
             {{- end }}
+            {{- with include "smg.historySecretName" . }}
+            - name: {{ include "smg.historyUrlEnv" $ }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ . }}
+                  key: {{ include "smg.historySecretKey" $ }}
+            {{- end }}
+            {{- with include "smg.oracleSecretName" . }}
+            {{- $secret := . }}
+            {{- range (include "smg.oracleCredentials" $ | fromJsonArray) }}
+            - name: {{ .env }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secret }}
+                  key: {{ .key }}
+            {{- end }}
+            {{- end }}
             {{- with .Values.router.extraEnv }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
             - name: tmp
               mountPath: /tmp
+            {{- if include "smg.authSecretName" . }}
+            - name: auth
+              mountPath: /etc/smg/auth
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
+        {{- if include "smg.authSecretName" . }}
+        - name: auth
+          secret:
+            secretName: {{ include "smg.authSecretName" . }}
+            items:
+              - key: {{ include "smg.authSecretKey" . }}
+                path: {{ include "smg.authSecretKey" . }}
+        {{- end }}
       {{- with .Values.router.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

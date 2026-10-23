@@ -12,7 +12,11 @@ use smg_data_connector::{
 use smg_mcp::{McpOrchestrator, McpToolSession};
 
 use super::provider::Provider;
-use crate::{openai_bridge, tenant::TenantRequestMeta, worker::ExternalWorker};
+use crate::{
+    openai_bridge,
+    tenant::{storage_tenant, TenantRequestMeta},
+    worker::ExternalWorker,
+};
 
 pub struct RequestContext {
     pub input: RequestInput,
@@ -219,6 +223,8 @@ pub struct StorageHandles {
     pub conversation: Arc<dyn ConversationStorage>,
     pub conversation_item: Arc<dyn ConversationItemStorage>,
     pub request_context: Option<StorageRequestContext>,
+    /// The caller's tenant: the stored response is scoped to it.
+    pub tenant: Option<String>,
 }
 
 pub struct OwnedStreamingContext {
@@ -265,6 +271,7 @@ impl RequestContext {
                 conversation,
                 conversation_item,
                 request_context: self.storage_request_context,
+                tenant: self.tenant_request_meta.as_ref().and_then(storage_tenant),
             },
         })
     }

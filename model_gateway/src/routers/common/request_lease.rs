@@ -73,17 +73,17 @@ struct Held<T> {
 enum SerializedBody {
     None,
     Single(Bytes),
-    Legs(Bytes, Bytes),
+    Sides(Bytes, Bytes),
 }
 
 impl SerializedBody {
-    /// One upstream rendering of the request; PD legs differ only in
-    /// injected fields, so the larger leg stands for both.
+    /// One upstream rendering of the request; PD sides differ only in
+    /// injected fields, so the larger side stands for both.
     fn released_len(&self) -> usize {
         match self {
             Self::None => 0,
             Self::Single(body) => body.len(),
-            Self::Legs(prefill, decode) => prefill.len().max(decode.len()),
+            Self::Sides(prefill, decode) => prefill.len().max(decode.len()),
         }
     }
 }
@@ -127,10 +127,10 @@ impl<T> RequestLease<T> {
         Ok(body)
     }
 
-    /// Two-leg (PD) variant of [`Self::serialize_with`]: both leg bodies come
+    /// Two-side (PD) variant of [`Self::serialize_with`]: both side bodies come
     /// from one pass over the leased request, and the closure's intermediate
     /// trees die with it.
-    pub(crate) fn serialize_legs_with<E>(
+    pub(crate) fn serialize_sides_with<E>(
         &self,
         f: impl FnOnce(LeaseView<'_, T>) -> Result<(Vec<u8>, Vec<u8>), E>,
     ) -> Result<(Bytes, Bytes), E> {
@@ -138,12 +138,12 @@ impl<T> RequestLease<T> {
         let (mut prefill, mut decode) = f(Self::view(&inner))?;
         trim_serialization_slack(&mut prefill);
         trim_serialization_slack(&mut decode);
-        let legs = (Bytes::from(prefill), Bytes::from(decode));
-        inner.body = SerializedBody::Legs(legs.0.clone(), legs.1.clone());
-        Ok(legs)
+        let sides = (Bytes::from(prefill), Bytes::from(decode));
+        inner.body = SerializedBody::Sides(sides.0.clone(), sides.1.clone());
+        Ok(sides)
     }
 
-    /// Memoized upstream body from the last single-leg serialization; the
+    /// Memoized upstream body from the last single-body serialization; the
     /// handle is cheap and safe to hand to (re)dispatch attempts.
     #[cfg_attr(
         not(test),
@@ -155,7 +155,7 @@ impl<T> RequestLease<T> {
     pub(crate) fn body(&self) -> Option<Bytes> {
         match &self.lock().body {
             SerializedBody::Single(body) => Some(body.clone()),
-            SerializedBody::None | SerializedBody::Legs(..) => None,
+            SerializedBody::None | SerializedBody::Sides(..) => None,
         }
     }
 
@@ -347,12 +347,12 @@ mod tests {
     }
 
     #[test]
-    fn legs_serialize_from_one_view_and_release_together() {
+    fn sides_serialize_from_one_view_and_release_together() {
         let (lease, probe) = lease(ReleasePoint::AfterDispatch);
         let (prefill, decode) = lease
-            .serialize_legs_with(|_| Ok::<_, Infallible>((b"pp".to_vec(), b"dddd".to_vec())))
+            .serialize_sides_with(|_| Ok::<_, Infallible>((b"pp".to_vec(), b"dddd".to_vec())))
             .unwrap();
-        assert_eq!(lease.body(), None, "legs are not a single-body memo");
+        assert_eq!(lease.body(), None, "sides are not a single-body memo");
 
         lease.release_dispatch();
 

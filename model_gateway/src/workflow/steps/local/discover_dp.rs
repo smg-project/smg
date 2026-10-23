@@ -29,9 +29,8 @@ pub async fn get_dp_info(
 ) -> Result<DpInfo, String> {
     let info = get_server_info(client, url, api_key).await?;
 
-    let dp_size = info
-        .dp_size
-        .ok_or_else(|| format!("No dp_size in response from {url}"))?;
+    let dp_size = routing_dp_size(info.dp_size, info.attn_dp_size)
+        .map_err(|error| format!("Invalid DP metadata from {url}: {error}"))?;
 
     let model_id = info
         .model_id
@@ -46,19 +45,37 @@ pub async fn get_dp_info(
     Ok(DpInfo { dp_size, model_id })
 }
 
-/// Build DP info from gRPC-discovered metadata labels (`dp_size` is reported
-/// via GetServerInfo and normalized into the label set by metadata discovery).
+/// Build DP info from gRPC-discovered metadata labels, normalized by metadata discovery.
 pub fn dp_info_from_labels(labels: &HashMap<String, String>) -> Result<DpInfo, String> {
-    let dp_size = labels
-        .get("dp_size")
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n > 0)
-        .ok_or_else(|| "no positive dp_size in discovered metadata".to_string())?;
+    let width = |name: &str| {
+        labels
+            .get(name)
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid {name} in discovered metadata: {value}"))
+            })
+            .transpose()
+    };
+    let dp_size = routing_dp_size(width("dp_size")?, width("attn_dp_size")?)?;
 
     Ok(DpInfo {
         dp_size,
         model_id: model_id_from_labels(labels),
     })
+}
+
+fn routing_dp_size(dp_size: Option<usize>, attn_dp_size: Option<usize>) -> Result<usize, String> {
+    if dp_size.is_none() && attn_dp_size.is_none() {
+        return Err("no DP size in discovered metadata".to_string());
+    }
+    // Newer SGLang separates model replicas from attention-DP groups; older
+    // servers report their routing width in dp_size alone.
+    dp_size
+        .unwrap_or(1)
+        .checked_mul(attn_dp_size.unwrap_or(1))
+        .filter(|&width| width > 0)
+        .ok_or_else(|| "DP sizes must be positive and their product must fit usize".to_string())
 }
 
 /// Best-effort model identity from discovered metadata labels.
@@ -191,10 +208,18 @@ mod tests {
 
     #[test]
     fn dp_info_from_labels_reads_dp_size_and_model() {
-        let info =
-            dp_info_from_labels(&labels(&[("dp_size", "4"), ("served_model_name", "m")])).unwrap();
-        assert_eq!(info.dp_size, 4);
-        assert_eq!(info.model_id, "m");
+        for widths in [
+            vec![("dp_size", "4")],
+            vec![("dp_size", "1"), ("attn_dp_size", "4")],
+            vec![("attn_dp_size", "4")],
+            vec![("dp_size", "2"), ("attn_dp_size", "2")],
+        ] {
+            let mut metadata = labels(&widths);
+            metadata.insert("served_model_name".to_string(), "m".to_string());
+            let info = dp_info_from_labels(&metadata).unwrap();
+            assert_eq!(info.dp_size, 4);
+            assert_eq!(info.model_id, "m");
+        }
     }
 
     #[test]
@@ -235,5 +260,11 @@ mod tests {
         assert!(dp_info_from_labels(&labels(&[])).is_err());
         assert!(dp_info_from_labels(&labels(&[("dp_size", "0")])).is_err());
         assert!(dp_info_from_labels(&labels(&[("dp_size", "abc")])).is_err());
+        assert!(dp_info_from_labels(&labels(&[("dp_size", "1"), ("attn_dp_size", "0")])).is_err());
+        assert!(
+            dp_info_from_labels(&labels(&[("dp_size", "1"), ("attn_dp_size", "abc")])).is_err()
+        );
+        let overflow = labels(&[("dp_size", &usize::MAX.to_string()), ("attn_dp_size", "2")]);
+        assert!(dp_info_from_labels(&overflow).is_err());
     }
 }

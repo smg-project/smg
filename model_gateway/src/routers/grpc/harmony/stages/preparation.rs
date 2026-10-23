@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::{
     chat::ChatCompletionRequest,
-    common::{ResponseFormat, Tool, ToolChoice, ToolChoiceValue},
+    common::{ResponseFormat, Tool, ToolChoice},
     responses::ResponsesRequest,
 };
 use serde_json::json;
@@ -97,10 +97,15 @@ impl HarmonyPreparationStage {
         // Step 1: Filter tools if needed
         let mut body_ref = utils::filter_chat_request_by_tool_choice(request);
 
-        // Step 2: Build structural tag constraint
-        let tool_constraint = if let Some(tools) = body_ref.tools.as_ref() {
-            Self::generate_tool_call_constraint(tools, body_ref.tool_choice.as_ref())
-                .map_err(|e| *e)?
+        // Step 2: Build structural tag constraint over the tools the choice may
+        // force, wherever the request declares them (`callable_tools`; the
+        // request declares some when `declares_tools` says so).
+        let tool_constraint = if request.declares_tools() {
+            Self::generate_tool_call_constraint(
+                &request.callable_tools(),
+                body_ref.tool_choice.as_ref(),
+            )
+            .map_err(|e| *e)?
         } else {
             None
         };
@@ -307,29 +312,15 @@ impl HarmonyPreparationStage {
         tools: &[Tool],
         tool_choice: Option<&ToolChoice>,
     ) -> Result<Option<(String, String)>, Box<Response>> {
-        let Some(choice) = tool_choice else {
+        let Some(choice) = tool_choice.filter(|choice| choice.forces_call()) else {
             return Ok(None);
         };
-
-        match choice {
-            ToolChoice::Function { function, .. } => {
-                let tag = Self::build_tool_call_structural_tag(tools, Some(&function.name))?;
-                Ok(Some(("structural_tag".to_string(), tag)))
-            }
-            ToolChoice::Value(ToolChoiceValue::Required) => {
-                let tag = Self::build_tool_call_structural_tag(tools, None)?;
-                Ok(Some(("structural_tag".to_string(), tag)))
-            }
-            ToolChoice::AllowedTools { mode, .. } => {
-                if mode == "required" {
-                    let tag = Self::build_tool_call_structural_tag(tools, None)?;
-                    Ok(Some(("structural_tag".to_string(), tag)))
-                } else {
-                    Ok(None)
-                }
-            }
-            ToolChoice::Value(_) => Ok(None),
-        }
+        let function = match choice {
+            ToolChoice::Function { function, .. } => Some(function.name.as_str()),
+            _ => None,
+        };
+        let tag = Self::build_tool_call_structural_tag(tools, function)?;
+        Ok(Some(("structural_tag".to_string(), tag)))
     }
 
     /// Build Harmony structural tag for tool calling constraints

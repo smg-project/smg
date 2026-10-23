@@ -15,6 +15,7 @@ use std::time::Instant;
 
 use llm_multimodal::{
     jpeg_turbo,
+    types::Modality,
     vision::{
         preprocessor_config::PreProcessorConfig, processors::Qwen3VLProcessor, VisionPreProcessor,
     },
@@ -30,12 +31,12 @@ fn bench_decode_preprocess() {
     let config =
         PreProcessorConfig::from_json(&std::fs::read_to_string(&cfg_path).expect("read config"))
             .expect("parse preprocessor config");
-    let proc = Qwen3VLProcessor::new();
+    let proc = Qwen3VLProcessor::from_config_for(&config, Modality::Image);
 
     // warmup
     let img = jpeg_turbo::decode_jpeg_rgb(&bytes).expect("turbojpeg decode");
     let _ = proc
-        .preprocess(std::slice::from_ref(&img), &config)
+        .preprocess(std::slice::from_ref(&img))
         .expect("preprocess");
 
     let n_dec = 300usize;
@@ -48,9 +49,7 @@ fn bench_decode_preprocess() {
     let n_pp = 200usize;
     let t1 = Instant::now();
     for _ in 0..n_pp {
-        let _ = proc
-            .preprocess(std::slice::from_ref(&img), &config)
-            .unwrap();
+        let _ = proc.preprocess(std::slice::from_ref(&img)).unwrap();
     }
     let pp_ms = t1.elapsed().as_secs_f64() * 1000.0 / n_pp as f64;
 

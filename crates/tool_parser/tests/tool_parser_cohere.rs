@@ -203,6 +203,7 @@ async fn test_cohere_streaming_basic() {
             description: Some("Get weather".to_string()),
             parameters: json!({}),
             strict: None,
+            extra: Default::default(),
         },
     }];
 

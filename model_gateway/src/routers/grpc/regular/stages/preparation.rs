@@ -1,19 +1,23 @@
 //! Preparation stage for the chat + generate pipeline
 //!
 //! Dispatches to ChatPreparationStage or GeneratePreparationStage based on
-//! request type.
+//! request type, through their inherent futures: the stage call boxes once
+//! (this stage's `async_trait` future), not once more for the inner stage.
 
 use async_trait::async_trait;
 use axum::response::Response;
 use tracing::error;
 
 use super::{chat::ChatPreparationStage, generate::GeneratePreparationStage};
-use crate::routers::{
-    error as grpc_error,
-    grpc::{
-        common::stages::PipelineStage,
-        context::{RequestContext, RequestType},
+use crate::{
+    routers::{
+        error as grpc_error,
+        grpc::{
+            common::stages::PipelineStage,
+            context::{RequestContext, RequestType},
+        },
     },
+    worker::RoutingPool,
 };
 
 /// Preparation stage for chat + generate pipelines
@@ -23,17 +27,13 @@ pub(crate) struct ChatGeneratePreparationStage {
 }
 
 impl ChatGeneratePreparationStage {
-    pub fn new() -> Self {
+    /// `wire_pools`: the pools the pipeline's mode selects from, for the
+    /// multimodal wire dtype.
+    pub fn new(wire_pools: &'static [RoutingPool]) -> Self {
         Self {
-            chat_stage: ChatPreparationStage,
+            chat_stage: ChatPreparationStage::new(wire_pools),
             generate_stage: GeneratePreparationStage,
         }
-    }
-}
-
-impl Default for ChatGeneratePreparationStage {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -41,8 +41,8 @@ impl Default for ChatGeneratePreparationStage {
 impl PipelineStage for ChatGeneratePreparationStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         match &ctx.input.request_type {
-            RequestType::Chat(_) => self.chat_stage.execute(ctx).await,
-            RequestType::Generate(_) => self.generate_stage.execute(ctx).await,
+            RequestType::Chat(_) => self.chat_stage.prepare(ctx).await,
+            RequestType::Generate(_) => self.generate_stage.prepare(ctx).await,
             request_type => {
                 error!(
                     function = "ChatGeneratePreparationStage::execute",

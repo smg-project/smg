@@ -11,13 +11,41 @@ use std::{
 };
 
 use openai_protocol::worker::HttpPoolConfig;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::config::RouterConfig;
 
 /// Default pool settings for worker-directed HTTP clients.
 const DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 500;
-const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+/// The connect timeout every gateway HTTP client starts from (the worker
+/// clients and the shared external-provider client), clamped below the
+/// request timeout by [`connect_timeout_secs_below`].
+pub(crate) const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+/// The connect timeout a client may use under `request_timeout_secs`: the
+/// requested `connect_timeout_secs`, clamped to one second below the request
+/// timeout. A total timeout that runs out while the connect is still pending
+/// reads as the request's own (`retry::is_request_timeout`: terminal for the
+/// retry layer), so a host that has gone dark must fail as a connect timeout
+/// first, which the retry layer routes around; with the defaults (10 s
+/// against 1800 s) nothing changes. Whole seconds cannot go below one: a
+/// request timeout of 1 s (or 0) keeps a 1 s connect timeout, and the two
+/// timers race there. Every client the gateway builds with a request timeout
+/// takes its connect timeout from here (the worker clients through
+/// [`WorkerHttpClientCache`], the shared client for external providers in
+/// `AppContext::with_client`), so the two cannot drift.
+pub(crate) const fn connect_timeout_secs_below(
+    connect_timeout_secs: u64,
+    request_timeout_secs: u64,
+) -> u64 {
+    let below = request_timeout_secs.saturating_sub(1);
+    let floor = if below < 1 { 1 } else { below };
+    if connect_timeout_secs < floor {
+        connect_timeout_secs
+    } else {
+        floor
+    }
+}
 
 /// HTTP/2 tuning for `--upstream-http2`, applied to every worker client under
 /// the flag; only the prior-knowledge bucket forces h2 on cleartext.
@@ -44,6 +72,10 @@ fn tune_http2(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
 /// process-constant, so they apply to every entry instead of keying it.
 #[derive(Debug, PartialEq, Eq, Hash)]
 struct ClientKey {
+    /// Below `timeout_secs` where whole seconds allow it
+    /// ([`connect_timeout_secs_below`]): the connect phase times out as a
+    /// connect failure, not as the request's own timeout, except under a 1 s
+    /// request timeout, where the two timers race.
     connect_timeout_secs: u64,
     pool_max_idle_per_host: usize,
     /// `0` keeps idle connections indefinitely.
@@ -100,19 +132,24 @@ impl WorkerHttpClientCache {
     }
 
     fn key(&self, pool_config: &HttpPoolConfig, http2: bool) -> ClientKey {
-        ClientKey {
-            connect_timeout_secs: pool_config
+        let timeout_secs = pool_config
+            .timeout_secs
+            .unwrap_or(self.request_timeout_secs);
+        let connect_timeout_secs = connect_timeout_secs_below(
+            pool_config
                 .connect_timeout_secs
                 .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+            timeout_secs,
+        );
+        ClientKey {
+            connect_timeout_secs,
             pool_max_idle_per_host: pool_config
                 .pool_max_idle_per_host
                 .unwrap_or(DEFAULT_POOL_MAX_IDLE_PER_HOST),
             pool_idle_timeout_secs: pool_config
                 .pool_idle_timeout_secs
                 .unwrap_or(self.pool_idle_timeout_secs),
-            timeout_secs: pool_config
-                .timeout_secs
-                .unwrap_or(self.request_timeout_secs),
+            timeout_secs,
             http2,
         }
     }
@@ -136,40 +173,175 @@ impl WorkerHttpClientCache {
             0 => None,
             secs => Some(Duration::from_secs(secs)),
         };
-        let mut builder = reqwest::Client::builder()
-            .pool_max_idle_per_host(key.pool_max_idle_per_host)
-            .pool_idle_timeout(pool_idle_timeout)
-            .timeout(Duration::from_secs(key.timeout_secs))
-            .connect_timeout(Duration::from_secs(key.connect_timeout_secs))
-            .tcp_nodelay(true)
-            .tcp_keepalive(Some(Duration::from_secs(30)));
+        let identity = self
+            .client_identity
+            .as_deref()
+            .map(reqwest::Identity::from_pem)
+            .transpose()
+            .map_err(|e| format!("Failed to create client identity: {e}"))?;
+        let ca_certificates = self
+            .ca_certificates
+            .iter()
+            .map(|pem| reqwest::Certificate::from_pem(pem))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Failed to add CA certificate: {e}"))?;
 
-        if self.upstream_http2 {
-            builder = tune_http2(builder);
-        }
-        if key.http2 {
-            builder = builder.http2_prior_knowledge();
-        }
+        let make_builder = || {
+            let mut builder = crate::clients::http_client_builder()
+                .pool_max_idle_per_host(key.pool_max_idle_per_host)
+                .pool_idle_timeout(pool_idle_timeout)
+                .timeout(Duration::from_secs(key.timeout_secs))
+                .connect_timeout(Duration::from_secs(key.connect_timeout_secs))
+                .tcp_nodelay(true)
+                .tcp_keepalive(Some(Duration::from_secs(30)));
 
-        if has_tls {
-            builder = builder.use_rustls_tls();
-        }
+            if self.upstream_http2 {
+                builder = tune_http2(builder);
+            }
+            if key.http2 {
+                builder = builder.http2_prior_knowledge();
+            }
 
-        if let Some(identity_pem) = &self.client_identity {
-            let identity = reqwest::Identity::from_pem(identity_pem)
-                .map_err(|e| format!("Failed to create client identity: {e}"))?;
-            builder = builder.identity(identity);
-        }
+            if has_tls {
+                builder = builder.use_rustls_tls();
+            }
+            if let Some(identity) = &identity {
+                builder = builder.identity(identity.clone());
+            }
+            for cert in &ca_certificates {
+                builder = builder.add_root_certificate(cert.clone());
+            }
+            builder
+        };
+        build_client(make_builder, has_tls, "worker HTTP client")
+    }
+}
 
-        for ca_cert in &self.ca_certificates {
-            let cert = reqwest::Certificate::from_pem(ca_cert)
-                .map_err(|e| format!("Failed to add CA certificate: {e}"))?;
-            builder = builder.add_root_certificate(cert);
-        }
+/// Build a `reqwest` client, tolerating a host without a native CA root store
+/// when the gateway has no TLS configuration of its own.
+///
+/// `reqwest`'s rustls backend loads the platform's root certificates while the
+/// client is built and refuses to build when it finds none (a minimal
+/// container image without the `ca-certificates` package, for example). A
+/// gateway whose workers are plaintext does not need them: with no client
+/// identity or CA bundle configured, the client is rebuilt without the
+/// platform store (HTTPS upstreams then fail at the handshake with an unknown
+/// issuer, which the warning explains) instead of refusing to start. With TLS
+/// configured the error is returned with its full cause chain, which
+/// `reqwest`'s top-level message ("builder error") omits.
+pub(crate) fn build_client(
+    make_builder: impl Fn() -> reqwest::ClientBuilder,
+    tls_configured: bool,
+    purpose: &str,
+) -> Result<reqwest::Client, String> {
+    build_with(
+        make_builder,
+        tls_configured,
+        purpose,
+        reqwest::ClientBuilder::build,
+    )
+}
 
-        builder
-            .build()
-            .map_err(|e| format!("Failed to create worker HTTP client: {e}"))
+/// [`build_client`] for a client that `build` finishes from the builder (a
+/// library that completes the client it fetches with), with the same
+/// tolerance of a host without a root store: `build` is tried on the
+/// builder, then, with no TLS configured, on the builder without the
+/// platform store. An error of `build`'s own (not the client's) fails the
+/// same way both times and is reported as it is.
+pub(crate) fn build_with<T, E: std::error::Error + 'static>(
+    make_builder: impl Fn() -> reqwest::ClientBuilder,
+    tls_configured: bool,
+    purpose: &str,
+    build: impl Fn(reqwest::ClientBuilder) -> Result<T, E>,
+) -> Result<T, String> {
+    let error = match build(make_builder()) {
+        Ok(client) => return Ok(client),
+        Err(error) => error,
+    };
+    if tls_configured {
+        return Err(format!("Failed to create {purpose}: {}", describe(&error)));
+    }
+    match build(make_builder().tls_certs_only(std::iter::empty())) {
+        Ok(client) => {
+            warn!(
+                "Failed to create {purpose} with the platform's root certificates ({}); no TLS \
+                 client identity or CA bundle is configured, so it runs without a root store: \
+                 plaintext upstreams work, HTTPS upstreams fail until the ca-certificates \
+                 package is installed or SSL_CERT_FILE/SSL_CERT_DIR names a PEM bundle",
+                describe(&error)
+            );
+            Ok(client)
+        }
+        Err(retry_error) => Err(format!(
+            "Failed to create {purpose}: {}",
+            describe(&retry_error)
+        )),
+    }
+}
+
+/// `reqwest::Error` displays its kind alone ("builder error"); the cause is in
+/// its source chain. Spell the chain out and, when it is the missing platform
+/// root store, say what to do about it.
+fn describe(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    if text.contains("No CA certificates were loaded") {
+        text.push_str(
+            " (no native CA root store: install the ca-certificates package or point \
+             SSL_CERT_FILE/SSL_CERT_DIR at a PEM bundle)",
+        );
+    }
+    text
+}
+
+/// Test support: run one `#[test]` of this binary in a child process whose
+/// certificate environment names no root certificate at all. This only removes
+/// native roots on platforms using the file-based verifier; Apple, Windows and
+/// Android use their system trust APIs instead and ignore these variables.
+#[cfg(test)]
+pub(crate) mod no_root_store {
+    use std::process::Command;
+
+    /// Names the case a child-body test runs; unset in the parent process,
+    /// where the child-body tests return at once.
+    pub(crate) const CASE: &str = "SMG_TEST_NO_ROOT_STORE_CASE";
+
+    /// The libtest name of `test` in `module` (a `module_path!()`, which
+    /// carries the crate name libtest leaves out).
+    pub(crate) fn test_name(module: &str, test: &str) -> String {
+        let module = module.strip_prefix("smg::").unwrap_or(module);
+        format!("{module}::{test}")
+    }
+
+    /// Run `test` in a child process with `SSL_CERT_FILE` naming an empty
+    /// bundle and `SSL_CERT_DIR` an empty directory, so the platform
+    /// verifier finds no root certificate, and assert that it passes.
+    pub(crate) fn run(test: &str, case: &str) {
+        let dir =
+            std::env::temp_dir().join(format!("smg-no-root-store-{}-{case}", std::process::id()));
+        let empty_dir = dir.join("certs");
+        std::fs::create_dir_all(&empty_dir).expect("temp dir");
+        let empty_bundle = dir.join("empty.pem");
+        std::fs::write(&empty_bundle, b"").expect("empty bundle");
+
+        let output = Command::new(std::env::current_exe().expect("test binary"))
+            .args([test, "--exact", "--test-threads=1"])
+            .env(CASE, case)
+            .env("SSL_CERT_FILE", &empty_bundle)
+            .env("SSL_CERT_DIR", &empty_dir)
+            .output()
+            .expect("run the child test");
+        assert!(
+            output.status.success(),
+            "child test {test} ({case}) failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
@@ -186,6 +358,91 @@ mod tests {
             upstream_http2: true,
             ..RouterConfig::default()
         })
+    }
+
+    /// A throwaway self-signed certificate with its key, as a client identity.
+    fn self_signed_identity_pem() -> Vec<u8> {
+        use openssl::{
+            asn1::Asn1Time,
+            hash::MessageDigest,
+            pkey::PKey,
+            rsa::Rsa,
+            x509::{X509NameBuilder, X509},
+        };
+
+        let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+        let mut name = X509NameBuilder::new().unwrap();
+        name.append_entry_by_text("CN", "test-client").unwrap();
+        let name = name.build();
+        let mut builder = X509::builder().unwrap();
+        builder.set_version(2).unwrap();
+        builder.set_subject_name(&name).unwrap();
+        builder.set_issuer_name(&name).unwrap();
+        builder.set_pubkey(&key).unwrap();
+        builder
+            .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        builder
+            .set_not_after(&Asn1Time::days_from_now(1).unwrap())
+            .unwrap();
+        builder.sign(&key, MessageDigest::sha256()).unwrap();
+        let mut pem = builder.build().to_pem().unwrap();
+        pem.extend(key.private_key_to_pem_pkcs8().unwrap());
+        pem
+    }
+
+    /// Child-process body of the two root-store tests below (see
+    /// `no_root_store`); a no-op unless the case variable is set.
+    #[test]
+    fn child_builds_without_native_roots() {
+        let Ok(case) = std::env::var(no_root_store::CASE) else {
+            return;
+        };
+        match case.as_str() {
+            "plaintext" => {
+                cache(RouterConfig::default())
+                    .get(&HttpPoolConfig::default(), false)
+                    .expect("a plaintext worker client needs no root store");
+            }
+            "tls" => {
+                let error = cache(RouterConfig {
+                    client_identity: Some(self_signed_identity_pem()),
+                    ..RouterConfig::default()
+                })
+                .get(&HttpPoolConfig::default(), false)
+                .expect_err("a client identity needs a root store");
+                assert!(
+                    error.contains("No CA certificates were loaded"),
+                    "cause missing: {error}"
+                );
+                assert!(error.contains("SSL_CERT_FILE"), "hint missing: {error}");
+            }
+            other => panic!("unknown case {other}"),
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        any(target_vendor = "apple", windows, target_os = "android"),
+        ignore = "the native verifier does not use SSL_CERT_FILE/SSL_CERT_DIR"
+    )]
+    fn plaintext_worker_clients_build_without_a_native_root_store() {
+        no_root_store::run(
+            &no_root_store::test_name(module_path!(), "child_builds_without_native_roots"),
+            "plaintext",
+        );
+    }
+
+    #[test]
+    #[cfg_attr(
+        any(target_vendor = "apple", windows, target_os = "android"),
+        ignore = "the native verifier does not use SSL_CERT_FILE/SSL_CERT_DIR"
+    )]
+    fn a_missing_root_store_is_named_when_tls_is_configured() {
+        no_root_store::run(
+            &no_root_store::test_name(module_path!(), "child_builds_without_native_roots"),
+            "tls",
+        );
     }
 
     /// Loopback echo server; axum::serve accepts HTTP/1.1 and prior-knowledge
@@ -212,6 +469,84 @@ mod tests {
             axum::serve(listener, app).await.expect("echo serve");
         });
         format!("http://{addr}/probe")
+    }
+
+    /// The connect timeout never reaches the request timeout where whole
+    /// seconds allow it: a request timeout of 2 s clamps the default 10 s
+    /// connect timeout to 1 s, a worker's own 30 s request timeout leaves it
+    /// at 10 s, and an explicit connect timeout above the request timeout is
+    /// clamped the same way, so a host that has gone dark fails as a connect
+    /// timeout (routed around) before the request's own timeout (terminal)
+    /// can fire; a 1 s request timeout keeps the 1 s floor (the two timers
+    /// race there), as the helper's doc says.
+    #[test]
+    fn connect_timeout_stays_below_the_request_timeout() {
+        assert_eq!(connect_timeout_secs_below(10, 1800), 10);
+        assert_eq!(connect_timeout_secs_below(10, 2), 1);
+        assert_eq!(connect_timeout_secs_below(3, 2), 1);
+        assert_eq!(connect_timeout_secs_below(10, 1), 1, "the floor");
+        assert_eq!(connect_timeout_secs_below(10, 0), 1, "the floor");
+        assert_eq!(connect_timeout_secs_below(10, 11), 10);
+        assert_eq!(connect_timeout_secs_below(10, 10), 9);
+        let floor = cache(RouterConfig {
+            request_timeout_secs: 1,
+            ..RouterConfig::default()
+        });
+        assert_eq!(
+            floor
+                .key(
+                    &HttpPoolConfig {
+                        timeout_secs: Some(1),
+                        ..Default::default()
+                    },
+                    false
+                )
+                .connect_timeout_secs,
+            1
+        );
+        let short = cache(RouterConfig {
+            request_timeout_secs: 2,
+            ..RouterConfig::default()
+        });
+        assert_eq!(
+            short
+                .key(&HttpPoolConfig::default(), false)
+                .connect_timeout_secs,
+            1
+        );
+        assert_eq!(
+            short
+                .key(
+                    &HttpPoolConfig {
+                        timeout_secs: Some(30),
+                        ..Default::default()
+                    },
+                    false
+                )
+                .connect_timeout_secs,
+            DEFAULT_CONNECT_TIMEOUT_SECS
+        );
+        assert_eq!(
+            short
+                .key(
+                    &HttpPoolConfig {
+                        connect_timeout_secs: Some(3),
+                        ..Default::default()
+                    },
+                    false
+                )
+                .connect_timeout_secs,
+            1
+        );
+        let long = cache(RouterConfig {
+            request_timeout_secs: 1800,
+            ..RouterConfig::default()
+        });
+        let key = long.key(&HttpPoolConfig::default(), false);
+        assert_eq!(
+            (key.connect_timeout_secs, key.timeout_secs),
+            (DEFAULT_CONNECT_TIMEOUT_SECS, 1800)
+        );
     }
 
     #[test]

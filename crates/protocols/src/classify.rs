@@ -1,7 +1,7 @@
 //! Classify API protocol definitions.
 //!
 //! This module defines the request and response types for the `/v1/classify` API,
-//! which is compatible with vLLM's classification endpoint.
+//! which is compatible with the serving engine's classification endpoint.
 //!
 //! Classification reuses the embedding backend - the scheduler returns logits as
 //! "embeddings", and the classify layer applies softmax + label mapping.
@@ -15,7 +15,7 @@ use super::common::{GenerationRequest, UsageInfo};
 // Classify API
 // ============================================================================
 
-/// Classification request - compatible with vLLM's /v1/classify API
+/// Classification request - compatible with the serving engine's /v1/classify API
 #[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
 pub struct ClassifyRequest {
@@ -31,10 +31,10 @@ pub struct ClassifyRequest {
     /// Optional user identifier
     pub user: Option<String>,
 
-    /// SGLang extension: request id for tracking
+    /// Engine extension: request id for tracking
     pub rid: Option<String>,
 
-    /// SGLang extension: request priority
+    /// Engine extension: request priority
     pub priority: Option<i32>,
 }
 

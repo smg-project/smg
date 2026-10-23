@@ -138,6 +138,7 @@ fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
         Tool {
@@ -153,6 +154,7 @@ fn create_test_tools() -> Vec<Tool> {
                     }
                 }),
                 strict: None,
+                extra: Default::default(),
             },
         },
     ]

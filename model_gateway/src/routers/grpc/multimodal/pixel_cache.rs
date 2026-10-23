@@ -11,6 +11,8 @@ use llm_multimodal::{ModelSpecificValue, PreprocessedEncoderInputs};
 use lru::LruCache;
 use parking_lot::Mutex;
 
+use crate::observability::metrics::Metrics;
+
 /// Identifies a preprocessed image output. Hashing raw image bytes alone is not
 /// enough because the same bytes preprocess differently under another model config.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
@@ -82,6 +84,9 @@ pub(crate) struct PixelCache {
 
 impl PixelCache {
     pub(crate) fn new(max_bytes: usize) -> Self {
+        // The cache's occupancy and evictions are on the first scrape, at
+        // zero, rather than appearing with the first image.
+        Metrics::init_mm_pixel_cache_series();
         Self {
             inner: Mutex::new(PixelCacheInner {
                 map: LruCache::unbounded(),
@@ -111,15 +116,20 @@ impl PixelCache {
             *cur_bytes = cur_bytes.saturating_sub(previous.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD);
         }
         *cur_bytes += entry_bytes;
+        let mut evicted_entries = 0;
         while *cur_bytes > *max_bytes {
             match map.pop_lru() {
                 Some((_, evicted)) => {
                     *cur_bytes =
                         cur_bytes.saturating_sub(evicted.heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD);
+                    evicted_entries += 1;
                 }
                 None => break,
             }
         }
+        let (bytes, entries) = (*cur_bytes, map.len());
+        drop(inner);
+        Metrics::record_mm_pixel_cache_insert(evicted_entries, bytes, entries);
     }
 
     #[cfg(test)]
@@ -242,6 +252,49 @@ mod tests {
         assert!(cache.get(&pixel_cache_key("b")).is_none());
         assert!(cache.get(&pixel_cache_key("c")).is_some());
         assert!(cache.current_bytes() <= budget);
+    }
+
+    /// The series a sample is on, as `(bytes, entries, evictions)`; `None`
+    /// until every one of the three families is rendered.
+    fn exported(handle: &metrics_exporter_prometheus::PrometheusHandle) -> Option<(f64, f64, f64)> {
+        let body = handle.render();
+        let sample = |family: &str| -> Option<f64> {
+            body.lines()
+                .find_map(|line| line.strip_prefix(&format!("{family} ")))
+                .and_then(|value| value.trim().parse().ok())
+        };
+        Some((
+            sample("smg_mm_pixel_cache_bytes")?,
+            sample("smg_mm_pixel_cache_entries")?,
+            sample("smg_mm_pixel_cache_evictions_total")?,
+        ))
+    }
+
+    /// What the cache holds and what it has dropped are on `/metrics`: at
+    /// zero from the moment the cache exists, then after every insert.
+    #[test]
+    fn occupancy_and_evictions_are_exported() {
+        let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let entry = (pixel_cache_item(1, 4096).heap_bytes() + PIXEL_CACHE_KEY_OVERHEAD) as f64;
+            let cache = PixelCache::new(entry as usize * 2 + entry as usize / 2);
+            assert_eq!(exported(&handle), Some((0.0, 0.0, 0.0)));
+
+            cache.insert(pixel_cache_key("a"), pixel_cache_item(1, 4096));
+            cache.insert(pixel_cache_key("b"), pixel_cache_item(2, 4096));
+            assert_eq!(exported(&handle), Some((entry * 2.0, 2.0, 0.0)));
+
+            // The third entry pushes the first one out.
+            cache.insert(pixel_cache_key("c"), pixel_cache_item(3, 4096));
+            assert_eq!(exported(&handle), Some((entry * 2.0, 2.0, 1.0)));
+            assert!(cache.get(&pixel_cache_key("a")).is_none());
+
+            // An entry the whole budget cannot hold is bypassed, not counted
+            // as an eviction.
+            cache.insert(pixel_cache_key("huge"), pixel_cache_item(4, 1 << 20));
+            assert_eq!(exported(&handle), Some((entry * 2.0, 2.0, 1.0)));
+        });
     }
 
     #[test]

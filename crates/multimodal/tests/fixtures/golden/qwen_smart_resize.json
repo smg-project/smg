@@ -1,0 +1,637 @@
+{
+  "generator": "crates/multimodal/scripts/generate_qwen_smart_resize_golden.py",
+  "transformers": "5.17.0",
+  "minimax_m3_image_processor_sha256": "8218f98634c365608a98ea887bfebac37131ec2acdb8445188350490de7cf994",
+  "families": {
+    "qwen2_vl": {
+      "patch_size": 14,
+      "merge_size": 2,
+      "min_pixels": 3136,
+      "max_pixels": 12845056,
+      "cases": [
+        {
+          "height": 1,
+          "width": 100,
+          "resized": [
+            28,
+            560
+          ]
+        },
+        {
+          "height": 100,
+          "width": 1,
+          "resized": [
+            560,
+            28
+          ]
+        },
+        {
+          "height": 1,
+          "width": 150,
+          "resized": [
+            28,
+            700
+          ]
+        },
+        {
+          "height": 1,
+          "width": 199,
+          "resized": [
+            28,
+            812
+          ]
+        },
+        {
+          "height": 199,
+          "width": 1,
+          "resized": [
+            812,
+            28
+          ]
+        },
+        {
+          "height": 2,
+          "width": 300,
+          "resized": [
+            28,
+            700
+          ]
+        },
+        {
+          "height": 10,
+          "width": 100,
+          "resized": [
+            28,
+            196
+          ]
+        },
+        {
+          "height": 100,
+          "width": 10,
+          "resized": [
+            196,
+            28
+          ]
+        },
+        {
+          "height": 10,
+          "width": 1900,
+          "resized": [
+            28,
+            784
+          ]
+        },
+        {
+          "height": 12,
+          "width": 2400,
+          "resized": [
+            28,
+            812
+          ]
+        },
+        {
+          "height": 15,
+          "width": 2050,
+          "resized": [
+            28,
+            2044
+          ]
+        },
+        {
+          "height": 16,
+          "width": 2048,
+          "resized": [
+            28,
+            2044
+          ]
+        },
+        {
+          "height": 6000,
+          "width": 31,
+          "resized": [
+            5992,
+            28
+          ]
+        },
+        {
+          "height": 9,
+          "width": 7,
+          "resized": [
+            84,
+            56
+          ]
+        },
+        {
+          "height": 13,
+          "width": 14,
+          "resized": [
+            56,
+            84
+          ]
+        },
+        {
+          "height": 27,
+          "width": 27,
+          "resized": [
+            56,
+            56
+          ]
+        },
+        {
+          "height": 28,
+          "width": 28,
+          "resized": [
+            56,
+            56
+          ]
+        },
+        {
+          "height": 100,
+          "width": 100,
+          "resized": [
+            112,
+            112
+          ]
+        },
+        {
+          "height": 400,
+          "width": 800,
+          "resized": [
+            392,
+            812
+          ]
+        },
+        {
+          "height": 500,
+          "width": 500,
+          "resized": [
+            504,
+            504
+          ]
+        },
+        {
+          "height": 640,
+          "width": 480,
+          "resized": [
+            644,
+            476
+          ]
+        },
+        {
+          "height": 1080,
+          "width": 1920,
+          "resized": [
+            1092,
+            1932
+          ]
+        },
+        {
+          "height": 3000,
+          "width": 3000,
+          "resized": [
+            2996,
+            2996
+          ]
+        },
+        {
+          "height": 4000,
+          "width": 3000,
+          "resized": [
+            4004,
+            2996
+          ]
+        },
+        {
+          "height": 100,
+          "width": 30000,
+          "error": "absolute aspect ratio must be smaller than 200"
+        },
+        {
+          "height": 13,
+          "width": 3000,
+          "error": "absolute aspect ratio must be smaller than 200"
+        }
+      ]
+    },
+    "qwen3_vl": {
+      "patch_size": 16,
+      "merge_size": 2,
+      "min_pixels": 65536,
+      "max_pixels": 16777216,
+      "cases": [
+        {
+          "height": 1,
+          "width": 100,
+          "resized": [
+            32,
+            2560
+          ]
+        },
+        {
+          "height": 100,
+          "width": 1,
+          "resized": [
+            2560,
+            32
+          ]
+        },
+        {
+          "height": 1,
+          "width": 150,
+          "resized": [
+            32,
+            3136
+          ]
+        },
+        {
+          "height": 1,
+          "width": 199,
+          "resized": [
+            32,
+            3616
+          ]
+        },
+        {
+          "height": 199,
+          "width": 1,
+          "resized": [
+            3616,
+            32
+          ]
+        },
+        {
+          "height": 2,
+          "width": 300,
+          "resized": [
+            32,
+            3136
+          ]
+        },
+        {
+          "height": 10,
+          "width": 100,
+          "resized": [
+            96,
+            832
+          ]
+        },
+        {
+          "height": 100,
+          "width": 10,
+          "resized": [
+            832,
+            96
+          ]
+        },
+        {
+          "height": 10,
+          "width": 1900,
+          "resized": [
+            32,
+            3552
+          ]
+        },
+        {
+          "height": 12,
+          "width": 2400,
+          "resized": [
+            32,
+            3648
+          ]
+        },
+        {
+          "height": 15,
+          "width": 2050,
+          "resized": [
+            32,
+            3008
+          ]
+        },
+        {
+          "height": 16,
+          "width": 2048,
+          "resized": [
+            32,
+            2912
+          ]
+        },
+        {
+          "height": 6000,
+          "width": 31,
+          "resized": [
+            6016,
+            32
+          ]
+        },
+        {
+          "height": 9,
+          "width": 7,
+          "resized": [
+            320,
+            256
+          ]
+        },
+        {
+          "height": 13,
+          "width": 14,
+          "resized": [
+            256,
+            288
+          ]
+        },
+        {
+          "height": 27,
+          "width": 27,
+          "resized": [
+            256,
+            256
+          ]
+        },
+        {
+          "height": 28,
+          "width": 28,
+          "resized": [
+            256,
+            256
+          ]
+        },
+        {
+          "height": 100,
+          "width": 100,
+          "resized": [
+            256,
+            256
+          ]
+        },
+        {
+          "height": 400,
+          "width": 800,
+          "resized": [
+            384,
+            800
+          ]
+        },
+        {
+          "height": 500,
+          "width": 500,
+          "resized": [
+            512,
+            512
+          ]
+        },
+        {
+          "height": 640,
+          "width": 480,
+          "resized": [
+            640,
+            480
+          ]
+        },
+        {
+          "height": 1080,
+          "width": 1920,
+          "resized": [
+            1088,
+            1920
+          ]
+        },
+        {
+          "height": 3000,
+          "width": 3000,
+          "resized": [
+            3008,
+            3008
+          ]
+        },
+        {
+          "height": 4000,
+          "width": 3000,
+          "resized": [
+            4000,
+            3008
+          ]
+        },
+        {
+          "height": 100,
+          "width": 30000,
+          "error": "absolute aspect ratio must be smaller than 200"
+        },
+        {
+          "height": 13,
+          "width": 3000,
+          "error": "absolute aspect ratio must be smaller than 200"
+        }
+      ]
+    },
+    "minimax_m3": {
+      "patch_size": 14,
+      "merge_size": 2,
+      "min_pixels": 3136,
+      "max_pixels": 451584,
+      "cases": [
+        {
+          "height": 1,
+          "width": 100,
+          "resized": [
+            28,
+            112
+          ]
+        },
+        {
+          "height": 100,
+          "width": 1,
+          "resized": [
+            112,
+            28
+          ]
+        },
+        {
+          "height": 1,
+          "width": 150,
+          "resized": [
+            28,
+            140
+          ]
+        },
+        {
+          "height": 1,
+          "width": 199,
+          "resized": [
+            28,
+            196
+          ]
+        },
+        {
+          "height": 199,
+          "width": 1,
+          "resized": [
+            196,
+            28
+          ]
+        },
+        {
+          "height": 2,
+          "width": 300,
+          "resized": [
+            28,
+            308
+          ]
+        },
+        {
+          "height": 10,
+          "width": 100,
+          "resized": [
+            28,
+            112
+          ]
+        },
+        {
+          "height": 100,
+          "width": 10,
+          "resized": [
+            112,
+            28
+          ]
+        },
+        {
+          "height": 10,
+          "width": 1900,
+          "resized": [
+            28,
+            1904
+          ]
+        },
+        {
+          "height": 12,
+          "width": 2400,
+          "resized": [
+            28,
+            2408
+          ]
+        },
+        {
+          "height": 15,
+          "width": 2050,
+          "resized": [
+            28,
+            2044
+          ]
+        },
+        {
+          "height": 16,
+          "width": 2048,
+          "resized": [
+            28,
+            2044
+          ]
+        },
+        {
+          "height": 6000,
+          "width": 31,
+          "resized": [
+            5992,
+            28
+          ]
+        },
+        {
+          "height": 9,
+          "width": 7,
+          "resized": [
+            84,
+            56
+          ]
+        },
+        {
+          "height": 13,
+          "width": 14,
+          "resized": [
+            56,
+            84
+          ]
+        },
+        {
+          "height": 27,
+          "width": 27,
+          "resized": [
+            56,
+            56
+          ]
+        },
+        {
+          "height": 28,
+          "width": 28,
+          "resized": [
+            56,
+            56
+          ]
+        },
+        {
+          "height": 100,
+          "width": 100,
+          "resized": [
+            112,
+            112
+          ]
+        },
+        {
+          "height": 400,
+          "width": 800,
+          "resized": [
+            392,
+            812
+          ]
+        },
+        {
+          "height": 500,
+          "width": 500,
+          "resized": [
+            504,
+            504
+          ]
+        },
+        {
+          "height": 640,
+          "width": 480,
+          "resized": [
+            644,
+            476
+          ]
+        },
+        {
+          "height": 1080,
+          "width": 1920,
+          "resized": [
+            504,
+            896
+          ]
+        },
+        {
+          "height": 3000,
+          "width": 3000,
+          "resized": [
+            672,
+            672
+          ]
+        },
+        {
+          "height": 4000,
+          "width": 3000,
+          "resized": [
+            756,
+            560
+          ]
+        },
+        {
+          "height": 100,
+          "width": 30000,
+          "error": "absolute aspect ratio must be smaller than 200"
+        },
+        {
+          "height": 13,
+          "width": 3000,
+          "error": "absolute aspect ratio must be smaller than 200"
+        }
+      ]
+    }
+  }
+}

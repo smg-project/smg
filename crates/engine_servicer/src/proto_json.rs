@@ -51,3 +51,10 @@ pub(crate) fn number(value: i32) -> Value {
         kind: Some(Kind::NumberValue(f64::from(value))),
     }
 }
+
+/// A boolean as a proto `Value`.
+pub(crate) fn boolean(value: bool) -> Value {
+    Value {
+        kind: Some(Kind::BoolValue(value)),
+    }
+}

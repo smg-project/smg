@@ -1,10 +1,12 @@
 //! vLLM PD KV-transfer connector handling, shared by both transports.
 //!
-//! The prefill leg is tagged with connector params, the engine returns (or
-//! the router mints) the handoff params, and the decode leg carries them;
-//! only a MoRI-IO WRITE decode leg can also go out first, with params minted
+//! The prefill side is tagged with connector params, the engine returns (or
+//! the router mints) the handoff params, and the decode side carries them;
+//! only a MoRI-IO WRITE decode side can also go out first, with params minted
 //! up front. The gRPC pipeline and the HTTP PD router both implement that
 //! flow; the connector vocabulary lives here so the two stay in lockstep.
+
+use std::borrow::Cow;
 
 use serde_json::{value::RawValue, Value};
 use tracing::warn;
@@ -12,12 +14,13 @@ use tracing::warn;
 use crate::{
     observability::metrics::metrics_labels,
     worker::{
+        pd_pairing::{connector_profile, KvTransferProfile},
         Worker, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, MORIIO_CONNECTOR, MORIIO_MODE_LABEL,
         NIXL_CONNECTOR,
     },
 };
 
-/// KV-transfer params tagged onto the NIXL prefill leg so the engine pins its
+/// KV-transfer params tagged onto the NIXL prefill side so the engine pins its
 /// KV blocks and returns the handoff params for the decode worker.
 pub(crate) const NIXL_PREFILL_KV_PARAMS: &str =
     r#"{"do_remote_decode":true,"do_remote_prefill":false}"#;
@@ -25,7 +28,7 @@ pub(crate) const NIXL_PREFILL_KV_PARAMS: &str =
 /// PD KV-transfer behavior derived from prefill worker metadata.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum KvConnectorMode {
-    /// MooncakeConnector: mint a transfer_id, tag both legs, synthesize decode
+    /// MooncakeConnector: mint a transfer_id, tag both sides, synthesize decode
     /// params from worker metadata; legacy host/port injection when the
     /// servicer predates kv_engine_id reporting (or DP runs without a pinned rank).
     Mooncake {
@@ -40,6 +43,13 @@ pub(crate) enum KvConnectorMode {
     /// or, dispatched concurrently, tag decode with the prefill peer (see
     /// [`moriio_decode_params`]).
     MoriIo,
+    /// A connector whose sides meet in a store the deployment shares (the
+    /// Mooncake store, the shared-storage, FlexKV and 3FS connectors; see
+    /// [`KvTransferProfile::Store`]): the decode engine reads the prefill's
+    /// blocks back by prefix hash, so the gateway mints nothing: neither side
+    /// is tagged; params the engine does return are relayed, for a store
+    /// that runs a handoff of its own.
+    Store,
     /// Unknown/absent connector: relay returned params opportunistically.
     Passthrough,
 }
@@ -50,6 +60,7 @@ impl KvConnectorMode {
             Self::Mooncake { .. } => metrics_labels::KV_CONNECTOR_MOONCAKE,
             Self::Nixl => metrics_labels::KV_CONNECTOR_NIXL,
             Self::MoriIo => metrics_labels::KV_CONNECTOR_MORIIO,
+            Self::Store => metrics_labels::KV_CONNECTOR_STORE,
             Self::Passthrough => metrics_labels::KV_CONNECTOR_PASSTHROUGH,
         }
     }
@@ -70,6 +81,9 @@ pub(crate) fn kv_connector_mode(
         },
         Some(NIXL_CONNECTOR) => KvConnectorMode::Nixl,
         Some(MORIIO_CONNECTOR) => KvConnectorMode::MoriIo,
+        Some(connector) if connector_profile(connector) == KvTransferProfile::Store => {
+            KvConnectorMode::Store
+        }
         _ => KvConnectorMode::Passthrough,
     }
 }
@@ -80,7 +94,7 @@ pub(crate) fn kv_connector_mode(
 pub(crate) const MORIIO_HOST_LABEL: &str = "moriio_host";
 pub(crate) const MORIIO_HANDSHAKE_PORT_LABEL: &str = "moriio_handshake_port";
 pub(crate) const MORIIO_NOTIFY_PORT_LABEL: &str = "moriio_notify_port";
-/// How the two WRITE legs are sent: `sequential` (default) or `concurrent`.
+/// How the two WRITE sides are sent: `sequential` (default) or `concurrent`.
 /// Honoured on the decode worker; an invalid value on either worker refuses
 /// the pair.
 pub(crate) const MORIIO_WRITE_DISPATCH_LABEL: &str = "moriio_write_dispatch";
@@ -100,10 +114,10 @@ pub(crate) fn carries_moriio_peer_markers(request_id: &str) -> bool {
         .any(|marker| request_id.contains(marker))
 }
 
-/// MoRI-IO transfer direction; both legs of a pair must run the same one.
+/// MoRI-IO transfer direction; both sides of a pair must run the same one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MoriIoTransfer {
-    /// The decode engine pulls KV after the prefill leg returns.
+    /// The decode engine pulls KV after the prefill side returns.
     Read,
     /// The prefill engine pushes KV into blocks the decode engine allocates.
     Write,
@@ -121,7 +135,7 @@ pub(crate) struct MoriIoEndpoint {
     pub(crate) tp_size: Option<usize>,
     /// From the worker's `dp_size` or the `dp_size` label, 1 when unset.
     pub(crate) dp_size: usize,
-    /// Send the WRITE legs at once. Opt-in: a decode request aborted before
+    /// Send the WRITE sides at once. Opt-in: a decode request aborted before
     /// the prefill pushes leaves its blocks allocated in the vLLM connector.
     pub(crate) concurrent_write: bool,
 }
@@ -219,8 +233,8 @@ pub(crate) fn moriio_endpoint(worker: &dyn Worker) -> Result<MoriIoEndpoint, Str
 /// engine core.
 pub(crate) const DATA_PARALLEL_RANK_HEADER: &str = "x-data-parallel-rank";
 
-/// Why one data-parallel rank cannot serve both legs. A WRITE decode engine
-/// notifies the prefill only from the rank the prefill ran on, so both legs
+/// Why one data-parallel rank cannot serve both sides. A WRITE decode engine
+/// notifies the prefill only from the rank the prefill ran on, so both sides
 /// go to the same rank, which both engines must have.
 pub(crate) fn moriio_dp_mismatch_error(
     prefill: &MoriIoEndpoint,
@@ -235,11 +249,11 @@ pub(crate) fn moriio_dp_mismatch_error(
     })
 }
 
-/// Prefill-leg params for MoRI-IO. `remote_tp_size` is the decode's TP (the
+/// Prefill-side params for MoRI-IO. `remote_tp_size` is the decode's TP (the
 /// connector reads it as the peer's), sent only when labeled; the prefill
 /// engine returns its own as `tp_size` in the handoff. `dp_rank` is the
-/// data-parallel rank both legs are pinned to. WRITE also names the decode's
-/// side channel: the producer pushes KV before the decode leg exists.
+/// data-parallel rank both sides are pinned to. WRITE also names the decode's
+/// side channel: the producer pushes KV before the decode side exists.
 pub(crate) fn moriio_prefill_params(
     transfer_id: &str,
     decode: &MoriIoEndpoint,
@@ -267,7 +281,7 @@ pub(crate) fn moriio_prefill_params(
     params.to_string()
 }
 
-/// Decode-leg params for MoRI-IO WRITE, minted up front so both legs can go
+/// Decode-side params for MoRI-IO WRITE, minted up front so both sides can go
 /// out at once: the decode engine allocates its blocks and tells the prefill
 /// engine where to push them, through the side channel of the prefill's
 /// `dp_rank`.
@@ -347,12 +361,12 @@ pub(crate) fn moriio_write_target_error(
     None
 }
 
-/// Check the prefill engine's MoRI-IO handoff before the decode leg goes
-/// out, or before a concurrent decode leg's response is forwarded. A MoRI-IO
+/// Check the prefill engine's MoRI-IO handoff before the decode side goes
+/// out, or before a concurrent decode side's response is forwarded. A MoRI-IO
 /// decode engine without it computes over KV that never arrives (READ) or
 /// waits for a push that never comes (WRITE), so a missing, foreign or
 /// malformed handoff must fail the request instead. `dp_rank` is the
-/// data-parallel rank both legs were pinned to, if any.
+/// data-parallel rank both sides were pinned to, if any.
 pub(crate) fn validate_moriio_handoff(
     handoff: &RawValue,
     transfer_id: &str,
@@ -424,7 +438,7 @@ pub(crate) fn validate_moriio_handoff(
         }
     }
     // A WRITE decode engine notifies the prefill only when it runs on the
-    // rank the handoff names, and the decode leg goes to the pinned rank.
+    // rank the handoff names, and the decode side goes to the pinned rank.
     if let Some(rank) = dp_rank {
         let named = params.get("remote_dp_rank").and_then(Value::as_u64);
         if named.and_then(|n| usize::try_from(n).ok()) != Some(rank) {
@@ -468,7 +482,7 @@ fn handoff_port(value: &Value) -> Option<u16> {
 }
 
 /// Why a valid handoff from `prefill` does not match the side channel a
-/// concurrent decode leg was sent to notify: that decode engine then waits for
+/// concurrent decode side was sent to notify: that decode engine then waits for
 /// a push that never comes. The engine reports its configured base ports,
 /// as a string or a number.
 pub(crate) fn moriio_side_channel_error(
@@ -497,7 +511,7 @@ pub(crate) fn moriio_side_channel_error(
     ))
 }
 
-/// Connector id of the engine core serving the prefill leg. With DP the cores
+/// Connector id of the engine core serving the prefill side. With DP the cores
 /// suffix the configured id as `{base}_dp{rank}`, so minting needs a pinned
 /// rank; unpinned DP>1 yields None (no mint — decode recomputes locally).
 pub(crate) fn effective_kv_engine_id(
@@ -544,7 +558,7 @@ pub(crate) fn connector_mode_for_worker(worker: &dyn Worker) -> KvConnectorMode 
     )
 }
 
-/// Prefill-leg params for Mooncake: the engine pins blocks under the minted id.
+/// Prefill-side params for Mooncake: the engine pins blocks under the minted id.
 pub(crate) fn mooncake_prefill_params(transfer_id: &str) -> String {
     serde_json::json!({
         "do_remote_decode": true,
@@ -554,7 +568,18 @@ pub(crate) fn mooncake_prefill_params(transfer_id: &str) -> String {
     .to_string()
 }
 
-/// Decode-leg params for Mooncake, synthesized from prefill worker metadata
+/// `host` as it goes into a URL authority: an IPv6 literal in brackets, so
+/// `http://{host}:{port}` parses whether the bootstrap host came bracketed
+/// out of a worker URL or bare from a label or a configured value.
+fn url_host(host: &str) -> Cow<'_, str> {
+    if host.contains(':') && !host.starts_with('[') {
+        Cow::Owned(format!("[{host}]"))
+    } else {
+        Cow::Borrowed(host)
+    }
+}
+
+/// Decode-side params for Mooncake, synthesized from prefill worker metadata
 /// (the engine returns nothing to relay; the connector is push-based).
 pub(crate) fn mooncake_decode_params(
     transfer_id: &str,
@@ -567,7 +592,7 @@ pub(crate) fn mooncake_decode_params(
         "do_remote_prefill": true,
         "transfer_id": transfer_id,
         "remote_engine_id": engine_id,
-        "remote_bootstrap_addr": format!("http://{host}:{port}"),
+        "remote_bootstrap_addr": format!("http://{}:{port}", url_host(host)),
     })
     .to_string()
 }
@@ -575,6 +600,27 @@ pub(crate) fn mooncake_decode_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The decode side's bootstrap URL must parse for every spelling the
+    /// bootstrap host arrives in: bracketed from a worker URL, bare from a
+    /// label or a configured value, IPv4, or a hostname.
+    #[test]
+    fn mooncake_decode_params_bracket_an_ipv6_bootstrap_host() {
+        for (host, expected) in [
+            ("fd00::1", "http://[fd00::1]:8998"),
+            ("[fd00::1]", "http://[fd00::1]:8998"),
+            ("::1", "http://[::1]:8998"),
+            ("10.0.0.7", "http://10.0.0.7:8998"),
+            ("prefill-host", "http://prefill-host:8998"),
+        ] {
+            let value: Value =
+                serde_json::from_str(&mooncake_decode_params("t", "e", host, 8998)).unwrap();
+            assert_eq!(value["remote_bootstrap_addr"], expected, "host {host}");
+            let addr = value["remote_bootstrap_addr"].as_str().unwrap();
+            let url = url::Url::parse(addr).unwrap_or_else(|e| panic!("host {host}: {e}"));
+            assert_eq!(url.port(), Some(8998), "host {host}");
+        }
+    }
 
     #[test]
     fn kv_connector_mode_mooncake_uses_bootstrap_metadata() {
@@ -709,7 +755,7 @@ mod tests {
             .label("moriio_mode", "read")
             .build();
         assert!(moriio_endpoint(&nixl).is_err());
-        // One worker per rank would let the two legs of a request pick
+        // One worker per rank would let the two sides of a request pick
         // different ranks.
         let per_rank = crate::worker::BasicWorkerBuilder::new("http://decode:8200")
             .worker_type(crate::worker::WorkerType::Decode)
@@ -808,7 +854,7 @@ mod tests {
                 endpoint("127.0.0.1", 6301, 62005),
                 true,
             ),
-            // A sequential decode leg reaches the prefill at the side channel
+            // A sequential decode side reaches the prefill at the side channel
             // the prefill reports in its handoff ...
             (
                 &endpoint("127.0.0.1", 6301, 61005),
@@ -886,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    fn moriio_pair_needs_one_dp_size_for_both_legs() {
+    fn moriio_pair_needs_one_dp_size_for_both_sides() {
         let endpoint = |dp_size| MoriIoEndpoint {
             transfer: MoriIoTransfer::Write,
             host: "10.0.0.1".to_string(),
@@ -1080,12 +1126,48 @@ mod tests {
         }
     }
 
+    /// A store connector takes the store mode whatever bootstrap metadata the
+    /// side carries: nothing is minted from it.
+    #[test]
+    fn kv_connector_mode_store_connectors_take_the_store_mode() {
+        for connector in [
+            "MooncakeStoreConnector",
+            "SharedStorageConnector",
+            "FlexKVConnectorV1",
+            "HF3FSKVConnector",
+        ] {
+            assert_eq!(
+                kv_connector_mode(
+                    Some(connector),
+                    "prefill-host",
+                    Some(8998),
+                    Some("engine-1")
+                ),
+                KvConnectorMode::Store,
+                "{connector}"
+            );
+        }
+        assert_eq!(KvConnectorMode::Store.metrics_label(), "store");
+    }
+
+    /// Unknown connectors, and the connectors whose blocks stay in the engine
+    /// or whose disaggregated mode the request would have to address, keep
+    /// the passthrough handling.
     #[test]
     fn kv_connector_mode_unknown_or_missing_is_passthrough() {
-        assert_eq!(
-            kv_connector_mode(Some("LMCacheConnector"), "host", None, None),
-            KvConnectorMode::Passthrough
-        );
+        for connector in [
+            "P2pNcclConnector",
+            "OffloadingConnector",
+            "SimpleCPUOffloadConnector",
+            "LMCacheConnectorV1",
+            "LMCacheMPConnector",
+        ] {
+            assert_eq!(
+                kv_connector_mode(Some(connector), "host", None, None),
+                KvConnectorMode::Passthrough,
+                "{connector}"
+            );
+        }
         assert_eq!(
             kv_connector_mode(None, "host", None, None),
             KvConnectorMode::Passthrough

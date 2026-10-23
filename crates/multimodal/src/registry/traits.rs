@@ -10,8 +10,21 @@ use crate::{
     types::{
         EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId, VideoSamplingInfo,
     },
-    vision::PreProcessorConfig,
+    vision::{PreProcessorConfig, VisionPreProcessor},
 };
+
+/// The format of the encoder inputs a spec's processors emit, which decides
+/// the engines whose models can read them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EncoderInputFormat {
+    /// The model family's reference processor outputs, which every engine
+    /// serving the family reads.
+    Reference,
+    /// Images and video frames as patch rows with per-item grids, audio as mel
+    /// frames with per-clip lengths, for an engine whose model reads them
+    /// packed rather than the reference processor's tensors.
+    Packed,
+}
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ModelRegistryError {
@@ -23,12 +36,20 @@ pub enum ModelRegistryError {
     MissingConfigField { field: String },
     #[error("invalid or missing preprocessed field '{field}'")]
     InvalidPreprocessedField { field: String },
+    #[error("config field '{field}' is present but unusable: {reason}")]
+    InvalidConfigField { field: String, reason: String },
     #[error("model spec {spec} could not encode '{text}' with the model tokenizer")]
     TextEncodingFailed { spec: &'static str, text: String },
     #[error("modality {modality} is not supported by model spec {spec}")]
     UnsupportedModality {
         spec: &'static str,
         modality: Modality,
+    },
+    #[error("the {modality} processor of model spec {spec} cannot serve its preprocessor config: {reason}")]
+    InvalidPreprocessorConfig {
+        spec: &'static str,
+        modality: Modality,
+        reason: String,
     },
     #[error("model spec {spec} supports at most {limit} {modality} inputs; got {requested}")]
     ModalityLimitExceeded {
@@ -59,12 +80,13 @@ fn env_count_override(cache: &'static OnceLock<Option<usize>>, env_var: &str) ->
     })
 }
 
-/// Deployment-wide override of a spec's per-request media-count limit.
+/// Deployment-wide override of a spec's per-request media-count limit
+/// (`SMG_IMAGE_MAX_COUNT`, `SMG_VIDEO_MAX_COUNT`, `SMG_AUDIO_MAX_COUNT`).
 ///
 /// The override replaces the spec's declared limit (it can raise or lower
 /// it) but never enables a modality the spec does not declare. Unset,
 /// non-numeric, or zero values are ignored.
-fn modality_limit_override(modality: Modality) -> Option<usize> {
+pub fn modality_limit_override(modality: Modality) -> Option<usize> {
     match modality {
         Modality::Image => env_count_override(&IMAGE_MAX_COUNT_OVERRIDE, "SMG_IMAGE_MAX_COUNT"),
         Modality::Video => env_count_override(&VIDEO_MAX_COUNT_OVERRIDE, "SMG_VIDEO_MAX_COUNT"),
@@ -107,10 +129,15 @@ fn check_media_counts(
     Ok(())
 }
 
-/// Ordering of media and text parts when rendering a multipart message.
+/// Where a message's media parts go relative to its text when the chat
+/// template takes one string per message and so cannot place them itself. A
+/// template that takes content parts places them itself and always gets them
+/// in the request's order, as the serving engine's own server hands them to
+/// such a template; this order does not apply to it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaPartOrder {
-    /// Emit media parts before text (vLLM `interleave_mm_strings=false`).
+    /// Emit media parts before text (the serving engine's placement for a
+    /// string-content template).
     MediaFirst,
     /// Keep parts in request order; part order is protocol-visible.
     Authored,
@@ -151,6 +178,21 @@ impl<'a> ModelMetadata<'a> {
             })
     }
 
+    /// `text` encoded on its own by the model tokenizer, the way a spec
+    /// splices a frame stamp or a dimension line into a replacement. A
+    /// tokenizer that cannot encode it is the request's error, never an
+    /// empty splice: a replacement missing a stamp would reach the engine
+    /// with a layout its reference processor does not write.
+    pub fn encode_plain(&self, spec: &'static str, text: &str) -> RegistryResult<Vec<TokenId>> {
+        let ids = self.tokenizer.encode_text(text).ok_or_else(|| {
+            ModelRegistryError::TextEncodingFailed {
+                spec,
+                text: text.to_string(),
+            }
+        })?;
+        Ok(ids.into_iter().map(|id| id as TokenId).collect())
+    }
+
     pub fn config_u32(&self, path: &[&str]) -> Option<u32> {
         Self::find_value(self.config, path).and_then(|value| value.as_u64().map(|v| v as u32))
     }
@@ -175,21 +217,73 @@ pub struct MediaItemInfo {
     pub video_sampling: Option<VideoSamplingInfo>,
 }
 
+/// The replacements for a preprocessed batch of one modality, given the
+/// decoder-side facts of its media items and the config the modality was
+/// preprocessed with (empty and default when the caller has none).
+pub type ReplacementsHook = fn(
+    &ModelMetadata,
+    &PreprocessedEncoderInputs,
+    &[MediaItemInfo],
+    &PreProcessorConfig,
+) -> RegistryResult<Vec<PromptReplacement>>;
+
+/// What one spec knows about one modality: the anchor its template writes and
+/// the id behind it, how its replacements are built, and how its tensors are
+/// laid out. A spec's table of these drives the trait's per-modality methods
+/// through [`ModelProcessorSpec::hooks`], so the Image / Video / Audio dispatch
+/// is written once per spec instead of once per method.
+pub struct ModalityHooks {
+    /// The placeholder the rendered prompt carries for one item.
+    pub placeholder: fn(&ModelMetadata) -> RegistryResult<String>,
+    /// The token id the placeholder expands around.
+    pub placeholder_id: fn(&ModelMetadata) -> RegistryResult<TokenId>,
+    /// The replacements for a preprocessed batch of the modality.
+    pub replacements: ReplacementsHook,
+    /// The primary and side-tensor layouts of the modality's batch.
+    pub layouts: fn() -> EncoderFieldLayouts,
+    /// Tensor keys that stay on the CPU.
+    pub keep_on_cpu: &'static [&'static str],
+    /// The engine-side name of the primary encoder input, when it is not the
+    /// conventional one.
+    pub encoder_input_key: Option<&'static str>,
+    /// Whether the serving engine expands the placeholder itself.
+    pub worker_expandable: bool,
+}
+
 pub trait ModelProcessorSpec: Send + Sync {
     fn name(&self) -> &'static str;
     fn matches(&self, metadata: &ModelMetadata) -> bool;
 
-    /// Ordering of media/text parts this model's chat template expects. Most
-    /// models use vLLM-compatible media-first; families whose template renders
-    /// parts positionally override to `Authored`.
+    /// The spec's hooks for one modality: `None` for a modality it does not
+    /// serve, and for a spec that keeps the per-method defaults (an image-only
+    /// spec needs no table). The `*_for` methods below read the table first
+    /// and fall back to those defaults.
+    fn hooks(&self, _modality: Modality) -> Option<ModalityHooks> {
+        None
+    }
+
+    /// Where this model's media parts go relative to its text when its
+    /// template takes one string per message (see [`MediaPartOrder`]): the
+    /// serving engine's media-first order by default; a family whose string
+    /// renderer is positional overrides to `Authored`. A template that takes
+    /// content parts gets them in the request's order whatever this says.
     fn media_part_order(&self) -> MediaPartOrder {
         MediaPartOrder::MediaFirst
     }
 
     /// Whether the anchor rendered for `modality` is exactly the single token
-    /// vLLM's prompt updates target, so a worker can expand it itself.
-    fn worker_expandable(&self, _modality: Modality) -> bool {
-        false
+    /// the serving engine's prompt updates target, so a worker can expand it itself.
+    fn worker_expandable(&self, modality: Modality) -> bool {
+        self.hooks(modality)
+            .is_some_and(|hooks| hooks.worker_expandable)
+    }
+
+    /// The format of the encoder inputs this spec's processors emit. The
+    /// gateway applies the spec only while every engine serving the model
+    /// reads that format; otherwise the model is handled as having no spec,
+    /// and its workers process media themselves.
+    fn encoder_input_format(&self) -> EncoderInputFormat {
+        EncoderInputFormat::Reference
     }
 
     fn placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String>;
@@ -199,9 +293,10 @@ pub trait ModelProcessorSpec: Send + Sync {
         metadata: &ModelMetadata,
         modality: Modality,
     ) -> RegistryResult<String> {
-        match modality {
-            Modality::Image => self.placeholder_token(metadata),
-            _ => Err(ModelRegistryError::UnsupportedModality {
+        match (self.hooks(modality), modality) {
+            (Some(hooks), _) => (hooks.placeholder)(metadata),
+            (None, Modality::Image) => self.placeholder_token(metadata),
+            (None, _) => Err(ModelRegistryError::UnsupportedModality {
                 spec: self.name(),
                 modality,
             }),
@@ -212,14 +307,24 @@ pub trait ModelProcessorSpec: Send + Sync {
         metadata: &ModelMetadata,
         modality: Modality,
     ) -> RegistryResult<TokenId> {
-        match modality {
-            Modality::Image => self.placeholder_token_id(metadata),
-            _ => Err(ModelRegistryError::UnsupportedModality {
+        match (self.hooks(modality), modality) {
+            (Some(hooks), _) => (hooks.placeholder_id)(metadata),
+            (None, Modality::Image) => self.placeholder_token_id(metadata),
+            (None, _) => Err(ModelRegistryError::UnsupportedModality {
                 spec: self.name(),
                 modality,
             }),
         }
     }
+    /// The text the model's chat template writes for one item of `modality`
+    /// when that is not the anchor token itself but several tokens (a
+    /// literal such as `<video>`). The gateway rewrites each occurrence in
+    /// the rendered prompt to the anchor before tokenizing; `None` when the
+    /// template writes the anchor.
+    fn rendered_marker_for(&self, _modality: Modality) -> Option<&'static str> {
+        None
+    }
+
     fn modality_limits(&self, metadata: &ModelMetadata)
         -> RegistryResult<HashMap<Modality, usize>>;
 
@@ -255,14 +360,35 @@ pub trait ModelProcessorSpec: Send + Sync {
         })
     }
 
-    fn processor_kwargs(&self, metadata: &ModelMetadata) -> RegistryResult<Value>;
+    /// Build the vision preprocessor of `modality` (image or video) for this
+    /// model from that modality's preprocessor config.
+    ///
+    /// The spec that owns a model's prompt and placeholder logic also selects
+    /// its vision processors, so the two cannot disagree. A caller builds each
+    /// processor once per loaded model and reuses it across requests; a
+    /// config the processor cannot serve is an error here rather than on a
+    /// request. A modality the spec does not preprocess is
+    /// [`ModelRegistryError::UnsupportedModality`].
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        _preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        Err(ModelRegistryError::UnsupportedModality {
+            spec: self.name(),
+            modality,
+        })
+    }
 
     /// Build the audio preprocessor for this model, if it supports audio.
     ///
     /// This is the single source of truth for audio-processor selection: the
     /// same spec that owns a model's prompt/placeholder logic also owns its
     /// audio preprocessor factory, so there is no separate string-keyed
-    /// registry to keep in sync. Audio-less specs use the default (`None`).
+    /// registry to keep in sync. Audio-less specs use the default
+    /// (`Ok(None)`); an audio config the spec cannot serve is an error
+    /// naming the field, never `None`.
     ///
     /// The processor is built from the current model config because its feature
     /// shapes and quantization parameters can be checkpoint-specific.
@@ -270,51 +396,62 @@ pub trait ModelProcessorSpec: Send + Sync {
         &self,
         _model_config: &Value,
         _preprocessor_config: &PreProcessorConfig,
-    ) -> Option<Box<dyn AudioPreProcessor>> {
-        None
+    ) -> RegistryResult<Option<Box<dyn AudioPreProcessor>>> {
+        Ok(None)
     }
 
     /// Compute per-media prompt replacement token sequences.
     ///
     /// Receives the full preprocessed output so each model can extract whatever
     /// metadata it needs (e.g. aspect_ratios for tile-based models).  This
-    /// mirrors vLLM's `_get_prompt_updates(out_mm_kwargs)` pattern.
+    /// mirrors the reference implementation's `_get_prompt_updates(out_mm_kwargs)` pattern.
     fn prompt_replacements(
         &self,
         metadata: &ModelMetadata,
         preprocessed: &PreprocessedEncoderInputs,
     ) -> RegistryResult<Vec<PromptReplacement>>;
+    /// The replacements for one modality without the media items' facts: a
+    /// hooked modality is built with no items and the default config, which
+    /// is how the stamped families fall back to their assumed timing.
     fn prompt_replacements_for(
         &self,
         metadata: &ModelMetadata,
         preprocessed: &PreprocessedEncoderInputs,
         modality: Modality,
     ) -> RegistryResult<Vec<PromptReplacement>> {
-        match modality {
-            Modality::Image => self.prompt_replacements(metadata, preprocessed),
-            _ => Err(ModelRegistryError::UnsupportedModality {
+        match (self.hooks(modality), modality) {
+            (Some(hooks), _) => {
+                (hooks.replacements)(metadata, preprocessed, &[], &PreProcessorConfig::default())
+            }
+            (None, Modality::Image) => self.prompt_replacements(metadata, preprocessed),
+            (None, _) => Err(ModelRegistryError::UnsupportedModality {
                 spec: self.name(),
                 modality,
             }),
         }
     }
 
-    /// Prompt replacements given one [`MediaItemInfo`] per media item in batch order and the config the modality was preprocessed with; the default ignores both.
+    /// Prompt replacements given one [`MediaItemInfo`] per media item in batch
+    /// order and the config the modality was preprocessed with; a hooked
+    /// modality receives both, the default ignores them.
     fn prompt_replacements_with_media(
         &self,
         metadata: &ModelMetadata,
         preprocessed: &PreprocessedEncoderInputs,
         modality: Modality,
-        _media: &[MediaItemInfo],
-        _preprocessor_config: &PreProcessorConfig,
+        media: &[MediaItemInfo],
+        preprocessor_config: &PreProcessorConfig,
     ) -> RegistryResult<Vec<PromptReplacement>> {
-        self.prompt_replacements_for(metadata, preprocessed, modality)
+        match self.hooks(modality) {
+            Some(hooks) => (hooks.replacements)(metadata, preprocessed, media, preprocessor_config),
+            None => self.prompt_replacements_for(metadata, preprocessed, modality),
+        }
     }
 
     /// Declare how each tensor's first dimension maps to media items.
     ///
     /// Keys not listed are treated as shared (replicated across all media items).
-    /// The `"pixel_values"` key mirrors HF/vLLM vision kwargs and should be
+    /// The `"pixel_values"` key mirrors the reference processors' vision kwargs and should be
     /// included when the primary encoder input differs from batched layout.
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
         // Default: encoder_input is batched (most models).
@@ -323,16 +460,21 @@ pub trait ModelProcessorSpec: Send + Sync {
 
     /// Declare the neutral primary/side-tensor layout contract for one modality.
     ///
-    /// The default converts the legacy HF/vLLM-shaped field map so existing
-    /// vision specs remain source-compatible. New multimodal specs should
-    /// override this method and keep backend-specific field names at adapters.
-    fn encoder_field_layouts_for(&self, _modality: Modality) -> EncoderFieldLayouts {
-        EncoderFieldLayouts::from_legacy_fields(self.field_layouts())
+    /// A hooked modality reads its layouts from [`ModelProcessorSpec::hooks`];
+    /// otherwise the default converts the legacy reference-shaped field map so
+    /// existing vision specs remain source-compatible. New multimodal specs
+    /// declare their layouts in `hooks()` rather than override this, and keep
+    /// backend-specific field names at adapters.
+    fn encoder_field_layouts_for(&self, modality: Modality) -> EncoderFieldLayouts {
+        match self.hooks(modality) {
+            Some(hooks) => (hooks.layouts)(),
+            None => EncoderFieldLayouts::from_legacy_fields(self.field_layouts()),
+        }
     }
 
     /// Tensor keys that should remain on CPU (not transferred to GPU).
     ///
-    /// In vLLM, certain model-specific tensors are marked `keep_on_cpu=True`
+    /// In the serving engine, certain model-specific tensors are marked `keep_on_cpu=True`
     /// in their `MultiModalFieldConfig`.  This method mirrors that per-model
     /// knowledge so the router can send the hint via gRPC, avoiding the need
     /// for the backend to instantiate a Python processor just to query it.
@@ -342,9 +484,17 @@ pub trait ModelProcessorSpec: Send + Sync {
 
     /// Tensor keys that should remain on CPU for one modality.
     ///
-    /// The default preserves the legacy model-wide declaration.
-    fn keep_on_cpu_keys_for(&self, _modality: Modality) -> Vec<String> {
-        self.keep_on_cpu_keys()
+    /// A hooked modality reads them from [`ModelProcessorSpec::hooks`];
+    /// otherwise the default preserves the legacy model-wide declaration.
+    fn keep_on_cpu_keys_for(&self, modality: Modality) -> Vec<String> {
+        match self.hooks(modality) {
+            Some(hooks) => hooks
+                .keep_on_cpu
+                .iter()
+                .map(|key| (*key).to_string())
+                .collect(),
+            None => self.keep_on_cpu_keys(),
+        }
     }
 
     /// The engine-side name of the primary encoder input for one modality,
@@ -352,8 +502,9 @@ pub trait ModelProcessorSpec: Send + Sync {
     /// (DeepSeek-V4.1's forward pops `patches`). `None` keeps the default
     /// name; adapters that build the engine request consult this before
     /// naming the tensor.
-    fn encoder_input_key_for(&self, _modality: Modality) -> Option<String> {
-        None
+    fn encoder_input_key_for(&self, modality: Modality) -> Option<String> {
+        self.hooks(modality)
+            .and_then(|hooks| hooks.encoder_input_key.map(str::to_string))
     }
 
     /// Frame rate to sample a video at when the request names no `fps`: the
@@ -363,10 +514,24 @@ pub trait ModelProcessorSpec: Send + Sync {
         None
     }
 
+    /// [`Self::default_video_sample_fps`] given the video preprocessor config
+    /// the checkpoint ships, for a family whose reference reads the rate from
+    /// it; the default ignores the config.
+    fn default_video_sample_fps_with(&self, _config: Option<&PreProcessorConfig>) -> Option<f32> {
+        self.default_video_sample_fps()
+    }
+
     /// Where a video's sampled frames sit: evenly spread, or one per interval
     /// from the start with the last frame kept, as the model's reference does.
     fn video_frame_sampling(&self) -> FrameSampling {
         FrameSampling::Even
+    }
+
+    /// [`Self::video_frame_sampling`] given the video preprocessor config the
+    /// checkpoint ships, for a family whose reference reads its frame budget
+    /// or grouping from it; the default ignores the config.
+    fn video_frame_sampling_with(&self, _config: Option<&PreProcessorConfig>) -> FrameSampling {
+        self.video_frame_sampling()
     }
 }
 
@@ -379,6 +544,46 @@ mod tests {
         registry::test_helpers::{test_preprocessed_with_tokens, TestTokenizer},
         types::ImageSize,
     };
+
+    #[test]
+    fn encode_plain_maps_the_ids_or_names_the_spec_and_the_text() {
+        let config = json!({});
+        let encoding = TestTokenizer::new(&[]).with_byte_encoder(1000);
+        let metadata = ModelMetadata {
+            model_id: "m",
+            tokenizer: &encoding,
+            config: &config,
+        };
+        assert_eq!(
+            metadata.encode_plain("test", "ab").unwrap(),
+            vec![1097 as TokenId, 1098]
+        );
+
+        struct NoText;
+        impl Tokenizer for NoText {
+            fn token_to_id(&self, _: &str) -> Option<u32> {
+                None
+            }
+            fn id_to_token(&self, _: u32) -> Option<String> {
+                None
+            }
+            fn encode_text(&self, _: &str) -> Option<Vec<u32>> {
+                None
+            }
+        }
+        let metadata = ModelMetadata {
+            model_id: "m",
+            tokenizer: &NoText,
+            config: &config,
+        };
+        assert_eq!(
+            metadata.encode_plain("test", "<0.2 seconds>").unwrap_err(),
+            ModelRegistryError::TextEncodingFailed {
+                spec: "test",
+                text: "<0.2 seconds>".to_string(),
+            }
+        );
+    }
 
     struct TestSpec;
 
@@ -404,10 +609,6 @@ mod tests {
             _metadata: &ModelMetadata,
         ) -> RegistryResult<HashMap<Modality, usize>> {
             Ok(HashMap::from([(Modality::Image, 2), (Modality::Audio, 1)]))
-        }
-
-        fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-            Ok(json!({}))
         }
 
         fn prompt_replacements(
@@ -651,5 +852,168 @@ mod tests {
             env_count_override(&VALID, "SMG_TEST_MAX_COUNT_VALID"),
             Some(20)
         );
+    }
+
+    struct HookedSpec;
+
+    impl ModelProcessorSpec for HookedSpec {
+        fn name(&self) -> &'static str {
+            "hooked"
+        }
+
+        fn matches(&self, _metadata: &ModelMetadata) -> bool {
+            true
+        }
+
+        fn hooks(&self, modality: Modality) -> Option<ModalityHooks> {
+            match modality {
+                Modality::Video => Some(ModalityHooks {
+                    placeholder: |_| Ok("<video>".to_string()),
+                    placeholder_id: |_| Ok(7),
+                    replacements: |_, preprocessed, media, config| {
+                        Ok(vec![PromptReplacement::sequence(
+                            Modality::Video,
+                            "<video>",
+                            vec![
+                                preprocessed.feature_token_counts.len() as TokenId,
+                                media.len() as TokenId,
+                                config.temporal_patch_size.unwrap_or(0) as TokenId,
+                            ],
+                        )])
+                    },
+                    layouts: || {
+                        EncoderFieldLayouts::new(FieldLayout::flat("frames"), HashMap::new())
+                    },
+                    keep_on_cpu: &["frames"],
+                    encoder_input_key: Some("pixel_values_videos"),
+                    worker_expandable: true,
+                }),
+                _ => None,
+            }
+        }
+
+        fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
+            Ok("<image>".to_string())
+        }
+
+        fn placeholder_token_id(&self, _metadata: &ModelMetadata) -> RegistryResult<TokenId> {
+            Ok(1)
+        }
+
+        fn modality_limits(
+            &self,
+            _metadata: &ModelMetadata,
+        ) -> RegistryResult<HashMap<Modality, usize>> {
+            Ok(HashMap::from([(Modality::Image, 1), (Modality::Video, 1)]))
+        }
+
+        fn prompt_replacements(
+            &self,
+            _metadata: &ModelMetadata,
+            preprocessed: &PreprocessedEncoderInputs,
+        ) -> RegistryResult<Vec<PromptReplacement>> {
+            Ok(vec![PromptReplacement::sequence(
+                Modality::Image,
+                "<image>",
+                vec![1; preprocessed.feature_token_counts.len()],
+            )])
+        }
+    }
+
+    /// A hooked modality is served from the table; the modalities without
+    /// hooks keep the image-only defaults the specs without a table rely on.
+    #[test]
+    fn hooks_drive_the_per_modality_methods_and_the_defaults_stand_without_them() {
+        let tokenizer = TestTokenizer::new(&[]);
+        let config = json!({});
+        let metadata = ModelMetadata {
+            model_id: "hooked",
+            tokenizer: &tokenizer,
+            config: &config,
+        };
+        let spec = HookedSpec;
+        let preprocessed = test_preprocessed_with_tokens(&[ImageSize::new(8, 8); 2], &[4, 4]);
+
+        assert_eq!(
+            spec.placeholder_token_for(&metadata, Modality::Video)
+                .unwrap(),
+            "<video>"
+        );
+        assert_eq!(
+            spec.placeholder_token_id_for(&metadata, Modality::Video)
+                .unwrap(),
+            7
+        );
+        assert!(spec.worker_expandable(Modality::Video));
+        assert_eq!(
+            spec.encoder_field_layouts_for(Modality::Video)
+                .encoder_input,
+            FieldLayout::flat("frames")
+        );
+        assert_eq!(spec.keep_on_cpu_keys_for(Modality::Video), ["frames"]);
+        assert_eq!(
+            spec.encoder_input_key_for(Modality::Video).as_deref(),
+            Some("pixel_values_videos")
+        );
+        // Without media the hook sees no items and the default config.
+        let plain = spec
+            .prompt_replacements_for(&metadata, &preprocessed, Modality::Video)
+            .unwrap();
+        assert_eq!(plain[0].tokens, [2, 0, 0]);
+        let with_media = spec
+            .prompt_replacements_with_media(
+                &metadata,
+                &preprocessed,
+                Modality::Video,
+                &[MediaItemInfo::default(), MediaItemInfo::default()],
+                &PreProcessorConfig {
+                    temporal_patch_size: Some(4),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(with_media[0].tokens, [2, 2, 4]);
+
+        // The image path has no hooks: the required methods answer, as for
+        // every spec without a table.
+        assert_eq!(
+            spec.placeholder_token_for(&metadata, Modality::Image)
+                .unwrap(),
+            "<image>"
+        );
+        assert_eq!(
+            spec.placeholder_token_id_for(&metadata, Modality::Image)
+                .unwrap(),
+            1
+        );
+        assert!(!spec.worker_expandable(Modality::Image));
+        assert_eq!(
+            spec.encoder_field_layouts_for(Modality::Image),
+            EncoderFieldLayouts::from_legacy_fields(spec.field_layouts())
+        );
+        assert!(spec.keep_on_cpu_keys_for(Modality::Image).is_empty());
+        assert_eq!(spec.encoder_input_key_for(Modality::Image), None);
+        assert_eq!(
+            spec.prompt_replacements_with_media(
+                &metadata,
+                &preprocessed,
+                Modality::Image,
+                &[],
+                &PreProcessorConfig::default(),
+            )
+            .unwrap()[0]
+                .tokens,
+            [1, 1]
+        );
+        for modality in [Modality::Audio, Modality::ImageEmbeds] {
+            assert!(matches!(
+                spec.placeholder_token_for(&metadata, modality),
+                Err(ModelRegistryError::UnsupportedModality { spec: "hooked", .. })
+            ));
+            assert!(matches!(
+                spec.prompt_replacements_for(&metadata, &preprocessed, modality),
+                Err(ModelRegistryError::UnsupportedModality { spec: "hooked", .. })
+            ));
+        }
     }
 }

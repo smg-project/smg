@@ -2,15 +2,22 @@
 
 use std::fmt::Write as _;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 use thiserror::Error;
 
-// `find_last_user_index` and `at_or_after_last_user` are byte-for-byte
-// identical to the V4-family copies; shared via `deepseek_common` rather than
-// duplicated a third time. V3.2's other tool/drop-thinking helpers are
-// genuinely different algorithms (not just a naming coincidence) and are
-// intentionally kept local to this file.
-use super::deepseek_common::{at_or_after_last_user, find_last_user_index};
+// The index predicates, the JSON spelling and the OpenAI-shape readers are
+// the V4 family's too and come from `deepseek_common`. V3.2's tool-message
+// handling, drop-thinking role set, DSML argument rendering and tools
+// template are different algorithms and texts and stay here.
+use super::{
+    deepseek_common::{
+        after_last_user, at_or_after_last_user, find_last_user_index, to_json,
+        tool_calls_from_openai_format, tool_schemas, tools_from_openai_format, ASSISTANT, BOS,
+        DSML, EOS, THINKING_END, THINKING_START, USER,
+    },
+    marks, RendererProfile,
+};
+use crate::chat_template::{ThinkingKeyName, ThinkingToggle};
 
 /// Mode for thinking/reasoning rendering.
 ///
@@ -75,17 +82,30 @@ pub enum DsEncodingError {
 }
 
 // ---------------------------------------------------------------------------
-// Special-token constants — copied verbatim from the Python source.
+// Special-token constants: the family's shared ones come from `deepseek_common`
+// (re-exported under this renderer's path). Copied verbatim from the Python
+// source.
 // ---------------------------------------------------------------------------
 
-pub const BOS_TOKEN: &str = "<｜begin▁of▁sentence｜>";
-pub const EOS_TOKEN: &str = "<｜end▁of▁sentence｜>";
-pub const THINKING_START_TOKEN: &str = "<think>";
-pub const THINKING_END_TOKEN: &str = "</think>";
-pub const DSML_TOKEN: &str = "｜DSML｜";
+pub use super::deepseek_common::{
+    BOS_TOKEN, DSML_TOKEN, EOS_TOKEN, THINKING_END_TOKEN, THINKING_START_TOKEN,
+};
 
-const USER_PREFIX: &str = "<｜User｜>";
-const ASSISTANT_SUFFIX: &str = "<｜Assistant｜>";
+/// What this renderer answers around a render (see [`RendererProfile`]).
+pub(crate) const PROFILE: RendererProfile = RendererProfile {
+    // No opinion on content parts: the (usually absent) template's format.
+    content_format: None,
+    // Thinking is gated on the `thinking` kwarg, default off.
+    thinking_toggle: ThinkingToggle::DefaultOff,
+    thinking_key_name: ThinkingKeyName::Thinking,
+    // Switches off on the protocol's `none` / `minimal`: no words of its own.
+    native_effort_values: &[],
+    native_effort_off_values: &[],
+    // `<｜Assistant｜><think>` ends the prompt when thinking is on.
+    think_in_prefill: true,
+    capabilities: RendererProfile::NO_CAPABILITIES,
+    thinking_mode: None,
+};
 
 // ---------------------------------------------------------------------------
 // Templates
@@ -94,9 +114,9 @@ const ASSISTANT_SUFFIX: &str = "<｜Assistant｜>";
 /// Mirrors `TOOLS_SYSTEM_TEMPLATE` from the Python source, including the
 /// blank lines between paragraphs that the upstream template preserves.
 fn render_tools_template(tool_schemas: &str) -> String {
-    let dsml = DSML_TOKEN;
-    let tstart = THINKING_START_TOKEN;
-    let tend = THINKING_END_TOKEN;
+    let dsml = DSML;
+    let tstart = THINKING_START;
+    let tend = THINKING_END;
     format!(
 "## Tools
 
@@ -141,40 +161,7 @@ fn response_format_block(schema: &str) -> String {
 }
 
 fn user_msg(content: &str) -> String {
-    format!("{USER_PREFIX}{content}{ASSISTANT_SUFFIX}")
-}
-
-// ---------------------------------------------------------------------------
-// JSON helpers
-// ---------------------------------------------------------------------------
-
-/// Mirrors the Python `to_json` helper: `json.dumps(value, ensure_ascii=False)`,
-/// which uses spaced `", "` / `": "` separators. Compact `serde_json::to_string`
-/// would change the prompt bytes vLLM renders from.
-fn to_json(value: &Value) -> String {
-    crate::json_dumps::to_string(value)
-}
-
-/// `[tool["function"] for tool in tools]`
-fn tools_from_openai_format(tools: &[Value]) -> Vec<Value> {
-    tools
-        .iter()
-        .filter_map(|t| t.get("function").cloned())
-        .collect()
-}
-
-/// `[{ "name": tc["function"]["name"], "arguments": tc["function"]["arguments"] } for tc in tool_calls]`
-fn tool_calls_from_openai_format(tool_calls: &[Value]) -> Vec<Value> {
-    tool_calls
-        .iter()
-        .filter_map(|tc| {
-            let f = tc.get("function")?;
-            Some(json!({
-                "name": f.get("name").cloned().unwrap_or(Value::Null),
-                "arguments": f.get("arguments").cloned().unwrap_or(Value::Null),
-            }))
-        })
-        .collect()
+    format!("{USER}{content}{ASSISTANT}")
 }
 
 /// Mirrors `encode_arguments_to_dsml`. `tool_call["arguments"]` is a JSON
@@ -209,23 +196,14 @@ fn encode_arguments_to_dsml(tool_call: &Value) -> Result<String, DsEncodingError
             other => ("false", to_json(other)),
         };
         parts.push(format!(
-            "<{DSML_TOKEN}parameter name=\"{k}\" string=\"{is_str}\">{value_str}</{DSML_TOKEN}parameter>",
+            "<{DSML}parameter name=\"{k}\" string=\"{is_str}\">{value_str}</{DSML}parameter>",
         ));
     }
     Ok(parts.join("\n"))
 }
 
 fn render_tools(tools: &[Value]) -> String {
-    let schemas: Vec<String> = tools.iter().map(to_json).collect();
-    render_tools_template(&schemas.join("\n"))
-}
-
-/// Returns `true` when `index > last_user_idx` in the Python sense.
-fn after_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
-    match last_user_idx {
-        Some(idx) => index > idx,
-        None => true,
-    }
+    render_tools_template(&tool_schemas(tools))
 }
 
 /// Returns `true` when `index == last_user_idx`.
@@ -234,13 +212,11 @@ fn equals_last_user(index: usize, last_user_idx: Option<usize>) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// render_message — direct port of the Python function with the same name.
+// render_message — direct port of the Python function with the same name:
+// the message read into its parts, one function per role for the arms of its
+// `match role`.
 // ---------------------------------------------------------------------------
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "mirrors the Python render_message function 1:1 for sync-ability"
-)]
 fn render_message(
     index: usize,
     messages: &[Value],
@@ -273,19 +249,12 @@ fn render_message(
     let tool_calls_owned = tool_calls_raw.map(|tc| tool_calls_from_openai_format(tc));
     let tool_calls = tool_calls_owned.as_deref();
 
+    // The thinking token after a user or developer message opens the thinking
+    // at the last user turn in thinking mode and closes it everywhere else.
+    let opens_thinking = equals_last_user(index, last_user_idx) && thinking_mode.is_thinking();
+
     match role {
-        "system" => {
-            // system_msg_template is "{content}"
-            prompt.push_str(content);
-            if let Some(tools) = tools.filter(|t| !t.is_empty()) {
-                prompt.push_str("\n\n");
-                prompt.push_str(&render_tools(tools));
-            }
-            if let Some(rf) = response_format {
-                prompt.push_str("\n\n");
-                prompt.push_str(&response_format_block(&to_json(rf)));
-            }
-        }
+        "system" => render_system(&mut prompt, content, tools, response_format),
         "developer" => {
             if content.is_empty() {
                 return Err(DsEncodingError::InvalidMessage {
@@ -293,142 +262,244 @@ fn render_message(
                     msg: msg.to_string(),
                 });
             }
-            let mut content_developer = String::new();
-            if let Some(tools) = tools.filter(|t| !t.is_empty()) {
-                content_developer.push_str("\n\n");
-                content_developer.push_str(&render_tools(tools));
-            }
-            if let Some(rf) = response_format {
-                content_developer.push_str("\n\n");
-                content_developer.push_str(&response_format_block(&to_json(rf)));
-            }
-            let _ = write!(content_developer, "\n\n# The user's message is: {content}");
-
-            prompt.push_str(&user_msg(&content_developer));
-
-            if equals_last_user(index, last_user_idx) && thinking_mode.is_thinking() {
-                prompt.push_str(THINKING_START_TOKEN);
-            } else {
-                prompt.push_str(THINKING_END_TOKEN);
-            }
+            render_developer(&mut prompt, content, tools, response_format, opens_thinking);
         }
-        "user" => {
-            prompt.push_str(&user_msg(content));
-            if equals_last_user(index, last_user_idx) && thinking_mode.is_thinking() {
-                prompt.push_str(THINKING_START_TOKEN);
-            } else {
-                prompt.push_str(THINKING_END_TOKEN);
-            }
-        }
+        "user" => render_user(&mut prompt, content, opens_thinking),
         "tool" => {
-            // Walk back over consecutive tool messages to find the originating
-            // assistant turn — same logic as Python.
-            let mut prev_assistant_idx: isize = index as isize - 1;
-            while prev_assistant_idx >= 0
-                && messages[prev_assistant_idx as usize]
-                    .get("role")
-                    .and_then(|v| v.as_str())
-                    == Some("tool")
-            {
-                prev_assistant_idx -= 1;
-            }
-
-            let assistant_role = if prev_assistant_idx >= 0 {
-                messages[prev_assistant_idx as usize]
-                    .get("role")
-                    .and_then(|v| v.as_str())
-            } else {
-                None
-            };
-
-            let valid_anchor =
-                index == 0 || (prev_assistant_idx >= 0 && assistant_role == Some("assistant"));
-            if !valid_anchor {
-                let anchor_idx = prev_assistant_idx.max(0) as usize;
-                return Err(DsEncodingError::InvalidToolMessages {
-                    index,
-                    context: messages[anchor_idx].to_string(),
-                });
-            }
-
-            let assistant_tool_calls = if prev_assistant_idx >= 0 {
-                messages[prev_assistant_idx as usize]
-                    .get("tool_calls")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-
-            let tool_call_order = (index as isize - prev_assistant_idx) as usize;
-            if assistant_tool_calls == 0 || assistant_tool_calls < tool_call_order {
-                return Err(DsEncodingError::NoToolCalls);
-            }
-
-            if tool_call_order == 1 {
-                prompt.push_str("\n\n<function_results>");
-            }
-
-            // tool_output_template = "\n<result>{content}</result>"
-            let _ = write!(prompt, "\n<result>{content}</result>");
-
-            if tool_call_order == assistant_tool_calls {
-                prompt.push_str("\n</function_results>");
-
-                if at_or_after_last_user(index, last_user_idx) && thinking_mode.is_thinking() {
-                    prompt.push_str("\n\n");
-                    prompt.push_str(THINKING_START_TOKEN);
-                } else {
-                    prompt.push_str("\n\n");
-                    prompt.push_str(THINKING_END_TOKEN);
-                }
-            }
+            let position = tool_result_position(index, messages)?;
+            // The last result of a block opens the thinking from the last user
+            // turn on in thinking mode (not the user message's rule above).
+            let block_opens_thinking =
+                at_or_after_last_user(index, last_user_idx) && thinking_mode.is_thinking();
+            render_tool(&mut prompt, position, content, block_opens_thinking);
         }
         "assistant" => {
-            let mut thinking_part = String::new();
-
-            let mut tool_calls_content = String::new();
-            if let Some(tcs) = tool_calls.filter(|t| !t.is_empty()) {
-                let mut rendered = Vec::with_capacity(tcs.len());
-                for tc in tcs {
-                    let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                    let args = encode_arguments_to_dsml(tc)?;
-                    rendered.push(format!(
-                        "<{DSML_TOKEN}invoke name=\"{name}\">\n{args}\n</{DSML_TOKEN}invoke>",
-                    ));
-                }
-                let joined = rendered.join("\n");
-                let _ = write!(
-                    tool_calls_content,
-                    "\n\n<{DSML_TOKEN}function_calls>\n{joined}\n</{DSML_TOKEN}function_calls>"
-                );
-            }
-
-            let summary_content = content;
-
-            if thinking_mode.is_thinking() && after_last_user(index, last_user_idx) {
-                let has_reasoning = !reasoning_content.is_empty();
-                let has_tool_calls = tool_calls.is_some_and(|t| !t.is_empty());
-                if !has_reasoning && !has_tool_calls {
-                    return Err(DsEncodingError::MissingReasoningOrToolCalls(
-                        msg.to_string(),
-                    ));
-                }
-                thinking_part.push_str(reasoning_content);
-                thinking_part.push_str(THINKING_END_TOKEN);
-            }
-
-            // assistant_msg_template = "{reasoning}{content}{tool_calls}<｜end▁of▁sentence｜>"
-            prompt.push_str(&thinking_part);
-            prompt.push_str(summary_content);
-            prompt.push_str(&tool_calls_content);
-            prompt.push_str(EOS_TOKEN);
+            let assistant = AssistantParts {
+                message: msg,
+                content,
+                tool_calls,
+                reasoning_content,
+                emits_thinking: thinking_mode.is_thinking()
+                    && after_last_user(index, last_user_idx),
+            };
+            render_assistant(&mut prompt, &assistant)?;
         }
         other => return Err(DsEncodingError::UnknownRole(other.to_string())),
     }
 
     Ok(prompt)
+}
+
+/// The thinking token that follows a user, developer or final tool message:
+/// the opener when the turn thinks, the closer otherwise.
+fn thinking_token(opens_thinking: bool) -> &'static str {
+    if opens_thinking {
+        THINKING_START
+    } else {
+        THINKING_END
+    }
+}
+
+/// The tools and the response format a system or developer message carries,
+/// each after a blank line.
+fn render_tools_and_response_format(
+    prompt: &mut String,
+    tools: Option<&[Value]>,
+    response_format: Option<&Value>,
+) {
+    if let Some(tools) = tools.filter(|t| !t.is_empty()) {
+        prompt.push_str("\n\n");
+        prompt.push_str(&render_tools(tools));
+    }
+    if let Some(rf) = response_format {
+        prompt.push_str("\n\n");
+        prompt.push_str(&response_format_block(&to_json(rf)));
+    }
+}
+
+/// A system message: its content (`system_msg_template` is "{content}"),
+/// then the tools and the response format it carries.
+fn render_system(
+    prompt: &mut String,
+    content: &str,
+    tools: Option<&[Value]>,
+    response_format: Option<&Value>,
+) {
+    prompt.push_str(content);
+    render_tools_and_response_format(prompt, tools, response_format);
+}
+
+/// A developer message: a user message made of the tools and the response
+/// format it carries and its content under a heading, then the thinking
+/// token (the content is never empty: the caller refused an empty one).
+fn render_developer(
+    prompt: &mut String,
+    content: &str,
+    tools: Option<&[Value]>,
+    response_format: Option<&Value>,
+    opens_thinking: bool,
+) {
+    let mut content_developer = String::new();
+    render_tools_and_response_format(&mut content_developer, tools, response_format);
+    let _ = write!(content_developer, "\n\n# The user's message is: {content}");
+
+    prompt.push_str(&user_msg(&content_developer));
+    prompt.push_str(thinking_token(opens_thinking));
+}
+
+/// A user message: its content between the user and assistant tokens, then
+/// the thinking token.
+fn render_user(prompt: &mut String, content: &str, opens_thinking: bool) {
+    prompt.push_str(&user_msg(content));
+    prompt.push_str(thinking_token(opens_thinking));
+}
+
+/// Where a tool message stands in its block of results.
+struct ToolResultPosition {
+    /// The result's order among the originating assistant turn's tool calls,
+    /// from one.
+    order: usize,
+    /// How many tool calls that turn made.
+    count: usize,
+}
+
+/// Walks back over the consecutive tool messages before `index` to the
+/// assistant turn that made the calls (the same logic as the Python) and
+/// places the message among that turn's calls; a block with no assistant
+/// turn before it, or with more results than calls, is refused.
+fn tool_result_position(
+    index: usize,
+    messages: &[Value],
+) -> Result<ToolResultPosition, DsEncodingError> {
+    let mut prev_assistant_idx: isize = index as isize - 1;
+    while prev_assistant_idx >= 0
+        && messages[prev_assistant_idx as usize]
+            .get("role")
+            .and_then(|v| v.as_str())
+            == Some("tool")
+    {
+        prev_assistant_idx -= 1;
+    }
+
+    let assistant_role = if prev_assistant_idx >= 0 {
+        messages[prev_assistant_idx as usize]
+            .get("role")
+            .and_then(|v| v.as_str())
+    } else {
+        None
+    };
+
+    let valid_anchor =
+        index == 0 || (prev_assistant_idx >= 0 && assistant_role == Some("assistant"));
+    if !valid_anchor {
+        let anchor_idx = prev_assistant_idx.max(0) as usize;
+        return Err(DsEncodingError::InvalidToolMessages {
+            index,
+            context: messages[anchor_idx].to_string(),
+        });
+    }
+
+    let assistant_tool_calls = if prev_assistant_idx >= 0 {
+        messages[prev_assistant_idx as usize]
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let tool_call_order = (index as isize - prev_assistant_idx) as usize;
+    if assistant_tool_calls == 0 || assistant_tool_calls < tool_call_order {
+        return Err(DsEncodingError::NoToolCalls);
+    }
+
+    Ok(ToolResultPosition {
+        order: tool_call_order,
+        count: assistant_tool_calls,
+    })
+}
+
+/// A tool message: the block's opener before its first result, the result
+/// (`tool_output_template` is "\n<result>{content}</result>"), and after the
+/// block's last result its closer and the thinking token.
+fn render_tool(
+    prompt: &mut String,
+    position: ToolResultPosition,
+    content: &str,
+    opens_thinking: bool,
+) {
+    if position.order == 1 {
+        prompt.push_str("\n\n<function_results>");
+    }
+
+    let _ = write!(prompt, "\n<result>{content}</result>");
+
+    if position.order == position.count {
+        prompt.push_str("\n</function_results>");
+        prompt.push_str("\n\n");
+        prompt.push_str(thinking_token(opens_thinking));
+    }
+}
+
+/// What an assistant message renders from: its content, its tool calls, its
+/// reasoning, and whether the turn's thinking goes out (thinking mode, after
+/// the last user message); the message itself names a refused one.
+struct AssistantParts<'a> {
+    message: &'a Value,
+    content: &'a str,
+    tool_calls: Option<&'a [Value]>,
+    reasoning_content: &'a str,
+    emits_thinking: bool,
+}
+
+/// An assistant message (`assistant_msg_template` is
+/// "{reasoning}{content}{tool_calls}<｜end▁of▁sentence｜>"): its reasoning and
+/// the thinking end token when the turn's thinking goes out (a turn with
+/// neither reasoning nor tool calls is refused then), its content, its tool
+/// calls as a DSML block, and the EOS token.
+fn render_assistant(
+    prompt: &mut String,
+    parts: &AssistantParts<'_>,
+) -> Result<(), DsEncodingError> {
+    let mut thinking_part = String::new();
+
+    let mut tool_calls_content = String::new();
+    if let Some(tcs) = parts.tool_calls.filter(|t| !t.is_empty()) {
+        let mut rendered = Vec::with_capacity(tcs.len());
+        for tc in tcs {
+            let name = tc.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            let args = encode_arguments_to_dsml(tc)?;
+            rendered.push(format!(
+                "<{DSML}invoke name=\"{name}\">\n{args}\n</{DSML}invoke>",
+            ));
+        }
+        let joined = rendered.join("\n");
+        let _ = write!(
+            tool_calls_content,
+            "\n\n<{DSML}function_calls>\n{joined}\n</{DSML}function_calls>"
+        );
+    }
+
+    let summary_content = parts.content;
+
+    if parts.emits_thinking {
+        let has_reasoning = !parts.reasoning_content.is_empty();
+        let has_tool_calls = parts.tool_calls.is_some_and(|t| !t.is_empty());
+        if !has_reasoning && !has_tool_calls {
+            return Err(DsEncodingError::MissingReasoningOrToolCalls(
+                parts.message.to_string(),
+            ));
+        }
+        thinking_part.push_str(parts.reasoning_content);
+        thinking_part.push_str(THINKING_END);
+    }
+
+    prompt.push_str(&thinking_part);
+    prompt.push_str(summary_content);
+    prompt.push_str(&tool_calls_content);
+    prompt.push_str(EOS);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -479,10 +550,27 @@ pub fn encode_messages(
     thinking_mode: ThinkingMode,
     params: &EncodeParams,
 ) -> Result<String, DsEncodingError> {
-    let mut full_messages: Vec<Value> = messages.to_vec();
+    render_messages(messages, thinking_mode, params)
+        .map(|marked| marks::strip(&marked).into_owned())
+}
+
+/// [`encode_messages`] with the renderer's own control tokens marked (see
+/// `marks`): the form the tokenizer wrapper encodes by segments, so that a
+/// control-token spelling typed in a message stays text. Request strings
+/// lose any mark a client wrote into them first.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "the same signature as `encode_messages`"
+)]
+pub(crate) fn render_messages(
+    messages: &[Value],
+    thinking_mode: ThinkingMode,
+    params: &EncodeParams,
+) -> Result<String, DsEncodingError> {
+    let mut full_messages: Vec<Value> = marks::without_marks(messages).into_owned();
 
     let mut prompt = if params.add_default_bos_token {
-        BOS_TOKEN.to_string()
+        BOS.to_string()
     } else {
         String::new()
     };
@@ -506,7 +594,10 @@ pub fn encode_messages(
 mod tests {
     use serde_json::json;
 
-    use super::*;
+    use super::{
+        super::deepseek_common::{ASSISTANT_SP_TOKEN, USER_SP_TOKEN},
+        *,
+    };
 
     fn user(text: &str) -> Value {
         json!({ "role": "user", "content": text })
@@ -526,7 +617,7 @@ mod tests {
         let out = encode_messages(&msgs, ThinkingMode::Chat, &EncodeParams::default()).unwrap();
 
         let expected =
-            format!("{BOS_TOKEN}{USER_PREFIX}Hello{ASSISTANT_SUFFIX}{THINKING_END_TOKEN}",);
+            format!("{BOS_TOKEN}{USER_SP_TOKEN}Hello{ASSISTANT_SP_TOKEN}{THINKING_END_TOKEN}",);
         assert_eq!(out, expected);
     }
 
@@ -536,7 +627,7 @@ mod tests {
         let out = encode_messages(&msgs, ThinkingMode::Thinking, &EncodeParams::default()).unwrap();
 
         let expected =
-            format!("{BOS_TOKEN}{USER_PREFIX}Hello{ASSISTANT_SUFFIX}{THINKING_START_TOKEN}",);
+            format!("{BOS_TOKEN}{USER_SP_TOKEN}Hello{ASSISTANT_SP_TOKEN}{THINKING_START_TOKEN}",);
         assert_eq!(out, expected);
     }
 
@@ -659,7 +750,7 @@ mod tests {
         };
         let out = encode_messages(&msgs, ThinkingMode::Chat, &params).unwrap();
         assert!(!out.starts_with(BOS_TOKEN));
-        assert!(out.starts_with(USER_PREFIX));
+        assert!(out.starts_with(USER_SP_TOKEN));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # BFCL nightly A/B — `scripts/bfcl/`
 
-**Track B** of the parser-verification proposal (`docs/proposals/2026-06-10-bfcl-nightly-parser-verification.md`): run the **official** Berkeley Function Calling Leaderboard (`bfcl-eval`) against two serving "arms" and diff the scores. The companion **Track A** (offline, deterministic parser-conformance gate) lives in `crates/parser_conformance/`.
+**Track B** of the parser-verification proposal: run the **official** Berkeley Function Calling Leaderboard (`bfcl-eval`) against two serving "arms" and diff the scores. The companion **Track A** (an offline, deterministic parser-conformance gate) is proposed but not yet built.
 
 ## The experiment
 
@@ -54,7 +54,7 @@ B_URL=$(BFCL_GPU=2,3 BFCL_SMG_TOOL_PARSER=qwen_xml  BFCL_SMG_REASONING_PARSER=qw
 bash launch_arm.sh stop
 ```
 
-Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`), `BFCL_TP` (tensor-parallel size — match the GPU count), `BFCL_MAX_MODEL_LEN`, `BFCL_{VLLM,SMG}_{TOOL,REASONING}_PARSER`, and `BFCL_VLLM_EXTRA` for extra vLLM flags.
+Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`), `BFCL_TP` (tensor-parallel size — match the GPU count), `BFCL_MAX_MODEL_LEN`, `BFCL_{VLLM,SMG}_{TOOL,REASONING}_PARSER`, `BFCL_VLLM_EXTRA` for extra vLLM flags, and `BFCL_VLLM_ENV` for extra vLLM environment (`NAME=VALUE` words).
 
 `run_ab.py` exits non-zero if the candidate's overall accuracy drops more than `--tolerance` (default 2pp) below the baseline.
 
@@ -64,9 +64,12 @@ Key env knobs for `launch_arm.sh`: `BFCL_GPU` (CUDA_VISIBLE_DEVICES, e.g. `0,1`)
 |---|---|---|---|---|
 | Qwen3.8-27B (`qwen3.8`) | `4-gpu-h100` | 2 | `qwen3_xml` / `qwen3` | `qwen_xml` / `qwen3` |
 | gpt-oss-120b (`gpt-oss`) | `4-gpu-h100` | 2 | `openai` / — | _(none — SMG auto-routes harmony)_ / — |
-| DeepSeek-V4.1-Flash (`deepseek-v4.1`) | `blackwell` | 8 (seq) | `deepseek_v41` / `deepseek_v41` (+`--tokenizer-mode deepseek_v41 --trust-remote-code`; per-commit vLLM main wheel) | `deepseek_v41` / `deepseek_v41` |
+| DeepSeek-V4.1-Flash-1017 (`deepseek-v4.1`) | `blackwell` | 8 (seq) | `deepseek_v41` / `deepseek_v41` (+`--tokenizer-mode deepseek_v41 --trust-remote-code`; per-commit vLLM main wheel) | `deepseek_v41` / `deepseek_v41` |
 | MiniMax-M3 MXFP8 (`minimax-m3`) | `blackwell` | 4 | `minimax_m3` / `minimax_m3` (+`--trust-remote-code --block-size 128 --attention_config.indexer_kv_dtype fp8`) | `minimax_m3` / `minimax_m3` |
 | GLM-5.3-Flash (`glm-5.3-flash`) | `blackwell` | 4 | `glm47` / `glm45` (+`--trust-remote-code --kv-cache-dtype fp8`; per-commit vLLM main wheel) | `glm47_moe` / `glm45` |
+| DeepSeek-V4.1-Flash-1017 (`deepseek-v4.1-amd`) | `8-gpu-mi300x` | 4 | `deepseek_v41` / `deepseek_v41` (+`--tokenizer-mode deepseek_v41 --trust-remote-code --moe-backend aiter --engram-config {"cpu_offload":true} --compilation-config {"cudagraph_mode":"FULL_DECODE_ONLY"}`; vLLM ROCm 10.0 nightly image) | `deepseek_v41` / `deepseek_v41` |
+| MiniMax-M3 MXFP8 (`minimax-m3-amd`) | `8-gpu-mi300x` | 8 (seq) | `minimax_m3` / `minimax_m3` (+`--trust-remote-code --block-size 128 --attention-backend TRITON_ATTN --language-model-only --async-scheduling --max-num-batched-tokens 16384`; vLLM ROCm nightly image) | `minimax_m3` / `minimax_m3` |
+| GLM-5.3-Flash (`glm-5.3-flash-amd`) | `8-gpu-mi300x` | 4 | `glm47` / `glm45` (+`--trust-remote-code --attention-backend ROCM_AITER_MLA_SPARSE --max-num-seqs 512`; vLLM ROCm nightly image) | `glm47_moe` / `glm45` |
 
 > **gpt-oss has no SMG tool-call-parser.** SMG handles gpt-oss through its harmony
 > pipeline (`model_gateway/src/routers/grpc/harmony/`), auto-activated by
@@ -89,6 +92,30 @@ a GitHub Actions matrix — one leg per model, `fail-fast: false`, each on its o
   scheduled run skips these legs while the `blackwell` runner is offline (it has
   served no job since 2026-09-18); a `workflow_dispatch`, with or without `only`,
   still runs them.
+- `8-gpu-mi300x` (AMD Instinct MI300X; label overridable with the repo variable
+  `SMG_RUNNER_AMD_GPU_8`) — `gpt-oss-amd` and `qwen3.8-amd`: the H100 legs'
+  models and parsers, TP=1 per arm, both arms concurrent on GPUs 0 and 1. The
+  legs run in vLLM's ROCm image of the same CI pin
+  (`vllm/vllm-openai-rocm:v0.31.0`, set up by
+  `scripts/ci_setup_vllm_rocm_image.sh`), so an AMD leg and its H100 counterpart
+  differ only in hardware, and the runner needs only Docker and the GPUs, not a
+  particular ROCm release. These legs need an
+  AMD-provided self-hosted runner; until one is registered and the repo variable
+  `SMG_RUN_AMD_LEGS` is `true`, they run only from a `workflow_dispatch` that
+  asks for them, with `only` or with `hardware: amd`. They never run on
+  `pull_request`.
+
+  The AMD legs whose models need ROCm fixes newer than the pin run in a pinned
+  vLLM ROCm nightly instead, on the channel the model's vLLM recipe names, with
+  the flags and engine environment (`vllm_env`) of the configuration that recipe
+  marks verified on MI300X:
+  - `deepseek-v4.1-amd` — DeepSeek-V4.1-Flash, TP=4 per arm with the Engram
+    tables in host memory, both arms concurrent (GPUs 0-3 + 4-7).
+  - `minimax-m3-amd` — MiniMax-M3 MXFP8 on the whole node (TP=8, arms
+    sequential).
+  - `glm-5.3-flash-amd` — GLM-5.3-Flash, TP=4 per arm, both arms concurrent
+    (GPUs 0-3 + 4-7). The recipe marks MI355X verified but not MI300X, so this
+    leg follows its generic AMD settings.
 
 All legs use `max_model_len` **32768**: the `multi_turn` categories emit ~18k-token
 prompts that 400'd ("decoder prompt longer than the maximum model length") at 16384.
@@ -99,7 +126,7 @@ Each leg sets `arm_mode`:
 
 - **concurrent** (the half-node legs) — both arms serve at once on opposite GPU halves;
   `run_ab.py` scores them **in parallel** (separate servers/GPUs, no contention) and diffs.
-- **sequential** (`deepseek-v4.1`) — for a model that needs the whole node (TP=8)
+- **sequential** (`deepseek-v4.1`, `minimax-m3-amd`) — for a model that needs the whole node (TP=8)
   so the arms can't coexist: `run_ab.py --score-arm` scores arm A alone → tears it
   down → scores arm B alone → `--diff-baseline/--diff-candidate` compares the two
   saved score files. Flip a leg's `arm_mode` to enable it.
@@ -110,16 +137,18 @@ the `deepseek_v41` parser without the full V4.1 weights. There is no Kimi leg: t
 former Kimi-K2.6 leg exercised the K2 parser, not the K3 one SMG now ships, and every
 published Kimi-K3 checkpoint is about 1.5 TB, which does not fit a single 8-GPU node.
 
-`workflow_dispatch` can target one leg via the `only` input and override
-`model`/`bfcl_model`/parsers per run. PRs touching this pipeline run **all** legs
-(H100 + Blackwell) as an end-to-end sanity check, but cheaply — the PR category set
+`workflow_dispatch` can target one leg via the `only` input, or one vendor's legs
+via `hardware` (`both`, the default, `nvidia` or `amd`), and override
+`model`/`bfcl_model`/parsers per run. PRs touching this pipeline run the H100 and
+Blackwell legs as an end-to-end sanity check, but cheaply — the PR category set
 is a tiny non-live subset (`simple_python,irrelevance`) for every leg.
 
 A leg whose model the pinned vLLM release (`scripts/ci_install_vllm.sh`) cannot serve
 sets `vllm_commit` + `vllm_version` in its matrix entry; the job then swaps in that
 per-commit main wheel from `wheels.vllm.ai/<commit>` for **both** arms (the A/B stays
 engine-identical). `deepseek-v4.1` and `glm-5.3-flash` share one such wheel until a
-vLLM release ships both models and the CI pin moves; drop the keys then.
+vLLM release ships both models and the CI pin moves; drop the keys then. The AMD legs
+cannot take these wheels (they are CUDA builds); an AMD leg sets its own `image` instead.
 
 ## Gotchas discovered while bringing this up (read before debugging)
 
@@ -150,4 +179,4 @@ Run on a dev H100 box, **`Qwen/Qwen3.6-27B` at TP=2** (one arm per GPU pair), th
 
 So SMG's Rust frontend is **at parity** with vLLM's native parser across the full non-live set — marginally ahead overall (+0.18pp), and never worse than −0.25pp on any category. Both arms reasoning-parse `<think>` into `reasoning_content` and emit native `tool_calls` (FC confirmed end to end). The low java/js numbers are the *model's* non-Python ability (identical on both arms) — confirming the A/B isolates the frontend, not model quality. (An earlier `simple_python`-only run on Qwen3-4B gave 95.50 vs 95.25, same parity story.)
 
-Scope note: the table above is the `non_live` slice. The **nightly** runs the broader reproducible set — **`non_live` + `live` + `multi_turn`** (17 categories; `live` is real-user data, `multi_turn` is state-based simulation — both static, no internet). It excludes the agentic/executable categories (`web_search_*`, `memory_*`, `exec_*`) that need web-search/memory/sandbox infra. **PRs** that touch the pipeline run only a quick non-live sanity subset (`simple_python,irrelevance`); per-PR correctness is the cheap CPU Track-A parser-conformance gate (`crates/parser_conformance`). Scale to multiple runs × the five target models for tight confidence intervals.
+Scope note: the table above is the `non_live` slice. The **nightly** runs the broader reproducible set — **`non_live` + `live` + `multi_turn`** (17 categories; `live` is real-user data, `multi_turn` is state-based simulation — both static, no internet). It excludes the agentic/executable categories (`web_search_*`, `memory_*`, `exec_*`) that need web-search/memory/sandbox infra. **PRs** that touch the pipeline run only a quick non-live sanity subset (`simple_python,irrelevance`); per-PR correctness is the job of the Track-A parser-conformance gate, which is proposed but not yet built. Scale to multiple runs × the five target models for tight confidence intervals.

@@ -163,7 +163,7 @@ func (c *MultiClient) CreateChatCompletion(ctx context.Context, req ChatCompleti
 	defer stream.Close()
 
 	var fullContent strings.Builder
-	var fullToolCalls []ToolCall
+	var toolCalls toolCallAssembler
 	var finishReason string
 	var usage Usage
 	var responseID string
@@ -202,9 +202,7 @@ func (c *MultiClient) CreateChatCompletion(ctx context.Context, req ChatCompleti
 			if choice.Delta.Content != "" {
 				fullContent.WriteString(choice.Delta.Content)
 			}
-			if len(choice.Delta.ToolCalls) > 0 {
-				fullToolCalls = append(fullToolCalls, choice.Delta.ToolCalls...)
-			}
+			toolCalls.add(choice.Delta.ToolCalls)
 			if choice.FinishReason != "" {
 				finishReason = choice.FinishReason
 			}
@@ -216,11 +214,9 @@ func (c *MultiClient) CreateChatCompletion(ctx context.Context, req ChatCompleti
 	}
 
 	message := Message{
-		Role:    "assistant",
-		Content: fullContent.String(),
-	}
-	if len(fullToolCalls) > 0 {
-		message.ToolCalls = fullToolCalls
+		Role:      "assistant",
+		Content:   fullContent.String(),
+		ToolCalls: toolCalls.toolCalls(),
 	}
 
 	if finishReason == "" {

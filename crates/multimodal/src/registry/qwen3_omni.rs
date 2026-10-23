@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
     audio::{AudioPreProcessor, Qwen3AudioProcessor},
     encoder_inputs::PreprocessedEncoderInputs,
     registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{EncoderFieldLayouts, FieldLayout, Modality, PromptReplacement, TokenId},
-    vision::PreProcessorConfig,
+    vision::{PreProcessorConfig, Qwen3OmniVisionProcessor, VisionPreProcessor},
 };
 
 const IMAGE_PAD_TOKEN: &str = "<|image_pad|>";
@@ -45,17 +45,28 @@ impl Qwen3OmniSpec {
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let token_id = Self::token_id(metadata, field)?;
         let token = Self::token(metadata, field, fallback)?;
-        Ok(preprocessed
-            .feature_token_counts
-            .iter()
-            .map(|&count| PromptReplacement::repeated(modality, &token, token_id, count))
-            .collect())
+        Ok(PromptReplacement::repeated_per_item(
+            modality,
+            &token,
+            token_id,
+            &preprocessed.feature_token_counts,
+        ))
     }
 }
 
 impl ModelProcessorSpec for Qwen3OmniSpec {
     fn name(&self) -> &'static str {
         "qwen3_omni"
+    }
+
+    /// `<|image_pad|>`, `<|video_pad|>` and `<|audio_pad|>` (the thinker
+    /// config's token ids) are the single-token targets the serving engine's
+    /// prompt updates expand, so a worker can expand them itself.
+    fn worker_expandable(&self, modality: Modality) -> bool {
+        matches!(
+            modality,
+            Modality::Image | Modality::Video | Modality::Audio
+        )
     }
 
     fn matches(&self, metadata: &ModelMetadata) -> bool {
@@ -118,19 +129,32 @@ impl ModelProcessorSpec for Qwen3OmniSpec {
         ]))
     }
 
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({"use_audio_in_video": false}))
+    fn vision_processor(
+        &self,
+        _model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image | Modality::Video => Ok(Box::new(
+                Qwen3OmniVisionProcessor::from_config_for(preprocessor_config, modality),
+            )),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn audio_processor(
         &self,
         model_config: &Value,
         preprocessor_config: &PreProcessorConfig,
-    ) -> Option<Box<dyn AudioPreProcessor>> {
-        Some(Box::new(Qwen3AudioProcessor::from_configs(
+    ) -> RegistryResult<Option<Box<dyn AudioPreProcessor>>> {
+        Ok(Some(Box::new(Qwen3AudioProcessor::from_configs(
             model_config,
             preprocessor_config,
-        )))
+        ))))
     }
 
     fn prompt_replacements(
@@ -290,6 +314,17 @@ mod tests {
         }
     }
 
+    /// Every modality's anchor is the one token the serving engine expands,
+    /// so images, video and audio may all be forwarded to a worker that
+    /// processes media itself.
+    #[test]
+    fn omni_media_can_be_expanded_by_a_worker() {
+        for modality in [Modality::Image, Modality::Video, Modality::Audio] {
+            assert!(Qwen3OmniSpec.worker_expandable(modality), "{modality}");
+        }
+        assert!(!Qwen3OmniSpec.worker_expandable(Modality::ImageEmbeds));
+    }
+
     #[test]
     fn omni_layouts_are_modality_specific() {
         let image = Qwen3OmniSpec.encoder_field_layouts_for(Modality::Image);
@@ -348,6 +383,7 @@ mod tests {
         .unwrap();
         let processor = spec
             .audio_processor(&config, &preprocessor_config)
+            .unwrap()
             .expect("qwen3_omni spec must provide an audio processor");
 
         let clip = Arc::new(AudioClip::new(

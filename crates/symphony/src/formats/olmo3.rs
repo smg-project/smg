@@ -3,7 +3,10 @@
 //! A turn opens with `<|im_start|>assistant`, so the prompt's replay starts there. Recorded as
 //! `olmo-3-7b-instruct` (allenai/Olmo-3-7B-Instruct).
 
-use crate::format::{CallSyntax, Emits, Format};
+use crate::{
+    format::{CallSyntax, Emits, Format},
+    pythonic::Dialect,
+};
 
 /// The Olmo 3 table.
 pub fn olmo3() -> Format {
@@ -14,60 +17,29 @@ pub fn olmo3() -> Format {
         .state("calls", Emits::Arguments)
         .transition("content", "calls_open", "calls")
         .transition("calls", "calls_close", "content")
-        .calls(CallSyntax::Pythonic)
+        .calls(CallSyntax::Pythonic(Dialect::OLMO3))
         .opens_turn("<|im_start|>assistant")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        engine::Engine,
-        event::{Event, Events},
-        input::{EngineFinish, Input},
-        parser::Parser,
-        tagged::Declared,
-    };
+    use crate::{engine::Engine, event::Event, testing::drive, Declared};
 
-    fn run(prompt: &str, output: &str) -> Vec<Event> {
-        let mut parser = Engine::new(olmo3(), Declared::default());
-        let mut out = Events::new();
-        parser
-            .feed(
-                Input::Prompt {
-                    token_ids: &[],
-                    text: prompt,
-                },
-                &mut out,
-            )
-            .expect("prompt");
-        parser
-            .feed(
-                Input::Delta {
-                    token_ids: &[],
-                    text: output,
-                    spans: &[],
-                },
-                &mut out,
-            )
-            .expect("delta");
-        parser
-            .feed(
-                Input::End {
-                    finish: EngineFinish::Stop,
-                },
-                &mut out,
-            )
-            .expect("end");
-        out.drain()
+    fn run(prompt: &str, output: &str) -> Vec<Event<'static>> {
+        drive(
+            &mut Engine::new(olmo3(), Declared::default()),
+            prompt,
+            &[output],
+        )
     }
 
     fn text_of(events: &[Event], reasoning: bool) -> String {
         events
             .iter()
             .filter_map(|event| match event {
-                Event::Reasoning(text) if reasoning => Some(text.text.as_str()),
-                Event::Content(text) if !reasoning => Some(text.text.as_str()),
+                Event::Reasoning(text) if reasoning => Some(&*text.text),
+                Event::Content(text) if !reasoning => Some(&*text.text),
                 _ => None,
             })
             .collect()

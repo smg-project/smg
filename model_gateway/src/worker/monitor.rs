@@ -166,12 +166,15 @@ impl WorkerLoadManager {
         }
     }
 
+    /// Replace cached rank loads for the supplied workers, preserving other workers.
     pub fn update_dp_loads(&self, loads: &HashMap<String, HashMap<isize, isize>>) {
         debug!("WorkerLoadManager update_dp_loads map:{:?}", loads);
         let mut cached = self.dp_cached_loads.write();
         cached.extend(loads.iter().map(|(k, v)| (k.clone(), v.clone())));
     }
 
+    /// Select and increment the least-loaded eligible rank. A virtual worker
+    /// can only select its pinned rank; missing telemetry returns `None`.
     pub fn select_and_increment_lowest_dp_load(
         &self,
         worker: &dyn Worker,
@@ -179,7 +182,14 @@ impl WorkerLoadManager {
     ) -> Option<isize> {
         let mut cached = self.dp_cached_loads.write();
         let loads = cached.get_mut(worker.url())?;
-        let (&dp_rank, _) = loads.iter().min_by_key(|&(rank, load)| (*load, *rank))?;
+        let (&dp_rank, _) = loads
+            .iter()
+            .filter(|(rank, _)| {
+                worker
+                    .dp_rank()
+                    .is_none_or(|pinned| **rank == pinned as isize)
+            })
+            .min_by_key(|&(rank, load)| (*load, *rank))?;
         if let Some(v) = loads.get_mut(&dp_rank) {
             *v += increment;
         }
@@ -343,8 +353,12 @@ pub struct WorkerMonitor {
     event_task: Mutex<Option<JoinHandle<()>>>,
     eviction_flush_task: Mutex<Option<JoinHandle<()>>>,
     liveness_sweep_task: Mutex<Option<JoinHandle<()>>>,
-    /// Load records pushed on the KV-event streams, per worker and rank,
-    /// merged into one report per worker the way a poll reports every rank.
+    /// Each worker's report by rank, as its stream and the poll last left
+    /// it: a record pushed on the KV-event stream replaces its rank's entry
+    /// ([`Self::apply_pushed_load`]), a poll's entry replaces a rank's that
+    /// pushed nothing since the poll began ([`Self::apply_polled_load`]);
+    /// every push rebuilds the worker's report from it, the way a poll
+    /// reports every rank.
     pushed_ranks: Mutex<HashMap<String, BTreeMap<i32, SchedulerLoadSnapshot>>>,
     /// When each rank of a worker last pushed a load record, by receipt:
     /// the tick's poll decision reads it (see [`PollMode`]).
@@ -424,8 +438,13 @@ fn keep_telemetry(
 /// `age_ms`: the servicer-to-gateway one-way latency.
 const PUSHED_ONE_WAY_MARGIN: Duration = Duration::from_millis(20);
 /// Pushed reports are published into the shared snapshot in one rebuild per
-/// window: the rebuild is O(fleet), the records arrive per scheduler step.
-const PUSHED_PUBLISH_WINDOW: Duration = Duration::from_millis(100);
+/// window: the rebuild is O(fleet) pointer work, the records arrive per
+/// scheduler step from every engine. Routing reads the snapshot, so a record
+/// steers within a window of its receipt; the policies' dispatch credit
+/// covers the gap. Twenty milliseconds is about one scheduler step, and at
+/// fifty rebuilds a second a thousand-worker fleet spends well under a
+/// percent of a core here.
+const PUSHED_PUBLISH_WINDOW: Duration = Duration::from_millis(20);
 
 /// Debounce window for batching worker evictions into one snapshot rebuild.
 /// Registry churn (a rollout, a scale-down) emits removals as a gradual
@@ -476,14 +495,55 @@ impl WorkerMonitor {
         }
     }
 
+    /// The absolute overload verdict of one load report (`None`: a poll that
+    /// brought none, which clears the veto; absent means no opinion),
+    /// applied to `worker` under its effective thresholds (resolved at
+    /// registration; nothing happens while they are off). An edge is an
+    /// INFO line with the report's figures, the thresholds and `source`:
+    /// a worker vetoed by overload reads as "unavailable" in a refusal line
+    /// exactly like one with an open breaker, and the breaker and the
+    /// liveness veto log their edges already. Re-asserting the verdict the
+    /// worker carries writes nothing; the counters and the gauge move once
+    /// per edge, in the registry.
+    fn apply_overload_verdict(
+        &self,
+        worker: &Arc<dyn Worker>,
+        load: Option<&WorkerLoadResponse>,
+        source: &'static str,
+    ) {
+        let overload = worker.metadata().overload;
+        if !overload.is_enabled() {
+            return;
+        }
+        let verdict = load.is_some_and(|load| overload.is_overloaded(load));
+        if !self.worker_registry.set_worker_overloaded(worker, verdict) {
+            return;
+        }
+        let waiting = load.map_or(0, WorkerLoadResponse::total_waiting_reqs);
+        let kv_pressure = load.map_or(0.0, WorkerLoadResponse::effective_kv_pressure);
+        info!(
+            worker_url = %worker.url(),
+            overloaded = verdict,
+            waiting_requests = waiting,
+            kv_pressure,
+            waiting_threshold = ?overload.waiting_requests,
+            kv_pressure_threshold = ?overload.token_usage,
+            source,
+            "Worker overload veto {}",
+            if verdict { "set" } else { "cleared" }
+        );
+    }
+
     /// A load record pushed on a worker's KV-event stream (`KvEventBatch.load`,
     /// the servicer's `GetLoads` figures for `dp_rank`, received at
     /// `received_at`): the same input as a poll of that worker. It replaces
     /// the rank's entry in the worker's report, goes to the overload verdict,
-    /// the wedged rule, the load-aware policies and the `smg_engine_*` gauges
-    /// at once, and into the shared snapshot in the next coalesced publish.
+    /// the wedged rule and the `smg_engine_*` gauges at once, and into the
+    /// shared snapshot, which routing reads, in the next coalesced publish.
     /// The report's `sampled_at` is the receipt less the record's age and
-    /// the one-way margin, what a policy resets its in-flight tally against.
+    /// the one-way margin, what a policy releases its dispatch credit against.
+    /// Negative ranks and records for another virtual worker's rank are
+    /// ignored before updating freshness, liveness, metrics or routing state.
     pub fn apply_pushed_load(
         self: &Arc<Self>,
         worker: &Arc<dyn Worker>,
@@ -491,9 +551,19 @@ impl WorkerMonitor {
         record: &EngineLoad,
         received_at: Instant,
     ) {
+        if dp_rank < 0
+            || worker
+                .dp_rank()
+                .is_some_and(|rank| usize::try_from(dp_rank) != Ok(rank))
+        {
+            return;
+        }
         let age = Duration::from_millis(u64::from(record.age_ms)) + PUSHED_ONE_WAY_MARGIN;
         let sampled_at = received_at.checked_sub(age).unwrap_or(received_at);
         let url = worker.url().to_string();
+        // The stream pushes: silence from this worker is judged by the
+        // stream's cadence from now on (`liveness`, the stale rule).
+        worker.note_load_record();
         // The poll decision reads the receipt, not the sample's age: a record
         // that arrives is a stream that works, whatever the engine's clock.
         self.pushed_at
@@ -523,22 +593,21 @@ impl WorkerMonitor {
         };
         // What a poll does with a fresh report, minus the DP-rank token cache
         // (a record carries no absolute token counts).
-        let overload = worker.metadata().overload;
-        if overload.is_enabled() {
-            self.worker_registry
-                .set_worker_overloaded(worker, overload.is_overloaded(&response));
-        }
+        self.apply_overload_verdict(worker, Some(&response), "pushed record");
         let waiting: i64 = response
             .loads
             .iter()
             .map(|rank| i64::from(rank.num_waiting_reqs))
             .sum();
-        liveness::on_load_report(worker, waiting);
-        let single: HashMap<String, WorkerLoadResponse> =
-            HashMap::from([(url.clone(), (*response).clone())]);
-        for policy in self.policy_registry.get_all_load_aware_policies() {
-            policy.update_loads(&single);
-        }
+        liveness::on_load_report(
+            worker,
+            waiting,
+            record
+                .engine_silence_ms
+                .map(|ms| Duration::from_millis(u64::from(ms))),
+            record.engine_reports_steps.unwrap_or(false),
+            record.prefill_pending_tokens.map(u64::from),
+        );
         Metrics::record_engine_load(&url, worker.model_id(), &response);
         // The DP-rank token cache takes a report with absolute token counts,
         // as it takes a poll; a core-only record leaves its last-known-good
@@ -572,6 +641,62 @@ impl WorkerMonitor {
                 }
             }
             _ => PollMode::Poll,
+        }
+    }
+
+    /// A poll's report of `url` (`load`, asked at `polled_at`) is the newer
+    /// figure for every rank that pushed no record since the poll began.
+    /// Under data parallelism the ranks' streams are not equally busy: a
+    /// rank whose working set is cached, or that has nothing in flight,
+    /// stores no blocks, and the heartbeats that keep the worker's stream
+    /// alive name the last active rank, so a quiet rank's own record stops
+    /// arriving while the worker's report is rebuilt on every push from
+    /// the record it last sent. The tick's decision ([`Self::poll_mode`])
+    /// falls back to the poll for such a worker; the poll's entry for the
+    /// quiet rank replaces the one on file, so the next push rebuilds the
+    /// report from it and the rank's figures are at most a tick interval
+    /// old, the poll decision's own bound. A rank whose record arrived
+    /// since the poll began keeps it: the stream's is the newer. The
+    /// receipts (`pushed_at`) are not touched: a poll is not the stream
+    /// working, and the worker stays polled until the rank's records
+    /// resume. Only a rank on file is replaced: a rank the stream never
+    /// named has no receipt for the poll decision to age, so a poll's
+    /// figure for it would sit in the report unrefreshed once the pushing
+    /// ranks are fresh again; it stays out of the pushed report, and the
+    /// poll's report stands for it while the worker is polled. A worker
+    /// with no pushed record on file has no report to merge into; the
+    /// poll's report stands on its own, as always.
+    pub(crate) fn apply_polled_load(
+        &self,
+        url: &str,
+        load: &WorkerLoadResponse,
+        polled_at: Instant,
+    ) {
+        // A rollup from a gateway registered as a worker is keyed by
+        // downstream worker, not by rank: its entries all say rank 0 and
+        // would collapse into one slot (the DP cache applies the same
+        // guard).
+        if !load.ranks_are_dp_ranks() {
+            return;
+        }
+        // Both tables held together so a record landing between the two
+        // reads is not undone; nothing else takes both at once.
+        let mut pushed = self.pushed_ranks.lock();
+        let Some(ranks) = pushed.get_mut(url) else {
+            return;
+        };
+        let pushed_at = self.pushed_at.lock();
+        let receipts = pushed_at.get(url);
+        for entry in &load.loads {
+            let pushed_since = receipts
+                .and_then(|ranks| ranks.get(&entry.dp_rank))
+                .is_some_and(|&at| at >= polled_at);
+            if pushed_since {
+                continue;
+            }
+            if let Some(slot) = ranks.get_mut(&entry.dp_rank) {
+                *slot = entry.clone();
+            }
         }
     }
 
@@ -1120,7 +1245,7 @@ impl WorkerMonitor {
             }
             Ok(Err(e)) => {
                 debug!("backend GetLoads failed for {}: {e}", worker.url());
-                if liveness::is_transport_failure(e.code()) {
+                if liveness::is_connection_code(e.code()) {
                     liveness::on_contact_failed(worker, "load poll");
                 }
                 None
@@ -1371,9 +1496,8 @@ async fn poll_group_once(
     // conditional gate: a load-aware policy, engine-metrics re-export, or
     // overload protection on any group member still forces the poll —
     // never "never poll".
-    let load_aware_policies = monitor.policy_registry.get_all_load_aware_policies();
     if monitor.conditional_polling {
-        let routing_needs_load = !load_aware_policies.is_empty()
+        let routing_needs_load = monitor.policy_registry.needs_backend_loads()
             || monitor.policy_registry.get_dp_rank_policy().is_some();
         let overload_needs_load = workers.iter().any(|w| w.metadata().overload.is_enabled());
         if !routing_needs_load && !monitor.engine_metrics && !overload_needs_load {
@@ -1431,24 +1555,20 @@ async fn poll_group_once(
         // on a request path, against the worker's effective thresholds
         // (resolved at registration). A failed fetch means no fresh
         // signal, which clears the flag — absent means no opinion.
-        let overload = worker.metadata().overload;
-        if overload.is_enabled() {
-            let verdict = response
-                .as_ref()
-                .is_some_and(|load| overload.is_overloaded(load));
-            monitor
-                .worker_registry
-                .set_worker_overloaded(&worker, verdict);
-        }
+        monitor.apply_overload_verdict(&worker, response.as_ref(), "poll");
         if let Some(mut load) = response {
             load.sampled_at = Some(Instant::now());
+            // A worker polled because a rank's records went quiet
+            // (`fallback`) takes the poll's figures for the ranks that
+            // pushed nothing since the tick began.
+            monitor.apply_polled_load(&url, &load, now);
             // The wedged rule reads the queue depth off every report.
             let waiting: i64 = load
                 .loads
                 .iter()
                 .map(|rank| i64::from(rank.num_waiting_reqs))
                 .sum();
-            liveness::on_load_report(&worker, waiting);
+            liveness::on_load_report(&worker, waiting, None, false, None);
             // Only feed the DP-rank cache from responses that carry real
             // absolute per-rank token counts. Ratio-only snapshots,
             // which would otherwise poison with a fake `{0: 0}`
@@ -1501,9 +1621,6 @@ async fn poll_group_once(
         polled.len()
     );
 
-    for policy in &load_aware_policies {
-        policy.update_loads(&group_loads);
-    }
     monitor.worker_load_manager.update_dp_loads(&group_dp_loads);
 
     if !dp_evict.is_empty() {
@@ -1524,8 +1641,8 @@ async fn poll_group_once(
     // paired with the worker that produced it so the incarnation fence
     // can drop reports that raced a removal or replacement. Workers that
     // failed this tick get their stale entries pruned along with the
-    // rest. The responses move (no deep clones): the policy push and the
-    // metrics pass above already took their references.
+    // rest. The responses move (no deep clones): the metrics pass above
+    // took its references.
     let worker_by_url: HashMap<&str, &Arc<dyn Worker>> =
         polled.iter().map(|w| (w.url(), w)).collect();
     let fresh: Vec<(Arc<dyn Worker>, Arc<WorkerLoadResponse>)> = group_loads
@@ -1624,7 +1741,7 @@ mod worker_monitor_tests {
         config::types::PolicyConfig,
         observability::metrics::test_support::render_with_recorder,
         policies::PolicyRegistry,
-        worker::{BasicWorkerBuilder, ConnectionMode, WorkerType},
+        worker::{overload::OverloadThresholds, BasicWorkerBuilder, ConnectionMode, WorkerType},
     };
 
     fn ready_worker(url: &str, model: &str) -> Arc<dyn Worker> {
@@ -1641,6 +1758,7 @@ mod worker_monitor_tests {
         Arc::new(worker)
     }
 
+    /// Build an isolated monitor and registry with round-robin routing for tests.
     fn build_monitor() -> (Arc<WorkerRegistry>, Arc<WorkerMonitor>) {
         let registry = Arc::new(WorkerRegistry::new());
         let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
@@ -1652,6 +1770,89 @@ mod worker_monitor_tests {
             false,
         ));
         (registry, monitor)
+    }
+
+    /// Backend-wide pushes only refresh the matching virtual rank; quiet ranks keep polling.
+    #[tokio::test]
+    async fn dp8_pushes_cannot_redirect_virtual_workers_to_active_ranks() {
+        let (registry, monitor) = build_monitor();
+        let now = Instant::now();
+        let interval = Duration::from_secs(10);
+        let active = EngineLoad {
+            num_used_tokens: Some(2048),
+            max_total_num_tokens: Some(8192),
+            max_running_requests: 64,
+            ..pushed(7)
+        };
+        for rank in 0..8 {
+            let worker: Arc<dyn Worker> = Arc::new(
+                BasicWorkerBuilder::new("grpc://decode:9000")
+                    .worker_type(WorkerType::Decode)
+                    .dp_config(rank, 8)
+                    .build(),
+            );
+            worker.set_status(WorkerStatus::Ready);
+            registry.register(Arc::clone(&worker)).unwrap();
+            // Every subscription receives the same backend-wide stream.
+            for pushing_rank in [0, 2] {
+                monitor.apply_pushed_load(&worker, pushing_rank, &active, now);
+            }
+            let is_active = rank == 0 || rank == 2;
+            assert_eq!(worker.pushes_load_records(), is_active);
+            assert_eq!(
+                monitor.poll_mode(worker.url(), now, interval),
+                if is_active {
+                    PollMode::Suppressed
+                } else {
+                    PollMode::Poll
+                }
+            );
+            monitor.flush_pushed();
+            let snapshot = monitor.load_state.snapshot();
+            if is_active {
+                let report = snapshot.get(worker.url()).unwrap();
+                assert_eq!(report.loads.len(), 1);
+                assert_eq!(report.loads[0].dp_rank, rank as i32);
+            } else {
+                assert!(snapshot.get(worker.url()).is_none());
+            }
+
+            // A poll supplies each quiet rank's real idle sample. A later
+            // foreign push must neither overwrite it nor redirect selection.
+            let loads = HashMap::from([(
+                worker.url().to_string(),
+                HashMap::from([(rank as isize, 0)]),
+            )]);
+            monitor.worker_load_manager.update_dp_loads(&loads);
+            for pushing_rank in [0, 2] {
+                monitor.apply_pushed_load(&worker, pushing_rank, &active, now);
+            }
+            let manager = &monitor.worker_load_manager;
+            assert_eq!(
+                manager.select_and_increment_lowest_dp_load(worker.as_ref(), 1),
+                Some(rank as isize)
+            );
+        }
+    }
+
+    /// Foreign cached ranks cannot redirect a pinned worker or invent missing telemetry.
+    #[test]
+    fn virtual_rank_selection_rejects_foreign_cached_ranks() {
+        let worker = BasicWorkerBuilder::new("grpc://decode:9000")
+            .dp_config(7, 8)
+            .build();
+        let manager = Arc::new(WorkerLoadManager::new());
+        let mut loads = HashMap::from([(0, 0), (2, 0)]);
+        manager.update_dp_loads(&HashMap::from([(worker.url().to_string(), loads.clone())]));
+        assert!(manager
+            .select_and_increment_lowest_dp_load(&worker, 1)
+            .is_none());
+        loads.insert(7, 100);
+        manager.update_dp_loads(&HashMap::from([(worker.url().to_string(), loads)]));
+        assert_eq!(
+            manager.select_and_increment_lowest_dp_load(&worker, 1),
+            Some(7)
+        );
     }
 
     /// A pushed record is a poll of its worker: the rank's entry is replaced
@@ -1999,6 +2200,153 @@ mod worker_monitor_tests {
         }
     }
 
+    /// A pushed record that carries the engine's own silence past the wedge
+    /// threshold vetoes the worker with nothing of this gateway's in flight
+    /// on it; the record that shows the engine producing again lifts it.
+    #[tokio::test]
+    async fn a_pushed_record_with_the_engines_silence_vetoes_the_worker() {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("grpc://w1:9000", "llama-3");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let mut record = pushed(1);
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert!(worker.stall_reason().is_none(), "no silence reported");
+        record.engine_silence_ms = Some(5_000);
+        record.engine_reports_steps = Some(true);
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert_eq!(
+            worker.stall_reason(),
+            Some(super::super::worker::StallReason::Wedged)
+        );
+        assert!(!worker.is_healthy_and_eligible());
+        record.engine_silence_ms = None;
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert!(worker.stall_reason().is_none(), "the engine produces again");
+    }
+
+    /// A pushed record from a step-reporting wire whose silence is past the
+    /// threshold while the servicer reports a long prefill in hand (the step
+    /// that starts a long multimodal prompt, or a kernel built for it) is no
+    /// veto until twice that prefill's time has passed; the same silence
+    /// with nothing pending, a frozen engine, is the veto it was.
+    #[tokio::test]
+    async fn a_pushed_record_with_a_long_pending_prefill_behind_the_engines_silence_is_no_veto() {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("grpc://w1:9000", "llama-3");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let mut record = pushed(1);
+        record.engine_reports_steps = Some(true);
+        record.prefill_pending_tokens = Some(156_752);
+        for silence in [3_000, 10_000, 31_000] {
+            record.engine_silence_ms = Some(silence);
+            monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+            assert!(
+                worker.stall_reason().is_none(),
+                "{silence} ms of silence inside the prefill's allowance"
+            );
+        }
+        record.engine_silence_ms = Some(32_000);
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert_eq!(
+            worker.stall_reason(),
+            Some(super::super::worker::StallReason::Wedged),
+            "silent past twice the prefill at the cold prior"
+        );
+        record.engine_silence_ms = None;
+        record.prefill_pending_tokens = Some(0);
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert!(worker.stall_reason().is_none(), "the engine produces again");
+        // Nothing pending: the threshold, as before.
+        record.engine_silence_ms = Some(3_000);
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert_eq!(
+            worker.stall_reason(),
+            Some(super::super::worker::StallReason::Wedged),
+            "a frozen engine with nothing to prefill"
+        );
+    }
+
+    /// The overload veto's edges are INFO lines with the report's figures:
+    /// a record at the waiting threshold sets it, the next under it clears
+    /// it, and a record that re-asserts the verdict the worker carries
+    /// writes nothing new.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn the_overload_vetos_edges_are_logged_with_their_figures() {
+        let (registry, monitor) = build_monitor();
+        let worker: Arc<dyn Worker> = {
+            let worker = BasicWorkerBuilder::new("grpc://w1:9000")
+                .worker_type(WorkerType::Regular)
+                .connection_mode(ConnectionMode::Http)
+                .model(ModelCard::new("llama-3"))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .overload_defaults(OverloadThresholds {
+                    waiting_requests: Some(8),
+                    token_usage: Some(0.8),
+                })
+                .build();
+            worker.set_status(WorkerStatus::Ready);
+            Arc::new(worker)
+        };
+        registry.register(Arc::clone(&worker)).unwrap();
+        let mut record = pushed(1);
+        record.waiting_requests = 8;
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert!(worker.is_overloaded(), "eight waiting is the threshold");
+        assert!(logs_contain("Worker overload veto set"));
+        assert!(logs_contain("waiting_requests=8"));
+        assert!(logs_contain("pushed record"));
+        assert!(!logs_contain("Worker overload veto cleared"));
+        record.sample = 2;
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        logs_assert(|lines: &[&str]| {
+            let edges = lines
+                .iter()
+                .filter(|line| line.contains("Worker overload veto"))
+                .count();
+            if edges == 1 {
+                Ok(())
+            } else {
+                Err(format!("{edges} edge lines for one edge"))
+            }
+        });
+        record.waiting_requests = 0;
+        record.sample = 3;
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert!(!worker.is_overloaded(), "the queue drained");
+        assert!(logs_contain("Worker overload veto cleared"));
+    }
+
+    /// A worker's first pushed record may be a `load_only` one the servicer
+    /// sends before the engine's first batch (from the subscription on, to
+    /// a gateway that asks for them): with the engine's silence on it, it
+    /// vetoes the worker like any later record, so an engine frozen on the
+    /// first request it ever receives leaves routing within the threshold
+    /// rather than never.
+    #[tokio::test]
+    async fn the_first_record_a_worker_pushes_is_judged_before_any_event_batch() {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("grpc://w1:9000", "llama-3");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let record = EngineLoad {
+            engine_silence_ms: Some(5_000),
+            engine_reports_steps: Some(true),
+            prefill_pending_tokens: Some(47),
+            load_only: true,
+            sample: 1,
+            ..Default::default()
+        };
+        monitor.apply_pushed_load(&worker, 0, &record, Instant::now());
+        assert_eq!(
+            worker.stall_reason(),
+            Some(super::super::worker::StallReason::Wedged)
+        );
+        assert!(!worker.is_healthy_and_eligible());
+    }
+
     /// A record's telemetry feeds the `smg_engine_*` gauges, the PD gauges
     /// included, as a poll's does; a core-only record after it (an event
     /// batch between heartbeats) keeps the telemetry the worker last sent
@@ -2113,6 +2461,180 @@ mod worker_monitor_tests {
         // A worker that leaves takes its records with it.
         monitor.evict_worker_loads(&worker);
         assert_eq!(monitor.poll_mode(url, late, interval), PollMode::Poll);
+    }
+
+    /// Under data parallelism a quiet rank's record stops arriving while
+    /// the other rank's heartbeats keep the stream alive, and the tick
+    /// falls back to the poll for the worker. The poll's figure for the
+    /// quiet rank replaces its entry in the pushed report: a heartbeat
+    /// naming the busy rank no longer rebuilds the report from the quiet
+    /// rank's last pushed record, the rank follows the poll from then on,
+    /// a rank whose own record arrived since the poll began keeps it, and
+    /// the poll decision is unchanged (the worker stays polled until the
+    /// rank's records resume).
+    #[tokio::test]
+    async fn a_quiet_ranks_figures_follow_the_poll_rather_than_its_last_pushed_record() {
+        let (registry, monitor) = build_monitor();
+        let worker = ready_worker("grpc://w1:9000", "llama-3");
+        registry.register(Arc::clone(&worker)).unwrap();
+        let url = "grpc://w1:9000";
+        let interval = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let record = |running: u32, hit_rate: f64| EngineLoad {
+            cache_hit_rate: Some(hit_rate),
+            ..pushed(running)
+        };
+        let poll = |rank1_hit_rate: f64| WorkerLoadResponse {
+            dp_rank_count: 2,
+            loads: vec![
+                SchedulerLoadSnapshot {
+                    dp_rank: 0,
+                    num_running_reqs: 2,
+                    cache_hit_rate: 0.9,
+                    ..Default::default()
+                },
+                SchedulerLoadSnapshot {
+                    dp_rank: 1,
+                    num_running_reqs: 8,
+                    cache_hit_rate: rank1_hit_rate,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let ranks_of = |report: &WorkerLoadResponse| -> Vec<(i32, i32, f64)> {
+            report
+                .loads
+                .iter()
+                .map(|rank| (rank.dp_rank, rank.num_running_reqs, rank.cache_hit_rate))
+                .collect()
+        };
+
+        // Both ranks push during the first passes; then rank 1's working
+        // set is cached and its records stop, while rank 0 keeps pushing.
+        monitor.apply_pushed_load(&worker, 0, &record(3, 0.5), t0);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0.65), t0);
+        let polled_at = t0 + interval;
+        assert_eq!(
+            monitor.poll_mode(url, polled_at, interval),
+            PollMode::Fallback
+        );
+        // Rank 0 pushed while the poll was in flight: its own record is the
+        // newer; rank 1 pushed nothing since the poll began.
+        monitor.apply_pushed_load(
+            &worker,
+            0,
+            &record(4, 0.5),
+            polled_at + Duration::from_millis(1),
+        );
+        monitor.apply_polled_load(url, &poll(0.91), polled_at);
+        // The next heartbeat names rank 0 only: the report it rebuilds and
+        // the gauges carry rank 1 at the poll's figure, rank 0 at its own.
+        let rendered = render_with_recorder(|| {
+            monitor.apply_pushed_load(
+                &worker,
+                0,
+                &record(5, 0.5),
+                polled_at + Duration::from_millis(2),
+            );
+        });
+        monitor.flush_pushed();
+        let snapshot = monitor.load_state.snapshot();
+        let report = snapshot.get(url).expect("published");
+        assert_eq!(report.version, "pushed");
+        assert_eq!(ranks_of(report), vec![(0, 5, 0.5), (1, 8, 0.91)]);
+        let rank1_hit_rate = rendered
+            .lines()
+            .find(|l| {
+                l.starts_with("smg_engine_cache_hit_rate{")
+                    && l.contains("worker=\"grpc://w1:9000\"")
+                    && l.contains("dp_rank=\"1\"")
+            })
+            .map(|l| l.rsplit(' ').next().unwrap_or("").to_string())
+            .unwrap_or_else(|| panic!("rank 1's hit rate gauge missing:\n{rendered}"));
+        assert_eq!(rank1_hit_rate, "0.91");
+
+        // The receipts are the stream's: rank 1 is still quiet, the worker
+        // stays polled, and each poll's figure replaces the last. A rank
+        // the stream never named (here a rank 2 the poll reports) stays
+        // out of the pushed report: nothing would refresh it once the
+        // pushing ranks are fresh again.
+        let next = polled_at + interval;
+        assert_eq!(monitor.poll_mode(url, next, interval), PollMode::Fallback);
+        let mut with_a_third_rank = poll(0.93);
+        with_a_third_rank.loads.push(SchedulerLoadSnapshot {
+            dp_rank: 2,
+            num_running_reqs: 1,
+            cache_hit_rate: 0.2,
+            ..Default::default()
+        });
+        with_a_third_rank.dp_rank_count = 3;
+        monitor.apply_polled_load(url, &with_a_third_rank, next);
+        monitor.apply_pushed_load(&worker, 0, &record(6, 0.5), next + Duration::from_millis(1));
+        monitor.flush_pushed();
+        let snapshot = monitor.load_state.snapshot();
+        assert_eq!(
+            ranks_of(snapshot.get(url).expect("published")),
+            vec![(0, 6, 0.5), (1, 8, 0.93)]
+        );
+        // A rollup keyed by downstream worker rather than by rank is
+        // ignored: its entries both say rank 0, and rank 0's slot keeps
+        // the record the stream pushed before the rollup was asked.
+        let rollup = WorkerLoadResponse {
+            dp_rank_count: 2,
+            loads: vec![
+                SchedulerLoadSnapshot {
+                    dp_rank: 0,
+                    num_running_reqs: 40,
+                    worker: Some("http://downstream-a:8000".to_string()),
+                    ..Default::default()
+                },
+                SchedulerLoadSnapshot {
+                    dp_rank: 0,
+                    num_running_reqs: 41,
+                    worker: Some("http://downstream-b:8000".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        monitor.apply_polled_load(url, &rollup, next + Duration::from_millis(2));
+        let rank0 = monitor
+            .pushed_ranks
+            .lock()
+            .get(url)
+            .and_then(|ranks| ranks.get(&0).cloned())
+            .expect("rank 0 on file");
+        assert_eq!(
+            (rank0.num_running_reqs, rank0.cache_hit_rate, rank0.worker),
+            (6, 0.5, None)
+        );
+        // Rank 1's own record, once it pushes again, is the newer figure
+        // and suppresses the poll again; the report it rebuilds carries
+        // rank 0 as the stream left it.
+        monitor.apply_pushed_load(&worker, 1, &record(7, 0.7), next + Duration::from_millis(3));
+        monitor.flush_pushed();
+        let snapshot = monitor.load_state.snapshot();
+        assert_eq!(
+            ranks_of(snapshot.get(url).expect("published")),
+            vec![(0, 6, 0.5), (1, 7, 0.7)]
+        );
+        assert_eq!(
+            monitor.poll_mode(url, next + Duration::from_millis(4), interval),
+            PollMode::Suppressed
+        );
+
+        // A worker with no pushed record on file has no report to merge
+        // into: the poll's report stands on its own and the worker is
+        // polled as always.
+        let other = ready_worker("grpc://w2:9000", "llama-3");
+        registry.register(Arc::clone(&other)).unwrap();
+        monitor.apply_polled_load("grpc://w2:9000", &poll(0.1), t0);
+        assert!(monitor.pushed_ranks.lock().get("grpc://w2:9000").is_none());
+        assert_eq!(
+            monitor.poll_mode("grpc://w2:9000", t0, interval),
+            PollMode::Poll
+        );
     }
 
     /// A tick does not poll a worker whose stream pushed within the
@@ -2525,6 +3047,8 @@ mod native_loads_tests {
             cache_boundaries: Vec::new(),
             selection_policy: None,
             selection_accounting_ttl_ms: 0,
+            balance_prefix_margin_tokens: 0,
+            balance_uncached_credit: false,
         }
     }
 
@@ -3047,5 +3571,59 @@ mod native_loads_tests {
             stub.gateway_query.lock().clone(),
             Some("model=meta-llama%2FLlama-3.1-8B".to_string())
         );
+    }
+
+    /// The tick's fallback poll of a worker whose stream went quiet on one
+    /// rank refreshes that rank's entry in the pushed report: the next
+    /// record the stream pushes rebuilds the report from the poll's figure
+    /// for it, not from the rank's last pushed record.
+    #[tokio::test]
+    async fn a_fallback_polls_figures_reach_the_pushed_report_of_a_quiet_rank() {
+        const TWO_RANKS: &str = r#"{"loads":[
+            {"dp_rank":0,"num_running_reqs":3,"num_waiting_reqs":0,"token_usage":0.25,"cache_hit_rate":0.9},
+            {"dp_rank":1,"num_running_reqs":8,"num_waiting_reqs":0,"token_usage":0.5,"cache_hit_rate":0.91}]}"#;
+        let stub = spawn_engine(StatusCode::OK, TWO_RANKS).await;
+        let (registry, monitor) = monitor_with_policy(PolicyConfig::RoundRobin);
+        let worker = vllm_worker(&stub.url);
+        worker.set_status(WorkerStatus::Ready);
+        registry.register(Arc::clone(&worker)).unwrap();
+        let key = WorkerGroupKey {
+            model_id: "a".to_string(),
+            worker_type: WorkerType::Regular,
+            connection_mode: ConnectionMode::Http,
+        };
+        let interval = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let record = |running: u32, hit_rate: f64, sample: u64| EngineLoad {
+            running_requests: running,
+            cache_hit_rate: Some(hit_rate),
+            sample,
+            ..Default::default()
+        };
+        monitor.apply_pushed_load(&worker, 0, &record(2, 0.5, 1), t0);
+        monitor.apply_pushed_load(&worker, 1, &record(8, 0.65, 2), t0);
+
+        // One interval later rank 1's record is older than the interval:
+        // the tick polls the worker.
+        poll_group_once(&monitor, &key, interval, t0 + interval).await;
+        assert_eq!(stub.probes.load(Ordering::SeqCst), 1, "one fallback poll");
+
+        // The stream's next record names rank 0 only.
+        monitor.apply_pushed_load(
+            &worker,
+            0,
+            &record(4, 0.5, 3),
+            t0 + interval + Duration::from_millis(1),
+        );
+        monitor.flush_pushed();
+        let snapshot = monitor.load_state.snapshot();
+        let report = snapshot.get(stub.url.as_str()).expect("published");
+        assert_eq!(report.version, "pushed");
+        let ranks: Vec<(i32, i32, f64)> = report
+            .loads
+            .iter()
+            .map(|rank| (rank.dp_rank, rank.num_running_reqs, rank.cache_hit_rate))
+            .collect();
+        assert_eq!(ranks, vec![(0, 4, 0.5), (1, 8, 0.91)]);
     }
 }

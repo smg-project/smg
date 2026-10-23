@@ -51,14 +51,9 @@ Compiler:\n\
     )
 }
 
-/// Get version number only
-pub fn get_version() -> &'static str {
-    VERSION
-}
-
 /// Print the startup banner with braille art and key configuration info.
 ///
-/// Layout inspired by vLLM's startup banner — art on the left,
+/// Layout inspired by a serving engine's startup banner — art on the left,
 /// useful context on the right. Shepherd with sheep motif.
 #[expect(
     clippy::print_stdout,
@@ -68,7 +63,12 @@ pub fn print_banner(host: &str, port: u16, mode: &str) {
     let info: [(&str, String); 4] = [
         ("", PROJECT_NAME.to_string()),
         ("version", VERSION.to_string()),
-        ("listening", format!("{host}:{port}")),
+        (
+            "listening",
+            crate::config::bind_socket_addr(host, port)
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|_| format!("{host}:{port}")),
+        ),
         ("mode", mode.to_string()),
     ];
 

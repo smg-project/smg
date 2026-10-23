@@ -8,8 +8,10 @@ silent-swallow path.
 The gateway deserializes every ``/v1/responses`` body through
 ``ValidatedJson<ResponsesRequest>`` (crates/protocols/src/validated.rs). Any
 serde error surfaces as ``HTTP 400`` with
-``{"error": {"type": "invalid_request_error", "code": "json_parse_error"}}``
-(see validated.rs:60-85), so these tests hit the gateway directly with
+``{"error": {"type": "invalid_request_error", "code": <one of PARSER_CODES>}}``
+(the code names the deserializer's reason, as the public API's does: a missing
+field, an unknown field, a wrong type, a value outside an enumeration, a
+negative integer, malformed JSON), so these tests hit the gateway directly with
 ``httpx`` instead of the OpenAI SDK — both to exercise the exact wire shape
 and to bypass client-side shape enforcement.
 
@@ -62,17 +64,41 @@ def _post_responses(gateway, body: dict, timeout: float = 30.0) -> httpx.Respons
     )
 
 
-def _assert_validation_400(resp: httpx.Response) -> dict:
+# The codes ``ValidatedJson`` gives a body the deserializer refused
+# (crates/protocols/src/validated.rs, ``deserialize_code``): the public API's
+# names for the reason, and ``json_parse_error`` for anything it cannot name.
+PARSER_CODES = frozenset(
+    {
+        "missing_required_parameter",
+        "unknown_parameter",
+        "invalid_type",
+        "invalid_value",
+        "integer_below_min_value",
+        "invalid_json",
+        "json_parse_error",
+    }
+)
+
+# The prefixes of the parser's messages (``ValidatedJson``'s ``map_err`` on
+# ``Json::from_request``). The validator branch shares several codes with the
+# parser (``invalid_type``, ``invalid_value``, ``missing_required_parameter``,
+# ``integer_below_min_value``) but renders its own report, so the prefix is
+# what tells a parser-level rejection from a validator-level one.
+PARSER_MESSAGE_PREFIXES = ("Invalid JSON data:", "JSON syntax error:")
+
+
+def _assert_validation_400(resp: httpx.Response, code: str | None = None) -> dict:
     """Assert the gateway returned a 400 with the canonical parser envelope.
 
-    Pins the full shape emitted by ``ValidatedJson``'s ``JsonDataError``
-    branch (``crates/protocols/src/validated.rs:74-84``): status 400,
-    ``error.type == "invalid_request_error"``, and
-    ``error.code == "json_parse_error"``. The ``code`` assertion is what
-    distinguishes a parser-level rejection from the validator-level
-    rejection emitted at validated.rs:91-103 (which uses ``code: 400`` as
-    an integer) or any upstream/auth 400 that happens to share the
-    envelope prefix.
+    Pins the shape emitted by ``ValidatedJson``'s ``JsonDataError`` branch
+    (``crates/protocols/src/validated.rs``): status 400,
+    ``error.type == "invalid_request_error"``, ``error.code`` one of
+    ``PARSER_CODES`` (or exactly ``code`` when given), and ``error.message``
+    starting with one of ``PARSER_MESSAGE_PREFIXES``. The prefix is what
+    distinguishes a parser-level rejection from a validator-level one (the
+    validator shares codes with the parser but renders its own report) or any
+    upstream/auth 400 that happens to share the envelope; ``code`` pins the
+    deserializer's reason for the case at hand.
 
     Returns the parsed JSON body so individual tests can make per-case
     assertions about the error message contents.
@@ -85,11 +111,14 @@ def _assert_validation_400(resp: httpx.Response) -> dict:
     assert err.get("type") == "invalid_request_error", (
         f"expected invalid_request_error, got {err!r}"
     )
-    assert err.get("code") == "json_parse_error", (
-        f"expected code=json_parse_error (parser branch), got {err!r}"
+    expected = {code} if code else PARSER_CODES
+    assert err.get("code") in expected, (
+        f"expected code in {sorted(expected)} (parser branch), got {err!r}"
     )
     message = err.get("message", "")
-    assert isinstance(message, str) and message, f"expected non-empty message, got {err!r}"
+    assert isinstance(message, str) and message.startswith(PARSER_MESSAGE_PREFIXES), (
+        f"expected a message with one of the parser's prefixes {PARSER_MESSAGE_PREFIXES}, got {err!r}"
+    )
     return body
 
 
@@ -114,7 +143,9 @@ def _is_validation_400(resp: httpx.Response) -> bool:
     err = body.get("error")
     if not isinstance(err, dict):
         return False
-    return err.get("code") == "json_parse_error"
+    return err.get("code") in PARSER_CODES and str(err.get("message", "")).startswith(
+        PARSER_MESSAGE_PREFIXES
+    )
 
 
 @pytest.mark.vendor("openai")
@@ -158,7 +189,9 @@ class TestResponsesInputValidation:
             ],
         }
         resp = _post_responses(gw, body)
-        err = _assert_validation_400(resp)
+        # ``input`` is an untagged enum, so a part no variant accepts is
+        # serde's "data did not match any variant": a wrong type.
+        err = _assert_validation_400(resp, code="invalid_type")
         message = err["error"]["message"].lower()
         # Minimal observable invariant: the error must surface at the
         # ``input`` field (the only field that can carry content parts),
@@ -208,7 +241,7 @@ class TestResponsesInputValidation:
         }
         resp = _post_responses(gw, body)
         # The critical invariant is narrow: the gateway's *parser* must not
-        # emit its json_parse_error envelope for the extra field. A plain
+        # emit its rejection envelope for the extra field. A plain
         # `status_code != 400` check would let an unrelated downstream 400
         # (e.g. auth, upstream validation) vacuously satisfy the assertion,
         # so we target the parser-specific envelope via _is_validation_400.
@@ -219,22 +252,14 @@ class TestResponsesInputValidation:
             f"status={resp.status_code} body={resp.text!r}"
         )
 
-    def test_message_with_invalid_role_not_rejected_by_body_parser(self, setup_backend):
-        """Invalid role strings pass the body parser unchanged (E7 case 3).
+    def test_message_with_invalid_role_rejected_400(self, setup_backend):
+        """An input message with an unknown role is refused before generation
+        (E7 case 3), as the public API refuses it: only ``assistant``,
+        ``system``, ``developer`` and ``user`` are input roles.
 
-        Audit §E7 lists ``{"type": "message", "role": "martian"}`` as a 400,
-        but role validation is **outside P5's scope**: ``SimpleInputMessage.role``
-        is ``String`` (responses.rs:1239), not an enum, and the regular
-        gRPC conversion at
-        model_gateway/src/routers/grpc/regular/responses/conversions.rs:264-270
-        silently maps unknown roles to ``User``. The body parser therefore
-        accepts ``role: "martian"`` today; any rejection is upstream policy,
-        not gateway policy.
-
-        This test captures that observation so a future reviewer sees E7's
-        role-validation case as a known gap rather than a regression. If the
-        protocol later tightens ``role`` to an enum, flip the assertion to
-        require 400.
+        The rejection comes from the request validator (``validate()`` after
+        the body parser), so the envelope is the validator's
+        ``invalid_request_error`` with the rule's code.
         """
         _, model_path, _, gw = setup_backend
         body = {
@@ -245,16 +270,12 @@ class TestResponsesInputValidation:
             "max_output_tokens": 16,
         }
         resp = _post_responses(gw, body)
-        # As in the extra-field test, we target the parser-specific envelope
-        # rather than any 400: upstream or auth 4xx responses are allowed,
-        # but the gateway's own json_parse_error path must stay silent on
-        # an arbitrary role string today.
-        assert not _is_validation_400(resp), (
-            f"role='martian' unexpectedly rejected by body parser: "
-            f"status={resp.status_code} body={resp.text!r} — if this is "
-            f"intentional, update the test to expect 400 and cite the "
-            f"protocol change."
+        assert resp.status_code == 400, (
+            f"role='martian' must be rejected: status={resp.status_code} body={resp.text!r}"
         )
+        err = resp.json()["error"]
+        assert err["type"] == "invalid_request_error", err
+        assert "martian" in err["message"], err
 
     def test_content_part_array_with_empty_type_rejected_400(self, setup_backend):
         """Empty-string ``type`` on a content part must fail-fast (E7 case 4).
@@ -282,4 +303,5 @@ class TestResponsesInputValidation:
             ],
         }
         resp = _post_responses(gw, body)
-        _assert_validation_400(resp)
+        # The same untagged ``input``: the empty ``type`` matches no variant.
+        _assert_validation_400(resp, code="invalid_type")

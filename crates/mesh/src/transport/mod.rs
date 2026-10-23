@@ -6,4 +6,5 @@ pub mod chunk_assembler;
 pub mod chunking;
 pub mod crdt_batch;
 pub mod limits;
+pub mod peer_stream;
 pub mod sync_stream;

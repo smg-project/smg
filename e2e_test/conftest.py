@@ -105,8 +105,10 @@ def pytest_runtest_logstart(nodeid: str, location: tuple) -> None:
 import pytest
 from fixtures import (
     backend_router,
+    mock_answers,
     pytest_collection_modifyitems,
     pytest_configure,
+    pytest_runtest_makereport,
     pytest_runtest_setup,
     pytest_sessionfinish,
     setup_backend,
@@ -149,6 +151,7 @@ def api_client(request, setup_backend):
 __all__ = [
     # Hooks
     "pytest_runtest_logstart",
+    "pytest_runtest_makereport",
     "pytest_runtest_setup",
     "pytest_collection_modifyitems",
     "pytest_configure",
@@ -156,6 +159,7 @@ __all__ = [
     # Fixtures
     "setup_backend",
     "backend_router",
+    "mock_answers",
     "model",
     "api_client",
 ]

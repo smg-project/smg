@@ -15,6 +15,7 @@ use axum::{
     Json, Router,
 };
 use openai_protocol::worker::{ConnectionMode, RuntimeType, WorkerStatus, WorkerType};
+use rustls::crypto::ring;
 use serde_json::json;
 use tokio::net::TcpListener;
 
@@ -37,10 +38,11 @@ pub fn worker(id: &str, url: &str, runtime: RuntimeType) -> RlWorkerInfo {
     labels.insert("dp_size".to_string(), "1".to_string());
     labels.insert("pp_size".to_string(), "1".to_string());
     labels.insert("weight_version".to_string(), "default".to_string());
+    let base_url = url.split('@').next().unwrap_or(url).to_string();
     RlWorkerInfo {
         id: id.to_string(),
         url: url.to_string(),
-        base_url: url.split('@').next().unwrap_or(url).to_string(),
+        base_url: base_url.clone(),
         api_key: None,
         model_id: "mock-model".to_string(),
         runtime,
@@ -50,15 +52,24 @@ pub fn worker(id: &str, url: &str, runtime: RuntimeType) -> RlWorkerInfo {
         is_dp_aware: url.contains('@'),
         dp_size: None,
         labels,
-        http_client: Some(test_client()),
+        control_url: Some(base_url),
+        control_client: Ok(test_client()),
     }
 }
 
 /// One plain client shared by every fake worker, standing in for the
-/// gateway's per-worker negotiated client.
+/// gateway's per-worker negotiated client; the process-level TLS crypto
+/// provider is installed before it is built.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "a test binary's client factory; the process TLS crypto provider is installed first"
+)]
 pub fn test_client() -> Arc<reqwest::Client> {
     static CLIENT: OnceLock<Arc<reqwest::Client>> = OnceLock::new();
-    Arc::clone(CLIENT.get_or_init(|| Arc::new(reqwest::Client::new())))
+    Arc::clone(CLIENT.get_or_init(|| {
+        let _ = ring::default_provider().install_default();
+        Arc::new(reqwest::Client::new())
+    }))
 }
 
 /// One recorded request seen by a fake engine.

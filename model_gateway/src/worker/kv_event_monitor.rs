@@ -1,8 +1,8 @@
 //! Per-worker KV cache event subscription manager.
 //!
 //! `KvEventMonitor` spawns a background tokio task per gRPC worker that subscribes
-//! to KV cache events and feeds them into a shared [`KvIndex`] (one per model;
-//! the positional indexer or the chain index, per `--kv-index`).
+//! to KV cache events and feeds them into a shared [`KvIndex`] (one per model:
+//! the chain index).
 //! This enables event-driven cache-aware routing as an alternative to the approximate
 //! radix tree approach.
 //!
@@ -28,7 +28,7 @@ use std::{
     },
 };
 
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use futures::FutureExt as _;
 use tokio::{
     sync::{oneshot, watch, Mutex},
@@ -36,10 +36,7 @@ use tokio::{
 };
 use tracing::{debug, error, info, warn};
 
-use super::{
-    kv_index_backend::{KvIndex, KvIndexKind},
-    monitor::WorkerMonitor,
-};
+use super::{kv_index_backend::KvIndex, monitor::WorkerMonitor};
 use crate::{
     observability::metrics::Metrics,
     policies::utils::PeriodicTask,
@@ -50,14 +47,8 @@ mod admission;
 mod apply;
 mod subscription;
 
+#[cfg(any(test, feature = "test-util"))]
 pub(crate) use apply::WorkerIndexState;
-
-/// Default jump size for new positional indexers.
-const DEFAULT_JUMP_SIZE: usize = 64;
-
-/// Interval between positional-indexer prune cycles (matches the routing
-/// policies' default eviction cadence).
-const PRUNE_INTERVAL_SECS: u64 = 30;
 
 /// Interval between publications of each model's index size and, for the chain
 /// index, its shape and memory (`smg_kv_index_*` gauges by model).
@@ -68,9 +59,22 @@ const STATS_INTERVAL_SECS: u64 = 30;
 /// Each gRPC worker gets a dedicated tokio task that subscribes to the backend's
 /// KV cache event stream and feeds events into a shared [`KvIndex`]
 /// (one per `model_id`). Workers serving the same model share the same indexer.
+/// A model's KV block size as the monitor knows it: provisional until a
+/// stored event names it. A provisional size (a `WorkerSpec` seed or
+/// `set_block_size`) is replaced by the first stored block; a size the
+/// events named is only ever raised. Hybrid engines publish, beside their
+/// full blocks, partial entries at their hash granularity (a fraction of
+/// the block), and a request hashed at that size would never match a full
+/// block, so the size of record is the largest block the events carried.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KvBlockSize {
+    pub(crate) tokens: usize,
+    pub(crate) from_events: bool,
+}
+
 pub struct KvEventMonitor {
     /// Per-model KV indexes: model_id → shared indexer.
-    /// Arc-wrapped so the prune task can share the map WITHOUT holding (even
+    /// Arc-wrapped so the stats task can share the map WITHOUT holding (even
     /// weakly) the monitor itself: `PeriodicTask` joins its thread on drop, so
     /// a task that could ever own the last monitor reference would run the
     /// monitor's drop — and thus its own join — on its own thread.
@@ -78,21 +82,15 @@ pub struct KvEventMonitor {
     /// Per-model block sizes learned from KV events or set via WorkerSpec.
     /// Used by CacheAwarePolicy to chunk request tokens at query time.
     /// Arc-wrapped so subscription tasks can update it from events.
-    block_sizes: Arc<DashMap<String, usize>>,
+    block_sizes: Arc<DashMap<String, KvBlockSize>>,
     /// Per-worker subscription slots: worker_url → the live subscription, or
     /// the reservation a removal leaves until the old task has cleaned up.
     /// Mutex matches LoadMonitor pattern for atomic abort + remove; Arc so a
     /// task can lift its own reservation at the end of its exit path.
     worker_handles: Arc<Mutex<HashMap<String, Slot>>>,
-    /// Which index new models get.
-    kind: KvIndexKind,
-    /// Jump size for new positional indexers.
-    jump_size: usize,
-    /// Periodic indexer prune, held so it aborts when the monitor drops.
-    /// Set once by [`start_prune_task`](Self::start_prune_task); sync mutex
-    /// because it is touched only at startup, never on event paths.
-    prune_task: parking_lot::Mutex<Option<PeriodicTask>>,
-    /// Periodic index-shape publication, held like the prune task.
+    /// Periodic index-shape publication, held so it aborts when the monitor
+    /// drops. Set once by [`start_stats_task`](Self::start_stats_task); sync
+    /// mutex because it is touched only at startup, never on event paths.
     stats_task: parking_lot::Mutex<Option<PeriodicTask>>,
     /// Where the load records on the event streams go (`KvEventBatch.load`):
     /// the worker monitor, which treats them as polls. Weak: the monitors
@@ -145,68 +143,21 @@ struct WorkerSubscription {
 static NEXT_SUBSCRIPTION_ID: AtomicU64 = AtomicU64::new(1);
 
 impl KvEventMonitor {
-    /// A monitor whose models get positional indexers.
-    ///
-    /// `jump_size` is the positional indexer's historical tuning knob.
-    /// Pass `None` for the default (64).
-    pub fn new(jump_size: Option<usize>) -> Self {
-        Self::with_kind(KvIndexKind::Positional, jump_size)
-    }
-
-    /// A monitor whose models get indexes of `kind` (see `--kv-index`).
-    pub fn with_kind(kind: KvIndexKind, jump_size: Option<usize>) -> Self {
-        let jump_size = jump_size.unwrap_or(DEFAULT_JUMP_SIZE).max(1);
+    /// A monitor whose models get chain indexes.
+    pub fn new() -> Self {
         Self {
             indexers: Arc::new(DashMap::new()),
             block_sizes: Arc::new(DashMap::new()),
             worker_handles: Arc::new(Mutex::new(HashMap::new())),
-            kind,
-            jump_size,
-            prune_task: parking_lot::Mutex::new(None),
             stats_task: parking_lot::Mutex::new(None),
             load_sink: OnceLock::new(),
         }
-    }
-
-    /// The kind of index this monitor builds per model.
-    pub fn kind(&self) -> KvIndexKind {
-        self.kind
     }
 
     /// Route the load records on every worker's event stream to the worker
     /// monitor (once; a later call is ignored).
     pub fn set_load_sink(&self, monitor: &Arc<WorkerMonitor>) {
         let _ = self.load_sink.set(Arc::downgrade(monitor));
-    }
-
-    /// Prune every model's positional indexer with the given bounds.
-    /// `ttl_secs`/`max_entries` of 0 disable the respective pass — see
-    /// [`KvIndex::prune`]. The chain index has no prune and is left alone.
-    pub fn prune_all(&self, ttl_secs: u64, max_entries: usize) {
-        Self::prune_indexers(&self.indexers, ttl_secs, max_entries);
-    }
-
-    fn prune_indexers(indexers: &DashMap<String, Arc<KvIndex>>, ttl_secs: u64, max_entries: usize) {
-        let ttl = u32::try_from(ttl_secs).unwrap_or(u32::MAX - 1);
-        let ttl = (ttl > 0).then_some(ttl);
-        let max = (max_entries > 0).then_some(max_entries);
-        if ttl.is_none() && max.is_none() {
-            return;
-        }
-        for entry in indexers {
-            let Some(stats) = entry.value().prune(ttl, max) else {
-                continue;
-            };
-            if stats.evicted_ttl + stats.evicted_capacity > 0 {
-                info!(
-                    model_id = %entry.key(),
-                    evicted_ttl = stats.evicted_ttl,
-                    evicted_capacity = stats.evicted_capacity,
-                    remaining = stats.remaining,
-                    "Pruned positional indexer"
-                );
-            }
-        }
     }
 
     /// Publish every model's index size, and the chain index's shape and
@@ -216,55 +167,43 @@ impl KvEventMonitor {
     /// 30 s cadence and never on a request.
     fn publish_stats(indexers: &DashMap<String, Arc<KvIndex>>) {
         for entry in indexers {
-            let index = entry.value();
-            Metrics::set_kv_index_size(entry.key(), index.current_size(), index.entry_count());
-            if let Some(stats) = index.chain_stats() {
-                Metrics::set_kv_index_chain_stats(entry.key(), &stats);
-            }
+            Self::publish_index(entry.key(), entry.value());
         }
     }
 
-    /// Start the periodic index-shape publication. Like the prune task, it
-    /// shares only the indexer map, never the monitor, and stops when the
-    /// monitor drops.
+    /// One model's index size and chain shape as gauges: the periodic
+    /// publication's unit, and what a new index publishes at once, so the
+    /// model's series exist (at zero) from its first worker rather than
+    /// from the first tick.
+    fn publish_index(model_id: &str, index: &KvIndex) {
+        Metrics::set_kv_index_size(model_id, index.current_size(), index.entry_count());
+        if let Some(stats) = index.chain_stats() {
+            Metrics::set_kv_index_chain_stats(model_id, &stats);
+        }
+    }
+
+    /// Zero a model's index-shape gauges once its index is dropped. The
+    /// periodic publication only sees the indexes that exist, and a series
+    /// keeps its last value, so without this the gauges would report the
+    /// last worker's blocks for as long as no worker of the model joins
+    /// again (an engine replaced behind a one-engine gateway, a model scaled
+    /// to zero).
+    fn publish_dropped_index(model_id: &str) {
+        Metrics::set_kv_index_size(model_id, 0, 0);
+        Metrics::set_kv_index_chain_stats(model_id, &kv_index::ChainIndexStats::default());
+    }
+
+    /// Start the periodic index-shape publication. The task shares only the
+    /// indexer map, never a reference to the monitor itself, so it can never
+    /// be the one to run the monitor's drop (and with it its own thread's
+    /// join; see the `indexers` field docs); the monitor holds the handle, so
+    /// the task stops when the monitor drops.
     pub fn start_stats_task(&self) {
         let indexers = Arc::clone(&self.indexers);
         let task = PeriodicTask::spawn(STATS_INTERVAL_SECS, "KvIndexStats", move || {
             Self::publish_stats(&indexers);
         });
         *self.stats_task.lock() = Some(task);
-    }
-
-    /// Start the periodic indexer prune. No-op when both bounds are 0/unset.
-    /// The task shares only the indexer map — never a reference to the monitor
-    /// itself — so it can never be the one to run the monitor's drop (and with
-    /// it its own thread's join; see the `indexers` field docs). The handle is
-    /// held by the monitor, so the task stops when the monitor drops.
-    pub fn start_prune_task(&self, ttl_secs: u64, max_entries: usize) {
-        if ttl_secs == 0 && max_entries == 0 {
-            return;
-        }
-        if self.kind == KvIndexKind::Chain {
-            warn!(
-                ttl_secs,
-                max_entries,
-                "The chain index has no prune: it holds what the engines report and \
-                 shrinks with their removals; --kv-indexer-ttl-secs and \
-                 --kv-indexer-max-entries apply to --kv-index positional only"
-            );
-            return;
-        }
-        let indexers = Arc::clone(&self.indexers);
-        let task = PeriodicTask::spawn(PRUNE_INTERVAL_SECS, "KvIndexerPrune", move || {
-            Self::prune_indexers(&indexers, ttl_secs, max_entries);
-        });
-        *self.prune_task.lock() = Some(task);
-        info!(
-            ttl_secs,
-            max_entries,
-            interval_secs = PRUNE_INTERVAL_SECS,
-            "Started positional-indexer prune task"
-        );
     }
 
     /// Start a KV event subscription for a worker.
@@ -298,9 +237,14 @@ impl KvEventMonitor {
             // The previous subscription for this URL is still being taken
             // out of the index: intern it again only once its task has ended.
             if done.has_changed().is_err() {
-                // The task is gone without lifting its reservation (aborted,
-                // or a panic past its guard): nothing is left to wait for.
+                // The task is gone without lifting its reservation (it ended
+                // before the removal began, was aborted, or panicked past its
+                // guard): nothing is left to wait for. Whatever it raised on
+                // the gauge is lowered before its successor starts, whose
+                // answer owns the gauge from here (the removal's own reset
+                // skips a slot that is no longer its reservation).
                 handles.remove(&url);
+                Metrics::set_kv_events_unavailable(&url, false);
                 break handles;
             }
             drop(handles);
@@ -308,16 +252,29 @@ impl KvEventMonitor {
             let _ = done.changed().await;
         };
 
-        let indexer = self
-            .indexers
-            .entry(model_id.clone())
-            .or_insert_with(|| Arc::new(KvIndex::new(self.kind, self.jump_size)))
-            .clone();
+        let (indexer, created) = match self.indexers.entry(model_id.clone()) {
+            Entry::Occupied(entry) => (Arc::clone(entry.get()), false),
+            Entry::Vacant(entry) => {
+                let index = Arc::new(KvIndex::chain());
+                entry.insert(Arc::clone(&index));
+                (index, true)
+            }
+        };
+        if created {
+            Self::publish_index(&model_id, &indexer);
+        }
+        // The worker's integrity series exist before its stream does.
+        Metrics::init_kv_event_series(&url);
         // Seed block_size provisionally from WorkerSpec. The event stream will
         // overwrite this with the backend's actual page size once received.
         if let Some(bs) = worker.metadata().spec.kv_block_size {
             if bs > 0 {
-                self.block_sizes.entry(model_id.clone()).or_insert(bs);
+                self.block_sizes
+                    .entry(model_id.clone())
+                    .or_insert(KvBlockSize {
+                        tokens: bs,
+                        from_events: false,
+                    });
             } else {
                 warn!(worker_url = %url, "Worker reports kv_block_size=0, ignoring");
             }
@@ -407,14 +364,15 @@ impl KvEventMonitor {
     /// The end of a removal, run by the subscription task once its blocks
     /// are out of the index: lift the URL's reservation if it is this task's
     /// (a later subscription under the URL has its own), and drop the
-    /// model's index with the model's last subscription. The task does this
-    /// rather than `on_worker_removed`, whose future a caller may drop
-    /// before the task has ended; a slot that is `Active` (the task ended on
-    /// its own, or `stop` took the subscription) is left as it is.
+    /// model's index with the model's last subscription, zeroing the gauges
+    /// that index fed. The task does this rather than `on_worker_removed`,
+    /// whose future a caller may drop before the task has ended; a slot that
+    /// is `Active` (the task ended on its own, or `stop` took the
+    /// subscription) is left as it is.
     async fn complete_removal(
         slots: &Mutex<HashMap<String, Slot>>,
         indexers: &DashMap<String, Arc<KvIndex>>,
-        block_sizes: &DashMap<String, usize>,
+        block_sizes: &DashMap<String, KvBlockSize>,
         worker_url: &str,
         id: u64,
         model_id: &str,
@@ -423,6 +381,13 @@ impl KvEventMonitor {
         if !matches!(handles.get(worker_url), Some(Slot::Removing(held)) if held.id == id) {
             return;
         }
+        // A backend without KV events is no longer a blind spot once its
+        // worker has left: lowered here, by the task that owned the
+        // subscription and under the slot lock, so a re-add of the URL that
+        // follows the removal cannot see its fresh gauge reset by a stale
+        // caller, and a caller that dropped `on_worker_removed` early does
+        // not leave it raised.
+        Metrics::set_kv_events_unavailable(worker_url, false);
         handles.remove(worker_url);
         // Under the slot lock, which `on_worker_added` holds from its lookup
         // of the model's index to its insert: an add of the model racing
@@ -434,6 +399,7 @@ impl KvEventMonitor {
         if last_of_model {
             indexers.remove(model_id);
             block_sizes.remove(model_id);
+            Self::publish_dropped_index(model_id);
         }
     }
 
@@ -478,6 +444,7 @@ impl KvEventMonitor {
         // future here loses nothing but the join error below.
         // Panics are caught inside the task; a JoinError here (abort or a
         // panic that escaped the guard) must still be surfaced, not discarded.
+        let id = sub.id;
         if let Err(e) = sub.handle.await {
             error!(
                 worker_url = %worker_url,
@@ -485,6 +452,17 @@ impl KvEventMonitor {
                 "KV event subscription task failed"
             );
             Metrics::record_kv_event_subscription_failure(worker_url, "join_error");
+        }
+        // A task that ends on the shutdown signal lowers the gauge in its own
+        // cleanup (`complete_removal`). One that had ended before this removal
+        // began (the answer that raises the gauge ends the subscription), or
+        // that did not reach its cleanup, left the reservation in place and
+        // the gauge with it: lowered here, under the slot lock and only while
+        // the reservation is still this subscription's. A successor under the
+        // URL owns the gauge from its add on.
+        let handles = self.worker_handles.lock().await;
+        if matches!(handles.get(worker_url), Some(Slot::Removing(held)) if held.id == id) {
+            Metrics::set_kv_events_unavailable(worker_url, false);
         }
     }
 
@@ -536,7 +514,7 @@ impl KvEventMonitor {
 
     /// Get the block size for a model (learned from events or set via `set_block_size`).
     pub fn block_size(&self, model_id: &str) -> Option<usize> {
-        self.block_sizes.get(model_id).map(|v| *v)
+        self.block_sizes.get(model_id).map(|v| v.tokens)
     }
 
     /// Set the block size for a model (e.g. from WorkerSpec during registration).
@@ -544,7 +522,10 @@ impl KvEventMonitor {
     pub fn set_block_size(&self, model_id: &str, block_size: usize) {
         self.block_sizes
             .entry(model_id.to_string())
-            .or_insert(block_size);
+            .or_insert(KvBlockSize {
+                tokens: block_size,
+                from_events: false,
+            });
     }
 
     /// Normalize model_id to match routing's `normalize_model_key`.
@@ -624,13 +605,17 @@ impl Drop for KvEventMonitor {
     }
 }
 
+impl Default for KvEventMonitor {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl fmt::Debug for KvEventMonitor {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("KvEventMonitor")
             .field("models", &self.indexers.len())
             .field("block_sizes", &self.block_sizes.len())
-            .field("kind", &self.kind)
-            .field("jump_size", &self.jump_size)
             .finish()
     }
 }
@@ -682,8 +667,8 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_same_url_re_add_waits_for_the_old_subscriptions_cleanup() {
         // The chain index releases a removed worker's id and name, which is
-        // what makes the window observable: the positional index keeps both.
-        let monitor = Arc::new(KvEventMonitor::with_kind(KvIndexKind::Chain, None));
+        // what makes the window observable.
+        let monitor = Arc::new(KvEventMonitor::new());
         let worker = refusing_grpc_worker();
         let url = worker.url().to_string();
         monitor.on_worker_added(&worker).await;
@@ -758,7 +743,7 @@ mod tests {
     /// through, with nobody awaiting the removal.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dropped_removal_leaves_no_reservation_behind() {
-        let monitor = Arc::new(KvEventMonitor::with_kind(KvIndexKind::Chain, None));
+        let monitor = Arc::new(KvEventMonitor::new());
         let worker = refusing_grpc_worker();
         let url = worker.url().to_string();
         monitor.on_worker_added(&worker).await;
@@ -822,37 +807,31 @@ mod tests {
 
     #[test]
     fn a_new_monitor_holds_no_index() {
-        let monitor = KvEventMonitor::new(None);
+        let monitor = KvEventMonitor::new();
         assert!(monitor.indexers.is_empty());
     }
 
     #[tokio::test]
-    async fn a_zero_jump_size_is_clamped_to_one() {
-        let monitor = KvEventMonitor::new(Some(0));
-        assert_eq!(monitor.jump_size, 1);
-    }
-
-    #[tokio::test]
     async fn an_unknown_model_has_no_index() {
-        let monitor = KvEventMonitor::new(None);
+        let monitor = KvEventMonitor::new();
         assert!(monitor.get_indexer("nonexistent").is_none());
     }
 
     #[tokio::test]
     async fn stopping_an_empty_monitor_is_a_no_op() {
-        let monitor = KvEventMonitor::new(None);
+        let monitor = KvEventMonitor::new();
         monitor.stop().await;
     }
 
     #[tokio::test]
     async fn removing_an_unknown_worker_is_a_no_op() {
-        let monitor = KvEventMonitor::new(None);
+        let monitor = KvEventMonitor::new();
         monitor.on_worker_removed("http://nonexistent:8000").await;
     }
 
     #[test]
     fn set_block_size_keeps_the_first_value() {
-        let monitor = KvEventMonitor::new(None);
+        let monitor = KvEventMonitor::new();
 
         // Initially no block_size
         assert!(monitor.block_size("llama").is_none());
@@ -868,7 +847,7 @@ mod tests {
 
     #[tokio::test]
     async fn stop_forgets_the_block_sizes() {
-        let monitor = KvEventMonitor::new(None);
+        let monitor = KvEventMonitor::new();
         monitor.set_block_size("llama", 16);
         assert_eq!(monitor.block_size("llama"), Some(16));
 
@@ -876,61 +855,11 @@ mod tests {
         assert!(monitor.block_size("llama").is_none());
     }
 
+    /// The index-shape gauges come from the index's own counters, by model:
+    /// memberships and entries, runs, blocks, arena and slab bytes, moved
+    /// hashes and engine conflicts.
     #[test]
-    fn prune_all_enforces_the_capacity_ceiling_after_the_grace() {
-        let monitor = KvEventMonitor::new(None);
-        let indexer = monitor
-            .indexers
-            .entry("llama".to_string())
-            .or_insert_with(|| Arc::new(KvIndex::positional(64)))
-            .clone();
-
-        let worker = indexer.intern_worker("http://w1:8000").unwrap();
-        let mut worker_blocks = WorkerBlocks::default();
-        // Ten independent single-block chains → ten index entries.
-        for i in 0u64..10 {
-            let block = StoredBlock {
-                seq_hash: SequenceHash(1000 + i),
-                content_hash: ContentHash(2000 + i),
-            };
-            indexer
-                .apply_stored(worker, &[block], None, &mut worker_blocks)
-                .unwrap();
-        }
-        assert_eq!(indexer.entry_count(), 10);
-
-        // Disabled bounds → no-op.
-        monitor.prune_all(0, 0);
-        assert_eq!(indexer.entry_count(), 10);
-
-        // Freshly stored entries sit inside the capacity-eviction grace and
-        // are spared — a prune must not race a store batch's accounting.
-        monitor.prune_all(0, 5);
-        assert_eq!(indexer.entry_count(), 10);
-
-        // Age them past the grace (the indexer's test clock is crate-private
-        // to kv_index, so this test uses the real clock) and the ceiling is
-        // enforced down to the low-water mark (5 - 5/10 = 5).
-        std::thread::sleep(Duration::from_secs(3));
-        monitor.prune_all(0, 5);
-        assert_eq!(indexer.entry_count(), 5);
-    }
-
-    #[tokio::test]
-    async fn the_prune_task_starts_only_with_a_bound() {
-        let monitor = Arc::new(KvEventMonitor::new(None));
-        monitor.start_prune_task(0, 0);
-        assert!(monitor.prune_task.lock().is_none());
-
-        monitor.start_prune_task(60, 0);
-        assert!(monitor.prune_task.lock().is_some());
-    }
-
-    /// The index-shape gauges come from the indexes' own counters, by model:
-    /// memberships and entries for both kinds, the chain index's runs, blocks,
-    /// arena and slab bytes and moved hashes for the chain kind.
-    #[test]
-    fn index_shape_gauges_follow_the_indexes() {
+    fn index_shape_gauges_follow_the_index() {
         use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
         fn gauge(handle: &PrometheusHandle, name: &str, model: &str) -> Option<f64> {
@@ -946,38 +875,26 @@ mod tests {
         let recorder = PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
-            let monitor = KvEventMonitor::new(None);
-            for (model, kind) in [
-                ("pos", KvIndexKind::Positional),
-                ("chain", KvIndexKind::Chain),
-            ] {
-                let index = Arc::new(KvIndex::new(kind, 8));
-                let worker = index.intern_worker("grpc://w1:9000").unwrap();
-                let mut held = WorkerBlocks::default();
-                let blocks: Vec<StoredBlock> = (1..=3u64)
-                    .map(|i| StoredBlock {
-                        seq_hash: SequenceHash(i),
-                        content_hash: ContentHash(100 + i),
-                    })
-                    .collect();
-                index
-                    .apply_stored(worker, &blocks, None, &mut held)
-                    .unwrap();
-                monitor.indexers.insert(model.to_string(), index);
-            }
+            let monitor = KvEventMonitor::new();
+            let index = Arc::new(KvIndex::chain());
+            let worker = index.intern_worker("grpc://w1:9000").unwrap();
+            let mut held = WorkerBlocks::default();
+            let blocks: Vec<StoredBlock> = (1..=3u64)
+                .map(|i| StoredBlock {
+                    seq_hash: SequenceHash(i),
+                    content_hash: ContentHash(100 + i),
+                })
+                .collect();
+            index
+                .apply_stored(worker, &blocks, None, &mut held)
+                .unwrap();
+            monitor.indexers.insert("chain".to_string(), index);
             KvEventMonitor::publish_stats(&monitor.indexers);
-            for model in ["pos", "chain"] {
-                assert_eq!(
-                    gauge(&handle, "smg_kv_index_memberships", model),
-                    Some(3.0),
-                    "{model}"
-                );
-                assert_eq!(
-                    gauge(&handle, "smg_kv_index_entries", model),
-                    Some(3.0),
-                    "{model}"
-                );
-            }
+            assert_eq!(
+                gauge(&handle, "smg_kv_index_memberships", "chain"),
+                Some(3.0)
+            );
+            assert_eq!(gauge(&handle, "smg_kv_index_entries", "chain"), Some(3.0));
             assert_eq!(gauge(&handle, "smg_kv_index_runs_live", "chain"), Some(1.0));
             assert_eq!(
                 gauge(&handle, "smg_kv_index_blocks_live", "chain"),
@@ -993,13 +910,178 @@ mod tests {
             );
             assert!(gauge(&handle, "smg_kv_index_arena_bytes", "chain").is_some_and(|b| b > 0.0));
             assert!(gauge(&handle, "smg_kv_index_slab_bytes", "chain").is_some_and(|b| b > 0.0));
-            assert_eq!(gauge(&handle, "smg_kv_index_runs_live", "pos"), None);
+        });
+    }
+
+    /// A worker's integrity series and its model's index gauges exist from
+    /// the subscription's start, at zero: a scrape of a fresh gateway tells
+    /// "nothing happened" from "nothing exported".
+    #[test]
+    fn a_new_subscription_publishes_its_series_at_zero() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        fn sample(body: &str, family: &str, labels: &[(&str, &str)]) -> Option<f64> {
+            let prefix = format!("{family}{{");
+            body.lines()
+                .find(|line| {
+                    line.starts_with(&prefix)
+                        && labels
+                            .iter()
+                            .all(|(key, value)| line.contains(&format!("{key}=\"{value}\"")))
+                })
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+        }
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async {
+                let monitor = KvEventMonitor::new();
+                let worker = refusing_grpc_worker();
+                monitor.on_worker_added(&worker).await;
+                let body = handle.render();
+                let url = worker.url();
+                for (family, labels) in [
+                    (
+                        "smg_kv_event_gaps_total",
+                        vec![("worker", url), ("outcome", "replay_requested")],
+                    ),
+                    (
+                        "smg_kv_event_gaps_total",
+                        vec![("worker", url), ("outcome", "unrecovered_cleared")],
+                    ),
+                    ("smg_kv_event_missed_batches_total", vec![("worker", url)]),
+                    (
+                        "smg_kv_event_resyncs_total",
+                        vec![("worker", url), ("reason", "snapshot")],
+                    ),
+                    (
+                        "smg_kv_event_resyncs_total",
+                        vec![("worker", url), ("reason", "publisher_restart")],
+                    ),
+                    (
+                        "smg_kv_event_subscription_failures_total",
+                        vec![("worker", url), ("reason", "panic")],
+                    ),
+                    (
+                        "smg_kv_event_parentless_stores_total",
+                        vec![("worker", url)],
+                    ),
+                    (
+                        "smg_kv_event_parentless_blocks_total",
+                        vec![("worker", url)],
+                    ),
+                    ("smg_kv_event_degraded_ranks", vec![("worker", url)]),
+                    (
+                        "smg_kv_index_moved_hashes",
+                        vec![("model", UNKNOWN_MODEL_ID)],
+                    ),
+                    (
+                        "smg_kv_index_engine_conflicts",
+                        vec![("model", UNKNOWN_MODEL_ID)],
+                    ),
+                    (
+                        "smg_kv_index_memberships",
+                        vec![("model", UNKNOWN_MODEL_ID)],
+                    ),
+                ] {
+                    assert_eq!(
+                        sample(&body, family, &labels),
+                        Some(0.0),
+                        "{family} {labels:?} on a fresh gateway:\n{body}"
+                    );
+                }
+                monitor.stop().await;
+            });
+        });
+    }
+
+    /// A model's index goes with its last subscription, and nothing publishes
+    /// the model's gauges after that: the removal itself zeroes them, or they
+    /// keep the removed worker's count until a worker of the model joins
+    /// again (an engine replaced behind a one-engine gateway).
+    #[test]
+    fn the_models_last_removal_zeroes_its_index_gauges() {
+        use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
+
+        fn gauge(handle: &PrometheusHandle, name: &str, model: &str) -> Option<f64> {
+            let prefix = format!("{name}{{model=\"{model}\"}}");
+            handle
+                .render()
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .and_then(|line| line.rsplit(' ').next())
+                .and_then(|value| value.parse().ok())
+        }
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        // The removal task publishes from the runtime's thread, which must
+        // be the one holding the local recorder.
+        metrics::with_local_recorder(&recorder, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let monitor = Arc::new(KvEventMonitor::new());
+                let worker = refusing_grpc_worker();
+                let url = worker.url().to_string();
+                monitor.on_worker_added(&worker).await;
+                let index = monitor
+                    .get_indexer(UNKNOWN_MODEL_ID)
+                    .expect("the model's index");
+                wait_until("the subscription interns its worker", || {
+                    index.worker_id(&url).is_some()
+                })
+                .await;
+                let worker_id = index.worker_id(&url).unwrap();
+                let blocks: Vec<StoredBlock> = (1..=3u64)
+                    .map(|i| StoredBlock {
+                        seq_hash: SequenceHash(i),
+                        content_hash: ContentHash(100 + i),
+                    })
+                    .collect();
+                index
+                    .apply_stored(worker_id, &blocks, None, &mut WorkerBlocks::default())
+                    .unwrap();
+                KvEventMonitor::publish_stats(&monitor.indexers);
+                assert_eq!(
+                    gauge(&handle, "smg_kv_index_memberships", UNKNOWN_MODEL_ID),
+                    Some(3.0)
+                );
+                assert_eq!(
+                    gauge(&handle, "smg_kv_index_blocks_live", UNKNOWN_MODEL_ID),
+                    Some(3.0)
+                );
+
+                monitor.on_worker_removed(&url).await;
+                assert!(
+                    monitor.get_indexer(UNKNOWN_MODEL_ID).is_none(),
+                    "the model's last worker takes its index with it"
+                );
+                for name in [
+                    "smg_kv_index_memberships",
+                    "smg_kv_index_entries",
+                    "smg_kv_index_blocks_live",
+                    "smg_kv_index_runs_live",
+                    "smg_kv_index_arena_bytes",
+                    "smg_kv_index_slab_bytes",
+                ] {
+                    assert_eq!(gauge(&handle, name, UNKNOWN_MODEL_ID), Some(0.0), "{name}");
+                }
+            });
         });
     }
 
     #[test]
     fn start_stats_task_holds_the_task() {
-        let monitor = KvEventMonitor::new(None);
+        let monitor = KvEventMonitor::new();
         assert!(monitor.stats_task.lock().is_none());
         monitor.start_stats_task();
         assert!(monitor.stats_task.lock().is_some());

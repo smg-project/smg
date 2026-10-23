@@ -1,4 +1,9 @@
-# Router with PostgreSQL history backend.
+# Router with PostgreSQL history backend. The URL carries the database
+# password: the chart writes it into a Secret and the router reads it from the
+# SMG_POSTGRES_DB_URL environment variable, never from an argument. For a URL
+# kept outside the chart's values, set history.postgres.existingSecret to a
+# Secret holding it under the key postgres-url (history.postgres.secretKey)
+# and leave url empty.
 # Usage: helm install smg deploy/helm/smg -f deploy/helm/smg/examples/with-postgres.yaml
 router:
   workerUrls:

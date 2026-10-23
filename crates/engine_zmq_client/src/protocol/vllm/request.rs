@@ -9,7 +9,10 @@ use serde_default::DefaultFromSerde;
 use serde_tuple::{Deserialize_tuple, Serialize_tuple};
 
 use crate::{
-    codec::OpaqueValue,
+    codec::{
+        tensor::{TensorFields, WireArrayData},
+        OpaqueValue,
+    },
     protocol::vllm::{
         lora, multimodal::MmFeatures, pooling::PoolingParams, sampling::EngineCoreSamplingParams,
     },
@@ -159,11 +162,22 @@ impl EngineCoreRequest {
         }
         Ok(())
     }
+}
 
-    // NOTE: multimodal tensors are sent as inline ext-3 raw views in the
-    // request frame — valid at any size (the engine's aux-frame split is an
-    // encoder-side optimization only). Send-side aux extraction is a perf
-    // follow-up.
+impl TensorFields for EngineCoreRequest {
+    /// The tensors of features this client built. Raw features are the
+    /// encoder's own bytes, already split the way it chose: left as they are.
+    fn for_each_tensor(&self, visit: &mut dyn FnMut(&WireArrayData)) {
+        if let Some(MmFeaturesPayload::Typed(features)) = &self.mm_features {
+            features.for_each_tensor(visit);
+        }
+    }
+
+    fn for_each_tensor_mut(&mut self, visit: &mut dyn FnMut(&mut WireArrayData)) {
+        if let Some(MmFeaturesPayload::Typed(features)) = &mut self.mm_features {
+            features.for_each_tensor_mut(visit);
+        }
+    }
 }
 
 /// A utility RPC to one engine (`EngineCoreRequestType::Utility`): the

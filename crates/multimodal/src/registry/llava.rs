@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::{
     encoder_inputs::PreprocessedEncoderInputs,
-    registry::{ModelMetadata, ModelProcessorSpec, RegistryResult},
+    registry::{ModelMetadata, ModelProcessorSpec, ModelRegistryError, RegistryResult},
     types::{FieldLayout, Modality, PromptReplacement, TokenId},
+    vision::{LlavaNextProcessor, LlavaProcessor, PreProcessorConfig, VisionPreProcessor},
 };
 
 pub(super) struct LlavaSpec;
@@ -29,6 +30,13 @@ impl ModelProcessorSpec for LlavaSpec {
         model_id_lower.contains("llava") || model_type.is_some_and(|mt| mt == "llava")
     }
 
+    /// `<image>` (the config's `image_token_index`) is the single token the
+    /// serving engine's prompt updates target, so a worker can expand it
+    /// itself.
+    fn worker_expandable(&self, modality: Modality) -> bool {
+        matches!(modality, Modality::Image)
+    }
+
     fn placeholder_token(&self, _metadata: &ModelMetadata) -> RegistryResult<String> {
         Ok("<image>".to_string())
     }
@@ -47,8 +55,22 @@ impl ModelProcessorSpec for LlavaSpec {
         Ok(HashMap::from([(Modality::Image, 4)]))
     }
 
-    fn processor_kwargs(&self, _metadata: &ModelMetadata) -> RegistryResult<Value> {
-        Ok(json!({}))
+    fn vision_processor(
+        &self,
+        model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(LlavaProcessor::from_configs(
+                model_config,
+                preprocessor_config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn prompt_replacements(
@@ -58,11 +80,12 @@ impl ModelProcessorSpec for LlavaSpec {
     ) -> RegistryResult<Vec<PromptReplacement>> {
         let token_id = self.placeholder_token_id(metadata)?;
         let token = self.placeholder_token(metadata)?;
-        Ok(preprocessed
-            .feature_token_counts
-            .iter()
-            .map(|&count| PromptReplacement::repeated(Modality::Image, &token, token_id, count))
-            .collect())
+        Ok(PromptReplacement::repeated_per_item(
+            Modality::Image,
+            &token,
+            token_id,
+            &preprocessed.feature_token_counts,
+        ))
     }
 }
 
@@ -75,6 +98,13 @@ impl ModelProcessorSpec for LlavaNextSpec {
         metadata
             .config_model_type()
             .is_some_and(|mt| mt == "llava_next")
+    }
+
+    /// `<image>` (the config's `image_token_index`) is the single token the
+    /// serving engine's prompt updates target, so a worker can expand it
+    /// itself.
+    fn worker_expandable(&self, modality: Modality) -> bool {
+        matches!(modality, Modality::Image)
     }
 
     fn placeholder_token(&self, metadata: &ModelMetadata) -> RegistryResult<String> {
@@ -92,8 +122,22 @@ impl ModelProcessorSpec for LlavaNextSpec {
         LlavaSpec.modality_limits(metadata)
     }
 
-    fn processor_kwargs(&self, metadata: &ModelMetadata) -> RegistryResult<Value> {
-        LlavaSpec.processor_kwargs(metadata)
+    fn vision_processor(
+        &self,
+        model_config: &Value,
+        preprocessor_config: &PreProcessorConfig,
+        modality: Modality,
+    ) -> RegistryResult<Box<dyn VisionPreProcessor>> {
+        match modality {
+            Modality::Image => Ok(Box::new(LlavaNextProcessor::from_configs(
+                model_config,
+                preprocessor_config,
+            ))),
+            _ => Err(ModelRegistryError::UnsupportedModality {
+                spec: self.name(),
+                modality,
+            }),
+        }
     }
 
     fn prompt_replacements(
@@ -107,16 +151,17 @@ impl ModelProcessorSpec for LlavaNextSpec {
         // and stored in preprocessed.feature_token_counts.
         let token_id = LlavaSpec.placeholder_token_id(metadata)?;
         let token = LlavaSpec.placeholder_token(metadata)?;
-        Ok(preprocessed
-            .feature_token_counts
-            .iter()
-            .map(|&count| PromptReplacement::repeated(Modality::Image, &token, token_id, count))
-            .collect())
+        Ok(PromptReplacement::repeated_per_item(
+            Modality::Image,
+            &token,
+            token_id,
+            &preprocessed.feature_token_counts,
+        ))
     }
 
     fn field_layouts(&self) -> HashMap<String, FieldLayout> {
         // encoder_input is [num_images, max_patches, C, H, W] (5D, batched).
-        // image_sizes is [num_images, 2] (batched), matching HF/vLLM kwargs.
+        // image_sizes is [num_images, 2] (batched), matching the reference processor's kwargs.
         HashMap::from([
             ("pixel_values".to_string(), FieldLayout::Batched),
             ("image_sizes".to_string(), FieldLayout::Batched),
@@ -182,6 +227,22 @@ mod tests {
         assert_eq!(replacements[1].tokens.len(), 1024);
     }
 
+    /// Both specs render the one token the serving engine expands, so their
+    /// images may be forwarded to a worker that processes media itself.
+    #[test]
+    fn llava_images_can_be_expanded_by_a_worker() {
+        use crate::{registry::ModelProcessorSpec, types::Modality};
+
+        for spec in [
+            &super::LlavaSpec as &dyn ModelProcessorSpec,
+            &super::LlavaNextSpec,
+        ] {
+            assert!(spec.worker_expandable(Modality::Image), "{}", spec.name());
+            assert!(!spec.worker_expandable(Modality::Video), "{}", spec.name());
+            assert!(!spec.worker_expandable(Modality::Audio), "{}", spec.name());
+        }
+    }
+
     #[test]
     fn llava_matches_alias_via_model_type() {
         let tokenizer = TestTokenizer::new(&[("<image>", 32000)]);
@@ -215,6 +276,7 @@ mod tests {
         let spec = registry.lookup(&metadata).expect("llava spec");
         assert!(spec
             .audio_processor(&config, &PreProcessorConfig::default())
+            .unwrap()
             .is_none());
     }
 }

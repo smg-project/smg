@@ -29,6 +29,7 @@ pub mod router;
 pub mod sglang_fields;
 pub mod sse;
 pub mod tenant;
+pub mod upstream_body;
 pub mod worker;
 
 pub use context::ExternalContext;

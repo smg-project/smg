@@ -4,7 +4,12 @@
 the Router already speaks to the Python servicer) over a same-host vLLM
 EngineCore, from a Rust-owned thread. Python owns the lifecycle only: launch
 the headless engine, construct the server, poll ``engine_ready`` /
-``last_error``, announce draining with ``set_serving(False)``, then ``stop``.
+``last_error``, close admission with ``set_serving(False)``, then wait for
+``active_requests`` to reach zero (or the drain deadline) before ``stop``.
+The count includes aborted requests until their response streams are released.
+``set_ready(False)`` holds the health answer alone, admission open, for the
+launcher's own requests before SERVING (its planned warm-up); ``set_ready(True)``
+releases it.
 Worker-side media processing is the one request-time crossing, when the
 Python processors are chosen: a ``media_processor`` object
 (``smg_grpc_servicer.vllm.rust_media``) runs them for a request's

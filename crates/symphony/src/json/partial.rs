@@ -8,9 +8,10 @@
 //! on a character boundary, so the caller can slice the input by it.
 //!
 //! Ported from `crates/tool_parser/src/partial_json.rs` (smg 897ef9a9) under ground rule 27. What
-//! changed in form: an error type of its own, `is_complete` as a function of this module, the
-//! cursor's literal parsing shared by `true`, `false` and `null`, names and documentation. What
-//! changed in behaviour, twice. A word of letters that is no literal never advances the cursor: the
+//! changed in form: an error type of its own, the cursor's literal parsing shared by `true`,
+//! `false` and `null`, names and documentation (the original's `is_complete` has no caller here,
+//! since the prefix judge decides whole arguments itself, `Prefix::whole`). What changed in
+//! behaviour, twice. A word of letters that is no literal never advances the cursor: the
 //! original looked ahead over at most the longest literal of the kind (five bytes for either
 //! boolean, four for `null`), so `truex` was rejected unseen but `false` or `null` followed by
 //! letters passed the look-ahead, was consumed, and was rejected only then (`[1, falsex` consumed
@@ -25,8 +26,7 @@
 //! becomes `0`, a prefix of `true`, `false` or `null` counts as the literal, and a trailing comma
 //! before a closing bracket is accepted.
 
-use serde::{de::IgnoredAny, Deserialize};
-use serde_json::{Deserializer, Map, Number, Value};
+use serde_json::{Map, Number, Value};
 
 /// Why a parse stopped with an error rather than a value.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -88,12 +88,6 @@ impl Default for PartialJson {
     fn default() -> Self {
         Self::new(Self::DEFAULT_MAX_DEPTH, true)
     }
-}
-
-/// Whether `input` is one complete JSON value with nothing but whitespace after it.
-pub fn is_complete(input: &str) -> bool {
-    let mut de = Deserializer::from_str(input);
-    IgnoredAny::deserialize(&mut de).is_ok() && de.end().is_ok()
 }
 
 /// One pass over the input.
@@ -643,14 +637,5 @@ mod tests {
     fn trailing_commas_are_accepted_as_the_original_did() {
         assert_eq!(prefix(r#"{"a": 1,}"#).0, json!({"a": 1}));
         assert_eq!(prefix("[1,]").0, json!([1]));
-    }
-
-    #[test]
-    fn is_complete_accepts_one_whole_value_and_nothing_else() {
-        assert!(is_complete(r#"{"a": [1, "b"]}"#));
-        assert!(is_complete("  42 \n"));
-        assert!(!is_complete(r#"{"a": [1, "b"]"#));
-        assert!(!is_complete(r#"{"a": 1} x"#));
-        assert!(!is_complete(""));
     }
 }

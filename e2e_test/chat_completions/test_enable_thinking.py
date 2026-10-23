@@ -81,7 +81,7 @@ class TestEnableThinking:
         ) as stream:
             for chunk in stream:
                 if chunk.choices and len(chunk.choices) > 0:
-                    if chunk.choices[0].delta.reasoning_content:
+                    if getattr(chunk.choices[0].delta, "reasoning_content", None):
                         has_reasoning = True
                     if chunk.choices[0].delta.content:
                         has_content = True
@@ -106,7 +106,7 @@ class TestEnableThinking:
         ) as stream:
             for chunk in stream:
                 if chunk.choices and len(chunk.choices) > 0:
-                    if chunk.choices[0].delta.reasoning_content:
+                    if getattr(chunk.choices[0].delta, "reasoning_content", None):
                         has_reasoning = True
                     if chunk.choices[0].delta.content:
                         has_content = True

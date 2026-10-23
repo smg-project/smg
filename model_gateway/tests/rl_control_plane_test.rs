@@ -63,13 +63,12 @@ async fn flag_off_leaves_v1_rl_unmounted() {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{method} {uri}");
-        assert!(resp
-            .into_body()
-            .collect()
-            .await
-            .unwrap()
-            .to_bytes()
-            .is_empty());
+        // An unmounted route answers the JSON not-found envelope, never an empty body.
+        let body = json_of(resp).await;
+        assert_eq!(
+            body["error"]["code"], "unknown_url",
+            "{method} {uri}: {body}"
+        );
     }
     assert!(ctx.app_context.rl.is_none());
     ctx.shutdown().await;

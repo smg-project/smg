@@ -1,38 +1,55 @@
 //! Chat preparation stage: Filter tools, process messages, tokenize, build constraints
 
-use async_trait::async_trait;
 use axum::response::Response;
 use openai_protocol::{
     chat::ChatCompletionRequest,
     common::{ToolChoice, ToolChoiceValue},
 };
-use tracing::{debug, error};
+use tracing::error;
 
-use crate::routers::{
-    error,
-    grpc::{
-        common::stages::PipelineStage,
-        context::{PreparationOutput, RequestContext},
-        multimodal, utils, ProcessedMessages,
+use crate::{
+    routers::{
+        error,
+        grpc::{
+            context::{PreparationOutput, RequestContext},
+            multimodal,
+            regular::{
+                stages::{
+                    reading,
+                    rendered_prompt::{prepare_rendered_prompt, RenderedPrompt},
+                },
+                symphony,
+            },
+            utils, ProcessedMessages,
+        },
     },
+    worker::RoutingPool,
 };
 
 /// Chat preparation stage
 ///
 /// Extracts chat-specific preparation logic from the old unified PreparationStage.
 /// This is a direct extraction without architectural changes.
-pub(crate) struct ChatPreparationStage;
+pub(crate) struct ChatPreparationStage {
+    /// The pools whose workers this pipeline's requests can reach (the
+    /// mode's pools): the multimodal wire dtype is resolved over them.
+    wire_pools: &'static [RoutingPool],
+}
 
-#[async_trait]
-impl PipelineStage for ChatPreparationStage {
-    async fn execute(&self, ctx: &mut RequestContext) -> Result<(), Response> {
+impl ChatPreparationStage {
+    pub(crate) fn new(wire_pools: &'static [RoutingPool]) -> Self {
+        Self { wire_pools }
+    }
+}
+
+impl ChatPreparationStage {
+    /// The stage's work. The chat+generate dispatcher calls this directly, so
+    /// the stage's future lives inline in the dispatcher's: one box per stage
+    /// call, not a second one for a boxed trait method.
+    pub(crate) async fn prepare(&self, ctx: &mut RequestContext) -> Result<(), Response> {
         let request = ctx.chat_request_arc();
         self.prepare_chat(ctx, &request).await?;
         Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        "ChatPreparation"
     }
 }
 
@@ -42,8 +59,15 @@ impl ChatPreparationStage {
         ctx: &mut RequestContext,
         request: &ChatCompletionRequest,
     ) -> Result<(), Response> {
+        // Which parser reads this response: the request's X-SMG-Parser header
+        // when it carries one, else the gateway's --parser flag (see
+        // `regular::symphony`). Decided once here; the constraint below and
+        // request building read the same choice.
+        let parser = symphony::choice(ctx.components.parser, ctx.input.headers.as_ref())
+            .map_err(|why| error::bad_request("invalid_parser_header", why))?;
+        ctx.state.parser = Some(parser);
         let (token_ids, processed_messages, tool_constraints) =
-            prepare_chat_like(ctx, request).await?;
+            prepare_chat_like(ctx, request, self.wire_pools).await?;
         ctx.state.preparation = Some(PreparationOutput::Chat {
             token_ids,
             processed_messages,
@@ -64,7 +88,8 @@ impl ChatPreparationStage {
 pub(crate) async fn prepare_chat_like(
     ctx: &mut RequestContext,
     request: &ChatCompletionRequest,
-) -> Result<(Vec<u32>, ProcessedMessages, Option<(String, String)>), Response> {
+    wire_pools: &'static [RoutingPool],
+) -> Result<(Vec<u32>, ProcessedMessages, symphony::PreparedConstraint), Response> {
     utils::validate_chat_content_parts(&request.messages)
         .map_err(|e| error::bad_request("unsupported_content_part", e))?;
     {
@@ -72,103 +97,32 @@ pub(crate) async fn prepare_chat_like(
         let tokenizer =
             utils::resolve_tokenizer(ctx, "ChatPreparationStage::prepare_chat").map_err(|e| *e)?;
 
-        // Step 1: Filter tools if needed
-        let body_ref = utils::filter_chat_request_by_tool_choice(request);
+        // Step 1: the request whose tools the template renders (every tool
+        // for a named tool_choice; the constraint built below forces the call;
+        // under `none` the tools stay only for a renderer that declares them
+        // itself)
+        let body_ref = utils::request_as_rendered(request, tokenizer.renderer_capabilities());
 
-        // Resolve media-part ordering from the model registry so it stays owned
-        // by the per-model spec. Falls back to vLLM-compatible media-first when
-        // the model has no multimodal components or matches no spec.
+        // The media-part order and, for a request with media, the plan and
+        // the placeholder tokens, resolved from the registries as the
+        // Messages stage resolves them (`utils::resolve_media`).
         let model_id = ctx.input.model_id.as_str();
-        let tokenizer_entry = ctx
-            .components
-            .tokenizer_registry
-            .get_by_name(model_id)
-            .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id));
-        let media_order = match (ctx.components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
-            (Some(mm_components), Some(entry)) => {
-                multimodal::resolve_media_part_order(
-                    model_id,
-                    &*tokenizer,
-                    mm_components,
-                    &entry.id,
-                    &entry.source,
-                )
-                .await
-            }
-            _ => llm_multimodal::MediaPartOrder::MediaFirst,
-        };
-
-        // Normalize media once. The same plan drives placeholder resolution,
-        // rendering, fetching, preprocessing, and final count validation.
-        let media_plan = multimodal::media_plan_chat(&request.messages);
-        let (placeholder_tokens, mm_context) = if media_plan.is_empty() {
-            (None, None)
-        } else if let Some(mm_components) = ctx.components.multimodal.as_ref() {
-            let model_id = ctx.input.model_id.as_str();
-            let (tokenizer_id, tokenizer_source) = match tokenizer_entry {
-                Some(e) => (e.id, e.source),
-                None => {
-                    error!(
-                        function = "ChatPreparationStage::execute",
-                        model = %model_id,
-                        "Tokenizer entry not found for multimodal processing"
-                    );
-                    return Err(error::bad_request(
-                        "multimodal_config_missing",
-                        format!("Tokenizer not found for model: {model_id}"),
-                    ));
-                }
-            };
-
-            let placeholders = multimodal::prepare_placeholder_tokens(
-                &media_plan,
-                model_id,
-                &*tokenizer,
-                mm_components,
-                &tokenizer_id,
-                &tokenizer_source,
-            )
-            .await
-            .map_err(|e| {
-                error!(
-                    function = "ChatPreparationStage::execute",
-                    model = %model_id,
-                    error = %e,
-                    "Failed to prepare multimodal prompt plan"
-                );
-                error::bad_request(
-                    "invalid_multimodal_request",
-                    format!("Invalid multimodal request: {e}"),
-                )
-            })?;
-
-            (
-                Some(placeholders),
-                Some((
-                    mm_components,
-                    model_id,
-                    tokenizer_id,
-                    tokenizer_source,
-                    media_plan,
-                )),
-            )
-        } else {
-            error!(
-                function = "ChatPreparationStage::execute",
-                "Multimodal content detected but multimodal components not initialized"
-            );
-            return Err(error::bad_request(
-                "multimodal_not_supported",
-                "Multimodal content detected but multimodal processing is not available",
-            ));
-        };
+        let media = utils::resolve_media(
+            &ctx.components,
+            model_id,
+            &*tokenizer,
+            "ChatPreparationStage::execute",
+            || multimodal::media_plan_chat(&request.messages),
+        )
+        .await?;
+        let media_order = media.media_order;
 
         // Step 2: Process messages and apply chat template
         let (processed_messages, prompt_encoding) =
             match utils::process_chat_messages_with_placeholders(
                 &body_ref,
                 &*tokenizer,
-                placeholder_tokens.as_ref(),
+                media.placeholders(),
                 media_order,
             ) {
                 Ok(msgs) => msgs,
@@ -178,105 +132,23 @@ pub(crate) async fn prepare_chat_like(
                 }
             };
 
-        // Step 3: Tokenize the prompt the way its renderer said to (a flat
-        // encode of the text, or the encode the renderer prepared)
-        let encoding = match utils::encode_prompt_blocking(
-            tokenizer.clone(),
+        // Steps 3 and 4: the prompt tokenized the way its renderer said to,
+        // the media anchors checked, the media processed or kept as
+        // references (shared with the Messages stage).
+        let RenderedPrompt {
+            token_ids,
+            multimodal_intermediate,
+            multimodal_refs,
+        } = prepare_rendered_prompt(
+            ctx,
+            &tokenizer,
             &processed_messages.text,
             prompt_encoding,
+            media.media,
+            wire_pools,
+            "ChatPreparationStage::execute",
         )
-        .await
-        {
-            Ok(encoding) => encoding,
-            Err(e) => {
-                error!(function = "ChatPreparationStage::execute", error = %e, "Tokenization failed");
-                return Err(error::internal_error(
-                    "tokenization_failed",
-                    format!("Tokenization failed: {e}"),
-                ));
-            }
-        };
-
-        let mut token_ids = encoding.token_ids().to_vec();
-
-        if let (Some(placeholders), Some((_, _, _, _, media_plan))) =
-            (placeholder_tokens.as_ref(), mm_context.as_ref())
-        {
-            multimodal::validate_rendered_media_anchors(
-                media_plan,
-                placeholders,
-                &*tokenizer,
-                &token_ids,
-            )
-            .map_err(|error| {
-                error!(
-                    function = "ChatPreparationStage::execute",
-                    %error,
-                    "Rendered multimodal anchors do not match request media"
-                );
-                error::bad_request("multimodal_prompt_contract_mismatch", error.to_string())
-            })?;
-        }
-
-        // Step 4: Full multimodal processing (fetch + preprocess + expand tokens + hash),
-        // or keep the media references for a worker that processes them itself.
-        let mut multimodal_intermediate = None;
-        let mut multimodal_refs = None;
-        if let (
-            Some(placeholders),
-            Some((mm_components, model_id, tokenizer_id, tokenizer_source, media_plan)),
-        ) = (placeholder_tokens.as_ref(), mm_context)
-        {
-            let processing = multimodal::resolve_mm_processing(
-                mm_components,
-                &ctx.components.worker_registry,
-                model_id,
-                &media_plan,
-                placeholders,
-            )
-            .map_err(|e| error::bad_request(e.code(), e.to_string()))?;
-            if processing == multimodal::MmProcessing::Worker {
-                debug!(
-                    function = "ChatPreparationStage::execute",
-                    media_items = media_plan.parts().len(),
-                    "Forwarding media references for worker-side processing"
-                );
-                multimodal_refs = Some(media_plan);
-            } else {
-                match multimodal::process_multimodal_plan(
-                    media_plan,
-                    model_id,
-                    &*tokenizer,
-                    token_ids,
-                    mm_components,
-                    &tokenizer_id,
-                    &tokenizer_source,
-                )
-                .await
-                {
-                    Ok(output) => {
-                        debug!(
-                            function = "ChatPreparationStage::execute",
-                            expanded_tokens = output.expanded_token_ids.len(),
-                            "Multimodal processing complete"
-                        );
-                        token_ids = output.expanded_token_ids;
-                        multimodal_intermediate = Some(output.intermediate);
-                    }
-                    Err(e) => {
-                        error!(
-                            function = "ChatPreparationStage::execute",
-                            error = %e,
-                            "Multimodal processing failed"
-                        );
-                        return Err(error::bad_request(
-                            "multimodal_processing_failed",
-                            format!("Multimodal processing failed: {e}"),
-                        ));
-                    }
-                }
-            }
-        }
+        .await?;
 
         // Step 4: Build tool constraints if needed
         // The tool parser registry handles both structural tag (for native format
@@ -287,63 +159,34 @@ pub(crate) async fn prepare_chat_like(
         // the choice lets the model call, dynamic tools declared on messages
         // included (see `ChatCompletionRequest::callable_tools`).
         let constraint_tools = request.callable_tools();
-        let tool_call_constraint = if let (false, Some(tool_choice)) =
-            (constraint_tools.is_empty(), request.tool_choice.as_ref())
-        {
-            let reasoning = utils::chat_reasoning_starts_in_prefill(request, tokenizer.as_ref());
-            ctx.components
-                .tool_parser_factory
-                .registry()
-                .generate_tool_constraint(
-                    ctx.components
-                        .parser_resolver
-                        .tool_parser(&request.model)
-                        .as_deref(),
-                    &constraint_tools,
-                    tool_choice,
-                    reasoning,
-                )
-                .map_err(|e| {
-                    error!(function = "ChatPreparationStage::execute", error = %e, "Invalid tool configuration");
-                    error::bad_request(
-                        "invalid_tool_configuration",
-                        format!("Invalid tool configuration: {e}"),
-                    )
-                })?
-        } else {
-            None
-        };
+        // All of it, and whether the decoder keeps the special tokens the
+        // reader needs, is decided as for a Messages request
+        // (`reading::prepare`). Only the chat stage chooses a parser:
+        // transcription, which shares this preparation, keeps the legacy
+        // parsers.
+        let reading::Prepared {
+            constraint: tool_call_constraint,
+            json_schema: json_schema_constraint,
+            keeps_special_tokens: preserve_reasoning_special_tokens,
+        } = reading::prepare(
+            ctx,
+            symphony::Asks::Chat(request),
+            &constraint_tools,
+            &processed_messages.text,
+            utils::chat_reasoning_starts_in_rendered_prefill(
+                request,
+                processed_messages.continued_final_message,
+                tokenizer.as_ref(),
+            ),
+            &tokenizer,
+            "ChatPreparationStage::execute",
+        )?;
 
-        let preserve_reasoning_special_tokens = request.separate_reasoning
-            && utils::reasoning_parser_requires_special_tokens(
-                &ctx.components.reasoning_parser_factory,
-                ctx.components
-                    .parser_resolver
-                    .reasoning_parser(&request.model)
-                    .as_deref(),
-                &request.model,
-            );
-
-        // Derive skip_special_tokens from parser and constraint type:
-        // - typed reasoning parsers need their control tokens preserved
-        // - json_schema: backend forces JSON, no trigger tokens to preserve
-        // - structural_tag or no constraint (auto): parser needs trigger tokens
-        let skip_special_tokens = if preserve_reasoning_special_tokens {
-            false
-        } else {
-            match &tool_call_constraint {
-                Some(c) if c.is_json_schema() => request.skip_special_tokens,
-                _ if request.tools.is_some()
-                    && !matches!(
-                        request.tool_choice,
-                        Some(ToolChoice::Value(ToolChoiceValue::None))
-                    ) =>
-                {
-                    false
-                }
-                _ => request.skip_special_tokens,
-            }
-        };
+        let skip_special_tokens = skips_special_tokens(
+            request,
+            json_schema_constraint,
+            preserve_reasoning_special_tokens,
+        );
 
         // Step 5: Create stop sequence decoder (build once, reuse in non-stream)
         let stop_decoder = utils::create_stop_decoder(
@@ -363,10 +206,150 @@ pub(crate) async fn prepare_chat_like(
         ctx.state.response.stop_decoder = Some(stop_decoder);
         ctx.state.response.skip_special_tokens = Some(skip_special_tokens);
 
-        Ok((
-            token_ids,
-            processed_messages,
-            tool_call_constraint.map(|c| c.to_tuple()),
-        ))
+        Ok((token_ids, processed_messages, tool_call_constraint))
+    }
+}
+
+/// Whether the engine drops its special tokens from the response. A reasoning
+/// parser or a table whose markers are special tokens needs them kept, whatever
+/// the request says; a JSON-schema constraint forces the call's JSON, so there
+/// are no markers to keep and the request's own setting stands; a request that
+/// offers tools the model may call (declared at the request level or on a
+/// message, see `ChatCompletionRequest::declares_tools`, the calls not switched
+/// off by `tool_choice: none`) keeps them for the tool parser's markers; any
+/// other request keeps its own setting.
+fn skips_special_tokens(
+    request: &ChatCompletionRequest,
+    json_schema_constraint: bool,
+    preserve_reasoning_special_tokens: bool,
+) -> bool {
+    if preserve_reasoning_special_tokens {
+        return false;
+    }
+    if json_schema_constraint {
+        return request.skip_special_tokens;
+    }
+    let calls_off = matches!(
+        request.tool_choice,
+        Some(ToolChoice::Value(ToolChoiceValue::None))
+    );
+    if request.declares_tools() && !calls_off {
+        false
+    } else {
+        request.skip_special_tokens
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openai_protocol::validated::Normalizable;
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    fn tool(name: &str) -> Value {
+        json!({
+            "type": "function",
+            "function": {"name": name, "parameters": {"type": "object", "properties": {}}}
+        })
+    }
+
+    /// A system message declaring `tools`, as the profiles that read such
+    /// declarations take it.
+    fn declaring(tools: &[Value]) -> Value {
+        json!({"role": "system", "content": "", "tools": tools})
+    }
+
+    fn user() -> Value {
+        json!({"role": "user", "content": "weather?"})
+    }
+
+    /// A request as the HTTP layer hands it on: normalized, so an empty `tools`
+    /// list has become `tool_choice: none`.
+    fn request(value: Value) -> ChatCompletionRequest {
+        let mut request: ChatCompletionRequest =
+            serde_json::from_value(value).expect("request deserializes");
+        request.normalize();
+        request
+    }
+
+    fn message_level_only() -> ChatCompletionRequest {
+        request(json!({
+            "model": "kimi-k3",
+            "messages": [declaring(&[tool("get_weather")]), user()]
+        }))
+    }
+
+    #[test]
+    fn tools_keep_the_special_tokens_wherever_they_are_declared() {
+        let request_level_only = request(json!({
+            "model": "kimi-k3",
+            "messages": [user()],
+            "tools": [tool("get_time")]
+        }));
+        assert!(!skips_special_tokens(&request_level_only, false, false));
+
+        assert!(!skips_special_tokens(&message_level_only(), false, false));
+
+        let both = request(json!({
+            "model": "kimi-k3",
+            "messages": [declaring(&[tool("get_weather")]), user()],
+            "tools": [tool("get_time")]
+        }));
+        assert!(!skips_special_tokens(&both, false, false));
+
+        // No tools anywhere: the request's own setting, whichever way it goes.
+        let none = request(json!({"model": "kimi-k3", "messages": [user()]}));
+        assert!(skips_special_tokens(&none, false, false));
+        let kept = request(json!({
+            "model": "kimi-k3",
+            "messages": [user()],
+            "skip_special_tokens": false
+        }));
+        assert!(!skips_special_tokens(&kept, false, false));
+    }
+
+    #[test]
+    fn conflicting_declarations_resolve_as_the_other_gates_resolve_them() {
+        // An empty request-level list beside a message's declaration: the
+        // normalizer's `tool_choice: none` switches the calls off, as it does
+        // without the message, so the parser is off too and nothing is kept.
+        let empty_list = request(json!({
+            "model": "kimi-k3",
+            "messages": [declaring(&[tool("get_weather")]), user()],
+            "tools": []
+        }));
+        assert!(matches!(
+            empty_list.tool_choice,
+            Some(ToolChoice::Value(ToolChoiceValue::None))
+        ));
+        assert!(skips_special_tokens(&empty_list, false, false));
+
+        // `tool_choice: none` written by the client, over a message's declaration.
+        let switched_off = request(json!({
+            "model": "kimi-k3",
+            "messages": [declaring(&[tool("get_weather")]), user()],
+            "tool_choice": "none"
+        }));
+        assert!(skips_special_tokens(&switched_off, false, false));
+
+        // A message's declaration under a profile that reads none widens nothing.
+        let unread = request(json!({
+            "model": "self-hosted-model",
+            "messages": [declaring(&[tool("get_weather")]), user()]
+        }));
+        assert!(skips_special_tokens(&unread, false, false));
+    }
+
+    #[test]
+    fn the_constraint_and_the_reasoning_markers_decide_before_the_tools() {
+        // A JSON-schema constraint forces the call's JSON: nothing to keep, the
+        // request's setting stands even with a message-declared tool.
+        assert!(skips_special_tokens(&message_level_only(), true, false));
+
+        // Reasoning markers the decoder would drop are kept whatever the request says.
+        let none = request(json!({"model": "kimi-k3", "messages": [user()]}));
+        assert!(!skips_special_tokens(&none, false, true));
+        assert!(!skips_special_tokens(&none, true, true));
     }
 }

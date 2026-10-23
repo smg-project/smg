@@ -4,6 +4,7 @@
 //! - RS256, RS384, RS512 (RSA)
 //! - ES256, ES384 (ECDSA)
 //! - Audience and issuer validation
+//! - Expiry and not-before validation with a shared leeway
 //! - Role extraction from claims
 //!
 //! Security features:
@@ -184,12 +185,6 @@ pub struct JwtValidator {
 }
 
 impl JwtValidator {
-    /// Create a new JWT validator with explicit JWKS URI.
-    #[expect(dead_code)]
-    pub(crate) fn new(config: JwtConfig, jwks_provider: Arc<JwksProvider>) -> Self {
-        Self::new_with_options(config, jwks_provider, false)
-    }
-
     /// Create a new JWT validator with optional JTI replay protection.
     pub(crate) fn new_with_options(
         config: JwtConfig,
@@ -206,6 +201,11 @@ impl JwtValidator {
 
         // Set leeway for clock skew
         validation.leeway = config.leeway_secs;
+
+        // Enforce `nbf`: jsonwebtoken leaves it off by default, which let a token
+        // minted for a future window through. Same leeway as `exp`; a token
+        // without the claim is still accepted.
+        validation.validate_nbf = true;
 
         validation.algorithms = vec![
             Algorithm::RS256,
@@ -499,21 +499,131 @@ impl JwtValidator {
         }
     }
 
-    /// Get a reference to the JWKS provider.
-    #[expect(dead_code)]
-    pub(crate) fn jwks_provider(&self) -> &Arc<JwksProvider> {
-        &self.jwks_provider
-    }
-
     /// Get a reference to the JWT config.
     pub fn config(&self) -> &JwtConfig {
         &self.config
     }
 }
 
+/// A loopback JWKS and signed tokens for the tests of the validator and of
+/// the middleware that runs it.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::{
+        sync::LazyLock,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use axum::{routing::get, Json, Router};
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
+    use rsa::{
+        pkcs8::{EncodePrivateKey, LineEnding},
+        rand_core::OsRng,
+        traits::PublicKeyParts,
+        RsaPrivateKey,
+    };
+    use serde_json::json;
+    use tokio::net::TcpListener;
+
+    use super::JwtValidator;
+    use crate::config::{JwtConfig, Role};
+
+    pub(crate) const ISSUER: &str = "https://issuer.example.com";
+    const AUDIENCE: &str = "smg";
+    const KID: &str = "test-key-1";
+
+    /// One RSA key pair for the module: the private half signs the test tokens,
+    /// the public components are what the JWKS endpoint serves.
+    struct TestKeyPair {
+        private_key_pem: String,
+        jwk: serde_json::Value,
+    }
+
+    static TEST_KEYS: LazyLock<TestKeyPair> = LazyLock::new(|| {
+        let private_key = RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
+        let jwk = json!({
+            "kty": "RSA",
+            "use": "sig",
+            "alg": "RS256",
+            "kid": KID,
+            "n": URL_SAFE_NO_PAD.encode(private_key.n().to_bytes_be()),
+            "e": URL_SAFE_NO_PAD.encode(private_key.e().to_bytes_be()),
+        });
+        let private_key_pem = private_key
+            .to_pkcs8_pem(LineEnding::LF)
+            .unwrap()
+            .to_string();
+        TestKeyPair {
+            private_key_pem,
+            jwk,
+        }
+    });
+
+    /// A validator with the default leeway, reading the test key set over loopback.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the JWKS server lives exactly as long as the test"
+    )]
+    pub(crate) async fn validator() -> JwtValidator {
+        let jwks = json!({ "keys": [TEST_KEYS.jwk.clone()] });
+        let app = Router::new().route(
+            "/jwks.json",
+            get(move || {
+                let jwks = jwks.clone();
+                async move { Json(jwks) }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let jwks_uri = format!(
+            "http://127.0.0.1:{}/jwks.json",
+            listener.local_addr().unwrap().port()
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let config = JwtConfig::new(ISSUER, AUDIENCE)
+            .with_jwks_uri(jwks_uri)
+            .with_role_mapping("admin", Role::Admin);
+        JwtValidator::from_config(config).await.unwrap()
+    }
+
+    pub(crate) fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// An admin token for `alice`, good for an hour, with the given `nbf`.
+    pub(crate) fn token(nbf: Option<u64>) -> String {
+        let now = now();
+        let mut claims = json!({
+            "iss": ISSUER,
+            "aud": AUDIENCE,
+            "sub": "alice",
+            "iat": now,
+            "exp": now + 3600,
+            "roles": ["admin"],
+        });
+        if let Some(nbf) = nbf {
+            claims["nbf"] = json!(nbf);
+        }
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(KID.to_string());
+        let key = EncodingKey::from_rsa_pem(TEST_KEYS.private_key_pem.as_bytes()).unwrap();
+        encode(&header, &claims, &key).unwrap()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use jsonwebtoken::errors::ErrorKind;
+
+    use super::{
+        test_support::{now, token, validator, ISSUER},
+        *,
+    };
+    use crate::jwks::test_support::discovery_server;
 
     #[test]
     fn test_audience_contains() {
@@ -529,5 +639,59 @@ mod tests {
 
         let none = Audience::None;
         assert!(!none.contains("anything"));
+    }
+
+    #[tokio::test]
+    async fn a_token_that_is_not_valid_yet_is_rejected() {
+        let validator = validator().await;
+
+        let err = validator
+            .validate(&token(Some(now() + 60)))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                JwtValidatorError::DecodeFailed(e)
+                    if matches!(e.kind(), ErrorKind::ImmatureSignature)
+            ),
+            "expected ImmatureSignature, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nbf_in_the_past_or_within_the_leeway_is_accepted() {
+        let validator = validator().await;
+        assert_eq!(validator.config().leeway_secs, 30);
+
+        for nbf in [Some(now() - 1), Some(now() + 10), None] {
+            let validated = validator
+                .validate(&token(nbf))
+                .await
+                .unwrap_or_else(|e| panic!("nbf {nbf:?} must be accepted: {e}"));
+            assert_eq!(validated.subject, "alice");
+            assert_eq!(validated.role, Role::Admin);
+        }
+    }
+
+    #[tokio::test]
+    async fn no_validator_is_built_on_a_discovery_document_for_another_issuer() {
+        // The document at the configured issuer's discovery endpoint names another
+        // issuer: the key set provider refuses it, so no validator comes to be.
+        let origin = discovery_server(|_| ISSUER.to_string()).await;
+
+        let Err(err) = JwtValidator::from_config(JwtConfig::new(&origin, "smg")).await else {
+            panic!("no validator may be built on a discovery document for another issuer");
+        };
+
+        assert!(
+            matches!(
+                &err,
+                JwtValidatorError::KeyError(JwksError::IssuerMismatch { configured, discovered })
+                    if configured == &origin && discovered == ISSUER
+            ),
+            "{err:?}"
+        );
     }
 }

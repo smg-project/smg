@@ -1,0 +1,104 @@
+name: symphony fuzz campaign
+
+# The Symphony crate's coverage-guided fuzz targets (crates/symphony/fuzz, cargo-fuzz on
+# nightly): the engine over every table, with random bytes cut into random deltas, checked
+# against the crate's contract on every input. They run here nightly, bounded, so that the
+# parser's robustness does not depend on someone remembering to run them; a crash fails the
+# job and its artifact is uploaded for the report crates/symphony/fuzz/README.md describes.
+# Budget: nine targets, three at a time, ten minutes each on a hosted runner. The run looks past
+# the classes reported and not yet fixed, by the name of their shape (SYMPHONY_FUZZ_ALLOW); a
+# name covers that shape from any reader, on every target: tolerated-json, the JSON syntax
+# passing on what its prefix judge tolerates, and empty-arguments, the pythonic reader's call
+# cut at the stream's end, today. A night's red is then a shape not yet reported; a name leaves
+# the list with its fix (made-up-empty-string left it with the pythonic reader's fix for a
+# parameter without a value), and a new breach of an allowed shape surfaces then.
+
+on:
+  schedule:
+    - cron: "41 5 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Minutes per target"
+        default: "10"
+      targets:
+        description: "Targets to run (space separated; empty for all)"
+        default: ""
+      allow:
+        description: "Breach names the run looks past (comma separated; empty for none)"
+        default: "tolerated-json,empty-arguments"
+
+concurrency:
+  group: symphony-fuzz
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  campaign:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      # The seeds are the recorded outputs of bellwether's hand-written sets for the tables'
+      # groups (crates/symphony/tests/common/slices.rs), read from the bellwether commit
+      # .github/versions/bellwether.ref pins. bellwether keeps those sets plain in its
+      # fixtures/ tree, so the checkout is the tree the crate reads (`bellwether unpack`
+      # writes the same files for them) and nothing is fetched from Git LFS.
+      - name: Read the pinned bellwether commit
+        id: pin
+        run: |
+          ref="$(tr -d '[:space:]' < .github/versions/bellwether.ref)"
+          if ! [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error file=.github/versions/bellwether.ref::expected one 40-character commit hash"
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      - name: Check out bellwether
+        uses: actions/checkout@v7
+        with:
+          repository: smg-project/bellwether
+          ref: ${{ steps.pin.outputs.ref }}
+          path: .bellwether
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: symphony-fuzz
+          workspaces: crates/symphony/fuzz
+      # The crate is a workspace of its own, outside the repository's fmt and clippy jobs. Its
+      # seed tests read the tree; without the variable they would skip.
+      - name: Format, lint and test the fuzz crate
+        env:
+          BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures
+        run: |
+          cargo fmt --manifest-path crates/symphony/fuzz/Cargo.toml --all -- --check
+          cargo clippy --manifest-path crates/symphony/fuzz/Cargo.toml --all-targets -- -D warnings
+          cargo test --manifest-path crates/symphony/fuzz/Cargo.toml
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+      - name: Run the targets
+        env:
+          BELLWETHER_FIXTURES: ${{ github.workspace }}/.bellwether/fixtures
+          MINUTES: ${{ github.event.inputs.minutes || '10' }}
+          TARGETS: ${{ github.event.inputs.targets || '' }}
+          EVENT: ${{ github.event_name }}
+          ALLOW_INPUT: ${{ github.event.inputs.allow }}
+        run: |
+          # A dispatch's allowance is its own, an empty one included (an expression's `||` would
+          # put the default back); a scheduled run looks past the classes reported and not yet fixed.
+          if [ "$EVENT" = workflow_dispatch ]; then ALLOW=$ALLOW_INPUT; else ALLOW=tolerated-json,empty-arguments; fi
+          # shellcheck disable=SC2086
+          crates/symphony/fuzz/run.sh --minutes "$MINUTES" --jobs 3 ${ALLOW:+--allow "$ALLOW"} $TARGETS
+      - name: Upload crashes and logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: symphony-fuzz-${{ github.sha }}
+          path: |
+            crates/symphony/fuzz/artifacts/
+            crates/symphony/fuzz/logs/
+          if-no-files-found: ignore

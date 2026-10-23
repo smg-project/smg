@@ -23,10 +23,15 @@ use futures::Stream;
 use smg_grpc_client::vllm_proto as vllm;
 
 use crate::{
+    context_window::admit_prompt,
     eos::EosTokenIds,
     fanout::fan_out_n,
     multimodal,
     stream::{poll_mapped, MappedGenerateStream, StreamState},
+    structured_outputs::{
+        refuse_unenforceable_constraint, ConstraintRef, StructuredOutputsBackendConfig,
+        StructuredOutputsSupport,
+    },
 };
 
 /// Ranked candidates to emit per position for a requested logprob count:
@@ -117,6 +122,17 @@ impl VllmGenerateStream {
     /// The choice `index` stamped on this stream's responses.
     pub fn index(&self) -> u32 {
         self.index
+    }
+
+    /// The engine-side id of this choice's request.
+    pub fn request_id(&self) -> &str {
+        self.inner.request_id()
+    }
+
+    /// The data-parallel rank this choice's engine request went to; `None`
+    /// for an engine whose identity names no index.
+    pub fn engine_index(&self) -> Option<u32> {
+        self.inner.engine_index()
     }
 
     /// Whether the engine already finished this choice and its terminal
@@ -304,7 +320,15 @@ impl MappedGenerateStream for VllmGenerateStream {
 
         // An engine-side request failure (e.g. grammar compilation) must
         // surface as an error, not as a normal completion with empty output —
-        // that would produce a 200 with no content.
+        // that would produce a 200 with no content. The engine names no cause
+        // on this wire: the same `Error` ends a request whose grammar rejected
+        // a token, a decode side whose KV load failed, an encoder-cache miss
+        // and a pre-processing fault, and an `Abort` the frontend did not ask
+        // for is a pause or a shutdown aborting every request; so a
+        // constrained request's `Error` stays the engine's own report (the
+        // router retries, charges and probes it as such) and its `Abort` keeps
+        // its shape. The constraint-failure status is raised only by a wire
+        // whose engine attributes the failure (see the SGLang stream).
         if matches!(output.finish_reason, Some(EngineCoreFinishReason::Error)) {
             return Err(tonic::Status::internal(
                 "engine finished the request with an error (see engine logs)",
@@ -443,19 +467,13 @@ pub(crate) fn translate_request(
     model_dtype: ModelDtype,
     eos: &EosTokenIds,
 ) -> Result<EngineCoreRequest, String> {
-    translate_request_with_backend(req, max_model_len, model_dtype, eos, None)
-}
-
-/// The engine's `--structured-outputs-config.backend`, as it bears on the
-/// `_backend` this translation stamps on structured requests: `auto` (vLLM's
-/// default) resolves per constraint the way vLLM's frontend does
-/// ([`StructuredOutputsParams::with_auto_backend`]); an explicit backend is
-/// pinned on every request. The engine keeps the backend of its first
-/// structured request, as it does behind vLLM's own frontend.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StructuredOutputsBackendConfig {
-    Auto,
-    Pinned(StructuredOutputBackend),
+    translate_request_with_backend(
+        req,
+        max_model_len,
+        model_dtype,
+        eos,
+        StructuredOutputsBackendConfig::default(),
+    )
 }
 
 /// [`StructuredOutputsBackendConfig`] from the configured backend name.
@@ -629,34 +647,37 @@ pub(crate) fn translated_from_processed(
     processed.into_translated(req, model_dtype)
 }
 
-/// [`translate_request`] with the grammar backend configured for the engine
-/// (`None` keeps the per-constraint default of the translation); the
-/// request's media is translated inline.
+/// [`translate_request`] with the grammar backend configured for the engine;
+/// the request's media is translated inline.
 #[cfg(test)]
 pub(crate) fn translate_request_with_backend(
     mut req: vllm::GenerateRequest,
     max_model_len: u64,
     model_dtype: ModelDtype,
     eos: &EosTokenIds,
-    structured_backend: Option<StructuredOutputsBackendConfig>,
+    structured_backend: StructuredOutputsBackendConfig,
 ) -> Result<EngineCoreRequest, String> {
     let media = translate_media(&mut req, model_dtype)?;
-    translate_request_with_media(req, media, max_model_len, eos, structured_backend)
+    translate_request_with_media(req, media, max_model_len, eos, structured_backend.into())
 }
 
 /// Translate a request whose media was already translated
 /// ([`translate_media`]), so the choices of one request share the work.
+/// An empty prompt, or one that fills the context window, is refused before
+/// it can reach the engine ([`admit_prompt`]).
 pub(crate) fn translate_request_with_media(
     req: vllm::GenerateRequest,
     media: TranslatedMedia,
     max_model_len: u64,
     eos: &EosTokenIds,
-    structured_backend: Option<StructuredOutputsBackendConfig>,
+    support: StructuredOutputsSupport,
 ) -> Result<EngineCoreRequest, String> {
     // Connector params ride `SamplingParams.extra_args`, where vLLM's own
     // frontend puts them, so a request carrying them always gets params.
     let kv_transfer_params = kv_transfer_params(&req)?;
-    prompt_token_ids(&req)?;
+    // vLLM's frontend defaults an unset `max_tokens` to the remaining context
+    // (`max_model_len - prompt_len`).
+    let default_max_tokens = admit_prompt(prompt_token_ids(&req)?.len(), max_model_len)?;
     let prompt_token_ids = match req.input {
         Some(vllm::generate_request::Input::Tokenized(tokenized)) => Some(tokenized.input_ids),
         _ => None,
@@ -670,14 +691,20 @@ pub(crate) fn translate_request_with_media(
         .data_parallel_rank
         .map(|rank| u32::try_from(rank).map_err(|_| format!("invalid data_parallel_rank: {rank}")))
         .transpose()?;
-    // vLLM's frontend defaults an unset `max_tokens` to the remaining context
-    // (`max_model_len - prompt_len`).
-    let prompt_len = prompt_token_ids.as_ref().map_or(0, |ids| ids.len()) as u64;
-    let default_max_tokens =
-        u32::try_from(max_model_len.saturating_sub(prompt_len)).unwrap_or(u32::MAX);
     if let Some(sp) = req.sampling_params.as_ref() {
         validate_sampling(sp, sp.max_tokens.unwrap_or(default_max_tokens))?;
+        refuse_unenforceable_constraint(constraint_ref(sp), support)?;
     }
+    // A grammar the gateway led with the model's thought for a worker whose
+    // grammar starts at the first token starts there whatever reasoning parser
+    // the engine runs: `reasoning_ended = true` is the engine's own switch for
+    // the gate behind its parser being passed. A request that constrains
+    // nothing, or whose grammar the gateway did not shape, says nothing of it,
+    // and the engine starts the grammar where it does.
+    let grammar_from_first_token = req
+        .sampling_params
+        .as_ref()
+        .is_some_and(|sp| sp.grammar_from_first_token && sp.constraint.is_some());
     let sampling_params = match (req.sampling_params, kv_transfer_params.is_some()) {
         (None, false) => None,
         (sp, _) => Some(translate_sampling(
@@ -685,7 +712,7 @@ pub(crate) fn translate_request_with_media(
             default_max_tokens,
             eos,
             kv_transfer_params,
-            structured_backend,
+            support.backend,
         )),
     };
     Ok(EngineCoreRequest {
@@ -696,6 +723,7 @@ pub(crate) fn translate_request_with_media(
         arrival_time: now_secs(),
         data_parallel_rank,
         cache_salt,
+        reasoning_ended: grammar_from_first_token.then_some(true),
         ..EngineCoreRequest::default()
     })
 }
@@ -736,7 +764,7 @@ pub(crate) fn translate_sampling(
     default_max_tokens: u32,
     eos: &EosTokenIds,
     kv_transfer_params: Option<serde_json::Value>,
-    structured_backend: Option<StructuredOutputsBackendConfig>,
+    structured_backend: StructuredOutputsBackendConfig,
 ) -> EngineCoreSamplingParams {
     // Stopping at EOS is the frontend's duty here: the primary id rides
     // `_eos_token_id`, extra ids merge into `stop_token_ids`, and the union
@@ -792,15 +820,10 @@ pub(crate) fn translate_sampling(
         logprobs: sp.logprobs,
         prompt_logprobs: sp.prompt_logprobs,
         logit_bias,
-        structured_outputs: sp.constraint.and_then(translate_constraint).map(|params| {
-            match structured_backend {
-                None => params,
-                Some(StructuredOutputsBackendConfig::Auto) => params.with_auto_backend(),
-                Some(StructuredOutputsBackendConfig::Pinned(backend)) => {
-                    params.with_backend(backend)
-                }
-            }
-        }),
+        structured_outputs: sp
+            .constraint
+            .and_then(translate_constraint)
+            .map(|params| params.with_backend(structured_backend.backend())),
         extra_args: kv_transfer_params
             .map(|params| HashMap::from([("kv_transfer_params".to_string(), params)])),
         ..EngineCoreSamplingParams::default()
@@ -883,9 +906,26 @@ pub(crate) fn validate_sampling(sp: &vllm::SamplingParams, max_tokens: u32) -> R
     Ok(())
 }
 
-/// Map the proto `constraint` oneof onto typed structured-output params. The
-/// backend defaults to guidance engine-side; `json_object=false` selects no
-/// constraint (the caller opted out), so it maps to `None`.
+/// The request's constraint as the shared refusal reads it
+/// ([`refuse_unenforceable_constraint`]): the proto `constraint` one-of by
+/// kind, with its text. `json_object = false` is an opt-out, no constraint.
+pub(crate) fn constraint_ref(sp: &vllm::SamplingParams) -> Option<ConstraintRef<'_>> {
+    use vllm::sampling_params::Constraint;
+    match sp.constraint.as_ref()? {
+        Constraint::JsonSchema(schema) => Some(ConstraintRef::JsonSchema(schema)),
+        Constraint::Regex(regex) => Some(ConstraintRef::Regex(regex)),
+        Constraint::Grammar(grammar) => Some(ConstraintRef::Ebnf(grammar)),
+        Constraint::StructuralTag(tag) => Some(ConstraintRef::StructuralTag(tag)),
+        Constraint::JsonObject(true) => Some(ConstraintRef::JsonObject),
+        Constraint::JsonObject(false) => None,
+        Constraint::Choice(_) => Some(ConstraintRef::Choice),
+    }
+}
+
+/// Map the proto `constraint` oneof onto typed structured-output params (the
+/// backend is pinned by the caller, [`translate_sampling`]);
+/// `json_object=false` selects no constraint (the caller opted out), so it
+/// maps to `None`.
 pub(crate) fn translate_constraint(
     constraint: vllm::sampling_params::Constraint,
 ) -> Option<StructuredOutputsParams> {
@@ -1030,6 +1070,8 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
 
         let req = vllm::GenerateRequest {
@@ -1239,6 +1281,8 @@ mod tests {
             };
             assert_eq!(request.sampling_params.as_ref().unwrap().logprobs, Some(2));
             output.send_outputs(&outputs).await.unwrap();
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
 
         let req = vllm::GenerateRequest {
@@ -1383,6 +1427,8 @@ mod tests {
             );
             output.send_outputs(&prefill).await.unwrap();
             output.send_outputs(&decode).await.unwrap();
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
 
         let req = vllm::GenerateRequest {
@@ -1484,6 +1530,39 @@ mod tests {
             stream: true,
             ..Default::default()
         }
+    }
+
+    /// A grammar the gateway led for a first-token start reaches the engine
+    /// with `reasoning_ended = true`, the gate behind its reasoning parser
+    /// taken as passed; a grammar the gateway did not shape, and a request
+    /// that constrains nothing, say nothing of it.
+    #[test]
+    fn a_grammar_led_for_the_first_token_starts_there_whatever_the_engines_parser() {
+        let translated = |sampling| {
+            translate_request(
+                tokenized_req(sampling),
+                4096,
+                ModelDtype::BFloat16,
+                &EosTokenIds::default(),
+            )
+            .expect("translated")
+        };
+        let led = translated(vllm::SamplingParams {
+            constraint: Some(vllm::sampling_params::Constraint::JsonObject(true)),
+            grammar_from_first_token: true,
+            ..Default::default()
+        });
+        assert_eq!(led.reasoning_ended, Some(true));
+        let unshaped = translated(vllm::SamplingParams {
+            constraint: Some(vllm::sampling_params::Constraint::JsonObject(true)),
+            ..Default::default()
+        });
+        assert_eq!(unshaped.reasoning_ended, None);
+        let free = translated(vllm::SamplingParams {
+            grammar_from_first_token: true,
+            ..Default::default()
+        });
+        assert_eq!(free.reasoning_ended, None, "no grammar, nothing to start");
     }
 
     #[test]
@@ -1658,9 +1737,10 @@ mod tests {
             structured_outputs_backend_from_config("xgrammar:disable-any-whitespace"),
             Pinned(StructuredOutputBackend::Xgrammar)
         );
-        // `auto` (and anything unknown) resolves per constraint.
+        // `auto` (and anything unknown) is the engine's own default.
         assert_eq!(structured_outputs_backend_from_config("auto"), Auto);
         assert_eq!(structured_outputs_backend_from_config(""), Auto);
+        assert_eq!(StructuredOutputsBackendConfig::default(), Auto);
 
         let constrained = || {
             tokenized_req(vllm::SamplingParams {
@@ -1681,11 +1761,11 @@ mod tests {
             4096,
             ModelDtype::BFloat16,
             &EosTokenIds::default(),
-            Some(Pinned(StructuredOutputBackend::Guidance)),
+            Pinned(StructuredOutputBackend::Guidance),
         )
         .expect("translated");
         assert_eq!(backend_of(request), StructuredOutputBackend::Guidance);
-        // Unpinned: the translation's own per-constraint default.
+        // Nothing configured: the engine's `auto`.
         let request = translate_request(
             constrained(),
             4096,
@@ -1693,12 +1773,12 @@ mod tests {
             &EosTokenIds::default(),
         )
         .expect("translated");
-        assert_eq!(backend_of(request), StructuredOutputBackend::default());
+        assert_eq!(backend_of(request), StructuredOutputBackend::Xgrammar);
 
-        // `auto`: vLLM's per-constraint resolution. A Lark grammar goes to
-        // xgrammar unchanged (vLLM 0.30 parses Lark there); a schema with a
-        // feature xgrammar lacks goes to guidance; a choice headed for
-        // xgrammar is lowered to the grammar vLLM's frontend substitutes.
+        // `auto`: xgrammar for every constraint, the engine's one backend
+        // being the one structural tags compile on. A Lark grammar goes to
+        // xgrammar unchanged (vLLM 0.30 parses Lark there); a choice is
+        // lowered to the grammar vLLM's frontend substitutes.
         let auto = |constraint| {
             translate_request_with_backend(
                 tokenized_req(vllm::SamplingParams {
@@ -1708,7 +1788,7 @@ mod tests {
                 4096,
                 ModelDtype::BFloat16,
                 &EosTokenIds::default(),
-                Some(Auto),
+                Auto,
             )
             .expect("translated")
             .sampling_params
@@ -1722,10 +1802,6 @@ mod tests {
             params.constraint,
             StructuredOutputConstraint::Grammar(lark.to_string())
         );
-        let params = auto(vllm::sampling_params::Constraint::JsonSchema(
-            r#"{"type":"integer","multipleOf":3}"#.to_string(),
-        ));
-        assert_eq!(params.backend, StructuredOutputBackend::Guidance);
         let params = auto(vllm::sampling_params::Constraint::Choice(
             vllm::ChoiceConstraint {
                 choices: vec!["a".to_string(), "b".to_string()],
@@ -1736,6 +1812,146 @@ mod tests {
             params.constraint,
             StructuredOutputConstraint::Grammar("root ::= \"a\" | \"b\"".to_string())
         );
+    }
+
+    /// A JSON schema with a feature xgrammar lacks (vLLM's own static check)
+    /// is refused before it reaches the engine wherever the resolved backend
+    /// is xgrammar, `auto` included, as vLLM's frontend refuses it under
+    /// `backend=xgrammar`: xgrammar would compile it with the keyword dropped
+    /// and the engine would answer off the schema. A pinned guidance enforces
+    /// such a schema and takes it as is. The tool parameters of a forced tool
+    /// call reach this translation as the same `JsonSchema` constraint (a
+    /// parser without structural tags builds one from the tools), or inside
+    /// a `StructuralTag` (a parser with structural tags embeds each tool's
+    /// parameters as a `json_schema` element), so a tool whose parameters use
+    /// such a keyword is refused the same way on both; the message names the
+    /// keyword and where it stands.
+    #[test]
+    fn a_schema_xgrammar_cannot_enforce_is_refused_wherever_xgrammar_is_the_backend() {
+        use engine_zmq_client::protocol::vllm::structured_outputs::StructuredOutputConstraint;
+        use StructuredOutputsBackendConfig::{Auto, Pinned};
+        let schema = |text: &str| {
+            tokenized_req(vllm::SamplingParams {
+                constraint: Some(vllm::sampling_params::Constraint::JsonSchema(
+                    text.to_string(),
+                )),
+                ..Default::default()
+            })
+        };
+        let translate = |request, config| {
+            translate_request_with_backend(
+                request,
+                4096,
+                ModelDtype::BFloat16,
+                &EosTokenIds::default(),
+                config,
+            )
+        };
+        let multiple_of = r#"{"type":"integer","multipleOf":3}"#;
+        for config in [Auto, Pinned(StructuredOutputBackend::Xgrammar)] {
+            let refused = translate(schema(multiple_of), config).expect_err("refused");
+            assert!(
+                refused.contains("not supported by xgrammar"),
+                "{config:?}: {refused}"
+            );
+        }
+        // The parameters of a forced tool call, as a tool-call parser without
+        // structural tags sends them: an array parameter with `uniqueItems`.
+        let tool_parameters = r#"{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string"},"uniqueItems":true}},"required":["tags"]}"#;
+        let refused = translate(schema(tool_parameters), Auto).expect_err("refused");
+        assert!(
+            refused.contains("tool parameters of a forced tool call")
+                && refused.contains("`uniqueItems` at `/properties/tags`"),
+            "{refused}"
+        );
+        let refused = translate(schema(multiple_of), Auto).expect_err("refused");
+        assert!(refused.contains("`multipleOf` at its root"), "{refused}");
+        // The same parameters inside a forced call's structural tag, as a
+        // parser with structural tags sends them (one `tag` per tool, the
+        // parameters its `json_schema` content): refused under `auto` and a
+        // pinned xgrammar, the message naming the keyword and where it
+        // stands in the tag; a pinned guidance takes the tag as it is; a tag
+        // whose schemas xgrammar compiles whole passes, stamped xgrammar.
+        let tag = |parameters: serde_json::Value| {
+            let tag = serde_json::json!({"format": {"type": "triggered_tags",
+                "triggers": ["<tool_call>"], "tags": [
+                    {"begin": "<tool_call>{\"name\": \"plain\", \"arguments\": ",
+                     "content": {"type": "json_schema", "json_schema":
+                        {"type": "object", "properties": {"city": {"type": "string"}}}},
+                     "end": "}</tool_call>"},
+                    {"begin": "<tool_call>{\"name\": \"tagged\", \"arguments\": ",
+                     "content": {"type": "json_schema", "json_schema": parameters},
+                     "end": "}</tool_call>"},
+                ], "at_least_one": true}});
+            tokenized_req(vllm::SamplingParams {
+                constraint: Some(vllm::sampling_params::Constraint::StructuralTag(
+                    tag.to_string(),
+                )),
+                ..Default::default()
+            })
+        };
+        let unique_items: serde_json::Value = serde_json::from_str(tool_parameters).unwrap();
+        for config in [Auto, Pinned(StructuredOutputBackend::Xgrammar)] {
+            let refused = translate(tag(unique_items.clone()), config).expect_err("refused");
+            assert!(
+                refused.contains("structural tag constraint")
+                    && refused.contains(
+                        "`uniqueItems` at `/format/tags/1/content/json_schema/properties/tags` \
+                         (inside the tag that begins `<tool_call>{\"name\": \"tagged\", \
+                         \"arguments\": `)"
+                    )
+                    && refused.contains("not supported by xgrammar"),
+                "{config:?}: {refused}"
+            );
+        }
+        let params = translate(tag(unique_items), Pinned(StructuredOutputBackend::Guidance))
+            .expect("translated")
+            .sampling_params
+            .and_then(|sp| sp.structured_outputs)
+            .expect("structured outputs");
+        assert_eq!(params.backend, StructuredOutputBackend::Guidance);
+        assert!(matches!(
+            params.constraint,
+            StructuredOutputConstraint::StructuralTag(_)
+        ));
+        let params = translate(
+            tag(serde_json::json!({"type": "object", "properties": {"n": {"type": "integer"}}})),
+            Auto,
+        )
+        .expect("translated")
+        .sampling_params
+        .and_then(|sp| sp.structured_outputs)
+        .expect("structured outputs");
+        assert_eq!(params.backend, StructuredOutputBackend::Xgrammar);
+        assert!(matches!(
+            params.constraint,
+            StructuredOutputConstraint::StructuralTag(_)
+        ));
+        let params = translate(
+            schema(multiple_of),
+            Pinned(StructuredOutputBackend::Guidance),
+        )
+        .expect("translated")
+        .sampling_params
+        .and_then(|sp| sp.structured_outputs)
+        .expect("structured outputs");
+        assert_eq!(params.backend, StructuredOutputBackend::Guidance);
+        assert_eq!(
+            params.constraint,
+            StructuredOutputConstraint::Json(
+                serde_json::json!({"type": "integer", "multipleOf": 3})
+            )
+        );
+        // A schema xgrammar compiles whole passes under `auto`.
+        let params = translate(
+            schema(r#"{"type":"object","properties":{"city":{"type":"string"}}}"#),
+            Auto,
+        )
+        .expect("translated")
+        .sampling_params
+        .and_then(|sp| sp.structured_outputs)
+        .expect("structured outputs");
+        assert_eq!(params.backend, StructuredOutputBackend::Xgrammar);
     }
 
     #[test]
@@ -1769,6 +1985,70 @@ mod tests {
         assert_eq!(ranked_candidate_count(Some(3)), 3);
         // -1 asks for every candidate the engine returned.
         assert_eq!(ranked_candidate_count(Some(-1)), usize::MAX);
+    }
+
+    /// Prompt bounds apply before engine admission, with or without an output limit.
+    #[test]
+    fn vllm_validates_prompt_length_even_with_explicit_max_tokens() {
+        for sampling in [
+            None,
+            Some(vllm::SamplingParams::default()),
+            Some(vllm::SamplingParams {
+                max_tokens: Some(16_384),
+                ..Default::default()
+            }),
+        ] {
+            for (prompt_len, max_model_len, accepted) in [
+                (0, 4, false),
+                (3, 4, true),
+                (4, 4, false),
+                (5, 4, false),
+                (1_049_692, 1_048_576, false),
+                // An engine that reported no window bounds nothing but
+                // emptiness (unreachable from vLLM, which always reports one).
+                (1_049_692, 0, true),
+                (0, 0, false),
+            ] {
+                let mut req = tokenized_req(vllm::SamplingParams::default());
+                req.sampling_params = sampling.clone();
+                req.input = Some(vllm::generate_request::Input::Tokenized(
+                    vllm::TokenizedInput {
+                        input_ids: vec![1; prompt_len],
+                        ..Default::default()
+                    },
+                ));
+                let result = translate_request(
+                    req,
+                    max_model_len,
+                    ModelDtype::BFloat16,
+                    &EosTokenIds::default(),
+                );
+                assert_eq!(
+                    result.is_ok(),
+                    accepted,
+                    "prompt_len={prompt_len}, max_model_len={max_model_len}, max_tokens={:?}",
+                    sampling.as_ref().and_then(|sp| sp.max_tokens)
+                );
+                match result {
+                    Err(error) => assert!(error.contains("prompt"), "{error}"),
+                    Ok(request) => {
+                        // The request's own limit is kept; an unset one is the
+                        // window's remainder, and no bound under no window.
+                        if let Some(sp) = sampling.as_ref() {
+                            let remainder = if max_model_len == 0 {
+                                u32::MAX
+                            } else {
+                                u32::try_from(max_model_len - prompt_len as u64).unwrap()
+                            };
+                            assert_eq!(
+                                request.sampling_params.expect("params").max_tokens,
+                                sp.max_tokens.unwrap_or(remainder)
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -1856,15 +2136,15 @@ mod tests {
             .structured_outputs
         };
 
-        // Each constraint mode maps onto its typed counterpart, always lowering
-        // to the guidance backend engine-side.
+        // Each constraint mode maps onto its typed counterpart, under the
+        // engine's `auto` backend when nothing configured one.
         let json_object = translate(vllm::sampling_params::Constraint::JsonObject(true))
             .expect("json_object translated");
         assert_eq!(
             json_object.constraint,
             StructuredOutputConstraint::JsonObject
         );
-        assert_eq!(json_object.backend, StructuredOutputBackend::Guidance);
+        assert_eq!(json_object.backend, StructuredOutputBackend::Xgrammar);
 
         let regex = translate(vllm::sampling_params::Constraint::Regex("a.*".to_string()))
             .expect("regex translated");
@@ -1873,6 +2153,8 @@ mod tests {
             StructuredOutputConstraint::Regex("a.*".to_string())
         );
 
+        // A choice is lowered to the grammar xgrammar compiles, as vLLM's
+        // frontend does before it sends one there.
         let choice = translate(vllm::sampling_params::Constraint::Choice(
             vllm::ChoiceConstraint {
                 choices: vec!["yes".to_string(), "no".to_string()],
@@ -1881,7 +2163,7 @@ mod tests {
         .expect("choice translated");
         assert_eq!(
             choice.constraint,
-            StructuredOutputConstraint::Choice(vec!["yes".to_string(), "no".to_string()])
+            StructuredOutputConstraint::Grammar("root ::= \"yes\" | \"no\"".to_string())
         );
 
         // A JSON schema string is parsed to preserve object shape.
@@ -2005,6 +2287,8 @@ mod tests {
                 .send_outputs(&batch("r1-1", 11, None, Some(EngineCoreFinishReason::Stop)))
                 .await
                 .unwrap();
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
         });
 
         let mut req = tokenized_req(vllm::SamplingParams {
@@ -2211,5 +2495,135 @@ mod tests {
             .expect_err(field);
             assert!(error.contains(field), "{field}: {error}");
         }
+    }
+
+    /// This wire's engine names no cause: an `Error` finish on a constrained
+    /// request is as often a decode side's failed KV load (the request
+    /// carries `kv_transfer_params`) as a grammar rejection, and an `Abort` the
+    /// frontend did not ask for is a pause or a shutdown. Both keep the shape
+    /// they have on every request: the `Error` is the engine's own report (the
+    /// internal status the router retries, charges and probes), the `Abort` a
+    /// `Complete` with finish reason `abort`; neither is the constraint-failure
+    /// status, which only an engine's own attribution raises.
+    #[tokio::test]
+    async fn an_error_or_abort_finish_of_a_constrained_request_keeps_the_engines_own_shape() {
+        use smg_grpc_client::is_constraint_failure;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ep = |name: &str| format!("ipc://{}", dir.path().join(name).display());
+        let (handshake, input, output) = (ep("hs.sock"), ep("in.sock"), ep("out.sock"));
+        let (client, engine) = tokio::join!(
+            ZmqEngineClient::connect(
+                &handshake,
+                &input,
+                &output,
+                1,
+                "m".to_string(),
+                EosTokenIds::default(),
+                RuntimeType::Vllm,
+                Duration::from_secs(10)
+            ),
+            connect_to_frontend(
+                &handshake,
+                EngineId::from_engine_index(0),
+                default_ready_response()
+            ),
+        );
+        let client = client.expect("adapter connect");
+        let engine = engine.expect("mock engine");
+        // (rid, the finish, constrained, a decode side carrying its KV handoff)
+        let cases = [
+            ("r1", EngineCoreFinishReason::Error, true, true),
+            ("r2", EngineCoreFinishReason::Error, true, false),
+            ("r3", EngineCoreFinishReason::Abort, true, false),
+            ("r4", EngineCoreFinishReason::Error, false, false),
+            ("r5", EngineCoreFinishReason::Abort, false, false),
+        ];
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "engine task ends after responding"
+        )]
+        let engine_task = tokio::spawn(async move {
+            let (mut input, mut output) = engine.split();
+            for (rid, finish, _, _) in cases {
+                let request = loop {
+                    match input.recv().await.unwrap() {
+                        EngineInbound::Add(request) => break request,
+                        // A dropped stream's abort of a request the engine
+                        // already finished.
+                        EngineInbound::Abort(_) => continue,
+                        other => panic!("expected Add, got {other:?}"),
+                    }
+                };
+                assert_eq!(request.request_id, rid);
+                output
+                    .send_outputs(&batch(rid, 10, None, Some(finish)))
+                    .await
+                    .unwrap();
+            }
+            // Keep the peer alive until the frontend has consumed the replies.
+            (input, output)
+        });
+
+        for (rid, finish, constrained, decode_side) in cases {
+            let req = vllm::GenerateRequest {
+                request_id: rid.to_string(),
+                input: Some(vllm::generate_request::Input::Tokenized(
+                    vllm::TokenizedInput {
+                        original_text: String::new(),
+                        input_ids: vec![1, 2, 3],
+                    },
+                )),
+                sampling_params: Some(vllm::SamplingParams {
+                    max_tokens: Some(8),
+                    constraint: constrained.then(|| {
+                        vllm::sampling_params::Constraint::JsonSchema(
+                            r#"{"type":"object"}"#.to_string(),
+                        )
+                    }),
+                    ..Default::default()
+                }),
+                kv_transfer_params_json: decode_side.then(|| {
+                    r#"{"do_remote_prefill":true,"remote_host":"prefill","remote_port":5600}"#
+                        .to_string()
+                }),
+                stream: true,
+                ..Default::default()
+            };
+            let mut stream = client.generate_vllm(req).await.expect("generate");
+            let item = stream.next().await.expect("an item");
+            match finish {
+                EngineCoreFinishReason::Error => {
+                    let error = item.expect_err("an error");
+                    assert_eq!(error.code(), tonic::Code::Internal, "{rid}");
+                    assert_eq!(
+                        error.message(),
+                        "engine finished the request with an error (see engine logs)",
+                        "{rid}: the engine's own report, word for word"
+                    );
+                    assert!(!is_constraint_failure(&error), "{rid}: {error}");
+                }
+                _ => {
+                    // The tick's token goes out as a chunk; the parked
+                    // `Complete` keeps the abort finish.
+                    assert!(
+                        matches!(
+                            item.expect("a chunk").response,
+                            Some(vllm::generate_response::Response::Chunk(_))
+                        ),
+                        "{rid}"
+                    );
+                    let complete = stream.next().await.expect("an item").expect("a response");
+                    match complete.response {
+                        Some(vllm::generate_response::Response::Complete(complete)) => {
+                            assert_eq!(complete.finish_reason, "abort", "{rid}");
+                        }
+                        other => panic!("{rid}: expected a Complete, got {other:?}"),
+                    }
+                }
+            }
+        }
+        engine_task.await.unwrap();
     }
 }
