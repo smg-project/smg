@@ -664,8 +664,10 @@ fn a_miss_avoids_the_worker_whose_report_hides_the_requests_the_router_holds() {
 fn a_request_the_report_already_counts_is_not_priced_again() {
     // `w1` holds three requests and its report counts them as running:
     // three mean prefills at 100 tokens/s = 30.72 s, nothing more. `w2`
-    // holds nothing and reports 3,100 queued tokens = 31 s. Charged a
-    // second time for the three, `w1` would read as 61.44 s and lose.
+    // holds nothing, reports nothing running and 3,100 queued tokens =
+    // 31 s at `w1`'s live rate (its own idle gauge does not count).
+    // Charged a second time for the three, `w1` would read as 61.44 s
+    // and lose.
     let policy = CacheAwarePolicy::with_config(test_config());
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     policy.init_workers(&workers);
@@ -674,18 +676,19 @@ fn a_request_the_report_already_counts_is_not_priced_again() {
     }
     let mut running = expected_wait_load(0, 0.1, 100.0);
     running.loads[0].num_running_reqs = 3;
+    let mut queued = expected_wait_load(3_100, 0.1, 100.0);
+    queued.loads[0].num_running_reqs = 0;
     TestFeed::attached_to(&policy).publish(&HashMap::from([
         (workers[0].url().to_string(), running),
-        (
-            workers[1].url().to_string(),
-            expected_wait_load(3_100, 0.1, 100.0),
-        ),
+        (workers[1].url().to_string(), queued),
     ]));
     assert_eq!(route_text(&policy, &workers, "alpha"), Some(0));
 
     // The same three requests dispatched after `w1`'s report: the
     // since-poll credit carries them (3 × 1024 tokens = 30.72 s), and
-    // nothing is charged on top of the credit either.
+    // nothing is charged on top of the credit either. Both reports carry
+    // the fixture's one running request (10.24 s each), so it cancels:
+    // 40.96 s against `w2`'s 41.24 s.
     let policy = CacheAwarePolicy::with_config(test_config());
     let workers = make_workers(&["http://w1:8000", "http://w2:8000"]);
     policy.init_workers(&workers);
