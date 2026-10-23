@@ -10,10 +10,11 @@ from smg_grpc_servicer.vllm.config_view import EngineConfigView
 logger = logging.getLogger(__name__)
 
 _MULTI_CONNECTOR = "MultiConnector"
+MOONCAKE_CONNECTOR = "MooncakeConnector"
 # The connectors that hand a request's KV to the one partner the router names
 # (a rendezvous or side channel per pair): the router tags both sides of such
 # a pair, so the child that carries the handoff is the one it must see.
-_P2P_CONNECTORS = frozenset({"MooncakeConnector", "NixlConnector", "MoRIIOConnector"})
+_P2P_CONNECTORS = frozenset({MOONCAKE_CONNECTOR, "NixlConnector", "MoRIIOConnector"})
 # The P2P connector whose handoff the gRPC router does not drive (its pipeline
 # refuses a disaggregated request on a worker that names it): beside exactly
 # one store child the store is the mover the router can serve, as it was when
@@ -55,6 +56,16 @@ def pairing_fields(vllm_config: object) -> dict:
 
 def _is_store_connector(connector: str) -> bool:
     return connector in _STORE_CONNECTORS or connector.startswith(_STORE_CONNECTOR_FAMILIES)
+
+
+def pd_connector(vllm_config: object) -> str:
+    """The connector this engine moves PD KV with, as ``GetServerInfo`` reports
+    it: the engine's ``kv_transfer_config`` projected by
+    :func:`resolve_pd_connector` (a wrapper's mover); empty without one."""
+    config = EngineConfigView(vllm_config).kv_transfer.config
+    if config is None:
+        return ""
+    return str(resolve_pd_connector(config)[0] or "")
 
 
 def resolve_pd_connector(config: object) -> tuple[str, str]:

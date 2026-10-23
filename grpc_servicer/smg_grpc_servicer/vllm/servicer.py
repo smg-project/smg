@@ -44,8 +44,10 @@ from smg_grpc_servicer.vllm.kv_events import (
     resolve_kv_events_config,
 )
 from smg_grpc_servicer.vllm.kv_transfer import (
+    MOONCAKE_CONNECTOR,
     params_from_request,
     params_to_response_fields,
+    pd_connector,
 )
 
 # The launcher imports this module before it defines serve_grpc: the moment
@@ -286,6 +288,10 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         # Resolve KV-event publishing config from the engine. Non-None only when
         # vLLM was started with --kv-events-config enabling the ZMQ publisher.
         self._kv_events_config = resolve_kv_events_config(async_llm)
+        # The connector the engine moves PD KV with (what GetServerInfo
+        # reports): the pre-admission rejection notice is withheld on
+        # Mooncake, see _notify_kv_transfer_rejected.
+        self._pd_connector = pd_connector(getattr(async_llm, "vllm_config", None))
         # Queued token-work, generation throughput and hit rate for GetLoads,
         # per rank, from the requests this servicer forwards (vLLM's stats
         # carry none); an unpinned request's queued prompt counts on the rank
@@ -699,10 +705,36 @@ class VllmEngineServicer(vllm_engine_pb2_grpc.VllmEngineServicer):
         engine's own abort answers a caller that gives up after admission; the
         prefill side's lease covers the window in which the engine never got
         the request.
+
+        On the Mooncake connector no notice is sent at all, a legitimate
+        pre-admission one included: that connector reports the notice's
+        empty pull as a finished transfer and the decode engine dies on it
+        (the comment at the check below); the prefill side's blocks are
+        released by the connector's own abort timeout instead.
         """
         if handed_to_engine or not kv_transfer_params:
             return
         if not kv_transfer_params.get("do_remote_prefill"):
+            return
+        if self._pd_connector == MOONCAKE_CONNECTOR:
+            # Remove once upstream fixes the connector: in vLLM 0.31's
+            # MooncakeConnector the notice's request is admitted and freed in
+            # one scheduler step, its empty pull (the prefill-block release)
+            # completes afterwards, and process_pulling_result reports it as
+            # finished_recving like a pull that carried KV; the scheduler's
+            # _update_from_kv_xfer_finished then asserts that the freed id is
+            # still tracked and the EngineCore exits. The connector's failure
+            # path (_handle_failed_recv) guards exactly this case and names
+            # this hook; the success path does not. NIXL releases with a
+            # notification and no pull, so it keeps the notice.
+            logger.warning(
+                "Request %s: KV-transfer rejection notice withheld on the Mooncake connector: "
+                "vLLM 0.31's MooncakeConnector.process_pulling_result reports the notice's empty "
+                "pull as finished_recving for an id Scheduler._update_from_kv_xfer_finished no "
+                "longer tracks, which kills the decode engine; the prefill side releases the "
+                "blocks at the connector's own abort timeout instead",
+                request_id,
+            )
             return
         # Older vLLM releases lack this hook; the lease expiry covers them
         notify = getattr(self.engine, "notify_kv_transfer_request_rejected", None)
