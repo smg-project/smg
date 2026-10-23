@@ -334,6 +334,141 @@ mod tests {
         }
     }
 
+    /// A call the token limit cut inside a string value's closing tag, the shapes one tool
+    /// request recorded with `max_tokens` below the call's length as the cut walked through the
+    /// tag: the arguments are the prefix as the model wrote it, up to the value's last byte and
+    /// nothing of the tag (`"KRW`, `"JFK`; the tag's start leaves as wrapping after the call's
+    /// end), the preamble is the content and nothing of the call is, the finish is the engine's
+    /// `length`, and the shapes recorded around it (a cut inside the value, after a complete
+    /// member inside the next parameter's tag) read as before; whole, a character at a time and
+    /// at every two-way cut. Before this the tag's bytes rode inside the value,
+    /// `"from_currency": "KRW</｜DSML｜ parameter`.
+    #[test]
+    fn a_call_the_token_limit_cut_inside_a_string_values_closing_tag_keeps_the_value_not_the_tag() {
+        use crate::{
+            event::{DropReason, FinishReason, MalformedReason},
+            testing::{drive_to, the_same_at_every_cut},
+        };
+        let currency = (
+            "I'll convert 2,500 South Korean Won to Vietnamese Dong for you.",
+            concat!(
+                "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"convert_currency\">\n",
+                "<｜DSML｜ parameter name=\"amount\" string=\"false\">2500</｜DSML｜ parameter>\n",
+                "<｜DSML｜ parameter name=\"from_currency\" string=\"true\">KRW"
+            ),
+            "convert_currency",
+        );
+        let flights = (
+            "I'll search for flights from CDG to JFK on that date for 3 passengers.",
+            concat!(
+                "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"search_flights\">\n",
+                "<｜DSML｜ parameter name=\"origin\" string=\"true\">CDG</｜DSML｜ parameter>\n",
+                "<｜DSML｜ parameter name=\"destination\" string=\"true\">JFK"
+            ),
+            "search_flights",
+        );
+        // A recorded request's preamble and call up to the value, its function's name; the tail
+        // after the value; the arguments; the wrapping dropped after the call started.
+        type Case<'a> = (
+            &'a (&'a str, &'a str, &'a str),
+            &'a str,
+            &'a str,
+            &'a [&'a str],
+        );
+        let cases: [Case; 5] = [
+            // Inside the closing tag: after its word, and right after its sentinel.
+            (
+                &currency,
+                "</｜DSML｜ parameter",
+                r#"{"amount": 2500, "from_currency": "KRW"#,
+                &["</｜DSML｜ parameter"],
+            ),
+            (
+                &flights,
+                "</｜DSML｜",
+                r#"{"origin": "CDG", "destination": "JFK"#,
+                &["</｜DSML｜"],
+            ),
+            // Inside the value.
+            (
+                &flights,
+                "",
+                r#"{"origin": "CDG", "destination": "JFK"#,
+                &[],
+            ),
+            // After the closing tag, inside the next parameter's tag: the member whole, the tag
+            // the end cut short and the newline before it as wrapping, before the call's end.
+            (
+                &currency,
+                "</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"to_",
+                r#"{"amount": 2500, "from_currency": "KRW""#,
+                &["\n<｜DSML｜ parameter name=\"to_"],
+            ),
+            (
+                &flights,
+                "</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"stops\" string=\"false\"",
+                r#"{"origin": "CDG", "destination": "JFK""#,
+                &["\n<｜DSML｜ parameter name=\"stops\" string=\"false\""],
+            ),
+        ];
+        for ((preamble, call, name), tail, arguments, wrapping) in cases {
+            let output = format!("</think>{preamble}\n\n{call}{tail}");
+            let read = |pieces: &[&str]| {
+                drive_to(
+                    &mut Engine::with_call_ids(
+                        Arc::new(deepseek_v4_1()),
+                        Declared::default(),
+                        ids(),
+                    ),
+                    "<think>",
+                    pieces,
+                    EngineFinish::Length,
+                )
+            };
+            let said = the_same_at_every_cut(read, &output);
+            assert_eq!(
+                said.calls,
+                vec![(name.to_string(), arguments.to_string())],
+                "{tail:?}"
+            );
+            assert_eq!(said.finish, Some((FinishReason::Length, 1)), "{tail:?}");
+            assert_eq!(said.content, *preamble, "{tail:?}");
+            let events = read(&[&output]);
+            assert_eq!(bytes(&events), output, "{tail:?}");
+            let shown: String = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Content(text) | Event::Malformed { text, .. } => Some(&*text.text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                shown, *preamble,
+                "nothing of the call is content: {events:?}"
+            );
+            let wrapping_after_the_start: Vec<&str> = events
+                .iter()
+                .skip_while(|event| !matches!(event, Event::ToolCallStart { .. }))
+                .filter_map(|event| match event {
+                    Event::Dropped {
+                        text,
+                        why: DropReason::Wrapper,
+                    } => Some(&*text.text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(wrapping_after_the_start, wrapping, "{tail:?}: {events:?}");
+            assert!(
+                events.iter().any(|event| matches!(
+                    event,
+                    Event::Malformed { text, why: MalformedReason::UnterminatedRegion }
+                        if text.text.is_empty()
+                )),
+                "{tail:?}: {events:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_calls_block_inside_the_thought_ends_it_and_a_second_invoke_ends_the_first() {
         let output = concat!(

@@ -462,11 +462,12 @@ impl Assembler {
     /// as the model wrote them (`, "prefs": {"size": "large", "temp`), since a client reads the
     /// prefix as written under `length`, never the call's bytes as the answer's prose, and a
     /// section that closed is written whole; a string whose key came and no byte opens as its
-    /// first byte would have opened it; a parameter tag the end cut short and the template's
-    /// whitespace between tags leave as the syntax's wrapping, as the stop drops a cut tag
-    /// ([`Self::cut_value`]). A call that started still ends, with no bytes of its own, as every
-    /// assembler ends one, after the one `Malformed { UnterminatedRegion }` event of no bytes
-    /// that says that its arguments are no whole value ([`end_cut_call`]); what a block that
+    /// first byte would have opened it; a parameter tag the end cut short, the start of a closing
+    /// tag held behind the value and the template's whitespace between tags leave as the syntax's
+    /// wrapping, as the stop drops a cut tag ([`Self::cut_value`]). A call that started still
+    /// ends, with no bytes of its own, as every assembler ends one, after the one `Malformed {
+    /// UnterminatedRegion }` event of no bytes that says that its arguments are no whole value
+    /// ([`end_cut_call`]); what a block that
     /// named no call held is refused as `UnterminatedRegion`, as the keyed assembler refuses it,
     /// so that the reader's release of a refused output that made no call takes the whole slice
     /// (a `Malformed` event with bytes would end that release).
@@ -504,10 +505,11 @@ impl Assembler {
 
     /// The value the end of the stream cut ([`Self::finish`]), written as far as the model wrote
     /// it. The bytes the value held (the start of a CDATA closer, the opener's first bytes while
-    /// the section was undecided) are its text; the start of a tag the scanner held is its text
-    /// too, unless it begins with one of the family's structural tokens or follows a closed
-    /// section, where it is a tag the end cut short, returned to be dropped after the call's end
-    /// so that every byte keeps its place; a newline held as the template's framing before a
+    /// the section was undecided) are its text; the start of a tag the scanner held is a tag the
+    /// end cut short, never the value's text, whatever the family builds its tags of (a cut
+    /// inside a string value's closing tag used to deliver the tag's bytes as the value's,
+    /// `"KRW</｜DSML｜ parameter`; the value is `"KRW`), returned to be dropped after the call's
+    /// end so that every byte keeps its place; a newline held as the template's framing before a
     /// closing tag that never came stays the template's. Then by the value's mode: a streamed
     /// string's fragments stand; a string whose key came and no byte opens, `{"key": "`; a value
     /// held for its close is written as one fragment, its key and its bytes as the JSON they
@@ -533,16 +535,12 @@ impl Assembler {
             return None;
         };
         let section_closed = value.cdata == Cdata::Done;
-        let mut text = self.take_held();
-        let tail = self.scanner.set_aside();
-        let mut cut_tag = None;
-        if !tail.is_empty() {
-            if section_closed || self.tags.is_cut_tag(&tail) {
-                cut_tag = Some(tail);
-            } else {
-                text.push_str(&tail);
-            }
-        }
+        let text = self.take_held();
+        // The start of a tag the scanner holds is a tag the end cut short, never the value's
+        // text, whatever the family builds its tags of: the limit fell while the model was
+        // writing, and the start of the closing tag at the end of its output is that tag (`KRW`
+        // and then `</`, up to the tag's last byte). It leaves after the call's end.
+        let cut_tag = Some(self.scanner.set_aside()).filter(|tail| !tail.is_empty());
         if self.tags.value_on_its_own_line && text == "\n" {
             if let Stage::Value(value) = &mut self.stage {
                 if matches!(value.mode, Mode::Whole | Mode::Undecided) && value.end.is_none() {
@@ -2148,7 +2146,7 @@ mod tests {
     /// arguments are no whole value before the call's end; whole and one character at a time.
     #[test]
     fn a_value_the_end_cut_leaves_as_the_calls_own_bytes_and_nothing_as_content() {
-        let cases: [(Tags, &str, &str, &[&str]); 19] = [
+        let cases: [(Tags, &str, &str, &[&str]); 28] = [
             // Typed by the tools: an object cut inside a nested string.
             (
                 Tags::MINIMAX_M2,
@@ -2241,6 +2239,65 @@ mod tests {
                 r#"{"o": {"k": 1}"#,
                 &[],
             ),
+            // The end inside a string value's closing tag, as recorded: the value as far as the
+            // model wrote it, the tag's start as wrapping after the call's end; cut after the
+            // tag's word and right after its sentinel. (The tag's bytes used to ride inside the
+            // value, `"from_currency": "KRW</｜DSML｜ parameter`.)
+            (
+                Tags::DSML,
+                "f\">\n<｜DSML｜ parameter name=\"amount\" string=\"false\">2500</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"from_currency\" string=\"true\">KRW</｜DSML｜ parameter",
+                r#"{"amount": 2500, "from_currency": "KRW"#,
+                &["</｜DSML｜ parameter"],
+            ),
+            (
+                Tags::DSML,
+                "f\">\n<｜DSML｜ parameter name=\"origin\" string=\"true\">CDG</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"destination\" string=\"true\">JFK</｜DSML｜",
+                r#"{"origin": "CDG", "destination": "JFK"#,
+                &["</｜DSML｜"],
+            ),
+            // The same inside the closing tag of an empty string, which opens, and of a JSON
+            // value the model wrote whole, which is whole.
+            (
+                Tags::DSML,
+                "f\">\n<｜DSML｜ parameter name=\"s\" string=\"true\"></｜DSML｜ param",
+                r#"{"s": ""#,
+                &["</｜DSML｜ param"],
+            ),
+            (
+                Tags::DSML,
+                "f\">\n<｜DSML｜ parameter name=\"o\" string=\"false\">{\"a\": 1}</｜DSML｜ parameter",
+                r#"{"o": {"a": 1}"#,
+                &["</｜DSML｜ parameter"],
+            ),
+            // The families whose tags are text the model could write: the tag's start at the
+            // end of a cut output is the tag all the same, down to its first byte.
+            (
+                Tags::MINIMAX_M2,
+                "f\">\n<parameter name=\"s\">Paris</par",
+                r#"{"s": "Paris"#,
+                &["</par"],
+            ),
+            (
+                Tags::MINIMAX_M2,
+                "f\">\n<parameter name=\"o\">{\"k\": 1}</parameter",
+                r#"{"o": {"k": 1}"#,
+                &["</parameter"],
+            ),
+            (Tags::MINIMAX_M2, "f\">\n<parameter name=\"n\">12<", r#"{"n": 12"#, &["<"]),
+            (
+                Tags::MINICPM5,
+                "f\"><param name=\"s\">x</par",
+                r#"{"s": "x"#,
+                &["</par"],
+            ),
+            // A value on its own line: the newline before the cut tag is the template's framing,
+            // in the fragment's source.
+            (
+                Tags::DOTS3,
+                "f\">\n<parameter name=\"n\">\n3\n</par",
+                r#"{"n": 3"#,
+                &["</par"],
+            ),
         ];
         for (tags, call, expected, wrapping) in cases {
             let characters: Vec<&str> = call
@@ -2267,14 +2324,30 @@ mod tests {
                     vec![(String::new(), MalformedReason::UnterminatedRegion)],
                     "{call:?} {how}: {events:?}"
                 );
+                // The call ends after the one word of no bytes; a tag the end cut short behind
+                // the value leaves after the end, as wrapping, where there is one.
+                let end_at = events
+                    .iter()
+                    .position(|event| matches!(event, Event::ToolCallEnd { .. }))
+                    .expect("the call's end");
                 assert!(
                     matches!(
-                        &events[events.len() - 2..],
+                        &events[end_at - 1..=end_at],
                         [
                             Event::Malformed { .. },
                             Event::ToolCallEnd { source, .. }
                         ] if source.text.is_empty()
                     ),
+                    "{call:?} {how}: {events:?}"
+                );
+                assert!(
+                    events[end_at + 1..].iter().all(|event| matches!(
+                        event,
+                        Event::Dropped {
+                            why: DropReason::Wrapper,
+                            ..
+                        }
+                    )),
                     "{call:?} {how}: {events:?}"
                 );
                 let dropped_after_the_start: Vec<String> = events
@@ -2289,7 +2362,8 @@ mod tests {
                     dropped_after_the_start, wrapping,
                     "{call:?} {how}: {events:?}"
                 );
-                nothing_empty(&events[..events.len() - 2]);
+                nothing_empty(&events[..end_at - 1]);
+                nothing_empty(&events[end_at + 1..]);
             }
         }
     }
