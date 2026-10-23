@@ -136,7 +136,8 @@ class ParserProof:
             observed = [row for row in tool_records if row["model"] == model]
             require(
                 any(
-                    row["delta"]["outputs"] > 0 or row["delta"]["fallback"] > 0 for row in observed
+                    row["delta"]["clean_outputs"] > 0 or row["delta"]["fallback"] > 0
+                    for row in observed
                 ),
                 "applicable tool model has no observed table or fallback path: " + model,
             )
