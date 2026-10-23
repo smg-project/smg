@@ -36,6 +36,10 @@ def git_output(*args):
 
 
 def check_source(inputs):
+    require(
+        (ROOT / ".github/amd-qa/vllm-required-cases.json").is_file(),
+        "required installed-vLLM runtime manifest is missing",
+    )
     for path, oid in inputs["source_trees"].items():
         actual = git_output("rev-parse", f"HEAD:{path}").strip()
         require(actual == oid, f"source identity differs: {path}")

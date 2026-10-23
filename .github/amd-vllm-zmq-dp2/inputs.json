@@ -1,6 +1,6 @@
 {
-  "ready": true,
-  "run_budget_admitted": true,
+  "ready": false,
+  "run_budget_admitted": false,
   "run_id": 40023385348,
   "run_attempt": 1,
   "producer_sha": "0474fbdeb4274d57be30351a718934e073f9bc46",
@@ -91,7 +91,7 @@
     "e2e_test": "0c1b778ffa433470e51be16334015adf82e01ba9",
     "scripts": "d2332134f3fe28c3cbb0069838cb6e2a52c0b250",
     ".github/actions": "a2c04716dbe54449fa894a9f7d4e519077efdbf4",
-    ".github/amd-qa": "b72ee4f8eebe8e81056dbc77c980e48dc5dd75e3",
+    ".github/amd-qa": "118f63faa06ee099507e0a00dbe5717a439ce8b1",
     "README.md": "83b7df25632da03f0184bd5b4628b9c9a3ace803",
     "LICENSE": "9088c2872db9763b9e6533c6960e9adb0c9cb65f",
     "rustfmt.toml": "19e1ab31f8958c31292f0f568976a036af7e683b",

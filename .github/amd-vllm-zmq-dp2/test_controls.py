@@ -139,3 +139,11 @@ def test_55_minute_absolute_budget_and_closed_flags(tmp_path, monkeypatch):
     monkeypatch.setattr(reuse, "api_get", lambda *_: pytest.fail("unadmitted API"))
     with pytest.raises(ValueError, match="not admitted"):
         reuse.main()
+
+
+def test_missing_runtime_manifest_fails_before_git_or_artifacts(tmp_path, monkeypatch):
+    monkeypatch.setattr(reuse, "ROOT", tmp_path)
+    monkeypatch.setattr(reuse, "git_output", lambda *_: pytest.fail("unexpected git check"))
+    monkeypatch.setattr(reuse, "api_get", lambda *_: pytest.fail("unexpected artifact query"))
+    with pytest.raises(ValueError, match="runtime manifest is missing"):
+        reuse.check_source({})
