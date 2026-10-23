@@ -288,7 +288,8 @@ pub enum WorkerMediaError {
     /// resolved or refuses the connection, its 4xx, a payload that is not the
     /// media it claims to be or is over a size cap) or its host's for now (a
     /// fetch that ran out of its budget, a 5xx, a broken transfer). Neither
-    /// is this worker's; the Router answers a 400 for either under `code`.
+    /// is this worker's; the Router answers the request's own a 400 and its
+    /// host's a 502, under `code`.
     #[error("{message}")]
     Media {
         fault: WorkerMediaFault,

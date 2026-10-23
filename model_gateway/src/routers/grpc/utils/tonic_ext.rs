@@ -17,11 +17,11 @@ pub(crate) const CONSTRAINT_FAILED_CODE: &str = "constraint_failed";
 pub(crate) trait TonicStatusExt {
     /// Map gRPC status code to the corresponding HTTP status code. A failure
     /// of the request's media (see [`TonicStatusExt::media_fault`]) is
-    /// answered for the media, a 400 whichever side of the fetch failed: a
-    /// reference the request got wrong and an origin that does not deliver
-    /// within the fetch budget are both the request's input, which the
-    /// reference APIs answer a 4xx for; the worker's own trouble with the
-    /// media stays the worker's 5xx (it carries no media fault). A
+    /// answered for the media: a 400 for a reference the request got wrong,
+    /// a 502 for an origin that does not deliver within the fetch budget,
+    /// answers 5xx or breaks the transfer, so the client knows whether to
+    /// retry; the worker's own trouble with the media stays the worker's 5xx
+    /// (it carries no media fault). A
     /// `CANCELLED` the worker answered is the worker's side ending the
     /// call (its connection closed under it, its server reset the stream):
     /// a bad gateway, never the request's fault. So is a status tonic made
@@ -81,8 +81,14 @@ impl TonicStatusExt for tonic::Status {
         if is_constraint_failure(self) {
             return StatusCode::UNPROCESSABLE_ENTITY;
         }
-        if self.media_fault().is_some() {
-            return StatusCode::BAD_REQUEST;
+        // The request's media failed, not the worker (the trailer says whose
+        // fault): the request's own reference is a 400, its host's trouble for
+        // now a 502, so a client knows whether to retry.
+        if let Some(fault) = self.media_fault() {
+            return match fault {
+                WorkerMediaFault::Client => StatusCode::BAD_REQUEST,
+                WorkerMediaFault::Transient => StatusCode::BAD_GATEWAY,
+            };
         }
         // tonic makes a status of a failure in the HTTP/2 layer under the
         // call (the connection went away: a GOAWAY of either side, the one
@@ -293,10 +299,10 @@ mod tests {
     }
 
     /// A worker's report that the request's media failed is answered for the
-    /// media (a 400 for the request's own fault and for the media host's
-    /// alike) and is no circuit-breaker sample, whichever code carries it.
-    /// The API's code is the one the worker names, `media_fetch_failed` when
-    /// it names none or one this router does not know.
+    /// media (a 400 for the request's own fault, a 502 for the media host's)
+    /// and is no circuit-breaker sample, whichever code carries it. The API's
+    /// code is the one the worker names, `media_fetch_failed` when it names
+    /// none or one this router does not know.
     #[test]
     fn a_media_fault_answers_for_the_media_and_is_no_breaker_sample() {
         let client = WorkerMediaFault::Client.stamp(tonic::Status::invalid_argument(
@@ -312,7 +318,7 @@ mod tests {
             "media fetch of https://media.example/a.png timed out after 10s",
         ));
         assert_eq!(transient.media_fault(), Some(WorkerMediaFault::Transient));
-        assert_eq!(transient.http_status(), StatusCode::BAD_REQUEST);
+        assert_eq!(transient.http_status(), StatusCode::BAD_GATEWAY);
         assert_eq!(transient.media_code(), MediaErrorCode::FetchFailed);
         let result: Result<(), tonic::Status> = Err(transient);
         assert_eq!(result.breaker_status(), None);
@@ -338,8 +344,8 @@ mod tests {
 
     /// A worker that predates the trailer reports a fetch failure on
     /// `UNAVAILABLE` in the connector's words; it is read as the media host's
-    /// fault and answered for the media. The worker's own trouble, and a
-    /// caller fault the worker already answers 4xx, are read as before.
+    /// fault and answered for the media (a 502). The worker's own trouble, and
+    /// a caller fault the worker already answers 4xx, are read as before.
     #[test]
     fn a_fetch_failure_in_the_connectors_words_is_read_without_the_trailer() {
         for message in [
@@ -355,7 +361,7 @@ mod tests {
                 Some(WorkerMediaFault::Transient),
                 "{message}"
             );
-            assert_eq!(legacy.http_status(), StatusCode::BAD_REQUEST);
+            assert_eq!(legacy.http_status(), StatusCode::BAD_GATEWAY);
             assert_eq!(legacy.media_code(), MediaErrorCode::FetchFailed);
             assert_eq!(legacy.breaker_status(), None);
         }
