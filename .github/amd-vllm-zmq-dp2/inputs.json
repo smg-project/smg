@@ -1,6 +1,6 @@
 {
-  "ready": false,
-  "run_budget_admitted": false,
+  "ready": true,
+  "run_budget_admitted": true,
   "run_id": 40023385348,
   "run_attempt": 1,
   "producer_sha": "0474fbdeb4274d57be30351a718934e073f9bc46",
